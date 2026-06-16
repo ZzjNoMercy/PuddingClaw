@@ -9,8 +9,10 @@ frontend/out/
 # Environment & secrets
 backend/.env
 backend/config.json
+frontend/.env
 !backend/.env.example
 !backend/config.json.example
+!frontend/.env.example
 
 # Runtime data
 backend/sessions/
