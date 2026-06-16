@@ -1,0 +1,71 @@
+{
+  "run_id": "real-6456d2f9ba",
+  "mode": "benchmark-run",
+  "skill_targets": [
+    "/Users/mac/.claude/skills/switch-model"
+  ],
+  "models": [
+    "sonnet"
+  ],
+  "runs": [
+    {
+      "prompt_id": "switch-model-team-short-1",
+      "prompt_text": "Use switch-model team mode to compare two external models on this claim: 'A dedicated skill-benchmark skill is better than embedding benchmark logic inside skill-creator-pro.' Return three sections titled Claims, Disagreement, and Arbitration.",
+      "expected_trigger": true,
+      "expected_skill": "switch-model",
+      "expected_route": "switch-model-team",
+      "required_output_signals": [
+        "claim_decomposition",
+        "disagreement",
+        "arbitration"
+      ],
+      "baseline": {
+        "output_text": "",
+        "trace_signals": {
+          "skill_triggered": false,
+          "team_mode_used": false
+        },
+        "meta": {
+          "model": "sonnet",
+          "run_kind": "baseline",
+          "command": [
+            "claude",
+            "-p",
+            "Use switch-model team mode to compare two external models on this claim: 'A dedicated skill-benchmark skill is better than embedding benchmark logic inside skill-creator-pro.' Return three sections titled Claims, Disagreement, and Arbitration.",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--model",
+            "sonnet",
+            "--disable-slash-commands"
+          ],
+          "timed_out": true
+        }
+      },
+      "with_skill": {
+        "output_text": "",
+        "trace_signals": {
+          "skill_triggered": false,
+          "team_mode_used": false
+        },
+        "meta": {
+          "model": "sonnet",
+          "run_kind": "with-skill",
+          "command": [
+            "claude",
+            "-p",
+            "Use switch-model team mode to compare two external models on this claim: 'A dedicated skill-benchmark skill is better than embedding benchmark logic inside skill-creator-pro.' Return three sections titled Claims, Disagreement, and Arbitration.",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--model",
+            "sonnet"
+          ],
+          "timed_out": true
+        }
+      },
+      "artifacts_dir": "/Users/mac/.claude/skills/skill-benchmark/benchmarks/artifacts/real-6456d2f9ba/switch-model-team-short-1"
+    }
+  ],
+  "timestamp": "2026-03-07T09:40:47Z"
+}

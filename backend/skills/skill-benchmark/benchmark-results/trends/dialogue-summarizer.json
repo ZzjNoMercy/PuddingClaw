@@ -1,0 +1,10 @@
+{
+  "skill_name": "dialogue-summarizer",
+  "run_count": 1,
+  "latest_verdict": "ineffective",
+  "trend_signal": "stable",
+  "models_seen": [
+    "claude-3-5-sonnet-20241022"
+  ],
+  "last_updated": "2026-03-17T10:40:45Z"
+}

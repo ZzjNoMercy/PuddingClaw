@@ -1,0 +1,42 @@
+{
+  "prompt_set_name": "starter-benchmark-set",
+  "notes": "Use this template as a minimal benchmark set after create or upgrade work. Replace placeholders with realistic prompts for the target skill.",
+  "prompts": [
+    {
+      "id": "should-trigger-1",
+      "category": "should-trigger",
+      "text": "[A realistic user request that should trigger the skill]",
+      "should_trigger": true,
+      "expected_skill": "[target-skill-name]",
+      "expected_route": null,
+      "required_output_signals": []
+    },
+    {
+      "id": "should-not-trigger-1",
+      "category": "should-not-trigger",
+      "text": "[A nearby request that should not trigger the skill]",
+      "should_trigger": false,
+      "expected_skill": "[target-skill-name]",
+      "expected_route": null,
+      "required_output_signals": []
+    },
+    {
+      "id": "edge-1",
+      "category": "edge",
+      "text": "[An ambiguous or partial request that tests trigger boundaries]",
+      "should_trigger": true,
+      "expected_skill": "[target-skill-name]",
+      "expected_route": null,
+      "required_output_signals": []
+    },
+    {
+      "id": "comparison-1",
+      "category": "comparison",
+      "text": "[A representative task prompt used for baseline vs with-skill comparison]",
+      "should_trigger": true,
+      "expected_skill": "[target-skill-name]",
+      "expected_route": "switch-model-team",
+      "required_output_signals": ["claim_decomposition", "disagreement", "arbitration"]
+    }
+  ]
+}

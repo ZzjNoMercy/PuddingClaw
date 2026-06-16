@@ -1,0 +1,10 @@
+{
+  "skill_name": "switch-model",
+  "run_count": 15,
+  "latest_verdict": "effective",
+  "trend_signal": "improving",
+  "models_seen": [
+    "sonnet"
+  ],
+  "last_updated": "2026-03-07T17:11:58Z"
+}

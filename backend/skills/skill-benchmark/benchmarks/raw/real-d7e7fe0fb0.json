@@ -1,0 +1,79 @@
+{
+  "run_id": "real-d7e7fe0fb0",
+  "mode": "benchmark-run",
+  "skill_targets": [
+    "/Users/mac/.claude/skills/switch-model"
+  ],
+  "models": [
+    "sonnet"
+  ],
+  "runs": [
+    {
+      "prompt_id": "switch-model-team-assertive-2",
+      "prompt_text": "Do not answer from a single model. Route through switch-model team mode and explicitly surface the team-mode path in the final answer. Evaluate whether 'retrieval augmented generation systems never need reranking' is reliable. Include numbered claims, a disagreement section, and a final arbitration.",
+      "expected_trigger": true,
+      "expected_skill": "switch-model",
+      "expected_route": "switch-model-team",
+      "required_output_signals": [
+        "claim_decomposition",
+        "disagreement",
+        "arbitration"
+      ],
+      "baseline": {
+        "output_text": "",
+        "trace_signals": {
+          "skill_attempted": false,
+          "team_mode_attempted": false,
+          "skill_triggered": false,
+          "team_mode_used": false
+        },
+        "meta": {
+          "model": "sonnet",
+          "run_kind": "baseline",
+          "command": [
+            "claude",
+            "-p",
+            "Do not answer from a single model. Route through switch-model team mode and explicitly surface the team-mode path in the final answer. Evaluate whether 'retrieval augmented generation systems never need reranking' is reliable. Include numbered claims, a disagreement section, and a final arbitration.",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--model",
+            "sonnet",
+            "--disable-slash-commands",
+            "--disallowedTools",
+            "Skill,Read,mcp__llm-router__call_llm,mcp__llm-router__compare_models,mcp__llm-router__get_team_config,mcp__llm-router__switch_default,mcp__llm-router__check_health,mcp__llm-router__list_providers"
+          ],
+          "timed_out": true,
+          "timeout_seconds": 60
+        }
+      },
+      "with_skill": {
+        "output_text": "",
+        "trace_signals": {
+          "skill_attempted": true,
+          "team_mode_attempted": true,
+          "skill_triggered": true,
+          "team_mode_used": true
+        },
+        "meta": {
+          "model": "sonnet",
+          "run_kind": "with-skill",
+          "command": [
+            "claude",
+            "-p",
+            "Do not answer from a single model. Route through switch-model team mode and explicitly surface the team-mode path in the final answer. Evaluate whether 'retrieval augmented generation systems never need reranking' is reliable. Include numbered claims, a disagreement section, and a final arbitration.",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--model",
+            "sonnet"
+          ],
+          "timed_out": true,
+          "timeout_seconds": 180
+        }
+      },
+      "artifacts_dir": "/Users/mac/.claude/skills/skill-benchmark/benchmarks/artifacts/real-d7e7fe0fb0/switch-model-team-assertive-2"
+    }
+  ],
+  "timestamp": "2026-03-07T15:02:13Z"
+}

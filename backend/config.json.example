@@ -1,0 +1,115 @@
+{
+  "rag_mode": false,
+  "memory_backend": "mem0",
+  "llm": {
+    "provider": "deepseek",
+    "model": "deepseek-chat",
+    "base_url": "https://api.deepseek.com",
+    "api_key": "",
+    "temperature": 0.7,
+    "max_tokens": 4096,
+    "context_window": 1000000
+  },
+  "embedding": {
+    "provider": "openai",
+    "model": "text-embedding-v4",
+    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "api_key": ""
+  },
+  "rag": {
+    "top_k": 3,
+    "similarity_threshold": 0.7
+  },
+  "compression": {
+    "ratio": 0.5,
+    "trigger_count": 20,
+    "max_history_messages": 100,
+    "middleware": {
+      "enabled": true,
+      "tool_clear": {
+        "keep_recent": 10,
+        "min_summary_length": 500
+      },
+      "summarization": {
+        "enabled": true,
+        "trigger_tokens": 200000,
+        "keep_messages": 10,
+        "use_chinese_prompt": true
+      },
+      "trim": {
+        "max_tokens": 12000,
+        "keep_last": 10
+      },
+      "compaction": {
+        "enabled": true,
+        "trigger_tokens": 500000,
+        "keep_recent": 8,
+        "compact_budget_tokens": 120000
+      }
+    }
+  },
+  "cache": {
+    "enabled": true,
+    "cache_boundary": {
+      "enabled": true
+    },
+    "tail_trim": {
+      "enabled": true,
+      "max_tokens": 200000,
+      "head_keep": 2,
+      "keep_recent": 30
+    }
+  },
+  "mcp": {
+    "enabled": []
+  },
+  "mem0": {
+    "user_id": "default_user",
+    "llm": {
+      "provider": "openai",
+      "config": {
+        "model": "deepseek-chat",
+        "openai_base_url": "https://api.deepseek.com/v1"
+      }
+    },
+    "embedder": {
+      "provider": "openai",
+      "config": {
+        "model": "text-embedding-v4"
+      }
+    },
+    "version": "v1.1",
+    "vector_store": {
+      "provider": "milvus",
+      "config": {
+        "collection_name": "puddingclaw_memory",
+        "url": "http://localhost:19530",
+        "token": ""
+      }
+    }
+  },
+  "smart_extractor": {
+    "throttle_every": 3,
+    "score_threshold": 0.1,
+    "stale_days": 30
+  },
+  "skills_router": {
+    "enabled": true,
+    "history_window": 2
+  },
+  "write_middleware": {
+    "enabled": true,
+    "task_state": {
+      "enabled": true,
+      "todo_path": "workspace/TODO.md",
+      "triggers": [
+        "帮我",
+        "待办",
+        "记得",
+        "提醒",
+        "任务",
+        "需要做"
+      ]
+    }
+  }
+}

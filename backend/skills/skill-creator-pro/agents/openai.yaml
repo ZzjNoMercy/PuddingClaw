@@ -1,0 +1,4 @@
+interface:
+  display_name: "Skill Creator Pro"
+  short_description: "Design and refine production-grade AI skills"
+  default_prompt: "Use $skill-creator-pro to design or upgrade a reusable AI skill with strong triggers, structure, and validation."

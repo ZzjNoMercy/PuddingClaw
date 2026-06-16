@@ -1,0 +1,11 @@
+{
+  "id": "edge-1",
+  "category": "edge",
+  "text": "刚才说了什么",
+  "should_trigger": true,
+  "expected_skill": "dialogue-summarizer",
+  "expected_route": null,
+  "required_output_signals": [
+    "对话总结"
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "output_text": "",
+  "trace_signals": {
+    "skill_attempted": true,
+    "team_mode_attempted": true,
+    "skill_triggered": true,
+    "team_mode_used": true
+  },
+  "meta": {
+    "model": "sonnet",
+    "run_kind": "with-skill",
+    "command": [
+      "claude",
+      "-p",
+      "Do not answer from a single model. Route through switch-model team mode and explicitly surface the team-mode path in the final answer. Evaluate whether 'retrieval augmented generation systems never need reranking' is reliable. Include numbered claims, a disagreement section, and a final arbitration.",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--model",
+      "sonnet"
+    ],
+    "timed_out": true
+  }
+}

@@ -1,0 +1,44 @@
+# Dependencies
+backend/.venv/
+backend/.venv.*/
+backend/node_modules/
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+
+# Environment & secrets
+backend/.env
+backend/config.json
+!backend/.env.example
+!backend/config.json.example
+
+# Runtime data
+backend/sessions/
+backend/workspace/
+backend/memory/
+backend/logs/
+backend/archive/
+backend/storage/
+__pycache__/
+*.py[cod]
+*$py.class
+backend/.pytest_cache/
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# Build outputs
+dist/
+build/
+*.egg-info/
+
+# Docker volumes (if any)
+volumes/

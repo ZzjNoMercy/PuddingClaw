@@ -1,0 +1,12 @@
+{
+  "id": "edge-2",
+  "category": "edge",
+  "text": "提取关键信息",
+  "should_trigger": true,
+  "expected_skill": "dialogue-summarizer",
+  "expected_route": null,
+  "required_output_signals": [
+    "关键点",
+    "信息提取"
+  ]
+}

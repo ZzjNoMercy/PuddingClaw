@@ -1,0 +1,12 @@
+{
+  "id": "switch-model-team-short-3",
+  "text": "Use switch-model team mode to quickly compare two model perspectives on whether the statement 'vector databases always eliminate the need for reranking' is reliable. Keep it brief. Show claim decomposition, disagreement, and arbitration.",
+  "should_trigger": true,
+  "expected_skill": "switch-model",
+  "expected_route": "switch-model-team",
+  "required_output_signals": [
+    "claim_decomposition",
+    "disagreement",
+    "arbitration"
+  ]
+}

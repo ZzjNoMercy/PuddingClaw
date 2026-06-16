@@ -1,0 +1,16 @@
+{
+  "run_id": "real-0770a1f7b2",
+  "skill_targets": [
+    "/Users/mac/.claude/skills/switch-model"
+  ],
+  "models": [
+    "sonnet"
+  ],
+  "aggregate_scores": {
+    "trigger_accuracy": 1.0,
+    "routing_clarity": 1.0,
+    "output_signal_retention": 1.0
+  },
+  "final_verdict": "effective",
+  "timestamp": "2026-03-07T17:11:58Z"
+}

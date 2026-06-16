@@ -1,0 +1,13 @@
+{
+  "id": "switch-model-team-strict-1",
+  "category": "comparison",
+  "text": "Use switch-model team mode to compare two external models on this claim: 'A dedicated skill-benchmark skill is better than embedding benchmark logic inside skill-creator-pro.' Return three sections titled Claims, Disagreement, and Arbitration.",
+  "should_trigger": true,
+  "expected_skill": "switch-model",
+  "expected_route": "switch-model-team",
+  "required_output_signals": [
+    "claim_decomposition",
+    "disagreement",
+    "arbitration"
+  ]
+}

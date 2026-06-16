@@ -1,0 +1,178 @@
+{
+  "skill_name": "dialogue-summarizer",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "总结一下我们刚才关于天气查询的对话",
+      "expected_output": "包含天气信息、查询时间、建议等关键点的快速总结",
+      "files": [],
+      "assertions": [
+        {
+          "type": "contains",
+          "value": "天气",
+          "description": "总结应包含天气相关信息"
+        },
+        {
+          "type": "contains",
+          "value": "温度",
+          "description": "总结应包含温度信息"
+        },
+        {
+          "type": "length",
+          "min": 100,
+          "max": 500,
+          "description": "快速总结应在100-500字之间"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "帮我复盘一下这次技能创建的讨论",
+      "expected_output": "包含问题描述、解决方案、代码示例、后续步骤的标准总结",
+      "files": [],
+      "assertions": [
+        {
+          "type": "contains",
+          "value": "技能",
+          "description": "总结应包含技能相关信息"
+        },
+        {
+          "type": "contains_table",
+          "description": "总结应包含行动项表格"
+        },
+        {
+          "type": "contains",
+          "value": "行动项",
+          "description": "总结应识别行动项"
+        },
+        {
+          "type": "length",
+          "min": 300,
+          "max": 1000,
+          "description": "标准总结应在300-1000字之间"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "生成这次项目规划会议的纪要",
+      "expected_output": "包含项目目标、任务分配、时间线、风险点的详细复盘",
+      "files": [],
+      "assertions": [
+        {
+          "type": "contains",
+          "value": "项目",
+          "description": "总结应包含项目相关信息"
+        },
+        {
+          "type": "contains",
+          "value": "时间线",
+          "description": "详细复盘应包含时间线"
+        },
+        {
+          "type": "contains",
+          "value": "风险评估",
+          "description": "详细复盘应包含风险评估"
+        },
+        {
+          "type": "length",
+          "min": 800,
+          "max": 2000,
+          "description": "详细复盘应在800-2000字之间"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "刚才说了什么",
+      "expected_output": "回退机制，请求用户提供更多信息或基于有限上下文生成总结",
+      "files": [],
+      "assertions": [
+        {
+          "type": "contains",
+          "value": "上下文",
+          "description": "应提及上下文不完整"
+        },
+        {
+          "type": "contains_any",
+          "values": ["提供", "描述", "信息"],
+          "description": "应请求用户提供更多信息"
+        },
+        {
+          "type": "length",
+          "min": 50,
+          "max": 300,
+          "description": "回退响应应在50-300字之间"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "提取对话中的关键点",
+      "expected_output": "提取并列出对话中的关键信息点",
+      "files": [],
+      "assertions": [
+        {
+          "type": "contains_list",
+          "description": "应使用列表格式呈现关键点"
+        },
+        {
+          "type": "count_list_items",
+          "min": 3,
+          "description": "至少应提取3个关键点"
+        },
+        {
+          "type": "length",
+          "min": 150,
+          "max": 600,
+          "description": "关键点提取应在150-600字之间"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "prompt": "有哪些行动项需要跟进？",
+      "expected_output": "识别并列出对话中的行动项和待办事项",
+      "files": [],
+      "assertions": [
+        {
+          "type": "contains",
+          "value": "行动项",
+          "description": "应明确标识行动项"
+        },
+        {
+          "type": "contains_table",
+          "description": "应使用表格格式呈现行动项"
+        },
+        {
+          "type": "contains",
+          "value": "负责人",
+          "description": "行动项应包含负责人信息"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "prompt": "对话回顾",
+      "expected_output": "全面的对话回顾，包含总结、分析和建议",
+      "files": [],
+      "assertions": [
+        {
+          "type": "contains",
+          "value": "回顾",
+          "description": "应包含回顾相关内容"
+        },
+        {
+          "type": "contains",
+          "value": "建议",
+          "description": "应包含改进建议"
+        },
+        {
+          "type": "contains",
+          "value": "统计",
+          "description": "应包含对话统计数据"
+        }
+      ]
+    }
+  ]
+}

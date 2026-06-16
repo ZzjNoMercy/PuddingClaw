@@ -1,0 +1,69 @@
+{
+  "prompt_set_name": "dialogue-summarizer-benchmark-set",
+  "notes": "Benchmark prompts for dialogue-summarizer skill evaluation",
+  "prompts": [
+    {
+      "id": "should-trigger-1",
+      "category": "should-trigger",
+      "text": "总结一下我们刚才关于天气查询的对话",
+      "should_trigger": true,
+      "expected_skill": "dialogue-summarizer",
+      "expected_route": null,
+      "required_output_signals": ["对话总结", "关键点", "行动项"]
+    },
+    {
+      "id": "should-trigger-2",
+      "category": "should-trigger",
+      "text": "帮我复盘一下这次技能创建的讨论",
+      "should_trigger": true,
+      "expected_skill": "dialogue-summarizer",
+      "expected_route": null,
+      "required_output_signals": ["对话总结", "关键讨论点", "已达成共识"]
+    },
+    {
+      "id": "should-not-trigger-1",
+      "category": "should-not-trigger",
+      "text": "今天天气怎么样？",
+      "should_trigger": false,
+      "expected_skill": "dialogue-summarizer",
+      "expected_route": null,
+      "required_output_signals": []
+    },
+    {
+      "id": "should-not-trigger-2",
+      "category": "should-not-trigger",
+      "text": "创建一个新的技能",
+      "should_trigger": false,
+      "expected_skill": "dialogue-summarizer",
+      "expected_route": null,
+      "required_output_signals": []
+    },
+    {
+      "id": "edge-1",
+      "category": "edge",
+      "text": "刚才说了什么",
+      "should_trigger": true,
+      "expected_skill": "dialogue-summarizer",
+      "expected_route": null,
+      "required_output_signals": ["对话总结"]
+    },
+    {
+      "id": "edge-2",
+      "category": "edge",
+      "text": "提取关键信息",
+      "should_trigger": true,
+      "expected_skill": "dialogue-summarizer",
+      "expected_route": null,
+      "required_output_signals": ["关键点", "信息提取"]
+    },
+    {
+      "id": "comparison-1",
+      "category": "comparison",
+      "text": "我们刚才讨论了技能质量评估、对话总结和天气查询等多个话题。请帮我生成一个完整的对话总结报告，包括所有关键讨论点、行动项和复盘建议。",
+      "should_trigger": true,
+      "expected_skill": "dialogue-summarizer",
+      "expected_route": null,
+      "required_output_signals": ["对话总结报告", "关键讨论点", "行动项", "复盘建议", "数据统计"]
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "id": "should-not-trigger-1",
+  "category": "should-not-trigger",
+  "text": "今天天气怎么样？",
+  "should_trigger": false,
+  "expected_skill": "dialogue-summarizer",
+  "expected_route": null,
+  "required_output_signals": []
+}

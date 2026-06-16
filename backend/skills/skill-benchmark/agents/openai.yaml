@@ -1,0 +1,4 @@
+interface:
+  display_name: "Skill Benchmark"
+  short_description: "Benchmark whether a local or external skill is actually effective across prompts, models, and baseline comparisons"
+  default_prompt: "Use $skill-benchmark when the user wants to test whether a skill is genuinely effective, compare it against a baseline or another skill, or accumulate benchmark results over time."

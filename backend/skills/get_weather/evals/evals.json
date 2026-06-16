@@ -1,0 +1,53 @@
+{
+  "skill_name": "get_weather",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "查询北京的天气",
+      "expected_output": "包含北京当前天气信息的自然语言描述，包括天气状况、温度、湿度、风速等基本信息",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "上海今天热吗？",
+      "expected_output": "包含上海温度和天气状况的回复，判断是否炎热并提供穿衣建议",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "天气怎么样？",
+      "expected_output": "询问用户要查询哪个城市，因为未指定具体城市",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "告诉我纽约的温度和湿度",
+      "expected_output": "包含纽约温度和湿度的详细天气信息，使用英文城市名查询",
+      "files": []
+    },
+    {
+      "id": 5,
+      "prompt": "明天广州会下雨吗？",
+      "expected_output": "查询广州的天气预报，特别是降水概率",
+      "files": []
+    },
+    {
+      "id": 6,
+      "prompt": "北京和上海哪个更冷？",
+      "expected_output": "比较北京和上海的天气，指出哪个城市温度更低",
+      "files": []
+    },
+    {
+      "id": 7,
+      "prompt": "现在外面适合跑步吗？",
+      "expected_output": "根据当前天气（默认位置或询问位置）提供运动建议",
+      "files": []
+    },
+    {
+      "id": 8,
+      "prompt": "湿度多少？",
+      "expected_output": "询问具体城市后提供湿度信息",
+      "files": []
+    }
+  ]
+}

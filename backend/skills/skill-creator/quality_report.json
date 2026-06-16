@@ -1,0 +1,70 @@
+{
+  "skill_path": "../skill-creator",
+  "skill_name": "skill-creator",
+  "structure": {
+    "has_skill_md": true,
+    "has_scripts": true,
+    "has_references": true,
+    "has_assets": true,
+    "skill_md_lines": 486,
+    "description_length": 319,
+    "has_standard_sections": {
+      "goal": false,
+      "workflow": false,
+      "decision_tree": false,
+      "constraints": false,
+      "validation": false,
+      "resources": false
+    }
+  },
+  "scores": {
+    "trigger_quality": 3,
+    "routing_clarity": 0,
+    "context_efficiency": 3,
+    "reuse_determinism": 4,
+    "validation_strength": 2
+  },
+  "evidence": {
+    "trigger_quality": [
+      "description 长度足够 (319 字符)",
+      "包含 'Use when...' 触发词",
+      "缺少负面边界排除",
+      "未列出典型对象/文件类型",
+      "触发描述精确且详细"
+    ],
+    "routing_clarity": [
+      "只有 0/6 个标准章节",
+      "缺少 Decision Tree 章节",
+      "缺少 Constraints 章节"
+    ],
+    "context_efficiency": [
+      "SKILL.md 臃肿 (486 行)",
+      "有 references/ 目录用于分层",
+      "缺少 Resources 章节"
+    ],
+    "reuse_determinism": [
+      "有 scripts/ 目录",
+      "有 9 个脚本文件",
+      "run_eval.py 看起来是可执行脚本",
+      "手动操作较少"
+    ],
+    "validation_strength": [
+      "缺少 Validation 章节",
+      "有明确的成功标准",
+      "有证据要求"
+    ]
+  },
+  "total": {
+    "total_score": 12,
+    "max_score": 25,
+    "grade": "🟠 可用但不稳定 (Usable but unstable)",
+    "grade_color": "orange",
+    "percentage": 48.0
+  },
+  "needs_human_review": {
+    "trigger_precision": true,
+    "decision_tree_quality": true,
+    "paradigm_identification": true,
+    "constitution_compliance": true
+  }
+}

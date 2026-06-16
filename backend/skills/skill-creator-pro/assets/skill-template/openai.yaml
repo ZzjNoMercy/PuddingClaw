@@ -1,0 +1,4 @@
+interface:
+  display_name: "Example Skill"
+  short_description: "Replace with a concise UI description"
+  default_prompt: "Use $example-skill to handle this repeated workflow."

@@ -1,0 +1,32 @@
+{
+  "prompt_set_name": "switch-model-team-benchmark",
+  "notes": "Route-sensitive benchmark prompts for verifying that switch-model actually enters team mode rather than merely producing a multi-perspective answer directly.",
+  "prompts": [
+    {
+      "id": "switch-model-team-assertive-1",
+      "category": "route-sensitive",
+      "text": "Use the switch-model skill in team mode, not a direct single-model answer. Compare two model perspectives on whether the statement 'vector databases always eliminate the need for reranking' is reliable. The final answer must explicitly say that team mode was used. Include claim decomposition, a disagreement section, and an arbitration section.",
+      "should_trigger": true,
+      "expected_skill": "switch-model",
+      "expected_route": "switch-model-team",
+      "required_output_signals": [
+        "claim_decomposition",
+        "disagreement",
+        "arbitration"
+      ]
+    },
+    {
+      "id": "switch-model-team-assertive-2",
+      "category": "route-sensitive",
+      "text": "Do not answer from a single model. Route through switch-model team mode and explicitly surface the team-mode path in the final answer. Evaluate whether 'retrieval augmented generation systems never need reranking' is reliable. Include numbered claims, a disagreement section, and a final arbitration.",
+      "should_trigger": true,
+      "expected_skill": "switch-model",
+      "expected_route": "switch-model-team",
+      "required_output_signals": [
+        "claim_decomposition",
+        "disagreement",
+        "arbitration"
+      ]
+    }
+  ]
+}

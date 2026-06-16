@@ -1,0 +1,9 @@
+{
+  "id": "should-trigger-1",
+  "category": "should-trigger",
+  "text": "请帮我搜索开源 skills，找几个和 skill governance 或 skill upgrade 相关的外部 skills，再和我本地的 /Users/mac/.claude/skills/skill-governance 对比，告诉我哪些结构和流程值得借鉴。",
+  "should_trigger": true,
+  "expected_skill": "skill-patrol",
+  "expected_route": null,
+  "required_output_signals": []
+}

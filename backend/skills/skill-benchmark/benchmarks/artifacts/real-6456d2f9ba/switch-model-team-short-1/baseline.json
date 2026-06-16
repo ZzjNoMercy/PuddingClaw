@@ -1,0 +1,23 @@
+{
+  "output_text": "",
+  "trace_signals": {
+    "skill_triggered": false,
+    "team_mode_used": false
+  },
+  "meta": {
+    "model": "sonnet",
+    "run_kind": "baseline",
+    "command": [
+      "claude",
+      "-p",
+      "Use switch-model team mode to compare two external models on this claim: 'A dedicated skill-benchmark skill is better than embedding benchmark logic inside skill-creator-pro.' Return three sections titled Claims, Disagreement, and Arbitration.",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--model",
+      "sonnet",
+      "--disable-slash-commands"
+    ],
+    "timed_out": true
+  }
+}

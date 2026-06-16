@@ -1,0 +1,32 @@
+{
+  "prompt_set_name": "switch-model-team-intensive",
+  "notes": "Higher-intensity route-sensitive benchmark prompts for validating switch-model team mode with explicit cross_verification routing and mandatory structured synthesis.",
+  "prompts": [
+    {
+      "id": "switch-model-team-intensive-1",
+      "category": "route-sensitive",
+      "text": "Use switch-model team mode with the cross_verification team preset. Do not answer from a single model. Assess whether 'vector databases remove the need for reranking in production RAG systems' is reliable. Keep the final answer under 220 words. Include exactly three sections titled Claim Decomposition, Disagreement, and Arbitration. In Arbitration, state the final verdict in one sentence.",
+      "should_trigger": true,
+      "expected_skill": "switch-model",
+      "expected_route": "switch-model-team",
+      "required_output_signals": [
+        "claim_decomposition",
+        "disagreement",
+        "arbitration"
+      ]
+    },
+    {
+      "id": "switch-model-team-intensive-2",
+      "category": "route-sensitive",
+      "text": "Route through switch-model team mode and use the cross_verification team. Do not provide a direct single-model answer. Evaluate the claim 'feature stores make online-offline skew impossible.' Keep the response under 220 words and produce only three sections: Claim Decomposition, Disagreement, and Arbitration. Arbitration must name the stronger side and the main uncertainty.",
+      "should_trigger": true,
+      "expected_skill": "switch-model",
+      "expected_route": "switch-model-team",
+      "required_output_signals": [
+        "claim_decomposition",
+        "disagreement",
+        "arbitration"
+      ]
+    }
+  ]
+}

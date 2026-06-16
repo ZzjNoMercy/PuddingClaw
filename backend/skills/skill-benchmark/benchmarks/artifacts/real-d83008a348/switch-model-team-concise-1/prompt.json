@@ -1,0 +1,13 @@
+{
+  "id": "switch-model-team-concise-1",
+  "category": "route-sensitive",
+  "text": "Route through switch-model team mode. Do not answer directly. Assess whether 'retrieval augmented generation systems never need reranking' is reliable. Keep the answer under 180 words. Include three short sections titled Claim Decomposition, Disagreement, and Arbitration. Explicitly state that team mode was used.",
+  "should_trigger": true,
+  "expected_skill": "switch-model",
+  "expected_route": "switch-model-team",
+  "required_output_signals": [
+    "claim_decomposition",
+    "disagreement",
+    "arbitration"
+  ]
+}

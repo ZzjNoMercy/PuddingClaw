@@ -1,0 +1,13 @@
+{
+  "id": "switch-model-team-intensive-1",
+  "category": "route-sensitive",
+  "text": "Use switch-model team mode with the cross_verification team preset. Do not answer from a single model. Assess whether 'vector databases remove the need for reranking in production RAG systems' is reliable. Keep the final answer under 220 words. Include exactly three sections titled Claim Decomposition, Disagreement, and Arbitration. In Arbitration, state the final verdict in one sentence.",
+  "should_trigger": true,
+  "expected_skill": "switch-model",
+  "expected_route": "switch-model-team",
+  "required_output_signals": [
+    "claim_decomposition",
+    "disagreement",
+    "arbitration"
+  ]
+}

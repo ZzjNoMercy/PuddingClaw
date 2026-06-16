@@ -1,0 +1,13 @@
+{
+  "id": "switch-model-team-1",
+  "category": "comparison",
+  "text": "Use switch-model team mode to have multiple external models evaluate whether adding a dedicated skill-benchmark skill is better than embedding benchmark logic inside skill-creator-pro. Present the result with explicit claim decomposition, disagreements between model roles, and a final arbitration.",
+  "should_trigger": true,
+  "expected_skill": "switch-model",
+  "expected_route": "switch-model-team",
+  "required_output_signals": [
+    "claim_decomposition",
+    "disagreement",
+    "arbitration"
+  ]
+}

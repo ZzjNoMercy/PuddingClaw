@@ -1,0 +1,70 @@
+# PuddingClaw Docker Compose
+# 一键启动前后端服务
+#
+# 用法：
+#   docker-compose up --build -d     # 构建并后台启动
+#   docker-compose logs -f backend   # 查看后端日志
+#   docker-compose down              # 停止并移除容器
+#
+# 访问：
+#   前端：http://localhost:3000
+#   后端 API：http://localhost:9100
+#   API 文档：http://localhost:9100/docs
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: puddingclaw-backend
+    ports:
+      - "9100:9100"
+    environment:
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      - DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-deepseek-chat}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      - BACKEND_HOST=0.0.0.0
+      - BACKEND_PORT=9100
+    volumes:
+      # 持久化会话、workspace、memory、日志到宿主机
+      - ./backend/sessions:/app/sessions
+      - ./backend/workspace:/app/workspace
+      - ./backend/memory:/app/memory
+      - ./backend/logs:/app/logs
+      # 挂载 skills，便于在容器外修改/清理技能定义
+      - ./backend/skills:/app/skills:ro
+      # 挂载 .env 与 config.json，便于在容器外修改配置
+      - ./backend/.env:/app/.env:ro
+      - ./backend/config.json:/app/config.json
+      - ./logging.yaml:/app/logging.yaml:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9100/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: puddingclaw-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      # 前端默认通过浏览器访问 localhost:9100 连接后端
+      # 若部署到服务器，请改为服务器 IP 或域名，并确保后端端口可达
+      - NEXT_PUBLIC_API_HOST=${NEXT_PUBLIC_API_HOST:-}
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+# 可选：使用外部网络，便于与其他服务（如 Milvus）集成
+# networks:
+#   default:
+#     name: puddingclaw-network

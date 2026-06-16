@@ -1,0 +1,9 @@
+{
+  "id": "comparison-1",
+  "category": "comparison",
+  "text": "请比较我本地的 /Users/mac/.claude/skills/skill-patrol 和外部开源 skill 的模式差异，提炼可迁移做法，并把本地升级需求归到 L1、L2、或 L3。",
+  "should_trigger": true,
+  "expected_skill": "skill-patrol",
+  "expected_route": null,
+  "required_output_signals": []
+}

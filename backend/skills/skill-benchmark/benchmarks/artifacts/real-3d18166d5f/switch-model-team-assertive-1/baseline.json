@@ -1,0 +1,28 @@
+{
+  "output_text": "",
+  "trace_signals": {
+    "skill_attempted": false,
+    "team_mode_attempted": false,
+    "skill_triggered": false,
+    "team_mode_used": false
+  },
+  "meta": {
+    "model": "sonnet",
+    "run_kind": "baseline",
+    "command": [
+      "claude",
+      "-p",
+      "Use the switch-model skill in team mode, not a direct single-model answer. Compare two model perspectives on whether the statement 'vector databases always eliminate the need for reranking' is reliable. The final answer must explicitly say that team mode was used. Include claim decomposition, a disagreement section, and an arbitration section.",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--model",
+      "sonnet",
+      "--disable-slash-commands",
+      "--disallowedTools",
+      "Skill,Read,mcp__llm-router__call_llm,mcp__llm-router__compare_models,mcp__llm-router__get_team_config,mcp__llm-router__switch_default,mcp__llm-router__check_health,mcp__llm-router__list_providers"
+    ],
+    "timed_out": true,
+    "timeout_seconds": 60
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "output_text": "",
+  "trace_signals": {
+    "skill_attempted": false,
+    "team_mode_attempted": false,
+    "skill_triggered": false,
+    "team_mode_used": false
+  },
+  "meta": {
+    "model": "sonnet",
+    "run_kind": "baseline",
+    "command": [
+      "claude",
+      "-p",
+      "Do not answer from a single model. Route through switch-model team mode and explicitly surface the team-mode path in the final answer. Evaluate whether 'retrieval augmented generation systems never need reranking' is reliable. Include numbered claims, a disagreement section, and a final arbitration.",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--model",
+      "sonnet",
+      "--disable-slash-commands",
+      "--disallowedTools",
+      "Skill,Read,mcp__llm-router__call_llm,mcp__llm-router__compare_models,mcp__llm-router__get_team_config,mcp__llm-router__switch_default,mcp__llm-router__check_health,mcp__llm-router__list_providers"
+    ],
+    "timed_out": true,
+    "timeout_seconds": 60
+  }
+}

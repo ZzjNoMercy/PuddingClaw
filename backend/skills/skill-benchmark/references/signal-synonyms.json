@@ -1,0 +1,23 @@
+{
+  "_comment": "Signal synonym mapping for output_signal_retention scoring. Keys are signal names used in benchmark prompts. Values are lists of alternative strings that count as a match. Add new entries here without modifying judge_real_results.py.",
+  "workflow": ["流程", "work flow", "pipeline", "工作流", "步骤", "流水线"],
+  "recon": ["侦察", "reconnaissance", "inspect first", "检查", "recon-first", "先检查"],
+  "finding": ["发现", "findings", "issue", "问题", "detected", "found", "缺陷", "风险"],
+  "paradigm": ["范式", "pattern", "paradigms", "设计范式", "设计模式", "design pattern"],
+  "operator": ["操作者", "toolchain", "工具链", "执行者", "operator paradigm"],
+  "navigator": ["导航者", "路由", "routing", "导航", "navigator paradigm"],
+  "architect": ["架构师", "设计者", "designer", "系统设计", "architect paradigm"],
+  "partner": ["协作者", "collaborat", "协作", "交互", "partner paradigm"],
+  "orchestrator": ["编排者", "coordinat", "协调", "编排", "orchestrator paradigm"],
+  "scout": ["侦察者", "inspect", "侦察", "调查", "scout paradigm"],
+  "philosopher": ["哲学家", "principle", "原则", "治理", "philosopher paradigm"],
+  "review": ["审查", "检查", "inspect", "analyze", "分析", "评估"],
+  "scripts": ["脚本", "script", "automation", "自动化"],
+  "confirm": ["确认", "confirmation", "approve", "审批"],
+  "inspect": ["检查", "investigate", "调查", "侦察", "examine"],
+  "template": ["模板", "scaffold", "脚手架", "starter"],
+  "validation": ["验证", "validate", "check", "检验"],
+  "trigger": ["触发", "activate", "invoke", "调用"],
+  "boundary": ["边界", "scope", "范围", "边界定义"],
+  "decision": ["决策", "decision tree", "分支", "路由"]
+}

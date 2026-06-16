@@ -1,0 +1,161 @@
+{
+  "skill_name": "dialogue-summarizer",
+  "timestamp": 1773748087.217,
+  "total_score": 22,
+  "grade": "生产级",
+  "verdict_note": "技能设计优秀，触发精准，结构清晰，建议加强错误处理和自动化验证",
+  "dimensions": [
+    {
+      "name": "触发质量",
+      "score": 5,
+      "reason": "触发描述极其详细，边界清晰，包含多种场景和回退机制",
+      "checks": [
+        {
+          "item": "description包含明确的触发场景",
+          "passed": true
+        },
+        {
+          "item": "提供具体触发短语示例",
+          "passed": true
+        },
+        {
+          "item": "包含边界条件说明（上下文不完整时也触发）",
+          "passed": true
+        }
+      ]
+    },
+    {
+      "name": "路由清晰度",
+      "score": 4,
+      "reason": "流程清晰但缺少错误处理细节",
+      "checks": [
+        {
+          "item": "有明确的执行流程步骤",
+          "passed": true
+        },
+        {
+          "item": "包含决策树（三种模式选择）",
+          "passed": true
+        },
+        {
+          "item": "提供具体模板和格式要求",
+          "passed": true
+        }
+      ]
+    },
+    {
+      "name": "上下文效率",
+      "score": 5,
+      "reason": "完美的分层设计，SKILL.md简洁而完整",
+      "checks": [
+        {
+          "item": "SKILL.md行数适中（203行）",
+          "passed": true
+        },
+        {
+          "item": "详细内容分层到references和assets目录",
+          "passed": true
+        },
+        {
+          "item": "核心技能描述与实现细节分离",
+          "passed": true
+        }
+      ]
+    },
+    {
+      "name": "复用与确定性",
+      "score": 4,
+      "reason": "脚本化程度高但模板集成不够完善",
+      "checks": [
+        {
+          "item": "提供可复用的Python脚本",
+          "passed": true
+        },
+        {
+          "item": "脚本包含完整的类和函数",
+          "passed": true
+        },
+        {
+          "item": "有测试脚本验证功能",
+          "passed": true
+        }
+      ]
+    },
+    {
+      "name": "验证强度",
+      "score": 4,
+      "reason": "验证框架完整但执行验证不够自动化",
+      "checks": [
+        {
+          "item": "提供测试用例",
+          "passed": true
+        },
+        {
+          "item": "有评估文件（evals.json）",
+          "passed": true
+        },
+        {
+          "item": "测试脚本覆盖主要功能",
+          "passed": true
+        }
+      ]
+    }
+  ],
+  "strengths": [
+    {
+      "dimension": "触发质量",
+      "text": "触发描述非常详细，包含7个具体触发短语示例"
+    },
+    {
+      "dimension": "触发质量",
+      "text": "明确说明\"即使对话很长或上下文不完整，也要使用此技能\""
+    },
+    {
+      "dimension": "路由清晰度",
+      "text": "执行流程分4个清晰步骤，每个步骤都有详细说明"
+    },
+    {
+      "dimension": "路由清晰度",
+      "text": "提供完整的总结模板，agent可直接使用"
+    },
+    {
+      "dimension": "上下文效率",
+      "text": "优秀的文件组织，将模板、参考文档、脚本分离"
+    },
+    {
+      "dimension": "上下文效率",
+      "text": "SKILL.md保持简洁，复杂内容外置"
+    },
+    {
+      "dimension": "复用与确定性",
+      "text": "提供两个完整的Python模块，544行代码"
+    },
+    {
+      "dimension": "复用与确定性",
+      "text": "脚本设计良好，支持多种总结模式"
+    },
+    {
+      "dimension": "验证强度",
+      "text": "提供7个详细的评估用例，每个都有断言"
+    },
+    {
+      "dimension": "验证强度",
+      "text": "测试脚本覆盖6个主要测试场景"
+    }
+  ],
+  "weaknesses": [
+    {
+      "dimension": "路由清晰度",
+      "text": "没有明确的错误处理流程，只有上下文回退"
+    },
+    {
+      "dimension": "复用与确定性",
+      "text": "脚本中的模板是硬编码的，没有使用assets目录的实际模板文件"
+    },
+    {
+      "dimension": "验证强度",
+      "text": "评估用例没有与脚本集成，实际执行验证不足"
+    }
+  ],
+  "session_id": "eval-dialogue-summarizer-1773747994830"
+}

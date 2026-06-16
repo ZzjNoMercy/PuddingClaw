@@ -1,0 +1,10 @@
+{
+  "skill_name": "skill-patrol",
+  "run_count": 1,
+  "latest_verdict": "partially effective",
+  "trend_signal": "stable",
+  "models_seen": [
+    "sonnet"
+  ],
+  "last_updated": "2026-03-09T10:54:08Z"
+}

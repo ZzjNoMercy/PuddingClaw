@@ -1,0 +1,94 @@
+# OpenAI Agent 配置
+# 用于定义技能在前端界面的元数据
+
+name: get-date
+description: 获取当前系统日期和时间信息。当用户询问日期、时间、今天是星期几、当前时间、现在几点了、今天是几月几号、现在是哪一年、或者任何与当前日期时间相关的问题时，立即使用此技能。
+
+# 触发关键词
+triggers:
+  - 日期
+  - 时间
+  - 星期
+  - 几点
+  - 几月
+  - 几年
+  - 现在几点了
+  - 今天星期几
+  - 今天的日期
+  - 完整日期时间
+  - date
+  - time
+  - weekday
+  - what time
+  - current date
+  - today
+
+# 技能类别
+category: utility
+subcategory: time
+
+# 技能属性
+attributes:
+  reliability: high
+  complexity: low
+  frequency: high
+  language: zh-CN, en-US
+
+# 执行参数
+parameters:
+  - name: query
+    type: string
+    description: 用户查询语句
+    required: true
+
+# 输出格式
+output:
+  format: natural_language
+  language: auto
+  style: concise
+
+# 版本信息
+version: 2.0.0
+created: 2026-03-19
+updated: 2026-03-19
+author: mini OpenClaw
+
+# 依赖项
+dependencies:
+  - python: ">=3.8"
+  - packages:
+    - datetime
+
+# 技能限制
+limitations:
+  - 只查询当前系统时间
+  - 不处理时区转换
+  - 不进行日期计算
+  - 不查询历史或未来日期
+
+# 使用示例
+examples:
+  - query: "现在几点了？"
+    response: "当前时间是 21:50:15"
+  - query: "今天星期几？"
+    response: "今天是星期四"
+  - query: "今天的日期是什么？"
+    response: "今天是2026年03月19日 星期四"
+  - query: "告诉我完整的日期时间"
+    response: "当前日期时间是：2026年03月19日 星期四 21:50:15"
+  - query: "现在是几月？"
+    response: "现在是3月"
+  - query: "今年是哪一年？"
+    response: "今年是2026年"
+
+# 错误处理
+error_handling:
+  - type: time_retrieval_failure
+    message: "无法获取当前时间，请检查系统时间设置"
+    action: retry_once
+  - type: format_error
+    message: "当前时间：{default_format}"
+    action: use_default
+  - type: intent_unclear
+    message: "当前日期时间：{full_datetime_zh}"
+    action: provide_full_info

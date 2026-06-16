@@ -1,0 +1,148 @@
+{
+  "run_id": "real-2230eb3b97",
+  "skill_targets": [
+    "../dialogue-summarizer"
+  ],
+  "models": [
+    "claude-3-5-sonnet-20241022"
+  ],
+  "aggregate_scores": {
+    "trigger_accuracy": 0.2857,
+    "routing_clarity": 1.0,
+    "output_signal_retention": 0.0,
+    "task_completion": {
+      "baseline": 0.0,
+      "with_skill": 0.0,
+      "gain": 0.0
+    },
+    "outcome_quality": 0.0
+  },
+  "final_verdict": "ineffective",
+  "per_run_details": [
+    {
+      "prompt_id": "should-trigger-1",
+      "trigger_correct": false,
+      "route_correct": true,
+      "signals": [
+        {
+          "signal": "对话总结",
+          "hit": false
+        },
+        {
+          "signal": "关键点",
+          "hit": false
+        },
+        {
+          "signal": "行动项",
+          "hit": false
+        }
+      ],
+      "baseline_completed": false,
+      "withskill_completed": false,
+      "outcome_score": 0.0
+    },
+    {
+      "prompt_id": "should-trigger-2",
+      "trigger_correct": false,
+      "route_correct": true,
+      "signals": [
+        {
+          "signal": "对话总结",
+          "hit": false
+        },
+        {
+          "signal": "关键讨论点",
+          "hit": false
+        },
+        {
+          "signal": "已达成共识",
+          "hit": false
+        }
+      ],
+      "baseline_completed": false,
+      "withskill_completed": false,
+      "outcome_score": 0.0
+    },
+    {
+      "prompt_id": "should-not-trigger-1",
+      "trigger_correct": true,
+      "route_correct": true,
+      "signals": [],
+      "baseline_completed": false,
+      "withskill_completed": false,
+      "outcome_score": 0.0
+    },
+    {
+      "prompt_id": "should-not-trigger-2",
+      "trigger_correct": true,
+      "route_correct": true,
+      "signals": [],
+      "baseline_completed": false,
+      "withskill_completed": false,
+      "outcome_score": 0.0
+    },
+    {
+      "prompt_id": "edge-1",
+      "trigger_correct": false,
+      "route_correct": true,
+      "signals": [
+        {
+          "signal": "对话总结",
+          "hit": false
+        }
+      ],
+      "baseline_completed": false,
+      "withskill_completed": false,
+      "outcome_score": 0.0
+    },
+    {
+      "prompt_id": "edge-2",
+      "trigger_correct": false,
+      "route_correct": true,
+      "signals": [
+        {
+          "signal": "关键点",
+          "hit": false
+        },
+        {
+          "signal": "信息提取",
+          "hit": false
+        }
+      ],
+      "baseline_completed": false,
+      "withskill_completed": false,
+      "outcome_score": 0.0
+    },
+    {
+      "prompt_id": "comparison-1",
+      "trigger_correct": false,
+      "route_correct": true,
+      "signals": [
+        {
+          "signal": "对话总结报告",
+          "hit": false
+        },
+        {
+          "signal": "关键讨论点",
+          "hit": false
+        },
+        {
+          "signal": "行动项",
+          "hit": false
+        },
+        {
+          "signal": "复盘建议",
+          "hit": false
+        },
+        {
+          "signal": "数据统计",
+          "hit": false
+        }
+      ],
+      "baseline_completed": false,
+      "withskill_completed": false,
+      "outcome_score": 0.0
+    }
+  ],
+  "timestamp": "2026-03-17T10:40:45Z"
+}

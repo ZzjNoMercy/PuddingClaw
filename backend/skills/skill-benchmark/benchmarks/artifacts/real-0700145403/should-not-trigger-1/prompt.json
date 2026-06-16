@@ -1,0 +1,9 @@
+{
+  "id": "should-not-trigger-1",
+  "category": "should-not-trigger",
+  "text": "请按治理规则清理 /Users/mac/.claude/skills/skill-patrol 目录里的 archive 和运行产物，并更新归档记录。",
+  "should_trigger": false,
+  "expected_skill": "skill-patrol",
+  "expected_route": null,
+  "required_output_signals": []
+}

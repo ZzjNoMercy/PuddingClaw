@@ -1,0 +1,9 @@
+{
+  "id": "edge-1",
+  "category": "edge",
+  "text": "我有一个本地 skill 想参考外部最佳实践升级一下，但先别直接改。先判断应该去研究哪些开源 skill，再把差距分成轻量升级和重构级升级。",
+  "should_trigger": true,
+  "expected_skill": "skill-patrol",
+  "expected_route": null,
+  "required_output_signals": []
+}
