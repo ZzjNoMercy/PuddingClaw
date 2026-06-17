@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useRef, useCallback } from "react";
+import { useEffect, useState, useRef, useCallback, useMemo } from "react";
 import {
   MessageSquare,
   Plus,
@@ -38,6 +38,12 @@ export default function Sidebar() {
   const [rawExpanded, setRawExpanded] = useState(false);
   const [sessionTokens, setSessionTokens] = useState<number | null>(null);
 
+  // Sort sessions by most recent activity first
+  const sortedSessions = useMemo(
+    () => [...sessions].sort((a, b) => b.updated_at - a.updated_at),
+    [sessions]
+  );
+
   // Load raw messages when section is opened or session changes
   useEffect(() => {
     if (rawOpen) {
@@ -72,7 +78,7 @@ export default function Sidebar() {
             <p className="px-3 pt-1 pb-1 text-[10px] font-semibold text-gray-400 uppercase tracking-widest">
               Recent
             </p>
-            {sessions.map((s) => (
+            {sortedSessions.map((s) => (
               <SessionItem
                 key={s.id}
                 id={s.id}
