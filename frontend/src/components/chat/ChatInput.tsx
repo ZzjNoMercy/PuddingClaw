@@ -215,27 +215,18 @@ export default function ChatInput() {
       </div>
 
       {/* Context Usage */}
-      <div className="max-w-2xl mx-auto px-4 py-1.5">
-        <div className="flex items-center justify-between mb-1">
-          <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-widest">
-            Context
-          </span>
-          <span className="text-[10px] text-gray-400">
-            {formatTokens(contextUsage.used)} / {formatTokens(contextUsage.total)}
-          </span>
-        </div>
-        <div className="h-1 w-full bg-gray-100 rounded-full overflow-hidden">
-          <div
-            className={`h-full rounded-full transition-all duration-300 ${
-              contextUsage.percentage >= 90
-                ? "bg-red-500"
-                : contextUsage.percentage >= 70
-                ? "bg-amber-500"
-                : "bg-[#002fa7]"
-            }`}
-            style={{ width: `${Math.min(contextUsage.percentage, 100)}%` }}
-          />
-        </div>
+      <div className="max-w-2xl mx-auto px-4 py-1 flex justify-end">
+        <span
+          className={`text-[10px] font-medium ${
+            contextUsage.percentage >= 90
+              ? "text-red-500"
+              : contextUsage.percentage >= 70
+              ? "text-amber-500"
+              : "text-gray-400"
+          }`}
+        >
+          CONTEXT：{contextUsage.percentage.toFixed(1)}%({formatTokens(contextUsage.used)}/{formatTokens(contextUsage.total)})
+        </span>
       </div>
 
       <p className="text-center text-[10px] text-gray-400/70 mt-2">
