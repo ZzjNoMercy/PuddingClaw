@@ -15,16 +15,10 @@ import {
   Maximize2,
   Minimize2,
   RefreshCw,
-  Wrench,
-  Loader2,
   Database,
 } from "lucide-react";
 import { useApp } from "@/lib/store";
 import { getSessionTokenCount } from "@/lib/api";
-
-function formatTokens(n: number): string {
-  return `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k`;
-}
 
 export default function Sidebar() {
   const {
@@ -36,31 +30,13 @@ export default function Sidebar() {
     deleteSession,
     rawMessages,
     loadRawMessages,
-    isCompressing,
-    compressCurrentSession,
     ragMode,
     toggleRagMode,
-    contextUsage,
-    setContextUsage,
   } = useApp();
 
   const [rawOpen, setRawOpen] = useState(false);
   const [rawExpanded, setRawExpanded] = useState(false);
   const [sessionTokens, setSessionTokens] = useState<number | null>(null);
-  const [showCompressModal, setShowCompressModal] = useState(false);
-
-  // Fetch token count on mount and when session changes
-  useEffect(() => {
-    getSessionTokenCount(sessionId)
-      .then((data) => {
-        setContextUsage({
-          used: data.total_tokens,
-          total: data.compaction_trigger,
-          percentage: data.percentage,
-        });
-      })
-      .catch(() => {});
-  }, [sessionId, setContextUsage]);
 
   // Load raw messages when section is opened or session changes
   useEffect(() => {
@@ -69,15 +45,10 @@ export default function Sidebar() {
       getSessionTokenCount(sessionId)
         .then((data) => {
           setSessionTokens(data.total_tokens);
-          setContextUsage({
-            used: data.total_tokens,
-            total: data.compaction_trigger,
-            percentage: data.percentage,
-          });
         })
         .catch(() => setSessionTokens(null));
     }
-  }, [rawOpen, sessionId, loadRawMessages, setContextUsage]);
+  }, [rawOpen, sessionId, loadRawMessages]);
 
   return (
     <aside className="flex flex-col h-full relative">
@@ -119,30 +90,6 @@ export default function Sidebar() {
       {/* Divider */}
       <div className="mx-3 h-px bg-black/[0.04]" />
 
-      {/* Context Usage */}
-      <div className="px-4 py-2 shrink-0">
-        <div className="flex items-center justify-between mb-1">
-          <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-widest">
-            Context
-          </span>
-          <span className="text-[10px] text-gray-400">
-            {formatTokens(contextUsage.used)} / {formatTokens(contextUsage.total)}
-          </span>
-        </div>
-        <div className="h-1.5 w-full bg-gray-100 rounded-full overflow-hidden">
-          <div
-            className={`h-full rounded-full transition-all duration-300 ${
-              contextUsage.percentage >= 90
-                ? "bg-red-500"
-                : contextUsage.percentage >= 70
-                ? "bg-amber-500"
-                : "bg-[#002fa7]"
-            }`}
-            style={{ width: `${Math.min(contextUsage.percentage, 100)}%` }}
-          />
-        </div>
-      </div>
-
       {/* Raw Messages section */}
       <div className="shrink-0">
         <div className="flex items-center">
@@ -175,18 +122,6 @@ export default function Sidebar() {
                 title={ragMode ? "RAG Mode ON" : "RAG Mode OFF"}
               >
                 <Database className="w-3.5 h-3.5" />
-              </button>
-              <button
-                onClick={() => setShowCompressModal(true)}
-                disabled={isCompressing}
-                className="p-1 rounded-md text-gray-400 hover:text-gray-600 hover:bg-black/[0.04] transition-colors disabled:opacity-40"
-                title="Compress history"
-              >
-                {isCompressing ? (
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                ) : (
-                  <Wrench className="w-3.5 h-3.5" />
-                )}
               </button>
               <button
                 onClick={loadRawMessages}
@@ -251,45 +186,6 @@ export default function Sidebar() {
         </div>
       )}
 
-      {/* Compress confirmation modal */}
-      {showCompressModal && (
-        <div className="fixed inset-0 z-[110] bg-black/50 flex items-center justify-center p-6 animate-fade-in">
-          <div className="bg-white rounded-xl shadow-2xl w-full max-w-sm p-5 space-y-4">
-            <h3 className="text-[14px] font-semibold text-gray-800">Compress History</h3>
-            <p className="text-[13px] text-gray-600 leading-relaxed">
-              Are you sure you want to compress 50% of conversation history? The compressed messages will be archived and replaced with a summary.
-            </p>
-            <div className="flex items-center justify-end gap-2">
-              <button
-                onClick={() => setShowCompressModal(false)}
-                className="px-3 py-1.5 text-[12px] font-medium text-gray-600 hover:bg-gray-100 rounded-lg transition-colors"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={async () => {
-                  setShowCompressModal(false);
-                  await compressCurrentSession();
-                  // Refresh token count
-                  getSessionTokenCount(sessionId)
-                    .then((data) => {
-                      setSessionTokens(data.total_tokens);
-                      setContextUsage({
-                        used: data.total_tokens,
-                        total: data.compaction_trigger,
-                        percentage: data.percentage,
-                      });
-                    })
-                    .catch(() => {});
-                }}
-                className="px-3 py-1.5 text-[12px] font-medium text-white bg-[#002fa7] hover:bg-[#001f7a] rounded-lg transition-colors"
-              >
-                Confirm
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </aside>
   );
 }
