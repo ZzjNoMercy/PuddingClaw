@@ -16,11 +16,16 @@ frontend/.env
 
 # Runtime data
 backend/sessions/
-backend/workspace/
 backend/memory/
 backend/logs/
 backend/archive/
 backend/storage/
+backend/workspace/*
+!backend/workspace/AGENTS.md
+!backend/workspace/SOUL.md
+!backend/workspace/IDENTITY.md
+!backend/workspace/USER.md
+!backend/workspace/system.md
 __pycache__/
 *.py[cod]
 *$py.class
