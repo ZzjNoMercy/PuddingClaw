@@ -22,6 +22,11 @@ backend/archive/
 backend/storage/
 backend/workspace/
 
+# Legacy task/reminder files (should not be in backend root)
+backend/tasks.json
+backend/task_reminders.log
+backend/reminder_analysis.json
+
 # Static system prompt files (tracked)
 !backend/prompts/
 backend/prompts/*
