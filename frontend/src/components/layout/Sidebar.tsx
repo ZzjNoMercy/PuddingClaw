@@ -49,6 +49,19 @@ export default function Sidebar() {
   const [sessionTokens, setSessionTokens] = useState<number | null>(null);
   const [showCompressModal, setShowCompressModal] = useState(false);
 
+  // Fetch token count on mount and when session changes
+  useEffect(() => {
+    getSessionTokenCount(sessionId)
+      .then((data) => {
+        setContextUsage({
+          used: data.total_tokens,
+          total: data.compaction_trigger,
+          percentage: data.percentage,
+        });
+      })
+      .catch(() => {});
+  }, [sessionId, setContextUsage]);
+
   // Load raw messages when section is opened or session changes
   useEffect(() => {
     if (rawOpen) {
