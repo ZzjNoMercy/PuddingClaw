@@ -33,8 +33,8 @@ services:
       - ./backend/workspace:/app/workspace
       - ./backend/memory:/app/memory
       - ./backend/logs:/app/logs
-      # 挂载 skills，便于在容器外修改/清理技能定义
-      - ./backend/skills:/app/skills:ro
+      # 挂载 skills，允许容器内 API/工具写入（import/save/rename/version）
+      - ./backend/skills:/app/skills
       # 挂载 .env 与 config.json，便于在容器外修改配置
       - ./backend/.env:/app/.env:ro
       - ./backend/config.json:/app/config.json
