@@ -255,10 +255,10 @@ def build_system_prompt(
     拼接顺序（Ch5 cache-aware 重构后）：
     【静态前缀 — cache 锚点区】
     1. SKILLS_SNAPSHOT.md  — 当前可用技能快照
-    2. workspace/SOUL.md   — Agent 人格、语气、行为边界
-    3. workspace/IDENTITY.md — Agent 名称、风格、emoji 设定
-    4. workspace/USER.md   — 用户画像与偏好
-    5. workspace/AGENTS.md — 操作指令、记忆与技能协议
+    2. prompts/SOUL.md     — Agent 人格、语气、行为边界
+    3. prompts/IDENTITY.md — Agent 名称、风格、emoji 设定
+    4. prompts/USER.md     — 用户画像与偏好
+    5. prompts/AGENTS.md   — 操作指令、记忆与技能协议
     6. MEMORY_WRITE_PROTOCOL_STATIC — markdown 模式的记忆写入协议（静态部分）
 
     【动态区块 — 随记忆/检索结果变化】
@@ -277,20 +277,20 @@ def build_system_prompt(
     - 禁止调整以上组件顺序，否则会破坏静态前缀连续性，导致缓存失效
     """
     # 可选 system.md：如果存在则插入在 IDENTITY 之后
-    system_md_path = base_dir / "workspace" / "system.md"
+    system_md_path = base_dir / "prompts" / "system.md"
     has_system_md = system_md_path.exists()
 
     # ⚠️ 组件顺序不可调整（1-5 为 Prefix Caching 静态前缀），详见上方 docstring
     components = [
         ("Skills Snapshot", base_dir / "SKILLS_SNAPSHOT.md"),
-        ("Soul", base_dir / "workspace" / "SOUL.md"),
-        ("Identity", base_dir / "workspace" / "IDENTITY.md"),
+        ("Soul", base_dir / "prompts" / "SOUL.md"),
+        ("Identity", base_dir / "prompts" / "IDENTITY.md"),
     ]
     if has_system_md:
         components.append(("System Rules", system_md_path))
     components.extend([
-        ("User Profile", base_dir / "workspace" / "USER.md"),
-        ("Agents Guide", base_dir / "workspace" / "AGENTS.md"),
+        ("User Profile", base_dir / "prompts" / "USER.md"),
+        ("Agents Guide", base_dir / "prompts" / "AGENTS.md"),
     ])
 
     parts: list[str] = []

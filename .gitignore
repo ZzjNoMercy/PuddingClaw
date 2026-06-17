@@ -20,12 +20,16 @@ backend/memory/
 backend/logs/
 backend/archive/
 backend/storage/
-backend/workspace/*
-!backend/workspace/AGENTS.md
-!backend/workspace/SOUL.md
-!backend/workspace/IDENTITY.md
-!backend/workspace/USER.md
-!backend/workspace/system.md
+backend/workspace/
+
+# Static system prompt files (tracked)
+!backend/prompts/
+backend/prompts/*
+!backend/prompts/AGENTS.md
+!backend/prompts/SOUL.md
+!backend/prompts/IDENTITY.md
+!backend/prompts/USER.md
+!backend/prompts/system.md
 __pycache__/
 *.py[cod]
 *$py.class
