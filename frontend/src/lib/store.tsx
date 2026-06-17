@@ -285,6 +285,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     []
   );
 
+  // On mount, after sessions are loaded, auto-switch to the most recent session
+  useEffect(() => {
+    if (sessions.length === 0) return;
+    const latest = [...sessions].sort((a, b) => b.updated_at - a.updated_at)[0];
+    if (latest && latest.id !== sessionIdRef.current) {
+      setSessionId(latest.id);
+    }
+  }, [sessions, setSessionId]);
+
   const createSession = useCallback(async () => {
     try {
       const meta = await apiCreateSession();
