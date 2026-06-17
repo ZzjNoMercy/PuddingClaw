@@ -254,11 +254,11 @@ def build_system_prompt(
 
     拼接顺序（Ch5 cache-aware 重构后）：
     【静态前缀 — cache 锚点区】
-    1. SKILLS_SNAPSHOT.md  — 当前可用技能快照
-    2. prompts/SOUL.md     — Agent 人格、语气、行为边界
-    3. prompts/IDENTITY.md — Agent 名称、风格、emoji 设定
-    4. prompts/USER.md     — 用户画像与偏好
-    5. prompts/AGENTS.md   — 操作指令、记忆与技能协议
+    1. workspace/SKILLS_SNAPSHOT.md  — 当前可用技能快照（运行时生成）
+    2. prompts/SOUL.md              — Agent 人格、语气、行为边界
+    3. prompts/IDENTITY.md          — Agent 名称、风格、emoji 设定
+    4. prompts/USER.md              — 用户画像与偏好
+    5. prompts/AGENTS.md            — 操作指令、记忆与技能协议
     6. MEMORY_WRITE_PROTOCOL_STATIC — markdown 模式的记忆写入协议（静态部分）
 
     【动态区块 — 随记忆/检索结果变化】
@@ -282,7 +282,7 @@ def build_system_prompt(
 
     # ⚠️ 组件顺序不可调整（1-5 为 Prefix Caching 静态前缀），详见上方 docstring
     components = [
-        ("Skills Snapshot", base_dir / "SKILLS_SNAPSHOT.md"),
+        ("Skills Snapshot", base_dir / "workspace" / "SKILLS_SNAPSHOT.md"),
         ("Soul", base_dir / "prompts" / "SOUL.md"),
         ("Identity", base_dir / "prompts" / "IDENTITY.md"),
     ]

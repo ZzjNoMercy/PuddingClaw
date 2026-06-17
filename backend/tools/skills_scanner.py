@@ -8,7 +8,7 @@ import yaml
 def scan_skills(base_dir: Path) -> str:
     """Scan all SKILL.md files and generate SKILLS_SNAPSHOT.md."""
     skills_dir = base_dir / "skills"
-    snapshot_path = base_dir / "SKILLS_SNAPSHOT.md"
+    snapshot_path = base_dir / "workspace" / "SKILLS_SNAPSHOT.md"
 
     if not skills_dir.exists():
         skills_dir.mkdir(parents=True)
