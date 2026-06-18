@@ -16,18 +16,22 @@
 ```text
 chat.py::_maybe_middle_trim_session  # 入模前：中段摘要 + 归档 + 前端完整轨维护
     ↓
-DeepSeekCacheBoundaryMiddleware (observer)
+DeepSeekCacheBoundaryMiddleware (observer)      # backend/graph/middlewares/cache.py
     ↓
-TailTrimMiddleware               # 运行时兜底裁剪，不持久化
+TailTrimMiddleware               # 运行时兜底裁剪，不持久化 (cache.py)
     ↓
-ToolResultClearMiddleware        # 工具结果摘要（主力）
+ToolResultClearMiddleware        # 工具结果摘要（主力）(compression.py)
     ↓
-SummarizationMiddleware          # 叙述性摘要（中间兜底）
+SummarizationMiddleware          # 叙述性摘要（中间兜底）(compression.py)
     ↓
-CompactionMiddleware             # 全局 reset（最后兜底）
+CompactionMiddleware             # 全局 reset（最后兜底）(compression.py)
+    ↓
+agent.py::_build_messages        # 入模前最后一层 0.85*context_window 硬兜底
     ↓
 skills_router → task_state → LLM
 ```
+
+> **废弃组件**：`MessageTrimMiddleware`（原 `compression.py` 中的硬截断实现）已不在默认装配链中，由 `TailTrimMiddleware` 接管。迁移到好得 app 时无需迁移该类。
 
 ---
 
@@ -45,7 +49,7 @@ skills_router → task_state → LLM
 | `TailTrimMiddleware.keep_recent` | `30` | 保护最近 30 条消息 |
 | `ToolResultClearMiddleware.keep_recent` | `10` + 轮次边界 | 只摘要最后一条 HumanMessage 之前的旧 ToolMessage，保留最近 10 条完整；当前轮次工具结果不摘要 |
 | `ToolResultClearMiddleware.min_summary_length` | `500` 字符 | 原始输出长度 ≥ 500 字符才做 LLM 摘要，避免短输出被越摘要越长 |
-| `_summarize_tool_result` 阈值 | `20000` tokens | 单条 tool output 超过 20K 时立即按 tool 类型摘要 |
+| `_summarize_tool_result` 阈值 | `20000` tokens（字符比例估算） | 单条 tool output 估算超过 20K 时立即按 tool 类型摘要；实际使用 `_estimate_tokens` 做字符比例估算，非 DeepSeek tokenizer 精确计数 |
 | `SummarizationMiddleware.trigger_tokens` | `200000` | 总 token 超过 200K 时触发叙述性摘要 |
 | `SummarizationMiddleware.keep_messages` | `10` | 保留最近 10 条消息 |
 | `CompactionMiddleware.trigger_tokens` | `500000` | 总 token 超过 500K 时触发全局 reset |
@@ -81,7 +85,8 @@ skills_router → task_state → LLM
 
 ### 4.2 TailTrimMiddleware
 
-- **触发条件**：`state["messages"]` 总 token > 200K，且消息数 > 32。
+- **位置**：`backend/graph/middlewares/cache.py`（**注意**：不在 `compression.py` 中）。
+- **触发条件**：`state["messages"]` 总 token > 200K，且消息数 > `head_keep + keep_recent`（即 > 32）。
 - **行为**：作为运行时兜底删除 middle slice。tail 起点同样向前对齐到 `HumanMessage`；middle 中的 `HumanMessage` 也会删除，避免留下“用户请求还在、完成证据没了”的残缺历史。AI+Tool 配对仍保持原子删除，跨保护区边界的配对会被保护。
 - **持久化**：不持久化，只改运行时 state。
 - **影响**：正常情况下应由 Middle Trim Session Preflight 先完成摘要归档；TailTrim 只作为最后的 cache-friendly 兜底。
@@ -90,19 +95,21 @@ skills_router → task_state → LLM
 
 - **触发条件**：
   1. 只考虑**最后一条 HumanMessage 之前**的 ToolMessage。
-  2. 这些 ToolMessage 数量 > 10。
-  3. 候选 ToolMessage 的原始输出长度 ≥ `min_summary_length`（默认 500 字符）。
+  2. 这些 ToolMessage 数量 > `keep_recent`（默认 10 条）**才会进入处理循环**。
+  3. 在候选 ToolMessage 中，只有原始输出长度 ≥ `min_summary_length`（默认 500 字符）的最旧消息才会被 LLM 摘要替换；若候选全为短输出，则本次不修改。
 - **行为**：
   1. 满足长度门槛的最旧 ToolMessage 被 LLM 摘要替换。
   2. 摘要结果加 `[摘要] ` 前缀。
   3. 已带 `[摘要] ` 前缀的 ToolMessage 不再二次摘要。
   4. 短输出（< 500 字符）即使位于历史区域也保留原文，避免无意义摘要。
 - **持久化**：触发时 emit `tool_result_clear` 事件，`chat.py` 收到后按 `tool_call_id` 把摘要写回对应 tool_call 的 `output`，并在 `tool_calls` 对象上标记 `summary_source: "tool_result_clear"`。
+- **前缀**：固定为 `[摘要] `（含一个空格）。迁移到好得 app 时保持该前缀和 `summary_source` 字段不变。
 - **影响**：保证当前轮次所有 ToolMessage 完整，只压缩上一轮及更早的历史；短工具输出不被污染。
 
 ### 4.4 _summarize_tool_result（单条超长兜底）
 
-- **触发条件**：单条 tool output > 20000 tokens。
+- **位置**：`backend/graph/agent.py`（**注意**：不在 `chat.py` 中）。
+- **触发条件**：单条 tool output 估算 token > 20000（使用 `_estimate_tokens` 字符比例估算，非 DeepSeek tokenizer 精确计数）。
 - **行为**：按 tool 类型选择 prompt，LLM 生成结构化摘要。
 - **持久化**：替换当前 segment 中的 tool output，最终写入 session，并在 `tool_calls` 对象上标记 `summary_source: "single_tool_overflow"`。
 - **影响**：防止单条 patent/文档 output 直接撑爆上下文。
@@ -129,10 +136,19 @@ skills_router → task_state → LLM
      - `ToolMessage` 2K-20K tokens：保留约 5K 字符
      - `ToolMessage` > 20K tokens：保留约 10K 字符
      - 超出预算时截断并追加 `[更多历史已省略]`
-  4. 摘要前缀 `[历史对话摘要]`。
+  4. 摘要前缀 `[历史对话摘要]`（代码外层强制包装）。
+     - **注意**：`COMPACTION_SUMMARY_PROMPT` 内部模板也要求 LLM 以 `[对话摘要]` 为前缀，因此实际摘要中可能出现 `[历史对话摘要][对话摘要]...` 的双前缀现象。迁移时建议统一 prompt，只保留一个前缀。
   5. 清空旧 messages，重置为 `[System, 摘要, 最近 8 条]`。
 - **持久化**：触发时 emit `compaction` 事件，`chat.py` 调用 `compress_history` 归档旧消息并写入 `compressed_context`。
 - **影响**：彻底的 reset，但前端通过 archive 合并仍能看到完整历史。
+
+### 4.7 `_build_messages` 入模前最后一层兜底
+
+- **位置**：`backend/graph/agent.py::_build_messages()`。
+- **触发条件**：按字符比例估算 `messages` 总 token > `context_window * 0.85`（即 850K）。
+- **行为**：直接丢弃前半段消息，保留后半段，确保不超出模型上下文硬上限。
+- **持久化**：不持久化，只改运行时 state。
+- **影响**：这是进入 LLM 之前的最后一道保险丝，正常情况下不应触发；若触发说明前面所有压缩层都未生效。
 
 ---
 
@@ -216,7 +232,7 @@ sessions/
 
 - `load_session_for_agent()` 注入：
   1. `compressed_context`（如果存在）：`[历史对话摘要]`
-  2. `middle_trim_context`（如果存在）：`[中段历史摘要]`
+  2. `middle_trim_context`（如果存在）：代码会额外包裹一段引导语（如"以下是被移出活跃上下文的中段历史摘要，只用于理解历史完成情况，不代表当前任务结果..."），再附上 `[中段历史摘要]` 内容
   3. `session.json.messages` active messages
 - LLM 看到压缩视图，控制 token。
 - `display_messages` 不进入 LLM context，只用于前端展示。
@@ -372,7 +388,7 @@ compaction_trigger = get_compaction_trigger_tokens()
 - 接近 500K 时会触发 Compaction
 - 不需要关心 1M 的模型上下文上限
 
-后端 `context_usage` 事件和 `/api/tokens/session/{id}` 都统一返回 `total_tokens = compaction_trigger`。
+`context_usage` 事件返回 `total_tokens = compaction_trigger`；`/api/tokens/session/{id}` 返回真实的 `total_tokens = system_tokens + message_tokens`，并额外返回 `compaction_trigger` 字段供前端进度条使用。前端应使用 `compaction_trigger` 作为进度条分母，而不是 `total_tokens`。
 
 ---
 
@@ -382,7 +398,7 @@ compaction_trigger = get_compaction_trigger_tokens()
 2. **摘要结果持久化**：避免多轮重复摘要同一内容。
 3. **前端无感**：完整历史通过 `display_messages` 或 archive 合并展示，压缩只影响 LLM 视图。
 4. **中段不残缺**：中段不能只保留用户请求而删除完成证据；正式路径用 middle summary，TailTrim 兜底也删除完整 middle slice。
-5. **分级兜底**：MiddleTrimSession → ToolResultClear → TailTrim → Summarization → Compaction，从轻到重。
+5. **分级兜底**：MiddleTrimSession → ToolResultClear → TailTrim → Summarization → Compaction → `_build_messages` 0.85 兜底，从轻到重。`MessageTrimMiddleware` 已废弃，不再使用。
 6. **类型化摘要**：专利、文档、技能等不同 tool 使用不同摘要策略。
 
 ---
