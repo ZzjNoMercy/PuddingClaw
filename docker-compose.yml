@@ -19,6 +19,8 @@ services:
     container_name: puddingclaw-backend
     ports:
       - "9100:9100"
+    env_file:
+      - ./backend/.env
     environment:
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
       - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-https://api.deepseek.com}

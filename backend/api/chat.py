@@ -14,7 +14,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from graph.agent import agent_manager
 from graph.session_manager import session_manager
-from config import get_llm_config, get_memory_backend
+from config import get_cache_config, get_llm_config, get_memory_backend
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -103,6 +103,11 @@ def _actually_called_write_file(segments: list[dict]) -> bool:
                 if "MEMORY" in tool_input or "memory" in tool_input:
                     return True
     return False
+
+
+def _segment_has_payload(segment: dict) -> bool:
+    """Return True when an assistant segment has text or tool call data."""
+    return bool(segment.get("content") or segment.get("tool_calls"))
 
 
 async def _detect_and_retry_memory_write(
@@ -267,6 +272,158 @@ def _get_user_friendly_error(err: Exception) -> dict[str, str]:
     return {"error": f"生成回复时出错: {raw}"}
 
 
+MIDDLE_TRIM_SUMMARY_PROMPT = """请总结以下被移出活跃上下文的历史对话。
+
+这是内部上下文优化摘要，用户不会直接看到；请只保留事实，不要补充原文没有的信息。
+
+重点保留：
+1. 用户提出过的任务和问题
+2. 每个任务的状态：已完成、失败、部分完成、未完成
+3. 已执行的重要工具操作、命令、安装、配置、文件路径、版本号和结果
+4. 关键结论、错误信息、后续待办
+5. 哪些内容属于旧任务，不能在后续新任务中续写或当作当前任务结果
+
+输出要求：
+- 使用中文短 bullet
+- 偏“任务状态摘要”，不要写成聊天复述
+- 不要编造，不确定就写“不确定”
+
+历史对话：
+{history}
+"""
+
+
+def _message_to_summary_text(msg: dict) -> str:
+    role = msg.get("role", "unknown")
+    parts = [f"[{role}] {msg.get('content', '')}"]
+    for tc in msg.get("tool_calls", []) or []:
+        parts.append(f"[tool_call] {tc.get('tool', '')} input={tc.get('input', '')}")
+        if tc.get("output"):
+            parts.append(f"[tool_output] {tc.get('output', '')}")
+    return "\n".join(parts)
+
+
+def _rough_message_tokens(msg: dict) -> int:
+    try:
+        from graph.middlewares.compression import count_text_tokens
+        return count_text_tokens(_message_to_summary_text(msg))
+    except Exception:
+        return max(1, len(_message_to_summary_text(msg)) // 4)
+
+
+def _select_middle_trim_span(messages: list[dict], cfg: dict) -> tuple[int, int] | None:
+    """Return active-message slice [start, end) to summarize/archive, or None."""
+    if not cfg.get("enabled", True):
+        return None
+
+    max_tokens = cfg.get("max_tokens", 200000)
+    if sum(_rough_message_tokens(m) for m in messages) <= max_tokens:
+        return None
+
+    head_keep = cfg.get("head_keep", 2)
+    keep_recent = cfg.get("keep_recent", 30)
+    if len(messages) <= head_keep + keep_recent:
+        return None
+
+    start = head_keep
+    end = len(messages) - keep_recent
+
+    # 保留的 tail 必须从用户消息开始，避免给 LLM 留半截最近任务。
+    while end > start and messages[end].get("role") != "user":
+        end -= 1
+
+    if end <= start:
+        return None
+    return start, end
+
+
+def _build_middle_trim_history_text(messages: list[dict], budget_chars: int) -> str:
+    parts: list[str] = []
+    used = 0
+    for msg in messages:
+        text = _message_to_summary_text(msg)
+        remaining = budget_chars - used
+        if remaining <= 0:
+            parts.append("[更多中段历史因摘要预算限制已省略]")
+            break
+        if len(text) > remaining:
+            parts.append(text[:remaining] + "\n[单条消息已截断]")
+            break
+        parts.append(text)
+        used += len(text)
+    return "\n\n".join(parts)
+
+
+async def _maybe_middle_trim_session(session_id: str) -> None:
+    """Summarize/archive active middle history before building LLM context.
+
+    This keeps frontend history complete via archive + current messages, while
+    preventing the LLM context from containing a request-only middle with its
+    completion/tool evidence removed.
+    """
+    cache_cfg = get_cache_config()
+    cfg = cache_cfg.get("middle_trim") or {
+        "enabled": True,
+        "max_tokens": 200000,
+        "head_keep": 2,
+        "keep_recent": 30,
+        "summary_budget_chars": 60000,
+    }
+
+    active_messages = session_manager.get_active_messages(session_id)
+    span = _select_middle_trim_span(active_messages, cfg)
+    if not span:
+        return
+
+    start, end = span
+    middle = active_messages[start:end]
+    if not middle:
+        return
+
+    history_text = _build_middle_trim_history_text(
+        middle,
+        cfg.get("summary_budget_chars", 60000),
+    )
+    prompt = MIDDLE_TRIM_SUMMARY_PROMPT.format(history=history_text)
+
+    try:
+        from langchain_deepseek import ChatDeepSeek
+        from langchain_core.messages import HumanMessage as HM
+
+        llm_cfg = get_llm_config()
+        llm = ChatDeepSeek(
+            model=llm_cfg["model"],
+            api_key=llm_cfg["api_key"],
+            base_url=llm_cfg["base_url"],
+            temperature=0,
+        )
+        result = await llm.ainvoke([HM(content=prompt)])
+        summary = result.content.strip()
+    except Exception as e:
+        print(f"[middle-trim] 摘要失败，跳过本次中段裁剪: {type(e).__name__}: {e}")
+        return
+
+    if not summary:
+        return
+
+    archive_name = session_manager.middle_trim_history(
+        session_id,
+        summary,
+        start,
+        end,
+        metadata={
+            "reason": "middle_trim",
+            "active_message_count_before": len(active_messages),
+            "summary_budget_chars": cfg.get("summary_budget_chars", 60000),
+        },
+    )
+    if archive_name:
+        print(
+            f"[middle-trim] session={session_id} archived active messages[{start}:{end}] "
+            f"to {archive_name}"
+        )
+
+
 async def event_generator(message: str, session_id: str, user_id: str = "default_user") -> AsyncGenerator[dict, None]:
     """Generate SSE events from agent stream.
 
@@ -290,6 +447,8 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
     stream_error: Exception | None = None
 
     try:
+        await _maybe_middle_trim_session(session_id)
+
         # Use merged history for agent context (combines consecutive assistant msgs)
         history = session_manager.load_session_for_agent(session_id)
         is_first_message = len(history) == 0
@@ -376,7 +535,8 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
                 }
 
             elif event_type == "new_response":
-                segments.append(current_segment)
+                if _segment_has_payload(current_segment):
+                    segments.append(current_segment)
                 current_segment = {"content": "", "tool_calls": []}
                 yield {
                     "event": "new_response",
@@ -418,7 +578,8 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
                     "data": json.dumps(
                         {
                             "tool": event["tool"],
-                            "output": event["output"],
+                            "output": event.get("output_preview", event["output"]),
+                            "output_full_length": len(event["output"]),
                             "summary_source": event.get("summary_source"),
                         },
                         ensure_ascii=False,
@@ -426,7 +587,8 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
                 }
 
             elif event_type == "done":
-                segments.append(current_segment)
+                if _segment_has_payload(current_segment):
+                    segments.append(current_segment)
 
                 session_manager.save_message(session_id, "user", message)
                 for seg in segments:

@@ -29,7 +29,7 @@ def scan_skills(base_dir: Path) -> str:
                             print(f"⚠️  Duplicate skill name '{name}' at {skill_md}, skipping")
                             continue
                         seen_names.add(name)
-                        rel_path = f"./backend/skills/{skill_md.parent.name}/SKILL.md"
+                        rel_path = str(skill_md.relative_to(base_dir))
                         skills.append({
                             "name": name,
                             "description": meta.get("description", ""),

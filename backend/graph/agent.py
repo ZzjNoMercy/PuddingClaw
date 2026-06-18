@@ -45,6 +45,10 @@ def _format_mem0_context(typed_context: dict[str, list[str]]) -> str:
 # ========== Context Rot 阈值 ==========
 CONTEXT_ROT_WARNING_RATIO = 0.40
 CONTEXT_ROT_CRITICAL_RATIO = 0.85
+HISTORICAL_TOOL_OUTPUT_PREFIX = (
+    "【历史工具输出：仅在用户明确追问该结果时作为背景使用；"
+    "禁止在当前回复中复述、续写或当作当前任务结果。】\n"
+)
 
 
 def _estimate_tokens(text) -> int:
@@ -301,7 +305,9 @@ class AgentManager:
                         if output:
                             tc_id = tc.get("id") or f"tc_{i}"
                             messages.append(ToolMessage(
-                                content=str(output), tool_call_id=tc_id, name=tc["tool"]
+                                content=f"{HISTORICAL_TOOL_OUTPUT_PREFIX}{output}",
+                                tool_call_id=tc_id,
+                                name=tc["tool"],
                             ))
                 else:
                     messages.append(AIMessage(content=content))
@@ -392,7 +398,11 @@ class AgentManager:
                 if mode == "messages":
                     msg, metadata = data
                     if hasattr(msg, "content") and msg.content:
-                        if msg.type == "AIMessageChunk" or msg.type == "ai":
+                        # LangGraph's messages stream should be consumed as token chunks.
+                        # Full AIMessage objects can appear as graph state/replay events and
+                        # may contain stale history or prior tool summaries; treating them as
+                        # tokens pollutes the saved assistant reply.
+                        if msg.type == "AIMessageChunk":
                             if msg.content and not getattr(msg, "tool_calls", None):
                                 if tools_just_finished:
                                     yield {"type": "new_response"}
@@ -436,7 +446,8 @@ class AgentManager:
                                         yield {
                                             "type": "tool_end",
                                             "tool": tool_msg.name,
-                                            "output": str(tool_msg.content)[:2000],
+                                            "output": str(tool_msg.content),
+                                            "output_preview": str(tool_msg.content)[:2000],
                                             "id": tc_id,
                                             "summary_source": summary_source,
                                         }

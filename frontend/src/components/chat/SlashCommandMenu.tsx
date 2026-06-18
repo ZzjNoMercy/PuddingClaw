@@ -51,7 +51,7 @@ export default function SlashCommandMenu({
 
   return (
     <div ref={containerRef} className="absolute bottom-full left-0 right-0 mb-2 z-50">
-      <div className="bg-white/90 backdrop-blur-lg border border-black/[0.08] rounded-2xl shadow-xl overflow-hidden mx-1">
+      <div className="bg-white border border-black/[0.08] rounded-2xl shadow-xl overflow-hidden mx-1">
         {/* Header */}
         <div className="px-3 pt-2.5 pb-1.5 border-b border-black/[0.05]">
           <span className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider">

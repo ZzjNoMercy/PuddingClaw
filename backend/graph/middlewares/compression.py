@@ -21,25 +21,48 @@ _TIKTOKEN_ENC = None
 
 
 def _get_tokenizer():
-    """Lazy-load tokenizer. 返回 (encode_fn, name)。"""
+    """Lazy-load tokenizer. 返回 (encode_fn, name)。
+
+    默认优先使用 DeepSeek 官方 tokenizer（Docker 镜像已预缓存，无需网络）。
+    若缓存缺失或加载失败，降级到 tiktoken cl100k_base；再失败则用字符估算。
+    如需强制使用 tiktoken，可设置环境变量 USE_TIKTOKEN=1。
+    """
+    import os
+
     global _DEEPSEEK_TOKENIZER, _TIKTOKEN_ENC
     if _DEEPSEEK_TOKENIZER is not None:
         return _DEEPSEEK_TOKENIZER, "deepseek"
     if _TIKTOKEN_ENC is not None:
         return _TIKTOKEN_ENC, "tiktoken"
-    # 首次加载：尝试 DeepSeek 官方
+
+    # 可选：强制 tiktoken
+    if os.getenv("USE_TIKTOKEN") == "1":
+        _tk_logger.info("USE_TIKTOKEN=1, skip deepseek tokenizer")
+    else:
+        # 默认：DeepSeek 官方 tokenizer（镜像已预缓存到 /app/.hf_cache）
+        try:
+            from transformers import AutoTokenizer
+            tok = AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-V3", trust_remote_code=True)
+            _DEEPSEEK_TOKENIZER = tok
+            _tk_logger.info("token counter: using deepseek-ai/DeepSeek-V3 tokenizer")
+            return tok, "deepseek"
+        except Exception as e:
+            _tk_logger.warning("failed to load deepseek tokenizer (%s), falling back to tiktoken", e)
+
+    # 降级：tiktoken
     try:
-        from transformers import AutoTokenizer
-        # DeepSeek V3 公开在 HF 上，trust_remote_code 兼容 V2.5/V3
-        tok = AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-V3", trust_remote_code=True)
-        _DEEPSEEK_TOKENIZER = tok
-        _tk_logger.info("token counter: using deepseek-ai/DeepSeek-V3 tokenizer")
-        return tok, "deepseek"
-    except Exception as e:
-        _tk_logger.warning("failed to load deepseek tokenizer (%s), falling back to tiktoken cl100k_base", e)
         import tiktoken
         _TIKTOKEN_ENC = tiktoken.get_encoding("cl100k_base")
+        _tk_logger.info("token counter: using tiktoken cl100k_base")
         return _TIKTOKEN_ENC, "tiktoken"
+    except Exception as e:
+        _tk_logger.warning("failed to load tiktoken (%s), falling back to rough estimate", e)
+
+        class _RoughEncoder:
+            def encode(self, text: str) -> list[int]:
+                return [0] * max(1, len(text) // 4)
+
+        return _RoughEncoder(), "rough"
 
 
 def _encode_text(text: str) -> int:
@@ -47,7 +70,7 @@ def _encode_text(text: str) -> int:
     tok, name = _get_tokenizer()
     if name == "deepseek":
         return len(tok.encode(text, add_special_tokens=False))
-    return len(tok.encode(text))  # tiktoken
+    return len(tok.encode(text))  # tiktoken / rough
 
 
 def count_tokens_tiktoken(messages) -> int:

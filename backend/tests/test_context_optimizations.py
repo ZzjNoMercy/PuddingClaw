@@ -38,6 +38,9 @@ class TestContextEngineeringConfig:
         assert _DEFAULT_CONFIG["cache"]["tail_trim"]["max_tokens"] == 200000
         assert _DEFAULT_CONFIG["cache"]["tail_trim"]["head_keep"] == 2
         assert _DEFAULT_CONFIG["cache"]["tail_trim"]["keep_recent"] == 30
+        assert _DEFAULT_CONFIG["cache"]["middle_trim"]["max_tokens"] == 200000
+        assert _DEFAULT_CONFIG["cache"]["middle_trim"]["head_keep"] == 2
+        assert _DEFAULT_CONFIG["cache"]["middle_trim"]["keep_recent"] == 30
 
     def test_tool_clear_thresholds(self):
         from config import _DEFAULT_CONFIG
@@ -57,6 +60,106 @@ class TestContextEngineeringConfig:
         assert cm["trigger_tokens"] == 500000
         assert cm["keep_recent"] == 8
         assert cm["compact_budget_tokens"] == 120000
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Agent streaming
+# ══════════════════════════════════════════════════════════════════════
+
+class TestAgentStreaming:
+    """流式回复只收集当前 token chunk，不保存图状态回放的旧 AIMessage。"""
+
+    def test_ignores_full_ai_message_replay(self):
+        from graph.agent import AgentManager
+        from langchain_core.messages import AIMessage, AIMessageChunk
+
+        class FakeAgent:
+            async def astream(self, *_args, **_kwargs):
+                yield ("messages", (AIMessage(content="上一轮 BYD 报告"), {}))
+                yield ("messages", (AIMessageChunk(content="当前 SkillHub 回复"), {}))
+
+        async def collect_events():
+            manager = AgentManager()
+            return [
+                event
+                async for event in manager._run_agent_stream(
+                    FakeAgent(), messages=[], system_prompt_tokens=0
+                )
+            ]
+
+        events = asyncio.run(collect_events())
+
+        token_text = "".join(e["content"] for e in events if e["type"] == "token")
+        done = next(e for e in events if e["type"] == "done")
+
+        assert token_text == "当前 SkillHub 回复"
+        assert done["content"] == "当前 SkillHub 回复"
+        assert "BYD" not in done["content"]
+
+    def test_historical_tool_outputs_are_labeled(self):
+        from graph.agent import AgentManager, HISTORICAL_TOOL_OUTPUT_PREFIX
+
+        manager = AgentManager()
+        messages = manager._build_messages(
+            "安装 SkillHub",
+            [
+                {
+                    "role": "assistant",
+                    "content": "上一轮分析",
+                    "tool_calls": [
+                        {
+                            "tool": "search_patents",
+                            "input": "{}",
+                            "id": "tc1",
+                            "output": "比亚迪旧专利结果",
+                        }
+                    ],
+                }
+            ],
+        )
+
+        tool_messages = [m for m in messages if getattr(m, "type", "") == "tool"]
+        assert tool_messages
+        assert tool_messages[0].content.startswith(HISTORICAL_TOOL_OUTPUT_PREFIX)
+        assert "比亚迪旧专利结果" in tool_messages[0].content
+
+    def test_tool_end_keeps_full_output_and_preview_separate(self):
+        from graph.agent import AgentManager
+        from langchain_core.messages import ToolMessage
+
+        long_output = "x" * 2500
+
+        class FakeAgent:
+            async def astream(self, *_args, **_kwargs):
+                yield (
+                    "updates",
+                    {
+                        "tools": {
+                            "messages": [
+                                ToolMessage(
+                                    content=long_output,
+                                    tool_call_id="tc1",
+                                    name="terminal",
+                                )
+                            ]
+                        }
+                    },
+                )
+
+        async def collect_events():
+            manager = AgentManager()
+            return [
+                event
+                async for event in manager._run_agent_stream(
+                    FakeAgent(), messages=[], system_prompt_tokens=0
+                )
+            ]
+
+        events = asyncio.run(collect_events())
+        tool_end = next(e for e in events if e["type"] == "tool_end")
+
+        assert tool_end["output"] == long_output
+        assert tool_end["output_preview"] == long_output[:2000]
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -269,7 +372,7 @@ class TestSessionManagerPersistence:
 
     def test_load_session_merges_archive(self, tmp_path):
         from graph.session_manager import SessionManager
-        import time
+        import json
         mgr = SessionManager()
         mgr.initialize(tmp_path)
         sid = "test-session"
@@ -278,18 +381,93 @@ class TestSessionManagerPersistence:
         # 手动写入归档
         archive_dir = tmp_path / "sessions" / "archive"
         archive_dir.mkdir(exist_ok=True)
-        archive = {
+        archive_old = {
             "session_id": sid,
-            "archived_at": time.time(),
-            "messages": [{"role": "user", "content": "archived"}],
+            "archived_at": 1,
+            "messages": [{"role": "user", "content": "archived-old"}],
         }
-        (archive_dir / f"{sid}_{int(time.time())}.json").write_text(
-            __import__("json").dumps(archive), encoding="utf-8"
+        archive_new = {
+            "session_id": sid,
+            "archived_at": 2,
+            "messages": [{"role": "user", "content": "archived-new"}],
+        }
+        (archive_dir / f"{sid}_1.json").write_text(
+            json.dumps(archive_old), encoding="utf-8"
+        )
+        (archive_dir / f"{sid}_2.json").write_text(
+            json.dumps(archive_new), encoding="utf-8"
         )
         messages = mgr.load_session(sid)
-        assert len(messages) == 2
-        assert messages[0]["content"] == "archived"
-        assert messages[1]["content"] == "current"
+        assert [m["content"] for m in messages] == [
+            "archived-old",
+            "archived-new",
+            "current",
+        ]
+
+    def test_middle_trim_archives_but_display_history_stays_complete(self, tmp_path):
+        from graph.session_manager import MIDDLE_TRIM_CONTEXT_PREFIX, SessionManager
+
+        mgr = SessionManager()
+        mgr.initialize(tmp_path)
+        sid = "test-session"
+        mgr.create_session(sid)
+        for content in ["head", "trim-user", "trim-assistant", "tail"]:
+            role = "assistant" if "assistant" in content else "user"
+            mgr.save_message(sid, role, content)
+
+        archive_name = mgr.middle_trim_history(
+            sid,
+            "trimmed task was completed",
+            1,
+            3,
+            metadata={"reason": "test"},
+        )
+
+        assert archive_name
+        active = mgr.get_active_messages(sid)
+        assert [m["content"] for m in active] == ["head", "tail"]
+
+        display = mgr.load_session(sid)
+        assert [m["content"] for m in display] == [
+            "head",
+            "trim-user",
+            "trim-assistant",
+            "tail",
+        ]
+
+        mgr.save_message(sid, "assistant", "future")
+        assert [m["content"] for m in mgr.load_session(sid)] == [
+            "head",
+            "trim-user",
+            "trim-assistant",
+            "tail",
+            "future",
+        ]
+
+        agent_history = mgr.load_session_for_agent(sid)
+        assert agent_history[0]["content"].startswith(MIDDLE_TRIM_CONTEXT_PREFIX)
+        assert "trimmed task was completed" in agent_history[0]["content"]
+        assert all(m["content"] != "trim-user" for m in agent_history[1:])
+
+    def test_middle_trim_span_aligns_tail_to_user(self):
+        from api.chat import _select_middle_trim_span
+
+        messages = [
+            {"role": "user", "content": "head user"},
+            {"role": "assistant", "content": "head assistant"},
+            {"role": "user", "content": "middle user"},
+            {"role": "assistant", "content": "middle assistant"},
+            {"role": "tool", "content": "middle tool"},
+            {"role": "user", "content": "tail user"},
+            {"role": "assistant", "content": "tail assistant"},
+        ]
+
+        span = _select_middle_trim_span(
+            messages,
+            {"enabled": True, "max_tokens": 1, "head_keep": 2, "keep_recent": 2},
+        )
+
+        assert span == (2, 5)
 
 
 # ══════════════════════════════════════════════════════════════════════

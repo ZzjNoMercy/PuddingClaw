@@ -56,6 +56,13 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": True,
         "cache_boundary": {"enabled": True},
         "tail_trim": {"enabled": True, "max_tokens": 200000, "head_keep": 2, "keep_recent": 30},
+        "middle_trim": {
+            "enabled": True,
+            "max_tokens": 200000,
+            "head_keep": 2,
+            "keep_recent": 30,
+            "summary_budget_chars": 60000,
+        },
     },
     "mem0": {
         "user_id": "default_user",
@@ -162,6 +169,13 @@ def get_cache_config() -> dict:
         "enabled": True,
         "cache_boundary": {"enabled": True},
         "tail_trim": {"enabled": True, "max_tokens": 200000, "head_keep": 2, "keep_recent": 30},
+        "middle_trim": {
+            "enabled": True,
+            "max_tokens": 200000,
+            "head_keep": 2,
+            "keep_recent": 30,
+            "summary_budget_chars": 60000,
+        },
     })
 
 

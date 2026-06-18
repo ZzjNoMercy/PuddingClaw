@@ -7,6 +7,7 @@ from typing import Any        # 类型注解
 
 # 压缩摘要的固定前缀标识，agent.py 和本模块共用，用于识别摘要消息
 COMPRESSED_CONTEXT_PREFIX = "[历史对话摘要]"
+MIDDLE_TRIM_CONTEXT_PREFIX = "[中段历史摘要]"
 
 
 class SessionManager:
@@ -75,12 +76,15 @@ class SessionManager:
         if not data:
             return []
 
+        if isinstance(data.get("display_messages"), list):
+            return list(data.get("display_messages", []))
+
         messages = list(data.get("messages", []))
 
         # 合并 archive/ 中的归档消息（按 archived_at 升序）
         archive_dir = self._sessions_dir / "archive"
         if archive_dir.exists():
-            archived: list[list[dict[str, Any]]] = []
+            archived: list[tuple[float, list[dict[str, Any]]]] = []
             for f in sorted(archive_dir.glob(f"{session_id}_*.json")):
                 try:
                     arc = json.loads(f.read_text(encoding="utf-8"))
@@ -88,8 +92,10 @@ class SessionManager:
                 except Exception:
                     continue
             # 按归档时间升序拼接
+            archived_messages: list[dict[str, Any]] = []
             for _, arc_messages in sorted(archived, key=lambda x: x[0]):
-                messages = arc_messages + messages
+                archived_messages.extend(arc_messages)
+            messages = archived_messages + messages
 
         return messages
 
@@ -114,6 +120,8 @@ class SessionManager:
         if tool_calls:                                            # 有工具调用则附加
             msg["tool_calls"] = tool_calls
         data["messages"].append(msg)              # 追加到消息列表末尾
+        if isinstance(data.get("display_messages"), list):
+            data["display_messages"].append(dict(msg))
         self._write_file(session_id, data)        # 写回磁盘
 
     def rename_session(self, session_id: str, title: str) -> None:
@@ -139,7 +147,16 @@ class SessionManager:
         data = self._read_file(session_id)                     # 读取会话文件
         if not data:                                           # 不存在返回空结构
             return {"title": "", "messages": []}
+        data = dict(data)
+        data["messages"] = self.load_session(session_id)
         return data                                            # 返回完整数据
+
+    def get_active_messages(self, session_id: str) -> list[dict[str, Any]]:
+        """返回当前 session.json 中尚未归档的活跃消息。仅供 Agent 上下文优化使用。"""
+        data = self._read_file(session_id)
+        if not data:
+            return []
+        return list(data.get("messages", []))
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """列出所有会话的元数据（id/title/updated_at），按修改时间倒序"""
@@ -211,6 +228,80 @@ class SessionManager:
             return None
         return data.get("compressed_context")           # 返回摘要字段
 
+    def middle_trim_history(
+        self,
+        session_id: str,
+        summary: str,
+        start_idx: int,
+        end_idx: int,
+        metadata: dict[str, Any] | None = None,
+    ) -> str | None:
+        """归档 active messages 的中段，并把摘要追加到 middle_trim_context。
+
+        start_idx/end_idx 是当前 session.json 中 data["messages"] 的半开区间。
+        前端仍可通过 load_session() 看到 archive + current 的完整历史；LLM 只读取
+        middle_trim_context + current active messages。
+        """
+        assert self._sessions_dir is not None
+        data = self._read_file(session_id)
+        if not data:
+            return None
+
+        messages = data.get("messages", [])
+        start_idx = max(0, start_idx)
+        end_idx = min(len(messages), end_idx)
+        if start_idx >= end_idx:
+            return None
+
+        archived_messages = messages[start_idx:end_idx]
+        if not isinstance(data.get("display_messages"), list):
+            data["display_messages"] = self.load_session(session_id)
+
+        archive_dir = self._sessions_dir / "archive"
+        archive_dir.mkdir(exist_ok=True)
+        now = time.time()
+        archive_name = f"{session_id}_middle_{int(now * 1000)}.json"
+        archive_path = archive_dir / archive_name
+        archive_data = {
+            "session_id": session_id,
+            "archive_type": "middle_trim",
+            "archived_at": now,
+            "range": {"start_idx": start_idx, "end_idx": end_idx},
+            "messages": archived_messages,
+            "summary": summary,
+        }
+        if metadata:
+            archive_data["metadata"] = metadata
+        archive_path.write_text(
+            json.dumps(archive_data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        data["messages"] = messages[:start_idx] + messages[end_idx:]
+
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+        block = (
+            f"[中段裁剪摘要 {timestamp}]\n"
+            f"archive: {archive_name}\n"
+            f"messages: {len(archived_messages)}\n"
+            f"range: active messages[{start_idx}:{end_idx}]\n"
+            f"摘要：\n{summary.strip()}"
+        )
+        existing_context = data.get("middle_trim_context", "")
+        data["middle_trim_context"] = (
+            existing_context + "\n---\n" + block if existing_context else block
+        )
+
+        self._write_file(session_id, data)
+        return archive_name
+
+    def get_middle_trim_context(self, session_id: str) -> str | None:
+        """获取中段裁剪摘要（如果存在）。"""
+        data = self._read_file(session_id)
+        if not data:
+            return None
+        return data.get("middle_trim_context")
+
     def update_tool_call_output(
         self,
         session_id: str,
@@ -276,6 +367,18 @@ class SessionManager:
                 "content": f"{COMPRESSED_CONTEXT_PREFIX}\n{compressed}", # 前缀标识 + 摘要内容
             })
 
+        middle_trim_context = data.get("middle_trim_context", "") if data else ""
+        if middle_trim_context:
+            merged.append({
+                "role": "assistant",
+                "content": (
+                    f"{MIDDLE_TRIM_CONTEXT_PREFIX}\n"
+                    "以下内容是因上下文裁剪移出活跃消息的历史任务状态摘要。"
+                    "它只用于理解历史完成情况，不代表当前任务结果，也不要在新任务中续写。\n"
+                    f"{middle_trim_context}"
+                ),
+            })
+
         for msg in messages:                                             # 遍历所有消息
             entry: dict[str, Any] = {"role": msg["role"], "content": msg["content"]}
             if msg.get("tool_calls"):
@@ -304,8 +407,12 @@ class SessionManager:
         if not data:                                # 不存在则跳过
             return
         data["messages"] = []                       # 清空消息列表
+        if "display_messages" in data:
+            del data["display_messages"]
         if "compressed_context" in data:            # 同时清除压缩摘要
             del data["compressed_context"]
+        if "middle_trim_context" in data:
+            del data["middle_trim_context"]
         self._write_file(session_id, data)          # 写回磁盘
 
 

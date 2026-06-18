@@ -15,12 +15,28 @@ router = APIRouter()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Cache the encoder instance
-_encoder = tiktoken.get_encoding("cl100k_base")
+# Cache the encoder instance with a fallback for offline / slow networks.
+try:
+    _encoder = tiktoken.get_encoding("cl100k_base")
+except Exception as _tiktoken_exc:  # pragma: no cover - offline fallback
+    import warnings
+
+    warnings.warn(
+        f"Failed to load tiktoken cl100k_base ({_tiktoken_exc}); "
+        "using rough character-based token estimate."
+    )
+
+    class _FallbackEncoder:
+        """Rough token estimator when tiktoken encodings cannot be downloaded."""
+
+        def encode(self, text: str) -> list[int]:
+            return [0] * max(1, len(text) // 4)
+
+    _encoder = _FallbackEncoder()
 
 
 def _count_tokens(text: str) -> int:
-    """Count tokens using cl100k_base encoding."""
+    """Count tokens using cl100k_base encoding (or a rough fallback)."""
     return len(_encoder.encode(text))
 
 

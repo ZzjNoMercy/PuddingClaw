@@ -24,11 +24,20 @@ _REGISTRY: dict[str, Any] = {
     #     },
     #     "timeout": 60,
     # },
+    "zhihuiya_patents": {
+        "transport": "streamable-http",
+        "url": "https://connect.zhihuiya.com/1458a4/mcp",
+        "headers": {
+            "Authorization": f"Bearer {_get_env('ZHIHUIYA_MCP_API_KEY')}",
+        },
+        "timeout": 60,
+    },
 }
 
 # 服务器中文显示名映射（供前端看板使用）
 _SERVER_DISPLAY_NAMES: dict[str, str] = {
     # "technical_qa": "技术研发问答",
+    "zhihuiya_patents": "智慧芽专利检索",
 }
 
 

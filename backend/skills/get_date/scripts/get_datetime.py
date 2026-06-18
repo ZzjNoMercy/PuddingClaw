@@ -6,18 +6,20 @@
 
 import sys
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 def get_current_datetime():
     """
-    获取当前系统日期时间信息
-    
+    获取当前北京时间日期时间信息
+
     Returns:
         dict: 包含各种格式的日期时间信息
     Raises:
         Exception: 如果时间获取失败
     """
     try:
-        now = datetime.now()
+        # 强制使用北京时间（Asia/Shanghai），避免容器默认 UTC 导致时间不对
+        now = datetime.now(ZoneInfo("Asia/Shanghai"))
         
         # 中文星期映射
         weekday_zh = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"][now.weekday()]

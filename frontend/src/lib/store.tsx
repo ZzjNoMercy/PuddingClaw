@@ -21,6 +21,7 @@ import {
   getRagMode as apiGetRagMode,
   setRagMode as apiSetRagMode,
   loadSkill as apiLoadSkill,
+  listMcpServers as apiListMcpServers,
 } from "./api";
 
 // ── Types ──────────────────────────────────────────────────
@@ -94,8 +95,12 @@ interface AppState {
   toggleInspector: () => void;
 
   // Right panel tab
-  rightTab: "memory" | "skills";
-  setRightTab: (tab: "memory" | "skills") => void;
+  rightTab: "memory" | "skills" | "mcp";
+  setRightTab: (tab: "memory" | "skills" | "mcp") => void;
+
+  // MCP servers
+  mcpServers: Array<{ key: string; name: string; url: string; transport: string }>;
+  loadMcpServers: () => void;
 
   // Raw messages
   rawMessages: RawMessage[] | null;
@@ -191,7 +196,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [inspectorFile, setInspectorFileRaw] = useState<string | null>(null);
   const [inspectorOpen, setInspectorOpen] = useState(false);
-  const [rightTab, setRightTab] = useState<"memory" | "skills">("memory");
+  const [rightTab, setRightTab] = useState<"memory" | "skills" | "mcp">("memory");
+  const [mcpServers, setMcpServers] = useState<Array<{ key: string; name: string; url: string; transport: string }>>([]);
   const [rawMessages, setRawMessages] = useState<RawMessage[] | null>(null);
   const [expandedFile, setExpandedFile] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(260);
@@ -246,10 +252,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       .catch(() => {});
   }, []);
 
-  // Load sessions on mount
+  const loadMcpServers = useCallback(() => {
+    apiListMcpServers()
+      .then((list) => setMcpServers(list))
+      .catch(() => setMcpServers([]));
+  }, []);
+
+  // Load sessions and MCP servers on mount
   useEffect(() => {
     loadSessions();
-  }, [loadSessions]);
+    loadMcpServers();
+  }, [loadSessions, loadMcpServers]);
 
   const setSessionId = useCallback(
     (id: string) => {
@@ -412,6 +425,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     if (controller) {
       controller.abort();
       abortControllersRef.current.delete(sessionId);
+      // Immediately drop the streaming badge so the UI responds even if the
+      // SSE reader is slow to terminate.
+      setStreamingSessions((prev) => {
+        const next = new Set(prev);
+        next.delete(sessionId);
+        return next;
+      });
     }
   }, [sessionId]);
 
@@ -631,10 +651,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           updateMsgs((prev) => {
             const updated = [...prev];
             const idx = updated.findIndex((m) => m.id === targetId);
-            if (idx !== -1 && updated[idx].content) {
+            if (idx !== -1) {
+              // If no token arrived yet, replace the empty placeholder so the
+              // typing indicator disappears; otherwise append the stop marker.
+              const marker = "*— 已停止生成 —*";
               updated[idx] = {
                 ...updated[idx],
-                content: updated[idx].content + "\n\n*— 已停止生成 —*",
+                content: updated[idx].content
+                  ? updated[idx].content + "\n\n" + marker
+                  : marker,
               };
             }
             return updated;
@@ -693,6 +718,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         toggleInspector,
         rightTab,
         setRightTab,
+        mcpServers,
+        loadMcpServers,
         rawMessages,
         loadRawMessages,
         expandedFile,

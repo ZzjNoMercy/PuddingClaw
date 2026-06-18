@@ -193,10 +193,9 @@ class TailTrimMiddleware(AgentMiddleware):
     触发条件：token 总数 > max_tokens 且消息总数 > head_keep + keep_recent。
     裁剪范围：msgs[head_keep : len(msgs) - keep_recent] 的中段。
     删除策略：
-      - 纯文本 AIMessage（无 tool_calls）：可独立删
+      - middle slice 中的消息作为一个残缺风险区整体移除
       - AIMessage(tool_calls=[x]) + 对应 ToolMessage(tool_call_id=x)：**原子成对**
         仅当全组都在 middle slice 内才删；任何一个在保护区（head/recent）则整组保留
-      - HumanMessage / SystemMessage：永不删（保持对话结构）
       - 无 id 的消息：跳过（保守策略）
 
     为什么必须原子配对：
@@ -307,13 +306,9 @@ class TailTrimMiddleware(AgentMiddleware):
 
         groups = self._build_ai_tool_groups(messages)
 
-        # 所有"属于 AI+Tool 配对组"的消息下标，用于后续独立 AIMessage 判断
-        grouped_indices: set[int] = set()
-        for ai_idx, tool_indices in groups:
-            grouped_indices.add(ai_idx)
-            grouped_indices.update(tool_indices)
-
         removes: list[RemoveMessage] = []
+        removed_ids: set[str] = set()
+        protected_indices: set[int] = set()
         skipped_pairs = 0  # 观测：多少组因跨保护区边界被保留
 
         # 步骤 1：原子删除"整组在 middle slice"的 AI+Tool 配对
@@ -324,32 +319,35 @@ class TailTrimMiddleware(AgentMiddleware):
                 # AIMessage 有 tool_calls 但尚无对应 ToolMessage（pending 响应 / 末尾未完成）
                 # 若删 AI 会留下孤立的 tool_call 意图，下轮 DeepSeek 会报 400
                 skipped_pairs += 1
+                protected_indices.add(ai_idx)
                 continue
             if any(not (head_end <= ti < tail_start) for ti in tool_indices):
                 skipped_pairs += 1
+                protected_indices.add(ai_idx)
+                protected_indices.update(tool_indices)
                 continue  # 至少一个 Tool 在保护区（head/recent）→ 整组保留
             # 整组可删
             ai_msg = messages[ai_idx]
             ai_id = getattr(ai_msg, "id", None)
             if ai_id:
                 removes.append(RemoveMessage(id=ai_id))
+                removed_ids.add(ai_id)
             for ti in tool_indices:
                 tm_id = getattr(messages[ti], "id", None)
                 if tm_id:
                     removes.append(RemoveMessage(id=tm_id))
+                    removed_ids.add(tm_id)
 
-        # 步骤 2：删除 middle 里的纯文本 AIMessage（无 tool_calls）
+        # 步骤 2：删除 middle 中其余消息。这里会删除 HumanMessage，避免留下
+        # “用户请求仍在、完成过程被删”的残缺历史误导模型。
         for i in range(head_end, tail_start):
-            if i in grouped_indices:
-                continue  # 已由步骤 1 处理
-            m = messages[i]
-            if not isinstance(m, AIMessage):
+            if i in protected_indices:
                 continue
-            if getattr(m, "tool_calls", None):
-                continue  # 有 tool_calls 但未进组（应不会出现，防御式判断）
+            m = messages[i]
             m_id = getattr(m, "id", None)
-            if m_id:
+            if m_id and m_id not in removed_ids:
                 removes.append(RemoveMessage(id=m_id))
+                removed_ids.add(m_id)
 
         if not removes:
             # token 超限但没删到任何消息：可能 middle 全是 Human、或全是跨边界组

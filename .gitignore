@@ -55,6 +55,12 @@ backend/.pytest_cache/
 dist/
 build/
 *.egg-info/
+frontend/tsconfig.tsbuildinfo
 
 # Docker volumes (if any)
 volumes/
+
+# SkillHub runtime lock
+backend/skills/.skills_store_lock.json
+
+.pytest_cache

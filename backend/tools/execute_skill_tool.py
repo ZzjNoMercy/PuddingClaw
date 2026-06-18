@@ -53,13 +53,32 @@ class ExecuteSkillTool(BaseTool):
                 scripts.append(py_match.group(1))
         return scripts
 
+    def _resolve_skill_dir(self, skills_dir: Path, skill_name: str) -> Path | None:
+        """智能匹配技能目录：兼容 -/_ 差异和大小写差异。"""
+        # 直接候选
+        candidates = [
+            skills_dir / skill_name,
+            skills_dir / skill_name.replace("-", "_"),
+            skills_dir / skill_name.replace("_", "-"),
+        ]
+        # 遍历已存在的目录做大小写和规范化匹配
+        norm_target = skill_name.lower().replace("-", "_")
+        for subdir in skills_dir.iterdir():
+            if subdir.is_dir():
+                if subdir.name.lower().replace("-", "_") == norm_target:
+                    candidates.append(subdir)
+        for cand in candidates:
+            if cand.is_dir():
+                return cand
+        return None
+
     def _run(self, skill_name: str, user_query: str = "") -> str:
         skills_dir = Path(self.skills_dir)
-        skill_dir = skills_dir / skill_name
+        skill_dir = self._resolve_skill_dir(skills_dir, skill_name)
 
         # 1. 验证 skill 目录存在
-        if not skill_dir.is_dir():
-            return f"错误：技能目录不存在：{skill_dir}"
+        if skill_dir is None:
+            return f"错误：技能目录不存在：{skills_dir / skill_name}"
 
         skill_md = skill_dir / "SKILL.md"
         if not skill_md.is_file():

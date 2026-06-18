@@ -184,6 +184,18 @@ export async function listSkills(): Promise<
 }
 
 /**
+ * List enabled MCP servers.
+ */
+export async function listMcpServers(): Promise<
+  Array<{ key: string; name: string; url: string; transport: string }>
+> {
+  const resp = await fetch(`${API_BASE}/mcp/servers`);
+  if (!resp.ok) throw new Error(`Failed to list MCP servers: ${resp.status}`);
+  const data = await resp.json();
+  return data.servers;
+}
+
+/**
  * Load a skill into the current session.
  */
 export async function loadSkill(skillName: string): Promise<void> {

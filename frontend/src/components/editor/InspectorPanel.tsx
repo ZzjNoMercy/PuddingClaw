@@ -15,6 +15,7 @@ import {
   Maximize2,
   Minimize2,
   Settings2,
+  Server,
 } from "lucide-react";
 import dynamic from "next/dynamic";
 import { useRouter } from "next/navigation";
@@ -47,6 +48,7 @@ export default function InspectorPanel() {
     setRightTab,
     expandedFile,
     setExpandedFile,
+    mcpServers,
   } = useApp();
 
   const router = useRouter();
@@ -152,10 +154,14 @@ export default function InspectorPanel() {
     <div className="flex flex-col h-full">
       {/* Tab bar */}
       <div className="flex gap-0.5 p-2 pb-0 shrink-0">
-        {(["memory", "skills"] as const).map((tab) => {
+        {(["memory", "skills", "mcp"] as const).map((tab) => {
           const active = rightTab === tab;
-          const Icon = tab === "memory" ? Brain : Zap;
-          const color = tab === "memory" ? "#7c3aed" : "#f59e0b";
+          const Icon =
+            tab === "memory" ? Brain : tab === "skills" ? Zap : Server;
+          const color =
+            tab === "memory" ? "#7c3aed" : tab === "skills" ? "#f59e0b" : "#0ea5e9";
+          const label =
+            tab === "memory" ? "Memory" : tab === "skills" ? "Skills" : "MCP";
           return (
             <button
               key={tab}
@@ -167,7 +173,7 @@ export default function InspectorPanel() {
               }`}
             >
               <Icon className="w-3.5 h-3.5" style={active ? { color } : {}} />
-              {tab === "memory" ? "Memory" : "Skills"}
+              {label}
             </button>
           );
         })}
@@ -180,7 +186,7 @@ export default function InspectorPanel() {
         <div className="shrink-0 overflow-y-auto px-1.5 max-h-[35%]">
           {rightTab === "memory" ? (
             <FileList files={MEMORY_FILES} onSelect={setInspectorFile} selectedPath={inspectorFile} tokenCounts={tokenCounts} />
-          ) : (
+          ) : rightTab === "skills" ? (
             <SkillsFileList
               skills={skills}
               activeSkills={activeSkills}
@@ -188,6 +194,8 @@ export default function InspectorPanel() {
               selectedPath={inspectorFile}
               onNavigateToConfig={() => router.push("/skills")}
             />
+          ) : (
+            <McpServerList servers={mcpServers} />
           )}
         </div>
       )}
@@ -323,6 +331,41 @@ function FileList({
           </button>
         );
       })}
+    </div>
+  );
+}
+
+// ── MCP Server List ─────────────────────────────────────
+
+function McpServerList({
+  servers,
+}: {
+  servers: Array<{ key: string; name: string; url: string; transport: string }>;
+}) {
+  return (
+    <div className="space-y-0.5">
+      <p className="px-3 pt-1 pb-1 text-[10px] font-semibold text-gray-400 uppercase tracking-widest">
+        Enabled MCP Servers
+      </p>
+      {servers.length === 0 && (
+        <p className="px-3 py-2 text-[11px] text-gray-400">
+          No MCP servers enabled. Add one in backend/config.json.
+        </p>
+      )}
+      {servers.map((s) => (
+        <div
+          key={s.key}
+          className="w-full flex items-start gap-2 px-3 py-2 text-[12px] rounded-lg text-left text-gray-500"
+        >
+          <Server className="w-3.5 h-3.5 shrink-0 text-[#0ea5e9] mt-0.5" />
+          <div className="min-w-0 flex-1">
+            <div className="font-medium text-gray-700 mb-0.5">{s.name}</div>
+            <div className="text-[10px] text-gray-400 leading-relaxed truncate">
+              {s.transport} · {s.url}
+            </div>
+          </div>
+        </div>
+      ))}
     </div>
   );
 }
