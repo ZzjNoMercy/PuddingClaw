@@ -16,6 +16,10 @@
 ```text
 chat.py::_maybe_middle_trim_session  # 入模前：中段摘要 + 归档 + 前端完整轨维护
     ↓
+session_manager.load_session_for_agent
+    ↓
+agent.py::_build_messages        # middleware 前：还原历史 tool_calls + 0.85*context_window 构造兜底
+    ↓
 DeepSeekCacheBoundaryMiddleware (observer)      # backend/graph/middlewares/cache.py
     ↓
 TailTrimMiddleware               # 运行时兜底裁剪，不持久化 (cache.py)
@@ -25,8 +29,6 @@ ToolResultClearMiddleware        # 工具结果摘要（主力）(compression.py
 SummarizationMiddleware          # 叙述性摘要（中间兜底）(compression.py)
     ↓
 CompactionMiddleware             # 全局 reset（最后兜底）(compression.py)
-    ↓
-agent.py::_build_messages        # 入模前最后一层 0.85*context_window 硬兜底
     ↓
 skills_router → task_state → LLM
 ```
@@ -136,19 +138,24 @@ skills_router → task_state → LLM
      - `ToolMessage` 2K-20K tokens：保留约 5K 字符
      - `ToolMessage` > 20K tokens：保留约 10K 字符
      - 超出预算时截断并追加 `[更多历史已省略]`
-  4. 摘要前缀 `[历史对话摘要]`（代码外层强制包装）。
-     - **注意**：`COMPACTION_SUMMARY_PROMPT` 内部模板也要求 LLM 以 `[对话摘要]` 为前缀，因此实际摘要中可能出现 `[历史对话摘要][对话摘要]...` 的双前缀现象。迁移时建议统一 prompt，只保留一个前缀。
+  4. 摘要前缀 `[历史对话摘要]`（代码外层强制包装）。prompt 内部不再要求 LLM 加前缀，避免双前缀冗余。
   5. 清空旧 messages，重置为 `[System, 摘要, 最近 8 条]`。
 - **持久化**：触发时 emit `compaction` 事件，`chat.py` 调用 `compress_history` 归档旧消息并写入 `compressed_context`。
 - **影响**：彻底的 reset，但前端通过 archive 合并仍能看到完整历史。
 
-### 4.7 `_build_messages` 入模前最后一层兜底
+### 4.7 `_build_messages` middleware 前构造兜底
 
 - **位置**：`backend/graph/agent.py::_build_messages()`。
+- **执行时机**：在 `agent.astream()` / `agent.ainvoke()` 之前执行，也就是 LangChain middleware 链之前。它不是 `CompactionMiddleware` 之后的最后一层 middleware，而是进入 agent runtime 前的消息构造与兜底。
 - **触发条件**：按字符比例估算 `messages` 总 token > `context_window * 0.85`（即 850K）。
-- **行为**：直接丢弃前半段消息，保留后半段，确保不超出模型上下文硬上限。
+- **行为**：
+  1. 先把 session 历史转成 LangChain message，并还原历史 `AIMessage(tool_calls)` + 对应 `ToolMessage`。
+  2. 历史 ToolMessage 会附加历史工具输出提示前缀，避免模型把旧工具输出当成本轮结果复述。
+  3. 若估算 token 超过 0.85 * context_window，则 `keep_count = max(2, len(messages)//2)`，从尾部保留约一半消息。
+  4. 截断起点会向前对齐到 `HumanMessage` 或无 tool_calls 的 `AIMessage`，避免从 tool 调用链中间开始。
+  5. 如果首条消息是压缩摘要，会额外保留首条摘要。
 - **持久化**：不持久化，只改运行时 state。
-- **影响**：这是进入 LLM 之前的最后一道保险丝，正常情况下不应触发；若触发说明前面所有压缩层都未生效。
+- **影响**：这是进入 agent runtime 前的构造期保险丝，正常情况下不应触发；真正的运行时最后 reset 兜底仍是 `CompactionMiddleware`。
 
 ---
 
@@ -398,7 +405,7 @@ compaction_trigger = get_compaction_trigger_tokens()
 2. **摘要结果持久化**：避免多轮重复摘要同一内容。
 3. **前端无感**：完整历史通过 `display_messages` 或 archive 合并展示，压缩只影响 LLM 视图。
 4. **中段不残缺**：中段不能只保留用户请求而删除完成证据；正式路径用 middle summary，TailTrim 兜底也删除完整 middle slice。
-5. **分级兜底**：MiddleTrimSession → ToolResultClear → TailTrim → Summarization → Compaction → `_build_messages` 0.85 兜底，从轻到重。`MessageTrimMiddleware` 已废弃，不再使用。
+5. **分级兜底**：MiddleTrimSession → `_build_messages` 构造期 0.85 兜底 → ToolResultClear → TailTrim → Summarization → Compaction。`_build_messages` 发生在 middleware 链之前；运行时最后 reset 兜底是 `CompactionMiddleware`。`MessageTrimMiddleware` 已废弃，不再使用。
 6. **类型化摘要**：专利、文档、技能等不同 tool 使用不同摘要策略。
 
 ---
