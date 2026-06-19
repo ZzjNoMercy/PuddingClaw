@@ -511,6 +511,31 @@ class AgentManager:
         result = await self._llm.ainvoke([HumanMessage(content=prompt)])
         return str(getattr(result, "content", result))
 
+    @staticmethod
+    def _recent_successful_tool_results_from_history(
+        history: list[dict[str, Any]],
+        *,
+        limit: int = 12,
+    ) -> list[dict[str, str]]:
+        """Collect recent successful persisted tool outputs for fallback answers."""
+        results: list[dict[str, str]] = []
+        for msg in reversed(history):
+            for tc in reversed(msg.get("tool_calls", []) or []):
+                output = str(tc.get("output", "") or "")
+                if not output.strip():
+                    continue
+                if tc.get("is_error"):
+                    continue
+                if tc.get("summary_source") == "missing_tool_output":
+                    continue
+                results.append({
+                    "tool": str(tc.get("tool") or tc.get("name") or "unknown_tool"),
+                    "output": output,
+                })
+                if len(results) >= limit:
+                    return list(reversed(results))
+        return list(reversed(results))
+
     # ========== _run_agent_stream ==========
     async def _run_agent_stream(
         self, agent, messages: list, system_prompt_tokens: int,
@@ -884,7 +909,35 @@ class AgentManager:
                 except Exception as e:
                     logger.exception("Persistent MCP session failed")
                     if self._looks_like_mcp_required(message, history):
-                        reply = _mcp_patent_unavailable_reply()
+                        recent_results = self._recent_successful_tool_results_from_history(history)
+                        if recent_results and self._llm is not None:
+                            yield {
+                                "type": "context_maintenance",
+                                "status": "start",
+                                "phase": "partial_answer",
+                                "message": "正在基于已返回结果整理回答...",
+                            }
+                            try:
+                                reply = await self._answer_from_partial_tool_results(
+                                    messages=messages,
+                                    successful_tool_results=recent_results,
+                                    error_msg=f"{type(e).__name__}: {e}",
+                                )
+                            except Exception as fallback_error:
+                                logger.exception("outer partial answer fallback failed")
+                                reply = (
+                                    "后续专利工具连接失败；我已经拿到部分检索和著录结果，"
+                                    "但自动整理阶段也失败了。请基于上方已返回的工具结果继续，"
+                                    f"或稍后重试。整理错误：{type(fallback_error).__name__}: {fallback_error}"
+                                )
+                            finally:
+                                yield {
+                                    "type": "context_maintenance",
+                                    "status": "done",
+                                    "phase": "partial_answer",
+                                }
+                        else:
+                            reply = _mcp_patent_unavailable_reply()
                         yield {
                             "type": "token",
                             "content": reply,

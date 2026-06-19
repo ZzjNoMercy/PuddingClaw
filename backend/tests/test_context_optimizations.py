@@ -248,6 +248,26 @@ class TestAgentStreaming:
         assert tc["is_error"] is True
         assert tc["summary_source"] == "missing_tool_output"
 
+    def test_chat_missing_tool_end_events_for_frontend(self):
+        from api.chat import MISSING_TOOL_OUTPUT_PLACEHOLDER, _missing_tool_end_events
+
+        segment = {
+            "content": "我来查一下。",
+            "tool_calls": [
+                {"tool": "bibliography", "id": "tc_missing", "input": "{}"},
+                {"tool": "bibliography", "id": "tc_done", "input": "{}", "output": "ok"},
+            ],
+        }
+
+        events = _missing_tool_end_events(segment)
+
+        assert len(events) == 1
+        assert events[0]["tool"] == "bibliography"
+        assert events[0]["id"] == "tc_missing"
+        assert events[0]["output"] == MISSING_TOOL_OUTPUT_PLACEHOLDER
+        assert events[0]["is_error"] is True
+        assert events[0]["summary_source"] == "missing_tool_output"
+
     def test_tool_end_keeps_full_output_and_preview_separate(self):
         from graph.agent import AgentManager
         from langchain_core.messages import ToolMessage
@@ -473,6 +493,33 @@ class TestAgentStreaming:
         assert failed_tool_end["is_error"] is True
         assert "后续检索失败" in token_text
         assert "CN1" in token_text
+
+    def test_recent_successful_tool_results_skip_missing_output_placeholders(self):
+        from graph.agent import AgentManager
+
+        history = [
+            {
+                "role": "assistant",
+                "content": "old",
+                "tool_calls": [
+                    {"tool": "search_patents", "output": "real search result"},
+                    {
+                        "tool": "bibliography",
+                        "output": "[工具执行失败/无返回]",
+                        "is_error": True,
+                        "summary_source": "missing_tool_output",
+                    },
+                    {"tool": "bibliography", "output": "real bibliography"},
+                ],
+            }
+        ]
+
+        results = AgentManager._recent_successful_tool_results_from_history(history)
+
+        assert results == [
+            {"tool": "search_patents", "output": "real search result"},
+            {"tool": "bibliography", "output": "real bibliography"},
+        ]
 
     def test_single_tool_overflow_emits_context_maintenance_events(self):
         from graph.agent import AgentManager

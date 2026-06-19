@@ -135,6 +135,24 @@ def _ensure_tool_call_outputs(segment: dict) -> dict:
     return normalized
 
 
+def _missing_tool_end_events(segment: dict) -> list[dict]:
+    """Return synthetic tool_end events for tool_calls that never completed."""
+    fixed = _ensure_tool_call_outputs(segment)
+    events: list[dict] = []
+    for tc in fixed.get("tool_calls", []):
+        if tc.get("summary_source") != "missing_tool_output":
+            continue
+        events.append({
+            "tool": tc.get("tool", ""),
+            "id": tc.get("id", ""),
+            "output": tc.get("output", MISSING_TOOL_OUTPUT_PLACEHOLDER),
+            "output_preview": str(tc.get("output", MISSING_TOOL_OUTPUT_PLACEHOLDER))[:2000],
+            "summary_source": tc.get("summary_source"),
+            "is_error": True,
+        })
+    return events
+
+
 async def _detect_and_retry_memory_write(
     user_message: str, segments: list[dict], session_id: str
 ) -> None:
@@ -689,6 +707,22 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
                 }
 
             elif event_type == "done":
+                for missing_event in _missing_tool_end_events(current_segment):
+                    yield {
+                        "event": "tool_end",
+                        "data": json.dumps(
+                            {
+                                "tool": missing_event["tool"],
+                                "id": missing_event.get("id", ""),
+                                "output": missing_event["output_preview"],
+                                "output_full_length": len(missing_event["output"]),
+                                "summary_source": missing_event.get("summary_source"),
+                                "is_error": True,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+
                 if _segment_has_payload(current_segment):
                     segments.append(current_segment)
 
