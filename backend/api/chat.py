@@ -14,11 +14,16 @@ from sse_starlette.sse import EventSourceResponse
 
 from graph.agent import agent_manager
 from graph.session_manager import session_manager
-from config import get_cache_config, get_llm_config, get_memory_backend
+from config import get_cache_config, get_llm_config, get_memory_backend, get_middleware_config
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 router = APIRouter()
+
+MISSING_TOOL_OUTPUT_PLACEHOLDER = (
+    "[工具执行失败/无返回] 工具调用已开始，但没有收到完成事件；"
+    "可能是流中断、工具服务异常或连接中断。"
+)
 
 
 class ChatRequest(BaseModel):
@@ -108,6 +113,26 @@ def _actually_called_write_file(segments: list[dict]) -> bool:
 def _segment_has_payload(segment: dict) -> bool:
     """Return True when an assistant segment has text or tool call data."""
     return bool(segment.get("content") or segment.get("tool_calls"))
+
+
+def _ensure_tool_call_outputs(segment: dict) -> dict:
+    """Ensure every persisted tool_call has an output.
+
+    Chat history is later reconstructed into AIMessage(tool_calls) followed by
+    ToolMessage entries. Persisting a tool_call without output creates an
+    invalid provider request on the next turn.
+    """
+    normalized = {
+        "content": segment.get("content", ""),
+        "tool_calls": list(segment.get("tool_calls", []) or []),
+    }
+    for tc in normalized["tool_calls"]:
+        output = tc.get("output")
+        if output is None or str(output).strip() == "":
+            tc["output"] = MISSING_TOOL_OUTPUT_PLACEHOLDER
+            tc["is_error"] = True
+            tc.setdefault("summary_source", "missing_tool_output")
+    return normalized
 
 
 async def _detect_and_retry_memory_write(
@@ -337,6 +362,43 @@ def _select_middle_trim_span(messages: list[dict], cfg: dict) -> tuple[int, int]
     return start, end
 
 
+def _should_preannounce_tool_result_clear(history: list[dict]) -> bool:
+    """Mirror ToolResultClear trigger enough to show UI status immediately.
+
+    The actual compression still happens in ToolResultClearMiddleware. This
+    preflight only prevents a silent delay before LangGraph reaches before_model.
+    """
+    cfg = get_middleware_config()
+    if not cfg.get("enabled", True):
+        return False
+
+    tool_cfg = cfg.get("tool_clear", {})
+    keep_recent = tool_cfg.get("keep_recent", 10)
+    min_summary_length = tool_cfg.get("min_summary_length", 500)
+    summary_prefix = "[摘要] "
+
+    candidates: list[dict] = []
+    for msg in history:
+        for tc in msg.get("tool_calls", []) or []:
+            output = str(tc.get("output", "") or "")
+            if output:
+                candidates.append(tc)
+
+    if len(candidates) <= keep_recent:
+        return False
+
+    to_clear = candidates if keep_recent == 0 else candidates[:-keep_recent]
+    for tc in to_clear:
+        output = str(tc.get("output", "") or "")
+        if tc.get("summary_source") == "tool_result_clear":
+            continue
+        if output.startswith(summary_prefix):
+            continue
+        if len(output) >= min_summary_length:
+            return True
+    return False
+
+
 def _build_middle_trim_history_text(messages: list[dict], budget_chars: int) -> str:
     parts: list[str] = []
     used = 0
@@ -452,6 +514,19 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
         # Use merged history for agent context (combines consecutive assistant msgs)
         history = session_manager.load_session_for_agent(session_id)
         is_first_message = len(history) == 0
+        preannounced_tool_clear = _should_preannounce_tool_result_clear(history)
+        if preannounced_tool_clear:
+            yield {
+                "event": "context_maintenance",
+                "data": json.dumps(
+                    {
+                        "status": "start",
+                        "phase": "tool_result_clear",
+                        "message": "正在整理历史工具结果...",
+                    },
+                    ensure_ascii=False,
+                ),
+            }
 
         async for event in agent_manager.astream(message, history, user_id=user_id, session_id=session_id):
             event_type = event.get("type", "unknown")
@@ -508,6 +583,19 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
                     ),
                 }
 
+            elif event_type == "context_maintenance":
+                yield {
+                    "event": "context_maintenance",
+                    "data": json.dumps(
+                        {
+                            "status": event.get("status", ""),
+                            "phase": event.get("phase", ""),
+                            "message": event.get("message", ""),
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+
             elif event_type == "compaction":
                 # CompactionMiddleware 触发全局 reset，归档旧消息并写入 compressed_context
                 try:
@@ -552,7 +640,7 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
                 yield {
                     "event": "tool_start",
                     "data": json.dumps(
-                        {"tool": event["tool"], "input": event["input"]},
+                        {"tool": event["tool"], "input": event["input"], "id": event.get("id", "")},
                         ensure_ascii=False,
                     ),
                 }
@@ -565,6 +653,7 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
                         if tc.get("id") == tc_id and "output" not in tc:
                             tc["output"] = event["output"]
                             tc["summary_source"] = event.get("summary_source")
+                            tc["is_error"] = bool(event.get("is_error"))
                             matched = True
                             break
                 if not matched:
@@ -572,16 +661,29 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
                         if tc["tool"] == event["tool"] and "output" not in tc:
                             tc["output"] = event["output"]
                             tc["summary_source"] = event.get("summary_source")
+                            tc["is_error"] = bool(event.get("is_error"))
                             break
                 yield {
                     "event": "tool_end",
                     "data": json.dumps(
                         {
                             "tool": event["tool"],
+                            "id": event.get("id", ""),
                             "output": event.get("output_preview", event["output"]),
                             "output_full_length": len(event["output"]),
                             "summary_source": event.get("summary_source"),
+                            "is_error": bool(event.get("is_error")),
                         },
+                        ensure_ascii=False,
+                    ),
+                }
+
+            elif event_type == "error":
+                error_msg = event.get("message") or event.get("error") or "Unknown error"
+                yield {
+                    "event": "error",
+                    "data": json.dumps(
+                        {"error": error_msg, "message": error_msg},
                         ensure_ascii=False,
                     ),
                 }
@@ -592,6 +694,7 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
 
                 session_manager.save_message(session_id, "user", message)
                 for seg in segments:
+                    seg = _ensure_tool_call_outputs(seg)
                     tc = seg["tool_calls"] if seg["tool_calls"] else None
                     session_manager.save_message(
                         session_id, "assistant", seg["content"], tool_calls=tc
@@ -687,6 +790,7 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
                 if has_content:
                     session_manager.save_message(session_id, "user", message)
                     for seg in segments:
+                        seg = _ensure_tool_call_outputs(seg)
                         if seg["content"] or seg["tool_calls"]:
                             tc = seg["tool_calls"] if seg["tool_calls"] else None
                             session_manager.save_message(

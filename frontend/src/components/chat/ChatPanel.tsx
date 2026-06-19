@@ -4,15 +4,15 @@ import { useEffect, useRef } from "react";
 import { useApp } from "@/lib/store";
 import ChatMessage from "./ChatMessage";
 import ChatInput from "./ChatInput";
-import { Sparkles } from "lucide-react";
+import { Loader2, Sparkles } from "lucide-react";
 
 export default function ChatPanel() {
-  const { messages } = useApp();
+  const { messages, maintenanceStatus } = useApp();
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  }, [messages, maintenanceStatus]);
 
   return (
     <div className="flex flex-col h-full">
@@ -40,6 +40,16 @@ export default function ChatPanel() {
             {messages.map((msg) => (
               <ChatMessage key={msg.id} message={msg} />
             ))}
+            {maintenanceStatus && (
+              <div className="animate-fade-in px-4 py-1.5">
+                <div className="max-w-2xl mx-auto">
+                  <div className="inline-flex items-center gap-2 rounded-full border border-[#002fa7]/10 bg-white/70 px-3 py-1.5 text-[12px] text-gray-500 shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin text-[#002fa7]" />
+                    <span>{maintenanceStatus.message}</span>
+                  </div>
+                </div>
+              </div>
+            )}
             <div ref={bottomRef} />
           </div>
         )}

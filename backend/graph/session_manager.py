@@ -351,7 +351,7 @@ class SessionManager:
         """加载会话历史并格式化为 LLM 可用的消息列表
 
         两个关键处理：
-        1. 合并连续的 assistant 消息（保持 user/assistant 严格交替）
+        1. 合并连续的普通 assistant 文本消息（保持 user/assistant 严格交替）
         2. 如有压缩摘要，在头部注入一条摘要消息让 LLM 保留历史上下文
         """
         data = self._read_file(session_id)                              # 读取会话数据
@@ -383,11 +383,14 @@ class SessionManager:
             entry: dict[str, Any] = {"role": msg["role"], "content": msg["content"]}
             if msg.get("tool_calls"):
                 entry["tool_calls"] = msg["tool_calls"]
+            prev_has_tool_calls = bool(merged[-1].get("tool_calls")) if merged else False
+            current_has_tool_calls = bool(entry.get("tool_calls"))
             if (
                 merged                                                   # 列表非空
                 and merged[-1]["role"] == "assistant"                     # 上一条是 assistant
                 and msg["role"] == "assistant"                            # 当前也是 assistant
-                and not entry.get("tool_calls")                           # 当前消息无 tool_calls 才合并
+                and not prev_has_tool_calls                                # 上一条也不能是 tool_call 消息
+                and not current_has_tool_calls                             # 当前消息无 tool_calls 才合并
             ):
                 merged[-1]["content"] += "\n" + msg["content"]           # 合并为一条（避免连续 assistant）
             else:

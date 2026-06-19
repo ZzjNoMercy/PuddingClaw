@@ -57,6 +57,9 @@ export default function ChatInput() {
   const showSlashMenuRef = useRef(false);
   useEffect(() => { showSlashMenuRef.current = showSlashMenu; }, [showSlashMenu]);
 
+  // Track IME composition so Enter to confirm pinyin/hiragana doesn't submit (fixes IME-1)
+  const isComposingRef = useRef(false);
+
   // Apply pending cursor position after React re-renders textarea with new text
   useEffect(() => {
     if (pendingCursorRef.current !== null && textareaRef.current) {
@@ -132,8 +135,9 @@ export default function ChatInput() {
         return;
       }
     }
-    // Original submit logic
-    if (e.key === "Enter" && !e.shiftKey) {
+    // Original submit logic — ignore Enter while IME is composing so users can
+    // confirm candidate characters (or type English directly) without sending.
+    if (e.key === "Enter" && !e.shiftKey && !isComposingRef.current && !e.nativeEvent.isComposing) {
       e.preventDefault();
       handleSubmit();
     }
@@ -191,6 +195,8 @@ export default function ChatInput() {
             }
           }}
           onKeyDown={handleKeyDown}
+          onCompositionStart={() => { isComposingRef.current = true; }}
+          onCompositionEnd={() => { isComposingRef.current = false; }}
           placeholder="输入消息... 输入 / 调用 Skill"
           rows={1}
           className="flex-1 resize-none bg-transparent text-[14px] outline-none placeholder:text-gray-400 max-h-40 py-1 leading-relaxed"

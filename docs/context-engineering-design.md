@@ -357,6 +357,54 @@ load_session_for_agent 注入 [中段历史摘要] + active messages
 - 摘要只影响 LLM context，不能作为普通 assistant 消息展示。
 - 归档是审计备份；用户历史以 `display_messages` 为准保持完整顺序。
 
+### 7.5 LangGraph 流式事件过滤（开发经验）
+
+`stream_mode=["messages", "updates", "custom"]` 中的 `messages` 事件不能默认等同于“当前 assistant 正在生成的 token”。LangGraph 可能在 `messages` 通道里返回：
+
+1. 当前模型节点的 `AIMessageChunk`。
+2. graph state replay 中的完整 `AIMessage`。
+3. 历史 `AIMessageChunk` 回放。
+4. 工具调用前后的中间态消息。
+
+因此 SSE 层必须把“当前可见回复 token”和“图状态/历史回放”分开处理：
+
+```text
+agent.astream(..., stream_mode=["messages", "updates", "custom"])
+  ↓
+mode == "messages"
+  ↓
+只接受 isinstance(msg, AIMessageChunk)
+且 metadata["langgraph_node"] == "model"
+  ↓
+作为 token 发送给前端，并累积到 full_response
+  ↓
+done 时保存到 session.json
+```
+
+`updates` 和 `custom` 事件只用于结构化状态：`tool_start`、`tool_end`、`tool_result_clear`、`compaction`、`context_usage` 等；不能把其中的历史消息文本混入 `full_response`。
+
+**典型故障**：
+
+```text
+用户新请求：整理最近一周的 AI 论文
+  ↓
+messages 通道回放上一任务的历史 chunk：
+搜索到15条专利，展示5条：比亚迪...
+  ↓
+后端误当作当前 token 累积
+  ↓
+session 保存为：
+比亚迪专利摘要... + 好的，我来查询最近一周的 AI 论文信息。
+  ↓
+前端正常展示被污染的 session
+```
+
+这类问题不是模型主动引用旧任务，也不是前端单独拼接错误；根因在后端流式消费阶段把历史回放保存成了当前 assistant 内容。排查时先看 `llm-input` 日志和 raw `session.json`：
+
+- 如果 `llm-input` 中当前 assistant 干净，但 `session.json` 污染，优先查 SSE token 过滤和保存逻辑。
+- 如果 `llm-input` 已经污染，优先查 `load_session_for_agent()`、Middle Trim、ToolResultClear、Compaction。
+- 如果 `session.json` 干净但页面污染，才查前端渲染和事件合并。
+
 ---
 
 ## 8. 前端 Token 统计修复
@@ -407,6 +455,7 @@ compaction_trigger = get_compaction_trigger_tokens()
 4. **中段不残缺**：中段不能只保留用户请求而删除完成证据；正式路径用 middle summary，TailTrim 兜底也删除完整 middle slice。
 5. **分级兜底**：MiddleTrimSession → `_build_messages` 构造期 0.85 兜底 → ToolResultClear → TailTrim → Summarization → Compaction。`_build_messages` 发生在 middleware 链之前；运行时最后 reset 兜底是 `CompactionMiddleware`。`MessageTrimMiddleware` 已废弃，不再使用。
 6. **类型化摘要**：专利、文档、技能等不同 tool 使用不同摘要策略。
+7. **流式事件不是响应文本**：SSE 保存 session 时，只能把当前 `model` 节点产生的 `AIMessageChunk` 累积为 assistant 回复；历史 replay、完整 `AIMessage`、tool/update/custom 状态都不能进入 `full_response`。
 
 ---
 

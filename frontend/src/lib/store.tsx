@@ -27,11 +27,13 @@ import {
 // ── Types ──────────────────────────────────────────────────
 
 export interface ToolCall {
+  id?: string;
   tool: string;
   input?: string;
   output?: string;
   status: "running" | "done";
   summary_source?: string;
+  is_error?: boolean;
 }
 
 export interface RetrievalResult {
@@ -64,6 +66,11 @@ export interface ContextUsage {
   used: number;
   total: number;
   percentage: number;
+}
+
+export interface ContextMaintenanceStatus {
+  phase: string;
+  message: string;
 }
 
 interface AppState {
@@ -130,13 +137,16 @@ interface AppState {
   // Context usage
   contextUsage: ContextUsage;
   setContextUsage: (usage: ContextUsage) => void;
+
+  // Context maintenance
+  maintenanceStatus: ContextMaintenanceStatus | null;
 }
 
 const AppContext = createContext<AppState | null>(null);
 
 // ── Helper: parse backend history into ChatMessage[] ────────
 function parseHistoryMessages(
-  backendMessages: Array<{ role: string; content: string; tool_calls?: Array<{ tool: string; input?: string; output?: string }> }>
+  backendMessages: Array<{ role: string; content: string; tool_calls?: Array<{ id?: string; tool: string; input?: string; output?: string; is_error?: boolean }> }>
 ): ChatMessage[] {
   const loaded: ChatMessage[] = [];
   let msgIndex = 0;
@@ -151,10 +161,12 @@ function parseHistoryMessages(
     } else if (msg.role === "assistant") {
       const toolCalls: ToolCall[] = (msg.tool_calls || []).map(
         (tc) => ({
+          id: tc.id,
           tool: tc.tool,
           input: tc.input || "",
           output: tc.output || "",
           status: "done" as const,
+          is_error: Boolean(tc.is_error),
         })
       );
       loaded.push({
@@ -209,6 +221,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     total: 500000,
     percentage: 0,
   });
+  const [maintenanceStatus, setMaintenanceStatus] =
+    useState<ContextMaintenanceStatus | null>(null);
 
   // Derived: is the CURRENT session streaming?
   const isStreaming = streamingSessions.has(sessionId);
@@ -522,6 +536,24 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             continue;
           }
 
+          // Handle context maintenance event (history tool summarization, compaction, etc.)
+          if (event.event === "context_maintenance") {
+            const payload = event.data as {
+              status?: "start" | "done" | "error";
+              phase?: string;
+              message?: string;
+            };
+            if (payload.status === "start") {
+              setMaintenanceStatus({
+                phase: payload.phase || "context",
+                message: payload.message || "正在维护上下文...",
+              });
+            } else {
+              setMaintenanceStatus(null);
+            }
+            continue;
+          }
+
           // Handle retrieval event (RAG mode)
           if (event.event === "retrieval") {
             const targetId = getAssistantId();
@@ -601,31 +633,54 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 msg.content += (event.data.content as string) || "";
                 break;
 
-              case "tool_start":
-                msg.toolCalls = [
-                  ...(msg.toolCalls || []),
-                  {
-                    tool: event.data.tool as string,
-                    input: event.data.input as string,
-                    status: "running",
-                  },
-                ];
+              case "tool_start": {
+                const tcId = (event.data.id as string) || "";
+                // Defensive deduplication: skip if a running/done call with the
+                // same id already exists (backend may replay events).
+                const existing = (msg.toolCalls || []).find(
+                  (c) => tcId && c.id === tcId
+                );
+                if (!existing) {
+                  msg.toolCalls = [
+                    ...(msg.toolCalls || []),
+                    {
+                      id: tcId,
+                      tool: event.data.tool as string,
+                      input: event.data.input as string,
+                      status: "running",
+                    },
+                  ];
+                }
                 break;
+              }
 
               case "tool_end": {
                 const calls = [...(msg.toolCalls || [])];
-                for (let i = calls.length - 1; i >= 0; i--) {
-                  if (
-                    calls[i].tool === event.data.tool &&
-                    calls[i].status === "running"
-                  ) {
-                    calls[i] = {
-                      ...calls[i],
-                      output: event.data.output as string,
-                      status: "done",
-                    };
-                    break;
+                const tcId = (event.data.id as string) || "";
+                // Prefer matching by id; fall back to last running call with the same tool name.
+                let idx = -1;
+                if (tcId) {
+                  idx = calls.findIndex((c) => c.id === tcId);
+                }
+                if (idx === -1) {
+                  for (let i = calls.length - 1; i >= 0; i--) {
+                    if (
+                      calls[i].tool === event.data.tool &&
+                      calls[i].status === "running"
+                    ) {
+                      idx = i;
+                      break;
+                    }
                   }
+                }
+                if (idx !== -1) {
+                  calls[idx] = {
+                    ...calls[idx],
+                    output: event.data.output as string,
+                    status: "done",
+                    summary_source: event.data.summary_source as string | undefined,
+                    is_error: Boolean(event.data.is_error),
+                  };
                 }
                 msg.toolCalls = calls;
                 break;
@@ -635,8 +690,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 break;
 
               case "error":
-                msg.content +=
-                  `\n\n**Error:** ${event.data.error || "Unknown error"}`;
+                // Protocol-level errors are surfaced through tool/error state,
+                // not appended to assistant prose.
                 break;
             }
 
@@ -683,6 +738,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       } finally {
         abortControllersRef.current.delete(sendSessionId);
         assistantIdsRef.current.delete(sendSessionId);
+        if (sessionIdRef.current === sendSessionId) {
+          setMaintenanceStatus(null);
+        }
         setStreamingSessions((prev) => {
           const next = new Set(prev);
           next.delete(sendSessionId);
@@ -735,6 +793,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         toggleRagMode,
         contextUsage,
         setContextUsage,
+        maintenanceStatus,
       }}
     >
       {children}

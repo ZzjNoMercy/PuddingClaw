@@ -50,6 +50,7 @@ from langchain_core.messages import (
 from langgraph.runtime import Runtime
 
 from graph.middlewares.compression import count_tokens_tiktoken
+from graph.llm_input_logger import log_llm_input
 
 logger = logging.getLogger(__name__)
 
@@ -170,12 +171,27 @@ class DeepSeekCacheBoundaryMiddleware(AgentMiddleware):
                 len(current_full),
             )
 
+    def _log_model_request(self, request: Any) -> None:
+        try:
+            log_llm_input(
+                source="model_request",
+                system_message=getattr(request, "system_message", None),
+                messages=list(getattr(request, "messages", []) or []),
+                metadata={
+                    "middleware": "DeepSeekCacheBoundaryMiddleware",
+                    "request_type": type(request).__name__,
+                },
+            )
+        except Exception as e:
+            logger.warning("[llm-input-log] failed to log model request: %s", e)
+
     def wrap_model_call(
         self,
         request: Any,
         handler: Callable[[Any], Any],
     ) -> Any:
         self._check_system_drift(request)
+        self._log_model_request(request)
         return handler(request)
 
     async def awrap_model_call(
@@ -184,6 +200,7 @@ class DeepSeekCacheBoundaryMiddleware(AgentMiddleware):
         handler: Callable[[Any], Awaitable[Any]],
     ) -> Any:
         self._check_system_drift(request)
+        self._log_model_request(request)
         return await handler(request)
 
 

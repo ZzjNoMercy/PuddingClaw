@@ -18,7 +18,7 @@ from typing import Any, AsyncGenerator
 
 logger = logging.getLogger(__name__)
 
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage, AIMessageChunk
 
 from config import get_rag_mode, get_memory_backend, get_smart_extractor_config, load_config, get_compaction_trigger_tokens, get_middleware_config, get_cache_config, get_skills_router_config, get_write_middleware_config
 
@@ -49,6 +49,10 @@ HISTORICAL_TOOL_OUTPUT_PREFIX = (
     "【历史工具输出：仅在用户明确追问该结果时作为背景使用；"
     "禁止在当前回复中复述、续写或当作当前任务结果。】\n"
 )
+MISSING_TOOL_OUTPUT_PLACEHOLDER = (
+    "[工具执行失败/无返回] 历史记录中存在 tool_call，但没有保存到对应工具输出；"
+    "这通常来自流中断或工具服务异常。"
+)
 
 
 def _estimate_tokens(text) -> int:
@@ -61,8 +65,66 @@ def _estimate_tokens(text) -> int:
     return int(chinese_chars / 1.5 + ascii_chars / 4)
 
 
+def _legacy_tool_output_looks_error(output: str) -> bool:
+    """兼容旧工具的字符串错误格式。
+
+    正式协议优先使用 ToolMessage.status == "error"。这个函数只用于兼容
+    当前本地工具中仍然以普通字符串返回错误的实现。
+    """
+    text = output.strip()
+    lower = text.lower()
+    error_markers = (
+        "error:",
+        "❌",
+        "错误：",
+        "错误:",
+        "[error]",
+        "timed out",
+        "timeout",
+        "exception",
+        "traceback",
+        "[deep_research error]",
+        "执行失败",
+        "failed:",
+        "access denied",
+        "file not found",
+        "not a valid tool",
+    )
+    return any(marker in lower or marker in text for marker in error_markers)
+
+
+def _tool_error_notice(tool_name: str, output: str, *, is_error: bool = False) -> str | None:
+    """把工具层错误转成用户可见的简短说明。
+
+    LangGraph 有时会把工具调用错误包装成 ToolMessage，而不是抛异常。
+    如果不显式处理，前端只显示工具卡片里的 Error，assistant 回复会停在
+    “我来查询...”这类前置语，用户会以为 agent 无响应。
+    """
+    text = output.strip()
+    if not is_error and not _legacy_tool_output_looks_error(text):
+        return None
+    if "is not a valid tool" in text:
+        if tool_name == "search_patents" or "search_patents" in text:
+            return (
+                "\n\n专利检索工具这一步没有加载成功。"
+                "我会先基于已经拿到的结果继续整理；如果当前没有可用结果，"
+                "需要稍后重试或检查 `zhihuiya_patents` MCP 配置。"
+            )
+        return f"\n\n工具 `{tool_name}` 当前没有加载成功，无法继续执行这个步骤。"
+    return f"\n\n工具 `{tool_name}` 执行失败：{text}"
+
+
+def _mcp_patent_unavailable_reply() -> str:
+    return (
+        "专利检索服务这次没有连接成功，所以我暂时没法继续调用 `search_patents` 扩展查询。"
+        "如果本轮前面已经拿到部分专利结果，我会先基于那些结果整理；如果还没有结果，"
+        "建议稍后重试，或检查 `zhihuiya_patents` MCP 配置。"
+    )
+
+
 from graph.prompt_builder import build_system_prompt
 from graph.session_manager import session_manager, COMPRESSED_CONTEXT_PREFIX
+from graph.llm_input_logger import current_session_id, current_user_id, log_llm_input
 from tools import get_all_tools
 
 
@@ -253,6 +315,33 @@ class AgentManager:
         mcp_cfg = cfg.get("mcp", {})
         return mcp_cfg.get("enabled", [])
 
+    @staticmethod
+    def _looks_like_mcp_required(message: str, history: list[dict[str, Any]]) -> bool:
+        """判断本轮是否明显依赖 MCP 工具。
+
+        MCP session 偶发失败时，普通聊天可以降级到本地工具；但专利类请求如果
+        静默降级，模型容易继续调用历史中出现过的 search_patents，触发
+        "not a valid tool"。这类请求应直接给出清晰错误。
+        """
+        needles = ("专利", "patent", "search_patents", "智慧芽", "zhihuiya")
+        text = message.lower()
+        if any(n in text for n in needles):
+            return True
+        # 中文里“申请了哪些/公开了哪些/授权了哪些”经常省略“专利”二字，
+        # 但对车企、技术主题的这类问法通常仍然是在查专利库。
+        patent_intent_terms = ("申请", "公开", "授权", "发明", "实用新型")
+        patent_subject_terms = ("车企", "车辆", "汽车", "智能座舱", "座舱", "agent")
+        if any(n in text for n in patent_intent_terms) and any(n in text for n in patent_subject_terms):
+            return True
+        for msg in history[-8:]:
+            content = str(msg.get("content", "")).lower()
+            if any(n in content for n in needles):
+                return True
+            for tc in msg.get("tool_calls", []) or []:
+                if any(n in str(tc.get("tool", "")).lower() for n in needles):
+                    return True
+        return False
+
     # ========== 核心升级：_build_messages ==========
     def _build_messages(self, user_message: str, history: list[dict[str, Any]]) -> list:
         from config import get_max_history_messages, get_context_window
@@ -293,22 +382,28 @@ class AgentManager:
                                 pass
                         return {}
 
+                    normalized_tool_calls = []
+                    for i, tc in enumerate(tool_calls):
+                        tool_name = tc.get("tool") or tc.get("name") or "unknown_tool"
+                        tc_id = tc.get("id") or f"tc_{i}"
+                        normalized_tool_calls.append((tc, tool_name, tc_id))
+
                     lc_tool_calls = [
-                        {"name": tc["tool"], "args": _parse_tool_args(tc.get("input", {})),
-                         "id": tc.get("id") or f"tc_{i}"}
-                        for i, tc in enumerate(tool_calls)
+                        {"name": tool_name, "args": _parse_tool_args(tc.get("input", tc.get("args", {}))),
+                         "id": tc_id}
+                        for tc, tool_name, tc_id in normalized_tool_calls
                     ]
                     messages.append(AIMessage(content=content, tool_calls=lc_tool_calls))
                     from langchain_core.messages import ToolMessage
-                    for i, tc in enumerate(tool_calls):
+                    for tc, tool_name, tc_id in normalized_tool_calls:
                         output = tc.get("output", "")
-                        if output:
-                            tc_id = tc.get("id") or f"tc_{i}"
-                            messages.append(ToolMessage(
-                                content=f"{HISTORICAL_TOOL_OUTPUT_PREFIX}{output}",
-                                tool_call_id=tc_id,
-                                name=tc["tool"],
-                            ))
+                        if output is None or str(output).strip() == "":
+                            output = MISSING_TOOL_OUTPUT_PLACEHOLDER
+                        messages.append(ToolMessage(
+                            content=f"{HISTORICAL_TOOL_OUTPUT_PREFIX}{output}",
+                            tool_call_id=tc_id,
+                            name=tool_name,
+                        ))
                 else:
                     messages.append(AIMessage(content=content))
 
@@ -371,16 +466,69 @@ class AgentManager:
     def _summary_prefix() -> str:
         return "[摘要] "
 
+    async def _answer_from_partial_tool_results(
+        self,
+        messages: list,
+        successful_tool_results: list[dict[str, str]],
+        error_msg: str,
+    ) -> str:
+        """Generate a final answer when later tool calls fail after partial success."""
+        last_user = ""
+        for msg in reversed(messages):
+            if isinstance(msg, HumanMessage):
+                last_user = str(msg.content)
+                break
+
+        snippets = []
+        for i, result in enumerate(successful_tool_results, 1):
+            output = result["output"]
+            if len(output) > 6000:
+                output = output[:6000] + "\n...[已截断]"
+            snippets.append(f"[成功工具结果 {i}] tool={result['tool']}\n{output}")
+
+        prompt = (
+            "你是一个工具型 Agent。上一轮任务中，部分工具调用已经成功返回，"
+            "但后续工具调用失败。请基于已成功返回的工具结果给用户一个可用的阶段性回答。\n\n"
+            "要求：\n"
+            "1. 不要声称检索完整；开头简短说明后续检索失败，因此以下基于已返回结果。\n"
+            "2. 只使用已成功返回的工具结果，不要编造专利、公司、编号或日期。\n"
+            "3. 如果结果很少，就明确说样本有限。\n"
+            "4. 回复中文，简洁、有条理。\n\n"
+            f"用户问题：{last_user}\n\n"
+            f"后续工具错误：{error_msg}\n\n"
+            "已成功返回的工具结果：\n"
+            + "\n\n".join(snippets)
+        )
+
+        chunks: list[str] = []
+        if hasattr(self._llm, "astream"):
+            async for chunk in self._llm.astream([HumanMessage(content=prompt)]):
+                content = getattr(chunk, "content", "")
+                if content:
+                    chunks.append(str(content))
+            return "".join(chunks)
+
+        result = await self._llm.ainvoke([HumanMessage(content=prompt)])
+        return str(getattr(result, "content", result))
+
     # ========== _run_agent_stream ==========
     async def _run_agent_stream(
         self, agent, messages: list, system_prompt_tokens: int,
         user_id: str = "default_user", session_id: str = "",
     ) -> AsyncGenerator[dict[str, Any], None]:
+        session_token = current_session_id.set(session_id)
+        user_token = current_user_id.set(user_id)
         full_response = ""
         tools_just_finished = False
         tool_outputs_tokens = 0
         round_num = 0
         stream_start_time = time.time()
+        # Track tool_call ids already emitted as tool_start to avoid duplicates
+        # when LangGraph replays model updates.
+        _emitted_tool_starts: set[str] = set()
+        _pending_tool_starts: dict[str, dict[str, str]] = {}
+        _emitted_tool_error_notice = False
+        successful_tool_results: list[dict[str, str]] = []
 
         compaction_trigger = get_compaction_trigger_tokens()
 
@@ -399,10 +547,13 @@ class AgentManager:
                     msg, metadata = data
                     if hasattr(msg, "content") and msg.content:
                         # LangGraph's messages stream should be consumed as token chunks.
-                        # Full AIMessage objects can appear as graph state/replay events and
-                        # may contain stale history or prior tool summaries; treating them as
-                        # tokens pollutes the saved assistant reply.
-                        if msg.type == "AIMessageChunk":
+                        # Full AIMessage objects and replayed chunks can appear as graph
+                        # state/history events. Only chunks emitted by the active model node
+                        # are user-visible reply tokens.
+                        if (
+                            isinstance(msg, AIMessageChunk)
+                            and metadata.get("langgraph_node") == "model"
+                        ):
                             if msg.content and not getattr(msg, "tool_calls", None):
                                 if tools_just_finished:
                                     yield {"type": "new_response"}
@@ -438,11 +589,28 @@ class AgentManager:
                                     if hasattr(tool_msg, "name"):
                                         raw_output = str(tool_msg.content)
                                         summary_source = None
+                                        is_error = getattr(tool_msg, "status", "success") == "error"
                                         if _estimate_tokens(raw_output) > self.SINGLE_TOOL_OVERFLOW_THRESHOLD:
-                                            raw_output = await self._summarize_tool_result(raw_output, tool_name=tool_msg.name)
-                                            tool_msg.content = raw_output
-                                            summary_source = "single_tool_overflow"
+                                            yield {
+                                                "type": "context_maintenance",
+                                                "status": "start",
+                                                "phase": "single_tool_overflow",
+                                                "message": "正在提炼超长工具结果...",
+                                            }
+                                            try:
+                                                raw_output = await self._summarize_tool_result(raw_output, tool_name=tool_msg.name)
+                                                tool_msg.content = raw_output
+                                                summary_source = "single_tool_overflow"
+                                            finally:
+                                                yield {
+                                                    "type": "context_maintenance",
+                                                    "status": "done",
+                                                    "phase": "single_tool_overflow",
+                                                }
                                         tc_id = getattr(tool_msg, "tool_call_id", "") or ""
+                                        if tc_id:
+                                            _pending_tool_starts.pop(tc_id, None)
+                                        is_error_final = is_error or _legacy_tool_output_looks_error(str(tool_msg.content))
                                         yield {
                                             "type": "tool_end",
                                             "tool": tool_msg.name,
@@ -450,7 +618,25 @@ class AgentManager:
                                             "output_preview": str(tool_msg.content)[:2000],
                                             "id": tc_id,
                                             "summary_source": summary_source,
+                                            "is_error": is_error_final,
                                         }
+                                        if not is_error_final and str(tool_msg.content).strip():
+                                            successful_tool_results.append({
+                                                "tool": str(tool_msg.name),
+                                                "output": str(tool_msg.content),
+                                            })
+                                        notice = _tool_error_notice(
+                                            tool_msg.name,
+                                            str(tool_msg.content),
+                                            is_error=is_error,
+                                        )
+                                        if notice and not _emitted_tool_error_notice:
+                                            _emitted_tool_error_notice = True
+                                            if tools_just_finished:
+                                                yield {"type": "new_response"}
+                                                tools_just_finished = False
+                                            full_response += notice
+                                            yield {"type": "token", "content": notice}
                                         tool_outputs_tokens += _estimate_tokens(str(tool_msg.content))
                                 try:
                                     current_tokens = (
@@ -475,11 +661,22 @@ class AgentManager:
                                         tools_just_finished = False
                                     if hasattr(agent_msg, "tool_calls") and agent_msg.tool_calls:
                                         for tc in agent_msg.tool_calls:
+                                            tc_id = tc.get("id", "")
+                                            # Deduplicate: the same model update can be replayed
+                                            # multiple times by LangGraph.
+                                            if tc_id and tc_id in _emitted_tool_starts:
+                                                continue
+                                            if tc_id:
+                                                _emitted_tool_starts.add(tc_id)
+                                                _pending_tool_starts[tc_id] = {
+                                                    "tool": str(tc["name"]),
+                                                    "input": str(tc.get("args", ""))[:1000],
+                                                }
                                             yield {
                                                 "type": "tool_start",
                                                 "tool": tc["name"],
                                                 "input": str(tc.get("args", ""))[:1000],
-                                                "id": tc.get("id", ""),
+                                                "id": tc_id,
                                             }
 
                 elif mode == "custom":
@@ -489,8 +686,57 @@ class AgentManager:
         except Exception as e:
             logger.error("astream exception: %s: %s", type(e).__name__, e)
             error_msg = f"{type(e).__name__}: {e}"
-            full_response += f"\n\n[Error] Tool execution failed: {error_msg}"
-            yield {"type": "error", "message": f"Tool execution failed: {error_msg}"}
+            failed_pending_output = f"Tool execution failed before completion: {error_msg}"
+            for tc_id, tc in list(_pending_tool_starts.items()):
+                yield {
+                    "type": "tool_end",
+                    "tool": tc["tool"],
+                    "output": failed_pending_output,
+                    "output_preview": failed_pending_output[:2000],
+                    "id": tc_id,
+                    "summary_source": None,
+                    "is_error": True,
+                }
+            _pending_tool_starts.clear()
+
+            if successful_tool_results and self._llm is not None:
+                yield {
+                    "type": "context_maintenance",
+                    "status": "start",
+                    "phase": "partial_answer",
+                    "message": "正在基于已返回结果整理回答...",
+                }
+                try:
+                    fallback_text = await self._answer_from_partial_tool_results(
+                        messages=messages,
+                        successful_tool_results=successful_tool_results,
+                        error_msg=error_msg,
+                    )
+                except Exception as fallback_error:
+                    logger.exception("partial answer fallback failed")
+                    fallback_text = (
+                        "\n\n后续工具调用失败；已获取到部分工具结果，但自动整理回答也失败了。"
+                        f"\n\n工具错误：{error_msg}"
+                        f"\n整理错误：{type(fallback_error).__name__}: {fallback_error}"
+                    )
+                finally:
+                    yield {
+                        "type": "context_maintenance",
+                        "status": "done",
+                        "phase": "partial_answer",
+                    }
+
+                if fallback_text:
+                    if tools_just_finished:
+                        yield {"type": "new_response"}
+                        tools_just_finished = False
+                    if full_response and not fallback_text.startswith(("\n", "。", "，", "；")):
+                        fallback_text = "\n\n" + fallback_text
+                    full_response += fallback_text
+                    yield {"type": "token", "content": fallback_text}
+            else:
+                full_response += f"\n\n[Error] Tool execution failed: {error_msg}"
+                yield {"type": "error", "message": f"Tool execution failed: {error_msg}"}
 
         try:
             final_tokens = (
@@ -509,6 +755,8 @@ class AgentManager:
             pass
 
         yield {"type": "done", "content": full_response}
+        current_session_id.reset(session_token)
+        current_user_id.reset(user_token)
 
     # ========== astream ==========
     async def astream(
@@ -571,6 +819,23 @@ class AgentManager:
             tool_reminder=len(history) >= 12,
         )
         system_prompt_tokens = _estimate_tokens(system_prompt)
+        try:
+            log_llm_input(
+                source="pre_agent",
+                system_message=system_prompt,
+                messages=messages,
+                session_id=session_id,
+                user_id=user_id,
+                metadata={
+                    "phase": "astream",
+                    "history_count": len(history),
+                    "rag_context_len": len(rag_context),
+                    "mem0_context_len": len(mem0_context),
+                    "system_prompt_tokens_estimate": system_prompt_tokens,
+                },
+            )
+        except Exception as e:
+            logger.warning("[llm-input-log] failed to log pre_agent payload: %s", e)
 
         try:
             exact_tokens = sum(_estimate_tokens(m.content) for m in messages) + system_prompt_tokens
@@ -617,7 +882,16 @@ class AgentManager:
                             yield event
                     return
                 except Exception as e:
-                    logger.warning("Persistent session failed, falling back: %s", e)
+                    logger.exception("Persistent MCP session failed")
+                    if self._looks_like_mcp_required(message, history):
+                        reply = _mcp_patent_unavailable_reply()
+                        yield {
+                            "type": "token",
+                            "content": reply,
+                        }
+                        yield {"type": "done", "content": reply}
+                        return
+                    logger.warning("Persistent MCP session failed, falling back to local tools: %s", e)
 
         # 原有非 MCP 逻辑
         agent = self._build_agent(
@@ -657,7 +931,29 @@ class AgentManager:
                             tool_reminder=len(history) >= 12,
                         )
                         messages = self._build_messages(message, history)
+                        try:
+                            log_llm_input(
+                                source="pre_agent",
+                                system_message=build_system_prompt(
+                                    self._base_dir,
+                                    rag_mode=get_rag_mode(),
+                                    memory_backend=get_memory_backend(),
+                                    mem0_context=mem0_context,
+                                    rag_context=rag_context,
+                                    tool_reminder=len(history) >= 12,
+                                ),
+                                messages=messages,
+                                session_id=session_id,
+                                user_id=user_id,
+                                metadata={"phase": "ainvoke_mcp", "history_count": len(history)},
+                            )
+                        except Exception as e:
+                            logger.warning("[llm-input-log] failed to log ainvoke MCP payload: %s", e)
+                        session_token = current_session_id.set(session_id)
+                        user_token = current_user_id.set(user_id)
                         result = await agent.ainvoke({"messages": messages})
+                        current_session_id.reset(session_token)
+                        current_user_id.reset(user_token)
                         final_messages = result.get("messages", [])
                         for msg in reversed(final_messages):
                             if hasattr(msg, "content") and msg.type == "ai" and msg.content:
@@ -667,7 +963,10 @@ class AgentManager:
                                 return response
                         return "No response generated."
                 except Exception as e:
-                    logger.warning("Persistent session failed in ainvoke, falling back: %s", e)
+                    logger.exception("Persistent MCP session failed in ainvoke")
+                    if self._looks_like_mcp_required(message, history):
+                        return _mcp_patent_unavailable_reply()
+                    logger.warning("Persistent MCP session failed in ainvoke, falling back to local tools: %s", e)
 
         agent = self._build_agent(
             mem0_context=mem0_context,
@@ -675,7 +974,29 @@ class AgentManager:
             tool_reminder=len(history) >= 12,
         )
         messages = self._build_messages(message, history)
+        try:
+            log_llm_input(
+                source="pre_agent",
+                system_message=build_system_prompt(
+                    self._base_dir,
+                    rag_mode=get_rag_mode(),
+                    memory_backend=get_memory_backend(),
+                    mem0_context=mem0_context,
+                    rag_context=rag_context,
+                    tool_reminder=len(history) >= 12,
+                ),
+                messages=messages,
+                session_id=session_id,
+                user_id=user_id,
+                metadata={"phase": "ainvoke", "history_count": len(history)},
+            )
+        except Exception as e:
+            logger.warning("[llm-input-log] failed to log ainvoke payload: %s", e)
+        session_token = current_session_id.set(session_id)
+        user_token = current_user_id.set(user_id)
         result = await agent.ainvoke({"messages": messages})
+        current_session_id.reset(session_token)
+        current_user_id.reset(user_token)
 
         final_messages = result.get("messages", [])
         for msg in reversed(final_messages):

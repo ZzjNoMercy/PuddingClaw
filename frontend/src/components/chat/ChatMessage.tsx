@@ -16,9 +16,15 @@ function formatTime(ts: number): string {
   return d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
 }
 
-/** Detect 401 / API key errors */
+/** Detect 401 / API key errors without matching arbitrary numbers like patent IDs. */
 function isAuthError(content: string): boolean {
-  return /401|authentication.?fail|invalid.*api.?key|api.?key.*invalid/i.test(content);
+  const lower = content.toLowerCase();
+  // Specific HTTP 401 contexts (avoid matching a bare "401" in patent numbers / dates)
+  const has401 = /\b401\s*(unauthorized| unauthorised|禁止|认证失败|未授权)\b/i.test(content) ||
+    /\b(http\s*401|status\s*401|error\s*401|code\s*401|返回\s*401)\b/i.test(content);
+  const hasApiKeyError = /invalid.*api\s*key|api\s*key.*invalid|api\s*key.*missing|api\s*key.*not\s*set|apikey.*invalid/i.test(lower);
+  const hasAuthFail = /authentication\s*(fail|error|failed)|认证失败|鉴权失败|未通过认证|授权失败/i.test(content);
+  return has401 || hasApiKeyError || hasAuthFail;
 }
 
 export default function ChatMessage({ message }: Props) {

@@ -232,7 +232,22 @@ class ToolResultClearMiddleware(AgentMiddleware):
             if len(content_str) < self.min_summary_length:
                 continue
 
-            summary = await self._asummarize(msg)
+            if runtime is not None and hasattr(runtime, "stream_writer"):
+                runtime.stream_writer({
+                    "type": "context_maintenance",
+                    "status": "start",
+                    "phase": "tool_result_clear",
+                    "message": "正在整理历史工具结果...",
+                })
+            try:
+                summary = await self._asummarize(msg)
+            finally:
+                if runtime is not None and hasattr(runtime, "stream_writer"):
+                    runtime.stream_writer({
+                        "type": "context_maintenance",
+                        "status": "done",
+                        "phase": "tool_result_clear",
+                    })
             summarized_content = f"{SUMMARY_PREFIX}{summary}"
             new_messages[i] = ToolMessage(
                 content=summarized_content,
@@ -441,6 +456,13 @@ class CompactionMiddleware(AgentMiddleware):
 
         history_text = self._budget_truncate_messages(to_compact)
         prompt = self.summary_prompt.format(history=history_text)
+        if runtime is not None and hasattr(runtime, "stream_writer"):
+            runtime.stream_writer({
+                "type": "context_maintenance",
+                "status": "start",
+                "phase": "compaction",
+                "message": "正在压缩长对话历史...",
+            })
         try:
             if hasattr(self.model, "ainvoke"):
                 summary_text = (await self.model.ainvoke([HumanMessage(content=prompt)])).content
@@ -450,6 +472,13 @@ class CompactionMiddleware(AgentMiddleware):
             # 压缩失败降级：跳过本次压缩，让 TailTrim/Summarization 兜底
             logger.warning("[CompactionMiddleware] 摘要失败降级: %s: %s", type(e).__name__, e)
             return None
+        finally:
+            if runtime is not None and hasattr(runtime, "stream_writer"):
+                runtime.stream_writer({
+                    "type": "context_maintenance",
+                    "status": "done",
+                    "phase": "compaction",
+                })
 
         compaction_msg = SystemMessage(content=f"{COMPRESSED_CONTEXT_PREFIX}\n{summary_text}")
         new_messages = []

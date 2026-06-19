@@ -61,6 +61,50 @@ class TestContextEngineeringConfig:
         assert cm["keep_recent"] == 8
         assert cm["compact_budget_tokens"] == 120000
 
+    def test_chat_preannounces_pending_tool_result_clear(self):
+        from api.chat import _should_preannounce_tool_result_clear
+
+        history = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"tool": "t", "output": "x" * 600}
+                    for _ in range(11)
+                ],
+            }
+        ]
+
+        with patch("api.chat.get_middleware_config", return_value={
+            "enabled": True,
+            "tool_clear": {"keep_recent": 10, "min_summary_length": 500},
+        }):
+            assert _should_preannounce_tool_result_clear(history) is True
+
+    def test_chat_does_not_preannounce_already_summarized_tool_results(self):
+        from api.chat import _should_preannounce_tool_result_clear
+
+        history = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "tool": "t",
+                        "output": "[摘要] 已整理",
+                        "summary_source": "tool_result_clear",
+                    }
+                    for _ in range(11)
+                ],
+            }
+        ]
+
+        with patch("api.chat.get_middleware_config", return_value={
+            "enabled": True,
+            "tool_clear": {"keep_recent": 10, "min_summary_length": 500},
+        }):
+            assert _should_preannounce_tool_result_clear(history) is False
+
 
 # ══════════════════════════════════════════════════════════════════════
 # Agent streaming
@@ -76,7 +120,10 @@ class TestAgentStreaming:
         class FakeAgent:
             async def astream(self, *_args, **_kwargs):
                 yield ("messages", (AIMessage(content="上一轮 BYD 报告"), {}))
-                yield ("messages", (AIMessageChunk(content="当前 SkillHub 回复"), {}))
+                yield (
+                    "messages",
+                    (AIMessageChunk(content="当前 SkillHub 回复"), {"langgraph_node": "model"}),
+                )
 
         async def collect_events():
             manager = AgentManager()
@@ -95,6 +142,39 @@ class TestAgentStreaming:
         assert token_text == "当前 SkillHub 回复"
         assert done["content"] == "当前 SkillHub 回复"
         assert "BYD" not in done["content"]
+
+    def test_ignores_replayed_ai_message_chunk(self):
+        from graph.agent import AgentManager
+        from langchain_core.messages import AIMessageChunk
+
+        class FakeAgent:
+            async def astream(self, *_args, **_kwargs):
+                yield (
+                    "messages",
+                    (AIMessageChunk(content="搜索到15条专利，展示5条：比亚迪..."), {"langgraph_node": "history"}),
+                )
+                yield (
+                    "messages",
+                    (AIMessageChunk(content="好的，我来查询最近一周的 AI 论文信息。"), {"langgraph_node": "model"}),
+                )
+
+        async def collect_events():
+            manager = AgentManager()
+            return [
+                event
+                async for event in manager._run_agent_stream(
+                    FakeAgent(), messages=[], system_prompt_tokens=0
+                )
+            ]
+
+        events = asyncio.run(collect_events())
+
+        token_text = "".join(e["content"] for e in events if e["type"] == "token")
+        done = next(e for e in events if e["type"] == "done")
+
+        assert token_text == "好的，我来查询最近一周的 AI 论文信息。"
+        assert done["content"] == "好的，我来查询最近一周的 AI 论文信息。"
+        assert "比亚迪" not in done["content"]
 
     def test_historical_tool_outputs_are_labeled(self):
         from graph.agent import AgentManager, HISTORICAL_TOOL_OUTPUT_PREFIX
@@ -122,6 +202,51 @@ class TestAgentStreaming:
         assert tool_messages
         assert tool_messages[0].content.startswith(HISTORICAL_TOOL_OUTPUT_PREFIX)
         assert "比亚迪旧专利结果" in tool_messages[0].content
+
+    def test_build_messages_backfills_missing_tool_output(self):
+        from graph.agent import AgentManager, MISSING_TOOL_OUTPUT_PLACEHOLDER
+
+        manager = AgentManager()
+        messages = manager._build_messages(
+            "继续",
+            [
+                {
+                    "role": "assistant",
+                    "content": "我来查一下。",
+                    "tool_calls": [
+                        {
+                            "tool": "search_patents",
+                            "input": "{'query_text': '智能座舱'}",
+                            "id": "tc_missing",
+                        }
+                    ],
+                }
+            ],
+        )
+
+        ai_messages = [m for m in messages if getattr(m, "type", "") == "ai"]
+        tool_messages = [m for m in messages if getattr(m, "type", "") == "tool"]
+
+        assert ai_messages[0].tool_calls[0]["id"] == "tc_missing"
+        assert tool_messages[0].tool_call_id == "tc_missing"
+        assert MISSING_TOOL_OUTPUT_PLACEHOLDER in tool_messages[0].content
+
+    def test_chat_save_sanitizer_backfills_missing_tool_output(self):
+        from api.chat import MISSING_TOOL_OUTPUT_PLACEHOLDER, _ensure_tool_call_outputs
+
+        segment = {
+            "content": "我来查一下。",
+            "tool_calls": [
+                {"tool": "search_patents", "id": "tc_missing", "input": "{}"}
+            ],
+        }
+
+        normalized = _ensure_tool_call_outputs(segment)
+
+        tc = normalized["tool_calls"][0]
+        assert tc["output"] == MISSING_TOOL_OUTPUT_PLACEHOLDER
+        assert tc["is_error"] is True
+        assert tc["summary_source"] == "missing_tool_output"
 
     def test_tool_end_keeps_full_output_and_preview_separate(self):
         from graph.agent import AgentManager
@@ -160,6 +285,237 @@ class TestAgentStreaming:
 
         assert tool_end["output"] == long_output
         assert tool_end["output_preview"] == long_output[:2000]
+
+    def test_tool_error_generates_user_visible_notice(self):
+        from graph.agent import AgentManager
+        from langchain_core.messages import ToolMessage
+
+        tool_error = (
+            "Error: search_patents is not a valid tool, try one of "
+            "[terminal, read_file]."
+        )
+
+        class FakeAgent:
+            async def astream(self, *_args, **_kwargs):
+                yield (
+                    "updates",
+                    {
+                        "tools": {
+                            "messages": [
+                                ToolMessage(
+                                    content=tool_error,
+                                    tool_call_id="tc1",
+                                    name="search_patents",
+                                )
+                            ]
+                        }
+                    },
+                )
+
+        async def collect_events():
+            manager = AgentManager()
+            return [
+                event
+                async for event in manager._run_agent_stream(
+                    FakeAgent(), messages=[], system_prompt_tokens=0
+                )
+            ]
+
+        events = asyncio.run(collect_events())
+        token_text = "".join(e["content"] for e in events if e["type"] == "token")
+        done = next(e for e in events if e["type"] == "done")
+
+        assert "专利检索工具这一步没有加载成功" in token_text
+        assert "基于已经拿到的结果继续整理" in done["content"]
+        assert "MCP 专利检索服务暂时不可用" not in done["content"]
+
+    def test_generic_tool_error_generates_user_visible_notice(self):
+        from graph.agent import AgentManager
+        from langchain_core.messages import ToolMessage
+
+        class FakeAgent:
+            async def astream(self, *_args, **_kwargs):
+                yield (
+                    "updates",
+                    {
+                        "tools": {
+                            "messages": [
+                                ToolMessage(
+                                    content="❌ File not found: missing.txt",
+                                    tool_call_id="tc1",
+                                    name="read_file",
+                                )
+                            ]
+                        }
+                    },
+                )
+
+        async def collect_events():
+            manager = AgentManager()
+            return [
+                event
+                async for event in manager._run_agent_stream(
+                    FakeAgent(), messages=[], system_prompt_tokens=0
+                )
+            ]
+
+        events = asyncio.run(collect_events())
+        token_text = "".join(e["content"] for e in events if e["type"] == "token")
+        done = next(e for e in events if e["type"] == "done")
+
+        assert "工具 `read_file` 执行失败" in token_text
+        assert "missing.txt" in done["content"]
+
+    def test_tool_message_status_error_is_authoritative(self):
+        from graph.agent import AgentManager
+        from langchain_core.messages import ToolMessage
+
+        class FakeAgent:
+            async def astream(self, *_args, **_kwargs):
+                yield (
+                    "updates",
+                    {
+                        "tools": {
+                            "messages": [
+                                ToolMessage(
+                                    content="permission denied by harness",
+                                    tool_call_id="tc1",
+                                    name="terminal",
+                                    status="error",
+                                )
+                            ]
+                        }
+                    },
+                )
+
+        async def collect_events():
+            manager = AgentManager()
+            return [
+                event
+                async for event in manager._run_agent_stream(
+                    FakeAgent(), messages=[], system_prompt_tokens=0
+                )
+            ]
+
+        events = asyncio.run(collect_events())
+        tool_end = next(e for e in events if e["type"] == "tool_end")
+        token_text = "".join(e["content"] for e in events if e["type"] == "token")
+
+        assert tool_end["is_error"] is True
+        assert "工具 `terminal` 执行失败" in token_text
+        assert "permission denied by harness" in token_text
+
+    def test_partial_tool_success_generates_answer_when_later_tool_fails(self):
+        from graph.agent import AgentManager
+        from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
+
+        class FakeAgent:
+            async def astream(self, *_args, **_kwargs):
+                yield (
+                    "updates",
+                    {
+                        "tools": {
+                            "messages": [
+                                ToolMessage(
+                                    content='{"success":true,"data":{"results":[{"pn":"CN1","title":"智能座舱Agent"}]}}',
+                                    tool_call_id="tc1",
+                                    name="search_patents",
+                                )
+                            ]
+                        }
+                    },
+                )
+                yield (
+                    "updates",
+                    {
+                        "model": {
+                            "messages": [
+                                AIMessage(
+                                    content="",
+                                    tool_calls=[
+                                        {
+                                            "name": "search_patents",
+                                            "args": {"query_text": "more"},
+                                            "id": "tc2",
+                                        }
+                                    ],
+                                )
+                            ]
+                        }
+                    },
+                )
+                raise RuntimeError("MCP disconnected")
+
+        class FakeLLM:
+            async def astream(self, *_args, **_kwargs):
+                yield AIMessageChunk(content="后续检索失败，先基于已返回结果回答：CN1 智能座舱Agent。")
+
+        async def collect_events():
+            manager = AgentManager()
+            manager._llm = FakeLLM()
+            return [
+                event
+                async for event in manager._run_agent_stream(
+                    FakeAgent(),
+                    messages=[HumanMessage(content="最近车企申请了哪些核心的智能座舱Agent")],
+                    system_prompt_tokens=0,
+                )
+            ]
+
+        events = asyncio.run(collect_events())
+        token_text = "".join(e["content"] for e in events if e["type"] == "token")
+        failed_tool_end = [
+            e for e in events
+            if e["type"] == "tool_end" and e.get("id") == "tc2"
+        ][0]
+
+        assert not [e for e in events if e["type"] == "error"]
+        assert failed_tool_end["is_error"] is True
+        assert "后续检索失败" in token_text
+        assert "CN1" in token_text
+
+    def test_single_tool_overflow_emits_context_maintenance_events(self):
+        from graph.agent import AgentManager
+        from langchain_core.messages import ToolMessage
+
+        class FakeAgent:
+            async def astream(self, *_args, **_kwargs):
+                yield (
+                    "updates",
+                    {
+                        "tools": {
+                            "messages": [
+                                ToolMessage(
+                                    content="x" * 100,
+                                    tool_call_id="tc1",
+                                    name="terminal",
+                                )
+                            ]
+                        }
+                    },
+                )
+
+        async def collect_events():
+            manager = AgentManager()
+            manager.SINGLE_TOOL_OVERFLOW_THRESHOLD = 1
+            return [
+                event
+                async for event in manager._run_agent_stream(
+                    FakeAgent(), messages=[], system_prompt_tokens=0
+                )
+            ]
+
+        events = asyncio.run(collect_events())
+        maintenance = [
+            (e.get("status"), e.get("phase"))
+            for e in events
+            if e["type"] == "context_maintenance"
+        ]
+
+        assert maintenance == [
+            ("start", "single_tool_overflow"),
+            ("done", "single_tool_overflow"),
+        ]
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -403,6 +759,44 @@ class TestSessionManagerPersistence:
             "archived-new",
             "current",
         ]
+
+    def test_load_session_for_agent_does_not_merge_final_answer_into_tool_call(self, tmp_path):
+        from graph.session_manager import SessionManager
+
+        mgr = SessionManager()
+        mgr.initialize(tmp_path)
+        sid = "test-session"
+        mgr.create_session(sid)
+        mgr.save_message(sid, "user", "search topic")
+        mgr.save_message(
+            sid,
+            "assistant",
+            "I will search now.",
+            tool_calls=[{"tool": "search", "id": "tc1", "args": {"q": "topic"}}],
+        )
+        mgr.save_message(sid, "assistant", "Final answer from the searched topic.")
+
+        agent_history = mgr.load_session_for_agent(sid)
+
+        assert [m["role"] for m in agent_history] == ["user", "assistant", "assistant"]
+        assert agent_history[1]["content"] == "I will search now."
+        assert agent_history[1]["tool_calls"][0]["id"] == "tc1"
+        assert agent_history[2]["content"] == "Final answer from the searched topic."
+        assert "tool_calls" not in agent_history[2]
+
+    def test_load_session_for_agent_still_merges_plain_consecutive_assistant_text(self, tmp_path):
+        from graph.session_manager import SessionManager
+
+        mgr = SessionManager()
+        mgr.initialize(tmp_path)
+        sid = "test-session"
+        mgr.create_session(sid)
+        mgr.save_message(sid, "assistant", "first")
+        mgr.save_message(sid, "assistant", "second")
+
+        agent_history = mgr.load_session_for_agent(sid)
+
+        assert agent_history == [{"role": "assistant", "content": "first\nsecond"}]
 
     def test_middle_trim_archives_but_display_history_stays_complete(self, tmp_path):
         from graph.session_manager import MIDDLE_TRIM_CONTEXT_PREFIX, SessionManager

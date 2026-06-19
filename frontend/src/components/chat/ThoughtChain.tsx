@@ -18,7 +18,7 @@ const TOOL_META: Record<string, { icon: React.ElementType; color: string; bg: st
 interface Props { toolCalls: ToolCall[] }
 
 export default function ThoughtChain({ toolCalls }: Props) {
-  const [expanded, setExpanded] = useState<Record<number, boolean>>({});
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   if (toolCalls.length === 0) return null;
 
   return (
@@ -26,12 +26,13 @@ export default function ThoughtChain({ toolCalls }: Props) {
       {toolCalls.map((tc, idx) => {
         const meta = TOOL_META[tc.tool] || TOOL_META.terminal;
         const Icon = meta.icon;
-        const isOpen = expanded[idx] ?? false;
+        const key = tc.id || `${idx}`;
+        const isOpen = expanded[key] ?? false;
 
         return (
-          <div key={idx} className="rounded-xl border border-black/[0.04] bg-white/50 overflow-hidden animate-fade-in-scale">
+          <div key={key} className="rounded-xl border border-black/[0.04] bg-white/50 overflow-hidden animate-fade-in-scale">
             <button
-              onClick={() => setExpanded((p) => ({ ...p, [idx]: !p[idx] }))}
+              onClick={() => setExpanded((p) => ({ ...p, [key]: !p[key] }))}
               className="w-full flex items-center gap-2 px-3 py-1.5 text-[12px] hover:bg-black/[0.02] transition-colors"
             >
               {isOpen
