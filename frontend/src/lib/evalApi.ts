@@ -2,10 +2,7 @@
  * Eval API client for PuddingClaw — Skills evaluation review.
  */
 
-const API_BASE =
-  typeof window !== "undefined"
-    ? `http://${window.location.hostname}:9100/api`
-    : "http://localhost:9100/api";
+const API_BASE = "/api";
 
 // ── Types ────────────────────────────────────────────────
 

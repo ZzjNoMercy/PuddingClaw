@@ -2,9 +2,12 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import dynamic from "next/dynamic";
+import { usePathname, useRouter } from "next/navigation";
 import "@/lib/monaco-config";
 import Navbar from "@/components/layout/Navbar";
+import Sidebar from "@/components/layout/Sidebar";
 import FileTree from "@/components/skills/FileTree";
+import { useApp } from "@/lib/store";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -23,11 +26,13 @@ import {
   EyeOff,
   X,
   ChevronRight,
+  ChevronLeft,
   File,
   Clock,
   HardDrive,
   Upload,
   Sparkles,
+  Server,
 } from "lucide-react";
 import {
   listSkills,
@@ -55,6 +60,16 @@ const MonacoEditor = dynamic(() => import("@monaco-editor/react"), {
 
 // ── Main Page ────────────────────────────────────────────
 export default function SkillsPage() {
+  const {
+    sidebarOpen,
+    toggleSidebar,
+    sidebarWidth,
+    mcpServers,
+    loadMcpServers,
+    triggerSkillCreator,
+    setPendingInput,
+  } = useApp();
+  const [extensionView, setExtensionView] = useState<"mcp" | "skills">("skills");
   const [skills, setSkills] = useState<SkillInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedSkill, setSelectedSkill] = useState<string | null>(null);
@@ -75,6 +90,8 @@ export default function SkillsPage() {
   const [importing, setImporting] = useState(false);
   const [showRenameModal, setShowRenameModal] = useState(false);
   const [renamingSkill, setRenamingSkill] = useState<string | null>(null);
+  const pathname = usePathname();
+  const router = useRouter();
 
   // Dirty flag
   const isDirty = editorContent !== originalContent;
@@ -100,6 +117,10 @@ export default function SkillsPage() {
   useEffect(() => {
     loadSkills();
   }, [loadSkills]);
+
+  useEffect(() => {
+    if (extensionView === "mcp") loadMcpServers();
+  }, [extensionView, loadMcpServers]);
 
   // ── Load skill detail ────────────────────────────────
   const loadSkillDetail = useCallback(
@@ -237,10 +258,23 @@ export default function SkillsPage() {
     [loadSkills, showToast]
   );
 
-  // ── Navigate to chat page to create skill ────────────
+  // ── Create or try-out a skill in chat ────────────────
   const handleNavigateToCreate = useCallback(() => {
-    window.location.href = "/?trigger=skill-creator&action=create";
-  }, []);
+    if (selectedSkill) {
+      // When a skill is selected, prefill its slash command so the user can
+      // try it out in a new chat. The session is created lazily on send.
+      setPendingInput(`/${selectedSkill} `);
+      if (pathname !== "/") {
+        router.push("/");
+      }
+    } else {
+      // In the default list view, prefill the skill-creator prompt.
+      triggerSkillCreator();
+      if (pathname !== "/") {
+        router.push("/?trigger=skill-creator&action=create");
+      }
+    }
+  }, [pathname, router, selectedSkill, setPendingInput, triggerSkillCreator]);
 
   // ── Delete skill ─────────────────────────────────────
   const handleDeleteSkill = useCallback(
@@ -310,13 +344,32 @@ export default function SkillsPage() {
       s.description.toLowerCase().includes(searchQuery.toLowerCase())
   );
 
+  const handleExtensionViewChange = useCallback(
+    (view: "mcp" | "skills") => {
+      if (view === extensionView) return;
+      if (isDirty && !window.confirm("当前文件有未保存的更改，确定要切换吗？")) return;
+      setExtensionView(view);
+    },
+    [extensionView, isDirty]
+  );
+
   // ── Loading state ────────────────────────────────────
   if (loading) {
     return (
       <div className="h-screen flex flex-col app-bg">
-        <Navbar />
-        <div className="flex-1 flex items-center justify-center">
-          <Loader2 className="w-6 h-6 animate-spin text-gray-400" />
+        <Navbar sidebarOpen={sidebarOpen} toggleSidebar={toggleSidebar} showPanelToggles />
+        <div className="flex-1 flex overflow-hidden p-2 pt-0">
+          <div
+            className="workspace-sidebar-shell shrink-0 panel-transition overflow-hidden"
+            style={{ width: sidebarOpen ? sidebarWidth : 0 }}
+          >
+            <div style={{ width: sidebarWidth, minWidth: 200 }} className="h-full">
+              <Sidebar />
+            </div>
+          </div>
+          <div className="flex-1 flex items-center justify-center">
+            <Loader2 className="w-6 h-6 animate-spin text-gray-400" />
+          </div>
         </div>
       </div>
     );
@@ -324,16 +377,81 @@ export default function SkillsPage() {
 
   return (
     <div className="h-screen flex flex-col app-bg">
-      <Navbar />
+      <Navbar sidebarOpen={sidebarOpen} toggleSidebar={toggleSidebar} showPanelToggles />
+      <div className="flex-1 flex overflow-hidden p-2 pt-0">
+        <div
+          className="workspace-sidebar-shell shrink-0 panel-transition overflow-hidden"
+          style={{ width: sidebarOpen ? sidebarWidth : 0 }}
+        >
+          <div style={{ width: sidebarWidth, minWidth: 200 }} className="h-full">
+            <Sidebar />
+          </div>
+        </div>
+
+        <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
+      <div className="flex h-11 shrink-0 items-center border-b border-black/[0.06] bg-white px-4">
+        <div className="flex items-center gap-1 rounded-lg bg-gray-100 p-1" role="tablist" aria-label="扩展类型">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={extensionView === "skills"}
+            onClick={() => handleExtensionViewChange("skills")}
+            className={`rounded-md px-3 py-1 text-[12px] font-medium transition-colors ${
+              extensionView === "skills"
+                ? "bg-white text-gray-900 shadow-sm"
+                : "text-gray-500 hover:text-gray-800"
+            }`}
+          >
+            技能
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={extensionView === "mcp"}
+            onClick={() => handleExtensionViewChange("mcp")}
+            className={`rounded-md px-3 py-1 text-[12px] font-medium transition-colors ${
+              extensionView === "mcp"
+                ? "bg-white text-gray-900 shadow-sm"
+                : "text-gray-500 hover:text-gray-800"
+            }`}
+          >
+            MCP
+          </button>
+        </div>
+      </div>
+
+      {extensionView === "mcp" ? (
+        <McpServerCatalog servers={mcpServers} />
+      ) : (
       <div className="flex-1 flex overflow-hidden">
-        {/* ── Left: Skills List ──────────────────────────── */}
-        <div className="w-[240px] glass-panel border-r border-black/[0.06] shrink-0 flex flex-col">
+        {/* ── Skills catalog / editor navigation ─────────── */}
+        <div className={`${
+          selectedSkill
+            ? "w-[240px] shrink-0 border-r border-black/[0.06]"
+            : "flex-1"
+        } glass-panel flex min-w-0 flex-col`}>
           {/* Header */}
-          <div className="p-3 border-b border-black/[0.06]">
+          <div className={selectedSkill ? "border-b border-black/[0.06] p-3" : "mx-auto w-full max-w-4xl px-6 pb-4 pt-10"}>
+            {!selectedSkill && (
+              <div className="mb-6">
+                <h1 className="text-2xl font-semibold text-gray-900">技能</h1>
+                <p className="mt-1 text-[13px] text-gray-500">通过任务专用技能扩展 PuddingClaw 的能力</p>
+              </div>
+            )}
             <div className="flex items-center justify-between mb-2.5">
               <div className="flex items-center gap-2">
-                <Zap className="w-4 h-4 text-amber-500" />
-                <span className="text-[13px] font-semibold text-gray-700">Skills</span>
+                {selectedSkill && (
+                  <button
+                    type="button"
+                    onClick={() => setSelectedSkill(null)}
+                    className="flex h-7 w-7 items-center justify-center rounded-md text-gray-400 transition-colors hover:bg-black/[0.04] hover:text-gray-700"
+                    title="返回技能列表"
+                  >
+                    <ChevronLeft className="h-4 w-4" />
+                  </button>
+                )}
+                <Zap className="w-4 h-4 text-[#002fa7]" />
+                <span className="text-[13px] font-semibold text-gray-700">{selectedSkill ? "Skills" : "已安装"}</span>
                 <span className="text-[10px] text-gray-400 bg-gray-100 px-1.5 py-0.5 rounded-full">
                   {skills.length}
                 </span>
@@ -349,13 +467,13 @@ export default function SkillsPage() {
                 <button
                   onClick={handleNavigateToCreate}
                   className="w-7 h-7 flex items-center justify-center rounded-lg bg-purple-500/10 text-purple-600 hover:bg-purple-500/20 transition-colors"
-                  title="创建 Skill"
+                  title={selectedSkill ? `试用 ${selectedSkill}` : "创建 Skill"}
                 >
                   <Sparkles className="w-3.5 h-3.5" />
                 </button>
                 <button
                   onClick={() => setShowNewModal(true)}
-                  className="w-7 h-7 flex items-center justify-center rounded-lg bg-amber-500/10 text-amber-600 hover:bg-amber-500/20 transition-colors"
+                  className="w-7 h-7 flex items-center justify-center rounded-lg bg-[#002fa7]/10 text-[#001f7a] hover:bg-[#002fa7]/20 transition-colors"
                   title="新建 Skill"
                 >
                   <Plus className="w-3.5 h-3.5" />
@@ -367,16 +485,20 @@ export default function SkillsPage() {
               <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-400" />
               <input
                 type="text"
-                placeholder="搜索 Skills..."
+                placeholder="搜索技能"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                className="w-full pl-8 pr-3 py-1.5 text-[12px] rounded-lg bg-white/60 border border-black/[0.06] outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-400/20 transition-all placeholder:text-gray-400"
+                className={`w-full border border-black/[0.06] bg-white outline-none transition-all placeholder:text-gray-400 focus:border-[#002fa7]/40 focus:ring-1 focus:ring-[#002fa7]/10 ${
+                  selectedSkill
+                    ? "rounded-lg py-1.5 pl-8 pr-3 text-[12px]"
+                    : "rounded-xl py-3 pl-10 pr-4 text-[13px] shadow-sm"
+                }`}
               />
             </div>
           </div>
 
           {/* List */}
-          <div className="flex-1 overflow-y-auto p-2 space-y-0.5">
+          <div className={selectedSkill ? "flex-1 space-y-0.5 overflow-y-auto p-2" : "mx-auto w-full max-w-4xl flex-1 space-y-1 overflow-y-auto px-6 pb-10"}>
             {filteredSkills.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-12 text-gray-400">
                 <FolderOpen className="w-8 h-8 mb-2 opacity-40" />
@@ -393,28 +515,32 @@ export default function SkillsPage() {
                     e.preventDefault();
                     setContextMenu({ skillName: skill.name, x: e.clientX, y: e.clientY });
                   }}
-                  className={`group flex items-start gap-2.5 px-2.5 py-2 rounded-lg cursor-pointer transition-all ${
+                  className={`group flex cursor-pointer items-center transition-all ${
+                    selectedSkill ? "gap-2.5 rounded-lg px-2.5 py-2" : "gap-3 rounded-lg px-4 py-3"
+                  } ${
                     selectedSkill === skill.name
-                      ? "bg-amber-500/10 border border-amber-400/20"
-                      : "hover:bg-white/50 border border-transparent"
+                      ? "bg-[#002fa7]/10 border border-[#002fa7]/20"
+                      : "hover:bg-white/70 border border-transparent"
                   }`}
                 >
                   <div
-                    className={`w-7 h-7 rounded-md flex items-center justify-center shrink-0 mt-0.5 ${
+                    className={`${selectedSkill ? "h-7 w-7" : "h-10 w-10"} flex shrink-0 items-center justify-center rounded-lg ${
                       selectedSkill === skill.name
-                        ? "bg-amber-500 text-white"
-                        : "bg-gray-100 text-gray-400 group-hover:bg-amber-500/10 group-hover:text-amber-500"
+                        ? "bg-[#002fa7] text-white"
+                        : "bg-gray-100 text-gray-400 group-hover:bg-[#002fa7]/10 group-hover:text-[#002fa7]"
                     } transition-colors`}
                   >
-                    <Zap className="w-3.5 h-3.5" />
+                    <Zap className={selectedSkill ? "h-3.5 w-3.5" : "h-5 w-5"} />
                   </div>
                   <div className="flex-1 min-w-0">
-                    <div className="text-[12px] font-medium text-gray-700 truncate">
+                    <div className={`${selectedSkill ? "text-[12px]" : "text-[14px]"} truncate font-medium text-gray-700`}>
                       {skill.name}
                     </div>
-                    <div className="text-[10px] text-gray-400 truncate mt-0.5">
-                      {skill.description || "No description"}
-                    </div>
+                    {!selectedSkill && (
+                      <div className="mt-0.5 text-[12px] text-gray-500 line-clamp-2 leading-relaxed">
+                        {skill.description || "No description"}
+                      </div>
+                    )}
                   </div>
                   <button
                     onClick={(e) => {
@@ -432,14 +558,14 @@ export default function SkillsPage() {
                 </div>
               ))
             )}
+
           </div>
         </div>
 
-        {/* ── Center: Editor ─────────────────────────────── */}
+        {/* ── Center: Editor / Preview ─────────────────────────────── */}
+        {selectedSkill && (
         <div className="flex-1 flex flex-col min-w-0">
-          {!selectedSkill ? (
-            <EmptyEditor />
-          ) : detailLoading ? (
+          {detailLoading ? (
             <div className="flex-1 flex items-center justify-center">
               <Loader2 className="w-5 h-5 animate-spin text-gray-300" />
             </div>
@@ -449,13 +575,13 @@ export default function SkillsPage() {
               <div className="h-10 flex items-center justify-between px-3 border-b border-black/[0.06] bg-white/40 shrink-0">
                 <div className="flex items-center gap-2">
                   {/* Current file indicator */}
-                  <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-amber-500/10 text-amber-700 border border-amber-400/20">
+                  <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-[#002fa7]/10 text-[#001f7a] border border-[#002fa7]/20">
                     <FileText className="w-3 h-3" />
                     <span className="text-[11px] font-medium">{activeFile}</span>
                   </div>
                   {/* Dirty indicator */}
                   {isDirty && (
-                    <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" title="未保存的更改" />
+                    <span className="w-2 h-2 rounded-full bg-[#4a6de5] animate-pulse" title="未保存的更改" />
                   )}
                 </div>
                 <div className="flex items-center gap-2">
@@ -463,10 +589,10 @@ export default function SkillsPage() {
                     onClick={() => setShowPreview((v) => !v)}
                     className={`w-7 h-7 flex items-center justify-center rounded-lg transition-all ${
                       showPreview
-                        ? "bg-amber-500/10 text-amber-600"
+                        ? "bg-[#002fa7]/10 text-[#001f7a]"
                         : "text-gray-400 hover:text-gray-600 hover:bg-black/[0.04]"
                     }`}
-                    title={showPreview ? "隐藏预览" : "显示预览"}
+                    title={showPreview ? "切换为编辑" : "切换为预览"}
                   >
                     {showPreview ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
                   </button>
@@ -485,85 +611,83 @@ export default function SkillsPage() {
                 </div>
               </div>
 
-              {/* Editor + Preview */}
-              <div className="flex-1 flex overflow-hidden">
-                {/* Monaco Editor */}
-                <div className="flex-1 min-w-0">
-                  <MonacoEditor
-                    height="100%"
-                    language="markdown"
-                    theme="vs"
-                    value={editorContent}
-                    onChange={(value) => setEditorContent(value || "")}
-                    options={{
-                      fontSize: 13,
-                      fontFamily: "'SF Mono', 'JetBrains Mono', 'Fira Code', Consolas, monospace",
-                      lineHeight: 22,
-                      minimap: { enabled: false },
-                      wordWrap: "on",
-                      padding: { top: 12, bottom: 12 },
-                      scrollBeyondLastLine: false,
-                      renderLineHighlight: "gutter",
-                      overviewRulerBorder: false,
-                      hideCursorInOverviewRuler: true,
-                      lineNumbers: "on",
-                      glyphMargin: false,
-                      folding: true,
-                      lineDecorationsWidth: 8,
-                      contextmenu: false,
-                    }}
-                  />
-                </div>
-
-                {/* Preview panel */}
-                {showPreview && (
-                  <div className="w-[300px] shrink-0 border-l border-black/[0.06] flex flex-col bg-white/30">
-                    {/* Meta card */}
-                    <div className="p-3 border-b border-black/[0.06]">
-                      <div className="flex items-center gap-2 mb-2">
-                        <div className="w-6 h-6 rounded-md bg-amber-500 flex items-center justify-center">
-                          <Zap className="w-3 h-3 text-white" />
-                        </div>
-                        <div>
-                          <div className="text-[12px] font-semibold text-gray-700">
-                            {skillDetail?.name}
-                          </div>
-                          <div className="text-[10px] text-gray-400">
-                            {skillDetail?.description || "No description"}
-                          </div>
-                        </div>
-                      </div>
-                      {/* File tree */}
-                      {skillTree.length > 0 && (
-                        <div className="mt-2">
-                          <div className="text-[10px] font-medium text-gray-400 uppercase tracking-wider mb-1.5 px-2">
-                            Files
-                          </div>
-                          <FileTree
-                            nodes={skillTree}
-                            activeFile={activeFile}
-                            onFileSelect={setActiveFile}
-                          />
-                        </div>
-                      )}
+              {/* Editor or Markdown Preview in the center */}
+              <div className="flex-1 overflow-hidden">
+                {showPreview ? (
+                  <div className="h-full overflow-y-auto p-6 bg-white/30">
+                    <div className="max-w-3xl mx-auto markdown-content">
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                        {editorContent}
+                      </ReactMarkdown>
                     </div>
-                    {/* Markdown preview */}
-                    <div className="flex-1 overflow-y-auto p-3">
-                      <div className="text-[10px] font-medium text-gray-400 uppercase tracking-wider mb-2">
-                        Preview
-                      </div>
-                      <div className="markdown-content text-[12px]">
-                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                          {editorContent}
-                        </ReactMarkdown>
-                      </div>
-                    </div>
+                  </div>
+                ) : (
+                  <div className="h-full">
+                    <MonacoEditor
+                      height="100%"
+                      language="markdown"
+                      theme="vs"
+                      value={editorContent}
+                      onChange={(value) => setEditorContent(value || "")}
+                      options={{
+                        fontSize: 13,
+                        fontFamily: "'SF Mono', 'JetBrains Mono', 'Fira Code', Consolas, monospace",
+                        lineHeight: 22,
+                        minimap: { enabled: false },
+                        wordWrap: "on",
+                        padding: { top: 12, bottom: 12 },
+                        scrollBeyondLastLine: false,
+                        renderLineHighlight: "gutter",
+                        overviewRulerBorder: false,
+                        hideCursorInOverviewRuler: true,
+                        lineNumbers: "on",
+                        glyphMargin: false,
+                        folding: true,
+                        lineDecorationsWidth: 8,
+                        contextmenu: false,
+                      }}
+                    />
                   </div>
                 )}
               </div>
             </>
           )}
         </div>
+        )}
+
+        {/* ── Right: Skill meta + Description + Files ───────────── */}
+        {selectedSkill && (
+          <div className="w-[260px] shrink-0 border-l border-black/[0.06] flex flex-col bg-white/30">
+            <div className="p-3 border-b border-black/[0.06]">
+              {/* DESCRIPTION */}
+              <div className="mb-3">
+                <div className="text-[10px] font-medium text-gray-400 uppercase tracking-wider mb-1.5 px-2">
+                  Description
+                </div>
+                <div className="max-h-[120px] overflow-y-auto px-2 py-1.5 text-[11px] text-gray-600 leading-relaxed bg-black/[0.02] rounded-md">
+                  {skillDetail?.description || "No description"}
+                </div>
+              </div>
+
+              {/* FILES */}
+              {skillTree.length > 0 && (
+                <div>
+                  <div className="text-[10px] font-medium text-gray-400 uppercase tracking-wider mb-1.5 px-2">
+                    Files
+                  </div>
+                  <FileTree
+                    nodes={skillTree}
+                    activeFile={activeFile}
+                    onFileSelect={setActiveFile}
+                  />
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+      )}
+        </main>
       </div>
 
       {/* ── Context Menu ──────────────────────────────────── */}
@@ -644,12 +768,66 @@ export default function SkillsPage() {
   );
 }
 
+function McpServerCatalog({
+  servers,
+}: {
+  servers: Array<{ key: string; name: string; url: string; transport: string }>;
+}) {
+  return (
+    <div className="flex-1 overflow-y-auto bg-white/30">
+      <div className="mx-auto w-full max-w-4xl px-6 pb-10 pt-10">
+        <div className="mb-6">
+          <h1 className="text-2xl font-semibold text-gray-900">MCP</h1>
+          <p className="mt-1 text-[13px] text-gray-500">连接外部服务，为对话提供工具与数据能力</p>
+        </div>
+
+        <div className="mb-2 flex items-center gap-2 text-[13px] font-semibold text-gray-700">
+          <Server className="h-4 w-4 text-sky-500" />
+          已启用
+          <span className="rounded-full bg-gray-100 px-1.5 py-0.5 text-[10px] font-normal text-gray-500">
+            {servers.length}
+          </span>
+        </div>
+
+        {servers.length === 0 ? (
+          <div className="rounded-lg border border-dashed border-black/[0.08] px-4 py-8 text-center text-[12px] text-gray-400">
+            暂无已配置 MCP Server
+          </div>
+        ) : (
+          <div className="space-y-1">
+            {servers.map((server) => (
+              <div
+                key={server.key}
+                className="flex items-center gap-3 rounded-lg border border-transparent px-4 py-3 transition-colors hover:border-black/[0.05] hover:bg-white/70"
+              >
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-sky-50 text-sky-600">
+                  <Server className="h-5 w-5" />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-[14px] font-medium text-gray-800">{server.name}</p>
+                  <p className="mt-0.5 truncate text-[12px] text-gray-400">
+                    {server.transport} · {server.url}
+                  </p>
+                </div>
+                <div className="flex shrink-0 items-center gap-1 text-[11px] text-emerald-600">
+                  <CheckCircle2 className="h-3.5 w-3.5" />
+                  已启用
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── Empty Editor Placeholder ─────────────────────────────
 function EmptyEditor() {
   return (
     <div className="flex-1 flex items-center justify-center">
       <div className="text-center">
-        <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-amber-400 to-amber-500 flex items-center justify-center mx-auto mb-4 shadow-lg shadow-amber-400/15">
+        <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-[#4a6de5] to-[#002fa7] flex items-center justify-center mx-auto mb-4 shadow-lg shadow-[#4a6de5]/15">
           <Zap className="w-8 h-8 text-white" />
         </div>
         <h2 className="text-[15px] font-semibold text-gray-700 mb-1">
@@ -712,8 +890,8 @@ function NewSkillModal({
       <div className="relative bg-white/95 backdrop-blur-xl rounded-2xl shadow-2xl border border-black/[0.06] w-[400px] p-5 animate-fade-in-scale">
         <div className="flex items-center justify-between mb-4">
           <div className="flex items-center gap-2">
-            <div className="w-7 h-7 rounded-lg bg-amber-500/10 flex items-center justify-center">
-              <Plus className="w-4 h-4 text-amber-600" />
+            <div className="w-7 h-7 rounded-lg bg-[#002fa7]/10 flex items-center justify-center">
+              <Plus className="w-4 h-4 text-[#001f7a]" />
             </div>
             <h3 className="text-[14px] font-semibold text-gray-800">新建 Skill</h3>
           </div>
@@ -765,7 +943,7 @@ function NewSkillModal({
           <button
             onClick={handleSubmit}
             disabled={creating || !name.trim()}
-            className="flex items-center gap-1.5 px-4 py-2 text-[12px] font-medium text-white bg-amber-500 hover:bg-amber-600 rounded-lg transition-colors disabled:opacity-50 shadow-sm shadow-amber-500/15"
+            className="flex items-center gap-1.5 px-4 py-2 text-[12px] font-medium text-white bg-[#002fa7] hover:bg-[#001f7a] rounded-lg transition-colors disabled:opacity-50 shadow-sm shadow-[#002fa7]/15"
           >
             {creating ? (
               <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -872,7 +1050,7 @@ function ImportSkillModal({
 
       try {
         // Use full backend URL instead of relative path
-        const API_BASE = `http://${window.location.hostname}:9100/api`;
+        const API_BASE = "/api";
         const response = await fetch(`${API_BASE}/skills/import`, {
           method: "POST",
           body: formData,

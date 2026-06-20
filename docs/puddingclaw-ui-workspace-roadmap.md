@@ -109,6 +109,47 @@ context maintenance：短暂状态行，不落库
 - 不新增后端接口。
 - `npm run build` 通过。
 
+### 一阶段开发计划与状态
+
+更新时间：2026-06-20
+
+| 状态 | 任务 | 文件范围 | 说明 |
+| --- | --- | --- | --- |
+| [x] | 持久化一阶段执行清单 | `docs/puddingclaw-ui-workspace-roadmap.md` | 将本阶段拆成可跟踪任务，并在完成后回写状态。 |
+| [x] | 顶部导航改为工作台语义 | `frontend/src/components/layout/Navbar.tsx`, `frontend/src/lib/navigation.ts` | 将 Skills 入口统一命名为“扩展”，保留原 `/skills` 路由。 |
+| [x] | 左侧侧栏工作台化 | `frontend/src/components/layout/Sidebar.tsx` | 增加项目、快捷入口、扩展能力分组并保留会话列表。Raw Messages 从主界面隐藏，底层调试 API 与状态能力保留。 |
+| [x] | 隐藏 Raw Messages 调试界面 | `frontend/src/components/layout/Sidebar.tsx` | 移除侧栏折叠区、token 请求和全屏弹层，保留会话、RAG 状态及后端消息接口。 |
+| [x] | RAG 开关迁移至设置页 | `frontend/src/app/settings/page.tsx` | 在 RAG 设置分区提供即时生效的标准开关，并复用全局 RAG 状态。 |
+| [x] | 工作台统一为浅色界面 | `frontend/src/app/globals.css`, `frontend/src/components/layout/Navbar.tsx`, `frontend/src/components/layout/Sidebar.tsx` | 保留工作台结构，顶部、侧栏、内容外壳和菜单统一使用白色与浅灰层级。 |
+| [x] | 区分项目与普通对话 | `frontend/src/components/layout/Sidebar.tsx` | 当前 session 均无项目归属，统一放入“对话”；“项目”独立展示空状态，等待二阶段 workspace 绑定。 |
+| [x] | 修正宽屏对话主列对齐 | `frontend/src/components/chat/ChatPanel.tsx`, `ChatMessage.tsx`, `ChatInput.tsx` | 消息、状态与输入框统一扩展至 `max-w-5xl`，减少宽屏右侧拥挤感。 |
+| [x] | 扩展页增加类型标签切换 | `frontend/src/app/skills/page.tsx` | 顶部提供“MCP / 技能”分段标签；技能保留现有编辑器，MCP 在无配置数据时展示真实空状态。 |
+| [x] | 顶部导航收纳至侧栏 | `frontend/src/components/layout/Navbar.tsx`, `Sidebar.tsx` | 顶部仅保留品牌与面板控制；扩展、GitHub 等入口归入侧栏，设置固定为侧栏最后一项。 |
+| [x] | 删除重复扩展能力区并校正全局对话轴 | `Sidebar.tsx`, `page.tsx`, chat components | 删除侧栏重复入口；宽屏按左右面板宽度差补偿，使消息与输入框相对整个窗口居中。 |
+| [x] | 收紧对话历史密度 | `frontend/src/components/layout/Sidebar.tsx` | 缩小历史行高、字号、图标及分组间距，提高侧栏会话容量。 |
+| [x] | 收窄对话内容列 | chat components | 消息、工具卡、状态与输入框统一由 `max-w-5xl` 收至 `max-w-4xl`，保持全局居中。 |
+| [x] | 扩展页保持工作台侧栏 | `frontend/src/app/skills/page.tsx` | 进入扩展时保留项目、对话和底部设置侧栏，MCP/技能内容作为右侧二级工作区切换。 |
+| [x] | 技能目录居中展示 | `frontend/src/app/skills/page.tsx` | 默认以居中目录展示标题、搜索和已安装技能；选中技能后再进入列表加编辑器工作区。 |
+| [x] | 对话列进一步收窄并保持居中 | chat components | 内容宽度由 `max-w-4xl` 收至 `max-w-3xl`，继续使用全局中心补偿。 |
+| [x] | 页脚品牌文案全屏居中 | `ChatInput.tsx`, `globals.css` | Powered by 文案始终按左右面板宽度差补偿，相对整个窗口横向居中。 |
+| [x] | 对话内容按剩余区域动态居中 | chat components, `page.tsx` | 消息、工具卡和输入框取消全屏补偿，始终在左右面板之间的可用聊天区域内居中。 |
+| [x] | MCP 标签接入真实服务器数据 | `frontend/src/app/skills/page.tsx` | 复用全局 MCP Server 状态和现有 API，展示智慧芽等已启用服务器，不再使用静态空状态。 |
+| [x] | 修复本地前后端 CORS | `backend/app.py`, `docker-compose.yml` | 用明确的本地前端来源替代通配来源，并支持通过 `CORS_ORIGINS` 扩展部署域名。 |
+| [x] | 前端 API 改为同源代理 | `frontend/next.config.mjs`, API clients, Docker 配置 | 浏览器统一请求 `/api`，由 Next 容器转发至 backend，彻底移除跨端口 CORS 依赖。 |
+| [x] | 中央聊天区视觉收紧 | `frontend/src/components/chat/ChatPanel.tsx`, `frontend/src/components/chat/ChatMessage.tsx` | 内容宽度、欢迎态、消息气泡向工作台风格调整。 |
+| [x] | Composer 工作台化 | `frontend/src/components/chat/ChatInput.tsx` | 输入框改为底部浮动 composer，保留 `/` Skill 调用、停止生成、context usage。 |
+| [x] | Tool card 状态优化 | `frontend/src/components/chat/ThoughtChain.tsx` | 增加错误态和摘要态展示，保留现有 toolCalls 数据结构。 |
+| [x] | 建立工作台视觉 token | `frontend/src/app/globals.css`, `frontend/src/app/page.tsx` | 统一背景、panel、composer、滚动阴影和布局边界。 |
+| [ ] | 二阶段项目目录 API 设计落地 | 后端 API + 前端项目绑定 | 本阶段不做。 |
+| [ ] | 三阶段右侧 coding agent 环境面板 | workspace/git/editor 能力 | 本阶段只保留现有 Inspector，不实现 git/diff/commit。 |
+
+一阶段修改边界：
+
+- 不新增后端 API。
+- 不修改 agent/session/tool output/context maintenance 协议。
+- 不接入真实本地目录选择、git diff、commit/push。
+- 保持 `/skills`、`/skills/compare`、`/skills/review` 路由可访问。
+
 ## 阶段二：项目目录与本地电脑操作能力
 
 ### 目标

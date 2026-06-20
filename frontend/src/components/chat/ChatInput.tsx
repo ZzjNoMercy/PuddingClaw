@@ -12,7 +12,7 @@ import SlashCommandMenu from "./SlashCommandMenu";
 
 export default function ChatInput() {
   const [text, setText] = useState("");
-  const { sendMessage, stopStreaming, isStreaming, isCompressing, sessionId, contextUsage, setContextUsage } = useApp();
+  const { sendMessage, stopStreaming, isStreaming, isCompressing, sessionId, contextUsage, setContextUsage, pendingInput, setPendingInput } = useApp();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const disabled = isStreaming || isCompressing;
 
@@ -60,6 +60,18 @@ export default function ChatInput() {
   // Track IME composition so Enter to confirm pinyin/hiragana doesn't submit (fixes IME-1)
   const isComposingRef = useRef(false);
 
+  // Prefill input from external actions (e.g. "create skill" button in /skills)
+  useEffect(() => {
+    if (pendingInput && textareaRef.current) {
+      setText(pendingInput);
+      setPendingInput(null);
+      textareaRef.current.focus();
+      // Auto-resize to fit prefilled text
+      textareaRef.current.style.height = "auto";
+      textareaRef.current.style.height = `${textareaRef.current.scrollHeight}px`;
+    }
+  }, [pendingInput, setPendingInput]);
+
   // Apply pending cursor position after React re-renders textarea with new text
   useEffect(() => {
     if (pendingCursorRef.current !== null && textareaRef.current) {
@@ -72,8 +84,9 @@ export default function ChatInput() {
     if (!text.trim() || disabled) return;
     sendMessage(text.trim());
     setText("");
+    setPendingInput(null);
     if (textareaRef.current) textareaRef.current.style.height = "auto";
-  }, [text, disabled, sendMessage]);
+  }, [text, disabled, sendMessage, setPendingInput]);
 
   const handleSlashSelect = useCallback((skillName: string) => {
     // Use textarea DOM value as source of truth to avoid stale closure (fixes I-1)
@@ -149,8 +162,8 @@ export default function ChatInput() {
   };
 
   return (
-    <div className="p-4 pb-5">
-      <div className="glass-input rounded-2xl flex items-end gap-2 px-4 py-2.5 max-w-2xl mx-auto hover:shadow-md transition-shadow relative">
+    <div className="px-5 pb-4 pt-2">
+      <div className="glass-input relative mx-auto flex w-full max-w-3xl items-end gap-2 rounded-xl px-4 py-2.5 transition-shadow hover:shadow-xl">
         <SlashCommandMenu
           visible={showSlashMenu}
           filteredSkills={filteredSkills}
@@ -197,14 +210,14 @@ export default function ChatInput() {
           onKeyDown={handleKeyDown}
           onCompositionStart={() => { isComposingRef.current = true; }}
           onCompositionEnd={() => { isComposingRef.current = false; }}
-          placeholder="输入消息... 输入 / 调用 Skill"
+          placeholder="输入消息，或用 / 调用扩展能力"
           rows={1}
-          className="flex-1 resize-none bg-transparent text-[14px] outline-none placeholder:text-gray-400 max-h-40 py-1 leading-relaxed"
+          className="max-h-40 flex-1 resize-none bg-transparent py-1 text-[14px] leading-relaxed outline-none placeholder:text-gray-400"
         />
         {isStreaming ? (
           <button
             onClick={stopStreaming}
-            className="shrink-0 w-8 h-8 flex items-center justify-center rounded-xl bg-red-500 text-white hover:bg-red-600 transition-all active:scale-95"
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-red-500 text-white transition-all hover:bg-red-600 active:scale-95"
             title="停止生成 (Esc)"
           >
             <Square className="w-3.5 h-3.5 fill-current" />
@@ -213,7 +226,7 @@ export default function ChatInput() {
           <button
             onClick={handleSubmit}
             disabled={!text.trim() || isCompressing}
-            className="shrink-0 w-8 h-8 flex items-center justify-center rounded-xl bg-[#002fa7] text-white disabled:opacity-25 hover:bg-[#001f7a] transition-all active:scale-95"
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-[#002fa7] text-white transition-all hover:bg-[#001f7a] active:scale-95 disabled:opacity-25"
           >
             <ArrowUp className="w-4 h-4" />
           </button>
@@ -221,7 +234,7 @@ export default function ChatInput() {
       </div>
 
       {/* Context Usage */}
-      <div className="max-w-2xl mx-auto px-4 py-1 flex justify-end">
+      <div className="mx-auto flex w-full max-w-3xl justify-end px-2 py-1">
         <span
           className={`text-[10px] font-medium ${
             contextUsage.percentage >= 90
@@ -235,7 +248,7 @@ export default function ChatInput() {
         </span>
       </div>
 
-      <p className="text-center text-[10px] text-gray-400/70 mt-2">
+      <p className="viewport-center-axis mt-1 text-center text-[10px] text-gray-400/70">
         Powered by DeepSeek · PuddingClaw v0.1
       </p>
     </div>

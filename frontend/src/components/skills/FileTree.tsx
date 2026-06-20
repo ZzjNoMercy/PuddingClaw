@@ -62,7 +62,7 @@ function TreeNode({ node, activeFile, onFileSelect, level }: TreeNodeProps) {
         onClick={handleClick}
         className={`flex items-center gap-1.5 py-1 px-2 rounded-md cursor-pointer transition-colors ${
           isActive
-            ? "bg-amber-500/10 text-amber-700"
+            ? "bg-[#002fa7]/10 text-[#001f7a]"
             : "hover:bg-black/[0.04] text-gray-600"
         }`}
         style={{ paddingLeft: `${paddingLeft}px` }}
@@ -75,7 +75,7 @@ function TreeNode({ node, activeFile, onFileSelect, level }: TreeNodeProps) {
               <ChevronRight className="w-3 h-3 text-gray-400 shrink-0" />
             )}
             {isExpanded ? (
-              <FolderOpen className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+              <FolderOpen className="w-3.5 h-3.5 text-[#002fa7] shrink-0" />
             ) : (
               <Folder className="w-3.5 h-3.5 text-gray-400 shrink-0" />
             )}

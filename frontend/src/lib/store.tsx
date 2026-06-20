@@ -86,6 +86,12 @@ interface AppState {
   sessions: SessionMeta[];
   loadSessions: () => void;
   createSession: () => Promise<void>;
+  triggerSkillCreator: () => void;
+
+  // Pending input (prefill from external actions, cleared on send)
+  pendingInput: string | null;
+  setPendingInput: (text: string | null) => void;
+
   renameSession: (id: string, title: string) => Promise<void>;
   deleteSession: (id: string) => Promise<void>;
 
@@ -221,6 +227,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     total: 500000,
     percentage: 0,
   });
+  const [pendingInput, setPendingInput] = useState<string | null>(null);
   const [maintenanceStatus, setMaintenanceStatus] =
     useState<ContextMaintenanceStatus | null>(null);
 
@@ -315,6 +322,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   // On mount, after sessions are loaded, auto-switch to the most recent session
   useEffect(() => {
     if (sessions.length === 0) return;
+    // Don't auto-switch away from the placeholder "default" session; the user
+    // may have clicked "New Chat" and expects to start a fresh conversation.
+    if (sessionIdRef.current === "default") return;
+    // If the current session already exists in the loaded list, keep it.
+    // This prevents auto-switch from clobbering a newly-created session or a
+    // session the user explicitly selected.
+    if (sessions.some((s) => s.id === sessionIdRef.current)) return;
     const latest = [...sessions].sort((a, b) => b.updated_at - a.updated_at)[0];
     if (latest && latest.id !== sessionIdRef.current) {
       setSessionId(latest.id);
@@ -325,11 +339,24 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     try {
       const meta = await apiCreateSession();
       setSessions((prev) => [{ id: meta.id, title: meta.title, updated_at: Date.now() / 1000 }, ...prev]);
+      // Pre-populate the message cache so setSessionId shows the empty state
+      // immediately and doesn't overwrite locally-added messages with a later
+      // history fetch.
+      messagesMapRef.current[meta.id] = [];
       setSessionId(meta.id);
     } catch {
       // ignore
     }
   }, [setSessionId]);
+
+  // ── Ensure a real session exists before sending ────────
+  const ensureSession = useCallback(async () => {
+    // If we're on the placeholder "default" session, or the current session
+    // isn't in the loaded list, create a fresh one lazily.
+    if (sessionIdRef.current === "default" || !sessions.some((s) => s.id === sessionIdRef.current)) {
+      await createSession();
+    }
+  }, [sessions, createSession]);
 
   const renameSessionFn = useCallback(async (id: string, title: string) => {
     try {
@@ -456,8 +483,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       // Guard: only check if CURRENT session is streaming (other sessions can be)
       if (!text.trim() || streamingSessions.has(sessionId) || isCompressing) return;
 
+      // Lazily create a session only when we are on the placeholder "default"
+      // session (e.g. after the user clicked "New Chat" or triggered a skill
+      // from another page). Normal follow-up messages in an existing session
+      // must stay in that session.
+      if (sessionIdRef.current === "default") {
+        await createSession();
+      }
+
       // Capture the sessionId at send time (stable for entire SSE lifecycle)
-      const sendSessionId = sessionId;
+      const sendSessionId = sessionIdRef.current;
 
       // Slash command processing
       let processedText = text;
@@ -749,8 +784,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         loadSessions();
       }
     },
-    [streamingSessions, isCompressing, sessionId, loadSessions, updateSessionMessages]
+    [streamingSessions, isCompressing, sessionId, createSession, loadSessions, updateSessionMessages]
   );
+
+  // ── Prefill skill-creator prompt without auto-sending ─
+  const triggerSkillCreator = useCallback(() => {
+    setPendingInput("/skill-creator 帮我创建一个新的 Skill");
+    // Switch to the placeholder session so the next message creates a fresh
+    // chat instead of appending to the current conversation.
+    setSessionId("default");
+  }, [setSessionId]);
 
   return (
     <AppContext.Provider
@@ -764,6 +807,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         sessions,
         loadSessions,
         createSession,
+        triggerSkillCreator,
+        pendingInput,
+        setPendingInput,
         renameSession: renameSessionFn,
         deleteSession: deleteSessionFn,
         sidebarOpen,

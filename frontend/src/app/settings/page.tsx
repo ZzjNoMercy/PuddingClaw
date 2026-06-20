@@ -3,12 +3,12 @@
 import { useState, useEffect, useCallback } from "react";
 import Navbar from "@/components/layout/Navbar";
 import {
-  Settings,
   Bot,
   Sparkles,
   Database,
   HardDrive,
   Sliders,
+  Brain,
   Save,
   Loader2,
   CheckCircle2,
@@ -16,6 +16,7 @@ import {
   Eye,
   EyeOff,
   Zap,
+  ArrowLeft,
 } from "lucide-react";
 import {
   getSettings,
@@ -23,13 +24,17 @@ import {
   testConnection,
   type SystemSettings,
 } from "@/lib/settingsApi";
+import { useApp } from "@/lib/store";
+import MemoryEditor from "@/components/settings/MemoryEditor";
+import Link from "next/link";
 
-type SettingsCategory = "model" | "embedding" | "rag" | "data" | "advanced";
+type SettingsCategory = "model" | "embedding" | "rag" | "memory" | "data" | "advanced";
 
 const CATEGORIES: { key: SettingsCategory; label: string; icon: React.ElementType; color: string }[] = [
   { key: "model", label: "LLM 模型", icon: Bot, color: "#002fa7" },
   { key: "embedding", label: "Embedding", icon: Sparkles, color: "#f59e0b" },
   { key: "rag", label: "RAG 设置", icon: Database, color: "#7c3aed" },
+  { key: "memory", label: "记忆管理", icon: Brain, color: "#7c3aed" },
   { key: "data", label: "数据管理", icon: HardDrive, color: "#10b981" },
   { key: "advanced", label: "高级设置", icon: Sliders, color: "#6b7280" },
 ];
@@ -41,6 +46,7 @@ const LLM_PROVIDERS = [
 ];
 
 export default function SettingsPage() {
+  const { ragMode, toggleRagMode } = useApp();
   const [category, setCategory] = useState<SettingsCategory>("model");
   const [settings, setSettings] = useState<SystemSettings | null>(null);
   const [loading, setLoading] = useState(true);
@@ -70,7 +76,6 @@ export default function SettingsPage() {
   const [embTestResult, setEmbTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
 
   // RAG form state
-  const [ragEnabled, setRagEnabled] = useState(false);
   const [ragTopK, setRagTopK] = useState(3);
   const [ragThreshold, setRagThreshold] = useState(0.7);
 
@@ -95,7 +100,6 @@ export default function SettingsPage() {
         setEmbBaseUrl(s.embedding.base_url);
         setEmbApiKeyMasked(s.embedding.api_key_masked);
         // Populate RAG fields
-        setRagEnabled(s.rag.enabled);
         setRagTopK(s.rag.top_k);
         setRagThreshold(s.rag.similarity_threshold);
         // Compression
@@ -129,7 +133,7 @@ export default function SettingsPage() {
           ...(embApiKey ? { api_key: embApiKey } : {}),
         },
         rag: {
-          enabled: ragEnabled,
+          enabled: ragMode,
           top_k: ragTopK,
           similarity_threshold: ragThreshold,
         },
@@ -150,7 +154,7 @@ export default function SettingsPage() {
     } finally {
       setSaving(false);
     }
-  }, [llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embBaseUrl, embApiKey, ragEnabled, ragTopK, ragThreshold, compRatio, showToast]);
+  }, [llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embBaseUrl, embApiKey, ragMode, ragTopK, ragThreshold, compRatio, showToast]);
 
   const handleTestLlm = useCallback(async () => {
     const key = llmApiKey || settings?.llm.api_key_masked || "";
@@ -217,10 +221,13 @@ export default function SettingsPage() {
       <div className="flex-1 flex overflow-hidden">
         {/* Left: Category Navigation */}
         <div className="w-52 glass-panel border-r border-black/[0.06] shrink-0 p-3">
-          <div className="flex items-center gap-2 px-3 py-2 mb-2">
-            <Settings className="w-4 h-4 text-gray-500" />
-            <span className="text-[13px] font-semibold text-gray-700">系统设置</span>
-          </div>
+          <Link
+            href="/"
+            className="flex items-center gap-2.5 px-3 py-2.5 mb-3 text-[13px] font-medium text-gray-700 bg-black/[0.04] hover:bg-black/[0.08] rounded-xl transition-all group"
+          >
+            <ArrowLeft className="w-4 h-4 text-gray-500 group-hover:text-gray-700 transition-colors" />
+            返回应用
+          </Link>
           <div className="space-y-0.5">
             {CATEGORIES.map((cat) => {
               const Icon = cat.icon;
@@ -415,19 +422,30 @@ export default function SettingsPage() {
             {/* RAG Settings */}
             {category === "rag" && (
               <SettingsCard title="RAG 检索设置" icon={Database} color="#7c3aed">
-                <FormField label="RAG 模式">
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={ragEnabled}
-                      onChange={(e) => setRagEnabled(e.target.checked)}
-                      className="w-4 h-4 rounded accent-[#7c3aed]"
+                <div className="flex items-center justify-between gap-4 rounded-lg border border-black/[0.06] bg-white/50 px-3.5 py-3">
+                  <div className="min-w-0">
+                    <p className="text-[12px] font-medium text-gray-700">启用 RAG 检索</p>
+                    <p className="mt-0.5 text-[11px] text-gray-500">
+                      {ragMode ? "对话将检索 Memory 向量库" : "对话将使用完整上下文，不执行向量检索"}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={ragMode}
+                    aria-label="启用 RAG 检索"
+                    onClick={toggleRagMode}
+                    className={`relative h-5 w-9 shrink-0 rounded-full transition-colors ${
+                      ragMode ? "bg-[#7c3aed]" : "bg-gray-300"
+                    }`}
+                  >
+                    <span
+                      className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${
+                        ragMode ? "translate-x-[18px]" : "translate-x-0.5"
+                      }`}
                     />
-                    <span className="text-[12px] text-gray-600">
-                      {ragEnabled ? "已启用 — 对话时检索 Memory 向量库" : "已关闭"}
-                    </span>
-                  </label>
-                </FormField>
+                  </button>
+                </div>
                 <FormField label={`Top-K: ${ragTopK}`}>
                   <input
                     type="range"
@@ -477,6 +495,13 @@ export default function SettingsPage() {
                   </button>
                 </div>
               </SettingsCard>
+            )}
+
+            {/* Memory Editor */}
+            {category === "memory" && (
+              <div className="h-[calc(100vh-140px)]">
+                <MemoryEditor />
+              </div>
             )}
 
             {/* Advanced Settings */}

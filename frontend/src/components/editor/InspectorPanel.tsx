@@ -72,7 +72,7 @@ export default function InspectorPanel() {
   // Load active skills when Skills tab is opened
   useEffect(() => {
     if (rightTab === "skills") {
-      const API_BASE = `http://${window.location.hostname}:9100/api`;
+      const API_BASE = "/api";
       fetch(`${API_BASE}/skills/active`)
         .then(res => res.json())
         .then(data => setActiveSkills(data.skills || []))

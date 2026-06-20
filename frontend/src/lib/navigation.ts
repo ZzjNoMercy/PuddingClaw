@@ -16,11 +16,11 @@ export const NAV_ITEMS: NavItem[] = [
     icon: "MessageSquare",
   },
   {
-    label: "Skills",
+    label: "扩展",
     href: "/skills",
-    icon: "Zap",
+    icon: "Puzzle",
     children: [
-      { label: "配置管理", href: "/skills", icon: "Settings2" },
+      { label: "扩展管理", href: "/skills", icon: "Settings2" },
       { label: "版本对比", href: "/skills/compare", icon: "GitCompare" },
       { label: "评估审核", href: "/skills/review", icon: "ClipboardCheck" },
     ],
@@ -34,7 +34,7 @@ export const NAV_ITEMS: NavItem[] = [
 
 export const ROUTE_TITLES: Record<string, string> = {
   "/": "对话",
-  "/skills": "Skills 配置",
+  "/skills": "扩展管理",
   "/skills/compare": "版本对比",
   "/skills/review": "评估审核",
   "/settings": "系统设置",

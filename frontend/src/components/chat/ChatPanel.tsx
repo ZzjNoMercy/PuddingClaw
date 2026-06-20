@@ -16,34 +16,33 @@ export default function ChatPanel() {
 
   return (
     <div className="flex flex-col h-full">
-      <div className="flex-1 overflow-y-auto scroll-shadow">
+      <div className="flex-1 overflow-y-auto">
         {messages.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-full">
-            <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-[#002fa7] to-[#4070ff] flex items-center justify-center mb-4 shadow-lg shadow-[#002fa7]/15">
-              <Sparkles className="w-7 h-7 text-white" />
+          <div className="flex h-full flex-col items-center justify-center px-6 pb-16">
+            <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-xl bg-gradient-to-br from-[#002fa7] to-[#4070ff] shadow-lg shadow-blue-900/10">
+              <Sparkles className="h-6 w-6 text-white" />
             </div>
-            <h2 className="text-lg font-semibold text-gray-800 mb-1">
-              Hi, how can I help?
+            <h2 className="mb-1 text-lg font-semibold text-gray-900">
+              准备开始这个工作台
             </h2>
-            <p className="text-[13px] text-gray-400 max-w-xs text-center leading-relaxed">
-              Ask me anything, or try{" "}
-              <span className="text-[#ff6723] font-medium">&quot;查询北京天气&quot;</span>
+            <p className="max-w-sm text-center text-[13px] leading-relaxed text-gray-500">
+              保留当前对话能力，同时把会话、扩展和上下文状态集中到一个更安静的工作区。
             </p>
-            <div className="flex flex-wrap gap-2 mt-5 max-w-md justify-center">
+            <div className="mt-5 flex max-w-md flex-wrap justify-center gap-2">
               {["你好，介绍一下自己", "查询北京天气", "帮我写一段Python代码"].map((hint) => (
                 <QuickHint key={hint} text={hint} />
               ))}
             </div>
           </div>
         ) : (
-          <div className="py-4">
+          <div className="py-5 pb-3">
             {messages.map((msg) => (
               <ChatMessage key={msg.id} message={msg} />
             ))}
             {maintenanceStatus && (
               <div className="animate-fade-in px-4 py-1.5">
-                <div className="max-w-2xl mx-auto">
-                  <div className="inline-flex items-center gap-2 rounded-full border border-[#002fa7]/10 bg-white/70 px-3 py-1.5 text-[12px] text-gray-500 shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
+                <div className="mx-auto w-full max-w-3xl">
+                  <div className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white/80 px-3 py-1.5 text-[12px] text-gray-500 shadow-sm">
                     <Loader2 className="h-3.5 w-3.5 animate-spin text-[#002fa7]" />
                     <span>{maintenanceStatus.message}</span>
                   </div>
@@ -64,7 +63,7 @@ function QuickHint({ text }: { text: string }) {
   return (
     <button
       onClick={() => !isStreaming && sendMessage(text)}
-      className="px-3 py-1.5 rounded-full text-[12px] text-gray-500 bg-white/60 border border-black/[0.04] hover:bg-white hover:shadow-sm hover:text-gray-700 transition-all"
+      className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-[12px] text-gray-500 transition-all hover:border-slate-300 hover:text-gray-800 hover:shadow-sm"
     >
       {text}
     </button>

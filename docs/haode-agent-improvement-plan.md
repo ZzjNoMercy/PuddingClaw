@@ -18,6 +18,14 @@
 
 PuddingClaw 当前版本已经演进为“面向长会话和工具密集任务的 context-engineering agent”。迁移时应优先统一 session 数据模型和 SSE/tool output 契约，再逐层迁移 middleware。
 
+## 2026-06-20 迁移进度
+
+- `[x]` 建立 `structured_payload` 独立持久化契约，工具摘要不再覆盖智能录入卡片数据。
+- `[x]` 迁移历史 ToolResultClear 与单条超长工具摘要，并接入 context maintenance SSE。
+- `[x]` 迁移 Tail Trim、中段历史归档、Compaction 双轨保护和 context usage 峰值记录。
+- `[x]` 保留 smart_import 本地 skill 关键词路由和通用 MCP Server 接入能力。
+- `[x]` 容器构建、MCP 客户端构造和 6 项后端回归测试通过。
+
 ## 差异对照
 
 | 维度 | 好得 APP 现状 | PuddingClaw 现状 | 影响 |

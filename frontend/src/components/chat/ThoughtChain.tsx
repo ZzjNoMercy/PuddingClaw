@@ -4,6 +4,7 @@ import { useState } from "react";
 import {
   ChevronDown, ChevronRight, Terminal, Code, Globe,
   FileText, Search, Loader2, CheckCircle2,
+  XCircle,
 } from "lucide-react";
 import type { ToolCall } from "@/lib/store";
 
@@ -30,10 +31,17 @@ export default function ThoughtChain({ toolCalls }: Props) {
         const isOpen = expanded[key] ?? false;
 
         return (
-          <div key={key} className="rounded-xl border border-black/[0.04] bg-white/50 overflow-hidden animate-fade-in-scale">
+          <div
+            key={key}
+            className={`animate-fade-in-scale overflow-hidden rounded-lg border bg-white ${
+              tc.is_error ? "border-red-200" : "border-slate-200"
+            }`}
+          >
             <button
               onClick={() => setExpanded((p) => ({ ...p, [key]: !p[key] }))}
-              className="w-full flex items-center gap-2 px-3 py-1.5 text-[12px] hover:bg-black/[0.02] transition-colors"
+              className={`w-full flex items-center gap-2 px-3 py-1.5 text-[12px] transition-colors ${
+                tc.is_error ? "hover:bg-red-50/70" : "hover:bg-slate-50"
+              }`}
             >
               {isOpen
                 ? <ChevronDown className="w-3 h-3 text-gray-400" />
@@ -45,20 +53,27 @@ export default function ThoughtChain({ toolCalls }: Props) {
               >
                 <Icon className="w-3 h-3" style={{ color: meta.color }} />
               </div>
-              <span className="font-medium text-gray-600">{tc.tool}</span>
+              <span className="font-medium text-gray-700">{tc.tool}</span>
+              {tc.summary_source && (
+                <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-gray-500">
+                  {tc.summary_source}
+                </span>
+              )}
               <span className="ml-auto">
                 {tc.status === "running"
                   ? <Loader2 className="w-3.5 h-3.5 text-amber-500 animate-spin" />
+                  : tc.is_error
+                  ? <XCircle className="w-3.5 h-3.5 text-red-500" />
                   : <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" />
                 }
               </span>
             </button>
             {isOpen && (
-              <div className="px-3 pb-2 text-[11px] space-y-1.5 border-t border-black/[0.03] pt-1.5">
+              <div className="space-y-1.5 border-t border-slate-100 px-3 pb-2 pt-1.5 text-[11px]">
                 {tc.input && (
                   <div>
                     <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Input</span>
-                    <pre className="mt-0.5 p-2 bg-gray-50/80 rounded-lg overflow-x-auto whitespace-pre-wrap text-gray-600 font-mono leading-relaxed">
+                    <pre className="mt-0.5 overflow-x-auto whitespace-pre-wrap rounded-lg bg-slate-50 p-2 font-mono leading-relaxed text-gray-600">
                       {tc.input}
                     </pre>
                   </div>
@@ -66,7 +81,9 @@ export default function ThoughtChain({ toolCalls }: Props) {
                 {tc.output && (
                   <div>
                     <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Output</span>
-                    <pre className="mt-0.5 p-2 bg-gray-50/80 rounded-lg overflow-x-auto whitespace-pre-wrap text-gray-600 font-mono max-h-36 overflow-y-auto leading-relaxed">
+                    <pre className={`mt-0.5 max-h-36 overflow-y-auto overflow-x-auto whitespace-pre-wrap rounded-lg p-2 font-mono leading-relaxed ${
+                      tc.is_error ? "bg-red-50 text-red-700" : "bg-slate-50 text-gray-600"
+                    }`}>
                       {tc.output}
                     </pre>
                   </div>

@@ -10,6 +10,10 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci
 
+# API 代理地址只影响 Next 构建，不应使依赖安装层失效。
+ARG BACKEND_INTERNAL_URL=http://backend:9100
+ENV BACKEND_INTERNAL_URL=$BACKEND_INTERNAL_URL
+
 # 复制源码并构建
 COPY . .
 RUN npm run build
@@ -21,7 +25,9 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
-ENV FRONTEND_PORT=3000
+ENV HOSTNAME=0.0.0.0
+ENV PORT=3000
+ENV BACKEND_INTERNAL_URL=http://backend:9100
 
 # 仅复制运行所需文件
 COPY --from=builder /app/public ./public

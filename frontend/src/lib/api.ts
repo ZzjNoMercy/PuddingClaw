@@ -3,10 +3,7 @@
  * Custom SSE parser for POST requests (native EventSource only supports GET).
  */
 
-const API_BASE =
-  typeof window !== "undefined"
-    ? `http://${window.location.hostname}:9100/api`
-    : "http://localhost:9100/api";
+const API_BASE = "/api";
 
 export interface SSEEvent {
   event: string;

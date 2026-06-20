@@ -32,27 +32,27 @@ export default function ChatMessage({ message }: Props) {
   const hasAuthError = !isUser && isAuthError(message.content);
 
   return (
-    <div className="animate-fade-in px-4 py-1.5">
-      <div className="max-w-2xl mx-auto">
+    <div className="animate-fade-in px-5 py-2">
+      <div className="mx-auto w-full max-w-3xl">
         {/* User message — right-aligned bubble */}
         {isUser ? (
           <div className="flex justify-end gap-2">
             <div>
-              <div className="bg-[#002fa7] text-white px-4 py-2.5 rounded-2xl rounded-tr-md text-[14px] leading-relaxed shadow-sm">
+              <div className="max-w-xl rounded-2xl rounded-tr-md bg-[#002fa7] px-4 py-2.5 text-[14px] leading-relaxed text-white shadow-sm">
                 {message.content}
               </div>
               <div className="text-[10px] text-gray-400 mt-1 text-right pr-1">
                 {formatTime(message.timestamp)}
               </div>
             </div>
-            <div className="shrink-0 w-7 h-7 rounded-full bg-gray-200 flex items-center justify-center mt-0.5">
+            <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-slate-200">
               <User className="w-3.5 h-3.5 text-gray-500" />
             </div>
           </div>
         ) : (
           /* Assistant message — left-aligned */
           <div className="flex gap-2.5">
-            <div className="shrink-0 w-7 h-7 rounded-full bg-gradient-to-br from-[#002fa7] to-[#4070ff] flex items-center justify-center mt-0.5 shadow-sm">
+            <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-[#111827] shadow-sm">
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
                 <path d="M12 2L2 7L12 12L22 7L12 2Z" fill="white" fillOpacity="0.9" />
                 <path d="M2 17L12 22L22 17" stroke="white" strokeOpacity="0.7" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
@@ -70,7 +70,7 @@ export default function ChatMessage({ message }: Props) {
                 <AuthErrorAlert content={message.content} />
               ) : message.content ? (
                 <div>
-                  <div className="bg-white/60 px-4 py-2.5 rounded-2xl rounded-tl-md text-[14px] leading-relaxed shadow-[0_1px_3px_rgba(0,0,0,0.04)] border border-black/[0.04]">
+                  <div className="rounded-xl border border-slate-200 bg-white px-4 py-3 text-[14px] leading-relaxed shadow-sm">
                     <div className="markdown-content">
                       <ReactMarkdown remarkPlugins={[remarkGfm]}>
                         {message.content}
@@ -86,7 +86,7 @@ export default function ChatMessage({ message }: Props) {
                 </div>
               ) : (
                 /* Typing indicator */
-                <div className="bg-white/60 px-4 py-3 rounded-2xl rounded-tl-md inline-flex items-center gap-1.5 shadow-[0_1px_3px_rgba(0,0,0,0.04)] border border-black/[0.04]">
+                <div className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
                   <span className="typing-dot w-1.5 h-1.5 bg-[#002fa7] rounded-full" />
                   <span className="typing-dot w-1.5 h-1.5 bg-[#002fa7] rounded-full" />
                   <span className="typing-dot w-1.5 h-1.5 bg-[#002fa7] rounded-full" />
