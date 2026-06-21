@@ -289,6 +289,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     (id: string) => {
       // Switch view — do NOT abort any SSE streams (they continue in background)
       sessionIdRef.current = id;
+      // Persist the selected session so refresh returns to it instead of
+      // falling back to the latest/new-chat page.
+      try {
+        sessionStorage.setItem("puddingclaw_session_id", id);
+      } catch {
+        // ignore storage errors
+      }
       setSessionIdRaw(id);
       setRawMessages(null);
 
@@ -319,15 +326,28 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     []
   );
 
-  // On mount, after sessions are loaded, auto-switch to the most recent session
+  // On mount/refresh, restore the last viewed session from storage.
+  const restoredSessionRef = useRef(false);
   useEffect(() => {
     if (sessions.length === 0) return;
-    // Don't auto-switch away from the placeholder "default" session; the user
-    // may have clicked "New Chat" and expects to start a fresh conversation.
+
+    if (!restoredSessionRef.current) {
+      restoredSessionRef.current = true;
+      try {
+        const saved = sessionStorage.getItem("puddingclaw_session_id");
+        if (saved && (saved === "default" || sessions.some((s) => s.id === saved))) {
+          setSessionId(saved);
+          return;
+        }
+      } catch {
+        // ignore storage errors
+      }
+    }
+
+    // Fallback: don't auto-switch away from the placeholder "default" session;
+    // the user may have clicked "New Chat" and expects to start a fresh conversation.
     if (sessionIdRef.current === "default") return;
     // If the current session already exists in the loaded list, keep it.
-    // This prevents auto-switch from clobbering a newly-created session or a
-    // session the user explicitly selected.
     if (sessions.some((s) => s.id === sessionIdRef.current)) return;
     const latest = [...sessions].sort((a, b) => b.updated_at - a.updated_at)[0];
     if (latest && latest.id !== sessionIdRef.current) {

@@ -52,7 +52,7 @@ export default function ChatMessage({ message }: Props) {
         ) : (
           /* Assistant message — left-aligned */
           <div className="flex gap-2.5">
-            <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-[#111827] shadow-sm">
+            <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-[#002fa7] to-[#4070ff] shadow-sm">
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
                 <path d="M12 2L2 7L12 12L22 7L12 2Z" fill="white" fillOpacity="0.9" />
                 <path d="M2 17L12 22L22 17" stroke="white" strokeOpacity="0.7" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />

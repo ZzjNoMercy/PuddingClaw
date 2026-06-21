@@ -35,20 +35,29 @@
 
 ```text
 frontend/src/app/page.tsx
+frontend/src/app/settings/page.tsx
+frontend/src/app/skills/page.tsx
 frontend/src/app/globals.css
 frontend/src/components/layout/Sidebar.tsx
 frontend/src/components/layout/Navbar.tsx
 frontend/src/components/layout/SkillsBar.tsx
+frontend/src/components/layout/ResizeHandle.tsx
 frontend/src/components/chat/ChatPanel.tsx
 frontend/src/components/chat/ChatMessage.tsx
 frontend/src/components/chat/ChatInput.tsx
 frontend/src/components/chat/ThoughtChain.tsx
 frontend/src/components/chat/RetrievalCard.tsx
+frontend/src/components/chat/SlashCommandMenu.tsx
+frontend/src/components/settings/MemoryEditor.tsx
+frontend/src/components/editor/InspectorPanel.tsx
+frontend/src/components/skills/FileTree.tsx
 frontend/src/lib/store.tsx
 frontend/src/lib/navigation.ts
+frontend/src/lib/settingsApi.ts
+frontend/src/lib/skillsApi.ts
 ```
 
-建议新增：
+建议新增（可选/延后）：
 
 ```text
 frontend/src/components/workspace/WorkspaceShell.tsx
@@ -111,7 +120,7 @@ context maintenance：短暂状态行，不落库
 
 ### 一阶段开发计划与状态
 
-更新时间：2026-06-20
+更新时间：2026-06-21
 
 | 状态 | 任务 | 文件范围 | 说明 |
 | --- | --- | --- | --- |
@@ -140,6 +149,20 @@ context maintenance：短暂状态行，不落库
 | [x] | Composer 工作台化 | `frontend/src/components/chat/ChatInput.tsx` | 输入框改为底部浮动 composer，保留 `/` Skill 调用、停止生成、context usage。 |
 | [x] | Tool card 状态优化 | `frontend/src/components/chat/ThoughtChain.tsx` | 增加错误态和摘要态展示，保留现有 toolCalls 数据结构。 |
 | [x] | 建立工作台视觉 token | `frontend/src/app/globals.css`, `frontend/src/app/page.tsx` | 统一背景、panel、composer、滚动阴影和布局边界。 |
+| [x] | 新对话懒创建 Session | `frontend/src/components/layout/Sidebar.tsx`, `frontend/src/lib/store.tsx` | 点击「新对话」不立即创建 Session，仅切换到占位 `default` 会话；用户发送首消息时再由 `sendMessage` 调用 `createSession` 懒创建，避免产生空会话。 |
+| [x] | 会话按最近活动时间排序 | `frontend/src/components/layout/Sidebar.tsx` | 侧边栏历史会话按 `updated_at` 降序排列，最新活跃会话置顶。 |
+| [x] | 刷新后自动切换至最近会话 | `frontend/src/lib/store.tsx` | 切换会话时持久化到 `sessionStorage`，刷新后优先恢复上次选中的会话；未命中时自动切换到最近活跃的会话；若处于占位 `default` 会话则保持空对话状态。 |
+| [x] | Context Usage 下移至 Composer | `frontend/src/components/chat/ChatInput.tsx` | 将上下文用量从侧栏移除，紧凑展示在 composer 下方，按百分比阈值显示绿/黄/红状态。 |
+| [x] | 挂载及切换会话时拉取 token count | `frontend/src/components/chat/ChatInput.tsx` | 进入页面或切换 session 时调用 token 接口，实时更新 context usage。 |
+| [x] | 空对话快捷提示词 | `frontend/src/components/chat/ChatPanel.tsx` | 无消息时展示居中欢迎态与若干快捷提示按钮，点击即可发送。 |
+| [x] | Slash 命令选择菜单 | `frontend/src/components/chat/SlashCommandMenu.tsx`, `ChatInput.tsx` | 输入 `/` 时弹出可键盘导航的技能选择菜单，选中后自动替换为 `/skill-name `。 |
+| [x] | 设置页完整分区实现 | `frontend/src/app/settings/page.tsx`, `frontend/src/lib/settingsApi.ts` | 设置页扩展为 LLM、Embedding、RAG、Memory、Data、Advanced 六大分区，支持测试连接与保存。 |
+| [x] | 记忆编辑器 | `frontend/src/components/settings/MemoryEditor.tsx` | 在设置页 Memory 分区提供 MEMORY.md 等记忆文件的 Monaco 编辑与保存能力。 |
+| [x] | 右侧 Inspector 文件预览面板 | `frontend/src/components/editor/InspectorPanel.tsx` | 右侧面板支持 Memory/Skills/MCP 标签切换，选中文件后用 Monaco 预览/编辑。 |
+| [x] | Skill 编辑器与文件树 | `frontend/src/app/skills/page.tsx`, `FileTree.tsx` | 扩展页支持 Monaco 编辑 SKILL.md、文件树导航、ZIP 导入、重命名与删除。 |
+| [x] | 认证失败错误提示 | `frontend/src/components/chat/ChatMessage.tsx` | Assistant 消息检测到 401/API Key 错误时，显示红色认证失败提示并引导检查后端的 `.env` 配置。 |
+| [x] | 助手头像渐变风格化 | `frontend/src/components/chat/ChatMessage.tsx` | Assistant 消息头像由纯深色背景改为品牌蓝紫渐变，与顶部品牌图标视觉统一。 |
+| [x] | 导航栏去除底部分隔线 | `frontend/src/app/globals.css` | 移除 `glass-nav` 底部边框，使顶部与内容区更柔和地衔接。 |
 | [ ] | 二阶段项目目录 API 设计落地 | 后端 API + 前端项目绑定 | 本阶段不做。 |
 | [ ] | 三阶段右侧 coding agent 环境面板 | workspace/git/editor 能力 | 本阶段只保留现有 Inspector，不实现 git/diff/commit。 |
 
