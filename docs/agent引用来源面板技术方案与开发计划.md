@@ -135,6 +135,13 @@ markdown + citation_refs[]
 4. Markdown 链接和裸 URL：作为兼容兜底，进入“已检索”；只有最终答案明确引用后才进入“已引用”。
 5. 纯文本：不生成来源，不允许猜测 URL。
 
+隐式适配必须通过“来源资格门”：
+
+- `read_file`、`write_file`、`execute_skill` 的说明文本不做 JSON/Markdown URL 自动提取，避免把 SKILL.md、源码、Prompt、配置文件里的示例链接误判为检索结果。
+- `terminal`、`python_repl` 只有在输入同时包含 HTTP URL 和 `curl/wget/httpie/requests/urllib/fetch` 等网络调用信号时，才允许隐式提取来源。
+- 名称明确包含 `search/fetch/browse/research/retrieve/tavily/news/knowledge/web` 等语义的工具允许隐式适配，覆盖常见 Web Search 和 MCP 搜索工具。
+- 标准结构化 envelope 不受资格门限制，因为它是工具主动声明的来源协议。
+
 代码位置：
 
 ```text
@@ -670,7 +677,7 @@ frontend/src/components/citations/citationUtils.ts
 验证结果：
 
 - `PYTHONPYCACHEPREFIX=/private/tmp/puddingclaw_pycache python -m compileall -q backend/graph backend/tools backend/api`：通过。
-- `PYTHONPYCACHEPREFIX=/private/tmp/puddingclaw_pycache pytest -q backend/tests/test_citations.py`：`11 passed`，覆盖结构化协议、AI HOT、Tavily、fetch_url、Markdown、SSE、原始结果持久化、历史重新适配与会话恢复。
+- `PYTHONPYCACHEPREFIX=/private/tmp/puddingclaw_pycache pytest -q backend/tests/test_citations.py`：`13 passed`，覆盖结构化协议、AI HOT、Tavily、fetch_url、Markdown、SSE、原始结果持久化、历史重新适配、会话恢复，以及 read_file 读取 SKILL.md/JSON 不得产生来源的回归场景。
 - `npm run build`：通过，Next.js 静态页面与 TypeScript 类型检查成功。
 - `backend/tests/test_context_optimizations.py`：同步测试 `29 passed`；本机缺少 `pytest-asyncio`，原有 7 个 `@pytest.mark.asyncio` 用例无法由当前 host pytest 执行。该环境缺口与本次引用功能无关，未将其记录为通过。
 
@@ -679,3 +686,11 @@ frontend/src/components/citations/citationUtils.ts
 - 检索工具执行中的逐条 LangGraph custom stream。目前 `source_found` 在每次工具完成后、最终回答生成前批量发出。
 - 窄屏底部抽屉、本地文件受控预览和独立来源错误态。
 - Markdown/Word/PDF 导出与 citation entailment 质量评估。
+
+### 2026-06-22：修复 SKILL.md 示例链接误判
+
+- 现象：读取 `skills/aihot/SKILL.md` 后，说明文档中的官网、Base URL、OpenAPI 和示例 API 地址出现在“其他检索结果”。
+- 根因：Markdown/裸 URL 兜底适配对所有 ToolMessage 生效，没有区分“读取说明文件”和“真正执行外部检索”。
+- 修复：为隐式 JSON/Markdown 来源提取增加工具资格判断；`read_file` 等文件操作不再产生隐式来源，terminal 仅在真实网络命令下启用。
+- 历史兼容：前端根据 `tool_call_id + metadata.adapter` 隐藏旧会话中由 `read_file/write_file/execute_skill` 产生的遗留误判，不修改原始 Session 审计记录。
+- 验证：后端引用测试 `13 passed`，前端 `npm run build` 通过。

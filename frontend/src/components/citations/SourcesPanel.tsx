@@ -14,8 +14,15 @@ export default function SourcesPanel() {
   const { cited, retrieved } = useMemo(() => {
     const sourceMap = new Map<string, SourceRecord>();
     const citationIndex = new Map<string, number>();
+    const toolByCallId = new Map<string, string>();
+    for (const message of messages) {
+      for (const toolCall of message.toolCalls || []) {
+        if (toolCall.id) toolByCallId.set(toolCall.id, toolCall.tool);
+      }
+    }
     for (const message of messages) {
       for (const source of message.sources || []) {
+        if (isLegacyFalsePositive(source, toolByCallId)) continue;
         sourceMap.set(source.source_id, { ...sourceMap.get(source.source_id), ...source });
       }
       for (const citation of message.citations || []) {
@@ -84,6 +91,16 @@ export default function SourcesPanel() {
       </div>
     </aside>
   );
+}
+
+function isLegacyFalsePositive(
+  source: SourceRecord,
+  toolByCallId: Map<string, string>
+): boolean {
+  const adapter = String(source.metadata?.adapter || "");
+  if (!adapter || !["markdown_links", "common_json"].includes(adapter)) return false;
+  const tool = toolByCallId.get(source.tool_call_id || "");
+  return tool === "read_file" || tool === "write_file" || tool === "execute_skill";
 }
 
 function SourceGroup({

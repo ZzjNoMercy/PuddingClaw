@@ -44,14 +44,7 @@ class ToolResultAdapter:
         if sources or answer_context != raw_output:
             return AdaptedToolResult(answer_context, sources, "standard")
 
-        # 2. Common JSON search/news schemas (Tavily, AI HOT, generic APIs).
-        payload = self._parse_json(raw_output)
-        if payload is not None:
-            json_sources = self._sources_from_json(payload, tool_call_id)
-            if json_sources:
-                return AdaptedToolResult(raw_output, json_sources, "common_json")
-
-        # 3. fetch_url has one authoritative requested page. Do not mistake all
+        # 2. fetch_url has one authoritative requested page. Do not mistake all
         # links in the returned page body for evidence sources.
         requested_url = self._url_from_tool_input(tool_input)
         if tool_name == "fetch_url" and requested_url:
@@ -66,6 +59,20 @@ class ToolResultAdapter:
             }, tool_call_id)
             return AdaptedToolResult(raw_output, [source], "fetch_url")
 
+        # Implicit JSON/Markdown extraction is only valid for tools that
+        # actually retrieve external material. Reading SKILL.md, source code,
+        # prompts, or config files must never turn documented example URLs into
+        # retrieval sources.
+        if not self.supports_implicit_sources(tool_name, tool_input):
+            return AdaptedToolResult(raw_output, [], "plain_text")
+
+        # 3. Common JSON search/news schemas (Tavily, AI HOT, generic APIs).
+        payload = self._parse_json(raw_output)
+        if payload is not None:
+            json_sources = self._sources_from_json(payload, tool_call_id)
+            if json_sources:
+                return AdaptedToolResult(raw_output, json_sources, "common_json")
+
         # 4. Markdown/bare-link fallback. These are real URLs returned by the
         # tool, but remain retrieval-only until the model explicitly cites them.
         markdown_sources = self._sources_from_markdown(raw_output, tool_call_id)
@@ -73,6 +80,24 @@ class ToolResultAdapter:
             return AdaptedToolResult(raw_output, markdown_sources, "markdown_links")
 
         return AdaptedToolResult(raw_output, [], "plain_text")
+
+    @staticmethod
+    def supports_implicit_sources(tool_name: str, tool_input: str = "") -> bool:
+        """Whether unstructured output from this tool may represent retrieved sources."""
+        name = (tool_name or "").lower().replace("-", "_")
+        if name in {"read_file", "write_file", "create_skill_version", "execute_skill"}:
+            return False
+        if name in {"terminal", "python_repl"}:
+            command = (tool_input or "").lower()
+            return bool(
+                re.search(r"https?://", command)
+                and re.search(r"\b(curl|wget|httpie|requests\.|urllib|fetch)\b", command)
+            )
+        source_tokens = (
+            "search", "fetch", "browse", "browser", "research", "retrieve",
+            "lookup", "tavily", "news", "knowledge", "url", "web",
+        )
+        return any(token in name for token in source_tokens)
 
     @staticmethod
     def _parse_json(raw_output: str) -> Any | None:

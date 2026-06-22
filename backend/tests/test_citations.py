@@ -235,7 +235,10 @@ def test_tool_result_adapter_handles_aihot_items_json():
     }, ensure_ascii=False)
 
     adapted = tool_result_adapter.adapt(
-        output, tool_name="terminal", tool_call_id="aihot-call"
+        output,
+        tool_name="terminal",
+        tool_input="curl https://aihot.virxact.com/api/public/items?mode=selected",
+        tool_call_id="aihot-call",
     )
 
     assert adapted.adapter == "common_json"
@@ -258,7 +261,7 @@ def test_tool_result_adapter_handles_tavily_schema():
         }],
     })
 
-    adapted = tool_result_adapter.adapt(output, tool_name="execute_skill")
+    adapted = tool_result_adapter.adapt(output, tool_name="tavily_search")
 
     assert adapted.adapter == "common_json"
     assert len(adapted.sources) == 1
@@ -275,7 +278,11 @@ def test_tool_result_adapter_handles_markdown_links_and_dedupes_urls():
         "3. **第二条新闻**\n   https://example.org/other\n"
     )
 
-    adapted = tool_result_adapter.adapt(output, tool_name="terminal")
+    adapted = tool_result_adapter.adapt(
+        output,
+        tool_name="terminal",
+        tool_input="curl https://example.com/search",
+    )
 
     assert adapted.adapter == "markdown_links"
     assert [source["uri"] for source in adapted.sources] == [
@@ -299,3 +306,43 @@ def test_fetch_url_uses_requested_page_as_single_source():
     assert len(adapted.sources) == 1
     assert adapted.sources[0]["uri"] == "https://example.com/article"
     assert adapted.sources[0]["title"] == "Example Article"
+
+
+def test_read_file_skill_markdown_does_not_create_sources():
+    from graph.tool_result_adapter import tool_result_adapter
+
+    skill_md = """# AI HOT Skill
+
+线上：https://aihot.virxact.com
+
+- Base URL: https://aihot.virxact.com
+- 完整 OpenAPI: https://aihot.virxact.com/openapi.yaml
+```bash
+curl https://aihot.virxact.com/api/public/items
+```
+"""
+    adapted = tool_result_adapter.adapt(
+        skill_md,
+        tool_name="read_file",
+        tool_input="{'file_path': 'skills/aihot/SKILL.md'}",
+    )
+
+    assert adapted.adapter == "plain_text"
+    assert adapted.sources == []
+
+
+def test_read_file_json_document_does_not_create_sources():
+    import json
+    from graph.tool_result_adapter import tool_result_adapter
+
+    output = json.dumps({
+        "items": [{"title": "文档里的示例", "url": "https://example.com/demo"}]
+    })
+    adapted = tool_result_adapter.adapt(
+        output,
+        tool_name="read_file",
+        tool_input="{'file_path': 'example.json'}",
+    )
+
+    assert adapted.adapter == "plain_text"
+    assert adapted.sources == []
