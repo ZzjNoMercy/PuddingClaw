@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import logging
 import os
 import re
 import time
@@ -22,7 +21,6 @@ from config import get_cache_config, get_llm_config, get_memory_backend, get_mid
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 router = APIRouter()
-logger = logging.getLogger(__name__)
 
 MISSING_TOOL_OUTPUT_PLACEHOLDER = (
     "[工具执行失败/无返回] 工具调用已开始，但没有收到完成事件；"
@@ -533,15 +531,6 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
     conversation_saved = False
     stream_error: Exception | None = None
     waiting_for_first_action = True
-    sse_started_at = time.monotonic()
-    sse_token_events = 0
-    sse_token_chars = 0
-
-    logger.info(
-        "[SSE_TRACE] stream_start session=%s message_chars=%d",
-        session_id,
-        len(message),
-    )
 
     try:
         yield {
@@ -699,28 +688,12 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
 
             elif event_type == "token":
                 current_segment["content"] += event["content"]
-                sse_token_events += 1
-                sse_token_chars += len(event["content"])
-                if sse_token_events == 1 or sse_token_events % 25 == 0:
-                    logger.info(
-                        "[SSE_TRACE] backend_yield session=%s elapsed_ms=%d token_events=%d token_chars=%d last_chars=%d",
-                        session_id,
-                        int((time.monotonic() - sse_started_at) * 1000),
-                        sse_token_events,
-                        sse_token_chars,
-                        len(event["content"]),
-                    )
                 yield {
                     "event": "token",
                     "data": json.dumps({"content": event["content"]}, ensure_ascii=False),
                 }
 
             elif event_type == "new_response":
-                logger.info(
-                    "[SSE_TRACE] backend_structural session=%s elapsed_ms=%d event=new_response",
-                    session_id,
-                    int((time.monotonic() - sse_started_at) * 1000),
-                )
                 if _segment_has_payload(current_segment):
                     current_segment["sources"] = dedupe_sources(turn_sources)
                     current_segment["citations"] = finalize_citations(
@@ -734,12 +707,6 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
                 }
 
             elif event_type == "tool_start":
-                logger.info(
-                    "[SSE_TRACE] backend_structural session=%s elapsed_ms=%d event=tool_start tool=%s",
-                    session_id,
-                    int((time.monotonic() - sse_started_at) * 1000),
-                    event.get("tool", ""),
-                )
                 current_segment["tool_calls"].append({
                     "tool": event["tool"],
                     "input": event.get("input", ""),
@@ -754,12 +721,6 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
                 }
 
             elif event_type == "tool_end":
-                logger.info(
-                    "[SSE_TRACE] backend_structural session=%s elapsed_ms=%d event=tool_end tool=%s",
-                    session_id,
-                    int((time.monotonic() - sse_started_at) * 1000),
-                    event.get("tool", ""),
-                )
                 tc_id = event.get("id", "")
                 event_sources = dedupe_sources(list(event.get("sources", []) or []))
                 if event_sources:
@@ -827,13 +788,6 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
                 }
 
             elif event_type == "done":
-                logger.info(
-                    "[SSE_TRACE] backend_done session=%s elapsed_ms=%d token_events=%d token_chars=%d",
-                    session_id,
-                    int((time.monotonic() - sse_started_at) * 1000),
-                    sse_token_events,
-                    sse_token_chars,
-                )
                 for missing_event in _missing_tool_end_events(current_segment):
                     yield {
                         "event": "tool_end",

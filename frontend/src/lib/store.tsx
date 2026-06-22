@@ -10,7 +10,6 @@ import React, {
 } from "react";
 import {
   streamChat,
-  sseTrace,
   listSessions as apiListSessions,
   createSession as apiCreateSession,
   renameSession as apiRenameSession,
@@ -612,9 +611,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       // auto-batching an entire burst and client-side backpressure/replay.
       let pendingTokenContent = "";
       let tokenFlushTimer: number | null = null;
-      let receivedTokenEvents = 0;
-      let receivedTokenChars = 0;
-      let renderedTokenChars = 0;
       const flushPendingTokens = () => {
         if (tokenFlushTimer !== null) {
           window.clearTimeout(tokenFlushTimer);
@@ -623,15 +619,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         if (!pendingTokenContent) return;
         const content = pendingTokenContent;
         pendingTokenContent = "";
-        renderedTokenChars += content.length;
         const targetId = getAssistantId();
-        sseTrace("store_flush", {
-          session_id: sendSessionId,
-          assistant_id: targetId,
-          flush_chars: content.length,
-          rendered_chars_total: renderedTokenChars,
-          received_events_total: receivedTokenEvents,
-        });
         updateMsgs((prev) => {
           const updated = [...prev];
           const idx = updated.findIndex((m) => m.id === targetId);
@@ -645,17 +633,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       };
       const queueToken = (content: string) => {
         if (!content) return;
-        receivedTokenEvents += 1;
-        receivedTokenChars += content.length;
         pendingTokenContent += content;
-        if (receivedTokenEvents === 1 || receivedTokenEvents % 25 === 0) {
-          sseTrace("store_token_received", {
-            session_id: sendSessionId,
-            token_events_total: receivedTokenEvents,
-            received_chars_total: receivedTokenChars,
-            pending_chars: pendingTokenContent.length,
-          });
-        }
         if (tokenFlushTimer === null) {
           tokenFlushTimer = window.setTimeout(flushPendingTokens, 32);
         }
@@ -673,12 +651,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           // Preserve protocol ordering: all text preceding a structural event
           // must be visible on the current assistant message first.
           flushPendingTokens();
-          sseTrace("store_structural_event", {
-            session_id: sendSessionId,
-            event: event.event,
-            received_events_total: receivedTokenEvents,
-            rendered_chars_total: renderedTokenChars,
-          });
 
           // Handle context_usage event
           if (event.event === "context_usage") {
@@ -928,12 +900,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         }
       } finally {
         flushPendingTokens();
-        sseTrace("store_done", {
-          session_id: sendSessionId,
-          received_events_total: receivedTokenEvents,
-          received_chars_total: receivedTokenChars,
-          rendered_chars_total: renderedTokenChars,
-        });
         abortControllersRef.current.delete(sendSessionId);
         assistantIdsRef.current.delete(sendSessionId);
         if (sessionIdRef.current === sendSessionId) {
