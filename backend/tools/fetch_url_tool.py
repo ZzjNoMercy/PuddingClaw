@@ -39,6 +39,14 @@ class FetchURLTool(BaseTool):
                     text = text[:5000] + "\n...[truncated]"
                 return text
 
+            # requests falls back to ISO-8859-1 for some HTML responses even
+            # when the body is UTF-8/GBK. Prefer detected encoding in that case
+            # so error pages and Chinese snippets do not become mojibake.
+            if not resp.encoding or resp.encoding.lower() in {
+                "iso-8859-1", "latin-1", "ascii"
+            }:
+                resp.encoding = resp.apparent_encoding or "utf-8"
+
             # Convert HTML to Markdown
             converter = html2text.HTML2Text()
             converter.ignore_links = False

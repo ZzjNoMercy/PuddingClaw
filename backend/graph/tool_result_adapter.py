@@ -44,12 +44,23 @@ class ToolResultAdapter:
         if sources or answer_context != raw_output:
             return AdaptedToolResult(answer_context, sources, "standard")
 
-        # 2. fetch_url has one authoritative requested page. Do not mistake all
-        # links in the returned page body for evidence sources.
+        # 2. A normal fetch_url page is one authoritative source. Search result
+        # pages are different: the page is only a container and its outbound
+        # result links are the actual evidence sources.
         requested_url = self._url_from_tool_input(tool_input)
         if tool_name == "fetch_url" and requested_url:
+            if self._looks_like_fetch_failure(raw_output):
+                return AdaptedToolResult(raw_output, [], "fetch_url_rejected")
+            if self._is_search_results_url(requested_url):
+                search_sources = self._sources_from_search_page(
+                    raw_output, requested_url, tool_call_id
+                )
+                return AdaptedToolResult(
+                    raw_output, search_sources, "fetch_url_search_results"
+                )
+            title = self._title_from_markdown(raw_output)
             source = normalize_source({
-                "title": self._title_from_markdown(raw_output) or self._host_title(requested_url),
+                "title": title or self._host_title(requested_url),
                 "uri": requested_url,
                 "document_id": requested_url,
                 "chunk_id": "fetched-page",
@@ -209,6 +220,43 @@ class ToolResultAdapter:
                 break
         return self._dedupe(sources)
 
+    def _sources_from_search_page(
+        self, text: str, requested_url: str, tool_call_id: str
+    ) -> list[dict[str, Any]]:
+        """Extract actual outbound results instead of citing the search shell."""
+        search_host = (urlparse(requested_url).hostname or "").lower()
+        sources: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        for raw_title, raw_url in _MARKDOWN_LINK_RE.findall(text or ""):
+            title = self._plain_text(raw_title)
+            url = raw_url.rstrip(".,;，。；")
+            host = (urlparse(url).hostname or "").lower()
+            if (
+                not title
+                or len(title) < 4
+                or not host
+                or host == search_host
+                or host.endswith(f".{search_host}")
+                or url in seen_urls
+            ):
+                continue
+            seen_urls.add(url)
+            sources.append(normalize_source({
+                "title": title,
+                "uri": url,
+                "document_id": url,
+                "chunk_id": "search-result",
+                "source_type": "web",
+                "quote": self._context_around(text, url),
+                "metadata": {
+                    "adapter": "fetch_url_search_result",
+                    "search_page": requested_url,
+                },
+            }, tool_call_id))
+            if len(sources) >= _MAX_SOURCES:
+                break
+        return self._dedupe(sources)
+
     @staticmethod
     def _first(value: dict[str, Any], *keys: str) -> Any:
         for key in keys:
@@ -239,7 +287,42 @@ class ToolResultAdapter:
 
     def _title_from_markdown(self, text: str) -> str:
         match = re.search(r"^#{1,3}\s+(.+)$", text or "", re.MULTILINE)
-        return self._plain_text(match.group(1)) if match else ""
+        title = self._plain_text(match.group(1)) if match else ""
+        if not title or title.startswith(("[](", "[ ](")):
+            return ""
+        return title
+
+    @staticmethod
+    def _is_search_results_url(url: str) -> bool:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        path = parsed.path.lower()
+        if host.endswith("google.com") and path == "/search":
+            return True
+        if host.endswith("bing.com") and path in {"/search", "/news/search"}:
+            return True
+        if host.endswith("baidu.com") and path in {"/s", "/ns"}:
+            return True
+        return False
+
+    @staticmethod
+    def _looks_like_fetch_failure(text: str) -> bool:
+        normalized = re.sub(r"\s+", " ", text or "").strip().lower()
+        failure_markers = (
+            "request timed out",
+            "fetch error:",
+            "please click here if you are not redirected",
+            "if you're having trouble accessing google search",
+            "网络不给力",
+            "请稍后重试",
+            "enablejs",
+        )
+        if any(marker in normalized for marker in failure_markers):
+            return True
+        # Typical UTF-8 decoded as Latin-1/Windows-1252. Such a page is not
+        # trustworthy evidence even before the fetch tool's encoding repair.
+        mojibake_markers = ("ç½", "è¯", "å", "é¡", "ï¼")
+        return sum(marker in normalized for marker in mojibake_markers) >= 2
 
     def _nearest_markdown_title(self, text: str, position: int) -> str:
         before = (text or "")[:position]

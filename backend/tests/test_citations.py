@@ -308,6 +308,62 @@ def test_fetch_url_uses_requested_page_as_single_source():
     assert adapted.sources[0]["title"] == "Example Article"
 
 
+def test_fetch_url_search_page_extracts_outbound_results():
+    from graph.tool_result_adapter import tool_result_adapter
+
+    output = """# [](/?FORM=Z9FD1)
+
+[](https://news.example.com/article-1)
+## [比亚迪发布新车型](https://news.example.com/article-1)
+第一条新闻摘要。
+
+## [比亚迪销量继续增长](https://finance.example.org/article-2)
+第二条新闻摘要。
+
+[News](/news/search?q=nav)
+"""
+    adapted = tool_result_adapter.adapt(
+        output,
+        tool_name="fetch_url",
+        tool_input="{'url': 'https://www.bing.com/news/search?q=BYD'}",
+        tool_call_id="fetch-search",
+    )
+
+    assert adapted.adapter == "fetch_url_search_results"
+    assert [source["title"] for source in adapted.sources] == [
+        "比亚迪发布新车型",
+        "比亚迪销量继续增长",
+    ]
+    assert [source["uri"] for source in adapted.sources] == [
+        "https://news.example.com/article-1",
+        "https://finance.example.org/article-2",
+    ]
+    assert all(
+        source["metadata"]["adapter"] == "fetch_url_search_result"
+        for source in adapted.sources
+    )
+
+
+def test_fetch_url_rejects_blocked_and_mojibake_pages():
+    from graph.tool_result_adapter import tool_result_adapter
+
+    google = tool_result_adapter.adapt(
+        "Please click here if you are not redirected within a few seconds. enablejs",
+        tool_name="fetch_url",
+        tool_input="{'url': 'https://www.google.com/search?q=BYD'}",
+    )
+    baidu = tool_result_adapter.adapt(
+        "ç½ç»ä¸ç»åï¼è¯·ç¨åéè¯",
+        tool_name="fetch_url",
+        tool_input="{'url': 'https://news.baidu.com/ns?word=BYD'}",
+    )
+
+    assert google.adapter == "fetch_url_rejected"
+    assert google.sources == []
+    assert baidu.adapter == "fetch_url_rejected"
+    assert baidu.sources == []
+
+
 def test_read_file_skill_markdown_does_not_create_sources():
     from graph.tool_result_adapter import tool_result_adapter
 

@@ -100,9 +100,25 @@ function isLegacyFalsePositive(
   toolByCallId: Map<string, string>
 ): boolean {
   const adapter = String(source.metadata?.adapter || "");
+  if (adapter === "fetch_url" && looksLikeRejectedFetch(source.quote || "")) {
+    return true;
+  }
   if (!adapter || !["markdown_links", "common_json"].includes(adapter)) return false;
   const tool = toolByCallId.get(source.tool_call_id || "");
   return tool === "read_file" || tool === "write_file" || tool === "execute_skill";
+}
+
+function looksLikeRejectedFetch(quote: string): boolean {
+  const text = quote.toLowerCase();
+  const markers = [
+    "please click here if you are not redirected",
+    "trouble accessing google search",
+    "enablejs",
+    "网络不给力",
+    "请稍后重试",
+  ];
+  if (markers.some((marker) => text.includes(marker))) return true;
+  return ["ç½", "è¯", "å", "é¡", "ï¼"].filter((marker) => text.includes(marker)).length >= 2;
 }
 
 function SourceGroup({
@@ -129,6 +145,8 @@ function SourceGroup({
 
 function SourceCard({ source, citationIndex }: { source: SourceRecord; citationIndex?: number }) {
   const isExternal = /^https?:\/\//i.test(source.uri || "");
+  const displayTitle = sourceDisplayTitle(source);
+  const displayQuote = looksLikeRejectedFetch(source.quote || "") ? "" : source.quote;
   const locateCitation = () => {
     const marker = document.querySelector<HTMLElement>(`a[href="#source-${source.source_id}"]`);
     marker?.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -146,8 +164,8 @@ function SourceCard({ source, citationIndex }: { source: SourceRecord; citationI
           {citationIndex || <FileText className="h-3 w-3" />}
         </div>
         <div className="min-w-0 flex-1">
-          <p className="truncate text-[12px] font-medium text-slate-700" title={source.title}>
-            {source.title}
+          <p className="truncate text-[12px] font-medium text-slate-700" title={displayTitle}>
+            {displayTitle}
           </p>
           <p className="mt-0.5 text-[10px] text-slate-400">
             {source.page ? `第 ${source.page} 页 · ` : ""}
@@ -157,9 +175,9 @@ function SourceCard({ source, citationIndex }: { source: SourceRecord; citationI
         </div>
       </button>
 
-      {source.quote && (
+      {displayQuote && (
         <blockquote className="mt-2 line-clamp-4 border-l-2 border-slate-200 pl-2 text-[10px] leading-relaxed text-slate-500">
-          {source.quote}
+          {displayQuote}
         </blockquote>
       )}
 
@@ -176,6 +194,16 @@ function SourceCard({ source, citationIndex }: { source: SourceRecord; citationI
       )}
     </article>
   );
+}
+
+function sourceDisplayTitle(source: SourceRecord): string {
+  const title = (source.title || "").trim();
+  if (title && !title.startsWith("[](") && !title.startsWith("[ ](")) return title;
+  try {
+    return source.uri ? new URL(source.uri).hostname : "未命名来源";
+  } catch {
+    return title || "未命名来源";
+  }
 }
 
 function sourceTypeLabel(type: string): string {

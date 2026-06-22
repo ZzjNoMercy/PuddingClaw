@@ -726,3 +726,20 @@ frontend/src/components/citations/citationUtils.ts
 - `quick_validate.py backend/skills/aihot`：`Skill is valid!`。
 - 容器内真实请求“今天 AI 圈有什么”：标准 envelope 返回 `source_count=1`，首条 `uri` 为真实原文链接。
 - 重建 `puddingclaw-backend` 后通过 `execute_skill` 完整链路复测；容器健康状态为 `healthy`。
+
+### 2026-06-22：fetch_url 来源资格与可见流式修复
+
+- 最新 Session `session-ee1d4e9fae16.json` 取证：Google JS 跳转提示页、百度乱码错误页被当成来源；Bing 新闻搜索页被适配成单一 `fetched-page`，真正的站外新闻链接没有进入 `sources[]`，导致模型用一个搜索壳 source_id 支撑所有新闻。
+- `fetch_url` 现在区分两类页面：普通文章页仍以请求 URL 作为单一权威来源；Google/Bing/百度搜索结果页只提取带有效标题的站外绝对链接，每条结果生成独立 `source_id`。
+- 增加来源资格门：JS/重定向拦截文案、超时/Fetch error、中文错误页和明显 mojibake 输出不再生成来源。
+- `FetchURLTool` 在 HTML 响应缺失可靠 charset 时使用检测编码，降低中文页面被 ISO-8859-1 错解的概率。
+- 前端兼容旧 Session：隐藏由旧 `fetch_url` 适配器持久化的明显拦截/乱码来源；无效 Markdown 导航标题回退为 URL hostname。历史原始审计数据不被修改。
+- SSE 时间戳实测表明 `/api/chat` 经 Next 代理仍持续收到小块 token，后端与代理没有整段缓冲；原前端仅每约 48 字暂停 12ms，React 可能在一次绘制前消费完大量状态。
+- 前端 token 消费改为每个可见片段后等待一次 `requestAnimationFrame`，确保状态更新至少跨过一个浏览器绘制边界；大 token payload 仍按 12 字拆分。
+
+验证结果：
+
+- 前端代理 SSE trace 在 `22:03:32.324` 至 `22:03:38.749` 持续收到数据块，证明上游真实流式正常。
+- `pytest -q backend/tests/test_citations.py backend/tests/test_aihot_skill.py`：`21 passed`。
+- `npm --prefix frontend run build`：通过 TypeScript、Lint 与生产构建。
+- 重建前后端 Docker 后真实抓取 Bing 新闻页：`adapter=fetch_url_search_results`、`source_count=8`；backend 为 `healthy`，frontend 正常运行。

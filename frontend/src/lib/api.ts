@@ -41,7 +41,6 @@ export async function* streamChat(
 
   const decoder = new TextDecoder();
   let buffer = "";
-  let tokenBatchSize = 0;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -67,11 +66,10 @@ export async function* streamChat(
         const chunks = splitVisibleToken(parsed.data.content);
         for (const content of chunks) {
           yield { event: "token", data: { ...parsed.data, content } };
-          tokenBatchSize += 1;
-          if (tokenBatchSize >= 4) {
-            tokenBatchSize = 0;
-            await yieldToBrowser();
-          }
+          // The consumer updates React state after each yield. Waiting for the
+          // next animation frame before yielding another token guarantees the
+          // browser can paint that state instead of batching a whole answer.
+          await yieldToBrowser();
         }
         continue;
       }
@@ -112,7 +110,13 @@ function splitVisibleToken(content: string): string[] {
 }
 
 function yieldToBrowser(): Promise<void> {
-  return new Promise((resolve) => window.setTimeout(resolve, 12));
+  return new Promise((resolve) => {
+    if (typeof window.requestAnimationFrame === "function") {
+      window.requestAnimationFrame(() => resolve());
+    } else {
+      window.setTimeout(resolve, 16);
+    }
+  });
 }
 
 /**
