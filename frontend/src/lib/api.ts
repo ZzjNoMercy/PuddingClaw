@@ -41,37 +41,78 @@ export async function* streamChat(
 
   const decoder = new TextDecoder();
   let buffer = "";
+  let tokenBatchSize = 0;
 
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
 
     buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
+    // SSE uses an empty line as the event boundary. Parsing complete frames
+    // keeps event/data association correct even when a network chunk splits
+    // between the two lines.
+    buffer = buffer.replace(/\r\n/g, "\n");
+    const frames = buffer.split("\n\n");
+    buffer = frames.pop() || "";
 
-    let currentEvent = "message";
+    for (const frame of frames) {
+      const parsed = parseSSEFrame(frame);
+      if (!parsed) continue;
 
-    for (const line of lines) {
-      if (line.startsWith("event:")) {
-        currentEvent = line.slice(6).trim();
-      } else if (line.startsWith("data:")) {
-        const dataStr = line.slice(5).trim();
-        if (dataStr) {
-          try {
-            const data = JSON.parse(dataStr);
-            yield { event: currentEvent, data };
-          } catch {
-            // Skip malformed JSON
+      if (parsed.event === "token" && typeof parsed.data.content === "string") {
+        // Providers or proxies may coalesce many model chunks into one fetch
+        // read. Split unusually large token payloads and yield to the browser
+        // after a small batch so React cannot collapse the whole answer into a
+        // single paint.
+        const chunks = splitVisibleToken(parsed.data.content);
+        for (const content of chunks) {
+          yield { event: "token", data: { ...parsed.data, content } };
+          tokenBatchSize += 1;
+          if (tokenBatchSize >= 4) {
+            tokenBatchSize = 0;
+            await yieldToBrowser();
           }
         }
+        continue;
       }
-      // Empty line resets event type
-      if (line === "") {
-        currentEvent = "message";
-      }
+
+      yield parsed;
     }
   }
+}
+
+function parseSSEFrame(frame: string): SSEEvent | null {
+  let event = "message";
+  const dataLines: string[] = [];
+  for (const line of frame.split("\n")) {
+    if (!line || line.startsWith(":")) continue;
+    if (line.startsWith("event:")) {
+      event = line.slice(6).trim() || "message";
+    } else if (line.startsWith("data:")) {
+      dataLines.push(line.slice(5).trimStart());
+    }
+  }
+  if (dataLines.length === 0) return null;
+  try {
+    const data = JSON.parse(dataLines.join("\n"));
+    return { event, data };
+  } catch {
+    return null;
+  }
+}
+
+function splitVisibleToken(content: string): string[] {
+  const chars = Array.from(content);
+  if (chars.length <= 24) return [content];
+  const chunks: string[] = [];
+  for (let index = 0; index < chars.length; index += 12) {
+    chunks.push(chars.slice(index, index + 12).join(""));
+  }
+  return chunks;
+}
+
+function yieldToBrowser(): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, 12));
 }
 
 /**

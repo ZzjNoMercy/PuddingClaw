@@ -385,6 +385,7 @@ tool_start
 
 ### 8.2 交互规则
 
+- 右侧面板只展示当前轮次：从会话中最后一条 user message 开始，聚合其后的全部 assistant/tool 分段；上一轮来源不进入当前面板。
 - Agent 开始检索时自动打开面板，可在设置中关闭自动打开。
 - `source_found` 到达后立即新增卡片，并显示“已检索”状态。
 - `citations_finalized` 到达后，将真实采用的来源移动到“已引用”。
@@ -694,3 +695,16 @@ frontend/src/components/citations/citationUtils.ts
 - 修复：为隐式 JSON/Markdown 来源提取增加工具资格判断；`read_file` 等文件操作不再产生隐式来源，terminal 仅在真实网络命令下启用。
 - 历史兼容：前端根据 `tool_call_id + metadata.adapter` 隐藏旧会话中由 `read_file/write_file/execute_skill` 产生的遗留误判，不修改原始 Session 审计记录。
 - 验证：后端引用测试 `13 passed`，前端 `npm run build` 通过。
+
+### 2026-06-22：来源面板限定当前轮次
+
+- 原行为：面板聚合整个 Session 的 `sources/citations`，历史轮次来源会持续累积。
+- 新行为：以前端最后一条 user message 为当前轮起点，只聚合其后的 assistant/tool 分段。
+- 多段工具调用、`new_response` 和最终回答仍属于同一轮，不会因 assistant 分段而丢失来源。
+
+### 2026-06-22：恢复用户可见的流式渲染
+
+- 诊断：backend SSE 逐 token 正常，Next `/api` 代理也实时透传事件和 ping；AI HOT 的 terminal/curl 阶段因 `subprocess.run(capture_output=True)` 仍会等待工具完成。
+- 前端问题：旧 SSE parser 按单次 `reader.read()` 临时维护 event 名称，网络块恰好切在 `event:` 与 `data:` 之间时可能丢失事件类型；同一网络块内的大量 token 更新也可能被 React 合并成一次绘制。
+- 修复：改为按 SSE 空行边界解析完整 frame，跨网络块保留未完成 frame；对同批 token 每 4 个小批次让出浏览器渲染时间，大 token payload 再切成可见小段。
+- 边界：这保证最终回答渐进显示；terminal 工具 stdout 和引用来源真正逐条流式仍需要工具执行层 custom stream。

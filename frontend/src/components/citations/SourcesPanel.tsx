@@ -12,15 +12,17 @@ import { useApp, type SourceRecord } from "@/lib/store";
 export default function SourcesPanel() {
   const { messages, isStreaming } = useApp();
   const { cited, retrieved } = useMemo(() => {
+    const lastUserIndex = messages.findLastIndex((message) => message.role === "user");
+    const turnMessages = lastUserIndex >= 0 ? messages.slice(lastUserIndex) : [];
     const sourceMap = new Map<string, SourceRecord>();
     const citationIndex = new Map<string, number>();
     const toolByCallId = new Map<string, string>();
-    for (const message of messages) {
+    for (const message of turnMessages) {
       for (const toolCall of message.toolCalls || []) {
         if (toolCall.id) toolByCallId.set(toolCall.id, toolCall.tool);
       }
     }
-    for (const message of messages) {
+    for (const message of turnMessages) {
       for (const source of message.sources || []) {
         if (isLegacyFalsePositive(source, toolByCallId)) continue;
         sourceMap.set(source.source_id, { ...sourceMap.get(source.source_id), ...source });
