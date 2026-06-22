@@ -8,8 +8,8 @@
 #
 # 访问：
 #   前端：http://localhost:3000
-#   后端 API：http://localhost:9100
-#   API 文档：http://localhost:9100/docs
+#   后端 API：http://localhost:6666
+#   API 文档：http://localhost:6666/docs
 
 services:
   backend:
@@ -18,7 +18,7 @@ services:
       dockerfile: Dockerfile
     container_name: puddingclaw-backend
     ports:
-      - "9100:9100"
+      - "6666:9100"
     env_file:
       - ./backend/.env
     environment:
