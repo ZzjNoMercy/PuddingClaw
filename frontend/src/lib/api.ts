@@ -10,6 +10,26 @@ export interface SSEEvent {
   data: Record<string, unknown>;
 }
 
+export function isSseTraceEnabled(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    return new URLSearchParams(window.location.search).get("debug_sse") === "1"
+      || window.localStorage.getItem("puddingclaw_debug_sse") === "1";
+  } catch {
+    return false;
+  }
+}
+
+export function sseTrace(stage: string, details: Record<string, unknown> = {}): void {
+  if (!isSseTraceEnabled()) return;
+  console.info("[SSE_TRACE]", {
+    stage,
+    iso: new Date().toISOString(),
+    perf_ms: Math.round(performance.now() * 10) / 10,
+    ...details,
+  });
+}
+
 /**
  * Stream chat messages via POST SSE.
  * Yields parsed SSE events as they arrive.
@@ -20,6 +40,8 @@ export async function* streamChat(
   signal?: AbortSignal,
   userId?: string
 ): AsyncGenerator<SSEEvent> {
+  const requestStartedAt = performance.now();
+  sseTrace("fetch_start", { session_id: sessionId, message_chars: message.length });
   const response = await fetch(`${API_BASE}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -35,16 +57,34 @@ export async function* streamChat(
   if (!response.ok) {
     throw new Error(`Chat API error: ${response.status}`);
   }
+  sseTrace("fetch_headers", {
+    session_id: sessionId,
+    elapsed_ms: Math.round(performance.now() - requestStartedAt),
+    status: response.status,
+    content_type: response.headers.get("content-type"),
+  });
 
   const reader = response.body?.getReader();
   if (!reader) throw new Error("No response body");
 
   const decoder = new TextDecoder();
   let buffer = "";
+  let networkChunkIndex = 0;
+  let parsedTokenEvents = 0;
 
   while (true) {
     const { done, value } = await reader.read();
-    if (done) break;
+    if (done) {
+      sseTrace("reader_done", {
+        session_id: sessionId,
+        elapsed_ms: Math.round(performance.now() - requestStartedAt),
+        network_chunks: networkChunkIndex,
+        token_events: parsedTokenEvents,
+        remaining_buffer_chars: buffer.length,
+      });
+      break;
+    }
+    networkChunkIndex += 1;
 
     buffer += decoder.decode(value, { stream: true });
     // SSE uses an empty line as the event boundary. Parsing complete frames
@@ -54,9 +94,23 @@ export async function* streamChat(
     const frames = buffer.split("\n\n");
     buffer = frames.pop() || "";
 
-    for (const frame of frames) {
-      const parsed = parseSSEFrame(frame);
-      if (!parsed) continue;
+    const parsedFrames = frames
+      .map((frame) => parseSSEFrame(frame))
+      .filter((event): event is SSEEvent => event !== null);
+    const tokenFrames = parsedFrames.filter((event) => event.event === "token").length;
+    parsedTokenEvents += tokenFrames;
+    sseTrace("reader_chunk", {
+      session_id: sessionId,
+      elapsed_ms: Math.round(performance.now() - requestStartedAt),
+      chunk_index: networkChunkIndex,
+      bytes: value.byteLength,
+      frames: parsedFrames.length,
+      token_frames: tokenFrames,
+      token_events_total: parsedTokenEvents,
+      buffered_chars: buffer.length,
+    });
+
+    for (const parsed of parsedFrames) {
 
       if (parsed.event === "token" && typeof parsed.data.content === "string") {
         // Consume upstream chunks immediately. The HTTP trace proves the proxy

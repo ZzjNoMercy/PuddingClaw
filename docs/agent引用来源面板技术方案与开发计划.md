@@ -935,6 +935,14 @@ for (const frame of completeSSEFrames) {
 - 遇到 `new_response`、`tool_start`、`tool_end`、`source_found`、`done` 等结构事件前立即 flush token buffer，确保跨消息和工具事件的顺序不被重排；异常、中止和 finally 路径也强制 flush。
 - 该方案不会给 ReadableStream 施加人工背压，同时将 React/Markdown 渲染频率稳定在约 30 FPS，是其他项目可复用的推荐边界：**网络原速消费，UI 定时批量绘制**。
 
+### 2026-06-23：三层 SSE 时间戳观测
+
+- 在不改变流式行为的前提下增加统一 `[SSE_TRACE]` 日志，使用 `session_id + elapsed_ms/perf_ms` 对齐三层时间线。
+- backend 每 25 个 token 记录一次 `backend_yield`，并记录 `stream_start`、`tool_start/tool_end/new_response` 与 `backend_done`。
+- frontend API 记录 `fetch_start`、响应头到达、每次 `reader.read()` 的字节数、完整 frame 数、token frame 数和残留 buffer 长度。
+- React store 记录每 25 个 token 的接收进度、每次 32ms UI flush 的字符数，以及结构事件和 finally 完成汇总。
+- 浏览器日志默认关闭，访问 `/?debug_sse=1` 或设置 `localStorage.puddingclaw_debug_sse=1` 后启用，避免正常使用时产生大量 console 输出。
+
 验证结果：
 
 - 新 Session `session-d09ffa659097.json` 使用同一句“蔚来最近有什么新闻”复测：`22:49:26` 进入后端并发出第一次模型请求，`22:49:31` 已进入最终回答模型回合。
