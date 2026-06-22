@@ -708,3 +708,21 @@ frontend/src/components/citations/citationUtils.ts
 - 前端问题：旧 SSE parser 按单次 `reader.read()` 临时维护 event 名称，网络块恰好切在 `event:` 与 `data:` 之间时可能丢失事件类型；同一网络块内的大量 token 更新也可能被 React 合并成一次绘制。
 - 修复：改为按 SSE 空行边界解析完整 frame，跨网络块保留未完成 frame；对同批 token 每 4 个小批次让出浏览器渲染时间，大 token payload 再切成可见小段。
 - 边界：这保证最终回答渐进显示；terminal 工具 stdout 和引用来源真正逐条流式仍需要工具执行层 custom stream。
+
+### 2026-06-22：AI HOT Skill 确定性来源输出
+
+- 现象：AI HOT Skill 只有 API/curl 使用说明，Agent 会临时生成 `curl | python` 命令；当格式化代码只打印标题、摘要、来源名称而遗漏 `item.url` 时，回答内容正常但右侧引用来源为 0。
+- 原则：Skill 说明文件不是检索结果；只有 API 调用完成后返回的条目才具备来源资格。来源 URL 必须进入机器可读的 `sources[]`，不能依赖模型最终是否把链接写进 Markdown。
+- 新增 `backend/skills/aihot/scripts/aihot_query.py` 作为唯一生产查询入口：按本轮中文问题确定性选择精选/全部/日报/存档、类别、关键词和时间窗，统一处理 User-Agent、超时与重试。
+- 脚本直接输出 PuddingClaw 标准 `puddingclaw_tool_result: 1` envelope；items 的 `url`、日报的 `sourceUrl` 映射为 `source_type=web` 的独立来源对象。
+- AI HOT 的 `summary` 明确标记为 `metadata.evidence_kind=derived_summary`，用于回答上下文但不冒充原文逐字引文；`uri` 始终指向可追溯原文。
+- `execute_skill` 通过 `SKILL_USER_QUERY` 环境变量把当前用户问题传给脚本，兼容其他不接收 CLI 参数的 Skill。
+- 修复 `execute_skill` 先截断 stdout、后解析协议的问题：现在先解析完整结构化结果，仅限制 `answer_context` 长度，`sources[]` 不受预览截断影响。
+- `SKILL.md` 顶部增加强制执行路径，禁止生产查询继续临时拼 `curl | jq/python`；保留原 API 示例作为调试参考。
+
+验证结果：
+
+- `pytest -q backend/tests/test_aihot_skill.py backend/tests/test_citations.py`：`19 passed`，覆盖语义路由、items/daily URL 保真、本轮问题透传和超长上下文下来源保留。
+- `quick_validate.py backend/skills/aihot`：`Skill is valid!`。
+- 容器内真实请求“今天 AI 圈有什么”：标准 envelope 返回 `source_count=1`，首条 `uri` 为真实原文链接。
+- 重建 `puddingclaw-backend` 后通过 `execute_skill` 完整链路复测；容器健康状态为 `healthy`。

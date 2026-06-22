@@ -1,6 +1,6 @@
 ---
 name: aihot
-description: AI HOT (aihot.virxact.com) 中文 AI 资讯查询 Skill。当用户想知道"今天 AI 圈有什么"、"AI 日报"、"AI HOT"、"AI 资讯"、"AI 热点"、"最近 AI"、"OpenAI/Anthropic/Google 最近发布了什么"、"AI hot today"、"AI news today"、"看一下 AI 行业动态"、"今天有什么大模型发布"、"昨天 AI 圈"、"看下精选条目"、"AI HOT 精选"、"最近一周的 AI 论文"、"AI 模型发布"、"AI 产品发布"、"AI 行业动态"、"AI 技巧与观点" 等任何中文 AI 资讯查询时使用。即使用户只说"AI 圈"、"AI 新闻"、"AI 日报"，或者只是问"今天发生了什么"且上下文是 AI / 大模型 / LLM / 创业领域，也应该触发本 Skill。Skill 会直接 curl 公开 REST API 拉数据并整理成中文 markdown 简报，不需要用户配置任何 API Key 或 MCP server。**不要 undertrigger**——用户问 AI 资讯而你不调本 Skill 就是把过时的训练数据当作今日新闻，对用户有害。
+description: AI HOT (aihot.virxact.com) 中文 AI 资讯查询 Skill。当用户询问 AI 日报、AI 热点、最近 AI 动态、模型/产品发布、论文、行业动态或具体公司的近期 AI 新闻时使用。通过确定性脚本查询公开 API，并返回带原文链接的结构化来源；无需 API Key。不要用训练数据回答今日资讯。
 ---
 
 # AI HOT Skill
@@ -8,6 +8,29 @@ description: AI HOT (aihot.virxact.com) 中文 AI 资讯查询 Skill。当用户
 让 Agent 用最自然的中文查询拿到 aihot.virxact.com 上每天的 AI HOT 日报和全部 AI 动态，不需要打开浏览器。SKILL.md 标准格式，跨 Claude Code / Codex CLI / Cursor / Gemini CLI / OpenCode / 任何兼容平台可用。
 
 线上：https://aihot.virxact.com（公开匿名可访，无需 token）
+
+## 必须采用的执行方式
+
+优先调用 `execute_skill(skill_name="aihot", user_query=<用户原始问题>)`。执行器会把本轮问题放入 `SKILL_USER_QUERY`，并自动运行：
+
+`scripts/aihot_query.py`
+
+脚本负责语义路由、User-Agent、请求重试、字段整理以及标准 `answer_context + sources[]` 输出。每条有效动态的原文 URL 都保存在独立来源对象中，不依赖最终 Markdown 是否打印链接。
+
+如果当前环境没有 `execute_skill`，直接运行：
+
+```bash
+python3 scripts/aihot_query.py --user-query "<用户原始问题>"
+```
+
+**不要自行拼接 `curl | jq/python` 查询。** 临时格式化命令很容易只打印标题和摘要而丢掉 `url/sourceUrl`，导致内容能回答但引用面板为空。只有调试 API 时才参考下方 curl 示例。
+
+收到脚本结果后：
+
+1. 只根据 `answer_context` 总结，不编造脚本未返回的事实。
+2. 使用结果中给出的 `source_id` 标注 `[^source_id]`。
+3. `summary` 是 AI HOT 的派生摘要，不是原文逐字引文；来源 URL 才是追溯锚点。
+4. 不要为了“补链接”重复查询；结构化 `sources[]` 已经是引用来源。
 
 ## 先决条件：必须带 User-Agent（仅 API 端点）
 
@@ -420,3 +443,7 @@ curl -sH "User-Agent: $UA" "https://aihot.virxact.com/api/public/items?mode=sele
 - **不要在用户输出里暴露端点路径 / raw 参数 / 限流 / 缓存 TTL / cursor / hasNext 等基础设施细节** — 这些是给开发者看的，用户看不懂。详见上方"给用户的输出格式 → 副标题／元信息只写人话"
 - **不要在压缩 / 跨日 / 跨版块合并输出时丢掉每条的 sourceUrl** — 即使你为篇幅把 3 个日报合并成 5 类总结，每条 item 也必须保留 url（标题后或单独一行）。用户看到一条没 URL 就追溯不到原文，这条信息等于不可信
 - **不要把"端点路径 / 调用细节"作为输出的引用源** — 引用源就写 `<source>`（OpenAI 官网 / Anthropic Newsroom / X：Berry Xia 这种），不是 `GET /api/public/items?...`
+
+## Resources
+
+- `scripts/aihot_query.py`：唯一生产查询入口；输出 PuddingClaw 结构化工具结果与真实来源 URL。

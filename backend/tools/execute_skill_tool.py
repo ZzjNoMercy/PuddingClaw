@@ -1,5 +1,6 @@
 """ExecuteSkillTool — parse SKILL.md and execute its scripts in order."""
 
+import os
 import re
 import subprocess
 import sys
@@ -113,6 +114,11 @@ class ExecuteSkillTool(BaseTool):
                 result = subprocess.run(
                     [sys.executable, str(abs_script)],
                     cwd=str(skill_dir),
+                    env={
+                        **os.environ,
+                        "SKILL_NAME": skill_name,
+                        "SKILL_USER_QUERY": user_query,
+                    },
                     capture_output=True,
                     text=True,
                     timeout=30,
@@ -124,10 +130,10 @@ class ExecuteSkillTool(BaseTool):
                     output += f"\n[stderr]: {result.stderr}"
                 if not output.strip():
                     output = "(脚本执行完成，无输出)"
-                # 截断超长输出
-                if len(output) > 5000:
-                    output = output[:5000] + "\n...[已截断]"
+                # 结构化结果必须先解析，避免 stdout 截断破坏 sources[]。
                 answer_context, sources = parse_tool_result(output)
+                if len(answer_context) > 12000:
+                    answer_context = answer_context[:12000] + "\n...[上下文已截断，来源仍完整保留]"
                 for source in sources:
                     if source.get("source_type") == "knowledge_base":
                         source["source_type"] = "skill"
