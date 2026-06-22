@@ -943,6 +943,16 @@ for (const frame of completeSSEFrames) {
 - React store 记录每 25 个 token 的接收进度、每次 32ms UI flush 的字符数，以及结构事件和 finally 完成汇总。
 - 浏览器日志默认关闭，访问 `/?debug_sse=1` 或设置 `localStorage.puddingclaw_debug_sse=1` 后启用，避免正常使用时产生大量 console 输出。
 
+### 2026-06-23：确认并修复 Next.js gzip 缓冲根因
+
+- 前端 Trace `session-c5c6be1a6b3e` 显示：请求 20ms 即收到 SSE 响应头，但首个 `reader_chunk` 延迟 17.5 秒；首块已包含工具事件和约 75 个 token，第二块在 30ms 后一次交付约 650 个 token及 `done`。因此批量发生在浏览器 `reader.read()` 之前，React/store 不是根因。
+- 使用 curl 添加浏览器等价的 `Accept-Encoding: gzip, deflate, br` 后稳定复现：响应头包含 `Content-Encoding: gzip`，连接开始只收到 15 字节 gzip 头，约 7.5 秒后才一次收到 1983 字节压缩正文。
+- 不声明压缩的 curl 一直能逐块收到 SSE，这解释了此前命令行验证与真实浏览器表现矛盾的原因。
+- 根因是 Next.js standalone server 对 rewrite 代理的 `text/event-stream` 启用了 gzip；压缩器等待数据块/结束后才 flush，浏览器因此无法及时获得解压后的 token。
+- 在 `frontend/next.config.mjs` 设置 `compress: false`，关闭 Next 应用层压缩。SSE 已具备 `Cache-Control: no-store`、`X-Accel-Buffering: no` 与 chunked transfer，无需额外人工 pacing。
+- 前端 `fetch_headers` Trace 增加 `content_encoding` 和 `transfer_encoding`，用于部署后确认浏览器响应不再被 gzip。
+- 部署后使用同样的 `Accept-Encoding: gzip, deflate, br` 回归：响应不再包含 `Content-Encoding`，仅保留 `text/event-stream + chunked`；token 数据从 `01:06:09.991` 起以约 20–35ms 间隔持续到达，确认 gzip 缓冲已消除。
+
 验证结果：
 
 - 新 Session `session-d09ffa659097.json` 使用同一句“蔚来最近有什么新闻”复测：`22:49:26` 进入后端并发出第一次模型请求，`22:49:31` 已进入最终回答模型回合。

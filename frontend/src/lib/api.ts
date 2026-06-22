@@ -62,6 +62,8 @@ export async function* streamChat(
     elapsed_ms: Math.round(performance.now() - requestStartedAt),
     status: response.status,
     content_type: response.headers.get("content-type"),
+    content_encoding: response.headers.get("content-encoding"),
+    transfer_encoding: response.headers.get("transfer-encoding"),
   });
 
   const reader = response.body?.getReader();
