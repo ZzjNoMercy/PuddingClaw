@@ -295,6 +295,41 @@ def test_tavily_search_tool_returns_structured_sources(monkeypatch):
     assert sources[0]["metadata"]["adapter"] == "tavily_search"
 
 
+def test_tavily_search_retries_transient_connection_error(monkeypatch):
+    import requests
+    from graph.citations import parse_tool_result
+    from tools.tavily_search_tool import TavilySearchTool
+
+    attempts = 0
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"results": [{
+                "title": "比亚迪新闻",
+                "url": "https://example.com/byd",
+                "content": "近期动态",
+            }]}
+
+    def post(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise requests.ConnectionError("temporary disconnect")
+        return Response()
+
+    monkeypatch.setenv("TAVILY_API_KEY", "test-key")
+    monkeypatch.setattr("tools.tavily_search_tool.requests.post", post)
+    monkeypatch.setattr("tools.tavily_search_tool.time.sleep", lambda _seconds: None)
+
+    _, sources = parse_tool_result(TavilySearchTool()._run("比亚迪最近新闻"))
+
+    assert attempts == 2
+    assert sources[0]["uri"] == "https://example.com/byd"
+
+
 def test_news_intent_routes_to_tavily_search():
     from graph.middlewares.skills_router import SkillsRouterMiddleware
 

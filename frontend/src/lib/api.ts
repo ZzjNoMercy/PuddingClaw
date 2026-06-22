@@ -41,7 +41,6 @@ export async function* streamChat(
 
   const decoder = new TextDecoder();
   let buffer = "";
-  let tokensSincePaint = 0;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -60,22 +59,10 @@ export async function* streamChat(
       if (!parsed) continue;
 
       if (parsed.event === "token" && typeof parsed.data.content === "string") {
-        // Providers or proxies may coalesce many model chunks into one fetch
-        // read. Split unusually large token payloads and yield to the browser
-        // after a small batch so React cannot collapse the whole answer into a
-        // single paint.
-        const chunks = splitVisibleToken(parsed.data.content);
-        for (const content of chunks) {
-          yield { event: "token", data: { ...parsed.data, content } };
-          tokensSincePaint += 1;
-          // Paint small batches instead of forcing one frame per provider
-          // token. This remains visibly incremental without letting long agent
-          // runs build a large client-side backlog.
-          if (tokensSincePaint >= 4) {
-            tokensSincePaint = 0;
-            await yieldToBrowser();
-          }
-        }
+        // Consume upstream chunks immediately. The HTTP trace proves the proxy
+        // already delivers data incrementally; adding rAF/timer pacing here can
+        // only create a client-side queue and delayed "replay" on long runs.
+        yield parsed;
         continue;
       }
 
@@ -102,23 +89,6 @@ function parseSSEFrame(frame: string): SSEEvent | null {
   } catch {
     return null;
   }
-}
-
-function splitVisibleToken(content: string): string[] {
-  const chars = Array.from(content);
-  if (chars.length <= 24) return [content];
-  const chunks: string[] = [];
-  for (let index = 0; index < chars.length; index += 12) {
-    chunks.push(chars.slice(index, index + 12).join(""));
-  }
-  return chunks;
-}
-
-function yieldToBrowser(): Promise<void> {
-  // Do not make network consumption depend on requestAnimationFrame. Browsers
-  // may pause or heavily throttle rAF, which leaves SSE frames queued and then
-  // "replays" the whole agent process when painting resumes.
-  return new Promise((resolve) => window.setTimeout(resolve, 24));
 }
 
 /**

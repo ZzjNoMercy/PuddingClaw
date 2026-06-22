@@ -706,7 +706,7 @@ frontend/src/components/citations/citationUtils.ts
 
 - 诊断：backend SSE 逐 token 正常，Next `/api` 代理也实时透传事件和 ping；AI HOT 的 terminal/curl 阶段因 `subprocess.run(capture_output=True)` 仍会等待工具完成。
 - 前端问题：旧 SSE parser 按单次 `reader.read()` 临时维护 event 名称，网络块恰好切在 `event:` 与 `data:` 之间时可能丢失事件类型；同一网络块内的大量 token 更新也可能被 React 合并成一次绘制。
-- 修复：改为按 SSE 空行边界解析完整 frame，跨网络块保留未完成 frame；对同批 token 每 4 个小批次让出浏览器渲染时间，大 token payload 再切成可见小段。
+- 修复：改为按 SSE 空行边界解析完整 frame，跨网络块保留未完成 frame。人工 token 拆分/pacing 后续因长流补播回归被移除，当前按上游 frame 原速消费。
 - 边界：这保证最终回答渐进显示；terminal 工具 stdout 和引用来源真正逐条流式仍需要工具执行层 custom stream。
 
 ### 2026-06-22：AI HOT Skill 确定性来源输出
@@ -735,7 +735,7 @@ frontend/src/components/citations/citationUtils.ts
 - `FetchURLTool` 在 HTML 响应缺失可靠 charset 时使用检测编码，降低中文页面被 ISO-8859-1 错解的概率。
 - 前端兼容旧 Session：隐藏由旧 `fetch_url` 适配器持久化的明显拦截/乱码来源；无效 Markdown 导航标题回退为 URL hostname。历史原始审计数据不被修改。
 - SSE 时间戳实测表明 `/api/chat` 经 Next 代理仍持续收到小块 token，后端与代理没有整段缓冲；原前端仅每约 48 字暂停 12ms，React 可能在一次绘制前消费完大量状态。
-- 前端最初尝试在每个可见片段后等待一次 `requestAnimationFrame`；后续长工具链验证发现该做法会把 SSE 消费速度绑定到浏览器 paint，在 rAF 被抑制时产生积压和集中“补播”。最终方案改为每 4 个小片段通过短定时器让出事件循环；大 token payload 仍按 12 字拆分。
+- 前端曾先后尝试逐片段 `requestAnimationFrame` 和定时器批量 pacing；长工具链验证表明两者都会让客户端消费速度落后于原生 SSE，造成积压和集中“补播”。最终方案不再人工拆分或延迟 token，完整 SSE frame 到达后立即交给状态层。
 
 验证结果：
 
@@ -867,25 +867,20 @@ while (true) {
 
 “收到增量”不等于“用户看到增量”。React 会批处理短时间内的多次 state 更新；代理或浏览器也可能一次交付多个完整 SSE frame。
 
-推荐按小批量让出事件循环，不要让每个网络 token 都强制等待一次绘制：
+当 HTTP trace 已证明代理持续逐块交付时，推荐直接消费上游 chunk，不增加人工节奏：
 
 ```ts
-let tokensSinceYield = 0;
-for (const content of splitVisibleToken(tokenContent)) {
-  yield { event: "token", data: { content } };
-  tokensSinceYield += 1;
-  if (tokensSinceYield >= 4) {
-    tokensSinceYield = 0;
-    await new Promise<void>((resolve) => setTimeout(resolve, 24));
-  }
+for (const frame of completeSSEFrames) {
+  const event = parseSSEFrame(frame);
+  if (event) yield event;
 }
 ```
 
 实践建议：
 
 - 上游 chunk 很大时，按约 8–20 个可见字符拆分；不要逐字符制造过多 React render。
-- 不要让 SSE 读取循环依赖纯 `requestAnimationFrame`：后台标签、窗口遮挡或浏览器调度可能暂停 rAF，造成网络帧积压，恢复绘制后集中“补播”。短定时器虽然不保证每次都 paint，但能稳定释放事件循环且不会永久阻塞消费。
-- 如果回答很长，可实现自适应节奏：网络实时到达时按原速度渲染，检测到同批积压时才做 16–32ms pacing。
+- 不要让 SSE 读取循环依赖 `requestAnimationFrame` 或人为 `setTimeout`：它们都会引入背压。后台标签、窗口遮挡或浏览器调度还可能暂停 rAF，造成网络帧积压，恢复后集中“补播”。
+- 如果回答很长，优先在 React 状态层按时间窗口合并渲染更新，但不要阻塞底层 ReadableStream/SSE 消费；网络读取和 UI 刷新应解耦。
 - 消息 state 更新必须创建新数组和新 message 对象，避免原地修改导致 React 不重渲染。
 - 自动滚动不要对每个 token 使用长时间 `smooth` 动画，否则多个动画会相互覆盖；可在流式期间使用 `auto`，结束后再平滑定位。
 
@@ -915,7 +910,7 @@ for (const content of splitVisibleToken(tokenContent)) {
 
 - 后端 Agent chunk 过滤：[backend/graph/agent.py](../backend/graph/agent.py)
 - SSE 事件生成与 Session 分段：[backend/api/chat.py](../backend/api/chat.py)
-- 前端 frame parser 与可见 pacing：[frontend/src/lib/api.ts](../frontend/src/lib/api.ts)
+- 前端 frame parser 与原速消费：[frontend/src/lib/api.ts](../frontend/src/lib/api.ts)
 - React 消息状态更新：[frontend/src/lib/store.tsx](../frontend/src/lib/store.tsx)
 
 迁移到其他项目时，优先复制“诊断方法与边界原则”，再按目标框架改写实现；不要直接复制固定延迟参数，因为模型速度、代理行为和 UI 渲染成本会随项目变化。
@@ -924,11 +919,13 @@ for (const content of splitVisibleToken(tokenContent)) {
 
 - 最新 Session `diagnostic-stream-20260622.json` 中，“蔚来最近有什么新闻”在 `22:33:23` 进入后端，最后一次模型请求为 `22:34:42`；后端持续运行约 79 秒，并非最后才收到请求。
 - 本轮发生 15 次模型回合和大量串行 `fetch_url` 尝试。由于缺少一等 web search 工具，Agent 先误用 AI HOT，再连续猜测百度、Google News、财联社、IT之家、36Kr、懂车帝和 RSS URL。
-- 前端纯 rAF pacing 在长流中可能阻塞 SSE 消费，表现为长时间只有 typing indicator，随后快速补播完整流程；改为每 4 个小片段使用 24ms 定时器让出事件循环。
+- 前端纯 rAF pacing 在长流中可能阻塞 SSE 消费，表现为长时间只有 typing indicator，随后快速补播完整流程；短定时器批处理仍存在背压，最终移除全部人工 pacing，按 SSE frame 原速消费。
 - typing indicator 增加“Agent 正在处理”文字；后端在首个 token/tool 事件前发送 `agent_start` 状态，避免首模型等待阶段只有无语义圆点。
 - 新增一等 `tavily_search` 工具，直接返回结构化 `answer_context + sources[]`；通用新闻/近期动态路由优先 Tavily，明确文章 URL 才使用 `fetch_url`。
 - 增加单轮最多 12 个工具结果、连续 4 次工具失败的熔断；达到阈值后停止盲目重试，并基于已经成功返回的结果整理回答。
 - `fetch_url` 失败识别增加 JS-only、重定向提示和常见中文错误页，避免这些页面被计作成功结果。
+
+后续“比亚迪呢？”回归再次证明定时器 pacing 仍会产生补播，因此最终移除所有人工 token pacing。该轮 `23:37:52` 进入后端，第一次 Tavily 连接失败后触发多轮 fallback，`23:38:39` 才进入最终回答；Tavily 工具现将一次瞬时失败在内部自动重试，不再立即把控制权交还 Agent 扩展检索链。
 
 验证结果：
 
