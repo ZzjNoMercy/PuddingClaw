@@ -1,5 +1,5 @@
 /** @type {import('next').NextConfig} */
-const backendUrl = process.env.BACKEND_INTERNAL_URL || 'http://localhost:6666';
+const backendUrl = process.env.BACKEND_INTERNAL_URL || 'http://localhost:8888';
 
 const nextConfig = {
   output: 'standalone',
