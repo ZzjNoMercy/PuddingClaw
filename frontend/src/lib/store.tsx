@@ -605,9 +605,52 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       // Helper: get current assistant ID for this session
       const getAssistantId = () => assistantIdsRef.current.get(sendSessionId) || "";
 
+      // Keep network consumption independent from React rendering. SSE frames
+      // are drained immediately into this buffer, while the UI receives one
+      // immutable state update roughly every 32ms. This prevents both React
+      // auto-batching an entire burst and client-side backpressure/replay.
+      let pendingTokenContent = "";
+      let tokenFlushTimer: number | null = null;
+      const flushPendingTokens = () => {
+        if (tokenFlushTimer !== null) {
+          window.clearTimeout(tokenFlushTimer);
+          tokenFlushTimer = null;
+        }
+        if (!pendingTokenContent) return;
+        const content = pendingTokenContent;
+        pendingTokenContent = "";
+        const targetId = getAssistantId();
+        updateMsgs((prev) => {
+          const updated = [...prev];
+          const idx = updated.findIndex((m) => m.id === targetId);
+          if (idx === -1) return prev;
+          updated[idx] = {
+            ...updated[idx],
+            content: updated[idx].content + content,
+          };
+          return updated;
+        });
+      };
+      const queueToken = (content: string) => {
+        if (!content) return;
+        pendingTokenContent += content;
+        if (tokenFlushTimer === null) {
+          tokenFlushTimer = window.setTimeout(flushPendingTokens, 32);
+        }
+      };
+
       try {
         for await (const event of streamChat(processedText, sendSessionId, controller.signal, userId)) {
           if (controller.signal.aborted) break;
+
+          if (event.event === "token") {
+            queueToken((event.data.content as string) || "");
+            continue;
+          }
+
+          // Preserve protocol ordering: all text preceding a structural event
+          // must be visible on the current assistant message first.
+          flushPendingTokens();
 
           // Handle context_usage event
           if (event.event === "context_usage") {
@@ -752,10 +795,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             const msg = { ...updated[idx] };
 
             switch (event.event) {
-              case "token":
-                msg.content += (event.data.content as string) || "";
-                break;
-
               case "tool_start": {
                 const tcId = (event.data.id as string) || "";
                 // Defensive deduplication: skip if a running/done call with the
@@ -823,6 +862,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           });
         }
       } catch (err) {
+        flushPendingTokens();
         // Don't show error for manual abort (user clicked stop)
         if (err instanceof DOMException && err.name === "AbortError") {
           const targetId = getAssistantId();
@@ -859,6 +899,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           });
         }
       } finally {
+        flushPendingTokens();
         abortControllersRef.current.delete(sendSessionId);
         assistantIdsRef.current.delete(sendSessionId);
         if (sessionIdRef.current === sendSessionId) {

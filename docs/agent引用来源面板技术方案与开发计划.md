@@ -927,6 +927,14 @@ for (const frame of completeSSEFrames) {
 
 后续“比亚迪呢？”回归再次证明定时器 pacing 仍会产生补播，因此最终移除所有人工 token pacing。该轮 `23:37:52` 进入后端，第一次 Tavily 连接失败后触发多轮 fallback，`23:38:39` 才进入最终回答；Tavily 工具现将一次瞬时失败在内部自动重试，不再立即把控制权交还 Agent 扩展检索链。
 
+### 2026-06-23：网络消费与 React 绘制彻底解耦
+
+- Chrome EventStream 面板中同批 token 显示相同时间，用户侧仍观察到正文集中出现。重新使用 `curl -N --trace-time` 对当前 Next `/api/chat` 路径取证：`00:50:08.638` 至 `00:50:12.493` 之间持续收到 311 个 token event，确认模型、后端 SSE 和 Next rewrite 均在真实流式传输。
+- 根因收敛到 React 状态层：每个 token 直接调用 `setMessages`，既可能被 React 自动批处理成较少的 paint，也容易因为 Markdown 重解析和滚动更新增加主线程压力。
+- 最终架构将网络与绘制解耦：SSE async iterator 不等待 rAF/定时器，收到 token 后立即追加到内存 buffer；独立 32ms timer 将当前 buffer 合并为一次不可变 React state 更新。
+- 遇到 `new_response`、`tool_start`、`tool_end`、`source_found`、`done` 等结构事件前立即 flush token buffer，确保跨消息和工具事件的顺序不被重排；异常、中止和 finally 路径也强制 flush。
+- 该方案不会给 ReadableStream 施加人工背压，同时将 React/Markdown 渲染频率稳定在约 30 FPS，是其他项目可复用的推荐边界：**网络原速消费，UI 定时批量绘制**。
+
 验证结果：
 
 - 新 Session `session-d09ffa659097.json` 使用同一句“蔚来最近有什么新闻”复测：`22:49:26` 进入后端并发出第一次模型请求，`22:49:31` 已进入最终回答模型回合。
