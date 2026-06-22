@@ -7,9 +7,11 @@ import Navbar from "@/components/layout/Navbar";
 import Sidebar from "@/components/layout/Sidebar";
 import ChatPanel from "@/components/chat/ChatPanel";
 import ResizeHandle from "@/components/layout/ResizeHandle";
+import SourcesPanel from "@/components/citations/SourcesPanel";
 
 const MIN_SIDEBAR = 200;
 const MIN_CHAT = 360;
+const MIN_INSPECTOR = 280;
 
 function ChatLayout() {
   const {
@@ -18,6 +20,10 @@ function ChatLayout() {
     sidebarWidth,
     setSidebarWidth,
     triggerSkillCreator,
+    inspectorOpen,
+    toggleInspector,
+    inspectorWidth,
+    setInspectorWidth,
   } = useApp();
 
   const searchParams = useSearchParams();
@@ -41,12 +47,18 @@ function ChatLayout() {
     setSidebarWidth((prev: number) => Math.max(MIN_SIDEBAR, prev + delta));
   };
 
+  const handleInspectorResize = (delta: number) => {
+    setInspectorWidth((prev: number) => Math.max(MIN_INSPECTOR, prev + delta));
+  };
+
   return (
     <div className="h-screen flex flex-col app-bg">
       <Navbar
         sidebarOpen={sidebarOpen}
         toggleSidebar={toggleSidebar}
         showPanelToggles
+        inspectorOpen={inspectorOpen}
+        toggleInspector={toggleInspector}
       />
 
       {/* Content area — sidebar + chat only */}
@@ -74,6 +86,19 @@ function ChatLayout() {
         {/* Chat — fills remaining space */}
         <div className="flex-1 overflow-hidden workspace-chat-shell" style={{ minWidth: MIN_CHAT }}>
           <ChatPanel />
+        </div>
+
+        {inspectorOpen && (
+          <ResizeHandle onResize={handleInspectorResize} direction="right" />
+        )}
+
+        <div
+          className="shrink-0 panel-transition overflow-hidden"
+          style={{ width: inspectorOpen ? inspectorWidth : 0 }}
+        >
+          <div style={{ width: inspectorWidth, minWidth: MIN_INSPECTOR }} className="h-full pl-1">
+            <SourcesPanel />
+          </div>
         </div>
       </div>
     </div>

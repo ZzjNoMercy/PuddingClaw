@@ -105,6 +105,8 @@ class SessionManager:
         role: str,                                            # 角色：user 或 assistant
         content: str,                                         # 消息内容
         tool_calls: list[dict[str, Any]] | None = None,       # 可选的工具调用记录
+        sources: list[dict[str, Any]] | None = None,          # 用户可见的结构化来源
+        citations: list[dict[str, Any]] | None = None,        # 正文与来源的引用映射
     ) -> None:
         """追加一条消息到会话历史"""
         data = self._read_file(session_id)        # 读取现有数据
@@ -119,6 +121,10 @@ class SessionManager:
         msg: dict[str, Any] = {"role": role, "content": content}  # 构造消息字典
         if tool_calls:                                            # 有工具调用则附加
             msg["tool_calls"] = tool_calls
+        if sources:
+            msg["sources"] = sources
+        if citations:
+            msg["citations"] = citations
         data["messages"].append(msg)              # 追加到消息列表末尾
         if isinstance(data.get("display_messages"), list):
             data["display_messages"].append(dict(msg))

@@ -1,6 +1,5 @@
 """SearchKnowledgeBaseTool — LlamaIndex hybrid search (BM25 + Vector)."""
 
-import os
 from pathlib import Path
 from typing import Type, Optional
 
@@ -96,7 +95,38 @@ class SearchKnowledgeBaseTool(BaseTool):
             result = str(response)
             if len(result) > 5000:
                 result = result[:5000] + "\n...[truncated]"
-            return result
+            from graph.citations import encode_tool_result, normalize_source
+
+            sources = []
+            for index, item in enumerate(getattr(response, "source_nodes", []) or []):
+                node = getattr(item, "node", item)
+                metadata = dict(getattr(node, "metadata", {}) or {})
+                quote = ""
+                try:
+                    quote = node.get_content()
+                except Exception:
+                    quote = getattr(node, "text", "") or ""
+                file_name = metadata.get("file_name") or metadata.get("filename")
+                file_path = metadata.get("file_path") or metadata.get("source") or ""
+                page = metadata.get("page_label") or metadata.get("page")
+                document_id = getattr(node, "ref_doc_id", None) or metadata.get("document_id") or file_path
+                chunk_id = getattr(node, "node_id", None) or metadata.get("chunk_id") or str(index)
+                score = getattr(item, "score", None)
+                sources.append(normalize_source({
+                    "title": file_name or (Path(file_path).name if file_path else f"知识库来源 {index + 1}"),
+                    "uri": file_path,
+                    "document_id": document_id,
+                    "chunk_id": chunk_id,
+                    "source_type": "knowledge_base",
+                    "page": page,
+                    "quote": quote,
+                    "score": score,
+                    "metadata": {
+                        key: value for key, value in metadata.items()
+                        if key not in {"file_path"} and isinstance(value, (str, int, float, bool, type(None)))
+                    },
+                }))
+            return encode_tool_result(result, sources)
         except Exception as e:
             return f"❌ Search error: {str(e)}"
 

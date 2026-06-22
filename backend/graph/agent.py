@@ -124,6 +124,7 @@ def _mcp_patent_unavailable_reply() -> str:
 
 from graph.prompt_builder import build_system_prompt
 from graph.session_manager import session_manager, COMPRESSED_CONTEXT_PREFIX
+from graph.citations import format_sources_for_model, parse_tool_result
 from graph.llm_input_logger import current_session_id, current_user_id, log_llm_input
 from tools import get_all_tools
 
@@ -612,7 +613,10 @@ class AgentManager:
                             if node_name == "tools" and "messages" in node_data:
                                 for tool_msg in node_data["messages"]:
                                     if hasattr(tool_msg, "name"):
-                                        raw_output = str(tool_msg.content)
+                                        raw_tool_output = str(tool_msg.content)
+                                        tc_id = getattr(tool_msg, "tool_call_id", "") or ""
+                                        raw_output, sources = parse_tool_result(raw_tool_output, tc_id)
+                                        tool_msg.content = format_sources_for_model(raw_output, sources)
                                         summary_source = None
                                         is_error = getattr(tool_msg, "status", "success") == "error"
                                         if _estimate_tokens(raw_output) > self.SINGLE_TOOL_OVERFLOW_THRESHOLD:
@@ -624,7 +628,7 @@ class AgentManager:
                                             }
                                             try:
                                                 raw_output = await self._summarize_tool_result(raw_output, tool_name=tool_msg.name)
-                                                tool_msg.content = raw_output
+                                                tool_msg.content = format_sources_for_model(raw_output, sources)
                                                 summary_source = "single_tool_overflow"
                                             finally:
                                                 yield {
@@ -632,18 +636,18 @@ class AgentManager:
                                                     "status": "done",
                                                     "phase": "single_tool_overflow",
                                                 }
-                                        tc_id = getattr(tool_msg, "tool_call_id", "") or ""
                                         if tc_id:
                                             _pending_tool_starts.pop(tc_id, None)
-                                        is_error_final = is_error or _legacy_tool_output_looks_error(str(tool_msg.content))
+                                        is_error_final = is_error or _legacy_tool_output_looks_error(raw_output)
                                         yield {
                                             "type": "tool_end",
                                             "tool": tool_msg.name,
-                                            "output": str(tool_msg.content),
-                                            "output_preview": str(tool_msg.content)[:2000],
+                                            "output": raw_output,
+                                            "output_preview": raw_output[:2000],
                                             "id": tc_id,
                                             "summary_source": summary_source,
                                             "is_error": is_error_final,
+                                            "sources": sources,
                                         }
                                         if not is_error_final and str(tool_msg.content).strip():
                                             successful_tool_results.append({
@@ -652,7 +656,7 @@ class AgentManager:
                                             })
                                         notice = _tool_error_notice(
                                             tool_msg.name,
-                                            str(tool_msg.content),
+                                            raw_output,
                                             is_error=is_error,
                                         )
                                         if notice and not _emitted_tool_error_notice:

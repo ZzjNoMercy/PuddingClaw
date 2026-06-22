@@ -14,6 +14,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from graph.agent import agent_manager
 from graph.session_manager import session_manager
+from graph.citations import dedupe_sources, finalize_citations, normalize_source
 from config import get_cache_config, get_llm_config, get_memory_backend, get_middleware_config
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -112,7 +113,7 @@ def _actually_called_write_file(segments: list[dict]) -> bool:
 
 def _segment_has_payload(segment: dict) -> bool:
     """Return True when an assistant segment has text or tool call data."""
-    return bool(segment.get("content") or segment.get("tool_calls"))
+    return bool(segment.get("content") or segment.get("tool_calls") or segment.get("sources"))
 
 
 def _ensure_tool_call_outputs(segment: dict) -> dict:
@@ -125,6 +126,8 @@ def _ensure_tool_call_outputs(segment: dict) -> dict:
     normalized = {
         "content": segment.get("content", ""),
         "tool_calls": list(segment.get("tool_calls", []) or []),
+        "sources": dedupe_sources(list(segment.get("sources", []) or [])),
+        "citations": list(segment.get("citations", []) or []),
     }
     for tc in normalized["tool_calls"]:
         output = tc.get("output")
@@ -522,7 +525,8 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
     current_user_id.set(user_id)
 
     segments: list[dict] = []
-    current_segment: dict = {"content": "", "tool_calls": []}
+    current_segment: dict = {"content": "", "tool_calls": [], "sources": [], "citations": []}
+    turn_sources: list[dict] = []
     conversation_saved = False
     stream_error: Exception | None = None
 
@@ -550,6 +554,22 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
             event_type = event.get("type", "unknown")
 
             if event_type == "retrieval":
+                retrieval_sources = [
+                    normalize_source({
+                        "title": result.get("source") or "记忆检索",
+                        "uri": result.get("source", ""),
+                        "document_id": result.get("source", ""),
+                        "chunk_id": str(index),
+                        "source_type": "knowledge_base",
+                        "quote": result.get("text", ""),
+                        "score": result.get("score"),
+                    })
+                    for index, result in enumerate(event.get("results", []))
+                ]
+                turn_sources = dedupe_sources(turn_sources + retrieval_sources)
+                current_segment["sources"] = dedupe_sources(
+                    current_segment.get("sources", []) + retrieval_sources
+                )
                 yield {
                     "event": "retrieval",
                     "data": json.dumps(
@@ -557,6 +577,14 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
                         ensure_ascii=False,
                     ),
                 }
+                for source in retrieval_sources:
+                    yield {
+                        "event": "source_found",
+                        "data": json.dumps(
+                            {"tool_call_id": "retrieval", "source": source},
+                            ensure_ascii=False,
+                        ),
+                    }
 
             elif event_type == "context_usage":
                 # 记录运行时 token 用量峰值
@@ -642,8 +670,12 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
 
             elif event_type == "new_response":
                 if _segment_has_payload(current_segment):
+                    current_segment["sources"] = dedupe_sources(turn_sources)
+                    current_segment["citations"] = finalize_citations(
+                        current_segment.get("content", ""), turn_sources
+                    )
                     segments.append(current_segment)
-                current_segment = {"content": "", "tool_calls": []}
+                current_segment = {"content": "", "tool_calls": [], "sources": [], "citations": []}
                 yield {
                     "event": "new_response",
                     "data": json.dumps({}, ensure_ascii=False),
@@ -665,6 +697,23 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
 
             elif event_type == "tool_end":
                 tc_id = event.get("id", "")
+                event_sources = dedupe_sources(list(event.get("sources", []) or []))
+                if event_sources:
+                    turn_sources = dedupe_sources(turn_sources + event_sources)
+                    current_segment["sources"] = dedupe_sources(
+                        current_segment.get("sources", []) + event_sources
+                    )
+                    for source in event_sources:
+                        yield {
+                            "event": "source_found",
+                            "data": json.dumps(
+                                {
+                                    "tool_call_id": tc_id,
+                                    "source": source,
+                                },
+                                ensure_ascii=False,
+                            ),
+                        }
                 matched = False
                 if tc_id:
                     for tc in current_segment["tool_calls"]:
@@ -672,6 +721,8 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
                             tc["output"] = event["output"]
                             tc["summary_source"] = event.get("summary_source")
                             tc["is_error"] = bool(event.get("is_error"))
+                            if event_sources:
+                                tc["sources"] = event_sources
                             matched = True
                             break
                 if not matched:
@@ -680,6 +731,8 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
                             tc["output"] = event["output"]
                             tc["summary_source"] = event.get("summary_source")
                             tc["is_error"] = bool(event.get("is_error"))
+                            if event_sources:
+                                tc["sources"] = event_sources
                             break
                 yield {
                     "event": "tool_end",
@@ -691,6 +744,7 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
                             "output_full_length": len(event["output"]),
                             "summary_source": event.get("summary_source"),
                             "is_error": bool(event.get("is_error")),
+                            "sources": event_sources,
                         },
                         ensure_ascii=False,
                     ),
@@ -724,6 +778,10 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
                     }
 
                 if _segment_has_payload(current_segment):
+                    current_segment["sources"] = dedupe_sources(turn_sources)
+                    current_segment["citations"] = finalize_citations(
+                        current_segment.get("content", ""), turn_sources
+                    )
                     segments.append(current_segment)
 
                 session_manager.save_message(session_id, "user", message)
@@ -731,9 +789,30 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
                     seg = _ensure_tool_call_outputs(seg)
                     tc = seg["tool_calls"] if seg["tool_calls"] else None
                     session_manager.save_message(
-                        session_id, "assistant", seg["content"], tool_calls=tc
+                        session_id,
+                        "assistant",
+                        seg["content"],
+                        tool_calls=tc,
+                        sources=seg.get("sources"),
+                        citations=seg.get("citations"),
                     )
                 conversation_saved = True
+
+                final_citations = [
+                    citation for seg in segments for citation in seg.get("citations", [])
+                ]
+                yield {
+                    "event": "citations_finalized",
+                    "data": json.dumps(
+                        {
+                            "citations": final_citations,
+                            "cited_source_ids": list(dict.fromkeys(
+                                citation["source_id"] for citation in final_citations
+                            )),
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
 
                 yield {
                     "event": "done",
@@ -817,6 +896,10 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
         # - CancelledError (anyio cancel scope from sse-starlette)
         if not conversation_saved:
             try:
+                current_segment["sources"] = dedupe_sources(turn_sources)
+                current_segment["citations"] = finalize_citations(
+                    current_segment.get("content", ""), turn_sources
+                )
                 segments.append(current_segment)
                 has_content = any(
                     seg["content"] or seg["tool_calls"] for seg in segments
@@ -828,7 +911,12 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
                         if seg["content"] or seg["tool_calls"]:
                             tc = seg["tool_calls"] if seg["tool_calls"] else None
                             session_manager.save_message(
-                                session_id, "assistant", seg["content"], tool_calls=tc
+                                session_id,
+                                "assistant",
+                                seg["content"],
+                                tool_calls=tc,
+                                sources=seg.get("sources"),
+                                citations=seg.get("citations"),
                             )
                     print(f"[WARN] Stream interrupted, partial conversation saved for session {session_id}")
             except Exception as save_err:

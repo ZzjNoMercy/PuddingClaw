@@ -42,12 +42,37 @@ export interface RetrievalResult {
   source: string;
 }
 
+export interface SourceRecord {
+  source_id: string;
+  title: string;
+  uri?: string;
+  document_id?: string;
+  chunk_id?: string;
+  source_type: "knowledge_base" | "web" | "file" | "skill" | string;
+  page?: number | string;
+  quote?: string;
+  score?: number;
+  tool_call_id?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface CitationRef {
+  citation_id: string;
+  source_id: string;
+  display_index: number;
+  start?: number;
+  end?: number;
+  status: "pending" | "verified" | "invalid";
+}
+
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
   toolCalls?: ToolCall[];
   retrievals?: RetrievalResult[];
+  sources?: SourceRecord[];
+  citations?: CitationRef[];
   timestamp: number;
 }
 
@@ -152,7 +177,13 @@ const AppContext = createContext<AppState | null>(null);
 
 // ── Helper: parse backend history into ChatMessage[] ────────
 function parseHistoryMessages(
-  backendMessages: Array<{ role: string; content: string; tool_calls?: Array<{ id?: string; tool: string; input?: string; output?: string; is_error?: boolean }> }>
+  backendMessages: Array<{
+    role: string;
+    content: string;
+    tool_calls?: Array<{ id?: string; tool: string; input?: string; output?: string; is_error?: boolean }>;
+    sources?: SourceRecord[];
+    citations?: CitationRef[];
+  }>
 ): ChatMessage[] {
   const loaded: ChatMessage[] = [];
   let msgIndex = 0;
@@ -180,6 +211,8 @@ function parseHistoryMessages(
         role: "assistant",
         content: msg.content,
         toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+        sources: msg.sources,
+        citations: msg.citations,
         timestamp: Date.now() - (backendMessages.length - msgIndex) * 1000,
       });
     }
@@ -624,6 +657,41 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 ...updated[idx],
                 retrievals: retrievalData.results,
               };
+              return updated;
+            });
+            continue;
+          }
+
+          if (event.event === "source_found") {
+            const targetId = getAssistantId();
+            const source = event.data.source as unknown as SourceRecord;
+            if (source?.source_id) {
+              setInspectorOpen(true);
+              updateMsgs((prev) => {
+                const updated = [...prev];
+                const idx = updated.findIndex((m) => m.id === targetId);
+                if (idx === -1) return prev;
+                const existing = updated[idx].sources || [];
+                updated[idx] = {
+                  ...updated[idx],
+                  sources: existing.some((item) => item.source_id === source.source_id)
+                    ? existing.map((item) => item.source_id === source.source_id ? { ...item, ...source } : item)
+                    : [...existing, source],
+                };
+                return updated;
+              });
+            }
+            continue;
+          }
+
+          if (event.event === "citations_finalized") {
+            const targetId = getAssistantId();
+            const citations = (event.data.citations || []) as unknown as CitationRef[];
+            updateMsgs((prev) => {
+              const updated = [...prev];
+              const idx = updated.findIndex((m) => m.id === targetId);
+              if (idx === -1) return prev;
+              updated[idx] = { ...updated[idx], citations };
               return updated;
             });
             continue;

@@ -73,6 +73,8 @@ class ExecuteSkillTool(BaseTool):
         return None
 
     def _run(self, skill_name: str, user_query: str = "") -> str:
+        from graph.citations import encode_tool_result, parse_tool_result
+
         skills_dir = Path(self.skills_dir)
         skill_dir = self._resolve_skill_dir(skills_dir, skill_name)
 
@@ -96,6 +98,7 @@ class ExecuteSkillTool(BaseTool):
 
         # 4. 依次执行每个脚本
         results = []
+        collected_sources = []
         for script_path in scripts:
             # 安全约束：只执行 .py 文件
             if not script_path.endswith(".py"):
@@ -124,14 +127,21 @@ class ExecuteSkillTool(BaseTool):
                 # 截断超长输出
                 if len(output) > 5000:
                     output = output[:5000] + "\n...[已截断]"
-                results.append(f"[{script_path}]\n{output}")
+                answer_context, sources = parse_tool_result(output)
+                for source in sources:
+                    if source.get("source_type") == "knowledge_base":
+                        source["source_type"] = "skill"
+                    source.setdefault("metadata", {})["skill_name"] = skill_name
+                collected_sources.extend(sources)
+                results.append(f"[{script_path}]\n{answer_context}")
             except subprocess.TimeoutExpired:
                 results.append(f"[{script_path}] 错误：执行超时（30秒限制）")
             except Exception as e:
                 results.append(f"[{script_path}] 错误：{str(e)}")
 
         output_text = "\n\n".join(results)
-        return f"技能：{skill_name}\n描述：{description}\n\n执行结果：\n{output_text}"
+        answer = f"技能：{skill_name}\n描述：{description}\n\n执行结果：\n{output_text}"
+        return encode_tool_result(answer, collected_sources) if collected_sources else answer
 
 
 def create_execute_skill_tool(base_dir: Path) -> ExecuteSkillTool:

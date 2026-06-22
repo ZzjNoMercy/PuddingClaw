@@ -30,6 +30,7 @@ function isAuthError(content: string): boolean {
 export default function ChatMessage({ message }: Props) {
   const isUser = message.role === "user";
   const hasAuthError = !isUser && isAuthError(message.content);
+  const renderedContent = renderCitationMarkers(message);
 
   return (
     <div className="animate-fade-in px-5 py-2">
@@ -73,7 +74,7 @@ export default function ChatMessage({ message }: Props) {
                   <div className="rounded-xl border border-slate-200 bg-white px-4 py-3 text-[14px] leading-relaxed shadow-sm">
                     <div className="markdown-content">
                       <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                        {message.content}
+                        {renderedContent}
                       </ReactMarkdown>
                     </div>
                   </div>
@@ -98,6 +99,17 @@ export default function ChatMessage({ message }: Props) {
       </div>
     </div>
   );
+}
+
+function renderCitationMarkers(message: ChatMessageType): string {
+  if (!message.citations?.length) return message.content;
+  const indexes = new Map(
+    message.citations.map((citation) => [citation.source_id, citation.display_index])
+  );
+  return message.content.replace(/\[\^(src_[A-Za-z0-9_-]+)\]/g, (marker, sourceId: string) => {
+    const index = indexes.get(sourceId);
+    return index ? `[${index}](#source-${sourceId})` : marker;
+  });
 }
 
 /** Prominent auth error alert with setup guidance */
