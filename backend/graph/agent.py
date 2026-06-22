@@ -89,6 +89,11 @@ def _legacy_tool_output_looks_error(output: str) -> bool:
         "access denied",
         "file not found",
         "not a valid tool",
+        "please enable javascript",
+        "please click here if you are not redirected",
+        "network error, please try again",
+        "网络不给力",
+        "请稍后重试",
     )
     return any(marker in lower or marker in text for marker in error_markers)
 
@@ -131,6 +136,9 @@ from tools import get_all_tools
 
 
 class AgentManager:
+    MAX_TOOL_RESULTS_PER_TURN = 12
+    MAX_CONSECUTIVE_TOOL_ERRORS = 4
+
     def __init__(self) -> None:
         self._base_dir: Path | None = None
         self._tools: list = []
@@ -572,6 +580,8 @@ class AgentManager:
         _pending_tool_starts: dict[str, dict[str, str]] = {}
         _emitted_tool_error_notice = False
         successful_tool_results: list[dict[str, str]] = []
+        total_tool_results = 0
+        consecutive_tool_errors = 0
 
         compaction_trigger = get_compaction_trigger_tokens()
 
@@ -664,6 +674,10 @@ class AgentManager:
                                         if tc_id:
                                             _pending_tool_starts.pop(tc_id, None)
                                         is_error_final = is_error or _legacy_tool_output_looks_error(raw_output)
+                                        total_tool_results += 1
+                                        consecutive_tool_errors = (
+                                            consecutive_tool_errors + 1 if is_error_final else 0
+                                        )
                                         yield {
                                             "type": "tool_end",
                                             "tool": tool_msg.name,
@@ -680,6 +694,14 @@ class AgentManager:
                                                 "tool": str(tool_msg.name),
                                                 "output": str(tool_msg.content),
                                             })
+                                        if total_tool_results >= self.MAX_TOOL_RESULTS_PER_TURN:
+                                            raise RuntimeError(
+                                                "本轮工具调用已达到安全上限，停止继续尝试并基于已有结果回答"
+                                            )
+                                        if consecutive_tool_errors >= self.MAX_CONSECUTIVE_TOOL_ERRORS:
+                                            raise RuntimeError(
+                                                "连续工具失败已达到安全上限，停止继续尝试并基于已有结果回答"
+                                            )
                                         notice = _tool_error_notice(
                                             tool_msg.name,
                                             raw_output,

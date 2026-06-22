@@ -735,7 +735,7 @@ frontend/src/components/citations/citationUtils.ts
 - `FetchURLTool` 在 HTML 响应缺失可靠 charset 时使用检测编码，降低中文页面被 ISO-8859-1 错解的概率。
 - 前端兼容旧 Session：隐藏由旧 `fetch_url` 适配器持久化的明显拦截/乱码来源；无效 Markdown 导航标题回退为 URL hostname。历史原始审计数据不被修改。
 - SSE 时间戳实测表明 `/api/chat` 经 Next 代理仍持续收到小块 token，后端与代理没有整段缓冲；原前端仅每约 48 字暂停 12ms，React 可能在一次绘制前消费完大量状态。
-- 前端 token 消费改为每个可见片段后等待一次 `requestAnimationFrame`，确保状态更新至少跨过一个浏览器绘制边界；大 token payload 仍按 12 字拆分。
+- 前端最初尝试在每个可见片段后等待一次 `requestAnimationFrame`；后续长工具链验证发现该做法会把 SSE 消费速度绑定到浏览器 paint，在 rAF 被抑制时产生积压和集中“补播”。最终方案改为每 4 个小片段通过短定时器让出事件循环；大 token payload 仍按 12 字拆分。
 
 验证结果：
 
@@ -743,3 +743,197 @@ frontend/src/components/citations/citationUtils.ts
 - `pytest -q backend/tests/test_citations.py backend/tests/test_aihot_skill.py`：`21 passed`。
 - `npm --prefix frontend run build`：通过 TypeScript、Lint 与生产构建。
 - 重建前后端 Docker 后真实抓取 Bing 新闻页：`adapter=fetch_url_search_results`、`source_count=8`；backend 为 `healthy`，frontend 正常运行。
+
+## 18. 可复用的流式输出排查与修复指南
+
+本节不依赖 PuddingClaw 的具体业务，可迁移到其他采用 LLM + SSE + React/Next.js 的 Agent 项目。
+
+### 18.1 先区分四种“看起来不流式”
+
+不要看到内容一次出现就直接修改模型参数。流式链路至少有四层，每层症状相似但修复方式不同：
+
+1. **模型层没有流式**：SDK 使用同步 `invoke`，或模型客户端没有启用 `streaming=True`。
+2. **Agent 层聚合了 chunk**：框架先收集完整 AIMessage，再统一返回；工具执行期间同步阻塞也属于这一层。
+3. **HTTP/代理层缓冲**：后端虽逐 token yield，但网关、反向代理或框架 rewrite 合并响应块。
+4. **浏览器绘制被合并**：SSE 已逐块到达，但前端在同一个事件循环中连续更新状态，React 批处理后只产生一次可见绘制。
+
+工具调用等待和最终回答流式是两个不同问题：`fetch_url`、terminal、数据库查询等同步工具在执行完成前没有模型 token，这是正常的；工具结束后的最终回答仍应逐步显示。若希望工具过程也流式，需要工具主动发送 progress/custom stream 事件，不能靠拆分最终文本伪装。
+
+### 18.2 推荐诊断顺序
+
+按“离模型最近 → 离用户最近”的顺序检查，可以最快定位缓冲发生在哪一层：
+
+```text
+模型 SDK chunk
+  → Agent/LangGraph messages stream
+  → 后端 SSE event_generator
+  → HTTP/Next/Nginx 代理
+  → fetch ReadableStream
+  → SSE frame parser
+  → React state
+  → 浏览器 paint
+```
+
+#### A. 验证后端是否逐 token 产生
+
+- 在 Agent stream 循环中记录 chunk 长度和单调时钟，不要只记录最终内容。
+- LangGraph 场景应消费 `AIMessageChunk`，避免把 graph state 中回放的完整 AIMessage 当作新 token。
+- 工具调用 chunk 与回答文本 chunk 要区分；含 `tool_calls` 的模型消息不应直接渲染为正文。
+
+#### B. 绕过前端直接检查 SSE
+
+使用 `curl -N` 禁用客户端缓冲，并用 trace 时间观察响应块是否持续到达：
+
+```bash
+curl -sN \
+  --trace-time \
+  --trace-ascii /tmp/sse.trace \
+  --output /tmp/sse.body \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"请生成一段较长文本","stream":true}' \
+  http://localhost:3000/api/chat
+
+grep 'Recv data' /tmp/sse.trace
+```
+
+判断方式：
+
+- 数据块跨数秒持续到达：后端和代理正常，继续检查前端 parser 与绘制。
+- 长时间无数据、最后一个大块到达：检查后端生成器、gzip、代理 buffering、网关缓存和超时配置。
+- 只有 ping、没有 token：检查 Agent 是否消费了正确的模型 stream mode。
+
+#### C. 同时对比直连后端与经过代理
+
+- 直连后端流式、经过代理不流式：代理层问题。
+- 两者都流式、页面不流式：前端解析或浏览器绘制问题。
+- 两者都不流式：模型、Agent 或后端 SSE 生成器问题。
+
+### 18.3 后端实现原则
+
+后端应该保持事件小而完整：
+
+```python
+async for chunk in model.astream(messages):
+    if chunk.content:
+        yield {
+            "event": "token",
+            "data": json.dumps({"content": chunk.content}, ensure_ascii=False),
+        }
+```
+
+关键约束：
+
+- 使用支持异步生成器的 StreamingResponse/EventSourceResponse。
+- SSE 每个事件以空行结束：`event: token\ndata: {...}\n\n`。
+- 不要在返回前 `join` 所有 token。
+- 不要在 token 路径执行同步摘要、数据库写入或大对象序列化。
+- 会话持久化可以累积完整文本，但不能阻塞每个 token 的网络发送。
+- 工具执行、来源发现、上下文维护应使用独立事件，例如 `tool_start`、`tool_end`、`source_found`、`context_maintenance`，避免塞进 token 文本。
+
+### 18.4 SSE parser 必须按 frame，而不是按网络 chunk 解析
+
+`reader.read()` 返回的是任意网络块，不保证一个块正好包含一个 SSE 事件。以下边界都可能发生：
+
+```text
+chunk 1: event: token\n
+chunk 2: data: {"content":"你"}\n\n
+```
+
+也可能一个网络块包含多个事件。因此前端必须持久保留 buffer，只按 SSE 空行切出完整 frame：
+
+```ts
+const decoder = new TextDecoder();
+let buffer = "";
+
+while (true) {
+  const { done, value } = await reader.read();
+  if (done) break;
+
+  buffer += decoder.decode(value, { stream: true });
+  buffer = buffer.replace(/\r\n/g, "\n");
+  const frames = buffer.split("\n\n");
+  buffer = frames.pop() || "";
+
+  for (const frame of frames) {
+    const event = parseSSEFrame(frame);
+    if (event) yield event;
+  }
+}
+```
+
+不要把 `eventName` 只保存在单次 `reader.read()` 的局部变量里，否则 `event:` 与 `data:` 被网络切开时会丢失事件类型。
+
+### 18.5 React 中保证“可见流式”
+
+“收到增量”不等于“用户看到增量”。React 会批处理短时间内的多次 state 更新；代理或浏览器也可能一次交付多个完整 SSE frame。
+
+推荐按小批量让出事件循环，不要让每个网络 token 都强制等待一次绘制：
+
+```ts
+let tokensSinceYield = 0;
+for (const content of splitVisibleToken(tokenContent)) {
+  yield { event: "token", data: { content } };
+  tokensSinceYield += 1;
+  if (tokensSinceYield >= 4) {
+    tokensSinceYield = 0;
+    await new Promise<void>((resolve) => setTimeout(resolve, 24));
+  }
+}
+```
+
+实践建议：
+
+- 上游 chunk 很大时，按约 8–20 个可见字符拆分；不要逐字符制造过多 React render。
+- 不要让 SSE 读取循环依赖纯 `requestAnimationFrame`：后台标签、窗口遮挡或浏览器调度可能暂停 rAF，造成网络帧积压，恢复绘制后集中“补播”。短定时器虽然不保证每次都 paint，但能稳定释放事件循环且不会永久阻塞消费。
+- 如果回答很长，可实现自适应节奏：网络实时到达时按原速度渲染，检测到同批积压时才做 16–32ms pacing。
+- 消息 state 更新必须创建新数组和新 message 对象，避免原地修改导致 React 不重渲染。
+- 自动滚动不要对每个 token 使用长时间 `smooth` 动画，否则多个动画会相互覆盖；可在流式期间使用 `auto`，结束后再平滑定位。
+
+### 18.6 Next.js / Nginx / 网关注意项
+
+- `Content-Type` 应为 `text/event-stream`。
+- 禁止响应缓存；常见设置为 `Cache-Control: no-cache, no-transform`。
+- Nginx 场景关闭 `proxy_buffering`，必要时返回 `X-Accel-Buffering: no`。
+- 避免对 SSE 使用会聚合小块的压缩配置；如果必须 gzip，需要真实验证而不是假设可用。
+- Next.js rewrite 是否缓冲应通过 trace 实测；不要仅凭“用了 rewrite”就判断它一定破坏流式。
+- 容器部署后必须验证运行中的镜像，源码构建成功不代表浏览器访问的容器已经更新。
+
+### 18.7 最小回归测试矩阵
+
+| 场景 | 预期 |
+|---|---|
+| 无工具的 300 字回答 | 首 token 较快出现，正文持续增长 |
+| 先工具、后回答 | 工具卡先更新；工具结束后正文流式出现 |
+| 单个超大 token payload | 前端拆分并跨多个 paint 渲染 |
+| `event:` / `data:` 跨网络块 | parser 不丢事件类型 |
+| 一个网络块包含多个 SSE frame | 所有事件按顺序消费 |
+| 切换 Session 后后台流继续 | 不污染当前 Session 的消息 state |
+| 用户中止生成 | AbortController 立即停止，并保留已生成内容 |
+| Docker/代理路径 | 直连后端和前端代理均通过时间戳 trace |
+
+### 18.8 本项目可复制的参考文件
+
+- 后端 Agent chunk 过滤：[backend/graph/agent.py](../backend/graph/agent.py)
+- SSE 事件生成与 Session 分段：[backend/api/chat.py](../backend/api/chat.py)
+- 前端 frame parser 与可见 pacing：[frontend/src/lib/api.ts](../frontend/src/lib/api.ts)
+- React 消息状态更新：[frontend/src/lib/store.tsx](../frontend/src/lib/store.tsx)
+
+迁移到其他项目时，优先复制“诊断方法与边界原则”，再按目标框架改写实现；不要直接复制固定延迟参数，因为模型速度、代理行为和 UI 渲染成本会随项目变化。
+
+### 2026-06-22：长工具链等待与集中补播回归修复
+
+- 最新 Session `diagnostic-stream-20260622.json` 中，“蔚来最近有什么新闻”在 `22:33:23` 进入后端，最后一次模型请求为 `22:34:42`；后端持续运行约 79 秒，并非最后才收到请求。
+- 本轮发生 15 次模型回合和大量串行 `fetch_url` 尝试。由于缺少一等 web search 工具，Agent 先误用 AI HOT，再连续猜测百度、Google News、财联社、IT之家、36Kr、懂车帝和 RSS URL。
+- 前端纯 rAF pacing 在长流中可能阻塞 SSE 消费，表现为长时间只有 typing indicator，随后快速补播完整流程；改为每 4 个小片段使用 24ms 定时器让出事件循环。
+- typing indicator 增加“Agent 正在处理”文字；后端在首个 token/tool 事件前发送 `agent_start` 状态，避免首模型等待阶段只有无语义圆点。
+- 新增一等 `tavily_search` 工具，直接返回结构化 `answer_context + sources[]`；通用新闻/近期动态路由优先 Tavily，明确文章 URL 才使用 `fetch_url`。
+- 增加单轮最多 12 个工具结果、连续 4 次工具失败的熔断；达到阈值后停止盲目重试，并基于已经成功返回的结果整理回答。
+- `fetch_url` 失败识别增加 JS-only、重定向提示和常见中文错误页，避免这些页面被计作成功结果。
+
+验证结果：
+
+- 新 Session `session-d09ffa659097.json` 使用同一句“蔚来最近有什么新闻”复测：`22:49:26` 进入后端并发出第一次模型请求，`22:49:31` 已进入最终回答模型回合。
+- 新流程只调用 1 次 `tavily_search`；相比旧流程约 79 秒、15 次模型回合和大量猜测 URL，检索链路显著收敛。
+- Session 持久化 8 条结构化来源与 8 个已校验引用；页面刷新恢复后，来源面板显示 8 条来源，其中 3 条为正文已引用来源。
+- 容器内直接调用 `TavilySearchTool("蔚来最近有什么新闻", 3)` 返回 3 条有效结构化来源。
+- 相关后端测试 `23 passed`，前端生产构建通过；上下文测试另有 52 项通过，7 个异步用例因 host 缺少 `pytest-asyncio` 未执行，此环境缺口与本次修改无关。

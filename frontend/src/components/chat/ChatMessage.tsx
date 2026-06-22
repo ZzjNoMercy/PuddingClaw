@@ -87,10 +87,13 @@ export default function ChatMessage({ message }: Props) {
                 </div>
               ) : (
                 /* Typing indicator */
-                <div className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
-                  <span className="typing-dot w-1.5 h-1.5 bg-[#002fa7] rounded-full" />
-                  <span className="typing-dot w-1.5 h-1.5 bg-[#002fa7] rounded-full" />
-                  <span className="typing-dot w-1.5 h-1.5 bg-[#002fa7] rounded-full" />
+                <div className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-3 text-[12px] text-slate-500 shadow-sm">
+                  <span className="inline-flex items-center gap-1.5">
+                    <span className="typing-dot h-1.5 w-1.5 rounded-full bg-[#002fa7]" />
+                    <span className="typing-dot h-1.5 w-1.5 rounded-full bg-[#002fa7]" />
+                    <span className="typing-dot h-1.5 w-1.5 rounded-full bg-[#002fa7]" />
+                  </span>
+                  <span>Agent 正在处理</span>
                 </div>
               )}
             </div>

@@ -54,13 +54,16 @@ _DEFAULT_SKILL_REGISTRY: dict[str, dict[str, Any]] = {
     "knowledge": {
         # "分析"/"看一下"/"帮我看" 等泛意图归入 knowledge 而非 research，避免触发重量级 subagent
         "keywords": ["搜索", "查找", "查询", "知识", "知识库", "网页", "url", "http", "链接",
+                     "新闻", "资讯", "最近有什么", "最新消息", "近况",
                      "search", "find", "knowledge",
                      "分析", "梳理", "看一下", "帮我看", "深入"],
-        "preferred_tools": ["search_knowledge_base", "fetch_url"],
+        "preferred_tools": ["tavily_search", "search_knowledge_base", "fetch_url"],
         "tool_categories": ["knowledge"],  # cf. tools/__init__.py TOOL_CATEGORIES["knowledge"]
         "routing_prompt": (
             "用户意图为知识检索类。"
-            "请优先使用 search_knowledge_base 或 fetch_url 工具获取信息。"
+            "通用新闻、近期动态和公开网页检索优先使用 tavily_search，一次获得结构化搜索结果；"
+            "已有明确文章 URL 时才使用 fetch_url 抓正文；本地资料使用 search_knowledge_base。"
+            "不要通过连续猜测多个搜索页 URL 来替代 web search。"
         ),
     },
     "skill": {

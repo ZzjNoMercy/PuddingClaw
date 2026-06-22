@@ -41,6 +41,7 @@ export async function* streamChat(
 
   const decoder = new TextDecoder();
   let buffer = "";
+  let tokensSincePaint = 0;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -66,10 +67,14 @@ export async function* streamChat(
         const chunks = splitVisibleToken(parsed.data.content);
         for (const content of chunks) {
           yield { event: "token", data: { ...parsed.data, content } };
-          // The consumer updates React state after each yield. Waiting for the
-          // next animation frame before yielding another token guarantees the
-          // browser can paint that state instead of batching a whole answer.
-          await yieldToBrowser();
+          tokensSincePaint += 1;
+          // Paint small batches instead of forcing one frame per provider
+          // token. This remains visibly incremental without letting long agent
+          // runs build a large client-side backlog.
+          if (tokensSincePaint >= 4) {
+            tokensSincePaint = 0;
+            await yieldToBrowser();
+          }
         }
         continue;
       }
@@ -110,13 +115,10 @@ function splitVisibleToken(content: string): string[] {
 }
 
 function yieldToBrowser(): Promise<void> {
-  return new Promise((resolve) => {
-    if (typeof window.requestAnimationFrame === "function") {
-      window.requestAnimationFrame(() => resolve());
-    } else {
-      window.setTimeout(resolve, 16);
-    }
-  });
+  // Do not make network consumption depend on requestAnimationFrame. Browsers
+  // may pause or heavily throttle rAF, which leaves SSE frames queued and then
+  // "replays" the whole agent process when painting resumes.
+  return new Promise((resolve) => window.setTimeout(resolve, 24));
 }
 
 /**

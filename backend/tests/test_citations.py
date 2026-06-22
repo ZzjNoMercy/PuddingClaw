@@ -268,6 +268,43 @@ def test_tool_result_adapter_handles_tavily_schema():
     assert adapted.sources[0]["quote"] == "Tool messages can carry structured metadata."
 
 
+def test_tavily_search_tool_returns_structured_sources(monkeypatch):
+    from graph.citations import parse_tool_result
+    from tools.tavily_search_tool import TavilySearchTool
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"results": [{
+                "title": "蔚来最新消息",
+                "url": "https://example.com/nio",
+                "content": "蔚来发布近期业务进展。",
+                "score": 0.9,
+            }]}
+
+    monkeypatch.setenv("TAVILY_API_KEY", "test-key")
+    monkeypatch.setattr("tools.tavily_search_tool.requests.post", lambda *args, **kwargs: Response())
+
+    output = TavilySearchTool()._run("蔚来最近有什么新闻")
+    context, sources = parse_tool_result(output)
+
+    assert "蔚来最新消息" in context
+    assert sources[0]["uri"] == "https://example.com/nio"
+    assert sources[0]["metadata"]["adapter"] == "tavily_search"
+
+
+def test_news_intent_routes_to_tavily_search():
+    from graph.middlewares.skills_router import SkillsRouterMiddleware
+
+    decision = SkillsRouterMiddleware()._classify_intent("蔚来最近有什么新闻")
+
+    assert decision["matched"] is True
+    assert "knowledge" in decision["skills"]
+    assert decision["preferred_tools"][0] == "tavily_search"
+
+
 def test_tool_result_adapter_handles_markdown_links_and_dedupes_urls():
     from graph.tool_result_adapter import tool_result_adapter
 

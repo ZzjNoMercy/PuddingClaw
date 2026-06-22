@@ -529,8 +529,20 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
     turn_sources: list[dict] = []
     conversation_saved = False
     stream_error: Exception | None = None
+    waiting_for_first_action = True
 
     try:
+        yield {
+            "event": "context_maintenance",
+            "data": json.dumps(
+                {
+                    "status": "start",
+                    "phase": "agent_start",
+                    "message": "正在分析请求并选择合适的工具...",
+                },
+                ensure_ascii=False,
+            ),
+        }
         await _maybe_middle_trim_session(session_id)
 
         # Use merged history for agent context (combines consecutive assistant msgs)
@@ -552,6 +564,18 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
 
         async for event in agent_manager.astream(message, history, user_id=user_id, session_id=session_id):
             event_type = event.get("type", "unknown")
+
+            if waiting_for_first_action and event_type in {
+                "token", "new_response", "tool_start", "tool_end", "error"
+            }:
+                waiting_for_first_action = False
+                yield {
+                    "event": "context_maintenance",
+                    "data": json.dumps(
+                        {"status": "done", "phase": "agent_start", "message": ""},
+                        ensure_ascii=False,
+                    ),
+                }
 
             if event_type == "retrieval":
                 retrieval_sources = [
