@@ -128,6 +128,7 @@ def test_agent_tool_end_emits_sources_without_embedding_them_in_preview():
     tool_end = next(event for event in events if event["type"] == "tool_end")
 
     assert tool_end["output"] == "简洁答案"
+    assert tool_end["raw_output"] == encoded
     assert tool_end["sources"][0]["title"] == "检索文档"
     assert tool_end["sources"][0]["tool_call_id"] == "call-1"
 
@@ -145,6 +146,7 @@ def test_chat_stream_emits_and_persists_sources_and_citations(tmp_path, monkeypa
         "quote": "流式证据",
         "tool_call_id": "call-stream",
     })
+    original_tool_output = '{"items":[{"title":"流式来源","url":"https://example.com/source"}]}'
 
     async def fake_astream(*_args, **_kwargs):
         yield {"type": "tool_start", "tool": "search_knowledge_base", "input": "{}", "id": "call-stream"}
@@ -153,6 +155,7 @@ def test_chat_stream_emits_and_persists_sources_and_citations(tmp_path, monkeypa
             "tool": "search_knowledge_base",
             "output": "工具答案",
             "output_preview": "工具答案",
+            "raw_output": original_tool_output,
             "id": "call-stream",
             "sources": [source],
         }
@@ -180,6 +183,38 @@ def test_chat_stream_emits_and_persists_sources_and_citations(tmp_path, monkeypa
     assert "citations_finalized" in event_names
     assert final_message["sources"][0]["source_id"] == source["source_id"]
     assert final_message["citations"][0]["source_id"] == source["source_id"]
+    assert history[-2]["tool_calls"][0]["raw_output"] == original_tool_output
+
+
+def test_historical_tool_message_readapts_raw_output_without_mutating_session():
+    import json
+    from graph.agent import AgentManager
+
+    raw_output = json.dumps({
+        "results": [{
+            "title": "历史网页来源",
+            "url": "https://example.com/history",
+            "snippet": "历史工具结果仍在进入模型前重新适配。",
+        }]
+    }, ensure_ascii=False)
+    history = [{
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{
+            "tool": "web_search",
+            "input": "{'query': 'history'}",
+            "id": "history-call",
+            "output": "旧的展示输出",
+            "raw_output": raw_output,
+        }],
+    }]
+
+    messages = AgentManager()._build_messages("继续", history)
+    tool_message = next(message for message in messages if getattr(message, "type", "") == "tool")
+
+    assert "历史网页来源" in tool_message.content
+    assert "src_" in tool_message.content
+    assert history[0]["tool_calls"][0]["raw_output"] == raw_output
 
 
 def test_tool_result_adapter_handles_aihot_items_json():

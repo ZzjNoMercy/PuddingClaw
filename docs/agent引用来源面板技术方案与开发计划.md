@@ -420,6 +420,9 @@ tool_start
 要求：
 
 - `sources`、`citations` 属于用户可见记录，应跟随 `display_messages` 持久化。
+- `tool_calls.raw_output` 保存工具最初返回值，作为可审计的事实源；适配器不得覆盖它。
+- `tool_calls.output` 保存当前供模型使用的适配/摘要结果，以兼容现有上下文压缩逻辑。
+- 历史会话重新进入 LangChain 时，以 `raw_output` 为输入重新执行确定性适配；已经由 `single_tool_overflow` 或 `tool_result_clear` 摘要的记录继续使用其 `output`，避免重新注入超长结果。
 - 模型上下文中的工具输出可以压缩，但不得反向修改已存储的来源与引用。
 - `output_preview` 仅用于工具卡预览，不作为引用恢复的数据源。
 - 会话历史 API 必须原样返回 `sources` 和 `citations`。
@@ -657,6 +660,7 @@ frontend/src/components/citations/citationUtils.ts
 - 本地知识库检索保留 LlamaIndex `source_nodes` 的文档、chunk、页码、quote 和 score。
 - `execute_skill` 支持透传 Skill 脚本返回的结构化来源 envelope。
 - Agent 在超长工具结果摘要之前提取来源，来源不依赖 `output` 或 `output_preview`。
+- Session 同时保存原始 `raw_output` 与模型侧 `output`；适配只发生在工具结果交回 LangChain 的过渡边界，历史重放也会重新适配原始值。
 - SSE 增加 `source_found` 和 `citations_finalized`，`tool_end` 同时保留兼容的可选 `sources`。
 - assistant message 独立持久化 `sources` 与 `citations`，历史会话和断流保存路径可恢复。
 - 聊天首页接入可调整宽度、可折叠的右侧来源面板；检索到来源时自动打开。
@@ -666,7 +670,7 @@ frontend/src/components/citations/citationUtils.ts
 验证结果：
 
 - `PYTHONPYCACHEPREFIX=/private/tmp/puddingclaw_pycache python -m compileall -q backend/graph backend/tools backend/api`：通过。
-- `PYTHONPYCACHEPREFIX=/private/tmp/puddingclaw_pycache pytest -q backend/tests/test_citations.py`：`10 passed`，覆盖结构化协议、AI HOT、Tavily、fetch_url、Markdown、SSE 与会话持久化。
+- `PYTHONPYCACHEPREFIX=/private/tmp/puddingclaw_pycache pytest -q backend/tests/test_citations.py`：`11 passed`，覆盖结构化协议、AI HOT、Tavily、fetch_url、Markdown、SSE、原始结果持久化、历史重新适配与会话恢复。
 - `npm run build`：通过，Next.js 静态页面与 TypeScript 类型检查成功。
 - `backend/tests/test_context_optimizations.py`：同步测试 `29 passed`；本机缺少 `pytest-asyncio`，原有 7 个 `@pytest.mark.asyncio` 用例无法由当前 host pytest 执行。该环境缺口与本次引用功能无关，未将其记录为通过。
 

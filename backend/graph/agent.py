@@ -398,11 +398,27 @@ class AgentManager:
                     messages.append(AIMessage(content=content, tool_calls=lc_tool_calls))
                     from langchain_core.messages import ToolMessage
                     for tc, tool_name, tc_id in normalized_tool_calls:
-                        output = tc.get("output", "")
-                        if output is None or str(output).strip() == "":
-                            output = MISSING_TOOL_OUTPUT_PLACEHOLDER
+                        stored_output = tc.get("output", "")
+                        stored_raw_output = tc.get("raw_output", stored_output)
+                        if stored_raw_output is None or str(stored_raw_output).strip() == "":
+                            stored_raw_output = MISSING_TOOL_OUTPUT_PLACEHOLDER
+                        if tc.get("summary_source") in {"single_tool_overflow", "tool_result_clear"}:
+                            model_output = str(stored_output or stored_raw_output)
+                            model_sources = list(tc.get("sources", []) or [])
+                        else:
+                            adapted = tool_result_adapter.adapt(
+                                str(stored_raw_output),
+                                tool_name=tool_name,
+                                tool_input=str(tc.get("input", tc.get("args", ""))),
+                                tool_call_id=tc_id,
+                            )
+                            model_output = adapted.answer_context
+                            model_sources = adapted.sources or list(tc.get("sources", []) or [])
                         messages.append(ToolMessage(
-                            content=f"{HISTORICAL_TOOL_OUTPUT_PREFIX}{output}",
+                            content=(
+                                f"{HISTORICAL_TOOL_OUTPUT_PREFIX}"
+                                f"{format_sources_for_model(model_output, model_sources)}"
+                            ),
                             tool_call_id=tc_id,
                             name=tool_name,
                         ))
@@ -653,6 +669,7 @@ class AgentManager:
                                             "tool": tool_msg.name,
                                             "output": raw_output,
                                             "output_preview": raw_output[:2000],
+                                            "raw_output": raw_tool_output,
                                             "id": tc_id,
                                             "summary_source": summary_source,
                                             "is_error": is_error_final,

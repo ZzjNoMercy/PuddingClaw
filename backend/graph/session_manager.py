@@ -327,6 +327,7 @@ class SessionManager:
         for msg in data.get("messages", []):
             for tc in msg.get("tool_calls", []):
                 if tc.get("id") == tool_call_id:
+                    tc.setdefault("raw_output", tc.get("output", ""))
                     tc["output"] = output
                     if summary_source:
                         tc["summary_source"] = summary_source

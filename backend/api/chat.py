@@ -719,6 +719,7 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
                     for tc in current_segment["tool_calls"]:
                         if tc.get("id") == tc_id and "output" not in tc:
                             tc["output"] = event["output"]
+                            tc["raw_output"] = event.get("raw_output", event["output"])
                             tc["summary_source"] = event.get("summary_source")
                             tc["is_error"] = bool(event.get("is_error"))
                             if event_sources:
@@ -729,6 +730,7 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
                     for tc in reversed(current_segment["tool_calls"]):
                         if tc["tool"] == event["tool"] and "output" not in tc:
                             tc["output"] = event["output"]
+                            tc["raw_output"] = event.get("raw_output", event["output"])
                             tc["summary_source"] = event.get("summary_source")
                             tc["is_error"] = bool(event.get("is_error"))
                             if event_sources:
