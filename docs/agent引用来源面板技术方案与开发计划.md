@@ -117,6 +117,32 @@ markdown + citation_refs[]
 | 前端 | 动态展示、联动、高亮、过滤 | 修改引用事实 |
 | 导出层 | 将同一引用模型渲染成脚注或参考资料 | 重新调用模型生成引用 |
 
+### 4.2 工具结果适配层
+
+实现采用独立的 `ToolResultAdapter`，并在所有 `ToolMessage` 进入 Agent 的统一边界调用，而不是实现为 LangChain `AgentMiddleware`。
+
+原因：
+
+- 适配职责是将工具返回值规范化为 `answer_context + sources[]`，不负责模型调用策略、权限、重试或上下文裁剪。
+- ToolMessage 边界可以同时覆盖本地工具、`execute_skill`、Skill 内 terminal/curl、Web Search 和 MCP 工具。
+- 不依赖特定 LangChain middleware API，后续框架升级或迁移时更稳定。
+
+适配优先级：
+
+1. PuddingClaw 标准结构化 envelope，可信度最高。
+2. 通用 JSON：递归识别 `items/results/sections` 以及 `title/url/snippet/summary/sourceUrl` 等常见字段；覆盖 AI HOT、Tavily 和常见 MCP Web Search。
+3. `fetch_url`：以工具输入中的请求 URL 作为唯一页面来源，避免把页面内的所有外链误认为证据来源。
+4. Markdown 链接和裸 URL：作为兼容兜底，进入“已检索”；只有最终答案明确引用后才进入“已引用”。
+5. 纯文本：不生成来源，不允许猜测 URL。
+
+代码位置：
+
+```text
+backend/graph/tool_result_adapter.py
+backend/graph/citations.py
+backend/graph/agent.py
+```
+
 ## 5. 核心数据模型
 
 ### 5.1 工具结构化结果
@@ -627,6 +653,7 @@ frontend/src/components/citations/citationUtils.ts
 已完成：
 
 - 新增 `backend/graph/citations.py`，统一来源规范化、确定性 ID、结构化工具结果、引用校验与编号。
+- 新增 `backend/graph/tool_result_adapter.py`，在 ToolMessage 边界统一适配标准 envelope、AI HOT/Tavily 类 JSON、`fetch_url`、Markdown 链接和裸 URL。
 - 本地知识库检索保留 LlamaIndex `source_nodes` 的文档、chunk、页码、quote 和 score。
 - `execute_skill` 支持透传 Skill 脚本返回的结构化来源 envelope。
 - Agent 在超长工具结果摘要之前提取来源，来源不依赖 `output` 或 `output_preview`。
@@ -639,7 +666,7 @@ frontend/src/components/citations/citationUtils.ts
 验证结果：
 
 - `PYTHONPYCACHEPREFIX=/private/tmp/puddingclaw_pycache python -m compileall -q backend/graph backend/tools backend/api`：通过。
-- `PYTHONPYCACHEPREFIX=/private/tmp/puddingclaw_pycache pytest -q backend/tests/test_citations.py`：`6 passed`。
+- `PYTHONPYCACHEPREFIX=/private/tmp/puddingclaw_pycache pytest -q backend/tests/test_citations.py`：`10 passed`，覆盖结构化协议、AI HOT、Tavily、fetch_url、Markdown、SSE 与会话持久化。
 - `npm run build`：通过，Next.js 静态页面与 TypeScript 类型检查成功。
 - `backend/tests/test_context_optimizations.py`：同步测试 `29 passed`；本机缺少 `pytest-asyncio`，原有 7 个 `@pytest.mark.asyncio` 用例无法由当前 host pytest 执行。该环境缺口与本次引用功能无关，未将其记录为通过。
 

@@ -124,7 +124,8 @@ def _mcp_patent_unavailable_reply() -> str:
 
 from graph.prompt_builder import build_system_prompt
 from graph.session_manager import session_manager, COMPRESSED_CONTEXT_PREFIX
-from graph.citations import format_sources_for_model, parse_tool_result
+from graph.citations import format_sources_for_model
+from graph.tool_result_adapter import tool_result_adapter
 from graph.llm_input_logger import current_session_id, current_user_id, log_llm_input
 from tools import get_all_tools
 
@@ -615,7 +616,15 @@ class AgentManager:
                                     if hasattr(tool_msg, "name"):
                                         raw_tool_output = str(tool_msg.content)
                                         tc_id = getattr(tool_msg, "tool_call_id", "") or ""
-                                        raw_output, sources = parse_tool_result(raw_tool_output, tc_id)
+                                        pending_tool = _pending_tool_starts.get(tc_id, {})
+                                        adapted = tool_result_adapter.adapt(
+                                            raw_tool_output,
+                                            tool_name=str(tool_msg.name or ""),
+                                            tool_input=pending_tool.get("input", ""),
+                                            tool_call_id=tc_id,
+                                        )
+                                        raw_output = adapted.answer_context
+                                        sources = adapted.sources
                                         tool_msg.content = format_sources_for_model(raw_output, sources)
                                         summary_source = None
                                         is_error = getattr(tool_msg, "status", "success") == "error"

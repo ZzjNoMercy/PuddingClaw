@@ -180,3 +180,87 @@ def test_chat_stream_emits_and_persists_sources_and_citations(tmp_path, monkeypa
     assert "citations_finalized" in event_names
     assert final_message["sources"][0]["source_id"] == source["source_id"]
     assert final_message["citations"][0]["source_id"] == source["source_id"]
+
+
+def test_tool_result_adapter_handles_aihot_items_json():
+    import json
+    from graph.tool_result_adapter import tool_result_adapter
+
+    output = json.dumps({
+        "items": [{
+            "id": "news-1",
+            "title": "OpenAI 发布新模型",
+            "url": "https://example.com/openai-model",
+            "source": "OpenAI",
+            "summary": "模型能力和上下文窗口得到提升。",
+            "publishedAt": "2026-06-22T08:00:00Z",
+            "category": "ai-models",
+            "score": 0.95,
+        }]
+    }, ensure_ascii=False)
+
+    adapted = tool_result_adapter.adapt(
+        output, tool_name="terminal", tool_call_id="aihot-call"
+    )
+
+    assert adapted.adapter == "common_json"
+    assert adapted.sources[0]["title"] == "OpenAI 发布新模型"
+    assert adapted.sources[0]["uri"] == "https://example.com/openai-model"
+    assert adapted.sources[0]["source_type"] == "web"
+    assert adapted.sources[0]["metadata"]["published_at"] == "2026-06-22T08:00:00Z"
+
+
+def test_tool_result_adapter_handles_tavily_schema():
+    import json
+    from graph.tool_result_adapter import tool_result_adapter
+
+    output = json.dumps({
+        "query": "LangGraph citations",
+        "results": [{
+            "title": "LangGraph Documentation",
+            "url": "https://docs.example.com/langgraph",
+            "snippet": "Tool messages can carry structured metadata.",
+        }],
+    })
+
+    adapted = tool_result_adapter.adapt(output, tool_name="execute_skill")
+
+    assert adapted.adapter == "common_json"
+    assert len(adapted.sources) == 1
+    assert adapted.sources[0]["quote"] == "Tool messages can carry structured metadata."
+
+
+def test_tool_result_adapter_handles_markdown_links_and_dedupes_urls():
+    from graph.tool_result_adapter import tool_result_adapter
+
+    output = (
+        "1. [第一条新闻](https://example.com/news)\n"
+        "   新闻摘要\n"
+        "2. **重复链接**\n   https://example.com/news\n"
+        "3. **第二条新闻**\n   https://example.org/other\n"
+    )
+
+    adapted = tool_result_adapter.adapt(output, tool_name="terminal")
+
+    assert adapted.adapter == "markdown_links"
+    assert [source["uri"] for source in adapted.sources] == [
+        "https://example.com/news",
+        "https://example.org/other",
+    ]
+
+
+def test_fetch_url_uses_requested_page_as_single_source():
+    from graph.tool_result_adapter import tool_result_adapter
+
+    output = "# Example Article\n正文里还有 [其他链接](https://other.example/path)。"
+    adapted = tool_result_adapter.adapt(
+        output,
+        tool_name="fetch_url",
+        tool_input="{'url': 'https://example.com/article'}",
+        tool_call_id="fetch-call",
+    )
+
+    assert adapted.adapter == "fetch_url"
+    assert len(adapted.sources) == 1
+    assert adapted.sources[0]["uri"] == "https://example.com/article"
+    assert adapted.sources[0]["title"] == "Example Article"
