@@ -74,6 +74,15 @@ class ExecuteSkillTool(BaseTool):
         return None
 
     def _run(self, skill_name: str, user_query: str = "") -> str:
+        return self._execute(skill_name, user_query)
+
+    async def _arun(self, skill_name: str, user_query: str = "") -> str:
+        import asyncio
+        # 子进程可能是长时 IO（调外部 API），必须放到线程池执行，
+        # 否则同步 subprocess.run 会阻塞整个 asyncio 事件循环，导致后端无响应。
+        return await asyncio.to_thread(self._execute, skill_name, user_query)
+
+    def _execute(self, skill_name: str, user_query: str = "") -> str:
         from graph.citations import encode_tool_result, parse_tool_result
 
         skills_dir = Path(self.skills_dir)
