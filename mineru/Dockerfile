@@ -12,10 +12,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
+# Install Python dependencies.
+# Use long timeout and retries because the network inside the build container
+# can be slow/unstable.
 COPY requirements.txt .
-RUN pip install --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --default-timeout=300 --retries 10 -r requirements.txt
 
 # Ensure config/model directories exist even when not mounted
 RUN mkdir -p /root/.mineru/models
