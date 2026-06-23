@@ -30,6 +30,8 @@ services:
       - BACKEND_HOST=0.0.0.0
       - BACKEND_PORT=9100
       - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      # MinerU PDF parsing service URL (inside compose network)
+      - MINERU_URL=${MINERU_URL:-http://mineru:8002}
     volumes:
       # 持久化会话、workspace、memory、日志到宿主机
       - ./backend/sessions:/app/sessions
