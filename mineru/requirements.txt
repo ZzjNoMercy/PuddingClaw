@@ -3,5 +3,5 @@ fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
 python-multipart>=0.0.9
 torch==2.6.0+cpu
-torchvision==0.21.0+cpu
+torchvision
 mineru[pipeline]
