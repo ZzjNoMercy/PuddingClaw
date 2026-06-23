@@ -47,17 +47,14 @@ async def parse_pdf(
                 shutil.copyfileobj(file.file, f)
             source = "file"
         else:
-            # Download URL to local file using curl
-            result = subprocess.run(
-                ["curl", "-sL", "-o", str(input_path), url],
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            if result.returncode != 0:
+            # Download URL to local file using urllib (no curl in image)
+            import urllib.request
+            try:
+                urllib.request.urlretrieve(url, str(input_path))
+            except Exception as e:
                 return JSONResponse(
                     status_code=502,
-                    content={"error": f"Failed to download PDF: {result.stderr}"},
+                    content={"error": f"Failed to download PDF: {str(e)}"},
                 )
             source = "url"
 
