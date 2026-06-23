@@ -15,7 +15,7 @@ _tool_instance_cache: dict[tuple[str, str], List[BaseTool]] = {}
 # 动态工具加载注册表：按意图类别分组，用于按需加载工具子集
 # core 类别始终加载；其他类别根据用户消息意图检测按需激活
 TOOL_CATEGORIES: dict[str, list[str]] = {
-    "core": ["read_file_tool", "write_file_tool", "terminal_tool", "task_manager_tool"],
+    "core": ["read_file_tool", "write_file_tool", "terminal_tool", "task_manager_tool", "mineru_tool"],
     "knowledge": ["search_knowledge_tool", "tavily_search_tool", "fetch_url_tool"],
     # research 独立于 knowledge：deep_research 是 subagent 隔离工具，不是简单检索
     # cf. graph/middlewares/skills_router.py _DEFAULT_SKILL_REGISTRY["research"]

@@ -68,6 +68,30 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  mineru:
+    build:
+      context: ./mineru
+      dockerfile: Dockerfile
+    container_name: puddingclaw-mineru
+    ports:
+      - "8002:8002"
+    environment:
+      - MINERU_DEVICE=cpu
+    volumes:
+      # 复用宿主机已下载的 MinerU 模型，避免镜像内重复下载
+      - /Users/pet/models:/Users/pet/models:ro
+      - /Users/pet/.mineru/models:/root/.mineru/models:ro
+      # 复用宿主机 MinerU 配置（含模型路径）
+      - /Users/pet/.mineru/mineru.json:/root/.mineru/mineru.json:ro
+      - /Users/pet/.mineru/mineru.json:/app/mineru.json:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
 # 可选：使用外部网络，便于与其他服务（如 Milvus）集成
 # networks:
 #   default:
