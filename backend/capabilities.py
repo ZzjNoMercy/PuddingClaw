@@ -147,12 +147,9 @@ def _build_gateway_urls(explicit_url: str | None = None) -> list[str]:
     return urls
 
 
-async def _check_gateway_urls(health_path: str, explicit_url: str | None = None) -> CapabilityStatus:
-    """按优先级探测 Higress URL。
 
-    1. 显式 URL（函数参数或 config.json / AI_GATEWAY_URL）。
-    2. 默认 URL 列表（compose 内网、host.docker.internal、localhost）。
-    """
+async def _check_gateway_urls(health_path: str, explicit_url: str | None = None) -> CapabilityStatus:
+    """按优先级探测 Higress URL。"""
     global _EFFECTIVE_GATEWAY_URL
     urls_to_try = _build_gateway_urls(explicit_url)
 
@@ -162,7 +159,8 @@ async def _check_gateway_urls(health_path: str, explicit_url: str | None = None)
     last_status: CapabilityStatus | None = None
     for url in urls_to_try:
         base_url = _normalize_gateway_url(url)
-        last_status = await _check_http_get(base_url, health_path, timeout=2.0)
+        # Higress all-in-one 启动初期可能响应较慢，给 5 秒
+        last_status = await _check_http_get(base_url, health_path, timeout=5.0)
         if last_status.available:
             _EFFECTIVE_GATEWAY_URL = url
             logger.info("[capabilities] Higress detected at %s", url)
@@ -182,7 +180,7 @@ def _check_gateway_urls_sync(health_path: str, explicit_url: str | None = None) 
     last_status: CapabilityStatus | None = None
     for url in urls_to_try:
         base_url = _normalize_gateway_url(url)
-        last_status = _check_http_get_sync(base_url, health_path, timeout=2.0)
+        last_status = _check_http_get_sync(base_url, health_path, timeout=5.0)
         if last_status.available:
             _EFFECTIVE_GATEWAY_URL = url
             logger.info("[capabilities] Higress detected at %s", url)
