@@ -21,6 +21,7 @@ import {
   Network,
   Route,
   ShieldCheck,
+  ExternalLink,
 } from "lucide-react";
 import {
   getSettings,
@@ -341,17 +342,28 @@ export default function SettingsPage() {
                 </div>
 
                 <div className="rounded-2xl border border-[#002fa7]/15 bg-gradient-to-br from-white/90 to-[#f4f7ff]/80 p-5 shadow-sm">
-                  <div className="mb-5 flex items-center gap-3">
-                    <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#002fa7]/8 text-[#002fa7]">
-                      <Network className="h-4 w-4" />
+                  <div className="mb-5 flex items-center justify-between gap-4">
+                    <div className="flex items-center gap-3">
+                      <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#002fa7]/8 text-[#002fa7]">
+                        <Network className="h-4 w-4" />
+                      </div>
+                      <div>
+                        <h2 className="text-[14px] font-semibold text-gray-800">AI Gateway</h2>
+                        <p className="mt-0.5 text-[11px] text-gray-500">Higress · OpenAI-compatible endpoint</p>
+                        {gatewayEnvironmentOverride && (
+                          <p className="mt-1 text-[10px] font-medium text-amber-600">当前值由环境变量覆盖，页面保存不会改变运行时覆盖值</p>
+                        )}
+                      </div>
                     </div>
-                    <div>
-                      <h2 className="text-[14px] font-semibold text-gray-800">AI Gateway</h2>
-                      <p className="mt-0.5 text-[11px] text-gray-500">Higress · OpenAI-compatible endpoint</p>
-                      {gatewayEnvironmentOverride && (
-                        <p className="mt-1 text-[10px] font-medium text-amber-600">当前值由环境变量覆盖，页面保存不会改变运行时覆盖值</p>
-                      )}
-                    </div>
+                    <a
+                      href="http://localhost:8001"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="flex shrink-0 items-center gap-1.5 rounded-lg bg-[#002fa7]/10 px-3 py-2 text-[11px] font-medium text-[#002fa7] transition-colors hover:bg-[#002fa7]/15"
+                    >
+                      <ExternalLink className="h-3.5 w-3.5" />
+                      打开 Console
+                    </a>
                   </div>
                   <div className="grid grid-cols-2 gap-4">
                     <FormField label="Gateway 覆盖地址（可选）">
