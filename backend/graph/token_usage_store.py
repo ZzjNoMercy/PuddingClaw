@@ -5,7 +5,6 @@
 
 import json
 import logging
-import os
 import sqlite3
 import time
 from datetime import datetime
@@ -41,6 +40,12 @@ def _get_conn() -> sqlite3.Connection:
             timestamp REAL
         )
     """)
+    # 兼容旧表：添加 role 字段
+    try:
+        conn.execute("ALTER TABLE token_usage ADD COLUMN role TEXT DEFAULT 'agent'")
+    except sqlite3.OperationalError:
+        # 字段已存在
+        pass
     conn.commit()
     return conn
 
@@ -64,8 +69,13 @@ def record_token_usage(
     output_tokens: int,
     total_tokens: int,
     start_time: float,
+    role: str = "agent",
 ) -> None:
-    """双写 token 用量到 SQLite + jsonl。任何一步失败静默跳过，不阻塞主流程。"""
+    """双写 token 用量到 SQLite + jsonl。任何一步失败静默跳过，不阻塞主流程。
+
+    Args:
+        role: 调用角色，如 agent / title / summary / compensation / embedding
+    """
     timestamp = time.time()
     record: dict[str, Any] = {
         "user_id": user_id,
@@ -76,6 +86,7 @@ def record_token_usage(
         "total_tokens": total_tokens,
         "start_time": start_time,
         "timestamp": timestamp,
+        "role": role,
     }
 
     # 1. 写入 SQLite
@@ -84,10 +95,10 @@ def record_token_usage(
         conn.execute(
             """
             INSERT INTO token_usage
-            (user_id, session_id, round_num, input_tokens, output_tokens, total_tokens, start_time, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (user_id, session_id, round_num, input_tokens, output_tokens, total_tokens, start_time, timestamp, role)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (user_id, session_id, round_num, input_tokens, output_tokens, total_tokens, start_time, timestamp),
+            (user_id, session_id, round_num, input_tokens, output_tokens, total_tokens, start_time, timestamp, role),
         )
         conn.commit()
     except Exception as e:
@@ -169,16 +180,16 @@ def get_daily(days: int = 7) -> list[dict[str, Any]]:
         conn = _get_connection()
         # SQLite 日期格式化
         cur = conn.execute(
-            """
+            f"""
             SELECT DATE(datetime(timestamp, 'unixepoch')) AS day,
                    SUM(input_tokens) AS input_tokens,
                    SUM(output_tokens) AS output_tokens,
                    SUM(total_tokens) AS total_tokens
             FROM token_usage
-            WHERE timestamp >= strftime('%s', 'now', '-%d days')
+            WHERE timestamp >= strftime('%s', 'now', '-{days} days')
             GROUP BY day
             ORDER BY day DESC
-            """ % days,
+            """,
         )
         rows = cur.fetchall()
         return [

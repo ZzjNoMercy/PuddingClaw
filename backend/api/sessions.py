@@ -95,16 +95,10 @@ async def generate_title(session_id: str):
         raise HTTPException(status_code=400, detail="No user message found")
 
     try:
-        from langchain_deepseek import ChatDeepSeek
         from langchain_core.messages import HumanMessage as HM
+        from llm.model_client import ModelClient
 
-        cfg = get_llm_config()
-        llm = ChatDeepSeek(
-            model=cfg["model"],
-            api_key=cfg["api_key"],
-            base_url=cfg["base_url"],
-            temperature=0.3,
-        )
+        llm = ModelClient(role="title", temperature=0.3)
 
         prompt = (
             f"根据以下对话内容，生成一个不超过10个字的中文标题，只输出标题文本，不要加引号或标点。\n\n"

@@ -73,6 +73,7 @@ from api.eval_api import router as eval_router
 from api.skills_api import router as skills_router
 from api.stats_api import router as stats_router
 from api.mcp import router as mcp_router
+from api.capabilities import router as capabilities_router
 
 app.include_router(chat_router, prefix="/api")
 app.include_router(skills_router, prefix="/api")  # Must come before files_router
@@ -84,6 +85,7 @@ app.include_router(config_router, prefix="/api")
 app.include_router(eval_router, prefix="/api")
 app.include_router(stats_router, prefix="/api")
 app.include_router(mcp_router, prefix="/api")
+app.include_router(capabilities_router, prefix="/api")
 
 
 @app.get("/")

@@ -81,3 +81,20 @@ export async function testConnection(params: {
   }
   return resp.json();
 }
+
+export interface CapabilityStatus {
+  available: boolean;
+  reason: string | null;
+}
+
+export interface Capabilities {
+  ai_gateway: CapabilityStatus;
+  milvus: CapabilityStatus;
+  mineru: CapabilityStatus;
+}
+
+export async function getCapabilities(): Promise<Capabilities> {
+  const resp = await fetch(`${API_BASE}/capabilities`);
+  if (!resp.ok) throw new Error(`Failed to get capabilities: ${resp.status}`);
+  return resp.json();
+}

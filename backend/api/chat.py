@@ -52,16 +52,10 @@ async def _generate_title(session_id: str) -> str | None:
         if not first_user:
             return None
 
-        from langchain_deepseek import ChatDeepSeek
         from langchain_core.messages import HumanMessage as HM
+        from llm.model_client import ModelClient
 
-        cfg = get_llm_config()
-        llm = ChatDeepSeek(
-            model=cfg["model"],
-            api_key=cfg["api_key"],
-            base_url=cfg["base_url"],
-            temperature=0.3,
-        )
+        llm = ModelClient(role="title", temperature=0.3)
 
         prompt = (
             f"根据以下对话内容，生成一个不超过10个字的中文标题，只输出标题文本，不要加引号或标点。\n\n"
@@ -173,8 +167,8 @@ async def _detect_and_retry_memory_write(
     print(f"[WARN] Fake memory write detected in session {session_id}, triggering compensation")
 
     try:
-        from langchain_deepseek import ChatDeepSeek
         from langchain_core.messages import HumanMessage as HM
+        from llm.model_client import ModelClient
 
         # 读取当前 MEMORY.md
         memory_path = BASE_DIR / "memory" / "MEMORY.md"
@@ -187,13 +181,7 @@ async def _detect_and_retry_memory_write(
         assistant_reply = "\n".join(seg.get("content", "") for seg in segments)
 
         # 用独立 LLM 调用提取需要记忆的内容并生成更新后的 MEMORY.md
-        cfg = get_llm_config()
-        llm = ChatDeepSeek(
-            model=cfg["model"],
-            api_key=cfg["api_key"],
-            base_url=cfg["base_url"],
-            temperature=0,
-        )
+        llm = ModelClient(role="memory", temperature=0)
 
         prompt = f"""你是一个记忆管理助手。根据以下对话内容，将需要记住的信息追加到 MEMORY.md 中。
 
@@ -471,16 +459,10 @@ async def _maybe_middle_trim_session(session_id: str) -> None:
     prompt = MIDDLE_TRIM_SUMMARY_PROMPT.format(history=history_text)
 
     try:
-        from langchain_deepseek import ChatDeepSeek
         from langchain_core.messages import HumanMessage as HM
+        from llm.model_client import ModelClient
 
-        llm_cfg = get_llm_config()
-        llm = ChatDeepSeek(
-            model=llm_cfg["model"],
-            api_key=llm_cfg["api_key"],
-            base_url=llm_cfg["base_url"],
-            temperature=0,
-        )
+        llm = ModelClient(role="summary", temperature=0)
         result = await llm.ainvoke([HM(content=prompt)])
         summary = result.content.strip()
     except Exception as e:

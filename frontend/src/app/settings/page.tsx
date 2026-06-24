@@ -17,6 +17,7 @@ import {
   EyeOff,
   Zap,
   ArrowLeft,
+  Activity,
 } from "lucide-react";
 import {
   getSettings,
@@ -26,9 +27,10 @@ import {
 } from "@/lib/settingsApi";
 import { useApp } from "@/lib/store";
 import MemoryEditor from "@/components/settings/MemoryEditor";
+import CapabilitiesStatus from "@/components/settings/CapabilitiesStatus";
 import Link from "next/link";
 
-type SettingsCategory = "model" | "embedding" | "rag" | "memory" | "data" | "advanced";
+type SettingsCategory = "model" | "embedding" | "rag" | "memory" | "data" | "advanced" | "system";
 
 const CATEGORIES: { key: SettingsCategory; label: string; icon: React.ElementType; color: string }[] = [
   { key: "model", label: "LLM 模型", icon: Bot, color: "#002fa7" },
@@ -37,6 +39,7 @@ const CATEGORIES: { key: SettingsCategory; label: string; icon: React.ElementTyp
   { key: "memory", label: "记忆管理", icon: Brain, color: "#7c3aed" },
   { key: "data", label: "数据管理", icon: HardDrive, color: "#10b981" },
   { key: "advanced", label: "高级设置", icon: Sliders, color: "#6b7280" },
+  { key: "system", label: "系统状态", icon: Activity, color: "#002fa7" },
 ];
 
 const LLM_PROVIDERS = [
@@ -45,13 +48,24 @@ const LLM_PROVIDERS = [
   { value: "custom", label: "自定义", baseUrl: "" },
 ];
 
+const SETTINGS_CATEGORY_KEY = "settings:activeCategory";
+
 export default function SettingsPage() {
   const { ragMode, toggleRagMode } = useApp();
-  const [category, setCategory] = useState<SettingsCategory>("model");
+  const [category, setCategory] = useState<SettingsCategory>(() => {
+    if (typeof window === "undefined") return "model";
+    const saved = localStorage.getItem(SETTINGS_CATEGORY_KEY);
+    const valid = CATEGORIES.some((c) => c.key === saved);
+    return (valid ? (saved as SettingsCategory) : "model");
+  });
   const [settings, setSettings] = useState<SystemSettings | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [toast, setToast] = useState<{ type: "success" | "error"; message: string } | null>(null);
+
+  useEffect(() => {
+    localStorage.setItem(SETTINGS_CATEGORY_KEY, category);
+  }, [category]);
 
   // LLM form state
   const [llmProvider, setLlmProvider] = useState("deepseek");
@@ -436,7 +450,7 @@ export default function SettingsPage() {
                     aria-label="启用 RAG 检索"
                     onClick={toggleRagMode}
                     className={`relative h-5 w-9 shrink-0 rounded-full transition-colors ${
-                      ragMode ? "bg-[#7c3aed]" : "bg-gray-300"
+                      ragMode ? "bg-[#002fa7]" : "bg-gray-300"
                     }`}
                   >
                     <span
@@ -522,6 +536,13 @@ export default function SettingsPage() {
                     <span>多压缩 (80%)</span>
                   </div>
                 </FormField>
+              </SettingsCard>
+            )}
+
+            {/* System Status */}
+            {category === "system" && (
+              <SettingsCard title="系统状态" icon={Activity} color="#002fa7">
+                <CapabilitiesStatus refreshIntervalMs={30000} />
               </SettingsCard>
             )}
 

@@ -132,6 +132,7 @@ from graph.session_manager import session_manager, COMPRESSED_CONTEXT_PREFIX
 from graph.citations import format_sources_for_model
 from graph.tool_result_adapter import tool_result_adapter
 from graph.llm_input_logger import current_session_id, current_user_id, log_llm_input
+from llm.model_client import ModelClient
 from tools import get_all_tools
 
 
@@ -159,15 +160,8 @@ class AgentManager:
         api_base = llm_config.get("base_url") or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
         temperature = llm_config.get("temperature", 0.7)
 
-        from langchain_deepseek import ChatDeepSeek
-        self._llm = ChatDeepSeek(
-            model=model,
-            api_key=api_key,
-            base_url=api_base,
-            temperature=temperature,
-            streaming=True,
-            stream_usage=True,  # ← 新增：启用 usage_metadata 返回
-        )
+        self._llm_client = ModelClient(role="agent", streaming=True)
+        self._llm = self._llm_client.get_chat_model()
         self._config_sig = f"{model}|{api_key}|{api_base}|{temperature}"
 
         from graph.middlewares.skills_router import SkillsRouterMiddleware
@@ -190,11 +184,8 @@ class AgentManager:
 
         config_sig = f"{model}|{api_key}|{api_base}|{temperature}"
         if self._config_sig != config_sig:
-            from langchain_deepseek import ChatDeepSeek
-            self._llm = ChatDeepSeek(
-                model=model, api_key=api_key, base_url=api_base,
-                temperature=temperature, streaming=True, stream_usage=True,
-            )
+            self._llm_client = ModelClient(role="agent", streaming=True)
+            self._llm = self._llm_client.get_chat_model()
             self._config_sig = config_sig
 
     def _get_prompt_files_sig(self) -> str:

@@ -14,16 +14,10 @@ router = APIRouter()
 
 
 async def _generate_summary(messages: list[dict[str, Any]]) -> str:
-    """Use DeepSeek to generate a compressed summary of messages."""
-    from langchain_deepseek import ChatDeepSeek
+    """Use LLM to generate a compressed summary of messages."""
+    from llm.model_client import ModelClient
 
-    cfg = get_llm_config()
-    llm = ChatDeepSeek(
-        model=cfg["model"],
-        api_key=cfg["api_key"],
-        base_url=cfg["base_url"],
-        temperature=0.3,
-    )
+    llm = ModelClient(role="compress", temperature=0.3)
 
     # Format messages for summary
     formatted = []

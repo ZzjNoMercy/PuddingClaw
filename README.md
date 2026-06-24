@@ -22,6 +22,56 @@
 | 记忆检索 | LlamaIndex + OpenAI Embedding |
 | 实时通信 | SSE (Server-Sent Events) |
 
+## 知识库与数据库演进
+
+项目正在设计独立于长期记忆的知识库能力。目标架构采用：
+
+- **PostgreSQL（核心依赖）**：保存用户、会话、知识库目录、文档版本、摄取任务、发布状态和引用元数据。
+- **本地 Artifact 存储（核心能力）**：保存原始文档、完整 Markdown、图片和表格；支持 glob/ripgrep 精确检索。
+- **Milvus（可选）**：保存 LlamaIndex 生成的文本/图片向量，用于语义和多模态检索。
+- **MinerU（可选）**：作为独立解析服务处理扫描件、中文 OCR 和复杂图文 PDF；未启用时降级到 PyMuPDF/pypdf。
+
+上传与解析只执行一次，解析结果可以发布到 `local`、`indexed` 或 `both` 两条管道。PostgreSQL 是业务事实源，Milvus 不替代关系型数据库，MinerU 也不会作为重量级依赖安装进后端进程。
+
+> 当前状态：该部分处于方案设计阶段，根目录现有 Compose 和后端尚未完成 PostgreSQL/worker/可选依赖改造。请勿将下述目标结构当作已经可用的启动命令。
+
+详细设计：
+
+- [后端架构总览](docs/ARCHITECTURE.md)
+- [ADR-001：AI Gateway + ModelClient 统一模型接入层](docs/adr/ADR-001-ai-gateway-and-model-client.md)
+- [知识库双管道技术方案与实施计划](docs/知识库双管道技术方案与实施计划.md)
+- [开源项目结构与可选基础设施方案](docs/开源项目结构与可选基础设施方案.md)
+
+### 面向开源的目标发行方式
+
+Core 发行只强制启动 PostgreSQL、backend、worker 和 frontend。Milvus 使用独立 Compose overlay 按需叠加；MinerU 作为后端 optional dependency 管理，通过 uv 安装，并使用独立脚本 `scripts/setup-mineru.py` 处理部署：
+
+```text
+backend/pyproject.toml                 # 后端依赖，MinerU 为 optional
+compose.yaml                           # Core
+deploy/compose.milvus.yaml             # 可选 Milvus + etcd + MinIO
+deploy/compose.ai-gateway.yaml         # 可选 Higress AI Gateway
+scripts/setup-mineru.py                # 自动部署 MinerU（原生 / Docker / CPU / GPU）
+```
+
+目标启动矩阵：
+
+```bash
+# Core 模式（只依赖 PostgreSQL）
+docker compose up -d
+
+# 部署 MinerU（自动检测环境，下载模型，启动 mineru-api）
+python scripts/setup-mineru.py
+
+# 前台运行 mineru-api（开发调试，实时日志）
+# python scripts/setup-mineru.py --foreground
+
+# Full 模式（Higress + Milvus + 其余服务）
+docker compose --profile full up -d
+```
+
+开源前还需要完成：根目录真实 `LICENSE`、`CONTRIBUTING.md`、`SECURITY.md`、第三方许可证说明、脱敏配置、CI 测试矩阵，以及移除当前 Compose 中个人机器的绝对 MinerU 模型路径。
+
 ## 项目结构
 
 ```text
@@ -56,7 +106,9 @@ PuddingClaw/
 │   ├── skills/             # 可扩展技能库
 │   │   └── */SKILL.md
 │   ├── sessions/           # 会话持久化
-│   ├── requirements.txt
+│   ├── pyproject.toml      # 项目依赖（uv 管理）
+│   ├── uv.lock             # uv 锁定文件
+│   ├── requirements.txt    # 保留作为 fallback（将逐步迁移）
 │   └── .env.example
 └── frontend/               # 前端 (Next.js)
     ├── src/
@@ -69,6 +121,8 @@ PuddingClaw/
     ├── package.json
     └── .env.example
 ```
+
+上述是当前仓库结构。知识库实现会先在现有 `backend/` 内建立 `domain/application/infrastructure` 边界，再渐进迁移到 `apps/ + packages/ + services/ + deploy/`；不会为追求目录外观进行一次性大搬迁。
 
 ## 快速开始
 
@@ -109,13 +163,26 @@ scripts\start-windows.bat
 
 #### 后端
 
+推荐使用 [uv](https://docs.astral.sh/uv/) 管理依赖：
+
 ```bash
 cd backend
-python3 -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-python -m uvicorn app:app --reload --host 0.0.0.0 --port 8002
+uv sync                         # 安装核心依赖
+# 如需 MinerU 解析能力：
+# uv sync --extra mineru
+# 如需 Milvus 向量存储：
+# uv sync --extra milvus
+
+uv run python -m uvicorn app:app --reload --host 0.0.0.0 --port 8002
 ```
+
+如未安装 uv：
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+（保留 `requirements.txt` 作为传统 pip 用户的 fallback，但不保证与 `uv.lock` 完全同步。）
 
 #### 前端
 
