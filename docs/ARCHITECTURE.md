@@ -305,18 +305,26 @@ async def get_chat_model(self):
     gateway_url = os.getenv("AI_GATEWAY_URL")
 
     if gateway_url and capabilities.ai_gateway.available:
+        # Gateway 模式：PuddingClaw 不持有 Provider key，由 Higress 管理
         return ChatOpenAI(
             model=self.cfg["model"],
-            api_key=self.cfg["api_key"],
+            api_key="dummy",  # Higress 负责上游鉴权
             base_url=gateway_url,
             temperature=self.temperature,
             streaming=self.streaming,
         )
 
-    # fallback：按 provider 直连
-    provider = self.cfg.get("provider", "deepseek")
+    # fallback / direct 模式：使用本地 Fallback Provider
+    fallback = self.cfg.get("fallback_provider", {})
+    provider = fallback.get("provider", "deepseek")
     if provider == "deepseek":
-        return ChatDeepSeek(...)
+        return ChatDeepSeek(
+            model=fallback["model"],
+            api_key=fallback["api_key"],
+            base_url=fallback["base_url"],
+            temperature=self.temperature,
+            streaming=self.streaming,
+        )
     if provider == "openai":
         return ChatOpenAI(...)
     # 注意：DeepAgents 不是 model provider，属于 Agent 编排层，不在此处处理
@@ -547,11 +555,13 @@ ingestion-worker 领取任务
 | `OPENAI_API_KEY` | OpenAI API Key | embedding / mem0 使用 |
 | `DASHSCOPE_API_KEY` | 灵积 API Key | 多模态 embedding / 千问 |
 
-### 9.3 网关模式下的模型名
+### 9.3 网关模式下的模型名与鉴权
 
 走 Higress 时，`config.json` 里的 `llm.model` 保持不变（如 `deepseek-chat`），由 Higress 根据 model name 路由到真实 provider。`ModelClient` 用 `ChatOpenAI` 只是因为它实现了 OpenAI 兼容协议。
 
-Higress 在这里不提供模型，也不承担客户端鉴权；它只提供统一 Base URL、请求代理、Token 统计、限流和按 model 切换 Provider。无论直连还是经过 Higress，请求都使用所选 LLM / Embedding Provider 的 API Key。设置 API 永不返回 Provider Key 明文。
+Higress 在这里不提供模型；它提供统一 Base URL、请求代理、Token 统计、限流和按 model 切换 Provider。Gateway 模式下，PuddingClaw **不传递 Provider API Key**，上游鉴权由 Higress 中配置的 Provider key 负责。Fallback / direct 模式才使用 PuddingClaw 本地 Secret Store 中的 Provider key。
+
+设置 API 永不返回 Provider Key 明文。
 
 ---
 
