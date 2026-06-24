@@ -41,16 +41,9 @@ class SearchKnowledgeBaseTool(BaseTool):
                 VectorStoreIndex,
                 load_index_from_storage,
             )
-            from llama_index.core.settings import Settings
-            from llama_index.embeddings.openai import OpenAIEmbedding
+            from llm.embed_client import get_embedding_model
 
-            from config import get_embedding_config
-            emb_cfg = get_embedding_config()
-            Settings.embed_model = OpenAIEmbedding(
-                model=emb_cfg["model"],
-                api_key=emb_cfg["api_key"],
-                api_base=emb_cfg["api_base"],
-            )
+            embed_model = get_embedding_model()
 
             # Try loading persisted index
             if storage_dir.exists() and any(storage_dir.iterdir()):
@@ -58,7 +51,7 @@ class SearchKnowledgeBaseTool(BaseTool):
                     storage_context = StorageContext.from_defaults(
                         persist_dir=str(storage_dir)
                     )
-                    return load_index_from_storage(storage_context)
+                    return load_index_from_storage(storage_context, embed_model=embed_model)
                 except Exception:
                     pass
 
@@ -70,7 +63,7 @@ class SearchKnowledgeBaseTool(BaseTool):
             if not documents:
                 return None
 
-            index = VectorStoreIndex.from_documents(documents)
+            index = VectorStoreIndex.from_documents(documents, embed_model=embed_model)
             storage_dir.mkdir(parents=True, exist_ok=True)
             index.storage_context.persist(persist_dir=str(storage_dir))
             return index

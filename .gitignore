@@ -59,6 +59,10 @@ frontend/tsconfig.tsbuildinfo
 
 # Docker volumes (if any)
 volumes/
+data/
+
+# Generated design artifacts
+designs/
 
 # SkillHub runtime lock
 backend/skills/.skills_store_lock.json

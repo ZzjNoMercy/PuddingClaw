@@ -35,21 +35,24 @@ def _get_tokenizer():
     if _TIKTOKEN_ENC is not None:
         return _TIKTOKEN_ENC, "tiktoken"
 
-    # 可选：强制 tiktoken
-    if os.getenv("USE_TIKTOKEN") == "1":
-        _tk_logger.info("USE_TIKTOKEN=1, skip deepseek tokenizer")
-    else:
-        # 默认：DeepSeek 官方 tokenizer（镜像已预缓存到 /app/.hf_cache）
+    # 默认：tiktoken（已预缓存，不联网，不阻塞 event loop）
+    # 如需更精确的 DeepSeek tokenizer，确保 /app/.hf_cache 已缓存后设置 USE_DEEPSEEK_TOKENIZER=1
+    if os.getenv("USE_DEEPSEEK_TOKENIZER") == "1":
         try:
             from transformers import AutoTokenizer
-            tok = AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-V3", trust_remote_code=True)
+
+            tok = AutoTokenizer.from_pretrained(
+                "deepseek-ai/DeepSeek-V3",
+                trust_remote_code=True,
+                local_files_only=os.getenv("HF_HUB_OFFLINE", "0") == "1",
+            )
             _DEEPSEEK_TOKENIZER = tok
             _tk_logger.info("token counter: using deepseek-ai/DeepSeek-V3 tokenizer")
             return tok, "deepseek"
         except Exception as e:
             _tk_logger.warning("failed to load deepseek tokenizer (%s), falling back to tiktoken", e)
 
-    # 降级：tiktoken
+    # tiktoken 降级
     try:
         import tiktoken
         _TIKTOKEN_ENC = tiktoken.get_encoding("cl100k_base")

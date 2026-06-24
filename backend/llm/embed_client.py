@@ -7,11 +7,10 @@
 from __future__ import annotations
 
 import logging
-import os
-
 from llama_index.embeddings.openai import OpenAIEmbedding
 
-from config import load_config
+import capabilities
+from config import get_embedding_config, get_gateway_config
 
 logger = logging.getLogger(__name__)
 
@@ -22,10 +21,17 @@ def get_embedding_model() -> OpenAIEmbedding:
     如果 AI_GATEWAY_URL 可用，优先通过网关路由 embedding 请求；
     否则使用 config.json 中 embedding.base_url 直连。
     """
-    cfg = load_config().get("embedding", {})
-    gateway_url = os.getenv("AI_GATEWAY_URL")
+    cfg = get_embedding_config()
+    gateway = get_gateway_config()
+    use_gateway = False
+    if gateway.get("enabled") and gateway.get("base_url"):
+        try:
+            use_gateway = capabilities.detect_capabilities_sync().ai_gateway.available
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[EmbedClient] gateway detection failed: %s", exc)
 
-    api_base = gateway_url or cfg.get("base_url", "https://api.openai.com/v1")
+    api_base = gateway.get("base_url") if use_gateway else cfg.get("api_base", "https://api.openai.com/v1")
+    # Higress 不承担客户端鉴权；上下游始终使用所选 Embedding Provider 的凭证。
     api_key = cfg.get("api_key", "")
     model = cfg.get("model", "text-embedding-3-small")
 

@@ -8,6 +8,8 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from config import (
+    get_embedding_config,
+    get_llm_config,
     get_rag_mode,
     set_rag_mode,
     get_settings_for_display,
@@ -39,6 +41,7 @@ async def set_rag_mode_endpoint(request: RagModeRequest):
 
 
 class SettingsUpdateRequest(BaseModel):
+    ai_gateway: Optional[dict[str, Any]] = None
     llm: Optional[dict[str, Any]] = None
     embedding: Optional[dict[str, Any]] = None
     rag: Optional[dict[str, Any]] = None
@@ -57,6 +60,8 @@ async def put_settings(request: SettingsUpdateRequest):
     try:
         updates = request.model_dump(exclude_none=True)
         update_settings(updates)
+        import capabilities
+        capabilities.invalidate_capabilities()
         return {"success": True, "message": "Settings saved"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save settings: {e}")
@@ -66,11 +71,12 @@ async def put_settings(request: SettingsUpdateRequest):
 
 
 class TestConnectionRequest(BaseModel):
-    type: str  # "llm" or "embedding"
-    provider: str
-    model: str
+    type: str  # "gateway", "llm" or "embedding"
+    provider: str = ""
+    model: str = ""
     base_url: str
-    api_key: str
+    api_key: str = ""
+    health_path: str = "/health"
 
 
 @router.post("/settings/test-connection")
@@ -81,16 +87,29 @@ async def test_connection(request: TestConnectionRequest):
     start = time.time()
 
     try:
-        if request.type == "llm":
+        if request.type == "gateway":
+            result = await _test_gateway_connection(
+                request.base_url,
+                request.health_path,
+            )
+        elif request.type == "llm":
+            llm = get_llm_config()
             result = await _test_llm_connection(
-                request.provider, request.model, request.base_url, request.api_key
+                request.provider,
+                request.model,
+                request.base_url,
+                request.api_key or llm.get("api_key", ""),
             )
         elif request.type == "embedding":
+            embedding = get_embedding_config()
             result = await _test_embedding_connection(
-                request.provider, request.model, request.base_url, request.api_key
+                request.provider,
+                request.model,
+                request.base_url,
+                request.api_key or embedding.get("api_key", ""),
             )
         else:
-            raise HTTPException(status_code=400, detail="type must be 'llm' or 'embedding'")
+            raise HTTPException(status_code=400, detail="type must be 'gateway', 'llm' or 'embedding'")
 
         latency_ms = int((time.time() - start) * 1000)
         return {"success": True, "model": request.model, "latency_ms": latency_ms, **result}
@@ -119,6 +138,25 @@ async def _test_llm_connection(provider: str, model: str, base_url: str, api_key
         max_tokens=5,
     )
     return {"response_model": response.model or model}
+
+
+def _gateway_health_url(base_url: str, health_path: str) -> str:
+    """将 OpenAI `/v1` 入口转换为网关进程的健康检查地址。"""
+    normalized = base_url.rstrip("/")
+    if normalized.endswith("/v1"):
+        normalized = normalized[:-3]
+    return normalized + "/" + health_path.lstrip("/")
+
+
+async def _test_gateway_connection(base_url: str, health_path: str) -> dict:
+    import httpx
+
+    health_url = _gateway_health_url(base_url, health_path)
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.get(health_url)
+    if not 200 <= response.status_code < 400:
+        raise HTTPException(status_code=502, detail=f"Gateway health check returned HTTP {response.status_code}")
+    return {"health_url": health_url, "status_code": response.status_code}
 
 
 async def _test_embedding_connection(provider: str, model: str, base_url: str, api_key: str) -> dict:

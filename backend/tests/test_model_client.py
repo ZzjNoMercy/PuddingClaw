@@ -96,5 +96,34 @@ async def test_model_client_ainvoke_records_usage(mock_config):
             mock_record.assert_called_once()
             _, kwargs = mock_record.call_args
             assert kwargs["role"] == "title"
+            assert kwargs["user_id"] == "u1"
+            assert kwargs["session_id"] == "s1"
+            assert kwargs["round_num"] == 1
             assert kwargs["input_tokens"] == 10
             assert kwargs["output_tokens"] == 5
+
+
+@pytest.mark.asyncio
+async def test_model_client_gateway_failure_falls_back_to_direct(mock_config):
+    """Gateway 在首个响应前失败时，应回退直连 Provider。"""
+    from langchain_core.messages import AIMessage
+
+    client = ModelClient(role="title")
+    client.gateway_cfg = {
+        "enabled": True,
+        "base_url": "http://gateway:8080/v1",
+        "fallback_to_direct": True,
+    }
+    gateway = mock.AsyncMock()
+    gateway.ainvoke.side_effect = RuntimeError("gateway down")
+    direct = mock.AsyncMock()
+    direct.ainvoke.return_value = AIMessage(content="fallback")
+
+    with mock.patch.object(client, "_should_use_gateway", return_value=True):
+        with mock.patch.object(client, "get_chat_model", return_value=gateway):
+            with mock.patch.object(client, "_direct_model", return_value=direct):
+                with mock.patch("llm.model_client.record_token_usage"):
+                    result = await client.ainvoke([])
+
+    assert result.content == "fallback"
+    direct.ainvoke.assert_awaited_once()

@@ -20,8 +20,11 @@ async def lifespan(app: FastAPI):
     from tools.skills_scanner import scan_skills
     from graph.agent import agent_manager
     from graph.memory_indexer import get_memory_indexer
+    import capabilities
 
     scan_skills(BASE_DIR)
+    caps = await capabilities.detect_capabilities(force=True)
+    print(f"🔌 Capabilities: {caps.to_dict()}")
     try:
         agent_manager.initialize(BASE_DIR)
     except Exception as e:

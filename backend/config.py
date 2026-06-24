@@ -15,6 +15,12 @@ _LEGACY_WARN_SHOWN: bool = False
 _DEFAULT_CONFIG: dict[str, Any] = {
     "rag_mode": False,
     "memory_backend": "markdown",  # "markdown" = MEMORY.md 原生方案, "mem0" = mem0 框架
+    "ai_gateway": {
+        "enabled": False,
+        "base_url": "http://higress:8080/v1",
+        "health_path": "/health",
+        "fallback_to_direct": True,
+    },
     "llm": {
         "provider": "deepseek",
         "model": "deepseek-chat",
@@ -302,7 +308,21 @@ def get_smart_extractor_config() -> dict[str, int | float]:
     }
 
 
-def get_llm_config() -> dict[str, str]:
+def get_gateway_config() -> dict[str, Any]:
+    """读取 AI Gateway 配置，环境变量优先于持久化设置。"""
+    import os
+
+    gateway = load_config().get("ai_gateway", {})
+    env_url = os.getenv("AI_GATEWAY_URL", "").strip()
+    return {
+        "enabled": bool(gateway.get("enabled", False) or env_url),
+        "base_url": env_url or gateway.get("base_url", "http://higress:8080/v1"),
+        "health_path": gateway.get("health_path", "/health"),
+        "fallback_to_direct": bool(gateway.get("fallback_to_direct", True)),
+    }
+
+
+def get_llm_config() -> dict[str, Any]:
     """从 config.json 读取 LLM 配置，fallback 到环境变量。
 
     返回 model/api_key/base_url 三个字段。
@@ -312,13 +332,16 @@ def get_llm_config() -> dict[str, str]:
     config = load_config()
     llm = config.get("llm", {})
     return {
+        "provider": llm.get("provider", "deepseek"),
         "model": llm.get("model") or os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
         "api_key": llm.get("api_key") or os.getenv("DEEPSEEK_API_KEY", ""),
         "base_url": llm.get("base_url") or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+        "temperature": float(llm.get("temperature", 0.7)),
+        "max_tokens": int(llm.get("max_tokens", 4096)),
     }
 
 
-def get_embedding_config() -> dict[str, str]:
+def get_embedding_config() -> dict[str, Any]:
     """从 config.json 读取 Embedding 配置，fallback 到环境变量。
 
     返回 model/api_key/api_base 三个字段。
@@ -328,6 +351,7 @@ def get_embedding_config() -> dict[str, str]:
     config = load_config()
     emb = config.get("embedding", {})
     return {
+        "provider": emb.get("provider", "openai"),
         "model": emb.get("model") or os.getenv("EMBEDDING_MODEL", "text-embedding-3-small"),
         "api_key": emb.get("api_key") or os.getenv("OPENAI_API_KEY", ""),
         "api_base": emb.get("base_url") or os.getenv("OPENAI_BASE_URL", "https://ai.devtool.tech/proxy/v1"),
@@ -343,16 +367,25 @@ def mask_api_key(key: str) -> str:
 
 def get_settings_for_display() -> dict[str, Any]:
     """Get settings with masked API keys for frontend display."""
+    import os
+
     config = load_config()
+    effective_gateway = get_gateway_config()
+    effective_llm = get_llm_config()
+    effective_embedding = get_embedding_config()
     result = {
         "memory_backend": config.get("memory_backend", "markdown"),
+        "ai_gateway": {
+            **effective_gateway,
+            "environment_override": bool(os.getenv("AI_GATEWAY_URL")),
+        },
         "llm": {
             **config.get("llm", {}),
-            "api_key_masked": mask_api_key(config.get("llm", {}).get("api_key", "")),
+            "api_key_masked": mask_api_key(effective_llm.get("api_key", "")),
         },
         "embedding": {
             **config.get("embedding", {}),
-            "api_key_masked": mask_api_key(config.get("embedding", {}).get("api_key", "")),
+            "api_key_masked": mask_api_key(effective_embedding.get("api_key", "")),
         },
         "rag": {
             "enabled": config.get("rag_mode", False),
@@ -369,6 +402,14 @@ def get_settings_for_display() -> dict[str, Any]:
 def update_settings(updates: dict[str, Any]) -> None:
     """Update settings from frontend, handling partial updates and API key logic."""
     config = load_config()
+
+    if "ai_gateway" in updates:
+        gateway_update = updates["ai_gateway"]
+        if "ai_gateway" not in config:
+            config["ai_gateway"] = {}
+        for key in ("enabled", "base_url", "health_path", "fallback_to_direct"):
+            if key in gateway_update:
+                config["ai_gateway"][key] = gateway_update[key]
 
     if "llm" in updates:
         llm_update = updates["llm"]

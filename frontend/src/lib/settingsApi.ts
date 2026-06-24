@@ -13,6 +13,14 @@ export interface LlmSettings {
   max_tokens: number;
 }
 
+export interface GatewaySettings {
+  enabled: boolean;
+  base_url: string;
+  health_path: string;
+  fallback_to_direct: boolean;
+  environment_override: boolean;
+}
+
 export interface EmbeddingSettings {
   provider: string;
   model: string;
@@ -31,6 +39,7 @@ export interface CompressionSettings {
 }
 
 export interface SystemSettings {
+  ai_gateway: GatewaySettings;
   llm: LlmSettings;
   embedding: EmbeddingSettings;
   rag: RagSettings;
@@ -64,11 +73,12 @@ export interface TestConnectionResult {
 }
 
 export async function testConnection(params: {
-  type: "llm" | "embedding";
-  provider: string;
-  model: string;
+  type: "gateway" | "llm" | "embedding";
+  provider?: string;
+  model?: string;
   base_url: string;
-  api_key: string;
+  api_key?: string;
+  health_path?: string;
 }): Promise<TestConnectionResult> {
   const resp = await fetch(`${API_BASE}/settings/test-connection`, {
     method: "POST",

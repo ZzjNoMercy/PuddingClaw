@@ -1,11 +1,8 @@
 """MemoryIndexer — 长期记忆管理器，对 MEMORY.md 建立向量索引实现 RAG 检索"""
 
 import hashlib       # MD5 哈希计算，用于文件变更检测
-import os            # 读取环境变量（API Key、模型名等）
 from pathlib import Path    # 路径操作
 from typing import Any      # 类型注解
-
-from config import get_embedding_config  # 从 config.json 读取 Embedding 配置
 
 
 class MemoryIndexer:
@@ -65,16 +62,9 @@ class MemoryIndexer:
                 VectorStoreIndex,        # 向量索引类
             )
             from llama_index.core.node_parser import SentenceSplitter  # 按句子边界切分文本
-            from llama_index.core.settings import Settings             # 全局配置
-            from llama_index.embeddings.openai import OpenAIEmbedding  # OpenAI Embedding 模型
+            from llm.embed_client import get_embedding_model
 
-            # 配置 Embedding 模型（从 config.json 读取，fallback 到环境变量）
-            emb_cfg = get_embedding_config()
-            Settings.embed_model = OpenAIEmbedding(
-                model=emb_cfg["model"],
-                api_key=emb_cfg["api_key"],
-                api_base=emb_cfg["api_base"],
-            )
+            embed_model = get_embedding_model()
 
             content = self._memory_path.read_text(encoding="utf-8")  # 读取 MEMORY.md 全文
             if not content.strip():                                  # 文件为空则跳过
@@ -90,7 +80,7 @@ class MemoryIndexer:
 
             # 构建向量索引（调用 Embedding API 计算每个 chunk 的向量）
             self._storage_dir.mkdir(parents=True, exist_ok=True)    # 确保存储目录存在
-            index = VectorStoreIndex(nodes)                         # 构建内存中的向量索引
+            index = VectorStoreIndex(nodes, embed_model=embed_model)  # 显式注入，避免污染全局 Settings
 
             # 持久化到磁盘（下次启动直接加载，不用重新调 Embedding API）
             index.storage_context.persist(persist_dir=str(self._storage_dir))  # 写入 storage/memory_index/
@@ -119,22 +109,15 @@ class MemoryIndexer:
         try:
             # 延迟导入（与 rebuild_index 相同的依赖）
             from llama_index.core import StorageContext, load_index_from_storage  # 存储加载工具
-            from llama_index.core.settings import Settings                       # 全局配置
-            from llama_index.embeddings.openai import OpenAIEmbedding            # Embedding 模型
+            from llm.embed_client import get_embedding_model
 
-            # 加载时也要配置 Embedding（检索时需要对 query 做向量化，从 config.json 读取）
-            emb_cfg = get_embedding_config()
-            Settings.embed_model = OpenAIEmbedding(
-                model=emb_cfg["model"],
-                api_key=emb_cfg["api_key"],
-                api_base=emb_cfg["api_base"],
-            )
+            embed_model = get_embedding_model()
 
             # 从磁盘还原索引
             storage_context = StorageContext.from_defaults(
                 persist_dir=str(self._storage_dir)       # 指定持久化目录
             )
-            self._index = load_index_from_storage(storage_context)  # 加载索引到内存
+            self._index = load_index_from_storage(storage_context, embed_model=embed_model)
             return self._index                                      # 返回索引对象
         except Exception as e:                                      # 加载失败
             print(f"⚠️ Failed to load memory index: {e}")           # 打印错误

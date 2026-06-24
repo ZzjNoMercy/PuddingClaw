@@ -18,6 +18,9 @@ import {
   Zap,
   ArrowLeft,
   Activity,
+  Network,
+  Route,
+  ShieldCheck,
 } from "lucide-react";
 import {
   getSettings,
@@ -30,11 +33,10 @@ import MemoryEditor from "@/components/settings/MemoryEditor";
 import CapabilitiesStatus from "@/components/settings/CapabilitiesStatus";
 import Link from "next/link";
 
-type SettingsCategory = "model" | "embedding" | "rag" | "memory" | "data" | "advanced" | "system";
+type SettingsCategory = "ai" | "rag" | "memory" | "data" | "advanced" | "system";
 
 const CATEGORIES: { key: SettingsCategory; label: string; icon: React.ElementType; color: string }[] = [
-  { key: "model", label: "LLM 模型", icon: Bot, color: "#002fa7" },
-  { key: "embedding", label: "Embedding", icon: Sparkles, color: "#f59e0b" },
+  { key: "ai", label: "AI 接入", icon: Network, color: "#002fa7" },
   { key: "rag", label: "RAG 设置", icon: Database, color: "#7c3aed" },
   { key: "memory", label: "记忆管理", icon: Brain, color: "#7c3aed" },
   { key: "data", label: "数据管理", icon: HardDrive, color: "#10b981" },
@@ -45,6 +47,7 @@ const CATEGORIES: { key: SettingsCategory; label: string; icon: React.ElementTyp
 const LLM_PROVIDERS = [
   { value: "deepseek", label: "DeepSeek", baseUrl: "https://api.deepseek.com" },
   { value: "openai", label: "OpenAI", baseUrl: "https://api.openai.com/v1" },
+  { value: "qwen", label: "Qwen / DashScope", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1" },
   { value: "custom", label: "自定义", baseUrl: "" },
 ];
 
@@ -53,15 +56,24 @@ const SETTINGS_CATEGORY_KEY = "settings:activeCategory";
 export default function SettingsPage() {
   const { ragMode, toggleRagMode } = useApp();
   const [category, setCategory] = useState<SettingsCategory>(() => {
-    if (typeof window === "undefined") return "model";
+    if (typeof window === "undefined") return "ai";
     const saved = localStorage.getItem(SETTINGS_CATEGORY_KEY);
     const valid = CATEGORIES.some((c) => c.key === saved);
-    return (valid ? (saved as SettingsCategory) : "model");
+    return (valid ? (saved as SettingsCategory) : "ai");
   });
   const [settings, setSettings] = useState<SystemSettings | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [toast, setToast] = useState<{ type: "success" | "error"; message: string } | null>(null);
+
+  // AI Gateway form state
+  const [gatewayEnabled, setGatewayEnabled] = useState(false);
+  const [gatewayBaseUrl, setGatewayBaseUrl] = useState("http://higress:8080/v1");
+  const [gatewayHealthPath, setGatewayHealthPath] = useState("/health");
+  const [gatewayFallback, setGatewayFallback] = useState(true);
+  const [gatewayEnvironmentOverride, setGatewayEnvironmentOverride] = useState(false);
+  const [gatewayTesting, setGatewayTesting] = useState(false);
+  const [gatewayTestResult, setGatewayTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
 
   useEffect(() => {
     localStorage.setItem(SETTINGS_CATEGORY_KEY, category);
@@ -101,6 +113,11 @@ export default function SettingsPage() {
     getSettings()
       .then((s) => {
         setSettings(s);
+        setGatewayEnabled(s.ai_gateway.enabled);
+        setGatewayBaseUrl(s.ai_gateway.base_url);
+        setGatewayHealthPath(s.ai_gateway.health_path);
+        setGatewayFallback(s.ai_gateway.fallback_to_direct);
+        setGatewayEnvironmentOverride(s.ai_gateway.environment_override);
         // Populate LLM fields
         setLlmProvider(s.llm.provider);
         setLlmModel(s.llm.model);
@@ -132,6 +149,12 @@ export default function SettingsPage() {
     setSaving(true);
     try {
       await updateSettings({
+        ai_gateway: {
+          enabled: gatewayEnabled,
+          base_url: gatewayBaseUrl,
+          health_path: gatewayHealthPath,
+          fallback_to_direct: gatewayFallback,
+        },
         llm: {
           provider: llmProvider,
           model: llmModel,
@@ -168,7 +191,24 @@ export default function SettingsPage() {
     } finally {
       setSaving(false);
     }
-  }, [llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embBaseUrl, embApiKey, ragMode, ragTopK, ragThreshold, compRatio, showToast]);
+  }, [gatewayEnabled, gatewayBaseUrl, gatewayHealthPath, gatewayFallback, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embBaseUrl, embApiKey, ragMode, ragTopK, ragThreshold, compRatio, showToast]);
+
+  const handleTestGateway = useCallback(async () => {
+    setGatewayTesting(true);
+    setGatewayTestResult(null);
+    try {
+      const result = await testConnection({
+        type: "gateway",
+        base_url: gatewayBaseUrl,
+        health_path: gatewayHealthPath,
+      });
+      setGatewayTestResult({ ok: true, msg: `网关可用 (${result.latency_ms}ms)` });
+    } catch (err) {
+      setGatewayTestResult({ ok: false, msg: err instanceof Error ? err.message : "网关不可用" });
+    } finally {
+      setGatewayTesting(false);
+    }
+  }, [gatewayBaseUrl, gatewayHealthPath]);
 
   const handleTestLlm = useCallback(async () => {
     const key = llmApiKey || settings?.llm.api_key_masked || "";
@@ -266,9 +306,97 @@ export default function SettingsPage() {
 
         {/* Right: Settings Form */}
         <div className="flex-1 overflow-y-auto p-6">
-          <div className="max-w-2xl mx-auto space-y-6">
+          <div className={`${category === "ai" ? "max-w-4xl" : "max-w-2xl"} mx-auto space-y-6`}>
+            {category === "ai" && (
+              <>
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <h1 className="text-[22px] font-semibold tracking-tight text-gray-900">AI 接入</h1>
+                    <p className="mt-1 text-[12px] text-gray-500">
+                      管理请求经过哪里、使用哪个模型，以及每一层的访问凭证。
+                    </p>
+                  </div>
+                  <div className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[10px] font-medium ${
+                    gatewayEnabled ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-700"
+                  }`}>
+                    <span className="h-1.5 w-1.5 rounded-full bg-current" />
+                    {gatewayEnabled ? "Gateway 模式" : "Provider 直连"}
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-[1fr_28px_1fr_28px_1fr] items-center rounded-2xl border border-black/[0.06] bg-gradient-to-br from-white/90 to-[#f5f7ff]/80 p-4 shadow-sm">
+                  <RouteNode title="PuddingClaw" detail="ModelClient · 统一入口" status="运行中" tone="green" />
+                  <Route className="mx-auto h-4 w-4 text-gray-300" />
+                  <RouteNode
+                    title="Higress Gateway"
+                    detail={gatewayEnabled ? gatewayBaseUrl : "已绕过，失败不影响 Core"}
+                    status={gatewayEnabled ? "已接入" : "已绕过"}
+                    tone={gatewayEnabled ? "green" : "amber"}
+                  />
+                  <Route className="mx-auto h-4 w-4 text-gray-300" />
+                  <RouteNode title={llmProvider === "deepseek" ? "DeepSeek" : llmProvider} detail={llmModel} status="主模型" tone="blue" />
+                </div>
+
+                <div className="rounded-2xl border border-[#002fa7]/15 bg-gradient-to-br from-white/90 to-[#f4f7ff]/80 p-5 shadow-sm">
+                  <div className="mb-5 flex items-start justify-between gap-4">
+                    <div className="flex items-center gap-3">
+                      <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#002fa7]/8 text-[#002fa7]">
+                        <Network className="h-4 w-4" />
+                      </div>
+                      <div>
+                        <h2 className="text-[14px] font-semibold text-gray-800">AI Gateway</h2>
+                        <p className="mt-0.5 text-[11px] text-gray-500">Higress · OpenAI-compatible endpoint</p>
+                        {gatewayEnvironmentOverride && (
+                          <p className="mt-1 text-[10px] font-medium text-amber-600">当前值由环境变量覆盖，页面保存不会改变运行时覆盖值</p>
+                        )}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={gatewayEnabled}
+                      aria-label="启用 AI Gateway"
+                      onClick={() => setGatewayEnabled((value) => !value)}
+                      className={`relative h-6 w-11 shrink-0 rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#002fa7]/40 ${
+                        gatewayEnabled ? "bg-[#002fa7]" : "bg-gray-300"
+                      }`}
+                    >
+                      <span
+                        className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow-sm transition-transform ${
+                          gatewayEnabled ? "translate-x-[22px]" : "translate-x-0.5"
+                        }`}
+                      />
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <FormField label="Gateway URL">
+                      <input value={gatewayBaseUrl} onChange={(e) => setGatewayBaseUrl(e.target.value)} className="form-input" placeholder="http://higress:8080/v1" />
+                    </FormField>
+                    <FormField label="健康检查路径">
+                      <input value={gatewayHealthPath} onChange={(e) => setGatewayHealthPath(e.target.value)} className="form-input" placeholder="/health" />
+                    </FormField>
+                    <FormField label="失败策略">
+                      <label className="flex h-[34px] items-center justify-between rounded-lg border border-black/[0.08] bg-white/70 px-3 text-[11px] text-gray-600">
+                        首个 token 前失败时回退 Provider 直连
+                        <input type="checkbox" checked={gatewayFallback} onChange={(e) => setGatewayFallback(e.target.checked)} className="accent-[#002fa7]" />
+                      </label>
+                    </FormField>
+                    <div className="flex items-center justify-between gap-4 rounded-xl border border-black/[0.06] bg-white/55 px-3 py-2.5">
+                      <p className="text-[10px] leading-relaxed text-gray-500">
+                        Higress 只负责代理、Token 统计与模型切换；模型访问始终使用对应 Provider Key。
+                      </p>
+                      <button onClick={handleTestGateway} disabled={gatewayTesting || !gatewayBaseUrl} className="flex shrink-0 items-center gap-1.5 rounded-lg bg-[#002fa7]/10 px-3 py-2 text-[11px] font-medium text-[#002fa7] transition-colors hover:bg-[#002fa7]/15 disabled:opacity-50">
+                        {gatewayTesting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Zap className="h-3.5 w-3.5" />}
+                        测试网关
+                      </button>
+                    </div>
+                    {gatewayTestResult && <div className="col-span-2"><ConnectionResult result={gatewayTestResult} /></div>}
+                  </div>
+                </div>
+              </>
+            )}
             {/* LLM Settings */}
-            {category === "model" && (
+            {category === "ai" && (
               <SettingsCard title="LLM 模型配置" icon={Bot} color="#002fa7">
                 <FormField label="Provider">
                   <select
@@ -365,7 +493,7 @@ export default function SettingsPage() {
             )}
 
             {/* Embedding Settings */}
-            {category === "embedding" && (
+            {category === "ai" && (
               <SettingsCard title="Embedding 模型配置" icon={Sparkles} color="#f59e0b">
                 <FormField label="Provider">
                   <select
@@ -373,10 +501,12 @@ export default function SettingsPage() {
                     onChange={(e) => {
                       setEmbProvider(e.target.value);
                       if (e.target.value === "openai") setEmbBaseUrl("https://api.openai.com/v1");
+                      if (e.target.value === "dashscope") setEmbBaseUrl("https://dashscope.aliyuncs.com/compatible-mode/v1");
                     }}
                     className="form-select"
                   >
                     <option value="openai">OpenAI</option>
+                    <option value="dashscope">DashScope</option>
                     <option value="custom">自定义</option>
                   </select>
                 </FormField>
@@ -449,13 +579,13 @@ export default function SettingsPage() {
                     aria-checked={ragMode}
                     aria-label="启用 RAG 检索"
                     onClick={toggleRagMode}
-                    className={`relative h-5 w-9 shrink-0 rounded-full transition-colors ${
+                    className={`relative h-6 w-11 shrink-0 rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#002fa7]/40 ${
                       ragMode ? "bg-[#002fa7]" : "bg-gray-300"
                     }`}
                   >
                     <span
-                      className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${
-                        ragMode ? "translate-x-[18px]" : "translate-x-0.5"
+                      className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow-sm transition-transform ${
+                        ragMode ? "translate-x-[22px]" : "translate-x-0.5"
                       }`}
                     />
                   </button>
@@ -577,6 +707,42 @@ export default function SettingsPage() {
 }
 
 // ── Reusable Components ───────────────────────────────────
+
+function RouteNode({
+  title,
+  detail,
+  status,
+  tone,
+}: {
+  title: string;
+  detail: string;
+  status: string;
+  tone: "green" | "amber" | "blue";
+}) {
+  const tones = {
+    green: "bg-emerald-50 text-emerald-700",
+    amber: "bg-amber-50 text-amber-700",
+    blue: "bg-[#002fa7]/8 text-[#002fa7]",
+  };
+  return (
+    <div className="min-w-0 rounded-xl border border-black/[0.06] bg-white px-3 py-2.5">
+      <div className="flex items-center justify-between gap-2">
+        <span className="truncate text-[11px] font-semibold text-gray-800">{title}</span>
+        <span className={`shrink-0 rounded-full px-1.5 py-0.5 text-[9px] font-medium ${tones[tone]}`}>{status}</span>
+      </div>
+      <p className="mt-1.5 truncate text-[10px] text-gray-400" title={detail}>{detail}</p>
+    </div>
+  );
+}
+
+function ConnectionResult({ result }: { result: { ok: boolean; msg: string } }) {
+  return (
+    <div className={`mt-1.5 flex items-center gap-1 text-[11px] ${result.ok ? "text-emerald-600" : "text-red-500"}`}>
+      {result.ok ? <ShieldCheck className="h-3 w-3" /> : <XCircle className="h-3 w-3" />}
+      {result.msg}
+    </div>
+  );
+}
 
 function SettingsCard({
   title,

@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 from langchain_core.messages import HumanMessage, AIMessage, AIMessageChunk
 
-from config import get_rag_mode, get_memory_backend, get_smart_extractor_config, load_config, get_compaction_trigger_tokens, get_middleware_config, get_cache_config, get_skills_router_config, get_write_middleware_config
+from config import get_rag_mode, get_memory_backend, get_smart_extractor_config, load_config, get_compaction_trigger_tokens, get_middleware_config, get_cache_config, get_skills_router_config, get_write_middleware_config, get_gateway_config
 
 # Claude Code 记忆类型标签映射
 _MEM0_TYPE_LABELS: dict[str, str] = {
@@ -159,10 +159,11 @@ class AgentManager:
         api_key = llm_config.get("api_key") or os.getenv("DEEPSEEK_API_KEY", "")
         api_base = llm_config.get("base_url") or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
         temperature = llm_config.get("temperature", 0.7)
+        gateway_config = get_gateway_config()
 
         self._llm_client = ModelClient(role="agent", streaming=True)
         self._llm = self._llm_client.get_chat_model()
-        self._config_sig = f"{model}|{api_key}|{api_base}|{temperature}"
+        self._config_sig = f"{model}|{api_key}|{api_base}|{temperature}|{gateway_config}"
 
         from graph.middlewares.skills_router import SkillsRouterMiddleware
         _router = SkillsRouterMiddleware()
@@ -181,8 +182,9 @@ class AgentManager:
         api_key = llm_config.get("api_key") or os.getenv("DEEPSEEK_API_KEY", "")
         api_base = llm_config.get("base_url") or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
         temperature = llm_config.get("temperature", 0.7)
+        gateway_config = get_gateway_config()
 
-        config_sig = f"{model}|{api_key}|{api_base}|{temperature}"
+        config_sig = f"{model}|{api_key}|{api_base}|{temperature}|{gateway_config}"
         if self._config_sig != config_sig:
             self._llm_client = ModelClient(role="agent", streaming=True)
             self._llm = self._llm_client.get_chat_model()
