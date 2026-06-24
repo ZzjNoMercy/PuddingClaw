@@ -1,19 +1,23 @@
 # PuddingClaw Docker Compose
-# 一键启动前后端服务（MinerU 默认不在容器内部署，本机运行即可）
 #
-# 用法：
-#   docker-compose up --build -d     # 构建并后台启动
-#   docker-compose logs -f backend   # 查看后端日志
-#   docker-compose down              # 停止并移除容器
+# Core 模式：
+#   docker compose up --build -d
+#
+# Full 模式（含 AI Gateway、向量库）：
+#   docker compose --profile full up --build -d
 #
 # 访问：
 #   前端：http://localhost:3000
 #   后端 API：http://localhost:8888
 #   API 文档：http://localhost:8888/docs
+#   Higress Console：http://localhost:8001
 #
 # 注意：
 #   若本机运行 MinerU，请在 backend/.env 中设置
 #   MINERU_URL=http://host.docker.internal:8002
+#
+#   Full 模式下 backend 默认指向 Higress，首次启动后需要访问 Console 配置 Provider：
+#   http://localhost:8001
 
 services:
   backend:
@@ -34,7 +38,7 @@ services:
       - BACKEND_HOST=0.0.0.0
       - BACKEND_PORT=9100
       - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
-      # 其他环境变量在 backend/.env 中配置（如 MINERU_URL）
+      # 其他环境变量在 backend/.env 中配置（如 MINERU_URL、AI_GATEWAY_URL）
     volumes:
       # 持久化会话、workspace、memory、日志到宿主机
       - ./backend/sessions:/app/sessions
@@ -72,6 +76,28 @@ services:
       backend:
         condition: service_healthy
     restart: unless-stopped
+
+  higress:
+    image: higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/all-in-one:latest
+    container_name: puddingclaw-higress
+    profiles: ["full"]
+    ports:
+      - "8080:8080"
+      - "8001:8001"
+    environment:
+      - MODE=full
+      - USE_PLUGIN_SERVER=on
+      - ENABLE_CONSOLE_ROUTE=1
+    volumes:
+      # 持久化 Higress 配置，避免每次重启后 Provider 配置丢失
+      - ./data/higress:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
 # 可选：使用外部网络，便于与其他服务（如 Milvus）集成
 # networks:
