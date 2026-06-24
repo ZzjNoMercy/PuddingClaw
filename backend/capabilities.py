@@ -15,6 +15,8 @@ from typing import Any
 
 import httpx
 
+from config import get_gateway_config
+
 logger = logging.getLogger(__name__)
 
 # 缓存探测结果，避免每次请求都重复检测
@@ -24,6 +26,27 @@ _CACHE_TTL = timedelta(seconds=60)
 
 DEFAULT_MILVUS_URL = "http://localhost:19530"
 DEFAULT_MINERU_URL = "http://localhost:8002"
+
+# 当 AI_GATEWAY_URL 未配置时，自动探测这些地址
+# Higress 统一走 Docker full profile，backend 与 higress 在同一个 compose 网络内
+_DEFAULT_GATEWAY_URLS = [
+    "http://higress:8080/v1",
+]
+
+# 最后一次成功探测到的 Higress URL，供 ModelClient 等业务代码使用
+_EFFECTIVE_GATEWAY_URL: str | None = None
+
+
+def get_effective_gateway_url() -> str | None:
+    """返回当前生效的 Higress URL。
+
+    优先级：
+    1. 最近一次成功探测到的 URL（含自动探测）。
+    2. 显式配置的 URL（config.json / AI_GATEWAY_URL 环境变量）。
+    """
+    if _EFFECTIVE_GATEWAY_URL:
+        return _EFFECTIVE_GATEWAY_URL
+    return _resolve_explicit_gateway_url()
 
 
 @dataclass
@@ -58,7 +81,7 @@ async def _check_http_get(url: str, path: str, timeout: float = 3.0) -> Capabili
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.get(target)
-            if response.status_code < 500:
+            if 200 <= response.status_code < 400:
                 return CapabilityStatus(available=True)
             return CapabilityStatus(
                 available=False,
@@ -90,6 +113,84 @@ async def _check_milvus(url: str | None) -> CapabilityStatus:
         return CapabilityStatus(available=False, reason=f"{type(exc).__name__}: {exc}")
 
 
+def _normalize_gateway_url(url: str) -> str:
+    """把以 /v1 结尾的 gateway URL 归一化为 base URL（供 health check 使用）。"""
+    url = url.rstrip("/")
+    if url.endswith("/v1"):
+        return url[:-3]
+    return url
+
+
+def _resolve_explicit_gateway_url() -> str | None:
+    """返回用户显式配置的 Higress URL（参数 / config.json / 环境变量），未配置则返回 None。"""
+    gateway_config = get_gateway_config()
+    if gateway_config.get("enabled"):
+        return gateway_config.get("base_url")
+    return os.getenv("AI_GATEWAY_URL")
+
+
+def _build_gateway_urls(explicit_url: str | None = None) -> list[str]:
+    """构建待探测的 Higress URL 列表。
+
+    如果用户显式配置了 URL（参数 / config.json / 环境变量），只探测该 URL；
+    未配置时才 fallback 到默认 URL 列表。
+    """
+    urls: list[str] = []
+    if explicit_url:
+        urls.append(explicit_url)
+    explicit_config = _resolve_explicit_gateway_url()
+    if explicit_config and explicit_config not in urls:
+        urls.append(explicit_config)
+    # 只有完全没有显式配置时，才尝试自动探测默认地址
+    if not urls:
+        urls.extend(_DEFAULT_GATEWAY_URLS)
+    return urls
+
+
+async def _check_gateway_urls(health_path: str, explicit_url: str | None = None) -> CapabilityStatus:
+    """按优先级探测 Higress URL。
+
+    1. 显式 URL（函数参数或 config.json / AI_GATEWAY_URL）。
+    2. 默认 URL 列表（compose 内网、host.docker.internal、localhost）。
+    """
+    global _EFFECTIVE_GATEWAY_URL
+    urls_to_try = _build_gateway_urls(explicit_url)
+
+    if not urls_to_try:
+        return CapabilityStatus(available=False, reason="URL not configured")
+
+    last_status: CapabilityStatus | None = None
+    for url in urls_to_try:
+        base_url = _normalize_gateway_url(url)
+        last_status = await _check_http_get(base_url, health_path, timeout=2.0)
+        if last_status.available:
+            _EFFECTIVE_GATEWAY_URL = url
+            logger.info("[capabilities] Higress detected at %s", url)
+            return CapabilityStatus(available=True)
+    _EFFECTIVE_GATEWAY_URL = None
+    return last_status or CapabilityStatus(available=False, reason="URL not configured")
+
+
+def _check_gateway_urls_sync(health_path: str, explicit_url: str | None = None) -> CapabilityStatus:
+    """_check_gateway_urls 的同步版本。"""
+    global _EFFECTIVE_GATEWAY_URL
+    urls_to_try = _build_gateway_urls(explicit_url)
+
+    if not urls_to_try:
+        return CapabilityStatus(available=False, reason="URL not configured")
+
+    last_status: CapabilityStatus | None = None
+    for url in urls_to_try:
+        base_url = _normalize_gateway_url(url)
+        last_status = _check_http_get_sync(base_url, health_path, timeout=2.0)
+        if last_status.available:
+            _EFFECTIVE_GATEWAY_URL = url
+            logger.info("[capabilities] Higress detected at %s", url)
+            return CapabilityStatus(available=True)
+    _EFFECTIVE_GATEWAY_URL = None
+    return last_status or CapabilityStatus(available=False, reason="URL not configured")
+
+
 async def detect_capabilities(
     *,
     force: bool = False,
@@ -114,12 +215,13 @@ async def detect_capabilities(
         if datetime.now(timezone.utc) - _CAPABILITIES_CACHED_AT < _CACHE_TTL:
             return _CAPABILITIES_CACHE
 
-    gateway_url = ai_gateway_url or os.getenv("AI_GATEWAY_URL")
+    gateway_config = get_gateway_config()
+    gateway_health_path = str(gateway_config.get("health_path", "/health"))
     milvus_target = milvus_url or os.getenv("MILVUS_URL") or DEFAULT_MILVUS_URL
     mineru_target = mineru_url or os.getenv("MINERU_URL") or DEFAULT_MINERU_URL
 
     results = await asyncio.gather(
-        _check_http_get(gateway_url, "/health"),
+        _check_gateway_urls(gateway_health_path, explicit_url=ai_gateway_url),
         _check_milvus(milvus_target),
         _check_http_get(mineru_target, "/health"),
     )
@@ -144,6 +246,9 @@ def detect_capabilities_sync(
     mineru_url: str | None = None,
 ) -> Capabilities:
     """detect_capabilities 的同步包装，供同步代码（如 ModelClient.get_chat_model）使用。"""
+    if not force and _CAPABILITIES_CACHE is not None and _CAPABILITIES_CACHED_AT is not None:
+        if datetime.now(timezone.utc) - _CAPABILITIES_CACHED_AT < _CACHE_TTL:
+            return _CAPABILITIES_CACHE
     try:
         return asyncio.run(
             detect_capabilities(
@@ -156,12 +261,13 @@ def detect_capabilities_sync(
     except RuntimeError as exc:
         # 如果当前线程已有事件循环（如在异步 FastAPI 中同步调用），回退到同步探测
         logger.debug("[capabilities] asyncio.run failed (%s), falling back to sync checks", exc)
-        gateway_url = ai_gateway_url or os.getenv("AI_GATEWAY_URL")
+        gateway_config = get_gateway_config()
+        gateway_health_path = str(gateway_config.get("health_path", "/health"))
         milvus_target = milvus_url or os.getenv("MILVUS_URL") or DEFAULT_MILVUS_URL
         mineru_target = mineru_url or os.getenv("MINERU_URL") or DEFAULT_MINERU_URL
 
         return Capabilities(
-            ai_gateway=_check_http_get_sync(gateway_url, "/health"),
+            ai_gateway=_check_gateway_urls_sync(gateway_health_path, explicit_url=ai_gateway_url),
             milvus=_check_milvus_sync(milvus_target),
             mineru=_check_http_get_sync(mineru_target, "/health"),
         )
@@ -176,7 +282,7 @@ def _check_http_get_sync(url: str | None, path: str, timeout: float = 3.0) -> Ca
         import httpx
 
         response = httpx.get(target, timeout=timeout)
-        if response.status_code < 500:
+        if 200 <= response.status_code < 400:
             return CapabilityStatus(available=True)
         return CapabilityStatus(available=False, reason=f"HTTP {response.status_code}")
     except httpx.ConnectError as exc:
