@@ -26,7 +26,9 @@ import {
   getSettings,
   updateSettings,
   testConnection,
+  getCapabilities,
   type SystemSettings,
+  type Capabilities,
 } from "@/lib/settingsApi";
 import { useApp } from "@/lib/store";
 import MemoryEditor from "@/components/settings/MemoryEditor";
@@ -67,13 +69,13 @@ export default function SettingsPage() {
   const [toast, setToast] = useState<{ type: "success" | "error"; message: string } | null>(null);
 
   // AI Gateway form state
-  const [gatewayEnabled, setGatewayEnabled] = useState(false);
-  const [gatewayBaseUrl, setGatewayBaseUrl] = useState("http://higress:8080/v1");
+  const [gatewayBaseUrl, setGatewayBaseUrl] = useState("");
   const [gatewayHealthPath, setGatewayHealthPath] = useState("/health");
   const [gatewayFallback, setGatewayFallback] = useState(true);
   const [gatewayEnvironmentOverride, setGatewayEnvironmentOverride] = useState(false);
   const [gatewayTesting, setGatewayTesting] = useState(false);
   const [gatewayTestResult, setGatewayTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
 
   useEffect(() => {
     localStorage.setItem(SETTINGS_CATEGORY_KEY, category);
@@ -108,12 +110,12 @@ export default function SettingsPage() {
   // Compression
   const [compRatio, setCompRatio] = useState(0.5);
 
-  // Load settings on mount
+  // Load settings and capabilities on mount
   useEffect(() => {
-    getSettings()
-      .then((s) => {
+    Promise.all([getSettings(), getCapabilities().catch(() => null)])
+      .then(([s, caps]) => {
         setSettings(s);
-        setGatewayEnabled(s.ai_gateway.enabled);
+        setCapabilities(caps);
         setGatewayBaseUrl(s.ai_gateway.base_url);
         setGatewayHealthPath(s.ai_gateway.health_path);
         setGatewayFallback(s.ai_gateway.fallback_to_direct);
@@ -150,7 +152,6 @@ export default function SettingsPage() {
     try {
       await updateSettings({
         ai_gateway: {
-          enabled: gatewayEnabled,
           base_url: gatewayBaseUrl,
           health_path: gatewayHealthPath,
           fallback_to_direct: gatewayFallback,
@@ -191,7 +192,7 @@ export default function SettingsPage() {
     } finally {
       setSaving(false);
     }
-  }, [gatewayEnabled, gatewayBaseUrl, gatewayHealthPath, gatewayFallback, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embBaseUrl, embApiKey, ragMode, ragTopK, ragThreshold, compRatio, showToast]);
+  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embBaseUrl, embApiKey, ragMode, ragTopK, ragThreshold, compRatio, showToast]);
 
   const handleTestGateway = useCallback(async () => {
     setGatewayTesting(true);
@@ -199,7 +200,7 @@ export default function SettingsPage() {
     try {
       const result = await testConnection({
         type: "gateway",
-        base_url: gatewayBaseUrl,
+        base_url: gatewayBaseUrl || "http://higress:8080/v1",
         health_path: gatewayHealthPath,
       });
       setGatewayTestResult({ ok: true, msg: `网关可用 (${result.latency_ms}ms)` });
@@ -309,7 +310,7 @@ export default function SettingsPage() {
           <div className={`${category === "ai" ? "max-w-4xl" : "max-w-2xl"} mx-auto space-y-6`}>
             {category === "ai" && (
               <>
-                <div className="flex items-start justify-between gap-4">
+                <div className="flex items-center justify-between gap-4">
                   <div>
                     <h1 className="text-[22px] font-semibold tracking-tight text-gray-900">AI 接入</h1>
                     <p className="mt-1 text-[12px] text-gray-500">
@@ -317,10 +318,12 @@ export default function SettingsPage() {
                     </p>
                   </div>
                   <div className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[10px] font-medium ${
-                    gatewayEnabled ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-700"
+                    capabilities?.ai_gateway.available
+                      ? "bg-emerald-50 text-emerald-700"
+                      : "bg-amber-50 text-amber-700"
                   }`}>
                     <span className="h-1.5 w-1.5 rounded-full bg-current" />
-                    {gatewayEnabled ? "Gateway 模式" : "Provider 直连"}
+                    {capabilities?.ai_gateway.available ? "Gateway 模式" : "Provider 直连"}
                   </div>
                 </div>
 
@@ -329,48 +332,30 @@ export default function SettingsPage() {
                   <Route className="mx-auto h-4 w-4 text-gray-300" />
                   <RouteNode
                     title="Higress Gateway"
-                    detail={gatewayEnabled ? gatewayBaseUrl : "已绕过，失败不影响 Core"}
-                    status={gatewayEnabled ? "已接入" : "已绕过"}
-                    tone={gatewayEnabled ? "green" : "amber"}
+                    detail={capabilities?.ai_gateway.available ? (gatewayBaseUrl || "http://higress:8080/v1") : "未探测到，失败时回退 Provider 直连"}
+                    status={capabilities?.ai_gateway.available ? "已接入" : "未接入"}
+                    tone={capabilities?.ai_gateway.available ? "green" : "amber"}
                   />
                   <Route className="mx-auto h-4 w-4 text-gray-300" />
                   <RouteNode title={llmProvider === "deepseek" ? "DeepSeek" : llmProvider} detail={llmModel} status="主模型" tone="blue" />
                 </div>
 
                 <div className="rounded-2xl border border-[#002fa7]/15 bg-gradient-to-br from-white/90 to-[#f4f7ff]/80 p-5 shadow-sm">
-                  <div className="mb-5 flex items-start justify-between gap-4">
-                    <div className="flex items-center gap-3">
-                      <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#002fa7]/8 text-[#002fa7]">
-                        <Network className="h-4 w-4" />
-                      </div>
-                      <div>
-                        <h2 className="text-[14px] font-semibold text-gray-800">AI Gateway</h2>
-                        <p className="mt-0.5 text-[11px] text-gray-500">Higress · OpenAI-compatible endpoint</p>
-                        {gatewayEnvironmentOverride && (
-                          <p className="mt-1 text-[10px] font-medium text-amber-600">当前值由环境变量覆盖，页面保存不会改变运行时覆盖值</p>
-                        )}
-                      </div>
+                  <div className="mb-5 flex items-center gap-3">
+                    <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#002fa7]/8 text-[#002fa7]">
+                      <Network className="h-4 w-4" />
                     </div>
-                    <button
-                      type="button"
-                      role="switch"
-                      aria-checked={gatewayEnabled}
-                      aria-label="启用 AI Gateway"
-                      onClick={() => setGatewayEnabled((value) => !value)}
-                      className={`relative h-6 w-11 shrink-0 rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#002fa7]/40 ${
-                        gatewayEnabled ? "bg-[#002fa7]" : "bg-gray-300"
-                      }`}
-                    >
-                      <span
-                        className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow-sm transition-transform ${
-                          gatewayEnabled ? "translate-x-[22px]" : "translate-x-0.5"
-                        }`}
-                      />
-                    </button>
+                    <div>
+                      <h2 className="text-[14px] font-semibold text-gray-800">AI Gateway</h2>
+                      <p className="mt-0.5 text-[11px] text-gray-500">Higress · OpenAI-compatible endpoint</p>
+                      {gatewayEnvironmentOverride && (
+                        <p className="mt-1 text-[10px] font-medium text-amber-600">当前值由环境变量覆盖，页面保存不会改变运行时覆盖值</p>
+                      )}
+                    </div>
                   </div>
                   <div className="grid grid-cols-2 gap-4">
-                    <FormField label="Gateway URL">
-                      <input value={gatewayBaseUrl} onChange={(e) => setGatewayBaseUrl(e.target.value)} className="form-input" placeholder="http://higress:8080/v1" />
+                    <FormField label="Gateway 覆盖地址（可选）">
+                      <input value={gatewayBaseUrl} onChange={(e) => setGatewayBaseUrl(e.target.value)} className="form-input" placeholder="留空则自动探测 http://higress:8080/v1" />
                     </FormField>
                     <FormField label="健康检查路径">
                       <input value={gatewayHealthPath} onChange={(e) => setGatewayHealthPath(e.target.value)} className="form-input" placeholder="/health" />
@@ -385,7 +370,7 @@ export default function SettingsPage() {
                       <p className="text-[10px] leading-relaxed text-gray-500">
                         Higress 只负责代理、Token 统计与模型切换；模型访问始终使用对应 Provider Key。
                       </p>
-                      <button onClick={handleTestGateway} disabled={gatewayTesting || !gatewayBaseUrl} className="flex shrink-0 items-center gap-1.5 rounded-lg bg-[#002fa7]/10 px-3 py-2 text-[11px] font-medium text-[#002fa7] transition-colors hover:bg-[#002fa7]/15 disabled:opacity-50">
+                      <button onClick={handleTestGateway} disabled={gatewayTesting} className="flex shrink-0 items-center gap-1.5 rounded-lg bg-[#002fa7]/10 px-3 py-2 text-[11px] font-medium text-[#002fa7] transition-colors hover:bg-[#002fa7]/15 disabled:opacity-50">
                         {gatewayTesting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Zap className="h-3.5 w-3.5" />}
                         测试网关
                       </button>
@@ -579,12 +564,12 @@ export default function SettingsPage() {
                     aria-checked={ragMode}
                     aria-label="启用 RAG 检索"
                     onClick={toggleRagMode}
-                    className={`relative h-6 w-11 shrink-0 rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#002fa7]/40 ${
+                    className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#002fa7]/40 ${
                       ragMode ? "bg-[#002fa7]" : "bg-gray-300"
                     }`}
                   >
                     <span
-                      className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow-sm transition-transform ${
+                      className={`pointer-events-none mt-0.5 inline-block h-5 w-5 rounded-full bg-white shadow-sm transition-transform ${
                         ragMode ? "translate-x-[22px]" : "translate-x-0.5"
                       }`}
                     />

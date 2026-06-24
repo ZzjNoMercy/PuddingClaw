@@ -16,8 +16,8 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "rag_mode": False,
     "memory_backend": "markdown",  # "markdown" = MEMORY.md 原生方案, "mem0" = mem0 框架
     "ai_gateway": {
-        "enabled": False,
-        "base_url": "http://higress:8080/v1",
+        # 覆盖地址：为空时由 backend 自动探测 Docker full profile 中的 Higress
+        "base_url": "",
         "health_path": "/health",
         "fallback_to_direct": True,
     },
@@ -309,14 +309,17 @@ def get_smart_extractor_config() -> dict[str, int | float]:
 
 
 def get_gateway_config() -> dict[str, Any]:
-    """读取 AI Gateway 配置，环境变量优先于持久化设置。"""
+    """读取 AI Gateway 配置，环境变量优先于持久化设置。
+
+    当 base_url 为空且未配置环境变量时，backend 会自动探测默认地址。
+    """
     import os
 
     gateway = load_config().get("ai_gateway", {})
     env_url = os.getenv("AI_GATEWAY_URL", "").strip()
+    configured_url = gateway.get("base_url", "").strip()
     return {
-        "enabled": bool(gateway.get("enabled", False) or env_url),
-        "base_url": env_url or gateway.get("base_url", "http://higress:8080/v1"),
+        "base_url": env_url or configured_url or "",
         "health_path": gateway.get("health_path", "/health"),
         "fallback_to_direct": bool(gateway.get("fallback_to_direct", True)),
     }
@@ -378,6 +381,8 @@ def get_settings_for_display() -> dict[str, Any]:
         "ai_gateway": {
             **effective_gateway,
             "environment_override": bool(os.getenv("AI_GATEWAY_URL")),
+            # 是否启用由 backend 自动探测决定，前端不再展示开关
+            "enabled": bool(effective_gateway.get("base_url")),
         },
         "llm": {
             **config.get("llm", {}),
@@ -407,7 +412,7 @@ def update_settings(updates: dict[str, Any]) -> None:
         gateway_update = updates["ai_gateway"]
         if "ai_gateway" not in config:
             config["ai_gateway"] = {}
-        for key in ("enabled", "base_url", "health_path", "fallback_to_direct"):
+        for key in ("base_url", "health_path", "fallback_to_direct"):
             if key in gateway_update:
                 config["ai_gateway"][key] = gateway_update[key]
 

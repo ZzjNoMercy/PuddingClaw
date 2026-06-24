@@ -124,9 +124,7 @@ def _normalize_gateway_url(url: str) -> str:
 def _resolve_explicit_gateway_url() -> str | None:
     """返回用户显式配置的 Higress URL（参数 / config.json / 环境变量），未配置则返回 None。"""
     gateway_config = get_gateway_config()
-    if gateway_config.get("enabled"):
-        return gateway_config.get("base_url")
-    return os.getenv("AI_GATEWAY_URL")
+    return gateway_config.get("base_url") or os.getenv("AI_GATEWAY_URL")
 
 
 def _build_gateway_urls(explicit_url: str | None = None) -> list[str]:

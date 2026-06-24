@@ -9,7 +9,6 @@ def test_gateway_has_no_key_and_provider_key_is_masked(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({
         "ai_gateway": {
-            "enabled": True,
             "base_url": "http://gateway:8080/v1",
             "health_path": "/ready",
             "fallback_to_direct": True,
@@ -23,7 +22,7 @@ def test_gateway_has_no_key_and_provider_key_is_masked(tmp_path, monkeypatch):
     assert "api_key_masked" not in displayed["ai_gateway"]
     assert displayed["llm"]["api_key_masked"].endswith("1234")
 
-    config.update_settings({"ai_gateway": {"enabled": False}})
+    config.update_settings({"ai_gateway": {"base_url": "http://new-gateway:8080/v1"}})
     saved = json.loads(config_path.read_text(encoding="utf-8"))
-    assert saved["ai_gateway"]["enabled"] is False
-    assert "api_key" not in saved["ai_gateway"]
+    assert saved["ai_gateway"]["base_url"] == "http://new-gateway:8080/v1"
+    assert "enabled" not in saved["ai_gateway"]
