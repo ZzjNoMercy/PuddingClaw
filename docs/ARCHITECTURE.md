@@ -551,6 +551,8 @@ ingestion-worker 领取任务
 
 走 Higress 时，`config.json` 里的 `llm.model` 保持不变（如 `deepseek-chat`），由 Higress 根据 model name 路由到真实 provider。`ModelClient` 用 `ChatOpenAI` 只是因为它实现了 OpenAI 兼容协议。
 
+Higress 在这里不提供模型，也不承担客户端鉴权；它只提供统一 Base URL、请求代理、Token 统计、限流和按 model 切换 Provider。无论直连还是经过 Higress，请求都使用所选 LLM / Embedding Provider 的 API Key。设置 API 永不返回 Provider Key 明文。
+
 ---
 
 ## 10. 改造路线图
@@ -572,23 +574,23 @@ ingestion-worker 领取任务
 
 #### Phase 1.1：统一 LLM 调用
 
-- [ ] 新建 `backend/llm/model_client.py`
-- [ ] 替换 `backend/graph/agent.py` 中的 `ChatDeepSeek`
-- [ ] 替换 `backend/api/chat.py` 中的所有 `ChatDeepSeek`（标题生成、记忆补偿、中段摘要）
-- [ ] 在 `ModelClient` 层统一拦截并记录 token 用量（增加 `role` 维度）
+- [x] 新建 `backend/llm/model_client.py`
+- [x] 替换 `backend/graph/agent.py` 中的 `ChatDeepSeek`
+- [x] 替换 `backend/api/chat.py` 中的所有 `ChatDeepSeek`（标题生成、记忆补偿、中段摘要）
+- [x] 在 `ModelClient` 层统一拦截并记录辅助调用 token 用量（增加 `role` 维度）；LangGraph 主流仍在事件流记录
 
 #### Phase 1.2：统一 Embedding 调用
 
-- [ ] 新建 `backend/llm/embed_client.py`
-- [ ] 修复 `backend/graph/memory_indexer.py` 的 `Settings.embed_model` 全局污染
-- [ ] 所有 LlamaIndex 使用处显式传入 `embed_model`
+- [x] 新建 `backend/llm/embed_client.py`
+- [x] 修复 `backend/graph/memory_indexer.py` 的 `Settings.embed_model` 全局污染
+- [x] 所有 LlamaIndex 使用处显式传入 `embed_model`
 
 #### Phase 1.3：能力探测
 
-- [ ] 新建 `backend/capabilities.py`
-- [ ] 启动时异步探测 Higress / Milvus / MinerU
-- [ ] 增加 `GET /api/health/capabilities`
-- [ ] 启动日志打印能力状态
+- [x] 新建 `backend/capabilities.py`
+- [x] 启动时异步探测 Higress / Milvus / MinerU
+- [x] 增加 `GET /api/capabilities`
+- [x] 启动日志打印能力状态
 
 **第一阶段验收**：业务代码不再直接实例化 `ChatDeepSeek`；网关/Milvus/MinerU 任一不可用时，系统自动 fallback；token 用量按 role 完整记录。
 
@@ -685,6 +687,7 @@ ingestion-worker 领取任务
 ## 相关文档
 
 - `docs/adr/ADR-001-ai-gateway-and-model-client.md`：AI Gateway + ModelClient 决策记录
+- `docs/adr/ADR-002-dual-mode-provider-sync.md`：直连 / Higress 双模式与 Provider 单次录入、单向同步规则
 - `docs/知识库双管道技术方案与实施计划.md`：知识库详细设计
 - `docs/开源项目结构与可选基础设施方案.md`：部署拆分说明
 - `docs/context-engineering-design.md`：Agent 上下文压缩策略

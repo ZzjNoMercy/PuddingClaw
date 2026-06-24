@@ -297,6 +297,7 @@ agent = DeepAgent(llm=llm, tools=tools, ...)
 
 - 本 ADR 与 `docs/知识库双管道技术方案与实施计划.md` 中的 embedding 策略一致：统一 provider 接口，显式传参。
 - 本 ADR 与 `docs/开源项目结构与可选基础设施方案.md` 的部署拆分一致：可选基础设施不强制耦合 core。
+- Provider 凭证只录入一次、双模式切换及向 Higress 的同步规则由 `ADR-002-dual-mode-provider-sync.md` 进一步约束。
 
 ---
 

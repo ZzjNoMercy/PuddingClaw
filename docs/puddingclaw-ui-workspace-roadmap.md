@@ -157,6 +157,12 @@ context maintenance：短暂状态行，不落库
 | [x] | 空对话快捷提示词 | `frontend/src/components/chat/ChatPanel.tsx` | 无消息时展示居中欢迎态与若干快捷提示按钮，点击即可发送。 |
 | [x] | Slash 命令选择菜单 | `frontend/src/components/chat/SlashCommandMenu.tsx`, `ChatInput.tsx` | 输入 `/` 时弹出可键盘导航的技能选择菜单，选中后自动替换为 `/skill-name `。 |
 | [x] | 设置页完整分区实现 | `frontend/src/app/settings/page.tsx`, `frontend/src/lib/settingsApi.ts` | 设置页扩展为 LLM、Embedding、RAG、Memory、Data、Advanced 六大分区，支持测试连接与保存。 |
+| [x] | AI 接入管理页设计与实现 | `designs/ai-access-settings/`, `frontend/src/app/settings/page.tsx`, `frontend/src/lib/settingsApi.ts` | 在设置中统一展示实际请求链路，并管理 Higress Gateway、LLM Provider、Embedding Provider 与各自密钥。 |
+| [x] | Gateway 与 Provider 配置 API | `backend/config.py`, `backend/api/config_api.py` | Gateway 只管理启用状态、代理 URL、健康检查与回退策略；LLM/Embedding Provider Key 独立保存并始终用于真实模型访问。 |
+| [x] | ModelClient 与 Embedding 接入闭环 | `backend/llm/`, `backend/capabilities.py`, LlamaIndex 调用点 | 修复调用身份计量、健康误判、请求期阻塞与首 token 前 fallback；移除全局 `Settings.embed_model` 污染。 |
+| [x] | AI 接入端到端验证 | backend tests, frontend build, Docker runtime | 新增 16 项相关测试并通过，前端生产构建通过，后端与前端容器已重建且健康；浏览器受本机既定 localhost 访问限制，未对生产页重复截图。 |
+| [x] | 记录直连 / Higress 双模式同步决策 | `docs/adr/ADR-002-dual-mode-provider-sync.md` | Provider Profile 只录入一次并作为凭证事实源，向 Higress 单向幂等同步；Higress Console 负责路由与治理。 |
+| [ ] | 实现 Provider Profile 与 Higress 同步状态机 | backend + settings UI | 增加 Secret Store、受管资源 upsert、漂移检测、Key 轮换、Console 跳转和双模式切换前置校验。 |
 | [x] | 记忆编辑器 | `frontend/src/components/settings/MemoryEditor.tsx` | 在设置页 Memory 分区提供 MEMORY.md 等记忆文件的 Monaco 编辑与保存能力。 |
 | [x] | 右侧 Inspector 文件预览面板 | `frontend/src/components/editor/InspectorPanel.tsx` | 右侧面板支持 Memory/Skills/MCP 标签切换，选中文件后用 Monaco 预览/编辑。 |
 | [x] | Skill 编辑器与文件树 | `frontend/src/app/skills/page.tsx`, `FileTree.tsx` | 扩展页支持 Monaco 编辑 SKILL.md、文件树导航、ZIP 导入、重命名与删除。 |
