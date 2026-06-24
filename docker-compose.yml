@@ -10,7 +10,7 @@
 #   前端：http://localhost:3000
 #   后端 API：http://localhost:8888
 #   API 文档：http://localhost:8888/docs
-#   Higress Gateway：http://localhost:8081
+#   Higress Gateway：http://localhost:8080
 #   Higress Console：http://localhost:8001
 #
 # 注意：
@@ -83,8 +83,7 @@ services:
     container_name: puddingclaw-higress
     profiles: ["full"]
     ports:
-      # 8080 被 milvus-attu 占用，宿主机映射到 8081
-      - "8081:8080"
+      - "8080:8080"
       - "8001:8001"
     environment:
       - MODE=full
