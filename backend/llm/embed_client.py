@@ -24,7 +24,7 @@ def get_embedding_model() -> OpenAIEmbedding:
     cfg = get_embedding_config()
     gateway = get_gateway_config()
     use_gateway = False
-    if gateway.get("enabled") and gateway.get("base_url"):
+    if gateway.get("base_url"):
         try:
             use_gateway = capabilities.detect_capabilities_sync().ai_gateway.available
         except Exception as exc:  # noqa: BLE001
