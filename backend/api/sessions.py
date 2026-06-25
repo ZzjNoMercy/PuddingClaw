@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 from graph.session_manager import session_manager
 from graph.prompt_builder import build_system_prompt
-from config import get_rag_mode, get_llm_config
+from config import get_rag_mode
 
 router = APIRouter()
 

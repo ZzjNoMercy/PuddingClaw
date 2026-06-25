@@ -4,7 +4,7 @@
 
 const API_BASE = "/api";
 
-export interface LlmSettings {
+export interface FallbackLlmSettings {
   provider: string;
   model: string;
   base_url: string;
@@ -13,15 +13,20 @@ export interface LlmSettings {
   max_tokens: number;
 }
 
+export interface GatewayLlmSettings {
+  model: string;
+}
+
 export interface GatewaySettings {
   enabled: boolean;
   base_url: string;
   health_path: string;
   fallback_to_direct: boolean;
   environment_override: boolean;
+  routed_models: string[];
 }
 
-export interface EmbeddingSettings {
+export interface FallbackEmbeddingSettings {
   provider: string;
   model: string;
   base_url: string;
@@ -40,8 +45,9 @@ export interface CompressionSettings {
 
 export interface SystemSettings {
   ai_gateway: GatewaySettings;
-  llm: LlmSettings;
-  embedding: EmbeddingSettings;
+  gateway_llm: GatewayLlmSettings;
+  fallback_llm: FallbackLlmSettings;
+  fallback_embedding: FallbackEmbeddingSettings;
   rag: RagSettings;
   compression: CompressionSettings;
 }

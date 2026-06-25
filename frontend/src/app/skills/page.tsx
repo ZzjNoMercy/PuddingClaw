@@ -389,7 +389,7 @@ export default function SkillsPage() {
         </div>
 
         <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
-      <div className="flex h-11 shrink-0 items-center border-b border-black/[0.06] bg-white px-4">
+      <div className="flex h-11 shrink-0 items-center border-b border-black/[0.12] bg-white px-4">
         <div className="flex items-center gap-1 rounded-lg bg-gray-100 p-1" role="tablist" aria-label="扩展类型">
           <button
             type="button"

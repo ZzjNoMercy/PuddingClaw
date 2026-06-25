@@ -22,7 +22,7 @@ def _clear_env():
 
 @pytest.fixture
 def mock_config():
-    """Mock config.json 的 llm 配置。"""
+    """Mock config.json 的 fallback_llm 配置。"""
     cfg = {
         "provider": "deepseek",
         "model": "deepseek-chat",
@@ -30,7 +30,7 @@ def mock_config():
         "api_key": "test-key",
         "temperature": 0.7,
     }
-    with mock.patch("llm.model_client.get_llm_config", return_value=cfg):
+    with mock.patch("llm.model_client.get_fallback_llm_config", return_value=cfg):
         yield cfg
 
 

@@ -21,7 +21,11 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         "health_path": "/health",
         "fallback_to_direct": True,
     },
-    "llm": {
+    "gateway_llm": {
+        # Higress 可用时实际使用的模型；与 fallback_llm 分离，避免和 fallback 直连配置混淆
+        "model": "deepseek-v4-flash",
+    },
+    "fallback_llm": {
         "provider": "deepseek",
         "model": "deepseek-chat",
         "base_url": "https://api.deepseek.com",
@@ -30,7 +34,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         "max_tokens": 4096,
         "context_window": 1000000,
     },
-    "embedding": {
+    "fallback_embedding": {
         "provider": "openai",
         "model": "text-embedding-3-small",
         "base_url": "https://api.openai.com/v1",
@@ -118,13 +122,39 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
+def _migrate_legacy_config(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """将旧版 llm / embedding 顶层键迁移为 fallback_llm / fallback_embedding。
+
+    仅迁移一次：若存在旧键且新键不存在，则复制后删除旧键。
+    """
+    migrated = False
+    if "llm" in data:
+        if "fallback_llm" not in data:
+            data["fallback_llm"] = data["llm"]
+        del data["llm"]
+        migrated = True
+    if "embedding" in data:
+        if "fallback_embedding" not in data:
+            data["fallback_embedding"] = data["embedding"]
+        del data["embedding"]
+        migrated = True
+    if migrated:
+        logger.info("[config] 已迁移 legacy llm/embedding -> fallback_llm/fallback_embedding")
+    return data, migrated
+
+
 def load_config() -> dict[str, Any]:
     """Load configuration from disk, returning defaults if missing."""
     if not CONFIG_FILE.exists():
         return json.loads(json.dumps(_DEFAULT_CONFIG))
     try:
         data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        return _deep_merge(_DEFAULT_CONFIG, data)
+        data, migrated = _migrate_legacy_config(data)
+        merged = _deep_merge(_DEFAULT_CONFIG, data)
+        # 若发生迁移，立即回写，避免下次仍读取旧键
+        if migrated:
+            save_config(merged)
+        return merged
     except Exception:
         return json.loads(json.dumps(_DEFAULT_CONFIG))
 
@@ -220,14 +250,14 @@ def get_memory_backend() -> str:
 def get_mem0_config() -> dict[str, Any]:
     """构建 mem0 Memory.from_config() 所需的配置字典。
 
-    复用 llm 和 embedding 的 api_key，避免用户配置两套凭证。
+    复用 fallback_llm 和 fallback_embedding 的 api_key，避免用户配置两套凭证。
     """
     import copy
     import os
     config = load_config()
     mem0_cfg = copy.deepcopy(config.get("mem0", {}))
-    llm_cfg = config.get("llm", {})
-    emb_cfg = config.get("embedding", {})
+    llm_cfg = config.get("fallback_llm", {})
+    emb_cfg = config.get("fallback_embedding", {})
 
     # 复用已有的 api_key（llm → mem0.llm, embedding → mem0.embedder）
     mem0_llm = mem0_cfg.get("llm", {})
@@ -325,15 +355,15 @@ def get_gateway_config() -> dict[str, Any]:
     }
 
 
-def get_llm_config() -> dict[str, Any]:
-    """从 config.json 读取 LLM 配置，fallback 到环境变量。
+def get_fallback_llm_config() -> dict[str, Any]:
+    """从 config.json 读取 fallback LLM 直连配置，fallback 到环境变量。
 
     返回 model/api_key/base_url 三个字段。
     temperature 由调用方自行指定（不同场景需要不同值）。
     """
     import os
     config = load_config()
-    llm = config.get("llm", {})
+    llm = config.get("fallback_llm", {})
     return {
         "provider": llm.get("provider", "deepseek"),
         "model": llm.get("model") or os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
@@ -344,15 +374,29 @@ def get_llm_config() -> dict[str, Any]:
     }
 
 
-def get_embedding_config() -> dict[str, Any]:
-    """从 config.json 读取 Embedding 配置，fallback 到环境变量。
+def get_gateway_llm_config() -> dict[str, Any]:
+    """读取 Gateway 模式下的 LLM 模型配置。
+
+    与 fallback_llm 配置分离，避免 fallback 直连参数和网关路由模型混淆。
+    若 gateway_llm.model 未设置，向后兼容 fallback 到 fallback_llm.model。
+    """
+    config = load_config()
+    gateway_llm = config.get("gateway_llm", {})
+    fallback_model = get_fallback_llm_config().get("model", "deepseek-chat")
+    return {
+        "model": gateway_llm.get("model") or fallback_model,
+    }
+
+
+def get_fallback_embedding_config() -> dict[str, Any]:
+    """从 config.json 读取 fallback Embedding 直连配置，fallback 到环境变量。
 
     返回 model/api_key/api_base 三个字段。
     注意：api_base 是 OpenAIEmbedding 的参数名，与 config.json 中的 base_url 做了映射。
     """
     import os
     config = load_config()
-    emb = config.get("embedding", {})
+    emb = config.get("fallback_embedding", {})
     return {
         "provider": emb.get("provider", "openai"),
         "model": emb.get("model") or os.getenv("EMBEDDING_MODEL", "text-embedding-3-small"),
@@ -372,10 +416,12 @@ def get_settings_for_display() -> dict[str, Any]:
     """Get settings with masked API keys for frontend display."""
     import os
 
+    from higress_config_reader import get_higress_routed_models
+
     config = load_config()
     effective_gateway = get_gateway_config()
-    effective_llm = get_llm_config()
-    effective_embedding = get_embedding_config()
+    effective_llm = get_fallback_llm_config()
+    effective_embedding = get_fallback_embedding_config()
     result = {
         "memory_backend": config.get("memory_backend", "markdown"),
         "ai_gateway": {
@@ -383,13 +429,18 @@ def get_settings_for_display() -> dict[str, Any]:
             "environment_override": bool(os.getenv("AI_GATEWAY_URL")),
             # 是否启用由 backend 自动探测决定，前端不再展示开关
             "enabled": bool(effective_gateway.get("base_url")),
+            "routed_models": get_higress_routed_models(),
         },
-        "llm": {
-            **config.get("llm", {}),
+        "gateway_llm": {
+            **config.get("gateway_llm", {}),
+            "model": get_gateway_llm_config().get("model", effective_llm.get("model", "deepseek-chat")),
+        },
+        "fallback_llm": {
+            **config.get("fallback_llm", {}),
             "api_key_masked": mask_api_key(effective_llm.get("api_key", "")),
         },
-        "embedding": {
-            **config.get("embedding", {}),
+        "fallback_embedding": {
+            **config.get("fallback_embedding", {}),
             "api_key_masked": mask_api_key(effective_embedding.get("api_key", "")),
         },
         "rag": {
@@ -399,8 +450,8 @@ def get_settings_for_display() -> dict[str, Any]:
         "compression": config.get("compression", {}),
     }
     # Remove raw API keys from response
-    result["llm"].pop("api_key", None)
-    result["embedding"].pop("api_key", None)
+    result["fallback_llm"].pop("api_key", None)
+    result["fallback_embedding"].pop("api_key", None)
     return result
 
 
@@ -416,26 +467,33 @@ def update_settings(updates: dict[str, Any]) -> None:
             if key in gateway_update:
                 config["ai_gateway"][key] = gateway_update[key]
 
-    if "llm" in updates:
-        llm_update = updates["llm"]
-        if "llm" not in config:
-            config["llm"] = {}
+    if "gateway_llm" in updates:
+        gateway_llm_update = updates["gateway_llm"]
+        if "gateway_llm" not in config:
+            config["gateway_llm"] = {}
+        if "model" in gateway_llm_update:
+            config["gateway_llm"]["model"] = gateway_llm_update["model"]
+
+    if "fallback_llm" in updates:
+        llm_update = updates["fallback_llm"]
+        if "fallback_llm" not in config:
+            config["fallback_llm"] = {}
         for key in ("provider", "model", "base_url", "temperature", "max_tokens"):
             if key in llm_update:
-                config["llm"][key] = llm_update[key]
+                config["fallback_llm"][key] = llm_update[key]
         # Only update API key if a non-empty value is provided
         if llm_update.get("api_key"):
-            config["llm"]["api_key"] = llm_update["api_key"]
+            config["fallback_llm"]["api_key"] = llm_update["api_key"]
 
-    if "embedding" in updates:
-        emb_update = updates["embedding"]
-        if "embedding" not in config:
-            config["embedding"] = {}
+    if "fallback_embedding" in updates:
+        emb_update = updates["fallback_embedding"]
+        if "fallback_embedding" not in config:
+            config["fallback_embedding"] = {}
         for key in ("provider", "model", "base_url"):
             if key in emb_update:
-                config["embedding"][key] = emb_update[key]
+                config["fallback_embedding"][key] = emb_update[key]
         if emb_update.get("api_key"):
-            config["embedding"]["api_key"] = emb_update["api_key"]
+            config["fallback_embedding"]["api_key"] = emb_update["api_key"]
 
     if "rag" in updates:
         rag_update = updates["rag"]
@@ -478,7 +536,7 @@ def get_max_history_messages() -> int:
 
 def get_context_window() -> int:
     """获取当前模型的上下文窗口大小。"""
-    return load_config().get("llm", {}).get("context_window", 1000000)
+    return load_config().get("fallback_llm", {}).get("context_window", 1000000)
 
 
 def get_compaction_trigger_tokens() -> int:

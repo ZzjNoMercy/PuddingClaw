@@ -1,6 +1,7 @@
 """capabilities 模块单元测试。"""
 
 import os
+import warnings
 from unittest import mock
 
 import httpx
@@ -10,6 +11,7 @@ from capabilities import (
     Capabilities,
     CapabilityStatus,
     detect_capabilities,
+    detect_capabilities_sync,
     invalidate_capabilities,
 )
 
@@ -148,3 +150,32 @@ async def test_detect_capabilities_auto_gateway(httpx_mock):
     httpx_mock.add_exception(httpx.ConnectError("Connection refused"), url="http://localhost:8002/health")
     caps = await detect_capabilities(force=True)
     assert caps.ai_gateway.available is True
+
+
+@pytest.mark.asyncio
+async def test_detect_capabilities_sync_inside_event_loop_does_not_leak_coroutine_warning():
+    """同步包装在 async 环境里应直接走同步探测，不创建未 await 的 coroutine。"""
+
+    with (
+        mock.patch(
+            "capabilities._check_gateway_urls_sync",
+            return_value=CapabilityStatus(available=False, reason="mock gateway"),
+        ),
+        mock.patch(
+            "capabilities._check_milvus_sync",
+            return_value=CapabilityStatus(available=False, reason="mock milvus"),
+        ),
+        mock.patch(
+            "capabilities._check_http_get_sync",
+            return_value=CapabilityStatus(available=False, reason="mock mineru"),
+        ),
+        warnings.catch_warnings(record=True) as caught,
+    ):
+        warnings.simplefilter("always")
+        caps = detect_capabilities_sync(force=True)
+
+    assert caps.ai_gateway.reason == "mock gateway"
+    assert not [
+        warning for warning in caught
+        if "coroutine 'detect_capabilities' was never awaited" in str(warning.message)
+    ]

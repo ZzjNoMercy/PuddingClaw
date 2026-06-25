@@ -9,6 +9,7 @@ import RetrievalCard from "./RetrievalCard";
 
 interface Props {
   message: ChatMessageType;
+  isStreaming?: boolean;
 }
 
 function formatTime(ts: number): string {
@@ -27,7 +28,7 @@ function isAuthError(content: string): boolean {
   return has401 || hasApiKeyError || hasAuthFail;
 }
 
-export default function ChatMessage({ message }: Props) {
+export default function ChatMessage({ message, isStreaming = false }: Props) {
   const isUser = message.role === "user";
   const hasAuthError = !isUser && isAuthError(message.content);
   const renderedContent = renderCitationMarkers(message);
@@ -85,7 +86,7 @@ export default function ChatMessage({ message }: Props) {
                     {formatTime(message.timestamp)}
                   </div>
                 </div>
-              ) : (
+              ) : isStreaming ? (
                 /* Typing indicator */
                 <div className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-3 text-[12px] text-slate-500 shadow-sm">
                   <span className="inline-flex items-center gap-1.5">
@@ -95,7 +96,7 @@ export default function ChatMessage({ message }: Props) {
                   </span>
                   <span>Agent 正在处理</span>
                 </div>
-              )}
+              ) : null}
             </div>
           </div>
         )}

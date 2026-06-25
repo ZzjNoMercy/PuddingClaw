@@ -67,15 +67,15 @@ def _extract_cache_metrics(response: Any) -> dict[str, int]:
 def _build_llm():
     """用项目 config 统一入口构造 ChatDeepSeek。"""
     from langchain_deepseek import ChatDeepSeek
-    from config import get_llm_config
-    cfg = get_llm_config()
+    from config import get_fallback_llm_config
+    cfg = get_fallback_llm_config()
     key = cfg.get("api_key", "")
     # 同时检测空值和明显的占位符
     if not key or key.startswith("your_") or "placeholder" in key.lower() or key.endswith("_here"):
         print("[SKIP] DEEPSEEK_API_KEY 未配置或仍是占位符。")
         print("       请在以下任一位置设置真实 key：")
         print("         1. backend/.env:        DEEPSEEK_API_KEY=sk-...")
-        print("         2. backend/config.json: llm.api_key")
+        print("         2. backend/config.json: fallback_llm.api_key")
         print("         3. shell env:           export DEEPSEEK_API_KEY=sk-...")
         sys.exit(1)
     return ChatDeepSeek(

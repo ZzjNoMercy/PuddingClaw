@@ -8,8 +8,8 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from config import (
-    get_embedding_config,
-    get_llm_config,
+    get_fallback_embedding_config,
+    get_fallback_llm_config,
     get_rag_mode,
     set_rag_mode,
     get_settings_for_display,
@@ -42,8 +42,9 @@ async def set_rag_mode_endpoint(request: RagModeRequest):
 
 class SettingsUpdateRequest(BaseModel):
     ai_gateway: Optional[dict[str, Any]] = None
-    llm: Optional[dict[str, Any]] = None
-    embedding: Optional[dict[str, Any]] = None
+    gateway_llm: Optional[dict[str, Any]] = None
+    fallback_llm: Optional[dict[str, Any]] = None
+    fallback_embedding: Optional[dict[str, Any]] = None
     rag: Optional[dict[str, Any]] = None
     compression: Optional[dict[str, Any]] = None
 
@@ -93,7 +94,7 @@ async def test_connection(request: TestConnectionRequest):
                 request.health_path,
             )
         elif request.type == "llm":
-            llm = get_llm_config()
+            llm = get_fallback_llm_config()
             result = await _test_llm_connection(
                 request.provider,
                 request.model,
@@ -101,7 +102,7 @@ async def test_connection(request: TestConnectionRequest):
                 request.api_key or llm.get("api_key", ""),
             )
         elif request.type == "embedding":
-            embedding = get_embedding_config()
+            embedding = get_fallback_embedding_config()
             result = await _test_embedding_connection(
                 request.provider,
                 request.model,

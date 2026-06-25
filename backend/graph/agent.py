@@ -11,7 +11,6 @@
 
 import json
 import logging
-import os
 import time
 from pathlib import Path
 from typing import Any, AsyncGenerator
@@ -20,7 +19,20 @@ logger = logging.getLogger(__name__)
 
 from langchain_core.messages import HumanMessage, AIMessage, AIMessageChunk
 
-from config import get_rag_mode, get_memory_backend, get_smart_extractor_config, load_config, get_compaction_trigger_tokens, get_middleware_config, get_cache_config, get_skills_router_config, get_write_middleware_config, get_gateway_config
+from config import (
+    get_rag_mode,
+    get_memory_backend,
+    get_smart_extractor_config,
+    load_config,
+    get_compaction_trigger_tokens,
+    get_middleware_config,
+    get_cache_config,
+    get_skills_router_config,
+    get_write_middleware_config,
+    get_gateway_config,
+    get_gateway_llm_config,
+    get_fallback_llm_config,
+)
 
 # Claude Code 记忆类型标签映射
 _MEM0_TYPE_LABELS: dict[str, str] = {
@@ -53,6 +65,30 @@ MISSING_TOOL_OUTPUT_PLACEHOLDER = (
     "[工具执行失败/无返回] 历史记录中存在 tool_call，但没有保存到对应工具输出；"
     "这通常来自流中断或工具服务异常。"
 )
+
+
+def _agent_model_config_signature() -> tuple[str, str]:
+    """Return stable signature and display model for AgentManager cache refresh.
+
+    ModelClient now reads the split model config:
+    - ai_gateway: gateway URL/fallback behavior
+    - gateway_llm: model name sent through Higress
+    - fallback_llm: direct provider config used when gateway is disabled/fallback
+
+    AgentManager only needs a cache invalidation signature here; actual model
+    construction stays delegated to ModelClientChatModel.
+    """
+    gateway_cfg = get_gateway_config()
+    gateway_llm_cfg = get_gateway_llm_config()
+    fallback_llm_cfg = get_fallback_llm_config()
+    signature_payload = {
+        "ai_gateway": gateway_cfg,
+        "gateway_llm": gateway_llm_cfg,
+        "fallback_llm": fallback_llm_cfg,
+    }
+    signature = json.dumps(signature_payload, ensure_ascii=False, sort_keys=True, default=str)
+    display_model = gateway_llm_cfg.get("model") or fallback_llm_cfg.get("model", "deepseek-chat")
+    return signature, str(display_model)
 
 
 def _estimate_tokens(text) -> int:
@@ -132,7 +168,7 @@ from graph.session_manager import session_manager, COMPRESSED_CONTEXT_PREFIX
 from graph.citations import format_sources_for_model
 from graph.tool_result_adapter import tool_result_adapter
 from graph.llm_input_logger import current_session_id, current_user_id, log_llm_input
-from llm.model_client import ModelClient
+from llm.model_client import ModelClient, ModelClientChatModel
 from tools import get_all_tools
 
 
@@ -153,17 +189,8 @@ class AgentManager:
         self._base_dir = base_dir
         self._tools = get_all_tools(base_dir)
 
-        config = load_config()
-        llm_config = config.get("llm", {})
-        model = llm_config.get("model") or os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
-        api_key = llm_config.get("api_key") or os.getenv("DEEPSEEK_API_KEY", "")
-        api_base = llm_config.get("base_url") or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-        temperature = llm_config.get("temperature", 0.7)
-        gateway_config = get_gateway_config()
-
-        self._llm_client = ModelClient(role="agent", streaming=True)
-        self._llm = self._llm_client.get_chat_model()
-        self._config_sig = f"{model}|{api_key}|{api_base}|{temperature}|{gateway_config}"
+        self._llm = ModelClientChatModel(role="agent", streaming=True)
+        self._config_sig, model = _agent_model_config_signature()
 
         from graph.middlewares.skills_router import SkillsRouterMiddleware
         _router = SkillsRouterMiddleware()
@@ -176,18 +203,9 @@ class AgentManager:
         print(f"🤖 Agent initialized with {len(self._tools)} tools (model: {model})")
 
     def _refresh_llm_if_needed(self):
-        config = load_config()
-        llm_config = config.get("llm", {})
-        model = llm_config.get("model") or os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
-        api_key = llm_config.get("api_key") or os.getenv("DEEPSEEK_API_KEY", "")
-        api_base = llm_config.get("base_url") or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-        temperature = llm_config.get("temperature", 0.7)
-        gateway_config = get_gateway_config()
-
-        config_sig = f"{model}|{api_key}|{api_base}|{temperature}|{gateway_config}"
+        config_sig, _model = _agent_model_config_signature()
         if self._config_sig != config_sig:
-            self._llm_client = ModelClient(role="agent", streaming=True)
-            self._llm = self._llm_client.get_chat_model()
+            self._llm = ModelClientChatModel(role="agent", streaming=True)
             self._config_sig = config_sig
 
     def _get_prompt_files_sig(self) -> str:

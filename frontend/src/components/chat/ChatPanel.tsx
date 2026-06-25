@@ -7,12 +7,14 @@ import ChatInput from "./ChatInput";
 import { Loader2, Sparkles } from "lucide-react";
 
 export default function ChatPanel() {
-  const { messages, maintenanceStatus } = useApp();
+  const { messages, maintenanceStatus, isStreaming } = useApp();
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, maintenanceStatus]);
+
+  const lastAssistantId = [...messages].reverse().find((m) => m.role === "assistant")?.id;
 
   return (
     <div className="flex flex-col h-full">
@@ -37,7 +39,11 @@ export default function ChatPanel() {
         ) : (
           <div className="py-5 pb-3">
             {messages.map((msg) => (
-              <ChatMessage key={msg.id} message={msg} />
+              <ChatMessage
+                key={msg.id}
+                message={msg}
+                isStreaming={isStreaming && msg.id === lastAssistantId}
+              />
             ))}
             {maintenanceStatus && (
               <div className="animate-fade-in px-4 py-1.5">

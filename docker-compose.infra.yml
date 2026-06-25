@@ -1,0 +1,111 @@
+# PuddingClaw Local Infra Compose
+#
+# 用途：
+#   本地客户端/本地开发模式下，frontend 和 backend 直接在宿主机运行；
+#   Docker 只负责可选基础设施：Higress、Milvus。
+#   MinerU 按本机服务运行，使用 scripts/setup-mineru.py 或 scripts/start-mineru-host.sh 启动。
+#
+# 端口保持与现有部署约定一致：
+#   Higress Gateway: http://localhost:8080
+#   Higress Console: http://localhost:8001
+#   Milvus:          http://localhost:19530
+#   MinerU API:      http://localhost:8002  # 本机运行，不在本 compose 内
+#
+# 启动：
+#   docker compose -f docker-compose.infra.yml up -d
+#
+# 本地 backend 推荐环境变量：
+#   AI_GATEWAY_URL=http://localhost:8080/v1
+#   MINERU_URL=http://localhost:8002
+
+services:
+  higress:
+    image: ${HIGRESS_IMAGE:-higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/all-in-one:latest-o11y}
+    container_name: puddingclaw-higress
+    ports:
+      - "8080:8080"
+      - "8001:8001"
+      # 可观测套件端口（Prometheus / Grafana / Envoy metrics）
+      - "9090:9090"
+      - "3001:3000"
+      - "15020:15020"
+      - "15021:15021"
+    environment:
+      - MODE=full
+      - USE_PLUGIN_SERVER=on
+      - ENABLE_CONSOLE_ROUTE=1
+      - O11Y=on
+    volumes:
+      - ./data/higress:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  milvus-etcd:
+    image: ${ETCD_IMAGE:-quay.io/coreos/etcd:v3.5.18}
+    container_name: puddingclaw-milvus-etcd
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - ./data/milvus/etcd:/etcd
+    command: >
+      etcd
+      --advertise-client-urls=http://milvus-etcd:2379
+      --listen-client-urls=http://0.0.0.0:2379
+      --initial-advertise-peer-urls=http://milvus-etcd:2380
+      --listen-peer-urls=http://0.0.0.0:2380
+      --data-dir=/etcd
+    restart: unless-stopped
+
+  milvus-minio:
+    image: ${MINIO_IMAGE:-minio/minio:RELEASE.2025-04-22T22-12-26Z}
+    container_name: puddingclaw-milvus-minio
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    # MinIO 只作为 Milvus 内部对象存储使用；默认不暴露控制台端口，
+    # 避免和本机已有 MinIO/其他服务冲突。如需调试控制台，可设置：
+    #   MINIO_CONSOLE_PORT=19001 docker compose -f docker-compose.infra.yml up -d
+    ports:
+      - "${MINIO_CONSOLE_PORT:-127.0.0.1:19001}:9001"
+    volumes:
+      - ./data/milvus/minio:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  milvus:
+    image: ${MILVUS_IMAGE:-milvusdb/milvus:v2.5.4}
+    container_name: puddingclaw-milvus
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: milvus-etcd:2379
+      MINIO_ADDRESS: milvus-minio:9000
+    volumes:
+      - ./data/milvus/data:/var/lib/milvus
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    depends_on:
+      - milvus-etcd
+      - milvus-minio
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s

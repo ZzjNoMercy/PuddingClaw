@@ -1,4 +1,8 @@
-# PuddingClaw Docker Compose
+# PuddingClaw Docker Compose（旧 full-stack 部署文件）
+#
+# 当前推荐部署方式：
+#   1. Higress/Milvus: docker compose -f docker-compose.infra.yml up -d
+#   2. frontend/backend: scripts/start-macos-linux.sh
 #
 # Core 模式：
 #   docker compose up --build -d
@@ -14,10 +18,8 @@
 #   Higress Console：http://localhost:8001
 #
 # 注意：
-#   若本机运行 MinerU，请在 backend/.env 中设置
-#   MINERU_URL=http://host.docker.internal:8002
-#
-#   Full 模式下 backend 默认指向 Higress，首次启动后需要访问 Console 配置 Provider：
+#   Full 模式为旧部署路径；当前本地模式下 backend 不再运行在 Docker 容器内。
+#   首次启动 Higress 后需要访问 Console 配置 Provider：
 #   http://localhost:8001
 
 services:
@@ -54,6 +56,8 @@ services:
       - ./backend/.env:/app/.env:ro
       - ./backend/config.json:/app/config.json
       - ./logging.yaml:/app/logging.yaml:ro
+      # 挂载 Higress 配置目录，backend 可读取路由模型列表
+      - ./data/higress:/app/data/higress:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9100/"]
@@ -79,16 +83,23 @@ services:
     restart: unless-stopped
 
   higress:
-    image: higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/all-in-one:latest
+    # 必须使用带 -o11y 后缀的镜像，才能启用内置 Prometheus/Grafana/Loki 套件
+    image: higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/all-in-one:latest-o11y
     container_name: puddingclaw-higress
     profiles: ["full"]
     ports:
       - "8080:8080"
       - "8001:8001"
+      # 可观测套件端口（Prometheus / Grafana / Envoy metrics）
+      - "9090:9090"
+      - "3001:3000"
+      - "15020:15020"
+      - "15021:15021"
     environment:
       - MODE=full
       - USE_PLUGIN_SERVER=on
       - ENABLE_CONSOLE_ROUTE=1
+      - O11Y=on
     volumes:
       # 持久化 Higress 配置，避免每次重启后 Provider 配置丢失
       - ./data/higress:/data

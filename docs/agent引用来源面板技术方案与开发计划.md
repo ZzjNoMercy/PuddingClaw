@@ -960,3 +960,19 @@ for (const frame of completeSSEFrames) {
 - Session 持久化 8 条结构化来源与 8 个已校验引用；页面刷新恢复后，来源面板显示 8 条来源，其中 3 条为正文已引用来源。
 - 容器内直接调用 `TavilySearchTool("蔚来最近有什么新闻", 3)` 返回 3 条有效结构化来源。
 - 相关后端测试 `23 passed`，前端生产构建通过；上下文测试另有 52 项通过，7 个异步用例因 host 缺少 `pytest-asyncio` 未执行，此环境缺口与本次修改无关。
+
+### 2026-06-25：execute_skill 包装输出导致引用定稿为空
+
+- 现象：最新 Session `session-df1cad876f34.json` 中，最终回答正文已经包含 `[^src_...]` 标记，但最终 assistant 消息 `sources=0 / citations=0`，右侧来源面板无法显示已引用来源。
+- 判断：这不是模型没有生成引用，也不是前端展示层丢失；`finalize_citations(content, sources)` 需要用本轮 sources 作为白名单校验，sources 为空时会把正文里的所有 marker 判为无效。
+- 直接根因：`execute_skill` 的历史工具输出形态是“说明文字 + `[scripts/aihot_query.py]` + JSON envelope”。旧版解析只接受“整段就是 JSON”的标准 `puddingclaw_tool_result`，无法从包装文本中提取 envelope。
+- 叠加问题：该历史输出还被旧截断逻辑插入 `...[上下文已截断，来源仍完整保留]`，导致 JSON 字符串本身不合法；这类历史消息无法稳定回填，只能重新发起请求或做一次性数据修复。
+- 修复：`backend/graph/citations.py` 的 `parse_tool_result()` 增加包装文本中的标准 envelope 提取，只接受携带 `puddingclaw_tool_result: 1` 的对象，避免 read_file/SKILL.md 中的示例 JSON 被误当来源。
+- 现行 `backend/tools/execute_skill_tool.py` 已按正确边界处理：先解析脚本 stdout 的标准 envelope，再只截断 `answer_context`，最后重新 `encode_tool_result(answer, sources)`，不会再破坏 `sources[]`。
+- 回归测试：新增 `test_parse_tool_result_extracts_envelope_from_execute_skill_wrapper`，覆盖 `execute_skill` 包装前缀；`pytest -q backend/tests/test_citations.py backend/tests/test_aihot_skill.py` 结果为 `25 passed`。
+
+对其他项目的结论：
+
+- 引用协议必须把“结构化来源 envelope”当作机器协议，不要把它当普通展示文本截断。
+- 任何 tool runner / skill runner 可以添加人类可读前缀，但下游 adapter 必须能找到标准 envelope，且只信任带显式协议版本的对象。
+- 引用定稿失败时先看三件事：正文是否有 marker、本轮 sources 是否为空、marker 的 `source_id` 是否存在于 sources 白名单；不要先怀疑前端。

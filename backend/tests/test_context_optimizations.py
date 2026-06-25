@@ -31,7 +31,7 @@ class TestContextEngineeringConfig:
 
     def test_default_context_window_is_1m(self):
         from config import _DEFAULT_CONFIG
-        assert _DEFAULT_CONFIG["llm"]["context_window"] == 1000000
+        assert _DEFAULT_CONFIG["fallback_llm"]["context_window"] == 1000000
 
     def test_tail_trim_threshold_is_200k(self):
         from config import _DEFAULT_CONFIG
@@ -645,7 +645,27 @@ class TestToolResultClearMiddleware:
         assert new_msgs[2].tool_call_id == "tc1"
         # tc2 属于当前轮次，保持完整
         assert not new_msgs[5].content.startswith(SUMMARY_PREFIX)
-        runtime.stream_writer.assert_called_once()
+        events = [call.args[0] for call in runtime.stream_writer.call_args_list]
+        assert events == [
+            {
+                "type": "context_maintenance",
+                "status": "start",
+                "phase": "tool_result_clear",
+                "message": "正在整理历史工具结果...",
+            },
+            {
+                "type": "context_maintenance",
+                "status": "done",
+                "phase": "tool_result_clear",
+            },
+            {
+                "type": "tool_result_clear",
+                "tool_call_id": "tc1",
+                "tool": "read_file",
+                "summary": "摘要结果",
+                "summary_source": "tool_result_clear",
+            },
+        ]
 
     @pytest.mark.asyncio
     async def test_short_output_not_summarized(self, fake_llm):

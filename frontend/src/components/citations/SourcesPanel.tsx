@@ -1,8 +1,9 @@
 "use client";
 
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import {
   BookOpen,
+  ChevronDown,
   ExternalLink,
   FileText,
   Search,
@@ -46,52 +47,90 @@ export default function SourcesPanel() {
   const total = cited.length + retrieved.length;
 
   return (
-    <aside className="flex h-full flex-col overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
-      <div className="flex h-11 shrink-0 items-center gap-2 border-b border-slate-100 px-3.5">
-        <div className="flex h-6 w-6 items-center justify-center rounded-md bg-blue-50">
-          <BookOpen className="h-3.5 w-3.5 text-[#002fa7]" />
+    <div className="h-full overflow-y-auto pr-2 py-2 pl-1 space-y-3">
+      {total === 0 ? (
+        <div className="flex h-full flex-col items-center justify-center px-5 text-center">
+          <Search className="mb-3 h-8 w-8 text-slate-300" />
+          <p className="text-[12px] font-medium text-slate-500">暂无引用来源</p>
+          <p className="mt-1 text-[11px] leading-relaxed text-slate-400">
+            Agent 通过知识库工具或 Skill 找到文档后，来源会在这里动态出现。
+          </p>
         </div>
-        <span className="text-[13px] font-semibold text-slate-800">引用来源</span>
-        <span className="rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">
-          {total}
-        </span>
-        {isStreaming && total > 0 && (
-          <span className="ml-auto inline-flex items-center gap-1 text-[10px] text-blue-600">
-            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-blue-500" />
-            检索中
-          </span>
-        )}
-      </div>
+      ) : (
+        <>
+          <SourceCard
+            title="已引用"
+            icon={BookOpen}
+            count={cited.length}
+            defaultOpen
+          >
+            <div className="space-y-2">
+              {cited.map(({ source, index }) => (
+                <SourceItem key={source.source_id} source={source} citationIndex={index} />
+              ))}
+            </div>
+          </SourceCard>
 
-      <div className="flex-1 overflow-y-auto p-3">
-        {total === 0 ? (
-          <div className="flex h-full flex-col items-center justify-center px-5 text-center">
-            <Search className="mb-3 h-8 w-8 text-slate-300" />
-            <p className="text-[12px] font-medium text-slate-500">暂无引用来源</p>
-            <p className="mt-1 text-[11px] leading-relaxed text-slate-400">
-              Agent 通过知识库工具或 Skill 找到文档后，来源会在这里动态出现。
-            </p>
+          <SourceCard
+            title="其他检索结果"
+            icon={FileText}
+            count={retrieved.length}
+            defaultOpen={false}
+          >
+            <div className="space-y-2">
+              {retrieved.map(({ source }) => (
+                <SourceItem key={source.source_id} source={source} />
+              ))}
+            </div>
+          </SourceCard>
+
+          {isStreaming && total > 0 && (
+            <div className="flex items-center justify-center gap-1.5 py-1 text-[11px] text-blue-600">
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-blue-500" />
+              检索中
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function SourceCard({
+  title,
+  icon: Icon,
+  count,
+  children,
+  defaultOpen = true,
+}: {
+  title: string;
+  icon: React.ElementType;
+  count: number;
+  children: React.ReactNode;
+  defaultOpen?: boolean;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <section className="rounded-xl border border-slate-200 bg-white shadow-sm overflow-hidden">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="w-full flex items-center justify-between px-3.5 py-2.5 hover:bg-slate-50/60 transition-colors"
+      >
+        <div className="flex items-center gap-2">
+          <div className="flex h-6 w-6 items-center justify-center rounded-md bg-blue-50 text-[#002fa7]">
+            <Icon className="h-3.5 w-3.5" />
           </div>
-        ) : (
-          <div className="space-y-4">
-            {cited.length > 0 && (
-              <SourceGroup title="已引用" count={cited.length}>
-                {cited.map(({ source, index }) => (
-                  <SourceCard key={source.source_id} source={source} citationIndex={index} />
-                ))}
-              </SourceGroup>
-            )}
-            {retrieved.length > 0 && (
-              <SourceGroup title={cited.length ? "其他检索结果" : "已检索"} count={retrieved.length} muted>
-                {retrieved.map(({ source }) => (
-                  <SourceCard key={source.source_id} source={source} />
-                ))}
-              </SourceGroup>
-            )}
-          </div>
-        )}
-      </div>
-    </aside>
+          <span className="text-[13px] font-semibold text-slate-800">{title}</span>
+          <span className="rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">
+            {count}
+          </span>
+        </div>
+        <ChevronDown
+          className={`h-3.5 w-3.5 text-gray-400 transition-transform duration-200 ${!open ? "-rotate-90" : ""}`}
+        />
+      </button>
+      {open && <div className="px-3.5 pb-3">{children}</div>}
+    </section>
   );
 }
 
@@ -121,29 +160,13 @@ function looksLikeRejectedFetch(quote: string): boolean {
   return ["ç½", "è¯", "å", "é¡", "ï¼"].filter((marker) => text.includes(marker)).length >= 2;
 }
 
-function SourceGroup({
-  title,
-  count,
-  muted = false,
-  children,
+function SourceItem({
+  source,
+  citationIndex,
 }: {
-  title: string;
-  count: number;
-  muted?: boolean;
-  children: React.ReactNode;
+  source: SourceRecord;
+  citationIndex?: number;
 }) {
-  return (
-    <section>
-      <div className={`mb-2 flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider ${muted ? "text-slate-400" : "text-[#002fa7]"}`}>
-        <span>{title}</span>
-        <span>{count}</span>
-      </div>
-      <div className="space-y-2">{children}</div>
-    </section>
-  );
-}
-
-function SourceCard({ source, citationIndex }: { source: SourceRecord; citationIndex?: number }) {
   const isExternal = /^https?:\/\//i.test(source.uri || "");
   const displayTitle = sourceDisplayTitle(source);
   const displayQuote = looksLikeRejectedFetch(source.quote || "") ? "" : source.quote;
@@ -157,10 +180,16 @@ function SourceCard({ source, citationIndex }: { source: SourceRecord; citationI
   return (
     <article
       id={`source-${source.source_id}`}
-      className={`rounded-lg border p-2.5 transition-colors ${citationIndex ? "border-blue-200 bg-blue-50/40" : "border-slate-200 bg-slate-50/50"}`}
+      className={`rounded-lg border p-2.5 transition-colors ${
+        citationIndex ? "border-blue-200 bg-blue-50/40" : "border-slate-200 bg-slate-50/50"
+      }`}
     >
       <button onClick={locateCitation} className="flex w-full items-start gap-2 text-left">
-        <div className={`mt-0.5 flex h-5 min-w-5 items-center justify-center rounded text-[10px] font-semibold ${citationIndex ? "bg-[#002fa7] text-white" : "bg-slate-200 text-slate-500"}`}>
+        <div
+          className={`mt-0.5 flex h-5 min-w-5 items-center justify-center rounded text-[10px] font-semibold ${
+            citationIndex ? "bg-[#002fa7] text-white" : "bg-slate-200 text-slate-500"
+          }`}
+        >
           {citationIndex || <FileText className="h-3 w-3" />}
         </div>
         <div className="min-w-0 flex-1">
@@ -176,7 +205,7 @@ function SourceCard({ source, citationIndex }: { source: SourceRecord; citationI
       </button>
 
       {displayQuote && (
-        <blockquote className="mt-2 line-clamp-4 border-l-2 border-slate-200 pl-2 text-[10px] leading-relaxed text-slate-500">
+        <blockquote className="mt-2 line-clamp-3 border-l-2 border-slate-200 pl-2 text-[10px] leading-relaxed text-slate-500">
           {displayQuote}
         </blockquote>
       )}
@@ -198,7 +227,7 @@ function SourceCard({ source, citationIndex }: { source: SourceRecord; citationI
 
 function sourceDisplayTitle(source: SourceRecord): string {
   const title = (source.title || "").trim();
-  if (title && !title.startsWith("[](") && !title.startsWith("[ ](")) return title;
+  if (title && !title.startsWith("[]()") && !title.startsWith("[ ](")) return title;
   try {
     return source.uri ? new URL(source.uri).hostname : "未命名来源";
   } catch {

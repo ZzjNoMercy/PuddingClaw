@@ -1,7 +1,7 @@
 #!/bin/bash
 # Fallback: start MinerU service on the host using the existing conda environment.
 # This is useful when the Docker image build is blocked by network/proxy issues.
-# The backend container can reach this service at host.docker.internal:8002.
+# The local backend can reach this service at http://localhost:8002.
 
 set -e
 

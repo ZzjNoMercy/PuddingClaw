@@ -4,7 +4,6 @@ import { useState, useEffect, useCallback } from "react";
 import Navbar from "@/components/layout/Navbar";
 import {
   Bot,
-  Sparkles,
   Database,
   HardDrive,
   Sliders,
@@ -39,7 +38,7 @@ import Link from "next/link";
 type SettingsCategory = "ai" | "rag" | "memory" | "data" | "advanced" | "system";
 
 const CATEGORIES: { key: SettingsCategory; label: string; icon: React.ElementType; color: string }[] = [
-  { key: "ai", label: "AI 接入", icon: Network, color: "#002fa7" },
+  { key: "ai", label: "AI 网关", icon: Network, color: "#002fa7" },
   { key: "rag", label: "RAG 设置", icon: Database, color: "#7c3aed" },
   { key: "memory", label: "记忆管理", icon: Brain, color: "#7c3aed" },
   { key: "data", label: "数据管理", icon: HardDrive, color: "#10b981" },
@@ -49,9 +48,11 @@ const CATEGORIES: { key: SettingsCategory; label: string; icon: React.ElementTyp
 
 const LLM_PROVIDERS = [
   { value: "deepseek", label: "DeepSeek", baseUrl: "https://api.deepseek.com" },
-  { value: "openai", label: "OpenAI", baseUrl: "https://api.openai.com/v1" },
   { value: "qwen", label: "Qwen / DashScope", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1" },
-  { value: "custom", label: "自定义", baseUrl: "" },
+];
+
+const EMBEDDING_PROVIDERS = [
+  { value: "qwen", label: "Qwen / DashScope", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1" },
 ];
 
 const SETTINGS_CATEGORY_KEY = "settings:activeCategory";
@@ -76,6 +77,8 @@ export default function SettingsPage() {
   const [gatewayEnvironmentOverride, setGatewayEnvironmentOverride] = useState(false);
   const [gatewayTesting, setGatewayTesting] = useState(false);
   const [gatewayTestResult, setGatewayTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [gatewayModels, setGatewayModels] = useState<string[]>([]);
+  const [gatewayModel, setGatewayModel] = useState("deepseek-v4-flash");
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
 
   useEffect(() => {
@@ -95,9 +98,9 @@ export default function SettingsPage() {
   const [llmTestResult, setLlmTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
 
   // Embedding form state
-  const [embProvider, setEmbProvider] = useState("openai");
-  const [embModel, setEmbModel] = useState("text-embedding-3-small");
-  const [embBaseUrl, setEmbBaseUrl] = useState("https://api.openai.com/v1");
+  const [embProvider, setEmbProvider] = useState("qwen");
+  const [embModel, setEmbModel] = useState("text-embedding-v3");
+  const [embBaseUrl, setEmbBaseUrl] = useState("https://dashscope.aliyuncs.com/compatible-mode/v1");
   const [embApiKey, setEmbApiKey] = useState("");
   const [embApiKeyMasked, setEmbApiKeyMasked] = useState("");
   const [showEmbKey, setShowEmbKey] = useState(false);
@@ -121,18 +124,25 @@ export default function SettingsPage() {
         setGatewayHealthPath(s.ai_gateway.health_path);
         setGatewayFallback(s.ai_gateway.fallback_to_direct);
         setGatewayEnvironmentOverride(s.ai_gateway.environment_override);
+        setGatewayModels(s.ai_gateway.routed_models || []);
+        setGatewayModel(s.gateway_llm?.model || s.fallback_llm.model);
         // Populate LLM fields
-        setLlmProvider(s.llm.provider);
-        setLlmModel(s.llm.model);
-        setLlmBaseUrl(s.llm.base_url);
-        setLlmApiKeyMasked(s.llm.api_key_masked);
-        setTemperature(s.llm.temperature);
-        setMaxTokens(s.llm.max_tokens);
+        setLlmProvider(s.fallback_llm.provider);
+        setLlmModel(s.fallback_llm.model);
+        setLlmBaseUrl(s.fallback_llm.base_url);
+        setLlmApiKeyMasked(s.fallback_llm.api_key_masked);
+        setTemperature(s.fallback_llm.temperature);
+        setMaxTokens(s.fallback_llm.max_tokens);
         // Populate Embedding fields
-        setEmbProvider(s.embedding.provider);
-        setEmbModel(s.embedding.model);
-        setEmbBaseUrl(s.embedding.base_url);
-        setEmbApiKeyMasked(s.embedding.api_key_masked);
+        const validEmbProvider = EMBEDDING_PROVIDERS.some((p) => p.value === s.fallback_embedding.provider)
+          ? s.fallback_embedding.provider
+          : "qwen";
+        setEmbProvider(validEmbProvider);
+        setEmbModel(s.fallback_embedding.model);
+        setEmbBaseUrl(
+          EMBEDDING_PROVIDERS.find((p) => p.value === validEmbProvider)?.baseUrl ?? s.fallback_embedding.base_url
+        );
+        setEmbApiKeyMasked(s.fallback_embedding.api_key_masked);
         // Populate RAG fields
         setRagTopK(s.rag.top_k);
         setRagThreshold(s.rag.similarity_threshold);
@@ -157,7 +167,10 @@ export default function SettingsPage() {
           health_path: gatewayHealthPath,
           fallback_to_direct: gatewayFallback,
         },
-        llm: {
+        gateway_llm: {
+          model: gatewayModel,
+        },
+        fallback_llm: {
           provider: llmProvider,
           model: llmModel,
           base_url: llmBaseUrl,
@@ -165,7 +178,7 @@ export default function SettingsPage() {
           temperature,
           max_tokens: maxTokens,
         },
-        embedding: {
+        fallback_embedding: {
           provider: embProvider,
           model: embModel,
           base_url: embBaseUrl,
@@ -186,14 +199,14 @@ export default function SettingsPage() {
       setEmbApiKey("");
       // Reload to get fresh masked keys
       const fresh = await getSettings();
-      setLlmApiKeyMasked(fresh.llm.api_key_masked);
-      setEmbApiKeyMasked(fresh.embedding.api_key_masked);
+      setLlmApiKeyMasked(fresh.fallback_llm.api_key_masked);
+      setEmbApiKeyMasked(fresh.fallback_embedding.api_key_masked);
     } catch (err) {
       showToast("error", err instanceof Error ? err.message : "保存失败");
     } finally {
       setSaving(false);
     }
-  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embBaseUrl, embApiKey, ragMode, ragTopK, ragThreshold, compRatio, showToast]);
+  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embBaseUrl, embApiKey, ragMode, ragTopK, ragThreshold, compRatio, showToast]);
 
   const handleTestGateway = useCallback(async () => {
     setGatewayTesting(true);
@@ -213,7 +226,7 @@ export default function SettingsPage() {
   }, [gatewayBaseUrl, gatewayHealthPath]);
 
   const handleTestLlm = useCallback(async () => {
-    const key = llmApiKey || settings?.llm.api_key_masked || "";
+    const key = llmApiKey || settings?.fallback_llm.api_key_masked || "";
     if (!key || key === "***") {
       setLlmTestResult({ ok: false, msg: "请先输入 API Key" });
       return;
@@ -237,7 +250,7 @@ export default function SettingsPage() {
   }, [llmApiKey, llmProvider, llmModel, llmBaseUrl, settings]);
 
   const handleTestEmb = useCallback(async () => {
-    const key = embApiKey || settings?.embedding.api_key_masked || "";
+    const key = embApiKey || settings?.fallback_embedding.api_key_masked || "";
     if (!key || key === "***") {
       setEmbTestResult({ ok: false, msg: "请先输入 API Key" });
       return;
@@ -313,7 +326,7 @@ export default function SettingsPage() {
               <>
                 <div className="flex items-center justify-between gap-4">
                   <div>
-                    <h1 className="text-[22px] font-semibold tracking-tight text-gray-900">AI 接入</h1>
+                    <h1 className="text-[22px] font-semibold tracking-tight text-gray-900">AI 网关</h1>
                     <p className="mt-1 text-[12px] text-gray-500">
                       管理请求经过哪里、使用哪个模型，以及每一层的访问凭证。
                     </p>
@@ -338,7 +351,7 @@ export default function SettingsPage() {
                     tone={capabilities?.ai_gateway.available ? "green" : "amber"}
                   />
                   <Route className="mx-auto h-4 w-4 text-gray-300" />
-                  <RouteNode title={llmProvider === "deepseek" ? "DeepSeek" : llmProvider} detail={llmModel} status="主模型" tone="blue" />
+                  <RouteNode title={gatewayModel} detail="网关模型" status="主模型" tone="blue" />
                 </div>
 
                 <div className="rounded-2xl border border-[#002fa7]/15 bg-gradient-to-br from-white/90 to-[#f4f7ff]/80 p-5 shadow-sm">
@@ -389,12 +402,54 @@ export default function SettingsPage() {
                     </div>
                     {gatewayTestResult && <div className="col-span-2"><ConnectionResult result={gatewayTestResult} /></div>}
                   </div>
+
+                  {/* Higress Routed Models */}
+                  {gatewayModels.length > 0 && (
+                    <div className="mt-5 border-t border-black/[0.06] pt-5">
+                      <div className="flex items-center gap-3 mb-4">
+                        <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-emerald-50 text-emerald-600">
+                          <Route className="h-3.5 w-3.5" />
+                        </div>
+                        <div>
+                          <h3 className="text-[13px] font-semibold text-gray-800">网关模型</h3>
+                          <p className="mt-0.5 text-[11px] text-gray-500">当前：{gatewayModel}，点击下方路由切换，保存后生效</p>
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        {gatewayModels.map((model) => {
+                          const active = model === gatewayModel;
+                          return (
+                            <button
+                              key={model}
+                              onClick={() => setGatewayModel(model)}
+                              className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[11px] font-medium transition-all border ${
+                                active
+                                  ? "bg-[#002fa7] text-white border-[#002fa7] shadow-sm"
+                                  : "bg-white/70 text-gray-600 border-black/[0.06] hover:bg-white hover:border-[#002fa7]/30"
+                              }`}
+                              title={active ? "当前网关模型已匹配此路由" : "点击将网关模型设为此值"}
+                            >
+                              {active && <CheckCircle2 className="h-3 w-3" />}
+                              {model}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
                 </div>
               </>
             )}
-            {/* LLM Settings */}
+            {/* Fallback Settings */}
             {category === "ai" && (
-              <SettingsCard title="LLM 模型配置" icon={Bot} color="#002fa7">
+              <SettingsCard title="Fallback 直连配置" icon={Bot} color="#6b7280">
+                <div className="rounded-xl border border-amber-100/80 bg-amber-50/50 px-3.5 py-3 mb-4">
+                  <p className="text-[11px] leading-relaxed text-amber-700">
+                    <strong>说明：</strong>Higress 可用时，LLM / Embedding 请求会优先经过网关路由；以下配置仅在网关探测失败或 fallback 时生效。
+                  </p>
+                </div>
+
+                <h3 className="mb-3 text-[13px] font-semibold text-gray-700">LLM 模型</h3>
                 <FormField label="Provider">
                   <select
                     value={llmProvider}
@@ -486,25 +541,22 @@ export default function SettingsPage() {
                     className="form-input"
                   />
                 </FormField>
-              </SettingsCard>
-            )}
 
-            {/* Embedding Settings */}
-            {category === "ai" && (
-              <SettingsCard title="Embedding 模型配置" icon={Sparkles} color="#f59e0b">
+                <div className="my-5 border-t border-black/[0.06]" />
+                <h3 className="mb-3 text-[13px] font-semibold text-gray-700">Embedding 模型</h3>
                 <FormField label="Provider">
                   <select
                     value={embProvider}
                     onChange={(e) => {
                       setEmbProvider(e.target.value);
-                      if (e.target.value === "openai") setEmbBaseUrl("https://api.openai.com/v1");
-                      if (e.target.value === "dashscope") setEmbBaseUrl("https://dashscope.aliyuncs.com/compatible-mode/v1");
+                      const p = EMBEDDING_PROVIDERS.find((p) => p.value === e.target.value);
+                      if (p && p.baseUrl) setEmbBaseUrl(p.baseUrl);
                     }}
                     className="form-select"
                   >
-                    <option value="openai">OpenAI</option>
-                    <option value="dashscope">DashScope</option>
-                    <option value="custom">自定义</option>
+                    {EMBEDDING_PROVIDERS.map((p) => (
+                      <option key={p.value} value={p.value}>{p.label}</option>
+                    ))}
                   </select>
                 </FormField>
                 <FormField label="Model">
@@ -513,7 +565,7 @@ export default function SettingsPage() {
                     value={embModel}
                     onChange={(e) => setEmbModel(e.target.value)}
                     className="form-input"
-                    placeholder="text-embedding-3-small"
+                    placeholder="text-embedding-v3"
                   />
                 </FormField>
                 <FormField label="Base URL">

@@ -22,6 +22,11 @@ FRONTEND_PORT="${FRONTEND_PORT:-3000}"
 BACKEND_URL="http://127.0.0.1:${BACKEND_PORT}"
 FRONTEND_URL="http://127.0.0.1:${FRONTEND_PORT}"
 
+# 本地运行 frontend/backend 时，基础设施若由 docker-compose.infra.yml 提供，
+# backend 应通过宿主机端口访问，而不是 Docker service name。
+export AI_GATEWAY_URL="${AI_GATEWAY_URL:-http://localhost:8080/v1}"
+export MINERU_URL="${MINERU_URL:-http://localhost:8002}"
+
 echo ""
 echo "============================================"
 echo "  PuddingClaw - 一键启动脚本"
@@ -89,6 +94,8 @@ echo ""
 echo "  后端 API:  ${BACKEND_URL}"
 echo "  前端界面:  ${FRONTEND_URL}"
 echo "  API 文档:  ${BACKEND_URL}/docs"
+echo "  Higress:   ${AI_GATEWAY_URL}"
+echo "  MinerU:    ${MINERU_URL}"
 echo ""
 echo "============================================"
 echo "  按 Ctrl+C 停止所有服务"

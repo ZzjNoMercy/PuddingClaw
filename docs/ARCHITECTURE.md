@@ -218,9 +218,9 @@ python scripts/setup-mineru.py --foreground           # 前台运行，实时显
 ```yaml
 backend-api:
   environment:
-    - AI_GATEWAY_URL=http://higress:8080/v1
-    - MILVUS_URL=http://milvus:19530
-    - MINERU_URL=http://mineru:8000
+    - AI_GATEWAY_URL=http://localhost:8080/v1
+    - MILVUS_URL=http://localhost:19530
+    - MINERU_URL=http://localhost:8002
 ```
 
 ---

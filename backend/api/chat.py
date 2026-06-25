@@ -16,7 +16,7 @@ from sse_starlette.sse import EventSourceResponse
 from graph.agent import agent_manager
 from graph.session_manager import session_manager
 from graph.citations import dedupe_sources, finalize_citations, normalize_source
-from config import get_cache_config, get_llm_config, get_memory_backend, get_middleware_config
+from config import get_cache_config, get_memory_backend, get_middleware_config
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 

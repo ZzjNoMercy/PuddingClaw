@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, Suspense, useRef } from "react";
+import { useEffect, Suspense, useMemo, useRef } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useApp } from "@/lib/store";
 import Navbar from "@/components/layout/Navbar";
@@ -24,11 +24,19 @@ function ChatLayout() {
     toggleInspector,
     inspectorWidth,
     setInspectorWidth,
+    sessionId,
+    sessions,
   } = useApp();
 
   const searchParams = useSearchParams();
   const router = useRouter();
   const hasPrefilledRef = useRef(false);
+
+  const sessionTitle = useMemo(() => {
+    if (sessionId === "default") return "新对话";
+    const session = sessions.find((s) => s.id === sessionId);
+    return session?.title || "新对话";
+  }, [sessionId, sessions]);
 
   // ── Prefill skill-creator prompt from URL params ───────
   useEffect(() => {
@@ -54,6 +62,7 @@ function ChatLayout() {
   return (
     <div className="h-screen flex flex-col app-bg">
       <Navbar
+        title={sessionTitle}
         sidebarOpen={sidebarOpen}
         toggleSidebar={toggleSidebar}
         showPanelToggles

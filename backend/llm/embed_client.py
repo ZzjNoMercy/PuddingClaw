@@ -10,7 +10,7 @@ import logging
 from llama_index.embeddings.openai import OpenAIEmbedding
 
 import capabilities
-from config import get_embedding_config, get_gateway_config
+from config import get_fallback_embedding_config, get_gateway_config
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +21,7 @@ def get_embedding_model() -> OpenAIEmbedding:
     如果 AI_GATEWAY_URL 可用，优先通过网关路由 embedding 请求；
     否则使用 config.json 中 embedding.base_url 直连。
     """
-    cfg = get_embedding_config()
+    cfg = get_fallback_embedding_config()
     gateway = get_gateway_config()
     use_gateway = False
     if gateway.get("base_url"):

@@ -1,10 +1,6 @@
 "use client";
 
-import Link from "next/link";
-import {
-  PanelLeft,
-  PanelRight,
-} from "lucide-react";
+import { ChevronDown, PanelLeft, PanelRight } from "lucide-react";
 
 interface NavbarProps {
   sidebarOpen?: boolean;
@@ -13,6 +9,8 @@ interface NavbarProps {
   toggleInspector?: () => void;
   /** Hide sidebar/inspector toggles on non-chat pages */
   showPanelToggles?: boolean;
+  /** Optional centered title (e.g. current session name) */
+  title?: string;
 }
 
 export default function Navbar({
@@ -21,6 +19,7 @@ export default function Navbar({
   inspectorOpen,
   toggleInspector,
   showPanelToggles = false,
+  title,
 }: NavbarProps) {
   return (
     <nav className="glass-nav sticky top-0 z-50 h-11 flex items-center justify-between px-3">
@@ -35,28 +34,21 @@ export default function Navbar({
                 : "text-gray-400 hover:text-gray-700 hover:bg-black/[0.04]"
             }`}
             title="切换侧栏"
+            aria-label="切换侧栏"
           >
             <PanelLeft className="w-[16px] h-[16px]" />
           </button>
         ) : null}
       </div>
 
-      {/* Center — Brand */}
-      <div className="flex items-center min-w-0">
-        {/* Brand */}
-        <Link href="/" className="flex items-center gap-2">
-          <div className="w-6 h-6 rounded-md bg-gradient-to-br from-[#002fa7] to-[#4070ff] flex items-center justify-center">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
-              <path d="M12 2L2 7L12 12L22 7L12 2Z" fill="white" fillOpacity="0.9" />
-              <path d="M2 17L12 22L22 17" stroke="white" strokeOpacity="0.7" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-              <path d="M2 12L12 17L22 12" stroke="white" strokeOpacity="0.85" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-            </svg>
-          </div>
-          <span className="font-semibold text-[14px] tracking-tight text-gray-800">
-            PuddingClaw
-          </span>
-        </Link>
-
+      {/* Center — Title */}
+      <div className="flex-1 flex items-center justify-center min-w-0 px-4">
+        {title ? (
+          <button className="flex items-center gap-1.5 text-[14px] font-medium text-gray-800 hover:bg-black/[0.04] px-3 py-1.5 rounded-lg transition-colors">
+            <span className="truncate">{title}</span>
+            <ChevronDown className="w-[14px] h-[14px] text-gray-400" />
+          </button>
+        ) : null}
       </div>
 
       {/* Right — Inspector toggle (chat page only) or spacer */}
@@ -70,6 +62,7 @@ export default function Navbar({
                 : "text-gray-400 hover:text-gray-700 hover:bg-black/[0.04]"
             }`}
             title="切换右侧面板"
+            aria-label="切换右侧面板"
           >
             <PanelRight className="w-[16px] h-[16px]" />
           </button>

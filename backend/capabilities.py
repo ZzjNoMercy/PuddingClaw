@@ -246,6 +246,21 @@ def detect_capabilities_sync(
         if datetime.now(timezone.utc) - _CAPABILITIES_CACHED_AT < _CACHE_TTL:
             return _CAPABILITIES_CACHE
     try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        # We are already inside an event loop. Calling asyncio.run() here would
+        # create a coroutine and then fail, leaving an unawaited-coroutine
+        # warning. Use the blocking sync probes instead.
+        logger.debug("[capabilities] running loop detected, using sync checks")
+        return _detect_capabilities_sync_fallback(
+            force=force,
+            ai_gateway_url=ai_gateway_url,
+            milvus_url=milvus_url,
+            mineru_url=mineru_url,
+        )
+    try:
         return asyncio.run(
             detect_capabilities(
                 force=force,
@@ -257,16 +272,42 @@ def detect_capabilities_sync(
     except RuntimeError as exc:
         # 如果当前线程已有事件循环（如在异步 FastAPI 中同步调用），回退到同步探测
         logger.debug("[capabilities] asyncio.run failed (%s), falling back to sync checks", exc)
-        gateway_config = get_gateway_config()
-        gateway_health_path = str(gateway_config.get("health_path", "/health"))
-        milvus_target = milvus_url or os.getenv("MILVUS_URL") or DEFAULT_MILVUS_URL
-        mineru_target = mineru_url or os.getenv("MINERU_URL") or DEFAULT_MINERU_URL
-
-        return Capabilities(
-            ai_gateway=_check_gateway_urls_sync(gateway_health_path, explicit_url=ai_gateway_url),
-            milvus=_check_milvus_sync(milvus_target),
-            mineru=_check_http_get_sync(mineru_target, "/health"),
+        return _detect_capabilities_sync_fallback(
+            force=force,
+            ai_gateway_url=ai_gateway_url,
+            milvus_url=milvus_url,
+            mineru_url=mineru_url,
         )
+
+
+def _detect_capabilities_sync_fallback(
+    *,
+    force: bool = False,
+    ai_gateway_url: str | None = None,
+    milvus_url: str | None = None,
+    mineru_url: str | None = None,
+) -> Capabilities:
+    """Synchronous capability probing used when async probing is not available."""
+    global _CAPABILITIES_CACHE, _CAPABILITIES_CACHED_AT
+
+    if not force and _CAPABILITIES_CACHE is not None and _CAPABILITIES_CACHED_AT is not None:
+        if datetime.now(timezone.utc) - _CAPABILITIES_CACHED_AT < _CACHE_TTL:
+            return _CAPABILITIES_CACHE
+
+    gateway_config = get_gateway_config()
+    gateway_health_path = str(gateway_config.get("health_path", "/health"))
+    milvus_target = milvus_url or os.getenv("MILVUS_URL") or DEFAULT_MILVUS_URL
+    mineru_target = mineru_url or os.getenv("MINERU_URL") or DEFAULT_MINERU_URL
+
+    caps = Capabilities(
+        ai_gateway=_check_gateway_urls_sync(gateway_health_path, explicit_url=ai_gateway_url),
+        milvus=_check_milvus_sync(milvus_target),
+        mineru=_check_http_get_sync(mineru_target, "/health"),
+    )
+    _CAPABILITIES_CACHE = caps
+    _CAPABILITIES_CACHED_AT = datetime.now(timezone.utc)
+    logger.debug("Capabilities detected synchronously: %s", caps.to_dict())
+    return caps
 
 
 def _check_http_get_sync(url: str | None, path: str, timeout: float = 3.0) -> CapabilityStatus:

@@ -81,12 +81,44 @@ def encode_tool_result(answer_context: str, sources: list[dict[str, Any]]) -> st
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _find_structured_payload(raw_output: str) -> dict[str, Any] | None:
+    """Find a standard tool-result envelope, even when wrapped by tool logs.
+
+    Some tool runners prepend human-readable execution text before the actual
+    script output, for example:
+
+        技能：aihot
+        执行结果：
+        [scripts/aihot_query.py] {"puddingclaw_tool_result": 1, ...}
+
+    The citation protocol should treat the JSON envelope as authoritative even
+    when it is embedded in such wrappers. We deliberately only accept objects
+    carrying STRUCTURED_TOOL_RESULT_KEY, so example JSON in docs/read_file does
+    not become a source.
+    """
+    text = str(raw_output or "").strip()
+    if not text:
+        return None
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text):
+        try:
+            payload, _end = decoder.raw_decode(text[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get(STRUCTURED_TOOL_RESULT_KEY) == STRUCTURED_TOOL_RESULT_VERSION
+        ):
+            return payload
+    return None
+
+
 def parse_tool_result(raw_output: str, tool_call_id: str = "") -> tuple[str, list[dict[str, Any]]]:
     """Return display/model context and sources, preserving legacy plain text tools."""
     try:
         payload = json.loads(raw_output)
     except (TypeError, json.JSONDecodeError):
-        return raw_output, []
+        payload = _find_structured_payload(raw_output)
     if not isinstance(payload, dict) or payload.get(STRUCTURED_TOOL_RESULT_KEY) != STRUCTURED_TOOL_RESULT_VERSION:
         return raw_output, []
     sources = [

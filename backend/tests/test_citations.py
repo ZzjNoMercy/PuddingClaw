@@ -32,6 +32,33 @@ def test_tool_result_round_trip_keeps_sources_separate():
     assert sources[0]["page"] == 12
 
 
+def test_parse_tool_result_extracts_envelope_from_execute_skill_wrapper():
+    from graph.citations import encode_tool_result, parse_tool_result
+
+    encoded = encode_tool_result("AI HOT 返回 1 条动态", [{
+        "source_id": "src_aihot_demo",
+        "title": "GPT-5.5 Instant 新版发布",
+        "uri": "https://example.com/gpt-55",
+        "document_id": "https://example.com/gpt-55",
+        "chunk_id": "aihot-item",
+        "source_type": "web",
+        "quote": "OpenAI 推送更新。",
+    }])
+    wrapped = (
+        "技能：aihot\n"
+        "描述：AI HOT 中文资讯查询 Skill\n\n"
+        "执行结果：\n"
+        f"[scripts/aihot_query.py] {encoded}\n"
+    )
+
+    answer, sources = parse_tool_result(wrapped, "call-aihot")
+
+    assert answer == "AI HOT 返回 1 条动态"
+    assert len(sources) == 1
+    assert sources[0]["source_id"] == "src_aihot_demo"
+    assert sources[0]["tool_call_id"] == "call-aihot"
+
+
 def test_source_ids_are_deterministic_and_deduplicated():
     from graph.citations import dedupe_sources, normalize_source
 
