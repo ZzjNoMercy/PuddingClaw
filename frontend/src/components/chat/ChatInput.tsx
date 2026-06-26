@@ -221,8 +221,8 @@ export default function ChatInput() {
   };
 
   return (
-    <div className="px-5 pb-4 pt-2">
-      <div className="glass-input relative mx-auto flex w-full max-w-3xl flex-col gap-2 rounded-2xl px-4 py-3 transition-shadow hover:shadow-xl">
+    <div className="px-6 pb-4 pt-2">
+      <div className="glass-input relative mx-auto flex w-full max-w-[820px] flex-col gap-2 rounded-3xl px-4 py-3 transition-shadow hover:shadow-lg">
         <SlashCommandMenu
           visible={showSlashMenu}
           filteredSkills={filteredSkills}
@@ -284,7 +284,7 @@ export default function ChatInput() {
                   className={`flex h-8 max-w-[260px] items-center gap-1.5 rounded-full border px-3 text-[12px] transition-all ${
                     selectedProject
                       ? "border-[#002fa7]/15 bg-[#e8edff] text-[#002fa7] hover:bg-[#dfe7ff]"
-                      : "border-black/[0.08] bg-black/[0.03] text-gray-600 hover:bg-black/[0.06] hover:text-gray-900"
+                      : "border-black/[0.06] bg-white/42 text-gray-600 hover:bg-white/70 hover:text-gray-900"
                   }`}
                   title={selectedProject?.path || "选择 Agent 工作项目"}
                 >
@@ -393,7 +393,7 @@ export default function ChatInput() {
         </div>
       </div>
 
-      <p className="viewport-center-axis mt-1 text-center text-[10px] text-gray-400/70">
+      <p className="viewport-center-axis mt-1 text-center text-[10px] text-gray-400/45">
         Powered by DeepSeek · PuddingClaw v0.1
       </p>
     </div>
@@ -419,7 +419,7 @@ function ContextUsageTooltip({
     >
       <button
         type="button"
-        className={`flex h-7 items-center gap-1 rounded-full border border-black/[0.08] bg-white px-2.5 text-[11px] font-medium transition-colors hover:bg-black/[0.03] ${color}`}
+        className={`flex h-7 items-center gap-1 rounded-full border border-black/[0.06] bg-white/50 px-2.5 text-[11px] font-medium transition-colors hover:bg-white/80 ${color}`}
       >
         <Activity className="h-3 w-3" />
         {usage.percentage.toFixed(0)}%
@@ -431,7 +431,7 @@ function ContextUsageTooltip({
             {usage.percentage.toFixed(0)}% 已用
           </p>
           <p className="mt-1 text-[11px] text-gray-400">
-            已用 {formatTokens(usage.used)} 标记，共 {formatTokens(usage.total)}
+            已用 {formatTokens(usage.used)}，共 {formatTokens(usage.total)}
           </p>
           <div className="absolute bottom-[-5px] right-4 h-2.5 w-2.5 rotate-45 bg-[#1f2937]" />
         </div>
