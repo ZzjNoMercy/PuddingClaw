@@ -1,7 +1,6 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import Navbar from "@/components/layout/Navbar";
 import {
   Bot,
   Database,
@@ -276,7 +275,6 @@ export default function SettingsPage() {
   if (loading) {
     return (
       <div className="h-screen flex flex-col app-bg">
-        <Navbar />
         <div className="flex-1 flex items-center justify-center">
           <Loader2 className="w-6 h-6 animate-spin text-gray-400" />
         </div>
@@ -286,7 +284,6 @@ export default function SettingsPage() {
 
   return (
     <div className="h-screen flex flex-col app-bg">
-      <Navbar />
       <div className="flex-1 flex overflow-hidden">
         {/* Left: Category Navigation */}
         <div className="w-52 glass-panel border-r border-black/[0.06] shrink-0 p-3">
