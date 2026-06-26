@@ -56,7 +56,6 @@ body {
 
 .workspace-chat-shell {
   background: var(--workspace-surface);
-  border-top: 1px solid var(--workspace-border);
   border-bottom: 1px solid var(--workspace-border);
 }
 
