@@ -3,12 +3,10 @@
 import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import {
   ArrowUp,
-  Bot,
   Check,
   ChevronDown,
   FolderKanban,
   FolderPlus,
-  MessageSquare,
   Square,
   XCircle,
   Activity,
@@ -134,7 +132,12 @@ export default function ChatInput() {
   }, [text, disabled, sendMessage, setPendingInput]);
 
   const handleRegisterProject = useCallback(async () => {
-    const path = window.prompt("输入本地项目目录路径");
+    let path: string | null = null;
+    if (window.electron?.selectProjectFolder) {
+      path = await window.electron.selectProjectFolder();
+    } else {
+      path = window.prompt("输入本地项目目录路径");
+    }
     if (!path?.trim()) return;
     const project = await registerProject(path.trim());
     if (!project) {
@@ -367,33 +370,6 @@ export default function ChatInput() {
           </div>
 
           <div className="flex shrink-0 items-center gap-2">
-            <div className="grid grid-cols-2 rounded-full border border-black/[0.08] bg-white p-0.5">
-              <button
-                type="button"
-                onClick={() => setRuntimeMode("agent")}
-                className={`flex h-7 items-center gap-1 rounded-full px-2.5 text-[12px] transition-all ${
-                  runtimeMode === "agent"
-                    ? "bg-[#e8edff] text-[#002fa7]"
-                    : "text-gray-500 hover:text-gray-800"
-                }`}
-              >
-                <Bot className="h-3.5 w-3.5" />
-                Agent
-              </button>
-              <button
-                type="button"
-                onClick={() => setRuntimeMode("chat")}
-                className={`flex h-7 items-center gap-1 rounded-full px-2.5 text-[12px] transition-all ${
-                  runtimeMode === "chat"
-                    ? "bg-[#e8edff] text-[#002fa7]"
-                    : "text-gray-500 hover:text-gray-800"
-                }`}
-              >
-                <MessageSquare className="h-3.5 w-3.5" />
-                Chat
-              </button>
-            </div>
-
             <ContextUsageTooltip usage={contextUsage} />
 
             {isStreaming ? (
