@@ -2,8 +2,8 @@
 
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { User, AlertTriangle, Key } from "lucide-react";
-import type { ChatMessage as ChatMessageType } from "@/lib/store";
+import { AlertTriangle, Key } from "lucide-react";
+import { useApp, type ChatMessage as ChatMessageType } from "@/lib/store";
 import ThoughtChain from "./ThoughtChain";
 import RetrievalCard from "./RetrievalCard";
 
@@ -32,36 +32,39 @@ export default function ChatMessage({ message, isStreaming = false }: Props) {
   const isUser = message.role === "user";
   const hasAuthError = !isUser && isAuthError(message.content);
   const renderedContent = renderCitationMarkers(message);
+  const { setActiveSourceId, setInspectorOpen } = useApp();
+
+  const handleCitationClick = (e: React.MouseEvent) => {
+    const target = e.target as HTMLElement;
+    const anchor = target.closest("a[href^='#source-']");
+    if (!anchor) return;
+    e.preventDefault();
+    const href = anchor.getAttribute("href");
+    if (!href) return;
+    const sourceId = href.replace("#source-", "");
+    setActiveSourceId(sourceId);
+    setInspectorOpen(true);
+  };
 
   return (
-    <div className="animate-fade-in px-5 py-2">
-      <div className="mx-auto w-full max-w-3xl">
+    <div className="animate-fade-in px-7 py-3">
+      <div className="mx-auto w-full max-w-[900px]">
         {/* User message — right-aligned bubble */}
         {isUser ? (
-          <div className="flex justify-end gap-2">
+          <div className="flex justify-end">
             <div>
-              <div className="max-w-xl rounded-2xl rounded-tr-md bg-[#002fa7] px-4 py-2.5 text-[14px] leading-relaxed text-white shadow-sm">
+              <div className="max-w-xl rounded-2xl rounded-tr-md bg-[#002fa7] px-4 py-2.5 text-[14px] leading-relaxed text-white shadow-sm shadow-blue-950/10">
                 {message.content}
               </div>
               <div className="text-[10px] text-gray-400 mt-1 text-right pr-1">
                 {formatTime(message.timestamp)}
               </div>
             </div>
-            <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-slate-200">
-              <User className="w-3.5 h-3.5 text-gray-500" />
-            </div>
           </div>
         ) : (
           /* Assistant message — left-aligned */
-          <div className="flex gap-2.5">
-            <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-[#002fa7] to-[#4070ff] shadow-sm">
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
-                <path d="M12 2L2 7L12 12L22 7L12 2Z" fill="white" fillOpacity="0.9" />
-                <path d="M2 17L12 22L22 17" stroke="white" strokeOpacity="0.7" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-                <path d="M2 12L12 17L22 12" stroke="white" strokeOpacity="0.85" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-            </div>
-            <div className="flex-1 min-w-0">
+          <div>
+            <div className="min-w-0">
               {/* Tool calls */}
               {message.toolCalls && message.toolCalls.length > 0 && (
                 <ThoughtChain toolCalls={message.toolCalls} />
@@ -72,8 +75,8 @@ export default function ChatMessage({ message, isStreaming = false }: Props) {
                 <AuthErrorAlert content={message.content} />
               ) : message.content ? (
                 <div>
-                  <div className="rounded-xl border border-slate-200 bg-white px-4 py-3 text-[14px] leading-relaxed shadow-sm">
-                    <div className="markdown-content">
+                  <div className="px-1 py-1 text-[15px] leading-relaxed">
+                    <div className="markdown-content" onClick={handleCitationClick}>
                       <ReactMarkdown remarkPlugins={[remarkGfm]}>
                         {renderedContent}
                       </ReactMarkdown>
@@ -88,7 +91,7 @@ export default function ChatMessage({ message, isStreaming = false }: Props) {
                 </div>
               ) : isStreaming ? (
                 /* Typing indicator */
-                <div className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-3 text-[12px] text-slate-500 shadow-sm">
+                <div className="workspace-message-card inline-flex items-center gap-2 rounded-2xl px-4 py-3 text-[12px] text-slate-500">
                   <span className="inline-flex items-center gap-1.5">
                     <span className="typing-dot h-1.5 w-1.5 rounded-full bg-[#002fa7]" />
                     <span className="typing-dot h-1.5 w-1.5 rounded-full bg-[#002fa7]" />

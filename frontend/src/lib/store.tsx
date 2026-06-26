@@ -10,6 +10,7 @@ import React, {
 } from "react";
 import {
   streamChat,
+  streamAgent,
   listSessions as apiListSessions,
   createSession as apiCreateSession,
   renameSession as apiRenameSession,
@@ -22,6 +23,9 @@ import {
   setRagMode as apiSetRagMode,
   loadSkill as apiLoadSkill,
   listMcpServers as apiListMcpServers,
+  listProjects as apiListProjects,
+  registerProject as apiRegisterProject,
+  ProjectMeta,
 } from "./api";
 
 // ── Types ──────────────────────────────────────────────────
@@ -80,6 +84,11 @@ export interface SessionMeta {
   id: string;
   title: string;
   updated_at: number;
+  runtime_mode?: "agent" | "chat";
+  project_id?: string | null;
+  project_path?: string | null;
+  workspace_type?: string;
+  workspace_path?: string;
 }
 
 export interface RawMessage {
@@ -99,6 +108,15 @@ export interface ContextMaintenanceStatus {
 }
 
 interface AppState {
+  // Runtime mode
+  runtimeMode: "agent" | "chat";
+  setRuntimeMode: (mode: "agent" | "chat") => void;
+  currentProjectId: string | null;
+  setCurrentProjectId: (id: string | null) => void;
+  projects: ProjectMeta[];
+  loadProjects: () => void;
+  registerProject: (path: string) => Promise<ProjectMeta | null>;
+
   // Chat
   messages: ChatMessage[];
   isStreaming: boolean;
@@ -171,6 +189,10 @@ interface AppState {
 
   // Context maintenance
   maintenanceStatus: ContextMaintenanceStatus | null;
+
+  // Active citation source (syncs chat click with right panel)
+  activeSourceId: string | null;
+  setActiveSourceId: (id: string | null) => void;
 }
 
 const AppContext = createContext<AppState | null>(null);
@@ -244,6 +266,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [sessionId, setSessionIdRaw] = useState("default");
   const [userId] = useState(() => getOrCreateUserId());
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
+  const [runtimeMode, setRuntimeModeRaw] = useState<"agent" | "chat">("chat");
+  const [currentProjectId, setCurrentProjectIdRaw] = useState<string | null>(null);
+  const [projects, setProjects] = useState<ProjectMeta[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [inspectorFile, setInspectorFileRaw] = useState<string | null>(null);
   const [inspectorOpen, setInspectorOpen] = useState(false);
@@ -264,8 +289,42 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [maintenanceStatus, setMaintenanceStatus] =
     useState<ContextMaintenanceStatus | null>(null);
 
+  const [activeSourceId, setActiveSourceId] = useState<string | null>(null);
+
   // Derived: is the CURRENT session streaming?
   const isStreaming = streamingSessions.has(sessionId);
+
+  const setRuntimeMode = useCallback((mode: "agent" | "chat") => {
+    setRuntimeModeRaw(mode);
+    try {
+      localStorage.setItem("puddingclaw_runtime_mode", mode);
+    } catch {
+      // ignore storage errors
+    }
+  }, []);
+
+  const setCurrentProjectId = useCallback((id: string | null) => {
+    setCurrentProjectIdRaw(id);
+    try {
+      if (id) localStorage.setItem("puddingclaw_current_project_id", id);
+      else localStorage.removeItem("puddingclaw_current_project_id");
+    } catch {
+      // ignore storage errors
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      const savedMode = localStorage.getItem("puddingclaw_runtime_mode");
+      if (savedMode === "agent" || savedMode === "chat") {
+        setRuntimeModeRaw(savedMode);
+      }
+      const savedProjectId = localStorage.getItem("puddingclaw_current_project_id");
+      if (savedProjectId) setCurrentProjectIdRaw(savedProjectId);
+    } catch {
+      // ignore storage errors
+    }
+  }, []);
 
   // Load RAG mode on mount
   useEffect(() => {
@@ -306,6 +365,27 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       .catch(() => {});
   }, []);
 
+  const loadProjects = useCallback(() => {
+    apiListProjects()
+      .then((list) => setProjects(list))
+      .catch(() => setProjects([]));
+  }, []);
+
+  const registerProject = useCallback(async (path: string) => {
+    try {
+      const project = await apiRegisterProject(path);
+      setProjects((prev) => {
+        const others = prev.filter((item) => item.project_id !== project.project_id);
+        return [project, ...others];
+      });
+      setCurrentProjectId(project.project_id);
+      setRuntimeMode("agent");
+      return project;
+    } catch {
+      return null;
+    }
+  }, [setCurrentProjectId, setRuntimeMode]);
+
   const loadMcpServers = useCallback(() => {
     apiListMcpServers()
       .then((list) => setMcpServers(list))
@@ -315,8 +395,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   // Load sessions and MCP servers on mount
   useEffect(() => {
     loadSessions();
+    loadProjects();
     loadMcpServers();
-  }, [loadSessions, loadMcpServers]);
+  }, [loadSessions, loadProjects, loadMcpServers]);
 
   const setSessionId = useCallback(
     (id: string) => {
@@ -391,7 +472,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const createSession = useCallback(async () => {
     try {
       const meta = await apiCreateSession();
-      setSessions((prev) => [{ id: meta.id, title: meta.title, updated_at: Date.now() / 1000 }, ...prev]);
+      setSessions((prev) => [
+        {
+          id: meta.id,
+          title: meta.title,
+          updated_at: meta.updated_at || Date.now() / 1000,
+          runtime_mode: meta.runtime_mode || "chat",
+        },
+        ...prev,
+      ]);
       // Pre-populate the message cache so setSessionId shows the empty state
       // immediately and doesn't overwrite locally-added messages with a later
       // history fetch.
@@ -640,7 +729,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       };
 
       try {
-        for await (const event of streamChat(processedText, sendSessionId, controller.signal, userId)) {
+        const eventStream = runtimeMode === "agent"
+          ? streamAgent(processedText, sendSessionId, currentProjectId, controller.signal, userId)
+          : streamChat(processedText, sendSessionId, controller.signal, userId);
+
+        for await (const event of eventStream) {
           if (controller.signal.aborted) break;
 
           if (event.event === "token") {
@@ -913,7 +1006,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         loadSessions();
       }
     },
-    [streamingSessions, isCompressing, sessionId, createSession, loadSessions, updateSessionMessages]
+    [
+      streamingSessions,
+      isCompressing,
+      sessionId,
+      createSession,
+      loadSessions,
+      updateSessionMessages,
+      runtimeMode,
+      currentProjectId,
+    ]
   );
 
   // ── Prefill skill-creator prompt without auto-sending ─
@@ -927,6 +1029,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   return (
     <AppContext.Provider
       value={{
+        runtimeMode,
+        setRuntimeMode,
+        currentProjectId,
+        setCurrentProjectId,
+        projects,
+        loadProjects,
+        registerProject,
         messages,
         isStreaming,
         sendMessage,
@@ -969,6 +1078,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         contextUsage,
         setContextUsage,
         maintenanceStatus,
+        activeSourceId,
+        setActiveSourceId,
       }}
     >
       {children}

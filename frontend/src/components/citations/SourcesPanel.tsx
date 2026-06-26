@@ -1,26 +1,38 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   BookOpen,
+  CheckCircle2,
   ChevronDown,
+  Circle,
   ExternalLink,
   FileText,
-  Search,
+  ListChecks,
+  Timer,
 } from "lucide-react";
-import { useApp, type SourceRecord } from "@/lib/store";
+import { useApp, type SourceRecord, type ToolCall } from "@/lib/store";
+
+type TodoStatus = "completed" | "in_progress" | "pending";
+interface TodoItem {
+  content: string;
+  status: TodoStatus;
+}
 
 export default function SourcesPanel() {
   const { messages, isStreaming } = useApp();
-  const { cited, retrieved } = useMemo(() => {
+  const { cited, retrieved, todos } = useMemo(() => {
     const lastUserIndex = messages.findLastIndex((message) => message.role === "user");
     const turnMessages = lastUserIndex >= 0 ? messages.slice(lastUserIndex) : [];
     const sourceMap = new Map<string, SourceRecord>();
     const citationIndex = new Map<string, number>();
     const toolByCallId = new Map<string, string>();
+    let latestTodos: TodoItem[] = [];
     for (const message of turnMessages) {
       for (const toolCall of message.toolCalls || []) {
         if (toolCall.id) toolByCallId.set(toolCall.id, toolCall.tool);
+        const parsedTodos = extractTodosFromToolCall(toolCall);
+        if (parsedTodos.length > 0) latestTodos = parsedTodos;
       }
     }
     for (const message of turnMessages) {
@@ -41,96 +53,246 @@ export default function SourcesPanel() {
     const retrievedSources = Array.from(sourceMap.values())
       .filter((source) => !citationIndex.has(source.source_id))
       .map((source) => ({ source, index: undefined }));
-    return { cited: citedSources, retrieved: retrievedSources };
+    return { cited: citedSources, retrieved: retrievedSources, todos: latestTodos };
   }, [messages]);
 
   const total = cited.length + retrieved.length;
 
   return (
-    <div className="h-full overflow-y-auto pr-2 py-2 pl-1 space-y-3">
-      {total === 0 ? (
-        <div className="flex h-full flex-col items-center justify-center px-5 text-center">
-          <Search className="mb-3 h-8 w-8 text-slate-300" />
-          <p className="text-[12px] font-medium text-slate-500">暂无引用来源</p>
-          <p className="mt-1 text-[11px] leading-relaxed text-slate-400">
-            Agent 通过知识库工具或 Skill 找到文档后，来源会在这里动态出现。
-          </p>
+    <div className="h-full overflow-y-auto px-5 py-7 space-y-6">
+      <ProgressCard todos={todos} />
+
+      <ContextCard cited={cited} retrieved={retrieved} />
+
+      {isStreaming && total > 0 && (
+        <div className="flex items-center justify-center gap-1.5 py-1 text-[11px] text-blue-600">
+          <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-blue-500" />
+          检索中
         </div>
-      ) : (
-        <>
-          <SourceCard
-            title="已引用"
-            icon={BookOpen}
-            count={cited.length}
-            defaultOpen
-          >
-            <div className="space-y-2">
-              {cited.map(({ source, index }) => (
-                <SourceItem key={source.source_id} source={source} citationIndex={index} />
-              ))}
-            </div>
-          </SourceCard>
-
-          <SourceCard
-            title="其他检索结果"
-            icon={FileText}
-            count={retrieved.length}
-            defaultOpen={false}
-          >
-            <div className="space-y-2">
-              {retrieved.map(({ source }) => (
-                <SourceItem key={source.source_id} source={source} />
-              ))}
-            </div>
-          </SourceCard>
-
-          {isStreaming && total > 0 && (
-            <div className="flex items-center justify-center gap-1.5 py-1 text-[11px] text-blue-600">
-              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-blue-500" />
-              检索中
-            </div>
-          )}
-        </>
       )}
     </div>
   );
 }
 
-function SourceCard({
-  title,
-  icon: Icon,
-  count,
-  children,
-  defaultOpen = true,
-}: {
-  title: string;
-  icon: React.ElementType;
-  count: number;
-  children: React.ReactNode;
-  defaultOpen?: boolean;
-}) {
-  const [open, setOpen] = useState(defaultOpen);
+function ProgressCard({ todos }: { todos: TodoItem[] }) {
+  const [open, setOpen] = useState(true);
+  const completed = todos.filter((todo) => todo.status === "completed").length;
+  const hasTodos = todos.length > 0;
+
   return (
-    <section className="rounded-xl border border-slate-200 bg-white shadow-sm overflow-hidden">
+    <section className="workspace-side-card rounded-[28px] px-5 py-5">
       <button
-        onClick={() => setOpen((v) => !v)}
-        className="w-full flex items-center justify-between px-3.5 py-2.5 hover:bg-slate-50/60 transition-colors"
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        className="flex w-full items-center justify-between text-left"
       >
         <div className="flex items-center gap-2">
-          <div className="flex h-6 w-6 items-center justify-center rounded-md bg-blue-50 text-[#002fa7]">
-            <Icon className="h-3.5 w-3.5" />
+          <div className="flex h-7 w-7 items-center justify-center rounded-xl bg-black/[0.055] text-slate-800">
+            <ListChecks className="h-4 w-4" />
           </div>
-          <span className="text-[13px] font-semibold text-slate-800">{title}</span>
-          <span className="rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">
-            {count}
-          </span>
+          <span className="text-[15px] font-bold text-slate-900">进度</span>
+          {hasTodos && (
+            <span className="rounded-full bg-black/[0.045] px-2 py-0.5 text-[11px] font-medium text-slate-500">
+              {completed}/{todos.length}
+            </span>
+          )}
         </div>
         <ChevronDown
-          className={`h-3.5 w-3.5 text-gray-400 transition-transform duration-200 ${!open ? "-rotate-90" : ""}`}
+          className={`h-4 w-4 text-slate-500 transition-transform duration-200 ${!open ? "-rotate-90" : ""}`}
         />
       </button>
-      {open && <div className="px-3.5 pb-3">{children}</div>}
+
+      {open && (
+        <div className="mt-3 space-y-2.5">
+          {hasTodos ? (
+            <>
+              {todos.map((todo, index) => (
+                <div key={`${todo.content}-${index}`} className="flex items-start gap-2.5">
+                  <TodoStatusIcon status={todo.status} />
+                  <p
+                    className={`min-w-0 flex-1 text-[13px] leading-relaxed ${
+                      todo.status === "completed"
+                        ? "text-slate-500 line-through decoration-slate-500 decoration-[1.5px]"
+                        : todo.status === "in_progress"
+                        ? "text-slate-900 font-medium"
+                        : "text-slate-600"
+                    }`}
+                  >
+                    {todo.content}
+                  </p>
+                </div>
+              ))}
+              <button
+                type="button"
+                onClick={() => setOpen(false)}
+                className="mt-1 inline-flex items-center gap-2 rounded-full px-1 py-1 text-[12px] font-medium text-slate-500 hover:text-slate-800"
+              >
+                <ChevronDown className="h-3.5 w-3.5 rotate-180" />
+                收起
+              </button>
+            </>
+          ) : (
+            <ProgressEmptyState />
+          )}
+        </div>
+      )}
     </section>
+  );
+}
+
+function ProgressEmptyState() {
+  return (
+    <div className="flex flex-col items-center justify-center py-8 text-center">
+      <div className="relative mb-4 h-20 w-44 opacity-80">
+        <div className="absolute left-7 top-2 h-10 w-32 rounded-full border border-black/[0.08] bg-white" />
+        <div className="absolute left-12 top-5 h-3 w-20 rounded-full bg-slate-100" />
+        <div className="absolute left-10 top-5 h-3 w-3 rounded-full bg-slate-100" />
+        <div className="absolute right-5 top-0 flex h-7 w-7 items-center justify-center rounded-full border border-black/[0.08] bg-white text-slate-300">
+          <CheckCircle2 className="h-4 w-4" />
+        </div>
+        <div className="absolute bottom-1 left-1 h-10 w-36 rounded-full border border-black/[0.08] bg-white" />
+        <div className="absolute bottom-4 left-14 h-3 w-20 rounded-full bg-slate-100" />
+        <div className="absolute bottom-4 left-8 h-3 w-3 rounded-full bg-slate-100" />
+      </div>
+      <p className="text-[14px] font-medium text-slate-400">任务进度将显示在这里</p>
+    </div>
+  );
+}
+
+function TodoStatusIcon({ status }: { status: TodoStatus }) {
+  if (status === "completed") {
+    return <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 fill-slate-900 text-white" />;
+  }
+  if (status === "in_progress") {
+    return <Timer className="mt-0.5 h-5 w-5 shrink-0 text-[#002fa7]" />;
+  }
+  return <Circle className="mt-0.5 h-5 w-5 shrink-0 text-slate-300" />;
+}
+
+function ContextCard({
+  cited,
+  retrieved,
+}: {
+  cited: Array<{ source: SourceRecord; index?: number }>;
+  retrieved: Array<{ source: SourceRecord; index?: number }>;
+}) {
+  const [open, setOpen] = useState(true);
+  const { activeSourceId, setActiveSourceId } = useApp();
+  const activeRef = useRef<HTMLDivElement>(null);
+  const total = cited.length + retrieved.length;
+
+  useEffect(() => {
+    if (!activeSourceId) return;
+    const inCited = cited.some(({ source }) => source.source_id === activeSourceId);
+    const inRetrieved = retrieved.some(({ source }) => source.source_id === activeSourceId);
+    if (inCited || inRetrieved) {
+      setOpen(true);
+      window.setTimeout(() => {
+        activeRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+      }, 50);
+    }
+  }, [activeSourceId, cited, retrieved]);
+
+  return (
+    <section className="workspace-side-card rounded-[28px] px-5 py-5">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center justify-between text-left"
+      >
+        <div className="flex items-center gap-2">
+          <div className="flex h-6 w-6 items-center justify-center rounded-lg bg-[#002fa7]/[0.07] text-[#002fa7]">
+            <BookOpen className="h-3.5 w-3.5" />
+          </div>
+          <span className="text-[15px] font-bold text-slate-900">上下文</span>
+          {total > 0 && (
+            <span className="rounded-full bg-black/[0.045] px-2 py-0.5 text-[11px] font-medium text-slate-500">
+              {total}
+            </span>
+          )}
+        </div>
+        <ChevronDown
+          className={`h-4 w-4 text-slate-500 transition-transform duration-200 ${!open ? "-rotate-90" : ""}`}
+        />
+      </button>
+
+      {open && (
+        <div className="mt-4 space-y-5">
+          {total === 0 ? (
+            <ContextEmptyState />
+          ) : (
+            <>
+              {cited.length > 0 && (
+                <SourceSection title="已引用" count={cited.length}>
+                  {cited.map(({ source, index }) => (
+                    <SourceItem
+                      key={source.source_id}
+                      source={source}
+                      citationIndex={index}
+                      isActive={activeSourceId === source.source_id}
+                      ref={activeSourceId === source.source_id ? activeRef : undefined}
+                    />
+                  ))}
+                </SourceSection>
+              )}
+              {retrieved.length > 0 && (
+                <SourceSection title="其他检索结果" count={retrieved.length}>
+                  {retrieved.map(({ source }) => (
+                    <SourceItem
+                      key={source.source_id}
+                      source={source}
+                      isActive={activeSourceId === source.source_id}
+                      ref={activeSourceId === source.source_id ? activeRef : undefined}
+                    />
+                  ))}
+                </SourceSection>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function SourceSection({
+  title,
+  count,
+  children,
+}: {
+  title: string;
+  count: number;
+  children: React.ReactNode;
+}) {
+  return (
+    <div>
+      <div className="mb-2.5 flex items-center gap-2">
+        <span className="text-[12px] font-semibold text-slate-700">{title}</span>
+        <span className="rounded-full bg-black/[0.045] px-1.5 py-0.5 text-[10px] text-slate-500">
+          {count}
+        </span>
+      </div>
+      <div className="space-y-3">{children}</div>
+    </div>
+  );
+}
+
+function ContextEmptyState() {
+  return (
+    <div className="flex flex-col items-center justify-center py-8 text-center">
+      <div className="relative mb-4 h-20 w-44 opacity-80">
+        <div className="absolute left-6 top-2 h-14 w-14 rotate-6 rounded-xl border border-black/[0.08] bg-white" />
+        <div className="absolute left-[4.8rem] top-2 h-14 w-14 -rotate-2 rounded-xl border border-black/[0.08] bg-white" />
+        <div className="absolute right-6 top-2 h-14 w-14 rotate-6 rounded-xl border border-black/[0.08] bg-white" />
+        <div className="absolute left-10 top-6 h-3 w-3 rounded-full bg-slate-100" />
+        <div className="absolute left-9 top-11 h-2.5 w-9 rounded-full bg-slate-100" />
+        <div className="absolute left-[6.1rem] top-6 h-2.5 w-9 rounded-full bg-slate-100" />
+        <div className="absolute left-[6.1rem] top-11 h-2.5 w-9 rounded-full bg-slate-100" />
+        <div className="absolute right-10 top-6 h-2.5 w-10 rounded-full bg-slate-100" />
+        <div className="absolute right-10 top-11 h-2.5 w-9 rounded-full bg-slate-100" />
+      </div>
+      <p className="text-[14px] font-medium text-slate-400">引用和上传文件会显示在这里</p>
+    </div>
   );
 }
 
@@ -147,6 +309,81 @@ function isLegacyFalsePositive(
   return tool === "read_file" || tool === "write_file" || tool === "execute_skill";
 }
 
+function extractTodosFromToolCall(toolCall: ToolCall): TodoItem[] {
+  if (toolCall.tool !== "write_todos") return [];
+  const candidates = [
+    parseMaybeJson(toolCall.input),
+    parseMaybeJson(toolCall.output),
+  ];
+  for (const candidate of candidates) {
+    const todos = normalizeTodos(candidate);
+    if (todos.length > 0) return todos;
+  }
+  return [];
+}
+
+function parseMaybeJson(value: unknown): unknown {
+  if (!value || typeof value !== "string") return null;
+  const text = value.trim();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    const objectStart = text.indexOf("{");
+    const arrayStart = text.indexOf("[");
+    const starts = [objectStart, arrayStart].filter((index) => index >= 0);
+    if (starts.length === 0) return null;
+    try {
+      return JSON.parse(text.slice(Math.min(...starts)));
+    } catch {
+      return null;
+    }
+  }
+}
+
+function normalizeTodos(value: unknown): TodoItem[] {
+  const rawItems = Array.isArray(value)
+    ? value
+    : isRecord(value)
+    ? value.todos || value.tasks || value.items || value.todo
+    : null;
+  if (!Array.isArray(rawItems)) return [];
+
+  return rawItems
+    .map((item): TodoItem | null => {
+      if (typeof item === "string") {
+        const content = item.trim();
+        return content ? { content, status: "pending" } : null;
+      }
+      if (!isRecord(item)) return null;
+      const content = String(
+        item.content || item.todo || item.task || item.title || item.text || ""
+      ).trim();
+      if (!content) return null;
+      return {
+        content,
+        status: normalizeTodoStatus(item.status || item.state || item.done),
+      };
+    })
+    .filter((item): item is TodoItem => item !== null);
+}
+
+function normalizeTodoStatus(value: unknown): TodoStatus {
+  if (value === true) return "completed";
+  const status = String(value || "").toLowerCase().replace(/[-\s]/g, "_");
+  if (["completed", "complete", "done", "checked", "finished"].includes(status)) {
+    return "completed";
+  }
+  if (["in_progress", "inprogress", "active", "doing", "running"].includes(status)) {
+    return "in_progress";
+  }
+  return "pending";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function looksLikeRejectedFetch(quote: string): boolean {
   const text = quote.toLowerCase();
   const markers = [
@@ -160,13 +397,11 @@ function looksLikeRejectedFetch(quote: string): boolean {
   return ["ç½", "è¯", "å", "é¡", "ï¼"].filter((marker) => text.includes(marker)).length >= 2;
 }
 
-function SourceItem({
-  source,
-  citationIndex,
-}: {
+const SourceItem = React.forwardRef<HTMLDivElement, {
   source: SourceRecord;
   citationIndex?: number;
-}) {
+  isActive?: boolean;
+}>(function SourceItem({ source, citationIndex, isActive }, ref) {
   const isExternal = /^https?:\/\//i.test(source.uri || "");
   const displayTitle = sourceDisplayTitle(source);
   const displayQuote = looksLikeRejectedFetch(source.quote || "") ? "" : source.quote;
@@ -179,10 +414,11 @@ function SourceItem({
 
   return (
     <article
+      ref={ref}
       id={`source-${source.source_id}`}
-      className={`rounded-lg border p-2.5 transition-colors ${
-        citationIndex ? "border-blue-200 bg-blue-50/40" : "border-slate-200 bg-slate-50/50"
-      }`}
+      className={`rounded-2xl border border-black/[0.10] bg-white p-3 transition-colors hover:border-black/[0.16] ${
+        citationIndex ? "border-[#002fa7]/20 bg-[#f8faff]" : ""
+      } ${isActive ? "ring-2 ring-[#002fa7]/40 shadow-sm" : ""}`}
     >
       <button onClick={locateCitation} className="flex w-full items-start gap-2 text-left">
         <div
@@ -205,7 +441,7 @@ function SourceItem({
       </button>
 
       {displayQuote && (
-        <blockquote className="mt-2 line-clamp-3 border-l-2 border-slate-200 pl-2 text-[10px] leading-relaxed text-slate-500">
+        <blockquote className="mt-2 line-clamp-3 border-l-2 border-[#002fa7]/10 pl-2 text-[10px] leading-relaxed text-slate-500">
           {displayQuote}
         </blockquote>
       )}
@@ -223,7 +459,7 @@ function SourceItem({
       )}
     </article>
   );
-}
+});
 
 function sourceDisplayTitle(source: SourceRecord): string {
   const title = (source.title || "").trim();
