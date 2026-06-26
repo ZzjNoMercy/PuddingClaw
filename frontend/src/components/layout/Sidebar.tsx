@@ -14,12 +14,16 @@ import {
   Search,
   Puzzle,
   FolderKanban,
+  Bot,
+  MessagesSquare,
   Workflow,
   Settings,
   Github,
   ExternalLink,
+  Archive,
 } from "lucide-react";
 import { useApp } from "@/lib/store";
+import { openProject } from "@/lib/api";
 
 export default function Sidebar() {
   const {
@@ -28,6 +32,12 @@ export default function Sidebar() {
     sessions,
     renameSession,
     deleteSession,
+    runtimeMode,
+    setRuntimeMode,
+    currentProjectId,
+    setCurrentProjectId,
+    projects,
+    registerProject,
   } = useApp();
   const router = useRouter();
   const pathname = usePathname();
@@ -37,11 +47,79 @@ export default function Sidebar() {
     () => [...sessions].sort((a, b) => b.updated_at - a.updated_at),
     [sessions]
   );
+  const isAgentSession = useCallback(
+    (session: (typeof sessions)[number]) => session.runtime_mode === "agent",
+    []
+  );
+  const isChatSession = useCallback(
+    (session: (typeof sessions)[number]) => session.runtime_mode !== "agent",
+    []
+  );
+  const projectSessions = useMemo(() => {
+    const grouped = new Map<string, typeof sessions>();
+    for (const session of sortedSessions) {
+      if (!isAgentSession(session)) continue;
+      if (!session.project_id) continue;
+      const list = grouped.get(session.project_id) || [];
+      list.push(session);
+      grouped.set(session.project_id, list);
+    }
+    return grouped;
+  }, [sortedSessions, isAgentSession]);
+  const conversationSessions = useMemo(() => {
+    if (runtimeMode === "agent") {
+      return sortedSessions.filter((session) => isAgentSession(session) && !session.project_id);
+    }
+    return sortedSessions.filter((session) => isChatSession(session));
+  }, [runtimeMode, sortedSessions, isAgentSession, isChatSession]);
+
+  const handleAddProject = useCallback(async () => {
+    const path = window.prompt("输入本地项目目录路径");
+    if (!path?.trim()) return;
+    const project = await registerProject(path.trim());
+    if (!project) {
+      window.alert("项目目录登记失败，请确认路径存在且是文件夹。");
+    }
+  }, [registerProject]);
 
   return (
     <aside className="flex flex-col h-full relative bg-white text-gray-700">
       {/* Primary actions */}
       <div className="px-2 pt-2 pb-1 space-y-0.5">
+        <div className="mb-1 grid grid-cols-2 rounded-lg bg-black/[0.04] p-0.5">
+          <button
+            type="button"
+            onClick={() => {
+              setRuntimeMode("agent");
+              setSessionId("default");
+              if (pathname !== "/") router.push("/");
+            }}
+            className={`flex items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-[12px] transition-all ${
+              runtimeMode === "agent"
+                ? "bg-white text-gray-900 shadow-sm"
+                : "text-gray-500 hover:text-gray-800"
+            }`}
+          >
+            <Bot className="h-3.5 w-3.5" />
+            Agent
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setRuntimeMode("chat");
+              setSessionId("default");
+              if (pathname !== "/") router.push("/");
+            }}
+            className={`flex items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-[12px] transition-all ${
+              runtimeMode === "chat"
+                ? "bg-white text-gray-900 shadow-sm"
+                : "text-gray-500 hover:text-gray-800"
+            }`}
+          >
+            <MessagesSquare className="h-3.5 w-3.5" />
+            Chat
+          </button>
+        </div>
         <button
           onClick={() => {
             // Don't create a session eagerly; only navigate to the chat page.
@@ -73,17 +151,78 @@ export default function Sidebar() {
       <div className="mx-3 my-1.5 h-px bg-black/[0.06]" />
 
       {/* Projects */}
-      <div className="shrink-0 px-1.5 pb-2">
-        <p className="px-3 pt-2 pb-1 text-[10px] font-semibold text-gray-500 uppercase tracking-widest">
-          项目
-        </p>
-        <div className="flex items-center gap-2 px-3 py-2 text-[12px] text-gray-400">
-          <FolderKanban className="h-3.5 w-3.5" />
-          暂无项目
+      {runtimeMode === "agent" && (
+        <div className="shrink-0 px-1.5 pb-2">
+          <div className="flex items-center justify-between px-3 pt-2 pb-1">
+            <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-widest">
+              项目
+            </p>
+            <button
+              type="button"
+              onClick={handleAddProject}
+              className="rounded p-0.5 text-gray-400 hover:bg-black/[0.05] hover:text-gray-700"
+              title="添加项目"
+            >
+              <Plus className="h-3.5 w-3.5" />
+            </button>
+          </div>
+          {projects.length > 0 ? (
+            <div className="space-y-1">
+              {projects.map((project) => {
+                const childSessions = projectSessions.get(project.project_id) || [];
+                return (
+                  <div key={project.project_id}>
+                    <ProjectItem
+                      projectId={project.project_id}
+                      name={project.name}
+                      path={project.path}
+                      isActive={currentProjectId === project.project_id}
+                      onSelect={() => {
+                        setRuntimeMode("agent");
+                        setCurrentProjectId(project.project_id);
+                      }}
+                    />
+                    <div className="ml-5 mt-0.5 space-y-px">
+                      {childSessions.length > 0 ? (
+                        childSessions.slice(0, 5).map((s) => (
+                          <SessionItem
+                            key={s.id}
+                            id={s.id}
+                            title={s.title}
+                            isActive={sessionId === s.id}
+                            onSelect={() => {
+                              setRuntimeMode("agent");
+                              setCurrentProjectId(project.project_id);
+                              setSessionId(s.id);
+                              if (pathname !== "/") {
+                                router.push("/");
+                              }
+                            }}
+                            onRename={(title) => renameSession(s.id, title)}
+                            onDelete={() => deleteSession(s.id)}
+                          />
+                        ))
+                      ) : (
+                        <p className="px-3 py-1 text-[12px] text-gray-400">暂无对话</p>
+                      )}
+                      {childSessions.length > 5 && (
+                        <p className="px-3 py-1 text-[12px] text-gray-400">展开显示</p>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="flex items-center gap-2 px-3 py-2 text-[12px] text-gray-400">
+              <FolderKanban className="h-3.5 w-3.5" />
+              暂无项目
+            </div>
+          )}
         </div>
-      </div>
+      )}
 
-      <div className="mx-3 h-px bg-black/[0.06]" />
+      {runtimeMode === "agent" && <div className="mx-3 h-px bg-black/[0.06]" />}
 
       {/* Regular conversations */}
       <div className="flex-1 overflow-y-auto px-1.5">
@@ -91,14 +230,21 @@ export default function Sidebar() {
           <p className="px-3 pt-2 pb-0.5 text-[10px] font-semibold text-gray-500 uppercase tracking-widest">
             对话
           </p>
-          {sessions.length > 0 ? (
-            sortedSessions.map((s) => (
+          {conversationSessions.length > 0 ? (
+            conversationSessions.map((s) => (
               <SessionItem
                 key={s.id}
                 id={s.id}
                 title={s.title}
                 isActive={sessionId === s.id}
                 onSelect={() => {
+                  if (s.runtime_mode === "agent") {
+                    setRuntimeMode("agent");
+                    setCurrentProjectId(null);
+                  } else {
+                    setRuntimeMode("chat");
+                    setCurrentProjectId(null);
+                  }
                   setSessionId(s.id);
                   if (pathname !== "/") {
                     router.push("/");
@@ -138,6 +284,122 @@ export default function Sidebar() {
       </div>
 
     </aside>
+  );
+}
+
+function getSystemFileManagerLabel(): string {
+  if (typeof navigator === "undefined") return "文件管理器";
+  const platform = `${navigator.platform || ""} ${navigator.userAgent || ""}`;
+  if (/Mac|iPhone|iPad|iPod/i.test(platform)) return "访达";
+  if (/Win/i.test(platform)) return "资源管理器";
+  return "文件管理器";
+}
+
+function ProjectItem({
+  projectId,
+  name,
+  path,
+  isActive,
+  onSelect,
+}: {
+  projectId: string;
+  name: string;
+  path: string;
+  isActive: boolean;
+  onSelect: () => void;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [opening, setOpening] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const fileManagerLabel = getSystemFileManagerLabel();
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [menuOpen]);
+
+  const handleOpenProject = useCallback(async () => {
+    setOpening(true);
+    try {
+      await openProject(projectId);
+      setMenuOpen(false);
+    } catch {
+      window.alert(`无法在“${fileManagerLabel}”中打开项目，请确认后端运行在本机且项目路径可访问。`);
+    } finally {
+      setOpening(false);
+    }
+  }, [fileManagerLabel, projectId]);
+
+  return (
+    <div className="group/project relative flex items-center">
+      <button
+        type="button"
+        onClick={onSelect}
+        className={`flex min-w-0 flex-1 items-center gap-2 rounded-md px-3 py-1.5 pr-8 text-left text-[12px] transition-all ${
+          isActive
+            ? "bg-black/[0.06] text-gray-900 font-medium"
+            : "text-gray-700 hover:bg-black/[0.04]"
+        }`}
+        title={path}
+      >
+        <FolderKanban className="h-3.5 w-3.5 shrink-0 text-gray-500" />
+        <span className="truncate">{name}</span>
+      </button>
+
+      <div className={`absolute right-1 top-1/2 -translate-y-1/2 ${menuOpen ? "z-[60]" : ""}`} ref={menuRef}>
+        <button
+          type="button"
+          onClick={(event) => {
+            event.stopPropagation();
+            setMenuOpen((open) => !open);
+          }}
+          className={`rounded-md p-1 text-gray-400 transition-all hover:bg-black/[0.05] hover:text-gray-700 ${
+            menuOpen ? "opacity-100" : "opacity-0 group-hover/project:opacity-100"
+          }`}
+          title="项目操作"
+        >
+          <MoreHorizontal className="h-3.5 w-3.5" />
+        </button>
+
+        {menuOpen && (
+          <div className="absolute left-full top-0 ml-2 w-48 rounded-2xl border border-black/[0.08] bg-white p-1.5 shadow-2xl shadow-slate-900/15 animate-fade-in-scale">
+            <button
+              type="button"
+              onClick={handleOpenProject}
+              disabled={opening}
+              className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-[13px] text-gray-700 transition-colors hover:bg-black/[0.04] hover:text-gray-950 disabled:cursor-wait disabled:opacity-60"
+            >
+              <FolderKanban className="h-4 w-4" />
+              在“{fileManagerLabel}”中打开
+            </button>
+            <button
+              type="button"
+              disabled
+              className="flex w-full cursor-not-allowed items-center gap-2 rounded-xl px-3 py-2 text-left text-[13px] text-gray-300"
+              title="后续接入项目重命名"
+            >
+              <Pencil className="h-4 w-4" />
+              重命名项目
+            </button>
+            <button
+              type="button"
+              disabled
+              className="flex w-full cursor-not-allowed items-center gap-2 rounded-xl px-3 py-2 text-left text-[13px] text-gray-300"
+              title="后续接入项目归档"
+            >
+              <Archive className="h-4 w-4" />
+              归档
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 
