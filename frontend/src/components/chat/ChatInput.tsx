@@ -1,7 +1,18 @@
 "use client";
 
 import { useState, useRef, useCallback, useEffect, useMemo } from "react";
-import { ArrowUp, Square } from "lucide-react";
+import {
+  ArrowUp,
+  Bot,
+  Check,
+  ChevronDown,
+  FolderKanban,
+  FolderPlus,
+  MessageSquare,
+  Square,
+  XCircle,
+  Activity,
+} from "lucide-react";
 import { useApp } from "@/lib/store";
 import { listSkills, getSessionTokenCount } from "@/lib/api";
 
@@ -12,9 +23,27 @@ import SlashCommandMenu from "./SlashCommandMenu";
 
 export default function ChatInput() {
   const [text, setText] = useState("");
-  const { sendMessage, stopStreaming, isStreaming, isCompressing, sessionId, contextUsage, setContextUsage, pendingInput, setPendingInput } = useApp();
+  const {
+    sendMessage,
+    stopStreaming,
+    isStreaming,
+    isCompressing,
+    sessionId,
+    contextUsage,
+    setContextUsage,
+    pendingInput,
+    setPendingInput,
+    runtimeMode,
+    setRuntimeMode,
+    currentProjectId,
+    setCurrentProjectId,
+    projects,
+    registerProject,
+  } = useApp();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const projectMenuRef = useRef<HTMLDivElement>(null);
   const disabled = isStreaming || isCompressing;
+  const [projectMenuOpen, setProjectMenuOpen] = useState(false);
 
   // Fetch token count on mount and when session changes
   useEffect(() => {
@@ -57,6 +86,22 @@ export default function ChatInput() {
   const showSlashMenuRef = useRef(false);
   useEffect(() => { showSlashMenuRef.current = showSlashMenu; }, [showSlashMenu]);
 
+  const selectedProject = useMemo(
+    () => projects.find((project) => project.project_id === currentProjectId) || null,
+    [projects, currentProjectId]
+  );
+
+  useEffect(() => {
+    if (!projectMenuOpen) return;
+    const handler = (event: MouseEvent) => {
+      if (projectMenuRef.current && !projectMenuRef.current.contains(event.target as Node)) {
+        setProjectMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [projectMenuOpen]);
+
   // Track IME composition so Enter to confirm pinyin/hiragana doesn't submit (fixes IME-1)
   const isComposingRef = useRef(false);
 
@@ -87,6 +132,17 @@ export default function ChatInput() {
     setPendingInput(null);
     if (textareaRef.current) textareaRef.current.style.height = "auto";
   }, [text, disabled, sendMessage, setPendingInput]);
+
+  const handleRegisterProject = useCallback(async () => {
+    const path = window.prompt("输入本地项目目录路径");
+    if (!path?.trim()) return;
+    const project = await registerProject(path.trim());
+    if (!project) {
+      window.alert("项目目录登记失败，请确认路径存在且是文件夹。");
+      return;
+    }
+    setProjectMenuOpen(false);
+  }, [registerProject]);
 
   const handleSlashSelect = useCallback((skillName: string) => {
     // Use textarea DOM value as source of truth to avoid stale closure (fixes I-1)
@@ -163,7 +219,7 @@ export default function ChatInput() {
 
   return (
     <div className="px-5 pb-4 pt-2">
-      <div className="glass-input relative mx-auto flex w-full max-w-3xl items-end gap-2 rounded-xl px-4 py-2.5 transition-shadow hover:shadow-xl">
+      <div className="glass-input relative mx-auto flex w-full max-w-3xl flex-col gap-2 rounded-2xl px-4 py-3 transition-shadow hover:shadow-xl">
         <SlashCommandMenu
           visible={showSlashMenu}
           filteredSkills={filteredSkills}
@@ -212,45 +268,198 @@ export default function ChatInput() {
           onCompositionEnd={() => { isComposingRef.current = false; }}
           placeholder="输入消息，或用 / 调用扩展能力"
           rows={1}
-          className="max-h-40 flex-1 resize-none bg-transparent py-1 text-[14px] leading-relaxed outline-none placeholder:text-gray-400"
+          className="max-h-40 min-h-12 w-full resize-none bg-transparent px-1 py-1 text-[14px] leading-relaxed outline-none placeholder:text-gray-400"
         />
-        {isStreaming ? (
-          <button
-            onClick={stopStreaming}
-            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-red-500 text-white transition-all hover:bg-red-600 active:scale-95"
-            title="停止生成 (Esc)"
-          >
-            <Square className="w-3.5 h-3.5 fill-current" />
-          </button>
-        ) : (
-          <button
-            onClick={handleSubmit}
-            disabled={!text.trim() || isCompressing}
-            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-[#002fa7] text-white transition-all hover:bg-[#001f7a] active:scale-95 disabled:opacity-25"
-          >
-            <ArrowUp className="w-4 h-4" />
-          </button>
-        )}
-      </div>
 
-      {/* Context Usage */}
-      <div className="mx-auto flex w-full max-w-3xl justify-end px-2 py-1">
-        <span
-          className={`text-[10px] font-medium ${
-            contextUsage.percentage >= 90
-              ? "text-red-500"
-              : contextUsage.percentage >= 70
-              ? "text-amber-500"
-              : "text-gray-400"
-          }`}
-        >
-          CONTEXT：{contextUsage.percentage.toFixed(1)}%({formatTokens(contextUsage.used)}/{formatTokens(contextUsage.total)})
-        </span>
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex min-w-0 items-center gap-2">
+            {runtimeMode === "agent" && (
+              <div className="relative" ref={projectMenuRef}>
+                <button
+                  type="button"
+                  onClick={() => setProjectMenuOpen((open) => !open)}
+                  className={`flex h-8 max-w-[260px] items-center gap-1.5 rounded-full border px-3 text-[12px] transition-all ${
+                    selectedProject
+                      ? "border-[#002fa7]/15 bg-[#e8edff] text-[#002fa7] hover:bg-[#dfe7ff]"
+                      : "border-black/[0.08] bg-black/[0.03] text-gray-600 hover:bg-black/[0.06] hover:text-gray-900"
+                  }`}
+                  title={selectedProject?.path || "选择 Agent 工作项目"}
+                >
+                  <FolderKanban className="h-3.5 w-3.5 shrink-0" />
+                  <span className="truncate">
+                    {selectedProject ? selectedProject.name : "进入项目工作"}
+                  </span>
+                  <ChevronDown className="h-3.5 w-3.5 shrink-0" />
+                </button>
+
+                {projectMenuOpen && (
+                  <div className="absolute bottom-full left-0 z-50 mb-2 w-80 rounded-2xl border border-black/[0.10] bg-white p-2 shadow-2xl shadow-slate-900/15 animate-fade-in-scale">
+                    <div className="px-3 pb-2 pt-1">
+                      <p className="text-[11px] font-semibold text-gray-500">Agent 工作项目</p>
+                      <p className="mt-0.5 text-[11px] leading-relaxed text-gray-400">
+                        项目会作为 DeepAgents 文件工作区；不选择项目时使用隐式会话工作区。
+                      </p>
+                    </div>
+
+                    <div className="max-h-52 overflow-y-auto py-1">
+                      {projects.length > 0 ? (
+                        projects.map((project) => (
+                          <button
+                            type="button"
+                            key={project.project_id}
+                            onClick={() => {
+                              setRuntimeMode("agent");
+                              setCurrentProjectId(project.project_id);
+                              setProjectMenuOpen(false);
+                            }}
+                            className={`flex w-full items-start gap-2 rounded-xl px-3 py-2 text-left transition-colors ${
+                              currentProjectId === project.project_id
+                                ? "bg-[#002fa7]/[0.07] text-[#002fa7]"
+                                : "text-gray-700 hover:bg-black/[0.04] hover:text-gray-950"
+                            }`}
+                          >
+                            <FolderKanban className="mt-0.5 h-4 w-4 shrink-0" />
+                            <span className="min-w-0 flex-1">
+                              <span className="block truncate text-[13px] font-medium">
+                                {project.name}
+                              </span>
+                              <span className="block truncate text-[11px] text-gray-400">
+                                {project.path}
+                              </span>
+                            </span>
+                            {currentProjectId === project.project_id && (
+                              <Check className="mt-0.5 h-4 w-4 shrink-0" />
+                            )}
+                          </button>
+                        ))
+                      ) : (
+                        <p className="px-3 py-3 text-[12px] text-gray-400">
+                          还没有项目，先登记一个本地文件夹。
+                        </p>
+                      )}
+                    </div>
+
+                    <div className="my-1 h-px bg-black/[0.06]" />
+
+                    <button
+                      type="button"
+                      onClick={handleRegisterProject}
+                      className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-[13px] text-gray-700 transition-colors hover:bg-black/[0.04] hover:text-gray-950"
+                    >
+                      <FolderPlus className="h-4 w-4" />
+                      使用现有文件夹…
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setCurrentProjectId(null);
+                        setProjectMenuOpen(false);
+                      }}
+                      className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-[13px] text-gray-500 transition-colors hover:bg-black/[0.04] hover:text-gray-800"
+                    >
+                      <XCircle className="h-4 w-4" />
+                      不使用项目，作为 Agent 对话
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          <div className="flex shrink-0 items-center gap-2">
+            <div className="grid grid-cols-2 rounded-full border border-black/[0.08] bg-white p-0.5">
+              <button
+                type="button"
+                onClick={() => setRuntimeMode("agent")}
+                className={`flex h-7 items-center gap-1 rounded-full px-2.5 text-[12px] transition-all ${
+                  runtimeMode === "agent"
+                    ? "bg-[#e8edff] text-[#002fa7]"
+                    : "text-gray-500 hover:text-gray-800"
+                }`}
+              >
+                <Bot className="h-3.5 w-3.5" />
+                Agent
+              </button>
+              <button
+                type="button"
+                onClick={() => setRuntimeMode("chat")}
+                className={`flex h-7 items-center gap-1 rounded-full px-2.5 text-[12px] transition-all ${
+                  runtimeMode === "chat"
+                    ? "bg-[#e8edff] text-[#002fa7]"
+                    : "text-gray-500 hover:text-gray-800"
+                }`}
+              >
+                <MessageSquare className="h-3.5 w-3.5" />
+                Chat
+              </button>
+            </div>
+
+            <ContextUsageTooltip usage={contextUsage} />
+
+            {isStreaming ? (
+              <button
+                onClick={stopStreaming}
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-red-500 text-white transition-all hover:bg-red-600 active:scale-95"
+                title="停止生成 (Esc)"
+              >
+                <Square className="w-3.5 h-3.5 fill-current" />
+              </button>
+            ) : (
+              <button
+                onClick={handleSubmit}
+                disabled={!text.trim() || isCompressing}
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[#002fa7] text-white transition-all hover:bg-[#001f7a] active:scale-95 disabled:bg-gray-300 disabled:opacity-80"
+              >
+                <ArrowUp className="w-4 h-4" />
+              </button>
+            )}
+          </div>
+        </div>
       </div>
 
       <p className="viewport-center-axis mt-1 text-center text-[10px] text-gray-400/70">
         Powered by DeepSeek · PuddingClaw v0.1
       </p>
+    </div>
+  );
+}
+
+function ContextUsageTooltip({
+  usage,
+}: {
+  usage: { used: number; total: number; percentage: number };
+}) {
+  const [open, setOpen] = useState(false);
+  const color =
+    usage.percentage >= 90 ? "text-red-500" : usage.percentage >= 70 ? "text-amber-500" : "text-gray-400";
+
+  return (
+    <div
+      className="relative"
+      onMouseEnter={() => setOpen(true)}
+      onMouseLeave={() => setOpen(false)}
+      onFocus={() => setOpen(true)}
+      onBlur={() => setOpen(false)}
+    >
+      <button
+        type="button"
+        className={`flex h-7 items-center gap-1 rounded-full border border-black/[0.08] bg-white px-2.5 text-[11px] font-medium transition-colors hover:bg-black/[0.03] ${color}`}
+      >
+        <Activity className="h-3 w-3" />
+        {usage.percentage.toFixed(0)}%
+      </button>
+      {open && (
+        <div className="absolute bottom-full right-0 mb-2 w-56 rounded-xl bg-[#1f2937] px-3.5 py-2.5 text-[12px] text-white shadow-xl animate-fade-in-scale z-50">
+          <p className="font-medium text-gray-200">背景信息窗口</p>
+          <p className="mt-1 text-[16px] font-semibold">
+            {usage.percentage.toFixed(0)}% 已用
+          </p>
+          <p className="mt-1 text-[11px] text-gray-400">
+            已用 {formatTokens(usage.used)} 标记，共 {formatTokens(usage.total)}
+          </p>
+          <div className="absolute bottom-[-5px] right-4 h-2.5 w-2.5 rotate-45 bg-[#1f2937]" />
+        </div>
+      )}
     </div>
   );
 }
