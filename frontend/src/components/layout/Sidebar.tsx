@@ -83,20 +83,21 @@ export default function Sidebar() {
   }, [registerProject]);
 
   return (
-    <aside className="flex flex-col h-full relative bg-white text-gray-700">
+    <aside className="flex flex-col h-full relative bg-transparent text-gray-700">
       {/* Primary actions */}
       <div className="px-2 pt-2 pb-1 space-y-0.5">
-        <div className="mb-1 grid grid-cols-2 rounded-lg bg-black/[0.04] p-0.5">
+        <div className="mb-1 grid grid-cols-2 rounded-xl bg-black/[0.035] p-0.5">
           <button
             type="button"
             onClick={() => {
               setRuntimeMode("agent");
-              setSessionId("default");
+              const latest = sortedSessions.find((s) => s.runtime_mode === "agent");
+              setSessionId(latest ? latest.id : "default");
               if (pathname !== "/") router.push("/");
             }}
             className={`flex items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-[12px] transition-all ${
               runtimeMode === "agent"
-                ? "bg-white text-gray-900 shadow-sm"
+                ? "bg-white/85 text-gray-900 shadow-sm"
                 : "text-gray-500 hover:text-gray-800"
             }`}
           >
@@ -107,12 +108,13 @@ export default function Sidebar() {
             type="button"
             onClick={() => {
               setRuntimeMode("chat");
-              setSessionId("default");
+              const latest = sortedSessions.find((s) => s.runtime_mode !== "agent");
+              setSessionId(latest ? latest.id : "default");
               if (pathname !== "/") router.push("/");
             }}
             className={`flex items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-[12px] transition-all ${
               runtimeMode === "chat"
-                ? "bg-white text-gray-900 shadow-sm"
+                ? "bg-white/85 text-gray-900 shadow-sm"
                 : "text-gray-500 hover:text-gray-800"
             }`}
           >
@@ -132,7 +134,7 @@ export default function Sidebar() {
             // creates a fresh session instead of appending to the current one.
             setSessionId("default");
           }}
-          className="w-full flex items-center gap-2 px-3 py-2 text-[13px] font-medium text-gray-800 hover:bg-black/[0.04] rounded-lg transition-all"
+          className="w-full flex items-center gap-2 px-3 py-2 text-[13px] font-medium text-gray-800 hover:bg-white/50 rounded-xl transition-all"
         >
           <Plus className="w-4 h-4" />
           新对话
@@ -140,7 +142,7 @@ export default function Sidebar() {
         <SidebarLink icon={Search} label="搜索" muted />
         <Link
           href="/skills"
-          className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-gray-600 hover:text-gray-900 hover:bg-black/[0.04] rounded-lg transition-all"
+          className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-gray-600 hover:text-gray-900 hover:bg-white/50 rounded-xl transition-all"
         >
           <Puzzle className="w-4 h-4" />
           扩展
@@ -148,7 +150,7 @@ export default function Sidebar() {
         <SidebarLink icon={Workflow} label="定时任务" muted />
       </div>
 
-      <div className="mx-3 my-1.5 h-px bg-black/[0.06]" />
+      <div className="mx-4 my-1.5 h-px bg-black/[0.04]" />
 
       {/* Projects */}
       {runtimeMode === "agent" && (
@@ -222,7 +224,7 @@ export default function Sidebar() {
         </div>
       )}
 
-      {runtimeMode === "agent" && <div className="mx-3 h-px bg-black/[0.06]" />}
+      {runtimeMode === "agent" && <div className="mx-4 h-px bg-black/[0.04]" />}
 
       {/* Regular conversations */}
       <div className="flex-1 overflow-y-auto px-1.5">
@@ -260,7 +262,7 @@ export default function Sidebar() {
         </div>
       </div>
 
-      <div className="mx-3 h-px bg-black/[0.06]" />
+      <div className="mx-4 h-px bg-black/[0.04]" />
 
       {/* Footer navigation */}
       <div className="shrink-0 px-2 py-2 space-y-0.5">
@@ -268,7 +270,7 @@ export default function Sidebar() {
           href="https://github.com/ZzjNoMercy/PuddingClaw"
           target="_blank"
           rel="noopener noreferrer"
-          className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-[13px] text-gray-500 transition-all hover:bg-black/[0.04] hover:text-gray-800"
+          className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-[13px] text-gray-500 transition-all hover:bg-white/50 hover:text-gray-800"
         >
           <Github className="h-4 w-4" />
           GitHub
@@ -276,7 +278,7 @@ export default function Sidebar() {
         </a>
         <Link
           href="/settings"
-          className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-[13px] text-gray-600 transition-all hover:bg-black/[0.04] hover:text-gray-900"
+          className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-[13px] text-gray-600 transition-all hover:bg-white/50 hover:text-gray-900"
         >
           <Settings className="h-4 w-4" />
           设置
@@ -341,10 +343,10 @@ function ProjectItem({
       <button
         type="button"
         onClick={onSelect}
-        className={`flex min-w-0 flex-1 items-center gap-2 rounded-md px-3 py-1.5 pr-8 text-left text-[12px] transition-all ${
+        className={`flex min-w-0 flex-1 items-center gap-2 rounded-xl px-3 py-1.5 pr-8 text-left text-[12px] transition-all ${
           isActive
-            ? "bg-black/[0.06] text-gray-900 font-medium"
-            : "text-gray-700 hover:bg-black/[0.04]"
+            ? "bg-white/68 text-gray-900 font-medium shadow-sm"
+            : "text-gray-700 hover:bg-white/48"
         }`}
         title={path}
       >
@@ -414,10 +416,10 @@ function SidebarLink({
 }) {
   return (
     <button
-      className={`w-full flex items-center gap-2 px-3 py-2 text-[13px] rounded-lg transition-all ${
+      className={`w-full flex items-center gap-2 px-3 py-2 text-[13px] rounded-xl transition-all ${
         muted
-          ? "text-gray-500 hover:text-gray-700 hover:bg-black/[0.04]"
-          : "text-gray-600 hover:text-gray-900 hover:bg-black/[0.04]"
+          ? "text-gray-500 hover:text-gray-700 hover:bg-white/50"
+          : "text-gray-600 hover:text-gray-900 hover:bg-white/50"
       }`}
       type="button"
     >
@@ -519,15 +521,12 @@ function SessionItem({
     <div className="relative group">
       <button
         onClick={onSelect}
-        className={`w-full flex items-center gap-1.5 px-3 py-1.5 text-[12px] rounded-md transition-all text-left relative pr-8 ${
+        className={`w-full flex items-center gap-1.5 px-3 py-1.5 text-[12px] rounded-xl transition-all text-left relative pr-8 ${
           isActive
-            ? "bg-[#002fa7]/[0.08] text-[#002fa7] font-medium"
-            : "text-gray-600 hover:bg-black/[0.04] hover:text-gray-900"
+            ? "bg-white/72 text-[#002fa7] font-medium shadow-sm"
+            : "text-gray-600 hover:bg-white/48 hover:text-gray-900"
         }`}
       >
-        {isActive && (
-          <div className="absolute left-0 top-1/2 -translate-y-1/2 w-[3px] h-4 bg-[#002fa7] rounded-r-full" />
-        )}
         <MessageSquare className="h-3 w-3 shrink-0 text-gray-500" />
         <span className="truncate">{title}</span>
       </button>
