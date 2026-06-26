@@ -320,7 +320,7 @@ export default function SettingsPage() {
         </div>
 
         {/* Right: Settings Form */}
-        <div className="flex-1 overflow-y-auto p-6">
+        <div className="flex-1 overflow-y-auto px-6 pb-6 pt-0">
           <div className={`${category === "ai" ? "max-w-4xl" : "max-w-2xl"} mx-auto space-y-6`}>
             {category === "ai" && (
               <>
