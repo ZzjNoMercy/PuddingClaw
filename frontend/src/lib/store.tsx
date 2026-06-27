@@ -257,12 +257,25 @@ function parseHistoryMessages(
         ? normalizeSavedTimeline(msg.timeline, toolCalls)
         : buildHistoryTimeline(msg.reasoning_content, toolCalls);
       const segments: MessageSegment[] | undefined = msg.segments?.length
-        ? msg.segments.map((seg) => ({
-            content: seg.content || "",
-            reasoning: seg.reasoning_content,
-            toolCalls: seg.tool_calls,
-            timeline: seg.timeline,
-          }))
+        ? msg.segments.map((seg) => {
+            const segToolCalls: ToolCall[] = (seg.tool_calls || []).map((tc) => ({
+              id: tc.id || "",
+              tool: tc.tool,
+              input: tc.input || "",
+              output: tc.output || "",
+              status: "done" as const,
+              is_error: Boolean(tc.is_error),
+            }));
+            const segTimeline = seg.timeline?.length
+              ? normalizeSavedTimeline(seg.timeline, segToolCalls)
+              : undefined;
+            return {
+              content: seg.content || "",
+              reasoning: seg.reasoning_content,
+              toolCalls: segToolCalls.length > 0 ? segToolCalls : undefined,
+              timeline: segTimeline,
+            };
+          })
         : undefined;
       loaded.push({
         id: `hist-asst-${msgIndex++}`,

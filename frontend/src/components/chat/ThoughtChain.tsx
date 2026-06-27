@@ -92,14 +92,14 @@ export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
     wasStreamingRef.current = isStreaming;
   }, [isStreaming]);
 
-  const toolItems = timeline.filter((item) => item.type === "tool");
+  const toolItems = timeline.filter((item) => item.type === "tool" && item.toolCall);
   const toolCount = toolItems.length;
   const commandCount = toolItems.filter(
-    (item) => item.type === "tool" && COMMAND_TOOLS.has(item.toolCall.tool)
+    (item) => item.type === "tool" && COMMAND_TOOLS.has(item.toolCall?.tool || "")
   ).length;
 
   const hasRunningTool = toolItems.some(
-    (item) => item.type === "tool" && item.toolCall.status === "running"
+    (item) => item.type === "tool" && item.toolCall?.status === "running"
   );
 
   const runningSuffix = hasRunningTool && isStreaming ? " · 运行中..." : "";
@@ -166,6 +166,7 @@ export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
               }
 
               const tc = item.toolCall;
+              if (!tc) return null;
               const meta = getToolMeta(tc.tool);
               const Icon = meta.icon;
               const isOpen = expandedTools[item.id] ?? false;
