@@ -15,7 +15,6 @@ from deepagents.middleware.memory import MemoryMiddleware
 from langchain_core.messages import AIMessageChunk
 
 from graph.citations import dedupe_sources, finalize_citations, format_sources_for_model
-from graph.middlewares import TodoListMiddleware, write_todos
 from graph.session_manager import session_manager
 from graph.tool_result_adapter import tool_result_adapter
 from llm.model_client import ModelClientChatModel
@@ -147,7 +146,13 @@ class DeepAgentsAgentManager:
         )
 
     def _build_middlewares(self, project_id: str | None) -> list[Any]:
-        """Build DeepAgents middlewares: memory + todo list."""
+        """Build user-provided DeepAgents middlewares.
+
+        create_deep_agent() automatically injects TodoListMiddleware and other
+        base middleware. We only supply project-specific MemoryMiddleware here;
+        passing TodoListMiddleware again would trigger the duplicate-instance
+        assertion.
+        """
 
         assert self._base_dir is not None
 
@@ -177,10 +182,7 @@ class DeepAgentsAgentManager:
         else:
             memory_backend = FilesystemBackend(root_dir=memory_dir, virtual_mode=True)
 
-        return [
-            MemoryMiddleware(backend=memory_backend, sources=sources),
-            TodoListMiddleware(),
-        ]
+        return [MemoryMiddleware(backend=memory_backend, sources=sources)]
 
     def _build_tools(self, workspace_path: Path) -> list[Any]:
         """Return PuddingClaw tools that do not overlap DeepAgents built-ins."""
@@ -206,9 +208,6 @@ class DeepAgentsAgentManager:
                     for key, value in terminal_updates.items():
                         setattr(tool, key, value)
             tools.append(tool)
-        # Native DeepAgents-style todo middleware: expose the write_todos tool
-        # so the model can decompose tasks into a todo list.
-        tools.append(write_todos)
         return tools
 
     @staticmethod

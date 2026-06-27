@@ -9,8 +9,6 @@ from pathlib import Path
 from deepagents.middleware.memory import MemoryMiddleware
 from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 
-from graph.middlewares import TodoListMiddleware
-
 
 def test_deepagents_manager_emits_and_persists_tool_events(tmp_path, monkeypatch):
     """Agent mode should expose DeepAgents tool calls like Chat mode does."""
@@ -571,10 +569,8 @@ def test_memory_middleware_includes_project_and_gstack(tmp_path):
     runtime.initialize(backend_dir)
 
     middlewares = runtime._build_middlewares("proj_abc123")  # noqa: SLF001
-    assert len(middlewares) == 2
-    memory_mw = middlewares[0]
-    todo_mw = middlewares[1]
-    assert isinstance(memory_mw, MemoryMiddleware)
-    assert "/AGENTS.md" in memory_mw.sources
-    assert "/gstack/AGENTS.md" in memory_mw.sources
-    assert isinstance(todo_mw, TodoListMiddleware)
+    assert len(middlewares) == 1
+    mw = middlewares[0]
+    assert isinstance(mw, MemoryMiddleware)
+    assert "/AGENTS.md" in mw.sources
+    assert "/gstack/AGENTS.md" in mw.sources
