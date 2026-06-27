@@ -170,15 +170,6 @@ function SegmentBlock({
 
   return (
     <div className="space-y-2">
-      {segment.timeline && segment.timeline.length > 0 ? (
-        <ThoughtChain timeline={segment.timeline} isStreaming={isStreaming && isLast} />
-      ) : segment.reasoning ? (
-        <ReasoningBlock
-          content={segment.reasoning}
-          defaultOpen={isStreaming && !segment.content}
-          isStreaming={isStreaming && !segment.content}
-        />
-      ) : null}
       {segment.content ? (
         <div className="px-1 py-1 text-[15px] leading-relaxed">
           <div className="markdown-content">
@@ -187,6 +178,15 @@ function SegmentBlock({
             </ReactMarkdown>
           </div>
         </div>
+      ) : null}
+      {segment.timeline && segment.timeline.length > 0 ? (
+        <ThoughtChain timeline={segment.timeline} isStreaming={isStreaming && isLast} />
+      ) : segment.reasoning ? (
+        <ReasoningBlock
+          content={segment.reasoning}
+          defaultOpen={isStreaming && !segment.content}
+          isStreaming={isStreaming && !segment.content}
+        />
       ) : null}
     </div>
   );
