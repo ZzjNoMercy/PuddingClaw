@@ -434,8 +434,11 @@ class SessionManager:
 
         for msg in messages:                                             # 遍历所有消息
             entry: dict[str, Any] = {"role": msg["role"], "content": msg["content"]}
-            if msg.get("tool_calls"):
-                entry["tool_calls"] = msg["tool_calls"]
+            # 历史 tool_calls 不再回传给模型：
+            # 1. 我们的存储把 tool 结果合并到 assistant message，缺少独立 tool role 消息，
+            #    直接回传会导致 OpenAI API 报 duplicate tool_call_id。
+            # 2. 历史工具调用会在 LangGraph 流中重新被 emit，污染当前轮次时间轴。
+            # 上下文通过 assistant 文本内容和 reasoning_content 保留。
             # 思考模式下，assistant 消息的 reasoning_content 需要回传给 API（含工具调用时尤其关键）
             if msg.get("reasoning_content"):
                 entry["reasoning_content"] = msg["reasoning_content"]

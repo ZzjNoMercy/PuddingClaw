@@ -473,6 +473,12 @@ class DeepAgentsAgentManager:
             history = session_manager.load_session_for_agent(session_id)
             is_first_message = not any(item.get("role") == "user" for item in history)
             messages = self._build_messages(history, message)
+            historical_tool_call_ids = {
+                tc.get("id")
+                for msg in messages
+                for tc in msg.get("tool_calls") or []
+                if tc.get("id")
+            }
 
             model = ModelClientChatModel(role="agent", streaming=True)
             logger.info("Building DeepAgents agent for session=%s project=%s", session_id, project_id)
@@ -673,6 +679,10 @@ class DeepAgentsAgentManager:
                                 tool_calls = getattr(agent_msg, "tool_calls", None) or []
                                 for tool_call in tool_calls:
                                     tc_id = self._tool_call_id(tool_call)
+                                    if tc_id and tc_id in historical_tool_call_ids:
+                                        # Skip tool calls that originate from input history;
+                                        # they should not appear in the current turn timeline.
+                                        continue
                                     if tc_id and tc_id in emitted_tool_starts:
                                         continue
                                     tool_name = self._tool_call_name(tool_call)
