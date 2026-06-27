@@ -119,7 +119,7 @@ export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
       <button
         type="button"
         onClick={() => setIsExpanded((v) => !v)}
-        className="inline-flex items-center gap-2 text-[13px] text-gray-600 transition-colors hover:text-gray-900"
+        className="sticky top-0 z-10 inline-flex items-center gap-2 rounded-md bg-white/90 px-1 py-1 text-[13px] text-gray-600 backdrop-blur-sm transition-colors hover:text-gray-900"
       >
         {isExpanded ? (
           <ChevronDown className="h-4 w-4 text-gray-400" />
