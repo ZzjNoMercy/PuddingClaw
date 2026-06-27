@@ -218,6 +218,7 @@ function parseHistoryMessages(
     content: string;
     reasoning_content?: string;
     tool_calls?: Array<{ id?: string; tool: string; input?: string; output?: string; is_error?: boolean }>;
+    timeline?: Array<{ type: string; content?: string; tool_call?: ToolCall; id?: string }>;
     sources?: SourceRecord[];
     citations?: CitationRef[];
   }>
@@ -243,7 +244,9 @@ function parseHistoryMessages(
           is_error: Boolean(tc.is_error),
         })
       );
-      const timeline = buildHistoryTimeline(msg.reasoning_content, toolCalls);
+      const timeline = msg.timeline?.length
+        ? normalizeSavedTimeline(msg.timeline, toolCalls)
+        : buildHistoryTimeline(msg.reasoning_content, toolCalls);
       loaded.push({
         id: `hist-asst-${msgIndex++}`,
         role: "assistant",
@@ -333,6 +336,40 @@ function buildHistoryTimeline(
     });
   });
   return timeline;
+}
+
+function normalizeSavedTimeline(
+  saved: Array<{ type: string; content?: string; tool_call?: ToolCall; id?: string }>,
+  toolCalls: ToolCall[]
+): TimelineItem[] {
+  // Prefer the persisted tool_call from the timeline, but supplement with the
+  // full saved tool_calls list (status/output) when the timeline entry is partial.
+  const toolById = new Map(toolCalls.map((tc) => [tc.id, tc]));
+  return saved
+    .map((item): TimelineItem | null => {
+      if (item.type === "reasoning" && typeof item.content === "string") {
+        return { type: "reasoning", content: item.content, id: item.id || `saved-reasoning-${Date.now()}` };
+      }
+      if (item.type === "tool") {
+        const tc = item.tool_call;
+        if (!tc) return null;
+        const full = tc.id ? toolById.get(tc.id) : undefined;
+        return {
+          type: "tool",
+          toolCall: {
+            id: tc.id || `saved-tool-${Date.now()}`,
+            tool: tc.tool,
+            input: tc.input || "",
+            output: full?.output ?? tc.output ?? "",
+            status: full?.status ?? (tc.status === "running" ? "running" : "done"),
+            is_error: full?.is_error ?? Boolean(tc.is_error),
+          },
+          id: tc.id || `saved-tool-${Date.now()}`,
+        };
+      }
+      return null;
+    })
+    .filter((item): item is TimelineItem => item !== null);
 }
 
 function getOrCreateUserId(): string {

@@ -139,6 +139,7 @@ class SessionManager:
         sources: list[dict[str, Any]] | None = None,          # 用户可见的结构化来源
         citations: list[dict[str, Any]] | None = None,        # 正文与来源的引用映射
         reasoning_content: str | None = None,                  # 思考链内容（工具调用回合必须回传）
+        timeline: list[dict[str, Any]] | None = None,         # 前端时间轴（reasoning/tool 交错顺序）
     ) -> None:
         """追加一条消息到会话历史"""
         data = self._read_file(session_id)        # 读取现有数据
@@ -155,6 +156,8 @@ class SessionManager:
             msg["tool_calls"] = tool_calls
         if reasoning_content:                                     # 思考链内容持久化，支持历史回看与 API 回传
             msg["reasoning_content"] = reasoning_content
+        if timeline:                                              # 保留真实 reasoning/tool 交错顺序
+            msg["timeline"] = timeline
         if sources:
             msg["sources"] = sources
         if citations:

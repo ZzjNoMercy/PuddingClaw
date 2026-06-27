@@ -443,6 +443,68 @@ class DeepAgentsAgentManager:
         return bool(segment.get("content") or segment.get("tool_calls") or segment.get("sources"))
 
     @staticmethod
+    def _append_reasoning_to_timeline(segment: dict[str, Any], text: str) -> None:
+        """Append reasoning text to the current reasoning item, or create one."""
+        if not text:
+            return
+        timeline = segment.setdefault("timeline", [])
+        current = segment.get("_current_reasoning")
+        if current is None:
+            current = {
+                "type": "reasoning",
+                "content": "",
+                "id": f"reasoning-{len(timeline)}",
+            }
+            timeline.append(current)
+            segment["_current_reasoning"] = current
+        current["content"] += text
+
+    @staticmethod
+    def _finalize_reasoning_timeline(segment: dict[str, Any]) -> None:
+        """Close the current reasoning chunk so the next reasoning starts a new item."""
+        segment["_current_reasoning"] = None
+
+    @staticmethod
+    def _add_tool_start_to_timeline(
+        segment: dict[str, Any],
+        tool_call_id: str,
+        tool_name: str,
+        tool_input: str,
+    ) -> None:
+        """Add a tool_start item to the timeline."""
+        timeline = segment.setdefault("timeline", [])
+        timeline.append(
+            {
+                "type": "tool",
+                "tool_call": {
+                    "id": tool_call_id,
+                    "tool": tool_name,
+                    "input": tool_input,
+                    "status": "running",
+                },
+                "id": tool_call_id or f"tool-{len(timeline)}",
+            }
+        )
+
+    @staticmethod
+    def _update_tool_end_in_timeline(
+        segment: dict[str, Any],
+        tool_call_id: str,
+        output: str,
+        is_error: bool,
+    ) -> None:
+        """Update the matching tool item in the timeline with its result."""
+        timeline = segment.get("timeline", [])
+        for item in reversed(timeline):
+            if item.get("type") == "tool":
+                tc = item.get("tool_call", {})
+                if tc.get("id") == tool_call_id:
+                    tc["output"] = output
+                    tc["is_error"] = is_error
+                    tc["status"] = "error" if is_error else "completed"
+                    break
+
+    @staticmethod
     def _last_ai_content(state: dict[str, Any] | None) -> str:
         if not state:
             return ""
@@ -557,6 +619,7 @@ class DeepAgentsAgentManager:
                         if not node or node == "model":
                             emitted_reasoning = True
                             accumulated_reasoning += reasoning_text
+                            self._append_reasoning_to_timeline(current_segment, reasoning_text)
                             source = self._detect_reasoning_source(payload)
                             prev_logged_chars = reasoning_log_chars
                             reasoning_log_chars = len(accumulated_reasoning)
@@ -593,6 +656,7 @@ class DeepAgentsAgentManager:
                             # In agent mode we keep the entire turn (reasoning,
                             # tool calls and final answer) in a single assistant
                             # message so the frontend timeline is not split.
+                        self._finalize_reasoning_timeline(current_segment)
                         emitted_text += text
                         current_segment["content"] += text
                         yield self._sse("token", {"content": text})
@@ -644,6 +708,7 @@ class DeepAgentsAgentManager:
                                             },
                                         )
                                 is_error = self._is_tool_error(tool_msg, raw_output)
+                                self._update_tool_end_in_timeline(current_segment, tc_id or "", raw_output, is_error)
                                 pending_tool_starts.pop(tc_id, None)
 
                                 matched = False
@@ -701,12 +766,16 @@ class DeepAgentsAgentManager:
                                             "tool": tool_name,
                                             "input": tool_input,
                                         }
+                                    self._finalize_reasoning_timeline(current_segment)
                                     current_segment["tool_calls"].append(
                                         {
                                             "tool": tool_name,
                                             "input": tool_input,
                                             "id": tc_id,
                                         }
+                                    )
+                                    self._add_tool_start_to_timeline(
+                                        current_segment, tc_id or "", tool_name, tool_input
                                     )
                                     yield self._sse(
                                         "tool_start",
@@ -779,6 +848,8 @@ class DeepAgentsAgentManager:
                 len(emitted_text),
             )
             for segment in segments:
+                # Strip internal timeline builder state before persisting.
+                segment.pop("_current_reasoning", None)
                 session_manager.save_message(
                     session_id,
                     "assistant",
@@ -787,6 +858,7 @@ class DeepAgentsAgentManager:
                     sources=segment.get("sources"),
                     citations=segment.get("citations"),
                     reasoning_content=accumulated_reasoning or None,
+                    timeline=segment.get("timeline") or None,
                 )
             final_citations = [
                 citation for segment in segments for citation in segment.get("citations", [])
