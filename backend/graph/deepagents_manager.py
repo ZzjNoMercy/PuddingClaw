@@ -15,6 +15,7 @@ from deepagents.middleware.memory import MemoryMiddleware
 from langchain_core.messages import AIMessageChunk
 
 from graph.citations import dedupe_sources, finalize_citations, format_sources_for_model
+from graph.middlewares import TodoListMiddleware, write_todos
 from graph.session_manager import session_manager
 from graph.tool_result_adapter import tool_result_adapter
 from llm.model_client import ModelClientChatModel
@@ -145,8 +146,8 @@ class DeepAgentsAgentManager:
             routes=routes,
         )
 
-    def _build_memory_middleware(self, project_id: str | None) -> list[Any]:
-        """Build a single MemoryMiddleware that loads project and gstack AGENTS.md."""
+    def _build_middlewares(self, project_id: str | None) -> list[Any]:
+        """Build DeepAgents middlewares: memory + todo list."""
 
         assert self._base_dir is not None
 
@@ -176,7 +177,10 @@ class DeepAgentsAgentManager:
         else:
             memory_backend = FilesystemBackend(root_dir=memory_dir, virtual_mode=True)
 
-        return [MemoryMiddleware(backend=memory_backend, sources=sources)]
+        return [
+            MemoryMiddleware(backend=memory_backend, sources=sources),
+            TodoListMiddleware(),
+        ]
 
     def _build_tools(self, workspace_path: Path) -> list[Any]:
         """Return PuddingClaw tools that do not overlap DeepAgents built-ins."""
@@ -202,6 +206,9 @@ class DeepAgentsAgentManager:
                     for key, value in terminal_updates.items():
                         setattr(tool, key, value)
             tools.append(tool)
+        # Native DeepAgents-style todo middleware: expose the write_todos tool
+        # so the model can decompose tasks into a todo list.
+        tools.append(write_todos)
         return tools
 
     @staticmethod
@@ -486,13 +493,15 @@ class DeepAgentsAgentManager:
                 model=model,
                 tools=self._build_tools(workspace_path),
                 skills=["/skills/"],
-                middleware=self._build_memory_middleware(project_id),
+                middleware=self._build_middlewares(project_id),
                 backend=self._build_backend(workspace_path),
                 system_prompt=(
                     "You are PuddingClaw Agent mode. The filesystem tools are scoped to the current workspace. "
                     "Project-level memory and the gstack skill index have been injected via MemoryMiddleware. "
                     "Do not claim access to files outside this workspace unless an external-file permission flow "
                     "grants it.\n\n"
+                    "When the user asks you to break a task into steps or track progress, call the `write_todos` "
+                    "tool to create a structured todo list.\n\n"
                     "### 来源引用规则\n"
                     "- 检索类工具返回的结果中可能包含稳定的 `source_id`。\n"
                     "- 当回答中的具体论述使用了某个来源的信息时，必须在该论述后紧跟标记 `[^source_id]`。\n"
