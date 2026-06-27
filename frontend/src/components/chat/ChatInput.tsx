@@ -46,10 +46,12 @@ export default function ChatInput() {
   const disabled = isStreaming || isCompressing;
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
 
-  // Fetch token count on mount and when session changes.
+  // Fetch token count on mount, when session changes, and after a streaming
+  // response finishes (so newly loaded messages are reflected immediately).
   // 背景信息窗口进度条显示的是「对话内容 + 工具输出」占 compaction_trigger 的比例，
   // 不包含固定的 system prompt，否则无论对话长短都会显示系统提示的 6.6k 底数。
-  useEffect(() => {
+  const refreshContextUsage = useCallback(() => {
+    if (!sessionId) return;
     getSessionTokenCount(sessionId)
       .then((data) => {
         const used = data.message_tokens;
@@ -63,6 +65,16 @@ export default function ChatInput() {
       })
       .catch(() => {});
   }, [sessionId, setContextUsage]);
+
+  useEffect(() => {
+    refreshContextUsage();
+  }, [refreshContextUsage]);
+
+  useEffect(() => {
+    if (!isStreaming) {
+      refreshContextUsage();
+    }
+  }, [isStreaming, refreshContextUsage]);
 
   // Slash command state
   const [showSlashMenu, setShowSlashMenu] = useState(false);
