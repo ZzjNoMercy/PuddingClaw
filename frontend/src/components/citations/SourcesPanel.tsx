@@ -9,7 +9,6 @@ import {
   ExternalLink,
   FileText,
   ListChecks,
-  Search,
   Timer,
 } from "lucide-react";
 import { useApp, type SourceRecord, type ToolCall } from "@/lib/store";
@@ -70,9 +69,7 @@ export default function SourcesPanel() {
         </div>
       )}
 
-      {cited.length > 0 && <CitationsCard cited={cited} />}
-
-      {retrieved.length > 0 && <RetrievedCard retrieved={retrieved} />}
+      {total > 0 && <SourcesCard cited={cited} retrieved={retrieved} />}
     </div>
   );
 }
@@ -172,24 +169,28 @@ function TodoStatusIcon({ status }: { status: TodoStatus }) {
   return <Circle className="mt-0.5 h-5 w-5 shrink-0 text-slate-300" />;
 }
 
-function CitationsCard({
+function SourcesCard({
   cited,
+  retrieved,
 }: {
   cited: Array<{ source: SourceRecord; index?: number }>;
+  retrieved: Array<{ source: SourceRecord; index?: number }>;
 }) {
   const [open, setOpen] = useState(true);
   const { activeSourceId } = useApp();
   const activeRef = useRef<HTMLDivElement>(null);
+  const total = cited.length + retrieved.length;
 
   useEffect(() => {
     if (!activeSourceId) return;
-    if (cited.some(({ source }) => source.source_id === activeSourceId)) {
+    const allSources = [...cited, ...retrieved];
+    if (allSources.some(({ source }) => source.source_id === activeSourceId)) {
       setOpen(true);
       window.setTimeout(() => {
         activeRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
       }, 50);
     }
-  }, [activeSourceId, cited]);
+  }, [activeSourceId, cited, retrieved]);
 
   return (
     <section className="workspace-side-card rounded-[28px] px-5 py-5">
@@ -202,87 +203,46 @@ function CitationsCard({
           <div className="flex h-6 w-6 items-center justify-center rounded-lg bg-[#002fa7]/[0.07] text-[#002fa7]">
             <BookOpen className="h-3.5 w-3.5" />
           </div>
-          <span className="text-[15px] font-bold text-slate-900">引用</span>
+          <span className="text-[15px] font-bold text-slate-900">来源</span>
+          {total > 0 && (
+            <span className="rounded-full bg-black/[0.045] px-2 py-0.5 text-[11px] font-medium text-slate-500">
+              {total}
+            </span>
+          )}
+        </div>
+        <ChevronDown
+          className={`h-4 w-4 text-slate-500 transition-transform duration-200 ${!open ? "-rotate-90" : ""}`}
+        />
+      </button>
+
+      {open && (
+        <div className="mt-4 space-y-5">
           {cited.length > 0 && (
-            <span className="rounded-full bg-black/[0.045] px-2 py-0.5 text-[11px] font-medium text-slate-500">
-              {cited.length}
-            </span>
+            <SourceSection title="已引用" count={cited.length}>
+              {cited.map(({ source, index }) => (
+                <SourceItem
+                  key={source.source_id}
+                  source={source}
+                  citationIndex={index}
+                  isActive={activeSourceId === source.source_id}
+                  ref={activeSourceId === source.source_id ? activeRef : undefined}
+                />
+              ))}
+            </SourceSection>
           )}
-        </div>
-        <ChevronDown
-          className={`h-4 w-4 text-slate-500 transition-transform duration-200 ${!open ? "-rotate-90" : ""}`}
-        />
-      </button>
 
-      {open && (
-        <div className="mt-4 space-y-3">
-          {cited.map(({ source, index }) => (
-            <SourceItem
-              key={source.source_id}
-              source={source}
-              citationIndex={index}
-              isActive={activeSourceId === source.source_id}
-              ref={activeSourceId === source.source_id ? activeRef : undefined}
-            />
-          ))}
-        </div>
-      )}
-    </section>
-  );
-}
-
-function RetrievedCard({
-  retrieved,
-}: {
-  retrieved: Array<{ source: SourceRecord; index?: number }>;
-}) {
-  const [open, setOpen] = useState(true);
-  const { activeSourceId } = useApp();
-  const activeRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!activeSourceId) return;
-    if (retrieved.some(({ source }) => source.source_id === activeSourceId)) {
-      setOpen(true);
-      window.setTimeout(() => {
-        activeRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
-      }, 50);
-    }
-  }, [activeSourceId, retrieved]);
-
-  return (
-    <section className="workspace-side-card rounded-[28px] px-5 py-5">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center justify-between text-left"
-      >
-        <div className="flex items-center gap-2">
-          <div className="flex h-6 w-6 items-center justify-center rounded-lg bg-slate-100 text-slate-600">
-            <Search className="h-3.5 w-3.5" />
-          </div>
-          <span className="text-[15px] font-bold text-slate-900">检索结果</span>
           {retrieved.length > 0 && (
-            <span className="rounded-full bg-black/[0.045] px-2 py-0.5 text-[11px] font-medium text-slate-500">
-              {retrieved.length}
-            </span>
+            <SourceSection title="其他检索结果" count={retrieved.length}>
+              {retrieved.map(({ source }) => (
+                <SourceItem
+                  key={source.source_id}
+                  source={source}
+                  isActive={activeSourceId === source.source_id}
+                  ref={activeSourceId === source.source_id ? activeRef : undefined}
+                />
+              ))}
+            </SourceSection>
           )}
-        </div>
-        <ChevronDown
-          className={`h-4 w-4 text-slate-500 transition-transform duration-200 ${!open ? "-rotate-90" : ""}`}
-        />
-      </button>
-
-      {open && (
-        <div className="mt-4 space-y-3">
-          {retrieved.map(({ source }) => (
-            <SourceItem
-              key={source.source_id}
-              source={source}
-              isActive={activeSourceId === source.source_id}
-              ref={activeSourceId === source.source_id ? activeRef : undefined}
-            />
-          ))}
         </div>
       )}
     </section>
