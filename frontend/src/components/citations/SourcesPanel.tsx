@@ -62,16 +62,16 @@ export default function SourcesPanel() {
     <div className="h-full overflow-y-auto px-5 py-7 space-y-6">
       <ProgressCard todos={todos} />
 
-      {cited.length > 0 && <CitationsCard cited={cited} />}
-
-      {retrieved.length > 0 && <ContextCard retrieved={retrieved} />}
-
       {isStreaming && total > 0 && (
-        <div className="flex items-center justify-center gap-1.5 py-1 text-[11px] text-blue-600">
+        <div className="flex items-center justify-center gap-1.5 text-[11px] text-blue-600">
           <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-blue-500" />
           检索中
         </div>
       )}
+
+      {cited.length > 0 && <CitationsCard cited={cited} />}
+
+      {retrieved.length > 0 && <ContextCard retrieved={retrieved} />}
     </div>
   );
 }
