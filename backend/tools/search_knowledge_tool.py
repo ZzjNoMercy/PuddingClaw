@@ -80,7 +80,8 @@ class SearchKnowledgeBaseTool(BaseTool):
             self._index = self._build_index()
 
         if self._index is None:
-            return "📭 Knowledge base is empty. Add documents to backend/knowledge/ to enable search."
+            kb_dir = Path(self.base_dir) / "knowledge"
+            return f"📭 Knowledge base is empty. Add Markdown documents to {kb_dir}/ (or /workspace/knowledge/ in Agent mode) to enable search."
 
         try:
             query_engine = self._index.as_query_engine(similarity_top_k=3)

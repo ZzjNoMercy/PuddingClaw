@@ -194,19 +194,30 @@ class DeepAgentsAgentManager:
                 continue
             if getattr(tool, "name", "") == "terminal":
                 # In Agent mode, terminal should follow the same workspace
-                # boundary as the DeepAgents filesystem backend. DeepAgents
-                # skills are exposed through the virtual `/skills/` backend
-                # route, so terminal maps that same path to the real skills
-                # directory when a skill asks to run its bundled script.
+                # boundary as the DeepAgents filesystem backend. Map the
+                # virtual `/workspace/` and `/skills/` prefixes to real host
+                # directories so shell commands use the same paths as
+                # read_file/write_file.
                 terminal_updates = {
                     "root_dir": str(workspace_path),
-                    "path_aliases": {"/skills": str(self._base_dir / "skills")},
+                    "path_aliases": {
+                        "/workspace": str(workspace_path),
+                        "/skills": str(self._base_dir / "skills"),
+                    },
                 }
                 try:
                     tool = tool.model_copy(update=terminal_updates)
                 except Exception:
                     for key, value in terminal_updates.items():
                         setattr(tool, key, value)
+            elif getattr(tool, "name", "") == "search_knowledge_base":
+                # Knowledge base should be scoped to the current workspace so
+                # each project/session has isolated documents and the search
+                # tool sees files written by skills to /workspace/knowledge/.
+                try:
+                    tool = tool.model_copy(update={"base_dir": str(workspace_path)})
+                except Exception:
+                    setattr(tool, "base_dir", str(workspace_path))
             tools.append(tool)
         return tools
 
@@ -566,7 +577,9 @@ class DeepAgentsAgentManager:
                     "'/workspace/dashboard.html' or '/workspace/subdir/file.py'. Skill files live under "
                     "'/skills/', e.g. '/skills/design-html/SKILL.md'. The bare root '/' is an alias for "
                     "'/workspace/' but MUST NOT be mixed with '/workspace/'; pick '/workspace/' for user files "
-                    "and '/skills/' for skill files, and stick to those prefixes.\n\n"
+                    "and '/skills/' for skill files, and stick to those prefixes.\n"
+                    "The local knowledge base lives at '/workspace/knowledge/'. Add Markdown documents there "
+                    "when a skill needs to store retrievable knowledge; search_knowledge_base scans that directory.\n\n"
                     "When the user asks you to break a task into steps or track progress, call the `write_todos` "
                     "tool to create a structured todo list.\n\n"
                     "### 来源引用规则\n"
