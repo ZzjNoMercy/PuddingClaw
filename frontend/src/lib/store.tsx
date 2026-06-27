@@ -935,6 +935,24 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             continue;
           }
 
+          if (event.event === "content_reset") {
+            // The model was re-invoked after tool calls and intermediate
+            // planning text should be discarded. Clear the current assistant
+            // message content so the post-tool response starts fresh.
+            flushPendingTokens();
+            flushPendingReasoning();
+            const targetId = getAssistantId();
+            updateMsgs((prev) => {
+              const updated = [...prev];
+              const idx = updated.findIndex((m) => m.id === targetId);
+              if (idx !== -1) {
+                updated[idx] = { ...updated[idx], content: "" };
+              }
+              return updated;
+            });
+            continue;
+          }
+
           // Preserve protocol ordering: all text preceding a structural event
           // must be visible on the current assistant message first.
           flushPendingTokens();

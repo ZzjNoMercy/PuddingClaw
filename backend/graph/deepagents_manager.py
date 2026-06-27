@@ -661,6 +661,7 @@ class DeepAgentsAgentManager:
                             # message only contains the useful answer.
                             current_segment["content"] = text
                             emitted_text = text
+                            yield self._sse("content_reset", {})
                         else:
                             current_segment["content"] += text
                             emitted_text += text
