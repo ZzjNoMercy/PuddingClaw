@@ -62,7 +62,9 @@ export default function SourcesPanel() {
     <div className="h-full overflow-y-auto px-5 py-7 space-y-6">
       <ProgressCard todos={todos} />
 
-      <ContextCard cited={cited} retrieved={retrieved} />
+      {cited.length > 0 && <CitationsCard cited={cited} />}
+
+      {retrieved.length > 0 && <ContextCard retrieved={retrieved} />}
 
       {isStreaming && total > 0 && (
         <div className="flex items-center justify-center gap-1.5 py-1 text-[11px] text-blue-600">
@@ -169,29 +171,24 @@ function TodoStatusIcon({ status }: { status: TodoStatus }) {
   return <Circle className="mt-0.5 h-5 w-5 shrink-0 text-slate-300" />;
 }
 
-function ContextCard({
+function CitationsCard({
   cited,
-  retrieved,
 }: {
   cited: Array<{ source: SourceRecord; index?: number }>;
-  retrieved: Array<{ source: SourceRecord; index?: number }>;
 }) {
   const [open, setOpen] = useState(true);
-  const { activeSourceId, setActiveSourceId } = useApp();
+  const { activeSourceId } = useApp();
   const activeRef = useRef<HTMLDivElement>(null);
-  const total = cited.length + retrieved.length;
 
   useEffect(() => {
     if (!activeSourceId) return;
-    const inCited = cited.some(({ source }) => source.source_id === activeSourceId);
-    const inRetrieved = retrieved.some(({ source }) => source.source_id === activeSourceId);
-    if (inCited || inRetrieved) {
+    if (cited.some(({ source }) => source.source_id === activeSourceId)) {
       setOpen(true);
       window.setTimeout(() => {
         activeRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
       }, 50);
     }
-  }, [activeSourceId, cited, retrieved]);
+  }, [activeSourceId, cited]);
 
   return (
     <section className="workspace-side-card rounded-[28px] px-5 py-5">
@@ -204,10 +201,10 @@ function ContextCard({
           <div className="flex h-6 w-6 items-center justify-center rounded-lg bg-[#002fa7]/[0.07] text-[#002fa7]">
             <BookOpen className="h-3.5 w-3.5" />
           </div>
-          <span className="text-[15px] font-bold text-slate-900">上下文</span>
-          {total > 0 && (
+          <span className="text-[15px] font-bold text-slate-900">引用</span>
+          {cited.length > 0 && (
             <span className="rounded-full bg-black/[0.045] px-2 py-0.5 text-[11px] font-medium text-slate-500">
-              {total}
+              {cited.length}
             </span>
           )}
         </div>
@@ -217,38 +214,74 @@ function ContextCard({
       </button>
 
       {open && (
-        <div className="mt-4 space-y-5">
-          {total === 0 ? (
-            <ContextEmptyState />
-          ) : (
-            <>
-              {cited.length > 0 && (
-                <SourceSection title="已引用" count={cited.length}>
-                  {cited.map(({ source, index }) => (
-                    <SourceItem
-                      key={source.source_id}
-                      source={source}
-                      citationIndex={index}
-                      isActive={activeSourceId === source.source_id}
-                      ref={activeSourceId === source.source_id ? activeRef : undefined}
-                    />
-                  ))}
-                </SourceSection>
-              )}
-              {retrieved.length > 0 && (
-                <SourceSection title="其他检索结果" count={retrieved.length}>
-                  {retrieved.map(({ source }) => (
-                    <SourceItem
-                      key={source.source_id}
-                      source={source}
-                      isActive={activeSourceId === source.source_id}
-                      ref={activeSourceId === source.source_id ? activeRef : undefined}
-                    />
-                  ))}
-                </SourceSection>
-              )}
-            </>
+        <div className="mt-4 space-y-3">
+          {cited.map(({ source, index }) => (
+            <SourceItem
+              key={source.source_id}
+              source={source}
+              citationIndex={index}
+              isActive={activeSourceId === source.source_id}
+              ref={activeSourceId === source.source_id ? activeRef : undefined}
+            />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ContextCard({
+  retrieved,
+}: {
+  retrieved: Array<{ source: SourceRecord; index?: number }>;
+}) {
+  const [open, setOpen] = useState(true);
+  const { activeSourceId } = useApp();
+  const activeRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!activeSourceId) return;
+    if (retrieved.some(({ source }) => source.source_id === activeSourceId)) {
+      setOpen(true);
+      window.setTimeout(() => {
+        activeRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+      }, 50);
+    }
+  }, [activeSourceId, retrieved]);
+
+  return (
+    <section className="workspace-side-card rounded-[28px] px-5 py-5">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center justify-between text-left"
+      >
+        <div className="flex items-center gap-2">
+          <div className="flex h-6 w-6 items-center justify-center rounded-lg bg-slate-100 text-slate-600">
+            <FileText className="h-3.5 w-3.5" />
+          </div>
+          <span className="text-[15px] font-bold text-slate-900">上下文</span>
+          {retrieved.length > 0 && (
+            <span className="rounded-full bg-black/[0.045] px-2 py-0.5 text-[11px] font-medium text-slate-500">
+              {retrieved.length}
+            </span>
           )}
+        </div>
+        <ChevronDown
+          className={`h-4 w-4 text-slate-500 transition-transform duration-200 ${!open ? "-rotate-90" : ""}`}
+        />
+      </button>
+
+      {open && (
+        <div className="mt-4 space-y-3">
+          {retrieved.map(({ source }) => (
+            <SourceItem
+              key={source.source_id}
+              source={source}
+              isActive={activeSourceId === source.source_id}
+              ref={activeSourceId === source.source_id ? activeRef : undefined}
+            />
+          ))}
         </div>
       )}
     </section>
@@ -273,25 +306,6 @@ function SourceSection({
         </span>
       </div>
       <div className="space-y-3">{children}</div>
-    </div>
-  );
-}
-
-function ContextEmptyState() {
-  return (
-    <div className="flex flex-col items-center justify-center py-8 text-center">
-      <div className="relative mb-4 h-20 w-44 opacity-80">
-        <div className="absolute left-6 top-2 h-14 w-14 rotate-6 rounded-xl border border-black/[0.08] bg-white" />
-        <div className="absolute left-[4.8rem] top-2 h-14 w-14 -rotate-2 rounded-xl border border-black/[0.08] bg-white" />
-        <div className="absolute right-6 top-2 h-14 w-14 rotate-6 rounded-xl border border-black/[0.08] bg-white" />
-        <div className="absolute left-10 top-6 h-3 w-3 rounded-full bg-slate-100" />
-        <div className="absolute left-9 top-11 h-2.5 w-9 rounded-full bg-slate-100" />
-        <div className="absolute left-[6.1rem] top-6 h-2.5 w-9 rounded-full bg-slate-100" />
-        <div className="absolute left-[6.1rem] top-11 h-2.5 w-9 rounded-full bg-slate-100" />
-        <div className="absolute right-10 top-6 h-2.5 w-10 rounded-full bg-slate-100" />
-        <div className="absolute right-10 top-11 h-2.5 w-9 rounded-full bg-slate-100" />
-      </div>
-      <p className="text-[14px] font-medium text-slate-400">引用和上传文件会显示在这里</p>
     </div>
   );
 }
