@@ -9,6 +9,7 @@ import {
   ExternalLink,
   FileText,
   ListChecks,
+  Search,
   Timer,
 } from "lucide-react";
 import { useApp, type SourceRecord, type ToolCall } from "@/lib/store";
@@ -71,7 +72,7 @@ export default function SourcesPanel() {
 
       {cited.length > 0 && <CitationsCard cited={cited} />}
 
-      {retrieved.length > 0 && <ContextCard retrieved={retrieved} />}
+      {retrieved.length > 0 && <RetrievedCard retrieved={retrieved} />}
     </div>
   );
 }
@@ -230,7 +231,7 @@ function CitationsCard({
   );
 }
 
-function ContextCard({
+function RetrievedCard({
   retrieved,
 }: {
   retrieved: Array<{ source: SourceRecord; index?: number }>;
@@ -258,9 +259,9 @@ function ContextCard({
       >
         <div className="flex items-center gap-2">
           <div className="flex h-6 w-6 items-center justify-center rounded-lg bg-slate-100 text-slate-600">
-            <FileText className="h-3.5 w-3.5" />
+            <Search className="h-3.5 w-3.5" />
           </div>
-          <span className="text-[15px] font-bold text-slate-900">上下文</span>
+          <span className="text-[15px] font-bold text-slate-900">检索结果</span>
           {retrieved.length > 0 && (
             <span className="rounded-full bg-black/[0.045] px-2 py-0.5 text-[11px] font-medium text-slate-500">
               {retrieved.length}
