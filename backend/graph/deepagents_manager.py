@@ -135,7 +135,9 @@ class DeepAgentsAgentManager:
     def _build_backend(self, workspace_path: Path):
         assert self._base_dir is not None
         skills_dir = self._base_dir / "skills"
-        routes: dict[str, FilesystemBackend] = {}
+        routes: dict[str, FilesystemBackend] = {
+            "/workspace/": FilesystemBackend(root_dir=workspace_path, virtual_mode=True),
+        }
         if skills_dir.exists():
             routes["/skills/"] = FilesystemBackend(root_dir=skills_dir, virtual_mode=True)
         return CompositeBackend(
@@ -560,10 +562,10 @@ class DeepAgentsAgentManager:
                     "Do not claim access to files outside this workspace unless an external-file permission flow "
                     "grants it.\n\n"
                     "### Workspace paths\n"
-                    "The workspace root is '/'. All files live under this root. Reference files as "
-                    "'/filename' or '/subdir/filename'. Do NOT use '/workspace/' as a prefix; it does not exist "
-                    "and will cause duplicate or missing files. Tools such as read_file, write_file, edit_file, "
-                    "ls and glob all operate on this root.\n\n"
+                    "The workspace root is '/workspace/'. Always reference user files with this prefix, e.g. "
+                    "'/workspace/dashboard.html' or '/workspace/subdir/file.py'. The bare root '/' is an alias "
+                    "for the same location but MUST NOT be mixed with '/workspace/'; pick '/workspace/' and stick "
+                    "to it for every read, write, edit, ls and glob call.\n\n"
                     "When the user asks you to break a task into steps or track progress, call the `write_todos` "
                     "tool to create a structured todo list.\n\n"
                     "### 来源引用规则\n"
