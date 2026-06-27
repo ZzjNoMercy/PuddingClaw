@@ -936,9 +936,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           }
 
           if (event.event === "content_reset") {
-            // The model was re-invoked after tool calls and intermediate
-            // planning text should be discarded. Clear the current assistant
-            // message content so the post-tool response starts fresh.
+            // The model was re-invoked after tool calls. Insert a visual
+            // separator between the pre-tool planning phase and the post-tool
+            // response so they don't concatenate into one wall of text.
             flushPendingTokens();
             flushPendingReasoning();
             const targetId = getAssistantId();
@@ -946,7 +946,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               const updated = [...prev];
               const idx = updated.findIndex((m) => m.id === targetId);
               if (idx !== -1) {
-                updated[idx] = { ...updated[idx], content: "" };
+                const separator = "\n\n---\n\n";
+                updated[idx] = {
+                  ...updated[idx],
+                  content: updated[idx].content + separator,
+                };
               }
               return updated;
             });

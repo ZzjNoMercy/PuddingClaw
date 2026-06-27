@@ -655,16 +655,15 @@ class DeepAgentsAgentManager:
                         if tools_just_finished:
                             tools_just_finished = False
                             # The model has been re-invoked after tool calls.
-                            # Any text emitted before the tools was intermediate
-                            # planning (e.g. "I will search again"); replace it
-                            # with the post-tool response so the final assistant
-                            # message only contains the useful answer.
-                            current_segment["content"] = text
-                            emitted_text = text
+                            # Insert a visual break between the pre-tool planning
+                            # phase and the post-tool response so they don't
+                            # concatenate into one unreadable wall of text.
+                            separator = "\n\n---\n\n"
+                            current_segment["content"] += separator
+                            emitted_text += separator
                             yield self._sse("content_reset", {})
-                        else:
-                            current_segment["content"] += text
-                            emitted_text += text
+                        current_segment["content"] += text
+                        emitted_text += text
                         yield self._sse("token", {"content": text})
                 elif mode == "updates" and isinstance(payload, dict):
                     for node_name, node_data in payload.items():
@@ -805,10 +804,7 @@ class DeepAgentsAgentManager:
                     current_segment["content"] = final_content
                     emitted_text = final_content
                     yield self._sse("token", {"content": final_content})
-                elif (
-                    not current_text.strip().startswith(final_content.strip())
-                    and not final_content.strip().startswith(current_text.strip())
-                ):
+                elif final_content.strip() not in current_text:
                     # The authoritative final answer differs from the streamed
                     # text (e.g. only intermediate planning was streamed before
                     # tools). Replace with the final answer.
