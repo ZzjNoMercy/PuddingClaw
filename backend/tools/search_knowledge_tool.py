@@ -27,9 +27,9 @@ class SearchKnowledgeBaseTool(BaseTool):
         arbitrary_types_allowed = True
 
     def _build_index(self):
-        """Build or load LlamaIndex index from knowledge/ directory."""
-        knowledge_dir = Path(self.base_dir) / "knowledge"
-        storage_dir = Path(self.base_dir) / "storage"
+        """Build or load LlamaIndex index from backend/knowledge/ directory."""
+        knowledge_dir = Path(self.base_dir) / "backend" / "knowledge"
+        storage_dir = Path(self.base_dir) / "backend" / "storage"
 
         if not knowledge_dir.exists() or not any(knowledge_dir.iterdir()):
             return None
@@ -80,8 +80,8 @@ class SearchKnowledgeBaseTool(BaseTool):
             self._index = self._build_index()
 
         if self._index is None:
-            kb_dir = Path(self.base_dir) / "knowledge"
-            return f"📭 Knowledge base is empty. Add Markdown documents to {kb_dir}/ (or /workspace/knowledge/ in Agent mode) to enable search."
+            kb_dir = Path(self.base_dir) / "backend" / "knowledge"
+            return f"📭 Knowledge base is empty. Add Markdown documents to /knowledge/ (physical path: {kb_dir}/) to enable search."
 
         try:
             query_engine = self._index.as_query_engine(similarity_top_k=3)

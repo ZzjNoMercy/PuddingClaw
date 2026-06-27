@@ -135,8 +135,11 @@ class DeepAgentsAgentManager:
     def _build_backend(self, workspace_path: Path):
         assert self._base_dir is not None
         skills_dir = self._base_dir / "skills"
+        knowledge_dir = self._base_dir / "backend" / "knowledge"
+        knowledge_dir.mkdir(parents=True, exist_ok=True)
         routes: dict[str, FilesystemBackend] = {
             "/workspace/": FilesystemBackend(root_dir=workspace_path, virtual_mode=True),
+            "/knowledge/": FilesystemBackend(root_dir=knowledge_dir, virtual_mode=True),
         }
         if skills_dir.exists():
             routes["/skills/"] = FilesystemBackend(root_dir=skills_dir, virtual_mode=True)
@@ -202,6 +205,7 @@ class DeepAgentsAgentManager:
                     "root_dir": str(workspace_path),
                     "path_aliases": {
                         "/workspace": str(workspace_path),
+                        "/knowledge": str(self._base_dir / "backend" / "knowledge"),
                         "/skills": str(self._base_dir / "skills"),
                     },
                 }
@@ -210,14 +214,7 @@ class DeepAgentsAgentManager:
                 except Exception:
                     for key, value in terminal_updates.items():
                         setattr(tool, key, value)
-            elif getattr(tool, "name", "") == "search_knowledge_base":
-                # Knowledge base should be scoped to the current workspace so
-                # each project/session has isolated documents and the search
-                # tool sees files written by skills to /workspace/knowledge/.
-                try:
-                    tool = tool.model_copy(update={"base_dir": str(workspace_path)})
-                except Exception:
-                    setattr(tool, "base_dir", str(workspace_path))
+
             tools.append(tool)
         return tools
 
@@ -578,8 +575,9 @@ class DeepAgentsAgentManager:
                     "'/skills/', e.g. '/skills/design-html/SKILL.md'. The bare root '/' is an alias for "
                     "'/workspace/' but MUST NOT be mixed with '/workspace/'; pick '/workspace/' for user files "
                     "and '/skills/' for skill files, and stick to those prefixes.\n"
-                    "The local knowledge base lives at '/workspace/knowledge/'. Add Markdown documents there "
-                    "when a skill needs to store retrievable knowledge; search_knowledge_base scans that directory.\n\n"
+                    "The global knowledge base lives at '/knowledge/'. Add Markdown documents there when a "
+                    "skill needs to store retrievable knowledge; search_knowledge_base scans the backend/knowledge/ "
+                    "directory. Do NOT store knowledge under '/workspace/knowledge/'.\n\n"
                     "When the user asks you to break a task into steps or track progress, call the `write_todos` "
                     "tool to create a structured todo list.\n\n"
                     "### 来源引用规则\n"

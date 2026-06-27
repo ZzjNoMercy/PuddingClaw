@@ -29,10 +29,15 @@ def test_build_backend_resolves_workspace_and_skills(tmp_path, monkeypatch):
     (skills_dir / "design-html").mkdir()
     (skills_dir / "design-html" / "SKILL.md").write_text("skill doc")
 
+    knowledge_dir = tmp_path / "backend" / "knowledge"
+    knowledge_dir.mkdir(parents=True)
+    (knowledge_dir / "test.md").write_text("kb doc")
+
     backend = manager._build_backend(workspace)
 
     assert backend.read("/workspace/dashboard.html").file_data["content"] == "dashboard"
     assert backend.read("/skills/design-html/SKILL.md").file_data["content"] == "skill doc"
+    assert backend.read("/knowledge/test.md").file_data["content"] == "kb doc"
     # Bare root is an alias for workspace.
     assert backend.read("/dashboard.html").file_data["content"] == "dashboard"
 
