@@ -72,3 +72,4 @@ backend/skills/.skills_store_lock.json
 
 .pytest_cache
 notebooks/.env
+notebooks/
