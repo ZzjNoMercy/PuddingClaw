@@ -651,14 +651,19 @@ class DeepAgentsAgentManager:
                         node = self._metadata_node(metadata)
                         if node and node != "model":
                             continue
+                        self._finalize_reasoning_timeline(current_segment)
                         if tools_just_finished:
                             tools_just_finished = False
-                            # In agent mode we keep the entire turn (reasoning,
-                            # tool calls and final answer) in a single assistant
-                            # message so the frontend timeline is not split.
-                        self._finalize_reasoning_timeline(current_segment)
-                        emitted_text += text
-                        current_segment["content"] += text
+                            # The model has been re-invoked after tool calls.
+                            # Any text emitted before the tools was intermediate
+                            # planning (e.g. "I will search again"); replace it
+                            # with the post-tool response so the final assistant
+                            # message only contains the useful answer.
+                            current_segment["content"] = text
+                            emitted_text = text
+                        else:
+                            current_segment["content"] += text
+                            emitted_text += text
                         yield self._sse("token", {"content": text})
                 elif mode == "updates" and isinstance(payload, dict):
                     for node_name, node_data in payload.items():
@@ -793,10 +798,22 @@ class DeepAgentsAgentManager:
                     final_state = payload
 
             final_content = self._last_ai_content(final_state) or emitted_text
-            if final_content and not emitted_text:
-                current_segment["content"] += final_content
-                emitted_text += final_content
-                yield self._sse("token", {"content": final_content})
+            if final_content:
+                current_text = current_segment.get("content", "")
+                if not current_text.strip():
+                    current_segment["content"] = final_content
+                    emitted_text = final_content
+                    yield self._sse("token", {"content": final_content})
+                elif (
+                    not current_text.strip().startswith(final_content.strip())
+                    and not final_content.strip().startswith(current_text.strip())
+                ):
+                    # The authoritative final answer differs from the streamed
+                    # text (e.g. only intermediate planning was streamed before
+                    # tools). Replace with the final answer.
+                    current_segment["content"] = final_content
+                    emitted_text = final_content
+                    yield self._sse("token", {"content": final_content})
             elif emitted_reasoning and not final_content:
                 diagnostic = (
                     "模型本轮只返回了 reasoning_content，没有返回正式回答 content。"
