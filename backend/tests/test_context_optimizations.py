@@ -847,7 +847,9 @@ class TestSessionManagerPersistence:
 
         assert [m["role"] for m in agent_history] == ["user", "assistant", "assistant"]
         assert agent_history[1]["content"] == "I will search now."
-        assert agent_history[1]["tool_calls"][0]["id"] == "tc1"
+        # load_session_for_agent 不再把历史 tool_calls 回传给模型，避免重复 tool_call_id
+        # 以及污染当前轮次时间轴；但仍保留 assistant 文本内容作为上下文。
+        assert "tool_calls" not in agent_history[1]
         assert agent_history[2]["content"] == "Final answer from the searched topic."
         assert "tool_calls" not in agent_history[2]
 

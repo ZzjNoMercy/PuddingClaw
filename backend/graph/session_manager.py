@@ -442,18 +442,23 @@ class SessionManager:
             # 思考模式下，assistant 消息的 reasoning_content 需要回传给 API（含工具调用时尤其关键）
             if msg.get("reasoning_content"):
                 entry["reasoning_content"] = msg["reasoning_content"]
-            prev_has_tool_calls = bool(merged[-1].get("tool_calls")) if merged else False
-            current_has_tool_calls = bool(entry.get("tool_calls"))
+            # 合并判断仍依赖原始消息是否携带 tool_calls，但不要把 tool_calls 放进 entry。
+            msg_has_tool_calls = bool(msg.get("tool_calls"))
+            prev_has_tool_calls = bool(merged[-1].get("_had_tool_calls")) if merged else False
             if (
                 merged                                                   # 列表非空
                 and merged[-1]["role"] == "assistant"                     # 上一条是 assistant
                 and msg["role"] == "assistant"                            # 当前也是 assistant
                 and not prev_has_tool_calls                                # 上一条也不能是 tool_call 消息
-                and not current_has_tool_calls                             # 当前消息无 tool_calls 才合并
+                and not msg_has_tool_calls                                 # 当前消息无 tool_calls 才合并
             ):
                 merged[-1]["content"] += "\n" + msg["content"]           # 合并为一条（避免连续 assistant）
             else:
+                entry["_had_tool_calls"] = msg_has_tool_calls            # 内部标记，用于下一轮合并判断
                 merged.append(entry)
+        # 移除内部标记后再返回
+        for entry in merged:
+            entry.pop("_had_tool_calls", None)
         return merged                                                    # 返回格式化后的消息列表
 
     def get_message_count(self, session_id: str) -> int:

@@ -45,16 +45,20 @@ export default function ChatInput() {
   const projectMenuRef = useRef<HTMLDivElement>(null);
   const disabled = isStreaming || isCompressing;
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
-  const [thinkingLoading, setThinkingLoading] = useState(false);
 
-  // Fetch token count on mount and when session changes
+  // Fetch token count on mount and when session changes.
+  // 背景信息窗口进度条显示的是「对话内容 + 工具输出」占 compaction_trigger 的比例，
+  // 不包含固定的 system prompt，否则无论对话长短都会显示系统提示的 6.6k 底数。
   useEffect(() => {
     getSessionTokenCount(sessionId)
       .then((data) => {
+        const used = data.message_tokens;
+        const total = data.compaction_trigger;
+        const percentage = total > 0 ? Math.min(100, (used / total) * 100) : 0;
         setContextUsage({
-          used: data.total_tokens,
-          total: data.compaction_trigger,
-          percentage: data.percentage,
+          used,
+          total,
+          percentage,
         });
       })
       .catch(() => {});
@@ -67,6 +71,7 @@ export default function ChatInput() {
   const [skills, setSkills] = useState<Array<{ name: string; description: string }>>([]);
   // Track the position of the `/` that triggered the menu, for replacement on select
   const slashStartPosRef = useRef<number>(-1);
+  const thinkingToggleInFlightRef = useRef(false);
   // Pending cursor position to set after React re-render (fixes I-2: rAF race)
   const pendingCursorRef = useRef<number | null>(null);
 
@@ -136,11 +141,17 @@ export default function ChatInput() {
   }, [text, disabled, sendMessage, setPendingInput]);
 
   const handleToggleThinking = useCallback(async () => {
-    if (thinkingLoading) return;
-    setThinkingLoading(true);
-    await setThinkingMode(!thinkingMode);
-    setThinkingLoading(false);
-  }, [thinkingLoading, thinkingMode, setThinkingMode]);
+    if (thinkingToggleInFlightRef.current) return;
+    thinkingToggleInFlightRef.current = true;
+    const next = !thinkingMode;
+    try {
+      await setThinkingMode(next);
+    } catch (err) {
+      console.error("Failed to toggle thinking mode:", err);
+    } finally {
+      thinkingToggleInFlightRef.current = false;
+    }
+  }, [thinkingMode, setThinkingMode]);
 
   const handleRegisterProject = useCallback(async () => {
     let path: string | null = null;
@@ -382,13 +393,12 @@ export default function ChatInput() {
             <button
               type="button"
               onClick={handleToggleThinking}
-              disabled={thinkingLoading}
               title={thinkingMode ? "思考模式已开启" : "思考模式已关闭"}
               className={`flex h-8 items-center gap-1.5 rounded-full border px-3 text-[12px] transition-all ${
                 thinkingMode
                   ? "border-[#002fa7]/15 bg-[#e8edff] text-[#002fa7] hover:bg-[#dfe7ff]"
                   : "border-black/[0.06] bg-white/42 text-gray-600 hover:bg-white/70 hover:text-gray-900"
-              } ${thinkingLoading ? "opacity-60" : ""}`}
+              }`}
             >
               <Brain className="h-3.5 w-3.5 shrink-0" />
               <span className="truncate">思考模式</span>
