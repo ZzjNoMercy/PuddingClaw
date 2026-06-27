@@ -50,7 +50,12 @@ class SafeTerminalTool(BaseTool):
         return True
 
     def _apply_path_aliases(self, command: str) -> str:
-        """Map DeepAgents virtual paths to host paths before shell execution."""
+        """Map DeepAgents virtual paths to host paths before shell execution.
+
+        Aliases are only replaced when they appear as the root of a path
+        argument (start of command or after whitespace) so substrings such as
+        `/knowledge/` inside `/skills/backend/knowledge/` are not rewritten.
+        """
 
         rewritten = command
         for alias, target in sorted(self.path_aliases.items(), key=lambda item: len(item[0]), reverse=True):
@@ -60,17 +65,10 @@ class SafeTerminalTool(BaseTool):
             normalized_target = str(Path(target).expanduser())
             quoted_target = shlex.quote(normalized_target)
 
-            # Replace `/skills/foo.py` as `'<real skills dir>'/foo.py`.
-            rewritten = rewritten.replace(
-                f"{normalized_alias}/",
-                f"{quoted_target}/",
-            )
-            # Replace an exact `/skills` token without touching `/skills-old`.
-            rewritten = re.sub(
-                rf"(?<!\S){re.escape(normalized_alias)}(?![\w./-])",
-                quoted_target,
-                rewritten,
-            )
+            # Match alias at the start of the command or after whitespace, and
+            # only when it is followed by `/`, whitespace, or end of string.
+            pattern = rf"(^|\s){re.escape(normalized_alias)}(?=(/|\s|$))"
+            rewritten = re.sub(pattern, rf"\1{quoted_target}", rewritten)
         return rewritten
 
     def _run(self, command: str) -> str:

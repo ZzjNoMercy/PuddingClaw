@@ -29,7 +29,7 @@ def test_build_backend_resolves_workspace_and_skills(tmp_path, monkeypatch):
     (skills_dir / "design-html").mkdir()
     (skills_dir / "design-html" / "SKILL.md").write_text("skill doc")
 
-    knowledge_dir = tmp_path / "backend" / "knowledge"
+    knowledge_dir = tmp_path / "knowledge"
     knowledge_dir.mkdir(parents=True)
     (knowledge_dir / "test.md").write_text("kb doc")
 

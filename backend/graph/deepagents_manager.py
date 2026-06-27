@@ -135,7 +135,7 @@ class DeepAgentsAgentManager:
     def _build_backend(self, workspace_path: Path):
         assert self._base_dir is not None
         skills_dir = self._base_dir / "skills"
-        knowledge_dir = self._base_dir / "backend" / "knowledge"
+        knowledge_dir = self._base_dir / "knowledge"
         knowledge_dir.mkdir(parents=True, exist_ok=True)
         routes: dict[str, FilesystemBackend] = {
             "/workspace/": FilesystemBackend(root_dir=workspace_path, virtual_mode=True),
@@ -205,7 +205,7 @@ class DeepAgentsAgentManager:
                     "root_dir": str(workspace_path),
                     "path_aliases": {
                         "/workspace": str(workspace_path),
-                        "/knowledge": str(self._base_dir / "backend" / "knowledge"),
+                        "/knowledge": str(self._base_dir / "knowledge"),
                         "/skills": str(self._base_dir / "skills"),
                     },
                 }
@@ -575,9 +575,9 @@ class DeepAgentsAgentManager:
                     "'/skills/', e.g. '/skills/design-html/SKILL.md'. The bare root '/' is an alias for "
                     "'/workspace/' but MUST NOT be mixed with '/workspace/'; pick '/workspace/' for user files "
                     "and '/skills/' for skill files, and stick to those prefixes.\n"
-                    "The global knowledge base lives at '/knowledge/'. Add Markdown documents there when a "
-                    "skill needs to store retrievable knowledge; search_knowledge_base scans the backend/knowledge/ "
-                    "directory. Do NOT store knowledge under '/workspace/knowledge/'.\n\n"
+                    "The global knowledge base lives at '/knowledge/' (physical path: backend/knowledge/). Add "
+                    "Markdown documents there when a skill needs to store retrievable knowledge; search_knowledge_base "
+                    "scans that directory. Do NOT store knowledge under '/workspace/knowledge/'.\n\n"
                     "When the user asks you to break a task into steps or track progress, call the `write_todos` "
                     "tool to create a structured todo list.\n\n"
                     "### 来源引用规则\n"
