@@ -10,6 +10,33 @@ from deepagents.middleware.memory import MemoryMiddleware
 from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 
 
+def test_build_backend_resolves_workspace_and_skills(tmp_path, monkeypatch):
+    """/workspace/ and /skills/ routes should resolve to the correct directories."""
+
+    from graph import deepagents_manager as manager_module
+    from projects.registry import project_registry
+
+    project_registry.initialize(tmp_path)
+    manager = manager_module.DeepAgentsAgentManager()
+    manager.initialize(tmp_path)
+
+    workspace = tmp_path / "workspaces" / "test"
+    workspace.mkdir(parents=True)
+    (workspace / "dashboard.html").write_text("dashboard")
+
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir(parents=True)
+    (skills_dir / "design-html").mkdir()
+    (skills_dir / "design-html" / "SKILL.md").write_text("skill doc")
+
+    backend = manager._build_backend(workspace)
+
+    assert backend.read("/workspace/dashboard.html").file_data["content"] == "dashboard"
+    assert backend.read("/skills/design-html/SKILL.md").file_data["content"] == "skill doc"
+    # Bare root is an alias for workspace.
+    assert backend.read("/dashboard.html").file_data["content"] == "dashboard"
+
+
 def test_deepagents_manager_emits_and_persists_tool_events(tmp_path, monkeypatch):
     """Agent mode should expose DeepAgents tool calls like Chat mode does."""
 
