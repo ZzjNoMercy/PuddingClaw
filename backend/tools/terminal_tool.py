@@ -93,9 +93,11 @@ class SafeTerminalTool(BaseTool):
                 output += f"\n[stderr]: {result.stderr}"
             if not output.strip():
                 output = "(command completed with no output)"
-            # Truncate very long output
-            if len(output) > 5000:
-                output = output[:5000] + "\n...[truncated]"
+            # Truncate very long output, but preserve PuddingClaw structured tool-result
+            # envelopes so that citations/sources are not lost.
+            MAX_PLAIN_OUTPUT = 5000
+            if len(output) > MAX_PLAIN_OUTPUT and "puddingclaw_tool_result" not in output:
+                output = output[:MAX_PLAIN_OUTPUT] + "\n...[truncated]"
             return output
         except subprocess.TimeoutExpired:
             return "❌ Command timed out (30s limit)"

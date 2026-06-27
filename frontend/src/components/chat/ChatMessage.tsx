@@ -3,8 +3,9 @@
 import { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import type { Components } from "react-markdown";
 import { AlertTriangle, ChevronDown, ChevronRight, Key, Sparkles } from "lucide-react";
-import { useApp, type ChatMessage as ChatMessageType } from "@/lib/store";
+import { useApp, type ChatMessage as ChatMessageType, type SourceRecord } from "@/lib/store";
 import ThoughtChain from "./ThoughtChain";
 import RetrievalCard from "./RetrievalCard";
 
@@ -35,16 +36,17 @@ export default function ChatMessage({ message, isStreaming = false }: Props) {
   const renderedContent = renderCitationMarkers(message);
   const { setActiveSourceId, setInspectorOpen } = useApp();
 
-  const handleCitationClick = (e: React.MouseEvent) => {
-    const target = e.target as HTMLElement;
-    const anchor = target.closest("a[href^='#source-']");
-    if (!anchor) return;
-    e.preventDefault();
-    const href = anchor.getAttribute("href");
-    if (!href) return;
-    const sourceId = href.replace("#source-", "");
-    setActiveSourceId(sourceId);
-    setInspectorOpen(true);
+  const citationComponents: Components = {
+    a: (props) => (
+      <CitationLink
+        {...props}
+        sources={message.sources}
+        onActivate={(sourceId) => {
+          setActiveSourceId(sourceId);
+          setInspectorOpen(true);
+        }}
+      />
+    ),
   };
 
   return (
@@ -83,8 +85,8 @@ export default function ChatMessage({ message, isStreaming = false }: Props) {
               ) : message.content ? (
                 <div>
                   <div className="px-1 py-1 text-[15px] leading-relaxed">
-                    <div className="markdown-content" onClick={handleCitationClick}>
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                    <div className="markdown-content">
+                      <ReactMarkdown remarkPlugins={[remarkGfm]} components={citationComponents}>
                         {renderedContent}
                       </ReactMarkdown>
                     </div>
@@ -167,14 +169,64 @@ function ReasoningBlock({
 }
 
 function renderCitationMarkers(message: ChatMessageType): string {
-  if (!message.citations?.length) return message.content;
-  const indexes = new Map(
-    message.citations.map((citation) => [citation.source_id, citation.display_index])
-  );
+  const indexes = new Map<string, number>();
+
+  // Citations carry the authoritative display index.
+  message.citations?.forEach((citation) => {
+    indexes.set(citation.source_id, citation.display_index);
+  });
+
+  // Fallback: assign sequential indexes from sources for markers that were not
+  // finalized as citations (e.g. due to truncation or adapter mismatch).
+  const existingIndexes = Array.from(indexes.values());
+  let nextIndex = existingIndexes.length > 0 ? Math.max(...existingIndexes) + 1 : 1;
+  message.sources?.forEach((source) => {
+    if (source.source_id && !indexes.has(source.source_id)) {
+      indexes.set(source.source_id, nextIndex++);
+    }
+  });
+
+  if (indexes.size === 0) return message.content;
+
   return message.content.replace(/\[\^(src_[A-Za-z0-9_-]+)\]/g, (marker, sourceId: string) => {
     const index = indexes.get(sourceId);
     return index ? `[${index}](#source-${sourceId})` : marker;
   });
+}
+
+function CitationLink({
+  href,
+  children,
+  sources,
+  onActivate,
+}: {
+  href?: string;
+  children?: React.ReactNode;
+  sources?: SourceRecord[];
+  onActivate?: (sourceId: string) => void;
+}) {
+  if (!href?.startsWith("#source-")) {
+    return <a href={href}>{children}</a>;
+  }
+  const sourceId = href.replace("#source-", "");
+  const source = sources?.find((s) => s.source_id === sourceId);
+  const label = typeof children === "string" ? children : "•";
+
+  return (
+    <sup className="inline-block mx-0.5">
+      <button
+        type="button"
+        onClick={(e) => {
+          e.preventDefault();
+          onActivate?.(sourceId);
+        }}
+        title={source?.title || sourceId}
+        className="inline-flex h-4 min-w-4 items-center justify-center rounded bg-[#002fa7]/[0.08] px-1 text-[10px] font-semibold text-[#002fa7] hover:bg-[#002fa7]/[0.15]"
+      >
+        {label}
+      </button>
+    </sup>
+  );
 }
 
 /** Prominent auth error alert with setup guidance */
