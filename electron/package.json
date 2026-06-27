@@ -1,0 +1,91 @@
+{
+  "name": "puddingclaw-electron",
+  "version": "0.1.0",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "../scripts/start-electron-dev.sh",
+    "build": "electron-builder",
+    "build:dir": "electron-builder --dir"
+  },
+  "build": {
+    "appId": "com.puddingclaw.app",
+    "productName": "PuddingClaw",
+    "directories": {
+      "output": "../dist-electron"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "managers/**/*",
+      "!node_modules/electron/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "../frontend/.next-build/standalone",
+        "to": "frontend/.next-build/standalone",
+        "filter": ["**/*"]
+      },
+      {
+        "from": "../backend",
+        "to": "backend",
+        "filter": [
+          "pyproject.toml",
+          "uv.lock",
+          "app.py",
+          "capabilities.py",
+          "config.py",
+          "config.json",
+          "higress_config_reader.py",
+          "logging.yaml",
+          ".env",
+          ".env.example",
+          "api/**/*",
+          "graph/**/*",
+          "knowledge/**/*",
+          "llm/**/*",
+          "mcp_clients/**/*",
+          "memory/**/*",
+          "prompts/**/*",
+          "sessions/**/*",
+          "skills/**/*",
+          "storage/**/*",
+          "tools/**/*",
+          "utils/**/*",
+          "workspace/**/*",
+          "data/**/*"
+        ]
+      },
+      {
+        "from": "../README.md",
+        "to": "README.md"
+      },
+      {
+        "from": "../docker-compose.infra.yml",
+        "to": "docker-compose.infra.yml"
+      },
+      {
+        "from": "../data/higress",
+        "to": "data/higress",
+        "filter": ["**/*"]
+      }
+    ],
+    "mac": {
+      "target": [
+        {
+          "target": "dir",
+          "arch": ["arm64"]
+        }
+      ],
+      "category": "public.app-category.developer-tools",
+      "identity": null
+    },
+    "asar": true,
+    "asarUnpack": ["managers/**/*.js"]
+  },
+  "devDependencies": {
+    "electron": "^31.0.0",
+    "electron-builder": "^25.0.0"
+  }
+}

@@ -70,7 +70,7 @@ def test_items_formatter_keeps_urls_as_structured_sources():
     assert len(sources) == 1
     assert sources[0]["uri"] == "https://example.com/news"
     assert sources[0]["metadata"]["evidence_kind"] == "derived_summary"
-    assert f"[{sources[0]['source_id']}]" in context
+    assert f"[^{sources[0]['source_id']}]" in context
 
 
 def test_daily_formatter_keeps_source_url():

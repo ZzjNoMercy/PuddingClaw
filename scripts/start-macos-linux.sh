@@ -34,7 +34,13 @@ echo "============================================"
 echo ""
 
 if ! command -v python3 >/dev/null 2>&1; then
-    echo -e "${RED}[错误] 未找到 Python3，请先安装 Python 3.10+${NC}"
+    echo -e "${RED}[错误] 未找到 Python3，请先安装 Python 3.11+${NC}"
+    exit 1
+fi
+
+if ! command -v uv >/dev/null 2>&1; then
+    echo -e "${RED}[错误] 未找到 uv。PuddingClaw backend 现在使用 uv 管理依赖，请先安装 uv 后重试。${NC}"
+    echo "  macOS/Linux: curl -LsSf https://astral.sh/uv/install.sh | sh"
     exit 1
 fi
 
@@ -44,22 +50,22 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 
 echo -e "${BLUE}[信息] Python 版本:${NC} $(python3 --version)"
+echo -e "${BLUE}[信息] uv 版本:${NC} $(uv --version)"
 echo -e "${BLUE}[信息] Node.js 版本:${NC} $(node --version)"
 echo ""
 
 echo -e "${YELLOW}[步骤 1/5] 检查 Python 虚拟环境...${NC}"
-if [ ! -d "backend/.venv" ]; then
-    echo -e "${BLUE}[信息] 创建虚拟环境 backend/.venv ...${NC}"
-    python3 -m venv backend/.venv
-    echo -e "${GREEN}[成功] 虚拟环境创建完成${NC}"
-else
-    echo -e "${BLUE}[信息] 虚拟环境已存在${NC}"
-fi
+echo -e "${BLUE}[信息] backend/.venv 由 uv sync 自动创建/更新${NC}"
 
 echo ""
-echo -e "${YELLOW}[步骤 2/5] 安装后端依赖...${NC}"
-source backend/.venv/bin/activate
-pip install -r backend/requirements.txt
+echo -e "${YELLOW}[步骤 2/5] 安装后端依赖（完整开发配置）...${NC}"
+cd backend
+# 安装所有 optional 依赖 + 所有 dev/test 组，确保开发环境最全
+UV_CACHE_DIR="${UV_CACHE_DIR:-/private/tmp/puddingclaw-uv-cache}" uv sync \
+    --all-extras \
+    --group dev \
+    --group deepagents-test
+cd ..
 echo -e "${GREEN}[成功] 后端依赖安装完成${NC}"
 
 echo ""
@@ -95,7 +101,11 @@ echo "  后端 API:  ${BACKEND_URL}"
 echo "  前端界面:  ${FRONTEND_URL}"
 echo "  API 文档:  ${BACKEND_URL}/docs"
 echo "  Higress:   ${AI_GATEWAY_URL}"
+echo "  Milvus:    ${MILVUS_URL:-http://localhost:19530}"
 echo "  MinerU:    ${MINERU_URL}"
+echo ""
+echo -e "${YELLOW}[提示] 如需使用 Higress / Milvus / MinerU，请确保对应 Docker 服务已启动${NC}"
+echo -e "       docker ps | grep -E 'higress|milvus|mineru'"
 echo ""
 echo "============================================"
 echo "  按 Ctrl+C 停止所有服务"
@@ -133,10 +143,11 @@ fi
 
 echo -e "${BLUE}[信息] 启动后端服务...${NC}"
 cd backend
-source .venv/bin/activate
-python -m uvicorn app:app --host "$BACKEND_HOST" --port "$BACKEND_PORT" --reload \
+UV_CACHE_DIR="${UV_CACHE_DIR:-/private/tmp/puddingclaw-uv-cache}" uv run --all-extras --group dev --group deepagents-test \
+    python -m uvicorn app:app --host "$BACKEND_HOST" --port "$BACKEND_PORT" --reload \
     --reload-dir api \
     --reload-dir graph \
+    --reload-dir projects \
     --reload-dir tools \
     --reload-include "*.py" \
     --log-level info \
@@ -145,10 +156,28 @@ BACKEND_PID=$!
 cd ..
 
 echo -e "${BLUE}[信息] 等待后端启动...${NC}"
-sleep 3
+BACKEND_READY=false
+for i in $(seq 1 30); do
+    if curl -s "http://127.0.0.1:${BACKEND_PORT}/api/capabilities" >/dev/null 2>&1; then
+        BACKEND_READY=true
+        echo -e "${GREEN}[成功] 后端服务已就绪${NC}"
+        break
+    fi
+    echo -e "${BLUE}[信息] 等待后端就绪... ${i}/30${NC}"
+    sleep 1
+done
 
+if [ "$BACKEND_READY" = false ]; then
+    echo -e "${YELLOW}[警告] 后端服务未在 30 秒内就绪，继续启动前端...${NC}"
+fi
+
+echo ""
 echo -e "${BLUE}[信息] 启动前端服务...${NC}"
 cd frontend
+if [ -d ".next" ]; then
+    echo -e "${YELLOW}[信息] 清理前端 dev 缓存 .next，避免旧 chunks 造成 404...${NC}"
+    rm -rf .next
+fi
 npx next dev -H 0.0.0.0 --port "$FRONTEND_PORT"
 
 cleanup

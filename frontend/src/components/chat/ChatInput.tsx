@@ -10,6 +10,7 @@ import {
   Square,
   XCircle,
   Activity,
+  Brain,
 } from "lucide-react";
 import { useApp } from "@/lib/store";
 import { listSkills, getSessionTokenCount } from "@/lib/api";
@@ -37,11 +38,14 @@ export default function ChatInput() {
     setCurrentProjectId,
     projects,
     registerProject,
+    thinkingMode,
+    setThinkingMode,
   } = useApp();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const projectMenuRef = useRef<HTMLDivElement>(null);
   const disabled = isStreaming || isCompressing;
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
+  const [thinkingLoading, setThinkingLoading] = useState(false);
 
   // Fetch token count on mount and when session changes
   useEffect(() => {
@@ -130,6 +134,13 @@ export default function ChatInput() {
     setPendingInput(null);
     if (textareaRef.current) textareaRef.current.style.height = "auto";
   }, [text, disabled, sendMessage, setPendingInput]);
+
+  const handleToggleThinking = useCallback(async () => {
+    if (thinkingLoading) return;
+    setThinkingLoading(true);
+    await setThinkingMode(!thinkingMode);
+    setThinkingLoading(false);
+  }, [thinkingLoading, thinkingMode, setThinkingMode]);
 
   const handleRegisterProject = useCallback(async () => {
     let path: string | null = null;
@@ -222,7 +233,7 @@ export default function ChatInput() {
 
   return (
     <div className="px-6 pb-4 pt-2">
-      <div className="glass-input relative mx-auto flex w-full max-w-[820px] flex-col gap-2 rounded-3xl px-4 py-3 transition-shadow hover:shadow-lg">
+      <div className="glass-input relative mx-auto flex w-full max-w-[900px] flex-col gap-2 rounded-3xl px-4 py-3 transition-shadow hover:shadow-lg">
         <SlashCommandMenu
           visible={showSlashMenu}
           filteredSkills={filteredSkills}
@@ -367,6 +378,21 @@ export default function ChatInput() {
                 )}
               </div>
             )}
+
+            <button
+              type="button"
+              onClick={handleToggleThinking}
+              disabled={thinkingLoading}
+              title={thinkingMode ? "思考模式已开启" : "思考模式已关闭"}
+              className={`flex h-8 items-center gap-1.5 rounded-full border px-3 text-[12px] transition-all ${
+                thinkingMode
+                  ? "border-[#002fa7]/15 bg-[#e8edff] text-[#002fa7] hover:bg-[#dfe7ff]"
+                  : "border-black/[0.06] bg-white/42 text-gray-600 hover:bg-white/70 hover:text-gray-900"
+              } ${thinkingLoading ? "opacity-60" : ""}`}
+            >
+              <Brain className="h-3.5 w-3.5 shrink-0" />
+              <span className="truncate">思考模式</span>
+            </button>
           </div>
 
           <div className="flex shrink-0 items-center gap-2">

@@ -15,6 +15,7 @@ _LEGACY_WARN_SHOWN: bool = False
 _DEFAULT_CONFIG: dict[str, Any] = {
     "rag_mode": False,
     "memory_backend": "markdown",  # "markdown" = MEMORY.md 原生方案, "mem0" = mem0 框架
+    "thinking_mode": False,  # 开启后 gateway_llm / fallback_llm 使用 thinking 模型与参数
     "ai_gateway": {
         # 覆盖地址：为空时由 backend 自动探测 Docker full profile 中的 Higress
         "base_url": "",
@@ -24,6 +25,12 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "gateway_llm": {
         # Higress 可用时实际使用的模型；与 fallback_llm 分离，避免和 fallback 直连配置混淆
         "model": "deepseek-v4-flash",
+        # 思考模式开关开启时使用的模型与参数（DeepSeek 通过 extra_body 启用 thinking）
+        "thinking": {
+            "model": "deepseek-v4-pro",
+            "reasoning_effort": "high",
+            "extra_body": {"thinking": {"type": "enabled"}},
+        },
     },
     "fallback_llm": {
         "provider": "deepseek",
@@ -33,6 +40,12 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         "temperature": 0.7,
         "max_tokens": 4096,
         "context_window": 1000000,
+        # 直连 fallback 的思考模式配置
+        "thinking": {
+            "model": "deepseek-v4-pro",
+            "reasoning_effort": "high",
+            "extra_body": {"thinking": {"type": "enabled"}},
+        },
     },
     "fallback_embedding": {
         "provider": "openai",
@@ -360,17 +373,24 @@ def get_fallback_llm_config() -> dict[str, Any]:
 
     返回 model/api_key/base_url 三个字段。
     temperature 由调用方自行指定（不同场景需要不同值）。
+    当 thinking_mode 开启时，使用 thinking 下的模型与参数。
     """
     import os
     config = load_config()
     llm = config.get("fallback_llm", {})
+    thinking = llm.get("thinking", {})
+    thinking_enabled = bool(config.get("thinking_mode", False))
+    base_model = llm.get("model") or os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    effective_model = thinking["model"] if thinking_enabled and thinking.get("model") else base_model
     return {
         "provider": llm.get("provider", "deepseek"),
-        "model": llm.get("model") or os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
+        "model": effective_model,
         "api_key": llm.get("api_key") or os.getenv("DEEPSEEK_API_KEY", ""),
         "base_url": llm.get("base_url") or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
         "temperature": float(llm.get("temperature", 0.7)),
         "max_tokens": int(llm.get("max_tokens", 4096)),
+        "reasoning_effort": thinking.get("reasoning_effort") if thinking_enabled else None,
+        "extra_body": thinking.get("extra_body") if thinking_enabled else None,
     }
 
 
@@ -379,12 +399,19 @@ def get_gateway_llm_config() -> dict[str, Any]:
 
     与 fallback_llm 配置分离，避免 fallback 直连参数和网关路由模型混淆。
     若 gateway_llm.model 未设置，向后兼容 fallback 到 fallback_llm.model。
+    当 thinking_mode 开启时，使用 thinking 下的模型与参数。
     """
     config = load_config()
     gateway_llm = config.get("gateway_llm", {})
+    thinking = gateway_llm.get("thinking", {})
+    thinking_enabled = bool(config.get("thinking_mode", False))
     fallback_model = get_fallback_llm_config().get("model", "deepseek-chat")
+    base_model = gateway_llm.get("model") or fallback_model
+    effective_model = thinking["model"] if thinking_enabled and thinking.get("model") else base_model
     return {
-        "model": gateway_llm.get("model") or fallback_model,
+        "model": effective_model,
+        "reasoning_effort": thinking.get("reasoning_effort") if thinking_enabled else None,
+        "extra_body": thinking.get("extra_body") if thinking_enabled else None,
     }
 
 
@@ -424,6 +451,7 @@ def get_settings_for_display() -> dict[str, Any]:
     effective_embedding = get_fallback_embedding_config()
     result = {
         "memory_backend": config.get("memory_backend", "markdown"),
+        "thinking_mode": bool(config.get("thinking_mode", False)),
         "ai_gateway": {
             **effective_gateway,
             "environment_override": bool(os.getenv("AI_GATEWAY_URL")),
@@ -467,12 +495,17 @@ def update_settings(updates: dict[str, Any]) -> None:
             if key in gateway_update:
                 config["ai_gateway"][key] = gateway_update[key]
 
+    if "thinking_mode" in updates:
+        config["thinking_mode"] = bool(updates["thinking_mode"])
+
     if "gateway_llm" in updates:
         gateway_llm_update = updates["gateway_llm"]
         if "gateway_llm" not in config:
             config["gateway_llm"] = {}
         if "model" in gateway_llm_update:
             config["gateway_llm"]["model"] = gateway_llm_update["model"]
+        if "thinking" in gateway_llm_update:
+            config["gateway_llm"]["thinking"] = gateway_llm_update["thinking"]
 
     if "fallback_llm" in updates:
         llm_update = updates["fallback_llm"]
@@ -481,6 +514,8 @@ def update_settings(updates: dict[str, Any]) -> None:
         for key in ("provider", "model", "base_url", "temperature", "max_tokens"):
             if key in llm_update:
                 config["fallback_llm"][key] = llm_update[key]
+        if "thinking" in llm_update:
+            config["fallback_llm"]["thinking"] = llm_update["thinking"]
         # Only update API key if a non-empty value is provided
         if llm_update.get("api_key"):
             config["fallback_llm"]["api_key"] = llm_update["api_key"]

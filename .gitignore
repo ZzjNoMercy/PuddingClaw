@@ -3,7 +3,9 @@ backend/.venv/
 backend/.venv.*/
 backend/node_modules/
 frontend/node_modules/
+electron/node_modules/
 frontend/.next/
+frontend/.next-build/
 frontend/out/
 
 # Environment & secrets
@@ -54,6 +56,7 @@ backend/.pytest_cache/
 # Build outputs
 dist/
 build/
+dist-electron/
 *.egg-info/
 frontend/tsconfig.tsbuildinfo
 

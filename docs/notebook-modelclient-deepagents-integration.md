@@ -275,7 +275,7 @@ model = ModelClientChatModel(
 
 ### 10.2 为什么需要 `--group deepagents-test`？
 
-`deepagents` 当前只作为测试/验证依赖接入 backend，不属于生产 runtime 依赖。`deepagents-test` 组用于 Notebook 和集成测试：
+`deepagents` 已进入 backend runtime 依赖。`deepagents-test` 组只用于 Notebook 和集成测试辅助依赖（例如 `ipykernel` / `langgraph-cli`）：
 
 ```bash
 uv run --group deepagents-test ...

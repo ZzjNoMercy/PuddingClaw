@@ -178,7 +178,10 @@ export default function Sidebar() {
                       projectId={project.project_id}
                       name={project.name}
                       path={project.path}
-                      isActive={currentProjectId === project.project_id}
+                      isActive={
+                        currentProjectId === project.project_id &&
+                        !childSessions.some((s) => s.id === sessionId)
+                      }
                       onSelect={() => {
                         setRuntimeMode("agent");
                         setCurrentProjectId(project.project_id);

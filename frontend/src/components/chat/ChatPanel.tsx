@@ -47,8 +47,8 @@ export default function ChatPanel() {
             ))}
             {maintenanceStatus && (
               <div className="animate-fade-in px-4 py-1.5">
-                <div className="mx-auto w-full max-w-3xl">
-                  <div className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white/80 px-3 py-1.5 text-[12px] text-gray-500 shadow-sm">
+                <div className="mx-auto w-full max-w-[900px]">
+                  <div className="inline-flex items-center gap-2 rounded-full border border-black/[0.05] bg-white/70 px-3 py-1.5 text-[12px] text-gray-500 shadow-sm">
                     <Loader2 className="h-3.5 w-3.5 animate-spin text-[#002fa7]" />
                     <span>{maintenanceStatus.message}</span>
                   </div>
@@ -69,7 +69,7 @@ function QuickHint({ text }: { text: string }) {
   return (
     <button
       onClick={() => !isStreaming && sendMessage(text)}
-      className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-[12px] text-gray-500 transition-all hover:border-slate-300 hover:text-gray-800 hover:shadow-sm"
+      className="rounded-full border border-black/[0.06] bg-white/58 px-3 py-1.5 text-[12px] text-gray-500 transition-all hover:bg-white/80 hover:text-gray-800 hover:shadow-sm"
     >
       {text}
     </button>

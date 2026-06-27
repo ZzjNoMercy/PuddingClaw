@@ -1,8 +1,9 @@
 "use client";
 
+import { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { AlertTriangle, Key } from "lucide-react";
+import { AlertTriangle, ChevronDown, ChevronRight, Key, Sparkles } from "lucide-react";
 import { useApp, type ChatMessage as ChatMessageType } from "@/lib/store";
 import ThoughtChain from "./ThoughtChain";
 import RetrievalCard from "./RetrievalCard";
@@ -65,12 +66,18 @@ export default function ChatMessage({ message, isStreaming = false }: Props) {
           /* Assistant message — left-aligned */
           <div>
             <div className="min-w-0">
-              {/* Tool calls */}
-              {message.toolCalls && message.toolCalls.length > 0 && (
-                <ThoughtChain toolCalls={message.toolCalls} />
-              )}
+              {/* Timeline: interleaved reasoning + tool calls */}
+              {message.timeline && message.timeline.length > 0 ? (
+                <ThoughtChain timeline={message.timeline} isStreaming={isStreaming} />
+              ) : message.reasoning ? (
+                <ReasoningBlock
+                  content={message.reasoning}
+                  defaultOpen={isStreaming && !message.content}
+                  isStreaming={isStreaming && !message.content}
+                />
+              ) : null}
 
-              {/* Auth error alert */}
+              {/* Final answer */}
               {hasAuthError ? (
                 <AuthErrorAlert content={message.content} />
               ) : message.content ? (
@@ -89,8 +96,10 @@ export default function ChatMessage({ message, isStreaming = false }: Props) {
                     {formatTime(message.timestamp)}
                   </div>
                 </div>
-              ) : isStreaming ? (
-                /* Typing indicator */
+              ) : null}
+
+              {/* Typing indicator — only when nothing else is visible yet */}
+              {isStreaming && !message.content && !message.reasoning && !message.timeline?.length ? (
                 <div className="workspace-message-card inline-flex items-center gap-2 rounded-2xl px-4 py-3 text-[12px] text-slate-500">
                   <span className="inline-flex items-center gap-1.5">
                     <span className="typing-dot h-1.5 w-1.5 rounded-full bg-[#002fa7]" />
@@ -104,6 +113,55 @@ export default function ChatMessage({ message, isStreaming = false }: Props) {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+function ReasoningBlock({
+  content,
+  defaultOpen,
+  isStreaming,
+}: {
+  content: string;
+  defaultOpen?: boolean;
+  isStreaming?: boolean;
+}) {
+  const [open, setOpen] = useState(Boolean(defaultOpen));
+  const lineCount = content.split("\n").filter(Boolean).length;
+
+  return (
+    <div className="mb-2 inline-block max-w-full overflow-hidden rounded-xl border border-black/[0.055] bg-white/58 shadow-sm shadow-slate-950/[0.025]">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        className="flex max-w-full items-center gap-2 px-3 py-1.5 text-[12px] text-slate-600 transition-colors hover:bg-white/60"
+      >
+        {open ? (
+          <ChevronDown className="h-3 w-3 text-slate-400" />
+        ) : (
+          <ChevronRight className="h-3 w-3 text-slate-400" />
+        )}
+        <div className="flex h-5 w-5 items-center justify-center rounded bg-[#eef2ff] text-[#002fa7]">
+          <Sparkles className="h-3 w-3" />
+        </div>
+        <span className="font-medium">思考过程</span>
+        <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">
+          {content.length} 字{lineCount > 1 ? ` · ${lineCount} 行` : ""}
+        </span>
+        {isStreaming && (
+          <span className="ml-1 inline-flex items-center gap-1.5 text-[11px] text-[#002fa7]">
+            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-[#002fa7]" />
+            正在推理
+          </span>
+        )}
+      </button>
+      {open && (
+        <div className="w-[min(720px,calc(100vw-180px))] max-w-full border-t border-black/[0.045] px-3 pb-2 pt-1.5">
+          <pre className="max-h-56 overflow-y-auto whitespace-pre-wrap rounded-lg bg-white/58 p-2 text-[11px] leading-relaxed text-slate-500">
+            {content}
+          </pre>
+        </div>
+      )}
     </div>
   );
 }

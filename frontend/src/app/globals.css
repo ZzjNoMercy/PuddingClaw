@@ -3,10 +3,10 @@
 @tailwind utilities;
 
 :root {
-  --bg-primary: #f6f7f9;
-  --workspace-surface: #f6f7f9;
-  --workspace-panel: #ffffff;
-  --workspace-border: rgba(16, 24, 40, 0.08);
+  --bg-primary: #f1f3f6;
+  --workspace-surface: #ffffff;
+  --workspace-panel: rgba(255,255,255,0.74);
+  --workspace-border: rgba(16, 24, 40, 0.055);
   --text-primary: #1d1d1f;
   --text-secondary: #86868b;
   --accent: #002fa7;
@@ -24,14 +24,14 @@ body {
 
 /* ── Layered background ─────────────────────────────── */
 .app-bg {
-  background: #f6f7f9;
+  background: #f1f3f6;
 }
 
 /* ── Glass variants ─────────────────────────────────── */
 .glass-nav {
-  background: rgba(255,255,255,0.92);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
+  background: transparent;
+  backdrop-filter: blur(22px) saturate(150%);
+  -webkit-backdrop-filter: blur(22px) saturate(150%);
 }
 
 .glass-panel {
@@ -41,28 +41,58 @@ body {
 }
 
 .glass-input {
-  background: rgba(255,255,255,0.92);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
-  border: 1px solid rgba(16,24,40,0.10);
-  box-shadow: 0 18px 48px rgba(15,23,42,0.13), 0 1px 2px rgba(15,23,42,0.06);
+  background: rgba(255,255,255,0.88);
+  backdrop-filter: blur(24px) saturate(160%);
+  -webkit-backdrop-filter: blur(24px) saturate(160%);
+  border: 1px solid rgba(16,24,40,0.075);
+  box-shadow: 0 18px 46px rgba(15,23,42,0.08), 0 1px 2px rgba(15,23,42,0.04);
 }
 
 .workspace-sidebar-shell {
-  background: #ffffff;
-  border: 1px solid var(--workspace-border);
-  border-radius: 10px 0 0 10px;
+  background: #f1f3f6;
+  backdrop-filter: blur(18px) saturate(140%);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
 }
 
 .workspace-chat-shell {
-  background: var(--workspace-surface);
-  border-bottom: 1px solid var(--workspace-border);
+  background: #ffffff;
+}
+
+.workspace-content-frame {
+  margin-top: 8px;
+  background: #ffffff;
+  border-left: 1px solid rgba(16,24,40,0.08);
+  border-top: 1px solid rgba(16,24,40,0.08);
+  border-top-left-radius: 18px;
+  box-shadow: -1px 0 0 rgba(255,255,255,0.75);
 }
 
 .workspace-inspector-shell {
-  background: rgba(255,255,255,0.78);
-  border: 1px solid var(--workspace-border);
-  border-radius: 0 10px 10px 0;
+  background: #ffffff;
+}
+
+.workspace-message-card {
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+}
+
+.workspace-soft-card {
+  background: rgba(255,255,255,0.62);
+  border: 1px solid rgba(16,24,40,0.055);
+  box-shadow: 0 1px 2px rgba(15,23,42,0.03);
+}
+
+.workspace-floating-card {
+  background: #ffffff;
+  border: 1px solid rgba(16,24,40,0.12);
+  box-shadow: none;
+}
+
+.workspace-side-card {
+  background: #ffffff;
+  border: 1px solid rgba(16,24,40,0.14);
+  box-shadow: none;
 }
 
 .viewport-center-axis {
@@ -96,11 +126,11 @@ body {
 
 /* ── Markdown ───────────────────────────────────────── */
 .markdown-content h1 { font-size: 1.35em; font-weight: 700; margin: 0.5em 0 0.3em; }
-.markdown-content h2 { font-size: 1.15em; font-weight: 600; margin: 0.4em 0 0.3em; }
-.markdown-content h3 { font-size: 1.05em; font-weight: 600; margin: 0.3em 0 0.2em; }
-.markdown-content p { margin: 0.75em 0; line-height: 1.65; color: #333; }
+.markdown-content h2 { font-size: 1.35em; font-weight: 700; margin: 1.15em 0 0.55em; }
+.markdown-content h3 { font-size: 1.12em; font-weight: 700; margin: 0.95em 0 0.45em; }
+.markdown-content p { margin: 0.8em 0; line-height: 1.78; color: #2b2f36; }
 .markdown-content ul, .markdown-content ol { padding-left: 1.5em; margin: 0.6em 0; }
-.markdown-content li { margin: 0.25em 0; line-height: 1.6; }
+.markdown-content li { margin: 0.38em 0; line-height: 1.75; }
 .markdown-content code {
   background: rgba(0,47,167,0.06); padding: 0.1em 0.35em; border-radius: 4px;
   font-size: 0.87em; font-family: "SF Mono","JetBrains Mono","Fira Code",Consolas,monospace;
@@ -109,6 +139,29 @@ body {
   background: #1a1a2e; color: #d4d4e8; padding: 0.85em 1em; border-radius: 10px;
   overflow-x: auto; margin: 0.5em 0; font-size: 0.87em;
   box-shadow: 0 2px 8px rgba(0,0,0,0.10);
+}
+.markdown-content table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  margin: 1.1em 0;
+  overflow: hidden;
+  border: 1px solid rgba(16,24,40,0.12);
+  border-radius: 14px;
+}
+.markdown-content th,
+.markdown-content td {
+  border-right: 1px solid rgba(16,24,40,0.10);
+  border-bottom: 1px solid rgba(16,24,40,0.10);
+  padding: 0.72em 0.9em;
+  text-align: left;
+}
+.markdown-content th:last-child,
+.markdown-content td:last-child { border-right: 0; }
+.markdown-content tr:last-child td { border-bottom: 0; }
+.markdown-content th {
+  background: #f6f6f7;
+  font-weight: 700;
 }
 .markdown-content pre code { background: none; padding: 0; color: inherit; font-size: 1em; }
 .markdown-content blockquote {

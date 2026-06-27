@@ -60,19 +60,18 @@ function ChatLayout() {
   };
 
   return (
-    <div className="h-screen flex flex-col app-bg">
-      <Navbar
-        title={sessionTitle}
-        sidebarOpen={sidebarOpen}
-        toggleSidebar={toggleSidebar}
-        showPanelToggles
-        inspectorOpen={inspectorOpen}
-        toggleInspector={toggleInspector}
-      />
+    <div className="h-screen app-bg">
+      <div className="fixed left-3 top-3 z-[80]">
+        <Navbar
+          sidebarOpen={sidebarOpen}
+          toggleSidebar={toggleSidebar}
+          showPanelToggles
+          compact
+        />
+      </div>
 
-      {/* Content area — sidebar + chat only */}
       <div
-        className="flex-1 flex overflow-hidden p-2 pt-0 gap-0"
+        className="flex h-full overflow-hidden"
         style={{
           "--workspace-content-shift": `${(sidebarOpen ? sidebarWidth : 0) / 2}px`,
         } as React.CSSProperties}
@@ -82,8 +81,11 @@ function ChatLayout() {
           className="workspace-sidebar-shell shrink-0 panel-transition overflow-hidden"
           style={{ width: sidebarOpen ? sidebarWidth : 0 }}
         >
-          <div style={{ width: sidebarWidth, minWidth: MIN_SIDEBAR }} className="h-full">
-            <Sidebar />
+          <div style={{ width: sidebarWidth, minWidth: MIN_SIDEBAR }} className="h-full flex flex-col">
+            <div className="h-11 shrink-0" />
+            <div className="flex-1 min-h-0 overflow-hidden">
+              <Sidebar />
+            </div>
           </div>
         </div>
 
@@ -92,21 +94,32 @@ function ChatLayout() {
           <ResizeHandle onResize={handleSidebarResize} direction="left" />
         )}
 
-        {/* Chat — fills remaining space */}
-        <div className="flex-1 overflow-hidden workspace-chat-shell" style={{ minWidth: MIN_CHAT }}>
-          <ChatPanel />
-        </div>
+        <div className="workspace-content-frame flex min-w-0 flex-1 flex-col overflow-hidden" style={{ minWidth: MIN_CHAT }}>
+          <Navbar
+            title={sessionTitle}
+            inspectorOpen={inspectorOpen}
+            toggleInspector={toggleInspector}
+            showPanelToggles
+          />
 
-        {inspectorOpen && (
-          <ResizeHandle onResize={handleInspectorResize} direction="right" />
-        )}
+          <div className="flex min-h-0 flex-1 overflow-hidden">
+            {/* Chat — fills remaining space */}
+            <div className="flex-1 overflow-hidden workspace-chat-shell" style={{ minWidth: MIN_CHAT }}>
+              <ChatPanel />
+            </div>
 
-        <div
-          className="shrink-0 panel-transition overflow-hidden"
-          style={{ width: inspectorOpen ? inspectorWidth : 0 }}
-        >
-          <div style={{ width: inspectorWidth, minWidth: MIN_INSPECTOR }} className="h-full pl-1">
-            <SourcesPanel />
+            {inspectorOpen && (
+              <ResizeHandle onResize={handleInspectorResize} direction="right" />
+            )}
+
+            <div
+              className="workspace-inspector-shell shrink-0 panel-transition overflow-hidden"
+              style={{ width: inspectorOpen ? inspectorWidth : 0 }}
+            >
+              <div style={{ width: inspectorWidth, minWidth: MIN_INSPECTOR }} className="h-full">
+                <SourcesPanel />
+              </div>
+            </div>
           </div>
         </div>
       </div>

@@ -1,30 +1,44 @@
 #!/bin/bash
-# Fallback: start MinerU service on the host using the existing conda environment.
-# This is useful when the Docker image build is blocked by network/proxy issues.
-# The local backend can reach this service at http://localhost:8002.
+# 使用 uv 在宿主机启动 MinerU 服务。
+# 这是 setup-mineru.py 的简单包装，确保和项目其他脚本一样使用 uv 管理依赖。
+#
+# 用法：
+#   ./scripts/start-mineru-host.sh
+#   MINERU_PORT=8002 ./scripts/start-mineru-host.sh
+#   ./scripts/start-mineru-host.sh --skip-model-download
 
 set -e
 
-CONDA_ENV="mineru"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$SCRIPT_DIR"
+
 PORT="${MINERU_PORT:-8002}"
-APP_DIR="$(cd "$(dirname "$0")/.." && pwd)/mineru"
+UV_CACHE_DIR="${UV_CACHE_DIR:-/private/tmp/puddingclaw-uv-cache}"
 
-echo "Starting MinerU service on host port $PORT using conda env '$CONDA_ENV'..."
+echo "============================================"
+echo "  PuddingClaw - 启动 MinerU（uv 模式）"
+echo "============================================"
+echo ""
 
-# Locate conda
-if [ -z "$CONDA_EXE" ]; then
-    if [ -f "$HOME/miniconda3/bin/conda" ]; then
-        CONDA_EXE="$HOME/miniconda3/bin/conda"
-    elif [ -f "$HOME/anaconda3/bin/conda" ]; then
-        CONDA_EXE="$HOME/anaconda3/bin/conda"
-    elif command -v conda >/dev/null 2>&1; then
-        CONDA_EXE="$(command -v conda)"
-    else
-        echo "ERROR: conda not found. Please install conda or set CONDA_EXE."
-        exit 1
-    fi
+if ! command -v uv >/dev/null 2>&1; then
+    echo "[错误] 未找到 uv。请先安装 uv:"
+    echo "  curl -LsSf https://astral.sh/uv/install.sh | sh"
+    exit 1
 fi
 
-# Start uvicorn with the conda env's Python
-exec "$CONDA_EXE" run -n "$CONDA_ENV" --no-capture-output \
-    python -m uvicorn app:app --host 0.0.0.0 --port "$PORT" --app-dir "$APP_DIR"
+# 过滤掉外部可能激活的错误 VIRTUAL_ENV，确保使用 PuddingClaw 自己的 .venv
+unset VIRTUAL_ENV
+unset VIRTUAL_ENV_PROMPT
+hash -r
+
+echo "[信息] 启动 MinerU API（端口 ${PORT}）..."
+echo ""
+echo "  API: http://localhost:${PORT}"
+echo ""
+echo "============================================"
+echo "  按 Ctrl+C 停止服务"
+echo "============================================"
+echo ""
+
+# 调用 setup-mineru.py 完成依赖同步、模型下载、.env 更新并前台启动服务
+exec python scripts/setup-mineru.py --mode native --port "$PORT" --foreground "$@"

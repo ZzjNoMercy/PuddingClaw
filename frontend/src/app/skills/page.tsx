@@ -6,6 +6,7 @@ import { usePathname, useRouter } from "next/navigation";
 import "@/lib/monaco-config";
 import Navbar from "@/components/layout/Navbar";
 import Sidebar from "@/components/layout/Sidebar";
+import ResizeHandle from "@/components/layout/ResizeHandle";
 import FileTree from "@/components/skills/FileTree";
 import { useApp } from "@/lib/store";
 import ReactMarkdown from "react-markdown";
@@ -64,6 +65,7 @@ export default function SkillsPage() {
     sidebarOpen,
     toggleSidebar,
     sidebarWidth,
+    setSidebarWidth,
     mcpServers,
     loadMcpServers,
     triggerSkillCreator,
@@ -92,6 +94,19 @@ export default function SkillsPage() {
   const [renamingSkill, setRenamingSkill] = useState<string | null>(null);
   const pathname = usePathname();
   const router = useRouter();
+  const MIN_SIDEBAR = 200;
+
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+
+  const handleSidebarResize = useCallback(
+    (delta: number) => {
+      setSidebarWidth((prev: number) => Math.max(MIN_SIDEBAR, prev + delta));
+    },
+    [setSidebarWidth]
+  );
 
   // Dirty flag
   const isDirty = editorContent !== originalContent;
@@ -356,18 +371,33 @@ export default function SkillsPage() {
   // ── Loading state ────────────────────────────────────
   if (loading) {
     return (
-      <div className="h-screen flex flex-col app-bg">
-        <Navbar sidebarOpen={sidebarOpen} toggleSidebar={toggleSidebar} showPanelToggles />
-        <div className="flex-1 flex overflow-hidden p-2 pt-0">
+      <div className="h-screen app-bg">
+        <div className="fixed left-3 top-3 z-[80]">
+          <Navbar
+            sidebarOpen={sidebarOpen}
+            toggleSidebar={toggleSidebar}
+            showPanelToggles
+            compact
+          />
+        </div>
+        <div className="flex h-full overflow-hidden">
           <div
             className="workspace-sidebar-shell shrink-0 panel-transition overflow-hidden"
             style={{ width: sidebarOpen ? sidebarWidth : 0 }}
           >
-            <div style={{ width: sidebarWidth, minWidth: 200 }} className="h-full">
-              <Sidebar />
+            <div style={{ width: sidebarWidth, minWidth: 200 }} className="h-full flex flex-col">
+              <div className="h-11 shrink-0" />
+              <div className="flex-1 min-h-0 overflow-hidden">
+                <Sidebar />
+              </div>
             </div>
           </div>
-          <div className="flex-1 flex items-center justify-center">
+
+          {mounted && sidebarOpen && (
+            <ResizeHandle onResize={handleSidebarResize} direction="left" />
+          )}
+
+          <div className="workspace-content-frame flex-1 flex items-center justify-center">
             <Loader2 className="w-6 h-6 animate-spin text-gray-400" />
           </div>
         </div>
@@ -376,52 +406,40 @@ export default function SkillsPage() {
   }
 
   return (
-    <div className="h-screen flex flex-col app-bg">
-      <Navbar sidebarOpen={sidebarOpen} toggleSidebar={toggleSidebar} showPanelToggles />
-      <div className="flex-1 flex overflow-hidden p-2 pt-0">
+    <div className="h-screen app-bg">
+      <div className="fixed left-3 top-3 z-[80]">
+        <Navbar
+          sidebarOpen={sidebarOpen}
+          toggleSidebar={toggleSidebar}
+          showPanelToggles
+          compact
+        />
+      </div>
+
+      <div className="flex h-full overflow-hidden">
         <div
           className="workspace-sidebar-shell shrink-0 panel-transition overflow-hidden"
           style={{ width: sidebarOpen ? sidebarWidth : 0 }}
         >
-          <div style={{ width: sidebarWidth, minWidth: 200 }} className="h-full">
-            <Sidebar />
+          <div style={{ width: sidebarWidth, minWidth: 200 }} className="h-full flex flex-col">
+            <div className="h-11 shrink-0" />
+            <div className="flex-1 min-h-0 overflow-hidden">
+              <Sidebar />
+            </div>
           </div>
         </div>
 
-        <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
-      <div className="flex h-11 shrink-0 items-center border-b border-black/[0.12] bg-white px-4">
-        <div className="flex items-center gap-1 rounded-lg bg-gray-100 p-1" role="tablist" aria-label="扩展类型">
-          <button
-            type="button"
-            role="tab"
-            aria-selected={extensionView === "skills"}
-            onClick={() => handleExtensionViewChange("skills")}
-            className={`rounded-md px-3 py-1 text-[12px] font-medium transition-colors ${
-              extensionView === "skills"
-                ? "bg-white text-gray-900 shadow-sm"
-                : "text-gray-500 hover:text-gray-800"
-            }`}
-          >
-            技能
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={extensionView === "mcp"}
-            onClick={() => handleExtensionViewChange("mcp")}
-            className={`rounded-md px-3 py-1 text-[12px] font-medium transition-colors ${
-              extensionView === "mcp"
-                ? "bg-white text-gray-900 shadow-sm"
-                : "text-gray-500 hover:text-gray-800"
-            }`}
-          >
-            MCP
-          </button>
-        </div>
-      </div>
+        {mounted && sidebarOpen && (
+          <ResizeHandle onResize={handleSidebarResize} direction="left" />
+        )}
 
+        <main className="workspace-content-frame flex min-w-0 flex-1 flex-col overflow-hidden">
       {extensionView === "mcp" ? (
-        <McpServerCatalog servers={mcpServers} />
+        <McpServerCatalog
+          servers={mcpServers}
+          extensionView={extensionView}
+          onExtensionViewChange={handleExtensionViewChange}
+        />
       ) : (
       <div className="flex-1 flex overflow-hidden">
         {/* ── Skills catalog / editor navigation ─────────── */}
@@ -431,11 +449,33 @@ export default function SkillsPage() {
             : "flex-1"
         } glass-panel flex min-w-0 flex-col`}>
           {/* Header */}
-          <div className={selectedSkill ? "border-b border-black/[0.06] p-3" : "mx-auto w-full max-w-4xl px-6 pb-4 pt-10"}>
+          <div className={selectedSkill ? "border-b border-black/[0.06] p-3" : "mx-auto w-full max-w-4xl px-6 pb-4 pt-5"}>
             {!selectedSkill && (
-              <div className="mb-6">
-                <h1 className="text-2xl font-semibold text-gray-900">技能</h1>
-                <p className="mt-1 text-[13px] text-gray-500">通过任务专用技能扩展 PuddingClaw 的能力</p>
+              <div className="mb-6 flex items-end justify-between gap-4">
+                <div>
+                  <h1 className="text-2xl font-semibold text-gray-900">技能</h1>
+                  <p className="mt-1 text-[13px] text-gray-500">通过任务专用技能扩展 PuddingClaw 的能力</p>
+                </div>
+                <div className="flex items-center gap-1 rounded-lg bg-gray-100 p-1" role="tablist" aria-label="扩展类型">
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected
+                    onClick={() => handleExtensionViewChange("skills")}
+                    className="rounded-md px-3 py-1 text-[12px] font-medium transition-colors bg-white text-gray-900 shadow-sm"
+                  >
+                    技能
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={false}
+                    onClick={() => handleExtensionViewChange("mcp")}
+                    className="rounded-md px-3 py-1 text-[12px] font-medium transition-colors text-gray-500 hover:text-gray-800"
+                  >
+                    MCP
+                  </button>
+                </div>
               </div>
             )}
             <div className="flex items-center justify-between mb-2.5">
@@ -770,15 +810,49 @@ export default function SkillsPage() {
 
 function McpServerCatalog({
   servers,
+  extensionView,
+  onExtensionViewChange,
 }: {
   servers: Array<{ key: string; name: string; url: string; transport: string }>;
+  extensionView: "skills" | "mcp";
+  onExtensionViewChange: (view: "skills" | "mcp") => void;
 }) {
   return (
     <div className="flex-1 overflow-y-auto bg-white/30">
-      <div className="mx-auto w-full max-w-4xl px-6 pb-10 pt-10">
-        <div className="mb-6">
-          <h1 className="text-2xl font-semibold text-gray-900">MCP</h1>
-          <p className="mt-1 text-[13px] text-gray-500">连接外部服务，为对话提供工具与数据能力</p>
+      <div className="mx-auto w-full max-w-4xl px-6 pb-10 pt-5">
+        <div className="mb-6 flex items-end justify-between gap-4">
+          <div>
+            <h1 className="text-2xl font-semibold text-gray-900">MCP</h1>
+            <p className="mt-1 text-[13px] text-gray-500">连接外部服务，为对话提供工具与数据能力</p>
+          </div>
+          <div className="flex items-center gap-1 rounded-lg bg-gray-100 p-1" role="tablist" aria-label="扩展类型">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={extensionView === "skills"}
+              onClick={() => onExtensionViewChange("skills")}
+              className={`rounded-md px-3 py-1 text-[12px] font-medium transition-colors ${
+                extensionView === "skills"
+                  ? "bg-white text-gray-900 shadow-sm"
+                  : "text-gray-500 hover:text-gray-800"
+              }`}
+            >
+              技能
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={extensionView === "mcp"}
+              onClick={() => onExtensionViewChange("mcp")}
+              className={`rounded-md px-3 py-1 text-[12px] font-medium transition-colors ${
+                extensionView === "mcp"
+                  ? "bg-white text-gray-900 shadow-sm"
+                  : "text-gray-500 hover:text-gray-800"
+              }`}
+            >
+              MCP
+            </button>
+          </div>
         </div>
 
         <div className="mb-2 flex items-center gap-2 text-[13px] font-semibold text-gray-700">

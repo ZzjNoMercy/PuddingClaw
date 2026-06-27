@@ -44,6 +44,7 @@ export interface CompressionSettings {
 }
 
 export interface SystemSettings {
+  thinking_mode: boolean;
   ai_gateway: GatewaySettings;
   gateway_llm: GatewayLlmSettings;
   fallback_llm: FallbackLlmSettings;

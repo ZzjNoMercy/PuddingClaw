@@ -34,6 +34,16 @@ loggers:
     handlers: [console]
     propagate: false
 
+  graph.deepagents_manager:
+    level: INFO
+    handlers: [console]
+    propagate: false
+
+  llm.model_client:
+    level: INFO
+    handlers: [console]
+    propagate: false
+
   tools.deep_research_tool:
     level: INFO
     handlers: [console]

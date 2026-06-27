@@ -32,6 +32,7 @@ import {
 import { useApp } from "@/lib/store";
 import MemoryEditor from "@/components/settings/MemoryEditor";
 import CapabilitiesStatus from "@/components/settings/CapabilitiesStatus";
+import Navbar from "@/components/layout/Navbar";
 import Link from "next/link";
 
 type SettingsCategory = "ai" | "rag" | "memory" | "data" | "advanced" | "system";
@@ -57,7 +58,11 @@ const EMBEDDING_PROVIDERS = [
 const SETTINGS_CATEGORY_KEY = "settings:activeCategory";
 
 export default function SettingsPage() {
-  const { ragMode, toggleRagMode } = useApp();
+  const { ragMode, toggleRagMode, sidebarOpen, toggleSidebar, thinkingMode, setThinkingMode } = useApp();
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => {
+    setMounted(true);
+  }, []);
   const [category, setCategory] = useState<SettingsCategory>(() => {
     if (typeof window === "undefined") return "ai";
     const saved = localStorage.getItem(SETTINGS_CATEGORY_KEY);
@@ -205,7 +210,7 @@ export default function SettingsPage() {
     } finally {
       setSaving(false);
     }
-  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embBaseUrl, embApiKey, ragMode, ragTopK, ragThreshold, compRatio, showToast]);
+  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embBaseUrl, embApiKey, ragMode, ragTopK, ragThreshold, compRatio, showToast]);
 
   const handleTestGateway = useCallback(async () => {
     setGatewayTesting(true);
@@ -274,51 +279,88 @@ export default function SettingsPage() {
 
   if (loading) {
     return (
-      <div className="h-screen flex flex-col app-bg">
-        <div className="flex-1 flex items-center justify-center">
-          <Loader2 className="w-6 h-6 animate-spin text-gray-400" />
+      <div className="h-screen app-bg">
+        <div className="fixed left-3 top-3 z-[80]">
+          <Navbar
+            sidebarOpen={sidebarOpen}
+            toggleSidebar={toggleSidebar}
+            showPanelToggles
+            compact
+          />
+        </div>
+        <div className="flex h-full overflow-hidden">
+          <div
+            className="workspace-sidebar-shell shrink-0 panel-transition overflow-hidden"
+            style={{ width: !mounted || sidebarOpen ? 208 : 0 }}
+          >
+            <div className="h-full w-52 flex flex-col">
+              <div className="h-11 shrink-0" />
+              <div className="flex-1 min-h-0 overflow-y-auto p-3" />
+            </div>
+          </div>
+          <div className="workspace-content-frame flex-1 flex items-center justify-center">
+            <Loader2 className="w-6 h-6 animate-spin text-gray-400" />
+          </div>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="h-screen flex flex-col app-bg">
-      <div className="flex-1 flex overflow-hidden">
+    <div className="h-screen app-bg">
+      <div className="fixed left-3 top-3 z-[80]">
+        <Navbar
+          sidebarOpen={sidebarOpen}
+          toggleSidebar={toggleSidebar}
+          showPanelToggles
+          compact
+        />
+      </div>
+
+      <div className="flex h-full overflow-hidden">
         {/* Left: Category Navigation */}
-        <div className="w-52 glass-panel border-r border-black/[0.06] shrink-0 p-3">
-          <Link
-            href="/"
-            className="flex items-center gap-2.5 px-3 py-2.5 mb-3 text-[13px] font-medium text-gray-700 bg-black/[0.04] hover:bg-black/[0.08] rounded-xl transition-all group"
-          >
-            <ArrowLeft className="w-4 h-4 text-gray-500 group-hover:text-gray-700 transition-colors" />
-            返回应用
-          </Link>
-          <div className="space-y-0.5">
-            {CATEGORIES.map((cat) => {
-              const Icon = cat.icon;
-              const active = category === cat.key;
-              return (
-                <button
-                  key={cat.key}
-                  onClick={() => setCategory(cat.key)}
-                  className={`w-full flex items-center gap-2.5 px-3 py-2 text-[12px] rounded-lg transition-all text-left ${
-                    active
-                      ? "bg-white/70 text-gray-800 font-medium shadow-sm"
-                      : "text-gray-500 hover:bg-white/40"
-                  }`}
-                >
-                  <Icon className="w-3.5 h-3.5" style={active ? { color: cat.color } : {}} />
-                  {cat.label}
-                </button>
-              );
-            })}
+        <div
+          className="workspace-sidebar-shell shrink-0 panel-transition overflow-hidden"
+          style={{ width: !mounted || sidebarOpen ? 208 : 0 }}
+        >
+          <div className="h-full w-52 flex flex-col">
+            <div className="h-11 shrink-0" />
+            <div className="flex-1 min-h-0 overflow-y-auto p-3">
+              <Link
+                href="/"
+                className="flex items-center gap-2.5 px-3 py-2.5 mb-3 text-[13px] font-medium text-gray-700 bg-white/55 hover:bg-white/80 rounded-xl transition-all group"
+              >
+                <ArrowLeft className="w-4 h-4 text-gray-500 group-hover:text-gray-700 transition-colors" />
+                返回应用
+              </Link>
+              <div className="space-y-0.5">
+                {CATEGORIES.map((cat) => {
+                  const Icon = cat.icon;
+                  const active = category === cat.key;
+                  return (
+                    <button
+                      key={cat.key}
+                      onClick={() => setCategory(cat.key)}
+                      className={`w-full flex items-center gap-2.5 px-3 py-2 text-[12px] rounded-lg transition-all text-left ${
+                        active
+                          ? "bg-white/80 text-gray-900 font-medium shadow-sm"
+                          : "text-gray-500 hover:bg-white/55 hover:text-gray-800"
+                      }`}
+                    >
+                      <Icon className="w-3.5 h-3.5" style={active ? { color: cat.color } : {}} />
+                      {cat.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
           </div>
         </div>
 
         {/* Right: Settings Form */}
-        <div className="flex-1 overflow-y-auto px-6 pb-6 pt-4">
-          <div className={`${category === "ai" ? "max-w-4xl" : "max-w-2xl"} mx-auto space-y-6`}>
+        <main className="workspace-content-frame flex min-w-0 flex-1 flex-col overflow-hidden">
+          <div className="flex-1 overflow-y-auto px-8 pb-8 pt-6">
+            <div className={`${category === "ai" ? "max-w-4xl" : "max-w-2xl"} mx-auto space-y-6`}>
             {category === "ai" && (
               <>
                 <div className="flex items-center justify-between gap-4">
@@ -338,7 +380,7 @@ export default function SettingsPage() {
                   </div>
                 </div>
 
-                <div className="grid grid-cols-[1fr_28px_1fr_28px_1fr] items-center rounded-2xl border border-black/[0.06] bg-gradient-to-br from-white/90 to-[#f5f7ff]/80 p-4 shadow-sm">
+                <div className="grid grid-cols-[1fr_28px_1fr_28px_1fr] items-center rounded-2xl border border-black/[0.055] bg-white p-4 shadow-sm">
                   <RouteNode title="PuddingClaw" detail="ModelClient · 统一入口" status="运行中" tone="green" />
                   <Route className="mx-auto h-4 w-4 text-gray-300" />
                   <RouteNode
@@ -351,7 +393,7 @@ export default function SettingsPage() {
                   <RouteNode title={gatewayModel} detail="网关模型" status="主模型" tone="blue" />
                 </div>
 
-                <div className="rounded-2xl border border-[#002fa7]/15 bg-gradient-to-br from-white/90 to-[#f4f7ff]/80 p-5 shadow-sm">
+                <div className="rounded-2xl border border-black/[0.055] bg-white p-5 shadow-sm">
                   <div className="mb-5 flex items-center justify-between gap-4">
                     <div className="flex items-center gap-3">
                       <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#002fa7]/8 text-[#002fa7]">
@@ -434,6 +476,41 @@ export default function SettingsPage() {
                       </div>
                     </div>
                   )}
+                </div>
+
+                {/* Thinking Mode */}
+                <div className="mt-5 rounded-xl border border-black/[0.06] bg-white/55 px-4 py-3.5">
+                  <div className="flex items-center justify-between gap-4">
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#002fa7]/8 text-[#002fa7]">
+                        <Brain className="h-4 w-4" />
+                      </div>
+                      <div className="min-w-0">
+                        <h3 className="text-[13px] font-semibold text-gray-800">思考模式</h3>
+                        <p className="mt-0.5 text-[11px] text-gray-500 truncate">
+                          {thinkingMode
+                            ? "使用 deepseek-v4-pro 并输出思维链"
+                            : "使用默认模型，不输出思维链"}
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={thinkingMode}
+                      aria-label="启用思考模式"
+                      onClick={() => setThinkingMode(!thinkingMode)}
+                      className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#002fa7]/40 ${
+                        thinkingMode ? "bg-[#002fa7]" : "bg-gray-300"
+                      }`}
+                    >
+                      <span
+                        className={`pointer-events-none mt-0.5 inline-block h-5 w-5 rounded-full bg-white shadow-sm transition-transform ${
+                          thinkingMode ? "translate-x-[22px]" : "translate-x-0.5"
+                        }`}
+                      />
+                    </button>
+                  </div>
                 </div>
               </>
             )}
@@ -735,21 +812,22 @@ export default function SettingsPage() {
             </div>
           </div>
         </div>
-      </div>
-
-      {/* Toast */}
-      {toast && (
-        <div className={`fixed bottom-6 right-6 flex items-center gap-2 px-4 py-2.5 rounded-xl text-[13px] font-medium shadow-lg animate-fade-in ${
-          toast.type === "success"
-            ? "bg-emerald-500 text-white"
-            : "bg-red-500 text-white"
-        }`}>
-          {toast.type === "success" ? <CheckCircle2 className="w-4 h-4" /> : <XCircle className="w-4 h-4" />}
-          {toast.message}
-        </div>
-      )}
+      </main>
     </div>
-  );
+
+    {/* Toast */}
+    {toast && (
+      <div className={`fixed bottom-6 right-6 flex items-center gap-2 px-4 py-2.5 rounded-xl text-[13px] font-medium shadow-lg animate-fade-in ${
+        toast.type === "success"
+          ? "bg-emerald-500 text-white"
+          : "bg-red-500 text-white"
+      }`}>
+        {toast.type === "success" ? <CheckCircle2 className="w-4 h-4" /> : <XCircle className="w-4 h-4" />}
+        {toast.message}
+      </div>
+    )}
+  </div>
+);
 }
 
 // ── Reusable Components ───────────────────────────────────
@@ -802,7 +880,7 @@ function SettingsCard({
   children: React.ReactNode;
 }) {
   return (
-    <div className="bg-white/60 backdrop-blur-xl rounded-2xl border border-black/[0.06] p-5 shadow-sm">
+    <div className="bg-white rounded-2xl border border-black/[0.055] p-5 shadow-sm">
       <div className="flex items-center gap-2 mb-4">
         <Icon className="w-4 h-4" style={{ color }} />
         <h2 className="text-[14px] font-semibold text-gray-800">{title}</h2>

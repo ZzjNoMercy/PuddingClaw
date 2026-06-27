@@ -13,7 +13,7 @@ import time
 from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import AIMessageChunk, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.runnables.config import var_child_runnable_config
 
@@ -22,6 +22,54 @@ from config import get_fallback_llm_config, get_gateway_config, get_gateway_llm_
 from graph.token_usage_store import record_token_usage
 
 logger = logging.getLogger(__name__)
+
+
+def _patch_openai_reasoning_extraction() -> None:
+    """Preserve provider-specific reasoning fields that ChatOpenAI drops.
+
+    ChatOpenAI only targets official OpenAI delta fields. When Higress routes
+    to DeepSeek-style providers, the SSE delta contains ``reasoning_content``
+    which is silently discarded. This patch attaches it to
+    ``additional_kwargs`` so downstream extractors can surface it as the
+    thinking process.
+    """
+    try:
+        from langchain_openai.chat_models import base as openai_base
+    except Exception:
+        return
+
+    _original = openai_base._convert_delta_to_message_chunk
+
+    def _wrapped(_dict, default_class):
+        chunk = _original(_dict, default_class)
+        if not isinstance(chunk, AIMessageChunk):
+            return chunk
+
+        additional = getattr(chunk, "additional_kwargs", None) or {}
+        updated = False
+
+        # DeepSeek / third-party provider reasoning_content
+        if "reasoning_content" in _dict:
+            existing = additional.get("reasoning_content", "")
+            additional["reasoning_content"] = str(existing) + str(
+                _dict["reasoning_content"] or ""
+            )
+            updated = True
+
+        # OpenAI Responses API style reasoning object
+        if "reasoning" in _dict:
+            additional["reasoning"] = _dict["reasoning"]
+            updated = True
+
+        if updated:
+            chunk.additional_kwargs = additional
+
+        return chunk
+
+    openai_base._convert_delta_to_message_chunk = _wrapped
+
+
+_patch_openai_reasoning_extraction()
 
 
 def _child_callback_config(run_manager: Any) -> dict[str, Any] | None:
@@ -95,13 +143,37 @@ class ModelClient:
         """获取直连模型，并复用当前已绑定工具。"""
         return self._apply_tools(self._direct_model())
 
+    def _thinking_kwargs(self, cfg: dict[str, Any]) -> dict[str, Any]:
+        """构造思考模式参数（reasoning_effort / extra_body.thinking）。
+
+        当 thinking_mode 开启且配置中存在这些参数时，统一传递给底层模型。
+        DeepSeek 官方 API 以及 Higress 透传场景均支持这些参数。
+        """
+        kwargs: dict[str, Any] = {}
+        reasoning_effort = cfg.get("reasoning_effort")
+        extra_body = cfg.get("extra_body")
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+        return kwargs
+
     def _gateway_model(self) -> BaseChatModel:
         """通过 Higress（OpenAI-compatible）调用模型。"""
         from langchain_openai import ChatOpenAI
 
         gateway_url = capabilities.get_effective_gateway_url()
-        gateway_model = get_gateway_llm_config().get("model", self.cfg["model"])
-        logger.debug("[ModelClient] using AI Gateway: %s model=%s", gateway_url, gateway_model)
+        gateway_cfg = get_gateway_llm_config()
+        gateway_model = gateway_cfg.get("model", self.cfg["model"])
+        thinking_kwargs = self._thinking_kwargs(gateway_cfg)
+        logger.info(
+            "[ModelClient] using AI Gateway: url=%s model=%s thinking=%s",
+            gateway_url,
+            gateway_model,
+            bool(thinking_kwargs),
+        )
+        if thinking_kwargs:
+            logger.info("[ModelClient] thinking kwargs: %s", thinking_kwargs)
         return ChatOpenAI(
             model=gateway_model,
             # Higress 管理上游 Provider key，PuddingClaw 只传一个占位 key。
@@ -109,6 +181,7 @@ class ModelClient:
             base_url=gateway_url,
             temperature=self.temperature,
             streaming=self.streaming,
+            **thinking_kwargs,
         )
 
     def _direct_model(self) -> BaseChatModel:
@@ -123,7 +196,14 @@ class ModelClient:
     def _deepseek_model(self) -> BaseChatModel:
         from langchain_deepseek import ChatDeepSeek
 
-        logger.debug("[ModelClient] using direct DeepSeek")
+        thinking_kwargs = self._thinking_kwargs(self.cfg)
+        logger.info(
+            "[ModelClient] using direct DeepSeek: model=%s thinking=%s",
+            self.cfg["model"],
+            bool(thinking_kwargs),
+        )
+        if thinking_kwargs:
+            logger.info("[ModelClient] thinking kwargs: %s", thinking_kwargs)
         return ChatDeepSeek(
             model=self.cfg["model"],
             api_key=self.cfg.get("api_key", ""),
@@ -131,18 +211,27 @@ class ModelClient:
             temperature=self.temperature,
             streaming=self.streaming,
             stream_usage=True,
+            **thinking_kwargs,
         )
 
     def _openai_model(self) -> BaseChatModel:
         from langchain_openai import ChatOpenAI
 
-        logger.debug("[ModelClient] using direct OpenAI")
+        thinking_kwargs = self._thinking_kwargs(self.cfg)
+        logger.info(
+            "[ModelClient] using direct OpenAI: model=%s thinking=%s",
+            self.cfg["model"],
+            bool(thinking_kwargs),
+        )
+        if thinking_kwargs:
+            logger.info("[ModelClient] thinking kwargs: %s", thinking_kwargs)
         return ChatOpenAI(
             model=self.cfg["model"],
             api_key=self.cfg.get("api_key", ""),
             base_url=self.cfg.get("base_url", "https://api.openai.com/v1"),
             temperature=self.temperature,
             streaming=self.streaming,
+            **thinking_kwargs,
         )
 
     def _record_usage(

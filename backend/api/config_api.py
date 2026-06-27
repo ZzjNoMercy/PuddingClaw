@@ -41,6 +41,7 @@ async def set_rag_mode_endpoint(request: RagModeRequest):
 
 
 class SettingsUpdateRequest(BaseModel):
+    thinking_mode: Optional[bool] = None
     ai_gateway: Optional[dict[str, Any]] = None
     gateway_llm: Optional[dict[str, Any]] = None
     fallback_llm: Optional[dict[str, Any]] = None

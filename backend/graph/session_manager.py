@@ -55,17 +55,48 @@ class SessionManager:
             encoding="utf-8",                                              # UTF-8 编码
         )
 
-    def create_session(self, session_id: str) -> dict[str, Any]:
+    def create_session(self, session_id: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         """创建空会话，返回元数据（id/title/时间戳）"""
         now = time.time()                    # 当前时间戳
         data: dict[str, Any] = {             # 初始会话结构
             "title": "New Chat",             # 默认标题
             "created_at": now,               # 创建时间
             "updated_at": now,               # 更新时间
+            "runtime_mode": "chat",          # 默认会话运行时；Agent 路由会覆盖为 agent
             "messages": [],                  # 空消息列表
         }
+        if metadata:
+            data.update(metadata)
         self._write_file(session_id, data)   # 写入磁盘
-        return {"id": session_id, "title": data["title"], "created_at": now, "updated_at": now}  # 返回元数据
+        return self._metadata_from_data(session_id, data)
+
+    def _metadata_from_data(self, session_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        """Build a stable metadata object for list/create responses."""
+        meta = {
+            "id": session_id,
+            "title": data.get("title", session_id),
+            "created_at": data.get("created_at"),
+            "updated_at": data.get("updated_at"),
+            "runtime_mode": data.get("runtime_mode", "chat"),
+        }
+        for key in (
+            "project_id",
+            "project_path",
+            "workspace_type",
+            "workspace_path",
+        ):
+            if key in data:
+                meta[key] = data.get(key)
+        return meta
+
+    def update_metadata(self, session_id: str, metadata: dict[str, Any]) -> dict[str, Any]:
+        """Merge metadata into a session, creating the session if needed."""
+        data = self._read_file(session_id)
+        if not data:
+            return self.create_session(session_id, metadata=metadata)
+        data.update(metadata)
+        self._write_file(session_id, data)
+        return self._metadata_from_data(session_id, data)
 
     def load_session(self, session_id: str) -> list[dict[str, Any]]:
         """加载指定会话的消息列表，自动合并 archive/ 中的归档消息。
@@ -107,6 +138,7 @@ class SessionManager:
         tool_calls: list[dict[str, Any]] | None = None,       # 可选的工具调用记录
         sources: list[dict[str, Any]] | None = None,          # 用户可见的结构化来源
         citations: list[dict[str, Any]] | None = None,        # 正文与来源的引用映射
+        reasoning_content: str | None = None,                  # 思考链内容（工具调用回合必须回传）
     ) -> None:
         """追加一条消息到会话历史"""
         data = self._read_file(session_id)        # 读取现有数据
@@ -121,6 +153,8 @@ class SessionManager:
         msg: dict[str, Any] = {"role": role, "content": content}  # 构造消息字典
         if tool_calls:                                            # 有工具调用则附加
             msg["tool_calls"] = tool_calls
+        if reasoning_content:                                     # 思考链内容持久化，支持历史回看与 API 回传
+            msg["reasoning_content"] = reasoning_content
         if sources:
             msg["sources"] = sources
         if citations:
@@ -169,6 +203,7 @@ class SessionManager:
         assert self._sessions_dir is not None                  # 确保已初始化
         sessions: list[dict[str, Any]] = []                    # 结果列表
         for f in sorted(self._sessions_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):  # 遍历所有 JSON 文件，按修改时间倒序
+            raw: Any = None
             try:
                 raw = json.loads(f.read_text(encoding="utf-8"))         # 解析 JSON
                 if isinstance(raw, dict):                               # v2 格式
@@ -181,11 +216,22 @@ class SessionManager:
                 title = f.stem                                          # 用文件名
                 updated_at = f.stat().st_mtime                          # 用文件修改时间
 
-            sessions.append({                    # 追加到结果
+            meta = {
                 "id": f.stem,                    # 会话 ID = 文件名（不含 .json）
                 "title": title,                  # 会话标题
                 "updated_at": updated_at,        # 最后更新时间
-            })
+                "runtime_mode": raw.get("runtime_mode", "chat") if isinstance(raw, dict) else "chat",
+            }
+            if isinstance(raw, dict):
+                for key in (
+                    "project_id",
+                    "project_path",
+                    "workspace_type",
+                    "workspace_path",
+                ):
+                    if key in raw:
+                        meta[key] = raw.get(key)
+            sessions.append(meta)                 # 追加到结果
         return sessions                          # 返回所有会话列表
 
     # ── 短期记忆压缩（核心机制）────────────────────────────────────────────────
@@ -390,6 +436,9 @@ class SessionManager:
             entry: dict[str, Any] = {"role": msg["role"], "content": msg["content"]}
             if msg.get("tool_calls"):
                 entry["tool_calls"] = msg["tool_calls"]
+            # 思考模式下，assistant 消息的 reasoning_content 需要回传给 API（含工具调用时尤其关键）
+            if msg.get("reasoning_content"):
+                entry["reasoning_content"] = msg["reasoning_content"]
             prev_has_tool_calls = bool(merged[-1].get("tool_calls")) if merged else False
             current_has_tool_calls = bool(entry.get("tool_calls"))
             if (

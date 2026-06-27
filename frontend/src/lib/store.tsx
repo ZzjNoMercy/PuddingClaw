@@ -27,6 +27,10 @@ import {
   registerProject as apiRegisterProject,
   ProjectMeta,
 } from "./api";
+import {
+  getSettings as apiGetSettings,
+  updateSettings as apiUpdateSettings,
+} from "./settingsApi";
 
 // ── Types ──────────────────────────────────────────────────
 
@@ -39,6 +43,10 @@ export interface ToolCall {
   summary_source?: string;
   is_error?: boolean;
 }
+
+export type TimelineItem =
+  | { type: "reasoning"; content: string; id: string }
+  | { type: "tool"; toolCall: ToolCall; id: string };
 
 export interface RetrievalResult {
   text: string;
@@ -73,7 +81,9 @@ export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
+  reasoning?: string;
   toolCalls?: ToolCall[];
+  timeline?: TimelineItem[];
   retrievals?: RetrievalResult[];
   sources?: SourceRecord[];
   citations?: CitationRef[];
@@ -183,6 +193,10 @@ interface AppState {
   ragMode: boolean;
   toggleRagMode: () => void;
 
+  // Thinking mode
+  thinkingMode: boolean;
+  setThinkingMode: (value: boolean) => Promise<void>;
+
   // Context usage
   contextUsage: ContextUsage;
   setContextUsage: (usage: ContextUsage) => void;
@@ -202,6 +216,7 @@ function parseHistoryMessages(
   backendMessages: Array<{
     role: string;
     content: string;
+    reasoning_content?: string;
     tool_calls?: Array<{ id?: string; tool: string; input?: string; output?: string; is_error?: boolean }>;
     sources?: SourceRecord[];
     citations?: CitationRef[];
@@ -228,11 +243,14 @@ function parseHistoryMessages(
           is_error: Boolean(tc.is_error),
         })
       );
+      const timeline = buildHistoryTimeline(msg.reasoning_content, toolCalls);
       loaded.push({
         id: `hist-asst-${msgIndex++}`,
         role: "assistant",
         content: msg.content,
+        reasoning: msg.reasoning_content,
         toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+        timeline: timeline.length > 0 ? timeline : undefined,
         sources: msg.sources,
         citations: msg.citations,
         timestamp: Date.now() - (backendMessages.length - msgIndex) * 1000,
@@ -240,6 +258,71 @@ function parseHistoryMessages(
     }
   }
   return loaded;
+}
+
+// ── Timeline helpers ───────────────────────────────────────
+// Build a live timeline that interleaves reasoning and tool calls.
+
+function appendReasoningToTimeline(timeline: TimelineItem[], content: string): void {
+  if (!content) return;
+  const last = timeline[timeline.length - 1];
+  if (last?.type === "reasoning") {
+    last.content += content;
+  } else {
+    timeline.push({
+      type: "reasoning",
+      content,
+      id: `reasoning-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    });
+  }
+}
+
+function addToolToTimeline(timeline: TimelineItem[], toolCall: ToolCall): void {
+  timeline.push({
+    type: "tool",
+    toolCall,
+    id: toolCall.id || `tool-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+  });
+}
+
+function updateToolInTimeline(
+  timeline: TimelineItem[],
+  id: string,
+  toolName: string,
+  updates: Partial<ToolCall>
+): void {
+  for (let i = timeline.length - 1; i >= 0; i--) {
+    const item = timeline[i];
+    if (item.type === "tool") {
+      const tc = item.toolCall;
+      if ((id && tc.id === id) || (!id && tc.tool === toolName && tc.status === "running")) {
+        item.toolCall = { ...tc, ...updates };
+        return;
+      }
+    }
+  }
+}
+
+function buildHistoryTimeline(
+  reasoningContent: string | undefined,
+  toolCalls: ToolCall[]
+): TimelineItem[] {
+  const timeline: TimelineItem[] = [];
+  if (reasoningContent) {
+    timeline.push({
+      type: "reasoning",
+      content: reasoningContent,
+      id: `hist-reasoning-${Date.now()}`,
+    });
+  }
+  toolCalls.forEach((tc, idx) => {
+    timeline.push({
+      type: "tool",
+      toolCall: tc,
+      id: tc.id || `hist-tool-${Date.now()}-${idx}`,
+    });
+  });
+  return timeline;
 }
 
 function getOrCreateUserId(): string {
@@ -280,6 +363,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [inspectorWidth, setInspectorWidth] = useState(360);
   const [isCompressing, setIsCompressing] = useState(false);
   const [ragMode, setRagMode] = useState(false);
+  const [thinkingMode, setThinkingModeRaw] = useState(false);
   const [contextUsage, setContextUsage] = useState<ContextUsage>({
     used: 0,
     total: 500000,
@@ -331,6 +415,23 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     apiGetRagMode()
       .then((data) => setRagMode(data.rag_mode))
       .catch(() => {});
+  }, []);
+
+  // Load thinking mode on mount
+  useEffect(() => {
+    apiGetSettings()
+      .then((s) => setThinkingModeRaw(Boolean(s.thinking_mode)))
+      .catch(() => {});
+  }, []);
+
+  const setThinkingMode = useCallback(async (value: boolean) => {
+    setThinkingModeRaw(value);
+    try {
+      await apiUpdateSettings({ thinking_mode: value });
+    } catch {
+      // Revert on error so UI stays consistent with backend.
+      setThinkingModeRaw((prev) => !value);
+    }
   }, []);
 
   const toggleSidebar = useCallback(() => setSidebarOpen((v) => !v), []);
@@ -673,6 +774,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         role: "assistant",
         content: "",
         toolCalls: [],
+        timeline: [],
         timestamp: Date.now(),
       };
 
@@ -727,6 +829,40 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           tokenFlushTimer = window.setTimeout(flushPendingTokens, 32);
         }
       };
+      let pendingReasoningContent = "";
+      let reasoningFlushTimer: number | null = null;
+      const flushPendingReasoning = () => {
+        if (reasoningFlushTimer !== null) {
+          window.clearTimeout(reasoningFlushTimer);
+          reasoningFlushTimer = null;
+        }
+        if (!pendingReasoningContent) return;
+        const content = pendingReasoningContent;
+        pendingReasoningContent = "";
+        const targetId = getAssistantId();
+        updateMsgs((prev) => {
+          const updated = [...prev];
+          const idx = updated.findIndex((m) => m.id === targetId);
+          if (idx === -1) return prev;
+          const timeline = updated[idx].timeline
+            ? [...updated[idx].timeline]
+            : [];
+          appendReasoningToTimeline(timeline, content);
+          updated[idx] = {
+            ...updated[idx],
+            reasoning: `${updated[idx].reasoning || ""}${content}`,
+            timeline,
+          };
+          return updated;
+        });
+      };
+      const queueReasoning = (content: string) => {
+        if (!content) return;
+        pendingReasoningContent += content;
+        if (reasoningFlushTimer === null) {
+          reasoningFlushTimer = window.setTimeout(flushPendingReasoning, 80);
+        }
+      };
 
       try {
         const eventStream = runtimeMode === "agent"
@@ -737,13 +873,25 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           if (controller.signal.aborted) break;
 
           if (event.event === "token") {
+            setMaintenanceStatus((current) =>
+              current?.phase === "reasoning" ? null : current
+            );
             queueToken((event.data.content as string) || "");
+            continue;
+          }
+
+          if (event.event === "reasoning") {
+            // Reasoning is rendered inline as a collapsible block on the
+            // current assistant message, so we do not duplicate it with the
+            // global maintenance badge.
+            queueReasoning((event.data.content as string) || "");
             continue;
           }
 
           // Preserve protocol ordering: all text preceding a structural event
           // must be visible on the current assistant message first.
           flushPendingTokens();
+          flushPendingReasoning();
 
           // Handle context_usage event
           if (event.event === "context_usage") {
@@ -873,6 +1021,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 role: "assistant",
                 content: "",
                 toolCalls: [],
+                timeline: [],
                 timestamp: Date.now(),
               },
             ]);
@@ -896,15 +1045,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                   (c) => tcId && c.id === tcId
                 );
                 if (!existing) {
-                  msg.toolCalls = [
-                    ...(msg.toolCalls || []),
-                    {
-                      id: tcId,
-                      tool: event.data.tool as string,
-                      input: event.data.input as string,
-                      status: "running",
-                    },
-                  ];
+                  const newToolCall: ToolCall = {
+                    id: tcId,
+                    tool: event.data.tool as string,
+                    input: event.data.input as string,
+                    status: "running",
+                  };
+                  msg.toolCalls = [...(msg.toolCalls || []), newToolCall];
+                  const timeline = msg.timeline ? [...msg.timeline] : [];
+                  addToolToTimeline(timeline, newToolCall);
+                  msg.timeline = timeline;
                 }
                 break;
               }
@@ -913,31 +1063,34 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 const calls = [...(msg.toolCalls || [])];
                 const tcId = (event.data.id as string) || "";
                 // Prefer matching by id; fall back to last running call with the same tool name.
-                let idx = -1;
+                let callIdx = -1;
                 if (tcId) {
-                  idx = calls.findIndex((c) => c.id === tcId);
+                  callIdx = calls.findIndex((c) => c.id === tcId);
                 }
-                if (idx === -1) {
+                if (callIdx === -1) {
                   for (let i = calls.length - 1; i >= 0; i--) {
                     if (
                       calls[i].tool === event.data.tool &&
                       calls[i].status === "running"
                     ) {
-                      idx = i;
+                      callIdx = i;
                       break;
                     }
                   }
                 }
-                if (idx !== -1) {
-                  calls[idx] = {
-                    ...calls[idx],
-                    output: event.data.output as string,
-                    status: "done",
-                    summary_source: event.data.summary_source as string | undefined,
-                    is_error: Boolean(event.data.is_error),
-                  };
+                const updates: Partial<ToolCall> = {
+                  output: event.data.output as string,
+                  status: "done",
+                  summary_source: event.data.summary_source as string | undefined,
+                  is_error: Boolean(event.data.is_error),
+                };
+                if (callIdx !== -1) {
+                  calls[callIdx] = { ...calls[callIdx], ...updates };
                 }
                 msg.toolCalls = calls;
+                const timeline = msg.timeline ? [...msg.timeline] : [];
+                updateToolInTimeline(timeline, tcId, event.data.tool as string, updates);
+                msg.timeline = timeline;
                 break;
               }
 
@@ -945,8 +1098,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 break;
 
               case "error":
-                // Protocol-level errors are surfaced through tool/error state,
-                // not appended to assistant prose.
+                {
+                  const message =
+                    (event.data.message as string) ||
+                    (event.data.error as string) ||
+                    "Agent 运行失败，请查看后端日志。";
+                  msg.content = msg.content
+                    ? `${msg.content}\n\n**Agent error:** ${message}`
+                    : `**Agent error:** ${message}`;
+                }
                 break;
             }
 
@@ -956,6 +1116,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         }
       } catch (err) {
         flushPendingTokens();
+        flushPendingReasoning();
         // Don't show error for manual abort (user clicked stop)
         if (err instanceof DOMException && err.name === "AbortError") {
           const targetId = getAssistantId();
@@ -993,6 +1154,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         }
       } finally {
         flushPendingTokens();
+        flushPendingReasoning();
         abortControllersRef.current.delete(sendSessionId);
         assistantIdsRef.current.delete(sendSessionId);
         if (sessionIdRef.current === sendSessionId) {
@@ -1075,6 +1237,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         clearCurrentSession,
         ragMode,
         toggleRagMode,
+        thinkingMode,
+        setThinkingMode,
         contextUsage,
         setContextUsage,
         maintenanceStatus,

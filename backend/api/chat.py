@@ -506,6 +506,16 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
     # 设置请求级 user_id，供 memory_tools 中的 @tool 函数读取
     from tools.memory_tools import current_user_id
     current_user_id.set(user_id)
+    session_manager.update_metadata(
+        session_id,
+        {
+            "runtime_mode": "chat",
+            "project_id": None,
+            "project_path": None,
+            "workspace_type": None,
+            "workspace_path": None,
+        },
+    )
 
     segments: list[dict] = []
     current_segment: dict = {"content": "", "tool_calls": [], "sources": [], "citations": []}
@@ -944,6 +954,16 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
 
 @router.post("/chat")
 async def chat(request: ChatRequest):
+    session_manager.update_metadata(
+        request.session_id,
+        {
+            "runtime_mode": "chat",
+            "project_id": None,
+            "project_path": None,
+            "workspace_type": None,
+            "workspace_path": None,
+        },
+    )
     if request.stream:
         return EventSourceResponse(
             event_generator(request.message, request.session_id, request.user_id)

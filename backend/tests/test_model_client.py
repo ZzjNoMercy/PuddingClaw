@@ -127,3 +127,104 @@ async def test_model_client_gateway_failure_falls_back_to_direct(mock_config):
 
     assert result.content == "fallback"
     direct.ainvoke.assert_awaited_once()
+
+
+def test_model_client_patches_chatopenai_to_preserve_reasoning_content():
+    """ChatOpenAI drops provider-specific reasoning_content; our patch preserves it."""
+    from langchain_core.messages import AIMessageChunk
+    from langchain_openai.chat_models.base import _convert_delta_to_message_chunk
+
+    # Importing model_client applies the patch; keep reference to avoid F401.
+    from llm import model_client as _model_client_module
+
+    assert _model_client_module is not None
+
+    delta = {"role": "assistant", "content": "", "reasoning_content": "step 1"}
+    chunk = _convert_delta_to_message_chunk(delta, AIMessageChunk)
+    assert isinstance(chunk, AIMessageChunk)
+    assert chunk.additional_kwargs.get("reasoning_content") == "step 1"
+
+
+def test_model_client_gateway_uses_thinking_model_when_thinking_mode_enabled(mock_config):
+    """thinking_mode 开启时，gateway 使用 thinking 模型；OpenAI 风格参数保留。"""
+    thinking_cfg = {
+        "model": "o1",
+        "reasoning_effort": "high",
+        "extra_body": {"thinking": {"type": "enabled"}},
+    }
+
+    with mock.patch(
+        "llm.model_client.get_gateway_llm_config",
+        return_value={**thinking_cfg, "base_model": "gpt-4o"},
+    ):
+        with mock.patch(
+            "llm.model_client.get_gateway_config",
+            return_value={"base_url": "http://gateway/v1", "fallback_to_direct": True},
+        ):
+            with mock.patch(
+                "capabilities.get_effective_gateway_url",
+                return_value="http://gateway/v1",
+            ):
+                client = ModelClient(role="agent", force_direct=False)
+                with mock.patch.object(client, "_should_use_gateway", return_value=True):
+                    llm = client.get_chat_model()
+
+    assert llm.model_name == "o1"
+    assert llm.reasoning_effort == "high"
+    assert llm.extra_body == {"thinking": {"type": "enabled"}}
+
+
+def test_model_client_direct_deepseek_passes_thinking_params():
+    """直连 DeepSeek 时，thinking 参数按官方文档传入。"""
+    effective_cfg = {
+        "provider": "deepseek",
+        "model": "deepseek-v4-pro",
+        "base_url": "https://api.deepseek.com",
+        "api_key": "test-key",
+        "temperature": 0.7,
+        "max_tokens": 4096,
+        "reasoning_effort": "high",
+        "extra_body": {"thinking": {"type": "enabled"}},
+    }
+
+    with mock.patch(
+        "llm.model_client.get_fallback_llm_config",
+        return_value=effective_cfg,
+    ):
+        client = ModelClient(role="agent", force_direct=True)
+        llm = client.get_chat_model()
+
+    assert llm.__class__.__name__ == "ChatDeepSeek"
+    assert llm.model == "deepseek-v4-pro"
+    assert llm.reasoning_effort == "high"
+    assert llm.extra_body == {"thinking": {"type": "enabled"}}
+
+
+def test_model_client_gateway_deepseek_passes_thinking_params():
+    """走 Higress 网关且模型为 deepseek-v4-pro 时，thinking 参数正常透传。"""
+    gateway_cfg = {
+        "model": "deepseek-v4-pro",
+        "reasoning_effort": "high",
+        "extra_body": {"thinking": {"type": "enabled"}},
+    }
+
+    with mock.patch(
+        "llm.model_client.get_gateway_llm_config",
+        return_value=gateway_cfg,
+    ):
+        with mock.patch(
+            "llm.model_client.get_gateway_config",
+            return_value={"base_url": "http://gateway/v1", "fallback_to_direct": True},
+        ):
+            with mock.patch(
+                "capabilities.get_effective_gateway_url",
+                return_value="http://gateway/v1",
+            ):
+                client = ModelClient(role="agent", force_direct=False)
+                with mock.patch.object(client, "_should_use_gateway", return_value=True):
+                    llm = client.get_chat_model()
+
+    assert llm.__class__.__name__ == "ChatOpenAI"
+    assert llm.model_name == "deepseek-v4-pro"
+    assert llm.reasoning_effort == "high"
+    assert llm.extra_body == {"thinking": {"type": "enabled"}}

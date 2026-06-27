@@ -115,6 +115,10 @@ for /f "tokens=2" %%a in ('tasklist /fi "imagename eq python.exe" /fo list 2^>nu
 
 echo [信息] 启动前端服务...
 cd frontend
+if exist ".next" (
+    echo [信息] 清理前端 dev 缓存 .next，避免旧 chunks 造成 404...
+    rmdir /s /q ".next"
+)
 call npm run dev -- --host 0.0.0.0 --port %FRONTEND_PORT%
 
 echo.

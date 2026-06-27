@@ -241,7 +241,7 @@ def format_items(payload: dict[str, Any], request: dict[str, Any]) -> tuple[str,
         marker = ""
         if source:
             sources.append(source)
-            marker = f" [{source['source_id']}]"
+            marker = f" [^{source['source_id']}]"
         meta = " · ".join(
             filter(None, (_clean(item.get("source"), 100), _clean(item.get("publishedAt"), 40)))
         )
@@ -280,7 +280,7 @@ def format_daily(payload: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
             marker = ""
             if source:
                 sources.append(source)
-                marker = f" [{source['source_id']}]"
+                marker = f" [^{source['source_id']}]"
             lines.append(f"- {title}{marker}" + (f"：{summary}" if summary else ""))
     flashes = payload.get("flashes") if isinstance(payload.get("flashes"), list) else []
     if flashes:

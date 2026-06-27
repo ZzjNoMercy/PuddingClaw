@@ -1,5 +1,7 @@
 """SafeTerminalTool — sandboxed shell execution with command blacklist."""
 
+import re
+import shlex
 import subprocess
 from pathlib import Path
 from typing import Type
@@ -38,6 +40,7 @@ class SafeTerminalTool(BaseTool):
     args_schema: Type[BaseModel] = TerminalInput
     risk_level: str = "dangerous"
     root_dir: str = ""
+    path_aliases: dict[str, str] = Field(default_factory=dict)
 
     def _is_safe(self, command: str) -> bool:
         cmd_lower = command.lower().strip()
@@ -46,9 +49,34 @@ class SafeTerminalTool(BaseTool):
                 return False
         return True
 
+    def _apply_path_aliases(self, command: str) -> str:
+        """Map DeepAgents virtual paths to host paths before shell execution."""
+
+        rewritten = command
+        for alias, target in sorted(self.path_aliases.items(), key=lambda item: len(item[0]), reverse=True):
+            if not alias or not target:
+                continue
+            normalized_alias = alias.rstrip("/")
+            normalized_target = str(Path(target).expanduser())
+            quoted_target = shlex.quote(normalized_target)
+
+            # Replace `/skills/foo.py` as `'<real skills dir>'/foo.py`.
+            rewritten = rewritten.replace(
+                f"{normalized_alias}/",
+                f"{quoted_target}/",
+            )
+            # Replace an exact `/skills` token without touching `/skills-old`.
+            rewritten = re.sub(
+                rf"(?<!\S){re.escape(normalized_alias)}(?![\w./-])",
+                quoted_target,
+                rewritten,
+            )
+        return rewritten
+
     def _run(self, command: str) -> str:
         if not self._is_safe(command):
             return f"❌ Command blocked for safety: {command}"
+        command = self._apply_path_aliases(command)
         try:
             result = subprocess.run(
                 command,

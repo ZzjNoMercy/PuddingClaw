@@ -11,6 +11,8 @@ interface NavbarProps {
   showPanelToggles?: boolean;
   /** Optional centered title (e.g. current session name) */
   title?: string;
+  /** Compact mode for rendering only the sidebar toggle inside the drawer. */
+  compact?: boolean;
 }
 
 export default function Navbar({
@@ -20,7 +22,29 @@ export default function Navbar({
   toggleInspector,
   showPanelToggles = false,
   title,
+  compact = false,
 }: NavbarProps) {
+  if (compact) {
+    return (
+      <div className="flex h-full items-center">
+        {showPanelToggles && toggleSidebar ? (
+          <button
+            onClick={toggleSidebar}
+            className={`w-8 h-8 flex items-center justify-center rounded-lg transition-all ${
+              sidebarOpen
+                ? "bg-[#002fa7]/[0.08] text-[#002fa7] shadow-sm"
+                : "text-gray-400 hover:text-gray-700 hover:bg-black/[0.04]"
+            }`}
+            title="切换侧栏"
+            aria-label="切换侧栏"
+          >
+            <PanelLeft className="w-[16px] h-[16px]" />
+          </button>
+        ) : null}
+      </div>
+    );
+  }
+
   return (
     <nav className="glass-nav sticky top-0 z-50 h-11 flex items-center justify-between px-3">
       {/* Left — Sidebar toggle (chat page only) or spacer */}

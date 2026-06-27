@@ -43,6 +43,47 @@ _MEM0_TYPE_LABELS: dict[str, str] = {
 }
 
 
+def _extract_stream_text(msg: Any) -> str:
+    """Extract visible text from streamed model chunks.
+
+    Some OpenAI-compatible reasoning models routed through Higress emit early
+    deltas as `reasoning_content` instead of `content`. If callers only read
+    `content`, the UI looks frozen until a final answer chunk arrives.
+    """
+
+    content = getattr(msg, "content", None)
+    if isinstance(content, str) and content:
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+            elif isinstance(item, str):
+                parts.append(item)
+        text = "".join(parts)
+        if text:
+            return text
+
+    reasoning = getattr(msg, "reasoning_content", None)
+    if isinstance(reasoning, str) and reasoning:
+        return reasoning
+    additional = getattr(msg, "additional_kwargs", None) or {}
+    reasoning = additional.get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning:
+        return reasoning
+    if isinstance(reasoning, list):
+        parts = []
+        for item in reasoning:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+            elif isinstance(item, str):
+                parts.append(item)
+        return "".join(parts)
+
+    return ""
+
+
 def _format_mem0_context(typed_context: dict[str, list[str]]) -> str:
     sections: list[str] = []
     for mem_type in ("user", "feedback", "project", "reference"):
@@ -414,7 +455,12 @@ class AgentManager:
                          "id": tc_id}
                         for tc, tool_name, tc_id in normalized_tool_calls
                     ]
-                    messages.append(AIMessage(content=content, tool_calls=lc_tool_calls))
+                    # 思考模式下，含工具调用的 assistant 消息必须回传 reasoning_content
+                    reasoning_content = msg.get("reasoning_content")
+                    ai_kwargs: dict[str, Any] = {"content": content, "tool_calls": lc_tool_calls}
+                    if reasoning_content:
+                        ai_kwargs["reasoning_content"] = reasoning_content
+                    messages.append(AIMessage(**ai_kwargs))
                     from langchain_core.messages import ToolMessage
                     for tc, tool_name, tc_id in normalized_tool_calls:
                         stored_output = tc.get("output", "")
@@ -609,7 +655,8 @@ class AgentManager:
 
                 if mode == "messages":
                     msg, metadata = data
-                    if hasattr(msg, "content") and msg.content:
+                    chunk_text = _extract_stream_text(msg)
+                    if chunk_text:
                         # LangGraph's messages stream should be consumed as token chunks.
                         # Full AIMessage objects and replayed chunks can appear as graph
                         # state/history events. Only chunks emitted by the active model node
@@ -618,12 +665,12 @@ class AgentManager:
                             isinstance(msg, AIMessageChunk)
                             and metadata.get("langgraph_node") == "model"
                         ):
-                            if msg.content and not getattr(msg, "tool_calls", None):
+                            if not getattr(msg, "tool_calls", None):
                                 if tools_just_finished:
                                     yield {"type": "new_response"}
                                     tools_just_finished = False
-                                full_response += msg.content
-                                yield {"type": "token", "content": msg.content}
+                                full_response += chunk_text
+                                yield {"type": "token", "content": chunk_text}
                     # Token 统计：检查 usage_metadata（stream 最后一个 chunk）
                     usage = getattr(msg, "usage_metadata", None)
                     if usage:
@@ -1072,8 +1119,10 @@ class AgentManager:
                         current_user_id.reset(user_token)
                         final_messages = result.get("messages", [])
                         for msg in reversed(final_messages):
-                            if hasattr(msg, "content") and msg.type == "ai" and msg.content:
-                                response = msg.content
+                            if getattr(msg, "type", None) == "ai":
+                                response = _extract_stream_text(msg)
+                                if not response:
+                                    continue
                                 session_manager.save_message(session_id, "user", message)
                                 session_manager.save_message(session_id, "assistant", response)
                                 return response
@@ -1116,8 +1165,10 @@ class AgentManager:
 
         final_messages = result.get("messages", [])
         for msg in reversed(final_messages):
-            if hasattr(msg, "content") and msg.type == "ai" and msg.content:
-                response = msg.content
+            if getattr(msg, "type", None) == "ai":
+                response = _extract_stream_text(msg)
+                if not response:
+                    continue
                 session_manager.save_message(session_id, "user", message)
                 session_manager.save_message(session_id, "assistant", response)
                 return response

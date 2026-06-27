@@ -31,8 +31,8 @@ ENV BACKEND_INTERNAL_URL=http://backend:9100
 
 # 仅复制运行所需文件
 COPY --from=builder /app/public ./public
-COPY --from=builder /app/.next/standalone ./
-COPY --from=builder /app/.next/static ./.next/static
+COPY --from=builder /app/.next-build/standalone ./
+COPY --from=builder /app/.next-build/static ./.next/static
 
 EXPOSE 3000
 

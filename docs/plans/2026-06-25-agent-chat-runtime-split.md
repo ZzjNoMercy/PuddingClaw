@@ -14,7 +14,7 @@
 
 | 模式 | 运行时 | 工作区 | Sidebar 显示 |
 |---|---|---|---|
-| **Agent** | DeepAgents `create_deep_agent` | 必须选择一个文件夹作为项目工作区，所有文件操作（read/write/edit/glob）都在该文件夹内进行 | 显示"项目"列表；项目下是关联到该项目的 session |
+| **Agent** | DeepAgents `create_deep_agent` | 选择项目时使用该项目目录；未选择项目时使用隐式 session workspace | 显示"项目"列表；真实项目下显示关联 session；未选择项目的 Agent session 显示在普通"对话"列表 |
 | **Chat** | LangChain `create_agent` + 现有 middleware | 无项目概念，纯对话，不操作本地文件 | 不显示"项目"，只显示全局对话 session |
 
 ### 1.3 核心架构原则：透明 Claw
@@ -103,6 +103,60 @@ function SegmentedTabs() {
    - 只显示全局对话 session
    - "新对话" 创建不关联项目的 session
    - 发送消息时走 `/api/chat`
+
+### 2.4 Sidebar 项目与无项目 Agent Session 规则
+
+最终 UI 结构：
+
+```text
+项目
+├─ PuddingClaw
+│  ├─ 评估引入 Higress
+│  └─ 动态罗列 skill 文档
+├─ 好得APP
+│  ├─ 优化过期事件颜色优先级
+│  └─ 实现全局搜索
+├─ MagicClaw
+│  └─ 输出 LangChain 架构文档
+└─ HiClaw
+   └─ 暂无对话
+
+对话
+├─ 安装 aihot skill
+├─ 生成 agent 介绍视频提示词
+└─ 创建AI三平台报告
+```
+
+规则：
+
+- 项目名默认取 `project_path.name`，例如 `/Users/pet/Code/AI/Agent/PuddingClaw` 显示为 `PuddingClaw`。
+- 有 `project_id` 的 Agent session 显示在对应项目下面。
+- 用户在 Agent 模式未选择项目就发起 Agent work 时，UI 不显示"默认工作区"项目；该 session 显示在普通"对话"列表。
+- Agent / Chat 两个 tab 的 session 列表必须按 `runtime_mode` 隔离：
+  - Agent tab：只显示 `runtime_mode="agent"` 的 session；其中有 `project_id` 的显示在项目下，无 `project_id` 的显示在 Agent tab 的"对话"下。
+  - Chat tab：只显示 `runtime_mode!="agent"` 的 session；老数据没有 `runtime_mode` 时按 Chat legacy 处理。
+- 无项目 Agent session 虽然也显示在"对话"标题下，但只在 Agent tab 出现，不进入 Chat tab。
+- 无项目 Agent session 后端仍创建隐式 workspace，保证 DeepAgents 始终有明确 filesystem root。
+- 无项目 Agent session 的 metadata：
+
+```json
+{
+  "runtime_mode": "agent",
+  "project_id": null,
+  "project_path": null,
+  "workspace_type": "unscoped_agent",
+  "workspace_path": "~/PuddingClaw/Workspaces/Unscoped/<session_id>"
+}
+```
+
+- DeepAgents 运行时：
+
+```python
+root_dir = project_path if project_id else workspace_path
+FilesystemBackend(root_dir=root_dir, virtual_mode=True)
+```
+
+- 后续可支持"移动到项目"：将无项目 Agent session 绑定到真实 `project_id`，并按产品策略决定是否迁移 workspace 文件。
 
 ### 2.2 ChatPanel 适配
 
@@ -260,6 +314,7 @@ Agent 模式能力归属：
 |---|---|
 | 技能执行 | DeepAgents `skills` |
 | 文件操作 | DeepAgents filesystem suite：`ls/read_file/write_file/edit_file/glob/grep` |
+| 项目外文件读取 | PuddingClaw 外部文件授权工具；必须用户确认，默认只读、session 级授权 |
 | Todo / 子代理 | DeepAgents `write_todos` / `task` |
 | 终端 | 暂时保留 PuddingClaw `terminal`；后续如接入 DeepAgents sandbox `execute` 再替换 |
 | 搜索 / 知识库 / MCP | 继续保留 PuddingClaw 工具 |
@@ -283,8 +338,30 @@ Agent 模式下保留 PuddingClaw 非冲突工具：
 说明：
 
 - `execute_skill` 不再作为 Agent 模式默认工具；技能执行由 DeepAgents `skills` 接管。
+- 若技能需要执行脚本，不再通过 PuddingClaw `execute_skill` 二次包装，而是让 DeepAgents 先按需读取 `/skills/<skill>/SKILL.md`，再调用 PuddingClaw `terminal` 直接执行脚本，例如 `python3 /skills/aihot/scripts/aihot_query.py ...`。
+- `create_deep_agent` 需要同时配置 `skills=["/skills/"]` 和 backend `/skills/` route：前者告诉 DeepAgents 扫描技能目录，后者让这个虚拟路径能实际读到 PuddingClaw 全局 skills。
 - DeepAgents 默认 `execute` 只有在 backend 实现 `SandboxBackendProtocol` 时才可用；第一版不依赖它。
-- PuddingClaw `terminal` 必须继续遵守项目目录边界，默认工作目录应为当前 `project_path`。
+- PuddingClaw `terminal` 必须继续遵守项目目录边界，默认工作目录应为当前 `project_path` 或无项目 Agent session workspace；同时将 DeepAgents 虚拟路径 `/skills` 映射到后端真实 skills 目录，保证技能脚本可用同一套路径表达。
+- DeepAgents filesystem 只负责项目目录内文件；当用户粘贴或请求读取项目目录外的绝对路径时，不打开 `virtual_mode=False`，也不直接扩展 DeepAgents backend，而是走 PuddingClaw 外部文件授权工具。
+- 项目外文件访问必须先触发用户授权事件；第一版只支持只读、session 级授权。授权通过后，由 PuddingClaw 文件工具读取内容并作为 tool result 返回给 DeepAgents。
+
+项目外文件读取流程：
+
+```text
+Agent 请求读取绝对路径
+  ↓
+后端 resolve 路径并判断不在 project_path
+  ↓
+发起 permission_request: external_file_read
+  ↓
+用户确认
+  ↓
+session 记录 allowed_external_paths
+  ↓
+PuddingClaw 文件工具读取该文件
+  ↓
+内容作为 tool result 返回给 Agent
+```
 
 ### 3.6 DeepAgents backend、skills 与 checkpoint
 
@@ -508,6 +585,13 @@ POST /api/projects/register
 - path 必须 `resolve()` 后校验存在、是目录、可访问。
 - DeepAgents `FilesystemBackend` 的 root 只能设置为该项目目录。
 - session 中保存 `project_id` 与 `project_path` 作为透明记录，但权限判断以注册表解析结果为准。
+- session 中保存 `allowed_external_paths`，记录用户对项目外文件的授权：
+  - `path`
+  - `access: "read"`
+  - `granted_at`
+  - `source: "user_confirmed"`
+  - `scope: "session"`
+- 已授权外部路径不进入 DeepAgents `FilesystemBackend`；它们由 PuddingClaw 文件工具按授权表读取，保持 DeepAgents 项目沙箱边界清晰。
 
 浏览器形态说明：
 
@@ -571,6 +655,20 @@ def deepagents_messages_to_session_messages(messages) -> list[dict]:
 
 ## 6. 实施步骤
 
+### 6.0 实施进度台账
+
+| 阶段 | 状态 | 完成记录 |
+|---|---|---|
+| Phase 0：方案固化 | Done | 2026-06-26：确认项目 Sidebar 规则、无项目 Agent session 放入普通"对话"列表、后端使用隐式 session workspace |
+| Phase 1A：后端 `/api/agent` 最小 PoC | Done | 2026-06-26：已实现 project registry、session runtime metadata、DeepAgentsManager 最小骨架、/api/agent 路由；Chat session 默认/兜底写入 `runtime_mode=chat`，Agent session 写入 `runtime_mode=agent`；本地启动脚本改为 `uv sync`，避免旧 `requirements.txt` 缺少 DeepAgents；`py_compile`、ModelClient/DeepAgents 29 项测试、project registry smoke 通过 |
+| Phase 1B：前端切换 UI + 项目选择 | Done | 2026-06-26：已接入 runtimeMode、streamAgent、projects API、Next /api/agent SSE 代理、Sidebar Agent/Chat 切换、项目列表、手动路径登记、项目 session 分组、无项目 Agent session 归入普通"对话"；补充 `baoyu-design` 输入区项目选择参考稿 `designs/agent-input-project-picker/index.html`，并在 ChatInput 中加入 Agent 模式项目胶囊、项目菜单、添加本地文件夹入口、Agent/Chat 输入区切换；项目行增加更多菜单，可按系统显示"访达/资源管理器/文件管理器"并打开已登记项目目录；`npm run build` 通过 |
+| Phase 1C：本地开发热重载稳定性 | Done | 2026-06-26：定位 `_next/static/* 404` 根因是 `next dev` 与 `next build` 共用 `.next`，build 会覆盖 dev chunks；已改为 dev 使用 `.next`，build/start 使用 `.next-build`，启动脚本只清理 dev 缓存，避免验证构建打断热重载 |
+| Phase 1D：DeepAgents 运行时透明事件 | Done | 2026-06-26：参考 Chat `AgentManager._run_agent_stream`，Agent 模式从 DeepAgents `updates.model.messages[].tool_calls` emit `tool_start`，从 `updates.tools.messages[]` emit `tool_end`，工具完成后续文本 emit `new_response`；`custom` middleware 事件按原类型透传；tool_calls/output 写入 `session.json`；补齐 `source_found`、`citations_finalized`、首轮自动标题事件；DeepAgents 工具结果复用 `tool_result_adapter`，结构化 `puddingclaw_tool_result` 会拆分为展示文本和 sources，并通过 `format_sources_for_model` 提醒模型使用 `[^source_id]` 标注引用；新增 `tests/test_deepagents_manager.py` 验证事件、引用、标题与持久化 |
+| Phase 2：DeepAgents 工具 / skills / backend 对齐 | In Progress | 2026-06-26：Agent 模式已过滤 PuddingClaw 重叠工具，保留 `terminal/fetch_url/tavily_search/search_knowledge_base`；`create_deep_agent` 已显式传入 `skills=["/skills/"]`，并通过 backend `/skills/` route 指向全局 skills；terminal 工作目录跟随当前 project/unscoped workspace，并把 `/skills` 虚拟路径映射到后端真实 skills 目录，支持 DeepAgents skills 读取说明后直接通过 terminal 跑技能脚本 |
+| Phase 3：SSE、Context Engineering 与 checkpoint 对齐 | Pending | 待 DeepAgents event adapter 稳定后接入 |
+| Phase 4：会话持久化与 history 转换 | Pending | 待 Agent session 元数据骨架落地后完善 |
+| Phase 5：生产化 | Pending | 可选增强 |
+
 ### Phase 1A：后端 `/api/agent` 最小 PoC（1～2 天）
 
 1. 新增 `backend/graph/deepagents_manager.py`
@@ -581,20 +679,51 @@ def deepagents_messages_to_session_messages(messages) -> list[dict]:
 
 ### Phase 1B：前端切换 UI + 项目选择（1 天）
 
+设计约束：
+
+- 正式细化 Agent/Chat 切换、项目 Sidebar、项目选择、项目外文件授权弹窗等 UI 前，先使用 `baoyu-design` 产出自包含 HTML 设计参考。
+- 设计产物默认放在 `designs/agent-input-project-picker/`，再按确认后的视觉与交互实现到前端。
+- 未选择项目的 Agent session 不显示"默认工作区"，仍归入普通"对话"列表；设计稿必须体现这一点。
+
 1. Store 增加 `runtimeMode` 和 `currentProjectPath`
 2. Sidebar 增加 `SegmentedTabs`，Chat 模式隐藏"项目"
 3. Agent 模式下显示项目列表，每个项目下显示关联 session
 4. 增加"选择项目文件夹"入口，通过 `/api/projects/register` 换取 `project_id`
 5. `sendMessage` 根据 mode 调用不同 API，Agent 模式携带 `project_id`
 6. 新增 `streamAgent` 和 `/api/agent/route.ts`
+7. ChatInput 在 Agent 模式显示当前项目上下文：
+   - 已选项目：显示项目名，发送时沿用 `currentProjectId`。
+   - 未选项目：显示"进入项目工作"，发送时走无项目 Agent session / 隐式 workspace。
+   - 菜单支持选择已有项目、使用现有文件夹登记项目、不使用项目。
+   - Chat 模式隐藏项目入口，避免把纯聊天误绑定到项目。
+8. Sidebar 项目行提供系统文件管理器入口：
+   - macOS 显示"在“访达”中打开"。
+   - Windows 显示"在“资源管理器”中打开"。
+   - Linux / 其他桌面显示"在“文件管理器”中打开"。
+   - 后端只接收 `project_id`，通过项目注册表解析真实路径后调用系统打开命令，不接受前端任意 path。
 
 ### Phase 2：DeepAgents 工具 / skills / backend 对齐（2～3 天）
 
 1. 使用 DeepAgents `FilesystemBackend(root_dir=project_path, virtual_mode=True)`
 2. 配置 `/skills/` 路由，让 DeepAgents skills 能读取 PuddingClaw skills 目录
+   - `create_deep_agent(skills=["/skills/"], backend=CompositeBackend(... routes={"/skills/": ...}))`
 3. 过滤 PuddingClaw 重叠工具：`read_file` / `write_file` / `task_manager` / `execute_skill`
 4. 保留 PuddingClaw 非冲突工具：`terminal` / search / knowledge / MCP
-5. 跑通一次 skills 执行、一次文件读写、一次 `write_todos`、一次 `task`
+   - `terminal` cwd = 当前项目目录或无项目 Agent session workspace。
+   - `terminal` 将 `/skills` 映射到后端真实 skills 目录，因此 DeepAgents 读到的技能脚本路径可以直接用于执行。
+   - `execute_skill` 不挂载到 Agent 模式，避免与 DeepAgents skills 双轨执行。
+5. 新增项目外文件授权读取：绝对路径不在 `project_path` 时触发用户授权，确认后由 PuddingClaw 文件工具只读读取
+6. 跑通一次 skills 执行、一次项目内文件读写、一次项目外文件授权读取、一次 `write_todos`、一次 `task`
+
+已完成的透明事件规则：
+
+- DeepAgents 文件工具、`write_todos`、`task`、skills 读取等只要以 LangGraph tool call / ToolMessage 形式出现，都会进入前端现有工具卡片。
+- `tool_start` 的 `input` 来自 `AIMessage.tool_calls[].args`。
+- `tool_end` 的 `output` 来自 `ToolMessage.content`，并写入 Claw `session.json`。
+- `tool_end` 前复用 Chat 链路的 `tool_result_adapter`：结构化工具结果中的 `answer_context` 作为工具展示输出，`sources` 通过 `source_found` 事件暴露给前端，并保存到 assistant message。
+- 有来源时，写回给 DeepAgents 模型的 ToolMessage 使用 `format_sources_for_model` 附加可引用来源目录，要求模型在回答中使用 `[^source_id]` 标识。
+- `done` 前发送 `citations_finalized`，并将 `finalize_citations(content, sources)` 的结果保存到 `session.json`。
+- DeepAgents `custom` middleware 事件按 `type` 透传；后续如需更细 UI，可在前端增加专门的 middleware/skill event 展示。
 
 ### Phase 3：SSE、Context Engineering 与 checkpoint 对齐（2～3 天）
 
@@ -607,10 +736,11 @@ def deepagents_messages_to_session_messages(messages) -> list[dict]:
 ### Phase 4：会话持久化与 history 转换（1～2 天）
 
 1. session 元数据增加 `runtime_mode`、`project_id`、`project_path`
-2. Agent 执行完成后保存消息历史到对应项目 session
-3. 多轮对话测试
-4. 异常中断时保存部分对话
-5. HITL / checkpoint resume 完成后同步最终状态到 Claw JSON
+2. session 元数据增加 `allowed_external_paths`，用于透明记录项目外文件读取授权
+3. Agent 执行完成后保存消息历史到对应项目 session
+4. 多轮对话测试
+5. 异常中断时保存部分对话
+6. HITL / checkpoint resume 完成后同步最终状态到 Claw JSON
 
 ### Phase 5：生产化（可选）
 
@@ -632,7 +762,7 @@ def deepagents_messages_to_session_messages(messages) -> list[dict]:
 | 终端执行能力缺失 | DeepAgents `execute` 依赖 sandbox backend | 第一版保留 PuddingClaw `terminal`；后续提供 Docker 沙箱模式接管 execute |
 | Docker 门槛过高 | 本地客户端用户不一定安装 Docker 或资源有限 | 默认轻量模式，Docker 作为增强隔离选项 |
 | 性能与缓存 | DeepAgents agent 编译和当前 AgentManager 缓存策略不同 | DeepAgentsAgentManager 内部也可做缓存 |
-| 依赖污染 | `deepagents` 只在 `deepagents-test` 组，生产环境未安装 | 如需生产运行，需要把 deepagents 加入主依赖或确认部署环境 |
+| 依赖升级漂移 | DeepAgents / LangChain 版本更新较快，运行时 API 可能漂移 | `deepagents` 已进入主依赖；升级后跑 DeepAgents 集成测试与最小 smoke |
 
 ## 8. 最小可验证目标（MVP）
 
@@ -695,6 +825,7 @@ def deepagents_messages_to_session_messages(messages) -> list[dict]:
 
 - `POST /api/projects/register`
 - `GET /api/projects`
+- `POST /api/projects/{project_id}/open`
 - `DELETE /api/projects/{project_id}`
 
 能力：
@@ -920,8 +1051,8 @@ DeepAgents 接管：
 
 处理：
 
-- 决定 `deepagents==0.6.11` 是否进入主依赖。
-- 或新增可选 dependency group / extra。
+- `deepagents>=0.6.12` 已进入 backend 主依赖。
+- `deepagents-test` 仅保留 Notebook / 集成测试辅助依赖。
 - `/api/agent` 在 DeepAgents 未安装时返回明确错误，不影响 `/api/chat`。
 - Docker 沙箱镜像作为可选增强依赖，不阻塞轻量模式。
 

@@ -73,6 +73,58 @@ export async function* streamChat(
   }
 }
 
+/**
+ * Stream Agent-mode messages via POST SSE.
+ */
+export async function* streamAgent(
+  message: string,
+  sessionId: string,
+  projectId?: string | null,
+  signal?: AbortSignal,
+  userId?: string
+): AsyncGenerator<SSEEvent> {
+  const response = await fetch(`${API_BASE}/agent`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      message,
+      session_id: sessionId,
+      user_id: userId || "default_user",
+      project_id: projectId || null,
+      stream: true
+    }),
+    signal,
+  });
+
+  if (!response.ok) {
+    throw new Error(`Agent API error: ${response.status}`);
+  }
+
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("No response body");
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    buffer = buffer.replace(/\r\n/g, "\n");
+    const frames = buffer.split("\n\n");
+    buffer = frames.pop() || "";
+
+    const parsedFrames = frames
+      .map((frame) => parseSSEFrame(frame))
+      .filter((event): event is SSEEvent => event !== null);
+
+    for (const parsed of parsedFrames) {
+      yield parsed;
+    }
+  }
+}
+
 function parseSSEFrame(frame: string): SSEEvent | null {
   let event = "message";
   const dataLines: string[] = [];
@@ -119,7 +171,16 @@ export async function saveFile(path: string, content: string): Promise<void> {
  * List all sessions.
  */
 export async function listSessions(): Promise<
-  Array<{ id: string; title: string; updated_at: number }>
+  Array<{
+    id: string;
+    title: string;
+    updated_at: number;
+    runtime_mode?: "agent" | "chat";
+    project_id?: string | null;
+    project_path?: string | null;
+    workspace_type?: string;
+    workspace_path?: string;
+  }>
 > {
   const resp = await fetch(`${API_BASE}/sessions`);
   if (!resp.ok) throw new Error(`Failed to list sessions: ${resp.status}`);
@@ -127,10 +188,48 @@ export async function listSessions(): Promise<
   return data.sessions;
 }
 
+export interface ProjectMeta {
+  project_id: string;
+  name: string;
+  path: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export async function listProjects(): Promise<ProjectMeta[]> {
+  const resp = await fetch(`${API_BASE}/projects`);
+  if (!resp.ok) throw new Error(`Failed to list projects: ${resp.status}`);
+  const data = await resp.json();
+  return data.projects;
+}
+
+export async function registerProject(path: string, name?: string): Promise<ProjectMeta> {
+  const resp = await fetch(`${API_BASE}/projects/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, name }),
+  });
+  if (!resp.ok) throw new Error(`Failed to register project: ${resp.status}`);
+  return resp.json();
+}
+
+export async function openProject(projectId: string): Promise<void> {
+  const resp = await fetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/open`, {
+    method: "POST",
+  });
+  if (!resp.ok) throw new Error(`Failed to open project: ${resp.status}`);
+}
+
 /**
  * Create a new session.
  */
-export async function createSession(): Promise<{ id: string; title: string }> {
+export async function createSession(): Promise<{
+  id: string;
+  title: string;
+  created_at?: number;
+  updated_at?: number;
+  runtime_mode?: "agent" | "chat";
+}> {
   const resp = await fetch(`${API_BASE}/sessions`, { method: "POST" });
   if (!resp.ok) throw new Error(`Failed to create session: ${resp.status}`);
   return resp.json();
@@ -178,7 +277,12 @@ export async function getSessionHistory(
   sessionId: string
 ): Promise<{
   session_id: string;
-  messages: Array<{ role: string; content: string; tool_calls?: Array<{ tool: string; input?: string; output?: string }> }>;
+  messages: Array<{
+    role: string;
+    content: string;
+    reasoning_content?: string;
+    tool_calls?: Array<{ tool: string; input?: string; output?: string }>;
+  }>;
 }> {
   const resp = await fetch(
     `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/history`
