@@ -68,7 +68,7 @@ export default function ChatMessage({ message, isStreaming = false }: Props) {
           /* Assistant message — left-aligned */
           <div>
             <div className="min-w-0">
-              {message.segments && message.segments.length > 1 ? (
+              {message.segments && message.segments.length > 0 ? (
                 /* Multi-segment agent turn: each model invocation is its own block */
                 <div className="space-y-4">
                   {message.segments.map((segment, index) => (
@@ -89,17 +89,6 @@ export default function ChatMessage({ message, isStreaming = false }: Props) {
                 </div>
               ) : (
                 <>
-                  {/* Timeline: interleaved reasoning + tool calls */}
-                  {message.timeline && message.timeline.length > 0 ? (
-                    <ThoughtChain timeline={message.timeline} isStreaming={isStreaming} />
-                  ) : message.reasoning ? (
-                    <ReasoningBlock
-                      content={message.reasoning}
-                      defaultOpen={isStreaming && !message.content}
-                      isStreaming={isStreaming && !message.content}
-                    />
-                  ) : null}
-
                   {/* Final answer */}
                   {hasAuthError ? (
                     <AuthErrorAlert content={message.content} />
@@ -119,6 +108,17 @@ export default function ChatMessage({ message, isStreaming = false }: Props) {
                         {formatTime(message.timestamp)}
                       </div>
                     </div>
+                  ) : null}
+
+                  {/* Timeline: interleaved reasoning + tool calls */}
+                  {message.timeline && message.timeline.length > 0 ? (
+                    <ThoughtChain timeline={message.timeline} isStreaming={isStreaming} />
+                  ) : message.reasoning ? (
+                    <ReasoningBlock
+                      content={message.reasoning}
+                      defaultOpen={isStreaming && !message.content}
+                      isStreaming={isStreaming && !message.content}
+                    />
                   ) : null}
                 </>
               )}
