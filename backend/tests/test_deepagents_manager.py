@@ -99,7 +99,7 @@ def test_deepagents_manager_emits_and_persists_tool_events(tmp_path, monkeypatch
         message for message in history if message["role"] == "assistant" and message.get("tool_calls")
     )
 
-    assert event_names == ["tool_start", "tool_end", "content_reset", "token", "citations_finalized", "done"]
+    assert event_names == ["tool_start", "tool_end", "segment_break", "token", "citations_finalized", "done"]
     assert create_kwargs["skills"] == ["/skills/"]
     assert "memory" not in create_kwargs
     assert "middleware" in create_kwargs

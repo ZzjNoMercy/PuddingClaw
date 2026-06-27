@@ -579,13 +579,18 @@ class DeepAgentsAgentManager:
             emitted_tool_starts: set[str] = set()
             pending_tool_starts: dict[str, dict[str, str]] = {}
             turn_sources: list[dict[str, Any]] = []
-            current_segment: dict[str, Any] = {
-                "content": "",
-                "tool_calls": [],
-                "sources": [],
-                "citations": [],
-            }
-            segments: list[dict[str, Any]] = []
+
+            def new_segment() -> dict[str, Any]:
+                return {
+                    "content": "",
+                    "tool_calls": [],
+                    "timeline": [],
+                    "reasoning_content": "",
+                    "_current_reasoning": None,
+                }
+
+            segments: list[dict[str, Any]] = [new_segment()]
+            active_segment = segments[0]
             chunk_count = 0
             emitted_reasoning = False
             accumulated_reasoning = ""
@@ -619,7 +624,8 @@ class DeepAgentsAgentManager:
                         if not node or node == "model":
                             emitted_reasoning = True
                             accumulated_reasoning += reasoning_text
-                            self._append_reasoning_to_timeline(current_segment, reasoning_text)
+                            active_segment["reasoning_content"] += reasoning_text
+                            self._append_reasoning_to_timeline(active_segment, reasoning_text)
                             source = self._detect_reasoning_source(payload)
                             prev_logged_chars = reasoning_log_chars
                             reasoning_log_chars = len(accumulated_reasoning)
@@ -651,18 +657,16 @@ class DeepAgentsAgentManager:
                         node = self._metadata_node(metadata)
                         if node and node != "model":
                             continue
-                        self._finalize_reasoning_timeline(current_segment)
+                        self._finalize_reasoning_timeline(active_segment)
                         if tools_just_finished:
                             tools_just_finished = False
                             # The model has been re-invoked after tool calls.
-                            # Insert a visual break between the pre-tool planning
-                            # phase and the post-tool response so they don't
-                            # concatenate into one unreadable wall of text.
-                            separator = "\n\n---\n\n"
-                            current_segment["content"] += separator
-                            emitted_text += separator
-                            yield self._sse("content_reset", {})
-                        current_segment["content"] += text
+                            # Start a new segment so the frontend can render each
+                            # model invocation + its tools as a separate block.
+                            active_segment = new_segment()
+                            segments.append(active_segment)
+                            yield self._sse("segment_break", {})
+                        active_segment["content"] += text
                         emitted_text += text
                         yield self._sse("token", {"content": text})
                 elif mode == "updates" and isinstance(payload, dict):
@@ -697,9 +701,6 @@ class DeepAgentsAgentManager:
                                     except Exception:
                                         pass
                                     turn_sources = dedupe_sources(turn_sources + sources)
-                                    current_segment["sources"] = dedupe_sources(
-                                        current_segment.get("sources", []) + sources
-                                    )
                                     for source in sources:
                                         logger.info(
                                             "Emitting source_found event: source_id=%s",
@@ -713,12 +714,12 @@ class DeepAgentsAgentManager:
                                             },
                                         )
                                 is_error = self._is_tool_error(tool_msg, raw_output)
-                                self._update_tool_end_in_timeline(current_segment, tc_id or "", raw_output, is_error)
+                                self._update_tool_end_in_timeline(active_segment, tc_id or "", raw_output, is_error)
                                 pending_tool_starts.pop(tc_id, None)
 
                                 matched = False
                                 if tc_id:
-                                    for tc in current_segment["tool_calls"]:
+                                    for tc in active_segment["tool_calls"]:
                                         if tc.get("id") == tc_id and "output" not in tc:
                                             tc["output"] = raw_output
                                             tc["raw_output"] = original_output
@@ -728,7 +729,7 @@ class DeepAgentsAgentManager:
                                             matched = True
                                             break
                                 if not matched:
-                                    current_segment["tool_calls"].append(
+                                    active_segment["tool_calls"].append(
                                         {
                                             "tool": tool_name,
                                             "input": "",
@@ -771,8 +772,8 @@ class DeepAgentsAgentManager:
                                             "tool": tool_name,
                                             "input": tool_input,
                                         }
-                                    self._finalize_reasoning_timeline(current_segment)
-                                    current_segment["tool_calls"].append(
+                                    self._finalize_reasoning_timeline(active_segment)
+                                    active_segment["tool_calls"].append(
                                         {
                                             "tool": tool_name,
                                             "input": tool_input,
@@ -780,7 +781,7 @@ class DeepAgentsAgentManager:
                                         }
                                     )
                                     self._add_tool_start_to_timeline(
-                                        current_segment, tc_id or "", tool_name, tool_input
+                                        active_segment, tc_id or "", tool_name, tool_input
                                     )
                                     yield self._sse(
                                         "tool_start",
@@ -799,16 +800,16 @@ class DeepAgentsAgentManager:
 
             final_content = self._last_ai_content(final_state) or emitted_text
             if final_content:
-                current_text = current_segment.get("content", "")
+                current_text = active_segment.get("content", "")
                 if not current_text.strip():
-                    current_segment["content"] = final_content
+                    active_segment["content"] = final_content
                     emitted_text = final_content
                     yield self._sse("token", {"content": final_content})
                 elif final_content.strip() not in current_text:
                     # The authoritative final answer differs from the streamed
                     # text (e.g. only intermediate planning was streamed before
                     # tools). Replace with the final answer.
-                    current_segment["content"] = final_content
+                    active_segment["content"] = final_content
                     emitted_text = final_content
                     yield self._sse("token", {"content": final_content})
             elif emitted_reasoning and not final_content:
@@ -816,13 +817,13 @@ class DeepAgentsAgentManager:
                     "模型本轮只返回了 reasoning_content，没有返回正式回答 content。"
                     "请检查 Higress 路由模型是否应切换为非推理模型，或确认 provider 是否会在流结束前输出 content。"
                 )
-                current_segment["content"] += diagnostic
+                active_segment["content"] += diagnostic
                 final_content = diagnostic
                 yield self._sse("token", {"content": diagnostic})
 
             for tc_id, pending in list(pending_tool_starts.items()):
                 failed_output = "Tool execution did not return a result before the agent finished."
-                current_segment["tool_calls"].append(
+                active_segment["tool_calls"].append(
                     {
                         "tool": pending.get("tool", "unknown_tool"),
                         "input": pending.get("input", ""),
@@ -847,36 +848,37 @@ class DeepAgentsAgentManager:
                 )
 
             session_manager.save_message(session_id, "user", message)
-            if self._segment_has_payload(current_segment):
-                current_segment["sources"] = dedupe_sources(turn_sources)
-                current_segment["citations"] = finalize_citations(
-                    current_segment.get("content", ""), turn_sources
-                )
-                segments.append(current_segment)
+            # Build the single assistant message content by concatenating segment
+            # text, and persist the segments array for the UI.
+            full_content = "\n\n".join(
+                seg["content"] for seg in segments if seg.get("content")
+            )
+            all_tool_calls = [tc for seg in segments for tc in seg.get("tool_calls", [])]
+            all_timeline = [item for seg in segments for item in seg.get("timeline", [])]
+            final_citations = finalize_citations(full_content, turn_sources)
+            for seg in segments:
+                seg.pop("_current_reasoning", None)
             logger.info(
-                "Stream summary for session=%s: chunks=%d, reasoning_emitted=%s, reasoning_len=%d, text_len=%d",
+                "Stream summary for session=%s: chunks=%d, reasoning_emitted=%s, reasoning_len=%d, text_len=%d, segments=%d",
                 session_id,
                 chunk_count,
                 emitted_reasoning,
                 len(accumulated_reasoning),
                 len(emitted_text),
+                len(segments),
             )
-            for segment in segments:
-                # Strip internal timeline builder state before persisting.
-                segment.pop("_current_reasoning", None)
+            if self._segment_has_payload({"content": full_content, "tool_calls": all_tool_calls}):
                 session_manager.save_message(
                     session_id,
                     "assistant",
-                    str(segment.get("content") or ""),
-                    tool_calls=segment["tool_calls"] or None,
-                    sources=segment.get("sources"),
-                    citations=segment.get("citations"),
+                    full_content,
+                    tool_calls=all_tool_calls or None,
+                    sources=dedupe_sources(turn_sources) or None,
+                    citations=final_citations or None,
                     reasoning_content=accumulated_reasoning or None,
-                    timeline=segment.get("timeline") or None,
+                    timeline=all_timeline or None,
+                    segments=segments or None,
                 )
-            final_citations = [
-                citation for segment in segments for citation in segment.get("citations", [])
-            ]
             yield self._sse(
                 "citations_finalized",
                 {

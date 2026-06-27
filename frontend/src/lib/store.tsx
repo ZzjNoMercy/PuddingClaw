@@ -77,6 +77,13 @@ export interface CitationRef {
   status: "pending" | "verified" | "invalid";
 }
 
+export interface MessageSegment {
+  content: string;
+  reasoning?: string;
+  toolCalls?: ToolCall[];
+  timeline?: TimelineItem[];
+}
+
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
@@ -84,6 +91,7 @@ export interface ChatMessage {
   reasoning?: string;
   toolCalls?: ToolCall[];
   timeline?: TimelineItem[];
+  segments?: MessageSegment[];
   retrievals?: RetrievalResult[];
   sources?: SourceRecord[];
   citations?: CitationRef[];
@@ -219,6 +227,7 @@ function parseHistoryMessages(
     reasoning_content?: string;
     tool_calls?: Array<{ id?: string; tool: string; input?: string; output?: string; is_error?: boolean }>;
     timeline?: Array<{ type: string; content?: string; tool_call?: ToolCall; id?: string }>;
+    segments?: Array<{ content?: string; reasoning_content?: string; tool_calls?: ToolCall[]; timeline?: TimelineItem[] }>;
     sources?: SourceRecord[];
     citations?: CitationRef[];
   }>
@@ -247,6 +256,14 @@ function parseHistoryMessages(
       const timeline = msg.timeline?.length
         ? normalizeSavedTimeline(msg.timeline, toolCalls)
         : buildHistoryTimeline(msg.reasoning_content, toolCalls);
+      const segments: MessageSegment[] | undefined = msg.segments?.length
+        ? msg.segments.map((seg) => ({
+            content: seg.content || "",
+            reasoning: seg.reasoning_content,
+            toolCalls: seg.tool_calls,
+            timeline: seg.timeline,
+          }))
+        : undefined;
       loaded.push({
         id: `hist-asst-${msgIndex++}`,
         role: "assistant",
@@ -254,6 +271,7 @@ function parseHistoryMessages(
         reasoning: msg.reasoning_content,
         toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
         timeline: timeline.length > 0 ? timeline : undefined,
+        segments,
         sources: msg.sources,
         citations: msg.citations,
         timestamp: Date.now() - (backendMessages.length - msgIndex) * 1000,
@@ -822,6 +840,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         content: "",
         toolCalls: [],
         timeline: [],
+        segments: [{ content: "" }],
         timestamp: Date.now(),
       };
 
@@ -862,9 +881,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           const updated = [...prev];
           const idx = updated.findIndex((m) => m.id === targetId);
           if (idx === -1) return prev;
+          const segments = updated[idx].segments
+            ? [...updated[idx].segments]
+            : [{ content: updated[idx].content }];
+          const lastSegIdx = segments.length - 1;
+          segments[lastSegIdx] = {
+            ...segments[lastSegIdx],
+            content: segments[lastSegIdx].content + content,
+          };
           updated[idx] = {
             ...updated[idx],
             content: updated[idx].content + content,
+            segments,
           };
           return updated;
         });
@@ -895,10 +923,26 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             ? [...updated[idx].timeline]
             : [];
           appendReasoningToTimeline(timeline, content);
+          const segments = updated[idx].segments
+            ? [...updated[idx].segments]
+            : undefined;
+          if (segments) {
+            const lastSegIdx = segments.length - 1;
+            const segTimeline = segments[lastSegIdx].timeline
+              ? [...segments[lastSegIdx].timeline]
+              : [];
+            appendReasoningToTimeline(segTimeline, content);
+            segments[lastSegIdx] = {
+              ...segments[lastSegIdx],
+              reasoning: `${segments[lastSegIdx].reasoning || ""}${content}`,
+              timeline: segTimeline,
+            };
+          }
           updated[idx] = {
             ...updated[idx],
             reasoning: `${updated[idx].reasoning || ""}${content}`,
             timeline,
+            segments,
           };
           return updated;
         });
@@ -935,10 +979,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             continue;
           }
 
-          if (event.event === "content_reset") {
-            // The model was re-invoked after tool calls. Insert a visual
-            // separator between the pre-tool planning phase and the post-tool
-            // response so they don't concatenate into one wall of text.
+          if (event.event === "segment_break") {
+            // The model was re-invoked after tool calls. Start a new message
+            // segment so the UI can render each model invocation + its tools
+            // as a separate block.
             flushPendingTokens();
             flushPendingReasoning();
             const targetId = getAssistantId();
@@ -946,11 +990,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               const updated = [...prev];
               const idx = updated.findIndex((m) => m.id === targetId);
               if (idx !== -1) {
-                const separator = "\n\n---\n\n";
-                updated[idx] = {
-                  ...updated[idx],
-                  content: updated[idx].content + separator,
-                };
+                const segments = updated[idx].segments
+                  ? [...updated[idx].segments, { content: "" }]
+                  : [{ content: "" }];
+                updated[idx] = { ...updated[idx], segments };
               }
               return updated;
             });
@@ -1091,6 +1134,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 content: "",
                 toolCalls: [],
                 timeline: [],
+                segments: [{ content: "" }],
                 timestamp: Date.now(),
               },
             ]);
@@ -1124,6 +1168,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                   const timeline = msg.timeline ? [...msg.timeline] : [];
                   addToolToTimeline(timeline, newToolCall);
                   msg.timeline = timeline;
+                  // Also add to the current segment's timeline.
+                  const segments = msg.segments ? [...msg.segments] : undefined;
+                  if (segments) {
+                    const lastSegIdx = segments.length - 1;
+                    const segTimeline = segments[lastSegIdx].timeline
+                      ? [...segments[lastSegIdx].timeline]
+                      : [];
+                    addToolToTimeline(segTimeline, newToolCall);
+                    segments[lastSegIdx] = { ...segments[lastSegIdx], timeline: segTimeline };
+                    msg.segments = segments;
+                  }
                 }
                 break;
               }
@@ -1160,6 +1215,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 const timeline = msg.timeline ? [...msg.timeline] : [];
                 updateToolInTimeline(timeline, tcId, event.data.tool as string, updates);
                 msg.timeline = timeline;
+                // Also update the current segment's timeline.
+                const segments = msg.segments ? [...msg.segments] : undefined;
+                if (segments) {
+                  const lastSegIdx = segments.length - 1;
+                  const segTimeline = segments[lastSegIdx].timeline
+                    ? [...segments[lastSegIdx].timeline]
+                    : [];
+                  updateToolInTimeline(segTimeline, tcId, event.data.tool as string, updates);
+                  segments[lastSegIdx] = { ...segments[lastSegIdx], timeline: segTimeline };
+                  msg.segments = segments;
+                }
                 break;
               }
 

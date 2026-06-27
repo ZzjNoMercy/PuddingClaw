@@ -5,7 +5,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Components } from "react-markdown";
 import { AlertTriangle, ChevronDown, ChevronRight, Key, Sparkles } from "lucide-react";
-import { useApp, type ChatMessage as ChatMessageType, type SourceRecord } from "@/lib/store";
+import { useApp, type ChatMessage as ChatMessageType, type SourceRecord, type TimelineItem } from "@/lib/store";
 import ThoughtChain from "./ThoughtChain";
 import RetrievalCard from "./RetrievalCard";
 
@@ -68,29 +68,18 @@ export default function ChatMessage({ message, isStreaming = false }: Props) {
           /* Assistant message — left-aligned */
           <div>
             <div className="min-w-0">
-              {/* Timeline: interleaved reasoning + tool calls */}
-              {message.timeline && message.timeline.length > 0 ? (
-                <ThoughtChain timeline={message.timeline} isStreaming={isStreaming} />
-              ) : message.reasoning ? (
-                <ReasoningBlock
-                  content={message.reasoning}
-                  defaultOpen={isStreaming && !message.content}
-                  isStreaming={isStreaming && !message.content}
-                />
-              ) : null}
-
-              {/* Final answer */}
-              {hasAuthError ? (
-                <AuthErrorAlert content={message.content} />
-              ) : message.content ? (
-                <div>
-                  <div className="px-1 py-1 text-[15px] leading-relaxed">
-                    <div className="markdown-content">
-                      <ReactMarkdown remarkPlugins={[remarkGfm]} components={citationComponents}>
-                        {renderedContent}
-                      </ReactMarkdown>
-                    </div>
-                  </div>
+              {message.segments && message.segments.length > 1 ? (
+                /* Multi-segment agent turn: each model invocation is its own block */
+                <div className="space-y-4">
+                  {message.segments.map((segment, index) => (
+                    <SegmentBlock
+                      key={`${message.id}-seg-${index}`}
+                      segment={segment}
+                      message={message}
+                      isStreaming={isStreaming}
+                      isLast={index === message.segments!.length - 1}
+                    />
+                  ))}
                   {message.retrievals && message.retrievals.length > 0 && (
                     <RetrievalCard retrievals={message.retrievals} />
                   )}
@@ -98,7 +87,41 @@ export default function ChatMessage({ message, isStreaming = false }: Props) {
                     {formatTime(message.timestamp)}
                   </div>
                 </div>
-              ) : null}
+              ) : (
+                <>
+                  {/* Timeline: interleaved reasoning + tool calls */}
+                  {message.timeline && message.timeline.length > 0 ? (
+                    <ThoughtChain timeline={message.timeline} isStreaming={isStreaming} />
+                  ) : message.reasoning ? (
+                    <ReasoningBlock
+                      content={message.reasoning}
+                      defaultOpen={isStreaming && !message.content}
+                      isStreaming={isStreaming && !message.content}
+                    />
+                  ) : null}
+
+                  {/* Final answer */}
+                  {hasAuthError ? (
+                    <AuthErrorAlert content={message.content} />
+                  ) : message.content ? (
+                    <div>
+                      <div className="px-1 py-1 text-[15px] leading-relaxed">
+                        <div className="markdown-content">
+                          <ReactMarkdown remarkPlugins={[remarkGfm]} components={citationComponents}>
+                            {renderedContent}
+                          </ReactMarkdown>
+                        </div>
+                      </div>
+                      {message.retrievals && message.retrievals.length > 0 && (
+                        <RetrievalCard retrievals={message.retrievals} />
+                      )}
+                      <div className="text-[10px] text-gray-400 mt-1 pl-1">
+                        {formatTime(message.timestamp)}
+                      </div>
+                    </div>
+                  ) : null}
+                </>
+              )}
 
               {/* Typing indicator — only when nothing else is visible yet */}
               {isStreaming && !message.content && !message.reasoning && !message.timeline?.length ? (
@@ -117,6 +140,78 @@ export default function ChatMessage({ message, isStreaming = false }: Props) {
       </div>
     </div>
   );
+}
+
+function SegmentBlock({
+  segment,
+  message,
+  isStreaming,
+  isLast,
+}: {
+  segment: { content: string; reasoning?: string; timeline?: TimelineItem[] };
+  message: ChatMessageType;
+  isStreaming?: boolean;
+  isLast?: boolean;
+}) {
+  const { setActiveSourceId, setInspectorOpen } = useApp();
+  const rendered = renderCitationMarkersForSegment(message, segment.content);
+  const citationComponents: Components = {
+    a: (props) => (
+      <CitationLink
+        {...props}
+        sources={message.sources}
+        onActivate={(sourceId) => {
+          setActiveSourceId(sourceId);
+          setInspectorOpen(true);
+        }}
+      />
+    ),
+  };
+
+  return (
+    <div className="space-y-2">
+      {segment.timeline && segment.timeline.length > 0 ? (
+        <ThoughtChain timeline={segment.timeline} isStreaming={isStreaming && isLast} />
+      ) : segment.reasoning ? (
+        <ReasoningBlock
+          content={segment.reasoning}
+          defaultOpen={isStreaming && !segment.content}
+          isStreaming={isStreaming && !segment.content}
+        />
+      ) : null}
+      {segment.content ? (
+        <div className="px-1 py-1 text-[15px] leading-relaxed">
+          <div className="markdown-content">
+            <ReactMarkdown remarkPlugins={[remarkGfm]} components={citationComponents}>
+              {rendered}
+            </ReactMarkdown>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function renderCitationMarkersForSegment(
+  message: ChatMessageType,
+  content: string
+): string {
+  const indexes = new Map<string, number>();
+  message.citations?.forEach((citation) => {
+    indexes.set(citation.source_id, citation.display_index);
+  });
+  const existingIndexes = Array.from(indexes.values());
+  let nextIndex = existingIndexes.length > 0 ? Math.max(...existingIndexes) + 1 : 1;
+  message.sources?.forEach((source) => {
+    if (source.source_id && !indexes.has(source.source_id)) {
+      indexes.set(source.source_id, nextIndex++);
+    }
+  });
+  if (indexes.size === 0) return content;
+  return content.replace(/\[\^(src_[A-Za-z0-9_-]+)\]/g, (marker, sourceId: string) => {
+    const index = indexes.get(sourceId);
+    return index ? `[${index}](#source-${sourceId})` : marker;
+  });
 }
 
 function ReasoningBlock({

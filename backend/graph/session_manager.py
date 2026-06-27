@@ -140,6 +140,7 @@ class SessionManager:
         citations: list[dict[str, Any]] | None = None,        # 正文与来源的引用映射
         reasoning_content: str | None = None,                  # 思考链内容（工具调用回合必须回传）
         timeline: list[dict[str, Any]] | None = None,         # 前端时间轴（reasoning/tool 交错顺序）
+        segments: list[dict[str, Any]] | None = None,         # UI 分段（每轮模型调用为一个 segment）
     ) -> None:
         """追加一条消息到会话历史"""
         data = self._read_file(session_id)        # 读取现有数据
@@ -158,6 +159,8 @@ class SessionManager:
             msg["reasoning_content"] = reasoning_content
         if timeline:                                              # 保留真实 reasoning/tool 交错顺序
             msg["timeline"] = timeline
+        if segments:                                              # UI 分段信息
+            msg["segments"] = segments
         if sources:
             msg["sources"] = sources
         if citations:
