@@ -1,0 +1,22 @@
+# 默认监控的 GitHub 仓库列表
+# 格式: owner/repo
+
+repos:
+  - langchain-ai/langchain
+  - higress-group/higress
+  - opendatalab/MinerU
+  - vanna-ai/vanna
+
+# 知识库存储路径（Agent 通过 write_file 工具写入此路径）
+# Python 脚本备选路径: /tmp/github-monitor-kb/
+kb_path: /knowledge/
+
+# 可选: 每个仓库的额外配置
+config:
+  # 每仓库最大拉取条目数
+  max_releases: 5
+  max_commits: 10
+  max_pull_requests: 10
+
+  # 知识库存储路径
+  kb_path: /knowledge/
