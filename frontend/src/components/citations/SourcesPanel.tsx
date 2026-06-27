@@ -79,6 +79,13 @@ function ProgressCard({ todos }: { todos: TodoItem[] }) {
   const completed = todos.filter((todo) => todo.status === "completed").length;
   const hasTodos = todos.length > 0;
 
+  // Auto-expand when todos are detected so the user doesn't have to open the drawer manually.
+  useEffect(() => {
+    if (hasTodos) {
+      setOpen(true);
+    }
+  }, [hasTodos]);
+
   return (
     <section className="workspace-side-card rounded-[28px] px-5 py-5">
       <button
@@ -122,14 +129,6 @@ function ProgressCard({ todos }: { todos: TodoItem[] }) {
                   </p>
                 </div>
               ))}
-              <button
-                type="button"
-                onClick={() => setOpen(false)}
-                className="mt-1 inline-flex items-center gap-2 rounded-full px-1 py-1 text-[12px] font-medium text-slate-500 hover:text-slate-800"
-              >
-                <ChevronDown className="h-3.5 w-3.5 rotate-180" />
-                收起
-              </button>
             </>
           ) : (
             <ProgressEmptyState />
