@@ -116,18 +116,20 @@ export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
 
   return (
     <div className="mb-3">
-      <button
-        type="button"
-        onClick={() => setIsExpanded((v) => !v)}
-        className="sticky top-0 z-10 inline-flex items-center gap-2 rounded-md bg-white/90 px-1 py-1 text-[13px] text-gray-600 backdrop-blur-sm transition-colors hover:text-gray-900"
-      >
-        {isExpanded ? (
-          <ChevronDown className="h-4 w-4 text-gray-400" />
-        ) : (
-          <ChevronRight className="h-4 w-4 text-gray-400" />
-        )}
-        <span>{summaryText}</span>
-      </button>
+      <div className="sticky top-0 z-20 -mx-1 bg-white/95 px-1 py-1 backdrop-blur-sm">
+        <button
+          type="button"
+          onClick={() => setIsExpanded((v) => !v)}
+          className="inline-flex items-center gap-2 rounded-md px-1 py-0.5 text-[13px] text-gray-600 transition-colors hover:bg-gray-50 hover:text-gray-900"
+        >
+          {isExpanded ? (
+            <ChevronDown className="h-4 w-4 text-gray-400" />
+          ) : (
+            <ChevronRight className="h-4 w-4 text-gray-400" />
+          )}
+          <span>{summaryText}</span>
+        </button>
+      </div>
 
       {isExpanded && (
         <div className="relative mt-3 pl-3">

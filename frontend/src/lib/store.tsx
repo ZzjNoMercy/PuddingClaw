@@ -309,10 +309,20 @@ function buildHistoryTimeline(
 ): TimelineItem[] {
   const timeline: TimelineItem[] = [];
   if (reasoningContent) {
-    timeline.push({
-      type: "reasoning",
-      content: reasoningContent,
-      id: `hist-reasoning-${Date.now()}`,
+    // After the session ends we only have the final reasoning_content string.
+    // Split it at paragraph boundaries so the history timeline isn't one huge
+    // wall of text; this approximates the multiple reasoning chunks seen while
+    // streaming.
+    const chunks = reasoningContent
+      .split(/\n{2,}/)
+      .map((chunk) => chunk.trim())
+      .filter(Boolean);
+    chunks.forEach((chunk, idx) => {
+      timeline.push({
+        type: "reasoning",
+        content: chunk,
+        id: `hist-reasoning-${Date.now()}-${idx}`,
+      });
     });
   }
   toolCalls.forEach((tc, idx) => {
