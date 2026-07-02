@@ -11,6 +11,7 @@ aiosignal==1.4.0
     # via aiohttp
 aiosqlite==0.22.1
     # via
+    #   langgraph-checkpoint-sqlite
     #   llama-index-core
     #   puddingclaw-backend
 annotated-doc==0.0.4
@@ -239,7 +240,10 @@ langgraph==1.2.6
 langgraph-checkpoint==4.1.1
     # via
     #   langgraph
+    #   langgraph-checkpoint-sqlite
     #   langgraph-prebuilt
+langgraph-checkpoint-sqlite==3.1.0
+    # via puddingclaw-backend
 langgraph-prebuilt==1.1.0
     # via langgraph
 langgraph-sdk==0.4.2
@@ -447,6 +451,8 @@ sqlalchemy==2.0.51
     #   llama-index-core
     #   mem0ai
     #   puddingclaw-backend
+sqlite-vec==0.1.9
+    # via langgraph-checkpoint-sqlite
 sse-starlette==3.4.5
     # via
     #   mcp

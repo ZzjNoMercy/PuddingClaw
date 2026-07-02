@@ -142,6 +142,40 @@ ipcMain.handle('select-project-folder', async () => {
   return result.filePaths[0];
 });
 
+// IPC: 选择本地 Markdown 知识库文件
+ipcMain.handle('select-knowledge-file', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    properties: ['openFile'],
+    title: '选择 Markdown 知识库文件',
+    buttonLabel: '导入',
+    filters: [
+      { name: 'Markdown', extensions: ['md', 'markdown'] },
+      { name: 'All Files', extensions: ['*'] },
+    ],
+  });
+
+  if (result.canceled || result.filePaths.length === 0) {
+    return null;
+  }
+
+  return result.filePaths[0];
+});
+
+// IPC: 选择本地知识库目录
+ipcMain.handle('select-knowledge-folder', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    properties: ['openDirectory', 'createDirectory'],
+    title: '选择知识库目录',
+    buttonLabel: '设为知识库',
+  });
+
+  if (result.canceled || result.filePaths.length === 0) {
+    return null;
+  }
+
+  return result.filePaths[0];
+});
+
 // IPC: Backend 管理
 ipcMain.handle('start-backend', async () => {
   const result = await backendManager.startBackend();

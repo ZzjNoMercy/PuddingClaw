@@ -7,6 +7,7 @@ const REPO_ROOT = getRepoRoot();
 const INFRA_COMPOSE = getInfraComposePath();
 
 const INFRA_SERVICES = {
+  postgres: { type: 'tcp', host: '127.0.0.1', port: Number(process.env.POSTGRES_PORT || 5432), name: 'PostgreSQL' },
   higress: { url: 'http://127.0.0.1:8080/health', name: 'Higress' },
   milvus: { url: 'http://127.0.0.1:19530', name: 'Milvus' },
 };
@@ -57,6 +58,20 @@ async function checkDockerDaemon() {
 
 async function checkInfraService(key) {
   const service = INFRA_SERVICES[key];
+  if (service.type === 'tcp') {
+    return new Promise((resolve) => {
+      const net = require('net');
+      const socket = net.createConnection({ host: service.host, port: service.port, timeout: 2000 }, () => {
+        socket.destroy();
+        resolve('running');
+      });
+      socket.on('error', () => resolve('stopped'));
+      socket.on('timeout', () => {
+        socket.destroy();
+        resolve('stopped');
+      });
+    });
+  }
   return new Promise((resolve) => {
     const req = http.get(service.url, { timeout: 2000 }, (res) => {
       resolve(res.statusCode < 500 ? 'running' : 'error');
@@ -76,6 +91,7 @@ async function checkInfraStatus() {
     dockerError = 'Docker Desktop 未运行';
     return {
       docker: false,
+      postgres: 'stopped',
       higress: 'stopped',
       milvus: 'stopped',
       status: 'stopped',
@@ -83,13 +99,14 @@ async function checkInfraStatus() {
     };
   }
 
+  const postgres = await checkInfraService('postgres');
   const higress = await checkInfraService('higress');
   const milvus = await checkInfraService('milvus');
 
-  if (higress === 'running' && milvus === 'running') {
+  if (postgres === 'running' && higress === 'running' && milvus === 'running') {
     dockerStatus = 'running';
     dockerError = null;
-  } else if (higress === 'stopped' && milvus === 'stopped') {
+  } else if (postgres === 'stopped' && higress === 'stopped' && milvus === 'stopped') {
     dockerStatus = 'stopped';
   } else {
     dockerStatus = 'partial';
@@ -97,6 +114,7 @@ async function checkInfraStatus() {
 
   return {
     docker: true,
+    postgres,
     higress,
     milvus,
     status: dockerStatus,

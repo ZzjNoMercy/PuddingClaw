@@ -4,7 +4,8 @@ import { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Components } from "react-markdown";
-import { AlertTriangle, ChevronDown, ChevronRight, Key, Sparkles } from "lucide-react";
+import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, FileText, Key, KeyRound, Sparkles } from "lucide-react";
+import { denyPermissionRequest, grantExternalFileRead, type PermissionRequest } from "@/lib/api";
 import { useApp, type ChatMessage as ChatMessageType, type SourceRecord, type TimelineItem } from "@/lib/store";
 import ThoughtChain from "./ThoughtChain";
 import RetrievalCard from "./RetrievalCard";
@@ -34,7 +35,10 @@ export default function ChatMessage({ message, isStreaming = false }: Props) {
   const isUser = message.role === "user";
   const hasAuthError = !isUser && isAuthError(message.content);
   const renderedContent = renderCitationMarkers(message);
-  const { setActiveSourceId, setInspectorOpen } = useApp();
+  const { sessionId, setActiveSourceId, setInspectorOpen } = useApp();
+  const pendingPermissionRequests = (message.permissionRequests || []).filter(
+    (request) => request.status !== "resolved"
+  );
 
   const citationComponents: Components = {
     a: (props) => (
@@ -71,6 +75,13 @@ export default function ChatMessage({ message, isStreaming = false }: Props) {
               {message.segments && message.segments.length > 0 ? (
                 /* Multi-segment agent turn: each model invocation is its own block */
                 <div className="space-y-4">
+                  {pendingPermissionRequests.map((request) => (
+                    <ExternalFilePermissionCard
+                      key={request.id}
+                      request={request}
+                      sessionId={sessionId}
+                    />
+                  ))}
                   {message.segments.map((segment, index) => (
                     <SegmentBlock
                       key={`${message.id}-seg-${index}`}
@@ -89,37 +100,57 @@ export default function ChatMessage({ message, isStreaming = false }: Props) {
                 </div>
               ) : (
                 <>
-                  {/* Final answer */}
-                  {hasAuthError ? (
-                    <AuthErrorAlert content={message.content} />
-                  ) : message.content ? (
-                    <div>
-                      <div className="px-1 py-1 text-[15px] leading-relaxed">
-                        <div className="markdown-content">
-                          <ReactMarkdown remarkPlugins={[remarkGfm]} components={citationComponents}>
-                            {renderedContent}
-                          </ReactMarkdown>
+                  {(() => {
+                    const hasTools = message.timeline?.some((item) => item.type === "tool") ?? false;
+
+                    const thoughtChain =
+                      message.timeline && message.timeline.length > 0 ? (
+                        <ThoughtChain timeline={message.timeline} isStreaming={isStreaming} />
+                      ) : message.reasoning ? (
+                        <ReasoningBlock
+                          content={message.reasoning}
+                          defaultOpen={isStreaming && !message.content}
+                          isStreaming={isStreaming && !message.content}
+                        />
+                      ) : null;
+
+                    const contentBlock = hasAuthError ? (
+                      <AuthErrorAlert content={message.content} />
+                    ) : message.content ? (
+                      <div>
+                        <div className="px-1 py-1 text-[15px] leading-relaxed">
+                          <div className="markdown-content">
+                            <ReactMarkdown remarkPlugins={[remarkGfm]} components={citationComponents}>
+                              {renderedContent}
+                            </ReactMarkdown>
+                          </div>
+                        </div>
+                        {message.retrievals && message.retrievals.length > 0 && (
+                          <RetrievalCard retrievals={message.retrievals} />
+                        )}
+                        <div className="text-[10px] text-gray-400 mt-1 pl-1">
+                          {formatTime(message.timestamp)}
                         </div>
                       </div>
-                      {message.retrievals && message.retrievals.length > 0 && (
-                        <RetrievalCard retrievals={message.retrievals} />
-                      )}
-                      <div className="text-[10px] text-gray-400 mt-1 pl-1">
-                        {formatTime(message.timestamp)}
-                      </div>
-                    </div>
-                  ) : null}
+                    ) : null;
 
-                  {/* Timeline: interleaved reasoning + tool calls */}
-                  {message.timeline && message.timeline.length > 0 ? (
-                    <ThoughtChain timeline={message.timeline} isStreaming={isStreaming} />
-                  ) : message.reasoning ? (
-                    <ReasoningBlock
-                      content={message.reasoning}
-                      defaultOpen={isStreaming && !message.content}
-                      isStreaming={isStreaming && !message.content}
-                    />
-                  ) : null}
+                    // Pure reasoning precedes the answer; tool chains follow it
+                    // so intent and action stay adjacent.
+                    return (
+                      <>
+                        {pendingPermissionRequests.map((request) => (
+                          <ExternalFilePermissionCard
+                            key={request.id}
+                            request={request}
+                            sessionId={sessionId}
+                          />
+                        ))}
+                        {!hasTools && thoughtChain}
+                        {contentBlock}
+                        {hasTools && thoughtChain}
+                      </>
+                    );
+                  })()}
                 </>
               )}
 
@@ -137,6 +168,108 @@ export default function ChatMessage({ message, isStreaming = false }: Props) {
             </div>
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+function ExternalFilePermissionCard({
+  request,
+  sessionId,
+}: {
+  request: PermissionRequest;
+  sessionId: string;
+}) {
+  const [status, setStatus] = useState<"idle" | "loading" | "granted" | "denied" | "error">("idle");
+  const [error, setError] = useState("");
+  const path = request.path || "";
+  const name = path.split("/").filter(Boolean).pop() || "外部文件";
+
+  const grant = async (targetKind: "exact_file" | "all_external_files") => {
+    setStatus("loading");
+    setError("");
+    try {
+      await grantExternalFileRead(
+        sessionId,
+        targetKind,
+        targetKind === "exact_file" ? path : undefined,
+        request.id
+      );
+      setStatus("granted");
+      window.dispatchEvent(new CustomEvent("puddingclaw:permissions-changed"));
+    } catch (err) {
+      setStatus("error");
+      setError(err instanceof Error ? err.message : "授权失败");
+    }
+  };
+
+  const deny = async () => {
+    setStatus("loading");
+    setError("");
+    try {
+      await denyPermissionRequest(sessionId, request.id, "User denied external file read permission.");
+      setStatus("denied");
+      window.dispatchEvent(new CustomEvent("puddingclaw:permissions-changed"));
+    } catch (err) {
+      setStatus("error");
+      setError(err instanceof Error ? err.message : "拒绝失败");
+    }
+  };
+
+  return (
+    <div className="mb-3 max-w-[680px] rounded-2xl border border-black/[0.06] bg-white/75 p-4 shadow-sm shadow-slate-950/[0.04] backdrop-blur">
+      <div className="flex gap-3">
+        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-[#002fa7]/10 text-[#002fa7]">
+          {status === "granted" ? <CheckCircle2 className="h-5 w-5" /> : <KeyRound className="h-5 w-5" />}
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <h3 className="text-[15px] font-bold text-slate-950">允许读取外部文件</h3>
+            {status === "granted" ? (
+              <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700">
+                已授权
+              </span>
+            ) : null}
+          </div>
+          <div className="mt-2 flex items-start gap-2 rounded-xl bg-slate-50 px-3 py-2">
+            <FileText className="mt-0.5 h-4 w-4 shrink-0 text-slate-400" />
+            <div className="min-w-0">
+              <div className="truncate text-[13px] font-medium text-slate-800">{name}</div>
+              <div className="mt-0.5 truncate font-mono text-[11px] text-slate-500">{path}</div>
+            </div>
+          </div>
+          {status !== "granted" && status !== "denied" ? (
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                disabled={status === "loading"}
+                onClick={() => grant("exact_file")}
+                className="rounded-full bg-[#002fa7] px-3.5 py-2 text-[12px] font-semibold text-white shadow-sm transition hover:bg-[#00298f] disabled:cursor-default disabled:opacity-60"
+              >
+                允许此文件
+              </button>
+              <button
+                type="button"
+                disabled={status === "loading"}
+                onClick={() => grant("all_external_files")}
+                className="rounded-full bg-white px-3.5 py-2 text-[12px] font-semibold text-slate-700 shadow-sm ring-1 ring-black/[0.08] transition hover:bg-slate-50 disabled:cursor-default disabled:opacity-60"
+              >
+                本 session 允许所有外部文件
+              </button>
+              <button
+                type="button"
+                disabled={status === "loading"}
+                onClick={deny}
+                className="rounded-full px-3 py-2 text-[12px] font-semibold text-slate-500 transition hover:bg-slate-100 hover:text-slate-800 disabled:cursor-default disabled:opacity-60"
+              >
+                拒绝
+              </button>
+            </div>
+          ) : null}
+          {status === "loading" ? <div className="mt-2 text-[11px] text-slate-500">处理中...</div> : null}
+          {status === "denied" ? <div className="mt-2 text-[11px] text-slate-500">已拒绝</div> : null}
+          {status === "error" ? <div className="mt-2 text-[11px] text-rose-600">{error}</div> : null}
+        </div>
       </div>
     </div>
   );
@@ -168,26 +301,38 @@ function SegmentBlock({
     ),
   };
 
+  const hasTools = segment.timeline?.some((item) => item.type === "tool") ?? false;
+
+  const thoughtChain =
+    segment.timeline && segment.timeline.length > 0 ? (
+      <ThoughtChain timeline={segment.timeline} isStreaming={isStreaming && isLast} />
+    ) : segment.reasoning ? (
+      <ReasoningBlock
+        content={segment.reasoning}
+        defaultOpen={isStreaming && !segment.content}
+        isStreaming={isStreaming && !segment.content}
+      />
+    ) : null;
+
+  const contentBlock = segment.content ? (
+    <div className="px-1 py-1 text-[15px] leading-relaxed">
+      <div className="markdown-content">
+        <ReactMarkdown remarkPlugins={[remarkGfm]} components={citationComponents}>
+          {rendered}
+        </ReactMarkdown>
+      </div>
+    </div>
+  ) : null;
+
+  // Keep reasoning and tools together as one thought chain. If the chain only
+  // contains reasoning, show it before the statement so it doesn't jump after
+  // streaming ends. If it contains tools, show it after the statement so the
+  // user can see the intent -> action flow and why tools were called.
   return (
     <div className="space-y-2">
-      {segment.content ? (
-        <div className="px-1 py-1 text-[15px] leading-relaxed">
-          <div className="markdown-content">
-            <ReactMarkdown remarkPlugins={[remarkGfm]} components={citationComponents}>
-              {rendered}
-            </ReactMarkdown>
-          </div>
-        </div>
-      ) : null}
-      {segment.timeline && segment.timeline.length > 0 ? (
-        <ThoughtChain timeline={segment.timeline} isStreaming={isStreaming && isLast} />
-      ) : segment.reasoning ? (
-        <ReasoningBlock
-          content={segment.reasoning}
-          defaultOpen={isStreaming && !segment.content}
-          isStreaming={isStreaming && !segment.content}
-        />
-      ) : null}
+      {!hasTools && thoughtChain}
+      {contentBlock}
+      {hasTools && thoughtChain}
     </div>
   );
 }

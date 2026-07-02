@@ -1,6 +1,8 @@
 export interface ElectronAPI {
   // 文件夹选择
   selectProjectFolder: () => Promise<string | null>;
+  selectKnowledgeFile: () => Promise<string | null>;
+  selectKnowledgeFolder: () => Promise<string | null>;
 
   // Backend 管理
   startBackend: () => Promise<{ status: string; message: string }>;
@@ -12,6 +14,7 @@ export interface ElectronAPI {
   stopInfra: () => Promise<{ status: string; message: string }>;
   getInfraStatus: () => Promise<{
     docker: boolean;
+    postgres: string;
     higress: string;
     milvus: string;
     status: string;

@@ -8,12 +8,29 @@ Higress apiserver 的 18443 端口。
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_HIGRESS_DATA_DIR = Path("/app/data/higress")
+def _default_higress_data_dir() -> Path:
+    """Return the default Higress data directory.
+
+    Priority:
+    1. HIGRESS_DATA_DIR environment variable
+    2. Project-local data/higress (for local development)
+    3. Docker default /app/data/higress
+    """
+    if env_dir := os.getenv("HIGRESS_DATA_DIR"):
+        return Path(env_dir)
+    project_local = Path(__file__).resolve().parent.parent / "data" / "higress"
+    if project_local.exists():
+        return project_local
+    return Path("/app/data/higress")
+
+
+DEFAULT_HIGRESS_DATA_DIR = _default_higress_data_dir()
 INGRESSES_DIR = DEFAULT_HIGRESS_DATA_DIR / "ingresses"
 
 
@@ -34,25 +51,30 @@ def _extract_models_from_ingress(ingress: dict[str, Any]) -> list[str]:
     metadata = ingress.get("metadata", {}) or {}
     annotations = metadata.get("annotations", {}) or {}
 
-    # Higress AI Route 通常用 exact-match-header 注解匹配 model header
-    header_key = "higress.io/exact-match-header-x-higress-llm-model"
-    raw = annotations.get(header_key, "")
-    if raw:
-        # 逗号分隔表示多个模型名
-        for model in str(raw).split(","):
-            model = model.strip()
-            if model:
-                models.append(model)
+    # Higress AI Route 可用 exact-match-header 或 prefix-match-header 注解匹配 model header
+    header_keys = (
+        "higress.io/exact-match-header-x-higress-llm-model",
+        "higress.io/prefix-match-header-x-higress-llm-model",
+    )
+    for header_key in header_keys:
+        raw = annotations.get(header_key, "")
+        if raw:
+            # 逗号分隔表示多个模型名
+            for model in str(raw).split(","):
+                model = model.strip()
+                if model:
+                    models.append(model)
 
     # 兜底：也尝试从 ConfigMap 的 ai-route 数据里读取
     return models
 
 
-def get_higress_routed_models(data_dir: Path | str | None = None) -> list[str]:
+def get_higress_routed_models(data_dir: Path | str | None = None, *, include_embeddings: bool = False) -> list[str]:
     """返回 Higress 当前配置中所有 AI 路由模型名。
 
     Args:
         data_dir: Higress 数据目录，默认 /app/data/higress
+        include_embeddings: 是否包含 embeddings 路由（path=/v1/embeddings）的模型
 
     Returns:
         模型名列表，按发现顺序去重。
@@ -64,6 +86,12 @@ def get_higress_routed_models(data_dir: Path | str | None = None) -> list[str]:
         logger.warning("[higress_config_reader] ingresses dir not found: %s", ingresses_dir)
         return []
 
+    embedding_models: set[str] = set()
+    if not include_embeddings:
+        for route in get_higress_routes(base):
+            if route.get("path", "/").startswith("/v1/embeddings"):
+                embedding_models.add(route["model"])
+
     models: list[str] = []
     seen: set[str] = set()
 
@@ -73,9 +101,12 @@ def get_higress_routed_models(data_dir: Path | str | None = None) -> list[str]:
             continue
 
         for model in _extract_models_from_ingress(ingress):
-            if model not in seen:
-                seen.add(model)
-                models.append(model)
+            if model in seen:
+                continue
+            if not include_embeddings and model in embedding_models:
+                continue
+            seen.add(model)
+            models.append(model)
 
     return models
 
@@ -106,8 +137,14 @@ def get_higress_routes(data_dir: Path | str | None = None) -> list[dict[str, str
         paths = rules[0].get("http", {}).get("paths", []) if rules else []
         route_path = paths[0].get("path", "/") if paths else "/"
 
-        header_key = "higress.io/exact-match-header-x-higress-llm-model"
-        raw_models = annotations.get(header_key, "")
+        raw_models = ""
+        for header_key in (
+            "higress.io/exact-match-header-x-higress-llm-model",
+            "higress.io/prefix-match-header-x-higress-llm-model",
+        ):
+            raw_models = annotations.get(header_key, "")
+            if raw_models:
+                break
         if not raw_models:
             continue
 
@@ -123,3 +160,67 @@ def get_higress_routes(data_dir: Path | str | None = None) -> list[dict[str, str
             })
 
     return routes
+
+
+def _as_token_list(raw_tokens: Any) -> list[str]:
+    """Normalize Higress ai-proxy apiTokens into a flat list.
+
+    Higress may persist tokens as a plain string, comma-separated string, list
+    of strings, or list of token objects depending on console/version. This
+    helper intentionally never logs token values.
+    """
+
+    if raw_tokens is None:
+        return []
+    if isinstance(raw_tokens, str):
+        return [item.strip() for item in raw_tokens.split(",") if item.strip()]
+    if isinstance(raw_tokens, list):
+        tokens: list[str] = []
+        for item in raw_tokens:
+            if isinstance(item, str) and item.strip():
+                tokens.append(item.strip())
+            elif isinstance(item, dict):
+                for key in ("token", "value", "apiKey", "api_key", "key"):
+                    value = item.get(key)
+                    if isinstance(value, str) and value.strip():
+                        tokens.append(value.strip())
+                        break
+        return tokens
+    if isinstance(raw_tokens, dict):
+        for key in ("token", "value", "apiKey", "api_key", "key"):
+            value = raw_tokens.get(key)
+            if isinstance(value, str) and value.strip():
+                return [value.strip()]
+    return []
+
+
+def get_higress_dashscope_api_key(data_dir: Path | str | None = None) -> str:
+    """Return the DashScope/Qwen provider token from local Higress ai-proxy config.
+
+    This is a local-development convenience fallback for backend components that
+    need to call DashScope directly (for example Qwen-VL multimodal embedding).
+    It reads only the project-local mounted Higress YAML and returns an empty
+    string when the provider/token cannot be found.
+    """
+
+    base = Path(data_dir) if data_dir else DEFAULT_HIGRESS_DATA_DIR
+    plugin_path = base / "wasmplugins" / "ai-proxy.internal.yaml"
+    plugin = _safe_load_yaml(plugin_path)
+    if not plugin:
+        return ""
+
+    spec = plugin.get("spec", {}) or {}
+    default_config = spec.get("defaultConfig", {}) or {}
+    providers = default_config.get("providers", []) or []
+    for provider in providers:
+        if not isinstance(provider, dict):
+            continue
+        provider_type = str(provider.get("type", "")).lower()
+        provider_id = str(provider.get("id", "")).lower()
+        if provider_type not in {"qwen", "dashscope"} and "qwen" not in provider_id and "multi" not in provider_id:
+            continue
+        tokens = _as_token_list(provider.get("apiTokens"))
+        if tokens:
+            return tokens[0]
+
+    return ""

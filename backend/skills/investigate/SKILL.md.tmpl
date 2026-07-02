@@ -10,15 +10,7 @@ description: |
   Proactively invoke this skill (do NOT debug directly) when the user reports
   errors, 500 errors, stack traces, unexpected behavior, "it was working
   yesterday", or is troubleshooting why something stopped working. (gstack)
-allowed-tools:
-  - Bash
-  - Read
-  - Write
-  - Edit
-  - Grep
-  - Glob
-  - AskUserQuestion
-  - WebSearch
+allowed-tools: Bash Read Write Edit Grep Glob AskUserQuestion WebSearch
 triggers:
   - debug this
   - fix this bug

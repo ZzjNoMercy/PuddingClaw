@@ -445,7 +445,7 @@ load_session_for_agent(session_id)
 
 ```markdown
 ---
-name: get_weather
+name: get-weather
 description: 查询城市天气
 ---
 
@@ -469,7 +469,7 @@ system_prompt = build_system_prompt(base_dir)
 
 # 3. Agent 决定使用技能
 Agent: "我需要查询天气，先读取技能定义"
-read_file("./backend/skills/get_weather/SKILL.md")
+read_file("./backend/skills/get-weather/SKILL.md")
 
 # 4. Agent 根据定义执行
 Agent: "根据定义，我需要调用 fetch_url..."

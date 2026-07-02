@@ -1,12 +1,15 @@
 "use client";
 
-import { ChevronDown, PanelLeft, PanelRight } from "lucide-react";
+import { ChevronDown, Cpu, PanelLeft, PanelRight } from "lucide-react";
 
 interface NavbarProps {
   sidebarOpen?: boolean;
   toggleSidebar?: () => void;
   inspectorOpen?: boolean;
   toggleInspector?: () => void;
+  onToggleTrace?: () => void;
+  traceSpanCount?: number;
+  traceActive?: boolean;
   /** Hide sidebar/inspector toggles on non-chat pages */
   showPanelToggles?: boolean;
   /** Optional centered title (e.g. current session name) */
@@ -20,6 +23,9 @@ export default function Navbar({
   toggleSidebar,
   inspectorOpen,
   toggleInspector,
+  onToggleTrace,
+  traceSpanCount,
+  traceActive,
   showPanelToggles = false,
   title,
   compact = false,
@@ -76,7 +82,27 @@ export default function Navbar({
       </div>
 
       {/* Right — Inspector toggle (chat page only) or spacer */}
-      <div className="w-[120px] flex justify-end">
+      <div className="w-[160px] flex justify-end gap-1.5">
+        {showPanelToggles && onToggleTrace ? (
+          <button
+            onClick={onToggleTrace}
+            className={`h-8 flex items-center gap-1.5 rounded-lg px-2.5 text-[12px] font-semibold transition-all ${
+              traceActive
+                ? "bg-[#002fa7]/[0.08] text-[#002fa7] shadow-sm"
+                : "text-gray-500 hover:text-gray-800 hover:bg-black/[0.04]"
+            }`}
+            title={traceActive ? "关闭 Trace 看板" : "打开 Trace 看板"}
+            aria-label={traceActive ? "关闭 Trace 看板" : "打开 Trace 看板"}
+          >
+            <Cpu className="w-[15px] h-[15px]" />
+            <span className="hidden lg:inline">Trace</span>
+            {typeof traceSpanCount === "number" && traceSpanCount > 0 ? (
+              <span className="rounded-full bg-black/[0.06] px-1.5 py-0.5 text-[10px] font-medium">
+                {traceSpanCount}
+              </span>
+            ) : null}
+          </button>
+        ) : null}
         {showPanelToggles && toggleInspector ? (
           <button
             onClick={toggleInspector}

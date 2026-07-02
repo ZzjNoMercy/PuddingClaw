@@ -11,23 +11,83 @@ import {
   XCircle,
   Activity,
   Brain,
+  FileArchive,
+  FileImage,
+  FileSpreadsheet,
+  FileText,
+  ImagePlus,
+  Paperclip,
+  X,
+  type LucideIcon,
 } from "lucide-react";
 import { useApp } from "@/lib/store";
-import { listSkills, getSessionTokenCount } from "@/lib/api";
+import { useProjectFolderPicker } from "@/components/projects/useProjectFolderPicker";
+import { listSkills, getSessionTokenCount, uploadAgentAttachments, type AgentAttachment } from "@/lib/api";
 
 function formatTokens(n: number): string {
   return `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k`;
 }
 import SlashCommandMenu from "./SlashCommandMenu";
 
+type AttachmentKind = AgentAttachment["type"];
+
+function formatFileSize(size?: number): string {
+  if (!size) return "";
+  if (size < 1024) return `${size}B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(size < 10 * 1024 ? 1 : 0)}KB`;
+  return `${(size / 1024 / 1024).toFixed(size < 10 * 1024 * 1024 ? 1 : 0)}MB`;
+}
+
+const attachmentStyles: Record<AttachmentKind, { cls: string; label: string; Icon: LucideIcon }> = {
+  image: {
+    cls: "border-[#002fa7]/15 bg-[#e8edff] text-[#002fa7]",
+    label: "图片",
+    Icon: FileImage,
+  },
+  pdf: {
+    cls: "border-rose-500/15 bg-rose-50 text-rose-700",
+    label: "PDF",
+    Icon: FileText,
+  },
+  spreadsheet: {
+    cls: "border-emerald-500/15 bg-emerald-50 text-emerald-700",
+    label: "表格",
+    Icon: FileSpreadsheet,
+  },
+  markdown: {
+    cls: "border-violet-500/15 bg-violet-50 text-violet-700",
+    label: "MD",
+    Icon: FileText,
+  },
+  text: {
+    cls: "border-sky-500/15 bg-sky-50 text-sky-700",
+    label: "文本",
+    Icon: FileText,
+  },
+  document: {
+    cls: "border-amber-500/15 bg-amber-50 text-amber-700",
+    label: "文档",
+    Icon: FileText,
+  },
+  file: {
+    cls: "border-slate-500/15 bg-slate-100 text-slate-700",
+    label: "文件",
+    Icon: FileArchive,
+  },
+};
+
 export default function ChatInput() {
   const [text, setText] = useState("");
+  const [attachments, setAttachments] = useState<AgentAttachment[]>([]);
   const {
     sendMessage,
     stopStreaming,
     isStreaming,
     isCompressing,
     sessionId,
+    setSessionId,
+    createSession,
+    messages,
     contextUsage,
     setContextUsage,
     pendingInput,
@@ -42,9 +102,14 @@ export default function ChatInput() {
     setThinkingMode,
   } = useApp();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const attachmentInputRef = useRef<HTMLInputElement>(null);
   const projectMenuRef = useRef<HTMLDivElement>(null);
   const disabled = isStreaming || isCompressing;
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
+  const detectedImagePaths = useMemo(() => {
+    const matches = text.match(/(?:~|\/|[A-Za-z]:[\\/])(?:[^\s'"<>]|\\ )+\.(?:png|jpe?g|webp|gif|bmp|tiff?)/gi);
+    return Array.from(new Set(matches || [])).slice(0, 4);
+  }, [text]);
 
   // Fetch token count on mount, when session changes, and after a streaming
   // response finishes (so newly loaded messages are reflected immediately).
@@ -74,7 +139,7 @@ export default function ChatInput() {
     if (!isStreaming) {
       refreshContextUsage();
     }
-  }, [isStreaming, refreshContextUsage]);
+  }, [isStreaming, messages.length, refreshContextUsage]);
 
   // Slash command state
   const [showSlashMenu, setShowSlashMenu] = useState(false);
@@ -145,12 +210,36 @@ export default function ChatInput() {
   }, [text]);
 
   const handleSubmit = useCallback(() => {
-    if (!text.trim() || disabled) return;
-    sendMessage(text.trim());
+    if ((!text.trim() && attachments.length === 0) || disabled) return;
+    sendMessage(text.trim(), attachments);
     setText("");
+    setAttachments([]);
     setPendingInput(null);
     if (textareaRef.current) textareaRef.current.style.height = "auto";
-  }, [text, disabled, sendMessage, setPendingInput]);
+    if (attachmentInputRef.current) attachmentInputRef.current.value = "";
+  }, [text, attachments, disabled, sendMessage, setPendingInput]);
+
+  const handleAttachmentFiles = useCallback(async (files: FileList | File[] | null, source: "upload" | "paste" = "upload") => {
+    if (!files || files.length === 0) return;
+    const fileList = Array.from(files).slice(0, 8);
+    const targetSessionId = sessionId === "default" ? await createSession() : sessionId;
+    if (!targetSessionId) return;
+    const next = await uploadAgentAttachments(fileList, targetSessionId, source);
+    setAttachments((current) => [...current, ...next].slice(0, 8));
+    if (attachmentInputRef.current) attachmentInputRef.current.value = "";
+  }, [createSession, sessionId]);
+
+  const handlePaste = useCallback((event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const files = Array.from(event.clipboardData.files || []);
+    const itemFiles = Array.from(event.clipboardData.items || [])
+      .filter((item) => item.kind === "file")
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => Boolean(file));
+    const pastedFiles = files.length ? files : itemFiles;
+    if (pastedFiles.length === 0) return;
+    event.preventDefault();
+    void handleAttachmentFiles(pastedFiles, "paste");
+  }, [handleAttachmentFiles]);
 
   const handleToggleThinking = useCallback(async () => {
     if (thinkingToggleInFlightRef.current) return;
@@ -165,21 +254,25 @@ export default function ChatInput() {
     }
   }, [thinkingMode, setThinkingMode]);
 
-  const handleRegisterProject = useCallback(async () => {
-    let path: string | null = null;
-    if (window.electron?.selectProjectFolder) {
-      path = await window.electron.selectProjectFolder();
-    } else {
-      path = window.prompt("输入本地项目目录路径");
-    }
-    if (!path?.trim()) return;
+  const handleProjectPathSelected = useCallback(async (path: string) => {
     const project = await registerProject(path.trim());
     if (!project) {
-      window.alert("项目目录登记失败，请确认路径存在且是文件夹。");
-      return;
+      return false;
     }
+    setRuntimeMode("agent");
+    setCurrentProjectId(project.project_id);
+    setSessionId("default");
     setProjectMenuOpen(false);
-  }, [registerProject]);
+    return true;
+  }, [registerProject, setCurrentProjectId, setRuntimeMode, setSessionId]);
+
+  const { openProjectFolderPicker, projectFolderDialog } = useProjectFolderPicker({
+    onPathSelected: handleProjectPathSelected,
+  });
+
+  const handleRegisterProject = useCallback(async () => {
+    await openProjectFolderPicker();
+  }, [openProjectFolderPicker]);
 
   const handleSlashSelect = useCallback((skillName: string) => {
     // Use textarea DOM value as source of truth to avoid stale closure (fixes I-1)
@@ -255,6 +348,7 @@ export default function ChatInput() {
   };
 
   return (
+    <>
     <div className="px-6 pb-4 pt-2">
       <div className="glass-input relative mx-auto flex w-full max-w-[900px] flex-col gap-2 rounded-3xl px-4 py-3 transition-shadow hover:shadow-lg">
         <SlashCommandMenu
@@ -264,6 +358,27 @@ export default function ChatInput() {
           onSelect={handleSlashSelect}
           onClose={() => setShowSlashMenu(false)}
         />
+        {(attachments.length > 0 || detectedImagePaths.length > 0) && (
+          <div className="flex flex-wrap gap-1.5 px-1">
+            {attachments.map((item, index) => (
+              <AttachmentChip
+                key={`${item.id || item.name || "attachment"}-${index}`}
+                item={item}
+                onRemove={() => setAttachments((current) => current.filter((_, i) => i !== index))}
+              />
+            ))}
+            {detectedImagePaths.map((path) => (
+              <span
+                key={path}
+                className="inline-flex max-w-[260px] items-center gap-1.5 rounded-full border border-emerald-500/10 bg-emerald-50 px-2.5 py-1 text-[11px] text-emerald-700"
+                title="后端会识别这个本地图片路径并传给多模态模型"
+              >
+                <ImagePlus className="h-3 w-3 shrink-0" />
+                <span className="truncate">本地图片：{path}</span>
+              </span>
+            ))}
+          </div>
+        )}
         <textarea
           ref={textareaRef}
           value={text}
@@ -301,6 +416,7 @@ export default function ChatInput() {
             }
           }}
           onKeyDown={handleKeyDown}
+          onPaste={handlePaste}
           onCompositionStart={() => { isComposingRef.current = true; }}
           onCompositionEnd={() => { isComposingRef.current = false; }}
           placeholder="输入消息，或用 / 调用扩展能力"
@@ -347,6 +463,7 @@ export default function ChatInput() {
                             onClick={() => {
                               setRuntimeMode("agent");
                               setCurrentProjectId(project.project_id);
+                              setSessionId("default");
                               setProjectMenuOpen(false);
                             }}
                             className={`flex w-full items-start gap-2 rounded-xl px-3 py-2 text-left transition-colors ${
@@ -390,6 +507,7 @@ export default function ChatInput() {
                       type="button"
                       onClick={() => {
                         setCurrentProjectId(null);
+                        setSessionId("default");
                         setProjectMenuOpen(false);
                       }}
                       className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-[13px] text-gray-500 transition-colors hover:bg-black/[0.04] hover:text-gray-800"
@@ -418,6 +536,26 @@ export default function ChatInput() {
           </div>
 
           <div className="flex shrink-0 items-center gap-2">
+            {runtimeMode === "agent" && (
+              <>
+                <input
+                  ref={attachmentInputRef}
+                  type="file"
+                  accept="image/*,.pdf,.md,.markdown,.txt,.csv,.tsv,.xls,.xlsx,.doc,.docx,.ppt,.pptx,.json,.yaml,.yml"
+                  multiple
+                  className="hidden"
+                  onChange={(event) => handleAttachmentFiles(event.target.files, "upload")}
+                />
+                <button
+                  type="button"
+                  onClick={() => attachmentInputRef.current?.click()}
+                  className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-black/[0.06] bg-white/50 text-gray-500 transition-colors hover:bg-white/80 hover:text-[#002fa7]"
+                  title="添加附件"
+                >
+                  <Paperclip className="h-4 w-4" />
+                </button>
+              </>
+            )}
             <ContextUsageTooltip usage={contextUsage} />
 
             {isStreaming ? (
@@ -431,7 +569,7 @@ export default function ChatInput() {
             ) : (
               <button
                 onClick={handleSubmit}
-                disabled={!text.trim() || isCompressing}
+                disabled={(!text.trim() && attachments.length === 0) || isCompressing}
                 className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[#002fa7] text-white transition-all hover:bg-[#001f7a] active:scale-95 disabled:bg-gray-300 disabled:opacity-80"
               >
                 <ArrowUp className="w-4 h-4" />
@@ -445,6 +583,37 @@ export default function ChatInput() {
         Powered by DeepSeek · PuddingClaw v0.1
       </p>
     </div>
+    {projectFolderDialog}
+    </>
+  );
+}
+
+function AttachmentChip({ item, onRemove }: { item: AgentAttachment; onRemove: () => void }) {
+  const kind = item.type || "file";
+  const style = attachmentStyles[kind] || attachmentStyles.file;
+  const Icon = style.Icon;
+  const size = formatFileSize(item.size);
+
+  return (
+    <span
+      className={`inline-flex max-w-[260px] items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] ${style.cls}`}
+      title={`${style.label}${item.mime_type ? ` · ${item.mime_type}` : ""}${size ? ` · ${size}` : ""}`}
+    >
+      <Icon className="h-3 w-3 shrink-0" />
+      <span className="shrink-0 rounded-full bg-white/60 px-1.5 py-0.5 text-[9px] font-semibold uppercase leading-none">
+        {style.label}
+      </span>
+      <span className="truncate">{item.name || item.id || "attachment"}</span>
+      {size && <span className="shrink-0 text-[10px] opacity-65">{size}</span>}
+      <button
+        type="button"
+        onClick={onRemove}
+        className="rounded-full p-0.5 hover:bg-black/10"
+        aria-label="移除附件"
+      >
+        <X className="h-3 w-3" />
+      </button>
+    </span>
   );
 }
 

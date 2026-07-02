@@ -1,11 +1,15 @@
 """capabilities 模块单元测试。"""
 
 import os
+import sys
 import warnings
+from pathlib import Path
 from unittest import mock
 
 import httpx
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from capabilities import (
     Capabilities,
@@ -24,7 +28,7 @@ _DEFAULT_HIGRESS_HEALTH = "http://higress:8080/health"
 def _clear_cache_and_env():
     """每个测试前清除缓存和相关环境变量。"""
     invalidate_capabilities()
-    for key in ("AI_GATEWAY_URL", "MILVUS_URL", "MINERU_URL"):
+    for key in ("AI_GATEWAY_URL", "DATABASE_URL", "PUDDINGCLAW_DATABASE_URL", "POSTGRES_URL", "MILVUS_URL", "MINERU_URL"):
         os.environ.pop(key, None)
     yield
     invalidate_capabilities()
@@ -36,6 +40,22 @@ def _mock_default_higress_unavailable(httpx_mock):
         httpx.ConnectError("Connection refused"),
         url=_DEFAULT_HIGRESS_HEALTH,
     )
+
+
+@pytest.fixture(autouse=True)
+def _mock_gateway_config():
+    """避免本机 config.json / .env 中的 gateway 配置影响能力探测测试。"""
+    with mock.patch("capabilities.get_gateway_config") as mock_config:
+        mock_config.return_value = {"base_url": "", "health_path": "/health"}
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _mock_postgres_unavailable():
+    """默认将 PostgreSQL 探测 mock 为不可用，避免测试机本地数据库干扰。"""
+    with mock.patch("capabilities._check_postgres") as mock_check:
+        mock_check.return_value = CapabilityStatus(available=False, reason="mocked unavailable")
+        yield
 
 
 @pytest.fixture(autouse=True)
@@ -53,6 +73,7 @@ async def test_detect_capabilities_no_services(httpx_mock):
     httpx_mock.add_exception(httpx.ConnectError("Connection refused"), url="http://localhost:8002/health")
     caps = await detect_capabilities(force=True)
     assert isinstance(caps, Capabilities)
+    assert caps.database.available is False
     assert caps.ai_gateway.available is False
     assert caps.milvus.available is False
     assert caps.mineru.available is False
@@ -119,11 +140,13 @@ async def test_capability_status_to_dict():
 async def test_capabilities_to_dict():
     """Capabilities.to_dict 输出正确。"""
     caps = Capabilities(
+        database=CapabilityStatus(available=True),
         ai_gateway=CapabilityStatus(available=True),
         milvus=CapabilityStatus(available=False, reason="refused"),
         mineru=CapabilityStatus(available=True),
     )
     assert caps.to_dict() == {
+        "database": {"available": True, "reason": None},
         "ai_gateway": {"available": True, "reason": None},
         "milvus": {"available": False, "reason": "refused"},
         "mineru": {"available": True, "reason": None},
@@ -158,6 +181,10 @@ async def test_detect_capabilities_sync_inside_event_loop_does_not_leak_coroutin
 
     with (
         mock.patch(
+            "capabilities._check_postgres_sync",
+            return_value=CapabilityStatus(available=False, reason="mock postgres"),
+        ),
+        mock.patch(
             "capabilities._check_gateway_urls_sync",
             return_value=CapabilityStatus(available=False, reason="mock gateway"),
         ),
@@ -174,6 +201,7 @@ async def test_detect_capabilities_sync_inside_event_loop_does_not_leak_coroutin
         warnings.simplefilter("always")
         caps = detect_capabilities_sync(force=True)
 
+    assert caps.database.reason == "mock postgres"
     assert caps.ai_gateway.reason == "mock gateway"
     assert not [
         warning for warning in caught

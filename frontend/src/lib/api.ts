@@ -10,6 +10,467 @@ export interface SSEEvent {
   data: Record<string, unknown>;
 }
 
+export interface AgentAttachment {
+  type: "image" | "pdf" | "spreadsheet" | "markdown" | "text" | "document" | "file";
+  id?: string;
+  name?: string;
+  mime_type?: string;
+  path?: string;
+  size?: number;
+  source?: "upload" | "paste";
+  created_at?: number;
+}
+
+export interface KnowledgeDocument {
+  id: string;
+  knowledge_base_id: string;
+  title: string;
+  source_type: string;
+  source_path: string;
+  storage_path: string;
+  virtual_path: string;
+  mime_type: string;
+  content_sha256: string;
+  size_bytes: number;
+  status: string;
+  publish_targets: string[];
+  metadata?: Record<string, unknown>;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface KnowledgeDirectoryFile {
+  name: string;
+  extension: string;
+  virtual_path: string;
+  storage_path: string;
+  size_bytes: number;
+  modified_at: string;
+}
+
+export interface KnowledgeTreeNode {
+  name: string;
+  type: "directory" | "file";
+  virtual_path: string;
+  storage_path: string;
+  extension?: string;
+  size_bytes?: number;
+  modified_at?: string;
+  child_count?: number;
+  file_count?: number;
+  truncated?: boolean;
+  children?: KnowledgeTreeNode[];
+}
+
+export interface KnowledgeFilePreview {
+  name: string;
+  extension: string;
+  virtual_path: string;
+  storage_path: string;
+  size_bytes: number;
+  modified_at: string;
+  preview_type: "text" | "unsupported";
+  content: string;
+  truncated: boolean;
+  message?: string | null;
+}
+
+export interface KnowledgeStatus {
+  enabled: boolean;
+  database: {
+    configured: boolean;
+    provider: string;
+    url: string;
+    configured_by?: string;
+    environment_override?: boolean;
+    mode?: string;
+    configuration_hint?: string;
+    healthy: boolean;
+    last_error?: string | null;
+  };
+  local_markdown: {
+    enabled: boolean;
+    physical_path: string;
+    originals_path?: string;
+    configured_by?: string;
+    environment_override?: boolean;
+    deepagents_virtual_path: string;
+  };
+  vector: {
+    enabled: boolean;
+    provider?: string | null;
+    note?: string;
+    multimodal?: {
+      enabled: boolean;
+      vector_store: string;
+      milvus_uri: string;
+      text_collection: string;
+      image_collection: string;
+      overwrite?: boolean;
+    };
+  };
+  parser: {
+    mineru_optional: boolean;
+    note?: string;
+  };
+  markdown_search?: {
+    enabled: boolean;
+    glob_endpoint: string;
+    grep_endpoint: string;
+    deepagents_virtual_path: string;
+  };
+}
+
+export interface KnowledgeMarkdownFile {
+  name: string;
+  path: string;
+  virtual_path: string;
+  storage_path: string;
+  size_bytes: number;
+  modified_at: string;
+}
+
+export interface KnowledgeMarkdownMatch {
+  virtual_path: string;
+  path: string;
+  storage_path: string;
+  line_number: number;
+  line: string;
+  context: string[];
+}
+
+export async function getKnowledgeStatus(): Promise<KnowledgeStatus> {
+  const response = await fetch(`${API_BASE}/knowledge/status`, { cache: "no-store" });
+  if (!response.ok) {
+    throw new Error(`Failed to load knowledge status: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function listKnowledgeDocuments(): Promise<KnowledgeDocument[]> {
+  const response = await fetch(`${API_BASE}/knowledge/documents`, { cache: "no-store" });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(text || `Failed to load knowledge documents: ${response.status}`);
+  }
+  const payload = await response.json();
+  return Array.isArray(payload.documents) ? payload.documents : [];
+}
+
+export async function listKnowledgeFiles(): Promise<KnowledgeDirectoryFile[]> {
+  const response = await fetch(`${API_BASE}/knowledge/files`, { cache: "no-store" });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(text || `Failed to load knowledge files: ${response.status}`);
+  }
+  const payload = await response.json();
+  return Array.isArray(payload.files) ? payload.files : [];
+}
+
+export async function getKnowledgeFileTree(): Promise<KnowledgeTreeNode | null> {
+  const response = await fetch(`${API_BASE}/knowledge/tree`, { cache: "no-store" });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(text || `Failed to load knowledge file tree: ${response.status}`);
+  }
+  const payload = await response.json();
+  return payload.tree ?? null;
+}
+
+export async function previewKnowledgeFile(virtualPath: string): Promise<KnowledgeFilePreview> {
+  const params = new URLSearchParams({ virtual_path: virtualPath });
+  const response = await fetch(`${API_BASE}/knowledge/file/preview?${params.toString()}`, { cache: "no-store" });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(text || `Failed to preview knowledge file: ${response.status}`);
+  }
+  const payload = await response.json();
+  return payload.file;
+}
+
+export async function importLocalMarkdownDocument(
+  sourcePath: string,
+  title?: string
+): Promise<KnowledgeDocument> {
+  const response = await fetch(`${API_BASE}/knowledge/documents/import-local-md`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ source_path: sourcePath, title: title || undefined }),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(text || `Failed to import knowledge document: ${response.status}`);
+  }
+  const payload = await response.json();
+  return payload.document;
+}
+
+export async function uploadPdfKnowledgeDocument(
+  file: File,
+  title?: string,
+  publishTargets: string[] = ["local_markdown", "vector"]
+): Promise<{ document: KnowledgeDocument; ingestion: Record<string, unknown> }> {
+  const form = new FormData();
+  form.append("file", file, file.name);
+  if (title?.trim()) form.append("title", title.trim());
+  form.append("publish_targets", publishTargets.join(","));
+  const response = await fetch(`${API_BASE}/knowledge/documents/upload-pdf`, {
+    method: "POST",
+    body: form,
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(text || `Failed to upload PDF knowledge document: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function uploadKnowledgeDocument(
+  file: File,
+  title?: string,
+  publishTargets: string[] = ["local_markdown", "vector"]
+): Promise<{ document: KnowledgeDocument; ingestion: Record<string, unknown>; detected_type?: string }> {
+  const form = new FormData();
+  form.append("file", file, file.name);
+  if (title?.trim()) form.append("title", title.trim());
+  form.append("publish_targets", publishTargets.join(","));
+  const response = await fetch(`${API_BASE}/knowledge/documents/import`, {
+    method: "POST",
+    body: form,
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(text || `Failed to import knowledge document: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function globKnowledgeMarkdown(pattern = "**/*.md"): Promise<KnowledgeMarkdownFile[]> {
+  const params = new URLSearchParams({ pattern });
+  const response = await fetch(`${API_BASE}/knowledge/markdown/glob?${params.toString()}`, { cache: "no-store" });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(text || `Failed to glob knowledge Markdown: ${response.status}`);
+  }
+  const payload = await response.json();
+  return Array.isArray(payload.files) ? payload.files : [];
+}
+
+export async function grepKnowledgeMarkdown(
+  query: string,
+  pattern = "**/*.md"
+): Promise<KnowledgeMarkdownMatch[]> {
+  const response = await fetch(`${API_BASE}/knowledge/markdown/grep`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query, pattern, context_lines: 1, max_matches: 50 }),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(text || `Failed to grep knowledge Markdown: ${response.status}`);
+  }
+  const payload = await response.json();
+  return Array.isArray(payload.matches) ? payload.matches : [];
+}
+
+export async function uploadAgentAttachments(
+  files: File[],
+  sessionId: string,
+  source: "upload" | "paste" = "upload"
+): Promise<AgentAttachment[]> {
+  const form = new FormData();
+  form.append("session_id", sessionId);
+  form.append("source", source);
+  files.forEach((file) => form.append("files", file, file.name));
+  const response = await fetch(`${API_BASE}/attachments`, {
+    method: "POST",
+    body: form,
+  });
+  if (!response.ok) {
+    throw new Error(`Attachment upload failed: ${response.status}`);
+  }
+  const payload = await response.json();
+  return Array.isArray(payload.attachments) ? payload.attachments : [];
+}
+
+export interface TodoItem {
+  id: string;
+  content: string;
+  status: "pending" | "in_progress" | "completed" | "error";
+  created_at?: number;
+  updated_at?: number;
+  metadata?: Record<string, unknown>;
+}
+
+export interface TraceSpan {
+  id: string;
+  parent_id: string | null;
+  type:
+    | "root"
+    | "llm"
+    | "model_input"
+    | "tool"
+    | "reasoning"
+    | "todo"
+    | "custom"
+    | "graph"
+    | "middleware"
+    | "memory"
+    | "skill"
+    | "subagent"
+    | "permission";
+  name: string;
+  started_at: number;
+  completed_at: number | null;
+  status: "running" | "completed" | "error";
+  input: unknown;
+  output: unknown;
+  metadata?: Record<string, unknown>;
+  children?: TraceSpan[];
+}
+
+export interface TraceRuntimeMiddlewareEntry {
+  name: string;
+  order?: number;
+  stack_order?: number;
+  execution_order?: number;
+  source?: string;
+  hooks?: string[];
+  note?: string;
+}
+
+export interface TraceRuntimeInventory {
+  middleware?: {
+    stack?: TraceRuntimeMiddlewareEntry[];
+    hooks?: Record<string, TraceRuntimeMiddlewareEntry[]>;
+    order_rule?: Record<string, string>;
+  };
+  tools?: Array<{
+    name: string;
+    source?: string;
+    description?: string;
+  }>;
+  skills?: Array<{
+    name: string;
+    description?: string;
+    location?: string;
+    system_prompt_source?: string;
+    in_system_prompt?: boolean;
+    href?: string;
+  }>;
+  subagents?: Array<{
+    name: string;
+    enabled?: boolean;
+    model?: string;
+    description?: string;
+    route_trigger?: string;
+    tools_mode?: string;
+    skills_mode?: string;
+    href?: string;
+  }>;
+  package_versions?: Record<string, string>;
+}
+
+export interface TraceMiddlewareEffect {
+  id: string;
+  category: string;
+  title: string;
+  hook?: string | null;
+  middleware?: string[];
+  before?: unknown;
+  after?: unknown;
+  diff?: Record<string, unknown>;
+  evidence?: string[];
+  metadata?: Record<string, unknown>;
+  created_at?: number;
+}
+
+export interface TraceMiddlewareInvocation {
+  id: string;
+  hook: string;
+  middleware?: string[];
+  category?: string | null;
+  title: string;
+  invocation_index: number;
+  sequence: number;
+  status: "changed" | "read" | "noop" | "error" | string;
+  evidence?: string[];
+  before?: unknown;
+  after?: unknown;
+  diff?: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
+  flow_ref?: Record<string, unknown>;
+  created_at?: number;
+}
+
+export interface TraceHookBoundarySnapshot {
+  id: string;
+  hook: string;
+  phase: "before" | "after" | string;
+  title: string;
+  snapshot?: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
+  evidence?: string[];
+  created_at?: number;
+  sequence?: number;
+}
+
+export interface AgentTrace {
+  trace_id: string;
+  query_id?: string;
+  session_id: string;
+  started_at: number;
+  completed_at: number | null;
+  status: "running" | "completed" | "error";
+  runtime_inventory?: TraceRuntimeInventory;
+  middleware_effects?: TraceMiddlewareEffect[];
+  middleware_invocations?: TraceMiddlewareInvocation[];
+  hook_boundary_snapshots?: TraceHookBoundarySnapshot[];
+  spans: TraceSpan[];
+}
+
+export interface GraphNode {
+  id: string;
+  type?: string;
+  data?: unknown;
+}
+
+export interface GraphEdge {
+  source: string;
+  target: string;
+}
+
+export interface GraphStructure {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  mermaid?: string;
+  mermaid_png_data_url?: string;
+}
+
+export interface PermissionGrant {
+  id: string;
+  type: string;
+  scope: "once" | "session" | string;
+  target_kind: "exact_file" | "all_external_files" | string;
+  target: string;
+  capabilities: string[];
+  source?: string;
+  created_at?: number;
+  revoked_at?: number;
+}
+
+export interface PermissionRequest {
+  id: string;
+  type: string;
+  session_id: string;
+  query_id?: string;
+  tool_call_id?: string;
+  path?: string;
+  target_kind?: string;
+  capabilities?: string[];
+  status?: string;
+}
+
 /**
  * Stream chat messages via POST SSE.
  * Yields parsed SSE events as they arrive.
@@ -81,7 +542,8 @@ export async function* streamAgent(
   sessionId: string,
   projectId?: string | null,
   signal?: AbortSignal,
-  userId?: string
+  userId?: string,
+  attachments?: AgentAttachment[]
 ): AsyncGenerator<SSEEvent> {
   const response = await fetch(`${API_BASE}/agent`, {
     method: "POST",
@@ -91,6 +553,7 @@ export async function* streamAgent(
       session_id: sessionId,
       user_id: userId || "default_user",
       project_id: projectId || null,
+      attachments: attachments || [],
       stream: true
     }),
     signal,
@@ -194,6 +657,7 @@ export interface ProjectMeta {
   path: string;
   created_at: number;
   updated_at: number;
+  pinned?: boolean;
 }
 
 export async function listProjects(): Promise<ProjectMeta[]> {
@@ -218,6 +682,70 @@ export async function openProject(projectId: string): Promise<void> {
     method: "POST",
   });
   if (!resp.ok) throw new Error(`Failed to open project: ${resp.status}`);
+}
+
+export async function updateProject(
+  projectId: string,
+  update: { name?: string; pinned?: boolean }
+): Promise<ProjectMeta> {
+  const resp = await fetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(update),
+  });
+  if (!resp.ok) throw new Error(`Failed to update project: ${resp.status}`);
+  return resp.json();
+}
+
+export async function removeProject(projectId: string): Promise<void> {
+  const resp = await fetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}`, {
+    method: "DELETE",
+  });
+  if (!resp.ok) throw new Error(`Failed to remove project: ${resp.status}`);
+}
+
+export async function listSessionPermissions(sessionId: string): Promise<PermissionGrant[]> {
+  const resp = await fetch(`${API_BASE}/sessions/${encodeURIComponent(sessionId)}/permissions`);
+  if (!resp.ok) throw new Error(`Failed to list permissions: ${resp.status}`);
+  const data = await resp.json();
+  return data.grants || [];
+}
+
+export async function grantExternalFileRead(
+  sessionId: string,
+  targetKind: "exact_file" | "all_external_files",
+  path?: string,
+  permissionRequestId?: string
+): Promise<PermissionGrant> {
+  const resp = await fetch(`${API_BASE}/sessions/${encodeURIComponent(sessionId)}/permissions/external-files`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ target_kind: targetKind, path, permission_request_id: permissionRequestId }),
+  });
+  if (!resp.ok) throw new Error(`Failed to grant external file permission: ${resp.status}`);
+  const data = await resp.json();
+  return data.grant;
+}
+
+export async function revokePermissionGrant(sessionId: string, grantId: string): Promise<void> {
+  const resp = await fetch(
+    `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/permissions/${encodeURIComponent(grantId)}/revoke`,
+    { method: "POST" }
+  );
+  if (!resp.ok) throw new Error(`Failed to revoke permission: ${resp.status}`);
+}
+
+export async function denyPermissionRequest(
+  sessionId: string,
+  permissionRequestId: string,
+  message?: string
+): Promise<void> {
+  const resp = await fetch(`${API_BASE}/sessions/${encodeURIComponent(sessionId)}/permissions/deny`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ permission_request_id: permissionRequestId, message }),
+  });
+  if (!resp.ok) throw new Error(`Failed to deny permission: ${resp.status}`);
 }
 
 /**
@@ -262,7 +790,17 @@ export async function deleteSession(id: string): Promise<void> {
  */
 export async function getRawMessages(
   sessionId: string
-): Promise<{ session_id: string; title: string; messages: Array<{ role: string; content: string }> }> {
+): Promise<{
+  session_id: string;
+  title: string;
+  messages: Array<{ role: string; content: string }>;
+  todos?: TodoItem[];
+  trace?: AgentTrace | null;
+  traces?: Record<string, AgentTrace>;
+  latest_query_id?: string;
+  latest_trace_id?: string;
+  graph?: GraphStructure | null;
+}> {
   const resp = await fetch(
     `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/messages`
   );

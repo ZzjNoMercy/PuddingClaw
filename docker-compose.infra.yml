@@ -2,23 +2,54 @@
 #
 # 用途：
 #   本地客户端/本地开发模式下，frontend 和 backend 直接在宿主机运行；
-#   Docker 只负责可选基础设施：Higress、Milvus。
+#   Docker 负责基础设施：Higress、Milvus，以及可选 bundled PostgreSQL。
 #   MinerU 按本机服务运行，使用 scripts/setup-mineru.py 或 scripts/start-mineru-host.sh 启动。
 #
 # 端口保持与现有部署约定一致：
 #   Higress Gateway: http://localhost:8080
 #   Higress Console: http://localhost:8001
-#   Milvus:          http://localhost:19530
+#   Milvus:          grpc://localhost:19530
+#   PostgreSQL:      postgresql://localhost:5432  # 可选 bundled；已有本机 PostgreSQL 时可外接
 #   MinerU API:      http://localhost:8002  # 本机运行，不在本 compose 内
 #
 # 启动：
 #   docker compose -f docker-compose.infra.yml up -d
+#   # 推荐使用 scripts/start-local-infra.sh，它会检测本机已有 PostgreSQL，避免强占 5432。
+#
+# PostgreSQL 模式：
+#   PUDDINGCLAW_POSTGRES_MODE=detect    默认；5432 被非 Docker 本机服务占用时跳过 bundled postgres。
+#   PUDDINGCLAW_POSTGRES_MODE=bundled   强制启动本 compose 的 postgres service。
+#   PUDDINGCLAW_POSTGRES_MODE=external  明确使用用户已有 PostgreSQL，本 compose 不启动 postgres service。
+#
+# Bundled PostgreSQL 默认账号：
+#   database: puddingclaw
+#   username: puddingclaw
+#   password: puddingclaw
 #
 # 本地 backend 推荐环境变量：
+#   DATABASE_URL=postgresql+asyncpg://puddingclaw:puddingclaw@127.0.0.1:5432/puddingclaw
 #   AI_GATEWAY_URL=http://localhost:8080/v1
 #   MINERU_URL=http://localhost:8002
 
 services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    container_name: puddingclaw-postgres
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-puddingclaw}
+      - POSTGRES_USER=${POSTGRES_USER:-puddingclaw}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-puddingclaw}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
   higress:
     image: ${HIGRESS_IMAGE:-higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/all-in-one:latest-o11y}
     container_name: puddingclaw-higress

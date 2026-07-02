@@ -28,6 +28,17 @@ const SERVICE_META: Record<
     details: { label: string; value: string }[];
   }
 > = {
+  database: {
+    label: "PostgreSQL 核心数据库",
+    description: "知识库 catalog、任务状态与后续业务事实库",
+    icon: Database,
+    color: "#0f766e",
+    details: [
+      { label: "功能", value: "知识库目录 / 文档版本 / 任务状态 / 引用元数据" },
+      { label: "检测地址", value: "postgresql://localhost:5432" },
+      { label: "降级策略", value: "不可用时，知识库管理降级，聊天能力保持可用" },
+    ],
+  },
   ai_gateway: {
     label: "AI Gateway (Higress)",
     description: "统一模型路由、计量与限流",
@@ -36,7 +47,7 @@ const SERVICE_META: Record<
     details: [
       { label: "功能", value: "LLM 请求代理 / Token 计量 / 限流" },
       { label: "检测地址", value: "http://localhost:8080/health" },
-      { label: "降级策略", value: "直接连接模型提供商" },
+      { label: "降级策略", value: "不可用时，LLM / Embedding 直连 Provider" },
     ],
   },
   milvus: {
@@ -46,8 +57,8 @@ const SERVICE_META: Record<
     color: "#7c3aed",
     details: [
       { label: "功能", value: "向量检索 / 记忆相似度匹配" },
-      { label: "检测地址", value: "http://localhost:19530" },
-      { label: "降级策略", value: "关闭 RAG，使用完整上下文" },
+      { label: "检测地址", value: "grpc://localhost:19530" },
+      { label: "降级策略", value: "不可用时，关闭向量检索，使用完整上下文" },
     ],
   },
   mineru: {
@@ -58,7 +69,7 @@ const SERVICE_META: Record<
     details: [
       { label: "功能", value: "PDF 结构化提取 / 版面还原" },
       { label: "检测地址", value: "http://localhost:8002/health" },
-      { label: "降级策略", value: "跳过文档解析，仅处理文本" },
+      { label: "降级策略", value: "不可用时，跳过版面解析，仅处理文本内容" },
     ],
   },
 };
@@ -213,6 +224,7 @@ export default function CapabilitiesStatus({ refreshIntervalMs = 30000 }: Capabi
   const [error, setError] = useState<string | null>(null);
   const [lastChecked, setLastChecked] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Record<keyof Capabilities, boolean>>({
+    database: false,
     ai_gateway: false,
     milvus: false,
     mineru: false,
@@ -296,7 +308,7 @@ export default function CapabilitiesStatus({ refreshIntervalMs = 30000 }: Capabi
         ))}
       </div>
       <p className="text-[11px] text-gray-500 leading-relaxed px-1">
-        Core 模式无需这些服务即可运行；Full 模式会启用全部能力。Unavailable 的服务会自动降级。
+        PostgreSQL 是知识库功能的核心基础设施；Higress、Milvus、MinerU 可按能力逐步启用。Unavailable 的服务会按各自策略降级。
       </p>
     </div>
   );

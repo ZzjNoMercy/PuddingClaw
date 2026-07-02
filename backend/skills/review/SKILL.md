@@ -7,16 +7,7 @@ description: |
   boundary violations, conditional side effects, and other structural issues. Use when
   asked to "review this PR", "code review", "pre-landing review", or "check my diff".
   Proactively suggest when the user is about to merge or land code changes. (gstack)
-allowed-tools:
-  - Bash
-  - Read
-  - Edit
-  - Write
-  - Grep
-  - Glob
-  - Agent
-  - AskUserQuestion
-  - WebSearch
+allowed-tools: Bash Read Edit Write Grep Glob Agent AskUserQuestion WebSearch
 triggers:
   - review this pr
   - code review

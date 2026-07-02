@@ -22,6 +22,7 @@ class ProjectRecord:
     path: str
     created_at: float
     updated_at: float
+    pinned: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -30,6 +31,7 @@ class ProjectRecord:
             "path": self.path,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "pinned": self.pinned,
         }
 
 
@@ -101,6 +103,7 @@ class ProjectRegistry:
             path=str(resolved),
             created_at=created_at,
             updated_at=now,
+            pinned=bool(existing.get("pinned") or False),
         )
         records[project_id] = record.to_dict()
         self._write_all(records)
@@ -118,11 +121,45 @@ class ProjectRegistry:
                         path=str(raw["path"]),
                         created_at=float(raw.get("created_at") or 0),
                         updated_at=float(raw.get("updated_at") or 0),
+                        pinned=bool(raw.get("pinned") or False),
                     )
                 )
             except Exception:
                 continue
-        return sorted(projects, key=lambda item: item.updated_at, reverse=True)
+        return sorted(projects, key=lambda item: (not item.pinned, -item.updated_at))
+
+    def update(self, project_id: str, *, name: str | None = None, pinned: bool | None = None) -> ProjectRecord:
+        records = self._read_all()
+        raw = records.get(project_id)
+        if not raw:
+            raise KeyError(f"Unknown project_id: {project_id}")
+
+        next_raw = dict(raw)
+        if name is not None:
+            next_name = name.strip()
+            if not next_name:
+                raise ValueError("Project name cannot be empty")
+            next_raw["name"] = next_name
+        if pinned is not None:
+            next_raw["pinned"] = pinned
+        next_raw["updated_at"] = time.time()
+        records[project_id] = next_raw
+        self._write_all(records)
+        return ProjectRecord(
+            project_id=project_id,
+            name=str(next_raw.get("name") or project_id),
+            path=str(next_raw["path"]),
+            created_at=float(next_raw.get("created_at") or 0),
+            updated_at=float(next_raw.get("updated_at") or 0),
+            pinned=bool(next_raw.get("pinned") or False),
+        )
+
+    def remove(self, project_id: str) -> None:
+        records = self._read_all()
+        if project_id not in records:
+            raise KeyError(f"Unknown project_id: {project_id}")
+        records.pop(project_id, None)
+        self._write_all(records)
 
     def resolve(self, project_id: str) -> Path:
         records = self._read_all()
@@ -146,4 +183,3 @@ class ProjectRegistry:
 
 
 project_registry = ProjectRegistry()
-

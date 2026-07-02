@@ -17,15 +17,23 @@ BASE_DIR = Path(__file__).resolve().parent
 async def lifespan(app: FastAPI):
     """Startup: scan skills, initialize agent, build memory index."""
     import traceback
+    from db import init_database
     from tools.skills_scanner import scan_skills
     from graph.agent import agent_manager
     from graph.deepagents_manager import deepagents_agent_manager
+    from graph.attachment_store import attachment_store
     from graph.memory_indexer import get_memory_indexer
     from projects.registry import project_registry
     import capabilities
 
     scan_skills(BASE_DIR)
     project_registry.initialize(BASE_DIR)
+    attachment_store.initialize(BASE_DIR)
+    db_ready = await init_database()
+    if db_ready:
+        print("🗄️ Knowledge catalog database ready")
+    else:
+        print("⚠️ Knowledge catalog database unavailable; knowledge management API will report degraded status")
     caps = await capabilities.detect_capabilities(force=True)
     print(f"🔌 Capabilities: {caps.to_dict()}")
     try:
@@ -88,6 +96,9 @@ from api.stats_api import router as stats_router
 from api.mcp import router as mcp_router
 from api.capabilities import router as capabilities_router
 from api.projects import router as projects_router
+from api.permissions import router as permissions_router
+from api.attachments import router as attachments_router
+from api.knowledge import router as knowledge_router
 
 app.include_router(chat_router, prefix="/api")
 app.include_router(agent_router, prefix="/api")
@@ -102,6 +113,9 @@ app.include_router(stats_router, prefix="/api")
 app.include_router(mcp_router, prefix="/api")
 app.include_router(capabilities_router, prefix="/api")
 app.include_router(projects_router, prefix="/api")
+app.include_router(permissions_router, prefix="/api")
+app.include_router(attachments_router, prefix="/api")
+app.include_router(knowledge_router, prefix="/api")
 
 
 @app.get("/")

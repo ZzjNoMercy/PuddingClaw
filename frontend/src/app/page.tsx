@@ -8,6 +8,7 @@ import Sidebar from "@/components/layout/Sidebar";
 import ChatPanel from "@/components/chat/ChatPanel";
 import ResizeHandle from "@/components/layout/ResizeHandle";
 import SourcesPanel from "@/components/citations/SourcesPanel";
+import TraceDashboard from "@/components/agent/TraceDashboard";
 
 const MIN_SIDEBAR = 200;
 const MIN_CHAT = 360;
@@ -21,11 +22,15 @@ function ChatLayout() {
     setSidebarWidth,
     triggerSkillCreator,
     inspectorOpen,
+    setInspectorOpen,
     toggleInspector,
     inspectorWidth,
     setInspectorWidth,
     sessionId,
     sessions,
+    workspaceView,
+    setWorkspaceView,
+    trace,
   } = useApp();
 
   const searchParams = useSearchParams();
@@ -57,6 +62,13 @@ function ChatLayout() {
 
   const handleInspectorResize = (delta: number) => {
     setInspectorWidth((prev: number) => Math.max(MIN_INSPECTOR, prev + delta));
+  };
+
+  const toggleTraceDashboard = () => {
+    setWorkspaceView(workspaceView === "trace" ? "chat" : "trace");
+    if (workspaceView !== "trace") {
+      setInspectorOpen(false);
+    }
   };
 
   return (
@@ -99,13 +111,16 @@ function ChatLayout() {
             title={sessionTitle}
             inspectorOpen={inspectorOpen}
             toggleInspector={toggleInspector}
+            onToggleTrace={toggleTraceDashboard}
+            traceSpanCount={trace?.spans?.length || 0}
+            traceActive={workspaceView === "trace"}
             showPanelToggles
           />
 
           <div className="flex min-h-0 flex-1 overflow-hidden">
             {/* Chat — fills remaining space */}
             <div className="flex-1 overflow-hidden workspace-chat-shell" style={{ minWidth: MIN_CHAT }}>
-              <ChatPanel />
+              {workspaceView === "trace" ? <TraceDashboard /> : <ChatPanel />}
             </div>
 
             {inspectorOpen && (

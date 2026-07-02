@@ -69,7 +69,7 @@ python3 scripts/fetch_github.py --repo langchain-ai/langchain | python3 scripts/
   3. 从搜索结果中提取 star 数、release 版本、commit 信息、PR 动态
   4. 将结构化数据写入 `/knowledge/{owner}_{repo}_tracker.md`
 - 每次调用 `scripts/fetch_github.py` 必须指定 `--repo` 参数（格式 `owner/repo`）。
-- 拉取到的文档存入 `/knowledge/` 后，提醒用户可通过 `search_knowledge_base` 检索。
+- 拉取到的文档存入 `/knowledge/` 后，提醒用户可通过 `llamaindex_knowledge_query` 检索。
 - 网络失败时不要重试超过 2 次，返回已有数据并报告失败仓库。
 - **终端沙箱 `/knowledge/` 为只读**：脚本输出到 `/tmp/`，再用 `write_file` 工具搬运到 `/knowledge/`。
 

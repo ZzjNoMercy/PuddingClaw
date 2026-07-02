@@ -25,7 +25,17 @@ import {
   listMcpServers as apiListMcpServers,
   listProjects as apiListProjects,
   registerProject as apiRegisterProject,
+  updateProject as apiUpdateProject,
+  removeProject as apiRemoveProject,
   ProjectMeta,
+  TodoItem,
+  AgentTrace,
+  TraceSpan,
+  TraceHookBoundarySnapshot,
+  TraceMiddlewareInvocation,
+  GraphStructure,
+  PermissionRequest,
+  AgentAttachment,
 } from "./api";
 import {
   getSettings as apiGetSettings,
@@ -42,6 +52,7 @@ export interface ToolCall {
   status: "running" | "done";
   summary_source?: string;
   is_error?: boolean;
+  permissionRequest?: PermissionRequest;
 }
 
 export type TimelineItem =
@@ -95,6 +106,7 @@ export interface ChatMessage {
   retrievals?: RetrievalResult[];
   sources?: SourceRecord[];
   citations?: CitationRef[];
+  permissionRequests?: PermissionRequest[];
   timestamp: number;
 }
 
@@ -128,17 +140,20 @@ export interface ContextMaintenanceStatus {
 interface AppState {
   // Runtime mode
   runtimeMode: "agent" | "chat";
+  runtimeReady: boolean;
   setRuntimeMode: (mode: "agent" | "chat") => void;
   currentProjectId: string | null;
   setCurrentProjectId: (id: string | null) => void;
   projects: ProjectMeta[];
   loadProjects: () => void;
   registerProject: (path: string) => Promise<ProjectMeta | null>;
+  updateProject: (projectId: string, update: { name?: string; pinned?: boolean }) => Promise<ProjectMeta | null>;
+  removeProject: (projectId: string) => Promise<boolean>;
 
   // Chat
   messages: ChatMessage[];
   isStreaming: boolean;
-  sendMessage: (text: string) => Promise<void>;
+  sendMessage: (text: string, attachments?: AgentAttachment[]) => Promise<void>;
   stopStreaming: () => void;
 
   // Sessions
@@ -146,7 +161,7 @@ interface AppState {
   setSessionId: (id: string) => void;
   sessions: SessionMeta[];
   loadSessions: () => void;
-  createSession: () => Promise<void>;
+  createSession: () => Promise<string | null>;
   triggerSkillCreator: () => void;
 
   // Pending input (prefill from external actions, cleared on send)
@@ -167,6 +182,8 @@ interface AppState {
   inspectorOpen: boolean;
   setInspectorOpen: (open: boolean) => void;
   toggleInspector: () => void;
+  inspectorActiveTab: "progress" | "sources" | "permissions";
+  setInspectorActiveTab: (tab: "progress" | "sources" | "permissions") => void;
 
   // Right panel tab
   rightTab: "memory" | "skills" | "mcp";
@@ -179,6 +196,21 @@ interface AppState {
   // Raw messages
   rawMessages: RawMessage[] | null;
   loadRawMessages: () => void;
+
+  // Agent white-box state
+  todos: TodoItem[];
+  trace: AgentTrace | null;
+  traceHistory: Record<string, AgentTrace>;
+  selectedTraceQueryId: string | null;
+  selectTraceQuery: (queryId: string) => void;
+
+  // LangGraph execution graph for Agent mode
+  graph: GraphStructure | null;
+  activeGraphNode: string | null;
+
+  // Main workspace view
+  workspaceView: "chat" | "trace";
+  setWorkspaceView: (view: "chat" | "trace") => void;
 
   // Expanded file (editor full-panel mode)
   expandedFile: boolean;
@@ -414,25 +446,72 @@ function getOrCreateUserId(): string {
   return id;
 }
 
+function sortProjects(projects: ProjectMeta[]): ProjectMeta[] {
+  return [...projects].sort((a, b) => {
+    if (Boolean(a.pinned) !== Boolean(b.pinned)) return a.pinned ? -1 : 1;
+    return b.updated_at - a.updated_at;
+  });
+}
+
 export function AppProvider({ children }: { children: React.ReactNode }) {
   // ── Per-session state (Map-based, supports parallel sessions) ──
   const messagesMapRef = useRef<Record<string, ChatMessage[]>>({});
+  const todosMapRef = useRef<Record<string, TodoItem[]>>({});
+  const tracesMapRef = useRef<Record<string, AgentTrace | null>>({});
+  const traceHistoriesMapRef = useRef<Record<string, Record<string, AgentTrace>>>({});
+  const selectedTraceQueryMapRef = useRef<Record<string, string | null>>({});
+  const graphsMapRef = useRef<Record<string, GraphStructure | null>>({});
+  const graphActiveNodesRef = useRef<Record<string, string | null>>({});
   const abortControllersRef = useRef<Map<string, AbortController>>(new Map());
   const assistantIdsRef = useRef<Map<string, string>>(new Map());
   const sessionIdRef = useRef("default"); // tracks current sessionId for SSE callbacks
 
   // ── UI state (reflects current session) ──
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [todos, setTodos] = useState<TodoItem[]>([]);
+  const [trace, setTrace] = useState<AgentTrace | null>(null);
+  const [traceHistory, setTraceHistory] = useState<Record<string, AgentTrace>>({});
+  const [selectedTraceQueryId, setSelectedTraceQueryId] = useState<string | null>(null);
+  const [graph, setGraph] = useState<GraphStructure | null>(null);
+  const [activeGraphNode, setActiveGraphNode] = useState<string | null>(null);
+  const [workspaceView, setWorkspaceViewRaw] = useState<"chat" | "trace">("chat");
+
+  const setWorkspaceView = useCallback(
+    (view: "chat" | "trace") => {
+      try {
+        sessionStorage.setItem("puddingclaw_workspace_view", view);
+      } catch {
+        // ignore storage errors
+      }
+      setWorkspaceViewRaw(view);
+    },
+    []
+  );
+
+  // Restore workspace view from sessionStorage on the client to avoid SSR
+  // hydration mismatches (sessionStorage is not available during server render).
+  useEffect(() => {
+    try {
+      const saved = sessionStorage.getItem("puddingclaw_workspace_view");
+      if (saved === "chat" || saved === "trace") {
+        setWorkspaceViewRaw(saved);
+      }
+    } catch {
+      // ignore storage errors
+    }
+  }, []);
   const [streamingSessions, setStreamingSessions] = useState<Set<string>>(new Set());
   const [sessionId, setSessionIdRaw] = useState("default");
   const [userId] = useState(() => getOrCreateUserId());
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
   const [runtimeMode, setRuntimeModeRaw] = useState<"agent" | "chat">("chat");
+  const [runtimeReady, setRuntimeReady] = useState(false);
   const [currentProjectId, setCurrentProjectIdRaw] = useState<string | null>(null);
   const [projects, setProjects] = useState<ProjectMeta[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [inspectorFile, setInspectorFileRaw] = useState<string | null>(null);
   const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [inspectorActiveTab, setInspectorActiveTab] = useState<"progress" | "sources" | "permissions">("progress");
   const [rightTab, setRightTab] = useState<"memory" | "skills" | "mcp">("memory");
   const [mcpServers, setMcpServers] = useState<Array<{ key: string; name: string; url: string; transport: string }>>([]);
   const [rawMessages, setRawMessages] = useState<RawMessage[] | null>(null);
@@ -485,6 +564,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       if (savedProjectId) setCurrentProjectIdRaw(savedProjectId);
     } catch {
       // ignore storage errors
+    } finally {
+      setRuntimeReady(true);
     }
   }, []);
 
@@ -536,6 +617,198 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     []
   );
 
+  // ── Helper: update Agent white-box state for a session ──────────────
+  const updateSessionTodos = useCallback((sid: string, nextTodos: TodoItem[]) => {
+    todosMapRef.current[sid] = nextTodos;
+    if (sessionIdRef.current === sid) {
+      setTodos(nextTodos);
+    }
+  }, []);
+
+  const updateSessionTrace = useCallback((sid: string, nextTrace: AgentTrace | null) => {
+    tracesMapRef.current[sid] = nextTrace;
+    if (nextTrace?.query_id) {
+      const history = {
+        ...(traceHistoriesMapRef.current[sid] || {}),
+        [nextTrace.query_id]: nextTrace,
+      };
+      traceHistoriesMapRef.current[sid] = history;
+      selectedTraceQueryMapRef.current[sid] = nextTrace.query_id;
+      if (sessionIdRef.current === sid) {
+        setTraceHistory(history);
+        setSelectedTraceQueryId(nextTrace.query_id || null);
+      }
+    }
+    if (sessionIdRef.current === sid) {
+      setTrace(nextTrace);
+    }
+  }, []);
+
+  const selectTraceQuery = useCallback((queryId: string) => {
+    const sid = sessionIdRef.current;
+    const history = traceHistoriesMapRef.current[sid] || {};
+    const nextTrace = history[queryId];
+    if (!nextTrace) return;
+    selectedTraceQueryMapRef.current[sid] = queryId;
+    tracesMapRef.current[sid] = nextTrace;
+    setSelectedTraceQueryId(queryId);
+    setTrace(nextTrace);
+  }, []);
+
+  const updateSessionGraph = useCallback((sid: string, nextGraph: GraphStructure | null) => {
+    graphsMapRef.current[sid] = nextGraph;
+    if (sessionIdRef.current === sid) {
+      setGraph(nextGraph);
+    }
+  }, []);
+
+  const updateSessionActiveGraphNode = useCallback((sid: string, node: string | null) => {
+    graphActiveNodesRef.current[sid] = node;
+    if (sessionIdRef.current === sid) {
+      setActiveGraphNode(node);
+    }
+  }, []);
+
+  const applyMiddlewareInvocationEvent = useCallback(
+    (
+      sid: string,
+      invocation: TraceMiddlewareInvocation,
+      traceMeta?: { trace_id?: string; query_id?: string }
+    ) => {
+      const current = tracesMapRef.current[sid];
+      const base: AgentTrace = current || {
+        trace_id: traceMeta?.trace_id || `trace-${sid}`,
+        query_id: traceMeta?.query_id,
+        session_id: sid,
+        started_at: invocation.created_at || Date.now() / 1000,
+        completed_at: null,
+        status: "running",
+        spans: [],
+      };
+      const existing = base.middleware_invocations || [];
+      const nextInvocations = existing.some((item) => item.id === invocation.id)
+        ? existing.map((item) => (item.id === invocation.id ? invocation : item))
+        : [...existing, invocation];
+      updateSessionTrace(sid, {
+        ...base,
+        trace_id: traceMeta?.trace_id || base.trace_id,
+        query_id: traceMeta?.query_id || base.query_id,
+        middleware_invocations: nextInvocations,
+      });
+    },
+    [updateSessionTrace]
+  );
+
+  const applyHookBoundarySnapshotEvent = useCallback(
+    (
+      sid: string,
+      snapshot: TraceHookBoundarySnapshot,
+      traceMeta?: { trace_id?: string; query_id?: string }
+    ) => {
+      const current = tracesMapRef.current[sid];
+      const base: AgentTrace = current || {
+        trace_id: traceMeta?.trace_id || `trace-${sid}`,
+        query_id: traceMeta?.query_id,
+        session_id: sid,
+        started_at: snapshot.created_at || Date.now() / 1000,
+        completed_at: null,
+        status: "running",
+        spans: [],
+      };
+      const existing = base.hook_boundary_snapshots || [];
+      const nextSnapshots = existing.some((item) => item.id === snapshot.id)
+        ? existing.map((item) => (item.id === snapshot.id ? snapshot : item))
+        : [...existing, snapshot];
+      updateSessionTrace(sid, {
+        ...base,
+        trace_id: traceMeta?.trace_id || base.trace_id,
+        query_id: traceMeta?.query_id || base.query_id,
+        hook_boundary_snapshots: nextSnapshots,
+      });
+    },
+    [updateSessionTrace]
+  );
+
+  // Apply a trace_span_start / trace_span_end event to the in-memory trace.
+  // The backend sends flattened span dictionaries; we rebuild the tree on the fly.
+  const applyTraceSpanEvent = useCallback(
+    (
+      sid: string,
+      span: TraceSpan,
+      isEnd: boolean,
+      traceMeta?: { trace_id?: string; query_id?: string }
+    ) => {
+      const current = tracesMapRef.current[sid];
+      const base: AgentTrace = current || {
+        trace_id: traceMeta?.trace_id || `trace-${sid}`,
+        query_id: traceMeta?.query_id,
+        session_id: sid,
+        started_at: span.started_at,
+        completed_at: null,
+        status: "running",
+        spans: [],
+      };
+
+      const spansById = new Map(base.spans.map((s) => [s.id, s]));
+      if (!spansById.has(span.id)) {
+        spansById.set(span.id, { ...span, children: [] });
+      } else {
+        const existing = spansById.get(span.id)!;
+        spansById.set(span.id, {
+          ...existing,
+          ...span,
+          children: existing.children || [],
+        });
+      }
+
+      // Rebuild parent -> children links for all spans.
+      const childrenByParent = new Map<string | null, TraceSpan[]>();
+      Array.from(spansById.values()).forEach((s) => {
+        const parentId = s.parent_id;
+        if (!childrenByParent.has(parentId)) {
+          childrenByParent.set(parentId, []);
+        }
+        childrenByParent.get(parentId)!.push(s);
+      });
+
+      // Reconstruct flattened list with correct children pointers.
+      const visited = new Set<string>();
+      const walk = (spanId: string): TraceSpan[] => {
+        if (visited.has(spanId)) return [];
+        visited.add(spanId);
+        const s = spansById.get(spanId);
+        if (!s) return [];
+        const children = (childrenByParent.get(spanId) || [])
+          .flatMap((child) => walk(child.id))
+          .sort((a: TraceSpan, b: TraceSpan) => a.started_at - b.started_at);
+        return [{ ...s, children }];
+      };
+
+      // Find the root span (parent_id == null). If missing, use the earliest span.
+      let rootId: string | null = null;
+      Array.from(spansById.values()).forEach((s) => {
+        if (rootId === null && s.parent_id === null) {
+          rootId = s.id;
+        }
+      });
+      if (!rootId && spansById.size > 0) {
+        rootId = Array.from(spansById.values())
+          .sort((a: TraceSpan, b: TraceSpan) => a.started_at - b.started_at)[0].id;
+      }
+
+      const nextSpans = rootId ? walk(rootId) : [];
+      const nextTrace: AgentTrace = {
+        ...base,
+        trace_id: traceMeta?.trace_id || base.trace_id,
+        query_id: traceMeta?.query_id || base.query_id,
+        spans: nextSpans,
+      };
+
+      updateSessionTrace(sid, nextTrace);
+    },
+    [updateSessionTrace]
+  );
+
   // ── Session management ─────────────────────────────
 
   const loadSessions = useCallback(() => {
@@ -555,7 +828,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const project = await apiRegisterProject(path);
       setProjects((prev) => {
         const others = prev.filter((item) => item.project_id !== project.project_id);
-        return [project, ...others];
+        return sortProjects([project, ...others]);
       });
       setCurrentProjectId(project.project_id);
       setRuntimeMode("agent");
@@ -564,6 +837,37 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       return null;
     }
   }, [setCurrentProjectId, setRuntimeMode]);
+
+  const updateProject = useCallback(
+    async (projectId: string, update: { name?: string; pinned?: boolean }): Promise<ProjectMeta | null> => {
+      try {
+        const project = await apiUpdateProject(projectId, update);
+        setProjects((prev) =>
+          sortProjects(prev.map((item) => (item.project_id === project.project_id ? project : item)))
+        );
+        return project;
+      } catch {
+        return null;
+      }
+    },
+    []
+  );
+
+  const removeProject = useCallback(
+    async (projectId: string): Promise<boolean> => {
+      try {
+        await apiRemoveProject(projectId);
+        setProjects((prev) => prev.filter((item) => item.project_id !== projectId));
+        if (sessionIdRef.current === "default" && currentProjectId === projectId) {
+          setCurrentProjectId(null);
+        }
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [currentProjectId, setCurrentProjectId]
+  );
 
   const loadMcpServers = useCallback(() => {
     apiListMcpServers()
@@ -592,28 +896,77 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       setSessionIdRaw(id);
       setRawMessages(null);
 
+      // Restore cached Agent white-box state if available
+      const cachedTodos = todosMapRef.current[id];
+      const cachedTrace = tracesMapRef.current[id];
+      const cachedTraceHistory = traceHistoriesMapRef.current[id];
+      const cachedSelectedTraceQuery = selectedTraceQueryMapRef.current[id];
+      const cachedGraph = graphsMapRef.current[id];
+      const cachedActiveNode = graphActiveNodesRef.current[id];
+      if (cachedTodos) setTodos(cachedTodos);
+      else setTodos([]);
+      if (cachedTrace !== undefined) setTrace(cachedTrace);
+      else setTrace(null);
+      if (cachedTraceHistory !== undefined) setTraceHistory(cachedTraceHistory);
+      else setTraceHistory({});
+      if (cachedSelectedTraceQuery !== undefined) setSelectedTraceQueryId(cachedSelectedTraceQuery);
+      else setSelectedTraceQueryId(null);
+      if (cachedGraph !== undefined) setGraph(cachedGraph);
+      else setGraph(null);
+      if (cachedActiveNode !== undefined) setActiveGraphNode(cachedActiveNode);
+      else setActiveGraphNode(null);
+
       // Show cached messages immediately if available
       const cached = messagesMapRef.current[id];
       if (cached && cached.length > 0) {
         setMessages(cached);
-        return; // already have messages, no need to fetch
+      } else {
+        // No cache — clear and load from backend
+        setMessages([]);
+        apiGetSessionHistory(id)
+          .then((data) => {
+            if (data.messages && data.messages.length > 0) {
+              const loaded = parseHistoryMessages(data.messages);
+              messagesMapRef.current[id] = loaded;
+              // Only update UI if still viewing this session
+              if (sessionIdRef.current === id) {
+                setMessages(loaded);
+              }
+            }
+          })
+          .catch(() => {
+            // Session might not exist yet, that's OK
+          });
       }
 
-      // No cache — clear and load from backend
-      setMessages([]);
-      apiGetSessionHistory(id)
+      // Load persisted todos / trace / graph for Agent sessions
+      apiGetRawMessages(id)
         .then((data) => {
-          if (data.messages && data.messages.length > 0) {
-            const loaded = parseHistoryMessages(data.messages);
-            messagesMapRef.current[id] = loaded;
-            // Only update UI if still viewing this session
+          if (data.todos) {
+            todosMapRef.current[id] = data.todos;
+            if (sessionIdRef.current === id) setTodos(data.todos);
+          }
+          if (data.trace) {
+            tracesMapRef.current[id] = data.trace;
+            if (sessionIdRef.current === id) setTrace(data.trace);
+          }
+          if (data.traces) {
+            traceHistoriesMapRef.current[id] = data.traces;
+            const selected = data.latest_query_id || data.trace?.query_id || null;
+            selectedTraceQueryMapRef.current[id] = selected;
             if (sessionIdRef.current === id) {
-              setMessages(loaded);
+              setTraceHistory(data.traces);
+              setSelectedTraceQueryId(selected);
+              if (selected && data.traces[selected]) setTrace(data.traces[selected]);
             }
+          }
+          if (data.graph) {
+            graphsMapRef.current[id] = data.graph as GraphStructure;
+            if (sessionIdRef.current === id) setGraph(data.graph as GraphStructure);
           }
         })
         .catch(() => {
-          // Session might not exist yet, that's OK
+          // ignore
         });
     },
     []
@@ -648,7 +1001,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     }
   }, [sessions, setSessionId]);
 
-  const createSession = useCallback(async () => {
+  const createSession = useCallback(async (): Promise<string | null> => {
     try {
       const meta = await apiCreateSession();
       setSessions((prev) => [
@@ -665,8 +1018,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       // history fetch.
       messagesMapRef.current[meta.id] = [];
       setSessionId(meta.id);
+      return meta.id;
     } catch {
       // ignore
+      return null;
     }
   }, [setSessionId]);
 
@@ -769,8 +1124,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     try {
       await apiClearSession(sessionId);
       messagesMapRef.current[sessionId] = [];
+      todosMapRef.current[sessionId] = [];
+      tracesMapRef.current[sessionId] = null;
+      traceHistoriesMapRef.current[sessionId] = {};
+      selectedTraceQueryMapRef.current[sessionId] = null;
       if (sessionIdRef.current === sessionId) {
         setMessages([]);
+        setTodos([]);
+        setTrace(null);
+        setTraceHistory({});
+        setSelectedTraceQueryId(null);
       }
       setRawMessages(null);
     } catch {
@@ -800,9 +1163,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   // ── Send message ───────────────────────────────────
 
   const sendMessage = useCallback(
-    async (text: string) => {
+    async (text: string, attachments: AgentAttachment[] = []) => {
       // Guard: only check if CURRENT session is streaming (other sessions can be)
-      if (!text.trim() || streamingSessions.has(sessionId) || isCompressing) return;
+      if ((!text.trim() && attachments.length === 0) || streamingSessions.has(sessionId) || isCompressing) return;
 
       // Lazily create a session only when we are on the placeholder "default"
       // session (e.g. after the user clicked "New Chat" or triggered a skill
@@ -816,11 +1179,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const sendSessionId = sessionIdRef.current;
 
       // Slash command processing
-      let processedText = text;
+      // Only treat tokens like "/skill-name" as skill invocations; ignore
+      // absolute file paths such as "/Users/..." or "/home/...".
+      const SKILL_NAME_RE = /^\/[^/]+$/;
+      let processedText = text.trim() || "请分析这张图片。";
       const tokens = text.split(/(\s+)/);
       const skillNames: string[] = [];
       for (const token of tokens) {
-        if (token.startsWith("/") && token.length > 1 && !/\s/.test(token)) {
+        if (SKILL_NAME_RE.test(token)) {
           skillNames.push(token.slice(1));
         }
       }
@@ -828,7 +1194,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         await Promise.allSettled(skillNames.map((name) => apiLoadSkill(name)));
         processedText = tokens
           .map((t) => {
-            if (t.startsWith("/") && t.length > 1 && !/\s/.test(t)) {
+            if (SKILL_NAME_RE.test(t)) {
               return `[使用技能: ${t.slice(1)}]`;
             }
             return t;
@@ -842,7 +1208,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const userMsg: ChatMessage = {
         id: `user-${Date.now()}`,
         role: "user",
-        content: text,
+        content: attachments.length
+          ? `${text}\n\n[附件]\n${attachments.map((item) => `- ${item.name || item.path || item.id || "attachment"}`).join("\n")}`
+          : text,
         timestamp: Date.now(),
       };
 
@@ -970,7 +1338,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
       try {
         const eventStream = runtimeMode === "agent"
-          ? streamAgent(processedText, sendSessionId, currentProjectId, controller.signal, userId)
+          ? streamAgent(processedText, sendSessionId, currentProjectId, controller.signal, userId, attachments)
           : streamChat(processedText, sendSessionId, controller.signal, userId);
 
         for await (const event of eventStream) {
@@ -1076,6 +1444,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             const source = event.data.source as unknown as SourceRecord;
             if (source?.source_id) {
               setInspectorOpen(true);
+              setActiveSourceId(source.source_id);
               updateMsgs((prev) => {
                 const updated = [...prev];
                 const idx = updated.findIndex((m) => m.id === targetId);
@@ -1103,6 +1472,146 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               updated[idx] = { ...updated[idx], citations };
               return updated;
             });
+            continue;
+          }
+
+          // Agent white-box state: todo list updates
+          if (event.event === "todos_updated") {
+            const nextTodos = (event.data.todos || []) as TodoItem[];
+            updateSessionTodos(sendSessionId, nextTodos);
+            if (workspaceView === "chat" && nextTodos.length > 0) {
+              setInspectorOpen(true);
+              setInspectorActiveTab("progress");
+            }
+            continue;
+          }
+
+          if (event.event === "permission_required") {
+            const targetId = getAssistantId();
+            const permissionRequest = event.data as unknown as PermissionRequest;
+            const toolCallId = permissionRequest.tool_call_id || "";
+            setInspectorOpen(true);
+            setInspectorActiveTab("permissions");
+            updateMsgs((prev) => {
+              const updated = [...prev];
+              const idx = updated.findIndex((m) => m.id === targetId);
+              if (idx === -1) return prev;
+              const msg = { ...updated[idx] };
+              const output = `Permission required\nPath: ${permissionRequest.path || ""}`;
+              const calls = [...(msg.toolCalls || [])];
+              let callIdx = toolCallId ? calls.findIndex((call) => call.id === toolCallId) : -1;
+              if (callIdx === -1) {
+                callIdx = calls.findIndex((call) => call.tool === "read_external_file" && call.status === "running");
+              }
+              if (callIdx !== -1) {
+                calls[callIdx] = {
+                  ...calls[callIdx],
+                  output,
+                  permissionRequest,
+                };
+              }
+              msg.toolCalls = calls;
+              const existingRequests = msg.permissionRequests || [];
+              msg.permissionRequests = existingRequests.some((request) => request.id === permissionRequest.id)
+                ? existingRequests.map((request) => request.id === permissionRequest.id ? permissionRequest : request)
+                : [...existingRequests, permissionRequest];
+              const timeline = msg.timeline ? [...msg.timeline] : [];
+              updateToolInTimeline(timeline, toolCallId, "read_external_file", {
+                output,
+                permissionRequest,
+              });
+              msg.timeline = timeline;
+              const segments = msg.segments ? [...msg.segments] : undefined;
+              if (segments) {
+                const lastSegIdx = segments.length - 1;
+                const segTimeline = segments[lastSegIdx].timeline
+                  ? [...segments[lastSegIdx].timeline]
+                  : [];
+                updateToolInTimeline(segTimeline, toolCallId, "read_external_file", {
+                  output,
+                  permissionRequest,
+                });
+                segments[lastSegIdx] = { ...segments[lastSegIdx], timeline: segTimeline };
+                msg.segments = segments;
+              }
+              updated[idx] = msg;
+              return updated;
+            });
+            continue;
+          }
+
+          if (event.event === "permission_resolved") {
+            const targetId = getAssistantId();
+            const requestId = (event.data.request_id as string) || "";
+            updateMsgs((prev) => {
+              const updated = [...prev];
+              const idx = updated.findIndex((m) => m.id === targetId);
+              if (idx === -1 || !requestId) return prev;
+              const msg = { ...updated[idx] };
+              msg.permissionRequests = (msg.permissionRequests || []).map((request) =>
+                request.id === requestId ? { ...request, status: "resolved" } : request
+              );
+              updated[idx] = msg;
+              return updated;
+            });
+            continue;
+          }
+
+          // Agent white-box state: execution trace update
+          if (event.event === "trace_updated") {
+            const nextTrace = (event.data.trace || null) as AgentTrace | null;
+            updateSessionTrace(sendSessionId, nextTrace);
+            updateSessionActiveGraphNode(sendSessionId, null);
+            continue;
+          }
+
+          // Real-time trace span events
+          if (event.event === "trace_span_start") {
+            const span = event.data.span as TraceSpan;
+            applyTraceSpanEvent(sendSessionId, span, false, {
+              trace_id: event.data.trace_id as string | undefined,
+              query_id: event.data.query_id as string | undefined,
+            });
+            continue;
+          }
+          if (event.event === "trace_span_end") {
+            const span = event.data.span as TraceSpan;
+            applyTraceSpanEvent(sendSessionId, span, true, {
+              trace_id: event.data.trace_id as string | undefined,
+              query_id: event.data.query_id as string | undefined,
+            });
+            continue;
+          }
+          if (event.event === "middleware_invocation") {
+            const invocation = event.data.invocation as TraceMiddlewareInvocation;
+            if (invocation?.id) {
+              applyMiddlewareInvocationEvent(sendSessionId, invocation, {
+                trace_id: event.data.trace_id as string | undefined,
+                query_id: event.data.query_id as string | undefined,
+              });
+            }
+            continue;
+          }
+          if (event.event === "hook_boundary_snapshot") {
+            const snapshot = event.data.snapshot as TraceHookBoundarySnapshot;
+            if (snapshot?.id) {
+              applyHookBoundarySnapshotEvent(sendSessionId, snapshot, {
+                trace_id: event.data.trace_id as string | undefined,
+                query_id: event.data.query_id as string | undefined,
+              });
+            }
+            continue;
+          }
+
+          // LangGraph structure and active node
+          if (event.event === "graph_structure") {
+            const nextGraph = event.data as unknown as GraphStructure;
+            updateSessionGraph(sendSessionId, nextGraph);
+            continue;
+          }
+          if (event.event === "graph_node_active") {
+            const node = (event.data.node as string) || null;
+            updateSessionActiveGraphNode(sendSessionId, node);
             continue;
           }
 
@@ -1340,12 +1849,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     <AppContext.Provider
       value={{
         runtimeMode,
+        runtimeReady,
         setRuntimeMode,
         currentProjectId,
         setCurrentProjectId,
         projects,
         loadProjects,
         registerProject,
+        updateProject,
+        removeProject,
         messages,
         isStreaming,
         sendMessage,
@@ -1368,12 +1880,23 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         inspectorOpen,
         setInspectorOpen,
         toggleInspector,
+        inspectorActiveTab,
+        setInspectorActiveTab,
         rightTab,
         setRightTab,
         mcpServers,
         loadMcpServers,
         rawMessages,
         loadRawMessages,
+        todos,
+        trace,
+        traceHistory,
+        selectedTraceQueryId,
+        selectTraceQuery,
+        graph,
+        activeGraphNode,
+        workspaceView,
+        setWorkspaceView,
         expandedFile,
         setExpandedFile,
         sidebarWidth,

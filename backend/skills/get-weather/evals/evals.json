@@ -1,5 +1,5 @@
 {
-  "skill_name": "get_weather",
+  "skill_name": "get-weather",
   "evals": [
     {
       "id": 1,

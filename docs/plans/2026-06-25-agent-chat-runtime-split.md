@@ -666,8 +666,9 @@ def deepagents_messages_to_session_messages(messages) -> list[dict]:
 | Phase 1D：DeepAgents 运行时透明事件 | Done | 2026-06-26：参考 Chat `AgentManager._run_agent_stream`，Agent 模式从 DeepAgents `updates.model.messages[].tool_calls` emit `tool_start`，从 `updates.tools.messages[]` emit `tool_end`，工具完成后续文本 emit `new_response`；`custom` middleware 事件按原类型透传；tool_calls/output 写入 `session.json`；补齐 `source_found`、`citations_finalized`、首轮自动标题事件；DeepAgents 工具结果复用 `tool_result_adapter`，结构化 `puddingclaw_tool_result` 会拆分为展示文本和 sources，并通过 `format_sources_for_model` 提醒模型使用 `[^source_id]` 标注引用；新增 `tests/test_deepagents_manager.py` 验证事件、引用、标题与持久化 |
 | Phase 2：DeepAgents 工具 / skills / backend 对齐 | In Progress | 2026-06-26：Agent 模式已过滤 PuddingClaw 重叠工具，保留 `terminal/fetch_url/tavily_search/search_knowledge_base`；`create_deep_agent` 已显式传入 `skills=["/skills/"]`，并通过 backend `/skills/` route 指向全局 skills；terminal 工作目录跟随当前 project/unscoped workspace，并把 `/skills` 虚拟路径映射到后端真实 skills 目录，支持 DeepAgents skills 读取说明后直接通过 terminal 跑技能脚本 |
 | Phase 3：SSE、Context Engineering 与 checkpoint 对齐 | Pending | 待 DeepAgents event adapter 稳定后接入 |
-| Phase 4：会话持久化与 history 转换 | Pending | 待 Agent session 元数据骨架落地后完善 |
-| Phase 5：生产化 | Pending | 可选增强 |
+| Phase 4：会话持久化与 history 转换 | Done | session 元数据 `runtime_mode` / `project_id` / `project_path`、Agent 执行完保存消息历史、HITL resume 同步回 Claw JSON 已完成 |
+| Phase 5：白盒化重构（todo 持久化 + 本地 trace） | Done | 已实现：session.json 新增 `todos`/`trace` 字段并随 DeepAgents graph state 同步；前端 Trace 面板改为「进度/来源/Trace」三 Tab，`TraceViewer` 实时展示 span 树；运行中后端通过 `trace_span_start`/`trace_span_end` SSE 事件增量更新 trace，结束后写入 `session.json` 并 emit `trace_updated`；LangGraph 结构通过 `graph_structure` 事件下发，前端 SVG 渲染执行图并高亮 `graph_node_active` 当前节点；LangSmith 仍保留为可选配置；新增 `tests/test_trace_collector.py`、`tests/test_deepagents_manager_graph.py` 及现有 DeepAgents 测试覆盖动态 trace 与 graph 事件 |
+| Phase 6：生产化 | Pending | 可选增强 |
 
 ### Phase 1A：后端 `/api/agent` 最小 PoC（1～2 天）
 
@@ -742,7 +743,28 @@ def deepagents_messages_to_session_messages(messages) -> list[dict]:
 5. 异常中断时保存部分对话
 6. HITL / checkpoint resume 完成后同步最终状态到 Claw JSON
 
-### Phase 5：生产化（可选）
+### Phase 5：白盒化重构（todo 持久化 + 本地 trace）（2～3 天）
+
+目标：不依赖 DeepAgents checkpoint 黑盒，把 Agent 运行时的 todo 状态和执行 trace 全部写入 Claw `session.json`，让前端可以完整展示“做了什么、为什么做、做到哪一步”。LangSmith 云端 trace 保留为可选开关，默认不走。
+
+1. `session.json` 新增 `todos` 字段，结构随 `write_todos` 工具调用同步更新
+   - todo 项字段：`id`、`content`、`status`（pending/done/error）、`created_at`、`updated_at`、`metadata`
+   - `write_todos` 调用后写入；后续调用（完成/新增/删除）增量更新
+   - 前端通过 `todos_updated` SSE 事件实时刷新
+2. `session.json` 新增 `traces` 字段，保存最近一次 Agent 运行的执行树
+   - span 类型：`root`、`llm`、`tool`、`reasoning`、`todo`、`custom`
+   - 每个 span 记录：id、parent_id、name、start/end time、input/output、status、metadata
+   - 从 DeepAgents graph updates / tool calls / reasoning chunks 中收集，不依赖 LangSmith
+3. Agent 启动时从 `session.json` 恢复 `todos` 到 DeepAgents `TodoListMiddleware` 状态
+   - 不再依赖 checkpoint 恢复 todo；checkpoint 仅作为 runtime 中断恢复的可选兜底
+4. 前端展示
+   - 新增 TodoList 面板：显示当前 session 的 todos，支持状态变化动画
+   - 新增 TraceViewer 面板：树状/时间轴展示 Agent 执行链路，可展开每个 span 的输入输出
+5. LangSmith 保留为可选
+   - 仅当 `LANGSMITH_TRACING=true` 且 `LANGSMITH_API_KEY` 存在时才启用云端 trace
+   - 本地白盒 trace 默认开启，与 LangSmith 互不影响
+
+### Phase 6：生产化（可选）
 
 1. 后端配置开关
 2. 默认模式选择
@@ -1079,3 +1101,27 @@ DeepAgents 接管：
 - checkpoint resume 不重复写历史。
 - 三档沙箱模式工具暴露符合预期。
 - Docker 模式下 execute、timeout、资源限制、只读 `/skills` 生效。
+
+### Phase 12：白盒化重构（todo 持久化 + 本地 trace）
+
+目标：不依赖 checkpoint 黑盒，把 Agent 运行时的 todo 状态和执行 trace 全部写入 Claw `session.json`。
+
+后端：
+
+- `session.json` 新增 `todos` 字段，结构随 `write_todos` 同步。
+- `session.json` 新增 `traces` 字段，保存最近一次 Agent 运行 trace tree。
+- Agent 启动时从 `session.json` 恢复 `todos` 到 `TodoListMiddleware`。
+- 新增 SSE 事件：`todos_updated`、`trace_span_start`、`trace_span_end`。
+- LangSmith 仅当 `LANGSMITH_TRACING=true` 且 key 存在时才启用，默认关闭。
+
+前端：
+
+- TodoList 面板：展示当前 session todos，实时响应 `todos_updated`。
+- TraceViewer 面板：树状/时间轴展示 Agent 执行链路。
+
+验收：
+
+- 刷新页面后 todo 状态不丢。
+- 不使用 checkpoint 也能恢复 todo。
+- trace 能看到 LLM / tool / reasoning / todo 各层级。
+- LangSmith 配置保留但默认不启用。

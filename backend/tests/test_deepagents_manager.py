@@ -10,6 +10,220 @@ from deepagents.middleware.memory import MemoryMiddleware
 from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 
 
+def test_middleware_inventory_uses_actual_hook_overrides(tmp_path):
+    """Runtime inventory should not treat inherited no-op hooks as mounted hooks."""
+
+    from deepagents.backends import FilesystemBackend
+    from graph.deepagents_manager import DeepAgentsAgentManager
+
+    middleware = MemoryMiddleware(
+        backend=FilesystemBackend(root_dir=tmp_path, virtual_mode=True),
+        sources=["/AGENTS.md"],
+    )
+
+    hooks = DeepAgentsAgentManager._middleware_hooks(middleware)
+    inventory = DeepAgentsAgentManager._middleware_inventory([middleware], ["/skills/"])
+
+    assert hooks == ["before_agent", "wrap_model_call"]
+    assert [item["name"] for item in inventory["hooks"]["before_agent"]] == [
+        "TodoListMiddleware",
+        "SkillsMiddleware",
+        "MemoryMiddleware",
+    ]
+    assert [item["name"] for item in inventory["hooks"]["after_model"]] == [
+        "PatchToolCallsMiddleware",
+        "TodoListMiddleware",
+    ]
+
+
+def test_build_middlewares_includes_model_call_limit(tmp_path, monkeypatch):
+    import config
+    from graph.deepagents_manager import DeepAgentsAgentManager
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "harness": {
+                    "model_call_limit": {
+                        "enabled": True,
+                        "run_limit": 7,
+                        "thread_limit": None,
+                        "exit_behavior": "end",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
+
+    manager = DeepAgentsAgentManager()
+    manager.initialize(tmp_path)
+
+    middlewares = manager._build_middlewares(project_id=None)
+    limiter = next(item for item in middlewares if item.__class__.__name__ == "ModelCallLimitMiddleware")
+
+    assert limiter.run_limit == 7
+    assert limiter.thread_limit is None
+    assert limiter.exit_behavior == "end"
+
+
+def test_runtime_inventory_lists_skills_for_system_prompt(tmp_path):
+    """Skills inventory should expose the skill detail link and prompt-injection flag."""
+
+    from graph.deepagents_manager import DeepAgentsAgentManager
+
+    skill_dir = tmp_path / "skills" / "demo-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: demo-skill\ndescription: Demo skill\n---\n# Demo\n",
+        encoding="utf-8",
+    )
+
+    manager = DeepAgentsAgentManager()
+    manager.initialize(tmp_path)
+
+    inventory = manager._runtime_inventory(tools=[], middleware=[], skills=["/skills/"])
+
+    assert inventory["skills"] == [
+        {
+            "name": "demo-skill",
+            "description": "Demo skill",
+            "location": "skills/demo-skill/SKILL.md",
+            "system_prompt_source": "/skills/",
+            "in_system_prompt": True,
+            "href": "/skills?skill=demo-skill",
+        }
+    ]
+    assert inventory["checkpointer"] == {}
+
+
+def test_runtime_inventory_lists_subagents_for_mount_panel(tmp_path, monkeypatch):
+    """SubAgents inventory should expose default and configured delegates."""
+
+    import graph.deepagents_manager as manager_module
+    from graph.deepagents_manager import DeepAgentsAgentManager
+
+    monkeypatch.setattr(
+        manager_module.config,
+        "get_settings_for_display",
+        lambda: {
+            "subagents": {
+                "items": [
+                    {
+                        "enabled": True,
+                        "name": "vision router",
+                        "model": "qwen:qwen3.7",
+                        "description": "Analyze uploaded images for the main agent.",
+                        "route_trigger": "image_input",
+                        "tools": {"mode": "inherit"},
+                        "skills": {"mode": "custom", "paths": ["/skills/"]},
+                    }
+                ]
+            }
+        },
+    )
+
+    manager = DeepAgentsAgentManager()
+    manager.initialize(tmp_path)
+
+    inventory = manager._runtime_inventory(tools=[], middleware=[], skills=[])
+
+    assert [item["name"] for item in inventory["subagents"]] == [
+        "general-purpose",
+        "vision router",
+    ]
+    vision_router = inventory["subagents"][1]
+    assert vision_router["enabled"] is True
+    assert vision_router["model"] == "qwen:qwen3.7"
+    assert vision_router["route_trigger"] == "image_input"
+    assert vision_router["tools_mode"] == "inherit"
+    assert vision_router["skills_mode"] == "custom"
+    assert vision_router["href"] == "/settings?category=harness&tab=subagent&subagent=vision%20router"
+    assert "deepagents" in inventory["package_versions"]
+    assert "langgraph" in inventory["package_versions"]
+
+
+def test_build_checkpointer_is_available_for_interrupt_resume(tmp_path):
+    """DeepAgents should always receive a checkpointer for interrupt/resume."""
+
+    import asyncio
+
+    from graph.deepagents_manager import DeepAgentsAgentManager
+
+    manager = DeepAgentsAgentManager()
+    manager.initialize(tmp_path)
+
+    checkpointer = asyncio.run(manager._build_checkpointer())
+
+    assert checkpointer is not None
+    assert manager._checkpointer_info
+    assert manager._checkpointer_info["type"] in {"async_sqlite", "memory"}
+    if manager._checkpointer_info["type"] == "async_sqlite":
+        assert manager._checkpointer_info["path"].endswith("data/checkpoints/deepagents.sqlite")
+
+
+def test_permission_resume_helper_continues_after_decision(tmp_path):
+    """Permission interrupts should resume the same graph stream after approval."""
+
+    import asyncio
+
+    from graph.deepagents_manager import DeepAgentsAgentManager
+    from graph.permission_resume import permission_resume_registry
+    from graph.trace_collector import TraceCollector
+    from langgraph.types import Command, Interrupt
+
+    request = {
+        "id": "perm-req-test",
+        "type": "external_file_read",
+        "session_id": "resume-session",
+        "query_id": "query-resume",
+        "tool_call_id": "call-read",
+        "path": "/tmp/example.md",
+    }
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self.inputs = []
+
+        async def astream(self, graph_input, **_kwargs):
+            self.inputs.append(graph_input)
+            if len(self.inputs) == 1:
+                yield {"__interrupt__": (Interrupt(value={"type": "permission_request", "request": request}, id="i1"),)}
+                return
+            yield ("messages", ("resumed", {"langgraph_node": "model"}))
+
+    runtime = DeepAgentsAgentManager()
+    runtime.initialize(tmp_path)
+    agent = FakeAgent()
+
+    async def run():
+        with TraceCollector(session_id="resume-session", query_id="query-resume") as trace:
+            events = []
+            async for item in runtime._astream_with_permission_resume(
+                agent,
+                {"messages": []},
+                stream_mode=["messages", "updates", "custom", "values"],
+                config={"configurable": {"thread_id": "resume-session"}},
+                context={"session_id": "resume-session", "query_id": "query-resume"},
+                trace_collector=trace,
+            ):
+                events.append(item)
+                if isinstance(item, dict) and item.get("event") == "permission_required":
+                    permission_resume_registry._pending["perm-req-test"] = asyncio.get_running_loop().create_future()
+                    permission_resume_registry.resolve("perm-req-test", {"type": "approve"})
+            return events
+
+    events = asyncio.run(run())
+
+    assert [event.get("event") for event in events if isinstance(event, dict)] == [
+        "permission_required",
+        "permission_resolved",
+    ]
+    assert isinstance(agent.inputs[-1], Command)
+
+
 def test_build_backend_resolves_workspace_and_skills(tmp_path, monkeypatch):
     """/workspace/ and /skills/ routes should resolve to the correct directories."""
 
@@ -131,10 +345,19 @@ def test_deepagents_manager_emits_and_persists_tool_events(tmp_path, monkeypatch
         message for message in history if message["role"] == "assistant" and message.get("tool_calls")
     )
 
-    assert event_names == ["tool_start", "tool_end", "segment_break", "token", "citations_finalized", "done"]
+    assert "tool_start" in event_names
+    assert "tool_end" in event_names
+    assert "segment_break" in event_names
+    assert "token" in event_names
+    assert "citations_finalized" in event_names
+    assert "done" in event_names
+    # Dynamic trace events should be emitted during the run.
+    assert "trace_span_start" in event_names
+    assert "trace_span_end" in event_names
     assert create_kwargs["skills"] == ["/skills/"]
     assert "memory" not in create_kwargs
     assert "middleware" in create_kwargs
+    assert "checkpointer" in create_kwargs
     assert any(isinstance(m, MemoryMiddleware) for m in create_kwargs["middleware"])
     assert json.loads(tool_start["data"]) == {
         "tool": "read_file",
@@ -587,9 +810,10 @@ def test_memory_dir_and_agents_md_creation(tmp_path):
 
 
 def test_memory_middleware_includes_project_and_gstack(tmp_path):
-    """When gstack/AGENTS.md exists, a single MemoryMiddleware loads both sources."""
+    """When gstack/AGENTS.md exists, one MemoryMiddleware loads both sources."""
 
     from graph.deepagents_manager import DeepAgentsAgentManager
+    from graph.permission_middleware import ExternalFilePermissionMiddleware
 
     # Simulate backend layout with bundled gstack index
     backend_dir = tmp_path
@@ -601,8 +825,68 @@ def test_memory_middleware_includes_project_and_gstack(tmp_path):
     runtime.initialize(backend_dir)
 
     middlewares = runtime._build_middlewares("proj_abc123")  # noqa: SLF001
-    assert len(middlewares) == 1
-    mw = middlewares[0]
+    memory_middlewares = [mw for mw in middlewares if isinstance(mw, MemoryMiddleware)]
+    assert any(isinstance(mw, ExternalFilePermissionMiddleware) for mw in middlewares)
+    assert len(memory_middlewares) == 1
+    mw = memory_middlewares[0]
     assert isinstance(mw, MemoryMiddleware)
     assert "/AGENTS.md" in mw.sources
     assert "/gstack/AGENTS.md" in mw.sources
+
+
+def test_deepagents_manager_emits_graph_structure(tmp_path, monkeypatch):
+    """Agent mode should emit the LangGraph structure at the start of the run."""
+
+    import asyncio
+
+    from graph import deepagents_manager as manager_module
+    from graph.session_manager import session_manager
+    from langchain_core.messages import AIMessage, AIMessageChunk
+    from projects.registry import project_registry
+
+    session_manager.initialize(tmp_path)
+    project_registry.initialize(tmp_path)
+    session_manager.create_session("agent-graph-session")
+
+    class FakeGraph:
+        nodes = [("__start__", None), ("model", None), ("tools", None)]
+        edges = [("__start__", "model"), ("model", "tools"), ("tools", "model")]
+
+    class FakeDeepAgent:
+        def get_graph(self):
+            return FakeGraph()
+
+        async def astream(self, *_args, **_kwargs):
+            yield (
+                "messages",
+                (AIMessageChunk(content="hello"), {"langgraph_node": "model"}),
+            )
+            yield ("values", {"messages": [AIMessage(content="hello")]})
+
+    monkeypatch.setattr(manager_module, "create_deep_agent", lambda **_kwargs: FakeDeepAgent())
+
+    async def no_title(_session_id: str):
+        return None
+
+    monkeypatch.setattr(manager_module, "_generate_title", no_title)
+
+    runtime = manager_module.DeepAgentsAgentManager()
+    runtime.initialize(Path(tmp_path))
+
+    async def collect():
+        return [
+            event
+            async for event in runtime.astream(
+                message="hi",
+                session_id="agent-graph-session",
+                project_id=None,
+                user_id="test-user",
+            )
+        ]
+
+    events = asyncio.run(collect())
+    graph_event = next((e for e in events if e["event"] == "graph_structure"), None)
+    assert graph_event is not None
+    structure = json.loads(graph_event["data"])
+    assert {n["id"] for n in structure["nodes"]} == {"__start__", "model", "tools"}
+    assert any(e["source"] == "__start__" and e["target"] == "model" for e in structure["edges"])

@@ -78,9 +78,76 @@ def write_todos(todos: list[dict[str, Any]]) -> str:
 
 ### 4.1 设计目标
 
-- 显示：模型调用 → 工具调用 → 工具返回 → state 更新 → 最终回答。
-- 包含中间件痕迹：在 trace 中标注 `memory`、`summarization`、`permissions` 等包装层的进入/退出。
-- 白盒：trace 数据写入本地，可下载/查看原始 JSON。
+- 显示：LangGraph 节点切换 → 模型调用 → 工具调用 → 工具返回 → state 更新 → 最终回答。
+- 包含中间件痕迹：在 trace 中标注 `MemoryMiddleware.*`、`SkillsMiddleware.*`、`PatchToolCallsMiddleware.*`、`TodoListMiddleware.*` 等包装层。
+- 区分运行类型：`graph`、`middleware`、`skill`、`memory`、`tool`、`llm`、`reasoning`、`todo`。
+- 白盒：trace 数据写入本地 session JSON，前端实时消费 `trace_span_*` / `graph_node_active` SSE。
+
+### 4.1.1 当前实现梳理（2026-06-29）
+
+后端当前链路：
+
+1. `backend/graph/deepagents_manager.py` 构建 DeepAgents agent 后，通过 `agent.get_graph()` 提取 LangGraph `nodes` / `edges`，以 `graph_structure` SSE 发给前端。
+2. 每次 `messages` 流事件携带 `metadata.langgraph_node` 时，后端发出 `graph_node_active`，并通过 `TraceCollector.add_graph_node_span()` 写入图节点 trace。
+3. 模型输出文本时，`TraceCollector.start_llm_span()` 创建 `llm` span；节点离开 model 或工具开始/结束时关闭该 span。
+4. 工具调用开始时，`TraceCollector.start_tool_span()` 创建 span，并根据工具名/输入细分：
+   - `execute_skill` 或 skill 相关工具：`skill`
+   - `save_*_memory`、`search_*_memories`、读写 `memory` 路径：`memory`
+   - 其他工具：`tool`
+5. `values.todos` 变化时写入 session JSON，并创建 `todo` span。
+6. 结束时 `TraceCollector.finish()` 生成扁平 trace，`session_manager.update_trace()` 持久化，并以 `trace_updated` 发给前端。
+
+前端当前链路：
+
+1. `frontend/src/lib/store.tsx` 接收 `graph_structure`、`graph_node_active`、`trace_span_start`、`trace_span_end`、`trace_updated`。
+2. `applyTraceSpanEvent()` 在内存中重建 span 树，右侧面板即时刷新。
+3. `frontend/src/components/agent/TraceViewer.tsx` 同时渲染：
+   - LangGraph 执行图：按 DAG 分层布局、可滚动、不让长 middleware 名称挤压节点。
+   - Trace span 列表：按父子关系显示 model / skill / middleware / tool / memory / todo。
+4. 图节点状态由 trace 中的 `metadata.graph_node` 和当前 `activeGraphNode` 共同推导：
+   - running：当前活跃节点
+   - completed：本轮已进入过的节点
+   - error：相关 span 异常
+
+### 4.1.2 前端样式修正（2026-06-29）
+
+- 执行图容器改为固定最大高度 + 横纵向滚动，避免小侧栏里强行压缩。
+- 节点宽度根据压缩后的标签动态计算，保留 SVG `<title>` 展示完整节点名。
+- `Middleware`、`Memory`、`Skills`、`PatchToolCalls` 等长名称会压缩成短标签，例如 `Skills:before`、`Memory:before`。
+- 节点按类型使用不同底色，当前节点和关联边高亮，已运行节点显示完成态。
+- Trace 列表增加类型 pill，能直接看到 `skill` / `memory` / `middleware` / `tool` 的区别。
+
+### 4.1.3 Trace 看板形态调整（2026-06-29）
+
+右侧抽屉宽度不足以承载 LangGraph 执行图，尤其是包含 middleware 回边、tools 循环、memory/skill 节点时，图会被迫横纵滚动且阅读成本高。因此 Trace 不再作为抽屉里的第三个 tab 承载主体内容：
+
+- 右侧抽屉保留 `进度` / `来源` 两个轻量 tab。
+- 抽屉中提供 `打开 Trace 看板` 入口，只显示 span 数量摘要。
+- 主工作区新增 `TraceDashboard`，在聊天区和 Trace 看板之间切换。
+- Trace 看板顶部展示运行状态、节点/边数量、span 数量。
+- Trace 看板使用更大的图画布（默认 960px 起步、最大高度 760px），用于观察 LangGraph 动态运行、skill 调用、middleware、tools、memory 写入。
+
+### 4.1.4 语义执行图而非原始 compiled graph（2026-06-29）
+
+LangChain Agent middleware 的 node-style hooks 会编译进 LangGraph 节点，例如 `before_agent`、`before_model`、`after_model`、`after_agent`。如果前端按原始图最长路径自动布局，`model -> tools -> model` 这类循环边会把层级无限拉长，导致 `MemoryMiddleware.before_agent` 到 `model` 出现很长的竖线。
+
+前端执行图改为语义层级：
+
+1. `Agent start`
+2. `*.before_agent`
+3. `*.before_model`
+4. `model`
+5. `*.after_model`
+6. `tools`
+7. `*.after_agent`
+8. `Agent end`
+
+节点标签显示为两行：
+
+- 第一行：完整中间件名，例如 `MemoryMiddleware`、`SkillsMiddleware`、`PatchToolCallsMiddleware`、`TodoListMiddleware`
+- 第二行：hook 名，例如 `before_agent`、`before_model`、`after_model`
+
+这个视角更接近 LangSmith 的 trace/run tree：关注 Agent、Model、Tool、Retriever/Memory、Middleware Hook 等语义运行单元，而不是把所有 compiled graph implementation detail 等权展示。
 
 ### 4.2 后端事件
 
@@ -127,20 +194,21 @@ def write_todos(todos: list[dict[str, Any]]) -> str:
 - [ ] 手动测试：发送拆解任务，确认 ProgressCard 显示 todo
 
 ### Phase 2：Trace 事件流
-- [ ] 后端 `astream` 增强 `values` 分支，emit `trace_*` 事件
-- [ ] 前端新增 `TracePanel` 组件
-- [ ] 将 trace 接入 assistant message 时间轴或右侧边栏
+- [x] 后端 `astream` 增强 `values` / `messages` / `updates` 分支，emit `trace_*` 和 `graph_node_active` 事件
+- [x] 前端在 `TraceViewer` 中渲染执行图和 trace 树
+- [x] 将 trace 接入右侧边栏
 - [ ] 手动测试：发送多工具调用请求，确认 trace 树正确
 
 ### Phase 3：本地持久化
-- [ ] `session_manager` 增加 `save_trace` / `load_trace`
-- [ ] `write_todos` 产生的 todos 保存到 session JSON
+- [x] `session_manager` 增加 trace 更新/读取能力
+- [x] `write_todos` / `values.todos` 产生的 todos 保存到 session JSON
 - [ ] 新会话加载时，把历史 todos 注入 system prompt 或作为上下文
 - [ ] 验证跨轮 todo 可见
 
 ### Phase 4： polish
 - [ ] trace 可下载原始 JSON
-- [ ] trace 支持过滤（只看 tool / 只看 state）
+- [ ] trace 支持过滤（只看 tool / skill / memory / middleware）
+- [x] Trace 从右侧抽屉移到独立看板，抽屉只保留入口摘要
 - [ ] 单元测试
 
 ---

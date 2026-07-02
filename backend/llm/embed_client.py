@@ -31,13 +31,32 @@ def get_embedding_model() -> OpenAIEmbedding:
             logger.warning("[EmbedClient] gateway detection failed: %s", exc)
 
     api_base = gateway.get("base_url") if use_gateway else cfg.get("api_base", "https://api.openai.com/v1")
-    # Higress 不承担客户端鉴权；上下游始终使用所选 Embedding Provider 的凭证。
-    api_key = cfg.get("api_key", "")
     model = cfg.get("model", "text-embedding-3-small")
 
+    # When routing through Higress AI Gateway, the gateway's ai-proxy plugin
+    # replaces the Authorization header with the configured upstream provider
+    # token. The client only needs a non-empty placeholder unless Higress
+    # consumer auth is enabled on the route.
+    api_key = cfg.get("api_key", "")
+    if use_gateway and not api_key:
+        api_key = "higress-placeholder"
+
     logger.debug("[EmbedClient] api_base=%s model=%s", api_base, model)
-    return OpenAIEmbedding(
-        model=model,
+
+    # LlamaIndex's OpenAIEmbedding validates the model name against OpenAI's
+    # enum. For OpenAI-compatible providers (e.g. DashScope) that expose custom
+    # names such as "text-embedding-v4", we initialize with a known-valid name
+    # and override the engine names that are actually sent to the API.
+    from llama_index.embeddings.openai import OpenAIEmbeddingModelType
+
+    valid_models = {m.value for m in OpenAIEmbeddingModelType}
+    init_model = model if model in valid_models else "text-embedding-3-small"
+    embed_model = OpenAIEmbedding(
+        model=init_model,
         api_key=api_key,
         api_base=api_base,
     )
+    if init_model != model:
+        embed_model._query_engine = model
+        embed_model._text_engine = model
+    return embed_model

@@ -79,6 +79,33 @@ def _child_callback_config(run_manager: Any) -> dict[str, Any] | None:
     return None
 
 
+def _record_model_input_trace(
+    messages: list[BaseMessage],
+    *,
+    tool_schema_count: int,
+    tool_schemas: list[Any] | None = None,
+    model_params: dict[str, Any] | None = None,
+    capture_boundary: str,
+) -> None:
+    """Best-effort local trace hook for the final payload entering the model."""
+
+    try:
+        from graph.trace_collector import get_current_trace_collector
+
+        collector = get_current_trace_collector()
+        if collector is None:
+            return
+        collector.add_model_input_span(
+            messages=messages,
+            tool_schema_count=tool_schema_count,
+            tool_schemas=tool_schemas or [],
+            model_params=model_params or {},
+            capture_boundary=capture_boundary,
+        )
+    except Exception:
+        logger.debug("[ModelClient] failed to record model input trace", exc_info=True)
+
+
 class ModelClient:
     """统一 LLM 调用入口。
 
@@ -465,6 +492,13 @@ class ModelClientChatModel(BaseChatModel):
         run_manager: Any = None,
         **kwargs: Any,
     ) -> ChatResult:
+        _record_model_input_trace(
+            messages,
+            tool_schema_count=len(self._client.tools),
+            tool_schemas=self._client.tools,
+            model_params=self._model_trace_params(),
+            capture_boundary="ModelClientChatModel._generate",
+        )
         config = _child_callback_config(run_manager)
         response = self._client.invoke(messages, config=config, stop=stop, **kwargs)
         return ChatResult(generations=[ChatGeneration(message=response)])
@@ -476,6 +510,13 @@ class ModelClientChatModel(BaseChatModel):
         run_manager: Any = None,
         **kwargs: Any,
     ) -> ChatResult:
+        _record_model_input_trace(
+            messages,
+            tool_schema_count=len(self._client.tools),
+            tool_schemas=self._client.tools,
+            model_params=self._model_trace_params(),
+            capture_boundary="ModelClientChatModel._agenerate",
+        )
         config = _child_callback_config(run_manager)
         response = await self._client.ainvoke(messages, config=config, stop=stop, **kwargs)
         return ChatResult(generations=[ChatGeneration(message=response)])
@@ -487,6 +528,13 @@ class ModelClientChatModel(BaseChatModel):
         run_manager: Any = None,
         **kwargs: Any,
     ) -> Any:
+        _record_model_input_trace(
+            messages,
+            tool_schema_count=len(self._client.tools),
+            tool_schemas=self._client.tools,
+            model_params=self._model_trace_params(),
+            capture_boundary="ModelClientChatModel._stream",
+        )
         # Do not pass a child callback manager to the nested provider stream.
         # BaseChatModel will emit callbacks for the chunks yielded here; passing
         # callbacks inward makes LangGraph see each delta twice. Passing
@@ -506,6 +554,13 @@ class ModelClientChatModel(BaseChatModel):
         run_manager: Any = None,
         **kwargs: Any,
     ) -> Any:
+        _record_model_input_trace(
+            messages,
+            tool_schema_count=len(self._client.tools),
+            tool_schemas=self._client.tools,
+            model_params=self._model_trace_params(),
+            capture_boundary="ModelClientChatModel._astream",
+        )
         # See _stream: nested streaming callbacks duplicate token deltas.
         token = var_child_runnable_config.set(None)
         try:
@@ -528,3 +583,14 @@ class ModelClientChatModel(BaseChatModel):
             tools=tools,
             bind_tools_kwargs=kwargs,
         )
+
+    def _model_trace_params(self) -> dict[str, Any]:
+        return {
+            "role": self._client.role,
+            "model": self._client.cfg.get("model"),
+            "temperature": self._client.temperature,
+            "streaming": self._client.streaming,
+            "force_direct": self._client.force_direct,
+            "tool_choice": self._client.bind_tools_kwargs.get("tool_choice"),
+            "strict": self._client.bind_tools_kwargs.get("strict"),
+        }

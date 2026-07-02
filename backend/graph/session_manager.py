@@ -2,6 +2,7 @@
 
 import json      # JSON 序列化/反序列化
 import time      # 获取时间戳
+import uuid
 from pathlib import Path      # 路径操作
 from typing import Any        # 类型注解
 
@@ -178,6 +179,94 @@ class SessionManager:
         data["title"] = title                                          # 更新标题
         self._write_file(session_id, data)                             # 写回磁盘
 
+    def get_todos(self, session_id: str) -> list[dict[str, Any]]:
+        """Return the persisted todo list for a session."""
+        data = self._read_file(session_id)
+        if not data:
+            return []
+        todos = data.get("todos")
+        return list(todos) if isinstance(todos, list) else []
+
+    def update_todos(
+        self,
+        session_id: str,
+        todos: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Persist the todo list and return the saved list."""
+        data = self._read_file(session_id)
+        if not data:
+            return []
+        data["todos"] = list(todos)
+        self._write_file(session_id, data)
+        return list(todos)
+
+    def get_trace(self, session_id: str) -> dict[str, Any] | None:
+        """Return the latest persisted execution trace for a session."""
+        data = self._read_file(session_id)
+        if not data:
+            return None
+        latest_query_id = data.get("latest_query_id")
+        traces = data.get("traces")
+        if isinstance(latest_query_id, str) and isinstance(traces, dict):
+            trace = traces.get(latest_query_id)
+            if isinstance(trace, dict):
+                return dict(trace)
+        trace = data.get("trace")
+        return dict(trace) if isinstance(trace, dict) else None
+
+    def get_traces(self, session_id: str) -> dict[str, dict[str, Any]]:
+        """Return all query-scoped traces for a session."""
+        data = self._read_file(session_id)
+        traces = data.get("traces") if data else None
+        if not isinstance(traces, dict):
+            return {}
+        return {
+            str(query_id): dict(trace)
+            for query_id, trace in traces.items()
+            if isinstance(trace, dict)
+        }
+
+    def update_trace(
+        self,
+        session_id: str,
+        trace: dict[str, Any],
+        query_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist the execution trace and return the saved trace.
+
+        ``trace`` is still saved at the legacy ``trace`` key for current UI
+        compatibility, while ``traces[query_id]`` keeps per-request history.
+        """
+        data = self._read_file(session_id)
+        if not data:
+            return trace
+        saved = dict(trace)
+        effective_query_id = query_id or saved.get("query_id")
+        if isinstance(effective_query_id, str) and effective_query_id:
+            saved["query_id"] = effective_query_id
+            traces = data.get("traces")
+            if not isinstance(traces, dict):
+                traces = {}
+            traces[effective_query_id] = saved
+            data["traces"] = traces
+            data["latest_query_id"] = effective_query_id
+        data["trace"] = saved
+        if saved.get("trace_id"):
+            data["latest_trace_id"] = saved.get("trace_id")
+        self._write_file(session_id, data)
+        return dict(saved)
+
+    def update_graph(self, session_id: str, graph: dict[str, Any]) -> dict[str, Any]:
+        """Persist the compiled LangGraph structure for trace inspection."""
+
+        data = self._read_file(session_id)
+        if not data:
+            return graph
+        saved = dict(graph)
+        data["graph"] = saved
+        self._write_file(session_id, data)
+        return dict(saved)
+
     def update_title(self, session_id: str, title: str) -> None:
         """更新标题（rename_session 的别名，供 API 层调用）"""
         self.rename_session(session_id, title)
@@ -189,12 +278,29 @@ class SessionManager:
             path.unlink()
 
     def get_raw_messages(self, session_id: str) -> dict[str, Any]:
-        """返回完整会话数据（含标题、时间戳、所有消息），供前端展示"""
+        """返回完整会话数据（含标题、时间戳、所有消息、todos、trace），供前端展示"""
         data = self._read_file(session_id)                     # 读取会话文件
         if not data:                                           # 不存在返回空结构
             return {"title": "", "messages": []}
         data = dict(data)
         data["messages"] = self.load_session(session_id)
+        # Expose runtime state for white-box Agent sessions.
+        if isinstance(data.get("todos"), list):
+            data["todos"] = list(data["todos"])
+        else:
+            data.pop("todos", None)
+        if isinstance(data.get("trace"), dict):
+            data["trace"] = dict(data["trace"])
+        else:
+            data.pop("trace", None)
+        if isinstance(data.get("traces"), dict):
+            data["traces"] = self.get_traces(session_id)
+        else:
+            data.pop("traces", None)
+        if isinstance(data.get("graph"), dict):
+            data["graph"] = dict(data["graph"])
+        else:
+            data.pop("graph", None)
         return data                                            # 返回完整数据
 
     def get_active_messages(self, session_id: str) -> list[dict[str, Any]]:
@@ -403,6 +509,101 @@ class SessionManager:
         if not data:
             return 0
         return data.get("context_usage_peak", 0) or 0
+
+    # ── Permission grants ─────────────────────────────────────────────────────
+
+    def list_permission_grants(self, session_id: str) -> list[dict[str, Any]]:
+        """Return active session permission grants."""
+        data = self._read_file(session_id)
+        permissions = data.get("permissions") if data else None
+        grants = permissions.get("grants") if isinstance(permissions, dict) else None
+        if not isinstance(grants, list):
+            return []
+        return [
+            dict(grant)
+            for grant in grants
+            if isinstance(grant, dict) and not grant.get("revoked_at")
+        ]
+
+    def add_permission_grant(
+        self,
+        session_id: str,
+        *,
+        grant_type: str,
+        target_kind: str,
+        target: str,
+        capabilities: list[str],
+        scope: str = "session",
+        source: str = "user",
+    ) -> dict[str, Any]:
+        """Persist a session permission grant and return it."""
+        data = self._read_file(session_id)
+        if not data:
+            now = time.time()
+            data = {
+                "title": "New Chat",
+                "created_at": now,
+                "updated_at": now,
+                "runtime_mode": "agent",
+                "messages": [],
+            }
+
+        permissions = data.get("permissions")
+        if not isinstance(permissions, dict):
+            permissions = {}
+        grants = permissions.get("grants")
+        if not isinstance(grants, list):
+            grants = []
+
+        now = time.time()
+        grant = {
+            "id": f"grant-{uuid.uuid4().hex[:12]}",
+            "type": grant_type,
+            "scope": scope,
+            "target_kind": target_kind,
+            "target": target,
+            "capabilities": list(dict.fromkeys(capabilities)),
+            "source": source,
+            "created_at": now,
+        }
+        grants.append(grant)
+        permissions["grants"] = grants
+        data["permissions"] = permissions
+        self._write_file(session_id, data)
+        return dict(grant)
+
+    def revoke_permission_grant(self, session_id: str, grant_id: str) -> bool:
+        """Mark a session permission grant as revoked."""
+        data = self._read_file(session_id)
+        permissions = data.get("permissions") if data else None
+        grants = permissions.get("grants") if isinstance(permissions, dict) else None
+        if not isinstance(grants, list):
+            return False
+        now = time.time()
+        changed = False
+        for grant in grants:
+            if isinstance(grant, dict) and grant.get("id") == grant_id and not grant.get("revoked_at"):
+                grant["revoked_at"] = now
+                changed = True
+                break
+        if changed:
+            self._write_file(session_id, data)
+        return changed
+
+    def has_external_file_read_permission(self, session_id: str, path: Path) -> bool:
+        """Return whether the session may read the given external file."""
+        resolved = str(path.expanduser().resolve())
+        for grant in self.list_permission_grants(session_id):
+            if grant.get("type") != "external_file_read":
+                continue
+            if "read" not in (grant.get("capabilities") or []):
+                continue
+            target_kind = grant.get("target_kind")
+            if target_kind == "all_external_files":
+                return True
+            if target_kind == "exact_file" and grant.get("target") == resolved:
+                return True
+        return False
 
     # ── 为 Agent（LLM）准备消息 ─────────────────────────────────────────────────
 

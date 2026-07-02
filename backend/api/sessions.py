@@ -58,12 +58,29 @@ async def delete_session(session_id: str):
 
 @router.get("/sessions/{session_id}/messages")
 async def get_raw_messages(session_id: str):
-    """Get complete raw messages including system prompt."""
+    """Get complete raw messages including system prompt, plus Agent runtime state."""
     data = session_manager.get_raw_messages(session_id)
     system_prompt = build_system_prompt(BASE_DIR, rag_mode=get_rag_mode())
     # Prepend system prompt as the first message
     all_messages = [{"role": "system", "content": system_prompt}] + data.get("messages", [])
-    return {"session_id": session_id, "title": data.get("title", ""), "messages": all_messages}
+    result: dict[str, Any] = {
+        "session_id": session_id,
+        "title": data.get("title", ""),
+        "messages": all_messages,
+    }
+    if "todos" in data:
+        result["todos"] = data["todos"]
+    if "trace" in data:
+        result["trace"] = data["trace"]
+    if "traces" in data:
+        result["traces"] = data["traces"]
+    if "latest_query_id" in data:
+        result["latest_query_id"] = data["latest_query_id"]
+    if "latest_trace_id" in data:
+        result["latest_trace_id"] = data["latest_trace_id"]
+    if "graph" in data:
+        result["graph"] = data["graph"]
+    return result
 
 
 @router.get("/sessions/{session_id}/history")

@@ -1,0 +1,128 @@
+"""ReadResourceTool — unified PuddingClaw resource reader."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Type
+
+from langchain_core.tools import BaseTool
+from pydantic import BaseModel, Field
+
+from graph.attachment_store import attachment_store
+from graph.managed_paths import is_managed_resource_path
+from graph.session_manager import session_manager
+from tools.read_external_file_tool import ReadExternalFileTool
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
+
+
+class ReadResourceInput(BaseModel):
+    resource: str = Field(
+        description=(
+            "Resource to read. Pass either an attachment id like att_11d3cfb4dc67 for uploaded/pasted "
+            "attachments, or the exact non-workspace path the user provided. This includes POSIX absolute paths, "
+            "Windows absolute paths, and home-relative paths. Do not pass /workspace virtual paths here."
+        )
+    )
+
+
+class ReadResourceTool(BaseTool):
+    name: str = "read_resource"
+    description: str = (
+        "Read a PuddingClaw resource from a single entry point. Use this for uploaded/pasted attachment refs "
+        "(`att_xxx`) and user-provided paths outside the `/workspace/` virtual namespace. "
+        "Never use read_file for non-workspace paths; read_file is only for `/workspace/...` virtual paths."
+    )
+    args_schema: Type[BaseModel] = ReadResourceInput
+    risk_level: str = "moderate"
+    session_id: str = ""
+    workspace_path: str = ""
+
+    def _read_attachment(self, attachment_id: str) -> str:
+        item = attachment_store.get(self.session_id, attachment_id)
+        if not item:
+            return f"❌ Attachment not found: {attachment_id}"
+        attachment_type = str(item.get("type") or "file")
+        if attachment_type == "image":
+            return (
+                f"Attachment: {item.get('name')}\n"
+                "Type: image\n"
+                f"Size: {item.get('size')} bytes\n"
+                f"PuddingClaw-Resource-Image: {attachment_id}\n\n"
+                "The image resource has been opened for the image_analyzer subagent. Continue with visual analysis."
+            )
+        if attachment_type in {"pdf", "document"}:
+            return (
+                f"Attachment {attachment_id} is {attachment_type}. Text extraction for this type is not enabled yet; "
+                "ask the user to export it as Markdown/text for now."
+            )
+
+        path = Path(str(item.get("path") or ""))
+        if not path.is_file():
+            return f"❌ Attachment file missing: {attachment_id}"
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            return f"❌ Error reading attachment: {exc}"
+        if len(content) > 40000:
+            content = content[:40000] + "\n...[truncated]"
+        return (
+            f"Attachment: {item.get('name')}\n"
+            f"Type: {attachment_type}\n"
+            f"Size: {item.get('size')} bytes\n\n"
+            f"{content}"
+        )
+
+    @staticmethod
+    def _is_relative_to(path: Path, parent: Path) -> bool:
+        try:
+            path.relative_to(parent)
+            return True
+        except ValueError:
+            return False
+
+    def _read_image_path_marker(self, value: str) -> str | None:
+        path = Path(value).expanduser().resolve()
+        if path.suffix.lower() not in IMAGE_EXTENSIONS:
+            return None
+        if not path.is_absolute():
+            return "❌ Image path must be absolute or home-relative."
+        if not path.exists():
+            return f"❌ File not found: {path}"
+        if not path.is_file():
+            return f"❌ Not a file: {path}"
+
+        workspace = Path(self.workspace_path).expanduser().resolve() if self.workspace_path else None
+        base_dir = Path(__file__).resolve().parent.parent
+        if workspace is not None and not self._is_relative_to(path, workspace):
+            if not is_managed_resource_path(path, base_dir) and not session_manager.has_external_file_read_permission(self.session_id, path):
+                return (
+                    "🔒 Permission required: this file is outside the current workspace.\n"
+                    f"Path: {path}"
+                )
+
+        return (
+            f"Local resource: {path}\n"
+            "Type: image\n"
+            f"Size: {path.stat().st_size} bytes\n"
+            f"PuddingClaw-Resource-Image-Path: {path}\n\n"
+            "The image resource has been opened for the image_analyzer subagent. Continue with visual analysis."
+        )
+
+    def _run(self, resource: str) -> str:
+        value = resource.strip()
+        if not value:
+            return "❌ Missing resource."
+        if value.startswith("att_"):
+            return self._read_attachment(value)
+        image_marker = self._read_image_path_marker(value)
+        if image_marker is not None:
+            return image_marker
+        return ReadExternalFileTool(
+            session_id=self.session_id,
+            workspace_path=self.workspace_path,
+        ).invoke({"path": value})
+
+
+def create_read_resource_tool(base_dir: Path) -> ReadResourceTool:
+    return ReadResourceTool()

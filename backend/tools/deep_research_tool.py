@@ -117,7 +117,7 @@ class DeepResearchTool(BaseTool):
         # 注意：get_tools_by_categories({'knowledge'}) 实现上会隐式包含 core，
         # 所以 core+knowledge 拼接会产生 read_file/terminal 重复，必须按 name 去重
         # 同时严格排除 write_file 和 deep_research 自身（防递归）
-        _ALLOWED_SUB_TOOL_NAMES = ("read_file", "terminal", "fetch_url", "search_knowledge_base")
+        _ALLOWED_SUB_TOOL_NAMES = ("read_file", "terminal", "fetch_url", "llamaindex_knowledge_query")
         all_candidates = get_tools_by_categories(base_dir, {"core"}) + \
                          get_tools_by_categories(base_dir, {"knowledge"})
         seen_names: set[str] = set()

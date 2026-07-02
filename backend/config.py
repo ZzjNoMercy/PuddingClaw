@@ -53,9 +53,51 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         "base_url": "https://api.openai.com/v1",
         "api_key": "",
     },
+    "multimodal_embedding": {
+        "provider": "dashscope",
+        "model": "qwen2.5-vl-embedding",
+        "dimension": 1024,
+        # qwen-vl embedding uses DashScope native API, not OpenAI-compatible /v1/embeddings.
+        # Leave base_url empty for direct DashScope SDK mode. If a Higress native passthrough
+        # route is configured, set base_url to the gateway root and keep route_path below.
+        "base_url": "",
+        "route_path": "/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding",
+        "api_key": "",
+        "prefer_gateway": False,
+    },
     "rag": {
         "top_k": 3,
         "similarity_threshold": 0.7,
+    },
+    "database": {
+        # Catalog database for knowledge documents, ingestion jobs and future
+        # business facts. start-local-infra.sh detects local PostgreSQL and
+        # writes either bundled or external into this section.
+        #
+        # Environment variables still have higher priority:
+        #   PUDDINGCLAW_DATABASE_URL / DATABASE_URL / POSTGRES_URL
+        "mode": "bundled",  # bundled | external
+        "host": "127.0.0.1",
+        "port": 5432,
+        "database": "puddingclaw",
+        "username": "puddingclaw",
+        "password": "puddingclaw",
+        # Advanced escape hatch for deployments that need a full SQLAlchemy URL.
+        # The frontend intentionally does not ask normal desktop users to write this.
+        "url": "",
+    },
+    "knowledge": {
+        # User-owned physical directory for local knowledge artifacts. Empty
+        # means backend/knowledge for development; PUDDINGCLAW_KNOWLEDGE_DIR can
+        # still override this temporarily.
+        "root_dir": "",
+        "multimodal_index": {
+            "enabled": True,
+            "vector_store": "milvus",
+            "milvus_uri": "http://localhost:19530",
+            "text_collection": "puddingclaw_knowledge_text",
+            "image_collection": "puddingclaw_knowledge_image",
+        },
     },
     "compression": {
         "ratio": 0.5,
@@ -85,6 +127,29 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "head_keep": 2,
             "keep_recent": 30,
             "summary_budget_chars": 60000,
+        },
+    },
+    "subagents": {
+        "image_analyzer": {
+            "enabled": False,
+            "model": "qwen:qwen3.7",
+            "description": "Analyze image inputs and answer questions about them.",
+            "route_trigger": "image_input",
+            "tools": {"mode": "inherit"},
+            "skills": {"mode": "inherit", "paths": []},
+            "system_prompt": (
+                "You are an image analysis specialist. When given an image, describe its contents "
+                "in detail and answer any questions about it. Return your findings as concise, "
+                "structured text."
+            ),
+        },
+    },
+    "harness": {
+        "model_call_limit": {
+            "enabled": True,
+            "run_limit": 50,
+            "thread_limit": None,
+            "exit_behavior": "end",
         },
     },
     "mem0": {
@@ -151,6 +216,15 @@ def _migrate_legacy_config(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
             data["fallback_embedding"] = data["embedding"]
         del data["embedding"]
         migrated = True
+    if isinstance(data.get("subagent"), dict) and "subagents" not in data:
+        data["subagents"] = data["subagent"]
+        del data["subagent"]
+        migrated = True
+    if isinstance(data.get("subagents"), dict):
+        canonical = _subagent_config_from_items(_subagent_items_for_display(data["subagents"]))
+        if canonical != data["subagents"]:
+            data["subagents"] = canonical
+            migrated = True
     if migrated:
         logger.info("[config] 已迁移 legacy llm/embedding -> fallback_llm/fallback_embedding")
     return data, migrated
@@ -432,11 +506,208 @@ def get_fallback_embedding_config() -> dict[str, Any]:
     }
 
 
+def get_multimodal_embedding_config() -> dict[str, Any]:
+    """Read multimodal embedding config.
+
+    Qwen-VL embedding is DashScope-native rather than OpenAI-compatible. It can
+    run in direct SDK mode, or through a user-managed Higress native passthrough
+    route when base_url is configured.
+    """
+
+    import os
+
+    from higress_config_reader import get_higress_dashscope_api_key
+
+    config = load_config()
+    mm = config.get("multimodal_embedding", {})
+    return {
+        "provider": mm.get("provider", "dashscope"),
+        "model": mm.get("model") or os.getenv("PUDDINGCLAW_MULTIMODAL_EMBED_MODEL", "qwen2.5-vl-embedding"),
+        "dimension": int(mm.get("dimension") or os.getenv("PUDDINGCLAW_MULTIMODAL_EMBED_DIM", "1024")),
+        "api_key": (
+            mm.get("api_key")
+            or os.getenv("DASHSCOPE_API_KEY", "")
+            or os.getenv("EMBEDDING_API_KEY", "")
+            or get_higress_dashscope_api_key()
+        ),
+        "base_url": (
+            mm.get("base_url")
+            or os.getenv("PUDDINGCLAW_MULTIMODAL_EMBED_BASE_URL", "")
+            or os.getenv("PUDDINGCLAW_MULTIMODAL_EMBEDDING_BASE_URL", "")
+        ),
+        "route_path": (
+            mm.get("route_path")
+            or os.getenv(
+                "PUDDINGCLAW_MULTIMODAL_EMBED_ROUTE_PATH",
+                "/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding",
+            )
+        ),
+        "prefer_gateway": bool(mm.get("prefer_gateway", False)),
+    }
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    import os
+
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_knowledge_multimodal_index_config() -> dict[str, Any]:
+    """Read LlamaIndex multimodal index publishing config.
+
+    Stored in config.json for normal use, with env variables kept as deployment
+    overrides for Docker/CI.
+    """
+
+    import os
+
+    config = load_config()
+    index = config.get("knowledge", {}).get("multimodal_index", {})
+    return {
+        "enabled": _env_bool("PUDDINGCLAW_ENABLE_MULTIMODAL_INDEX", bool(index.get("enabled", False))),
+        "vector_store": os.getenv("PUDDINGCLAW_MULTIMODAL_VECTOR_STORE") or index.get("vector_store", "milvus"),
+        "milvus_uri": (
+            os.getenv("MILVUS_URI")
+            or os.getenv("PUDDINGCLAW_MILVUS_URI")
+            or index.get("milvus_uri", "http://localhost:19530")
+        ),
+        "text_collection": (
+            os.getenv("PUDDINGCLAW_MILVUS_TEXT_COLLECTION")
+            or index.get("text_collection", "puddingclaw_knowledge_text")
+        ),
+        "image_collection": (
+            os.getenv("PUDDINGCLAW_MILVUS_IMAGE_COLLECTION")
+            or index.get("image_collection", "puddingclaw_knowledge_image")
+        ),
+        "overwrite": False,
+    }
+
+
+def get_knowledge_root_config() -> dict[str, Any]:
+    """Read user-configurable local knowledge root directory."""
+
+    import os
+
+    config = load_config()
+    knowledge = config.get("knowledge", {})
+    env_root = os.getenv("PUDDINGCLAW_KNOWLEDGE_DIR", "").strip()
+    configured_root = str(knowledge.get("root_dir", "") or "").strip()
+    return {
+        "root_dir": env_root or configured_root,
+        "configured_by": "PUDDINGCLAW_KNOWLEDGE_DIR" if env_root else "config.json" if configured_root else "default",
+        "environment_override": bool(env_root),
+    }
+
+
+def get_database_config() -> dict[str, Any]:
+    """Read catalog database connection config.
+
+    Priority is explicit deployment/runtime env first, then config.json. If no
+    URL is configured, callers may choose their own fallback (for example
+    SQLite in the local backend DB wiring), but PostgreSQL capability detection
+    should treat it as not configured instead of probing a random local 5432.
+    """
+
+    import os
+    from urllib.parse import quote
+
+    env_url = (
+        os.getenv("PUDDINGCLAW_DATABASE_URL")
+        or os.getenv("DATABASE_URL")
+        or os.getenv("POSTGRES_URL")
+        or ""
+    ).strip()
+    database = load_config().get("database", {})
+    configured_url = str(database.get("url", "") or "").strip()
+    mode = str(database.get("mode", "bundled") or "bundled").strip() or "bundled"
+    host = str(database.get("host", "127.0.0.1") or "127.0.0.1").strip()
+    port = int(database.get("port") or 5432)
+    db_name = str(database.get("database", "puddingclaw") or "puddingclaw").strip()
+    username = str(database.get("username", "puddingclaw") or "puddingclaw").strip()
+    raw_password = database.get("password")
+    password = "puddingclaw" if raw_password is None else str(raw_password)
+    assembled_url = ""
+    if mode in {"bundled", "external"}:
+        assembled_url = (
+            "postgresql+asyncpg://"
+            f"{quote(username)}:{quote(password)}@{host}:{port}/{quote(db_name)}"
+        )
+    effective_config_url = configured_url or assembled_url
+    return {
+        "mode": mode,
+        "host": host,
+        "port": port,
+        "database": db_name,
+        "username": username,
+        "password": password,
+        "url": env_url or effective_config_url,
+        "configured_url": configured_url,
+        "configured_by": (
+            "environment"
+            if env_url
+            else "config.json"
+            if effective_config_url
+            else "default"
+        ),
+        "environment_override": bool(env_url),
+    }
+
+
 def mask_api_key(key: str) -> str:
     """Mask API key for display: sk-***...last4"""
     if not key or len(key) < 8:
         return "***"
     return f"{key[:3]}***...{key[-4:]}"
+
+
+_SUBAGENT_RESERVED_KEYS = {"enabled", "items"}
+
+
+def _subagent_items_for_display(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return display-friendly subagent items from canonical or legacy config."""
+    if not raw:
+        return []
+
+    # Legacy UI format: {"items": [{"name": "...", ...}]}
+    if "items" in raw:
+        return [item for item in raw.get("items", []) if isinstance(item, dict)]
+
+    items: list[dict[str, Any]] = []
+    for key, value in raw.items():
+        if key in _SUBAGENT_RESERVED_KEYS or not isinstance(value, dict):
+            continue
+        item = dict(value)
+        item["name"] = str(item.get("name") or key)
+        item.setdefault("enabled", False)
+        item.setdefault("description", "Analyze image inputs and answer questions about them.")
+        item.setdefault("model", "")
+        item.setdefault("system_prompt", "")
+        item.setdefault("route_trigger", "image_input")
+        item.setdefault("tools", {"mode": "inherit"})
+        item.setdefault("skills", {"mode": "inherit", "paths": []})
+        items.append(item)
+    return items
+
+
+def _subagent_config_from_items(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Persist subagents as a keyed object: {"image_analyzer": {...}}."""
+    result: dict[str, Any] = {}
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or f"subagent_{index + 1}").strip() or f"subagent_{index + 1}"
+        stored = dict(item)
+        stored.pop("name", None)
+        result[name] = stored
+    return result
+
+
+def _normalize_subagent_config(raw: dict[str, Any]) -> dict[str, Any]:
+    """Normalize subagent config for frontend display while keeping storage keyed."""
+    return {"items": _subagent_items_for_display(raw)}
 
 
 def get_settings_for_display() -> dict[str, Any]:
@@ -449,6 +720,10 @@ def get_settings_for_display() -> dict[str, Any]:
     effective_gateway = get_gateway_config()
     effective_llm = get_fallback_llm_config()
     effective_embedding = get_fallback_embedding_config()
+    effective_multimodal_embedding = get_multimodal_embedding_config()
+    effective_knowledge_index = get_knowledge_multimodal_index_config()
+    effective_knowledge_root = get_knowledge_root_config()
+    effective_database = get_database_config()
     result = {
         "memory_backend": config.get("memory_backend", "markdown"),
         "thinking_mode": bool(config.get("thinking_mode", False)),
@@ -471,15 +746,38 @@ def get_settings_for_display() -> dict[str, Any]:
             **config.get("fallback_embedding", {}),
             "api_key_masked": mask_api_key(effective_embedding.get("api_key", "")),
         },
+        "multimodal_embedding": {
+            **config.get("multimodal_embedding", {}),
+            "api_key_masked": mask_api_key(effective_multimodal_embedding.get("api_key", "")),
+            "effective_model": effective_multimodal_embedding.get("model"),
+            "effective_dimension": effective_multimodal_embedding.get("dimension"),
+            "gateway_route_required": True,
+            "openai_compatible": False,
+        },
         "rag": {
             "enabled": config.get("rag_mode", False),
             **config.get("rag", {}),
         },
+        "knowledge": {
+            **config.get("knowledge", {}),
+            **effective_knowledge_root,
+            "multimodal_index": {
+                **config.get("knowledge", {}).get("multimodal_index", {}),
+                **effective_knowledge_index,
+            },
+        },
+        "database": {
+            **config.get("database", {}),
+            **effective_database,
+        },
         "compression": config.get("compression", {}),
+        "harness": config.get("harness", {}),
+        "subagents": _normalize_subagent_config(config.get("subagents", {})),
     }
     # Remove raw API keys from response
     result["fallback_llm"].pop("api_key", None)
     result["fallback_embedding"].pop("api_key", None)
+    result["multimodal_embedding"].pop("api_key", None)
     return result
 
 
@@ -530,6 +828,16 @@ def update_settings(updates: dict[str, Any]) -> None:
         if emb_update.get("api_key"):
             config["fallback_embedding"]["api_key"] = emb_update["api_key"]
 
+    if "multimodal_embedding" in updates:
+        mm_update = updates["multimodal_embedding"]
+        if "multimodal_embedding" not in config:
+            config["multimodal_embedding"] = {}
+        for key in ("provider", "model", "base_url", "route_path", "dimension", "prefer_gateway"):
+            if key in mm_update:
+                config["multimodal_embedding"][key] = mm_update[key]
+        if mm_update.get("api_key"):
+            config["multimodal_embedding"]["api_key"] = mm_update["api_key"]
+
     if "rag" in updates:
         rag_update = updates["rag"]
         if "rag" not in config:
@@ -539,6 +847,40 @@ def update_settings(updates: dict[str, Any]) -> None:
                 config["rag"][key] = rag_update[key]
         if "enabled" in rag_update:
             config["rag_mode"] = rag_update["enabled"]
+
+    if "database" in updates:
+        database_update = updates["database"]
+        if "database" not in config:
+            config["database"] = {}
+        if isinstance(database_update, dict):
+            if "mode" in database_update:
+                mode = str(database_update.get("mode") or "bundled").strip() or "bundled"
+                config["database"]["mode"] = "external" if mode == "external" else "bundled"
+            for key in ("host", "database", "username", "password", "url"):
+                if key in database_update:
+                    config["database"][key] = str(database_update.get(key) or "").strip()
+            if "port" in database_update:
+                try:
+                    config["database"]["port"] = int(database_update.get("port") or 5432)
+                except (TypeError, ValueError):
+                    config["database"]["port"] = 5432
+
+    if "knowledge" in updates:
+        knowledge_update = updates["knowledge"]
+        if "knowledge" not in config:
+            config["knowledge"] = {}
+        if isinstance(knowledge_update, dict) and "root_dir" in knowledge_update:
+            config["knowledge"]["root_dir"] = str(knowledge_update.get("root_dir") or "").strip()
+        if isinstance(knowledge_update, dict) and "multimodal_index" in knowledge_update:
+            mm_index_update = knowledge_update["multimodal_index"]
+            existing = config["knowledge"].get("multimodal_index", {})
+            if not isinstance(existing, dict):
+                existing = {}
+            for key in ("enabled", "vector_store", "milvus_uri", "text_collection", "image_collection"):
+                if key in mm_index_update:
+                    existing[key] = mm_index_update[key]
+            existing["overwrite"] = False
+            config["knowledge"]["multimodal_index"] = existing
 
     if "compression" in updates:
         comp_update = updates["compression"]
@@ -560,6 +902,16 @@ def update_settings(updates: dict[str, Any]) -> None:
     if "write_middleware" in updates:
         existing = config.get("write_middleware", {})
         config["write_middleware"] = _deep_merge(existing, updates["write_middleware"])
+
+    if "harness" in updates:
+        existing = config.get("harness", {})
+        config["harness"] = _deep_merge(existing, updates["harness"])
+
+    sub_update = updates.get("subagents", updates.get("subagent"))
+    if sub_update is not None:
+        if isinstance(sub_update, dict):
+            config["subagents"] = _subagent_config_from_items(_subagent_items_for_display(sub_update))
+            config.pop("subagent", None)
 
     save_config(config)
 

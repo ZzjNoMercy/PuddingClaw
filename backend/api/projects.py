@@ -19,6 +19,11 @@ class RegisterProjectRequest(BaseModel):
     name: str | None = None
 
 
+class UpdateProjectRequest(BaseModel):
+    name: str | None = None
+    pinned: bool | None = None
+
+
 @router.get("/projects")
 async def list_projects():
     projects = [project.to_dict() for project in project_registry.list_projects()]
@@ -36,6 +41,28 @@ async def register_project(request: RegisterProjectRequest):
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return project.to_dict()
+
+
+@router.patch("/projects/{project_id}")
+async def update_project(project_id: str, request: UpdateProjectRequest):
+    try:
+        project = project_registry.update(project_id, name=request.name, pinned=request.pinned)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return project.to_dict()
+
+
+@router.delete("/projects/{project_id}")
+async def remove_project(project_id: str):
+    try:
+        project_registry.remove(project_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"ok": True, "project_id": project_id}
 
 
 @router.post("/projects/{project_id}/open")

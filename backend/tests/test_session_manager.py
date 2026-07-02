@@ -55,3 +55,79 @@ def test_reasoning_content_saved_for_plain_assistant(tmp_path):
     history = session_manager.load_session("plain-session")
     assistant = history[0]
     assert assistant["reasoning_content"] == "单纯问候也保存推理"
+
+
+def test_update_and_get_todos(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("todo-session")
+
+    todos = [
+        {"id": "todo-1", "content": "step one", "status": "pending"},
+        {"id": "todo-2", "content": "step two", "status": "in_progress"},
+    ]
+    session_manager.update_todos("todo-session", todos)
+
+    loaded = session_manager.get_todos("todo-session")
+    assert loaded == todos
+
+    raw = session_manager.get_raw_messages("todo-session")
+    assert raw["todos"] == todos
+
+
+def test_update_and_get_trace(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("trace-session")
+
+    trace = {
+        "trace_id": "trace-1",
+        "query_id": "query-1",
+        "session_id": "trace-session",
+        "started_at": 1.0,
+        "completed_at": 2.0,
+        "status": "completed",
+        "spans": [
+            {"id": "root", "parent_id": None, "type": "root", "name": "agent.run"}
+        ],
+    }
+    session_manager.update_trace("trace-session", trace, query_id="query-1")
+
+    loaded = session_manager.get_trace("trace-session")
+    assert loaded == trace
+
+    raw = session_manager.get_raw_messages("trace-session")
+    assert raw["trace"] == trace
+    assert raw["latest_query_id"] == "query-1"
+    assert raw["latest_trace_id"] == "trace-1"
+    assert raw["traces"]["query-1"] == trace
+
+
+def test_update_trace_keeps_latest_trace_compatible(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("trace-session-2")
+
+    first = {
+        "trace_id": "trace-1",
+        "query_id": "query-1",
+        "session_id": "trace-session-2",
+        "started_at": 1.0,
+        "completed_at": 2.0,
+        "status": "completed",
+        "spans": [],
+    }
+    second = {
+        "trace_id": "trace-2",
+        "query_id": "query-2",
+        "session_id": "trace-session-2",
+        "started_at": 3.0,
+        "completed_at": 4.0,
+        "status": "completed",
+        "spans": [],
+    }
+
+    session_manager.update_trace("trace-session-2", first, query_id="query-1")
+    session_manager.update_trace("trace-session-2", second, query_id="query-2")
+
+    assert session_manager.get_trace("trace-session-2") == second
+    traces = session_manager.get_traces("trace-session-2")
+    assert traces["query-1"] == first
+    assert traces["query-2"] == second

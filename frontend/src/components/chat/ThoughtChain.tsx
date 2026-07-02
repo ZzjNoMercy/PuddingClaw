@@ -15,6 +15,7 @@ import {
   Pencil,
   Lightbulb,
   FolderOpen,
+  KeyRound,
   Play,
   Wrench,
 } from "lucide-react";
@@ -34,7 +35,8 @@ const TOOL_META: Record<string, { icon: React.ElementType; color: string; bg: st
   python: { icon: Code, color: "#2563eb", bg: "#eff6ff" },
   fetch_url: { icon: Globe, color: "#059669", bg: "#ecfdf5" },
   read_file: { icon: FileText, color: "#d97706", bg: "#fffbeb" },
-  search_knowledge_base: { icon: Search, color: "#7c3aed", bg: "#f5f3ff" },
+  read_external_file: { icon: KeyRound, color: "#e11d48", bg: "#fff1f2" },
+  llamaindex_knowledge_query: { icon: Search, color: "#7c3aed", bg: "#f5f3ff" },
   write_file: { icon: Pencil, color: "#0891b2", bg: "#ecfeff" },
   edit_file: { icon: Pencil, color: "#0891b2", bg: "#ecfeff" },
   glob: { icon: FolderOpen, color: "#ea580c", bg: "#fff7ed" },
@@ -52,6 +54,9 @@ function getToolLabel(toolCall: ToolCall): string {
     const parsed = JSON.parse(input);
     if (tool === "read_file" && parsed.path) {
       return `阅读 ${parsed.path.split("/").pop() || parsed.path}`;
+    }
+    if (tool === "read_external_file" && parsed.path) {
+      return `读取外部文件 ${parsed.path.split("/").pop() || parsed.path}`;
     }
     if (tool === "write_file" && parsed.path) {
       return `写入文件 ${parsed.path.split("/").pop() || parsed.path}`;

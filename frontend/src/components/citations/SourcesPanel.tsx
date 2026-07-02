@@ -8,26 +8,61 @@ import {
   Circle,
   ExternalLink,
   FileText,
+  KeyRound,
   ListChecks,
+  ShieldCheck,
   Timer,
+  X,
 } from "lucide-react";
+import { listSessionPermissions, revokePermissionGrant, type PermissionGrant } from "@/lib/api";
 import { useApp, type SourceRecord, type ToolCall } from "@/lib/store";
 
 type TodoStatus = "completed" | "in_progress" | "pending";
-interface TodoItem {
-  content: string;
-  status: TodoStatus;
-}
 
 export default function SourcesPanel() {
-  const { messages, isStreaming } = useApp();
-  const { cited, retrieved, todos } = useMemo(() => {
+  const {
+    messages,
+    isStreaming,
+    sessionId,
+    todos,
+    activeSourceId,
+    inspectorActiveTab,
+    setInspectorActiveTab,
+  } = useApp();
+  const [permissionGrants, setPermissionGrants] = useState<PermissionGrant[]>([]);
+
+  const loadPermissions = React.useCallback(() => {
+    listSessionPermissions(sessionId)
+      .then(setPermissionGrants)
+      .catch(() => setPermissionGrants([]));
+  }, [sessionId]);
+
+  useEffect(() => {
+    loadPermissions();
+  }, [loadPermissions]);
+
+  useEffect(() => {
+    const handler = () => loadPermissions();
+    window.addEventListener("puddingclaw:permissions-changed", handler);
+    return () => window.removeEventListener("puddingclaw:permissions-changed", handler);
+  }, [loadPermissions]);
+
+  // When a citation marker in the chat is clicked, activeSourceId is set and the
+  // inspector opens. Make sure the drawer shows the Sources tab so the cited
+  // source is visible, instead of staying on Progress.
+  useEffect(() => {
+    if (activeSourceId) {
+      setInspectorActiveTab("sources");
+    }
+  }, [activeSourceId, setInspectorActiveTab]);
+
+  const { cited, retrieved, inferredTodos } = useMemo(() => {
     const lastUserIndex = messages.findLastIndex((message) => message.role === "user");
     const turnMessages = lastUserIndex >= 0 ? messages.slice(lastUserIndex) : [];
     const sourceMap = new Map<string, SourceRecord>();
     const citationIndex = new Map<string, number>();
     const toolByCallId = new Map<string, string>();
-    let latestTodos: TodoItem[] = [];
+    let latestTodos: Array<{ content: string; status: TodoStatus }> = [];
     for (const message of turnMessages) {
       for (const toolCall of message.toolCalls || []) {
         if (toolCall.id) toolByCallId.set(toolCall.id, toolCall.tool);
@@ -46,6 +81,34 @@ export default function SourcesPanel() {
         }
       }
     }
+
+    // Fallback: some tools emit sources the model cited with [^source_id] markers
+    // but the citations_finalized event did not include them (e.g. adapter timing
+    // or source_id mismatch). Treat any marker in the rendered content that points
+    // to a known source as a cited source so it does not end up under "其他检索结果".
+    const markerRe = /\[\^(src_[A-Za-z0-9_-]+)\]/g;
+    for (const message of turnMessages) {
+      const contents = [
+        message.content,
+        ...(message.segments?.map((s) => s.content) || []),
+      ];
+      for (const content of contents) {
+        if (!content) continue;
+        let match;
+        markerRe.lastIndex = 0;
+        while ((match = markerRe.exec(content)) !== null) {
+          const sourceId = match[1];
+          if (sourceMap.has(sourceId) && !citationIndex.has(sourceId)) {
+            const nextIndex =
+              citationIndex.size > 0
+                ? Math.max(...Array.from(citationIndex.values())) + 1
+                : 1;
+            citationIndex.set(sourceId, nextIndex);
+          }
+        }
+      }
+    }
+
     const citedSources = Array.from(sourceMap.values())
       .filter((source) => citationIndex.has(source.source_id))
       .sort((a, b) => (citationIndex.get(a.source_id) || 0) - (citationIndex.get(b.source_id) || 0))
@@ -53,64 +116,215 @@ export default function SourcesPanel() {
     const retrievedSources = Array.from(sourceMap.values())
       .filter((source) => !citationIndex.has(source.source_id))
       .map((source) => ({ source, index: undefined }));
-    return { cited: citedSources, retrieved: retrievedSources, todos: latestTodos };
+    return { cited: citedSources, retrieved: retrievedSources, inferredTodos: latestTodos };
   }, [messages]);
 
+  // Prefer persisted todos; fall back to todos inferred from the current turn
+  // when persistence has not been populated yet.
+  const displayTodos = useMemo(
+    () => (todos && todos.length > 0 ? todos : inferredTodos),
+    [todos, inferredTodos]
+  );
+
   const total = cited.length + retrieved.length;
-
+  const hasSources = total > 0;
+  const hasTodos = displayTodos.length > 0;
   return (
-    <div className="h-full overflow-y-auto px-5 py-7 space-y-6">
-      <ProgressCard todos={todos} />
-
-      {isStreaming && total > 0 && (
-        <div className="flex items-center justify-center gap-1.5 text-[11px] text-blue-600">
-          <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-blue-500" />
-          检索中
-        </div>
-      )}
-
-      {total > 0 && <SourcesCard cited={cited} retrieved={retrieved} />}
+    <div className="h-full overflow-y-auto px-5 py-5">
+      <div className="workspace-side-card overflow-hidden rounded-[28px] px-5 py-3">
+        <ProgressCard
+          active={inspectorActiveTab === "progress"}
+          onActivate={() => setInspectorActiveTab("progress")}
+          todos={displayTodos as Array<{ content: string; status: TodoStatus }>}
+        />
+        <PanelDivider />
+        <PermissionsCard
+          active={inspectorActiveTab === "permissions"}
+          onActivate={() => setInspectorActiveTab("permissions")}
+          grants={permissionGrants}
+          onRevoke={async (grantId) => {
+            await revokePermissionGrant(sessionId, grantId);
+            loadPermissions();
+            window.dispatchEvent(new CustomEvent("puddingclaw:permissions-changed"));
+          }}
+        />
+        <PanelDivider />
+        <SourcesCard
+          active={inspectorActiveTab === "sources"}
+          onActivate={() => setInspectorActiveTab("sources")}
+          cited={cited}
+          retrieved={retrieved}
+          isStreaming={isStreaming && hasSources}
+        />
+      </div>
     </div>
   );
 }
 
-function ProgressCard({ todos }: { todos: TodoItem[] }) {
-  const [open, setOpen] = useState(true);
+function PanelDivider() {
+  return <div className="mx-1 h-px bg-black/[0.06]" />;
+}
+
+function SectionHeader({
+  icon,
+  title,
+  metric,
+  open,
+  onToggle,
+}: {
+  icon: React.ReactNode;
+  title: string;
+  metric?: React.ReactNode;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      className="flex w-full items-center justify-between gap-3 py-4 text-left"
+    >
+      <div className="flex min-w-0 items-center gap-3">
+        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-black/[0.045] text-slate-500">
+          {icon}
+        </div>
+        <span className="truncate text-[15px] font-bold text-slate-700">{title}</span>
+        <ChevronDown
+          className={`h-4 w-4 shrink-0 text-slate-400 transition-transform duration-200 ${open ? "rotate-90" : ""}`}
+        />
+      </div>
+      {metric && (
+        <div className="shrink-0 text-[13px] font-semibold text-slate-500">
+          {metric}
+        </div>
+      )}
+    </button>
+  );
+}
+
+function PermissionsCard({
+  active,
+  onActivate,
+  grants,
+  onRevoke,
+}: {
+  active: boolean;
+  onActivate: () => void;
+  grants: PermissionGrant[];
+  onRevoke: (grantId: string) => Promise<void>;
+}) {
+  const [revoking, setRevoking] = useState<string | null>(null);
+
+  return (
+    <section>
+      <SectionHeader
+        icon={<ShieldCheck className="h-4 w-4" />}
+        title="权限"
+        open={active}
+        onToggle={onActivate}
+        metric={
+          grants.length > 0 ? (
+            <span className="text-[#002fa7]">{grants.length}</span>
+          ) : (
+            <span className="text-slate-300">0</span>
+          )
+        }
+      />
+
+      {active && grants.length === 0 ? (
+        <div className="flex flex-col items-center justify-center py-9 text-center">
+          <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-slate-50 text-slate-300">
+            <KeyRound className="h-5 w-5" />
+          </div>
+          <p className="text-[14px] font-medium text-slate-400">授权信息将显示在这里</p>
+        </div>
+      ) : active ? (
+        <div className="mt-4 space-y-3 pb-5">
+          {grants.map((grant) => {
+            const target = grant.target_kind === "all_external_files" ? "所有外部文件" : grant.target;
+            const name =
+              grant.target_kind === "all_external_files"
+                ? "本 session 外部文件读取"
+                : grant.target.split("/").filter(Boolean).pop() || "外部文件";
+            return (
+              <div key={grant.id} className="rounded-2xl border border-black/[0.06] bg-white/70 p-3">
+                <div className="flex items-start gap-2.5">
+                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[#002fa7]/10 text-[#002fa7]">
+                    <KeyRound className="h-4 w-4" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="min-w-0 truncate text-[13px] font-semibold text-slate-900">{name}</div>
+                      <button
+                        type="button"
+                        disabled={revoking === grant.id}
+                        onClick={async () => {
+                          setRevoking(grant.id);
+                          try {
+                            await onRevoke(grant.id);
+                          } finally {
+                            setRevoking(null);
+                          }
+                        }}
+                        className="rounded-full p-1 text-slate-400 transition hover:bg-slate-100 hover:text-slate-700 disabled:opacity-50"
+                        aria-label="撤销权限"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                    <div className="mt-1 truncate font-mono text-[10.5px] text-slate-500">{target}</div>
+                    <div className="mt-2 flex flex-wrap gap-1.5">
+                      <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-500">
+                        Session
+                      </span>
+                      <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-500">
+                        Read only
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function ProgressCard({
+  active,
+  onActivate,
+  todos,
+}: {
+  active: boolean;
+  onActivate: () => void;
+  todos: Array<{ content: string; status: TodoStatus }>;
+}) {
   const completed = todos.filter((todo) => todo.status === "completed").length;
   const hasTodos = todos.length > 0;
 
-  // Auto-expand when todos are detected so the user doesn't have to open the drawer manually.
-  useEffect(() => {
-    if (hasTodos) {
-      setOpen(true);
-    }
-  }, [hasTodos]);
-
   return (
-    <section className="workspace-side-card rounded-[28px] px-5 py-5">
-      <button
-        type="button"
-        onClick={() => setOpen((value) => !value)}
-        className="flex w-full items-center justify-between text-left"
-      >
-        <div className="flex items-center gap-2">
-          <div className="flex h-7 w-7 items-center justify-center rounded-xl bg-black/[0.055] text-slate-800">
-            <ListChecks className="h-4 w-4" />
-          </div>
-          <span className="text-[15px] font-bold text-slate-900">进度</span>
-          {hasTodos && (
-            <span className="rounded-full bg-black/[0.045] px-2 py-0.5 text-[11px] font-medium text-slate-500">
-              {completed}/{todos.length}
+    <section>
+      <SectionHeader
+        icon={<ListChecks className="h-4 w-4" />}
+        title="进度"
+        open={active}
+        onToggle={onActivate}
+        metric={
+          hasTodos ? (
+            <span>
+              <span className="text-emerald-500">{completed}</span>
+              <span className="text-slate-300">/{todos.length}</span>
             </span>
-          )}
-        </div>
-        <ChevronDown
-          className={`h-4 w-4 text-slate-500 transition-transform duration-200 ${!open ? "-rotate-90" : ""}`}
-        />
-      </button>
+          ) : (
+            <span className="text-slate-300">0</span>
+          )
+        }
+      />
 
-      {open && (
-        <div className="mt-3 space-y-2.5">
+      {active && (
+        <div className="pb-4 space-y-2.5">
           {hasTodos ? (
             <>
               {todos.map((todo, index) => (
@@ -158,6 +372,17 @@ function ProgressEmptyState() {
   );
 }
 
+function SourcesEmptyState() {
+  return (
+    <div className="flex flex-col items-center justify-center py-12 text-center">
+      <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-2xl bg-black/[0.045]">
+        <BookOpen className="h-6 w-6 text-slate-400" />
+      </div>
+      <p className="text-[14px] font-medium text-slate-400">来源将显示在这里</p>
+    </div>
+  );
+}
+
 function TodoStatusIcon({ status }: { status: TodoStatus }) {
   if (status === "completed") {
     return <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 fill-slate-900 text-white" />;
@@ -169,13 +394,18 @@ function TodoStatusIcon({ status }: { status: TodoStatus }) {
 }
 
 function SourcesCard({
+  active,
+  onActivate,
   cited,
   retrieved,
+  isStreaming,
 }: {
+  active: boolean;
+  onActivate: () => void;
   cited: Array<{ source: SourceRecord; index?: number }>;
   retrieved: Array<{ source: SourceRecord; index?: number }>;
+  isStreaming: boolean;
 }) {
-  const [open, setOpen] = useState(true);
   const { activeSourceId } = useApp();
   const activeRef = useRef<HTMLDivElement>(null);
   const total = cited.length + retrieved.length;
@@ -184,7 +414,6 @@ function SourcesCard({
     if (!activeSourceId) return;
     const allSources = [...cited, ...retrieved];
     if (allSources.some(({ source }) => source.source_id === activeSourceId)) {
-      setOpen(true);
       window.setTimeout(() => {
         activeRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
       }, 50);
@@ -192,30 +421,29 @@ function SourcesCard({
   }, [activeSourceId, cited, retrieved]);
 
   return (
-    <section className="workspace-side-card rounded-[28px] px-5 py-5">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center justify-between text-left"
-      >
-        <div className="flex items-center gap-2">
-          <div className="flex h-6 w-6 items-center justify-center rounded-lg bg-[#002fa7]/[0.07] text-[#002fa7]">
-            <BookOpen className="h-3.5 w-3.5" />
-          </div>
-          <span className="text-[15px] font-bold text-slate-900">来源</span>
-          {total > 0 && (
-            <span className="rounded-full bg-black/[0.045] px-2 py-0.5 text-[11px] font-medium text-slate-500">
+    <section>
+      <SectionHeader
+        icon={<BookOpen className="h-4 w-4" />}
+        title="来源"
+        open={active}
+        onToggle={onActivate}
+        metric={
+          isStreaming ? (
+            <span className="inline-flex items-center gap-1.5 text-[#002fa7]">
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-[#002fa7]" />
               {total}
             </span>
+          ) : total > 0 ? (
+            <span>{total}</span>
+          ) : (
+            <span className="text-slate-300">0</span>
           )}
-        </div>
-        <ChevronDown
-          className={`h-4 w-4 text-slate-500 transition-transform duration-200 ${!open ? "-rotate-90" : ""}`}
-        />
-      </button>
+      />
 
-      {open && (
-        <div className="mt-4 space-y-5">
+      {active && total === 0 ? (
+        <SourcesEmptyState />
+      ) : active ? (
+        <div className="pb-4 space-y-5">
           {cited.length > 0 && (
             <SourceSection title="已引用" count={cited.length}>
               {cited.map(({ source, index }) => (
@@ -237,13 +465,12 @@ function SourcesCard({
                   key={source.source_id}
                   source={source}
                   isActive={activeSourceId === source.source_id}
-                  ref={activeSourceId === source.source_id ? activeRef : undefined}
                 />
               ))}
             </SourceSection>
           )}
         </div>
-      )}
+      ) : null}
     </section>
   );
 }
@@ -259,116 +486,13 @@ function SourceSection({
 }) {
   return (
     <div>
-      <div className="mb-2.5 flex items-center gap-2">
-        <span className="text-[12px] font-semibold text-slate-700">{title}</span>
-        <span className="rounded-full bg-black/[0.045] px-1.5 py-0.5 text-[10px] text-slate-500">
-          {count}
-        </span>
-      </div>
+      <h4 className="mb-2 flex items-center gap-2 text-[12px] font-semibold uppercase tracking-wide text-slate-500">
+        {title}
+        <span className="rounded-full bg-black/[0.045] px-1.5 py-0 text-[10px]">{count}</span>
+      </h4>
       <div className="space-y-3">{children}</div>
     </div>
   );
-}
-
-function isLegacyFalsePositive(
-  source: SourceRecord,
-  toolByCallId: Map<string, string>
-): boolean {
-  const adapter = String(source.metadata?.adapter || "");
-  if (adapter === "fetch_url" && looksLikeRejectedFetch(source.quote || "")) {
-    return true;
-  }
-  if (!adapter || !["markdown_links", "common_json"].includes(adapter)) return false;
-  const tool = toolByCallId.get(source.tool_call_id || "");
-  return tool === "read_file" || tool === "write_file" || tool === "execute_skill";
-}
-
-function extractTodosFromToolCall(toolCall: ToolCall): TodoItem[] {
-  if (toolCall.tool !== "write_todos") return [];
-  const candidates = [
-    parseMaybeJson(toolCall.input),
-    parseMaybeJson(toolCall.output),
-  ];
-  for (const candidate of candidates) {
-    const todos = normalizeTodos(candidate);
-    if (todos.length > 0) return todos;
-  }
-  return [];
-}
-
-function parseMaybeJson(value: unknown): unknown {
-  if (!value || typeof value !== "string") return null;
-  const text = value.trim();
-  if (!text) return null;
-  try {
-    return JSON.parse(text);
-  } catch {
-    const objectStart = text.indexOf("{");
-    const arrayStart = text.indexOf("[");
-    const starts = [objectStart, arrayStart].filter((index) => index >= 0);
-    if (starts.length === 0) return null;
-    try {
-      return JSON.parse(text.slice(Math.min(...starts)));
-    } catch {
-      return null;
-    }
-  }
-}
-
-function normalizeTodos(value: unknown): TodoItem[] {
-  const rawItems = Array.isArray(value)
-    ? value
-    : isRecord(value)
-    ? value.todos || value.tasks || value.items || value.todo
-    : null;
-  if (!Array.isArray(rawItems)) return [];
-
-  return rawItems
-    .map((item): TodoItem | null => {
-      if (typeof item === "string") {
-        const content = item.trim();
-        return content ? { content, status: "pending" } : null;
-      }
-      if (!isRecord(item)) return null;
-      const content = String(
-        item.content || item.todo || item.task || item.title || item.text || ""
-      ).trim();
-      if (!content) return null;
-      return {
-        content,
-        status: normalizeTodoStatus(item.status || item.state || item.done),
-      };
-    })
-    .filter((item): item is TodoItem => item !== null);
-}
-
-function normalizeTodoStatus(value: unknown): TodoStatus {
-  if (value === true) return "completed";
-  const status = String(value || "").toLowerCase().replace(/[-\s]/g, "_");
-  if (["completed", "complete", "done", "checked", "finished"].includes(status)) {
-    return "completed";
-  }
-  if (["in_progress", "inprogress", "active", "doing", "running"].includes(status)) {
-    return "in_progress";
-  }
-  return "pending";
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function looksLikeRejectedFetch(quote: string): boolean {
-  const text = quote.toLowerCase();
-  const markers = [
-    "please click here if you are not redirected",
-    "trouble accessing google search",
-    "enablejs",
-    "网络不给力",
-    "请稍后重试",
-  ];
-  if (markers.some((marker) => text.includes(marker))) return true;
-  return ["ç½", "è¯", "å", "é¡", "ï¼"].filter((marker) => text.includes(marker)).length >= 2;
 }
 
 const SourceItem = React.forwardRef<HTMLDivElement, {
@@ -376,79 +500,78 @@ const SourceItem = React.forwardRef<HTMLDivElement, {
   citationIndex?: number;
   isActive?: boolean;
 }>(function SourceItem({ source, citationIndex, isActive }, ref) {
-  const isExternal = /^https?:\/\//i.test(source.uri || "");
-  const displayTitle = sourceDisplayTitle(source);
-  const displayQuote = looksLikeRejectedFetch(source.quote || "") ? "" : source.quote;
-  const locateCitation = () => {
-    const marker = document.querySelector<HTMLElement>(`a[href="#source-${source.source_id}"]`);
-    marker?.scrollIntoView({ behavior: "smooth", block: "center" });
-    marker?.classList.add("citation-marker-active");
-    window.setTimeout(() => marker?.classList.remove("citation-marker-active"), 1600);
-  };
-
   return (
-    <article
+    <div
       ref={ref}
-      id={`source-${source.source_id}`}
-      className={`rounded-2xl border border-black/[0.10] bg-white p-3 transition-colors hover:border-black/[0.16] ${
-        citationIndex ? "border-[#002fa7]/20 bg-[#f8faff]" : ""
-      } ${isActive ? "ring-2 ring-[#002fa7]/40 shadow-sm" : ""}`}
+      className={`group rounded-xl border p-3 transition-colors ${
+        isActive
+          ? "border-[#002fa7]/30 bg-[#002fa7]/[0.04]"
+          : "border-black/[0.06] bg-white hover:border-black/[0.12]"
+      }`}
     >
-      <button onClick={locateCitation} className="flex w-full items-start gap-2 text-left">
-        <div
-          className={`mt-0.5 flex h-5 min-w-5 items-center justify-center rounded text-[10px] font-semibold ${
-            citationIndex ? "bg-[#002fa7] text-white" : "bg-slate-200 text-slate-500"
-          }`}
-        >
-          {citationIndex || <FileText className="h-3 w-3" />}
+      <div className="flex items-start gap-2.5">
+        <div className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md bg-black/[0.055]">
+          <FileText className="h-3 w-3 text-slate-600" />
         </div>
         <div className="min-w-0 flex-1">
-          <p className="truncate text-[12px] font-medium text-slate-700" title={displayTitle}>
-            {displayTitle}
-          </p>
-          <p className="mt-0.5 text-[10px] text-slate-400">
-            {source.page ? `第 ${source.page} 页 · ` : ""}
-            {sourceTypeLabel(source.source_type)}
-            {typeof source.score === "number" ? ` · ${Math.round(source.score * 100)}%` : ""}
-          </p>
+          <div className="flex items-center gap-2">
+            {citationIndex !== undefined && (
+              <span className="inline-flex h-4 min-w-[16px] items-center justify-center rounded bg-[#002fa7]/10 px-1 text-[10px] font-bold text-[#002fa7]">
+                {citationIndex}
+              </span>
+            )}
+            <p className="truncate text-[13px] font-medium text-slate-800" title={source.title}>
+              {source.title}
+            </p>
+          </div>
+          {source.quote && (
+            <p className="mt-1 line-clamp-2 text-[11px] leading-relaxed text-slate-500">
+              {source.quote}
+            </p>
+          )}
+          {source.uri && (
+            <a
+              href={source.uri}
+              target="_blank"
+              rel="noreferrer"
+              className="mt-2 inline-flex items-center gap-1 text-[11px] text-[#002fa7] hover:underline"
+            >
+              查看来源
+              <ExternalLink className="h-3 w-3" />
+            </a>
+          )}
         </div>
-      </button>
-
-      {displayQuote && (
-        <blockquote className="mt-2 line-clamp-3 border-l-2 border-[#002fa7]/10 pl-2 text-[10px] leading-relaxed text-slate-500">
-          {displayQuote}
-        </blockquote>
-      )}
-
-      {isExternal && (
-        <a
-          href={source.uri}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="mt-2 inline-flex items-center gap-1 text-[10px] font-medium text-blue-600 hover:text-blue-800"
-        >
-          <ExternalLink className="h-3 w-3" />
-          打开原文
-        </a>
-      )}
-    </article>
+      </div>
+    </div>
   );
 });
 
-function sourceDisplayTitle(source: SourceRecord): string {
-  const title = (source.title || "").trim();
-  if (title && !title.startsWith("[]()") && !title.startsWith("[ ](")) return title;
+function extractTodosFromToolCall(toolCall: ToolCall): Array<{ content: string; status: TodoStatus }> {
+  if (toolCall.tool !== "write_todos" || !toolCall.output) return [];
   try {
-    return source.uri ? new URL(source.uri).hostname : "未命名来源";
+    const parsed = JSON.parse(toolCall.output);
+    const raw = parsed.todos || parsed;
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .filter((item: unknown) => item && typeof item === "object")
+      .map((item: any) => ({
+        content: item.content || item.text || String(item),
+        status: normalizeTodoStatus(item.status),
+      }));
   } catch {
-    return title || "未命名来源";
+    return [];
   }
 }
 
-function sourceTypeLabel(type: string): string {
-  if (type === "web") return "网页";
-  if (type === "skill") return "Skill";
-  if (type === "file") return "文件";
-  if (type === "knowledge_base") return "知识库";
-  return type || "来源";
+function normalizeTodoStatus(status: unknown): TodoStatus {
+  const s = String(status || "pending").toLowerCase();
+  if (s === "completed" || s === "done" || s === "finished") return "completed";
+  if (s === "in_progress" || s === "doing" || s === "in progress") return "in_progress";
+  return "pending";
+}
+
+function isLegacyFalsePositive(source: SourceRecord, toolByCallId: Map<string, string>): boolean {
+  if (source.source_type !== "skill") return false;
+  const toolName = source.tool_call_id ? toolByCallId.get(source.tool_call_id) : undefined;
+  return toolName === "execute_skill";
 }

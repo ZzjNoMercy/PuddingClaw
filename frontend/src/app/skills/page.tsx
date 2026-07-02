@@ -88,6 +88,7 @@ export default function SkillsPage() {
   const [toast, setToast] = useState<{ type: "success" | "error"; message: string } | null>(null);
   const [contextMenu, setContextMenu] = useState<{ skillName: string; x: number; y: number } | null>(null);
   const contextMenuRef = useRef<HTMLDivElement>(null);
+  const [skillFromQuery, setSkillFromQuery] = useState<string | null>(null);
   const [showImportModal, setShowImportModal] = useState(false);
   const [importing, setImporting] = useState(false);
   const [showRenameModal, setShowRenameModal] = useState(false);
@@ -99,6 +100,7 @@ export default function SkillsPage() {
   const [mounted, setMounted] = useState(false);
   useEffect(() => {
     setMounted(true);
+    setSkillFromQuery(new URLSearchParams(window.location.search).get("skill"));
   }, []);
 
   const handleSidebarResize = useCallback(
@@ -170,6 +172,13 @@ export default function SkillsPage() {
     },
     [isDirty, loadSkillDetail]
   );
+
+  useEffect(() => {
+    if (!skillFromQuery || loading || selectedSkill === skillFromQuery) return;
+    if (skills.some((skill) => skill.name === skillFromQuery)) {
+      handleSelectSkill(skillFromQuery);
+    }
+  }, [handleSelectSkill, loading, selectedSkill, skillFromQuery, skills]);
 
   // ── Load file content when activeFile changes ───────────
   useEffect(() => {

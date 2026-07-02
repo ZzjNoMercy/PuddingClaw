@@ -3,6 +3,8 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('electron', {
   // 选择项目文件夹
   selectProjectFolder: () => ipcRenderer.invoke('select-project-folder'),
+  selectKnowledgeFile: () => ipcRenderer.invoke('select-knowledge-file'),
+  selectKnowledgeFolder: () => ipcRenderer.invoke('select-knowledge-folder'),
 
   // Backend 管理
   startBackend: () => ipcRenderer.invoke('start-backend'),

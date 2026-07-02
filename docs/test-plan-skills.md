@@ -16,11 +16,11 @@
 
 ---
 
-### ✅ `get_weather`
+### ✅ `get-weather`
 **输入**：`北京今天天气怎么样？`
 
 **验证项**：
-- [ ] 调用 `execute_skill("get_weather")` 或 `fetch_url("https://wttr.in/Beijing?format=j1&lang=zh")`
+- [ ] 调用 `execute_skill("get-weather")` 或 `fetch_url("https://wttr.in/Beijing?format=j1&lang=zh")`
 - [ ] 返回温度、天气描述、湿度、风速
 - [ ] 没有编造数据
 
@@ -153,7 +153,7 @@
 
 ## 建议测试顺序
 
-1. **先跑基础**：get-date、get_weather，确认 execute_skill 通路正常
+1. **先跑基础**：get-date、get-weather，确认 execute_skill 通路正常
 2. **再跑信息查询**：aihot，验证引用和来源面板
 3. **跑代码类**：investigate 一个已知错误，验证时间轴和修复流程
 4. **跑内容类**：dialogue-summarizer，验证进度卡片自动展开

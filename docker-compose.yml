@@ -23,6 +23,24 @@
 #   http://localhost:8001
 
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: puddingclaw-postgres
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-puddingclaw}
+      - POSTGRES_USER=${POSTGRES_USER:-puddingclaw}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-puddingclaw}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
   backend:
     build:
       context: ./backend
@@ -41,12 +59,15 @@ services:
       - BACKEND_HOST=0.0.0.0
       - BACKEND_PORT=9100
       - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      - DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://puddingclaw:puddingclaw@postgres:5432/puddingclaw}
       # 其他环境变量在 backend/.env 中配置（如 MINERU_URL、AI_GATEWAY_URL）
     volumes:
       # 持久化会话、workspace、memory、日志到宿主机
       - ./backend/sessions:/app/sessions
       - ./backend/workspace:/app/workspace
       - ./backend/memory:/app/memory
+      - ./backend/data:/app/data
+      - ./backend/knowledge:/app/knowledge
       - ./backend/logs:/app/logs
       # 挂载 skills，允许容器内 API/工具写入（import/save/rename/version）
       - ./backend/skills:/app/skills
@@ -59,6 +80,9 @@ services:
       # 挂载 Higress 配置目录，backend 可读取路由模型列表
       - ./data/higress:/app/data/higress:ro
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9100/"]
       interval: 30s
@@ -115,3 +139,6 @@ services:
 # networks:
 #   default:
 #     name: puddingclaw-network
+
+volumes:
+  postgres_data:

@@ -16,15 +16,7 @@ triggers:
   - build the design
   - code the mockup
   - make design real
-allowed-tools:
-  - Bash
-  - Read
-  - Write
-  - Edit
-  - Glob
-  - Grep
-  - Agent
-  - AskUserQuestion
+allowed-tools: Bash Read Write Edit Glob Grep Agent AskUserQuestion
 ---
 <!-- AUTO-GENERATED from SKILL.md.tmpl — do not edit directly -->
 <!-- Regenerate: bun run gen:skill-docs -->
