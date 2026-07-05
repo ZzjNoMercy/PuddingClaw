@@ -23,6 +23,7 @@ async def lifespan(app: FastAPI):
     from graph.deepagents_manager import deepagents_agent_manager
     from graph.attachment_store import attachment_store
     from graph.memory_indexer import get_memory_indexer
+    from knowledge.import_worker import knowledge_import_worker_manager
     from projects.registry import project_registry
     import capabilities
 
@@ -32,6 +33,7 @@ async def lifespan(app: FastAPI):
     db_ready = await init_database()
     if db_ready:
         print("🗄️ Knowledge catalog database ready")
+        knowledge_import_worker_manager.start(BASE_DIR)
     else:
         print("⚠️ Knowledge catalog database unavailable; knowledge management API will report degraded status")
     caps = await capabilities.detect_capabilities(force=True)
@@ -61,7 +63,10 @@ async def lifespan(app: FastAPI):
         print("ℹ️ RAG mode disabled, skipping memory index build")
 
     print("✅ PuddingClaw backend ready")
-    yield
+    try:
+        yield
+    finally:
+        await knowledge_import_worker_manager.stop()
 
 
 app = FastAPI(title="PuddingClaw", version="0.1.0", lifespan=lifespan)

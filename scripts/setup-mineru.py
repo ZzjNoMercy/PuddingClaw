@@ -9,7 +9,7 @@ MinerU 是 PuddingClaw 的可选解析服务，通过 backend/pyproject.toml 中
 2. 推荐并执行合适的部署方式
 3. 用 uv 安装/同步依赖（含 mineru optional）
 4. 启动 mineru-api 服务
-5. 将 MINERU_URL 写回 backend/.env
+5. 将 MinerU 地址写回 backend/config.json
 
 用法：
     python scripts/setup-mineru.py [--mode native|docker] [--port 8002] [--dry-run]
@@ -26,6 +26,7 @@ MinerU 是 PuddingClaw 的可选解析服务，通过 backend/pyproject.toml 中
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import platform
 import shutil
@@ -37,7 +38,8 @@ from typing import Literal
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BACKEND_DIR = REPO_ROOT / "backend"
-ENV_FILE = BACKEND_DIR / ".env"
+CONFIG_FILE = BACKEND_DIR / "config.json"
+MINERU_RUNTIME_DIR = REPO_ROOT / "data" / "mineru-runtime"
 
 DEFAULT_PORT = 8002
 
@@ -269,6 +271,33 @@ def download_mineru_models(uv: str, gpu: str, skip_download: bool = False) -> No
 
 # ==================== 原生部署（uv） ====================
 
+def verify_mineru_runtime(uv: str) -> None:
+    """提前检查 MinerU pipeline 运行时依赖。
+
+    这里专门检查 torch：MinerU 的 base 包可以被成功安装，但 pipeline
+    解析 PDF 时会动态 import torch；如果缺失，用户会在上传 PDF 后收到
+    `/file_parse` 409 failed。把错误前置到启动阶段，小白用户能更快定位。
+    """
+    log("检查 MinerU 运行依赖...")
+    check_code = """
+import importlib.util
+missing = [name for name in ("mineru", "torch") if importlib.util.find_spec(name) is None]
+if missing:
+    raise SystemExit("缺少依赖: " + ", ".join(missing))
+import torch
+print(f"MinerU runtime OK, torch={torch.__version__}")
+""".strip()
+    try:
+        run([uv, "run", "--extra", "mineru", "python", "-c", check_code], cwd=BACKEND_DIR)
+    except subprocess.CalledProcessError:
+        log(
+            "MinerU 运行环境不完整：缺少 PyTorch。请重新执行 "
+            "`uv sync --extra mineru`，或直接重新运行 `scripts/start-mineru-host.sh`。",
+            level="error",
+        )
+        raise SystemExit(1)
+
+
 def setup_mineru_native(port: int, gpu: str, foreground: bool = False) -> None:
     """用 uv 安装并启动 MinerU。
 
@@ -292,6 +321,7 @@ def setup_mineru_native(port: int, gpu: str, foreground: bool = False) -> None:
     # 同步依赖（安装 mineru optional，base 包不含 GPU 后端）
     log("使用 uv 安装后端依赖（含 mineru optional）...")
     run([uv, "sync", "--extra", "mineru"], cwd=BACKEND_DIR)
+    verify_mineru_runtime(uv)
 
     # 预下载模型（避免首次 API 调用时等待）
     download_mineru_models(uv, gpu, skip_download=SKIP_MODEL_DOWNLOAD)
@@ -300,7 +330,7 @@ def setup_mineru_native(port: int, gpu: str, foreground: bool = False) -> None:
     log(f"启动 MinerU API 服务（端口 {port}）...")
 
     cmd = [
-        uv, "run", "--extra", "mineru",
+        uv, "run", "--project", str(BACKEND_DIR), "--extra", "mineru",
         "mineru-api", "--host", "0.0.0.0", "--port", str(port),
     ]
 
@@ -309,14 +339,15 @@ def setup_mineru_native(port: int, gpu: str, foreground: bool = False) -> None:
         log("[DRY-RUN] 跳过启动服务", level="info")
         return
 
-    update_env_file(f"http://localhost:{port}")
+    update_config_file(f"http://localhost:{port}")
 
     clean_env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+    MINERU_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
     if foreground:
         log("前台模式：按 Ctrl+C 停止服务。")
         try:
-            subprocess.run(cmd, cwd=BACKEND_DIR, env=clean_env, check=True)
+            subprocess.run(cmd, cwd=MINERU_RUNTIME_DIR, env=clean_env, check=True)
         except KeyboardInterrupt:
             log("收到中断信号，MinerU API 已停止。", level="warn")
             raise SystemExit(0)
@@ -325,7 +356,7 @@ def setup_mineru_native(port: int, gpu: str, foreground: bool = False) -> None:
             raise SystemExit(1)
         return
 
-    process = subprocess.Popen(cmd, cwd=BACKEND_DIR, env=clean_env)
+    process = subprocess.Popen(cmd, cwd=MINERU_RUNTIME_DIR, env=clean_env)
     time.sleep(3)
 
     if process.poll() is not None:
@@ -381,31 +412,31 @@ def start_mineru_docker(port: int, gpu: str) -> None:
     log("首次调用解析时会自动下载模型（约 10GB+），请耐心等待。")
     time.sleep(5)
 
-    update_env_file(f"http://localhost:{port}")
+    update_config_file(f"http://localhost:{port}")
 
 
 # ==================== 项目配置 ====================
 
-def update_env_file(mineru_url: str) -> None:
-    """将 MINERU_URL 写回 backend/.env。"""
-    ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
+def update_config_file(mineru_url: str) -> None:
+    """将 MinerU 地址写回 backend/config.json。"""
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-    lines: list[str] = []
-    if ENV_FILE.exists():
-        lines = ENV_FILE.read_text(encoding="utf-8").splitlines()
+    config: dict = {}
+    if CONFIG_FILE.exists():
+        try:
+            config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            log(f"{CONFIG_FILE} 不是合法 JSON，跳过自动写入。", level="warn")
+            return
 
-    found = False
-    for i, line in enumerate(lines):
-        if line.startswith("MINERU_URL="):
-            lines[i] = f"MINERU_URL={mineru_url}"
-            found = True
-            break
+    knowledge = config.setdefault("knowledge", {})
+    mineru = knowledge.setdefault("mineru", {})
+    mineru["base_url"] = mineru_url
+    mineru.setdefault("runtime_output_dir", "data/mineru-runtime/output")
+    mineru.setdefault("keep_runtime_output", False)
 
-    if not found:
-        lines.append(f"MINERU_URL={mineru_url}")
-
-    ENV_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    log(f"已更新 {ENV_FILE}: MINERU_URL={mineru_url}")
+    CONFIG_FILE.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    log(f"已更新 {CONFIG_FILE}: knowledge.mineru.base_url={mineru_url}")
 
 
 # ==================== 主流程 ====================

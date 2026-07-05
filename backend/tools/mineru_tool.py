@@ -4,13 +4,14 @@ Parses local PDF files into markdown by calling the MinerU service
 running inside the Docker Compose stack.
 """
 
-import os
 from pathlib import Path
 from typing import Type
 
 import requests
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
+
+from config import get_knowledge_mineru_config
 
 
 class MinerUParseInput(BaseModel):
@@ -46,17 +47,24 @@ class MinerUParseTool(BaseTool):
         if full_path.suffix.lower() != ".pdf":
             return f"❌ Not a PDF file: {file_path}"
 
-        url = self.base_url or os.environ.get("MINERU_URL", "http://mineru:8002")
+        mineru_config = get_knowledge_mineru_config()
+        url = self.base_url or str(mineru_config.get("base_url") or "http://localhost:8002")
         try:
             with open(full_path, "rb") as f:
                 response = requests.post(
-                    f"{url}/parse",
-                    files={"file": (full_path.name, f, "application/pdf")},
+                    f"{url}/file_parse",
+                    files={"files": (full_path.name, f, "application/pdf")},
+                    data={
+                        "backend": "pipeline",
+                        "lang_list": "ch",
+                        "return_md": "true",
+                        "response_format_zip": "true",
+                    },
                     timeout=300,
                 )
             response.raise_for_status()
             data = response.json()
-            markdown = data.get("markdown", "")
+            markdown = data.get("markdown", data.get("md_content", ""))
             if not markdown:
                 return f"⚠️ No markdown extracted. Response: {data}"
             return markdown

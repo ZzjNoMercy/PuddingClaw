@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from graph.attachment_store import attachment_store
 from graph.managed_paths import is_managed_resource_path
 from graph.session_manager import session_manager
+from knowledge.paths import get_knowledge_root
 from tools.read_external_file_tool import ReadExternalFileTool
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
@@ -20,8 +21,9 @@ class ReadResourceInput(BaseModel):
     resource: str = Field(
         description=(
             "Resource to read. Pass either an attachment id like att_11d3cfb4dc67 for uploaded/pasted "
-            "attachments, or the exact non-workspace path the user provided. This includes POSIX absolute paths, "
-            "Windows absolute paths, and home-relative paths. Do not pass /workspace virtual paths here."
+            "attachments, a /knowledge/... virtual path, or the exact non-workspace path the user provided. "
+            "This includes POSIX absolute paths, Windows absolute paths, and home-relative paths. "
+            "Do not pass /workspace virtual paths here."
         )
     )
 
@@ -30,7 +32,7 @@ class ReadResourceTool(BaseTool):
     name: str = "read_resource"
     description: str = (
         "Read a PuddingClaw resource from a single entry point. Use this for uploaded/pasted attachment refs "
-        "(`att_xxx`) and user-provided paths outside the `/workspace/` virtual namespace. "
+        "(`att_xxx`), `/knowledge/...` virtual paths, and user-provided paths outside the `/workspace/` virtual namespace. "
         "Never use read_file for non-workspace paths; read_file is only for `/workspace/...` virtual paths."
     )
     args_schema: Type[BaseModel] = ReadResourceInput
@@ -109,12 +111,28 @@ class ReadResourceTool(BaseTool):
             "The image resource has been opened for the image_analyzer subagent. Continue with visual analysis."
         )
 
+    def _resolve_knowledge_virtual_path(self, value: str) -> Path | None:
+        if not value.startswith("/knowledge/"):
+            return None
+        base_dir = Path(__file__).resolve().parent.parent
+        relative = value.removeprefix("/knowledge/").lstrip("/")
+        path = (get_knowledge_root(base_dir) / relative).expanduser().resolve()
+        knowledge_root = get_knowledge_root(base_dir).expanduser().resolve()
+        try:
+            path.relative_to(knowledge_root)
+        except ValueError:
+            return None
+        return path
+
     def _run(self, resource: str) -> str:
         value = resource.strip()
         if not value:
             return "❌ Missing resource."
         if value.startswith("att_"):
             return self._read_attachment(value)
+        knowledge_path = self._resolve_knowledge_virtual_path(value)
+        if knowledge_path is not None:
+            value = str(knowledge_path)
         image_marker = self._read_image_path_marker(value)
         if image_marker is not None:
             return image_marker

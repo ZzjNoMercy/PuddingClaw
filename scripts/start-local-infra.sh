@@ -160,9 +160,10 @@ if ! docker compose -f docker-compose.infra.yml up -d "${COMPOSE_SERVICES[@]}"; 
     echo ""
     echo "4. 如果只需要 Higress，可先继续使用已有 puddingclaw-higress 容器；Milvus 可稍后再启动。"
     echo ""
-    echo "5. 如果本机已有 PostgreSQL，请设置自己的连接串，例如："
+    echo "5. 如果本机已有 PostgreSQL，请在 Settings -> 知识库中配置端口、库名、账号和密码。"
+    echo "   如需命令行强制覆盖，可设置专用变量，例如："
     echo "   PUDDINGCLAW_POSTGRES_MODE=external \\"
-    echo "   DATABASE_URL=postgresql+asyncpg://<user>:<password>@127.0.0.1:<port>/<database> \\"
+    echo "   PUDDINGCLAW_DATABASE_URL=postgresql+asyncpg://<user>:<password>@127.0.0.1:<port>/<database> \\"
     echo "   ./scripts/start-local-infra.sh"
     exit 1
 fi
@@ -190,14 +191,16 @@ echo ""
 echo -e "${BLUE}[提示] 如需启动本机 MinerU：${NC}"
 echo "  python scripts/setup-mineru.py --foreground"
 echo "  # 或使用已有 conda 环境：MINERU_PORT=8002 scripts/start-mineru-host.sh"
+echo "  # MinerU 地址会写入 backend/config.json 的 knowledge.mineru.base_url"
 echo ""
 echo -e "${BLUE}[提示] 本机 backend 推荐环境变量：${NC}"
 if [ "$START_BUNDLED_POSTGRES" = "true" ]; then
-    echo "  DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:${POSTGRES_PORT}/${POSTGRES_DB}"
+    echo "  已写入 backend/config.json；backend 会使用 Settings 中的数据库配置。"
+    echo "  如需命令行强制覆盖，可设置："
+    echo "  PUDDINGCLAW_DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:${POSTGRES_PORT}/${POSTGRES_DB}"
 else
     echo "  已写入 backend/config.json；如需覆盖，可在 Settings -> 知识库 -> Catalog Database 中调整。"
 fi
 echo "  AI_GATEWAY_URL=http://localhost:8080/v1"
-echo "  MINERU_URL=http://localhost:8002"
 echo ""
 echo -e "${GREEN}[完成] 基础设施启动命令已执行。${NC}"

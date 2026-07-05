@@ -217,6 +217,14 @@ class _TracingMiddlewareProxyBase(AgentMiddleware):
     ) -> None:
         if collector is None:
             return
+        model_call_index = collector.model_call_index_for_hook(hook)
+        metadata = {
+            "proxied_middleware": self._wrapped.__class__.__name__,
+            "proxied_module": self._wrapped.__class__.__module__,
+            "observability_layer": "middleware_proxy",
+        }
+        if model_call_index is not None:
+            metadata["model_call_index"] = model_call_index
         collector.record_middleware_hook_attribution(
             hook=hook,
             middleware=self.name,
@@ -224,11 +232,7 @@ class _TracingMiddlewareProxyBase(AgentMiddleware):
             after=after,
             status=status,
             evidence=[f"{self.name}.{hook} captured by middleware proxy."],
-            metadata={
-                "proxied_middleware": self._wrapped.__class__.__name__,
-                "proxied_module": self._wrapped.__class__.__module__,
-                "observability_layer": "middleware_proxy",
-            },
+            metadata=metadata,
         )
 
     def _record_wrap(
@@ -242,6 +246,14 @@ class _TracingMiddlewareProxyBase(AgentMiddleware):
     ) -> None:
         if collector is None:
             return
+        model_call_index = collector.model_call_index_for_hook(hook)
+        metadata = {
+            "proxied_middleware": self._wrapped.__class__.__name__,
+            "proxied_module": self._wrapped.__class__.__module__,
+            "observability_layer": "middleware_proxy",
+        }
+        if model_call_index is not None:
+            metadata["model_call_index"] = model_call_index
         collector.record_wrap_hook_attribution(
             hook=hook,
             middleware=self.name,
@@ -249,11 +261,7 @@ class _TracingMiddlewareProxyBase(AgentMiddleware):
             request_sent=request_sent,
             response_observed=response_observed,
             evidence=[f"{self.name}.{hook} request captured by middleware proxy."],
-            metadata={
-                "proxied_middleware": self._wrapped.__class__.__name__,
-                "proxied_module": self._wrapped.__class__.__module__,
-                "observability_layer": "middleware_proxy",
-            },
+            metadata=metadata,
         )
 
     def _record_error(

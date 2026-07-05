@@ -16,6 +16,7 @@
 #   API 文档：http://localhost:8888/docs
 #   Higress Gateway：http://localhost:8080
 #   Higress Console：http://localhost:8001
+#   Higress Prometheus：http://localhost:19090  # 避免占用常见的宿主机 9090
 #
 # 注意：
 #   Full 模式为旧部署路径；当前本地模式下 backend 不再运行在 Docker 容器内。
@@ -115,10 +116,10 @@ services:
       - "8080:8080"
       - "8001:8001"
       # 可观测套件端口（Prometheus / Grafana / Envoy metrics）
-      - "9090:9090"
-      - "3001:3000"
-      - "15020:15020"
-      - "15021:15021"
+      - "${HIGRESS_PROMETHEUS_PORT:-19090}:9090"
+      - "${HIGRESS_GRAFANA_PORT:-3001}:3000"
+      - "${HIGRESS_ENVOY_METRICS_PORT:-15020}:15020"
+      - "${HIGRESS_ENVOY_HEALTH_PORT:-15021}:15021"
     environment:
       - MODE=full
       - USE_PLUGIN_SERVER=on

@@ -24,6 +24,7 @@ backend/archive/
 backend/storage/
 backend/workspace/
 backend/knowledge/
+backend/output/
 
 # Legacy task/reminder files (should not be in backend root)
 backend/tasks.json

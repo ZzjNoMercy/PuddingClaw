@@ -638,7 +638,12 @@ class DeepAgentsAgentManager:
                 }
             )
 
-        add("TodoListMiddleware", "deepagents.base", ["before_agent", "after_model"], "DeepAgents 自动挂载")
+        add(
+            "TodoListMiddleware",
+            "deepagents.base",
+            ["wrap_model_call", "after_model"],
+            "注入 write_todos 提示并检查 todo tool call",
+        )
         if skills:
             add("SkillsMiddleware", "deepagents.base", ["before_agent"], "将 skills snapshot 注入系统上下文")
         add("FilesystemMiddleware", "deepagents.base", ["wrap_tool_call"], "提供 /workspace 与 /skills 文件系统能力")
@@ -1111,8 +1116,9 @@ class DeepAgentsAgentManager:
             paths = "\n".join(f"- {path}" for path in external_paths_needing_permission)
             content[0]["text"] = (
                 f"{message}\n\n"
-                "[系统提示] 检测到 workspace 外的本地图片路径，当前不会直接读取或内联给子代理。"
-                "在委派给 image_analyzer 前，主 Agent 必须先通过 read_resource 触发外部文件授权；"
+                "[系统提示] 检测到 workspace 外且不属于 PuddingClaw 托管资源的本地图片路径，"
+                "当前不会直接读取或内联给子代理。"
+                "只有这种未授权外部图片，才需要主 Agent 先通过 read_resource 触发外部文件授权；"
                 "授权完成后再重试该图片分析。\n"
                 f"{paths}"
             )
@@ -1856,14 +1862,19 @@ class DeepAgentsAgentManager:
                     "and '/skills/' for skill files, and stick to those prefixes.\n"
                     "The global knowledge base lives at '/knowledge/' (physical path configured by "
                     "PUDDINGCLAW_KNOWLEDGE_DIR, defaulting to backend/knowledge/). Add "
-                    "Markdown documents there when a skill needs to store retrievable knowledge. Use built-in "
-                    "`glob` and `grep` for exact Markdown/file-level lookup, and use `llamaindex_knowledge_query` "
-                    "for indexed RAG retrieval. User-selected local Markdown files and MinerU-parsed PDFs are imported "
+                    "Markdown documents there when a skill needs to store retrievable knowledge. Use "
+                    "`llamaindex_knowledge_query` for indexed RAG retrieval. Only use built-in `glob`/`grep` "
+                    "under `/knowledge/` when the user explicitly asks for exact Markdown/file-name lookup; "
+                    "do not use broad patterns like `**/*` to recover RAG image hits. "
+                    "User-selected local Markdown files and MinerU-parsed PDFs are imported "
                     "by the backend into '/knowledge/imported/...', so prefer those virtual paths when citing or "
                     "reading imported docs. "
                     "If `llamaindex_knowledge_query` returns a `[图片命中]` section with local image paths, "
-                    "do not infer image contents from filenames alone; call `read_resource` on the image path "
-                    "and then delegate visual analysis to `subagent_type=image_analyzer` when the image is relevant. "
+                    "do not infer image contents from filenames alone. When the image is relevant, directly call "
+                    "the native `task` tool with `subagent_type=image_analyzer`. Put the complete request, image path, "
+                    "and retrieved context inside the task `description`; do not rely on a separate `prompt` field. "
+                    "Prefer `/knowledge/...` virtual paths when available. The image_analyzer subagent must call "
+                    "`read_resource` inside its own task before visual analysis. "
                     "Do NOT store knowledge under '/workspace/knowledge/'.\n\n"
                     "When the user asks you to break a task into steps or track progress, call the `write_todos` "
                     "tool to create a structured todo list.\n\n"

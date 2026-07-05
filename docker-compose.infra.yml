@@ -8,6 +8,7 @@
 # 端口保持与现有部署约定一致：
 #   Higress Gateway: http://localhost:8080
 #   Higress Console: http://localhost:8001
+#   Higress Prometheus: http://localhost:19090  # 避免占用常见的宿主机 9090
 #   Milvus:          grpc://localhost:19530
 #   PostgreSQL:      postgresql://localhost:5432  # 可选 bundled；已有本机 PostgreSQL 时可外接
 #   MinerU API:      http://localhost:8002  # 本机运行，不在本 compose 内
@@ -57,10 +58,10 @@ services:
       - "8080:8080"
       - "8001:8001"
       # 可观测套件端口（Prometheus / Grafana / Envoy metrics）
-      - "9090:9090"
-      - "3001:3000"
-      - "15020:15020"
-      - "15021:15021"
+      - "${HIGRESS_PROMETHEUS_PORT:-19090}:9090"
+      - "${HIGRESS_GRAFANA_PORT:-3001}:3000"
+      - "${HIGRESS_ENVOY_METRICS_PORT:-15020}:15020"
+      - "${HIGRESS_ENVOY_HEALTH_PORT:-15021}:15021"
     environment:
       - MODE=full
       - USE_PLUGIN_SERVER=on

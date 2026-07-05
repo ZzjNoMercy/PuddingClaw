@@ -30,6 +30,8 @@ export interface FallbackEmbeddingSettings {
   provider: string;
   model: string;
   base_url: string;
+  dimension?: number;
+  batch_size?: number;
   api_key_masked: string;
 }
 
@@ -37,6 +39,7 @@ export interface MultimodalEmbeddingSettings {
   provider: string;
   model: string;
   dimension: number;
+  batch_size?: number;
   base_url: string;
   route_path: string;
   prefer_gateway: boolean;
@@ -51,12 +54,34 @@ export interface RagSettings {
   enabled: boolean;
   top_k: number;
   similarity_threshold: number;
+  hybrid?: {
+    enabled: boolean;
+    mode: string;
+    text_vector_weight: number;
+    image_vector_weight: number;
+    bm25_weight: number;
+    candidate_top_k: number;
+  };
+  rerank?: {
+    enabled: boolean;
+    provider?: string;
+    model: string;
+    top_n: number;
+    candidate_top_k: number;
+    base_url?: string;
+    api_key_masked?: string;
+  };
 }
 
 export interface KnowledgeSettings {
   root_dir: string;
   configured_by?: string;
   environment_override?: boolean;
+  mineru?: {
+    base_url: string;
+    runtime_output_dir: string;
+    keep_runtime_output: boolean;
+  };
   multimodal_index: {
     enabled: boolean;
     vector_store: string;

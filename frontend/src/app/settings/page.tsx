@@ -60,9 +60,9 @@ const HARNESS_SECTIONS: HarnessSection[] = [
 
 const CATEGORIES: { key: SettingsCategory; label: string; icon: React.ElementType; color: string }[] = [
   { key: "ai", label: "AI 网关", icon: Network, color: "#002fa7" },
-  { key: "rag", label: "RAG 设置", icon: Database, color: "#7c3aed" },
+  { key: "rag", label: "RAG 设置", icon: Database, color: "#002fa7" },
   { key: "knowledge", label: "知识库", icon: FolderOpen, color: "#002fa7" },
-  { key: "memory", label: "记忆管理", icon: Brain, color: "#7c3aed" },
+  { key: "memory", label: "记忆管理", icon: Brain, color: "#002fa7" },
   { key: "data", label: "数据管理", icon: HardDrive, color: "#10b981" },
   { key: "harness", label: "Harness 配置", icon: Bot, color: "#002fa7" },
   { key: "advanced", label: "高级设置", icon: Sliders, color: "#6b7280" },
@@ -106,7 +106,7 @@ function positiveIntOrNull(value: string): number | null {
 }
 
 export default function SettingsPage() {
-  const { ragMode, toggleRagMode, sidebarOpen, toggleSidebar, thinkingMode, setThinkingMode } = useApp();
+  const { sidebarOpen, toggleSidebar, thinkingMode, setThinkingMode } = useApp();
   const [mounted, setMounted] = useState(false);
   const [selectedSubagentIndex, setSelectedSubagentIndex] = useState<number | null>(null);
   const [configModalOpen, setConfigModalOpen] = useState(false);
@@ -159,6 +159,8 @@ export default function SettingsPage() {
   // Embedding form state
   const [embProvider, setEmbProvider] = useState("qwen");
   const [embModel, setEmbModel] = useState("text-embedding-v3");
+  const [embDimension, setEmbDimension] = useState("1024");
+  const [embBatchSize, setEmbBatchSize] = useState("20");
   const [embBaseUrl, setEmbBaseUrl] = useState("https://dashscope.aliyuncs.com/compatible-mode/v1");
   const [embApiKey, setEmbApiKey] = useState("");
   const [embApiKeyMasked, setEmbApiKeyMasked] = useState("");
@@ -169,6 +171,13 @@ export default function SettingsPage() {
   // RAG form state
   const [ragTopK, setRagTopK] = useState(3);
   const [ragThreshold, setRagThreshold] = useState(0.7);
+  const [ragTextVectorWeight, setRagTextVectorWeight] = useState(0.45);
+  const [ragImageVectorWeight, setRagImageVectorWeight] = useState(0.35);
+  const [ragHybridCandidateTopK, setRagHybridCandidateTopK] = useState(10);
+  const [ragRerankEnabled, setRagRerankEnabled] = useState(true);
+  const [ragRerankCandidateTopK, setRagRerankCandidateTopK] = useState(50);
+  const ragBm25Weight = Math.max(0, Math.min(1, 1 - ragTextVectorWeight));
+  const ragTextGroupWeight = Math.max(0, Math.min(1, 1 - ragImageVectorWeight));
 
   // Knowledge base
   const [databaseMode, setDatabaseMode] = useState<"bundled" | "external">("bundled");
@@ -186,6 +195,7 @@ export default function SettingsPage() {
   const [knowledgeEnvOverride, setKnowledgeEnvOverride] = useState(false);
   const [mmModel, setMmModel] = useState("qwen2.5-vl-embedding");
   const [mmDimension, setMmDimension] = useState("1024");
+  const [mmConcurrency, setMmConcurrency] = useState("10");
   const [mmApiKey, setMmApiKey] = useState("");
   const [mmApiKeyMasked, setMmApiKeyMasked] = useState("");
   const [showMmKey, setShowMmKey] = useState(false);
@@ -254,6 +264,8 @@ export default function SettingsPage() {
           : "qwen";
         setEmbProvider(validEmbProvider);
         setEmbModel(s.fallback_embedding.model);
+        setEmbDimension(String(s.fallback_embedding.dimension || 1024));
+        setEmbBatchSize(String(s.fallback_embedding.batch_size || 20));
         setEmbBaseUrl(
           EMBEDDING_PROVIDERS.find((p) => p.value === validEmbProvider)?.baseUrl ?? s.fallback_embedding.base_url
         );
@@ -261,6 +273,14 @@ export default function SettingsPage() {
         // Populate RAG fields
         setRagTopK(s.rag.top_k);
         setRagThreshold(s.rag.similarity_threshold);
+        const textWeight = s.rag.hybrid?.text_vector_weight ?? 0.45;
+        const keywordWeight = s.rag.hybrid?.bm25_weight ?? 0.2;
+        const textMixTotal = textWeight + keywordWeight;
+        setRagTextVectorWeight(textMixTotal > 0 ? textWeight / textMixTotal : 0.7);
+        setRagImageVectorWeight(s.rag.hybrid?.image_vector_weight ?? 0.35);
+        setRagHybridCandidateTopK(s.rag.hybrid?.candidate_top_k ?? 10);
+        setRagRerankEnabled(s.rag.rerank?.enabled ?? true);
+        setRagRerankCandidateTopK(s.rag.rerank?.candidate_top_k ?? 50);
         // Knowledge base
         setDatabaseMode(s.database?.mode === "external" ? "external" : "bundled");
         setDatabaseHost(s.database?.host || "127.0.0.1");
@@ -275,6 +295,7 @@ export default function SettingsPage() {
         setKnowledgeEnvOverride(Boolean(s.knowledge?.environment_override));
         setMmModel(s.multimodal_embedding?.model || "qwen2.5-vl-embedding");
         setMmDimension(String(s.multimodal_embedding?.dimension || 1024));
+        setMmConcurrency(String(s.multimodal_embedding?.batch_size || 10));
         setMmApiKeyMasked(s.multimodal_embedding?.api_key_masked || "");
         setKbIndexEnabled(s.knowledge?.multimodal_index?.enabled ?? true);
         setKbVectorStore(s.knowledge?.multimodal_index?.vector_store || "milvus");
@@ -331,13 +352,31 @@ export default function SettingsPage() {
         fallback_embedding: {
           provider: embProvider,
           model: embModel,
+          dimension: Number.parseInt(embDimension, 10) || 1024,
+          batch_size: Number.parseInt(embBatchSize, 10) || 20,
           base_url: embBaseUrl,
           ...(embApiKey ? { api_key: embApiKey } : {}),
         },
         rag: {
-          enabled: ragMode,
+          enabled: true,
           top_k: ragTopK,
           similarity_threshold: ragThreshold,
+          hybrid: {
+            enabled: true,
+            mode: "reciprocal_rerank",
+            text_vector_weight: ragTextVectorWeight,
+            image_vector_weight: ragImageVectorWeight,
+            bm25_weight: ragBm25Weight,
+            candidate_top_k: ragHybridCandidateTopK,
+          },
+          rerank: {
+            enabled: ragRerankEnabled,
+            provider: "dashscope",
+            model: "qwen3-vl-rerank",
+            top_n: ragTopK,
+            candidate_top_k: ragRerankCandidateTopK,
+            base_url: "",
+          },
         },
         database: {
           mode: databaseMode,
@@ -352,6 +391,7 @@ export default function SettingsPage() {
           provider: "dashscope",
           model: mmModel,
           dimension: Number.parseInt(mmDimension, 10) || 1024,
+          batch_size: Number.parseInt(mmConcurrency, 10) || 10,
           base_url: "",
           prefer_gateway: false,
           ...(mmApiKey ? { api_key: mmApiKey } : {}),
@@ -398,7 +438,7 @@ export default function SettingsPage() {
     } finally {
       setSaving(false);
     }
-  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embBaseUrl, embApiKey, ragMode, ragTopK, ragThreshold, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmModel, mmDimension, mmApiKey, knowledgeRootDir, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, subagentItems, showToast]);
+  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmModel, mmDimension, mmApiKey, knowledgeRootDir, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, subagentItems, showToast]);
 
   const handleDatabaseModeChange = useCallback((mode: "bundled" | "external") => {
     setDatabaseMode(mode);
@@ -1003,6 +1043,31 @@ export default function SettingsPage() {
                     placeholder="text-embedding-v3"
                   />
                 </FormField>
+                <div className="grid gap-4 md:grid-cols-2">
+                  <FormField label="文本向量维度">
+                    <input
+                      type="number"
+                      min="1"
+                      value={embDimension}
+                      onChange={(e) => setEmbDimension(e.target.value)}
+                      className="form-input"
+                      placeholder="1024"
+                    />
+                  </FormField>
+                  <FormField label="文本批量大小">
+                    <input
+                      type="number"
+                      min="1"
+                      value={embBatchSize}
+                      onChange={(e) => setEmbBatchSize(e.target.value)}
+                      className="form-input"
+                      placeholder="20"
+                    />
+                    <p className="mt-1 text-[10px] text-gray-400">
+                      DashScope 文本向量建议不超过 20。
+                    </p>
+                  </FormField>
+                </div>
                 <FormField label="Base URL">
                   <input
                     type="text"
@@ -1049,32 +1114,14 @@ export default function SettingsPage() {
 
             {/* RAG Settings */}
             {category === "rag" && (
-              <SettingsCard title="RAG 检索设置" icon={Database} color="#7c3aed">
-                <div className="flex items-center justify-between gap-4 rounded-lg border border-black/[0.06] bg-white/50 px-3.5 py-3">
-                  <div className="min-w-0">
-                    <p className="text-[12px] font-medium text-gray-700">启用 RAG 检索</p>
-                    <p className="mt-0.5 text-[11px] text-gray-500">
-                      {ragMode ? "对话将检索 Memory 向量库" : "对话将使用完整上下文，不执行向量检索"}
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    role="switch"
-                    aria-checked={ragMode}
-                    aria-label="启用 RAG 检索"
-                    onClick={toggleRagMode}
-                    className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#002fa7]/40 ${
-                      ragMode ? "bg-[#002fa7]" : "bg-gray-300"
-                    }`}
-                  >
-                    <span
-                      className={`pointer-events-none mt-0.5 inline-block h-5 w-5 rounded-full bg-white shadow-sm transition-transform ${
-                        ragMode ? "translate-x-[22px]" : "translate-x-0.5"
-                      }`}
-                    />
-                  </button>
+              <SettingsCard title="RAG 检索设置" icon={Database} color="#002fa7">
+                <div className="rounded-lg border border-black/[0.06] bg-white/50 px-3.5 py-3">
+                  <p className="text-[12px] font-medium text-gray-700">知识库检索默认开启</p>
+                  <p className="mt-0.5 text-[11px] leading-5 text-gray-500">
+                    这里配置 LlamaIndex 工具的召回策略。Top-K 是最终交给 Agent/LLM 的结果数量；候选数量是中间召回池。
+                  </p>
                 </div>
-                <FormField label={`Top-K: ${ragTopK}`}>
+                <FormField label={`最终结果数 Top-K: ${ragTopK}`}>
                   <input
                     type="range"
                     min="1"
@@ -1082,7 +1129,7 @@ export default function SettingsPage() {
                     step="1"
                     value={ragTopK}
                     onChange={(e) => setRagTopK(parseInt(e.target.value))}
-                    className="w-full accent-[#7c3aed]"
+                    className="w-full accent-[#002fa7]"
                   />
                   <div className="flex justify-between text-[10px] text-gray-400 mt-0.5">
                     <span>精确 (1)</span>
@@ -1097,13 +1144,118 @@ export default function SettingsPage() {
                     step="0.05"
                     value={ragThreshold}
                     onChange={(e) => setRagThreshold(parseFloat(e.target.value))}
-                    className="w-full accent-[#7c3aed]"
+                    className="w-full accent-[#002fa7]"
                   />
                   <div className="flex justify-between text-[10px] text-gray-400 mt-0.5">
                     <span>宽松 (0)</span>
                     <span>严格 (1)</span>
                   </div>
                 </FormField>
+                <div className="rounded-xl border border-[#002fa7]/10 bg-[#002fa7]/[0.04] p-3.5 space-y-3">
+	                  <div className="min-w-0">
+	                    <p className="text-[12px] font-semibold text-gray-800">混合检索权重</p>
+	                    <p className="mt-0.5 text-[11px] text-gray-500">
+	                      先做文本混合检索，再和图片结果一起排序。
+	                    </p>
+	                  </div>
+	                  <FormField label={`召回池大小: ${ragHybridCandidateTopK}`}>
+	                    <input
+	                      type="range"
+	                      min="3"
+                      max="50"
+                      step="1"
+                      value={ragHybridCandidateTopK}
+                      onChange={(e) => setRagHybridCandidateTopK(parseInt(e.target.value))}
+	                      className="w-full accent-[#002fa7]"
+	                    />
+	                  </FormField>
+	                  <div className="rounded-2xl border border-black/[0.04] bg-white/60 p-3">
+	                    <div className="mb-3 flex items-center justify-between gap-3">
+	                      <p className="text-[11px] font-semibold text-gray-700">文本混合检索</p>
+	                      <p className="text-[11px] text-gray-400">合计 100%</p>
+	                    </div>
+	                    <div className="flex items-center justify-between text-[12px] font-medium text-gray-600">
+	                      <span>关键词匹配 {Math.round(ragBm25Weight * 100)}%</span>
+	                      <span>语义理解 {Math.round(ragTextVectorWeight * 100)}%</span>
+	                    </div>
+	                    <input
+	                      type="range"
+	                      min="0"
+	                      max="1"
+	                      step="0.05"
+	                      value={ragTextVectorWeight}
+	                      onChange={(e) => setRagTextVectorWeight(parseFloat(e.target.value))}
+	                      className="mt-3 w-full accent-[#002fa7]"
+	                    />
+	                    <div className="mt-1 flex justify-between text-[10px] text-gray-400">
+	                      <span>更偏关键词</span>
+	                      <span>更偏语义</span>
+	                    </div>
+	                  </div>
+	                  <div className="rounded-2xl border border-black/[0.04] bg-white/60 p-3">
+	                    <div className="mb-3 flex items-center justify-between gap-3">
+	                      <p className="text-[11px] font-semibold text-gray-700">图文融合</p>
+	                      <p className="text-[11px] text-gray-400">合计 100%</p>
+	                    </div>
+	                    <div className="flex items-center justify-between text-[12px] font-medium text-gray-600">
+	                      <span>文本整体 {Math.round(ragTextGroupWeight * 100)}%</span>
+	                      <span>图片理解 {Math.round(ragImageVectorWeight * 100)}%</span>
+	                    </div>
+	                      <input
+	                        type="range"
+	                        min="0"
+                        max="1"
+                        step="0.05"
+                        value={ragImageVectorWeight}
+	                        onChange={(e) => setRagImageVectorWeight(parseFloat(e.target.value))}
+	                        className="mt-3 w-full accent-[#002fa7]"
+	                      />
+	                    <div className="mt-1 flex justify-between text-[10px] text-gray-400">
+	                      <span>更偏文本</span>
+	                      <span>更偏图片</span>
+	                    </div>
+	                  </div>
+	                </div>
+                <div className="rounded-xl border border-[#002fa7]/10 bg-white/70 p-3.5 space-y-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <p className="text-[12px] font-semibold text-gray-800">重排 Rerank</p>
+                      <p className="mt-0.5 text-[11px] text-gray-500">
+                        对召回候选重新排序。开启后，最终结果会优先看重排模型判断。
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setRagRerankEnabled((value) => !value)}
+                      className={`relative h-7 w-12 rounded-full transition ${
+                        ragRerankEnabled ? "bg-[#002fa7]" : "bg-gray-200"
+                      }`}
+                      aria-pressed={ragRerankEnabled}
+                    >
+                      <span
+                        className={`absolute top-1 h-5 w-5 rounded-full bg-white shadow-sm transition ${
+                          ragRerankEnabled ? "left-6" : "left-1"
+                        }`}
+                      />
+                    </button>
+                  </div>
+                  <div className="grid gap-3">
+                    <FormField label={`重排候选池: ${ragRerankCandidateTopK}`}>
+                      <input
+                        type="range"
+                        min="10"
+                        max="100"
+                        step="5"
+                        value={ragRerankCandidateTopK}
+                        onChange={(e) => setRagRerankCandidateTopK(parseInt(e.target.value))}
+                        className="w-full accent-[#002fa7]"
+                      />
+                    </FormField>
+                  </div>
+                  <p className="text-[11px] leading-5 text-gray-400">
+                    重排后的最终输出数量跟随上面的 Top-K。
+                  </p>
+                </div>
               </SettingsCard>
             )}
 
@@ -1240,9 +1392,9 @@ export default function SettingsPage() {
                   </Link>
                 </SettingsCard>
 
-                <SettingsCard title="多模态 Embedding" icon={Database} color="#7c3aed">
-                  <div className="rounded-xl border border-purple-100 bg-purple-50/50 px-3.5 py-3">
-                    <p className="text-[11px] leading-relaxed text-purple-700">
+                <SettingsCard title="多模态 Embedding" icon={Database} color="#002fa7">
+                  <div className="rounded-xl border border-[#002fa7]/10 bg-[#002fa7]/[0.04] px-3.5 py-3">
+                    <p className="text-[11px] leading-relaxed text-[#002fa7]">
                       图文混排 PDF 默认使用 DashScope Qwen-VL Embedding 直连。通常只需要配置 API Key；如果 Higress 已有同一 DashScope Key，后端会自动复用。
                     </p>
                   </div>
@@ -1252,6 +1404,12 @@ export default function SettingsPage() {
                     </FormField>
                     <FormField label="Dimension">
                       <input value={mmDimension} onChange={(e) => setMmDimension(e.target.value)} className="form-input" placeholder="1024" />
+                    </FormField>
+                    <FormField label="并发数">
+                      <input value={mmConcurrency} onChange={(e) => setMmConcurrency(e.target.value)} className="form-input" placeholder="10" />
+                      <p className="mt-1 text-[11px] leading-relaxed text-gray-400">
+                        DashScope 多模态接口不支持同类型批量输入，这里控制同时发起多少个单条请求。
+                      </p>
                     </FormField>
                     <FormField label="API Key（可选）">
                       <div className="relative">

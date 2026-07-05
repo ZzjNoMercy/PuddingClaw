@@ -111,6 +111,9 @@ export default function TraceViewer({
   const summary = useMemo(() => buildHarnessSummary(trace), [trace]);
   const flatSpans = useMemo(() => flattenTraceSpans(trace), [trace]);
   const actualFlow = useMemo(() => buildActualFlowForTrace(trace, flatSpans), [trace, flatSpans]);
+  useEffect(() => {
+    emitTraceFlowDebug(trace, flatSpans, actualFlow);
+  }, [trace, flatSpans, actualFlow]);
   const filteredActualFlow = useMemo(
     () => filterActualFlow(actualFlow, selectedType),
     [actualFlow, selectedType]
@@ -707,6 +710,8 @@ function SpanIcon({
       return <ListChecks className={`${className} text-emerald-600`} />;
     case "permission":
       return <KeyRound className={`${className} text-rose-600`} />;
+    case "rag":
+      return <Network className={`${className} text-emerald-600`} />;
     case "custom":
       return <CheckCircle2 className={`${className} text-slate-500`} />;
     default:
@@ -723,6 +728,7 @@ function TypePill({ span }: { span: TraceSpan }) {
     skill: "skill",
     subagent: "subagent",
     tool: "tool",
+    rag: "rag",
     permission: "permission",
   };
   const label = labelByType[span.type];
@@ -1650,11 +1656,19 @@ function middlewareInvocationFlowItem(
     id: `middleware-trigger-${invocation.id}`,
     type: "middleware",
     status: markerSpan.status,
-    label: invocation.hook,
+    label: middlewareInvocationFlowLabel(invocation),
     subtitle: `中间件触发 · ${invocation.title}`,
     title: `${invocation.hook} · ${invocation.title}`,
     span: markerSpan,
   };
+}
+
+function middlewareInvocationFlowLabel(invocation: MiddlewareHookInvocation): string {
+  const firstMiddleware = stringArray(invocation.invocation?.middleware)[0] || stringArray(invocation.invocation?.metadata?.middleware)[0];
+  const raw = invocation.title && invocation.title !== invocation.hook ? invocation.title : firstMiddleware;
+  if (!raw) return invocation.hook;
+  const compact = raw.replace(/Middleware/g, "").replace(new RegExp(`\\.${invocation.hook}$`), "");
+  return compact === invocation.hook ? invocation.hook : `${compact}.${invocation.hook}`;
 }
 
 function insertTopLevelFlowMarkerByOrder(
@@ -1681,8 +1695,22 @@ function insertTopLevelFlowMarkerForInvocation(
   marker: ActualFlowItem,
   invocation: MiddlewareHookInvocation
 ): ActualFlowItem[] {
-  if (shouldNestInvocationInsideGraphModel(invocation)) {
-    return insertModelWrapperMarkerForInvocation(items, marker, invocation);
+  if (invocation.hook === "wrap_model_call") {
+    return insertWrapperMarkerForInvocation(items, marker, invocation, isGraphModelFlowItem, findGraphModelFlowIndex);
+  }
+  if (invocation.hook === "wrap_tool_call") {
+    return insertWrapperMarkerForInvocation(items, marker, invocation, isGraphToolsFlowItem, findGraphToolsFlowIndex);
+  }
+  if (invocation.hook === "before_agent") {
+    return insertBeforeFirstModelBoundary(items, marker);
+  }
+  if (invocation.hook === "before_model" || invocation.hook === "after_model") {
+    const targetIndex = findGraphModelFlowIndex(items, invocation, spanEventOrder(marker.span!));
+    if (targetIndex >= 0) {
+      const next = [...items];
+      next.splice(invocation.hook === "after_model" ? targetIndex + 1 : targetIndex, 0, marker);
+      return dedupeFlowItems(next, marker.id);
+    }
   }
   const modelCallIndex = invocationModelCallIndex(invocation);
   if (modelCallIndex !== null) {
@@ -1697,22 +1725,32 @@ function insertTopLevelFlowMarkerForInvocation(
   return insertTopLevelFlowMarkerByOrder(items, marker, spanEventOrder(marker.span!));
 }
 
-function shouldNestInvocationInsideGraphModel(invocation: MiddlewareHookInvocation): boolean {
-  return invocation.hook === "wrap_model_call";
+function insertBeforeFirstModelBoundary(items: ActualFlowItem[], marker: ActualFlowItem): ActualFlowItem[] {
+  const targetIndex = items.findIndex((item) =>
+    isGraphModelFlowItem(item) ||
+    (item.type === "middleware" && normalizeHookName(item.span?.metadata?.hook) === "before_model")
+  );
+  if (targetIndex < 0) return insertTopLevelFlowMarkerByOrder(items, marker, spanEventOrder(marker.span!));
+  const next = [...items];
+  next.splice(targetIndex, 0, marker);
+  return dedupeFlowItems(next, marker.id);
 }
 
-function insertModelWrapperMarkerForInvocation(
+function insertWrapperMarkerForInvocation(
   items: ActualFlowItem[],
   marker: ActualFlowItem,
-  invocation: MiddlewareHookInvocation
+  invocation: MiddlewareHookInvocation,
+  isTarget: (item: ActualFlowItem) => boolean,
+  findTargetIndex: (items: ActualFlowItem[], invocation: MiddlewareHookInvocation, markerOrder: number) => number
 ): ActualFlowItem[] {
-  const targetIndex = findGraphModelFlowIndex(items, invocation, spanEventOrder(marker.span!));
+  const targetIndex = findTargetIndex(items, invocation, spanEventOrder(marker.span!));
   if (targetIndex < 0) return insertTopLevelFlowMarkerByOrder(items, marker, spanEventOrder(marker.span!));
   const next = [...items];
   const target = next[targetIndex];
+  if (!isTarget(target)) return insertTopLevelFlowMarkerByOrder(items, marker, spanEventOrder(marker.span!));
   next[targetIndex] = {
     ...target,
-    children: insertModelWrapperChild(target.children || [], marker),
+    signature: insertModelHookSignature(target.signature || [], marker, invocation.hook),
   };
   return dedupeFlowItems(next, marker.id);
 }
@@ -1738,29 +1776,103 @@ function isGraphModelFlowItem(item: ActualFlowItem): boolean {
   return item.type === "graph" && item.label === "graph.model";
 }
 
-function insertModelWrapperChild(children: ActualFlowItem[], marker: ActualFlowItem): ActualFlowItem[] {
-  const withoutDuplicate = children.filter((child) => child.id !== marker.id);
-  const firstLlmIndex = withoutDuplicate.findIndex((child) => child.type === "llm");
-  const insertIndex = firstLlmIndex >= 0 ? firstLlmIndex : withoutDuplicate.length;
+function findGraphToolsFlowIndex(
+  items: ActualFlowItem[],
+  invocation: MiddlewareHookInvocation,
+  markerOrder: number
+): number {
+  const sourceSpanId = stringFromUnknown(invocation.invocation?.metadata?.source_span_id);
+  if (sourceSpanId) {
+    const bySource = items.findIndex((item) =>
+      isGraphToolsFlowItem(item) &&
+      (item.span?.id === sourceSpanId || (item.children || []).some((child) => child.span?.id === sourceSpanId))
+    );
+    if (bySource >= 0) return bySource;
+  }
+  const afterMarker = items.findIndex(
+    (item) => isGraphToolsFlowItem(item) && item.span && spanEventOrder(item.span) >= markerOrder
+  );
+  if (afterMarker >= 0) return afterMarker;
+  return items.findIndex(isGraphToolsFlowItem);
+}
+
+function isGraphToolsFlowItem(item: ActualFlowItem): boolean {
+  return item.type === "graph" && item.label === "graph.tools";
+}
+
+function insertModelHookSignature(
+  signature: ActualFlowItem[],
+  marker: ActualFlowItem,
+  hook: MiddlewareHookName
+): ActualFlowItem[] {
+  const withoutDuplicate = signature.filter((item) => item.id !== marker.id);
+  const subtitle =
+    hook === "before_model"
+      ? "模型调用前的中间件边界"
+      : hook === "wrap_model_call"
+        ? "包裹真实 LLM 调用"
+        : "模型返回后的中间件边界";
   return [
-    ...withoutDuplicate.slice(0, insertIndex),
+    ...withoutDuplicate,
     {
       ...marker,
-      subtitle: "包裹真实 LLM 调用",
-      title: `${marker.title} · wrapper around model call`,
+      label: modelHookSignatureLabel(marker, hook),
+      subtitle,
+      title: `${marker.title} · ${subtitle}`,
     },
-    ...withoutDuplicate.slice(insertIndex),
-  ];
+  ].sort((a, b) => {
+    const rank = (item: ActualFlowItem) => modelHookSignatureRank(normalizeHookName(item.span?.metadata?.hook) || hook);
+    const rankDelta = rank(a) - rank(b);
+    if (rankDelta !== 0) return rankDelta;
+    const orderDelta = (a.span ? spanEventOrder(a.span) : Number.POSITIVE_INFINITY) -
+      (b.span ? spanEventOrder(b.span) : Number.POSITIVE_INFINITY);
+    if (orderDelta !== 0) return orderDelta;
+    return a.label.localeCompare(b.label);
+  });
+}
+
+function modelHookSignatureRank(hook: MiddlewareHookName): number {
+  const ranks: Record<MiddlewareHookName, number> = {
+    before_agent: 0,
+    before_model: 1,
+    wrap_model_call: 2,
+    after_model: 3,
+    wrap_tool_call: 4,
+    after_agent: 5,
+  };
+  return ranks[hook];
+}
+
+function modelHookSignatureLabel(marker: ActualFlowItem, hook: MiddlewareHookName): string {
+  const rawTitle = marker.title.replace(`${hook} · `, "").replace(`${hook}: `, "");
+  const middlewareName = stringArray(marker.span?.metadata?.middleware)[0];
+  const raw = rawTitle && rawTitle !== hook ? rawTitle : middlewareName || hook;
+  const compact = raw.replace(/Middleware/g, "").replace(new RegExp(`\\.${hook}$`), "");
+  return compact === hook ? hook : `${compact}.${hook}`;
 }
 
 function invocationModelCallIndex(invocation: MiddlewareHookInvocation): number | null {
   const candidates = [
     invocation.invocation?.metadata?.model_call_index,
+    recordFromUnknown(invocation.invocation?.before).model_call_index,
+    recordFromUnknown(invocation.invocation?.after).model_call_index,
+    recordFromUnknown(invocation.invocation?.diff).model_call_index,
+    recordFromUnknown(invocation.invocation?.diff).model_call_index_after,
     invocation.spans[0]?.metadata?.model_call_index,
     invocation.effects[0]?.metadata?.model_call_index,
   ];
   for (const candidate of candidates) {
-    if (typeof candidate === "number") return candidate;
+    const parsed = numberFromUnknown(candidate);
+    if (parsed !== null) return parsed;
+  }
+  return null;
+}
+
+function numberFromUnknown(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
   }
   return null;
 }
@@ -1791,6 +1903,7 @@ function dedupeFlowItems(items: ActualFlowItem[], markerId: string): ActualFlowI
     return [
       {
         ...item,
+        signature: item.signature ? dedupeFlowItems(item.signature, markerId) : item.signature,
         children: item.children ? dedupeFlowItems(item.children, markerId) : item.children,
       },
     ];
@@ -1878,14 +1991,16 @@ function buildHookInvocations(
   const exactInvocations = dedupeInferredInvocations((trace.middleware_invocations || [])
     .filter((invocation) => normalizeHookName(invocation.hook) === hook)
     .sort((a, b) => {
+      const sequenceDelta = Number(a.sequence || 0) - Number(b.sequence || 0);
+      if (sequenceDelta !== 0) return sequenceDelta;
+      const createdAtDelta = Number(a.created_at || 0) - Number(b.created_at || 0);
+      if (createdAtDelta !== 0) return createdAtDelta;
       const aMiddlewareOrder = middlewareInvocationOrder(a, middleware);
       const bMiddlewareOrder = middlewareInvocationOrder(b, middleware);
       if ((Number.isFinite(aMiddlewareOrder) || Number.isFinite(bMiddlewareOrder)) && aMiddlewareOrder !== bMiddlewareOrder) {
         return aMiddlewareOrder - bMiddlewareOrder;
       }
-      const sequenceDelta = Number(a.sequence || 0) - Number(b.sequence || 0);
-      if (sequenceDelta !== 0) return sequenceDelta;
-      return Number(a.created_at || 0) - Number(b.created_at || 0);
+      return 0;
     }));
   if (exactInvocations.length) {
     return exactInvocations.map((invocation, index, all) => {
@@ -2990,7 +3105,7 @@ function SpanDetail({ span, allSpans = [], onClose }: { span: TraceSpan; allSpan
       {isModelInput ? (
         <ModelInputDetail span={span} allSpans={allSpans} />
       ) : isTool ? (
-        <ToolSpanDetail span={span} />
+        <ToolSpanDetail span={span} allSpans={allSpans} />
       ) : (
         <div className="grid gap-2 lg:grid-cols-2">
           <DetailBlock title="Output" value={span.output} />
@@ -3004,14 +3119,51 @@ function SpanDetail({ span, allSpans = [], onClose }: { span: TraceSpan; allSpan
   );
 }
 
-function ToolSpanDetail({ span }: { span: TraceSpan }) {
+function ToolSpanDetail({ span, allSpans = [] }: { span: TraceSpan; allSpans?: TraceSpan[] }) {
+  const ragSpans = allSpans.filter((item) => item.parent_id === span.id && item.type === "rag");
+  const ragStages = ragStageCounts(ragSpans);
   return (
-    <div className="grid gap-2 lg:grid-cols-2">
-      <DetailBlock title="Tool Input / Arguments" value={span.input} />
-      <DetailBlock title="Tool Output / Result" value={span.output} />
-      <DetailBlock title="Metadata" value={span.metadata || {}} />
+    <div className="space-y-2">
+      {ragSpans.length > 0 && (
+        <div className="rounded-lg border border-emerald-100 bg-emerald-50/50 p-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <p className="text-[11px] font-bold text-emerald-800">RAG 细节已折叠</p>
+              <p className="mt-0.5 text-[10px] text-emerald-700/70">
+                主流程只展示 tool output 和后续 model input；检索内部步骤保留在原始 trace 数据里。
+              </p>
+            </div>
+            <span className="rounded-full bg-white px-2 py-0.5 text-[10px] font-semibold text-emerald-700 shadow-sm">
+              {ragSpans.length} steps
+            </span>
+          </div>
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {ragStages.map((item) => (
+              <span key={item.stage} className="rounded-md border border-emerald-100 bg-white px-2 py-1 text-[10px] font-medium text-emerald-700">
+                {item.stage}
+                {item.count > 1 ? ` ×${item.count}` : ""}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+      <div className="grid gap-2 lg:grid-cols-2">
+        <DetailBlock title="Tool Input / Arguments" value={span.input} />
+        <DetailBlock title="Tool Output / Result" value={span.output} />
+        <DetailBlock title="Metadata" value={span.metadata || {}} />
+      </div>
     </div>
   );
+}
+
+function ragStageCounts(spans: TraceSpan[]): Array<{ stage: string; count: number }> {
+  const counts = new Map<string, number>();
+  spans.forEach((span) => {
+    const rawStage = typeof span.metadata?.rag_stage === "string" ? span.metadata.rag_stage : span.name.replace(/^rag\./, "");
+    const group = rawStage.split(".", 1)[0] || rawStage || "rag";
+    counts.set(group, (counts.get(group) || 0) + 1);
+  });
+  return Array.from(counts.entries()).map(([stage, count]) => ({ stage, count }));
 }
 
 function ModelInputDetail({ span, allSpans = [] }: { span: TraceSpan; allSpans?: TraceSpan[] }) {
@@ -3037,6 +3189,7 @@ function ModelInputDetail({ span, allSpans = [] }: { span: TraceSpan; allSpans?:
   const toolSchemas = contract?.tool_schemas || [];
   const previousToolSchemas = modelInputContractFromSpan(previousModelInputSpan(span, allSpans))?.tool_schemas || [];
   const toolDiff = compareToolSchemas(previousToolSchemas, toolSchemas);
+  const assembly = contract?.assembly || fallbackModelInputAssembly(messages, toolSchemas, contract?.params || {}, metadata, fingerprints);
   const visibleModelParams = Object.entries(contract?.params || {})
     .filter(([, value]) => value !== null && value !== undefined && value !== "")
     .slice(0, 6);
@@ -3066,7 +3219,7 @@ function ModelInputDetail({ span, allSpans = [] }: { span: TraceSpan; allSpans?:
         <MiniMetric label="Messages" value={String(metadata.message_count ?? messages.length)} />
         <MiniMetric label="Tokens" value={`~${metadata.estimated_tokens ?? 0}`} />
         <MiniMetric label="Tools" value={String(metadata.tool_schema_count ?? 0)} />
-        <MiniMetric label="Boundary" value={String(metadata.capture_boundary || "-").replace("ModelClientChatModel.", "")} />
+        <MiniMetric label="LLM 调用方式" value={formatModelCallBoundary(metadata.capture_boundary)} />
       </div>
       {visibleModelParams.length > 0 && (
         <div className="flex flex-wrap gap-1">
@@ -3077,6 +3230,8 @@ function ModelInputDetail({ span, allSpans = [] }: { span: TraceSpan; allSpans?:
           ))}
         </div>
       )}
+
+      <ModelInputAssemblyPanel assembly={assembly} />
 
       <ModelInputSection
         icon={<Cpu className="h-4 w-4" />}
@@ -3152,6 +3307,8 @@ function ModelInputDetail({ span, allSpans = [] }: { span: TraceSpan; allSpans?:
         title="Tools"
         subtitle={`${toolSchemas.length} schemas`}
         hash={fingerprints.tool_schema_hash}
+        defaultCollapsed
+        collapsedText="Tools schema 已折叠 · 展开后查看完整工具列表"
       >
         <ToolSchemaSummary tools={toolSchemas} diff={toolDiff} />
       </ModelInputSection>
@@ -3179,6 +3336,31 @@ interface ModelCallContract {
   tool_schemas?: ModelToolSchema[];
   params?: Record<string, unknown>;
   fingerprints?: ModelCallFingerprints;
+  assembly?: ModelInputAssembly;
+}
+
+interface ModelInputAssembly {
+  boundary?: string;
+  principle?: string;
+  sections?: ModelInputAssemblySection[];
+}
+
+interface ModelInputAssemblySection {
+  key?: string;
+  label?: string;
+  source?: string;
+  count?: number;
+  chars?: number;
+  hash?: string;
+  included?: boolean;
+  roles?: Record<string, number>;
+  tool_call_count?: number;
+  binding?: {
+    mode?: string;
+    kwargs?: Record<string, unknown>;
+  };
+  params?: Record<string, unknown>;
+  notes?: string[];
 }
 
 interface ToolSchemaDiff {
@@ -3193,19 +3375,178 @@ interface ModelToolSchema {
   schema_hash?: string;
 }
 
+function formatModelCallBoundary(value: unknown): string {
+  const raw = String(value || "").replace("ModelClientChatModel.", "");
+  const labelMap: Record<string, string> = {
+    _astream: "异步流式",
+    _stream: "同步流式",
+    _agenerate: "异步非流式",
+    _generate: "同步非流式",
+  };
+  return labelMap[raw] || raw || "-";
+}
+
+function fallbackModelInputAssembly(
+  messages: ModelMessagePreview[],
+  tools: ModelToolSchema[],
+  params: Record<string, unknown>,
+  metadata: Record<string, unknown>,
+  fingerprints: ModelCallFingerprints
+): ModelInputAssembly {
+  const systemMessages = messages.filter((message) => isSystemMessage(message));
+  const conversationMessages = messages.filter((message) => !isSystemMessage(message));
+  const roleCounts: Record<string, number> = {};
+  messages.forEach((message) => {
+    const role = String(message.role || "unknown").toLowerCase();
+    roleCounts[role] = (roleCounts[role] || 0) + 1;
+  });
+  const toolCallCount = messages.reduce((sum, message) => sum + (message.tool_call_count || 0), 0);
+  return {
+    boundary: String(metadata.capture_boundary || "model boundary"),
+    principle: "final_payload_entering_llm",
+    sections: [
+      {
+        key: "system_prompt",
+        label: "System prompt",
+        source: "LangChain messages with role=system",
+        count: systemMessages.length,
+        chars: Number(metadata.system_prompt_chars || 0),
+        hash: fingerprints.system_prompt_hash,
+        included: systemMessages.length > 0,
+        notes: ["System prompt is read from the final structured messages payload."],
+      },
+      {
+        key: "messages",
+        label: "Messages",
+        source: "LangChain messages payload",
+        count: conversationMessages.length,
+        chars: conversationMessages.reduce((sum, message) => sum + (message.chars || 0), 0),
+        hash: fingerprints.messages_hash,
+        included: conversationMessages.length > 0,
+        roles: roleCounts,
+        tool_call_count: toolCallCount,
+      },
+      {
+        key: "tools",
+        label: "Tools",
+        source: "ModelClient.bind_tools structured schema",
+        count: tools.length,
+        hash: fingerprints.tool_schema_hash,
+        included: tools.length > 0,
+        binding: { mode: "bind_tools", kwargs: {} },
+        notes: ["Tool schemas are separate from system prompt text."],
+      },
+      {
+        key: "params",
+        label: "Model params",
+        source: "ModelClient runtime configuration",
+        count: Object.values(params).filter((value) => value !== null && value !== undefined && value !== "").length,
+        included: Object.keys(params).length > 0,
+        params,
+      },
+    ],
+  };
+}
+
+function ModelInputAssemblyPanel({ assembly }: { assembly: ModelInputAssembly }) {
+  const sections = assembly.sections || [];
+  if (!sections.length) return null;
+  return (
+    <section className="rounded-xl border border-blue-100 bg-blue-50/40 p-3">
+      <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
+        <div className="flex min-w-0 items-start gap-2">
+          <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-white text-blue-600 shadow-sm">
+            <Split className="h-4 w-4" />
+          </span>
+          <div className="min-w-0">
+            <p className="text-[13px] font-bold text-slate-900">Model input 组装细则</p>
+            <p className="mt-0.5 text-[10px] text-slate-500">
+              {formatModelCallBoundary(assembly.boundary)}
+              {assembly.principle ? ` · ${assembly.principle}` : ""}
+            </p>
+          </div>
+        </div>
+        <span className="rounded-full bg-white px-2 py-1 text-[10px] font-semibold text-blue-600 shadow-sm">
+          {sections.length} parts
+        </span>
+      </div>
+      <div className="grid gap-2 lg:grid-cols-4">
+        {sections.map((section) => (
+          <ModelInputAssemblyCard key={section.key || section.label} section={section} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function ModelInputAssemblyCard({ section }: { section: ModelInputAssemblySection }) {
+  const notes = section.notes || [];
+  const metrics = [
+    typeof section.count === "number" ? `${section.count} item${section.count === 1 ? "" : "s"}` : null,
+    typeof section.chars === "number" ? `${section.chars} chars` : null,
+    typeof section.tool_call_count === "number" && section.tool_call_count > 0 ? `${section.tool_call_count} tool calls` : null,
+  ].filter(Boolean);
+  return (
+    <div className="min-w-0 rounded-lg border border-blue-100 bg-white p-2.5">
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <p className="truncate text-[11px] font-bold text-slate-900">{section.label || section.key || "part"}</p>
+          {section.source && <p className="mt-0.5 line-clamp-2 text-[10px] leading-relaxed text-slate-500">{section.source}</p>}
+        </div>
+        <span
+          className={`shrink-0 rounded-full px-1.5 py-0.5 text-[9px] font-bold ${
+            section.included ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-400"
+          }`}
+        >
+          {section.included ? "included" : "empty"}
+        </span>
+      </div>
+      {metrics.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-1">
+          {metrics.map((metric) => (
+            <span key={metric} className="rounded-md bg-slate-50 px-1.5 py-0.5 text-[9px] font-semibold text-slate-500">
+              {metric}
+            </span>
+          ))}
+        </div>
+      )}
+      {section.hash && <p className="mt-2 font-mono text-[9px] text-slate-300">hash {shortHash(section.hash)}</p>}
+      {section.binding?.mode && (
+        <p className="mt-2 rounded-md bg-emerald-50 px-2 py-1 text-[10px] font-medium text-emerald-700">
+          binding: {section.binding.mode}
+        </p>
+      )}
+      {notes.length > 0 && (
+        <ul className="mt-2 space-y-1">
+          {notes.slice(0, 2).map((note) => (
+            <li key={note} className="text-[10px] leading-relaxed text-slate-400">
+              {note}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 function ModelInputSection({
   icon,
   title,
   subtitle,
   hash,
+  defaultCollapsed = false,
+  collapsedText,
   children,
 }: {
   icon: React.ReactNode;
   title: string;
   subtitle?: string;
   hash?: string;
+  defaultCollapsed?: boolean;
+  collapsedText?: string;
   children: React.ReactNode;
 }) {
+  const [isCollapsed, setIsCollapsed] = useState(defaultCollapsed);
   return (
     <section className="rounded-xl border border-slate-100 bg-slate-50/50 p-3">
       <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
@@ -3218,13 +3559,31 @@ function ModelInputSection({
             {subtitle && <p className="mt-0.5 text-[10px] text-slate-400">{subtitle}</p>}
           </div>
         </div>
-        {hash && (
-          <span className="rounded-md border border-slate-100 bg-white px-2 py-1 font-mono text-[10px] font-semibold text-slate-500">
-            {shortHash(hash)}
-          </span>
-        )}
+        <div className="flex items-center gap-1.5">
+          {hash && (
+            <span className="rounded-md border border-slate-100 bg-white px-2 py-1 font-mono text-[10px] font-semibold text-slate-500">
+              {shortHash(hash)}
+            </span>
+          )}
+          {defaultCollapsed && (
+            <button
+              type="button"
+              onClick={() => setIsCollapsed((value) => !value)}
+              className="flex items-center gap-1 rounded-md border border-slate-100 bg-white px-2 py-1 text-[10px] font-semibold text-slate-500 hover:bg-slate-50"
+            >
+              {isCollapsed ? <ChevronRight className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+              {isCollapsed ? "展开" : "折叠"}
+            </button>
+          )}
+        </div>
       </div>
-      {children}
+      {isCollapsed ? (
+        <div className="rounded-lg border border-dashed border-slate-200 bg-white/70 px-3 py-3 text-[11px] text-slate-400">
+          {collapsedText || "已折叠，展开后查看完整内容。"}
+        </div>
+      ) : (
+        children
+      )}
     </section>
   );
 }
@@ -3583,6 +3942,7 @@ interface ActualFlowItem {
   subtitle: string;
   title: string;
   span?: TraceSpan;
+  signature?: ActualFlowItem[];
   children?: ActualFlowItem[];
 }
 
@@ -3615,13 +3975,111 @@ function buildActualFlowForTrace(trace: AgentTrace | null, spans: TraceSpan[]): 
     .map((rawInvocation) => middlewareInvocationFromRaw(rawInvocation, spans))
     .filter((invocation): invocation is MiddlewareHookInvocation => Boolean(invocation))
     .filter((invocation) => shouldShowInvocationInActualFlow(invocation))
-    .sort((a, b) => a.sequence - b.sequence);
+    .sort((a, b) => actualFlowInvocationOrder(a, trace) - actualFlowInvocationOrder(b, trace));
 
   return invocations.reduce((items, invocation) => {
     const markerSpan = middlewareInvocationMarkerSpan(invocation);
     const marker = middlewareInvocationFlowItem(invocation, markerSpan);
     return insertTopLevelFlowMarkerForInvocation(items, marker, invocation);
   }, base);
+}
+
+function traceFlowDebugEnabled(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    const params = new URLSearchParams(window.location.search);
+    return params.get("traceDebug") === "1" || window.localStorage.getItem("puddingclaw.traceDebug") === "1";
+  } catch {
+    return false;
+  }
+}
+
+function emitTraceFlowDebug(trace: AgentTrace | null, spans: TraceSpan[], actualFlow: ActualFlowItem[]) {
+  if (!trace || !traceFlowDebugEnabled()) return;
+  const invocations = (trace.middleware_invocations || [])
+    .map((rawInvocation) => middlewareInvocationFromRaw(rawInvocation, spans))
+    .filter((invocation): invocation is MiddlewareHookInvocation => Boolean(invocation))
+    .filter((invocation) => shouldShowInvocationInActualFlow(invocation));
+  const hookOrder = trace.runtime_inventory?.middleware?.hooks?.before_agent || [];
+  const table = invocations.map((invocation) => {
+    const raw = invocation.invocation;
+    return {
+      hook: invocation.hook,
+      title: invocation.title,
+      middleware: Array.isArray(raw?.middleware) ? raw.middleware.join(", ") : "",
+      coverage: raw?.metadata?.coverage,
+      semantic_order: raw?.metadata?.semantic_order,
+      stack_order: middlewareInvocationStackOrder(invocation, trace),
+      sequence: invocation.sequence,
+      computed_order: actualFlowInvocationOrder(invocation, trace),
+    };
+  });
+  const flow = actualFlow.map((item, index) => ({
+    index,
+    type: item.type,
+    label: item.label,
+    title: item.title,
+    hook: normalizeHookName(item.span?.metadata?.hook),
+    middleware: Array.isArray(item.span?.metadata?.middleware) ? item.span?.metadata?.middleware.join(", ") : undefined,
+  }));
+  console.groupCollapsed(`[PuddingClaw trace flow debug] ${trace.trace_id}`);
+  console.table(hookOrder.map((entry) => ({
+    hook: "before_agent",
+    name: entry.name,
+    execution_order: entry.execution_order,
+    stack_order: entry.stack_order || entry.order,
+  })));
+  console.table(table);
+  console.table(flow);
+  console.groupEnd();
+}
+
+function actualFlowInvocationOrder(invocation: MiddlewareHookInvocation, trace: AgentTrace | null): number {
+  const semantic =
+    numberFromUnknown(invocation.invocation?.metadata?.semantic_order) ??
+    hookSemanticOrder(invocation.hook);
+  const stackOrder = middlewareInvocationStackOrder(invocation, trace);
+  return semantic * 100000 + stackOrder * 100 + invocation.sequence;
+}
+
+function hookSemanticOrder(hook: string): number {
+  const order: Record<string, number> = {
+    before_agent: 10,
+    before_model: 20,
+    wrap_model_call: 30,
+    after_model: 40,
+    wrap_tool_call: 50,
+    after_agent: 60,
+  };
+  return order[hook] ?? 99;
+}
+
+function middlewareInvocationStackOrder(invocation: MiddlewareHookInvocation, trace: AgentTrace | null): number {
+  const inventory = trace?.runtime_inventory as TraceRuntimeInventory | undefined;
+  const invocationNames = new Set(
+    [
+      ...(Array.isArray(invocation.invocation?.middleware) ? invocation.invocation.middleware : []),
+      invocation.invocation?.metadata?.proxied_middleware,
+      invocation.title,
+      invocation.title.split(".", 1)[0],
+    ]
+      .map((value) => String(value || "").trim())
+      .filter(Boolean)
+  );
+  const hook = invocation.hook;
+  const hookEntries = inventory?.middleware?.hooks?.[hook] || [];
+  const hookMatch = hookEntries.find((entry) => invocationNames.has(String(entry.name || "").trim()));
+  const hookOrder = numberFromUnknown(hookMatch?.execution_order);
+  if (hookOrder !== null) return hookOrder;
+
+  const stack = inventory?.middleware?.stack || [];
+  const match = stack.find((entry) => {
+    const name = String(entry.name || "").trim();
+    const hooks = Array.isArray(entry.hooks) ? entry.hooks : [];
+    return invocationNames.has(name) && hooks.includes(hook);
+  });
+  const order = numberFromUnknown(match?.execution_order) ?? numberFromUnknown(match?.stack_order) ?? numberFromUnknown(match?.order);
+  return order ?? 9999;
 }
 
 function middlewareInvocationFromRaw(
@@ -3894,7 +4352,9 @@ function FlowNodeCard({
   onToggle: () => void;
   onSelect: (span: TraceSpan) => void;
 }) {
-  const hasChildren = Boolean(item.children?.length);
+  const visibleChildren = item.children || [];
+  const signatureItems = item.signature || [];
+  const hasChildren = visibleChildren.length > 0;
   const isSelected = selectedSpanId === item.span?.id;
   const isMiddlewareMarker = item.type === "middleware" && Boolean(item.span?.metadata?.middleware_invocation_id);
   return (
@@ -3927,9 +4387,23 @@ function FlowNodeCard({
               </span>
             )}
           </div>
-          {hasChildren ? (
+          {hasChildren || signatureItems.length ? (
             <div className="mt-1 flex flex-wrap gap-1">
-              {item.children!.map((child) => (
+              {signatureItems.map((child) => (
+                <button
+                  key={child.id}
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    if (child.span) onSelect(child.span);
+                  }}
+                  className="rounded border border-violet-100 bg-violet-50 px-1.5 py-0.5 text-[9px] font-semibold text-violet-700 hover:bg-violet-100"
+                  title={child.title}
+                >
+                  {child.label}
+                </button>
+              ))}
+              {visibleChildren.map((child) => (
                 <span
                   key={child.id}
                   className="rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[9px] font-medium text-slate-500"
@@ -3952,7 +4426,7 @@ function FlowNodeCard({
       </button>
       {expanded && hasChildren && (
         <div className="space-y-1 border-t border-slate-100 bg-white/70 px-3 py-2">
-          {item.children!.map((child) => (
+          {visibleChildren.map((child) => (
             <button
               key={child.id}
               type="button"
@@ -3987,6 +4461,7 @@ function spanLabel(span: TraceSpan): string {
     return `graph: ${span.metadata.graph_node}`;
   }
   if (span.type === "model_input") return "模型输入快照";
+  if (span.type === "rag") return `RAG: ${String(span.metadata?.rag_stage || span.name.replace(/^rag\./, ""))}`;
   if (span.type === "llm") {
     const displayIndex = span.metadata?.display_model_call_index;
     if (typeof displayIndex === "number") return `第 ${displayIndex + 1} 次模型调用`;
@@ -4007,6 +4482,7 @@ function typeLabel(type: TraceSpan["type"]): string {
     reasoning: "推理内容",
     todo: "Todo",
     custom: "自定义事件",
+    rag: "RAG",
     graph: "编译图节点",
     middleware: "Middleware",
     memory: "Memory",

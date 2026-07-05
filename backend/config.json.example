@@ -10,16 +10,19 @@
     "max_tokens": 4096,
     "context_window": 1000000
   },
-  "embedding": {
+  "fallback_embedding": {
     "provider": "openai",
     "model": "text-embedding-v4",
     "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    "api_key": ""
+    "api_key": "",
+    "dimension": 1024,
+    "batch_size": 20
   },
   "multimodal_embedding": {
     "provider": "dashscope",
     "model": "qwen2.5-vl-embedding",
     "dimension": 1024,
+    "batch_size": 10,
     "base_url": "",
     "route_path": "/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding",
     "api_key": "",
@@ -27,7 +30,24 @@
   },
   "rag": {
     "top_k": 3,
-    "similarity_threshold": 0.7
+    "similarity_threshold": 0.7,
+    "hybrid": {
+      "enabled": true,
+      "mode": "reciprocal_rerank",
+      "text_vector_weight": 0.45,
+      "image_vector_weight": 0.35,
+      "bm25_weight": 0.2,
+      "candidate_top_k": 10
+    },
+    "rerank": {
+      "enabled": false,
+      "provider": "dashscope",
+      "model": "qwen3-vl-rerank",
+      "top_n": 5,
+      "candidate_top_k": 50,
+      "base_url": "",
+      "api_key": ""
+    }
   },
   "database": {
     "mode": "bundled",

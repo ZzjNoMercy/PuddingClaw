@@ -26,9 +26,14 @@ def test_middleware_inventory_uses_actual_hook_overrides(tmp_path):
 
     assert hooks == ["before_agent", "wrap_model_call"]
     assert [item["name"] for item in inventory["hooks"]["before_agent"]] == [
-        "TodoListMiddleware",
         "SkillsMiddleware",
         "MemoryMiddleware",
+    ]
+    assert [item["name"] for item in inventory["hooks"]["wrap_model_call"]] == [
+        "TodoListMiddleware",
+        "SubAgentMiddleware",
+        "MemoryMiddleware",
+        "AnthropicPromptCachingMiddleware",
     ]
     assert [item["name"] for item in inventory["hooks"]["after_model"]] == [
         "PatchToolCallsMiddleware",

@@ -74,6 +74,30 @@ def test_trace_collector_adds_todo_span():
     assert effect["after"]["todo_count"] == 1
 
 
+def test_trace_collector_adds_rag_span_under_tool():
+    collector = TraceCollector(session_id="session-rag")
+    tool_id = collector.start_tool_span("llamaindex_knowledge_query", tool_call_id="call-rag", input_data={"query": "AI"})
+    rag_id = collector.add_rag_span(
+        "retrieve.text_vector",
+        {
+            "candidate_count": 2,
+            "top_candidates": [{"title": "Doc", "source_id": "src_1"}],
+        },
+        metadata={"rag_channel": "text_vector"},
+    )
+    collector.finish_tool_span("call-rag", output="encoded result", is_error=False)
+
+    trace = collector.finish(status="completed")
+    spans = {span["id"]: span for span in trace["spans"]}
+    rag_span = spans[rag_id]
+    assert rag_span["type"] == "rag"
+    assert rag_span["name"] == "rag.retrieve.text_vector"
+    assert rag_span["parent_id"] == tool_id
+    assert rag_span["metadata"]["rag_stage"] == "retrieve.text_vector"
+    assert rag_span["metadata"]["rag_channel"] == "text_vector"
+    assert rag_span["output"]["candidate_count"] == 2
+
+
 def test_trace_collector_adds_model_input_span():
     collector = TraceCollector(session_id="session-model-input", query_id="query-model")
     collector.add_model_input_span(
@@ -471,6 +495,7 @@ def test_middleware_trace_proxy_records_direct_state_hook_attribution():
     )
     assert invocation["metadata"]["attribution"] == "middleware_proxy"
     assert invocation["metadata"]["coverage"] == "direct"
+    assert invocation["metadata"]["model_call_index"] == 0
     assert invocation["status"] == "changed"
     assert invocation["diff"]["message_count_delta"] == 1
     assert invocation["diff"]["state_fields_changed"] == ["messages"]
@@ -485,6 +510,34 @@ def test_middleware_trace_proxy_records_direct_state_hook_attribution():
         "DemoBeforeModelMiddleware.before_model.before",
         "DemoBeforeModelMiddleware.before_model.after",
     ]
+
+
+def test_middleware_trace_proxy_records_model_call_index_per_before_model_call():
+    class DemoBeforeModelMiddleware(AgentMiddleware):
+        def before_model(self, state, runtime):
+            return None
+
+    proxied = wrap_middleware_for_trace(DemoBeforeModelMiddleware())
+    collector = TraceCollector(session_id="session-proxy-index", query_id="query-proxy-index")
+    with collector:
+        proxied.before_model({"messages": [{"role": "user", "content": "first"}]}, None)
+        collector.add_model_input_span(
+            messages=[{"role": "user", "content": "first"}],
+            capture_boundary="test.first",
+        )
+        proxied.before_model({"messages": [{"role": "user", "content": "second"}]}, None)
+        collector.add_model_input_span(
+            messages=[{"role": "user", "content": "second"}],
+            capture_boundary="test.second",
+        )
+
+    trace = collector.finish(status="completed")
+    invocations = [
+        item
+        for item in trace["middleware_invocations"]
+        if item["title"] == "DemoBeforeModelMiddleware.before_model"
+    ]
+    assert [item["metadata"]["model_call_index"] for item in invocations] == [0, 1]
 
 
 def test_middleware_trace_proxy_preserves_extra_state_hook_args():

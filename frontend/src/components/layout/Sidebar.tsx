@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useRef, useCallback, useMemo } from "react";
+import { createPortal } from "react-dom";
 import Link from "next/link";
 import { useRouter, usePathname } from "next/navigation";
 import {
@@ -239,7 +240,7 @@ export default function Sidebar() {
                         return removed;
                       }}
                     />
-                    <div className="relative z-0 ml-5 mt-0.5 space-y-px">
+                    <div className="relative ml-5 mt-0.5 space-y-px">
                       {childSessions.length > 0 ? (
                         childSessions.slice(0, 5).map((s) => (
                           <SessionItem
@@ -637,14 +638,21 @@ function SessionItem({
   const [menuOpen, setMenuOpen] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(title);
+  const [menuPosition, setMenuPosition] = useState<{ left: number; top: number } | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  const menuButtonRef = useRef<HTMLButtonElement>(null);
 
   // Close menu on outside click
   useEffect(() => {
     if (!menuOpen) return;
     const handler = (e: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+      const target = e.target as Node;
+      if (
+        menuRef.current &&
+        !menuRef.current.contains(target) &&
+        !menuButtonRef.current?.contains(target)
+      ) {
         setMenuOpen(false);
       }
     };
@@ -670,10 +678,24 @@ function SessionItem({
 
   const handleDelete = useCallback(() => {
     setMenuOpen(false);
-    if (confirm("Delete this session?")) {
+    if (confirm("确定删除这个对话吗？")) {
       onDelete();
     }
   }, [onDelete]);
+
+  const toggleMenu = useCallback(() => {
+    const rect = menuButtonRef.current?.getBoundingClientRect();
+    if (rect) {
+      const width = 128;
+      const height = 88;
+      const drawerRect = menuButtonRef.current?.closest("aside")?.getBoundingClientRect();
+      const drawerRight = drawerRect?.right ?? window.innerWidth;
+      const left = Math.min(drawerRight - width - 12, window.innerWidth - width - 12);
+      const top = Math.min(rect.bottom + 6, window.innerHeight - height - 12);
+      setMenuPosition({ left: Math.max(12, left), top: Math.max(12, top) });
+    }
+    setMenuOpen((v) => !v);
+  }, []);
 
   if (renaming) {
     return (
@@ -706,7 +728,7 @@ function SessionItem({
   }
 
   return (
-    <div className="relative group">
+    <div className={`relative group ${menuOpen ? "z-[90]" : ""}`}>
       <button
         onClick={onSelect}
         className={`w-full flex items-center gap-1.5 px-3 py-1.5 text-[12px] rounded-xl transition-all text-left relative pr-8 ${
@@ -720,19 +742,24 @@ function SessionItem({
       </button>
 
       {/* More button */}
-      <div className={`absolute right-1 top-1/2 -translate-y-1/2 ${menuOpen ? "z-[60]" : ""}`} ref={menuRef}>
+      <div className={`absolute right-1 top-1/2 -translate-y-1/2 ${menuOpen ? "z-[100]" : ""}`}>
         <button
+          ref={menuButtonRef}
           onClick={(e) => {
             e.stopPropagation();
-            setMenuOpen((v) => !v);
+            toggleMenu();
           }}
           className="p-1 rounded-md text-gray-400 opacity-0 group-hover:opacity-100 hover:text-gray-700 hover:bg-black/[0.05] transition-all"
         >
           <MoreHorizontal className="w-3.5 h-3.5" />
         </button>
 
-        {menuOpen && (
-          <div className="absolute right-0 top-full mt-1 w-32 bg-white rounded-lg shadow-lg border border-black/[0.08] py-1 z-50 animate-fade-in-scale">
+        {menuOpen && menuPosition && typeof document !== "undefined" ? createPortal(
+          <div
+            ref={menuRef}
+            style={{ left: menuPosition.left, top: menuPosition.top }}
+            className="fixed z-[9999] w-32 rounded-lg border border-black/[0.08] bg-white py-1 shadow-lg animate-fade-in-scale"
+          >
             <button
               onClick={() => {
                 setMenuOpen(false);
@@ -742,17 +769,18 @@ function SessionItem({
               className="w-full flex items-center gap-2 px-3 py-1.5 text-[12px] text-gray-600 hover:bg-black/[0.04] transition-colors"
             >
               <Pencil className="w-3 h-3" />
-              Rename
+              重命名
             </button>
             <button
               onClick={handleDelete}
               className="w-full flex items-center gap-2 px-3 py-1.5 text-[12px] text-red-500 hover:bg-red-50 transition-colors"
             >
               <Trash2 className="w-3 h-3" />
-              Delete
+              删除
             </button>
-          </div>
-        )}
+          </div>,
+          document.body
+        ) : null}
       </div>
     </div>
   );

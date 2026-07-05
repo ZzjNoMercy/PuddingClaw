@@ -41,6 +41,8 @@ dependencies = [
     # LlamaIndex (knowledge base & memory indexing)
     "llama-index-core>=0.14.17",
     "llama-index-embeddings-openai>=0.6.0",
+    "llama-index-retrievers-bm25>=0.7.0",
+    "rank-bm25>=0.2.2",
     # Memory
     "mem0ai>=1.0.9",
     # Context engineering / token counting
@@ -72,7 +74,14 @@ dependencies = [
 # `mineru[all]` separately; it currently conflicts with this project's
 # openai>=2.28.0 / llama-index-core setuptools constraints.
 mineru = [
-    "mineru>=3.0",
+    # MinerU pipeline backend. Using the [pipeline] extra pulls in torch,
+    # torchvision, transformers, ftfy, shapely, pyclipper, onnxruntime, etc.
+    # Native MinerU is mainly for macOS here; Linux users are steered to the
+    # official Docker image so we do not pull CUDA wheels into the lock.
+    "mineru[pipeline]>=3.0; sys_platform == 'darwin'",
+    # MinerU 3.4.0 imports `six` from its bundled OCR pipeline but does not
+    # declare it in package metadata, so keep it explicit for native MinerU.
+    "six>=1.17.0; sys_platform == 'darwin'",
 ]
 
 # Milvus vector store (optional infrastructure; pinned versions).

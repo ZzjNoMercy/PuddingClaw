@@ -139,6 +139,20 @@ class TraceCollector:
         self.root.metadata.setdefault("event_order", self._next_event_order())
         self._emit("trace_span_start", self._event_payload(self.root))
 
+    def model_call_index_for_hook(self, hook: str) -> int | None:
+        """Return the model call index currently associated with a model hook.
+
+        `before_model` and `wrap_model_call` run before `add_model_input_span`
+        increments the counter, so the current model call is `_model_input_count`.
+        `after_model` runs after the model input boundary has been captured.
+        """
+
+        if hook in {"before_model", "wrap_model_call"}:
+            return self._model_input_count
+        if hook == "after_model" and self._model_input_count > 0:
+            return self._model_input_count - 1
+        return None
+
     def __enter__(self) -> "TraceCollector":
         self._context_token = _current_trace_collector.set(self)
         return self
@@ -247,6 +261,13 @@ class TraceCollector:
             "system_prompt_hash": self._stable_hash(system_prompt_text),
             "tool_schema_hash": self._stable_hash(tool_schema_items),
         }
+        assembly = self._model_input_assembly(
+            preview=preview,
+            tool_schema_items=tool_schema_items,
+            model_params=model_params or {},
+            capture_boundary=capture_boundary,
+            fingerprints=fingerprints,
+        )
         contract = {
             "message_count": len(messages),
             "system_prompt_chars": system_prompt_chars,
@@ -255,6 +276,7 @@ class TraceCollector:
             "tool_schemas": tool_schema_items,
             "params": model_params or {},
             "fingerprints": fingerprints,
+            "assembly": assembly,
         }
         model_call_index = self._model_input_count
         self._model_input_count += 1
@@ -308,6 +330,103 @@ class TraceCollector:
             source_span_id=span_id,
         )
         return span_id
+
+    def _model_input_assembly(
+        self,
+        *,
+        preview: list[dict[str, Any]],
+        tool_schema_items: list[dict[str, Any]],
+        model_params: dict[str, Any],
+        capture_boundary: str,
+        fingerprints: dict[str, str],
+    ) -> dict[str, Any]:
+        """Describe how the final LLM payload is assembled at the model boundary."""
+
+        system_messages = [
+            item
+            for item in preview
+            if str(item.get("role", "")).lower() in {"system", "systemmessage"}
+        ]
+        conversation_messages = [
+            item
+            for item in preview
+            if str(item.get("role", "")).lower() not in {"system", "systemmessage"}
+        ]
+        role_counts: dict[str, int] = {}
+        for item in preview:
+            role = str(item.get("role") or "unknown").lower()
+            role_counts[role] = role_counts.get(role, 0) + 1
+
+        system_chars = sum(int(item.get("chars") or 0) for item in system_messages)
+        message_chars = sum(int(item.get("chars") or 0) for item in conversation_messages)
+        tool_call_count = sum(int(item.get("tool_call_count") or 0) for item in preview)
+        bind_kwargs = {
+            key: value
+            for key, value in {
+                "tool_choice": model_params.get("tool_choice"),
+                "strict": model_params.get("strict"),
+            }.items()
+            if value is not None
+        }
+        return {
+            "boundary": capture_boundary,
+            "principle": "final_payload_entering_llm",
+            "sections": [
+                {
+                    "key": "system_prompt",
+                    "label": "System prompt",
+                    "source": "LangChain messages with role=system",
+                    "count": len(system_messages),
+                    "chars": system_chars,
+                    "hash": fingerprints.get("system_prompt_hash"),
+                    "included": len(system_messages) > 0,
+                    "notes": [
+                        "DeepAgents base system prompt and middleware materialized prompt text appear here when present.",
+                        "Tools are not counted here unless some middleware writes tool text into the prompt.",
+                    ],
+                },
+                {
+                    "key": "messages",
+                    "label": "Messages",
+                    "source": "LangChain messages payload",
+                    "count": len(conversation_messages),
+                    "chars": message_chars,
+                    "hash": fingerprints.get("messages_hash"),
+                    "included": len(conversation_messages) > 0,
+                    "roles": role_counts,
+                    "tool_call_count": tool_call_count,
+                    "notes": [
+                        "User, assistant, tool, and AI messages are preserved as structured messages.",
+                    ],
+                },
+                {
+                    "key": "tools",
+                    "label": "Tools",
+                    "source": "ModelClient.bind_tools structured schema",
+                    "count": len(tool_schema_items),
+                    "hash": fingerprints.get("tool_schema_hash"),
+                    "included": len(tool_schema_items) > 0,
+                    "binding": {
+                        "mode": "bind_tools",
+                        "kwargs": bind_kwargs,
+                    },
+                    "notes": [
+                        "Tool schemas are sent as the model API tool/function schema field, not appended to system prompt text.",
+                    ],
+                },
+                {
+                    "key": "params",
+                    "label": "Model params",
+                    "source": "ModelClient runtime configuration",
+                    "count": len([value for value in model_params.values() if value is not None]),
+                    "included": bool(model_params),
+                    "params": model_params,
+                    "notes": [
+                        "Model, temperature, streaming, and tool binding options are transport parameters around the message payload.",
+                    ],
+                },
+            ],
+        }
 
     def _record_model_call_boundary_snapshots(
         self,
@@ -1170,9 +1289,22 @@ class TraceCollector:
                     "effect_id": effect_id,
                     "source_span_id": source_span_id,
                     "coverage": "inferred",
+                    "semantic_order": self._hook_semantic_order(normalized_hook),
                 },
             )
         return source_span_id
+
+    @staticmethod
+    def _hook_semantic_order(hook: str | None) -> int:
+        order = {
+            "before_agent": 10,
+            "before_model": 20,
+            "wrap_model_call": 30,
+            "after_model": 40,
+            "wrap_tool_call": 50,
+            "after_agent": 60,
+        }
+        return order.get(str(hook or ""), 99)
 
     @staticmethod
     def _is_hook_level_boundary_effect(*, category: str, title: str) -> bool:
@@ -1219,6 +1351,7 @@ class TraceCollector:
         invocation_index = self._middleware_invocation_counts.get(normalized_hook, 0)
         self._middleware_invocation_counts[normalized_hook] = invocation_index + 1
         invocation_metadata = dict(metadata) if metadata else {}
+        invocation_metadata.setdefault("semantic_order", self._hook_semantic_order(normalized_hook))
         sequence = invocation_metadata.get("event_order")
         if not isinstance(sequence, int):
             sequence = self._next_event_order()
@@ -1530,6 +1663,34 @@ class TraceCollector:
         self._emit("trace_span_start", self._event_payload(span))
         self._emit("trace_span_end", self._event_payload(span))
         return span_id
+
+    def add_rag_span(
+        self,
+        stage: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        """Record a white-box RAG step under the active tool span."""
+
+        span_metadata = {
+            "rag_stage": stage,
+            "harness": {
+                "mechanism": "context_management",
+                "pillars": [
+                    {"name": "context_engineering", "role": "primary"},
+                    {"name": "architectural_constraints", "role": "supporting"},
+                ],
+            },
+        }
+        if metadata:
+            span_metadata.update(metadata)
+        return self.add_custom_span(
+            f"rag.{stage}",
+            payload or {},
+            span_type="rag",
+            metadata=span_metadata,
+        )
 
     def add_graph_node_span(self, node: str) -> str:
         lower = node.lower()

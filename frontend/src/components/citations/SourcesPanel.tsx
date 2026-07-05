@@ -14,7 +14,7 @@ import {
   Timer,
   X,
 } from "lucide-react";
-import { listSessionPermissions, revokePermissionGrant, type PermissionGrant } from "@/lib/api";
+import { listSessionPermissions, rawKnowledgeFileUrl, revokePermissionGrant, type PermissionGrant } from "@/lib/api";
 import { useApp, type SourceRecord, type ToolCall } from "@/lib/store";
 
 type TodoStatus = "completed" | "in_progress" | "pending";
@@ -500,6 +500,9 @@ const SourceItem = React.forwardRef<HTMLDivElement, {
   citationIndex?: number;
   isActive?: boolean;
 }>(function SourceItem({ source, citationIndex, isActive }, ref) {
+  const openUrl = sourceOpenUrl(source);
+  const isLocalSource = isLocalResourceUri(source.uri);
+
   return (
     <div
       ref={ref}
@@ -529,9 +532,9 @@ const SourceItem = React.forwardRef<HTMLDivElement, {
               {source.quote}
             </p>
           )}
-          {source.uri && (
+          {openUrl ? (
             <a
-              href={source.uri}
+              href={openUrl}
               target="_blank"
               rel="noreferrer"
               className="mt-2 inline-flex items-center gap-1 text-[11px] text-[#002fa7] hover:underline"
@@ -539,12 +542,44 @@ const SourceItem = React.forwardRef<HTMLDivElement, {
               查看来源
               <ExternalLink className="h-3 w-3" />
             </a>
-          )}
+          ) : isLocalSource ? (
+            <p className="mt-2 break-all text-[11px] leading-relaxed text-slate-400" title={source.uri}>
+              本地知识库资源
+            </p>
+          ) : null}
         </div>
       </div>
     </div>
   );
 });
+
+function metadataString(source: SourceRecord, key: string): string {
+  const value = source.metadata?.[key];
+  return typeof value === "string" ? value : "";
+}
+
+function isHttpUrl(value: string | undefined): boolean {
+  return /^https?:\/\//i.test(value || "");
+}
+
+function isLocalResourceUri(value: string | undefined): boolean {
+  if (!value) return false;
+  return value.startsWith("/knowledge/") || value.startsWith("/") || value.startsWith("~");
+}
+
+function sourceOpenUrl(source: SourceRecord): string {
+  const uri = source.uri || "";
+  if (isHttpUrl(uri)) return uri;
+  if (uri.startsWith("/knowledge/")) return rawKnowledgeFileUrl(uri);
+
+  const virtualPath =
+    metadataString(source, "virtual_path") ||
+    metadataString(source, "linked_markdown_virtual_path") ||
+    metadataString(source, "browser_path");
+  if (virtualPath.startsWith("/knowledge/")) return rawKnowledgeFileUrl(virtualPath);
+
+  return "";
+}
 
 function extractTodosFromToolCall(toolCall: ToolCall): Array<{ content: string; status: TodoStatus }> {
   if (toolCall.tool !== "write_todos" || !toolCall.output) return [];

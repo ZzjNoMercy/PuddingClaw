@@ -34,8 +34,6 @@ MINERU_API_URL="http://localhost:8002"
 # 本地运行 frontend/backend 时，基础设施若由 docker-compose.infra.yml 提供，
 # backend 应通过宿主机端口访问，而不是 Docker service name。
 export AI_GATEWAY_URL="${AI_GATEWAY_URL:-http://localhost:8080/v1}"
-export MINERU_URL="${MINERU_URL:-http://localhost:8002}"
-export DATABASE_URL="${DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:${POSTGRES_PORT}/${POSTGRES_DB}}"
 
 echo ""
 echo "============================================"
@@ -112,7 +110,7 @@ echo "  前端界面:  ${FRONTEND_URL}"
 echo "  API 文档:  ${BACKEND_URL}/docs"
 echo "  PostgreSQL:      ${POSTGRES_SERVICE_URL}"
 echo "    bundled 默认:  database=${POSTGRES_DB}, username=${POSTGRES_USER}, password=${POSTGRES_PASSWORD}"
-echo "    外接 PostgreSQL 时请提前设置 DATABASE_URL=postgresql+asyncpg://<user>:<password>@<host>:<port>/<database>"
+echo "    数据库优先使用 Settings 中的配置；如需命令行强制覆盖，可设置 PUDDINGCLAW_DATABASE_URL"
 echo "  Higress Gateway: ${HIGRESS_GATEWAY_URL}"
 echo "  Higress Console: ${HIGRESS_CONSOLE_URL}"
 echo "  Milvus:          ${MILVUS_SERVICE_URL}"

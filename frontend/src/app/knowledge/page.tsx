@@ -1,18 +1,20 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import {
   AlertCircle,
   ChevronDown,
   ChevronRight,
   CheckCircle2,
+  Database,
   FileText,
   FileUp,
   FolderOpen,
   Loader2,
   RefreshCw,
   Settings,
+  X,
 } from "lucide-react";
 
 import Navbar from "@/components/layout/Navbar";
@@ -22,11 +24,13 @@ import { useApp } from "@/lib/store";
 import {
   getKnowledgeFileTree,
   getKnowledgeStatus,
+  listKnowledgeImportJobs,
   listKnowledgeFiles,
   previewKnowledgeFile,
-  uploadKnowledgeDocument,
+  createKnowledgeImportJob,
   type KnowledgeDirectoryFile,
   type KnowledgeFilePreview,
+  type KnowledgeImportJob,
   type KnowledgeStatus,
   type KnowledgeTreeNode,
 } from "@/lib/api";
@@ -46,6 +50,30 @@ function formatBytes(value: number): string {
 function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   return String(error || "未知错误");
+}
+
+function jobStatusLabel(job: KnowledgeImportJob): string {
+  if (job.status === "queued") return "排队中";
+  if (job.status === "running") return "导入中";
+  if (job.status === "succeeded") return "已完成";
+  if (job.status === "failed") return "失败";
+  if (job.status === "cancelled") return "已取消";
+  return job.status;
+}
+
+function jobStatusClass(job: KnowledgeImportJob): string {
+  if (job.status === "succeeded") return "bg-emerald-50 text-emerald-700";
+  if (job.status === "failed") return "bg-red-50 text-red-600";
+  if (job.status === "running") return "bg-[#002fa7]/10 text-[#002fa7]";
+  return "bg-gray-100 text-gray-600";
+}
+
+function isVectorPublishJob(job: KnowledgeImportJob): boolean {
+  return job.metadata?.kind === "vector_publish" || job.file_type === "vector";
+}
+
+function jobKindLabel(job: KnowledgeImportJob): string {
+  return isVectorPublishJob(job) ? "向量导入" : "文件导入";
 }
 
 function KnowledgeFileTree({
@@ -142,11 +170,13 @@ export default function KnowledgePage() {
   } = useApp();
   const [status, setStatus] = useState<KnowledgeStatus | null>(null);
   const [directoryFiles, setDirectoryFiles] = useState<KnowledgeDirectoryFile[]>([]);
+  const [importJobs, setImportJobs] = useState<KnowledgeImportJob[]>([]);
   const [fileTree, setFileTree] = useState<KnowledgeTreeNode | null>(null);
   const [expandedTreePaths, setExpandedTreePaths] = useState<Set<string>>(new Set());
   const [previewFile, setPreviewFile] = useState<KnowledgeFilePreview | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploadTitle, setUploadTitle] = useState("");
   const [loading, setLoading] = useState(true);
   const [uploadingDocument, setUploadingDocument] = useState(false);
@@ -156,6 +186,12 @@ export default function KnowledgePage() {
   useEffect(() => {
     setMounted(true);
   }, []);
+
+  useEffect(() => {
+    if (!toast) return;
+    const timer = window.setTimeout(() => setToast(null), 3000);
+    return () => window.clearTimeout(timer);
+  }, [toast]);
 
   const handleSidebarResize = useCallback(
     (delta: number) => {
@@ -176,6 +212,8 @@ export default function KnowledgePage() {
       ]);
       setDirectoryFiles(nextFiles);
       setFileTree(nextTree);
+      const nextJobs = await listKnowledgeImportJobs();
+      setImportJobs(nextJobs);
     } catch (error) {
       setToast({ type: "error", message: errorMessage(error) });
     } finally {
@@ -186,6 +224,14 @@ export default function KnowledgePage() {
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    if (!importJobs.some((job) => job.status === "queued" || job.status === "running")) return;
+    const timer = window.setInterval(() => {
+      refresh();
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [importJobs, refresh]);
 
   const toggleTreePath = useCallback((path: string) => {
     setExpandedTreePaths((current) => {
@@ -221,10 +267,11 @@ export default function KnowledgePage() {
     setUploadingDocument(true);
     setToast(null);
     try {
-      const result = await uploadKnowledgeDocument(selectedFile, uploadTitle.trim() || undefined);
+      const job = await createKnowledgeImportJob(selectedFile, uploadTitle.trim() || undefined);
       setSelectedFile(null);
+      if (fileInputRef.current) fileInputRef.current.value = "";
       setUploadTitle("");
-      setToast({ type: "success", message: `已导入并发布：${result.document.virtual_path}` });
+      setToast({ type: "success", message: `已加入导入队列：${job.file_name}` });
       await refresh();
     } catch (error) {
       setToast({ type: "error", message: errorMessage(error) });
@@ -232,6 +279,13 @@ export default function KnowledgePage() {
       setUploadingDocument(false);
     }
   }, [refresh, selectedFile, uploadTitle]);
+
+  const clearSelectedFile = useCallback(() => {
+    setSelectedFile(null);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  }, []);
 
   return (
     <div className="h-screen app-bg text-gray-900">
@@ -313,7 +367,7 @@ export default function KnowledgePage() {
                   <FolderOpen className="h-4.5 w-4.5" />
                 </div>
                 <div className="min-w-0">
-                  <h2 className="text-sm font-semibold text-gray-950">本地知识库目录</h2>
+                  <h2 className="text-sm font-semibold text-gray-950">知识库目录</h2>
                   <p className="mt-0.5 text-[11px] text-gray-500">
                     {directoryFiles.length} 个文件
                   </p>
@@ -329,7 +383,7 @@ export default function KnowledgePage() {
             </div>
 
             <div className="mt-4 rounded-2xl bg-black/[0.025] p-3">
-              <p className="text-[10px] font-semibold tracking-wide text-gray-400">本地目录</p>
+              <p className="text-[10px] font-semibold tracking-wide text-gray-400">目录</p>
               <p
                 className="mt-2 whitespace-normal break-words text-[12px] leading-5 text-gray-700 [overflow-wrap:anywhere]"
                 title={status?.local_markdown.physical_path || "backend/knowledge"}
@@ -338,20 +392,7 @@ export default function KnowledgePage() {
               </p>
             </div>
 
-            <div className="mt-4 grid grid-cols-2 gap-2">
-              <div className="rounded-2xl bg-[#002fa7]/[0.06] px-3 py-2">
-                <p className="text-[10px] text-[#002fa7]/70">记录</p>
-                <p className="mt-1 text-sm font-semibold text-[#002fa7]">
-                  {status?.database.healthy ? "可用" : status?.database.configured ? "异常" : "未配置"}
-                </p>
-              </div>
-              <div className="rounded-2xl bg-emerald-500/[0.07] px-3 py-2">
-                <p className="text-[10px] text-emerald-700/70">文件</p>
-                <p className="mt-1 text-sm font-semibold text-emerald-700">{directoryFiles.length}</p>
-              </div>
-            </div>
-
-            <div className="mt-5 min-h-0 flex-1">
+            <div className="mt-4 min-h-0 flex-1">
               <div className="mb-2 flex items-center justify-between">
                 <p className="text-[11px] font-semibold text-gray-500">文件树</p>
                 <span className="text-[10px] text-gray-400">{directoryFiles.length}</span>
@@ -393,6 +434,7 @@ export default function KnowledgePage() {
               <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
                 <label className="inline-flex h-11 cursor-pointer items-center gap-2 rounded-2xl bg-[#002fa7] px-5 text-sm font-semibold text-white shadow-sm transition hover:bg-[#001f7a]">
                   <input
+                    ref={fileInputRef}
                     type="file"
                     accept="application/pdf,.pdf,text/markdown,.md,.markdown,.xlsx,.xls,.csv,.tsv,.txt,.docx"
                     className="hidden"
@@ -419,12 +461,89 @@ export default function KnowledgePage() {
               </div>
 
               {selectedFile ? (
-                <div className="mt-5 rounded-2xl bg-[#002fa7]/[0.06] px-4 py-2 text-sm text-[#002fa7]">
-                  已选择：{selectedFile.name} · {formatBytes(selectedFile.size)}
+                <div className="mt-5 inline-flex max-w-full items-center gap-2 rounded-2xl bg-[#002fa7]/[0.06] px-4 py-2 text-sm text-[#002fa7]">
+                  <span className="min-w-0 truncate">
+                    已选择：{selectedFile.name} · {formatBytes(selectedFile.size)}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={clearSelectedFile}
+                    disabled={uploadingDocument}
+                    className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[#002fa7]/70 transition hover:bg-[#002fa7]/10 hover:text-[#002fa7] disabled:cursor-not-allowed disabled:opacity-45"
+                    title="移除已选择文件"
+                    aria-label="移除已选择文件"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
                 </div>
               ) : (
                 <p className="mt-5 text-xs text-gray-400">选择文件后，小爪子会自动处理。</p>
               )}
+            </div>
+
+            <div className="mt-5 rounded-[24px] border border-black/[0.06] bg-black/[0.018] p-4">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-sm font-semibold text-gray-950">任务队列</h3>
+                  <p className="mt-1 text-xs text-gray-400">
+                    文件 {importJobs.filter((job) => !isVectorPublishJob(job)).length} 条 · 向量{" "}
+                    {importJobs.filter(isVectorPublishJob).length} 条
+                  </p>
+                </div>
+                <Link
+                  href="/knowledge/imports"
+                  className="text-xs font-medium text-[#002fa7] transition hover:text-[#001f7a]"
+                >
+                  查看队列
+                </Link>
+              </div>
+              <div className="mt-3 space-y-2">
+                {importJobs.length > 0 ? (
+                  importJobs.slice(0, 6).map((job) => (
+                    <Link
+                      key={job.id}
+                      href={`/knowledge/imports/${job.id}`}
+                      className="block rounded-2xl bg-white px-3.5 py-3 shadow-sm ring-1 ring-black/[0.04] transition hover:bg-[#002fa7]/[0.025] hover:ring-[#002fa7]/20"
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0 flex-1">
+                          <div className="flex min-w-0 items-center gap-2">
+                            {isVectorPublishJob(job) ? (
+                              <Database className="h-4 w-4 shrink-0 text-[#002fa7]" />
+                            ) : (
+                              <FileText className="h-4 w-4 shrink-0 text-emerald-600" />
+                            )}
+                            <p className="truncate text-sm font-medium text-gray-900" title={job.file_name}>
+                              {job.title || job.file_name}
+                            </p>
+                          </div>
+                          <p className="mt-1 text-xs text-gray-400">
+                            {jobKindLabel(job)} · {job.current_step || job.status} · {formatBytes(job.file_size)}
+                          </p>
+                        </div>
+                        <span className={`shrink-0 rounded-full px-2.5 py-1 text-[11px] font-medium ${jobStatusClass(job)}`}>
+                          {jobStatusLabel(job)}
+                        </span>
+                      </div>
+                      <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-gray-100">
+                        <div
+                          className={`h-full rounded-full ${job.status === "failed" ? "bg-red-500" : "bg-[#002fa7]"}`}
+                          style={{ width: `${Math.max(0, Math.min(100, job.progress || 0))}%` }}
+                        />
+                      </div>
+                      {job.error_message ? (
+                        <p className="mt-2 line-clamp-2 text-xs text-red-500" title={job.error_message}>
+                          {job.error_message}
+                        </p>
+                      ) : null}
+                    </Link>
+                  ))
+                ) : (
+                  <div className="rounded-2xl border border-dashed border-black/[0.08] bg-white/70 px-4 py-5 text-center text-xs text-gray-400">
+                    还没有导入任务。
+                  </div>
+                )}
+              </div>
             </div>
 
             {previewFile || previewLoading ? (

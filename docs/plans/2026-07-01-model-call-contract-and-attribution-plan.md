@@ -7,6 +7,7 @@
 - [x] 记录关键运行包版本，便于排查 LangChain / LangGraph / DeepAgents 升级造成的 prompt 或 tool schema 变化。
 - [x] Trace 流程视图按 hook 语义展示：`before_model` 保持为 `graph.model` 前置处理，`wrap_model_call` 作为 `graph.model` 内部 wrapper，不再画成线性前置步骤。
 - [x] 后续逐步实现 middleware / hook 边界归因的第一版 proxy。
+- [x] 在 `Model Call Contract` 中记录 model input 组装细则，区分 system prompt、messages、tools schema 与 model params 的来源和边界。
 
 ## 第一性原则
 
@@ -47,10 +48,41 @@ Trace 的核心事实不是“源码里哪个中间件看起来会执行”，�
       "messages_hash": "...",
       "system_prompt_hash": "...",
       "tool_schema_hash": "..."
+    },
+    "assembly": {
+      "boundary": "ModelClientChatModel._astream",
+      "principle": "final_payload_entering_llm",
+      "sections": [
+        {
+          "key": "system_prompt",
+          "source": "LangChain messages with role=system",
+          "count": 1,
+          "chars": 28313,
+          "hash": "..."
+        },
+        {
+          "key": "messages",
+          "source": "LangChain messages payload",
+          "count": 1,
+          "roles": {"human": 1}
+        },
+        {
+          "key": "tools",
+          "source": "ModelClient.bind_tools structured schema",
+          "count": 13,
+          "binding": {"mode": "bind_tools"}
+        },
+        {
+          "key": "params",
+          "source": "ModelClient runtime configuration"
+        }
+      ]
     }
   }
 }
 ```
+
+`assembly` 只描述模型调用边界的事实：最终 payload 由哪些结构化部分组成，以及每一部分从哪个边界进入模型。它不替代 middleware 归因，也不把 tool schema 误认为 system prompt 文本。
 
 `runtime_inventory.package_versions` 保存：
 

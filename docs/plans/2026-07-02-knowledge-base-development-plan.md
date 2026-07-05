@@ -29,7 +29,10 @@
 - [x] `scripts/start-local-infra.sh` 纳入 PostgreSQL 启动、地址展示与 backend 环境变量提示。
 - [x] 新增 PDF 上传 API，调用 MinerU 解析并保存原始 PDF 与 Markdown artifact。
 - [x] PDF/MinerU 解析后的 Markdown 进入 LlamaIndex 索引刷新流程。
-- [x] 按 notebook 方案补齐 LlamaIndex 多模态发布结构：统一多模态 embedding、text/image 双路 Milvus collection、`MultiModalVectorStoreIndex`。
+- [x] 按 notebook 方案补齐 LlamaIndex 图文混排发布结构：text/image 双路 Milvus collection、`MultiModalVectorStoreIndex`。
+- [x] 将向量模型拆成文本/图片两路：文本 chunk 使用 OpenAI-compatible 文本 embedding（支持真 batch），图片 asset 使用 DashScope Qwen-VL 多模态 embedding（不支持同类型 batch，使用并发单条请求）。
+- [x] 查询工具改为双路召回：文本 collection 用文本 query embedding，图片 collection 用 Qwen-VL query embedding，再在 `llamaindex_knowledge_query` 中统一合并 text hits + image hits。
+- [ ] Rerank 接入：配置位已预留，默认关闭；推荐先接文本 rerank，再扩展到图文统一 rerank。
 - [x] MinerU zip 响应中的图片资产保存到 `/knowledge/assets/...`，与 Markdown 一起构造成 LlamaIndex `Document` / `ImageDocument`。
 - [x] 多模态 embedding 独立配置为 `multimodal_embedding`；不复用普通 `/v1/embeddings` 路由。
 - [x] 多模态索引发布参数进入 `config.json` 的 `knowledge.multimodal_index`；环境变量仅作为 Docker/CI/临时覆盖。
@@ -37,6 +40,7 @@
 - [x] 新增 Markdown glob/grep API，支持按 `/knowledge/` 下的 glob 模式列文件和全文命中行。
 - [x] 更新知识库前端页面，提供 PDF 上传、md glob/grep 与文档 catalog 列表。
 - [x] 支持用户指定知识库物理目录：`PUDDINGCLAW_KNOWLEDGE_DIR` 统一驱动 DeepAgents `/knowledge/`、md 导入、PDF/MinerU artifacts、glob/grep 与 LlamaIndex 索引。
+- [x] Parser job 队列化：上传只创建 `KnowledgeImportJob`，backend 内置 worker 后台消费，前端展示任务状态。
 - [x] 跑后端/前端基础校验。
 
 ## 校验记录
@@ -98,12 +102,37 @@
 1. 默认情况下，原始 PDF 保存到 `backend/data/knowledge/originals/YYYYMMDD/...`；若设置 `PUDDINGCLAW_KNOWLEDGE_DIR`，则保存到 `<knowledge_root>/originals/YYYYMMDD/...`。
 2. MinerU 解析出的 Markdown 保存到 `<knowledge_root>/imported/YYYYMMDD/...`。
 3. Catalog 记录 `source_type=pdf_mineru`、原始 PDF 路径、Markdown 虚拟路径、parser metadata。
-4. 若发布目标包含 `vector`，默认使用 Qwen-VL multimodal embedding 构建 `MultiModalVectorStoreIndex`，并写入 `multimodal_manifest.json`。
-5. 若 `knowledge.multimodal_index.vector_store=milvus`，按 notebook 方式写入双路 Milvus collection：
-   - text: `PUDDINGCLAW_MILVUS_TEXT_COLLECTION`
-   - image: `PUDDINGCLAW_MILVUS_IMAGE_COLLECTION`
-6. 只有显式设置 `knowledge.multimodal_index.enabled=false` 时，才使用 legacy text-only local index 作为兼容 fallback。
-7. 生成的 Markdown 可被 DeepAgents `/knowledge/` 的 `glob` / `grep` 精确检索，也可被 `llamaindex_knowledge_query` 统一 RAG 检索。
+4. Markdown 落盘后立即经过 LlamaIndex `MarkdownNodeParser` 生成 chunk manifest，写入文档 metadata，供任务详情页预览；这一步不依赖 Milvus / embedding。
+5. 若发布目标包含 `vector`，默认按 notebook 的图文混排方案构建索引：复用 Markdown parser 产出的 text nodes，MinerU 图片作为 `ImageDocument` 写入 image path 与上下文 metadata，然后交给 `MultiModalVectorStoreIndex`，并写入 `multimodal_manifest.json`。
+6. 若 `knowledge.multimodal_index.vector_store=milvus`，按 notebook 方式写入双路 Milvus collection：
+   - text: `PUDDINGCLAW_MILVUS_TEXT_COLLECTION`，使用 `fallback_embedding` / OpenAI-compatible 文本 embedding，支持文本 batch。
+   - image: `PUDDINGCLAW_MILVUS_IMAGE_COLLECTION`，使用 `multimodal_embedding` / DashScope Qwen-VL embedding。DashScope 多模态接口不支持同类型 batch，因此使用并发单条请求。
+7. 只有显式设置 `knowledge.multimodal_index.enabled=false` 时，才使用 legacy text-only local index 作为兼容 fallback。
+8. 生成的 Markdown 可被 DeepAgents `/knowledge/` 的 `glob` / `grep` 精确检索，也可被 `llamaindex_knowledge_query` 统一 RAG 检索。
+
+### 双路召回与 rerank 方案
+
+`llamaindex_knowledge_query` 对用户问题执行两路召回：
+
+1. 文本路：`fallback_embedding` 对 query 做文本向量，检索 text collection。
+2. 图片路：`multimodal_embedding` 对 query 做 Qwen-VL 向量，检索 image collection。
+3. 应用层合并：文本命中直接作为 RAG chunk；图片命中返回图片路径、虚拟路径、关联 Markdown 与上下文，并提示主 Agent 必要时调用 image analyzer 子 Agent。
+
+Rerank 按阿里云百炼排序模型文档接入：
+
+1. 默认推荐 `qwen3-vl-rerank`：支持文本、图片、视频混合重排序，只能走 DashScope 原生 SDK/API，不支持 OpenAI-compatible `/reranks`。
+2. 轻量文本备选为 `qwen3-rerank`：适合纯文本 RAG，可走 OpenAI-compatible `/reranks` 或 DashScope 原生接口。
+3. 不再使用 `gte-rerank-v2` 作为默认方案：官方文档标注该模型将于 2026-05-30 下线，推荐迁移到 `qwen3-rerank`。
+
+当前实现采用“独立 retriever + 统一 rerank”的方式：
+
+1. text retriever：文本向量召回 + BM25 关键词召回，先用 RRF 做文本内部融合。
+2. image retriever：图片向量召回，独立返回图片候选与关联 Markdown 上下文。
+3. final rerank：把 text candidates 与 image candidates 一起交给 `qwen3-vl-rerank` 统一排序。
+
+如果 rerank 未开启，则使用配置里的 text vector / BM25 / image vector 权重做 RRF 兜底排序。第一版不会在查询时重新上传本地图片文件，避免把本地资产暴露给 rerank API；图片本体仍由 image analyzer 子 Agent 在命中后按白名单路径读取。
+
+当前 `config.json` 已预留 `rag.rerank`，默认关闭。这样没有 rerank 服务时不会影响现有向量召回。
 
 前端交互收敛：
 
@@ -149,8 +178,8 @@ Higress 路由注意：
 
 ## 下一阶段
 
-- Parser job 队列化，避免大 PDF 同步阻塞请求。
+- 独立 worker 进程与多 worker 并发控制，增强当前内置 worker。
 - PyPDF/PyMuPDF fallback。
-- Milvus + LlamaIndex 多模态索引发布目标。
+- 基于真实 LlamaIndex chunk 的检索测试与引用预览。
 - Excel → Pandas Engine 管道。
 - PostgreSQL Alembic migrations，替换 MVP `create_all`。

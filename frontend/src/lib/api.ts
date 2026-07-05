@@ -4,6 +4,22 @@
  */
 
 const API_BASE = "/api";
+const DIRECT_BACKEND_API_BASE =
+  process.env.NEXT_PUBLIC_BACKEND_API_BASE ||
+  process.env.NEXT_PUBLIC_BACKEND_URL ||
+  "http://localhost:8888/api";
+
+function apiErrorMessage(text: string, fallback: string): string {
+  if (!text) return fallback;
+  try {
+    const payload = JSON.parse(text) as { detail?: unknown; message?: unknown };
+    const detail = payload.detail ?? payload.message;
+    if (typeof detail === "string" && detail.trim()) return detail;
+  } catch {
+    // keep raw text below
+  }
+  return text;
+}
 
 export interface SSEEvent {
   event: string;
@@ -139,6 +155,96 @@ export interface KnowledgeMarkdownMatch {
   context: string[];
 }
 
+export interface KnowledgeSearchHit {
+  rank: number;
+  modality: "text" | "image" | string;
+  title: string;
+  quote: string;
+  score?: number | null;
+  raw_score?: number | null;
+  normalized_score?: number | null;
+  retrieval_channel?: string;
+  source?: Record<string, unknown>;
+  image_hit?: {
+    title?: string;
+    file_path?: string;
+    virtual_path?: string;
+    score?: number | null;
+    raw_score?: number | null;
+    normalized_score?: number | null;
+    linked_markdown?: string;
+    linked_markdown_virtual_path?: string;
+    context?: Record<string, unknown>;
+  } | null;
+}
+
+export interface KnowledgeSearchResult {
+  query: string;
+  top_k: number;
+  candidate_top_k: number;
+  fusion?: {
+    text_vector_weight?: number;
+    bm25_weight?: number;
+    image_vector_weight?: number;
+    text_group_weight?: number;
+    rerank_enabled?: boolean;
+    rerank_top_n?: number;
+  };
+  retrieval: {
+    text_vector: number;
+    bm25: number;
+    image_vector: number;
+    selected: number;
+    hybrid_enabled: boolean;
+    rerank_enabled: boolean;
+  };
+  hits: KnowledgeSearchHit[];
+  candidate_pools?: {
+    text_vector?: KnowledgeSearchHit[];
+    bm25?: KnowledgeSearchHit[];
+    image_vector?: KnowledgeSearchHit[];
+  };
+  sources: Record<string, unknown>[];
+}
+
+export interface KnowledgeImportJob {
+  id: string;
+  knowledge_base_id: string;
+  status: "queued" | "running" | "succeeded" | "failed" | "cancelled" | string;
+  file_name: string;
+  file_type: string;
+  file_size: number;
+  source_path: string;
+  source_sha256: string;
+  title?: string | null;
+  publish_targets: string[];
+  current_step: string;
+  progress: number;
+  document_id?: string | null;
+  error_message?: string | null;
+  retry_count: number;
+  metadata?: Record<string, unknown>;
+  created_at?: string | null;
+  updated_at?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+}
+
+export interface KnowledgeImportEvent {
+  id: string;
+  job_id: string;
+  level: "info" | "warning" | "error" | string;
+  message: string;
+  metadata?: Record<string, unknown>;
+  created_at?: string | null;
+}
+
+export interface KnowledgeImportJobDetail {
+  job: KnowledgeImportJob;
+  events: KnowledgeImportEvent[];
+  document?: KnowledgeDocument | null;
+}
+
 export async function getKnowledgeStatus(): Promise<KnowledgeStatus> {
   const response = await fetch(`${API_BASE}/knowledge/status`, { cache: "no-store" });
   if (!response.ok) {
@@ -182,10 +288,19 @@ export async function previewKnowledgeFile(virtualPath: string): Promise<Knowled
   const response = await fetch(`${API_BASE}/knowledge/file/preview?${params.toString()}`, { cache: "no-store" });
   if (!response.ok) {
     const text = await response.text().catch(() => "");
-    throw new Error(text || `Failed to preview knowledge file: ${response.status}`);
+    throw new Error(apiErrorMessage(text, `Failed to preview knowledge file: ${response.status}`));
   }
   const payload = await response.json();
   return payload.file;
+}
+
+export function rawKnowledgeFileUrl(virtualPath: string): string {
+  if (!virtualPath) return "";
+  if (virtualPath.startsWith("/api/knowledge/file/raw?")) return virtualPath;
+  if (virtualPath.startsWith("/knowledge/")) {
+    return `${API_BASE}/knowledge/file/raw?virtual_path=${encodeURIComponent(virtualPath)}`;
+  }
+  return virtualPath;
 }
 
 export async function importLocalMarkdownDocument(
@@ -214,13 +329,13 @@ export async function uploadPdfKnowledgeDocument(
   form.append("file", file, file.name);
   if (title?.trim()) form.append("title", title.trim());
   form.append("publish_targets", publishTargets.join(","));
-  const response = await fetch(`${API_BASE}/knowledge/documents/upload-pdf`, {
+  const response = await fetch(`${DIRECT_BACKEND_API_BASE}/knowledge/documents/upload-pdf`, {
     method: "POST",
     body: form,
   });
   if (!response.ok) {
     const text = await response.text().catch(() => "");
-    throw new Error(text || `Failed to upload PDF knowledge document: ${response.status}`);
+    throw new Error(apiErrorMessage(text, `Failed to upload PDF knowledge document: ${response.status}`));
   }
   return response.json();
 }
@@ -234,13 +349,112 @@ export async function uploadKnowledgeDocument(
   form.append("file", file, file.name);
   if (title?.trim()) form.append("title", title.trim());
   form.append("publish_targets", publishTargets.join(","));
-  const response = await fetch(`${API_BASE}/knowledge/documents/import`, {
+  const response = await fetch(`${DIRECT_BACKEND_API_BASE}/knowledge/documents/import`, {
     method: "POST",
     body: form,
   });
   if (!response.ok) {
     const text = await response.text().catch(() => "");
-    throw new Error(text || `Failed to import knowledge document: ${response.status}`);
+    throw new Error(apiErrorMessage(text, `Failed to import knowledge document: ${response.status}`));
+  }
+  return response.json();
+}
+
+export async function createKnowledgeImportJob(
+  file: File,
+  title?: string,
+  publishTargets: string[] = ["local_markdown"]
+): Promise<KnowledgeImportJob> {
+  const form = new FormData();
+  form.append("file", file, file.name);
+  if (title?.trim()) form.append("title", title.trim());
+  form.append("publish_targets", publishTargets.join(","));
+  const response = await fetch(`${DIRECT_BACKEND_API_BASE}/knowledge/import-jobs`, {
+    method: "POST",
+    body: form,
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to create knowledge import job: ${response.status}`));
+  }
+  const payload = await response.json();
+  return payload.job;
+}
+
+export async function listKnowledgeImportJobs(limit = 20): Promise<KnowledgeImportJob[]> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  const response = await fetch(`${API_BASE}/knowledge/import-jobs?${params.toString()}`, { cache: "no-store" });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to load knowledge import jobs: ${response.status}`));
+  }
+  const payload = await response.json();
+  return Array.isArray(payload.jobs) ? payload.jobs : [];
+}
+
+export async function getKnowledgeImportJob(
+  jobId: string,
+  includeEvents = true
+): Promise<KnowledgeImportJobDetail> {
+  const params = new URLSearchParams({ include_events: includeEvents ? "true" : "false" });
+  const response = await fetch(`${API_BASE}/knowledge/import-jobs/${encodeURIComponent(jobId)}?${params.toString()}`, {
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to load knowledge import job: ${response.status}`));
+  }
+  const payload = await response.json();
+  return {
+    job: payload.job,
+    events: Array.isArray(payload.events) ? payload.events : [],
+    document: payload.document ?? null,
+  };
+}
+
+export async function retryKnowledgeImportJob(jobId: string): Promise<KnowledgeImportJob> {
+  const response = await fetch(`${API_BASE}/knowledge/import-jobs/${encodeURIComponent(jobId)}/retry`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to retry knowledge import job: ${response.status}`));
+  }
+  const payload = await response.json();
+  return payload.job;
+}
+
+export async function deleteKnowledgeImportJob(jobId: string): Promise<void> {
+  const response = await fetch(`${API_BASE}/knowledge/import-jobs/${encodeURIComponent(jobId)}`, {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to delete knowledge import job: ${response.status}`));
+  }
+}
+
+export async function clearKnowledgeImportJobs(): Promise<number> {
+  const response = await fetch(`${API_BASE}/knowledge/import-jobs`, {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to clear knowledge import jobs: ${response.status}`));
+  }
+  const payload = await response.json();
+  return typeof payload.deleted_count === "number" ? payload.deleted_count : 0;
+}
+
+export async function publishKnowledgeImportJobVector(
+  jobId: string
+): Promise<{ job: KnowledgeImportJob; queued: boolean; source_job_id?: string }> {
+  const response = await fetch(`${API_BASE}/knowledge/import-jobs/${encodeURIComponent(jobId)}/publish-vector`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to publish knowledge vector index: ${response.status}`));
   }
   return response.json();
 }
@@ -271,6 +485,19 @@ export async function grepKnowledgeMarkdown(
   }
   const payload = await response.json();
   return Array.isArray(payload.matches) ? payload.matches : [];
+}
+
+export async function searchKnowledge(query: string, topK?: number): Promise<KnowledgeSearchResult> {
+  const response = await fetch(`${API_BASE}/knowledge/search`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query, top_k: topK }),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to search knowledge: ${response.status}`));
+  }
+  return response.json();
 }
 
 export async function uploadAgentAttachments(
@@ -313,6 +540,7 @@ export interface TraceSpan {
     | "reasoning"
     | "todo"
     | "custom"
+    | "rag"
     | "graph"
     | "middleware"
     | "memory"

@@ -274,7 +274,7 @@ def test_database_settings_can_build_url_from_local_fields(tmp_path, monkeypatch
     assert saved["database"]["username"] == "me"
 
 
-def test_database_env_overrides_config_json(tmp_path, monkeypatch):
+def test_database_generic_env_does_not_override_config_json(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({
         "database": {
@@ -284,6 +284,24 @@ def test_database_env_overrides_config_json(tmp_path, monkeypatch):
     }), encoding="utf-8")
     monkeypatch.setattr(config, "CONFIG_FILE", config_path)
     monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://env:secret@127.0.0.1:5432/envdb")
+
+    database = config.get_database_config()
+    assert database["url"] == "postgresql+asyncpg://alice:secret@127.0.0.1:15432/pudding"
+    assert database["configured_url"].endswith(":15432/pudding")
+    assert database["configured_by"] == "config.json"
+    assert database["environment_override"] is False
+
+
+def test_database_puddingclaw_env_can_override_config_json(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "database": {
+            "mode": "external",
+            "url": "postgresql+asyncpg://alice:secret@127.0.0.1:15432/pudding",
+        }
+    }), encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
+    monkeypatch.setenv("PUDDINGCLAW_DATABASE_URL", "postgresql+asyncpg://env:secret@127.0.0.1:5432/envdb")
 
     database = config.get_database_config()
     assert database["url"] == "postgresql+asyncpg://env:secret@127.0.0.1:5432/envdb"

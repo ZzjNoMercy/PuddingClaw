@@ -19,7 +19,7 @@ import httpx
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from config import get_database_config, get_gateway_config
+from config import get_database_config, get_gateway_config, get_knowledge_mineru_config
 
 logger = logging.getLogger(__name__)
 
@@ -124,9 +124,6 @@ def _resolve_postgres_url(explicit_url: str | None = None) -> str:
     database_config = get_database_config()
     return (
         explicit_url
-        or os.getenv("PUDDINGCLAW_DATABASE_URL")
-        or os.getenv("DATABASE_URL")
-        or os.getenv("POSTGRES_URL")
         or str(database_config.get("url") or "")
         or DEFAULT_POSTGRES_URL
     )
@@ -247,9 +244,9 @@ async def detect_capabilities(
     Args:
         force: 是否强制重新探测，忽略缓存。
         ai_gateway_url: 显式指定 Higress URL；默认读 AI_GATEWAY_URL 环境变量。
-        postgres_url: 显式指定 PostgreSQL URL；默认读 DATABASE_URL / POSTGRES_URL。
+        postgres_url: 显式指定 PostgreSQL URL；默认读 Settings 中的数据库配置。
         milvus_url: 显式指定 Milvus URL；默认读 MILVUS_URL 环境变量。
-        mineru_url: 显式指定 MinerU URL；默认读 MINERU_URL 环境变量。
+        mineru_url: 显式指定 MinerU URL；默认读 config.json 的 knowledge.mineru.base_url。
 
     Returns:
         Capabilities 探测结果。
@@ -264,7 +261,8 @@ async def detect_capabilities(
     gateway_health_path = str(gateway_config.get("health_path", "/health"))
     postgres_target = _resolve_postgres_url(postgres_url)
     milvus_target = milvus_url or os.getenv("MILVUS_URL") or DEFAULT_MILVUS_URL
-    mineru_target = mineru_url or os.getenv("MINERU_URL") or DEFAULT_MINERU_URL
+    mineru_config = get_knowledge_mineru_config()
+    mineru_target = mineru_url or str(mineru_config.get("base_url") or DEFAULT_MINERU_URL)
 
     results = await asyncio.gather(
         _check_postgres(postgres_target),
@@ -355,7 +353,8 @@ def _detect_capabilities_sync_fallback(
     gateway_health_path = str(gateway_config.get("health_path", "/health"))
     postgres_target = _resolve_postgres_url(postgres_url)
     milvus_target = milvus_url or os.getenv("MILVUS_URL") or DEFAULT_MILVUS_URL
-    mineru_target = mineru_url or os.getenv("MINERU_URL") or DEFAULT_MINERU_URL
+    mineru_config = get_knowledge_mineru_config()
+    mineru_target = mineru_url or str(mineru_config.get("base_url") or DEFAULT_MINERU_URL)
 
     caps = Capabilities(
         database=_check_postgres_sync(postgres_target),

@@ -32,6 +32,12 @@ def get_embedding_model() -> OpenAIEmbedding:
 
     api_base = gateway.get("base_url") if use_gateway else cfg.get("api_base", "https://api.openai.com/v1")
     model = cfg.get("model", "text-embedding-3-small")
+    embed_batch_size = int(cfg.get("batch_size", 100))
+    if str(model).startswith("text-embedding-v") and "dashscope" in str(api_base).lower():
+        # DashScope text-embedding-v* OpenAI-compatible endpoint rejects
+        # input.contents batches larger than 20. Keep the UI/config flexible,
+        # but never send an invalid provider batch at runtime.
+        embed_batch_size = min(embed_batch_size, 20)
 
     # When routing through Higress AI Gateway, the gateway's ai-proxy plugin
     # replaces the Authorization header with the configured upstream provider
@@ -55,6 +61,8 @@ def get_embedding_model() -> OpenAIEmbedding:
         model=init_model,
         api_key=api_key,
         api_base=api_base,
+        dimensions=int(cfg.get("dimension", 1536)) if cfg.get("dimension") else None,
+        embed_batch_size=embed_batch_size,
     )
     if init_model != model:
         embed_model._query_engine = model

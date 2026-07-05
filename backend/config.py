@@ -52,11 +52,17 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         "model": "text-embedding-3-small",
         "base_url": "https://api.openai.com/v1",
         "api_key": "",
+        "dimension": 1536,
+        "batch_size": 20,
     },
     "multimodal_embedding": {
         "provider": "dashscope",
         "model": "qwen2.5-vl-embedding",
         "dimension": 1024,
+        # DashScope multimodal embedding does not accept multiple same-type
+        # inputs in one request. Keep the legacy key name for config
+        # compatibility, but use it as provider request concurrency.
+        "batch_size": 10,
         # qwen-vl embedding uses DashScope native API, not OpenAI-compatible /v1/embeddings.
         # Leave base_url empty for direct DashScope SDK mode. If a Higress native passthrough
         # route is configured, set base_url to the gateway root and keep route_path below.
@@ -68,14 +74,31 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "rag": {
         "top_k": 3,
         "similarity_threshold": 0.7,
+        "hybrid": {
+            "enabled": True,
+            "mode": "reciprocal_rerank",
+            "text_vector_weight": 0.45,
+            "image_vector_weight": 0.35,
+            "bm25_weight": 0.2,
+            "candidate_top_k": 10,
+        },
+        "rerank": {
+            "enabled": True,
+            "provider": "dashscope",
+            "model": "qwen3-vl-rerank",
+            "top_n": 3,
+            "candidate_top_k": 50,
+            "base_url": "",
+            "api_key": "",
+        },
     },
     "database": {
         # Catalog database for knowledge documents, ingestion jobs and future
         # business facts. start-local-infra.sh detects local PostgreSQL and
         # writes either bundled or external into this section.
         #
-        # Environment variables still have higher priority:
-        #   PUDDINGCLAW_DATABASE_URL / DATABASE_URL / POSTGRES_URL
+        # Settings page is the normal desktop source of truth. Only the
+        # PUDDINGCLAW_DATABASE_URL deployment escape hatch can override it.
         "mode": "bundled",  # bundled | external
         "host": "127.0.0.1",
         "port": 5432,
@@ -91,6 +114,19 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         # means backend/knowledge for development; PUDDINGCLAW_KNOWLEDGE_DIR can
         # still override this temporarily.
         "root_dir": "",
+        "mineru": {
+            "base_url": "http://localhost:8002",
+            # MinerU service writes its own runtime scratch files under
+            # data/mineru-runtime/output when started by setup-mineru.py.
+            # PuddingClaw copies final assets into the user knowledge directory,
+            # so successful imports clean runtime output by default.
+            "runtime_output_dir": "data/mineru-runtime/output",
+            "keep_runtime_output": False,
+            # Large PDFs can take minutes in MinerU pipeline mode. Keep connect
+            # timeout short, but allow a long read timeout for parsing.
+            "connect_timeout_seconds": 10,
+            "read_timeout_seconds": 1800,
+        },
         "multimodal_index": {
             "enabled": True,
             "vector_store": "milvus",
@@ -326,6 +362,61 @@ def set_rag_mode(enabled: bool) -> None:
     save_config(config)
 
 
+def get_rag_config() -> dict[str, Any]:
+    """Read general RAG retrieval settings from config.json."""
+
+    config = load_config()
+    rag = config.get("rag", {})
+
+    def _positive_int(value: Any, fallback: int) -> int:
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return fallback
+
+    def _float(value: Any, fallback: float) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return fallback
+
+    return {
+        "enabled": bool(config.get("rag_mode", False)),
+        "top_k": _positive_int(rag.get("top_k"), 3),
+        "similarity_threshold": _float(rag.get("similarity_threshold"), 0.7),
+    }
+
+
+def get_rag_hybrid_config() -> dict[str, Any]:
+    """Read LlamaIndex semantic hybrid retrieval settings from config.json."""
+
+    config = load_config()
+    rag = config.get("rag", {})
+    hybrid = rag.get("hybrid", {})
+
+    def _positive_int(value: Any, fallback: int) -> int:
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return fallback
+
+    def _weight(value: Any, fallback: float) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return fallback
+        return min(1.0, max(0.0, parsed))
+
+    return {
+        "enabled": bool(hybrid.get("enabled", True)),
+        "mode": hybrid.get("mode", "reciprocal_rerank"),
+        "text_vector_weight": _weight(hybrid.get("text_vector_weight", hybrid.get("vector_weight")), 0.45),
+        "image_vector_weight": _weight(hybrid.get("image_vector_weight"), 0.35),
+        "bm25_weight": _weight(hybrid.get("bm25_weight"), 0.2),
+        "candidate_top_k": _positive_int(hybrid.get("candidate_top_k"), 10),
+    }
+
+
 def get_memory_backend() -> str:
     """获取长期记忆后端类型：'markdown' 或 'mem0'。"""
     backend = load_config().get("memory_backend", "markdown")
@@ -498,11 +589,15 @@ def get_fallback_embedding_config() -> dict[str, Any]:
     import os
     config = load_config()
     emb = config.get("fallback_embedding", {})
+    model = emb.get("model") or os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+    default_dimension = "1024" if str(model).startswith("text-embedding-v") else "1536"
     return {
         "provider": emb.get("provider", "openai"),
-        "model": emb.get("model") or os.getenv("EMBEDDING_MODEL", "text-embedding-3-small"),
+        "model": model,
         "api_key": emb.get("api_key") or os.getenv("OPENAI_API_KEY", ""),
         "api_base": emb.get("base_url") or os.getenv("OPENAI_BASE_URL", "https://ai.devtool.tech/proxy/v1"),
+        "dimension": int(emb.get("dimension") or os.getenv("EMBEDDING_DIMENSION", default_dimension)),
+        "batch_size": max(1, int(emb.get("batch_size") or os.getenv("EMBEDDING_BATCH_SIZE", "20"))),
     }
 
 
@@ -524,6 +619,7 @@ def get_multimodal_embedding_config() -> dict[str, Any]:
         "provider": mm.get("provider", "dashscope"),
         "model": mm.get("model") or os.getenv("PUDDINGCLAW_MULTIMODAL_EMBED_MODEL", "qwen2.5-vl-embedding"),
         "dimension": int(mm.get("dimension") or os.getenv("PUDDINGCLAW_MULTIMODAL_EMBED_DIM", "1024")),
+        "batch_size": max(1, int(mm.get("batch_size") or os.getenv("PUDDINGCLAW_MULTIMODAL_EMBED_BATCH_SIZE", "10"))),
         "api_key": (
             mm.get("api_key")
             or os.getenv("DASHSCOPE_API_KEY", "")
@@ -586,6 +682,27 @@ def get_knowledge_multimodal_index_config() -> dict[str, Any]:
     }
 
 
+def get_rag_rerank_config() -> dict[str, Any]:
+    config = load_config()
+    rerank = config.get("rag", {}).get("rerank", {})
+
+    def _positive_int(value: Any, fallback: int) -> int:
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return fallback
+
+    return {
+        "enabled": bool(rerank.get("enabled", True)),
+        "provider": rerank.get("provider", "dashscope"),
+        "model": rerank.get("model", "qwen3-vl-rerank"),
+        "top_n": _positive_int(rerank.get("top_n"), 5),
+        "candidate_top_k": _positive_int(rerank.get("candidate_top_k"), 50),
+        "base_url": rerank.get("base_url", ""),
+        "api_key": rerank.get("api_key", ""),
+    }
+
+
 def get_knowledge_root_config() -> dict[str, Any]:
     """Read user-configurable local knowledge root directory."""
 
@@ -602,24 +719,34 @@ def get_knowledge_root_config() -> dict[str, Any]:
     }
 
 
+def get_knowledge_mineru_config() -> dict[str, Any]:
+    """Read MinerU runtime behavior from config.json."""
+
+    config = load_config()
+    mineru = config.get("knowledge", {}).get("mineru", {})
+    output_dir = str(mineru.get("runtime_output_dir") or "data/mineru-runtime/output").strip()
+    return {
+        "base_url": str(mineru.get("base_url") or "http://localhost:8002").strip(),
+        "runtime_output_dir": output_dir,
+        "keep_runtime_output": bool(mineru.get("keep_runtime_output", False)),
+        "connect_timeout_seconds": int(mineru.get("connect_timeout_seconds") or 10),
+        "read_timeout_seconds": int(mineru.get("read_timeout_seconds") or 1800),
+    }
+
+
 def get_database_config() -> dict[str, Any]:
     """Read catalog database connection config.
 
-    Priority is explicit deployment/runtime env first, then config.json. If no
-    URL is configured, callers may choose their own fallback (for example
-    SQLite in the local backend DB wiring), but PostgreSQL capability detection
-    should treat it as not configured instead of probing a random local 5432.
+    Settings page / config.json is the normal desktop source of truth. The only
+    environment override is PUDDINGCLAW_DATABASE_URL, reserved for deployment or
+    CI. Generic DATABASE_URL / POSTGRES_URL are intentionally ignored here:
+    they are too easy to inherit from Docker shells and make the UI look wrong.
     """
 
     import os
     from urllib.parse import quote
 
-    env_url = (
-        os.getenv("PUDDINGCLAW_DATABASE_URL")
-        or os.getenv("DATABASE_URL")
-        or os.getenv("POSTGRES_URL")
-        or ""
-    ).strip()
+    env_url = (os.getenv("PUDDINGCLAW_DATABASE_URL") or "").strip()
     database = load_config().get("database", {})
     configured_url = str(database.get("url", "") or "").strip()
     mode = str(database.get("mode", "bundled") or "bundled").strip() or "bundled"
@@ -723,6 +850,7 @@ def get_settings_for_display() -> dict[str, Any]:
     effective_multimodal_embedding = get_multimodal_embedding_config()
     effective_knowledge_index = get_knowledge_multimodal_index_config()
     effective_knowledge_root = get_knowledge_root_config()
+    effective_knowledge_mineru = get_knowledge_mineru_config()
     effective_database = get_database_config()
     result = {
         "memory_backend": config.get("memory_backend", "markdown"),
@@ -761,6 +889,10 @@ def get_settings_for_display() -> dict[str, Any]:
         "knowledge": {
             **config.get("knowledge", {}),
             **effective_knowledge_root,
+            "mineru": {
+                **config.get("knowledge", {}).get("mineru", {}),
+                **effective_knowledge_mineru,
+            },
             "multimodal_index": {
                 **config.get("knowledge", {}).get("multimodal_index", {}),
                 **effective_knowledge_index,
@@ -822,7 +954,7 @@ def update_settings(updates: dict[str, Any]) -> None:
         emb_update = updates["fallback_embedding"]
         if "fallback_embedding" not in config:
             config["fallback_embedding"] = {}
-        for key in ("provider", "model", "base_url"):
+        for key in ("provider", "model", "base_url", "dimension", "batch_size"):
             if key in emb_update:
                 config["fallback_embedding"][key] = emb_update[key]
         if emb_update.get("api_key"):
@@ -832,7 +964,7 @@ def update_settings(updates: dict[str, Any]) -> None:
         mm_update = updates["multimodal_embedding"]
         if "multimodal_embedding" not in config:
             config["multimodal_embedding"] = {}
-        for key in ("provider", "model", "base_url", "route_path", "dimension", "prefer_gateway"):
+        for key in ("provider", "model", "base_url", "route_path", "dimension", "batch_size", "prefer_gateway"):
             if key in mm_update:
                 config["multimodal_embedding"][key] = mm_update[key]
         if mm_update.get("api_key"):
@@ -845,6 +977,32 @@ def update_settings(updates: dict[str, Any]) -> None:
         for key in ("top_k", "similarity_threshold"):
             if key in rag_update:
                 config["rag"][key] = rag_update[key]
+        if isinstance(rag_update.get("hybrid"), dict):
+            existing_hybrid = config["rag"].get("hybrid", {})
+            if not isinstance(existing_hybrid, dict):
+                existing_hybrid = {}
+            for key in (
+                "enabled",
+                "mode",
+                "text_vector_weight",
+                "image_vector_weight",
+                "vector_weight",
+                "bm25_weight",
+                "candidate_top_k",
+            ):
+                if key in rag_update["hybrid"]:
+                    existing_hybrid[key] = rag_update["hybrid"][key]
+            config["rag"]["hybrid"] = existing_hybrid
+        if isinstance(rag_update.get("rerank"), dict):
+            existing_rerank = config["rag"].get("rerank", {})
+            if not isinstance(existing_rerank, dict):
+                existing_rerank = {}
+            for key in ("enabled", "provider", "model", "top_n", "candidate_top_k", "base_url"):
+                if key in rag_update["rerank"]:
+                    existing_rerank[key] = rag_update["rerank"][key]
+            if rag_update["rerank"].get("api_key"):
+                existing_rerank["api_key"] = rag_update["rerank"]["api_key"]
+            config["rag"]["rerank"] = existing_rerank
         if "enabled" in rag_update:
             config["rag_mode"] = rag_update["enabled"]
 
@@ -871,6 +1029,23 @@ def update_settings(updates: dict[str, Any]) -> None:
             config["knowledge"] = {}
         if isinstance(knowledge_update, dict) and "root_dir" in knowledge_update:
             config["knowledge"]["root_dir"] = str(knowledge_update.get("root_dir") or "").strip()
+        if isinstance(knowledge_update, dict) and "mineru" in knowledge_update:
+            mineru_update = knowledge_update["mineru"]
+            existing_mineru = config["knowledge"].get("mineru", {})
+            if not isinstance(existing_mineru, dict):
+                existing_mineru = {}
+            if isinstance(mineru_update, dict):
+                if "runtime_output_dir" in mineru_update:
+                    existing_mineru["runtime_output_dir"] = str(mineru_update.get("runtime_output_dir") or "").strip()
+                if "base_url" in mineru_update:
+                    existing_mineru["base_url"] = str(mineru_update.get("base_url") or "").strip()
+                if "keep_runtime_output" in mineru_update:
+                    existing_mineru["keep_runtime_output"] = bool(mineru_update.get("keep_runtime_output", False))
+                if "connect_timeout_seconds" in mineru_update:
+                    existing_mineru["connect_timeout_seconds"] = int(mineru_update.get("connect_timeout_seconds") or 10)
+                if "read_timeout_seconds" in mineru_update:
+                    existing_mineru["read_timeout_seconds"] = int(mineru_update.get("read_timeout_seconds") or 1800)
+            config["knowledge"]["mineru"] = existing_mineru
         if isinstance(knowledge_update, dict) and "multimodal_index" in knowledge_update:
             mm_index_update = knowledge_update["multimodal_index"]
             existing = config["knowledge"].get("multimodal_index", {})
