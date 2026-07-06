@@ -75,6 +75,7 @@ function JobIcon({ status }: { status: string }) {
 }
 
 type JobFilter = "all" | "file" | "vector";
+const JOB_PAGE_SIZE = 10;
 
 function isVectorPublishJob(job: KnowledgeImportJob): boolean {
   return job.metadata?.kind === "vector_publish" || job.file_type === "vector";
@@ -103,6 +104,7 @@ export default function KnowledgeImportJobsPage() {
   const [deletingJobId, setDeletingJobId] = useState<string | null>(null);
   const [clearingJobs, setClearingJobs] = useState(false);
   const [jobFilter, setJobFilter] = useState<JobFilter>("all");
+  const [jobPage, setJobPage] = useState(1);
   const [toast, setToast] = useState<{ type: "success" | "error"; message: string } | null>(null);
 
   useEffect(() => {
@@ -203,6 +205,19 @@ export default function KnowledgeImportJobsPage() {
     if (jobFilter === "file") return jobs.filter((job) => !isVectorPublishJob(job));
     return jobs;
   }, [jobFilter, jobs]);
+  const jobPageCount = Math.max(1, Math.ceil(visibleJobs.length / JOB_PAGE_SIZE));
+  const pagedJobs = useMemo(
+    () => visibleJobs.slice((jobPage - 1) * JOB_PAGE_SIZE, jobPage * JOB_PAGE_SIZE),
+    [jobPage, visibleJobs]
+  );
+
+  useEffect(() => {
+    setJobPage(1);
+  }, [jobFilter]);
+
+  useEffect(() => {
+    setJobPage((page) => Math.min(page, jobPageCount));
+  }, [jobPageCount]);
 
   return (
     <div className="h-screen app-bg text-gray-900">
@@ -307,7 +322,7 @@ export default function KnowledgeImportJobsPage() {
 
                 <div className="mt-4 space-y-3">
                   {visibleJobs.length > 0 ? (
-                    visibleJobs.map((job) => (
+                    pagedJobs.map((job) => (
                       <div
                         key={job.id}
                         className="group rounded-[24px] border border-black/[0.06] bg-black/[0.018] p-4 transition hover:border-[#002fa7]/20 hover:bg-[#002fa7]/[0.025]"
@@ -404,6 +419,31 @@ export default function KnowledgeImportJobsPage() {
                     </div>
                   )}
                 </div>
+                {visibleJobs.length > JOB_PAGE_SIZE ? (
+                  <div className="mt-5 flex flex-col gap-3 border-t border-black/[0.05] pt-4 text-xs text-gray-400 sm:flex-row sm:items-center sm:justify-between">
+                    <span>
+                      第 {jobPage} / {jobPageCount} 页 · 当前筛选 {visibleJobs.length} 条
+                    </span>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => setJobPage((page) => Math.max(1, page - 1))}
+                        disabled={jobPage <= 1}
+                        className="h-9 rounded-full border border-black/[0.06] bg-white px-3 font-medium text-gray-600 shadow-sm transition hover:text-[#002fa7] disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        上一页
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setJobPage((page) => Math.min(jobPageCount, page + 1))}
+                        disabled={jobPage >= jobPageCount}
+                        className="h-9 rounded-full border border-black/[0.06] bg-white px-3 font-medium text-gray-600 shadow-sm transition hover:text-[#002fa7] disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        下一页
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
               </section>
             </div>
           </div>

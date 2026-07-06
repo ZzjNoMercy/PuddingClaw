@@ -17,8 +17,9 @@ _tool_instance_cache: dict[tuple[str, str], List[BaseTool]] = {}
 TOOL_CATEGORIES: dict[str, list[str]] = {
     "core": ["read_file_tool", "write_file_tool", "terminal_tool", "task_manager_tool", "mineru_tool"],
     "knowledge": ["search_knowledge_tool", "tavily_search_tool", "fetch_url_tool"],
-    # research 独立于 knowledge：deep_research 是 subagent 隔离工具，不是简单检索
-    # cf. graph/middlewares/skills_router.py _DEFAULT_SKILL_REGISTRY["research"]
+    "table": ["pandas_knowledge_tool"],
+    # research 独立于 knowledge：deep_research 是 subagent 隔离工具，不是简单检索。
+    # 当前 ToolIntentRouter 默认不自动路由到 research，后续需要时再显式接入。
     "research": ["deep_research_tool"],
     "skill": ["execute_skill_tool", "create_skill_version_tool"],
     "code_exec": ["python_repl_tool"],

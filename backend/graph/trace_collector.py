@@ -603,25 +603,47 @@ class TraceCollector:
             "agent_memory block found in final system prompt" if agent_memory_present else "",
             *[f"memory source present: {source}" for source in matched_sources],
         ]
+        memory_after = {
+            "agent_memory_present": agent_memory_present,
+            "matched_sources": matched_sources,
+            "source_count": len(matched_sources),
+        }
+        memory_diff = {
+            "memory_contents_loaded": agent_memory_present or bool(matched_sources),
+            "source_count_delta": len(matched_sources),
+        }
         self.add_middleware_effect(
             category="memory",
             title="Memory loaded into agent state",
             hook="before_agent",
             middleware=memory_middlewares,
             before={"memory_contents_loaded": False},
-            after={
-                "agent_memory_present": agent_memory_present,
-                "matched_sources": matched_sources,
-                "source_count": len(matched_sources),
+            after=memory_after,
+            diff=memory_diff,
+            evidence=[item for item in evidence if item],
+            metadata={
+                "system_prompt_checked": True,
+                "memory_sources": matched_sources,
+                "state_field": "memory_contents",
             },
+        )
+        self.add_middleware_effect(
+            category="memory",
+            title="Memory injected into system prompt",
+            hook="wrap_model_call",
+            middleware=memory_middlewares,
+            before={"agent_memory_in_system_prompt": False},
+            after=memory_after,
             diff={
-                "memory_contents_loaded": agent_memory_present or bool(matched_sources),
+                "agent_memory_in_system_prompt": agent_memory_present,
                 "source_count_delta": len(matched_sources),
             },
             evidence=[item for item in evidence if item],
             metadata={
                 "system_prompt_checked": True,
                 "memory_sources": matched_sources,
+                "request_field": "system_message",
+                "state_field": "memory_contents",
             },
         )
         self._memory_effect_recorded = True

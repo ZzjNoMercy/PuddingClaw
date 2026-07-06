@@ -27,6 +27,7 @@ from langchain_core.messages import AIMessageChunk, HumanMessage, ToolMessage
 from langgraph.types import Command
 
 from graph.citations import dedupe_sources, finalize_citations, format_sources_for_model
+from graph.deepagents_prompt_builder import build_deepagents_system_prompt
 from graph.attachment_store import attachment_store
 from graph.managed_paths import is_managed_resource_path
 from graph.session_manager import session_manager
@@ -50,6 +51,7 @@ AGENT_MODE_PUDDINGCLAW_TOOLS = {
     "fetch_url",
     "tavily_search",
     "llamaindex_knowledge_query",
+    "pandas_knowledge_query",
 }
 
 DEFAULT_IMAGE_ANALYZER_PROMPT = (
@@ -1841,6 +1843,7 @@ class DeepAgentsAgentManager:
             traced_middlewares = wrap_middlewares_for_trace(agent_middlewares)
             logger.info("Building DeepAgents agent for session=%s project=%s", session_id, project_id)
             subagents = _build_subagents(agent_tools, agent_skills)
+            system_prompt = build_deepagents_system_prompt(self._base_dir, workspace_path)
             agent = create_deep_agent(
                 model=model,
                 tools=agent_tools,
@@ -1849,55 +1852,7 @@ class DeepAgentsAgentManager:
                 subagents=subagents,
                 checkpointer=checkpointer,
                 backend=self._build_backend(workspace_path),
-                system_prompt=(
-                    "You are PuddingClaw Agent mode. The filesystem tools are scoped to the current workspace. "
-                    "Project-level memory and the gstack skill index have been injected via MemoryMiddleware. "
-                    "Do not claim access to files outside this workspace unless an external-file permission flow "
-                    "grants it.\n\n"
-                    "### Workspace and skill paths\n"
-                    "User files live under '/workspace/'. Always reference them with this prefix, e.g. "
-                    "'/workspace/dashboard.html' or '/workspace/subdir/file.py'. Skill files live under "
-                    "'/skills/', e.g. '/skills/design-html/SKILL.md'. The bare root '/' is an alias for "
-                    "'/workspace/' but MUST NOT be mixed with '/workspace/'; pick '/workspace/' for user files "
-                    "and '/skills/' for skill files, and stick to those prefixes.\n"
-                    "The global knowledge base lives at '/knowledge/' (physical path configured by "
-                    "PUDDINGCLAW_KNOWLEDGE_DIR, defaulting to backend/knowledge/). Add "
-                    "Markdown documents there when a skill needs to store retrievable knowledge. Use "
-                    "`llamaindex_knowledge_query` for indexed RAG retrieval. Only use built-in `glob`/`grep` "
-                    "under `/knowledge/` when the user explicitly asks for exact Markdown/file-name lookup; "
-                    "do not use broad patterns like `**/*` to recover RAG image hits. "
-                    "User-selected local Markdown files and MinerU-parsed PDFs are imported "
-                    "by the backend into '/knowledge/imported/...', so prefer those virtual paths when citing or "
-                    "reading imported docs. "
-                    "If `llamaindex_knowledge_query` returns a `[图片命中]` section with local image paths, "
-                    "do not infer image contents from filenames alone. When the image is relevant, directly call "
-                    "the native `task` tool with `subagent_type=image_analyzer`. Put the complete request, image path, "
-                    "and retrieved context inside the task `description`; do not rely on a separate `prompt` field. "
-                    "Prefer `/knowledge/...` virtual paths when available. The image_analyzer subagent must call "
-                    "`read_resource` inside its own task before visual analysis. "
-                    "Do NOT store knowledge under '/workspace/knowledge/'.\n\n"
-                    "When the user asks you to break a task into steps or track progress, call the `write_todos` "
-                    "tool to create a structured todo list.\n\n"
-                    "### Resource access\n"
-                    "Use the built-in `read_file` only for virtual workspace paths such as `/workspace/...`. "
-                    "For uploaded/pasted attachment refs like `att_xxx` and user-provided resources outside "
-                    "the `/workspace/` virtual namespace, call `read_resource`. This includes platform-specific "
-                    "absolute paths (POSIX, Windows, or home-relative paths). Never pass non-workspace paths to "
-                    "`read_file`, `glob`, or `grep`; those tools are scoped to the workspace.\n\n"
-                    "### Attachment delegation\n"
-                    "If the latest user message contains `[系统提示] 检测到附件输入` and the attachment refs include "
-                    "image items, you MUST call the native `task` tool with `subagent_type` set to "
-                    "`image_analyzer` before answering image-content questions. Copy the `harness_attachment_session_id` "
-                    "and attachment refs into the task description exactly, ask the subagent to analyze the image "
-                    "contents, then summarize or use the returned ToolMessage in your final answer. Do not answer "
-                    "image-content questions from the placeholder text alone.\n\n"
-                    "### 来源引用规则\n"
-                    "- 检索类工具返回的结果中可能包含稳定的 `source_id`。\n"
-                    "- 当回答中的具体论述使用了某个来源的信息时，必须在该论述后紧跟标记 `[^source_id]`。\n"
-                    "- 只能引用工具实际提供的 `source_id`，禁止编造来源、文件名、URL 或页码。\n"
-                    "- 如果某来源未被用于支撑最终回答，不要为它添加引用标记。\n"
-                    "- 禁止只写『来源』等裸词而不带 `[^source_id]` 标记。"
-                ),
+                system_prompt=system_prompt,
             )
             logger.info("DeepAgents agent built successfully for session=%s", session_id)
 

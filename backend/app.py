@@ -96,7 +96,7 @@ from api.tokens import router as tokens_router
 from api.compress import router as compress_router
 from api.config_api import router as config_router
 from api.eval_api import router as eval_router
-from api.skills_api import router as skills_router
+from api.skills_api import router as skills_api_router
 from api.stats_api import router as stats_router
 from api.mcp import router as mcp_router
 from api.capabilities import router as capabilities_router
@@ -104,10 +104,11 @@ from api.projects import router as projects_router
 from api.permissions import router as permissions_router
 from api.attachments import router as attachments_router
 from api.knowledge import router as knowledge_router
+from api.analytics import router as analytics_router
 
 app.include_router(chat_router, prefix="/api")
 app.include_router(agent_router, prefix="/api")
-app.include_router(skills_router, prefix="/api")  # Must come before files_router
+app.include_router(skills_api_router, prefix="/api")  # Must come before files_router
 app.include_router(files_router, prefix="/api")
 app.include_router(sessions_router, prefix="/api")
 app.include_router(tokens_router, prefix="/api")
@@ -121,6 +122,7 @@ app.include_router(projects_router, prefix="/api")
 app.include_router(permissions_router, prefix="/api")
 app.include_router(attachments_router, prefix="/api")
 app.include_router(knowledge_router, prefix="/api")
+app.include_router(analytics_router, prefix="/api")
 
 
 @app.get("/")

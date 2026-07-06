@@ -43,6 +43,10 @@ dependencies = [
     "llama-index-embeddings-openai>=0.6.0",
     "llama-index-retrievers-bm25>=0.7.0",
     "rank-bm25>=0.2.2",
+    # Table question answering
+    "pandas>=2.3.0",
+    "openpyxl>=3.1.0",
+    "xlrd>=2.0.1",
     # Memory
     "mem0ai>=1.0.9",
     # Context engineering / token counting

@@ -8,7 +8,7 @@
     cache_boundary（最外，observer）
     → tail_trim（日常裁剪主力，cache-friendly）
     → [tool_clear, summarization, compaction]（高阈值兜底，会破 cache）
-    → skills_router → task_state
+    → tool_intent_router → task_state
 
 关键实现差异（vs 课程 Ch5 参考版）：
 - CacheBoundary 重写为 wrap_model_call 钩子：create_agent 的 system_prompt 只在
@@ -389,7 +389,7 @@ class TailTrimMiddleware(AgentMiddleware):
 def build_cache_middlewares(config: dict) -> list:
     """工厂函数：根据 config dict 构建 cache middleware 列表。
 
-    对齐 build_compression_middlewares / build_skills_router_middlewares /
+    对齐 build_compression_middlewares / build_tool_intent_router_middlewares /
     build_write_middlewares 的签名模式。
 
     config 格式：

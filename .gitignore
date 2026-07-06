@@ -23,7 +23,6 @@ backend/logs/
 backend/archive/
 backend/storage/
 backend/workspace/
-backend/knowledge/
 backend/output/
 
 # Legacy task/reminder files (should not be in backend root)
@@ -39,6 +38,8 @@ backend/prompts/*
 !backend/prompts/IDENTITY.md
 !backend/prompts/USER.md
 !backend/prompts/system.md
+!backend/prompts/deepagents/
+!backend/prompts/deepagents/*.md
 __pycache__/
 *.py[cod]
 *$py.class

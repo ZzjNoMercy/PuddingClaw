@@ -1644,7 +1644,8 @@ function buildActualFlowWithInvocation(
   return insertTopLevelFlowMarkerForInvocation(
     base,
     middlewareInvocationFlowItem(invocation, markerSpan),
-    invocation
+    invocation,
+    null
   );
 }
 
@@ -1690,16 +1691,84 @@ function insertTopLevelFlowMarkerByOrder(
   return dedupeFlowItems(result, marker.id);
 }
 
+function addMountedWrapperSignatures(items: ActualFlowItem[], trace: AgentTrace | null): ActualFlowItem[] {
+  const mountedWraps = mountedHookEntries(trace, "wrap_model_call");
+  if (mountedWraps.length === 0) return items;
+  return items.map((item) => {
+    if (!isGraphModelFlowItem(item)) return item;
+    let signature = item.signature || [];
+    for (const entry of mountedWraps) {
+      const order = middlewareStackOrderFromEntry(entry);
+      const hookName = compactMiddlewareName(String(entry.name || "Middleware"));
+      const existingIndex = signature.findIndex((candidate) =>
+        signatureHookName(candidate) === "wrap_model_call" &&
+        signatureMiddlewareName(candidate) === normalizeSignatureMiddlewareName(hookName)
+      );
+      const mountedMarker: ActualFlowItem = {
+        id: `mounted-wrap-${item.id}-${String(entry.name || "middleware")}`,
+        type: "middleware",
+        status: "completed",
+        label: `${hookName}.wrap_model_call`,
+        subtitle: "已挂载 wrap_model_call",
+        title: `${entry.name}.wrap_model_call · ${entry.note || "runtime inventory"}`,
+        signatureOrder: order,
+      };
+      if (existingIndex >= 0) {
+        const currentOrder = middlewareSignatureOrder(signature[existingIndex]);
+        signature[existingIndex] = {
+          ...signature[existingIndex],
+          signatureOrder: currentOrder === Number.POSITIVE_INFINITY ? order : currentOrder,
+        };
+      } else {
+        signature = [...signature, mountedMarker];
+      }
+    }
+    return {
+      ...item,
+      signature: sortModelHookSignature(signature),
+    };
+  });
+}
+
+function mountedHookEntries(trace: AgentTrace | null, hook: MiddlewareHookName): TraceRuntimeMiddlewareEntry[] {
+  const inventory = trace?.runtime_inventory as TraceRuntimeInventory | undefined;
+  const hookEntries = inventory?.middleware?.hooks?.[hook] || [];
+  const stackEntries = (inventory?.middleware?.stack || []).filter((entry) => middlewareHooks(entry).includes(hook));
+  return uniqueMiddlewareEntries([...hookEntries, ...stackEntries]).sort((a, b) => {
+    return middlewareStackOrderFromEntry(a) - middlewareStackOrderFromEntry(b);
+  });
+}
+
+function middlewareStackOrderFromEntry(entry: TraceRuntimeMiddlewareEntry | undefined): number {
+  return numberFromUnknown(entry?.stack_order) ??
+    numberFromUnknown(entry?.order) ??
+    numberFromUnknown(entry?.execution_order) ??
+    9999;
+}
+
+function compactMiddlewareName(name: string): string {
+  return name.replace(/Middleware$/, "");
+}
+
+function normalizeSignatureMiddlewareName(label: string): string {
+  return compactMiddlewareName(label.split(".", 1)[0] || label).toLowerCase();
+}
+
+function signatureMiddlewareName(item: ActualFlowItem): string {
+  return normalizeSignatureMiddlewareName(middlewareNameForFlowItem(item) || item.label);
+}
+
 function insertTopLevelFlowMarkerForInvocation(
   items: ActualFlowItem[],
   marker: ActualFlowItem,
-  invocation: MiddlewareHookInvocation
+  invocation: MiddlewareHookInvocation,
+  trace: AgentTrace | null
 ): ActualFlowItem[] {
   if (invocation.hook === "wrap_model_call") {
-    return insertWrapperMarkerForInvocation(items, marker, invocation, isGraphModelFlowItem, findGraphModelFlowIndex);
+    return insertWrapperMarkerForInvocation(items, marker, invocation, trace, isGraphModelFlowItem, findGraphModelFlowIndex);
   }
   if (invocation.hook === "wrap_tool_call") {
-    return insertWrapperMarkerForInvocation(items, marker, invocation, isGraphToolsFlowItem, findGraphToolsFlowIndex);
+    return insertWrapperMarkerForInvocation(items, marker, invocation, trace, isGraphToolsFlowItem, findGraphToolsFlowIndex);
   }
   if (invocation.hook === "before_agent") {
     return insertBeforeFirstModelBoundary(items, marker);
@@ -1740,6 +1809,7 @@ function insertWrapperMarkerForInvocation(
   items: ActualFlowItem[],
   marker: ActualFlowItem,
   invocation: MiddlewareHookInvocation,
+  trace: AgentTrace | null,
   isTarget: (item: ActualFlowItem) => boolean,
   findTargetIndex: (items: ActualFlowItem[], invocation: MiddlewareHookInvocation, markerOrder: number) => number
 ): ActualFlowItem[] {
@@ -1750,9 +1820,28 @@ function insertWrapperMarkerForInvocation(
   if (!isTarget(target)) return insertTopLevelFlowMarkerByOrder(items, marker, spanEventOrder(marker.span!));
   next[targetIndex] = {
     ...target,
-    signature: insertModelHookSignature(target.signature || [], marker, invocation.hook),
+    signature: insertModelHookSignature(
+      target.signature || [],
+      withMiddlewareExecutionOrder(marker, middlewareInvocationStackOrder(invocation, trace)),
+      invocation.hook
+    ),
   };
   return dedupeFlowItems(next, marker.id);
+}
+
+function withMiddlewareExecutionOrder(marker: ActualFlowItem, order: number): ActualFlowItem {
+  if (!marker.span) return { ...marker, signatureOrder: order };
+  return {
+    ...marker,
+    signatureOrder: order,
+    span: {
+      ...marker.span,
+      metadata: {
+        ...(marker.span.metadata || {}),
+        middleware_execution_order: order,
+      },
+    },
+  };
 }
 
 function findGraphModelFlowIndex(
@@ -1805,14 +1894,17 @@ function insertModelHookSignature(
   marker: ActualFlowItem,
   hook: MiddlewareHookName
 ): ActualFlowItem[] {
-  const withoutDuplicate = signature.filter((item) => item.id !== marker.id);
+  const markerKey = modelHookSignatureKey(marker, hook);
+  const withoutDuplicate = signature.filter((item) =>
+    item.id !== marker.id && modelHookSignatureKey(item) !== markerKey
+  );
   const subtitle =
     hook === "before_model"
       ? "模型调用前的中间件边界"
       : hook === "wrap_model_call"
         ? "包裹真实 LLM 调用"
         : "模型返回后的中间件边界";
-  return [
+  return sortModelHookSignature([
     ...withoutDuplicate,
     {
       ...marker,
@@ -1820,15 +1912,33 @@ function insertModelHookSignature(
       subtitle,
       title: `${marker.title} · ${subtitle}`,
     },
-  ].sort((a, b) => {
-    const rank = (item: ActualFlowItem) => modelHookSignatureRank(normalizeHookName(item.span?.metadata?.hook) || hook);
+  ]);
+}
+
+function modelHookSignatureKey(item: ActualFlowItem, hookOverride?: MiddlewareHookName): string {
+  const hook = hookOverride || signatureHookName(item);
+  return `${hook}:${signatureMiddlewareName(item)}`;
+}
+
+function sortModelHookSignature(signature: ActualFlowItem[]): ActualFlowItem[] {
+  return [...signature].sort((a, b) => {
+    const rank = (item: ActualFlowItem) => modelHookSignatureRank(signatureHookName(item));
     const rankDelta = rank(a) - rank(b);
     if (rankDelta !== 0) return rankDelta;
+    const stackDelta = middlewareSignatureOrder(a) - middlewareSignatureOrder(b);
+    if (stackDelta !== 0) return stackDelta;
     const orderDelta = (a.span ? spanEventOrder(a.span) : Number.POSITIVE_INFINITY) -
       (b.span ? spanEventOrder(b.span) : Number.POSITIVE_INFINITY);
     if (orderDelta !== 0) return orderDelta;
     return a.label.localeCompare(b.label);
   });
+}
+
+function signatureHookName(item: ActualFlowItem): MiddlewareHookName {
+  const fromMetadata = normalizeHookName(item.span?.metadata?.hook);
+  if (fromMetadata) return fromMetadata;
+  const fromLabel = item.label.match(/\.(before_agent|before_model|wrap_model_call|after_model|wrap_tool_call|after_agent)$/)?.[1];
+  return normalizeHookName(fromLabel) || "wrap_model_call";
 }
 
 function modelHookSignatureRank(hook: MiddlewareHookName): number {
@@ -1843,12 +1953,34 @@ function modelHookSignatureRank(hook: MiddlewareHookName): number {
   return ranks[hook];
 }
 
+function middlewareSignatureOrder(item: ActualFlowItem): number {
+  return numberFromUnknown(item.span?.metadata?.middleware_execution_order) ?? Number.POSITIVE_INFINITY;
+}
+
 function modelHookSignatureLabel(marker: ActualFlowItem, hook: MiddlewareHookName): string {
   const rawTitle = marker.title.replace(`${hook} · `, "").replace(`${hook}: `, "");
-  const middlewareName = stringArray(marker.span?.metadata?.middleware)[0];
-  const raw = rawTitle && rawTitle !== hook ? rawTitle : middlewareName || hook;
+  const middlewareName = middlewareNameForFlowItem(marker);
+  const raw = middlewareName || (rawTitle && rawTitle !== hook ? rawTitle : hook);
   const compact = raw.replace(/Middleware/g, "").replace(new RegExp(`\\.${hook}$`), "");
   return compact === hook ? hook : `${compact}.${hook}`;
+}
+
+function middlewareNameForFlowItem(item: ActualFlowItem): string {
+  const metadata = item.span?.metadata || {};
+  const candidates = [
+    ...stringArray(metadata.middleware),
+    ...stringArray(metadata.proxied_middleware),
+    stringFromUnknown(metadata.proxied_middleware),
+    stringFromUnknown(metadata.middleware_name),
+    stringFromUnknown(metadata.middleware),
+  ];
+  for (const candidate of candidates) {
+    const text = candidate.trim();
+    if (text) return text;
+  }
+  const labelMatch = item.label.match(/^([A-Za-z0-9_]+)(?:Middleware)?\./);
+  if (labelMatch) return labelMatch[1];
+  return "";
 }
 
 function invocationModelCallIndex(invocation: MiddlewareHookInvocation): number | null {
@@ -3942,6 +4074,7 @@ interface ActualFlowItem {
   subtitle: string;
   title: string;
   span?: TraceSpan;
+  signatureOrder?: number;
   signature?: ActualFlowItem[];
   children?: ActualFlowItem[];
 }
@@ -3977,11 +4110,12 @@ function buildActualFlowForTrace(trace: AgentTrace | null, spans: TraceSpan[]): 
     .filter((invocation) => shouldShowInvocationInActualFlow(invocation))
     .sort((a, b) => actualFlowInvocationOrder(a, trace) - actualFlowInvocationOrder(b, trace));
 
-  return invocations.reduce((items, invocation) => {
+  const withObservedInvocations = invocations.reduce((items, invocation) => {
     const markerSpan = middlewareInvocationMarkerSpan(invocation);
     const marker = middlewareInvocationFlowItem(invocation, markerSpan);
-    return insertTopLevelFlowMarkerForInvocation(items, marker, invocation);
+    return insertTopLevelFlowMarkerForInvocation(items, marker, invocation, trace);
   }, base);
+  return addMountedWrapperSignatures(withObservedInvocations, trace);
 }
 
 function traceFlowDebugEnabled(): boolean {
@@ -4069,8 +4203,7 @@ function middlewareInvocationStackOrder(invocation: MiddlewareHookInvocation, tr
   const hook = invocation.hook;
   const hookEntries = inventory?.middleware?.hooks?.[hook] || [];
   const hookMatch = hookEntries.find((entry) => invocationNames.has(String(entry.name || "").trim()));
-  const hookOrder = numberFromUnknown(hookMatch?.execution_order);
-  if (hookOrder !== null) return hookOrder;
+  if (hookMatch) return middlewareStackOrderFromEntry(hookMatch);
 
   const stack = inventory?.middleware?.stack || [];
   const match = stack.find((entry) => {
@@ -4078,8 +4211,7 @@ function middlewareInvocationStackOrder(invocation: MiddlewareHookInvocation, tr
     const hooks = Array.isArray(entry.hooks) ? entry.hooks : [];
     return invocationNames.has(name) && hooks.includes(hook);
   });
-  const order = numberFromUnknown(match?.execution_order) ?? numberFromUnknown(match?.stack_order) ?? numberFromUnknown(match?.order);
-  return order ?? 9999;
+  return middlewareStackOrderFromEntry(match);
 }
 
 function middlewareInvocationFromRaw(

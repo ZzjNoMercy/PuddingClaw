@@ -50,7 +50,7 @@ class TaskStateMiddleware(AgentMiddleware):
     def _extract_last_user_text(self, messages) -> str | None:
         """反向遍历 state messages，找到最后一条 HumanMessage 的文本内容。
 
-        注意：过滤掉 SkillsRouter 注入的路由提示，只保留用户原始输入。
+        注意：过滤掉 ToolIntentRouter 注入的路由提示，只保留用户原始输入。
         """
         for msg in reversed(messages):
             if isinstance(msg, HumanMessage):
@@ -64,7 +64,7 @@ class TaskStateMiddleware(AgentMiddleware):
                 if not isinstance(content, str):
                     content = str(content)
 
-                # 过滤 SkillsRouter 路由提示（格式：\n\n[系统路由提示] ...）
+                # 过滤 ToolIntentRouter 路由提示（格式：\n\n[系统路由提示] ...）
                 if "\n\n[系统路由提示]" in content:
                     content = content.split("\n\n[系统路由提示]")[0].strip()
 

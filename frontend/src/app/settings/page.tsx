@@ -5,6 +5,7 @@ import {
   Bot,
   Database,
   HardDrive,
+  FileText,
   Sliders,
   Brain,
   Save,
@@ -37,12 +38,13 @@ import {
   type SubAgentItem,
 } from "@/lib/settingsApi";
 import { useApp } from "@/lib/store";
+import { getProjectContext, updateProjectContext, type ProjectContextDocument } from "@/lib/api";
 import MemoryEditor from "@/components/settings/MemoryEditor";
 import CapabilitiesStatus from "@/components/settings/CapabilitiesStatus";
 import Navbar from "@/components/layout/Navbar";
 import Link from "next/link";
 
-type SettingsCategory = "ai" | "rag" | "knowledge" | "memory" | "data" | "harness" | "advanced" | "system";
+type SettingsCategory = "ai" | "project" | "rag" | "knowledge" | "memory" | "data" | "harness" | "advanced" | "system";
 type SubAgentConfigMap = Record<string, Omit<SubAgentItem, "name">>;
 
 type HarnessSection = {
@@ -60,6 +62,7 @@ const HARNESS_SECTIONS: HarnessSection[] = [
 
 const CATEGORIES: { key: SettingsCategory; label: string; icon: React.ElementType; color: string }[] = [
   { key: "ai", label: "AI 网关", icon: Network, color: "#002fa7" },
+  { key: "project", label: "项目上下文", icon: FileText, color: "#002fa7" },
   { key: "rag", label: "RAG 设置", icon: Database, color: "#002fa7" },
   { key: "knowledge", label: "知识库", icon: FolderOpen, color: "#002fa7" },
   { key: "memory", label: "记忆管理", icon: Brain, color: "#002fa7" },
@@ -106,7 +109,7 @@ function positiveIntOrNull(value: string): number | null {
 }
 
 export default function SettingsPage() {
-  const { sidebarOpen, toggleSidebar, thinkingMode, setThinkingMode } = useApp();
+  const { sidebarOpen, toggleSidebar, thinkingMode, setThinkingMode, currentProjectId, projects } = useApp();
   const [mounted, setMounted] = useState(false);
   const [selectedSubagentIndex, setSelectedSubagentIndex] = useState<number | null>(null);
   const [configModalOpen, setConfigModalOpen] = useState(false);
@@ -128,6 +131,7 @@ export default function SettingsPage() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [toast, setToast] = useState<{ type: "success" | "error"; message: string } | null>(null);
+  const currentProject = projects.find((project) => project.project_id === currentProjectId) || null;
 
   // AI Gateway form state
   const [gatewayBaseUrl, setGatewayBaseUrl] = useState("");
@@ -221,6 +225,12 @@ export default function SettingsPage() {
   // SubAgent / Harness
   const [subagentItems, setSubagentItems] = useState<SubAgentItem[]>([]);
   const [refreshingModels, setRefreshingModels] = useState(false);
+
+  // Project context
+  const [projectContextDoc, setProjectContextDoc] = useState<ProjectContextDocument | null>(null);
+  const [projectContextContent, setProjectContextContent] = useState("");
+  const [projectContextLoading, setProjectContextLoading] = useState(false);
+  const [projectContextSaving, setProjectContextSaving] = useState(false);
 
   const makeDefaultSubAgentItem = useCallback((models: string[]): SubAgentItem => {
     return {
@@ -328,6 +338,51 @@ export default function SettingsPage() {
     setToast({ type, message });
     setTimeout(() => setToast(null), 3000);
   }, []);
+
+  useEffect(() => {
+    if (!currentProjectId) {
+      setProjectContextDoc(null);
+      setProjectContextContent("");
+      return;
+    }
+
+    let cancelled = false;
+    setProjectContextLoading(true);
+    getProjectContext(currentProjectId)
+      .then((doc) => {
+        if (cancelled) return;
+        setProjectContextDoc(doc);
+        setProjectContextContent(doc.content);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setProjectContextDoc(null);
+        setProjectContextContent("");
+        showToast("error", err instanceof Error ? err.message : "加载项目上下文失败");
+      })
+      .finally(() => {
+        if (!cancelled) setProjectContextLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [currentProjectId, showToast]);
+
+  const handleSaveProjectContext = useCallback(async () => {
+    if (!currentProjectId) return;
+    setProjectContextSaving(true);
+    try {
+      const doc = await updateProjectContext(currentProjectId, projectContextContent);
+      setProjectContextDoc(doc);
+      setProjectContextContent(doc.content);
+      showToast("success", "项目上下文已保存");
+    } catch (err) {
+      showToast("error", err instanceof Error ? err.message : "项目上下文保存失败");
+    } finally {
+      setProjectContextSaving(false);
+    }
+  }, [currentProjectId, projectContextContent, showToast]);
 
   const handleSave = useCallback(async () => {
     setSaving(true);
@@ -760,7 +815,7 @@ export default function SettingsPage() {
         <main className="workspace-content-frame flex min-w-0 flex-1 flex-col overflow-hidden">
           <div className="flex-1 overflow-y-auto px-8 pb-8 pt-6">
             <div className={`${
-              category === "ai" ? "max-w-4xl" : category === "harness" ? "max-w-6xl" : "max-w-2xl"
+              category === "ai" ? "max-w-4xl" : category === "harness" || category === "project" ? "max-w-6xl" : "max-w-2xl"
             } mx-auto space-y-6`}>
             {category === "ai" && (
               <>
@@ -915,6 +970,75 @@ export default function SettingsPage() {
                 </div>
               </>
             )}
+
+            {category === "project" && (
+              <div className="space-y-5">
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <h1 className="text-[22px] font-semibold tracking-tight text-gray-900">项目上下文</h1>
+                    <p className="mt-1 text-[12px] text-gray-500">
+                      编辑当前项目注入 DeepAgents system prompt 的项目级上下文。
+                    </p>
+                  </div>
+                  {currentProject && (
+                    <span className="rounded-full bg-[#002fa7]/8 px-3 py-1 text-[11px] font-medium text-[#002fa7]">
+                      {currentProject.name}
+                    </span>
+                  )}
+                </div>
+
+                {!currentProjectId ? (
+                  <div className="rounded-2xl border border-dashed border-black/[0.08] bg-white/70 p-8 text-center shadow-sm">
+                    <FileText className="mx-auto h-8 w-8 text-gray-300" />
+                    <h2 className="mt-3 text-[14px] font-semibold text-gray-800">还没有选择项目</h2>
+                    <p className="mx-auto mt-2 max-w-md text-[12px] leading-relaxed text-gray-500">
+                      先在侧边栏或输入框添加本地项目。PuddingClaw 会在项目根目录创建
+                      <code className="mx-1 rounded bg-gray-100 px-1 py-0.5">.puddingclaw/PROJECT_CONTEXT.md</code>
+                      ，之后这里就能编辑。
+                    </p>
+                  </div>
+                ) : (
+                  <SettingsCard title="PROJECT_CONTEXT.md" icon={FileText} color="#002fa7">
+                    <div className="mb-4 grid gap-3 lg:grid-cols-[1fr_auto]">
+                      <div className="rounded-xl border border-black/[0.06] bg-white/55 px-3.5 py-3">
+                        <p className="text-[11px] font-semibold uppercase tracking-wide text-gray-400">文件位置</p>
+                        <p className="mt-1 break-all font-mono text-[11px] text-gray-600">
+                          {projectContextDoc?.path || `${currentProject?.path || ""}/.puddingclaw/PROJECT_CONTEXT.md`}
+                        </p>
+                        <p className="mt-2 text-[11px] text-gray-400">
+                          {projectContextDoc?.is_project_local
+                            ? "项目本地副本，随项目迁移和版本管理。"
+                            : "当前使用默认模板；保存后会写入项目本地副本。"}
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={handleSaveProjectContext}
+                        disabled={projectContextSaving || projectContextLoading}
+                        className="inline-flex h-full min-h-[72px] items-center justify-center gap-2 rounded-xl bg-[#002fa7] px-5 text-[12px] font-semibold text-white shadow-sm transition-colors hover:bg-[#00298f] disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {projectContextSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                        保存项目上下文
+                      </button>
+                    </div>
+
+                    <textarea
+                      value={projectContextContent}
+                      onChange={(event) => setProjectContextContent(event.target.value)}
+                      disabled={projectContextLoading}
+                      spellCheck={false}
+                      className="min-h-[520px] w-full resize-y rounded-xl border border-black/[0.08] bg-white/80 p-4 font-mono text-[12px] leading-relaxed text-gray-800 outline-none transition-colors focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/8 disabled:opacity-60"
+                      placeholder={projectContextLoading ? "正在加载项目上下文..." : "写入当前项目的业务背景、架构约束、目录约定和稳定决策。"}
+                    />
+
+                    <div className="mt-3 rounded-xl border border-amber-100 bg-amber-50/60 px-3.5 py-3 text-[11px] leading-relaxed text-amber-700">
+                      这里不要维护 skills 列表或工具 schema；skills 由 SkillsMiddleware 运行时注入，tools 通过 API tools 字段进入模型。
+                    </div>
+                  </SettingsCard>
+                )}
+              </div>
+            )}
+
             {/* Fallback Settings */}
             {category === "ai" && (
               <SettingsCard title="Fallback 直连配置" icon={Bot} color="#6b7280">

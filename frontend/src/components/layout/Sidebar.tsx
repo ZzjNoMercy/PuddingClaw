@@ -15,6 +15,7 @@ import {
   Search,
   Puzzle,
   Database,
+  BarChart3,
   FolderKanban,
   Bot,
   MessagesSquare,
@@ -49,6 +50,7 @@ export default function Sidebar() {
   } = useApp();
   const router = useRouter();
   const pathname = usePathname();
+  const isChatRoute = pathname === "/";
 
   // Sort sessions by most recent activity first
   const sortedSessions = useMemo(
@@ -174,6 +176,17 @@ export default function Sidebar() {
           知识库
         </Link>
         <Link
+          href="/analytics"
+          className={`w-full flex items-center gap-2 px-3 py-2 text-[13px] rounded-xl transition-all ${
+            runtimeReady && pathname.startsWith("/analytics")
+              ? "bg-white/72 text-[#002fa7] font-medium shadow-sm"
+              : "text-gray-600 hover:text-gray-900 hover:bg-white/50"
+          }`}
+        >
+          <BarChart3 className="w-4 h-4" />
+          智能问数
+        </Link>
+        <Link
           href="/skills"
           className={`w-full flex items-center gap-2 px-3 py-2 text-[13px] rounded-xl transition-all ${
             runtimeReady && pathname.startsWith("/skills")
@@ -187,103 +200,105 @@ export default function Sidebar() {
         <SidebarLink icon={Workflow} label="定时任务" muted />
       </div>
 
-      <div className="mx-4 my-1.5 h-px bg-black/[0.04]" />
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        <div className="mx-4 my-1.5 h-px bg-black/[0.04]" />
 
-      {/* Projects */}
-      {runtimeReady && runtimeMode === "agent" && (
-        <div className="shrink-0 px-1.5 pb-2">
-          <div className="flex items-center justify-between px-3 pt-2 pb-1">
-            <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-widest">
-              项目
-            </p>
-            <button
-              type="button"
-              onClick={handleAddProject}
-              className="rounded p-0.5 text-gray-400 hover:bg-black/[0.05] hover:text-gray-700"
-              title="添加项目"
-            >
-              <Plus className="h-3.5 w-3.5" />
-            </button>
-          </div>
-          {projects.length > 0 ? (
-            <div className="space-y-1">
-              {projects.map((project) => {
-                const childSessions = projectSessions.get(project.project_id) || [];
-                return (
-                  <div key={project.project_id} className="relative">
-                    <ProjectItem
-                      projectId={project.project_id}
-                      name={project.name}
-                      path={project.path}
-                      pinned={Boolean(project.pinned)}
-                      isActive={
-                        currentProjectId === project.project_id &&
-                        !childSessions.some((s) => s.id === sessionId)
-                      }
-                      onSelect={() => {
-                        setRuntimeMode("agent");
-                        setCurrentProjectId(project.project_id);
-                      }}
-                      onPinToggle={async () => {
-                        await updateProject(project.project_id, { pinned: !project.pinned });
-                      }}
-                      onRename={async (name) => {
-                        return Boolean(await updateProject(project.project_id, { name }));
-                      }}
-                      onRemove={async () => {
-                        const removed = await removeProject(project.project_id);
-                        if (removed && currentProjectId === project.project_id) {
-                          setCurrentProjectId(null);
-                          setWorkspaceView("chat");
-                          setSessionId("default");
+        {/* Projects */}
+        {runtimeReady && runtimeMode === "agent" && (
+          <div className="px-1.5 pb-2">
+            <div className="flex items-center justify-between px-3 pt-2 pb-1">
+              <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-widest">
+                项目
+              </p>
+              <button
+                type="button"
+                onClick={handleAddProject}
+                className="rounded p-0.5 text-gray-400 hover:bg-black/[0.05] hover:text-gray-700"
+                title="添加项目"
+              >
+                <Plus className="h-3.5 w-3.5" />
+              </button>
+            </div>
+            {projects.length > 0 ? (
+              <div className="space-y-1">
+                {projects.map((project) => {
+                  const childSessions = projectSessions.get(project.project_id) || [];
+                  return (
+                    <div key={project.project_id} className="relative">
+                      <ProjectItem
+                        projectId={project.project_id}
+                        name={project.name}
+                        path={project.path}
+                        pinned={Boolean(project.pinned)}
+                        isActive={
+                          isChatRoute &&
+                          currentProjectId === project.project_id &&
+                          !childSessions.some((s) => s.id === sessionId)
                         }
-                        return removed;
-                      }}
-                    />
-                    <div className="relative ml-5 mt-0.5 space-y-px">
-                      {childSessions.length > 0 ? (
-                        childSessions.slice(0, 5).map((s) => (
-                          <SessionItem
-                            key={s.id}
-                            id={s.id}
-                            title={s.title}
-                            isActive={sessionId === s.id}
-                            onSelect={() => {
-                              setRuntimeMode("agent");
-                              setCurrentProjectId(project.project_id);
-                              setSessionId(s.id);
-                              if (pathname !== "/") {
-                                router.push("/");
-                              }
-                            }}
-                            onRename={(title) => renameSession(s.id, title)}
-                            onDelete={() => deleteSession(s.id)}
-                          />
-                        ))
-                      ) : (
-                        <p className="px-3 py-1 text-[12px] text-gray-400">暂无对话</p>
-                      )}
-                      {childSessions.length > 5 && (
-                        <p className="px-3 py-1 text-[12px] text-gray-400">展开显示</p>
-                      )}
+                        onSelect={() => {
+                          setRuntimeMode("agent");
+                          setCurrentProjectId(project.project_id);
+                        }}
+                        onPinToggle={async () => {
+                          await updateProject(project.project_id, { pinned: !project.pinned });
+                        }}
+                        onRename={async (name) => {
+                          return Boolean(await updateProject(project.project_id, { name }));
+                        }}
+                        onRemove={async () => {
+                          const removed = await removeProject(project.project_id);
+                          if (removed && currentProjectId === project.project_id) {
+                            setCurrentProjectId(null);
+                            setWorkspaceView("chat");
+                            setSessionId("default");
+                          }
+                          return removed;
+                        }}
+                      />
+                      <div className="relative ml-5 mt-0.5 space-y-px">
+                        {childSessions.length > 0 ? (
+                          childSessions.slice(0, 5).map((s) => (
+                            <SessionItem
+                              key={s.id}
+                              id={s.id}
+                              title={s.title}
+                              isActive={isChatRoute && sessionId === s.id}
+                              onSelect={() => {
+                                setRuntimeMode("agent");
+                                setCurrentProjectId(project.project_id);
+                                setSessionId(s.id);
+                                if (pathname !== "/") {
+                                  router.push("/");
+                                }
+                              }}
+                              onRename={(title) => renameSession(s.id, title)}
+                              onDelete={() => deleteSession(s.id)}
+                            />
+                          ))
+                        ) : (
+                          <p className="px-3 py-1 text-[12px] text-gray-400">暂无对话</p>
+                        )}
+                        {childSessions.length > 5 && (
+                          <p className="px-3 py-1 text-[12px] text-gray-400">展开显示</p>
+                        )}
+                      </div>
                     </div>
-                  </div>
-                );
-              })}
-            </div>
-          ) : (
-            <div className="flex items-center gap-2 px-3 py-2 text-[12px] text-gray-400">
-              <FolderKanban className="h-3.5 w-3.5" />
-              暂无项目
-            </div>
-          )}
-        </div>
-      )}
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="flex items-center gap-2 px-3 py-2 text-[12px] text-gray-400">
+                <FolderKanban className="h-3.5 w-3.5" />
+                暂无项目
+              </div>
+            )}
+          </div>
+        )}
 
-      {runtimeReady && runtimeMode === "agent" && <div className="mx-4 h-px bg-black/[0.04]" />}
+        {runtimeReady && runtimeMode === "agent" && <div className="mx-4 h-px bg-black/[0.04]" />}
 
-      {/* Regular conversations */}
-      <div className="flex-1 overflow-y-auto px-1.5">
+        {/* Regular conversations */}
+        <div className="px-1.5">
         <div className="space-y-px">
           <p className="px-3 pt-2 pb-0.5 text-[10px] font-semibold text-gray-500 uppercase tracking-widest">
             对话
@@ -294,7 +309,7 @@ export default function Sidebar() {
                 key={s.id}
                 id={s.id}
                 title={s.title}
-                isActive={sessionId === s.id}
+                isActive={isChatRoute && sessionId === s.id}
                 onSelect={() => {
                   if (s.runtime_mode === "agent") {
                     setRuntimeMode("agent");
@@ -316,6 +331,7 @@ export default function Sidebar() {
           ) : (
             <p className="px-3 py-2 text-[12px] text-gray-400">暂无对话</p>
           )}
+        </div>
         </div>
       </div>
 

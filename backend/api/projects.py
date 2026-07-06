@@ -9,6 +9,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from projects.project_context import ensure_project_context, read_project_context, write_project_context
 from projects.registry import project_registry
 
 router = APIRouter()
@@ -22,6 +23,10 @@ class RegisterProjectRequest(BaseModel):
 class UpdateProjectRequest(BaseModel):
     name: str | None = None
     pinned: bool | None = None
+
+
+class UpdateProjectContextRequest(BaseModel):
+    content: str
 
 
 @router.get("/projects")
@@ -84,6 +89,47 @@ async def open_project(project_id: str):
         raise HTTPException(status_code=500, detail=f"Failed to open project: {exc}") from exc
 
     return {"ok": True, "project_id": project_id, "path": str(project_path)}
+
+
+@router.get("/projects/{project_id}/context")
+async def get_project_context(project_id: str):
+    try:
+        project_path = project_registry.resolve(project_id)
+        ensure_project_context(project_path, project_registry.base_dir)
+        content, source_path, is_project_local = read_project_context(project_path, project_registry.base_dir)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "project_id": project_id,
+        "content": content,
+        "path": str(source_path),
+        "is_project_local": is_project_local,
+    }
+
+
+@router.put("/projects/{project_id}/context")
+async def update_project_context(project_id: str, request: UpdateProjectContextRequest):
+    try:
+        project_path = project_registry.resolve(project_id)
+        context_path = write_project_context(project_path, project_registry.base_dir, request.content)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "project_id": project_id,
+        "content": request.content,
+        "path": str(context_path),
+        "is_project_local": True,
+    }
 
 
 def _open_in_file_manager(path: Path) -> None:

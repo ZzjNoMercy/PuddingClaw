@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import {
   AlertCircle,
@@ -14,6 +14,7 @@ import {
   Loader2,
   RefreshCw,
   Settings,
+  Table2,
   X,
 } from "lucide-react";
 
@@ -24,15 +25,22 @@ import { useApp } from "@/lib/store";
 import {
   getKnowledgeFileTree,
   getKnowledgeStatus,
+  listKnowledgeDatabaseSourceTables,
+  listKnowledgeDatabaseSources,
   listKnowledgeImportJobs,
   listKnowledgeFiles,
+  listTableAssets,
   previewKnowledgeFile,
   createKnowledgeImportJob,
+  saveKnowledgeDatabaseSource,
+  testKnowledgeDatabaseSource,
+  type KnowledgeDatabaseSource,
   type KnowledgeDirectoryFile,
   type KnowledgeFilePreview,
   type KnowledgeImportJob,
   type KnowledgeStatus,
   type KnowledgeTreeNode,
+  type TableAsset,
 } from "@/lib/api";
 
 function formatBytes(value: number): string {
@@ -74,6 +82,29 @@ function isVectorPublishJob(job: KnowledgeImportJob): boolean {
 
 function jobKindLabel(job: KnowledgeImportJob): string {
   return isVectorPublishJob(job) ? "向量导入" : "文件导入";
+}
+
+type AssetView = "files" | "tables" | "databases";
+const HOME_JOB_PAGE_SIZE = 3;
+
+function tableAssetLabel(asset: TableAsset): string {
+  if (asset.source_type === "excel") return `Excel${asset.sheet_name ? ` · ${asset.sheet_name}` : ""}`;
+  return asset.source_type.toUpperCase();
+}
+
+function emptyDatabaseSource(): KnowledgeDatabaseSource {
+  return {
+    id: "",
+    type: "postgresql",
+    name: "",
+    description: "",
+    host: "127.0.0.1",
+    port: 5432,
+    database: "puddingclaw",
+    username: "puddingclaw",
+    password: "",
+    selected_tables: [],
+  };
 }
 
 function KnowledgeFileTree({
@@ -171,6 +202,9 @@ export default function KnowledgePage() {
   const [status, setStatus] = useState<KnowledgeStatus | null>(null);
   const [directoryFiles, setDirectoryFiles] = useState<KnowledgeDirectoryFile[]>([]);
   const [importJobs, setImportJobs] = useState<KnowledgeImportJob[]>([]);
+  const [tableAssets, setTableAssets] = useState<TableAsset[]>([]);
+  const [databaseSources, setDatabaseSources] = useState<KnowledgeDatabaseSource[]>([]);
+  const [assetView, setAssetView] = useState<AssetView>("files");
   const [fileTree, setFileTree] = useState<KnowledgeTreeNode | null>(null);
   const [expandedTreePaths, setExpandedTreePaths] = useState<Set<string>>(new Set());
   const [previewFile, setPreviewFile] = useState<KnowledgeFilePreview | null>(null);
@@ -180,6 +214,11 @@ export default function KnowledgePage() {
   const [uploadTitle, setUploadTitle] = useState("");
   const [loading, setLoading] = useState(true);
   const [uploadingDocument, setUploadingDocument] = useState(false);
+  const [jobPage, setJobPage] = useState(1);
+  const [databaseModalOpen, setDatabaseModalOpen] = useState(false);
+  const [databaseDraft, setDatabaseDraft] = useState<KnowledgeDatabaseSource>(() => emptyDatabaseSource());
+  const [databaseTables, setDatabaseTables] = useState<string[]>([]);
+  const [databaseBusy, setDatabaseBusy] = useState(false);
   const [mounted, setMounted] = useState(false);
   const [toast, setToast] = useState<{ type: "success" | "error"; message: string } | null>(null);
 
@@ -206,12 +245,16 @@ export default function KnowledgePage() {
     try {
       const nextStatus = await getKnowledgeStatus();
       setStatus(nextStatus);
-      const [nextFiles, nextTree] = await Promise.all([
+      const [nextFiles, nextTree, nextTables, nextDatabaseSources] = await Promise.all([
         listKnowledgeFiles(),
         getKnowledgeFileTree(),
+        listTableAssets(false),
+        listKnowledgeDatabaseSources(),
       ]);
       setDirectoryFiles(nextFiles);
       setFileTree(nextTree);
+      setTableAssets(nextTables);
+      setDatabaseSources(nextDatabaseSources);
       const nextJobs = await listKnowledgeImportJobs();
       setImportJobs(nextJobs);
     } catch (error) {
@@ -232,6 +275,16 @@ export default function KnowledgePage() {
     }, 2500);
     return () => window.clearInterval(timer);
   }, [importJobs, refresh]);
+
+  const jobPageCount = Math.max(1, Math.ceil(importJobs.length / HOME_JOB_PAGE_SIZE));
+  const pagedImportJobs = useMemo(
+    () => importJobs.slice((jobPage - 1) * HOME_JOB_PAGE_SIZE, jobPage * HOME_JOB_PAGE_SIZE),
+    [importJobs, jobPage]
+  );
+
+  useEffect(() => {
+    setJobPage((page) => Math.min(page, jobPageCount));
+  }, [jobPageCount]);
 
   const toggleTreePath = useCallback((path: string) => {
     setExpandedTreePaths((current) => {
@@ -286,6 +339,70 @@ export default function KnowledgePage() {
       fileInputRef.current.value = "";
     }
   }, []);
+
+  const openDatabaseSourceModal = useCallback((source?: KnowledgeDatabaseSource) => {
+    setDatabaseDraft(source ? { ...source, password: "" } : emptyDatabaseSource());
+    setDatabaseTables(source?.selected_tables ?? []);
+    setDatabaseModalOpen(true);
+  }, []);
+
+  const updateDatabaseDraft = useCallback((updates: Partial<KnowledgeDatabaseSource>) => {
+    setDatabaseDraft((current) => ({ ...current, ...updates }));
+  }, []);
+
+  const loadDatabaseTables = useCallback(async () => {
+    if (!databaseDraft.id) {
+      setToast({ type: "error", message: "请先保存数据源，再读取表。" });
+      return;
+    }
+    setDatabaseBusy(true);
+    setToast(null);
+    try {
+      const tables = await listKnowledgeDatabaseSourceTables(databaseDraft.id);
+      setDatabaseTables(tables);
+      updateDatabaseDraft({
+        selected_tables: databaseDraft.selected_tables.length > 0 ? databaseDraft.selected_tables : tables,
+      });
+      setToast({ type: "success", message: `读取到 ${tables.length} 张表。` });
+    } catch (error) {
+      setToast({ type: "error", message: errorMessage(error) });
+    } finally {
+      setDatabaseBusy(false);
+    }
+  }, [databaseDraft.id, databaseDraft.selected_tables, updateDatabaseDraft]);
+
+  const testDatabaseDraft = useCallback(async () => {
+    setDatabaseBusy(true);
+    setToast(null);
+    try {
+      const result = await testKnowledgeDatabaseSource(databaseDraft);
+      setToast({ type: result.ok ? "success" : "error", message: result.message || (result.ok ? "连接成功" : "连接失败") });
+    } catch (error) {
+      setToast({ type: "error", message: errorMessage(error) });
+    } finally {
+      setDatabaseBusy(false);
+    }
+  }, [databaseDraft]);
+
+  const saveDatabaseDraft = useCallback(async () => {
+    setDatabaseBusy(true);
+    setToast(null);
+    try {
+      const saved = await saveKnowledgeDatabaseSource({
+        ...databaseDraft,
+        selected_tables: databaseDraft.selected_tables,
+      });
+      setDatabaseModalOpen(false);
+      setDatabaseDraft(emptyDatabaseSource());
+      setDatabaseTables([]);
+      setToast({ type: "success", message: `已保存数据源：${saved.name}` });
+      await refresh();
+    } catch (error) {
+      setToast({ type: "error", message: errorMessage(error) });
+    } finally {
+      setDatabaseBusy(false);
+    }
+  }, [databaseDraft, refresh]);
 
   return (
     <div className="h-screen app-bg text-gray-900">
@@ -392,26 +509,126 @@ export default function KnowledgePage() {
               </p>
             </div>
 
+            <div className="mt-4 flex rounded-2xl bg-black/[0.035] p-1 text-[11px] font-semibold text-gray-500">
+              {[
+                { key: "files" as const, label: "文件", count: directoryFiles.length, icon: FileText },
+                { key: "tables" as const, label: "表格", count: tableAssets.length, icon: Table2 },
+                { key: "databases" as const, label: "数据库", count: databaseSources.length, icon: Database },
+              ].map((item) => {
+                const Icon = item.icon;
+                const active = assetView === item.key;
+                return (
+                  <button
+                    key={item.key}
+                    type="button"
+                    onClick={() => setAssetView(item.key)}
+                    className={`flex min-w-0 flex-1 items-center justify-center gap-1.5 rounded-xl px-2 py-2 transition ${
+                      active ? "bg-white text-[#002fa7] shadow-sm" : "hover:bg-white/60"
+                    }`}
+                  >
+                    <Icon className="h-3.5 w-3.5" />
+                    <span>{item.label}</span>
+                    <span className={active ? "text-[#002fa7]/70" : "text-gray-400"}>{item.count}</span>
+                  </button>
+                );
+              })}
+            </div>
+
             <div className="mt-4 min-h-0 flex-1">
-              <div className="mb-2 flex items-center justify-between">
-                <p className="text-[11px] font-semibold text-gray-500">文件树</p>
-                <span className="text-[10px] text-gray-400">{directoryFiles.length}</span>
-              </div>
-              <div className="max-h-[280px] overflow-y-auto rounded-2xl bg-black/[0.018] px-1 py-2 pr-1">
-                {fileTree && (fileTree.children?.length ?? 0) > 0 ? (
-                  <KnowledgeFileTree
-                    node={fileTree}
-                    expandedPaths={expandedTreePaths}
-                    selectedPath={previewFile?.virtual_path}
-                    onToggle={toggleTreePath}
-                    onPreview={previewTreeFile}
-                  />
-                ) : (
-                  <div className="rounded-2xl border border-dashed border-black/[0.08] bg-white/60 px-3 py-6 text-center text-xs text-gray-400">
-                    目录里还没有文件。
+              {assetView === "files" ? (
+                <>
+                  <div className="mb-2 flex items-center justify-between">
+                    <p className="text-[11px] font-semibold text-gray-500">文件树</p>
+                    <span className="text-[10px] text-gray-400">{directoryFiles.length}</span>
                   </div>
-                )}
-              </div>
+                  <div className="max-h-[280px] overflow-y-auto rounded-2xl bg-black/[0.018] px-1 py-2 pr-1">
+                    {fileTree && (fileTree.children?.length ?? 0) > 0 ? (
+                      <KnowledgeFileTree
+                        node={fileTree}
+                        expandedPaths={expandedTreePaths}
+                        selectedPath={previewFile?.virtual_path}
+                        onToggle={toggleTreePath}
+                        onPreview={previewTreeFile}
+                      />
+                    ) : (
+                      <div className="rounded-2xl border border-dashed border-black/[0.08] bg-white/60 px-3 py-6 text-center text-xs text-gray-400">
+                        目录里还没有文件。
+                      </div>
+                    )}
+                  </div>
+                </>
+              ) : null}
+
+              {assetView === "tables" ? (
+                <div className="space-y-2">
+                  <div className="mb-2 flex items-center justify-between">
+                    <p className="text-[11px] font-semibold text-gray-500">表格资产</p>
+                    <Link href="/analytics" className="text-[10px] font-medium text-[#002fa7]">
+                      去问数
+                    </Link>
+                  </div>
+                  {tableAssets.length > 0 ? (
+                    tableAssets.slice(0, 30).map((asset) => (
+                      <div key={asset.asset_id} className="rounded-2xl bg-black/[0.025] px-3 py-3">
+                        <div className="flex items-start gap-2">
+                          <Table2 className="mt-0.5 h-4 w-4 shrink-0 text-[#002fa7]" />
+                          <div className="min-w-0">
+                            <p className="truncate text-xs font-semibold text-gray-900" title={asset.file_name}>
+                              {asset.file_name}
+                            </p>
+                            <p className="mt-1 text-[11px] text-gray-400">{tableAssetLabel(asset)}</p>
+                          </div>
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="rounded-2xl border border-dashed border-black/[0.08] bg-white/60 px-3 py-6 text-center text-xs text-gray-400">
+                      上传 Excel / CSV 后会出现在这里。
+                    </div>
+                  )}
+                </div>
+              ) : null}
+
+              {assetView === "databases" ? (
+                <div className="space-y-2">
+                  <div className="mb-2 flex items-center justify-between">
+                    <p className="text-[11px] font-semibold text-gray-500">数据库</p>
+                    <button
+                      type="button"
+                      onClick={() => openDatabaseSourceModal()}
+                      className="rounded-full bg-[#002fa7]/10 px-2.5 py-1 text-[10px] font-semibold text-[#002fa7] transition hover:bg-[#002fa7]/15"
+                    >
+                      添加
+                    </button>
+                  </div>
+                  {databaseSources.map((source) => (
+                    <button
+                      key={source.id}
+                      type="button"
+                      onClick={() => openDatabaseSourceModal(source)}
+                      className="w-full rounded-2xl bg-black/[0.025] px-3 py-3 text-left transition hover:bg-[#002fa7]/[0.05]"
+                    >
+                      <div className="flex items-start gap-2">
+                        <Database className="mt-0.5 h-4 w-4 shrink-0 text-[#002fa7]" />
+                        <div className="min-w-0 flex-1">
+                          <div className="flex min-w-0 items-center gap-1.5">
+                            <p className="truncate text-xs font-semibold text-gray-900">{source.name}</p>
+                            {source.builtin ? (
+                              <span className="shrink-0 rounded-full bg-emerald-50 px-1.5 py-0.5 text-[9px] font-medium text-emerald-700">
+                                默认
+                              </span>
+                            ) : null}
+                          </div>
+                          <p className="mt-1 truncate text-[11px] text-gray-400">
+                            {source.host}:{source.port}/{source.database}
+                          </p>
+                          <p className="mt-1 text-[10px] text-gray-400">已选 {source.selected_tables.length} 张表</p>
+                        </div>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
             </div>
           </aside>
 
@@ -499,7 +716,7 @@ export default function KnowledgePage() {
               </div>
               <div className="mt-3 space-y-2">
                 {importJobs.length > 0 ? (
-                  importJobs.slice(0, 6).map((job) => (
+                  pagedImportJobs.map((job) => (
                     <Link
                       key={job.id}
                       href={`/knowledge/imports/${job.id}`}
@@ -544,6 +761,31 @@ export default function KnowledgePage() {
                   </div>
                 )}
               </div>
+              {importJobs.length > HOME_JOB_PAGE_SIZE ? (
+                <div className="mt-3 flex items-center justify-between gap-3 text-xs text-gray-400">
+                  <span>
+                    第 {jobPage} / {jobPageCount} 页 · 共 {importJobs.length} 条
+                  </span>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => setJobPage((page) => Math.max(1, page - 1))}
+                      disabled={jobPage <= 1}
+                      className="h-8 rounded-full border border-black/[0.06] bg-white px-3 font-medium text-gray-600 transition hover:text-[#002fa7] disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      上一页
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setJobPage((page) => Math.min(jobPageCount, page + 1))}
+                      disabled={jobPage >= jobPageCount}
+                      className="h-8 rounded-full border border-black/[0.06] bg-white px-3 font-medium text-gray-600 transition hover:text-[#002fa7] disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      下一页
+                    </button>
+                  </div>
+                </div>
+              ) : null}
             </div>
 
             {previewFile || previewLoading ? (
@@ -588,6 +830,188 @@ export default function KnowledgePage() {
             ) : null}
           </section>
         </section>
+
+        {databaseModalOpen ? (
+          <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/35 px-4 py-6 backdrop-blur-sm">
+            <div className="flex max-h-[88vh] w-full max-w-3xl flex-col overflow-hidden rounded-[28px] bg-white shadow-2xl ring-1 ring-black/[0.08]">
+              <div className="flex items-start justify-between gap-4 border-b border-black/[0.06] px-6 py-5">
+                <div>
+                  <h3 className="text-lg font-semibold text-gray-950">
+                    {databaseDraft.id ? "编辑数据库" : "添加数据库"}
+                  </h3>
+                  <p className="mt-1 text-sm text-gray-500">保存数据库连接和可用表，后续问数 Agent 会优先从这里选择数据。</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setDatabaseModalOpen(false)}
+                  className="rounded-full p-2 text-gray-400 transition hover:bg-black/[0.04] hover:text-gray-900"
+                  aria-label="关闭"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+
+              <div className="flex-1 overflow-y-auto px-6 py-5">
+                <div className="grid gap-4 md:grid-cols-2">
+                  <label className="space-y-1.5">
+                    <span className="text-xs font-semibold text-gray-500">类型</span>
+                    <input
+                      value="PostgreSQL"
+                      readOnly
+                      className="h-11 w-full rounded-2xl border border-black/[0.08] bg-gray-50 px-4 text-sm text-gray-500 outline-none"
+                    />
+                  </label>
+                  <label className="space-y-1.5">
+                    <span className="text-xs font-semibold text-gray-500">显示名称</span>
+                    <input
+                      value={databaseDraft.name}
+                      onChange={(event) => updateDatabaseDraft({ name: event.target.value })}
+                      placeholder="例如：项目 PostgreSQL"
+                      className="h-11 w-full rounded-2xl border border-black/[0.08] bg-white px-4 text-sm outline-none transition focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/[0.08]"
+                    />
+                  </label>
+                  <label className="space-y-1.5 md:col-span-2">
+                    <span className="text-xs font-semibold text-gray-500">描述</span>
+                    <input
+                      value={databaseDraft.description || ""}
+                      onChange={(event) => updateDatabaseDraft({ description: event.target.value })}
+                      placeholder="这组表主要用来分析什么"
+                      className="h-11 w-full rounded-2xl border border-black/[0.08] bg-white px-4 text-sm outline-none transition focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/[0.08]"
+                    />
+                  </label>
+                  <label className="space-y-1.5">
+                    <span className="text-xs font-semibold text-gray-500">Host</span>
+                    <input
+                      value={databaseDraft.host}
+                      disabled={databaseDraft.id === "project_postgres"}
+                      onChange={(event) => updateDatabaseDraft({ host: event.target.value })}
+                      className="h-11 w-full rounded-2xl border border-black/[0.08] bg-white px-4 text-sm outline-none transition disabled:bg-gray-50 disabled:text-gray-400 focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/[0.08]"
+                    />
+                  </label>
+                  <label className="space-y-1.5">
+                    <span className="text-xs font-semibold text-gray-500">端口</span>
+                    <input
+                      type="number"
+                      value={databaseDraft.port}
+                      disabled={databaseDraft.id === "project_postgres"}
+                      onChange={(event) => updateDatabaseDraft({ port: Number(event.target.value) || 5432 })}
+                      className="h-11 w-full rounded-2xl border border-black/[0.08] bg-white px-4 text-sm outline-none transition disabled:bg-gray-50 disabled:text-gray-400 focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/[0.08]"
+                    />
+                  </label>
+                  <label className="space-y-1.5">
+                    <span className="text-xs font-semibold text-gray-500">数据库名</span>
+                    <input
+                      value={databaseDraft.database}
+                      disabled={databaseDraft.id === "project_postgres"}
+                      onChange={(event) => updateDatabaseDraft({ database: event.target.value })}
+                      className="h-11 w-full rounded-2xl border border-black/[0.08] bg-white px-4 text-sm outline-none transition disabled:bg-gray-50 disabled:text-gray-400 focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/[0.08]"
+                    />
+                  </label>
+                  <label className="space-y-1.5">
+                    <span className="text-xs font-semibold text-gray-500">用户名</span>
+                    <input
+                      value={databaseDraft.username}
+                      disabled={databaseDraft.id === "project_postgres"}
+                      onChange={(event) => updateDatabaseDraft({ username: event.target.value })}
+                      className="h-11 w-full rounded-2xl border border-black/[0.08] bg-white px-4 text-sm outline-none transition disabled:bg-gray-50 disabled:text-gray-400 focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/[0.08]"
+                    />
+                  </label>
+                  <label className="space-y-1.5 md:col-span-2">
+                    <span className="text-xs font-semibold text-gray-500">密码</span>
+                    <input
+                      type="password"
+                      value={databaseDraft.password || ""}
+                      disabled={databaseDraft.id === "project_postgres"}
+                      onChange={(event) => updateDatabaseDraft({ password: event.target.value })}
+                      placeholder={databaseDraft.password_configured ? "已配置，留空不修改" : "请输入密码"}
+                      className="h-11 w-full rounded-2xl border border-black/[0.08] bg-white px-4 text-sm outline-none transition disabled:bg-gray-50 disabled:text-gray-400 focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/[0.08]"
+                    />
+                  </label>
+                </div>
+
+                <div className="mt-5 rounded-3xl border border-black/[0.06] bg-black/[0.018] p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-semibold text-gray-950">选择表</p>
+                      <p className="mt-1 text-xs text-gray-400">只保存你希望 Agent 使用的表。</p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={loadDatabaseTables}
+                      disabled={databaseBusy || !databaseDraft.id}
+                      className="inline-flex h-9 items-center gap-2 rounded-full bg-white px-3 text-xs font-semibold text-[#002fa7] shadow-sm ring-1 ring-black/[0.05] transition hover:bg-[#002fa7]/[0.04] disabled:cursor-not-allowed disabled:opacity-45"
+                    >
+                      {databaseBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+                      读取表
+                    </button>
+                  </div>
+                  <div className="mt-3 max-h-52 overflow-y-auto rounded-2xl bg-white p-2">
+                    {databaseTables.length > 0 ? (
+                      <div className="grid gap-1.5 sm:grid-cols-2">
+                        {databaseTables.map((table) => {
+                          const checked = databaseDraft.selected_tables.includes(table);
+                          return (
+                            <label
+                              key={table}
+                              className={`flex cursor-pointer items-center gap-2 rounded-xl px-2.5 py-2 text-xs transition ${
+                                checked ? "bg-[#002fa7]/10 text-[#002fa7]" : "text-gray-600 hover:bg-black/[0.035]"
+                              }`}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                onChange={(event) => {
+                                  const next = event.target.checked
+                                    ? [...databaseDraft.selected_tables, table]
+                                    : databaseDraft.selected_tables.filter((item) => item !== table);
+                                  updateDatabaseDraft({ selected_tables: next });
+                                }}
+                                className="h-3.5 w-3.5 accent-[#002fa7]"
+                              />
+                              <span className="min-w-0 truncate" title={table}>{table}</span>
+                            </label>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      <p className="px-3 py-6 text-center text-xs text-gray-400">
+                        保存数据源后点击“读取表”，或先手动保存空表配置。
+                      </p>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-end gap-3 border-t border-black/[0.06] px-6 py-4">
+                <button
+                  type="button"
+                  onClick={testDatabaseDraft}
+                  disabled={databaseBusy}
+                  className="inline-flex h-10 items-center gap-2 rounded-2xl border border-black/[0.08] bg-white px-4 text-sm font-semibold text-gray-700 transition hover:bg-gray-50 disabled:cursor-wait disabled:opacity-60"
+                >
+                  {databaseBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Database className="h-4 w-4" />}
+                  测试连接
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDatabaseModalOpen(false)}
+                  className="h-10 rounded-2xl px-4 text-sm font-semibold text-gray-500 transition hover:bg-black/[0.04]"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  onClick={saveDatabaseDraft}
+                  disabled={databaseBusy || !databaseDraft.name.trim()}
+                  className="inline-flex h-10 items-center gap-2 rounded-2xl bg-[#002fa7] px-5 text-sm font-semibold text-white shadow-sm transition hover:bg-[#001f7a] disabled:cursor-not-allowed disabled:opacity-45"
+                >
+                  {databaseBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+                  保存
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
 
             </div>
           </div>

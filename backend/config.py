@@ -210,7 +210,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         "score_threshold": 0.1,
         "stale_days": 30,
     },
-    "skills_router": {
+    "tool_intent_router": {
         "enabled": True,
         "history_window": 2,
     },
@@ -483,10 +483,10 @@ def get_mem0_user_id() -> str:
     return load_config().get("mem0", {}).get("user_id", "default_user")
 
 
-def get_skills_router_config() -> dict:
-    """Get skills router middleware configuration."""
+def get_tool_intent_router_config() -> dict:
+    """Get tool-intent router middleware configuration."""
     config = load_config()
-    return config.get("skills_router", {
+    return config.get("tool_intent_router", {
         "enabled": True,
         "history_window": 2,
     })

@@ -1,0 +1,225 @@
+"""ToolIntentRouterMiddleware — 模型调用前的工具意图软路由。
+
+设计要点：
+- 只做工具选择引导，不执行工具，也不替模型做最终决策
+- 通过 before_model 在最后一条用户消息末尾追加临时路由提示
+- 不修改真正的 system prompt，避免破坏 DeepSeek prefix cache
+- 当前仅保留三类核心意图：表格问数、知识库 RAG、网页检索
+
+与 compression middleware 的叠加顺序：
+    compression（修改 messages，外层）→ tool_intent_router（注入路由，中层）→ write（after_model 副作用，内层）
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from langchain.agents.middleware import AgentMiddleware
+from langchain_core.messages import HumanMessage
+
+logger = logging.getLogger(__name__)
+
+
+_ROUTER_HINT_MARKER = "[系统路由提示]"
+
+
+_DEFAULT_INTENT_REGISTRY: dict[str, dict[str, Any]] = {
+    "table_analysis": {
+        "keywords": [
+            "excel", "xlsx", "xls", "csv", "tsv", "表格", "电子表格", "数据表",
+            "刚才导入", "导入的 excel", "导入的表", "统计", "筛选", "排序", "分组",
+            "聚合", "透视", "top", "行数", "列名", "字段", "sheet",
+            "数据分析", "分析数据", "数据统计", "数据汇总", "问数", "看数", "报表",
+            "指标", "指标计算", "明细", "汇总",
+            # 业务问数常见指标词：用户不一定会说“Excel/表格”，但这些问题通常应先查已导入表格。
+            "销量", "周销量", "月销量", "环比", "同比", "占比", "配置率", "渗透率",
+            "品牌", "车型", "车系", "款型", "价格段", "终端", "批发", "零售",
+        ],
+        "preferred_tools": ["pandas_knowledge_query"],
+        "tool_categories": ["table"],
+        "routing_prompt": (
+            "用户意图为表格问数。只要问题涉及已导入 Excel/CSV/TSV、刚才导入的表格、字段/列名、"
+            "行数、筛选、排序、分组、聚合、趋势、Top N、数据分析/问数/报表，"
+            "或销量/环比/同比/占比/配置率等业务指标，必须优先调用 pandas_knowledge_query。"
+            "即使用户说“知识库”，只要是在问结构化数据分析或指标计算，也应先走 pandas_knowledge_query。"
+            "不要先调用 llamaindex_knowledge_query、glob 或 grep 来查表格；这些工具不会可靠读取 Excel/CSV 的结构化数据。"
+        ),
+    },
+    "knowledge_rag": {
+        "keywords": [
+            "知识", "知识库", "文档", "图文", "pdf", "markdown", "md",
+            "白皮书", "报告", "图片", "架构图", "检索", "查找", "查询",
+            "rag", "knowledge",
+        ],
+        "preferred_tools": ["llamaindex_knowledge_query"],
+        "tool_categories": ["knowledge"],
+        "routing_prompt": (
+            "用户意图为本地知识库 RAG 检索。PDF、Markdown、图文混排和图片命中优先使用 "
+            "llamaindex_knowledge_query。不要用 pandas_knowledge_query 处理 PDF/Markdown。"
+        ),
+    },
+    "web_search": {
+        "keywords": [
+            "网页", "url", "http", "https", "链接", "新闻", "资讯", "最近有什么",
+            "最新消息", "近况", "联网", "搜索一下", "web", "search", "find",
+        ],
+        "preferred_tools": ["tavily_search", "fetch_url"],
+        "tool_categories": ["knowledge"],
+        "routing_prompt": (
+            "用户意图为网页或最新信息检索。公开网页、新闻和近期动态优先使用 tavily_search；"
+            "已有明确 URL 时才使用 fetch_url 抓正文。"
+        ),
+    },
+}
+
+
+class ToolIntentRouterMiddleware(AgentMiddleware):
+    """基于关键词的工具意图软路由中间件。
+
+    工作原理：
+    - 每次 LLM 调用前，读取最近几条用户消息
+    - 用可控关键词表判断当前更像哪类工具意图
+    - 命中时把一段内部路由提示追加到最后一条 HumanMessage
+    - 未命中时不注入，让模型按完整 tool schema 自行选择
+    """
+
+    def __init__(
+        self,
+        intent_registry: dict[str, dict[str, Any]] | None = None,
+        history_window: int = 2,
+    ) -> None:
+        super().__init__()
+        self.intent_registry = (
+            dict(intent_registry) if intent_registry is not None else dict(_DEFAULT_INTENT_REGISTRY)
+        )
+        self.history_window = history_window
+        self._last_decision: dict[str, Any] = {}
+
+    def _extract_context_text(self, messages: list) -> str:
+        """提取最近 N 条用户消息文本（N=history_window+1），用于意图分类。"""
+        user_texts: list[str] = []
+        count = 0
+        for msg in reversed(messages):
+            if isinstance(msg, HumanMessage):
+                content = msg.content
+                if isinstance(content, list):
+                    content = "".join(
+                        block.get("text", "") if isinstance(block, dict) else str(block)
+                        for block in content
+                    )
+                user_texts.append(str(content))
+                count += 1
+                if count > self.history_window:
+                    break
+        return " ".join(user_texts).lower()
+
+    def validate_preferred_tools(self, available_tool_names: set[str]) -> list[str]:
+        """校验 preferred_tools 名称在实际工具集中存在。"""
+        missing: list[str] = []
+        for intent_id, intent_def in self.intent_registry.items():
+            for tool_name in intent_def.get("preferred_tools", []):
+                if tool_name not in available_tool_names:
+                    missing.append(f"{intent_id}.{tool_name}")
+        return missing
+
+    def _classify_intent(self, text: str) -> dict[str, Any]:
+        """关键词匹配分类器，返回匹配意图、优先工具和路由提示。"""
+        matched_intents: list[str] = []
+        routing_prompts: list[str] = []
+        preferred_tools: list[str] = []
+
+        for intent_id, intent_def in self.intent_registry.items():
+            keywords = intent_def.get("keywords", [])
+            if any(kw.lower() in text for kw in keywords):
+                matched_intents.append(intent_id)
+                routing_prompts.append(intent_def["routing_prompt"])
+                preferred_tools.extend(intent_def.get("preferred_tools", []))
+
+        if not matched_intents:
+            return {"matched": False, "intents": [], "preferred_tools": [], "routing_prompt": ""}
+
+        # 表格问数优先级最高：避免 Excel/CSV 被 RAG 或网页检索抢走。
+        if "table_analysis" in matched_intents and len(matched_intents) > 1:
+            matched_intents = ["table_analysis"]
+            routing_prompts = [self.intent_registry["table_analysis"]["routing_prompt"]]
+            preferred_tools = list(self.intent_registry["table_analysis"].get("preferred_tools", []))
+
+        # URL/网页/最新信息优先走 web；纯本地知识库再走 RAG。
+        if "web_search" in matched_intents and "knowledge_rag" in matched_intents:
+            matched_intents.remove("knowledge_rag")
+            routing_prompts = [self.intent_registry[i]["routing_prompt"] for i in matched_intents]
+            preferred_tools = []
+            for intent_id in matched_intents:
+                preferred_tools.extend(self.intent_registry[intent_id].get("preferred_tools", []))
+
+        return {
+            "matched": True,
+            "intents": matched_intents,
+            "preferred_tools": list(dict.fromkeys(preferred_tools)),
+            "routing_prompt": "\n".join(routing_prompts),
+        }
+
+    def before_model(self, state: dict[str, Any], runtime: Any) -> dict[str, Any] | None:
+        """模型调用前：分类意图并追加内部路由提示。"""
+        messages = state.get("messages", [])
+        if not messages:
+            return None
+
+        cleaned = []
+        for msg in messages:
+            if isinstance(msg, HumanMessage):
+                content = msg.content
+                if isinstance(content, str) and f"\n\n{_ROUTER_HINT_MARKER}" in content:
+                    content = content.split(f"\n\n{_ROUTER_HINT_MARKER}")[0]
+                    cleaned.append(HumanMessage(content=content))
+                else:
+                    cleaned.append(msg)
+            else:
+                cleaned.append(msg)
+        had_old_routing = len(cleaned) != len(messages)
+
+        context_text = self._extract_context_text(cleaned)
+        if not context_text:
+            self._last_decision = {"matched": False, "intents": [], "preferred_tools": []}
+            return {"messages": cleaned} if had_old_routing else None
+
+        decision = self._classify_intent(context_text)
+        self._last_decision = decision
+
+        if not decision["matched"]:
+            logger.debug("[ToolIntentRouter] no intent matched, using full tools")
+            return {"messages": cleaned} if had_old_routing else None
+
+        last_human_idx = None
+        for i in range(len(cleaned) - 1, -1, -1):
+            if isinstance(cleaned[i], HumanMessage):
+                last_human_idx = i
+                break
+
+        if last_human_idx is not None:
+            original_content = cleaned[last_human_idx].content
+            routing_hint = f"\n\n{_ROUTER_HINT_MARKER} {decision['routing_prompt']}"
+            cleaned[last_human_idx] = HumanMessage(content=original_content + routing_hint)
+
+        logger.info(
+            "[ToolIntentRouter] matched intents=%s, preferred_tools=%s",
+            decision["intents"],
+            decision["preferred_tools"],
+        )
+        return {"messages": cleaned}
+
+
+def build_tool_intent_router_middlewares(config: dict) -> list:
+    """构造工具意图路由中间件。"""
+    if not config.get("enabled", True):
+        return []
+
+    # 新配置名叫 intents；保留旧 skills 字段兼容已经写入的 config.json。
+    intent_registry = config.get("intents") or config.get("skills")
+    history_window = config.get("history_window", 2)
+
+    return [ToolIntentRouterMiddleware(
+        intent_registry=intent_registry,
+        history_window=history_window,
+    )]

@@ -202,19 +202,28 @@ def test_trace_collector_records_memory_middleware_before_agent():
     )
 
     trace = collector.finish(status="completed")
-    effect = next(item for item in trace["middleware_effects"] if item["category"] == "memory")
-    assert effect["hook"] == "before_agent"
-    assert effect["middleware"] == ["MemoryMiddleware"]
-    assert effect["after"]["agent_memory_present"] is True
-    assert effect["after"]["matched_sources"] == ["/AGENTS.md", "/gstack/AGENTS.md"]
-    invocation = next(
+    effects = [item for item in trace["middleware_effects"] if item["category"] == "memory"]
+    assert [item["hook"] for item in effects] == ["before_agent", "wrap_model_call"]
+    assert all(item["middleware"] == ["MemoryMiddleware"] for item in effects)
+    assert effects[0]["after"]["agent_memory_present"] is True
+    assert effects[0]["after"]["matched_sources"] == ["/AGENTS.md", "/gstack/AGENTS.md"]
+    assert effects[1]["title"] == "Memory injected into system prompt"
+    assert effects[1]["after"]["agent_memory_present"] is True
+    before_agent_invocation = next(
         item
         for item in trace["middleware_invocations"]
         if item["hook"] == "before_agent" and item["category"] == "memory"
     )
-    assert invocation["title"] == "Memory loaded into agent state"
-    assert invocation["middleware"] == ["MemoryMiddleware"]
-    assert "agent_memory block found in final system prompt" in invocation["evidence"]
+    assert before_agent_invocation["title"] == "Memory loaded into agent state"
+    assert before_agent_invocation["middleware"] == ["MemoryMiddleware"]
+    assert "agent_memory block found in final system prompt" in before_agent_invocation["evidence"]
+    wrap_invocation = next(
+        item
+        for item in trace["middleware_invocations"]
+        if item["hook"] == "wrap_model_call" and item["category"] == "memory"
+    )
+    assert wrap_invocation["title"] == "Memory injected into system prompt"
+    assert wrap_invocation["middleware"] == ["MemoryMiddleware"]
 
 
 def test_trace_collector_records_subagent_middleware_prompt_injection():

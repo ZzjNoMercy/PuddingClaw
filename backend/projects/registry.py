@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from projects.project_context import ensure_project_context
+
 
 @dataclass(frozen=True)
 class ProjectRecord:
@@ -57,6 +59,12 @@ class ProjectRegistry:
         assert self._base_dir is not None
         assert self._projects_file is not None
         assert self._workspaces_dir is not None
+
+    @property
+    def base_dir(self) -> Path:
+        self._assert_ready()
+        assert self._base_dir is not None
+        return self._base_dir
 
     def _read_all(self) -> dict[str, dict[str, Any]]:
         self._assert_ready()
@@ -105,6 +113,8 @@ class ProjectRegistry:
             updated_at=now,
             pinned=bool(existing.get("pinned") or False),
         )
+        assert self._base_dir is not None
+        ensure_project_context(resolved, self._base_dir)
         records[project_id] = record.to_dict()
         self._write_all(records)
         return record
@@ -114,11 +124,14 @@ class ProjectRegistry:
         projects: list[ProjectRecord] = []
         for project_id, raw in records.items():
             try:
+                project_path = Path(str(raw["path"])).expanduser().resolve()
+                if project_path.exists() and project_path.is_dir():
+                    ensure_project_context(project_path, self.base_dir)
                 projects.append(
                     ProjectRecord(
                         project_id=project_id,
                         name=str(raw.get("name") or project_id),
-                        path=str(raw["path"]),
+                        path=str(project_path),
                         created_at=float(raw.get("created_at") or 0),
                         updated_at=float(raw.get("updated_at") or 0),
                         pinned=bool(raw.get("pinned") or False),

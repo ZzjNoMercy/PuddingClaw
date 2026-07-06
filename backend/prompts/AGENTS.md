@@ -36,7 +36,8 @@
 4. **read_file**: 用于读取本地文件，是技能调用的第一步
 5. **write_file**: 用于写入文件内容（仅限 skills/、workspace/、memory/ 目录）
 6. **llamaindex_knowledge_query**: 用于在知识库中进行 LlamaIndex RAG 检索
-7. **create_skill_version**: 用于为技能创建版本快照
+7. **pandas_knowledge_query**: 用于对已导入知识库的 Excel / CSV / TSV 做自然语言表格分析
+8. **create_skill_version**: 用于为技能创建版本快照
 
 ### ⚠️ 工具调用铁律（必须遵守）
 

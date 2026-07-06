@@ -14,6 +14,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import get_knowledge_multimodal_index_config, get_knowledge_root_config
 from db import get_database_status, get_db_session
+from knowledge.database_sources import (
+    KnowledgeDatabaseSourceError,
+    delete_database_source,
+    get_database_source,
+    list_database_sources,
+    list_database_tables,
+    test_database_source,
+    upsert_database_source,
+)
 from knowledge.import_jobs import (
     create_import_job,
     create_vector_publish_job,
@@ -32,6 +41,7 @@ from knowledge.paths import get_knowledge_originals_dir, get_knowledge_root
 from knowledge.models import new_id
 from knowledge.models import KnowledgeDocument
 from knowledge.service import DEFAULT_KNOWLEDGE_BASE_ID, KnowledgeService, KnowledgeServiceError, _slugify, document_to_dict
+from tools.pandas_knowledge_tool import PandasKnowledgeQueryTool
 from tools.search_knowledge_tool import LlamaIndexKnowledgeQueryTool
 
 router = APIRouter(prefix="/knowledge", tags=["knowledge"])
@@ -56,6 +66,27 @@ class MarkdownGrepRequest(BaseModel):
 class KnowledgeSearchRequest(BaseModel):
     query: str = Field(min_length=1, description="Semantic query for the LlamaIndex knowledge index.")
     top_k: int | None = Field(default=None, ge=1, le=20, description="Final number of hits returned to the Agent/LLM.")
+
+
+class KnowledgeTableQueryRequest(BaseModel):
+    query: str = Field(min_length=1, description="Natural-language table question for imported Excel/CSV/TSV files.")
+    file_hint: str | None = Field(default=None, description="Optional file name, title, or /knowledge/... path hint.")
+    sheet_name: str | None = Field(default=None, description="Optional Excel sheet name.")
+    preview_rows: int = Field(default=5, ge=1, le=20)
+
+
+class KnowledgeDatabaseSourceRequest(BaseModel):
+    id: str | None = None
+    type: str = Field(default="postgresql")
+    name: str = Field(default="PostgreSQL 数据源")
+    description: str = ""
+    host: str = Field(default="127.0.0.1")
+    port: int = Field(default=5432, ge=1, le=65535)
+    database: str = Field(default="puddingclaw")
+    username: str = Field(default="puddingclaw")
+    password: str = ""
+    selected_tables: list[str] = Field(default_factory=list)
+    knowledge_base_id: str = Field(default=DEFAULT_KNOWLEDGE_BASE_ID)
 
 
 async def _save_upload_to_task_source(file: UploadFile, *, job_id: str, filename: str) -> tuple[Path, int, str]:
@@ -115,6 +146,84 @@ async def knowledge_status():
             "deepagents_virtual_path": "/knowledge/",
         },
     }
+
+
+@router.get("/database-sources")
+async def list_knowledge_database_sources(
+    knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        sources = await list_database_sources(session, knowledge_base_id=knowledge_base_id)
+        return {"sources": sources, "count": len(sources)}
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Database sources unavailable: {exc}") from exc
+
+
+@router.post("/database-sources")
+async def save_knowledge_database_source(
+    request: KnowledgeDatabaseSourceRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        source = await upsert_database_source(
+            session,
+            request.model_dump(exclude={"knowledge_base_id"}),
+            knowledge_base_id=request.knowledge_base_id,
+        )
+        return {"source": source}
+    except KnowledgeDatabaseSourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to save database source: {exc}") from exc
+
+
+@router.post("/database-sources/test")
+async def test_knowledge_database_source(
+    request: KnowledgeDatabaseSourceRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        payload = request.model_dump(exclude={"knowledge_base_id"})
+        if payload.get("id") and not payload.get("password"):
+            source = await get_database_source(session, payload["id"], knowledge_base_id=request.knowledge_base_id)
+            return await test_database_source(source)
+        return await test_database_source(payload)
+    except KnowledgeDatabaseSourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to test database source: {exc}") from exc
+
+
+@router.get("/database-sources/{source_id}/tables")
+async def list_knowledge_database_source_tables(
+    source_id: str,
+    knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        source = await get_database_source(session, source_id, knowledge_base_id=knowledge_base_id)
+        tables = await list_database_tables(source)
+        return {"tables": tables, "count": len(tables)}
+    except KnowledgeDatabaseSourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to list database tables: {exc}") from exc
+
+
+@router.delete("/database-sources/{source_id}")
+async def delete_knowledge_database_source(
+    source_id: str,
+    knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        await delete_database_source(session, source_id, knowledge_base_id=knowledge_base_id)
+        return {"ok": True}
+    except KnowledgeDatabaseSourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to delete database source: {exc}") from exc
 
 
 @router.get("/documents")
@@ -353,6 +462,21 @@ async def search_knowledge(request: KnowledgeSearchRequest):
     except Exception as exc:
         logger.exception("[knowledge-search] failed query=%s", request.query)
         raise HTTPException(status_code=503, detail=f"Knowledge search failed: {exc}") from exc
+
+
+@router.post("/tables/query")
+async def query_knowledge_table(request: KnowledgeTableQueryRequest):
+    try:
+        tool = PandasKnowledgeQueryTool(base_dir=str(BASE_DIR))
+        return tool.query_structured(
+            request.query,
+            file_hint=request.file_hint,
+            sheet_name=request.sheet_name,
+            preview_rows=request.preview_rows,
+        )
+    except Exception as exc:
+        logger.exception("[knowledge-table-query] failed query=%s", request.query)
+        raise HTTPException(status_code=503, detail=f"Knowledge table query failed: {exc}") from exc
 
 
 @router.post("/documents/import-local-md")

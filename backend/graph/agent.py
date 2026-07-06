@@ -27,7 +27,7 @@ from config import (
     get_compaction_trigger_tokens,
     get_middleware_config,
     get_cache_config,
-    get_skills_router_config,
+    get_tool_intent_router_config,
     get_write_middleware_config,
     get_gateway_config,
     get_gateway_llm_config,
@@ -233,12 +233,12 @@ class AgentManager:
         self._llm = ModelClientChatModel(role="agent", streaming=True)
         self._config_sig, model = _agent_model_config_signature()
 
-        from graph.middlewares.skills_router import SkillsRouterMiddleware
-        _router = SkillsRouterMiddleware()
+        from graph.middlewares.tool_intent_router import ToolIntentRouterMiddleware
+        _router = ToolIntentRouterMiddleware()
         _tool_names = {t.name for t in self._tools}
         _missing = _router.validate_preferred_tools(_tool_names)
         if _missing:
-            logger.warning("[agent] SkillsRouter preferred_tools not in loaded tools: %s", _missing)
+            logger.warning("[agent] ToolIntentRouter preferred_tools not in loaded tools: %s", _missing)
 
         session_manager.initialize(base_dir)
         print(f"🤖 Agent initialized with {len(self._tools)} tools (model: {model})")
@@ -269,14 +269,14 @@ class AgentManager:
 
     def _get_full_cache_key(self, rag_mode: bool, memory_backend: str, tool_reminder: bool) -> str:
         import json as _json
-        from config import get_middleware_config, get_write_middleware_config, get_skills_router_config, get_cache_config
+        from config import get_middleware_config, get_write_middleware_config, get_tool_intent_router_config, get_cache_config
         config_sig = self._config_sig
         prompt_sig = self._get_prompt_files_sig()
         mw_sig = _json.dumps(get_middleware_config(), sort_keys=True)
         write_sig = _json.dumps(get_write_middleware_config(), sort_keys=True)
-        skills_sig = _json.dumps(get_skills_router_config(), sort_keys=True)
+        tool_intent_sig = _json.dumps(get_tool_intent_router_config(), sort_keys=True)
         cache_sig = _json.dumps(get_cache_config(), sort_keys=True)
-        return f"{config_sig}|{prompt_sig}|{rag_mode}|{memory_backend}|{tool_reminder}|{mw_sig}|{write_sig}|{skills_sig}|{cache_sig}"
+        return f"{config_sig}|{prompt_sig}|{rag_mode}|{memory_backend}|{tool_reminder}|{mw_sig}|{write_sig}|{tool_intent_sig}|{cache_sig}"
 
     def _build_agent_core(self, tools: list, mem0_context: str = "", rag_context: str = "", tool_reminder: bool = False):
         """构建 Agent 的纯逻辑，不涉及缓存。"""
@@ -284,7 +284,7 @@ class AgentManager:
         from graph.middlewares import (
             build_cache_middlewares,
             build_compression_middlewares,
-            build_skills_router_middlewares,
+            build_tool_intent_router_middlewares,
             build_write_middlewares,
         )
 
@@ -302,10 +302,10 @@ class AgentManager:
         )
 
         # Context Engineering 推荐顺序：
-        # cache_boundary(observer) → tail_trim → tool_clear → summarization → compaction → skills_router → write
+        # cache_boundary(observer) → tail_trim → tool_clear → summarization → compaction → tool_intent_router → write
         cache_mws = build_cache_middlewares(get_cache_config())
         compression_mws = build_compression_middlewares(self._llm, get_middleware_config())
-        skills_mws = build_skills_router_middlewares(get_skills_router_config())
+        tool_intent_mws = build_tool_intent_router_middlewares(get_tool_intent_router_config())
         write_mws = build_write_middlewares(
             self._base_dir,
             get_write_middleware_config(),
@@ -313,7 +313,7 @@ class AgentManager:
         all_middlewares = [
             *cache_mws,
             *compression_mws,
-            *skills_mws,
+            *tool_intent_mws,
             *write_mws,
         ]
 

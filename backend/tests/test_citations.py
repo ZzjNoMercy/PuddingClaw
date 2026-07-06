@@ -358,12 +358,12 @@ def test_tavily_search_retries_transient_connection_error(monkeypatch):
 
 
 def test_news_intent_routes_to_tavily_search():
-    from graph.middlewares.skills_router import SkillsRouterMiddleware
+    from graph.middlewares.tool_intent_router import ToolIntentRouterMiddleware
 
-    decision = SkillsRouterMiddleware()._classify_intent("蔚来最近有什么新闻")
+    decision = ToolIntentRouterMiddleware()._classify_intent("蔚来最近有什么新闻")
 
     assert decision["matched"] is True
-    assert "knowledge" in decision["skills"]
+    assert "web_search" in decision["intents"]
     assert decision["preferred_tools"][0] == "tavily_search"
 
 

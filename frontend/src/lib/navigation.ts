@@ -21,6 +21,11 @@ export const NAV_ITEMS: NavItem[] = [
     icon: "Database",
   },
   {
+    label: "智能问数",
+    href: "/analytics",
+    icon: "BarChart3",
+  },
+  {
     label: "扩展",
     href: "/skills",
     icon: "Puzzle",
@@ -40,6 +45,7 @@ export const NAV_ITEMS: NavItem[] = [
 export const ROUTE_TITLES: Record<string, string> = {
   "/": "对话",
   "/knowledge": "知识库",
+  "/analytics": "智能问数",
   "/skills": "扩展管理",
   "/skills/compare": "版本对比",
   "/skills/review": "评估审核",

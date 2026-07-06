@@ -245,6 +245,68 @@ export interface KnowledgeImportJobDetail {
   document?: KnowledgeDocument | null;
 }
 
+export interface TableAssetProfileColumn {
+  name: string;
+  dtype: string;
+  non_null?: number;
+  null_count?: number;
+  sample_values?: string[];
+  semantic_role_hint?: string;
+}
+
+export interface TableAssetProfile {
+  asset_id: string;
+  kind: string;
+  source_type: string;
+  file_name: string;
+  virtual_path: string;
+  sheet_name?: string | null;
+  size_bytes: number;
+  modified_at: string;
+  generated_at: string;
+  shape?: [number, number];
+  columns?: TableAssetProfileColumn[];
+  dtypes?: Record<string, string>;
+  preview?: Record<string, unknown>[];
+}
+
+export interface TableAsset {
+  asset_id: string;
+  file_name: string;
+  source_type: "excel" | "csv" | "tsv" | string;
+  virtual_path: string;
+  sheet_name?: string | null;
+  size_bytes: number;
+  modified_at: string;
+  profile_status: "ready" | "missing" | string;
+  profile_path?: string;
+  rows?: number | null;
+  columns_count?: number | null;
+  columns?: string[];
+  reference_status?: string;
+  profile?: TableAssetProfile;
+}
+
+export interface KnowledgeDatabaseSource {
+  id: string;
+  type: "postgresql" | string;
+  source_type?: "postgresql" | string;
+  name: string;
+  description?: string;
+  host: string;
+  port: number;
+  database: string;
+  username: string;
+  password?: string;
+  password_configured?: boolean;
+  selected_tables: string[];
+  builtin?: boolean;
+  configured_by?: string;
+  environment_override?: boolean;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
 export async function getKnowledgeStatus(): Promise<KnowledgeStatus> {
   const response = await fetch(`${API_BASE}/knowledge/status`, { cache: "no-store" });
   if (!response.ok) {
@@ -281,6 +343,69 @@ export async function getKnowledgeFileTree(): Promise<KnowledgeTreeNode | null> 
   }
   const payload = await response.json();
   return payload.tree ?? null;
+}
+
+export async function listKnowledgeDatabaseSources(): Promise<KnowledgeDatabaseSource[]> {
+  const response = await fetch(`${API_BASE}/knowledge/database-sources`, { cache: "no-store" });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to load database sources: ${response.status}`));
+  }
+  const payload = await response.json();
+  return Array.isArray(payload.sources) ? payload.sources : [];
+}
+
+export async function saveKnowledgeDatabaseSource(
+  source: Partial<KnowledgeDatabaseSource>
+): Promise<KnowledgeDatabaseSource> {
+  const response = await fetch(`${API_BASE}/knowledge/database-sources`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(source),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to save database source: ${response.status}`));
+  }
+  const payload = await response.json();
+  return payload.source;
+}
+
+export async function testKnowledgeDatabaseSource(
+  source: Partial<KnowledgeDatabaseSource>
+): Promise<{ ok: boolean; message: string }> {
+  const response = await fetch(`${API_BASE}/knowledge/database-sources/test`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(source),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to test database source: ${response.status}`));
+  }
+  return response.json();
+}
+
+export async function listKnowledgeDatabaseSourceTables(sourceId: string): Promise<string[]> {
+  const response = await fetch(`${API_BASE}/knowledge/database-sources/${encodeURIComponent(sourceId)}/tables`, {
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to list database tables: ${response.status}`));
+  }
+  const payload = await response.json();
+  return Array.isArray(payload.tables) ? payload.tables : [];
+}
+
+export async function deleteKnowledgeDatabaseSource(sourceId: string): Promise<void> {
+  const response = await fetch(`${API_BASE}/knowledge/database-sources/${encodeURIComponent(sourceId)}`, {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to delete database source: ${response.status}`));
+  }
 }
 
 export async function previewKnowledgeFile(virtualPath: string): Promise<KnowledgeFilePreview> {
@@ -496,6 +621,38 @@ export async function searchKnowledge(query: string, topK?: number): Promise<Kno
   if (!response.ok) {
     const text = await response.text().catch(() => "");
     throw new Error(apiErrorMessage(text, `Failed to search knowledge: ${response.status}`));
+  }
+  return response.json();
+}
+
+export async function listTableAssets(includeProfile = false): Promise<TableAsset[]> {
+  const params = new URLSearchParams({ include_profile: includeProfile ? "true" : "false" });
+  const response = await fetch(`${API_BASE}/analytics/table-assets?${params.toString()}`, { cache: "no-store" });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to load table assets: ${response.status}`));
+  }
+  const payload = await response.json();
+  return Array.isArray(payload.assets) ? payload.assets : [];
+}
+
+export async function generateTableAssetProfile(assetId: string): Promise<TableAsset> {
+  const response = await fetch(`${API_BASE}/analytics/table-assets/${encodeURIComponent(assetId)}/profile`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to generate table profile: ${response.status}`));
+  }
+  const payload = await response.json();
+  return payload.asset;
+}
+
+export async function refreshTableAssetProfiles(): Promise<{ generated: TableAsset[]; errors: Record<string, string>[]; total: number }> {
+  const response = await fetch(`${API_BASE}/analytics/table-assets/refresh-profiles`, { method: "POST" });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to refresh table profiles: ${response.status}`));
   }
   return response.json();
 }
@@ -888,6 +1045,13 @@ export interface ProjectMeta {
   pinned?: boolean;
 }
 
+export interface ProjectContextDocument {
+  project_id: string;
+  content: string;
+  path: string;
+  is_project_local: boolean;
+}
+
 export async function listProjects(): Promise<ProjectMeta[]> {
   const resp = await fetch(`${API_BASE}/projects`);
   if (!resp.ok) throw new Error(`Failed to list projects: ${resp.status}`);
@@ -930,6 +1094,25 @@ export async function removeProject(projectId: string): Promise<void> {
     method: "DELETE",
   });
   if (!resp.ok) throw new Error(`Failed to remove project: ${resp.status}`);
+}
+
+export async function getProjectContext(projectId: string): Promise<ProjectContextDocument> {
+  const resp = await fetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/context`);
+  if (!resp.ok) throw new Error(`Failed to get project context: ${resp.status}`);
+  return resp.json();
+}
+
+export async function updateProjectContext(
+  projectId: string,
+  content: string
+): Promise<ProjectContextDocument> {
+  const resp = await fetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/context`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content }),
+  });
+  if (!resp.ok) throw new Error(`Failed to update project context: ${resp.status}`);
+  return resp.json();
 }
 
 export async function listSessionPermissions(sessionId: string): Promise<PermissionGrant[]> {
