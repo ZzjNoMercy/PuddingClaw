@@ -4,15 +4,20 @@ from __future__ import annotations
 
 import json
 import re
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Type
 
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 
+from db import get_sessionmaker
+from knowledge.models import KnowledgeTableAsset
 from knowledge.paths import get_knowledge_root
 from utils.table_engine import PuddingClawPandasQueryEngine
+from analytics.table_catalog import IGNORED_TOP_LEVEL_DIRS, TableAssetCatalog
 
 TABLE_SUFFIXES = {".xlsx", ".xls", ".csv", ".tsv"}
 
@@ -32,6 +37,7 @@ class TableAsset:
     path: Path
     virtual_path: str
     sheet_name: str | None
+    source_type: str
     columns: list[str]
     rows: int | None
     score: int
@@ -65,30 +71,92 @@ class PandasKnowledgeQueryTool(BaseTool):
     class Config:
         arbitrary_types_allowed = True
 
+    def _score_asset(self, *, query: str, file_hint: str | None, sheet_name: str | None, file_name: str, virtual_path: str, sheet: str | None, columns: list[str]) -> int:
+        query_tokens = _tokenize(query)
+        hint_tokens = _tokenize(file_hint)
+        base_text = " ".join([file_name, Path(file_name).stem, virtual_path])
+        base_tokens = _tokenize(base_text)
+        score = len(query_tokens & base_tokens) + len(hint_tokens & base_tokens) * 4
+        if file_hint and _normalize_text(file_hint) in _normalize_text(base_text):
+            score += 20
+        sheet_tokens = _tokenize(sheet) | _tokenize(" ".join(columns))
+        score += len(query_tokens & sheet_tokens) * 2 + len(hint_tokens & sheet_tokens) * 4
+        if sheet_name and sheet and _normalize_text(sheet_name) == _normalize_text(sheet):
+            score += 30
+        return score
+
+    def _list_table_assets_from_catalog(self, *, query: str, file_hint: str | None, sheet_name: str | None) -> list[TableAsset]:
+        async def _load() -> list[TableAsset]:
+            sessionmaker = get_sessionmaker()
+            async with sessionmaker() as session:
+                await TableAssetCatalog(Path(self.base_dir)).ensure_catalog_populated(session, limit=2000)
+                stmt = (
+                    select(KnowledgeTableAsset)
+                    .order_by(KnowledgeTableAsset.updated_at.desc())
+                    .limit(2000)
+                )
+                result = await session.execute(stmt)
+                assets: list[TableAsset] = []
+                for item in result.scalars():
+                    if sheet_name and item.sheet_name and _normalize_text(sheet_name) != _normalize_text(item.sheet_name):
+                        continue
+                    path = Path(item.storage_path)
+                    if not path.exists() or path.suffix.lower() not in TABLE_SUFFIXES:
+                        continue
+                    columns = [str(column) for column in (item.columns or [])]
+                    score = self._score_asset(
+                        query=query,
+                        file_hint=file_hint,
+                        sheet_name=sheet_name,
+                        file_name=item.file_name,
+                        virtual_path=item.virtual_path,
+                        sheet=item.sheet_name,
+                        columns=columns,
+                    )
+                    assets.append(
+                        TableAsset(
+                            path=path,
+                            virtual_path=item.virtual_path,
+                            sheet_name=item.sheet_name,
+                            source_type=item.source_type,
+                            columns=columns,
+                            rows=item.rows,
+                            score=score,
+                        )
+                    )
+                return sorted(assets, key=lambda item: (item.score, item.path.stat().st_mtime_ns), reverse=True)
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                return asyncio.run(_load())
+            except Exception:
+                return []
+        return []
+
     def _list_table_assets(self, *, query: str, file_hint: str | None, sheet_name: str | None) -> list[TableAsset]:
+        catalog_assets = self._list_table_assets_from_catalog(query=query, file_hint=file_hint, sheet_name=sheet_name)
+        if catalog_assets:
+            return catalog_assets
+
         knowledge_root = get_knowledge_root(Path(self.base_dir))
         if not knowledge_root.exists():
             return []
 
-        query_tokens = _tokenize(query)
-        hint_tokens = _tokenize(file_hint)
         assets: list[TableAsset] = []
 
         for path in sorted(knowledge_root.rglob("*")):
             if not path.is_file() or path.name.startswith(".") or path.suffix.lower() not in TABLE_SUFFIXES:
                 continue
             try:
-                path.relative_to(knowledge_root)
+                relative_path = path.relative_to(knowledge_root)
             except ValueError:
+                continue
+            if relative_path.parts and relative_path.parts[0] in IGNORED_TOP_LEVEL_DIRS:
                 continue
 
             suffix = path.suffix.lower()
-            base_text = " ".join([path.name, path.stem, _virtual_path(knowledge_root, path)])
-            base_tokens = _tokenize(base_text)
-            base_score = len(query_tokens & base_tokens) + len(hint_tokens & base_tokens) * 4
-            if file_hint and _normalize_text(file_hint) in _normalize_text(base_text):
-                base_score += 20
-
             try:
                 if suffix in {".xlsx", ".xls"}:
                     import pandas as pd
@@ -98,15 +166,22 @@ class PandasKnowledgeQueryTool(BaseTool):
                         if sheet_name and _normalize_text(sheet_name) != _normalize_text(sheet):
                             continue
                         columns = [str(col) for col in pd.read_excel(path, sheet_name=sheet, nrows=0).columns]
-                        sheet_tokens = _tokenize(sheet) | _tokenize(" ".join(columns))
-                        score = base_score + len(query_tokens & sheet_tokens) * 2 + len(hint_tokens & sheet_tokens) * 4
-                        if sheet_name and _normalize_text(sheet_name) == _normalize_text(sheet):
-                            score += 30
+                        virtual_path = _virtual_path(knowledge_root, path)
+                        score = self._score_asset(
+                            query=query,
+                            file_hint=file_hint,
+                            sheet_name=sheet_name,
+                            file_name=path.name,
+                            virtual_path=virtual_path,
+                            sheet=sheet,
+                            columns=columns,
+                        )
                         assets.append(
                             TableAsset(
                                 path=path,
-                                virtual_path=_virtual_path(knowledge_root, path),
+                                virtual_path=virtual_path,
                                 sheet_name=sheet,
+                                source_type="excel",
                                 columns=columns,
                                 rows=None,
                                 score=score,
@@ -118,13 +193,23 @@ class PandasKnowledgeQueryTool(BaseTool):
                     sep = "\t" if suffix == ".tsv" else ","
                     preview = pd.read_csv(path, sep=sep, nrows=0)
                     columns = [str(col) for col in preview.columns]
-                    column_tokens = _tokenize(" ".join(columns))
-                    score = base_score + len(query_tokens & column_tokens) * 2 + len(hint_tokens & column_tokens) * 4
+                    virtual_path = _virtual_path(knowledge_root, path)
+                    source_type = "tsv" if suffix == ".tsv" else "csv"
+                    score = self._score_asset(
+                        query=query,
+                        file_hint=file_hint,
+                        sheet_name=sheet_name,
+                        file_name=path.name,
+                        virtual_path=virtual_path,
+                        sheet=None,
+                        columns=columns,
+                    )
                     assets.append(
                         TableAsset(
                             path=path,
-                            virtual_path=_virtual_path(knowledge_root, path),
+                            virtual_path=virtual_path,
                             sheet_name=None,
+                            source_type=source_type,
                             columns=columns,
                             rows=None,
                             score=score,

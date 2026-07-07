@@ -48,11 +48,11 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         },
     },
     "fallback_embedding": {
-        "provider": "openai",
-        "model": "text-embedding-3-small",
-        "base_url": "https://api.openai.com/v1",
+        "provider": "qwen",
+        "model": "text-embedding-v4",
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "api_key": "",
-        "dimension": 1536,
+        "dimension": 1024,
         "batch_size": 20,
     },
     "multimodal_embedding": {
@@ -133,6 +133,53 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "milvus_uri": "http://localhost:19530",
             "text_collection": "puddingclaw_knowledge_text",
             "image_collection": "puddingclaw_knowledge_image",
+        },
+    },
+    "vanna": {
+        # Global NL2SQL runtime for the analytics workbench. Training data is
+        # stored in Milvus collections; database credentials stay in the
+        # database-source catalog instead of being duplicated here.
+        "enabled": True,
+        "default_database_source_id": "project_postgres",
+        "default_dialect": "PostgreSQL",
+        "llm": {
+            # Reuse app-level gateway/fallback config by default. Override only
+            # when NL2SQL needs a dedicated model or endpoint.
+            "reuse": "gateway_llm",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "temperature": 0.2,
+            "max_tokens": 14000,
+        },
+        "embedding": {
+            # Reuse fallback_embedding by default. For Qwen/OpenAI compatible
+            # text embeddings, base_url is the /v1 root, not the /embeddings path.
+            # Vanna training data is text-only, so it intentionally does not
+            # reuse multimodal_embedding.
+            "reuse": "fallback_embedding",
+            "provider": "qwen",
+            "model": "text-embedding-v4",
+            "base_url": "",
+            "api_key": "",
+            "batch_size": 20,
+        },
+        "milvus": {
+            # Keep Vanna NL2SQL collections separate from document RAG
+            # collections. These are global to the app workspace.
+            "uri": "",
+            "sql_collection": "puddingclaw_vanna_sql",
+            "ddl_collection": "puddingclaw_vanna_ddl",
+            "doc_collection": "puddingclaw_vanna_doc",
+            "entity_collection": "puddingclaw_vanna_entity",
+            "metric_type": "COSINE",
+        },
+        "training": {
+            "train_models": True,
+            "train_measures": True,
+            "train_sql_examples": True,
+            "train_entities": True,
+            "train_temporary_files": False,
         },
     },
     "compression": {
@@ -731,6 +778,74 @@ def get_knowledge_mineru_config() -> dict[str, Any]:
         "keep_runtime_output": bool(mineru.get("keep_runtime_output", False)),
         "connect_timeout_seconds": int(mineru.get("connect_timeout_seconds") or 10),
         "read_timeout_seconds": int(mineru.get("read_timeout_seconds") or 1800),
+    }
+
+
+def get_vanna_config() -> dict[str, Any]:
+    """Read global Vanna NL2SQL runtime settings from config.json."""
+
+    config = load_config()
+    vanna = config.get("vanna", {})
+    embedding = vanna.get("embedding", {})
+    llm = vanna.get("llm", {})
+    milvus = vanna.get("milvus", {})
+    training = vanna.get("training", {})
+    knowledge_index = config.get("knowledge", {}).get("multimodal_index", {})
+    fallback_embedding = config.get("fallback_embedding", {})
+    gateway_llm = get_gateway_llm_config()
+    fallback_llm = get_fallback_llm_config()
+    gateway = get_gateway_config()
+
+    llm_reuse = str(llm.get("reuse") or "gateway_llm")
+    if llm_reuse == "fallback_llm":
+        default_llm_model = fallback_llm.get("model", "")
+        default_llm_base = fallback_llm.get("base_url", "")
+        default_llm_key = fallback_llm.get("api_key", "")
+    else:
+        default_llm_model = gateway_llm.get("model") or fallback_llm.get("model", "")
+        default_llm_base = gateway.get("base_url") or fallback_llm.get("base_url", "")
+        default_llm_key = fallback_llm.get("api_key", "")
+
+    embedding_reuse = str(embedding.get("reuse") or "fallback_embedding")
+    default_embedding_model = fallback_embedding.get("model", "")
+    default_embedding_base = fallback_embedding.get("base_url", "")
+    default_embedding_key = fallback_embedding.get("api_key", "")
+
+    return {
+        "enabled": bool(vanna.get("enabled", True)),
+        "default_database_source_id": str(vanna.get("default_database_source_id") or "project_postgres"),
+        "default_dialect": str(vanna.get("default_dialect") or "PostgreSQL"),
+        "llm": {
+            "reuse": llm_reuse,
+            "model": str(llm.get("model") or default_llm_model),
+            "base_url": str(llm.get("base_url") or default_llm_base),
+            "api_key": str(llm.get("api_key") or default_llm_key),
+            "temperature": float(llm.get("temperature", 0.2)),
+            "max_tokens": int(llm.get("max_tokens", 14000)),
+        },
+        "embedding": {
+            "reuse": embedding_reuse,
+            "provider": str(embedding.get("provider") or fallback_embedding.get("provider") or "qwen"),
+            "model": str(embedding.get("model") or default_embedding_model),
+            "base_url": str(embedding.get("base_url") or default_embedding_base),
+            "api_key": str(embedding.get("api_key") or default_embedding_key),
+            "batch_size": max(1, int(embedding.get("batch_size") or fallback_embedding.get("batch_size") or 10)),
+        },
+        "milvus": {
+            "uri": str(milvus.get("uri") or knowledge_index.get("milvus_uri") or "http://localhost:19530"),
+            "sql_collection": str(milvus.get("sql_collection") or "puddingclaw_vanna_sql"),
+            "ddl_collection": str(milvus.get("ddl_collection") or "puddingclaw_vanna_ddl"),
+            "doc_collection": str(milvus.get("doc_collection") or "puddingclaw_vanna_doc"),
+            "entity_collection": str(milvus.get("entity_collection") or "puddingclaw_vanna_entity"),
+            "metric_type": str(milvus.get("metric_type") or "COSINE").upper(),
+        },
+        "training": {
+            "train_models": bool(training.get("train_models", True)),
+            "train_measures": bool(training.get("train_measures", True)),
+            "train_sql_examples": bool(training.get("train_sql_examples", True)),
+            "train_entities": bool(training.get("train_entities", True)),
+            "train_temporary_files": bool(training.get("train_temporary_files", False)),
+        },
     }
 
 

@@ -441,6 +441,27 @@ async def process_import_job(session: AsyncSession, *, base_dir: Path, job: Know
         raise KnowledgeServiceError(f"Unsupported knowledge file type: {suffix or 'unknown'}")
 
     await update_job_progress(session, job, step="finalizing", progress=90, message="写入知识库记录")
+    if suffix in {".xlsx", ".xls", ".csv", ".tsv"}:
+        from analytics.table_catalog import TableAssetCatalog
+
+        registered_assets = await TableAssetCatalog(base_dir).register_path(
+            session,
+            Path(document.storage_path),
+            virtual_path=document.virtual_path,
+            knowledge_base_id=document.knowledge_base_id,
+            document_id=document.id,
+        )
+        ingest = {
+            **(ingest or {}),
+            "table_assets": [
+                {
+                    "asset_id": asset.asset_id,
+                    "virtual_path": asset.virtual_path,
+                    "sheet_name": asset.sheet_name,
+                }
+                for asset in registered_assets
+            ],
+        }
     job.status = "succeeded"
     job.current_step = "done"
     job.progress = 100

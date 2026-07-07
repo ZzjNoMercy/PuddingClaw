@@ -159,6 +159,20 @@ def _source_url(source: dict[str, Any]) -> str:
     return f"postgresql+asyncpg://{quote(username)}:{quote(password)}@{host}:{port}/{quote(database)}"
 
 
+def database_source_url(source: KnowledgeDatabaseSource | dict[str, Any]) -> str:
+    """Build a SQLAlchemy async URL for a configured database source."""
+
+    return _source_url(_connection_source(source))
+
+
+def database_source_selected_tables(source: KnowledgeDatabaseSource | dict[str, Any]) -> list[str]:
+    """Return the normalized selected-table list from a source object or payload."""
+
+    if isinstance(source, KnowledgeDatabaseSource):
+        return _normalize_tables(source.selected_tables or [])
+    return _normalize_tables(source.get("selected_tables") if isinstance(source.get("selected_tables"), list) else [])
+
+
 async def ensure_default_base(session: AsyncSession, knowledge_base_id: str) -> None:
     existing = await session.get(KnowledgeBase, knowledge_base_id)
     if existing is not None:

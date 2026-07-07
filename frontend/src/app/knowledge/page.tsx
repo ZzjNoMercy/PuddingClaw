@@ -219,6 +219,10 @@ export default function KnowledgePage() {
   const [databaseDraft, setDatabaseDraft] = useState<KnowledgeDatabaseSource>(() => emptyDatabaseSource());
   const [databaseTables, setDatabaseTables] = useState<string[]>([]);
   const [databaseBusy, setDatabaseBusy] = useState(false);
+  const [databaseModalStatus, setDatabaseModalStatus] = useState<{
+    type: "success" | "error" | "info";
+    message: string;
+  } | null>(null);
   const [mounted, setMounted] = useState(false);
   const [toast, setToast] = useState<{ type: "success" | "error"; message: string } | null>(null);
 
@@ -231,6 +235,12 @@ export default function KnowledgePage() {
     const timer = window.setTimeout(() => setToast(null), 3000);
     return () => window.clearTimeout(timer);
   }, [toast]);
+
+  useEffect(() => {
+    if (!databaseModalStatus) return;
+    const timer = window.setTimeout(() => setDatabaseModalStatus(null), 3000);
+    return () => window.clearTimeout(timer);
+  }, [databaseModalStatus]);
 
   const handleSidebarResize = useCallback(
     (delta: number) => {
@@ -343,6 +353,7 @@ export default function KnowledgePage() {
   const openDatabaseSourceModal = useCallback((source?: KnowledgeDatabaseSource) => {
     setDatabaseDraft(source ? { ...source, password: "" } : emptyDatabaseSource());
     setDatabaseTables(source?.selected_tables ?? []);
+    setDatabaseModalStatus(null);
     setDatabaseModalOpen(true);
   }, []);
 
@@ -352,20 +363,20 @@ export default function KnowledgePage() {
 
   const loadDatabaseTables = useCallback(async () => {
     if (!databaseDraft.id) {
-      setToast({ type: "error", message: "请先保存数据源，再读取表。" });
+      setDatabaseModalStatus({ type: "error", message: "请先保存数据源，再读取表。" });
       return;
     }
     setDatabaseBusy(true);
-    setToast(null);
+    setDatabaseModalStatus(null);
     try {
       const tables = await listKnowledgeDatabaseSourceTables(databaseDraft.id);
       setDatabaseTables(tables);
       updateDatabaseDraft({
         selected_tables: databaseDraft.selected_tables.length > 0 ? databaseDraft.selected_tables : tables,
       });
-      setToast({ type: "success", message: `读取到 ${tables.length} 张表。` });
+      setDatabaseModalStatus({ type: "success", message: `读取到 ${tables.length} 张表。` });
     } catch (error) {
-      setToast({ type: "error", message: errorMessage(error) });
+      setDatabaseModalStatus({ type: "error", message: errorMessage(error) });
     } finally {
       setDatabaseBusy(false);
     }
@@ -373,12 +384,15 @@ export default function KnowledgePage() {
 
   const testDatabaseDraft = useCallback(async () => {
     setDatabaseBusy(true);
-    setToast(null);
+    setDatabaseModalStatus(null);
     try {
       const result = await testKnowledgeDatabaseSource(databaseDraft);
-      setToast({ type: result.ok ? "success" : "error", message: result.message || (result.ok ? "连接成功" : "连接失败") });
+      setDatabaseModalStatus({
+        type: result.ok ? "success" : "error",
+        message: result.message || (result.ok ? "连接成功" : "连接失败"),
+      });
     } catch (error) {
-      setToast({ type: "error", message: errorMessage(error) });
+      setDatabaseModalStatus({ type: "error", message: errorMessage(error) });
     } finally {
       setDatabaseBusy(false);
     }
@@ -386,7 +400,7 @@ export default function KnowledgePage() {
 
   const saveDatabaseDraft = useCallback(async () => {
     setDatabaseBusy(true);
-    setToast(null);
+    setDatabaseModalStatus(null);
     try {
       const saved = await saveKnowledgeDatabaseSource({
         ...databaseDraft,
@@ -395,10 +409,11 @@ export default function KnowledgePage() {
       setDatabaseModalOpen(false);
       setDatabaseDraft(emptyDatabaseSource());
       setDatabaseTables([]);
+      setDatabaseModalStatus(null);
       setToast({ type: "success", message: `已保存数据源：${saved.name}` });
       await refresh();
     } catch (error) {
-      setToast({ type: "error", message: errorMessage(error) });
+      setDatabaseModalStatus({ type: "error", message: errorMessage(error) });
     } finally {
       setDatabaseBusy(false);
     }
@@ -928,6 +943,27 @@ export default function KnowledgePage() {
                     />
                   </label>
                 </div>
+
+                {databaseModalStatus ? (
+                  <div
+                    className={`mt-5 flex items-start gap-2 rounded-2xl border px-4 py-3 text-sm ${
+                      databaseModalStatus.type === "success"
+                        ? "border-emerald-500/15 bg-emerald-50 text-emerald-700"
+                        : databaseModalStatus.type === "error"
+                          ? "border-red-500/15 bg-red-50 text-red-600"
+                          : "border-[#002fa7]/15 bg-[#002fa7]/[0.05] text-[#002fa7]"
+                    }`}
+                  >
+                    {databaseModalStatus.type === "success" ? (
+                      <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
+                    ) : databaseModalStatus.type === "error" ? (
+                      <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                    ) : (
+                      <Database className="mt-0.5 h-4 w-4 shrink-0" />
+                    )}
+                    <span className="break-words">{databaseModalStatus.message}</span>
+                  </div>
+                ) : null}
 
                 <div className="mt-5 rounded-3xl border border-black/[0.06] bg-black/[0.018] p-4">
                   <div className="flex items-center justify-between gap-3">

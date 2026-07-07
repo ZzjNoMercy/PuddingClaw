@@ -250,6 +250,8 @@ export interface TableAssetProfileColumn {
   dtype: string;
   non_null?: number;
   null_count?: number;
+  distinct_count?: number;
+  distinct_ratio?: number;
   sample_values?: string[];
   semantic_role_hint?: string;
 }
@@ -305,6 +307,60 @@ export interface KnowledgeDatabaseSource {
   environment_override?: boolean;
   created_at?: string | null;
   updated_at?: string | null;
+}
+
+export type VannaTrainingType = "sql" | "ddl" | "documentation" | string;
+
+export interface VannaTrainingRecord {
+  id: string;
+  training_type: VannaTrainingType;
+  question?: string | null;
+  content: string;
+  preview?: string;
+}
+
+export interface VannaTrainingData {
+  records: VannaTrainingRecord[];
+  count: number;
+  counts: Record<string, number>;
+}
+
+export interface VannaTrainingResult {
+  ok: boolean;
+  training_type: VannaTrainingType;
+  ids: string[];
+  count: number;
+  message: string;
+}
+
+export interface TableEntityCandidate {
+  column: string;
+  suggested_entity_type: string;
+  score: number;
+  reasons: string[];
+  sample_values: string[];
+  table_column?: string | null;
+  distinct_count?: number | null;
+  distinct_ratio?: number | null;
+  dtype?: string | null;
+}
+
+export interface VannaEntityRecord {
+  pk?: number | string;
+  id?: number | string;
+  entity_type: string;
+  canonical_name: string;
+  aliases?: string[];
+  table_column?: string;
+}
+
+export interface VannaEntityImportResult {
+  ok: boolean;
+  source_table: string;
+  table_column: string;
+  entity_type: string;
+  count: number;
+  entities: Array<{ id: string; canonical_name: string; aliases: string[] }>;
 }
 
 export async function getKnowledgeStatus(): Promise<KnowledgeStatus> {
@@ -405,6 +461,135 @@ export async function deleteKnowledgeDatabaseSource(sourceId: string): Promise<v
   if (!response.ok) {
     const text = await response.text().catch(() => "");
     throw new Error(apiErrorMessage(text, `Failed to delete database source: ${response.status}`));
+  }
+}
+
+export async function listKnowledgeDatabaseSourceVannaTraining(
+  sourceId: string,
+  tableName?: string
+): Promise<VannaTrainingData> {
+  const params = new URLSearchParams();
+  if (tableName) params.set("table_name", tableName);
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const response = await fetch(
+    `${API_BASE}/knowledge/database-sources/${encodeURIComponent(sourceId)}/vanna/training-data${suffix}`,
+    { cache: "no-store" }
+  );
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to list Vanna training data: ${response.status}`));
+  }
+  const payload = await response.json();
+  return {
+    records: Array.isArray(payload.records) ? payload.records : [],
+    count: Number(payload.count || 0),
+    counts: payload.counts && typeof payload.counts === "object" ? payload.counts : {},
+  };
+}
+
+export async function trainKnowledgeDatabaseSourceVanna(
+  sourceId: string,
+  payload: {
+    training_type: "ddl" | "documentation" | "sql";
+    table_name?: string;
+    table_names?: string[];
+    ddl?: string;
+    documentation?: string;
+    question?: string;
+    sql?: string;
+  }
+): Promise<VannaTrainingResult> {
+  const response = await fetch(`${API_BASE}/knowledge/database-sources/${encodeURIComponent(sourceId)}/vanna/train`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to train Vanna: ${response.status}`));
+  }
+  return response.json();
+}
+
+export async function deleteKnowledgeDatabaseSourceVannaTraining(
+  sourceId: string,
+  trainingId: string
+): Promise<void> {
+  const response = await fetch(
+    `${API_BASE}/knowledge/database-sources/${encodeURIComponent(sourceId)}/vanna/training-data/${encodeURIComponent(trainingId)}`,
+    { method: "DELETE" }
+  );
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to delete Vanna training data: ${response.status}`));
+  }
+}
+
+export async function listKnowledgeDatabaseSourceVannaEntityCandidates(
+  sourceId: string,
+  payload: { table_name: string; max_candidates?: number }
+): Promise<TableEntityCandidate[]> {
+  const response = await fetch(
+    `${API_BASE}/knowledge/database-sources/${encodeURIComponent(sourceId)}/vanna/entities/candidates`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }
+  );
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to load Vanna entity candidates: ${response.status}`));
+  }
+  const data = await response.json();
+  return Array.isArray(data.candidates) ? data.candidates : [];
+}
+
+export async function importKnowledgeDatabaseSourceVannaEntities(
+  sourceId: string,
+  payload: {
+    table_name: string;
+    column: string;
+    entity_type: string;
+    alias_columns?: string[];
+    max_values?: number;
+  }
+): Promise<VannaEntityImportResult> {
+  const response = await fetch(
+    `${API_BASE}/knowledge/database-sources/${encodeURIComponent(sourceId)}/vanna/entities/import`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }
+  );
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to import Vanna entities: ${response.status}`));
+  }
+  return response.json();
+}
+
+export async function listKnowledgeDatabaseSourceVannaEntities(sourceId: string): Promise<VannaEntityRecord[]> {
+  const response = await fetch(`${API_BASE}/knowledge/database-sources/${encodeURIComponent(sourceId)}/vanna/entities`, {
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to list Vanna entities: ${response.status}`));
+  }
+  const data = await response.json();
+  return Array.isArray(data.entities) ? data.entities : [];
+}
+
+export async function deleteKnowledgeDatabaseSourceVannaEntity(sourceId: string, entityId: string): Promise<void> {
+  const response = await fetch(
+    `${API_BASE}/knowledge/database-sources/${encodeURIComponent(sourceId)}/vanna/entities/${encodeURIComponent(entityId)}`,
+    { method: "DELETE" }
+  );
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to delete Vanna entity: ${response.status}`));
   }
 }
 
@@ -636,6 +821,19 @@ export async function listTableAssets(includeProfile = false): Promise<TableAsse
   return Array.isArray(payload.assets) ? payload.assets : [];
 }
 
+export async function getTableAsset(assetId: string, includeProfile = true): Promise<TableAsset> {
+  const response = await fetch(
+    `${API_BASE}/analytics/table-assets/${encodeURIComponent(assetId)}?include_profile=${includeProfile ? "true" : "false"}`,
+    { cache: "no-store" }
+  );
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to load table asset: ${response.status}`));
+  }
+  const payload = await response.json();
+  return payload.asset;
+}
+
 export async function generateTableAssetProfile(assetId: string): Promise<TableAsset> {
   const response = await fetch(`${API_BASE}/analytics/table-assets/${encodeURIComponent(assetId)}/profile`, {
     method: "POST",
@@ -655,6 +853,20 @@ export async function refreshTableAssetProfiles(): Promise<{ generated: TableAss
     throw new Error(apiErrorMessage(text, `Failed to refresh table profiles: ${response.status}`));
   }
   return response.json();
+}
+
+export async function listTableAssetEntityCandidates(assetId: string, limit = 12): Promise<TableEntityCandidate[]> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  const response = await fetch(
+    `${API_BASE}/analytics/table-assets/${encodeURIComponent(assetId)}/entity-candidates?${params.toString()}`,
+    { cache: "no-store" }
+  );
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to load entity candidates: ${response.status}`));
+  }
+  const payload = await response.json();
+  return Array.isArray(payload.candidates) ? payload.candidates : [];
 }
 
 export async function uploadAgentAttachments(

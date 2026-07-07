@@ -86,6 +86,39 @@ class KnowledgeDatabaseSource(Base):
     knowledge_base: Mapped[KnowledgeBase] = relationship()
 
 
+class KnowledgeTableAsset(Base):
+    __tablename__ = "knowledge_table_assets"
+    __table_args__ = (
+        UniqueConstraint("knowledge_base_id", "virtual_path", "sheet_name", name="uq_kb_table_asset_virtual_sheet"),
+        Index("ix_knowledge_table_assets_kb_updated", "knowledge_base_id", "updated_at"),
+        Index("ix_knowledge_table_assets_kb_profile", "knowledge_base_id", "profile_status"),
+    )
+
+    asset_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    knowledge_base_id: Mapped[str] = mapped_column(String(64), ForeignKey("knowledge_bases.id"), nullable=False)
+    document_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("knowledge_documents.id"), nullable=True)
+    source_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    file_name: Mapped[str] = mapped_column(String(500), nullable=False)
+    storage_path: Mapped[str] = mapped_column(Text, nullable=False)
+    virtual_path: Mapped[str] = mapped_column(Text, nullable=False)
+    sheet_name: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    modified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    profile_status: Mapped[str] = mapped_column(String(40), nullable=False, default="missing")
+    profile_path: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    rows: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    columns_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    columns: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    reference_status: Mapped[str] = mapped_column(String(40), nullable=False, default="pending")
+    asset_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+    knowledge_base: Mapped[KnowledgeBase] = relationship()
+    document: Mapped[KnowledgeDocument | None] = relationship()
+
+
 class KnowledgeImportJob(Base):
     __tablename__ = "knowledge_import_jobs"
     __table_args__ = (

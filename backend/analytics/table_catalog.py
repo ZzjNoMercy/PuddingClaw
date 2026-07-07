@@ -1,8 +1,8 @@
-"""Table asset catalog for the analytics workbench.
+"""Persistent table asset catalog for the analytics workbench.
 
 The upload/import entry remains the existing knowledge import flow. This module
-only catalogs spreadsheet-like files already stored under the configured
-knowledge root and generates cached profile JSON for table analysis.
+keeps spreadsheet-like assets in the catalog database so the analytics page and
+Pandas tool do not repeatedly scan `/knowledge`.
 """
 
 from __future__ import annotations
@@ -14,15 +14,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from knowledge.models import KnowledgeDocument, KnowledgeTableAsset
 from knowledge.paths import get_knowledge_root
+from knowledge.service import DEFAULT_KNOWLEDGE_BASE_ID, KnowledgeService
 from utils.table_engine.profiler import profile_dataframe
 
 TABLE_SUFFIXES = {".xlsx", ".xls", ".csv", ".tsv"}
 IGNORED_TOP_LEVEL_DIRS = {".puddingclaw", ".tasks", "tasks", "originals", "assets"}
 
 
-def _utc_iso(timestamp: float) -> str:
-    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+def _utc_datetime(timestamp: float) -> datetime:
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+
+
+def _iso(value: datetime | None) -> str | None:
+    return value.isoformat() if value else None
 
 
 def _virtual_path(root: Path, path: Path) -> str:
@@ -36,6 +46,14 @@ def _profile_dir(root: Path) -> Path:
 def _asset_id(virtual_path: str, sheet_name: str | None) -> str:
     payload = f"{virtual_path}#{sheet_name or ''}"
     return "tbl_" + hashlib.sha1(payload.encode("utf-8")).hexdigest()[:24]
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _json_default(value: Any) -> Any:
@@ -53,7 +71,9 @@ class TableAssetRef:
     source_type: str
     sheet_name: str | None
     size_bytes: int
-    modified_at: str
+    modified_at: datetime
+    content_sha256: str = ""
+    document_id: str | None = None
 
 
 class TableCatalogError(RuntimeError):
@@ -61,7 +81,7 @@ class TableCatalogError(RuntimeError):
 
 
 class TableAssetCatalog:
-    """Scan imported table files and generate cached profiles."""
+    """Catalog imported table files and generate cached profiles."""
 
     def __init__(self, base_dir: Path):
         self.base_dir = base_dir
@@ -70,21 +90,53 @@ class TableAssetCatalog:
     def profile_path(self, asset_id: str) -> Path:
         return _profile_dir(self.knowledge_root) / f"{asset_id}.profile.json"
 
-    def list_assets(self, *, include_profile: bool = False, limit: int = 500) -> list[dict[str, Any]]:
-        assets = self._scan_assets(limit=limit)
-        return [self._asset_to_dict(asset, include_profile=include_profile) for asset in assets]
+    async def list_assets(
+        self,
+        session: AsyncSession,
+        *,
+        include_profile: bool = False,
+        limit: int = 500,
+        ensure_scanned: bool = True,
+    ) -> list[dict[str, Any]]:
+        if ensure_scanned:
+            await self.ensure_catalog_populated(session, limit=limit)
+        stmt = (
+            select(KnowledgeTableAsset)
+            .where(KnowledgeTableAsset.knowledge_base_id == DEFAULT_KNOWLEDGE_BASE_ID)
+            .order_by(KnowledgeTableAsset.updated_at.desc(), KnowledgeTableAsset.file_name.asc())
+            .limit(max(1, min(limit, 2000)))
+        )
+        result = await session.execute(stmt)
+        return [self._asset_to_dict(asset, include_profile=include_profile) for asset in result.scalars()]
 
-    def get_asset(self, asset_id: str, *, include_profile: bool = True) -> dict[str, Any]:
-        asset = self._find_asset(asset_id)
-        if not asset:
+    async def get_asset(self, session: AsyncSession, asset_id: str, *, include_profile: bool = True) -> dict[str, Any]:
+        asset = await session.get(KnowledgeTableAsset, asset_id)
+        if asset is None:
+            await self.ensure_catalog_populated(session, limit=2000)
+            asset = await session.get(KnowledgeTableAsset, asset_id)
+        if asset is None:
             raise TableCatalogError("Table asset not found.")
         return self._asset_to_dict(asset, include_profile=include_profile)
 
-    def generate_profile(self, asset_id: str) -> dict[str, Any]:
-        asset = self._find_asset(asset_id)
-        if not asset:
+    async def load_dataframe_for_asset(self, session: AsyncSession, asset_id: str):
+        asset = await session.get(KnowledgeTableAsset, asset_id)
+        if asset is None:
+            await self.ensure_catalog_populated(session, limit=2000)
+            asset = await session.get(KnowledgeTableAsset, asset_id)
+        if asset is None:
             raise TableCatalogError("Table asset not found.")
-        df = self._load_dataframe(asset)
+        return asset, self._load_dataframe(self._ref_from_model(asset))
+
+    async def generate_profile(self, session: AsyncSession, asset_id: str) -> dict[str, Any]:
+        asset = await session.get(KnowledgeTableAsset, asset_id)
+        if asset is None:
+            await self.ensure_catalog_populated(session, limit=2000)
+            asset = await session.get(KnowledgeTableAsset, asset_id)
+        if asset is None:
+            raise TableCatalogError("Table asset not found.")
+
+        ref = self._ref_from_model(asset)
+        df = self._load_dataframe(ref)
         base_profile = profile_dataframe(df, preview_rows=8)
         profile = {
             "asset_id": asset.asset_id,
@@ -94,28 +146,106 @@ class TableAssetCatalog:
             "virtual_path": asset.virtual_path,
             "sheet_name": asset.sheet_name,
             "size_bytes": asset.size_bytes,
-            "modified_at": asset.modified_at,
+            "modified_at": _iso(asset.modified_at),
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "shape": base_profile.get("shape"),
             "columns": self._column_profiles(df, base_profile),
             "dtypes": base_profile.get("dtypes", {}),
             "preview": base_profile.get("preview", []),
         }
-        path = self.profile_path(asset.asset_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(profile, ensure_ascii=False, indent=2, default=_json_default), encoding="utf-8")
+        profile_path = self.profile_path(asset.asset_id)
+        profile_path.parent.mkdir(parents=True, exist_ok=True)
+        profile_path.write_text(json.dumps(profile, ensure_ascii=False, indent=2, default=_json_default), encoding="utf-8")
+
+        shape = profile.get("shape") if isinstance(profile.get("shape"), list) else []
+        columns = [column.get("name") for column in profile.get("columns", []) if isinstance(column, dict)]
+        asset.profile_status = "ready"
+        asset.profile_path = str(profile_path)
+        asset.rows = int(shape[0]) if len(shape) > 0 and shape[0] is not None else None
+        asset.columns_count = int(shape[1]) if len(shape) > 1 and shape[1] is not None else None
+        asset.columns = [str(column) for column in columns if column]
+        asset.asset_metadata = {
+            **(asset.asset_metadata or {}),
+            "profile_generated_at": profile["generated_at"],
+        }
+        await session.commit()
+        await session.refresh(asset)
         return self._asset_to_dict(asset, include_profile=True)
 
-    def refresh_profiles(self, *, limit: int = 200) -> dict[str, Any]:
-        assets = self._scan_assets(limit=limit)
+    async def refresh_profiles(self, session: AsyncSession, *, limit: int = 200) -> dict[str, Any]:
+        await self.ensure_catalog_populated(session, limit=limit)
+        stmt = (
+            select(KnowledgeTableAsset.asset_id)
+            .where(KnowledgeTableAsset.knowledge_base_id == DEFAULT_KNOWLEDGE_BASE_ID)
+            .order_by(KnowledgeTableAsset.updated_at.desc())
+            .limit(max(1, min(limit, 1000)))
+        )
+        result = await session.execute(stmt)
+        asset_ids = [str(asset_id) for asset_id in result.scalars()]
         generated: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
-        for asset in assets:
+        for asset_id in asset_ids:
             try:
-                generated.append(self.generate_profile(asset.asset_id))
+                generated.append(await self.generate_profile(session, asset_id))
             except Exception as exc:  # pragma: no cover - error payload path
-                errors.append({"asset_id": asset.asset_id, "file_name": asset.file_name, "error": str(exc)})
-        return {"generated": generated, "errors": errors, "total": len(assets)}
+                errors.append({"asset_id": asset_id, "error": str(exc)})
+        return {"generated": generated, "errors": errors, "total": len(asset_ids)}
+
+    async def register_path(
+        self,
+        session: AsyncSession,
+        path: Path,
+        *,
+        virtual_path: str | None = None,
+        knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+        document_id: str | None = None,
+    ) -> list[KnowledgeTableAsset]:
+        await KnowledgeService(self.base_dir).ensure_default_knowledge_base(session)
+        if not path.exists() or not path.is_file() or path.suffix.lower() not in TABLE_SUFFIXES:
+            return []
+        refs = self._dedupe_refs(self._asset_refs_for_path(
+            path,
+            virtual_path=virtual_path,
+            document_id=document_id,
+            content_sha256=_sha256(path),
+        ))
+        return await self._commit_asset_refs(session, refs, knowledge_base_id=knowledge_base_id)
+
+    async def ensure_catalog_populated(self, session: AsyncSession, *, limit: int = 500) -> int:
+        await KnowledgeService(self.base_dir).ensure_default_knowledge_base(session)
+        count_stmt = select(KnowledgeTableAsset.asset_id).where(KnowledgeTableAsset.knowledge_base_id == DEFAULT_KNOWLEDGE_BASE_ID).limit(1)
+        existing = (await session.execute(count_stmt)).scalar_one_or_none()
+        if existing:
+            return 0
+        refs = self._dedupe_refs(self._scan_assets(limit=limit))
+        await self._commit_asset_refs(session, refs, knowledge_base_id=DEFAULT_KNOWLEDGE_BASE_ID)
+        return len(refs)
+
+    async def sync_from_documents(self, session: AsyncSession, *, limit: int = 500) -> int:
+        stmt = (
+            select(KnowledgeDocument)
+            .where(
+                KnowledgeDocument.knowledge_base_id == DEFAULT_KNOWLEDGE_BASE_ID,
+                KnowledgeDocument.source_type == "file_upload",
+            )
+            .order_by(KnowledgeDocument.updated_at.desc())
+            .limit(max(1, min(limit, 2000)))
+        )
+        result = await session.execute(stmt)
+        count = 0
+        for document in result.scalars():
+            path = Path(document.storage_path)
+            if path.suffix.lower() not in TABLE_SUFFIXES:
+                continue
+            assets = await self.register_path(
+                session,
+                path,
+                virtual_path=document.virtual_path,
+                knowledge_base_id=document.knowledge_base_id,
+                document_id=document.id,
+            )
+            count += len(assets)
+        return count
 
     def _scan_assets(self, *, limit: int) -> list[TableAssetRef]:
         if not self.knowledge_root.exists():
@@ -136,21 +266,48 @@ class TableAssetCatalog:
             if not self._is_catalog_asset_path(relative_path):
                 continue
             try:
-                assets.extend(self._asset_refs_for_path(path))
+                assets.extend(self._asset_refs_for_path(path, content_sha256=_sha256(path)))
             except Exception:
                 continue
         return sorted(assets, key=lambda asset: (asset.modified_at, asset.file_name, asset.sheet_name or ""), reverse=True)[:limit]
 
     @staticmethod
+    def _dedupe_refs(refs: list[TableAssetRef]) -> list[TableAssetRef]:
+        deduped: dict[str, TableAssetRef] = {}
+        for ref in refs:
+            deduped[ref.asset_id] = ref
+        return list(deduped.values())
+
+    async def _commit_asset_refs(
+        self,
+        session: AsyncSession,
+        refs: list[TableAssetRef],
+        *,
+        knowledge_base_id: str,
+    ) -> list[KnowledgeTableAsset]:
+        if not refs:
+            return []
+        last_error: IntegrityError | None = None
+        for _attempt in range(3):
+            assets = [
+                await self._upsert_asset_ref(session, ref, knowledge_base_id=knowledge_base_id)
+                for ref in refs
+            ]
+            try:
+                await session.commit()
+                refreshed: list[KnowledgeTableAsset] = []
+                for asset in assets:
+                    current = await session.get(KnowledgeTableAsset, asset.asset_id)
+                    if current is not None:
+                        refreshed.append(current)
+                return refreshed
+            except IntegrityError as exc:
+                last_error = exc
+                await session.rollback()
+        raise TableCatalogError(f"Failed to update table asset catalog: {last_error}") from last_error
+
+    @staticmethod
     def _is_catalog_asset_path(relative_path: Path) -> bool:
-        """Return whether a table path is a final user-facing asset.
-
-        Knowledge import keeps transient copies under `/knowledge/tasks/...`
-        and may keep originals under `/knowledge/originals/...`. Those are not
-        separate analytics assets; showing them duplicates the final
-        `/knowledge/imported/...` table.
-        """
-
         parts = relative_path.parts
         if not parts:
             return False
@@ -158,10 +315,18 @@ class TableAssetCatalog:
             return False
         return True
 
-    def _asset_refs_for_path(self, path: Path) -> list[TableAssetRef]:
+    def _asset_refs_for_path(
+        self,
+        path: Path,
+        *,
+        virtual_path: str | None = None,
+        document_id: str | None = None,
+        content_sha256: str = "",
+    ) -> list[TableAssetRef]:
         suffix = path.suffix.lower()
         stat = path.stat()
-        virtual_path = _virtual_path(self.knowledge_root, path)
+        if virtual_path is None:
+            virtual_path = _virtual_path(self.knowledge_root, path)
         source_type = "excel" if suffix in {".xlsx", ".xls"} else ("tsv" if suffix == ".tsv" else "csv")
         sheets: list[str | None]
         if source_type == "excel":
@@ -179,20 +344,67 @@ class TableAssetCatalog:
                 source_type=source_type,
                 sheet_name=sheet,
                 size_bytes=stat.st_size,
-                modified_at=_utc_iso(stat.st_mtime),
+                modified_at=_utc_datetime(stat.st_mtime),
+                content_sha256=content_sha256,
+                document_id=document_id,
             )
             for sheet in sheets
         ]
 
-    def _find_asset(self, asset_id: str) -> TableAssetRef | None:
-        for asset in self._scan_assets(limit=2000):
-            if asset.asset_id == asset_id:
-                return asset
-        return None
-
-    def _asset_to_dict(self, asset: TableAssetRef, *, include_profile: bool) -> dict[str, Any]:
-        profile_path = self.profile_path(asset.asset_id)
+    async def _upsert_asset_ref(
+        self,
+        session: AsyncSession,
+        ref: TableAssetRef,
+        *,
+        knowledge_base_id: str,
+    ) -> KnowledgeTableAsset:
+        with session.no_autoflush:
+            asset = await session.get(KnowledgeTableAsset, ref.asset_id)
+            if asset is None:
+                stmt = select(KnowledgeTableAsset).where(
+                    KnowledgeTableAsset.knowledge_base_id == knowledge_base_id,
+                    KnowledgeTableAsset.virtual_path == ref.virtual_path,
+                    KnowledgeTableAsset.sheet_name == ref.sheet_name,
+                )
+                asset = (await session.execute(stmt)).scalars().first()
+        profile_path = self.profile_path(ref.asset_id)
         profile = self._read_profile(profile_path) if profile_path.exists() else None
+        rows = None
+        columns_count = None
+        columns: list[str] = []
+        if profile:
+            shape = profile.get("shape") if isinstance(profile.get("shape"), list) else []
+            rows = int(shape[0]) if len(shape) > 0 and shape[0] is not None else None
+            columns_count = int(shape[1]) if len(shape) > 1 and shape[1] is not None else None
+            columns = [str(column.get("name")) for column in profile.get("columns", []) if isinstance(column, dict) and column.get("name")]
+
+        if asset is None:
+            asset = KnowledgeTableAsset(asset_id=ref.asset_id, knowledge_base_id=knowledge_base_id)
+            session.add(asset)
+        asset.document_id = ref.document_id or asset.document_id
+        asset.source_type = ref.source_type
+        asset.file_name = ref.file_name
+        asset.storage_path = str(ref.path)
+        asset.virtual_path = ref.virtual_path
+        asset.sheet_name = ref.sheet_name
+        asset.size_bytes = ref.size_bytes
+        asset.modified_at = ref.modified_at
+        asset.content_sha256 = ref.content_sha256 or asset.content_sha256 or ""
+        asset.profile_status = "ready" if profile else (asset.profile_status or "missing")
+        asset.profile_path = str(profile_path)
+        asset.rows = rows if rows is not None else asset.rows
+        asset.columns_count = columns_count if columns_count is not None else asset.columns_count
+        asset.columns = columns or asset.columns or []
+        asset.reference_status = asset.reference_status or "pending"
+        asset.asset_metadata = {
+            **(asset.asset_metadata or {}),
+            "catalog_source": "scan_or_import",
+        }
+        return asset
+
+    def _asset_to_dict(self, asset: KnowledgeTableAsset, *, include_profile: bool) -> dict[str, Any]:
+        profile = self._read_profile(Path(asset.profile_path)) if asset.profile_path and Path(asset.profile_path).exists() else None
+        profile_status = "ready" if profile else "missing"
         result: dict[str, Any] = {
             "asset_id": asset.asset_id,
             "file_name": asset.file_name,
@@ -200,13 +412,13 @@ class TableAssetCatalog:
             "virtual_path": asset.virtual_path,
             "sheet_name": asset.sheet_name,
             "size_bytes": asset.size_bytes,
-            "modified_at": asset.modified_at,
-            "profile_status": "ready" if profile else "missing",
-            "profile_path": str(profile_path),
-            "rows": profile.get("shape", [None, None])[0] if profile else None,
-            "columns_count": profile.get("shape", [None, None])[1] if profile else None,
-            "columns": [column.get("name") for column in profile.get("columns", [])] if profile else [],
-            "reference_status": "pending",
+            "modified_at": _iso(asset.modified_at) or _iso(asset.updated_at) or "",
+            "profile_status": profile_status,
+            "profile_path": asset.profile_path,
+            "rows": asset.rows,
+            "columns_count": asset.columns_count,
+            "columns": asset.columns or [],
+            "reference_status": asset.reference_status,
         }
         if include_profile and profile:
             result["profile"] = profile
@@ -219,6 +431,24 @@ class TableAssetCatalog:
         except Exception:
             return None
         return payload if isinstance(payload, dict) else None
+
+    @staticmethod
+    def _ref_from_model(asset: KnowledgeTableAsset) -> TableAssetRef:
+        path = Path(asset.storage_path)
+        if not path.exists():
+            raise TableCatalogError(f"Table asset file not found: {path}")
+        return TableAssetRef(
+            asset_id=asset.asset_id,
+            path=path,
+            virtual_path=asset.virtual_path,
+            file_name=asset.file_name,
+            source_type=asset.source_type,
+            sheet_name=asset.sheet_name,
+            size_bytes=asset.size_bytes,
+            modified_at=asset.modified_at or datetime.now(timezone.utc),
+            content_sha256=asset.content_sha256,
+            document_id=asset.document_id,
+        )
 
     @staticmethod
     def _load_dataframe(asset: TableAssetRef):
@@ -240,6 +470,8 @@ class TableAssetCatalog:
             name = str(column)
             series = df[column]
             non_null = int(series.notna().sum())
+            distinct_count = int(series.dropna().nunique())
+            distinct_ratio = distinct_count / non_null if non_null else 0
             sample_values = [
                 str(value)
                 for value in series.dropna().astype(str).drop_duplicates().head(5).tolist()
@@ -250,6 +482,8 @@ class TableAssetCatalog:
                     "dtype": str(dtypes.get(name, series.dtype)),
                     "non_null": non_null,
                     "null_count": int(len(series) - non_null),
+                    "distinct_count": distinct_count,
+                    "distinct_ratio": round(distinct_ratio, 6),
                     "sample_values": sample_values,
                     "semantic_role_hint": "measure_candidate" if str(series.dtype).startswith(("int", "float")) else "dimension_candidate",
                 }

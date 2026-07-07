@@ -12,6 +12,18 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from analytics.nl2sql.training import (
+    VannaTrainingError,
+    import_table_entities,
+    list_vanna_entities,
+    list_vanna_training_data,
+    recommend_database_entity_candidates,
+    remove_vanna_entity,
+    remove_vanna_training_data,
+    train_vanna_ddl,
+    train_vanna_documentation,
+    train_vanna_sql,
+)
 from config import get_knowledge_multimodal_index_config, get_knowledge_root_config
 from db import get_database_status, get_db_session
 from knowledge.database_sources import (
@@ -86,6 +98,32 @@ class KnowledgeDatabaseSourceRequest(BaseModel):
     username: str = Field(default="puddingclaw")
     password: str = ""
     selected_tables: list[str] = Field(default_factory=list)
+    knowledge_base_id: str = Field(default=DEFAULT_KNOWLEDGE_BASE_ID)
+
+
+class VannaTrainingRequest(BaseModel):
+    training_type: str = Field(default="ddl", description="ddl | documentation | sql")
+    table_name: str | None = None
+    table_names: list[str] = Field(default_factory=list)
+    ddl: str | None = None
+    documentation: str | None = None
+    question: str | None = None
+    sql: str | None = None
+    knowledge_base_id: str = Field(default=DEFAULT_KNOWLEDGE_BASE_ID)
+
+
+class VannaEntityCandidateRequest(BaseModel):
+    table_name: str
+    max_candidates: int = Field(default=12, ge=1, le=30)
+    knowledge_base_id: str = Field(default=DEFAULT_KNOWLEDGE_BASE_ID)
+
+
+class VannaEntityImportRequest(BaseModel):
+    table_name: str
+    column: str
+    entity_type: str
+    alias_columns: list[str] = Field(default_factory=list)
+    max_values: int = Field(default=1000, ge=1, le=10000)
     knowledge_base_id: str = Field(default=DEFAULT_KNOWLEDGE_BASE_ID)
 
 
@@ -224,6 +262,166 @@ async def delete_knowledge_database_source(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Failed to delete database source: {exc}") from exc
+
+
+@router.get("/database-sources/{source_id}/vanna/training-data")
+async def list_database_source_vanna_training_data(
+    source_id: str,
+    knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+    table_name: str | None = None,
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        await get_database_source(session, source_id, knowledge_base_id=knowledge_base_id)
+        return list_vanna_training_data(table_name=table_name)
+    except KnowledgeDatabaseSourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except VannaTrainingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to list Vanna training data: {exc}") from exc
+
+
+@router.post("/database-sources/{source_id}/vanna/train")
+async def train_database_source_vanna(
+    source_id: str,
+    request: VannaTrainingRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        source = await get_database_source(session, source_id, knowledge_base_id=request.knowledge_base_id)
+        training_type = request.training_type.strip().lower()
+        if training_type == "ddl":
+            table_names = request.table_names or ([request.table_name] if request.table_name else [])
+            result = await train_vanna_ddl(source, table_names=table_names, ddl=request.ddl)
+        elif training_type == "documentation":
+            documentation = request.documentation or ""
+            if request.table_name and "数据库表：" not in documentation:
+                documentation = f"数据库表：{request.table_name}\n{documentation}"
+            result = await train_vanna_documentation(documentation)
+        elif training_type == "sql":
+            question = request.question or ""
+            if request.table_name and "数据库表：" not in question:
+                question = f"{question}\n数据库表：{request.table_name}"
+            result = await train_vanna_sql(question, request.sql or "")
+        else:
+            raise VannaTrainingError("暂不支持的训练类型。")
+        return {
+            "ok": True,
+            "training_type": result.training_type,
+            "ids": result.ids,
+            "count": result.count,
+            "message": result.message,
+        }
+    except KnowledgeDatabaseSourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except VannaTrainingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to train Vanna: {exc}") from exc
+
+
+@router.delete("/database-sources/{source_id}/vanna/training-data/{training_id}")
+async def delete_database_source_vanna_training_data(
+    source_id: str,
+    training_id: str,
+    knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        await get_database_source(session, source_id, knowledge_base_id=knowledge_base_id)
+        ok = remove_vanna_training_data(training_id)
+        return {"ok": ok}
+    except KnowledgeDatabaseSourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except VannaTrainingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to delete Vanna training data: {exc}") from exc
+
+
+@router.post("/database-sources/{source_id}/vanna/entities/candidates")
+async def list_database_source_vanna_entity_candidates(
+    source_id: str,
+    request: VannaEntityCandidateRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        source = await get_database_source(session, source_id, knowledge_base_id=request.knowledge_base_id)
+        candidates = await recommend_database_entity_candidates(
+            source,
+            table_name=request.table_name,
+            max_candidates=request.max_candidates,
+        )
+        return {"candidates": candidates, "count": len(candidates)}
+    except KnowledgeDatabaseSourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except VannaTrainingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to recommend Vanna entities: {exc}") from exc
+
+
+@router.post("/database-sources/{source_id}/vanna/entities/import")
+async def import_database_source_vanna_entities(
+    source_id: str,
+    request: VannaEntityImportRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        source = await get_database_source(session, source_id, knowledge_base_id=request.knowledge_base_id)
+        return await import_table_entities(
+            source,
+            table_name=request.table_name,
+            column=request.column,
+            entity_type=request.entity_type,
+            alias_columns=request.alias_columns,
+            max_values=request.max_values,
+        )
+    except KnowledgeDatabaseSourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except VannaTrainingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to import Vanna entities: {exc}") from exc
+
+
+@router.get("/database-sources/{source_id}/vanna/entities")
+async def list_database_source_vanna_entities(
+    source_id: str,
+    knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+    entity_type: str | None = None,
+    table_column: str | None = None,
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        await get_database_source(session, source_id, knowledge_base_id=knowledge_base_id)
+        return list_vanna_entities(entity_type=entity_type, table_column=table_column)
+    except KnowledgeDatabaseSourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except VannaTrainingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to list Vanna entities: {exc}") from exc
+
+
+@router.delete("/database-sources/{source_id}/vanna/entities/{entity_id}")
+async def delete_database_source_vanna_entity(
+    source_id: str,
+    entity_id: str,
+    knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        await get_database_source(session, source_id, knowledge_base_id=knowledge_base_id)
+        ok = remove_vanna_entity(entity_id)
+        return {"ok": ok}
+    except KnowledgeDatabaseSourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except VannaTrainingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to delete Vanna entity: {exc}") from exc
 
 
 @router.get("/documents")
