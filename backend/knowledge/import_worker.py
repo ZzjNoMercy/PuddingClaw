@@ -5,12 +5,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
 from pathlib import Path
 
 from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 
 from db import get_sessionmaker
-from knowledge.import_jobs import claim_next_job, mark_job_failed, process_import_job
+from knowledge.import_jobs import (
+    VANNA_ENTITY_IMPORT_KIND,
+    claim_next_job,
+    job_kind,
+    mark_job_failed,
+    process_import_job,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -66,10 +73,16 @@ class KnowledgeImportWorkerManager:
             job = await claim_next_job(session)
             if job is None:
                 return False
-            logger.info("[knowledge-worker] claimed job_id=%s file=%s", job.id, job.file_name)
+            job_id = job.id
+            kind = job_kind(job)
+            logger.info("[knowledge-worker] claimed job_id=%s kind=%s file=%s", job.id, kind, job.file_name)
+
+        if kind == VANNA_ENTITY_IMPORT_KIND:
+            await self._run_vanna_entity_job_subprocess(sessionmaker, base_dir, job_id)
+            return True
 
         async with sessionmaker() as session:
-            job = await session.get(type(job), job.id)
+            job = await session.get(type(job), job_id)
             if job is None:
                 return True
             try:
@@ -80,6 +93,48 @@ class KnowledgeImportWorkerManager:
                 await mark_job_failed(session, job, exc)
             return True
 
+    async def _run_vanna_entity_job_subprocess(
+        self,
+        sessionmaker: async_sessionmaker[AsyncSession],
+        base_dir: Path,
+        job_id: str,
+    ) -> None:
+        backend_dir = Path(__file__).resolve().parents[1]
+        log_dir = backend_dir / "logs" / "vanna-entity-jobs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"{job_id}.log"
+
+        logger.info("[knowledge-worker] starting vanna entity subprocess job_id=%s log=%s", job_id, log_path)
+        with log_path.open("ab") as log_file:
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-m",
+                "knowledge.vanna_entity_job_runner",
+                job_id,
+                "--base-dir",
+                str(base_dir),
+                cwd=str(backend_dir),
+                stdout=log_file,
+                stderr=log_file,
+            )
+            return_code = await process.wait()
+
+        if return_code == 0:
+            logger.info("[knowledge-worker] vanna entity subprocess completed job_id=%s", job_id)
+            return
+
+        logger.error(
+            "[knowledge-worker] vanna entity subprocess failed job_id=%s return_code=%s log=%s",
+            job_id,
+            return_code,
+            log_path,
+        )
+        async with sessionmaker() as session:
+            from knowledge.models import KnowledgeImportJob
+
+            job = await session.get(KnowledgeImportJob, job_id)
+            if job is not None and job.status in {"queued", "running"}:
+                await mark_job_failed(session, job, f"实体导入子进程失败，详见日志：{log_path}")
+
 
 knowledge_import_worker_manager = KnowledgeImportWorkerManager()
-

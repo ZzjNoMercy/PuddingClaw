@@ -12,8 +12,9 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from analytics.nl2sql.training import VannaTrainingError, import_table_entities
 from knowledge.indexer import refresh_local_knowledge_index
-from knowledge.models import KnowledgeDocument, KnowledgeImportEvent, KnowledgeImportJob, new_id
+from knowledge.models import KnowledgeDatabaseSource, KnowledgeDocument, KnowledgeImportEvent, KnowledgeImportJob, new_id
 from knowledge.paths import get_knowledge_root
 from knowledge.service import (
     DEFAULT_KNOWLEDGE_BASE_ID,
@@ -29,11 +30,94 @@ logger = logging.getLogger(__name__)
 
 JOB_TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
 VECTOR_PUBLISH_KIND = "vector_publish"
+VANNA_ENTITY_IMPORT_KIND = "vanna_entity_import"
 
 
 def job_kind(job: KnowledgeImportJob) -> str:
     value = (job.job_metadata or {}).get("kind")
     return str(value or "import")
+
+
+def _database_source_snapshot(source: KnowledgeDatabaseSource | dict[str, Any]) -> dict[str, Any]:
+    if isinstance(source, KnowledgeDatabaseSource):
+        return {
+            "id": source.id,
+            "source_type": source.source_type,
+            "type": source.source_type,
+            "name": source.name,
+            "description": source.description,
+            "host": source.host,
+            "port": source.port,
+            "database": source.database,
+            "username": source.username,
+            "password": source.password,
+            "selected_tables": source.selected_tables or [],
+        }
+    payload = dict(source)
+    payload["source_type"] = payload.get("source_type") or payload.get("type") or "postgresql"
+    payload["type"] = payload.get("type") or payload["source_type"]
+    payload["selected_tables"] = payload.get("selected_tables") if isinstance(payload.get("selected_tables"), list) else []
+    return payload
+
+
+def _redact_database_source(source: Any) -> dict[str, Any] | None:
+    if not isinstance(source, dict):
+        return None
+    allowed_keys = (
+        "id",
+        "source_type",
+        "type",
+        "name",
+        "description",
+        "host",
+        "port",
+        "database",
+        "username",
+        "selected_tables",
+    )
+    return {key: source.get(key) for key in allowed_keys if key in source}
+
+
+def _job_metadata_for_api(job: KnowledgeImportJob) -> dict[str, Any]:
+    metadata = dict(job.job_metadata or {})
+    kind = str(metadata.get("kind") or "import")
+    if kind != VANNA_ENTITY_IMPORT_KIND:
+        return metadata
+
+    slim_metadata: dict[str, Any] = {"kind": kind}
+    for key in (
+        "database_source_id",
+        "table_name",
+        "column",
+        "entity_type",
+        "alias_columns",
+        "max_values",
+        "progress_detail",
+        "deepagents_backend",
+    ):
+        if key in metadata:
+            slim_metadata[key] = metadata[key]
+    source = _redact_database_source(metadata.get("database_source"))
+    if source is not None:
+        slim_metadata["database_source"] = source
+    result = metadata.get("result")
+    if isinstance(result, dict):
+        slim_metadata["result"] = {
+            key: result.get(key)
+            for key in (
+                "ok",
+                "source_table",
+                "table_column",
+                "entity_type",
+                "count",
+                "updated",
+                "skipped_duplicates",
+                "failed",
+                "total",
+            )
+            if key in result
+        }
+    return slim_metadata
 
 
 def job_to_dict(job: KnowledgeImportJob) -> dict[str, Any]:
@@ -53,7 +137,53 @@ def job_to_dict(job: KnowledgeImportJob) -> dict[str, Any]:
         "document_id": job.document_id,
         "error_message": job.error_message,
         "retry_count": job.retry_count,
-        "metadata": job.job_metadata,
+        "metadata": _job_metadata_for_api(job),
+        "created_at": job.created_at.isoformat() if job.created_at else None,
+        "updated_at": job.updated_at.isoformat() if job.updated_at else None,
+        "started_at": job.started_at.isoformat() if job.started_at else None,
+        "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+    }
+
+
+def job_to_list_dict(job: KnowledgeImportJob) -> dict[str, Any]:
+    metadata = dict(job.job_metadata or {})
+    kind = str(metadata.get("kind") or "import")
+    slim_metadata: dict[str, Any] = {
+        "kind": kind,
+    }
+    for key in (
+        "source_job_id",
+        "vector_job_status",
+        "vector_error_message",
+        "vector_progress",
+        "database_source_id",
+        "table_name",
+        "column",
+        "entity_type",
+        "alias_columns",
+        "max_values",
+        "progress_detail",
+    ):
+        if key in metadata:
+            slim_metadata[key] = metadata[key]
+
+    return {
+        "id": job.id,
+        "knowledge_base_id": job.knowledge_base_id,
+        "status": job.status,
+        "file_name": job.file_name,
+        "file_type": job.file_type,
+        "file_size": job.file_size,
+        "source_path": job.source_path,
+        "source_sha256": job.source_sha256,
+        "title": job.title,
+        "publish_targets": job.publish_targets,
+        "current_step": job.current_step,
+        "progress": job.progress,
+        "document_id": job.document_id,
+        "error_message": job.error_message,
+        "retry_count": job.retry_count,
+        "metadata": slim_metadata,
         "created_at": job.created_at.isoformat() if job.created_at else None,
         "updated_at": job.updated_at.isoformat() if job.updated_at else None,
         "started_at": job.started_at.isoformat() if job.started_at else None,
@@ -204,6 +334,82 @@ async def create_vector_publish_job(
     return job
 
 
+async def create_vanna_entity_import_job(
+    session: AsyncSession,
+    *,
+    base_dir: Path,
+    source: KnowledgeDatabaseSource | dict[str, Any],
+    table_name: str,
+    column: str,
+    entity_type: str,
+    alias_columns: list[str] | None = None,
+    max_values: int | None = None,
+    knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+) -> KnowledgeImportJob:
+    service = KnowledgeService(base_dir)
+    await service.ensure_default_knowledge_base(session)
+
+    source_snapshot = _database_source_snapshot(source)
+    clean_table = str(table_name or "").strip()
+    clean_column = str(column or "").strip()
+    clean_entity_type = str(entity_type or "").strip()
+    if not clean_table:
+        raise KnowledgeServiceError("请选择数据库表。")
+    if not clean_column:
+        raise KnowledgeServiceError("请选择实体字段。")
+    if not clean_entity_type:
+        raise KnowledgeServiceError("请填写实体类型。")
+    clean_alias_columns = [
+        str(item).strip()
+        for item in alias_columns or []
+        if str(item or "").strip() and str(item).strip() != clean_column
+    ]
+    clean_max_values = int(max_values) if max_values is not None else None
+    if clean_max_values is not None and clean_max_values < 1:
+        raise KnowledgeServiceError("导入数量必须大于 0。")
+    source_id = str(source_snapshot.get("id") or "database")
+    source_name = str(source_snapshot.get("name") or source_id)
+
+    job = KnowledgeImportJob(
+        id=new_id("job"),
+        knowledge_base_id=knowledge_base_id,
+        status="queued",
+        file_name=f"{source_name}:{clean_table}.{clean_column}",
+        file_type="vanna_entity",
+        file_size=0,
+        source_path=f"database://{source_id}/{clean_table}.{clean_column}",
+        source_sha256="",
+        title=f"{clean_table}.{clean_column} 实体导入",
+        publish_targets=["vanna_entity"],
+        current_step="queued",
+        progress=0,
+        job_metadata={
+            "kind": VANNA_ENTITY_IMPORT_KIND,
+            "database_source_id": source_id,
+            "database_source": source_snapshot,
+            "table_name": clean_table,
+            "column": clean_column,
+            "entity_type": clean_entity_type,
+            "alias_columns": clean_alias_columns,
+            "max_values": clean_max_values,
+            "progress_detail": {
+                "stage": "queued",
+                "done": 0,
+                "total": 0,
+                "imported": 0,
+                "failed": 0,
+                "batch_size": 100,
+            },
+            "deepagents_backend": "/knowledge/",
+        },
+    )
+    session.add(job)
+    session.add(KnowledgeImportEvent(job_id=job.id, level="info", message="实体导入任务已加入队列"))
+    await session.commit()
+    await session.refresh(job)
+    return job
+
+
 async def list_import_jobs(
     session: AsyncSession,
     *,
@@ -338,7 +544,13 @@ async def claim_next_job(session: AsyncSession) -> KnowledgeImportJob | None:
     job.started_at = datetime.now(timezone.utc)
     job.finished_at = None
     job.error_message = None
-    message = "开始导入向量" if job_kind(job) == VECTOR_PUBLISH_KIND else "开始导入"
+    kind = job_kind(job)
+    if kind == VECTOR_PUBLISH_KIND:
+        message = "开始导入向量"
+    elif kind == VANNA_ENTITY_IMPORT_KIND:
+        message = "开始导入实体"
+    else:
+        message = "开始导入"
     session.add(KnowledgeImportEvent(job_id=job.id, level="info", message=message))
     await session.commit()
     await session.refresh(job)
@@ -393,9 +605,148 @@ async def mark_job_failed(session: AsyncSession, job: KnowledgeImportJob, error:
     await session.commit()
 
 
+async def process_vanna_entity_import_job(
+    session: AsyncSession,
+    *,
+    base_dir: Path,
+    job: KnowledgeImportJob,
+) -> KnowledgeImportJob:
+    metadata = dict(job.job_metadata or {})
+    source = metadata.get("database_source")
+    if not isinstance(source, dict):
+        raise KnowledgeServiceError("实体导入任务缺少数据库源快照。")
+
+    table_name = str(metadata.get("table_name") or "").strip()
+    column = str(metadata.get("column") or "").strip()
+    entity_type = str(metadata.get("entity_type") or "").strip()
+    alias_columns = [str(item).strip() for item in metadata.get("alias_columns") or [] if str(item or "").strip()]
+    raw_max_values = metadata.get("max_values")
+    max_values = int(raw_max_values) if raw_max_values not in (None, "", 0) else None
+    batch_size = int((metadata.get("progress_detail") or {}).get("batch_size") or 100)
+
+    await update_job_progress(
+        session,
+        job,
+        step="preparing",
+        progress=10,
+        message="准备实体导入",
+        metadata_patch={
+            "progress_detail": {
+                "stage": "preparing",
+                "done": 0,
+                "total": 0,
+                "imported": 0,
+                "failed": 0,
+                "batch_size": batch_size,
+            }
+        },
+    )
+
+    last_event_done = 0
+
+    async def _persist_entity_progress(progress_payload: dict[str, Any]) -> None:
+        nonlocal last_event_done
+        done = int(progress_payload.get("done") or 0)
+        total = int(progress_payload.get("total") or 0)
+        imported = int(progress_payload.get("imported") or 0)
+        updated = int(progress_payload.get("updated") or 0)
+        skipped_duplicates = int(progress_payload.get("skipped_duplicates") or 0)
+        failed = int(progress_payload.get("failed") or 0)
+        stage = str(progress_payload.get("stage") or "indexing")
+        percent = 15 + int((done / total) * 75) if total > 0 else 15
+        if stage == "done":
+            percent = 95
+        message: str | None = None
+        record_event = False
+        if total > 0 and done == 0 and last_event_done == 0:
+            message = f"开始写入实体：0/{total}"
+            record_event = True
+        elif total > 0 and (done == total or done - last_event_done >= max(batch_size, 500)):
+            message = f"实体导入进度：{done}/{total}"
+            record_event = True
+            last_event_done = done
+        await update_job_progress(
+            session,
+            job,
+            step="indexing",
+            progress=percent,
+            message=message,
+            event_metadata=progress_payload,
+            metadata_patch={"progress_detail": progress_payload},
+            record_event=record_event,
+        )
+
+    try:
+        result = await import_table_entities(
+            source,
+            table_name=table_name,
+            column=column,
+            entity_type=entity_type,
+            alias_columns=alias_columns,
+            max_values=max_values,
+            batch_size=batch_size,
+            continue_on_error=True,
+            on_progress=_persist_entity_progress,
+        )
+    except VannaTrainingError as exc:
+        raise KnowledgeServiceError(str(exc)) from exc
+
+    total = int(result.get("total") or result.get("count") or 0)
+    failed = int(result.get("failed") or 0)
+    count = int(result.get("count") or 0)
+    updated = int(result.get("updated") or 0)
+    skipped_duplicates = int(result.get("skipped_duplicates") or 0)
+    progress_detail = {
+        "stage": "done",
+        "done": count + updated + skipped_duplicates + failed,
+        "total": total,
+        "imported": count,
+        "updated": updated,
+        "skipped_duplicates": skipped_duplicates,
+        "failed": failed,
+        "batch_size": batch_size,
+    }
+    await update_job_progress(
+        session,
+        job,
+        step="finalizing",
+        progress=95,
+        message="更新实体导入记录",
+        metadata_patch={"progress_detail": progress_detail, "result": result},
+    )
+
+    job.status = "succeeded"
+    job.current_step = "done"
+    job.progress = 100
+    job.error_message = None
+    job.finished_at = datetime.now(timezone.utc)
+    job.job_metadata = {**(job.job_metadata or {}), "progress_detail": progress_detail, "result": result}
+    session.add(
+        KnowledgeImportEvent(
+            job_id=job.id,
+            level="info",
+            message=f"实体导入完成：新增 {count}，更新 {updated}，跳过重复 {skipped_duplicates}，失败 {failed} / {total}",
+            event_metadata={
+                "count": count,
+                "updated": updated,
+                "skipped_duplicates": skipped_duplicates,
+                "total": total,
+                "failed": failed,
+                "table_column": result.get("table_column"),
+            },
+        )
+    )
+    await session.commit()
+    await session.refresh(job)
+    return job
+
+
 async def process_import_job(session: AsyncSession, *, base_dir: Path, job: KnowledgeImportJob) -> KnowledgeImportJob:
-    if job_kind(job) == VECTOR_PUBLISH_KIND:
+    kind = job_kind(job)
+    if kind == VECTOR_PUBLISH_KIND:
         return await process_vector_publish_job(session, base_dir=base_dir, job=job)
+    if kind == VANNA_ENTITY_IMPORT_KIND:
+        return await process_vanna_entity_import_job(session, base_dir=base_dir, job=job)
 
     service = KnowledgeService(base_dir)
     source_path = Path(job.source_path)

@@ -21,6 +21,24 @@ function apiErrorMessage(text: string, fallback: string): string {
   return text;
 }
 
+async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = 5000): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(input, {
+      ...init,
+      signal: init.signal ?? controller.signal,
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error("状态刷新超时，后台任务仍会继续处理。");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export interface SSEEvent {
   event: string;
   data: Record<string, unknown>;
@@ -354,13 +372,24 @@ export interface VannaEntityRecord {
   table_column?: string;
 }
 
+export interface VannaEntityListResult {
+  entities: VannaEntityRecord[];
+  count: number;
+  limited?: boolean;
+  type_counts?: Record<string, number>;
+  offset?: number;
+  limit?: number;
+}
+
 export interface VannaEntityImportResult {
   ok: boolean;
-  source_table: string;
-  table_column: string;
-  entity_type: string;
-  count: number;
-  entities: Array<{ id: string; canonical_name: string; aliases: string[] }>;
+  job_id?: string;
+  job?: KnowledgeImportJob;
+  source_table?: string;
+  table_column?: string;
+  entity_type?: string;
+  count?: number;
+  entities?: Array<{ id: string; canonical_name: string; aliases: string[] }>;
 }
 
 export async function getKnowledgeStatus(): Promise<KnowledgeStatus> {
@@ -570,16 +599,42 @@ export async function importKnowledgeDatabaseSourceVannaEntities(
   return response.json();
 }
 
-export async function listKnowledgeDatabaseSourceVannaEntities(sourceId: string): Promise<VannaEntityRecord[]> {
-  const response = await fetch(`${API_BASE}/knowledge/database-sources/${encodeURIComponent(sourceId)}/vanna/entities`, {
-    cache: "no-store",
-  });
+export async function listKnowledgeDatabaseSourceVannaEntities(
+  sourceId: string,
+  options?: string | {
+    tableName?: string;
+    entityType?: string;
+    search?: string;
+    offset?: number;
+    limit?: number;
+  }
+): Promise<VannaEntityListResult> {
+  const params = new URLSearchParams();
+  const normalizedOptions = typeof options === "string" ? { tableName: options } : options ?? {};
+  if (normalizedOptions.tableName) params.set("table_name", normalizedOptions.tableName);
+  if (normalizedOptions.entityType && normalizedOptions.entityType !== "all") params.set("entity_type", normalizedOptions.entityType);
+  if (normalizedOptions.search?.trim()) params.set("search", normalizedOptions.search.trim());
+  if (typeof normalizedOptions.offset === "number") params.set("offset", String(Math.max(0, normalizedOptions.offset)));
+  if (typeof normalizedOptions.limit === "number") params.set("limit", String(Math.max(1, normalizedOptions.limit)));
+  const query = params.toString();
+  const response = await fetch(
+    `${API_BASE}/knowledge/database-sources/${encodeURIComponent(sourceId)}/vanna/entities${query ? `?${query}` : ""}`,
+    { cache: "no-store" }
+  );
   if (!response.ok) {
     const text = await response.text().catch(() => "");
     throw new Error(apiErrorMessage(text, `Failed to list Vanna entities: ${response.status}`));
   }
   const data = await response.json();
-  return Array.isArray(data.entities) ? data.entities : [];
+  const entities = Array.isArray(data.entities) ? data.entities : [];
+  return {
+    entities,
+    count: typeof data.count === "number" ? data.count : entities.length,
+    limited: Boolean(data.limited),
+    type_counts: data.type_counts && typeof data.type_counts === "object" ? data.type_counts : {},
+    offset: typeof data.offset === "number" ? data.offset : 0,
+    limit: typeof data.limit === "number" ? data.limit : entities.length,
+  };
 }
 
 export async function deleteKnowledgeDatabaseSourceVannaEntity(sourceId: string, entityId: string): Promise<void> {
@@ -693,7 +748,11 @@ export async function createKnowledgeImportJob(
 
 export async function listKnowledgeImportJobs(limit = 20): Promise<KnowledgeImportJob[]> {
   const params = new URLSearchParams({ limit: String(limit) });
-  const response = await fetch(`${API_BASE}/knowledge/import-jobs?${params.toString()}`, { cache: "no-store" });
+  const response = await fetchWithTimeout(
+    `${API_BASE}/knowledge/import-jobs?${params.toString()}`,
+    { cache: "no-store" },
+    4000
+  );
   if (!response.ok) {
     const text = await response.text().catch(() => "");
     throw new Error(apiErrorMessage(text, `Failed to load knowledge import jobs: ${response.status}`));
@@ -707,9 +766,13 @@ export async function getKnowledgeImportJob(
   includeEvents = true
 ): Promise<KnowledgeImportJobDetail> {
   const params = new URLSearchParams({ include_events: includeEvents ? "true" : "false" });
-  const response = await fetch(`${API_BASE}/knowledge/import-jobs/${encodeURIComponent(jobId)}?${params.toString()}`, {
-    cache: "no-store",
-  });
+  const response = await fetchWithTimeout(
+    `${API_BASE}/knowledge/import-jobs/${encodeURIComponent(jobId)}?${params.toString()}`,
+    {
+      cache: "no-store",
+    },
+    includeEvents ? 8000 : 3000
+  );
   if (!response.ok) {
     const text = await response.text().catch(() => "");
     throw new Error(apiErrorMessage(text, `Failed to load knowledge import job: ${response.status}`));
@@ -867,6 +930,74 @@ export async function listTableAssetEntityCandidates(assetId: string, limit = 12
   }
   const payload = await response.json();
   return Array.isArray(payload.candidates) ? payload.candidates : [];
+}
+
+export interface DatabaseQueryResultSummary {
+  result_id: string;
+  session_id?: string;
+  tool_call_id?: string;
+  question: string;
+  sql: string;
+  columns: string[];
+  row_count: number;
+  profile?: Record<string, unknown>;
+  artifact_path: string;
+  storage_path?: string;
+  artifact_format: string;
+  status: string;
+  expired: boolean;
+  artifact_exists: boolean;
+  export_enabled?: boolean;
+  created_at: string;
+  expires_at: string;
+}
+
+export interface DatabaseQueryResultPage {
+  result_id: string;
+  expired: boolean;
+  status: string;
+  row_count: number;
+  columns: string[];
+  profile?: Record<string, unknown>;
+  export_enabled?: boolean;
+  page: number;
+  page_size: number;
+  has_next?: boolean;
+  has_previous?: boolean;
+  rows: Record<string, unknown>[];
+  expires_at: string;
+  message?: string;
+}
+
+export async function listDatabaseQueryResults(limit = 50): Promise<DatabaseQueryResultSummary[]> {
+  const params = new URLSearchParams({ limit: String(limit), include_expired: "true" });
+  const response = await fetch(`${API_BASE}/analytics/query-results?${params.toString()}`, { cache: "no-store" });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to load query results: ${response.status}`));
+  }
+  const payload = await response.json();
+  return Array.isArray(payload.items) ? payload.items : [];
+}
+
+export async function getDatabaseQueryResultPage(
+  resultId: string,
+  page = 1,
+  pageSize = 100
+): Promise<DatabaseQueryResultPage> {
+  const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) });
+  const response = await fetch(`${API_BASE}/analytics/query-results/${encodeURIComponent(resultId)}?${params.toString()}`, {
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to load query result page: ${response.status}`));
+  }
+  return response.json();
+}
+
+export function databaseQueryResultExportCsvUrl(resultId: string): string {
+  return `${API_BASE}/analytics/query-results/${encodeURIComponent(resultId)}/export.csv`;
 }
 
 export async function uploadAgentAttachments(

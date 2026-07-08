@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
+from sqlalchemy.pool import NullPool
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from config import get_database_config
@@ -33,6 +34,8 @@ def _engine_kwargs(url: str) -> dict[str, object]:
     }
     if url.startswith("sqlite+"):
         kwargs["connect_args"] = {"check_same_thread": False}
+    elif url.startswith("postgresql+asyncpg"):
+        kwargs["poolclass"] = NullPool
     return kwargs
 
 

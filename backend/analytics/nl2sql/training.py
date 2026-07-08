@@ -6,9 +6,10 @@ remain Pandas assets and never write training data into Vanna automatically.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Awaitable, Callable, Literal
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -46,13 +47,19 @@ def _as_list(value: str | list[str] | None) -> list[str]:
     return [str(value)] if str(value or "").strip() else []
 
 
-def _record_type(record_id: str) -> str:
+def _record_type(record_id: str, *, question: Any = None, content: str = "") -> str:
     if record_id.endswith("-sql"):
         return "sql"
     if record_id.endswith("-ddl"):
         return "ddl"
     if record_id.endswith("-doc"):
         return "documentation"
+    if question:
+        return "sql"
+    normalized = str(content or "").lstrip().lower()
+    if normalized.startswith("create table"):
+        return "ddl"
+    return "documentation" if normalized else "unknown"
     return "unknown"
 
 
@@ -132,59 +139,98 @@ async def recommend_database_entity_candidates(
     *,
     table_name: str,
     max_candidates: int = 12,
+    sample_rows: int = 2000,
 ) -> list[dict[str, Any]]:
     """Recommend entity columns from a live PostgreSQL table."""
 
     schema, table, qualified = _qualified_table_sql(table_name)
     columns = await _list_columns(source, table_name)
     textual_markers = ("character", "text", "varchar", "char", "boolean")
+    text_columns = [
+        column
+        for column in columns
+        if any(marker in str(column.get("dtype") or "").lower() for marker in textual_markers)
+    ]
+    if not text_columns:
+        return []
+
     profile_columns: list[dict[str, Any]] = []
+    total = 0
     engine = create_async_engine(database_source_url(source), pool_pre_ping=True)
     try:
         async with engine.connect() as conn:
-            total_result = await conn.execute(text(f"SELECT COUNT(*) AS total FROM {qualified}"))
+            await conn.execute(text("SET LOCAL statement_timeout = '5s'"))
+            total_result = await conn.execute(
+                text(
+                    """
+                    SELECT COALESCE(c.reltuples::bigint, 0) AS total
+                    FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = :schema
+                      AND c.relname = :table
+                    """
+                ),
+                {"schema": schema, "table": table},
+            )
             total = int(total_result.scalar() or 0)
-            for column in columns:
-                dtype = str(column.get("dtype") or "").lower()
-                if not any(marker in dtype for marker in textual_markers):
-                    continue
-                column_sql = _quote_ident(str(column["name"]))
-                stats = await conn.execute(
-                    text(
-                        f"""
-                        SELECT COUNT({column_sql}) AS non_null,
-                               COUNT(DISTINCT {column_sql}) AS distinct_count
-                        FROM {qualified}
-                        """
+
+            select_columns = ", ".join(_quote_ident(str(column["name"])) for column in text_columns)
+            sample_limit = max(100, min(int(sample_rows), 10000))
+            sample_result = await conn.execute(
+                text(f"SELECT {select_columns} FROM {qualified} LIMIT :sample_limit"),
+                {"sample_limit": sample_limit},
+            )
+            sample_records = [dict(row) for row in sample_result.mappings().all()]
+            sampled_total = len(sample_records)
+            if total <= 0:
+                total = sampled_total
+
+            for column in text_columns:
+                column_name = str(column["name"])
+                raw_values = [
+                    str(row.get(column_name) or "").strip()
+                    for row in sample_records
+                    if str(row.get(column_name) or "").strip()
+                ]
+                distinct_values = list(dict.fromkeys(raw_values))
+                sample_values = distinct_values[:10]
+
+                if not sample_values:
+                    column_sql = _quote_ident(column_name)
+                    fallback_samples = await conn.execute(
+                        text(
+                            f"""
+                            SELECT {column_sql}::text AS value
+                            FROM {qualified}
+                            WHERE {column_sql} IS NOT NULL
+                            LIMIT 10
+                            """
+                        )
                     )
-                )
-                stats_row = stats.first()
-                samples = await conn.execute(
-                    text(
-                        f"""
-                        SELECT DISTINCT {column_sql}::text AS value
-                        FROM {qualified}
-                        WHERE {column_sql} IS NOT NULL
-                        LIMIT 10
-                        """
-                    )
-                )
-                sample_values = [str(row.value) for row in samples if str(row.value or "").strip()]
-                distinct_count = int(stats_row.distinct_count or 0) if stats_row else 0
+                    sample_values = [
+                        str(row.value).strip()
+                        for row in fallback_samples
+                        if str(row.value or "").strip()
+                    ]
+
+                distinct_count = len(distinct_values)
                 profile_columns.append(
                     {
                         "name": column["name"],
                         "dtype": column["dtype"],
-                        "non_null": int(stats_row.non_null or 0) if stats_row else 0,
+                        "non_null": len(raw_values),
                         "distinct_count": distinct_count,
-                        "distinct_ratio": distinct_count / max(total, 1) if total else None,
+                        "distinct_ratio": distinct_count / max(sampled_total, 1) if sampled_total else None,
                         "sample_values": sample_values,
                     }
                 )
     finally:
         await engine.dispose()
 
-    profile = {"shape": [total if "total" in locals() else 0, len(columns)], "columns": profile_columns}
+    # Entity recommendation is based on a bounded sample for large database tables.
+    # Use the sample size as the scoring denominator; otherwise every sampled
+    # column looks sparse when compared with the full table estimate.
+    profile = {"shape": [sampled_total if "sampled_total" in locals() else total, len(columns)], "columns": profile_columns}
     return recommend_entity_candidates(profile, table_name=f"{schema}.{table}", max_candidates=max_candidates)
 
 
@@ -285,6 +331,88 @@ def _normalize_ids(value: str | list[str] | None) -> list[str]:
     return _as_list(value)
 
 
+def _milvus_string(value: str) -> str:
+    return str(value or "").replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _chunks(values: list[str], size: int) -> list[list[str]]:
+    size = max(1, size)
+    return [values[index : index + size] for index in range(0, len(values), size)]
+
+
+def _query_existing_entities(
+    vn: Any,
+    *,
+    table_column: str,
+    entity_type: str,
+    canonical_names: list[str],
+    batch_size: int,
+) -> dict[str, dict[str, Any]]:
+    """Return existing Vanna entities keyed by canonical_name.
+
+    Entity IDs are auto-generated by the Vanna Milvus store, so duplicate
+    prevention must happen by querying the semantic key before insert:
+    table_column + entity_type + canonical_name.
+    """
+
+    if not canonical_names:
+        return {}
+    try:
+        if not vn.milvus_client.has_collection(collection_name=vn.entity_collection):
+            return {}
+    except Exception:
+        return {}
+
+    existing: dict[str, dict[str, Any]] = {}
+    escaped_table_column = _milvus_string(table_column)
+    escaped_entity_type = _milvus_string(entity_type)
+    query_batch_size = max(1, min(int(batch_size or 100), 100))
+
+    for chunk in _chunks(canonical_names, query_batch_size):
+        quoted_names = ", ".join(f'"{_milvus_string(name)}"' for name in chunk)
+        filter_expr = (
+            f'table_column == "{escaped_table_column}" '
+            f'and entity_type == "{escaped_entity_type}" '
+            f"and canonical_name in [{quoted_names}]"
+        )
+        try:
+            rows = vn.milvus_client.query(
+                collection_name=vn.entity_collection,
+                filter=filter_expr,
+                output_fields=["pk", "entity_type", "canonical_name", "aliases", "table_column"],
+                limit=len(chunk),
+            )
+        except Exception:
+            rows = []
+            for name in chunk:
+                try:
+                    fallback_rows = vn.milvus_client.query(
+                        collection_name=vn.entity_collection,
+                        filter=(
+                            f'table_column == "{escaped_table_column}" '
+                            f'and entity_type == "{escaped_entity_type}" '
+                            f'and canonical_name == "{_milvus_string(name)}"'
+                        ),
+                        output_fields=["pk", "entity_type", "canonical_name", "aliases", "table_column"],
+                        limit=1,
+                    )
+                    rows.extend(fallback_rows or [])
+                except Exception:
+                    continue
+        for row in rows or []:
+            canonical = str(row.get("canonical_name") or "").strip()
+            if canonical:
+                existing[canonical] = dict(row)
+
+    return existing
+
+
+async def _call_vanna_sync(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Run blocking Vanna/Milvus operations off the FastAPI event loop."""
+
+    return await asyncio.to_thread(fn, *args, **kwargs)
+
+
 async def train_vanna_ddl(
     source: KnowledgeDatabaseSource | dict[str, Any],
     *,
@@ -325,7 +453,7 @@ def list_vanna_training_data(*, table_name: str | None = None) -> dict[str, Any]
             record_id = str(raw.get("id") or "")
             content = str(raw.get("content") or "")
             question = raw.get("question")
-            training_type = _record_type(record_id)
+            training_type = _record_type(record_id, question=question, content=content)
             records.append(
                 {
                     "id": record_id,
@@ -357,7 +485,10 @@ async def import_table_entities(
     column: str,
     entity_type: str,
     alias_columns: list[str] | None = None,
-    max_values: int = 1000,
+    max_values: int | None = None,
+    batch_size: int = 100,
+    continue_on_error: bool = False,
+    on_progress: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
     """Import distinct values from a database table column into Vanna entities."""
 
@@ -370,7 +501,9 @@ async def import_table_entities(
     column = str(column or "").strip()
     if not column:
         raise VannaTrainingError("请选择实体字段。")
-    max_values = max(1, min(int(max_values or 1000), 10000))
+    clean_max_values = int(max_values) if max_values is not None else None
+    if clean_max_values is not None and clean_max_values < 1:
+        raise VannaTrainingError("导入数量必须大于 0。")
     alias_columns = [str(item).strip() for item in alias_columns or [] if str(item or "").strip() and str(item).strip() != column]
 
     schema, table, qualified = _qualified_table_sql(table_name)
@@ -379,11 +512,13 @@ async def import_table_entities(
         raise VannaTrainingError("实体字段不存在。")
     for alias_column in alias_columns:
         if alias_column not in available_columns:
-            raise VannaTrainingError(f"别名字段不存在：{alias_column}")
+            raise VannaTrainingError(f"辅助匹配字段不存在：{alias_column}")
 
     selected_sql = ", ".join([f"{_quote_ident(column)}::text AS canonical", *[f"{_quote_ident(alias)}::text AS {_quote_ident(alias)}" for alias in alias_columns]])
     engine = create_async_engine(database_source_url(source), pool_pre_ping=True)
     grouped: dict[str, set[str]] = {}
+    limit_clause = "\n                    LIMIT :limit" if clean_max_values is not None else ""
+    query_params = {"limit": clean_max_values * 10 if alias_columns else clean_max_values} if clean_max_values is not None else {}
     try:
         async with engine.connect() as conn:
             result = await conn.execute(
@@ -391,11 +526,10 @@ async def import_table_entities(
                     f"""
                     SELECT {selected_sql}
                     FROM {qualified}
-                    WHERE {_quote_ident(column)} IS NOT NULL
-                    LIMIT :limit
+                    WHERE {_quote_ident(column)} IS NOT NULL{limit_clause}
                     """
                 ),
-                {"limit": max_values * 10 if alias_columns else max_values},
+                query_params,
             )
             for row in result.mappings():
                 canonical = str(row.get("canonical") or "").strip()
@@ -406,7 +540,7 @@ async def import_table_entities(
                     value = str(row.get(alias_column) or "").strip()
                     if value and value != canonical:
                         aliases.add(value)
-                if len(grouped) >= max_values:
+                if clean_max_values is not None and len(grouped) >= clean_max_values:
                     break
     finally:
         await engine.dispose()
@@ -416,15 +550,86 @@ async def import_table_entities(
 
     vn = build_vanna_client_from_app_config()
     table_column = f"{schema}.{table}.{column}"
+    batch_size = max(1, min(int(batch_size or 100), 1000))
+    existing_entities = await _call_vanna_sync(
+        _query_existing_entities,
+        vn,
+        table_column=table_column,
+        entity_type=entity_type,
+        canonical_names=list(grouped.keys()),
+        batch_size=batch_size,
+    )
     imported: list[dict[str, Any]] = []
-    for canonical, aliases in grouped.items():
-        entity_id = vn.add_entity(
-            canonical_name=canonical,
-            entity_type=entity_type,
-            aliases=sorted(aliases),
-            table_column=table_column,
+    updated: list[dict[str, Any]] = []
+    skipped_duplicates = 0
+    failed = 0
+    total = len(grouped)
+    if on_progress:
+        await on_progress(
+            {
+                "stage": "indexing",
+                "done": 0,
+                "total": total,
+                "imported": 0,
+                "updated": 0,
+                "skipped_duplicates": 0,
+                "failed": failed,
+                "batch_size": batch_size,
+            }
         )
-        imported.append({"id": entity_id, "canonical_name": canonical, "aliases": sorted(aliases)})
+    for canonical, aliases in grouped.items():
+        try:
+            existing = existing_entities.get(canonical)
+            next_aliases = set(aliases)
+            if existing:
+                existing_aliases = {str(item).strip() for item in existing.get("aliases") or [] if str(item or "").strip()}
+                merged_aliases = sorted(existing_aliases | next_aliases)
+                if set(merged_aliases) == existing_aliases:
+                    skipped_duplicates += 1
+                else:
+                    existing_id = str(existing.get("pk") or existing.get("id") or "").strip()
+                    if not existing_id:
+                        raise VannaTrainingError(f"实体已存在但缺少可更新 ID：{canonical}")
+                    if not await _call_vanna_sync(vn.remove_entity, existing_id):
+                        raise VannaTrainingError(f"更新实体前删除旧记录失败：{canonical}")
+                    entity_id = await _call_vanna_sync(
+                        vn.add_entity,
+                        canonical_name=canonical,
+                        entity_type=entity_type,
+                        aliases=merged_aliases,
+                        table_column=table_column,
+                    )
+                    updated.append({"id": entity_id, "canonical_name": canonical, "aliases": merged_aliases})
+            else:
+                entity_id = await _call_vanna_sync(
+                    vn.add_entity,
+                    canonical_name=canonical,
+                    entity_type=entity_type,
+                    aliases=sorted(aliases),
+                    table_column=table_column,
+                )
+                imported.append({"id": entity_id, "canonical_name": canonical, "aliases": sorted(aliases)})
+        except Exception:
+            failed += 1
+            if not continue_on_error:
+                raise
+        processed = len(imported) + len(updated) + skipped_duplicates + failed
+        if on_progress and (processed == total or processed % batch_size == 0):
+            await on_progress(
+                {
+                    "stage": "indexing",
+                    "done": processed,
+                    "total": total,
+                    "imported": len(imported),
+                    "updated": len(updated),
+                    "skipped_duplicates": skipped_duplicates,
+                    "failed": failed,
+                    "batch_size": batch_size,
+                }
+            )
+
+    if not imported and not updated and skipped_duplicates <= 0:
+        raise VannaTrainingError("实体导入失败，没有成功写入任何实体。")
 
     return {
         "ok": True,
@@ -432,20 +637,143 @@ async def import_table_entities(
         "table_column": table_column,
         "entity_type": entity_type,
         "count": len(imported),
+        "updated": len(updated),
+        "skipped_duplicates": skipped_duplicates,
+        "failed": failed,
+        "total": total,
         "entities": imported[:50],
+        "updated_entities": updated[:50],
     }
 
 
-def list_vanna_entities(*, entity_type: str | None = None, table_column: str | None = None) -> dict[str, Any]:
+def _vanna_entity_filter(
+    *,
+    entity_type: str | None = None,
+    table_column: str | None = None,
+    table_name: str | None = None,
+) -> str | None:
+    filters: list[str] = []
+    if entity_type:
+        filters.append(f'entity_type == "{_milvus_string(entity_type)}"')
+    if table_column:
+        filters.append(f'table_column == "{_milvus_string(table_column)}"')
+    elif table_name:
+        schema, table = _split_table_name(table_name)
+        schema = schema or "public"
+        if table:
+            filters.append(f'table_column like "{_milvus_string(f"{schema}.{table}.")}%"')
+    return " and ".join(filters) or None
+
+
+def _vanna_entity_base_filter(
+    *,
+    table_column: str | None = None,
+    table_name: str | None = None,
+) -> str | None:
+    return _vanna_entity_filter(table_column=table_column, table_name=table_name)
+
+
+def _entity_alias_values(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item or "").strip()]
+    return [str(value)]
+
+
+def _entity_matches_search(row: dict[str, Any], search: str | None) -> bool:
+    needle = str(search or "").strip().lower()
+    if not needle:
+        return True
+    haystack_values = [
+        row.get("entity_type"),
+        row.get("canonical_name"),
+        row.get("table_column"),
+        *_entity_alias_values(row.get("aliases")),
+    ]
+    return any(needle in str(value or "").lower() for value in haystack_values)
+
+
+def list_vanna_entities(
+    *,
+    entity_type: str | None = None,
+    table_column: str | None = None,
+    table_name: str | None = None,
+    search: str | None = None,
+    offset: int = 0,
+    limit: int = 50,
+) -> dict[str, Any]:
     vn = build_vanna_client_from_app_config()
-    rows = vn.get_all_entities(entity_type=entity_type) or []
+    try:
+        if not vn.milvus_client.has_collection(collection_name=vn.entity_collection):
+            return {"entities": [], "count": 0, "limited": False, "type_counts": {}, "offset": 0, "limit": 0}
+    except Exception:
+        return {"entities": [], "count": 0, "limited": False, "type_counts": {}, "offset": 0, "limit": 0}
+
+    # Count all entity types for the current table scope first. The frontend
+    # must not infer available types from a truncated page, otherwise a later
+    # imported type (e.g. brand) is invisible after 10k rows of another type.
+    base_filter_expr = _vanna_entity_base_filter(table_column=table_column, table_name=table_name)
+    filter_expr = _vanna_entity_filter(entity_type=entity_type, table_column=table_column, table_name=table_name)
+    safe_offset = max(0, int(offset or 0))
+    safe_limit = max(1, min(int(limit or 50), 200))
     records: list[dict[str, Any]] = []
-    for row in rows:
-        record = dict(row)
-        if table_column and str(record.get("table_column") or "") != table_column:
-            continue
-        records.append(record)
-    return {"entities": records, "count": len(records)}
+    type_counts: dict[str, int] = {}
+    matched_total = 0
+    iterator = None
+    try:
+        iterator = vn.milvus_client.query_iterator(
+            collection_name=vn.entity_collection,
+            filter=base_filter_expr,
+            output_fields=["pk", "entity_type", "canonical_name", "aliases", "table_column"],
+            batch_size=1000,
+        )
+        while True:
+            batch = iterator.next()
+            if not batch:
+                break
+            for row in batch:
+                type_key = str(row.get("entity_type") or "").strip()
+                if type_key:
+                    type_counts[type_key] = type_counts.get(type_key, 0) + 1
+    finally:
+        if iterator is not None:
+            iterator.close()
+
+    iterator = None
+    try:
+        iterator = vn.milvus_client.query_iterator(
+            collection_name=vn.entity_collection,
+            filter=filter_expr,
+            output_fields=["pk", "entity_type", "canonical_name", "aliases", "table_column"],
+            batch_size=1000,
+        )
+        while True:
+            batch = iterator.next()
+            if not batch:
+                break
+            for row in batch:
+                row_dict = dict(row)
+                if not _entity_matches_search(row_dict, search):
+                    continue
+                current_index = matched_total
+                matched_total += 1
+                if current_index < safe_offset:
+                    continue
+                if len(records) < safe_limit:
+                    records.append(row_dict)
+    finally:
+        if iterator is not None:
+            iterator.close()
+
+    return {
+        "entities": records,
+        "count": matched_total,
+        "limited": matched_total > safe_offset + len(records),
+        "type_counts": type_counts,
+        "offset": safe_offset,
+        "limit": safe_limit,
+    }
 
 
 def remove_vanna_entity(entity_id: str) -> bool:

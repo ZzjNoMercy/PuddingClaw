@@ -4,7 +4,7 @@
 - 只做工具选择引导，不执行工具，也不替模型做最终决策
 - 通过 before_model 在最后一条用户消息末尾追加临时路由提示
 - 不修改真正的 system prompt，避免破坏 DeepSeek prefix cache
-- 当前仅保留三类核心意图：表格问数、知识库 RAG、网页检索
+- 当前仅保留四类核心意图：数据库问数、表格问数、知识库 RAG、网页检索
 
 与 compression middleware 的叠加顺序：
     compression（修改 messages，外层）→ tool_intent_router（注入路由，中层）→ write（after_model 副作用，内层）
@@ -25,6 +25,23 @@ _ROUTER_HINT_MARKER = "[系统路由提示]"
 
 
 _DEFAULT_INTENT_REGISTRY: dict[str, dict[str, Any]] = {
+    "database_analysis": {
+        "keywords": [
+            "数据库", "数据源", "postgres", "postgresql", "sql", "vanna", "nl2sql",
+            "数据库表", "表结构", "ddl", "实体字典", "结构化数据库",
+            "问数 agent", "智能问数",
+        ],
+        "preferred_tools": ["database_knowledge_query"],
+        "tool_categories": ["table"],
+        "routing_prompt": (
+            "用户意图为结构化数据库问数。只要问题涉及已配置数据库源、数据库表、SQL、"
+            "Vanna/NL2SQL、实体字典、DDL、表结构，或用户明确在问数据库里的业务数据，"
+            "必须优先调用 database_knowledge_query。对于业务问数，直接把用户原问题交给 "
+            "database_knowledge_query；该工具内部会执行表 Router、加载 DDL/文档/实体并生成 SQL。"
+            "不要先调用 database_knowledge_query 去列出表、探查 schema、枚举品牌/字段/type_name，"
+            "除非用户明确要求查看这些元数据。Excel/CSV 文件仍使用 pandas_knowledge_query。"
+        ),
+    },
     "table_analysis": {
         "keywords": [
             "excel", "xlsx", "xls", "csv", "tsv", "表格", "电子表格", "数据表",
@@ -32,18 +49,20 @@ _DEFAULT_INTENT_REGISTRY: dict[str, dict[str, Any]] = {
             "聚合", "透视", "top", "行数", "列名", "字段", "sheet",
             "数据分析", "分析数据", "数据统计", "数据汇总", "问数", "看数", "报表",
             "指标", "指标计算", "明细", "汇总",
-            # 业务问数常见指标词：用户不一定会说“Excel/表格”，但这些问题通常应先查已导入表格。
+            # 业务问数常见指标词：用户不一定会说“Excel/表格”或“数据库”，但这些问题通常应先走结构化工具。
             "销量", "周销量", "月销量", "环比", "同比", "占比", "配置率", "渗透率",
             "品牌", "车型", "车系", "款型", "价格段", "终端", "批发", "零售",
         ],
-        "preferred_tools": ["pandas_knowledge_query"],
+        "preferred_tools": ["pandas_knowledge_query", "database_knowledge_query"],
         "tool_categories": ["table"],
         "routing_prompt": (
             "用户意图为表格问数。只要问题涉及已导入 Excel/CSV/TSV、刚才导入的表格、字段/列名、"
             "行数、筛选、排序、分组、聚合、趋势、Top N、数据分析/问数/报表，"
-            "或销量/环比/同比/占比/配置率等业务指标，必须优先调用 pandas_knowledge_query。"
-            "即使用户说“知识库”，只要是在问结构化数据分析或指标计算，也应先走 pandas_knowledge_query。"
-            "不要先调用 llamaindex_knowledge_query、glob 或 grep 来查表格；这些工具不会可靠读取 Excel/CSV 的结构化数据。"
+            "或销量/环比/同比/占比/配置率等业务指标，应优先使用结构化问数工具。"
+            "如果上下文是 Excel/CSV/TSV 或用户说“导入的表格/Excel”，调用 pandas_knowledge_query；"
+            "如果上下文是数据库源/数据库表/SQL/Vanna，调用 database_knowledge_query。"
+            "调用 database_knowledge_query 处理业务问数时，应直接传入用户原问题，不要先用它探查表结构或字段。"
+            "不要先调用 llamaindex_knowledge_query、glob 或 grep 来查结构化数据。"
         ),
     },
     "knowledge_rag": {
@@ -139,7 +158,13 @@ class ToolIntentRouterMiddleware(AgentMiddleware):
         if not matched_intents:
             return {"matched": False, "intents": [], "preferred_tools": [], "routing_prompt": ""}
 
-        # 表格问数优先级最高：避免 Excel/CSV 被 RAG 或网页检索抢走。
+        # 数据库问数优先级最高：避免结构化数据库问题被 Excel/PDF/Web 路由抢走。
+        if "database_analysis" in matched_intents and len(matched_intents) > 1:
+            matched_intents = ["database_analysis"]
+            routing_prompts = [self.intent_registry["database_analysis"]["routing_prompt"]]
+            preferred_tools = list(self.intent_registry["database_analysis"].get("preferred_tools", []))
+
+        # 表格问数优先级高于 RAG/Web：避免 Excel/CSV 被文档检索抢走。
         if "table_analysis" in matched_intents and len(matched_intents) > 1:
             matched_intents = ["table_analysis"]
             routing_prompts = [self.intent_registry["table_analysis"]["routing_prompt"]]

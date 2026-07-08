@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from graph.middlewares.tool_intent_router import ToolIntentRouterMiddleware
+from tools.database_knowledge_tool import DatabaseKnowledgeInput, DatabaseKnowledgeQueryTool
 
 
 def test_vehicle_sales_metric_routes_to_pandas_table_tool() -> None:
@@ -8,7 +9,8 @@ def test_vehicle_sales_metric_routes_to_pandas_table_tool() -> None:
 
     assert decision["matched"] is True
     assert decision["intents"] == ["table_analysis"]
-    assert decision["preferred_tools"] == ["pandas_knowledge_query"]
+    assert decision["preferred_tools"][0] == "pandas_knowledge_query"
+    assert "database_knowledge_query" in decision["preferred_tools"]
 
 
 def test_news_intent_still_routes_to_web_search() -> None:
@@ -19,12 +21,33 @@ def test_news_intent_still_routes_to_web_search() -> None:
     assert decision["preferred_tools"][0] == "tavily_search"
 
 
+def test_database_business_question_routes_directly_without_schema_probe() -> None:
+    decision = ToolIntentRouterMiddleware()._classify_intent("从数据库查询一下比亚迪及下属品牌6月上市的车型的价格")
+
+    assert decision["matched"] is True
+    assert decision["intents"] == ["database_analysis"]
+    assert decision["preferred_tools"] == ["database_knowledge_query"]
+    assert "直接把用户原问题交给 database_knowledge_query" in decision["routing_prompt"]
+    assert "不要先调用 database_knowledge_query 去列出表、探查 schema" in decision["routing_prompt"]
+
+
+def test_database_tool_schema_discourages_metadata_probe_for_business_questions() -> None:
+    tool = DatabaseKnowledgeQueryTool()
+    question_field = DatabaseKnowledgeInput.model_fields["question"]
+
+    assert "call it once with the user's original question" in tool.description
+    assert "Do not make preliminary calls" in tool.description
+    assert "pass the user's original question directly" in str(question_field.description)
+    assert "do not first ask this tool to list tables" in str(question_field.description)
+
+
 def test_table_metric_wins_over_generic_knowledge_words() -> None:
     decision = ToolIntentRouterMiddleware()._classify_intent("从知识库里看比亚迪销量环比")
 
     assert decision["matched"] is True
     assert decision["intents"] == ["table_analysis"]
-    assert decision["preferred_tools"] == ["pandas_knowledge_query"]
+    assert decision["preferred_tools"][0] == "pandas_knowledge_query"
+    assert "database_knowledge_query" in decision["preferred_tools"]
 
 
 def test_data_analysis_wins_over_knowledge_rag() -> None:
@@ -32,7 +55,8 @@ def test_data_analysis_wins_over_knowledge_rag() -> None:
 
     assert decision["matched"] is True
     assert decision["intents"] == ["table_analysis"]
-    assert decision["preferred_tools"] == ["pandas_knowledge_query"]
+    assert decision["preferred_tools"][0] == "pandas_knowledge_query"
+    assert "database_knowledge_query" in decision["preferred_tools"]
 
 
 def test_document_knowledge_request_still_routes_to_llamaindex() -> None:

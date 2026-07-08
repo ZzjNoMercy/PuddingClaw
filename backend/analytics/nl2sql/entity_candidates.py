@@ -18,7 +18,16 @@ TEXTUAL_DTYPE_MARKERS = (
     "string",
     "category",
     "bool",
+    "boolean",
+    "text",
+    "char",
+    "varchar",
+    "character",
 )
+
+BUSINESS_ENTITY_TYPE_LABELS = {
+    ("vehicle_params", "car_name"): "款型",
+}
 
 POSITIVE_NAME_HINTS = (
     "name",
@@ -236,7 +245,7 @@ def _score_column(column: dict[str, Any], *, row_count: int | None, table_name: 
     table_column = f"{table_name}.{name}" if table_name else name
     return EntityCandidate(
         column=name,
-        suggested_entity_type=_normalize_entity_type(name),
+        suggested_entity_type=_normalize_entity_type(name, table_name=table_name),
         score=score,
         reasons=reasons or ["通用候选"],
         sample_values=sample_values[:10],
@@ -247,7 +256,13 @@ def _score_column(column: dict[str, Any], *, row_count: int | None, table_name: 
     )
 
 
-def _normalize_entity_type(name: str) -> str:
+def _normalize_entity_type(name: str, *, table_name: str | None = None) -> str:
+    clean_name = name.strip()
+    clean_table = (table_name or "").strip().split(".")[-1]
+    mapped_label = BUSINESS_ENTITY_TYPE_LABELS.get((clean_table, clean_name))
+    if mapped_label:
+        return mapped_label
+
     normalized = re.sub(r"\s+", "_", name.strip().lower())
     normalized = re.sub(r"[^0-9a-zA-Z_\u4e00-\u9fff]+", "_", normalized)
     normalized = normalized.strip("_")

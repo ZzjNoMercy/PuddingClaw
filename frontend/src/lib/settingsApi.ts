@@ -73,6 +73,35 @@ export interface RagSettings {
   };
 }
 
+export interface VannaSettings {
+  enabled: boolean;
+  default_database_source_id: string;
+  default_dialect: string;
+  query: {
+    entity_top_k_default: number;
+    entity_top_k_by_type: Record<string, number>;
+  };
+}
+
+export interface DatabaseQaSettings {
+  full_rows_token_budget: number;
+  preview_rows_token_budget: number;
+  profile_token_budget: number;
+  full_rows_hard_row_cap: number;
+  full_rows_hard_column_cap: number;
+  max_cell_chars_for_llm: number;
+  result_store_enabled: boolean;
+  result_store_ttl_hours: number;
+  default_page_size: number;
+  max_page_size: number;
+  export_enabled: boolean;
+  profile_enabled: boolean;
+}
+
+export interface AnalyticsSettings {
+  database_qa: DatabaseQaSettings;
+}
+
 export interface KnowledgeSettings {
   root_dir: string;
   configured_by?: string;
@@ -146,6 +175,8 @@ export interface SystemSettings {
   fallback_embedding: FallbackEmbeddingSettings;
   multimodal_embedding: MultimodalEmbeddingSettings;
   rag: RagSettings;
+  vanna?: VannaSettings;
+  analytics?: AnalyticsSettings;
   database: DatabaseSettings;
   knowledge: KnowledgeSettings;
   compression: CompressionSettings;

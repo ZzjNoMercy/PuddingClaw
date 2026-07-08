@@ -119,6 +119,9 @@ class VannaBase(ABC):
         Returns:
             str: The SQL query that answers the question.
         """
+        has_prefetched_entities = "entity_list" in kwargs
+        prefetched_entity_list = kwargs.pop("entity_list", None)
+
         if self.config is not None:
             initial_prompt = self.config.get("initial_prompt", None)
         else:
@@ -127,12 +130,17 @@ class VannaBase(ABC):
         ddl_list = self.get_related_ddl(question, **kwargs)
         doc_list = self.get_related_documentation(question, **kwargs)
         
-        # 新增：检索实体映射
-        try:
-            entity_list = self.get_related_entities(question, **kwargs)
-        except Exception as e:
-            logger.warning(f"获取实体映射失败: {e}")
-            entity_list = []
+        # Entity mappings may be pre-fetched by PuddingClaw's NL2SQL service so
+        # Trace and SQL generation use the exact same candidates. If no
+        # pre-fetched list is supplied, keep Vanna's original retrieval path.
+        if has_prefetched_entities:
+            entity_list = prefetched_entity_list if isinstance(prefetched_entity_list, list) else []
+        else:
+            try:
+                entity_list = self.get_related_entities(question, **kwargs)
+            except Exception as e:
+                logger.warning(f"获取实体映射失败: {e}")
+                entity_list = []
         
         prompt = self.get_sql_prompt(
             initial_prompt=initial_prompt,
@@ -170,7 +178,7 @@ class VannaBase(ABC):
                 
                 # 添加实体映射
                 if entity_list:
-                    entity_prompt = self.add_entities_to_prompt("", entity_list)
+                    entity_prompt = self.add_entities_to_prompt("", entity_list, **kwargs)
                     message_log.append(self.user_message(f"实体映射:\n{entity_prompt}"))
                 
                 # 添加历史示例
@@ -695,17 +703,37 @@ class VannaBase(ABC):
                     grouped[etype] = []
                 grouped[etype].append(entity)
             
+            try:
+                top_k_per_type = max(1, int(kwargs.get("entity_top_k_per_type", 10)))
+            except Exception:
+                top_k_per_type = 10
+            raw_top_k_by_type = kwargs.get("entity_top_k_by_type") or {}
+            top_k_by_type = {}
+            if isinstance(raw_top_k_by_type, dict):
+                for key, value in raw_top_k_by_type.items():
+                    try:
+                        top_k_by_type[str(key)] = max(1, int(value))
+                    except Exception:
+                        continue
+
             for entity_type, entities in sorted(grouped.items(), key=lambda item: item[0]):
+                entity_type_top_k = top_k_by_type.get(str(entity_type), top_k_per_type)
                 table_column = entities[0].get("table_column") or "unspecified_column"
                 initial_prompt += f"[{entity_type}] column: {table_column}\n"
-                for entity in entities[:5]:
+                for entity in entities[:entity_type_top_k]:
                     canonical = entity.get("canonical_name", "")
                     aliases = entity.get("aliases", [])
+                    if isinstance(aliases, str):
+                        try:
+                            parsed_aliases = json.loads(aliases)
+                            aliases = parsed_aliases if isinstance(parsed_aliases, list) else [aliases]
+                        except Exception:
+                            aliases = [aliases]
                     aliases_str = ", ".join(str(alias) for alias in aliases[:8]) if aliases else "none"
                     initial_prompt += f"  - canonical_name: '{canonical}'\n"
                     initial_prompt += f"    aliases: {aliases_str}\n"
-                if len(entities) > 5:
-                    initial_prompt += f"  - ... {len(entities) - 5} more candidates omitted\n"
+                if len(entities) > entity_type_top_k:
+                    initial_prompt += f"  - ... {len(entities) - entity_type_top_k} more candidates omitted\n"
                 initial_prompt += "\n"
 
             initial_prompt += "Entity usage rules:\n"
@@ -771,7 +799,7 @@ class VannaBase(ABC):
 
         # 新增：添加实体映射到 Prompt
         if entity_list:
-            initial_prompt = self.add_entities_to_prompt(initial_prompt, entity_list)
+            initial_prompt = self.add_entities_to_prompt(initial_prompt, entity_list, **kwargs)
 
         # 修改：Response Guidelines 添加使用标准值的要求
         initial_prompt += (

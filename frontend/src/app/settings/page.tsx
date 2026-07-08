@@ -4,7 +4,6 @@ import { useState, useEffect, useCallback } from "react";
 import {
   Bot,
   Database,
-  HardDrive,
   FileText,
   Sliders,
   Brain,
@@ -38,13 +37,17 @@ import {
   type SubAgentItem,
 } from "@/lib/settingsApi";
 import { useApp } from "@/lib/store";
-import { getProjectContext, updateProjectContext, type ProjectContextDocument } from "@/lib/api";
+import {
+  getProjectContext,
+  updateProjectContext,
+  type ProjectContextDocument,
+} from "@/lib/api";
 import MemoryEditor from "@/components/settings/MemoryEditor";
 import CapabilitiesStatus from "@/components/settings/CapabilitiesStatus";
 import Navbar from "@/components/layout/Navbar";
 import Link from "next/link";
 
-type SettingsCategory = "ai" | "project" | "rag" | "knowledge" | "memory" | "data" | "harness" | "advanced" | "system";
+type SettingsCategory = "ai" | "project" | "databaseQa" | "rag" | "knowledge" | "memory" | "harness" | "advanced" | "system";
 type SubAgentConfigMap = Record<string, Omit<SubAgentItem, "name">>;
 
 type HarnessSection = {
@@ -63,10 +66,10 @@ const HARNESS_SECTIONS: HarnessSection[] = [
 const CATEGORIES: { key: SettingsCategory; label: string; icon: React.ElementType; color: string }[] = [
   { key: "ai", label: "AI 网关", icon: Network, color: "#002fa7" },
   { key: "project", label: "项目上下文", icon: FileText, color: "#002fa7" },
+  { key: "databaseQa", label: "智能问数设置", icon: Database, color: "#002fa7" },
   { key: "rag", label: "RAG 设置", icon: Database, color: "#002fa7" },
   { key: "knowledge", label: "知识库", icon: FolderOpen, color: "#002fa7" },
   { key: "memory", label: "记忆管理", icon: Brain, color: "#002fa7" },
-  { key: "data", label: "数据管理", icon: HardDrive, color: "#10b981" },
   { key: "harness", label: "Harness 配置", icon: Bot, color: "#002fa7" },
   { key: "advanced", label: "高级设置", icon: Sliders, color: "#6b7280" },
   { key: "system", label: "系统状态", icon: Activity, color: "#002fa7" },
@@ -183,6 +186,20 @@ export default function SettingsPage() {
   const ragBm25Weight = Math.max(0, Math.min(1, 1 - ragTextVectorWeight));
   const ragTextGroupWeight = Math.max(0, Math.min(1, 1 - ragImageVectorWeight));
 
+  // Smart Database Q&A
+  const [dbQaFullRowsTokenBudget, setDbQaFullRowsTokenBudget] = useState("10000");
+  const [dbQaPreviewRowsTokenBudget, setDbQaPreviewRowsTokenBudget] = useState("3000");
+  const [dbQaProfileTokenBudget, setDbQaProfileTokenBudget] = useState("3000");
+  const [dbQaFullRowsHardRowCap, setDbQaFullRowsHardRowCap] = useState("200");
+  const [dbQaFullRowsHardColumnCap, setDbQaFullRowsHardColumnCap] = useState("20");
+  const [dbQaMaxCellCharsForLlm, setDbQaMaxCellCharsForLlm] = useState("500");
+  const [dbQaResultStoreEnabled, setDbQaResultStoreEnabled] = useState(true);
+  const [dbQaResultStoreTtlHours, setDbQaResultStoreTtlHours] = useState("168");
+  const [dbQaDefaultPageSize, setDbQaDefaultPageSize] = useState("100");
+  const [dbQaMaxPageSize, setDbQaMaxPageSize] = useState("500");
+  const [dbQaExportEnabled, setDbQaExportEnabled] = useState(false);
+  const [dbQaProfileEnabled, setDbQaProfileEnabled] = useState(true);
+
   // Knowledge base
   const [databaseMode, setDatabaseMode] = useState<"bundled" | "external">("bundled");
   const [databaseHost, setDatabaseHost] = useState("127.0.0.1");
@@ -291,6 +308,19 @@ export default function SettingsPage() {
         setRagHybridCandidateTopK(s.rag.hybrid?.candidate_top_k ?? 10);
         setRagRerankEnabled(s.rag.rerank?.enabled ?? true);
         setRagRerankCandidateTopK(s.rag.rerank?.candidate_top_k ?? 50);
+        const databaseQa = s.analytics?.database_qa;
+        setDbQaFullRowsTokenBudget(String(databaseQa?.full_rows_token_budget ?? 10000));
+        setDbQaPreviewRowsTokenBudget(String(databaseQa?.preview_rows_token_budget ?? 3000));
+        setDbQaProfileTokenBudget(String(databaseQa?.profile_token_budget ?? 3000));
+        setDbQaFullRowsHardRowCap(String(databaseQa?.full_rows_hard_row_cap ?? 200));
+        setDbQaFullRowsHardColumnCap(String(databaseQa?.full_rows_hard_column_cap ?? 20));
+        setDbQaMaxCellCharsForLlm(String(databaseQa?.max_cell_chars_for_llm ?? 500));
+        setDbQaResultStoreEnabled(databaseQa?.result_store_enabled ?? true);
+        setDbQaResultStoreTtlHours(String(databaseQa?.result_store_ttl_hours ?? 168));
+        setDbQaDefaultPageSize(String(databaseQa?.default_page_size ?? 100));
+        setDbQaMaxPageSize(String(databaseQa?.max_page_size ?? 500));
+        setDbQaExportEnabled(databaseQa?.export_enabled ?? false);
+        setDbQaProfileEnabled(databaseQa?.profile_enabled ?? true);
         // Knowledge base
         setDatabaseMode(s.database?.mode === "external" ? "external" : "bundled");
         setDatabaseHost(s.database?.host || "127.0.0.1");
@@ -433,6 +463,22 @@ export default function SettingsPage() {
             base_url: "",
           },
         },
+        analytics: {
+          database_qa: {
+            full_rows_token_budget: positiveIntOrNull(dbQaFullRowsTokenBudget) ?? 10000,
+            preview_rows_token_budget: positiveIntOrNull(dbQaPreviewRowsTokenBudget) ?? 3000,
+            profile_token_budget: positiveIntOrNull(dbQaProfileTokenBudget) ?? 3000,
+            full_rows_hard_row_cap: positiveIntOrNull(dbQaFullRowsHardRowCap) ?? 200,
+            full_rows_hard_column_cap: positiveIntOrNull(dbQaFullRowsHardColumnCap) ?? 20,
+            max_cell_chars_for_llm: positiveIntOrNull(dbQaMaxCellCharsForLlm) ?? 500,
+            result_store_enabled: dbQaResultStoreEnabled,
+            result_store_ttl_hours: positiveIntOrNull(dbQaResultStoreTtlHours) ?? 168,
+            default_page_size: positiveIntOrNull(dbQaDefaultPageSize) ?? 100,
+            max_page_size: positiveIntOrNull(dbQaMaxPageSize) ?? 500,
+            export_enabled: dbQaExportEnabled,
+            profile_enabled: dbQaProfileEnabled,
+          },
+        },
         database: {
           mode: databaseMode,
           host: databaseHost || "127.0.0.1",
@@ -493,7 +539,7 @@ export default function SettingsPage() {
     } finally {
       setSaving(false);
     }
-  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmModel, mmDimension, mmApiKey, knowledgeRootDir, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, subagentItems, showToast]);
+  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmModel, mmDimension, mmApiKey, knowledgeRootDir, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, subagentItems, showToast]);
 
   const handleDatabaseModeChange = useCallback((mode: "bundled" | "external") => {
     setDatabaseMode(mode);
@@ -815,7 +861,7 @@ export default function SettingsPage() {
         <main className="workspace-content-frame flex min-w-0 flex-1 flex-col overflow-hidden">
           <div className="flex-1 overflow-y-auto px-8 pb-8 pt-6">
             <div className={`${
-              category === "ai" ? "max-w-4xl" : category === "harness" || category === "project" ? "max-w-6xl" : "max-w-2xl"
+              category === "ai" || category === "databaseQa" ? "max-w-4xl" : category === "harness" || category === "project" ? "max-w-6xl" : "max-w-2xl"
             } mx-auto space-y-6`}>
             {category === "ai" && (
               <>
@@ -1036,6 +1082,94 @@ export default function SettingsPage() {
                     </div>
                   </SettingsCard>
                 )}
+              </div>
+            )}
+
+            {category === "databaseQa" && (
+              <div className="space-y-5">
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <h1 className="text-[22px] font-semibold tracking-tight text-gray-900">智能问数</h1>
+                    <p className="mt-1 text-[12px] text-gray-500">
+                      控制数据库问数的上下文预算、结果持久化、分页和 Trace 可观测性。
+                    </p>
+                  </div>
+                  <button
+                    onClick={handleSave}
+                    disabled={saving}
+                    className="flex items-center gap-2 rounded-xl bg-[#002fa7] px-4 py-2.5 text-[12px] font-medium text-white shadow-sm transition-all hover:bg-[#002fa7]/90 disabled:opacity-50"
+                  >
+                    {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                    保存设置
+                  </button>
+                </div>
+                <SettingsCard title="模型上下文预算" icon={Database} color="#002fa7">
+                  <div className="grid grid-cols-2 gap-4">
+                    <FormField label="完整明细 Token 预算">
+                      <input value={dbQaFullRowsTokenBudget} onChange={(e) => setDbQaFullRowsTokenBudget(e.target.value)} className="form-input" inputMode="numeric" />
+                    </FormField>
+                    <FormField label="预览明细 Token 预算">
+                      <input value={dbQaPreviewRowsTokenBudget} onChange={(e) => setDbQaPreviewRowsTokenBudget(e.target.value)} className="form-input" inputMode="numeric" />
+                    </FormField>
+                    <FormField label="Profile Token 预算">
+                      <input value={dbQaProfileTokenBudget} onChange={(e) => setDbQaProfileTokenBudget(e.target.value)} className="form-input" inputMode="numeric" />
+                    </FormField>
+                    <FormField label="单元格最大字符数">
+                      <input value={dbQaMaxCellCharsForLlm} onChange={(e) => setDbQaMaxCellCharsForLlm(e.target.value)} className="form-input" inputMode="numeric" />
+                    </FormField>
+                  </div>
+                  <p className="mt-3 text-[11px] leading-relaxed text-gray-500">
+                    预算越大，明细问题越可能直接完整回答；同时会增加模型上下文占用和延迟。
+                  </p>
+                </SettingsCard>
+
+                <SettingsCard title="完整明细保护" icon={ShieldCheck} color="#0f172a">
+                  <div className="grid grid-cols-2 gap-4">
+                    <FormField label="完整明细最大行数">
+                      <input value={dbQaFullRowsHardRowCap} onChange={(e) => setDbQaFullRowsHardRowCap(e.target.value)} className="form-input" inputMode="numeric" />
+                    </FormField>
+                    <FormField label="完整明细最大列数">
+                      <input value={dbQaFullRowsHardColumnCap} onChange={(e) => setDbQaFullRowsHardColumnCap(e.target.value)} className="form-input" inputMode="numeric" />
+                    </FormField>
+                  </div>
+                </SettingsCard>
+
+                <SettingsCard title="持久化与分页" icon={FileText} color="#10b981">
+                  <div className="grid grid-cols-2 gap-4">
+                    <FormField label="默认分页大小">
+                      <input value={dbQaDefaultPageSize} onChange={(e) => setDbQaDefaultPageSize(e.target.value)} className="form-input" inputMode="numeric" />
+                    </FormField>
+                    <FormField label="最大分页大小">
+                      <input value={dbQaMaxPageSize} onChange={(e) => setDbQaMaxPageSize(e.target.value)} className="form-input" inputMode="numeric" />
+                    </FormField>
+                    <FormField label="结果保留时间（小时）">
+                      <input value={dbQaResultStoreTtlHours} onChange={(e) => setDbQaResultStoreTtlHours(e.target.value)} className="form-input" inputMode="numeric" />
+                    </FormField>
+                    <div className="grid gap-2">
+                      <ToggleRow
+                        label="持久化结果集"
+                        description="关闭后，大明细不会落盘，也不会生成 result_id、分页读取和导出入口。"
+                        checked={dbQaResultStoreEnabled}
+                        onChange={setDbQaResultStoreEnabled}
+                      />
+                      <ToggleRow
+                        label="生成 Profile"
+                        description="为截断明细生成分布摘要，帮助模型避免从预览行误判。"
+                        checked={dbQaProfileEnabled}
+                        onChange={setDbQaProfileEnabled}
+                      />
+                      <ToggleRow
+                        label="允许导出"
+                        description="控制查询结果页的 CSV 导出按钮和后端导出 API。"
+                        checked={dbQaExportEnabled}
+                        onChange={setDbQaExportEnabled}
+                      />
+                    </div>
+                  </div>
+                  <p className="mt-3 text-[11px] leading-relaxed text-gray-500">
+                    超出上下文预算的明细会落盘到 backend/data/database-query-results，并通过 Trace 暴露 result_id、过期时间和分页动作。
+                  </p>
+                </SettingsCard>
               </div>
             )}
 
@@ -1616,24 +1750,6 @@ export default function SettingsPage() {
                   </div>
                 </SettingsCard>
               </div>
-            )}
-
-            {/* Data Management */}
-            {category === "data" && (
-              <SettingsCard title="数据管理" icon={HardDrive} color="#10b981">
-                <div className="space-y-3">
-                  <p className="text-[12px] text-gray-500">管理会话数据和缓存</p>
-                  <button className="w-full px-4 py-2.5 text-[12px] font-medium text-gray-600 bg-white/60 border border-black/[0.06] rounded-lg hover:bg-white hover:shadow-sm transition-all text-left">
-                    导出所有会话 (JSON)
-                  </button>
-                  <button className="w-full px-4 py-2.5 text-[12px] font-medium text-red-500 bg-red-50/50 border border-red-100 rounded-lg hover:bg-red-50 transition-all text-left">
-                    清除所有会话数据
-                  </button>
-                  <button className="w-full px-4 py-2.5 text-[12px] font-medium text-gray-600 bg-white/60 border border-black/[0.06] rounded-lg hover:bg-white hover:shadow-sm transition-all text-left">
-                    重置所有设置为默认值
-                  </button>
-                </div>
-              </SettingsCard>
             )}
 
             {/* Agent / Harness Config */}
@@ -2304,6 +2420,28 @@ function ConnectionResult({ result }: { result: { ok: boolean; msg: string } }) 
     <div className={`mt-1.5 flex items-center gap-1 text-[11px] ${result.ok ? "text-emerald-600" : "text-red-500"}`}>
       {result.ok ? <ShieldCheck className="h-3 w-3" /> : <XCircle className="h-3 w-3" />}
       {result.msg}
+    </div>
+  );
+}
+
+function ToggleRow({
+  label,
+  description,
+  checked,
+  onChange,
+}: {
+  label: string;
+  description?: string;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-3 rounded-lg border border-black/[0.06] bg-white/60 px-3 py-2">
+      <span className="min-w-0">
+        <span className="block text-[11px] font-medium text-gray-600">{label}</span>
+        {description ? <span className="mt-0.5 block text-[10px] leading-4 text-gray-400">{description}</span> : null}
+      </span>
+      <SwitchButton checked={checked} onChange={onChange} ariaLabel={label} />
     </div>
   );
 }

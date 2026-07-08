@@ -10,7 +10,7 @@ import ResizeHandle from "@/components/layout/ResizeHandle";
 import FileTree from "@/components/skills/FileTree";
 import { useApp } from "@/lib/store";
 import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+import { markdownRemarkPlugins } from "@/lib/markdown";
 import {
   Zap,
   Search,
@@ -665,7 +665,7 @@ export default function SkillsPage() {
                 {showPreview ? (
                   <div className="h-full overflow-y-auto p-6 bg-white/30">
                     <div className="max-w-3xl mx-auto markdown-content">
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                      <ReactMarkdown remarkPlugins={markdownRemarkPlugins}>
                         {editorContent}
                       </ReactMarkdown>
                     </div>

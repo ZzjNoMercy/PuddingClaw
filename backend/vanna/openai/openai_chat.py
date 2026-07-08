@@ -1,5 +1,7 @@
 import os
+from urllib.parse import urlparse
 
+import httpx
 from openai import OpenAI
 
 from ..base import VannaBase
@@ -41,7 +43,14 @@ class OpenAI_Chat(VannaBase):
             return
 
         if "api_key" in config:
-            self.client = OpenAI(api_key=config["api_key"])
+            client_kwargs = {"api_key": config["api_key"]}
+            if config.get("base_url"):
+                base_url = config["base_url"]
+                client_kwargs["base_url"] = base_url
+                parsed = urlparse(str(base_url))
+                if parsed.hostname in {"localhost", "127.0.0.1", "::1"}:
+                    client_kwargs["http_client"] = httpx.Client(trust_env=False)
+            self.client = OpenAI(**client_kwargs)
 
     def system_message(self, message: str) -> any:
         return {"role": "system", "content": message}

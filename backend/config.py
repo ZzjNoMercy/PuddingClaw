@@ -181,6 +181,30 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "train_entities": True,
             "train_temporary_files": False,
         },
+        "query": {
+            # Entity recall is performed once by the NL2SQL service for trace
+            # visibility, then the exact same entity list is passed into Vanna
+            # SQL generation. Keep this default conservative; individual
+            # business entity types can override it below.
+            "entity_top_k_default": 10,
+            "entity_top_k_by_type": {},
+        },
+    },
+    "analytics": {
+        "database_qa": {
+            "full_rows_token_budget": 10000,
+            "preview_rows_token_budget": 3000,
+            "profile_token_budget": 3000,
+            "full_rows_hard_row_cap": 200,
+            "full_rows_hard_column_cap": 20,
+            "max_cell_chars_for_llm": 500,
+            "result_store_enabled": True,
+            "result_store_ttl_hours": 168,
+            "default_page_size": 100,
+            "max_page_size": 500,
+            "export_enabled": False,
+            "profile_enabled": True,
+        },
     },
     "compression": {
         "ratio": 0.5,
@@ -790,11 +814,32 @@ def get_vanna_config() -> dict[str, Any]:
     llm = vanna.get("llm", {})
     milvus = vanna.get("milvus", {})
     training = vanna.get("training", {})
+    query = vanna.get("query", {})
     knowledge_index = config.get("knowledge", {}).get("multimodal_index", {})
     fallback_embedding = config.get("fallback_embedding", {})
     gateway_llm = get_gateway_llm_config()
     fallback_llm = get_fallback_llm_config()
     gateway = get_gateway_config()
+
+    def _positive_int(value: Any, default: int) -> int:
+        try:
+            return max(1, int(value))
+        except Exception:
+            return default
+
+    def _positive_int_map(value: Any) -> dict[str, int]:
+        if not isinstance(value, dict):
+            return {}
+        normalized: dict[str, int] = {}
+        for key, item in value.items():
+            name = str(key).strip()
+            if not name:
+                continue
+            try:
+                normalized[name] = max(1, int(item))
+            except Exception:
+                continue
+        return normalized
 
     llm_reuse = str(llm.get("reuse") or "gateway_llm")
     if llm_reuse == "fallback_llm":
@@ -846,6 +891,41 @@ def get_vanna_config() -> dict[str, Any]:
             "train_entities": bool(training.get("train_entities", True)),
             "train_temporary_files": bool(training.get("train_temporary_files", False)),
         },
+        "query": {
+            "entity_top_k_default": _positive_int(query.get("entity_top_k_default"), 10),
+            "entity_top_k_by_type": _positive_int_map(query.get("entity_top_k_by_type")),
+        },
+    }
+
+
+def get_database_qa_config() -> dict[str, Any]:
+    """Read Smart Database Q&A result handling settings."""
+
+    config = load_config()
+    database_qa = config.get("analytics", {}).get("database_qa", {})
+
+    def _positive_int(value: Any, fallback: int, *, minimum: int = 1, maximum: int | None = None) -> int:
+        try:
+            parsed = max(minimum, int(value))
+        except Exception:
+            parsed = fallback
+        if maximum is not None:
+            return min(maximum, parsed)
+        return parsed
+
+    return {
+        "full_rows_token_budget": _positive_int(database_qa.get("full_rows_token_budget"), 10000, maximum=100000),
+        "preview_rows_token_budget": _positive_int(database_qa.get("preview_rows_token_budget"), 3000, maximum=50000),
+        "profile_token_budget": _positive_int(database_qa.get("profile_token_budget"), 3000, maximum=50000),
+        "full_rows_hard_row_cap": _positive_int(database_qa.get("full_rows_hard_row_cap"), 200, maximum=10000),
+        "full_rows_hard_column_cap": _positive_int(database_qa.get("full_rows_hard_column_cap"), 20, maximum=200),
+        "max_cell_chars_for_llm": _positive_int(database_qa.get("max_cell_chars_for_llm"), 500, maximum=10000),
+        "result_store_enabled": bool(database_qa.get("result_store_enabled", True)),
+        "result_store_ttl_hours": _positive_int(database_qa.get("result_store_ttl_hours"), 168, maximum=24 * 365),
+        "default_page_size": _positive_int(database_qa.get("default_page_size"), 100, maximum=5000),
+        "max_page_size": _positive_int(database_qa.get("max_page_size"), 500, maximum=10000),
+        "export_enabled": bool(database_qa.get("export_enabled", False)),
+        "profile_enabled": bool(database_qa.get("profile_enabled", True)),
     }
 
 
@@ -967,6 +1047,9 @@ def get_settings_for_display() -> dict[str, Any]:
     effective_knowledge_root = get_knowledge_root_config()
     effective_knowledge_mineru = get_knowledge_mineru_config()
     effective_database = get_database_config()
+    effective_vanna = get_vanna_config()
+    effective_database_qa = get_database_qa_config()
+    raw_vanna = config.get("vanna", {})
     result = {
         "memory_backend": config.get("memory_backend", "markdown"),
         "thinking_mode": bool(config.get("thinking_mode", False)),
@@ -1000,6 +1083,16 @@ def get_settings_for_display() -> dict[str, Any]:
         "rag": {
             "enabled": config.get("rag_mode", False),
             **config.get("rag", {}),
+        },
+        "vanna": {
+            "enabled": bool(raw_vanna.get("enabled", True)),
+            "default_database_source_id": str(raw_vanna.get("default_database_source_id") or "project_postgres"),
+            "default_dialect": str(raw_vanna.get("default_dialect") or "PostgreSQL"),
+            "query": effective_vanna.get("query", {}),
+        },
+        "analytics": {
+            **config.get("analytics", {}),
+            "database_qa": effective_database_qa,
         },
         "knowledge": {
             **config.get("knowledge", {}),
@@ -1085,6 +1178,30 @@ def update_settings(updates: dict[str, Any]) -> None:
         if mm_update.get("api_key"):
             config["multimodal_embedding"]["api_key"] = mm_update["api_key"]
 
+    if "analytics" in updates:
+        analytics_update = updates["analytics"]
+        if isinstance(analytics_update, dict):
+            config.setdefault("analytics", {})
+            database_qa_update = analytics_update.get("database_qa")
+            if isinstance(database_qa_update, dict):
+                config["analytics"].setdefault("database_qa", {})
+                for key in (
+                    "full_rows_token_budget",
+                    "preview_rows_token_budget",
+                    "profile_token_budget",
+                    "full_rows_hard_row_cap",
+                    "full_rows_hard_column_cap",
+                    "max_cell_chars_for_llm",
+                    "result_store_ttl_hours",
+                    "default_page_size",
+                    "max_page_size",
+                ):
+                    if key in database_qa_update:
+                        config["analytics"]["database_qa"][key] = database_qa_update[key]
+                for key in ("result_store_enabled", "export_enabled", "profile_enabled"):
+                    if key in database_qa_update:
+                        config["analytics"]["database_qa"][key] = bool(database_qa_update[key])
+
     if "rag" in updates:
         rag_update = updates["rag"]
         if "rag" not in config:
@@ -1120,6 +1237,38 @@ def update_settings(updates: dict[str, Any]) -> None:
             config["rag"]["rerank"] = existing_rerank
         if "enabled" in rag_update:
             config["rag_mode"] = rag_update["enabled"]
+
+    if "vanna" in updates:
+        vanna_update = updates["vanna"]
+        if "vanna" not in config:
+            config["vanna"] = {}
+        if isinstance(vanna_update, dict):
+            for key in ("enabled", "default_database_source_id", "default_dialect"):
+                if key in vanna_update:
+                    config["vanna"][key] = vanna_update[key]
+            if isinstance(vanna_update.get("query"), dict):
+                existing_query = config["vanna"].get("query", {})
+                if not isinstance(existing_query, dict):
+                    existing_query = {}
+                query_update = vanna_update["query"]
+                if "entity_top_k_default" in query_update:
+                    try:
+                        existing_query["entity_top_k_default"] = max(1, int(query_update.get("entity_top_k_default") or 10))
+                    except (TypeError, ValueError):
+                        existing_query["entity_top_k_default"] = 10
+                if "entity_top_k_by_type" in query_update:
+                    by_type: dict[str, int] = {}
+                    if isinstance(query_update.get("entity_top_k_by_type"), dict):
+                        for raw_key, raw_value in query_update["entity_top_k_by_type"].items():
+                            entity_type = str(raw_key).strip()
+                            if not entity_type:
+                                continue
+                            try:
+                                by_type[entity_type] = max(1, int(raw_value))
+                            except (TypeError, ValueError):
+                                continue
+                    existing_query["entity_top_k_by_type"] = by_type
+                config["vanna"]["query"] = existing_query
 
     if "database" in updates:
         database_update = updates["database"]

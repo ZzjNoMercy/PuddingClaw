@@ -7,8 +7,10 @@ import logging
 logger = logging.getLogger(__name__)
 import os
 import hashlib
+from urllib.parse import urlparse
 from typing import List, Union, Literal
 
+import httpx
 from vanna.milvus.milvus_vector import Milvus_VectorStore
 from vanna.openai import OpenAI_Chat
 from vanna.exceptions import ValidationError
@@ -447,13 +449,19 @@ def create_vanna_client(
     logger.info(f"Success connect to Milvus: {milvus_uri}")
     
     # 创建 OpenAI 客户端
-    openai_client = OpenAI(
-        api_key=openai_api_key,
-        base_url=openai_base_url
-    )
+    openai_client_kwargs = {
+        "api_key": openai_api_key,
+        "base_url": openai_base_url,
+    }
+    parsed_openai_base_url = urlparse(str(openai_base_url or ""))
+    if parsed_openai_base_url.hostname in {"localhost", "127.0.0.1", "::1"}:
+        openai_client_kwargs["http_client"] = httpx.Client(trust_env=False)
+    openai_client = OpenAI(**openai_client_kwargs)
     
     # 初始化 Vanna
     vn = MyVanna(config={
+        'api_key': openai_api_key,
+        'base_url': openai_base_url,
         'model': model,
         'milvus_uri': milvus_uri,
         'embedding_function': embedding_function,
@@ -468,6 +476,7 @@ def create_vanna_client(
         'doc_collection': doc_collection,
         'entity_collection': entity_collection,
     })
+    vn.client = openai_client
     
     vn.client = openai_client
     vn.run_sql_is_set = True

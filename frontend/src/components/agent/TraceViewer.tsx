@@ -2,12 +2,12 @@
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import {
   CheckCircle2,
   ChevronDown,
   ChevronRight,
   Circle,
+  Copy,
   Database,
   Cpu,
   ExternalLink,
@@ -21,6 +21,7 @@ import {
   Split,
   XCircle,
 } from "lucide-react";
+import { markdownRemarkPlugins } from "@/lib/markdown";
 import type {
   AgentTrace,
   GraphStructure,
@@ -3253,9 +3254,11 @@ function SpanDetail({ span, allSpans = [], onClose }: { span: TraceSpan; allSpan
 
 function ToolSpanDetail({ span, allSpans = [] }: { span: TraceSpan; allSpans?: TraceSpan[] }) {
   const ragSpans = allSpans.filter((item) => item.parent_id === span.id && item.type === "rag");
+  const databaseSpans = traceDescendantsOf(span.id, allSpans, "database");
   const ragStages = ragStageCounts(ragSpans);
   return (
     <div className="space-y-2">
+      {databaseSpans.length > 0 && <DatabaseTraceSummary spans={databaseSpans} />}
       {ragSpans.length > 0 && (
         <div className="rounded-lg border border-emerald-100 bg-emerald-50/50 p-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
@@ -3286,6 +3289,255 @@ function ToolSpanDetail({ span, allSpans = [] }: { span: TraceSpan; allSpans?: T
       </div>
     </div>
   );
+}
+
+function traceDescendantsOf(parentId: string, allSpans: TraceSpan[], type?: string): TraceSpan[] {
+  const byParent = new Map<string, TraceSpan[]>();
+  allSpans.forEach((span) => {
+    if (!span.parent_id) return;
+    const children = byParent.get(span.parent_id) || [];
+    children.push(span);
+    byParent.set(span.parent_id, children);
+  });
+
+  const result: TraceSpan[] = [];
+  const stack = [...(byParent.get(parentId) || [])];
+  const seen = new Set<string>();
+  while (stack.length) {
+    const span = stack.shift()!;
+    if (seen.has(span.id)) continue;
+    seen.add(span.id);
+    if (!type || span.type === type) result.push(span);
+    stack.push(...(byParent.get(span.id) || []));
+  }
+  return result.sort((a, b) => spanEventOrder(a) - spanEventOrder(b));
+}
+
+function DatabaseTraceSummary({ spans }: { spans: TraceSpan[] }) {
+  const ordered = [...spans].sort((a, b) => spanEventOrder(a) - spanEventOrder(b));
+  const stages = databaseStageCounts(ordered);
+
+  return (
+    <div className="rounded-lg border border-blue-100 bg-blue-50/40 p-3">
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <p className="text-[11px] font-bold text-blue-900">问数 Trace 明细</p>
+          <p className="mt-0.5 text-[10px] text-blue-700/70">
+            表 Router、Vanna 召回、SQL 生成和执行明细都在这里。
+          </p>
+        </div>
+        <span className="rounded-full bg-white px-2 py-0.5 text-[10px] font-semibold text-blue-700 shadow-sm">
+          {ordered.length} spans
+        </span>
+      </div>
+      <div className="mt-2 flex flex-wrap gap-1.5">
+        {stages.map((item) => (
+          <span key={item.stage} className="rounded-md border border-blue-100 bg-white px-2 py-1 text-[10px] font-medium text-blue-700">
+            {databaseStageLabel(item.stage)}
+            {item.count > 1 ? ` ×${item.count}` : ""}
+          </span>
+        ))}
+      </div>
+      <div className="mt-3 space-y-2">
+        {ordered.map((item) => (
+          <DatabaseTraceCard key={item.id} span={item} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function DatabaseTraceCard({ span }: { span: TraceSpan }) {
+  const stage = databaseStage(span);
+  const payload = objectFromUnknown(span.output);
+  const summary = databasePayloadSummary(stage, payload);
+
+  return (
+    <div className="rounded-lg border border-blue-100 bg-white p-2">
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="rounded-md bg-blue-50 px-2 py-0.5 text-[10px] font-bold text-blue-700">
+            {databaseStageLabel(stage)}
+          </span>
+          <span className="text-[10px] text-slate-400">{span.name}</span>
+        </div>
+        <span className="text-[10px] text-slate-400">{span.status}</span>
+      </div>
+      {summary.length > 0 && (
+        <div className="mb-2 grid gap-1.5 sm:grid-cols-2 lg:grid-cols-3">
+          {summary.map((item) => (
+            <MiniMetric key={item.label} label={item.label} value={item.value} />
+          ))}
+        </div>
+      )}
+      {stage === "vanna_entities" && <DatabaseEntitiesPreview value={payload} />}
+      <DetailBlock title="完整详情" value={span.output} collapsible defaultCollapsed copyable />
+    </div>
+  );
+}
+
+function DatabaseEntitiesPreview({ value }: { value: unknown }) {
+  const root = objectFromUnknown(value);
+  const groups = Array.isArray(root.groups) ? root.groups : [];
+  const total = Number(root.total ?? 0);
+  const strategy = typeof root.strategy === "string" ? root.strategy : "";
+  const topK = objectFromUnknown(root.top_k);
+  const defaultTopK = topK.default;
+  if (groups.length === 0 && total === 0) return null;
+
+  return (
+    <div className="mb-2 space-y-2">
+      <div className="rounded-lg border border-blue-100 bg-blue-50/50 p-2">
+        <div className="mb-1 flex items-center justify-between gap-2">
+          <span className="text-[10px] font-bold text-blue-700">按类型召回</span>
+          <span className="text-[10px] text-blue-400">
+            {total} 个{defaultTopK ? ` · 默认 Top ${String(defaultTopK)}` : ""}
+          </span>
+        </div>
+        <div className="flex flex-wrap gap-1">
+          {groups.map((rawGroup, index) => {
+            const group = objectFromUnknown(rawGroup);
+            const type = databaseEntityItemName(group.type ?? `类型 ${index + 1}`);
+            const count = Number(group.count ?? 0);
+            const top = group.top_k;
+            return (
+              <span key={`${type}-${index}`} className="rounded-full bg-white px-2 py-0.5 text-[10px] font-semibold text-blue-700">
+                {type} · {count}{top ? `/${String(top)}` : ""}
+              </span>
+            );
+          })}
+        </div>
+        {strategy && <div className="mt-1 text-[10px] text-blue-300">{strategy}</div>}
+      </div>
+      <div className="grid gap-2 lg:grid-cols-2">
+        {groups.map((rawGroup, groupIndex) => {
+          const group = objectFromUnknown(rawGroup);
+          const entityType = databaseEntityItemName(group.type ?? `类型 ${groupIndex + 1}`);
+          const column = typeof group.column === "string" ? group.column : "";
+          const items = (Array.isArray(group.items) ? group.items : []).slice(0, 8);
+          return (
+            <div key={`${entityType}-${groupIndex}`} className="rounded-lg border border-slate-100 bg-slate-50 p-2">
+              <div className="mb-1 flex items-center justify-between gap-2">
+                <span className="text-[10px] font-bold text-slate-700">{entityType}</span>
+                <span className="text-[10px] text-slate-400">
+                  Top {items.length}
+                  {group.top_k ? `/${String(group.top_k)}` : ""}
+                </span>
+              </div>
+              {column && <div className="mb-1 truncate text-[10px] text-slate-400">{column}</div>}
+              <div className="space-y-1">
+                {items.map((rawItem, index) => {
+                  const name = databaseEntityItemName(rawItem);
+                  const score = databaseEntityItemScore(rawItem);
+                  return (
+                    <div
+                      key={`${entityType}-${name}-${index}`}
+                      className="flex items-center justify-between gap-2 rounded-md bg-white px-2 py-1 text-[10px]"
+                    >
+                      <span className="truncate text-slate-600">{name}</span>
+                      {score && <span className="shrink-0 font-mono text-slate-400">{score}</span>}
+                    </div>
+                  );
+                })}
+                {items.length === 0 && <div className="rounded-md bg-white px-2 py-1 text-[10px] text-slate-400">无命中实体</div>}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function databaseEntityItemName(value: unknown): string {
+  if (value === null || value === undefined) return "-";
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return String(value);
+  const item = objectFromUnknown(value);
+  for (const key of ["canonical_name", "name", "entity_type", "type", "label", "value"]) {
+    const candidate = item[key];
+    if (typeof candidate === "string" || typeof candidate === "number") return String(candidate);
+  }
+  return formatTraceSummaryValue(value);
+}
+
+function databaseEntityItemScore(value: unknown): string | null {
+  const item = objectFromUnknown(value);
+  const rawScore = item.score ?? item.similarity ?? item.distance;
+  if (rawScore === undefined || rawScore === null || rawScore === "") return null;
+  const numericScore = Number(rawScore);
+  if (Number.isFinite(numericScore)) return numericScore.toFixed(4);
+  return String(rawScore);
+}
+
+function databaseStageCounts(spans: TraceSpan[]): Array<{ stage: string; count: number }> {
+  const counts = new Map<string, number>();
+  spans.forEach((span) => {
+    const stage = databaseStage(span);
+    counts.set(stage, (counts.get(stage) || 0) + 1);
+  });
+  return Array.from(counts.entries()).map(([stage, count]) => ({ stage, count }));
+}
+
+function databaseStage(span: TraceSpan): string {
+  const rawStage = typeof span.metadata?.database_stage === "string" ? span.metadata.database_stage : span.name.replace(/^database\./, "");
+  return rawStage || "database";
+}
+
+function databaseStageLabel(stage: string): string {
+  const labels: Record<string, string> = {
+    router: "表 Router",
+    vanna_references: "Vanna 资料",
+    vanna_entities: "实体召回",
+    sql_generation: "SQL 生成",
+    sql_execution: "SQL 执行",
+  };
+  return labels[stage] || stage;
+}
+
+function databasePayloadSummary(stage: string, payload: Record<string, unknown>): Array<{ label: string; value: string }> {
+  if (stage === "router") {
+    return [
+      { label: "selected_tables", value: formatUnknownList(payload.selected_tables) },
+      { label: "available_tables", value: formatUnknownList(payload.available_tables) },
+    ].filter((item) => item.value !== "-");
+  }
+  if (stage === "sql_generation") {
+    return [
+      { label: "source", value: formatTraceSummaryValue(payload.source) },
+      { label: "tables", value: formatUnknownList(payload.tables) },
+    ].filter((item) => item.value !== "-");
+  }
+  if (stage === "sql_execution") {
+    return [
+      { label: "rows", value: String(payload.row_count ?? "-") },
+      { label: "columns", value: formatUnknownList(payload.columns) },
+      { label: "limited", value: String(payload.limited ?? "-") },
+    ].filter((item) => item.value !== "-");
+  }
+  return [];
+}
+
+function formatUnknownList(value: unknown): string {
+  if (!Array.isArray(value)) return "-";
+  if (value.length === 0) return "0";
+  return value.slice(0, 5).map((item) => formatTraceSummaryValue(item)).join(", ") + (value.length > 5 ? ` +${value.length - 5}` : "");
+}
+
+function formatTraceSummaryValue(value: unknown): string {
+  if (value === null || value === undefined) return "-";
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) return formatUnknownList(value);
+  const objectValue = objectFromUnknown(value);
+  for (const key of ["name", "source_name", "database", "database_source_id", "id", "type"]) {
+    const candidate = objectValue[key];
+    if (typeof candidate === "string" || typeof candidate === "number") return String(candidate);
+  }
+  return prettyValue(value);
+}
+
+function objectFromUnknown(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return value as Record<string, unknown>;
 }
 
 function ragStageCounts(spans: TraceSpan[]): Array<{ stage: string; count: number }> {
@@ -3762,7 +4014,7 @@ function MessageContentBlock({ message, maxClass }: { message: ModelMessagePrevi
     <div className={`${maxClass} overflow-auto rounded-md bg-slate-50/70 p-3 text-[12px] leading-relaxed text-slate-700`}>
       {text.trim() ? (
         <div className="markdown-content trace-markdown-content">
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
+          <ReactMarkdown remarkPlugins={markdownRemarkPlugins}>{text}</ReactMarkdown>
         </div>
       ) : (
         <ModelToolCalls calls={toolCalls} count={message.tool_call_count || 0} />
@@ -3939,15 +4191,75 @@ function MiniMetric({ label, value }: { label: string; value: string }) {
   );
 }
 
-function DetailBlock({ title, value }: { title: string; value: unknown }) {
+function DetailBlock({
+  title,
+  value,
+  collapsible = false,
+  defaultCollapsed = false,
+  copyable = false,
+}: {
+  title: string;
+  value: unknown;
+  collapsible?: boolean;
+  defaultCollapsed?: boolean;
+  copyable?: boolean;
+}) {
+  const [collapsed, setCollapsed] = useState(defaultCollapsed);
+  const [copied, setCopied] = useState(false);
+  const formatted = prettyValue(value);
+
+  const copyValue = async () => {
+    try {
+      await navigator.clipboard.writeText(formatted);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1200);
+    } catch {
+      setCopied(false);
+    }
+  };
+
   return (
     <div className="min-w-0 rounded-lg border border-slate-100 bg-slate-50 p-2">
-      <div className="mb-1 text-[10px] font-semibold uppercase tracking-normal text-slate-400">
-        {title}
+      <div className="mb-1 flex items-center justify-between gap-2">
+        <button
+          type="button"
+          onClick={() => collapsible && setCollapsed((current) => !current)}
+          className={`inline-flex min-w-0 items-center gap-1 text-left text-[10px] font-semibold uppercase tracking-normal text-slate-400 ${
+            collapsible ? "transition hover:text-slate-600" : "cursor-default"
+          }`}
+        >
+          {collapsible ? (
+            collapsed ? <ChevronRight className="h-3 w-3 shrink-0" /> : <ChevronDown className="h-3 w-3 shrink-0" />
+          ) : null}
+          <span className="truncate">{title}</span>
+        </button>
+        <div className="flex shrink-0 items-center gap-1">
+          {copyable ? (
+            <button
+              type="button"
+              onClick={copyValue}
+              className="inline-flex h-6 items-center gap-1 rounded-md border border-slate-200 bg-white px-2 text-[10px] font-semibold text-slate-500 transition hover:border-blue-100 hover:text-blue-700"
+            >
+              {copied ? <CheckCircle2 className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+              {copied ? "已复制" : "复制"}
+            </button>
+          ) : null}
+          {collapsible ? (
+            <button
+              type="button"
+              onClick={() => setCollapsed((current) => !current)}
+              className="inline-flex h-6 items-center rounded-md border border-slate-200 bg-white px-2 text-[10px] font-semibold text-slate-500 transition hover:border-blue-100 hover:text-blue-700"
+            >
+              {collapsed ? "展开" : "收起"}
+            </button>
+          ) : null}
+        </div>
       </div>
-      <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words text-[11px] leading-relaxed text-slate-600">
-        {prettyValue(value)}
-      </pre>
+      {!collapsed && (
+        <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words text-[11px] leading-relaxed text-slate-600">
+          {formatted}
+        </pre>
+      )}
     </div>
   );
 }

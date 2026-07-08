@@ -14,7 +14,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from analytics.nl2sql.training import (
     VannaTrainingError,
-    import_table_entities,
     list_vanna_entities,
     list_vanna_training_data,
     recommend_database_entity_candidates,
@@ -37,12 +36,14 @@ from knowledge.database_sources import (
 )
 from knowledge.import_jobs import (
     create_import_job,
+    create_vanna_entity_import_job,
     create_vector_publish_job,
     clear_import_jobs,
     delete_import_job,
     event_to_dict,
     get_import_job,
     job_to_dict,
+    job_to_list_dict,
     list_related_import_events,
     list_import_jobs,
     retry_import_job,
@@ -123,7 +124,7 @@ class VannaEntityImportRequest(BaseModel):
     column: str
     entity_type: str
     alias_columns: list[str] = Field(default_factory=list)
-    max_values: int = Field(default=1000, ge=1, le=10000)
+    max_values: int | None = Field(default=None, ge=1)
     knowledge_base_id: str = Field(default=DEFAULT_KNOWLEDGE_BASE_ID)
 
 
@@ -370,14 +371,18 @@ async def import_database_source_vanna_entities(
 ):
     try:
         source = await get_database_source(session, source_id, knowledge_base_id=request.knowledge_base_id)
-        return await import_table_entities(
-            source,
+        job = await create_vanna_entity_import_job(
+            session,
+            base_dir=BASE_DIR,
+            source=source,
             table_name=request.table_name,
             column=request.column,
             entity_type=request.entity_type,
             alias_columns=request.alias_columns,
             max_values=request.max_values,
+            knowledge_base_id=request.knowledge_base_id,
         )
+        return {"ok": True, "job_id": job.id, "job": job_to_dict(job)}
     except KnowledgeDatabaseSourceError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except VannaTrainingError as exc:
@@ -392,11 +397,22 @@ async def list_database_source_vanna_entities(
     knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
     entity_type: str | None = None,
     table_column: str | None = None,
+    table_name: str | None = None,
+    search: str | None = None,
+    offset: int = 0,
+    limit: int = 50,
     session: AsyncSession = Depends(get_db_session),
 ):
     try:
         await get_database_source(session, source_id, knowledge_base_id=knowledge_base_id)
-        return list_vanna_entities(entity_type=entity_type, table_column=table_column)
+        return list_vanna_entities(
+            entity_type=entity_type,
+            table_column=table_column,
+            table_name=table_name,
+            search=search,
+            offset=offset,
+            limit=limit,
+        )
     except KnowledgeDatabaseSourceError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except VannaTrainingError as exc:
@@ -445,7 +461,7 @@ async def list_knowledge_import_jobs(
 ):
     try:
         jobs = await list_import_jobs(session, knowledge_base_id=knowledge_base_id, limit=limit)
-        return {"jobs": [job_to_dict(job) for job in jobs]}
+        return {"jobs": [job_to_list_dict(job) for job in jobs]}
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Knowledge import jobs unavailable: {exc}") from exc
 
@@ -472,7 +488,9 @@ async def get_knowledge_import_job(
     if job is None:
         raise HTTPException(status_code=404, detail=f"Import job not found: {job_id}")
     payload = {"job": job_to_dict(job), "document": None}
-    if job.document_id:
+    # Status polling should be a cheap DB read. Do not run document repair or
+    # load bulky document metadata when the frontend only asks for job status.
+    if include_events and job.document_id:
         document = await session.get(KnowledgeDocument, job.document_id)
         if document is not None:
             if job.status not in {"queued", "running"}:

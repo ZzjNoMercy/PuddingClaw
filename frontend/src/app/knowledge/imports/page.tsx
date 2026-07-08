@@ -74,24 +74,31 @@ function JobIcon({ status }: { status: string }) {
   return <Clock3 className="h-5 w-5 text-gray-400" />;
 }
 
-type JobFilter = "all" | "file" | "vector";
+type JobFilter = "all" | "file" | "vector" | "entity";
 const JOB_PAGE_SIZE = 10;
 
 function isVectorPublishJob(job: KnowledgeImportJob): boolean {
   return job.metadata?.kind === "vector_publish" || job.file_type === "vector";
 }
 
+function isVannaEntityJob(job: KnowledgeImportJob): boolean {
+  return job.metadata?.kind === "vanna_entity_import" || job.file_type === "vanna_entity";
+}
+
 function jobKindLabel(job: KnowledgeImportJob): string {
+  if (isVannaEntityJob(job)) return "实体导入";
   return isVectorPublishJob(job) ? "向量导入" : "文件导入";
 }
 
 function jobKindClass(job: KnowledgeImportJob): string {
+  if (isVannaEntityJob(job)) return "bg-amber-50 text-amber-700";
   return isVectorPublishJob(job) ? "bg-[#002fa7]/10 text-[#002fa7]" : "bg-emerald-50 text-emerald-700";
 }
 
 function filterLabel(filter: JobFilter): string {
   if (filter === "file") return "文件导入";
   if (filter === "vector") return "向量导入";
+  if (filter === "entity") return "实体导入";
   return "全部";
 }
 
@@ -143,8 +150,9 @@ export default function KnowledgeImportJobsPage() {
   useEffect(() => {
     if (!jobs.some((job) => job.status === "queued" || job.status === "running")) return;
     const timer = window.setInterval(() => {
+      if (globalThis.document?.visibilityState !== "visible") return;
       refresh({ silent: true });
-    }, globalThis.document?.visibilityState === "visible" ? 5000 : 15000);
+    }, 10000);
     return () => window.clearInterval(timer);
   }, [jobs, refresh]);
 
@@ -199,10 +207,12 @@ export default function KnowledgeImportJobsPage() {
   }, [jobs.length, refresh]);
 
   const vectorJobCount = useMemo(() => jobs.filter(isVectorPublishJob).length, [jobs]);
-  const fileJobCount = Math.max(0, jobs.length - vectorJobCount);
+  const entityJobCount = useMemo(() => jobs.filter(isVannaEntityJob).length, [jobs]);
+  const fileJobCount = Math.max(0, jobs.length - vectorJobCount - entityJobCount);
   const visibleJobs = useMemo(() => {
     if (jobFilter === "vector") return jobs.filter(isVectorPublishJob);
-    if (jobFilter === "file") return jobs.filter((job) => !isVectorPublishJob(job));
+    if (jobFilter === "entity") return jobs.filter(isVannaEntityJob);
+    if (jobFilter === "file") return jobs.filter((job) => !isVectorPublishJob(job) && !isVannaEntityJob(job));
     return jobs;
   }, [jobFilter, jobs]);
   const jobPageCount = Math.max(1, Math.ceil(visibleJobs.length / JOB_PAGE_SIZE));
@@ -301,11 +311,11 @@ export default function KnowledgeImportJobsPage() {
                   <div>
                     <h2 className="text-base font-semibold text-gray-950">任务队列</h2>
                     <p className="mt-1 text-xs text-gray-400">
-                      文件导入 {fileJobCount} 条 · 向量导入 {vectorJobCount} 条
+                      文件导入 {fileJobCount} 条 · 向量导入 {vectorJobCount} 条 · 实体导入 {entityJobCount} 条
                     </p>
                   </div>
                   <div className="inline-flex rounded-2xl bg-black/[0.035] p-1">
-                    {(["all", "file", "vector"] as JobFilter[]).map((filter) => (
+                    {(["all", "file", "vector", "entity"] as JobFilter[]).map((filter) => (
                       <button
                         key={filter}
                         type="button"

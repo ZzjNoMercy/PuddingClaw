@@ -52,6 +52,7 @@ AGENT_MODE_PUDDINGCLAW_TOOLS = {
     "tavily_search",
     "llamaindex_knowledge_query",
     "pandas_knowledge_query",
+    "database_knowledge_query",
 }
 
 DEFAULT_IMAGE_ANALYZER_PROMPT = (

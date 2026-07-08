@@ -48,6 +48,8 @@ class SettingsUpdateRequest(BaseModel):
     fallback_embedding: Optional[dict[str, Any]] = None
     multimodal_embedding: Optional[dict[str, Any]] = None
     rag: Optional[dict[str, Any]] = None
+    vanna: Optional[dict[str, Any]] = None
+    analytics: Optional[dict[str, Any]] = None
     database: Optional[dict[str, Any]] = None
     knowledge: Optional[dict[str, Any]] = None
     compression: Optional[dict[str, Any]] = None

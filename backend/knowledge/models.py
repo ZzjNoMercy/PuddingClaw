@@ -119,6 +119,29 @@ class KnowledgeTableAsset(Base):
     document: Mapped[KnowledgeDocument | None] = relationship()
 
 
+class AnalyticsQueryResult(Base):
+    __tablename__ = "analytics_query_results"
+    __table_args__ = (
+        Index("ix_analytics_query_results_created", "created_at"),
+        Index("ix_analytics_query_results_expires", "expires_at"),
+        Index("ix_analytics_query_results_session", "session_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: new_id("qr"))
+    session_id: Mapped[str] = mapped_column(String(120), nullable=False, default="")
+    tool_call_id: Mapped[str] = mapped_column(String(120), nullable=False, default="")
+    question: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    sql: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    columns: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    row_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    profile_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    artifact_path: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    artifact_format: Mapped[str] = mapped_column(String(20), nullable=False, default="jsonl")
+    status: Mapped[str] = mapped_column(String(40), nullable=False, default="ready")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class KnowledgeImportJob(Base):
     __tablename__ = "knowledge_import_jobs"
     __table_args__ = (

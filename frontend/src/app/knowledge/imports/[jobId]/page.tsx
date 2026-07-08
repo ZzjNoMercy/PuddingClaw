@@ -108,6 +108,10 @@ function isVectorPublishJob(job: KnowledgeImportJob | null): boolean {
   return job?.metadata?.kind === "vector_publish" || job?.file_type === "vector";
 }
 
+function isVannaEntityJob(job: KnowledgeImportJob | null): boolean {
+  return job?.metadata?.kind === "vanna_entity_import" || job?.file_type === "vanna_entity";
+}
+
 function sourceJobId(job: KnowledgeImportJob | null): string {
   const value = job?.metadata?.source_job_id;
   return typeof value === "string" ? value : "";
@@ -147,6 +151,30 @@ function vectorProgress(job: KnowledgeImportJob | null): {
   const imageTotal = metadataNumber(record.image_total);
   if (textTotal <= 0 && imageTotal <= 0) return null;
   return { textDone, textTotal, imageDone, imageTotal };
+}
+
+function entityProgress(job: KnowledgeImportJob | null): {
+  stage: string;
+  done: number;
+  total: number;
+  imported: number;
+  updated: number;
+  skippedDuplicates: number;
+  failed: number;
+  batchSize: number;
+} {
+  const value = job?.metadata?.progress_detail;
+  const record = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  return {
+    stage: typeof record.stage === "string" ? record.stage : job?.current_step || "-",
+    done: metadataNumber(record.done),
+    total: metadataNumber(record.total),
+    imported: metadataNumber(record.imported),
+    updated: metadataNumber(record.updated),
+    skippedDuplicates: metadataNumber(record.skipped_duplicates),
+    failed: metadataNumber(record.failed),
+    batchSize: metadataNumber(record.batch_size),
+  };
 }
 
 function hasActiveVectorJob(job: KnowledgeImportJob | null): boolean {
@@ -503,27 +531,34 @@ function InfoRow({ label, value, title }: { label: string; value: string; title?
   );
 }
 
-function EventList({ events }: { events: KnowledgeImportEvent[] }) {
+function EventList({ events, liveEvent }: { events: KnowledgeImportEvent[]; liveEvent?: KnowledgeImportEvent | null }) {
   const [emptyHintReady, setEmptyHintReady] = useState(false);
   const [eventPage, setEventPage] = useState(1);
-  const eventPageCount = Math.max(1, Math.ceil(events.length / EVENTS_PER_PAGE));
+  const displayEvents = useMemo(() => {
+    if (!liveEvent) return events;
+    const filteredEvents = events.filter(
+      (event) => !event.message.startsWith("开始写入实体") && !event.message.startsWith("实体导入进度")
+    );
+    return [...filteredEvents, liveEvent];
+  }, [events, liveEvent]);
+  const eventPageCount = Math.max(1, Math.ceil(displayEvents.length / EVENTS_PER_PAGE));
   const currentEventPage = Math.min(eventPage, eventPageCount);
   const pagedEvents = useMemo(
-    () => events.slice((currentEventPage - 1) * EVENTS_PER_PAGE, currentEventPage * EVENTS_PER_PAGE),
-    [events, currentEventPage]
+    () => displayEvents.slice((currentEventPage - 1) * EVENTS_PER_PAGE, currentEventPage * EVENTS_PER_PAGE),
+    [displayEvents, currentEventPage]
   );
-  const eventStart = events.length > 0 ? (currentEventPage - 1) * EVENTS_PER_PAGE + 1 : 0;
-  const eventEnd = Math.min(currentEventPage * EVENTS_PER_PAGE, events.length);
+  const eventStart = displayEvents.length > 0 ? (currentEventPage - 1) * EVENTS_PER_PAGE + 1 : 0;
+  const eventEnd = Math.min(currentEventPage * EVENTS_PER_PAGE, displayEvents.length);
 
   useEffect(() => {
     setEventPage(1);
-  }, [events.length]);
+  }, [displayEvents.length]);
 
   useEffect(() => {
     setEmptyHintReady(true);
   }, []);
 
-  if (events.length === 0) {
+  if (displayEvents.length === 0) {
     return (
       <div className="rounded-2xl bg-black/[0.025] px-4 py-5 text-sm text-gray-400" suppressHydrationWarning>
         {emptyHintReady ? "暂无处理记录。" : ""}
@@ -535,7 +570,7 @@ function EventList({ events }: { events: KnowledgeImportEvent[] }) {
     <div className="space-y-3">
       <div className="flex items-center justify-between gap-3 text-sm text-gray-400">
         <span>
-          {eventStart}-{eventEnd} / {events.length}
+          {eventStart}-{eventEnd} / {displayEvents.length}
         </span>
         {eventPageCount > 1 ? <span>第 {currentEventPage} / {eventPageCount} 页</span> : null}
       </div>
@@ -583,6 +618,142 @@ function EventList({ events }: { events: KnowledgeImportEvent[] }) {
   );
 }
 
+function StatCard({ label, value, tone = "blue" }: { label: string; value: string | number; tone?: "blue" | "green" | "amber" | "red" | "gray" }) {
+  const toneClass =
+    tone === "green"
+      ? "bg-emerald-500/[0.07] text-emerald-700"
+      : tone === "amber"
+        ? "bg-amber-500/[0.08] text-amber-700"
+        : tone === "red"
+          ? "bg-red-500/[0.07] text-red-600"
+          : tone === "gray"
+            ? "bg-gray-100 text-gray-700"
+            : "bg-[#002fa7]/[0.06] text-[#002fa7]";
+  return (
+    <div className={`rounded-2xl px-4 py-4 ${toneClass}`}>
+      <p className="text-2xl font-semibold">{value}</p>
+      <p className="mt-1 text-xs text-gray-500">{label}</p>
+    </div>
+  );
+}
+
+function VannaEntityJobDetail({ job, events }: { job: KnowledgeImportJob | null; events: KnowledgeImportEvent[] }) {
+  const metadata = (job?.metadata || {}) as Record<string, unknown>;
+  const source = metadata.database_source && typeof metadata.database_source === "object"
+    ? (metadata.database_source as Record<string, unknown>)
+    : null;
+  const progress = entityProgress(job);
+  const tableName = typeof metadata.table_name === "string" ? metadata.table_name : "-";
+  const column = typeof metadata.column === "string" ? metadata.column : "-";
+  const entityType = typeof metadata.entity_type === "string" ? metadata.entity_type : "-";
+  const aliasColumns = Array.isArray(metadata.alias_columns)
+    ? metadata.alias_columns.filter((item): item is string => typeof item === "string")
+    : [];
+  const sourceName = typeof source?.name === "string" ? source.name : typeof metadata.database_source_id === "string" ? metadata.database_source_id : "-";
+  const database = typeof source?.database === "string" ? source.database : "-";
+  const host = typeof source?.host === "string" ? source.host : "-";
+  const port = typeof source?.port === "number" || typeof source?.port === "string" ? String(source.port) : "-";
+  const liveProgressEvent: KnowledgeImportEvent | null = progress.total > 0
+    ? {
+        id: `${job?.id || "job"}-live-entity-progress`,
+        job_id: job?.id || "",
+        level: job?.status === "failed" ? "error" : "info",
+        message:
+          job?.status === "succeeded"
+            ? `实体导入完成：${progress.done}/${progress.total}`
+            : `实体导入进度：${progress.done}/${progress.total}`,
+        metadata: {
+          live: true,
+          done: progress.done,
+          total: progress.total,
+          imported: progress.imported,
+          updated: progress.updated,
+          skipped_duplicates: progress.skippedDuplicates,
+          failed: progress.failed,
+        },
+        created_at: job?.updated_at || job?.started_at || null,
+      }
+    : null;
+
+  return (
+    <section className="grid gap-5">
+      <div className="grid gap-5 lg:grid-cols-[1fr_1.2fr]">
+        <div className="rounded-[28px] border border-black/[0.06] bg-white p-5 shadow-sm">
+          <div className="flex items-center gap-3">
+            <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-[#002fa7]/10 text-[#002fa7]">
+              <Database className="h-5 w-5" />
+            </div>
+            <div>
+              <h2 className="text-base font-semibold text-gray-950">实体导入任务</h2>
+              <p className="mt-1 text-sm text-gray-400">面向 Vanna 的表级实体字典写入任务。</p>
+            </div>
+          </div>
+          <div className="mt-5 space-y-4">
+            <InfoRow label="数据源" value={sourceName} />
+            <InfoRow label="数据库" value={database} />
+            <InfoRow label="地址" value={`${host}:${port}`} />
+            <InfoRow label="数据表" value={tableName} />
+            <InfoRow label="实体字段" value={column} />
+            <InfoRow label="实体类型" value={entityType} />
+            <InfoRow label="辅助字段" value={aliasColumns.length > 0 ? aliasColumns.join("、") : "-"} />
+            <InfoRow label="导入范围" value={metadata.max_values ? `最多 ${metadataNumber(metadata.max_values)} 个` : "全量"} />
+            <InfoRow label="任务编号" value={job?.id || "-"} />
+            <InfoRow label="开始时间" value={formatTime(job?.started_at)} />
+            <InfoRow label="完成时间" value={formatTime(job?.finished_at)} />
+          </div>
+        </div>
+
+        <div className="rounded-[28px] border border-black/[0.06] bg-white p-5 shadow-sm">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div>
+              <h2 className="text-base font-semibold text-gray-950">导入进度</h2>
+              <p className="mt-1 text-sm text-gray-400">
+                当前步骤：{job?.current_step || progress.stage || "-"}
+              </p>
+            </div>
+            <span className={`inline-flex w-fit items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium ring-1 ${jobStatusClass(job?.status || "")}`}>
+              {job?.status === "running" ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+              {job?.status === "succeeded" ? <CheckCircle2 className="h-3 w-3" /> : null}
+              {job?.status === "failed" ? <AlertCircle className="h-3 w-3" /> : null}
+              {jobStatusLabel(job?.status || "-")}
+            </span>
+          </div>
+
+          <div className="mt-5 h-2 overflow-hidden rounded-full bg-gray-100">
+            <div
+              className={`h-full rounded-full ${job?.status === "failed" ? "bg-red-500" : "bg-[#002fa7]"}`}
+              style={{ width: `${Math.max(0, Math.min(100, job?.progress || 0))}%` }}
+            />
+          </div>
+
+          <div className="mt-5 grid gap-3 sm:grid-cols-3">
+            <StatCard label="进度" value={`${job?.progress || 0}%`} />
+            <StatCard label="处理" value={`${progress.done}/${progress.total || 0}`} tone="gray" />
+            <StatCard label="批大小" value={progress.batchSize || "-"} tone="gray" />
+            <StatCard label="新增" value={progress.imported} tone="green" />
+            <StatCard label="更新" value={progress.updated} tone="blue" />
+            <StatCard label="跳过重复" value={progress.skippedDuplicates} tone="amber" />
+            <StatCard label="失败" value={progress.failed} tone={progress.failed > 0 ? "red" : "gray"} />
+          </div>
+
+          {job?.error_message ? (
+            <div className="mt-5 rounded-2xl border border-red-500/15 bg-red-50 px-4 py-3 text-sm leading-6 text-red-600">
+              {job.error_message}
+            </div>
+          ) : null}
+        </div>
+      </div>
+
+      <div className="rounded-[28px] border border-black/[0.06] bg-white p-5 shadow-sm">
+        <h2 className="text-base font-semibold text-gray-950">处理记录</h2>
+        <div className="mt-4">
+          <EventList events={events} liveEvent={liveProgressEvent} />
+        </div>
+      </div>
+    </section>
+  );
+}
+
 export default function KnowledgeImportJobDetailPage() {
   const params = useParams<{ jobId?: string | string[] }>();
   const router = useRouter();
@@ -623,18 +794,25 @@ export default function KnowledgeImportJobDetailPage() {
     [setSidebarWidth]
   );
 
-  const refresh = useCallback(async (options?: { silent?: boolean }) => {
+  const refresh = useCallback(async (options?: { silent?: boolean; includeEvents?: boolean }) => {
     if (!jobId) return;
+    const includeEvents = options?.includeEvents ?? true;
     if (!options?.silent) setLoading(true);
     try {
-      const detail = await getKnowledgeImportJob(jobId);
+      const detail = await getKnowledgeImportJob(jobId, includeEvents);
       setJob(detail.job);
-      setEvents(detail.events);
-      setDocument(detail.document ?? null);
+      if (includeEvents) setEvents(detail.events);
+      if (includeEvents) {
+        setDocument(detail.document ?? null);
+      }
     } catch (error) {
-      setToast({ type: "error", message: errorMessage(error) });
+      if (!options?.silent) {
+        setToast({ type: "error", message: errorMessage(error) });
+      } else {
+        console.warn("[knowledge-import-job] status polling failed", error);
+      }
     } finally {
-      setLoading(false);
+      if (!options?.silent) setLoading(false);
     }
   }, [jobId]);
 
@@ -645,8 +823,9 @@ export default function KnowledgeImportJobDetailPage() {
   useEffect(() => {
     if (!isImportJobActive(job) && !hasActiveVectorJob(job)) return;
     const timer = window.setInterval(() => {
-      refresh({ silent: true });
-    }, globalThis.document?.visibilityState === "visible" ? 5000 : 15000);
+      if (globalThis.document?.visibilityState !== "visible") return;
+      refresh({ silent: true, includeEvents: false });
+    }, 10000);
     return () => window.clearInterval(timer);
   }, [job, refresh]);
 
@@ -714,6 +893,7 @@ export default function KnowledgeImportJobDetailPage() {
   const relatedSourceJobId = sourceJobId(job);
   const relatedVectorStatus = vectorJobStatus(job);
   const relatedVectorError = vectorJobError(job);
+  const currentIsVannaEntityJob = isVannaEntityJob(job);
   const vectorJobRunning =
     (currentIsVectorJob && isImportJobActive(job)) || relatedVectorStatus === "queued" || relatedVectorStatus === "running";
   const currentVectorProgress = vectorProgress(job);
@@ -818,9 +998,15 @@ export default function KnowledgeImportJobDetailPage() {
                               )}
                               {jobStatusLabel(job.status)}
                             </span>
-                            <span>{formatBytes(job.file_size)}</span>
-                            <span>·</span>
-                            <span>{currentIsVectorJob ? "向量导入" : job.file_type.toUpperCase()}</span>
+                            {!currentIsVannaEntityJob ? (
+                              <>
+                                <span>{formatBytes(job.file_size)}</span>
+                                <span>·</span>
+                              </>
+                            ) : null}
+                            <span>
+                              {currentIsVannaEntityJob ? "实体导入" : currentIsVectorJob ? "向量导入" : job.file_type.toUpperCase()}
+                            </span>
                             <span>·</span>
                             <span>{formatTime(job.created_at)}</span>
                             {document ? (
@@ -880,26 +1066,37 @@ export default function KnowledgeImportJobDetailPage() {
                 </div>
               ) : null}
 
-              <div className="grid grid-cols-4 overflow-hidden rounded-[24px] border border-black/[0.06] bg-white shadow-sm">
-                {(["overview", "result", "chunks", "search"] as MainTab[]).map((tab) => (
-                  <button
-                    key={tab}
-                    type="button"
-                    onClick={() => setActiveTab(tab)}
-                    className={`flex h-16 flex-col items-center justify-center gap-1 text-sm transition ${
-                      activeTab === tab
-                        ? "bg-[#002fa7]/[0.06] text-[#002fa7]"
-                        : "text-gray-500 hover:bg-black/[0.02]"
-                    }`}
-                  >
-                    {tab === "overview" ? <Clock3 className="h-4 w-4" /> : null}
-                    {tab === "result" ? <FileText className="h-4 w-4" /> : null}
-                    {tab === "chunks" ? <Layers3 className="h-4 w-4" /> : null}
-                    {tab === "search" ? <Search className="h-4 w-4" /> : null}
-                    {mainTabLabel(tab)}
-                  </button>
-                ))}
-              </div>
+              {!job ? (
+                <section className="rounded-[28px] border border-black/[0.06] bg-white p-8 shadow-sm">
+                  <div className="flex items-center justify-center gap-3 text-sm font-medium text-gray-400">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    加载任务详情...
+                  </div>
+                </section>
+              ) : currentIsVannaEntityJob ? (
+                <VannaEntityJobDetail job={job} events={events} />
+              ) : (
+                <>
+                  <div className="grid grid-cols-4 overflow-hidden rounded-[24px] border border-black/[0.06] bg-white shadow-sm">
+                    {(["overview", "result", "chunks", "search"] as MainTab[]).map((tab) => (
+                      <button
+                        key={tab}
+                        type="button"
+                        onClick={() => setActiveTab(tab)}
+                        className={`flex h-16 flex-col items-center justify-center gap-1 text-sm transition ${
+                          activeTab === tab
+                            ? "bg-[#002fa7]/[0.06] text-[#002fa7]"
+                            : "text-gray-500 hover:bg-black/[0.02]"
+                        }`}
+                      >
+                        {tab === "overview" ? <Clock3 className="h-4 w-4" /> : null}
+                        {tab === "result" ? <FileText className="h-4 w-4" /> : null}
+                        {tab === "chunks" ? <Layers3 className="h-4 w-4" /> : null}
+                        {tab === "search" ? <Search className="h-4 w-4" /> : null}
+                        {mainTabLabel(tab)}
+                      </button>
+                    ))}
+                  </div>
 
               {activeTab === "overview" ? (
                 <section className="grid gap-5 lg:grid-cols-2">
@@ -1456,6 +1653,8 @@ export default function KnowledgeImportJobDetailPage() {
                   ) : null}
                 </section>
               ) : null}
+                </>
+              )}
             </div>
           </div>
         </main>

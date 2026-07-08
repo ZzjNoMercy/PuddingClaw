@@ -2,10 +2,10 @@
 
 import { useState } from "react";
 import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import type { Components } from "react-markdown";
 import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, FileText, Key, KeyRound, Sparkles } from "lucide-react";
 import { denyPermissionRequest, grantExternalFileRead, type PermissionRequest } from "@/lib/api";
+import { markdownRemarkPlugins } from "@/lib/markdown";
 import { useApp, type ChatMessage as ChatMessageType, type SourceRecord, type TimelineItem } from "@/lib/store";
 import ThoughtChain from "./ThoughtChain";
 import RetrievalCard from "./RetrievalCard";
@@ -120,7 +120,7 @@ export default function ChatMessage({ message, isStreaming = false }: Props) {
                       <div>
                         <div className="px-1 py-1 text-[15px] leading-relaxed">
                           <div className="markdown-content">
-                            <ReactMarkdown remarkPlugins={[remarkGfm]} components={citationComponents}>
+                            <ReactMarkdown remarkPlugins={markdownRemarkPlugins} components={citationComponents}>
                               {renderedContent}
                             </ReactMarkdown>
                           </div>
@@ -317,7 +317,7 @@ function SegmentBlock({
   const contentBlock = segment.content ? (
     <div className="px-1 py-1 text-[15px] leading-relaxed">
       <div className="markdown-content">
-        <ReactMarkdown remarkPlugins={[remarkGfm]} components={citationComponents}>
+        <ReactMarkdown remarkPlugins={markdownRemarkPlugins} components={citationComponents}>
           {rendered}
         </ReactMarkdown>
       </div>
