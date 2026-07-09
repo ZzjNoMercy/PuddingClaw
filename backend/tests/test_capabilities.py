@@ -17,6 +17,8 @@ from capabilities import (
     detect_capabilities,
     detect_capabilities_sync,
     invalidate_capabilities,
+    _check_http_get,
+    _check_http_get_sync,
 )
 
 
@@ -207,3 +209,31 @@ async def test_detect_capabilities_sync_inside_event_loop_does_not_leak_coroutin
         warning for warning in caught
         if "coroutine 'detect_capabilities' was never awaited" in str(warning.message)
     ]
+
+
+@pytest.mark.asyncio
+async def test_http_health_check_ignores_environment_proxy():
+    """本机/内网健康检查不应被 HTTP_PROXY 等环境代理劫持。"""
+
+    with mock.patch("capabilities.httpx.AsyncClient") as mock_client:
+        mock_response = mock.Mock(status_code=200)
+        mock_client.return_value.__aenter__.return_value.get.return_value = mock_response
+
+        status = await _check_http_get("http://localhost:8080", "/health")
+
+    assert status == CapabilityStatus(available=True)
+    mock_client.assert_called_once_with(timeout=3.0, trust_env=False)
+
+
+def test_sync_http_health_check_ignores_environment_proxy():
+    """同步健康检查同样不能走环境代理。"""
+
+    with mock.patch("capabilities.httpx.get", return_value=mock.Mock(status_code=200)) as mock_get:
+        status = _check_http_get_sync("http://localhost:8080", "/health")
+
+    assert status == CapabilityStatus(available=True)
+    mock_get.assert_called_once_with(
+        "http://localhost:8080/health",
+        timeout=3.0,
+        trust_env=False,
+    )

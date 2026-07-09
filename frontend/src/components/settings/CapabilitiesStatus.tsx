@@ -16,6 +16,7 @@ import { getCapabilities, type Capabilities, type CapabilityStatus } from "@/lib
 
 interface CapabilitiesStatusProps {
   refreshIntervalMs?: number;
+  onChange?: (capabilities: Capabilities) => void;
 }
 
 const SERVICE_META: Record<
@@ -218,7 +219,7 @@ function SummaryBar({
   );
 }
 
-export default function CapabilitiesStatus({ refreshIntervalMs = 30000 }: CapabilitiesStatusProps) {
+export default function CapabilitiesStatus({ refreshIntervalMs = 30000, onChange }: CapabilitiesStatusProps) {
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -236,6 +237,7 @@ export default function CapabilitiesStatus({ refreshIntervalMs = 30000 }: Capabi
       setLoading(true);
       const data = await getCapabilities();
       setCapabilities(data);
+      onChange?.(data);
       setLastChecked(
         new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" })
       );
@@ -244,7 +246,7 @@ export default function CapabilitiesStatus({ refreshIntervalMs = 30000 }: Capabi
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [onChange]);
 
   useEffect(() => {
     fetchCapabilities();

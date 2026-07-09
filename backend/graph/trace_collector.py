@@ -1759,3 +1759,20 @@ class TraceCollector:
             "hook_boundary_snapshots": self._hook_boundary_snapshots,
             "spans": self._flatten_spans(self.root),
         }
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return a non-final trace snapshot for incremental persistence."""
+
+        return {
+            "trace_id": self.trace_id,
+            "query_id": self.query_id,
+            "session_id": self.session_id,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "status": self.status,
+            "runtime_inventory": self.runtime_inventory,
+            "middleware_effects": self._middleware_effects,
+            "middleware_invocations": self._middleware_invocations,
+            "hook_boundary_snapshots": self._hook_boundary_snapshots,
+            "spans": self._flatten_spans(self.root),
+        }

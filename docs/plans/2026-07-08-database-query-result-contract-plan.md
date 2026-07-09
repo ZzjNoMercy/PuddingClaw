@@ -685,8 +685,13 @@ Completed in follow-up:
 - Moved persisted-result browsing out of Settings; Settings now only owns Smart Database Q&A tunable configuration.
 - Wired `export_enabled` through result metadata, frontend export-button state, and backend CSV export authorization.
 - Hardened the main Agent database-question routing prompt and `database_knowledge_query` tool schema so business questions are passed directly into the tool instead of first doing schema/brand/type_name probe calls.
+- Investigated the latest DBQA session: no pagination was expected because the result was complete and only 6 rows; the real issue was a long single `database_knowledge_query` call.
+- Added stage timing metadata for router, reference/entity recall, SQL generation, SQL execution, and result-store persistence so future Trace payloads can identify which stage is slow.
+- Changed SQL execution to fetch the first `materialize_limit + 1` rows before running an outer `COUNT(*)`; small aggregate results no longer pay an extra full count query.
+- Normalized PostgreSQL statement-timeout failures into a clear SQL execution timeout message instead of exposing a raw asyncpg/SQLAlchemy error blob to the frontend.
 
 Still not completed:
 
 - Async Parquet / very-large CSV export jobs.
 - Warning badge polish for preview-only result cards.
+- SQL optimization/index strategy for expensive EAV queries such as `COUNT(DISTINCT car_name)` grouped by extracted model year.

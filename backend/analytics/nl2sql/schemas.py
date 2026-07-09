@@ -77,6 +77,8 @@ class DatabaseQueryResult:
     route: TableRoute
     execution: SqlExecutionResult
     references: dict[str, Any] = field(default_factory=dict)
+    semantic_assets: dict[str, Any] = field(default_factory=dict)
+    stage_timings: dict[str, float] = field(default_factory=dict)
     warning: str | None = None
 
 

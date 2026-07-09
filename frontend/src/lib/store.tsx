@@ -50,6 +50,8 @@ export interface ToolCall {
   input?: string;
   output?: string;
   status: "running" | "done";
+  startedAt?: number;
+  endedAt?: number;
   summary_source?: string;
   is_error?: boolean;
   permissionRequest?: PermissionRequest;
@@ -257,7 +259,15 @@ function parseHistoryMessages(
     role: string;
     content: string;
     reasoning_content?: string;
-    tool_calls?: Array<{ id?: string; tool: string; input?: string; output?: string; is_error?: boolean }>;
+    tool_calls?: Array<{
+      id?: string;
+      tool: string;
+      input?: string;
+      output?: string;
+      is_error?: boolean;
+      startedAt?: number;
+      endedAt?: number;
+    }>;
     timeline?: Array<{ type: string; content?: string; tool_call?: ToolCall; id?: string }>;
     segments?: Array<{ content?: string; reasoning_content?: string; tool_calls?: ToolCall[]; timeline?: TimelineItem[] }>;
     sources?: SourceRecord[];
@@ -282,6 +292,8 @@ function parseHistoryMessages(
           input: tc.input || "",
           output: tc.output || "",
           status: "done" as const,
+          startedAt: tc.startedAt,
+          endedAt: tc.endedAt,
           is_error: Boolean(tc.is_error),
         })
       );
@@ -296,6 +308,8 @@ function parseHistoryMessages(
               input: tc.input || "",
               output: tc.output || "",
               status: "done" as const,
+              startedAt: tc.startedAt,
+              endedAt: tc.endedAt,
               is_error: Boolean(tc.is_error),
             }));
             const segTimeline = seg.timeline?.length
@@ -369,6 +383,64 @@ function updateToolInTimeline(
   }
 }
 
+function finalizeRunningToolCall(toolCall: ToolCall, output: string): ToolCall {
+  if (toolCall.status !== "running") return toolCall;
+  return {
+    ...toolCall,
+    status: "done",
+    endedAt: toolCall.endedAt || Date.now(),
+    output: toolCall.output || output,
+    is_error: true,
+    summary_source: toolCall.summary_source || "stream_cancelled",
+  };
+}
+
+function finalizeRunningToolsInTimeline(timeline: TimelineItem[] | undefined, output: string): TimelineItem[] | undefined {
+  if (!timeline) return timeline;
+  let changed = false;
+  const next = timeline.map((item) => {
+    if (item.type !== "tool" || item.toolCall.status !== "running") return item;
+    changed = true;
+    return { ...item, toolCall: finalizeRunningToolCall(item.toolCall, output) };
+  });
+  return changed ? next : timeline;
+}
+
+function finalizeRunningToolsInMessage(message: ChatMessage, output: string): ChatMessage {
+  let changed = false;
+  const toolCalls = message.toolCalls?.map((toolCall) => {
+    const next = finalizeRunningToolCall(toolCall, output);
+    if (next !== toolCall) changed = true;
+    return next;
+  });
+  const timeline = finalizeRunningToolsInTimeline(message.timeline, output);
+  if (timeline !== message.timeline) changed = true;
+  const segments = message.segments?.map((segment) => {
+    let segmentChanged = false;
+    const segmentToolCalls = segment.toolCalls?.map((toolCall) => {
+      const next = finalizeRunningToolCall(toolCall, output);
+      if (next !== toolCall) segmentChanged = true;
+      return next;
+    });
+    const segmentTimeline = finalizeRunningToolsInTimeline(segment.timeline, output);
+    if (segmentTimeline !== segment.timeline) segmentChanged = true;
+    if (!segmentChanged) return segment;
+    changed = true;
+    return {
+      ...segment,
+      toolCalls: segmentToolCalls,
+      timeline: segmentTimeline,
+    };
+  });
+  if (!changed) return message;
+  return {
+    ...message,
+    toolCalls,
+    timeline,
+    segments,
+  };
+}
+
 function buildHistoryTimeline(
   reasoningContent: string | undefined,
   toolCalls: ToolCall[]
@@ -425,6 +497,8 @@ function normalizeSavedTimeline(
             input: tc.input || "",
             output: full?.output ?? tc.output ?? "",
             status: full?.status ?? (tc.status === "running" ? "running" : "done"),
+            startedAt: full?.startedAt ?? tc.startedAt,
+            endedAt: full?.endedAt ?? tc.endedAt,
             is_error: full?.is_error ?? Boolean(tc.is_error),
           },
           id: tc.id || `saved-tool-${Date.now()}`,
@@ -1150,6 +1224,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     if (controller) {
       controller.abort();
       abortControllersRef.current.delete(sessionId);
+      const targetAssistantId = assistantIdsRef.current.get(sessionId);
+      updateSessionMessages(sessionId, (prev) =>
+        prev.map((message) =>
+          message.role === "assistant" && (!targetAssistantId || message.id === targetAssistantId)
+            ? finalizeRunningToolsInMessage(message, "Stream cancelled before this tool returned a result.")
+            : message
+        )
+      );
       // Immediately drop the streaming badge so the UI responds even if the
       // SSE reader is slow to terminate.
       setStreamingSessions((prev) => {
@@ -1158,7 +1240,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         return next;
       });
     }
-  }, [sessionId]);
+  }, [sessionId, updateSessionMessages]);
 
   // ── Send message ───────────────────────────────────
 
@@ -1685,6 +1767,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                     tool: event.data.tool as string,
                     input: event.data.input as string,
                     status: "running",
+                    startedAt: Date.now(),
                   };
                   msg.toolCalls = [...(msg.toolCalls || []), newToolCall];
                   const timeline = msg.timeline ? [...msg.timeline] : [];
@@ -1727,6 +1810,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 const updates: Partial<ToolCall> = {
                   output: event.data.output as string,
                   status: "done",
+                  endedAt: Date.now(),
                   summary_source: event.data.summary_source as string | undefined,
                   is_error: Boolean(event.data.is_error),
                 };
@@ -1785,7 +1869,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               // typing indicator disappears; otherwise append the stop marker.
               const marker = "*— 已停止生成 —*";
               updated[idx] = {
-                ...updated[idx],
+                ...finalizeRunningToolsInMessage(
+                  updated[idx],
+                  "Stream cancelled before this tool returned a result."
+                ),
                 content: updated[idx].content
                   ? updated[idx].content + "\n\n" + marker
                   : marker,
@@ -1800,7 +1887,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             const idx = updated.findIndex((m) => m.id === targetId);
             if (idx !== -1) {
               updated[idx] = {
-                ...updated[idx],
+                ...finalizeRunningToolsInMessage(
+                  updated[idx],
+                  "Connection closed before this tool returned a result."
+                ),
                 content:
                   updated[idx].content +
                   `\n\n**Connection error:** ${err instanceof Error ? err.message : "Unknown"}`,
@@ -1812,6 +1902,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       } finally {
         flushPendingTokens();
         flushPendingReasoning();
+        const targetId = getAssistantId();
+        updateMsgs((prev) => {
+          const updated = [...prev];
+          const idx = updated.findIndex((m) => m.id === targetId);
+          if (idx === -1) return prev;
+          updated[idx] = finalizeRunningToolsInMessage(
+            updated[idx],
+            "Stream ended before this tool returned a result."
+          );
+          return updated;
+        });
         abortControllersRef.current.delete(sendSessionId);
         assistantIdsRef.current.delete(sendSessionId);
         if (sessionIdRef.current === sendSessionId) {

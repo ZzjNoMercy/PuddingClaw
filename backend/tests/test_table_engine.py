@@ -35,6 +35,16 @@ def test_in_process_runner_supports_groupby_sort_head() -> None:
     assert int(result.iloc[0]) == 30
 
 
+def test_in_process_runner_allows_pandas_boolean_masks() -> None:
+    result = InProcessPandasRunner().run(
+        _df(),
+        "filtered = df[((df['品牌'] == '比亚迪') & (df['销量'] >= 10)) | ~(df['月份'] == '2024-01')]\n"
+        "result = filtered['销量'].sum()",
+    )
+
+    assert int(result) == 30
+
+
 @pytest.mark.parametrize(
     "code",
     [

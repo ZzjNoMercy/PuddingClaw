@@ -64,6 +64,17 @@ class PermissionResumeRegistry:
             future.set_result(decision)
         return True
 
+    def reject_session(self, session_id: str, message: str) -> int:
+        """Reject all active permission requests for a cancelled session stream."""
+
+        rejected = 0
+        for request_id, request in list(self._requests.items()):
+            if request.get("session_id") != session_id or request.get("status") != "pending":
+                continue
+            if self.resolve(request_id, {"type": "reject", "message": message}):
+                rejected += 1
+        return rejected
+
     def get(self, request_id: str) -> dict[str, Any] | None:
         request = self._requests.get(request_id)
         return dict(request) if request else None

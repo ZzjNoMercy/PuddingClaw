@@ -161,6 +161,7 @@ UV_CACHE_DIR="${UV_CACHE_DIR:-/private/tmp/puddingclaw-uv-cache}" uv run --all-e
     --reload-dir graph \
     --reload-dir projects \
     --reload-dir tools \
+    --reload-dir analytics \
     --reload-include "*.py" \
     --log-level info \
     --log-config ../logging.yaml &

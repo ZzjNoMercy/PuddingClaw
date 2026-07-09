@@ -89,7 +89,7 @@ def test_runtime_inventory_lists_skills_for_system_prompt(tmp_path):
     manager = DeepAgentsAgentManager()
     manager.initialize(tmp_path)
 
-    inventory = manager._runtime_inventory(tools=[], middleware=[], skills=["/skills/"])
+    inventory = manager._runtime_inventory(tools=[], middleware=[], skills=["/skills/"], workspace_path=tmp_path)
 
     assert inventory["skills"] == [
         {
@@ -133,7 +133,7 @@ def test_runtime_inventory_lists_subagents_for_mount_panel(tmp_path, monkeypatch
     manager = DeepAgentsAgentManager()
     manager.initialize(tmp_path)
 
-    inventory = manager._runtime_inventory(tools=[], middleware=[], skills=[])
+    inventory = manager._runtime_inventory(tools=[], middleware=[], skills=[], workspace_path=tmp_path)
 
     assert [item["name"] for item in inventory["subagents"]] == [
         "general-purpose",
@@ -229,6 +229,61 @@ def test_permission_resume_helper_continues_after_decision(tmp_path):
     assert isinstance(agent.inputs[-1], Command)
 
 
+def test_cancelled_agent_stream_rejects_pending_permissions_and_cleans_checkpoint(tmp_path, monkeypatch):
+    """Client-side stream cancellation should not leave a resumable stale graph run."""
+
+    from graph import deepagents_manager as manager_module
+    from graph.session_manager import session_manager
+    from projects.registry import project_registry
+
+    session_manager.initialize(tmp_path)
+    project_registry.initialize(tmp_path)
+    session_manager.create_session("cancel-session")
+
+    class FakeDeepAgent:
+        async def astream(self, *_args, **_kwargs):
+            raise asyncio.CancelledError
+            yield  # pragma: no cover
+
+    monkeypatch.setattr(manager_module, "create_deep_agent", lambda **_kwargs: FakeDeepAgent())
+
+    rejected: list[tuple[str, str]] = []
+    deleted: list[str] = []
+
+    monkeypatch.setattr(
+        manager_module.permission_resume_registry,
+        "reject_session",
+        lambda session_id, message: rejected.append((session_id, message)) or 1,
+    )
+
+    runtime = manager_module.DeepAgentsAgentManager()
+    runtime.initialize(Path(tmp_path))
+
+    async def fake_delete(thread_id: str):
+        deleted.append(thread_id)
+
+    runtime._delete_checkpoint_thread = fake_delete  # type: ignore[method-assign]
+
+    async def run():
+        async for _event in runtime.astream(
+            message="会被取消",
+            session_id="cancel-session",
+            project_id=None,
+            user_id="test-user",
+        ):
+            pass
+
+    try:
+        asyncio.run(run())
+    except asyncio.CancelledError:
+        pass
+    else:
+        raise AssertionError("CancelledError should propagate")
+
+    assert rejected == [("cancel-session", "Agent stream was cancelled by the client.")]
+    assert deleted == ["cancel-session"]
+
+
 def test_build_backend_resolves_workspace_and_skills(tmp_path, monkeypatch):
     """/workspace/ and /skills/ routes should resolve to the correct directories."""
 
@@ -251,6 +306,7 @@ def test_build_backend_resolves_workspace_and_skills(tmp_path, monkeypatch):
     knowledge_dir = tmp_path / "knowledge"
     knowledge_dir.mkdir(parents=True)
     (knowledge_dir / "test.md").write_text("kb doc")
+    monkeypatch.setattr(manager_module, "get_knowledge_root", lambda _base_dir: knowledge_dir)
 
     backend = manager._build_backend(workspace)
 

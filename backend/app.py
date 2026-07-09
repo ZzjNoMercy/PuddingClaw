@@ -25,9 +25,12 @@ async def lifespan(app: FastAPI):
     from graph.memory_indexer import get_memory_indexer
     from knowledge.import_worker import knowledge_import_worker_manager
     from projects.registry import project_registry
+    from analytics.semantic_assets import get_semantic_asset_registry
     import capabilities
 
     scan_skills(BASE_DIR)
+    semantic_assets = get_semantic_asset_registry(BASE_DIR).refresh()
+    print(f"🧭 Semantic assets loaded: {semantic_assets.get('count', 0)}")
     project_registry.initialize(BASE_DIR)
     attachment_store.initialize(BASE_DIR)
     db_ready = await init_database()

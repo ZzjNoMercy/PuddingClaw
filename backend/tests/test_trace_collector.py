@@ -735,3 +735,15 @@ def test_trace_collector_emits_tool_span_events():
     tool_end = next((e for e in end_events if e[1]["span"]["type"] == "tool"), None)
     assert tool_end is not None
     assert tool_end[1]["span"]["status"] == "completed"
+
+
+def test_trace_collector_snapshot_keeps_running_spans_before_finish():
+    collector = TraceCollector(session_id="session-running-snapshot", query_id="query-1")
+
+    collector.start_tool_span("database_knowledge_query", tool_call_id="call-1", input_data="{}")
+    snapshot = collector.snapshot()
+
+    assert snapshot["status"] == "running"
+    tool_span = next(span for span in snapshot["spans"] if span["name"] == "database_knowledge_query")
+    assert tool_span["status"] == "running"
+    assert snapshot["completed_at"] is None

@@ -193,6 +193,7 @@ export default function SettingsPage() {
   const [dbQaFullRowsHardRowCap, setDbQaFullRowsHardRowCap] = useState("200");
   const [dbQaFullRowsHardColumnCap, setDbQaFullRowsHardColumnCap] = useState("20");
   const [dbQaMaxCellCharsForLlm, setDbQaMaxCellCharsForLlm] = useState("500");
+  const [dbQaQueryTimeoutSeconds, setDbQaQueryTimeoutSeconds] = useState("30");
   const [dbQaResultStoreEnabled, setDbQaResultStoreEnabled] = useState(true);
   const [dbQaResultStoreTtlHours, setDbQaResultStoreTtlHours] = useState("168");
   const [dbQaDefaultPageSize, setDbQaDefaultPageSize] = useState("100");
@@ -315,6 +316,7 @@ export default function SettingsPage() {
         setDbQaFullRowsHardRowCap(String(databaseQa?.full_rows_hard_row_cap ?? 200));
         setDbQaFullRowsHardColumnCap(String(databaseQa?.full_rows_hard_column_cap ?? 20));
         setDbQaMaxCellCharsForLlm(String(databaseQa?.max_cell_chars_for_llm ?? 500));
+        setDbQaQueryTimeoutSeconds(String(Math.max(1, Math.round((databaseQa?.query_timeout_ms ?? 30000) / 1000))));
         setDbQaResultStoreEnabled(databaseQa?.result_store_enabled ?? true);
         setDbQaResultStoreTtlHours(String(databaseQa?.result_store_ttl_hours ?? 168));
         setDbQaDefaultPageSize(String(databaseQa?.default_page_size ?? 100));
@@ -471,6 +473,7 @@ export default function SettingsPage() {
             full_rows_hard_row_cap: positiveIntOrNull(dbQaFullRowsHardRowCap) ?? 200,
             full_rows_hard_column_cap: positiveIntOrNull(dbQaFullRowsHardColumnCap) ?? 20,
             max_cell_chars_for_llm: positiveIntOrNull(dbQaMaxCellCharsForLlm) ?? 500,
+            query_timeout_ms: (positiveIntOrNull(dbQaQueryTimeoutSeconds) ?? 30) * 1000,
             result_store_enabled: dbQaResultStoreEnabled,
             result_store_ttl_hours: positiveIntOrNull(dbQaResultStoreTtlHours) ?? 168,
             default_page_size: positiveIntOrNull(dbQaDefaultPageSize) ?? 100,
@@ -539,7 +542,7 @@ export default function SettingsPage() {
     } finally {
       setSaving(false);
     }
-  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmModel, mmDimension, mmApiKey, knowledgeRootDir, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, subagentItems, showToast]);
+  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaQueryTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmModel, mmDimension, mmApiKey, knowledgeRootDir, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, subagentItems, showToast]);
 
   const handleDatabaseModeChange = useCallback((mode: "bundled" | "external") => {
     setDatabaseMode(mode);
@@ -1130,6 +1133,9 @@ export default function SettingsPage() {
                     </FormField>
                     <FormField label="完整明细最大列数">
                       <input value={dbQaFullRowsHardColumnCap} onChange={(e) => setDbQaFullRowsHardColumnCap(e.target.value)} className="form-input" inputMode="numeric" />
+                    </FormField>
+                    <FormField label="SQL 执行超时（秒）">
+                      <input value={dbQaQueryTimeoutSeconds} onChange={(e) => setDbQaQueryTimeoutSeconds(e.target.value)} className="form-input" inputMode="numeric" />
                     </FormField>
                   </div>
                 </SettingsCard>
@@ -2058,7 +2064,7 @@ export default function SettingsPage() {
             {/* System Status */}
             {category === "system" && (
               <SettingsCard title="系统状态" icon={Activity} color="#002fa7">
-                <CapabilitiesStatus refreshIntervalMs={30000} />
+                <CapabilitiesStatus refreshIntervalMs={30000} onChange={setCapabilities} />
               </SettingsCard>
             )}
 

@@ -22,7 +22,7 @@ class SandboxedWriteFileTool(BaseTool):
     name: str = "write_file"
     description: str = (
         "Write content to a local file. Path is relative to the project root. "
-        "Only files in skills/, workspace/, and memory/ directories can be modified. "
+        "Only files in skills/, semantic-assets/, workspace/, and memory/ directories can be modified. "
         "Use this to update SKILL.md files, memory files, or workspace documents. "
         "Example: write_file('skills/skill-creator/SKILL.md', '---\\nname: skill-creator\\n...')"
     )
@@ -41,10 +41,10 @@ class SandboxedWriteFileTool(BaseTool):
             # Normalize path
             normalized = file_path.replace("\\", "/").lstrip("./")
 
-            # Whitelist check: only allow skills/, workspace/, memory/
-            ALLOWED_PREFIXES = ["skills/", "workspace/", "memory/"]
+            # Whitelist check: only allow curated project authoring roots.
+            ALLOWED_PREFIXES = ["skills/", "semantic-assets/", "workspace/", "memory/"]
             if not any(normalized.startswith(prefix) for prefix in ALLOWED_PREFIXES):
-                return f"❌ Access denied: {file_path} (only skills/, workspace/, memory/ allowed)"
+                return f"❌ Access denied: {file_path} (only skills/, semantic-assets/, workspace/, memory/ allowed)"
 
             full_path = (root / normalized).resolve()
 

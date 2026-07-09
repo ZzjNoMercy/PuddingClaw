@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import base64
+import asyncio
 import time
 import traceback
 import uuid
@@ -422,11 +423,14 @@ class DeepAgentsAgentManager:
     def _build_backend(self, workspace_path: Path):
         assert self._base_dir is not None
         skills_dir = self._base_dir / "skills"
+        semantic_assets_dir = self._base_dir / "semantic-assets"
         knowledge_dir = get_knowledge_root(self._base_dir)
         knowledge_dir.mkdir(parents=True, exist_ok=True)
+        semantic_assets_dir.mkdir(parents=True, exist_ok=True)
         routes: dict[str, FilesystemBackend] = {
             "/workspace/": FilesystemBackend(root_dir=workspace_path, virtual_mode=True),
             "/knowledge/": FilesystemBackend(root_dir=knowledge_dir, virtual_mode=True),
+            "/semantic-assets/": FilesystemBackend(root_dir=semantic_assets_dir, virtual_mode=True),
         }
         if skills_dir.exists():
             routes["/skills/"] = FilesystemBackend(root_dir=skills_dir, virtual_mode=True)
@@ -542,6 +546,31 @@ class DeepAgentsAgentManager:
             }
             return self._checkpointer
 
+    async def _delete_checkpoint_thread(self, thread_id: str) -> None:
+        """Delete the LangGraph checkpoint thread for an explicitly cancelled stream."""
+
+        checkpointer = self._checkpointer
+        if checkpointer is None:
+            return
+        for method_name in ("adelete_thread", "delete_thread"):
+            method = getattr(checkpointer, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                result = method(thread_id)
+                if hasattr(result, "__await__"):
+                    await result
+                logger.info("Deleted DeepAgents checkpoint thread after cancellation: %s", thread_id)
+                return
+            except Exception:
+                logger.warning(
+                    "Failed to delete DeepAgents checkpoint thread %s via %s",
+                    thread_id,
+                    method_name,
+                    exc_info=True,
+                )
+                return
+
     def _build_tools(self, workspace_path: Path, session_id: str = "") -> list[Any]:
         """Return PuddingClaw tools that do not overlap DeepAgents built-ins."""
 
@@ -552,16 +581,16 @@ class DeepAgentsAgentManager:
                 continue
             if getattr(tool, "name", "") == "terminal":
                 # In Agent mode, terminal should follow the same workspace
-                # boundary as the DeepAgents filesystem backend. Map the
-                # virtual `/workspace/` and `/skills/` prefixes to real host
-                # directories so shell commands use the same paths as
-                # read_file/write_file.
+                # boundary as the DeepAgents filesystem backend. Map virtual
+                # prefixes to real host directories so shell commands use the
+                # same paths as read_file/write_file.
                 terminal_updates = {
                     "root_dir": str(workspace_path),
                     "path_aliases": {
                         "/workspace": str(workspace_path),
                         "/knowledge": str(get_knowledge_root(self._base_dir)),
                         "/skills": str(self._base_dir / "skills"),
+                        "/semantic-assets": str(self._base_dir / "semantic-assets"),
                     },
                 }
                 try:
@@ -649,7 +678,7 @@ class DeepAgentsAgentManager:
         )
         if skills:
             add("SkillsMiddleware", "deepagents.base", ["before_agent"], "将 skills snapshot 注入系统上下文")
-        add("FilesystemMiddleware", "deepagents.base", ["wrap_tool_call"], "提供 /workspace 与 /skills 文件系统能力")
+        add("FilesystemMiddleware", "deepagents.base", ["wrap_tool_call"], "提供 /workspace、/knowledge、/semantic-assets 与 /skills 文件系统能力")
         add("SubAgentMiddleware", "deepagents.base", ["wrap_model_call"], "向 system message 注入 task/subagent 使用说明")
         add("SummarizationMiddleware", "deepagents.base", ["before_model"], "DeepAgents 基础上下文压缩")
         add("PatchToolCallsMiddleware", "deepagents.base", ["after_model"], "修正/补齐工具调用")
@@ -826,16 +855,48 @@ class DeepAgentsAgentManager:
         tools: list[Any],
         middleware: list[Any],
         skills: list[str],
+        workspace_path: Path,
         checkpointer: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return {
             "middleware": self._middleware_inventory(middleware, skills),
+            "filesystem": self._filesystem_inventory(workspace_path),
             "tools": self._tool_inventory(tools),
             "skills": self._skills_inventory(),
             "subagents": self._subagent_inventory(),
             "package_versions": self._package_versions(),
             "checkpointer": checkpointer or {},
         }
+
+    def _filesystem_inventory(self, workspace_path: Path) -> dict[str, Any]:
+        assert self._base_dir is not None
+        mounts = [
+            {
+                "virtual_path": "/workspace/",
+                "root_dir": str(workspace_path),
+                "exists": workspace_path.exists(),
+                "role": "session workspace",
+            },
+            {
+                "virtual_path": "/knowledge/",
+                "root_dir": str(get_knowledge_root(self._base_dir)),
+                "exists": get_knowledge_root(self._base_dir).exists(),
+                "role": "knowledge resources",
+            },
+            {
+                "virtual_path": "/semantic-assets/",
+                "root_dir": str(self._base_dir / "semantic-assets"),
+                "exists": (self._base_dir / "semantic-assets").exists(),
+                "role": "semantic assets",
+            },
+            {
+                "virtual_path": "/skills/",
+                "root_dir": str(self._base_dir / "skills"),
+                "exists": (self._base_dir / "skills").exists(),
+                "role": "skills",
+            },
+        ]
+        return {"mounts": mounts}
 
     @staticmethod
     def _package_versions() -> dict[str, str]:
@@ -1839,6 +1900,7 @@ class DeepAgentsAgentManager:
                 tools=agent_tools,
                 skills=agent_skills,
                 middleware=agent_middlewares,
+                workspace_path=workspace_path,
                 checkpointer=self._checkpointer_info,
             )
             traced_middlewares = wrap_middlewares_for_trace(agent_middlewares)
@@ -1871,9 +1933,16 @@ class DeepAgentsAgentManager:
             # Buffer trace events emitted synchronously by TraceCollector so they
             # can be yielded asynchronously through the SSE stream.
             pending_trace_events: list[dict[str, str]] = []
+            trace_collector: TraceCollector | None = None
 
             def _trace_emit(event: str, payload: dict[str, Any]) -> None:
                 pending_trace_events.append(self._sse(event, payload))
+                if trace_collector is None:
+                    return
+                try:
+                    session_manager.update_trace(session_id, trace_collector.snapshot(), query_id=query_id)
+                except Exception:
+                    logger.debug("Failed to persist incremental trace for session=%s", session_id, exc_info=True)
 
             trace_collector = TraceCollector(
                 session_id=session_id,
@@ -2350,6 +2419,28 @@ class DeepAgentsAgentManager:
                 title = await _generate_title(session_id)
                 if title:
                     yield self._sse("title", {"session_id": session_id, "title": title})
+        except asyncio.CancelledError:
+            logger.info("Agent stream cancelled for session=%s", session_id)
+            try:
+                permission_resume_registry.reject_session(
+                    session_id,
+                    "Agent stream was cancelled by the client.",
+                )
+            except Exception:
+                logger.debug("Failed to reject pending permission requests for session=%s", session_id, exc_info=True)
+            try:
+                await self._delete_checkpoint_thread(session_id)
+            except Exception:
+                logger.debug("Failed to clean cancelled checkpoint for session=%s", session_id, exc_info=True)
+            try:
+                if trace_collector is not None:
+                    trace = trace_collector.finish(status="cancelled", error="client_cancelled")
+                    session_manager.update_trace(session_id, trace, query_id=query_id)
+            except Exception:
+                pass
+            if trace_context_active and trace_collector is not None:
+                trace_collector.__exit__(asyncio.CancelledError, None, None)
+            raise
         except Exception as exc:
             logger.exception("Agent stream failed for session=%s: %s", session_id, exc)
             traceback.print_exc()

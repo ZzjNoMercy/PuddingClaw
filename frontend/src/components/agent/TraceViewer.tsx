@@ -12,6 +12,7 @@ import {
   Cpu,
   ExternalLink,
   FileText,
+  FolderOpen,
   KeyRound,
   ListChecks,
   MessageSquare,
@@ -802,6 +803,7 @@ function RuntimeMountPanel({ inventory }: { inventory: TraceRuntimeInventory }) 
   const tools = inventory.tools || [];
   const skills = inventory.skills || [];
   const subagents = inventory.subagents || [];
+  const filesystemMounts = inventory.filesystem?.mounts || [];
   const packageVersions = inventory.package_versions || {};
   const stack = inventory.middleware?.stack || [];
   const middlewareHookGroups = useMemo(() => buildMountedMiddlewareHookGroups(inventory), [inventory]);
@@ -827,6 +829,8 @@ function RuntimeMountPanel({ inventory }: { inventory: TraceRuntimeInventory }) 
           <span>·</span>
           <span>{skills.length} skills</span>
           <span>·</span>
+          <span>{filesystemMounts.length} dirs</span>
+          <span>·</span>
           <span>{subagents.length} subagents</span>
           {isOpen ? (
             <ChevronDown className="h-4 w-4 text-slate-400" />
@@ -841,6 +845,22 @@ function RuntimeMountPanel({ inventory }: { inventory: TraceRuntimeInventory }) 
           <MountedMiddlewareHookCard
             groups={middlewareHookGroups}
             stackCount={stack.length}
+          />
+
+          <MountedListCard
+            icon={<FolderOpen className="h-4 w-4 text-emerald-500" />}
+            title="Directories"
+            subtitle="DeepAgents filesystem 虚拟目录挂载"
+            empty="没有目录挂载"
+            items={filesystemMounts.map((mount) => ({
+              key: mount.virtual_path,
+              title: mount.virtual_path,
+              subtitle: compactEvidence([
+                mount.root_dir || "",
+                mount.role ? `role: ${mount.role}` : "",
+              ]).join(" · "),
+              badge: mount.exists === false ? "missing" : "mounted",
+            }))}
           />
 
           <MountedListCard
@@ -3323,7 +3343,7 @@ function DatabaseTraceSummary({ spans }: { spans: TraceSpan[] }) {
         <div>
           <p className="text-[11px] font-bold text-blue-900">问数 Trace 明细</p>
           <p className="mt-0.5 text-[10px] text-blue-700/70">
-            表 Router、Vanna 召回、SQL 生成和执行明细都在这里。
+            语义资产、表 Router、Vanna 召回、SQL 生成和执行明细都在这里。
           </p>
         </div>
         <span className="rounded-full bg-white px-2 py-0.5 text-[10px] font-semibold text-blue-700 shadow-sm">
@@ -3486,6 +3506,7 @@ function databaseStage(span: TraceSpan): string {
 function databaseStageLabel(stage: string): string {
   const labels: Record<string, string> = {
     router: "表 Router",
+    semantic_assets: "语义资产",
     vanna_references: "Vanna 资料",
     vanna_entities: "实体召回",
     sql_generation: "SQL 生成",
@@ -3499,6 +3520,13 @@ function databasePayloadSummary(stage: string, payload: Record<string, unknown>)
     return [
       { label: "selected_tables", value: formatUnknownList(payload.selected_tables) },
       { label: "available_tables", value: formatUnknownList(payload.available_tables) },
+    ].filter((item) => item.value !== "-");
+  }
+  if (stage === "semantic_assets") {
+    return [
+      { label: "matched", value: String(payload.matched_count ?? "-") },
+      { label: "available", value: String(payload.available_count ?? "-") },
+      { label: "injected", value: String(payload.prompt_injected ?? "-") },
     ].filter((item) => item.value !== "-");
   }
   if (stage === "sql_generation") {

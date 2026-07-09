@@ -86,7 +86,7 @@ async def _check_http_get(url: str, path: str, timeout: float = 3.0) -> Capabili
 
     target = url.rstrip("/") + path
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
             response = await client.get(target)
             if 200 <= response.status_code < 400:
                 return CapabilityStatus(available=True)
@@ -376,7 +376,7 @@ def _check_http_get_sync(url: str | None, path: str, timeout: float = 3.0) -> Ca
     try:
         import httpx
 
-        response = httpx.get(target, timeout=timeout)
+        response = httpx.get(target, timeout=timeout, trust_env=False)
         if 200 <= response.status_code < 400:
             return CapabilityStatus(available=True)
         return CapabilityStatus(available=False, reason=f"HTTP {response.status_code}")

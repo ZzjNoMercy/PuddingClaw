@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import exc as sa_exc, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from analytics.nl2sql.schemas import SqlExecutionResult
@@ -16,6 +16,10 @@ from knowledge.models import KnowledgeDatabaseSource
 
 class SqlRunnerError(RuntimeError):
     """Raised when generated SQL is unsafe or cannot be executed."""
+
+    def __init__(self, message: str, *, sql: str | None = None) -> None:
+        super().__init__(message)
+        self.sql = sql
 
 
 _SQL_FENCE_RE = re.compile(r"```(?:sql)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
@@ -32,6 +36,11 @@ _CTE_NAME_RE = re.compile(
     r"(?:\bwith|,)\s+((?:\"[^\"]+\"|[a-zA-Z_][\w]*))\s+as\s*\(",
     re.IGNORECASE,
 )
+_SCALAR_SUBQUERY_LIST_RE = re.compile(
+    r"\)\s+as\s+(?:\"[^\"]+\"|[a-zA-Z_][\w]*)\s*,\s*\(\s*select\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_FUNCTION_FROM_KEYWORDS = {"extract", "substring", "trim"}
 
 _DIMENSION_HINTS = ("品牌", "brand", "车系", "serial", "车型", "name", "分类", "category", "类型", "type")
 _DATE_HINTS = ("日期", "时间", "date", "time", "created_at", "updated_at")
@@ -56,7 +65,60 @@ def extract_sql(raw_sql: str) -> str:
     value = value.strip().rstrip(";").strip()
     if not value:
         raise SqlRunnerError("Vanna 生成的 SQL 为空。")
-    return value
+    return _repair_scalar_subquery_list(value)
+
+
+def _paren_balance(sql: str) -> int:
+    balance = 0
+    in_single = False
+    in_double = False
+    index = 0
+    while index < len(sql):
+        char = sql[index]
+        if in_single:
+            if char == "'" and index + 1 < len(sql) and sql[index + 1] == "'":
+                index += 2
+                continue
+            if char == "'":
+                in_single = False
+        elif in_double:
+            if char == '"' and index + 1 < len(sql) and sql[index + 1] == '"':
+                index += 2
+                continue
+            if char == '"':
+                in_double = False
+        else:
+            if char == "'":
+                in_single = True
+            elif char == '"':
+                in_double = True
+            elif char == "(":
+                balance += 1
+            elif char == ")":
+                balance -= 1
+        index += 1
+    return balance
+
+
+def _repair_scalar_subquery_list(sql: str) -> str:
+    """Repair a common LLM shape: ``(SELECT ...) AS a, (SELECT ...) AS b``.
+
+    ``extract_sql`` intentionally starts at the first SELECT token. If the LLM
+    omits the outer ``SELECT`` and returns a list of scalar subqueries, that
+    strips the leading ``(`` and leaves invalid SQL. Only repair this narrow
+    shape when the parenthesis balance proves exactly one leading ``(`` is
+    missing.
+    """
+
+    stripped = sql.strip()
+    lowered = stripped.lower()
+    if not lowered.startswith("select "):
+        return sql
+    if _paren_balance(stripped) != -1:
+        return sql
+    if not _SCALAR_SUBQUERY_LIST_RE.search(stripped):
+        return sql
+    return "SELECT (" + stripped
 
 
 def _normalize_identifier(value: str) -> str:
@@ -76,11 +138,36 @@ def _table_aliases(table_name: str) -> set[str]:
 def _referenced_tables(sql: str) -> set[str]:
     tables: set[str] = set()
     for match in _TABLE_REF_RE.finditer(sql):
+        if _is_function_argument_from(sql, match.start()):
+            continue
         ref = match.group(1).strip()
         if ref.startswith("("):
             continue
         tables.add(_normalize_identifier(ref))
     return tables
+
+
+def _is_function_argument_from(sql: str, from_index: int) -> bool:
+    """Return true for PostgreSQL function syntax like ``EXTRACT(YEAR FROM x)``.
+
+    The table-scope validator intentionally uses a small parser instead of a
+    full SQL AST. PostgreSQL also uses the word FROM inside function arguments,
+    so a plain ``FROM <identifier>`` regex would otherwise treat ``to_date`` in
+    ``EXTRACT(YEAR FROM to_date(...))`` as an unauthorized table.
+    """
+
+    last_open = sql.rfind("(", 0, from_index)
+    if last_open < 0:
+        return False
+    last_close = sql.rfind(")", 0, from_index)
+    if last_close > last_open:
+        return False
+    before_open = sql[:last_open].rstrip()
+    function_match = re.search(r'(?:"([^"]+)"|([a-zA-Z_][\w]*))\s*$', before_open)
+    if not function_match:
+        return False
+    function_name = (function_match.group(1) or function_match.group(2) or "").lower()
+    return function_name in _FUNCTION_FROM_KEYWORDS
 
 
 def _cte_names(sql: str) -> set[str]:
@@ -110,7 +197,7 @@ def validate_readonly_sql(sql: str, *, allowed_tables: list[str]) -> str:
     referenced = _referenced_tables(clean_sql)
     blocked = sorted(ref for ref in referenced if ref not in allowed_aliases and ref not in cte_names)
     if blocked:
-        raise SqlRunnerError(f"SQL 引用了未授权数据表：{', '.join(blocked)}")
+        raise SqlRunnerError(f"SQL 引用了未授权数据表：{', '.join(blocked)}", sql=clean_sql)
     return clean_sql
 
 
@@ -132,6 +219,11 @@ def _compact_rows(rows: list[dict[str, Any]], columns: list[str], *, max_cell_ch
         {column: _compact_cell(row.get(column), max_chars=max_cell_chars) for column in columns}
         for row in rows
     ]
+
+
+def _is_statement_timeout(exc: BaseException) -> bool:
+    text_value = str(exc).lower()
+    return "statement timeout" in text_value or "querycancelederror" in text_value or "query canceled" in text_value
 
 
 def _profile_from_rows(rows: list[dict[str, Any]], columns: list[str]) -> dict[str, Any]:
@@ -217,7 +309,7 @@ async def run_readonly_sql(
     *,
     allowed_tables: list[str],
     limit: int = 100,
-    timeout_ms: int = 15000,
+    timeout_ms: int | None = None,
 ) -> SqlExecutionResult:
     """Execute validated SQL and return a completeness-aware result contract."""
 
@@ -227,25 +319,30 @@ async def run_readonly_sql(
     full_row_cap = int(config.get("full_rows_hard_row_cap") or 200)
     full_column_cap = int(config.get("full_rows_hard_column_cap") or 20)
     full_token_budget = int(config.get("full_rows_token_budget") or 10000)
+    effective_timeout_ms = int(timeout_ms or config.get("query_timeout_ms") or 30000)
     materialize_limit = max(5000, safe_limit, full_row_cap)
     clean_sql = validate_readonly_sql(sql, allowed_tables=allowed_tables)
     engine = create_async_engine(database_source_url(source), pool_pre_ping=True)
     try:
         async with engine.connect() as conn:
             async with conn.begin():
-                await conn.execute(text(f"SET LOCAL statement_timeout = '{int(timeout_ms)}ms'"))
-                count_result = await conn.execute(text(f"SELECT COUNT(*) AS count FROM ({clean_sql}) AS puddingclaw_count"))
-                total_row_count = int(count_result.scalar_one() or 0)
+                await conn.execute(text(f"SET LOCAL statement_timeout = '{effective_timeout_ms}ms'"))
                 result = await conn.execute(
                     text(f"SELECT * FROM ({clean_sql}) AS puddingclaw_result LIMIT :limit_value"),
-                    {"limit_value": min(total_row_count, materialize_limit)},
+                    {"limit_value": materialize_limit + 1},
                 )
-                rows = [dict(row) for row in result.mappings().all()]
+                fetched_rows = [dict(row) for row in result.mappings().all()]
+                rows = fetched_rows[:materialize_limit]
                 columns = list(rows[0].keys()) if rows else list(result.keys())
                 string_columns = [str(column) for column in columns]
                 compact_all_rows = _compact_rows(rows, string_columns, max_cell_chars=max_cell_chars)
                 estimated_tokens = _estimate_tokens({"columns": string_columns, "rows": compact_all_rows})
-                materialized_all = len(rows) == total_row_count
+                materialized_all = len(fetched_rows) <= materialize_limit
+                if materialized_all:
+                    total_row_count = len(rows)
+                else:
+                    count_result = await conn.execute(text(f"SELECT COUNT(*) AS count FROM ({clean_sql}) AS puddingclaw_count"))
+                    total_row_count = int(count_result.scalar_one() or 0)
                 can_include_full = (
                     materialized_all
                     and total_row_count <= full_row_cap
@@ -288,5 +385,15 @@ async def run_readonly_sql(
                     materialized_rows=rows,
                     materialized_all=materialized_all,
                 )
+    except sa_exc.DBAPIError as exc:
+        if _is_statement_timeout(exc):
+            raise SqlRunnerError(
+                "SQL 执行超时：数据库在 "
+                f"{effective_timeout_ms}ms 内没有返回结果。"
+                "这通常表示生成 SQL 需要全表扫描、COUNT(DISTINCT)、正则/substring 计算或缺少索引；"
+                "分页不会解决聚合计算超时，需要优化 SQL、增加索引/物化视图，或先缩小过滤范围。",
+                sql=clean_sql,
+            ) from exc
+        raise SqlRunnerError(f"{type(exc).__name__}: {exc}", sql=clean_sql) from exc
     finally:
         await engine.dispose()

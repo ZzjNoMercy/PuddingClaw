@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from analytics.semantic_assets import SemanticAssetError, get_semantic_asset_registry
 from analytics.nl2sql.entity_candidates import recommend_entity_candidates
 from analytics.nl2sql.result_store import (
     QueryResultStoreError,
@@ -22,6 +24,82 @@ from db import get_db_session
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+class SemanticAssetCreateRequest(BaseModel):
+    name: str
+    type: str = Field(pattern="^(measure|dimension|grain)$")
+    description: str = ""
+    aliases: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    version: str = "0.1.0"
+    slug: str | None = None
+
+
+@router.get("/semantic-assets")
+async def list_semantic_assets():
+    try:
+        return get_semantic_asset_registry(BASE_DIR).list_assets()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to list semantic assets: {exc}") from exc
+
+
+@router.post("/semantic-assets/refresh")
+async def refresh_semantic_assets():
+    try:
+        return get_semantic_asset_registry(BASE_DIR).refresh()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to refresh semantic assets: {exc}") from exc
+
+
+@router.post("/semantic-assets")
+async def create_semantic_asset(request: SemanticAssetCreateRequest):
+    try:
+        asset = get_semantic_asset_registry(BASE_DIR).create_asset(
+            name=request.name,
+            asset_type=request.type,
+            description=request.description,
+            aliases=request.aliases,
+            tags=request.tags,
+            version=request.version,
+            slug=request.slug,
+        )
+        return {"asset": asset, "status": "created"}
+    except SemanticAssetError as exc:
+        message = str(exc)
+        status_code = 409 if "already exists" in message else 400
+        raise HTTPException(status_code=status_code, detail=message) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to create semantic asset: {exc}") from exc
+
+
+@router.post("/semantic-assets/import")
+async def import_semantic_assets(files: list[UploadFile] = File(...)):
+    if not files:
+        raise HTTPException(status_code=400, detail="No files uploaded")
+    registry = get_semantic_asset_registry(BASE_DIR)
+    try:
+        first_filename = files[0].filename or ""
+        if len(files) == 1 and first_filename.lower().endswith(".zip"):
+            return registry.import_zip(files[0].file)
+        payload = []
+        for uploaded in files:
+            payload.append((uploaded.filename or "uploaded", await uploaded.read()))
+        return registry.import_files(payload)
+    except SemanticAssetError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to import semantic assets: {exc}") from exc
+
+
+@router.get("/semantic-assets/{asset_id:path}")
+async def get_semantic_asset(asset_id: str):
+    try:
+        return {"asset": get_semantic_asset_registry(BASE_DIR).get_asset(asset_id)}
+    except SemanticAssetError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to load semantic asset: {exc}") from exc
 
 
 @router.get("/query-results")

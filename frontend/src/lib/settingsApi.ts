@@ -90,6 +90,7 @@ export interface DatabaseQaSettings {
   full_rows_hard_row_cap: number;
   full_rows_hard_column_cap: number;
   max_cell_chars_for_llm: number;
+  query_timeout_ms: number;
   result_store_enabled: boolean;
   result_store_ttl_hours: number;
   default_page_size: number;
@@ -292,7 +293,7 @@ export interface Capabilities {
 }
 
 export async function getCapabilities(): Promise<Capabilities> {
-  const resp = await fetch(`${API_BASE}/capabilities`);
+  const resp = await fetch(`${API_BASE}/capabilities`, { cache: "no-store" });
   if (!resp.ok) throw new Error(`Failed to get capabilities: ${resp.status}`);
   return resp.json();
 }

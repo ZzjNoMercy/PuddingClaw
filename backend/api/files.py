@@ -15,7 +15,7 @@ router = APIRouter()
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Whitelist of editable directories (relative to backend/)
-ALLOWED_PREFIXES = ["workspace/", "memory/", "skills/", "knowledge/"]
+ALLOWED_PREFIXES = ["workspace/", "memory/", "skills/", "knowledge/", "semantic-assets/"]
 
 # Whitelist of specific root-level files that can be accessed
 ALLOWED_ROOT_FILES = {"SKILLS_SNAPSHOT.md"}
@@ -74,6 +74,13 @@ async def save_file(request: FileSaveRequest):
 
             indexer = get_memory_indexer(BASE_DIR)
             indexer.rebuild_index()
+        except Exception:
+            pass
+    elif normalized.startswith("semantic-assets/"):
+        try:
+            from analytics.semantic_assets import get_semantic_asset_registry
+
+            get_semantic_asset_registry(BASE_DIR).refresh()
         except Exception:
             pass
 

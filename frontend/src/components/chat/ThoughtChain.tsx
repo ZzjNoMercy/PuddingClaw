@@ -83,10 +83,31 @@ function getToolLabel(toolCall: ToolCall): string {
   return tool;
 }
 
+function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "";
+  if (ms < 1000) return "<1s";
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes < 60) return `${minutes}m ${seconds}s`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return `${hours}h ${remainingMinutes}m`;
+}
+
+function toolDurationMs(toolCall: ToolCall, now: number): number | null {
+  if (!toolCall.startedAt) return null;
+  const end = toolCall.endedAt || (toolCall.status === "running" ? now : undefined);
+  if (!end) return null;
+  return Math.max(0, end - toolCall.startedAt);
+}
+
 export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
   const [isExpanded, setIsExpanded] = useState(isStreaming);
   const wasStreamingRef = useRef(isStreaming);
   const [expandedTools, setExpandedTools] = useState<Record<string, boolean>>({});
+  const [now, setNow] = useState(Date.now());
 
   useEffect(() => {
     if (isStreaming && !wasStreamingRef.current) {
@@ -96,6 +117,16 @@ export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
     }
     wasStreamingRef.current = isStreaming;
   }, [isStreaming]);
+
+  useEffect(() => {
+    const hasRunningTool = timeline.some(
+      (item) => item.type === "tool" && item.toolCall?.status === "running"
+    );
+    if (!hasRunningTool) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [timeline]);
 
   const toolItems = timeline.filter((item) => item.type === "tool" && item.toolCall);
   const toolCount = toolItems.length;
@@ -107,7 +138,16 @@ export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
     (item) => item.type === "tool" && item.toolCall?.status === "running"
   );
 
-  const runningSuffix = hasRunningTool && isStreaming ? " · 运行中..." : "";
+  const runningDurations = toolItems
+    .map((item) => {
+      if (item.type !== "tool" || item.toolCall.status !== "running") return null;
+      return toolDurationMs(item.toolCall, now);
+    })
+    .filter((duration): duration is number => duration !== null);
+  const runningElapsed = runningDurations.length ? formatDuration(Math.max(...runningDurations)) : "";
+  const runningSuffix = hasRunningTool && isStreaming
+    ? ` · 运行中${runningElapsed ? ` ${runningElapsed}` : "..."}`
+    : "";
   const summaryText =
     toolCount > 0
       ? `使用了 ${toolCount} 个工具，运行 ${commandCount} 个命令${runningSuffix}`
@@ -176,6 +216,8 @@ export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
               const Icon = meta.icon;
               const isOpen = expandedTools[item.id] ?? false;
               const isRunning = tc.status === "running";
+              const duration = toolDurationMs(tc, now);
+              const durationText = duration === null ? "" : formatDuration(duration);
 
               return (
                 <div key={item.id} className="relative flex items-start gap-3">
@@ -192,6 +234,11 @@ export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
                       className="flex w-full items-center gap-2 text-left"
                     >
                       <span className="text-[13px] text-gray-700">{getToolLabel(tc)}</span>
+                      {durationText && (
+                        <span className="rounded-full bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] text-slate-500">
+                          {isRunning ? durationText : `耗时 ${durationText}`}
+                        </span>
+                      )}
                       <span className="shrink-0">
                         {isRunning ? (
                           <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-500" />

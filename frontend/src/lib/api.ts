@@ -932,6 +932,129 @@ export async function listTableAssetEntityCandidates(assetId: string, limit = 12
   return Array.isArray(payload.candidates) ? payload.candidates : [];
 }
 
+export type SemanticAssetType = "measure" | "dimension" | "grain";
+
+export interface SemanticAssetSummary {
+  id: string;
+  name: string;
+  type: SemanticAssetType;
+  path: string;
+  description?: string;
+  aliases?: string[];
+  tags?: string[];
+  formatter?: string;
+  mtime?: number;
+  size_bytes?: number;
+}
+
+export interface SemanticAssetFile {
+  name: string;
+  path: string;
+  relative_path: string;
+  size_bytes?: number;
+  mtime?: number;
+  editable?: boolean;
+  main?: boolean;
+}
+
+export interface SemanticAssetDetail extends SemanticAssetSummary {
+  body: string;
+  frontmatter: Record<string, unknown>;
+  files?: SemanticAssetFile[];
+}
+
+export interface SemanticAssetListResult {
+  assets: SemanticAssetSummary[];
+  count: number;
+  type_counts?: Record<string, number>;
+  root_dir?: string;
+  last_scanned_at?: string | null;
+}
+
+export interface SemanticAssetCreatePayload {
+  name: string;
+  type: SemanticAssetType;
+  description?: string;
+  aliases?: string[];
+  tags?: string[];
+  version?: string;
+  slug?: string;
+}
+
+export async function listSemanticAssets(): Promise<SemanticAssetListResult> {
+  const response = await fetch(`${API_BASE}/analytics/semantic-assets`, { cache: "no-store" });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to load semantic assets: ${response.status}`));
+  }
+  const payload = await response.json();
+  return {
+    ...payload,
+    assets: Array.isArray(payload.assets) ? payload.assets : [],
+    count: typeof payload.count === "number" ? payload.count : 0,
+  };
+}
+
+export async function refreshSemanticAssets(): Promise<SemanticAssetListResult> {
+  const response = await fetch(`${API_BASE}/analytics/semantic-assets/refresh`, { method: "POST" });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to refresh semantic assets: ${response.status}`));
+  }
+  const payload = await response.json();
+  return {
+    ...payload,
+    assets: Array.isArray(payload.assets) ? payload.assets : [],
+    count: typeof payload.count === "number" ? payload.count : 0,
+  };
+}
+
+export async function createSemanticAsset(payload: SemanticAssetCreatePayload): Promise<SemanticAssetDetail> {
+  const response = await fetch(`${API_BASE}/analytics/semantic-assets`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to create semantic asset: ${response.status}`));
+  }
+  const data = await response.json();
+  return data.asset;
+}
+
+export async function getSemanticAsset(assetId: string): Promise<SemanticAssetDetail> {
+  const response = await fetch(`${API_BASE}/analytics/semantic-assets/${encodeURIComponent(assetId)}`, { cache: "no-store" });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to load semantic asset: ${response.status}`));
+  }
+  const payload = await response.json();
+  return payload.asset;
+}
+
+export async function importSemanticAssets(files: File[]): Promise<SemanticAssetListResult> {
+  const form = new FormData();
+  files.forEach((file) => {
+    const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath;
+    form.append("files", file, relativePath || file.name);
+  });
+  const response = await fetch(`${API_BASE}/analytics/semantic-assets/import`, {
+    method: "POST",
+    body: form,
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to import semantic assets: ${response.status}`));
+  }
+  const payload = await response.json();
+  return {
+    ...payload,
+    assets: Array.isArray(payload.assets) ? payload.assets : [],
+    count: typeof payload.count === "number" ? payload.count : 0,
+  };
+}
+
 export interface DatabaseQueryResultSummary {
   result_id: string;
   session_id?: string;
@@ -1072,6 +1195,14 @@ export interface TraceRuntimeInventory {
     stack?: TraceRuntimeMiddlewareEntry[];
     hooks?: Record<string, TraceRuntimeMiddlewareEntry[]>;
     order_rule?: Record<string, string>;
+  };
+  filesystem?: {
+    mounts?: Array<{
+      virtual_path: string;
+      root_dir?: string;
+      exists?: boolean;
+      role?: string;
+    }>;
   };
   tools?: Array<{
     name: string;

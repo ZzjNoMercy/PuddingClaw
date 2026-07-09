@@ -17,6 +17,7 @@
 2. 不优先做传统 BI 的强关联建模；关系、主键、字段映射只在问数效果不稳定或业务确实需要时作为补充。
 3. 度量值是顶层资产，可以被多个数据模型复用。
 4. 产品术语向 BI 靠齐：数据资产、数据模型、度量值、维度、分析模型包、问数 Agent。
+5. 度量值和维度采用 Skill-like Markdown 资产：前置 metadata 只要求机器能解析 `name` 和 `type`，用于前端展示、筛选和选择；业务口径、计算步骤、禁止规则和字段解释保留在正文中，运行时作为 Agent reference 读取。
 
 ## 核心层级修正
 
@@ -43,17 +44,58 @@
 - 屏蔽底层 Excel / CSV / 数据库差异。
 - 第一版以“资产选择 + 模型 reference”为主，不做重型关系建模器。
 
-### 度量值层
+### 语义资产层
 
-对象：Measure。
+对象：Semantic Asset。左侧产品分类改为“语义资产”，内部包含 `type=measure` 的度量值资产和 `type=dimension` 的维度资产。
 
 职责：
 
 - 定义业务度量值口径，例如周销量、环比、配置率。
+- 定义可选分析维度，例如上市时间、品牌、车系、价格段。
 - 作为顶层 BI 资产存在，可以被多个数据模型复用。
 - 可选指明适用的数据模型、Excel/CSV 资产或结构化数据库，但不强绑定。
 - 保存自然语言定义、公式、字段需求、示例问法。
 - 不挂在单个 Excel 文件下面。
+- 支持文件夹形式：`semantic-assets/measures/**/measure.md` 存放度量值，`semantic-assets/dimensions/**/dimension.md` 存放维度；后端解析 metadata 中的 `name/type` 给前端呈现，正文由问数 Agent 运行时读取。
+
+### 语义资产 Metadata 边界
+
+第一版 metadata 只承担“索引和呈现”职责，不承担完整计算表达。
+
+示例：
+
+```markdown
+---
+formatter: semantic-asset
+name: 配置率
+type: measure
+---
+
+配置率 = 搭载某配置的对象数量 / 对象总数量。
+...
+```
+
+```markdown
+---
+formatter: semantic-asset
+name: 上市时间
+type: dimension
+---
+
+上市日期取 `vehicle_params` 中 `type_name='上市时间'` 的 `type_value`。
+禁止从 `car_name` 中的 25款/26款推断上市年份。
+...
+```
+
+后端解析规则：
+
+- 必须解析：`name`、`type`。
+- 可选透传：`formatter`、`description`、`tags`、`aliases`、`updated_at`。
+- 前端用 `name/type` 做列表、卡片、筛选和选择。
+- 前端信息架构上，`type=measure` 和 `type=dimension` 都归入“语义资产”分类，不单独新增左侧“维度”入口。
+- Agent 运行时读取 Markdown 正文，不能只看 `name/type` 就推断计算口径。
+- DeepAgents 文件系统后端需要像 `/skills/` 一样挂载 `/semantic-assets/`，并允许文件 API / 写文件工具读写 `semantic-assets/measures/**/measure.md` 与 `semantic-assets/dimensions/**/dimension.md`。
+- Trace 运行挂载清单需要展示 filesystem directories，能看到 `/workspace/`、`/knowledge/`、`/semantic-assets/`、`/skills/` 的虚拟路径、真实目录和 mounted/missing 状态。
 
 ### 分析包层
 
@@ -102,6 +144,523 @@
 4. Pandas tool 从 catalog 选表，而不是扫描 `/knowledge`。
 5. 新增数据模型与度量值管理 API。
 6. 专门问数 Agent 读取数据模型/度量值/profile/reference 后选择 pandas 或 Vanna。
+
+## 2026-07-08：语义资产开发方案（审核版）
+
+### 目标
+
+当前阶段先不依赖数据库表结构优化，不要求数据分析师理解索引、物化视图或宽表建模。优先支持用户用 Skill-like Markdown 定义度量值和维度，让 `database_knowledge_query` 在生成 SQL 前读取相关业务口径，减少模型根据字段名或款型名称自行猜测。
+
+核心判断：
+
+- 这是 AI BI / Chat BI 的语义层，不是传统 BI 建模器。
+- 数据分析师主要维护“度量值”和“维度”的自然语言定义。
+- 后端负责索引、匹配、按需注入上下文和 Trace 可观测性。
+- 数据库优化是后续增强项，不作为第一阶段必需条件。
+
+### 产品信息架构
+
+左侧导航使用“语义资产”分类。该分类内部统一承载两类同级语义资产：
+
+```text
+语义资产
+  - type=measure：度量值，例如配置率、销量、环比
+  - type=grain：颗粒度，例如款型颗粒度、车系颗粒度
+  - type=dimension：维度，例如上市时间、品牌、车系、价格段
+```
+
+不单独增加左侧“维度”入口。原因：
+
+- 用户心智上是在维护问数口径资产，而不是维护传统维表。
+- 维度和度量值都服务同一个问数上下文。
+- 前端只需要按 `name/type` 展示和筛选。
+
+### 文件目录与格式
+
+语义资产统一放在后端项目目录，度量值和维度在目录层面同级：
+
+```text
+backend/semantic-assets/
+  measures/
+    config_rate/
+      measure.md
+      references/
+        air_suspension.md
+  grains/
+    car_model/
+      grain.md
+  dimensions/
+    launch_time/
+      dimension.md
+```
+
+也允许未来扩展成：
+
+```text
+backend/semantic-assets/
+  automotive_config/
+    measures/
+      config_rate/
+        measure.md
+    dimensions/
+      launch_time/
+        dimension.md
+```
+
+第一版只要求识别两类文件：
+
+- `semantic-assets/measures/**/measure.md`
+- `semantic-assets/measures/**/references/*.md`
+- `semantic-assets/grains/**/grain.md`
+- `semantic-assets/dimensions/**/dimension.md`
+
+示例：度量值。
+
+```markdown
+---
+formatter: semantic-asset
+name: 配置率
+type: measure
+aliases:
+  - 搭载率
+  - 渗透率
+tags:
+  - 汽车配置
+---
+
+配置率 = 搭载某配置的对象数量 / 对象总数量。
+
+分母：
+- 满足当前筛选条件的去重车型数量。
+
+分子：
+- 分母范围内，存在目标配置项有效值的去重车型数量。
+
+有效配置：
+- type_value 非空。
+- type_value 不等于 "-"、"无"、"未配备"。
+```
+
+示例：维度。
+
+```markdown
+---
+formatter: semantic-asset
+name: 上市时间
+type: dimension
+aliases:
+  - 上市日期
+  - 上市年份
+tags:
+  - 汽车配置
+---
+
+上市时间取 `vehicle_params` 中 `type_name='上市时间'` 的 `type_value`。
+
+可派生：
+- 上市日期：将 type_value 转成 date。
+- 上市年份：从上市日期提取 year。
+- 上市月份：从上市日期提取 month。
+
+禁止：
+- 不要从 `car_name` 中的 25款、26款推断上市年份。
+- 不要从款型名称推断真实上市日期。
+```
+
+### Metadata 边界
+
+第一版 metadata 只用于机器索引和前端呈现，不承载完整计算表达。
+
+必须解析：
+
+- `name`
+- `type`
+
+可选解析并透传：
+
+- `formatter`
+- `aliases`
+- `tags`
+- `description`
+- `updated_at`
+
+正文处理规则：
+
+- 前端不理解正文，也不把正文编译成 SQL。
+- Agent / Vanna prompt 在运行时读取正文。
+- 计算口径、字段解释、禁止规则、多步查询策略都保留在正文中。
+
+### 文件系统与后端路径
+
+`/semantic-assets/` 要像 `/skills/` 一样作为后端可访问路径。
+
+已确定约束：
+
+- DeepAgents `FilesystemBackend` 挂载 `/semantic-assets/`。
+- terminal path aliases 支持 `/semantic-assets -> backend/semantic-assets`。
+- `/api/files` 允许读写 `semantic-assets/`。
+- `write_file` 工具允许写 `semantic-assets/`。
+- 运行时语义资产 registry 直接扫描 `backend/semantic-assets`，不通过前端 API 间接读取。
+- Trace runtime inventory 暴露 `filesystem.mounts`，前端“运行挂载清单”展示每个挂载目录，确保用户能确认 `/semantic-assets/` 本轮确实已加载。
+
+### Registry / Cache 设计
+
+不要每次 `database_knowledge_query` 都扫描文件系统。应参考 SkillsMiddleware 的方式，做应用级语义资产 registry。
+
+推荐结构：
+
+```text
+backend/analytics/semantic_assets/
+  schemas.py
+  scanner.py
+  registry.py
+  resolver.py
+```
+
+职责：
+
+```text
+scanner.py
+  - 扫描 backend/semantic-assets/measures/**/measure.md
+  - 扫描 backend/semantic-assets/dimensions/**/dimension.md
+  - 解析 frontmatter
+  - 返回轻量索引
+
+registry.py
+  - 应用启动时 refresh()
+  - 提供 list_assets()
+  - 提供 get_asset_content(asset_id)
+  - 缓存 index
+  - 可按 path + mtime 缓存正文
+
+resolver.py
+  - 输入用户问题
+  - 基于 name / aliases / tags / 简单关键词匹配候选资产
+  - 返回命中的资产 metadata + 正文
+```
+
+缓存分两层：
+
+```text
+Index Cache
+  - id
+  - name
+  - type
+  - aliases
+  - tags
+  - path
+  - mtime
+
+Content Cache
+  - path
+  - mtime
+  - body
+```
+
+刷新触发：
+
+- 后端启动时 refresh 一次。
+- 前端“语义资产”页面提供刷新按钮。
+- 后续保存/上传语义资产后调用 refresh。
+- 文件 watcher 暂不作为第一版必需项。
+
+Registry 放置位置：
+
+- 使用应用级 registry，例如 `app.state.semantic_asset_registry` 或同等全局单例。
+- 不放入每个 session 的 LangGraph state。
+- 每轮只把命中的小片段注入当前问数上下文。
+
+### 前端 API
+
+第一版前端只需要语义资产索引，不需要理解正文。
+
+建议 API：
+
+```text
+GET  /api/analytics/semantic-assets
+POST /api/analytics/semantic-assets/refresh
+GET  /api/analytics/semantic-assets/{asset_id}
+POST /api/analytics/semantic-assets
+POST /api/analytics/semantic-assets/import
+```
+
+列表返回：
+
+```json
+{
+  "assets": [
+    {
+      "id": "measure:config_rate",
+      "name": "配置率",
+      "type": "measure",
+      "aliases": ["搭载率", "渗透率"],
+      "tags": ["汽车配置"],
+      "path": "semantic-assets/measures/config_rate/measure.md",
+      "mtime": 1780000000
+    }
+  ],
+  "count": 1,
+  "type_counts": {
+    "measure": 1,
+    "dimension": 0
+  }
+}
+```
+
+前端行为：
+
+- “语义资产”页展示 `type=measure` 和 `type=dimension`。
+- 支持按类型筛选。
+- 卡片主要显示 `name/type/path/aliases/tags`。
+- 正文查看和编辑可以复用 `/api/files`。
+
+新建语义资产：
+
+- 点击“新建语义资产”打开弹窗。
+- 用户选择资产类型：`度量值 measure` 或 `维度 dimension`。
+- 用户填写名称、可选描述、可选别名。
+- 后端按类型生成 YAML frontmatter 模板。
+- `type=measure` 默认写入 `semantic-assets/measures/{slug}/measure.md`。
+- `type=dimension` 默认写入 `semantic-assets/dimensions/{slug}/dimension.md`。
+
+度量值模板：
+
+```markdown
+---
+formatter: semantic-asset
+name: 配置率
+type: measure
+aliases: []
+tags: []
+version: 0.1.0
+created: 2026-07-08T00:00:00Z
+---
+
+# 配置率
+
+## 定义
+
+描述这个度量值的业务含义。
+
+## 计算口径
+
+- 分母：
+- 分子：
+
+## 适用场景
+
+## 禁止规则
+```
+
+维度模板：
+
+```markdown
+---
+formatter: semantic-asset
+name: 上市时间
+type: dimension
+aliases: []
+tags: []
+version: 0.1.0
+created: 2026-07-08T00:00:00Z
+---
+
+# 上市时间
+
+## 字段口径
+
+描述这个维度从哪里取值。
+
+## 可派生字段
+
+- 年：
+- 月：
+- 日：
+
+## 禁止规则
+```
+
+导入语义资产：
+
+- 支持 ZIP 导入，安全校验逻辑参考 `/skills/import`。
+- 支持文件夹导入，前端使用 `webkitdirectory` 上传目录内文件，后端按相对路径还原。
+- ZIP / 文件夹必须至少包含一个 `measure.md` 或 `dimension.md`。
+- 导入根目录可以是完整 `semantic-assets/`，也可以是单个资产文件夹；后端归一化到 `backend/semantic-assets/` 下。
+- 禁止路径穿越和危险扩展名，沿用 skills 导入的 forbidden extensions。
+- 导入完成后刷新 semantic asset registry。
+
+### `database_knowledge_query` 集成边界
+
+对 Agent 暴露层，第一版不新增独立工具。仍然只暴露：
+
+```text
+database_knowledge_query
+```
+
+内部链路变成：
+
+```text
+database_knowledge_query
+  -> semantic_asset_resolver
+  -> table_router
+  -> Vanna references/entities
+  -> Vanna SQL generation
+  -> read-only SQL runner
+  -> result persistence / trace
+```
+
+不新增 `semantic_asset_search` 工具给 Agent 自己调用。原因：
+
+- Agent 可能忘记调用。
+- 多一步工具调用会增加不稳定性。
+- 语义资产对数据库问数是强前置约束，不应该依赖 Agent 自觉。
+
+### Prompt 注入策略
+
+不要把所有语义资产扫描后塞进 system prompt。
+
+system prompt 只放稳定规则：
+
+```text
+你是智能问数 Agent。
+查询前必须优先使用已注入的语义资产定义。
+度量值和维度定义高于字段名猜测。
+如果语义资产声明禁止某种推断，不得使用该推断。
+```
+
+本轮命中的语义资产正文，按需注入 `database_knowledge_query` 的 Vanna question/context：
+
+```text
+已命中语义资产定义：
+
+[度量值：配置率]
+...
+
+[维度：上市时间]
+...
+
+规则：
+- 必须优先遵守以上语义资产定义。
+- 维度定义高于字段名猜测。
+- 度量值定义高于模型自行推断。
+- 如果语义资产声明禁止某种字段推断，不得使用该推断。
+```
+
+示例效果：
+
+用户问：
+
+```text
+统计 2021-2026 年上市车型的激光雷达配置率
+```
+
+Resolver 应命中：
+
+```text
+measure: 配置率
+dimension: 上市时间
+```
+
+Vanna 生成 SQL 时必须知道：
+
+- 上市时间来自 `type_name='上市时间'` 的 `type_value`。
+- 不能从 `car_name` 中的 21款/26款推断上市年份。
+- 配置率的分母和分子都按去重车型计算。
+
+### Trace 可观测性
+
+新增 Trace 阶段：
+
+```text
+database.semantic_assets
+```
+
+payload：
+
+```json
+{
+  "matched": [
+    {
+      "name": "配置率",
+      "type": "measure",
+      "path": "semantic-assets/measures/config_rate/measure.md",
+      "match_reason": "question contains 配置率"
+    },
+    {
+      "name": "上市时间",
+      "type": "dimension",
+      "path": "semantic-assets/dimensions/launch_time/dimension.md",
+      "match_reason": "question contains 上市时间"
+    }
+  ],
+  "unmatched_terms": ["激光雷达"]
+}
+```
+
+排查目标：
+
+- 判断语义资产是否命中。
+- 判断 Vanna 是否拿到了正文。
+- 判断错误来自未命中、定义不清楚，还是 SQL 执行性能问题。
+
+### 数据库优化边界
+
+当前阶段不要求先改数据库表结构。原因：
+
+- 不是每个数据分析师都会做索引、物化视图或事实表优化。
+- 但多数分析师可以写清楚度量值和维度口径。
+- 第一阶段目标是让口径正确进入 Agent 上下文，先验证不改表结构时能否完成查询。
+
+后续如果仍遇到性能问题，再考虑：
+
+- 高频筛选维度索引，例如上市时间、品牌、车系、价格段。
+- 车型级缓存表或物化视图。
+- 配置项不按 400 多个配置逐一建索引，而是按通用访问模式优化，例如 `(type_name, car_name)`。
+
+这些属于性能增强，不是第一版语义资产开发的前置条件。
+
+### 第一版验收标准
+
+- 前端“语义资产”页能展示 `measure.md` 和 `dimension.md` 两类资产。
+- 后端启动时扫描 `backend/semantic-assets` 并建立 index cache。
+- 刷新接口能重新扫描语义资产。
+- `database_knowledge_query` 每次调用不重新全量扫描文件系统。
+- 用户问题命中度量值/维度后，Markdown 正文进入 Vanna SQL 生成上下文。
+- Trace 展示本轮命中的语义资产。
+- “上市时间”维度定义后，Agent 不应再从 `car_name` 的 25款/26款推断上市年份。
+- 没命中语义资产时，工具输出或 Trace 应明确说明，而不是静默退化。
+
+### 2026-07-08 实施进度
+
+已完成：
+
+- [x] 后端新增 `analytics.semantic_assets` registry，扫描 `backend/semantic-assets/measures/**/measure.md` 与 `backend/semantic-assets/dimensions/**/dimension.md`。
+- [x] registry 使用进程内缓存，后端启动、手动刷新、创建、导入、文件保存后刷新；`database_knowledge_query` 后续可直接复用，不需要每次调用扫描文件系统。
+- [x] 新增 `/api/analytics/semantic-assets`、`/refresh`、`/{asset_id}`、创建和导入接口。
+- [x] 新建语义资产会生成 YAML frontmatter 模板，支持 `measure` 与 `dimension` 两类。
+- [x] 导入支持 ZIP 和文件夹上传，支持完整 `semantic-assets/` 根目录或单个资产文件夹，至少要求包含一个 `measure.md` 或 `dimension.md`。
+- [x] `/api/files` 保存 `semantic-assets/` 下文件后刷新 registry。
+- [x] DeepAgents runtime 挂载 `/semantic-assets/`，Trace runtime inventory 暴露目录挂载清单。
+- [x] 前端“语义资产”页接入真实 API，支持列表、刷新、新建和导入。
+- [x] 回归测试覆盖创建、刷新和 ZIP 导入路径归一化。
+
+本轮暂未完成，进入下一阶段：
+
+- [x] `semantic_asset_resolver`：按用户问题命中 name / aliases / tags / 正文关键词，并支持显式 semantic asset id。
+- [x] `database_knowledge_query` 注入命中语义资产正文到 Vanna SQL 生成上下文。
+- [x] Trace 新增 `database.semantic_assets` 阶段，展示命中资产、正文是否进入上下文和未命中项。
+- [x] 工具输出展示本轮语义资产命中状态，未命中时明确提示 SQL 未获得度量值/维度正文约束。
+- [x] 支持 `type=grain` 颗粒度资产，路径为 `semantic-assets/grains/**/grain.md`。
+- [x] 支持度量值专用 reference：命中 `measure.md` 后继续匹配同目录 `references/*.md`，并把匹配 reference 注入 Vanna prompt。
+- [x] 内置 `上市时间` 维度、`配置率` 度量值、`款型颗粒度`、`车系颗粒度` 和 `空气悬架配置率口径` reference，覆盖 `vehicle_params` 上市时间不能从 `car_name` 推断、配置率必须按统计对象去重、空气悬架必须从 `可调悬架种类` 判断的基础口径。
+- [ ] 用 `上市时间` 维度与 `配置率` 度量值做真实 `vehicle_params` 端到端验收。
+
+本轮验证：
+
+- `backend/.venv/bin/pytest backend/tests/test_semantic_assets_registry.py -q`
+- `backend/.venv/bin/python -m py_compile backend/analytics/semantic_assets/__init__.py backend/analytics/semantic_assets/registry.py backend/api/analytics.py backend/app.py backend/api/files.py`
+- `backend/.venv/bin/python -m py_compile backend/analytics/semantic_assets/resolver.py backend/analytics/nl2sql/schemas.py backend/analytics/nl2sql/service.py backend/tools/database_knowledge_tool.py`
+- `cd frontend && npx tsc --noEmit`
 
 ## 2026-07-07：数据资产持久 Catalog 迁移
 

@@ -64,6 +64,74 @@ def _tokens(value: str | None) -> set[str]:
     return {token.lower() for token in _TOKEN_RE.findall(str(value or "")) if token.strip()}
 
 
+def _has_any(value: str, needles: tuple[str, ...]) -> bool:
+    return any(needle in value for needle in needles)
+
+
+def _semantic_table_boost(question: str, table_name: str, columns: list[str]) -> tuple[float, list[str]]:
+    """Add deterministic domain hints for Chinese BI questions.
+
+    Token matching works for explicit table/column names, but most user
+    questions say "上市/纯电/皮卡/配置率" instead of launch_year/energy_type.
+    Keep this as a small router hint, not SQL-generation logic.
+    """
+
+    normalized_table = _normalize_table_name(table_name).split(".")[-1]
+    column_set = {str(column) for column in columns}
+    reasons: list[str] = []
+    score = 0.0
+
+    dimension_terms = (
+        "上市",
+        "新车",
+        "年份",
+        "月份",
+        "今年",
+        "纯电",
+        "能源",
+        "级别",
+        "皮卡",
+        "价格",
+        "价位",
+        "品牌",
+        "车系",
+        "在售",
+        "停售",
+        "销售状态",
+    )
+    has_model_dimension_columns = {
+        "launch_year",
+        "launch_date",
+        "energy_type",
+        "vehicle_level",
+        "price_band",
+        "brand",
+        "serial_name",
+        "sale_status",
+    } <= column_set
+    if normalized_table == "vehicle_params_wide" and has_model_dimension_columns and _has_any(question, dimension_terms):
+        score += 18.0
+        reasons.append("语义命中：款型基础维度宽表")
+
+    config_terms = (
+        "配置率",
+        "配备率",
+        "搭载率",
+        "配置",
+        "配备",
+        "搭载",
+        "空气悬架",
+        "空气悬挂",
+        "激光雷达",
+    )
+    has_eav_columns = {"type_name", "type_value", "car_name"} <= column_set
+    if normalized_table == "vehicle_params" and has_eav_columns and _has_any(question, config_terms):
+        score += 16.0
+        reasons.append("语义命中：配置明细 EAV 表")
+
+    return score, reasons
+
+
 def _match_requested_tables(requested: list[str], available: list[str]) -> list[str]:
     if not requested:
         return []
@@ -142,6 +210,10 @@ def _score_table(question: str, table_name: str, columns: list[str]) -> TableCan
     if column_hits:
         score += 3.0 * len(column_hits)
         reasons.append(f"字段命中：{', '.join(sorted(column_hits)[:8])}")
+    semantic_score, semantic_reasons = _semantic_table_boost(question, table_name, columns)
+    if semantic_score:
+        score += semantic_score
+        reasons.extend(semantic_reasons)
     if not reasons:
         reasons.append("已选表候选")
     return TableCandidate(name=table_name, columns=columns, score=score, reasons=reasons)

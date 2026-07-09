@@ -11,10 +11,12 @@ import {
   ChevronRight,
   Database,
   Download,
+  FileText,
   FileSpreadsheet,
   Layers3,
   Loader2,
   RefreshCw,
+  Search,
   Sigma,
   Upload,
   X,
@@ -26,12 +28,15 @@ import ResizeHandle from "@/components/layout/ResizeHandle";
 import Sidebar from "@/components/layout/Sidebar";
 import {
   databaseQueryResultExportCsvUrl,
+  createSemanticAsset,
   generateTableAssetProfile,
   getDatabaseQueryResultPage,
+  getSemanticAsset,
   getTableAsset,
   deleteKnowledgeDatabaseSourceVannaEntity,
   deleteKnowledgeDatabaseSourceVannaTraining,
   importKnowledgeDatabaseSourceVannaEntities,
+  importSemanticAssets,
   listTableAssetEntityCandidates,
   listKnowledgeDatabaseSourceVannaEntities,
   listKnowledgeDatabaseSourceVannaEntityCandidates,
@@ -39,14 +44,22 @@ import {
   listDatabaseQueryResults,
   listKnowledgeDatabaseSourceTables,
   listKnowledgeDatabaseSources,
+  listSemanticAssets,
   listTableAssets,
+  readFile,
+  refreshSemanticAssets,
   refreshTableAssetProfiles,
+  saveFile,
   saveKnowledgeDatabaseSource,
   testKnowledgeDatabaseSource,
   trainKnowledgeDatabaseSourceVanna,
   type DatabaseQueryResultPage,
   type DatabaseQueryResultSummary,
   type KnowledgeDatabaseSource,
+  type SemanticAssetDetail,
+  type SemanticAssetFile,
+  type SemanticAssetSummary,
+  type SemanticAssetType,
   type TableAsset,
   type TableEntityCandidate,
   type VannaEntityListResult,
@@ -169,6 +182,19 @@ export default function AnalyticsWorkbenchPage() {
   const [queryResultPageLoading, setQueryResultPageLoading] = useState(false);
   const [queryResultPageNumber, setQueryResultPageNumber] = useState(1);
   const [queryResultPageSize, setQueryResultPageSize] = useState("100");
+  const [semanticAssets, setSemanticAssets] = useState<SemanticAssetSummary[]>([]);
+  const [semanticAssetsLoading, setSemanticAssetsLoading] = useState(false);
+  const [semanticAssetsBusy, setSemanticAssetsBusy] = useState(false);
+  const [semanticAssetModal, setSemanticAssetModal] = useState<"create" | "import" | null>(null);
+  const [semanticAssetSearch, setSemanticAssetSearch] = useState("");
+  const [semanticAssetTypeFilter, setSemanticAssetTypeFilter] = useState<"all" | SemanticAssetType>("all");
+  const [semanticAssetDetail, setSemanticAssetDetail] = useState<SemanticAssetDetail | null>(null);
+  const [semanticAssetDetailLoading, setSemanticAssetDetailLoading] = useState(false);
+  const [semanticAssetSelectedFile, setSemanticAssetSelectedFile] = useState<SemanticAssetFile | null>(null);
+  const [semanticAssetEditorContent, setSemanticAssetEditorContent] = useState("");
+  const [semanticAssetEditorOriginal, setSemanticAssetEditorOriginal] = useState("");
+  const [semanticAssetEditorLoading, setSemanticAssetEditorLoading] = useState(false);
+  const [semanticAssetEditorSaving, setSemanticAssetEditorSaving] = useState(false);
 
   useEffect(() => setMounted(true), []);
 
@@ -244,6 +270,142 @@ export default function AnalyticsWorkbenchPage() {
     }
   }, [activeSection, loadQueryResultPage, selectedQueryResultId]);
 
+  const loadSemanticAssets = useCallback(async (forceRefresh = false) => {
+    setSemanticAssetsLoading(true);
+    try {
+      const result = forceRefresh ? await refreshSemanticAssets() : await listSemanticAssets();
+      setSemanticAssets(result.assets);
+      return true;
+    } catch (error) {
+      setToast({ type: "error", message: errorMessage(error) });
+      return false;
+    } finally {
+      setSemanticAssetsLoading(false);
+    }
+  }, []);
+
+  const handleRefreshSemanticAssets = useCallback(async () => {
+    const ok = await loadSemanticAssets(true);
+    if (ok) {
+      setToast({ type: "success", message: "语义资产 registry 已刷新" });
+    }
+  }, [loadSemanticAssets]);
+
+  useEffect(() => {
+    if (activeSection === "measures") {
+      void loadSemanticAssets();
+    }
+  }, [activeSection, loadSemanticAssets]);
+
+  const handleCreateSemanticAsset = useCallback(
+    async (payload: {
+      name: string;
+      type: SemanticAssetType;
+      description: string;
+      aliases: string[];
+      tags: string[];
+      version: string;
+    }) => {
+      setSemanticAssetsBusy(true);
+      try {
+        const asset = await createSemanticAsset(payload);
+        await loadSemanticAssets();
+        setSemanticAssetModal(null);
+        setToast({ type: "success", message: `已创建语义资产：${asset.name}` });
+      } catch (error) {
+        setToast({ type: "error", message: errorMessage(error) });
+      } finally {
+        setSemanticAssetsBusy(false);
+      }
+    },
+    [loadSemanticAssets]
+  );
+
+  const handleImportSemanticAssets = useCallback(
+    async (files: File[]) => {
+      if (files.length === 0) {
+        setToast({ type: "error", message: "请选择 ZIP 或文件夹。" });
+        return;
+      }
+      setSemanticAssetsBusy(true);
+      try {
+        const result = await importSemanticAssets(files);
+        setSemanticAssets(result.assets);
+        setSemanticAssetModal(null);
+        setToast({ type: "success", message: `已导入 ${result.count} 个语义资产` });
+      } catch (error) {
+        setToast({ type: "error", message: errorMessage(error) });
+      } finally {
+        setSemanticAssetsBusy(false);
+      }
+    },
+    []
+  );
+
+  const openSemanticAssetDetail = useCallback(async (asset: SemanticAssetSummary) => {
+    setSemanticAssetDetailLoading(true);
+    setSemanticAssetDetail(null);
+    setSemanticAssetSelectedFile(null);
+    setSemanticAssetEditorContent("");
+    setSemanticAssetEditorOriginal("");
+    try {
+      const detail = await getSemanticAsset(asset.id);
+      setSemanticAssetDetail(detail);
+      const mainFile = (detail.files || []).find((file) => file.main) || detail.files?.[0] || null;
+      if (mainFile) {
+        setSemanticAssetSelectedFile(mainFile);
+        setSemanticAssetEditorLoading(true);
+        const content = await readFile(mainFile.path);
+        setSemanticAssetEditorContent(content);
+        setSemanticAssetEditorOriginal(content);
+      }
+    } catch (error) {
+      setToast({ type: "error", message: errorMessage(error) });
+    } finally {
+      setSemanticAssetDetailLoading(false);
+      setSemanticAssetEditorLoading(false);
+    }
+  }, []);
+
+  const selectSemanticAssetFile = useCallback(async (file: SemanticAssetFile) => {
+    if (!file.editable) {
+      setToast({ type: "error", message: "这个文件类型暂不支持在线编辑。" });
+      return;
+    }
+    setSemanticAssetSelectedFile(file);
+    setSemanticAssetEditorLoading(true);
+    try {
+      const content = await readFile(file.path);
+      setSemanticAssetEditorContent(content);
+      setSemanticAssetEditorOriginal(content);
+    } catch (error) {
+      setToast({ type: "error", message: errorMessage(error) });
+    } finally {
+      setSemanticAssetEditorLoading(false);
+    }
+  }, []);
+
+  const saveSemanticAssetFile = useCallback(async () => {
+    if (!semanticAssetSelectedFile) return;
+    setSemanticAssetEditorSaving(true);
+    try {
+      await saveFile(semanticAssetSelectedFile.path, semanticAssetEditorContent);
+      setSemanticAssetEditorOriginal(semanticAssetEditorContent);
+      await loadSemanticAssets(true);
+      if (semanticAssetDetail) {
+        const detail = await getSemanticAsset(semanticAssetDetail.id);
+        setSemanticAssetDetail(detail);
+        const updatedFile = (detail.files || []).find((file) => file.path === semanticAssetSelectedFile.path) || semanticAssetSelectedFile;
+        setSemanticAssetSelectedFile(updatedFile);
+      }
+      setToast({ type: "success", message: "语义资产文件已保存" });
+    } catch (error) {
+      setToast({ type: "error", message: errorMessage(error) });
+    } finally {
+      setSemanticAssetEditorSaving(false);
+    }
+  }, [loadSemanticAssets, semanticAssetDetail, semanticAssetEditorContent, semanticAssetSelectedFile]);
+
   const handleSidebarResize = useCallback(
     (delta: number) => {
       setSidebarWidth((prev: number) => Math.max(200, prev + delta));
@@ -254,6 +416,14 @@ export default function AnalyticsWorkbenchPage() {
   const readyCount = useMemo(() => assets.filter((asset) => asset.profile_status === "ready").length, [assets]);
   const missingCount = assets.length - readyCount;
   const totalDataAssets = assets.length + databaseSources.length;
+  const filteredSemanticAssets = useMemo(() => {
+    const keyword = semanticAssetSearch.trim().toLowerCase();
+    return semanticAssets.filter((asset) => {
+      if (semanticAssetTypeFilter !== "all" && asset.type !== semanticAssetTypeFilter) return false;
+      if (!keyword) return true;
+      return asset.name.toLowerCase().includes(keyword);
+    });
+  }, [semanticAssetSearch, semanticAssetTypeFilter, semanticAssets]);
 
   const generateOneProfile = useCallback(
     async (asset: TableAsset) => {
@@ -425,15 +595,6 @@ export default function AnalyticsWorkbenchPage() {
                     <Upload className="h-4 w-4" />
                     上传文件
                   </Link>
-                  <button
-                    type="button"
-                    onClick={refresh}
-                    disabled={loading}
-                    className="inline-flex h-10 items-center gap-2 rounded-full border border-black/[0.08] bg-white px-4 text-sm font-medium text-gray-700 shadow-sm transition hover:bg-gray-50 disabled:cursor-wait disabled:opacity-60"
-                  >
-                    <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
-                    刷新
-                  </button>
                 </div>
               </div>
 
@@ -454,7 +615,7 @@ export default function AnalyticsWorkbenchPage() {
                 <aside className="rounded-[26px] border border-black/[0.06] bg-white p-3 shadow-sm lg:sticky lg:top-6 lg:h-fit">
                   <div className="px-3 py-3">
                     <p className="text-xs font-semibold uppercase tracking-[0.18em] text-gray-400">问数工作台</p>
-                    <p className="mt-1 text-sm text-gray-500">资产、模型、度量值和问数入口放在同一层管理。</p>
+                    <p className="mt-1 text-sm text-gray-500">资产、模型、语义资产和问数入口放在同一层管理。</p>
                   </div>
                   <nav className="mt-1 space-y-1">
                     <AnalyticsNavButton
@@ -467,8 +628,8 @@ export default function AnalyticsWorkbenchPage() {
                     <AnalyticsNavButton
                       active={activeSection === "measures"}
                       icon={Sigma}
-                      title="度量值"
-                      description="指标口径"
+                      title="语义资产"
+                      description="度量值 / 维度"
                       onClick={() => setActiveSection("measures")}
                     />
                     <AnalyticsNavButton
@@ -533,15 +694,26 @@ export default function AnalyticsWorkbenchPage() {
                             表格文件和数据库源统一在这里管理；Profile 是问数 Agent 理解字段的机器画像。
                           </p>
                         </div>
-                        <button
-                          type="button"
-                          onClick={generateAllProfiles}
-                          disabled={refreshingProfiles || assets.length === 0}
-                          className="inline-flex h-10 items-center gap-2 rounded-2xl bg-[#002fa7] px-4 text-sm font-semibold text-white shadow-sm transition hover:bg-[#001f7a] disabled:cursor-not-allowed disabled:opacity-45"
-                        >
-                          {refreshingProfiles ? <Loader2 className="h-4 w-4 animate-spin" /> : <Database className="h-4 w-4" />}
-                          生成全部 Profile
-                        </button>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={refresh}
+                            disabled={loading}
+                            className="inline-flex h-10 items-center gap-2 rounded-2xl border border-black/[0.08] bg-white px-4 text-sm font-semibold text-gray-700 shadow-sm transition hover:bg-gray-50 disabled:cursor-wait disabled:opacity-60"
+                          >
+                            <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
+                            刷新数据资产
+                          </button>
+                          <button
+                            type="button"
+                            onClick={generateAllProfiles}
+                            disabled={refreshingProfiles || assets.length === 0}
+                            className="inline-flex h-10 items-center gap-2 rounded-2xl bg-[#002fa7] px-4 text-sm font-semibold text-white shadow-sm transition hover:bg-[#001f7a] disabled:cursor-not-allowed disabled:opacity-45"
+                          >
+                            {refreshingProfiles ? <Loader2 className="h-4 w-4 animate-spin" /> : <Database className="h-4 w-4" />}
+                            生成全部 Profile
+                          </button>
+                        </div>
                       </div>
 
                       <div className="mt-4 grid gap-3 md:grid-cols-4">
@@ -629,14 +801,72 @@ export default function AnalyticsWorkbenchPage() {
                   {activeSection === "measures" ? (
                     <WorkbenchSection
                       icon={Sigma}
-                      title="度量值"
-                      subtitle="度量值是顶层 BI 资产，保存自然语言口径、公式 hint、字段需求和示例问法，可被多个模型复用。"
-                      primaryAction="新建度量值"
+                      title="语义资产"
+                      subtitle="这里统一管理 Skill-like 语义资产：度量值定义业务算法，颗粒度定义统计对象，维度定义分析角度。"
+                      primaryAction="新建"
+                      onPrimaryAction={() => setSemanticAssetModal("create")}
+                      secondaryAction="导入"
+                      secondaryIcon={Upload}
+                      onSecondaryAction={() => setSemanticAssetModal("import")}
+                      tertiaryAction="刷新语义资产"
+                      tertiaryIcon={RefreshCw}
+                      tertiaryLoading={semanticAssetsLoading}
+                      onTertiaryAction={handleRefreshSemanticAssets}
                     >
-                      <EmptyWorkbenchState
-                        title="还没有度量值"
-                        description="例如：周销量、环比、配置率。后续这里会支持粘贴 reference 文档，问数 Agent 会像读取 skill reference 一样读取它。"
-                      />
+                      <div className="mb-4 flex flex-wrap items-center gap-3">
+                        <div className="relative min-w-[260px] flex-1">
+                          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
+                          <input
+                            value={semanticAssetSearch}
+                            onChange={(event) => setSemanticAssetSearch(event.target.value)}
+                            className="h-11 w-full rounded-2xl border border-black/[0.08] bg-white pl-9 pr-3 text-sm outline-none transition focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/[0.08]"
+                            placeholder="搜索 name"
+                          />
+                        </div>
+                        <div className="flex shrink-0 rounded-2xl bg-gray-100 p-1">
+                          {[
+                            { value: "all", label: "全部" },
+                            { value: "measure", label: "度量值" },
+                            { value: "grain", label: "颗粒度" },
+                            { value: "dimension", label: "维度" },
+                          ].map((item) => (
+                            <button
+                              key={item.value}
+                              type="button"
+                              onClick={() => setSemanticAssetTypeFilter(item.value as "all" | SemanticAssetType)}
+                              className={`h-9 rounded-xl px-4 text-sm font-semibold transition ${
+                                semanticAssetTypeFilter === item.value ? "bg-white text-[#002fa7] shadow-sm" : "text-gray-500 hover:text-gray-800"
+                              }`}
+                            >
+                              {item.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                      <div>
+                        {semanticAssetsLoading ? (
+                          <div className="flex items-center justify-center rounded-3xl border border-dashed border-black/[0.08] py-14 text-sm text-gray-400">
+                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                            正在读取语义资产…
+                          </div>
+                        ) : semanticAssets.length === 0 ? (
+                          <EmptyWorkbenchState
+                            title="还没有语义资产"
+                            description="可以新建度量值或维度，也可以导入包含 measure.md / dimension.md 的 ZIP 或文件夹。"
+                          />
+                        ) : filteredSemanticAssets.length === 0 ? (
+                          <EmptyWorkbenchState
+                            title="没有匹配的语义资产"
+                            description="调整搜索名称或类型筛选后再查看。"
+                          />
+                        ) : (
+                          <div className="grid gap-3 lg:grid-cols-2">
+                            {filteredSemanticAssets.map((asset) => (
+                              <SemanticAssetCard key={asset.id} asset={asset} onOpen={openSemanticAssetDetail} />
+                            ))}
+                          </div>
+                        )}
+                      </div>
                     </WorkbenchSection>
                   ) : null}
 
@@ -828,6 +1058,43 @@ export default function AnalyticsWorkbenchPage() {
           onClose={() => setVannaTrainingTarget(null)}
         />
       ) : null}
+
+      {semanticAssetModal === "create" ? (
+        <SemanticAssetCreateModal
+          busy={semanticAssetsBusy}
+          onClose={() => setSemanticAssetModal(null)}
+          onCreate={handleCreateSemanticAsset}
+        />
+      ) : null}
+
+      {semanticAssetModal === "import" ? (
+        <SemanticAssetImportModal
+          busy={semanticAssetsBusy}
+          onClose={() => setSemanticAssetModal(null)}
+          onImport={handleImportSemanticAssets}
+        />
+      ) : null}
+
+      {semanticAssetDetail || semanticAssetDetailLoading ? (
+        <SemanticAssetDetailModal
+          asset={semanticAssetDetail}
+          loading={semanticAssetDetailLoading}
+          selectedFile={semanticAssetSelectedFile}
+          editorContent={semanticAssetEditorContent}
+          editorOriginal={semanticAssetEditorOriginal}
+          editorLoading={semanticAssetEditorLoading}
+          editorSaving={semanticAssetEditorSaving}
+          onClose={() => {
+            setSemanticAssetDetail(null);
+            setSemanticAssetSelectedFile(null);
+            setSemanticAssetEditorContent("");
+            setSemanticAssetEditorOriginal("");
+          }}
+          onSelectFile={selectSemanticAssetFile}
+          onChangeContent={setSemanticAssetEditorContent}
+          onSave={saveSemanticAssetFile}
+        />
+      ) : null}
     </div>
   );
 }
@@ -978,12 +1245,28 @@ function WorkbenchSection({
   title,
   subtitle,
   primaryAction,
+  onPrimaryAction,
+  secondaryAction,
+  secondaryIcon: SecondaryIcon = Upload,
+  onSecondaryAction,
+  tertiaryAction,
+  tertiaryIcon: TertiaryIcon = RefreshCw,
+  tertiaryLoading = false,
+  onTertiaryAction,
   children,
 }: {
   icon: LucideIcon;
   title: string;
   subtitle: string;
   primaryAction: string;
+  onPrimaryAction?: () => void;
+  secondaryAction?: string;
+  secondaryIcon?: LucideIcon;
+  onSecondaryAction?: () => void;
+  tertiaryAction?: string;
+  tertiaryIcon?: LucideIcon;
+  tertiaryLoading?: boolean;
+  onTertiaryAction?: () => void;
   children: ReactNode;
 }) {
   return (
@@ -998,13 +1281,37 @@ function WorkbenchSection({
             <p className="mt-1 max-w-3xl text-sm leading-6 text-gray-500">{subtitle}</p>
           </div>
         </div>
-        <button
-          type="button"
-          className="inline-flex h-10 items-center gap-2 rounded-2xl bg-[#002fa7] px-4 text-sm font-semibold text-white shadow-sm transition hover:bg-[#001f7a]"
-        >
-          <PlusIcon />
-          {primaryAction}
-        </button>
+        <div className="flex items-center gap-2">
+          {secondaryAction ? (
+            <button
+              type="button"
+              onClick={onSecondaryAction}
+              className="inline-flex h-10 items-center gap-2 rounded-2xl border border-black/[0.08] bg-white px-4 text-sm font-semibold text-gray-700 shadow-sm transition hover:bg-gray-50"
+            >
+              <SecondaryIcon className="h-4 w-4" />
+              {secondaryAction}
+            </button>
+          ) : null}
+          {tertiaryAction ? (
+            <button
+              type="button"
+              onClick={onTertiaryAction}
+              disabled={tertiaryLoading}
+              className="inline-flex h-10 items-center gap-2 rounded-2xl border border-black/[0.08] bg-white px-4 text-sm font-semibold text-gray-700 shadow-sm transition hover:bg-gray-50 disabled:cursor-wait disabled:opacity-60"
+            >
+              <TertiaryIcon className={`h-4 w-4 ${tertiaryLoading ? "animate-spin" : ""}`} />
+              {tertiaryAction}
+            </button>
+          ) : null}
+          <button
+            type="button"
+            onClick={onPrimaryAction}
+            className="inline-flex h-10 items-center gap-2 rounded-2xl bg-[#002fa7] px-4 text-sm font-semibold text-white shadow-sm transition hover:bg-[#001f7a]"
+          >
+            <PlusIcon />
+            {primaryAction}
+          </button>
+        </div>
       </div>
       <div className="mt-5">{children}</div>
     </section>
@@ -1016,6 +1323,414 @@ function EmptyWorkbenchState({ title, description }: { title: string; descriptio
     <div className="rounded-3xl border border-dashed border-black/[0.08] bg-black/[0.015] px-6 py-14 text-center">
       <p className="text-sm font-semibold text-gray-800">{title}</p>
       <p className="mx-auto mt-2 max-w-xl text-sm leading-6 text-gray-500">{description}</p>
+    </div>
+  );
+}
+
+function SemanticAssetCard({ asset, onOpen }: { asset: SemanticAssetSummary; onOpen: (asset: SemanticAssetSummary) => void }) {
+  const typeLabel = asset.type === "measure" ? "度量值" : asset.type === "grain" ? "颗粒度" : "维度";
+  return (
+    <button
+      type="button"
+      onClick={() => onOpen(asset)}
+      className="rounded-3xl border border-black/[0.06] bg-white p-4 text-left shadow-sm transition hover:border-[#002fa7]/20 hover:bg-[#002fa7]/[0.015]"
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="rounded-full bg-[#002fa7]/10 px-2.5 py-1 text-xs font-semibold text-[#002fa7]">
+          {typeLabel}
+        </span>
+        <h3 className="min-w-0 flex-1 truncate text-sm font-semibold text-gray-950" title={asset.name}>
+          {asset.name}
+        </h3>
+      </div>
+      <p className="mt-2 line-clamp-2 min-h-10 text-sm leading-5 text-gray-500">
+        {asset.description || "未填写描述。"}
+      </p>
+      <p className="mt-3 truncate font-mono text-xs text-gray-400" title={asset.path}>
+        {asset.path}
+      </p>
+      <div className="mt-3 flex flex-wrap gap-2">
+        {(asset.aliases || []).slice(0, 4).map((alias) => (
+          <span key={alias} className="rounded-full bg-gray-100 px-2 py-0.5 text-[11px] font-medium text-gray-500">
+            {alias}
+          </span>
+        ))}
+        {(asset.tags || []).slice(0, 4).map((tag) => (
+          <span key={tag} className="rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700">
+            {tag}
+          </span>
+        ))}
+      </div>
+    </button>
+  );
+}
+
+function splitTokenList(value: string): string[] {
+  return value
+    .split(/[,\n，、]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function SemanticAssetCreateModal({
+  busy,
+  onClose,
+  onCreate,
+}: {
+  busy: boolean;
+  onClose: () => void;
+  onCreate: (payload: {
+    name: string;
+    type: SemanticAssetType;
+    description: string;
+    aliases: string[];
+    tags: string[];
+    version: string;
+  }) => void;
+}) {
+  const [type, setType] = useState<SemanticAssetType>("measure");
+  const [name, setName] = useState("");
+  const [version, setVersion] = useState("0.1.0");
+  const [description, setDescription] = useState("");
+  const [aliases, setAliases] = useState("");
+  const [tags, setTags] = useState("");
+  const typeLabel = type === "measure" ? "度量值" : type === "grain" ? "颗粒度" : "维度";
+
+  const templatePreview = `---
+formatter: semantic-asset
+name: ${name || typeLabel}
+type: ${type}
+description: ${description || "在这里描述业务口径"}
+aliases: []
+tags: []
+version: ${version || "0.1.0"}
+created: YYYY-MM-DD HH:mm:ss
+updated_at: YYYY-MM-DD HH:mm:ss
+---`;
+
+  return (
+    <div className="fixed inset-0 z-[130] flex items-center justify-center bg-black/35 px-4 py-6 backdrop-blur-sm">
+      <div className="w-full max-w-2xl overflow-hidden rounded-[28px] bg-white shadow-2xl ring-1 ring-black/[0.08]">
+        <div className="flex items-start justify-between gap-4 border-b border-black/[0.06] px-6 py-5">
+          <div>
+            <h3 className="text-lg font-semibold text-gray-950">新建语义资产</h3>
+            <p className="mt-1 text-sm text-gray-500">生成 measure.md、grain.md 或 dimension.md，后端会立即刷新 registry。</p>
+          </div>
+          <button type="button" onClick={onClose} className="rounded-full p-2 text-gray-400 transition hover:bg-black/[0.04] hover:text-gray-900">
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+        <div className="grid gap-5 px-6 py-5 md:grid-cols-[minmax(0,1fr)_260px]">
+          <div className="space-y-3">
+            <label className="block text-sm font-semibold text-gray-700">
+              类型
+              <select
+                value={type}
+                onChange={(event) => setType(event.target.value as SemanticAssetType)}
+                className="mt-2 h-10 w-full rounded-2xl border border-black/[0.08] bg-white px-3 text-sm outline-none focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/[0.08]"
+              >
+                <option value="measure">度量值 measure</option>
+                <option value="grain">颗粒度 grain</option>
+                <option value="dimension">维度 dimension</option>
+              </select>
+            </label>
+            <label className="block text-sm font-semibold text-gray-700">
+              名称
+              <input
+                value={name}
+                onChange={(event) => setName(event.target.value)}
+                className="mt-2 h-10 w-full rounded-2xl border border-black/[0.08] bg-white px-3 text-sm outline-none focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/[0.08]"
+                placeholder={type === "measure" ? "配置率" : type === "grain" ? "款型颗粒度" : "上市时间"}
+              />
+            </label>
+            <label className="block text-sm font-semibold text-gray-700">
+              版本
+              <input
+                value={version}
+                onChange={(event) => setVersion(event.target.value)}
+                className="mt-2 h-10 w-full rounded-2xl border border-black/[0.08] bg-white px-3 text-sm outline-none focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/[0.08]"
+                placeholder="0.1.0"
+              />
+            </label>
+            <label className="block text-sm font-semibold text-gray-700">
+              描述
+              <textarea
+                value={description}
+                onChange={(event) => setDescription(event.target.value)}
+                className="mt-2 min-h-24 w-full rounded-2xl border border-black/[0.08] bg-white px-3 py-2 text-sm outline-none focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/[0.08]"
+                placeholder="写清楚业务口径、适用字段、禁止推断规则。"
+              />
+            </label>
+            <label className="block text-sm font-semibold text-gray-700">
+              别名
+              <input
+                value={aliases}
+                onChange={(event) => setAliases(event.target.value)}
+                className="mt-2 h-10 w-full rounded-2xl border border-black/[0.08] bg-white px-3 text-sm outline-none focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/[0.08]"
+                placeholder="多个别名用逗号分隔"
+              />
+            </label>
+            <label className="block text-sm font-semibold text-gray-700">
+              标签
+              <input
+                value={tags}
+                onChange={(event) => setTags(event.target.value)}
+                className="mt-2 h-10 w-full rounded-2xl border border-black/[0.08] bg-white px-3 text-sm outline-none focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/[0.08]"
+                placeholder="多个标签用逗号分隔"
+              />
+            </label>
+          </div>
+          <div className="rounded-3xl bg-gray-950 p-4 text-xs text-gray-100">
+            <p className="mb-3 font-semibold text-white">YAML 模板</p>
+            <pre className="whitespace-pre-wrap leading-5">{templatePreview}</pre>
+          </div>
+        </div>
+        <div className="flex justify-end gap-2 border-t border-black/[0.06] px-6 py-4">
+          <button type="button" onClick={onClose} className="h-10 rounded-2xl border border-black/[0.08] bg-white px-4 text-sm font-semibold text-gray-700">
+            取消
+          </button>
+          <button
+            type="button"
+            disabled={busy || !name.trim()}
+            onClick={() =>
+              onCreate({
+                name,
+                type,
+                description,
+                aliases: splitTokenList(aliases),
+                tags: splitTokenList(tags),
+                version: version.trim() || "0.1.0",
+              })
+            }
+            className="inline-flex h-10 items-center gap-2 rounded-2xl bg-[#002fa7] px-4 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-45"
+          >
+            {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+            创建
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SemanticAssetImportModal({
+  busy,
+  onClose,
+  onImport,
+}: {
+  busy: boolean;
+  onClose: () => void;
+  onImport: (files: File[]) => void;
+}) {
+  const [mode, setMode] = useState<"zip" | "folder">("zip");
+  const [files, setFiles] = useState<File[]>([]);
+
+  return (
+    <div className="fixed inset-0 z-[130] flex items-center justify-center bg-black/35 px-4 py-6 backdrop-blur-sm">
+      <div className="w-full max-w-xl overflow-hidden rounded-[28px] bg-white shadow-2xl ring-1 ring-black/[0.08]">
+        <div className="flex items-start justify-between gap-4 border-b border-black/[0.06] px-6 py-5">
+          <div>
+            <h3 className="text-lg font-semibold text-gray-950">导入语义资产</h3>
+            <p className="mt-1 text-sm text-gray-500">支持 ZIP 或文件夹，至少包含一个 measure.md、grain.md 或 dimension.md。</p>
+          </div>
+          <button type="button" onClick={onClose} className="rounded-full p-2 text-gray-400 transition hover:bg-black/[0.04] hover:text-gray-900">
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+        <div className="space-y-4 px-6 py-5">
+          <div className="inline-flex rounded-2xl bg-gray-100 p-1">
+            {(["zip", "folder"] as const).map((item) => (
+              <button
+                key={item}
+                type="button"
+                onClick={() => {
+                  setMode(item);
+                  setFiles([]);
+                }}
+                className={`h-9 rounded-xl px-4 text-sm font-semibold transition ${
+                  mode === item ? "bg-white text-[#002fa7] shadow-sm" : "text-gray-500"
+                }`}
+              >
+                {item === "zip" ? "ZIP" : "文件夹"}
+              </button>
+            ))}
+          </div>
+          <label className="flex min-h-40 cursor-pointer flex-col items-center justify-center rounded-3xl border border-dashed border-black/[0.12] bg-[#f8fafc] px-5 py-8 text-center transition hover:border-[#002fa7]/30 hover:bg-[#002fa7]/[0.025]">
+            <Upload className="h-8 w-8 text-[#002fa7]" />
+            <span className="mt-3 text-sm font-semibold text-gray-800">
+              {files.length ? `已选择 ${files.length} 个文件` : mode === "zip" ? "选择 ZIP 文件" : "选择语义资产文件夹"}
+            </span>
+            <span className="mt-1 text-xs text-gray-400">
+              后端会归一化到 backend/semantic-assets
+            </span>
+            <input
+              type="file"
+              className="hidden"
+              accept={mode === "zip" ? ".zip" : undefined}
+              multiple={mode === "folder"}
+              {...(mode === "folder" ? { webkitdirectory: "" } : {})}
+              onChange={(event) => setFiles(Array.from(event.target.files || []))}
+            />
+          </label>
+          {files.length ? (
+            <div className="max-h-28 overflow-auto rounded-2xl bg-gray-50 p-3 text-xs text-gray-500">
+              {files.slice(0, 8).map((file) => {
+                const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath;
+                return <p key={`${file.name}-${file.size}`} className="truncate">{relativePath || file.name}</p>;
+              })}
+              {files.length > 8 ? <p>还有 {files.length - 8} 个文件…</p> : null}
+            </div>
+          ) : null}
+        </div>
+        <div className="flex justify-end gap-2 border-t border-black/[0.06] px-6 py-4">
+          <button type="button" onClick={onClose} className="h-10 rounded-2xl border border-black/[0.08] bg-white px-4 text-sm font-semibold text-gray-700">
+            取消
+          </button>
+          <button
+            type="button"
+            disabled={busy || files.length === 0}
+            onClick={() => onImport(files)}
+            className="inline-flex h-10 items-center gap-2 rounded-2xl bg-[#002fa7] px-4 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-45"
+          >
+            {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+            导入
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SemanticAssetDetailModal({
+  asset,
+  loading,
+  selectedFile,
+  editorContent,
+  editorOriginal,
+  editorLoading,
+  editorSaving,
+  onClose,
+  onSelectFile,
+  onChangeContent,
+  onSave,
+}: {
+  asset: SemanticAssetDetail | null;
+  loading: boolean;
+  selectedFile: SemanticAssetFile | null;
+  editorContent: string;
+  editorOriginal: string;
+  editorLoading: boolean;
+  editorSaving: boolean;
+  onClose: () => void;
+  onSelectFile: (file: SemanticAssetFile) => void;
+  onChangeContent: (value: string) => void;
+  onSave: () => void;
+}) {
+  const files = asset?.files || [];
+  const dirty = editorContent !== editorOriginal;
+  const typeLabel = asset?.type === "dimension" ? "维度" : asset?.type === "grain" ? "颗粒度" : "度量值";
+
+  return (
+    <div className="fixed inset-0 z-[130] flex items-center justify-center bg-black/35 px-4 py-6 backdrop-blur-sm">
+      <div className="flex max-h-[88vh] w-full max-w-6xl flex-col overflow-hidden rounded-[28px] bg-white shadow-2xl ring-1 ring-black/[0.08]">
+        <div className="flex items-start justify-between gap-4 border-b border-black/[0.06] px-6 py-5">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              {asset ? (
+                <span className="rounded-full bg-[#002fa7]/10 px-2.5 py-1 text-xs font-semibold text-[#002fa7]">
+                  {typeLabel}
+                </span>
+              ) : null}
+              <h3 className="truncate text-lg font-semibold text-gray-950">{asset?.name || "语义资产"}</h3>
+              {dirty ? <span className="rounded-full bg-amber-50 px-2 py-0.5 text-xs font-semibold text-amber-700">未保存</span> : null}
+            </div>
+            <p className="mt-1 truncate text-sm text-gray-500">{asset?.path || "正在加载..."}</p>
+          </div>
+          <button type="button" onClick={onClose} className="rounded-full p-2 text-gray-400 transition hover:bg-black/[0.04] hover:text-gray-900">
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        {loading ? (
+          <div className="flex min-h-[460px] items-center justify-center text-sm text-gray-400">
+            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+            正在读取语义资产…
+          </div>
+        ) : (
+          <div className="grid min-h-0 flex-1 grid-cols-[260px_minmax(0,1fr)] overflow-hidden">
+            <aside className="min-h-0 border-r border-black/[0.06] bg-slate-50/70 p-4">
+              <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-gray-900">
+                <FileText className="h-4 w-4 text-[#002fa7]" />
+                文件树
+              </div>
+              <div className="max-h-[620px] space-y-1 overflow-auto">
+                {files.map((file) => {
+                  const active = selectedFile?.path === file.path;
+                  return (
+                    <button
+                      key={file.path}
+                      type="button"
+                      onClick={() => onSelectFile(file)}
+                      className={`flex w-full items-center justify-between gap-2 rounded-xl px-3 py-2 text-left text-xs transition ${
+                        active ? "bg-[#002fa7] text-white" : "bg-white text-gray-600 hover:bg-[#002fa7]/[0.06] hover:text-[#002fa7]"
+                      }`}
+                      title={file.relative_path}
+                    >
+                      <span className="min-w-0 truncate font-mono">{file.relative_path}</span>
+                      {file.main ? (
+                        <span className={`shrink-0 rounded-full px-1.5 py-0.5 text-[10px] ${active ? "bg-white/15 text-white" : "bg-[#002fa7]/10 text-[#002fa7]"}`}>
+                          main
+                        </span>
+                      ) : null}
+                    </button>
+                  );
+                })}
+                {files.length === 0 ? (
+                  <div className="rounded-xl border border-dashed border-black/[0.08] px-3 py-8 text-center text-xs text-gray-400">
+                    没有文件
+                  </div>
+                ) : null}
+              </div>
+            </aside>
+            <section className="flex min-h-0 min-w-0 flex-col">
+              <div className="flex items-center justify-between gap-3 border-b border-black/[0.06] px-4 py-3">
+                <div className="min-w-0">
+                  <p className="truncate font-mono text-xs font-semibold text-gray-800">{selectedFile?.path || "未选择文件"}</p>
+                  <p className="mt-0.5 text-xs text-gray-400">
+                    {selectedFile?.editable ? "Markdown / 文本可编辑" : "当前文件不可编辑"}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={!selectedFile?.editable || editorLoading || editorSaving || !dirty}
+                  onClick={onSave}
+                  className="inline-flex h-9 items-center gap-2 rounded-2xl bg-[#002fa7] px-4 text-sm font-semibold text-white shadow-sm transition hover:bg-[#001f7a] disabled:cursor-not-allowed disabled:opacity-45"
+                >
+                  {editorSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+                  保存
+                </button>
+              </div>
+              <div className="min-h-0 flex-1 p-4">
+                {editorLoading ? (
+                  <div className="flex h-full min-h-[420px] items-center justify-center rounded-2xl border border-dashed border-black/[0.08] text-sm text-gray-400">
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    正在读取文件…
+                  </div>
+                ) : (
+                  <textarea
+                    value={editorContent}
+                    onChange={(event) => onChangeContent(event.target.value)}
+                    disabled={!selectedFile?.editable}
+                    spellCheck={false}
+                    className="h-full min-h-[520px] w-full resize-none rounded-2xl border border-black/[0.08] bg-gray-950 p-4 font-mono text-xs leading-5 text-gray-100 outline-none transition focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/[0.08] disabled:opacity-60"
+                    placeholder="选择一个 Markdown 文件"
+                  />
+                )}
+              </div>
+            </section>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

@@ -39,7 +39,10 @@ class DatabaseKnowledgeInput(BaseModel):
     )
     measure_ids: list[str] = Field(
         default_factory=list,
-        description="Optional BI measure ids. Reserved for measure/reference routing.",
+        description=(
+            "Optional semantic asset ids such as ['measure:config_rate', 'dimension:launch_time']. "
+            "When supplied, their Markdown definitions are forced into SQL-generation context."
+        ),
     )
     limit: int = Field(default=100, ge=1, le=1000, description="Maximum result rows returned from read-only SQL.")
 
@@ -100,6 +103,14 @@ def _format_actions(actions: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
+def _format_query_error(exc: DatabaseKnowledgeQueryError) -> str:
+    lines = [f"🧮 数据库问数失败：{exc}"]
+    sql = str(getattr(exc, "sql", "") or "").strip()
+    if sql:
+        lines.extend(["", "生成 SQL：", "```sql", sql, "```"])
+    return "\n".join(lines)
+
+
 def _emit_database_span(stage: str, payload: dict[str, Any], *, metadata: dict[str, Any] | None = None) -> None:
     try:
         from graph.trace_collector import get_current_trace_collector
@@ -113,6 +124,7 @@ def _emit_database_span(stage: str, payload: dict[str, Any], *, metadata: dict[s
         "harness": {
             "mechanism": "database_knowledge_query",
             "pillars": [
+                {"name": "semantic_assets", "role": "business_semantics"},
                 {"name": "table_router", "role": "scope"},
                 {"name": "vanna", "role": "sql_generation"},
                 {"name": "readonly_sql_runner", "role": "execution"},
@@ -137,7 +149,26 @@ def _emit_trace_spans(result: DatabaseQueryResult) -> None:
     route_debug = summarize_table_route(result.route)
     references = result.references or {}
     execution = result.execution
+    timings = result.stage_timings or {}
 
+    def stage_metadata(stage: str, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        metadata = {
+            "database_source_id": result.route.database_source_id,
+            "duration_ms": timings.get(f"{stage}_ms"),
+            "stage_timings": timings,
+        }
+        if extra:
+            metadata.update(extra)
+        return metadata
+
+    _emit_database_span(
+        "semantic_assets",
+        {
+            **(result.semantic_assets or {}),
+            "duration_ms": timings.get("semantic_assets_ms"),
+        },
+        metadata=stage_metadata("semantic_assets"),
+    )
     _emit_database_span(
         "router",
         {
@@ -145,8 +176,9 @@ def _emit_trace_spans(result: DatabaseQueryResult) -> None:
             "prompt_context": result.route.prompt_context,
             "selected_tables": result.route.table_names,
             "available_tables": result.route.available_tables,
+            "duration_ms": timings.get("router_ms"),
         },
-        metadata={"database_source_id": result.route.database_source_id},
+        metadata=stage_metadata("router"),
     )
     _emit_database_span(
         "vanna_references",
@@ -154,13 +186,17 @@ def _emit_trace_spans(result: DatabaseQueryResult) -> None:
             "ddl": references.get("ddl"),
             "documentation": references.get("documentation"),
             "sql_examples": references.get("sql_examples"),
+            "duration_ms": timings.get("vanna_references_ms"),
         },
-        metadata={"database_source_id": result.route.database_source_id},
+        metadata=stage_metadata("vanna_references"),
     )
     _emit_database_span(
         "vanna_entities",
-        references.get("entities") if isinstance(references.get("entities"), dict) else {},
-        metadata={"database_source_id": result.route.database_source_id},
+        {
+            **(references.get("entities") if isinstance(references.get("entities"), dict) else {}),
+            "duration_ms": timings.get("vanna_references_ms"),
+        },
+        metadata=stage_metadata("vanna_references"),
     )
     _emit_database_span(
         "sql_generation",
@@ -169,8 +205,9 @@ def _emit_trace_spans(result: DatabaseQueryResult) -> None:
             "sql": result.sql,
             "source": result.source,
             "tables": result.route.table_names,
+            "duration_ms": timings.get("sql_generation_ms"),
         },
-        metadata={"database_source_id": result.route.database_source_id},
+        metadata=stage_metadata("sql_generation"),
     )
     _emit_database_span(
         "sql_execution",
@@ -189,8 +226,10 @@ def _emit_trace_spans(result: DatabaseQueryResult) -> None:
             "result_store": execution.result_store,
             "actions": execution.actions,
             "llm_guardrail": execution.llm_guardrail,
+            "duration_ms": timings.get("sql_execution_ms"),
+            "stage_timings": timings,
         },
-        metadata={"database_source_id": result.route.database_source_id},
+        metadata=stage_metadata("sql_execution"),
     )
 
 
@@ -208,6 +247,26 @@ def _format_result(result: DatabaseQueryResult) -> str:
         f"- 结果：{result_size}",
         f"- 完整性：{'完整明细已进入模型上下文' if execution.is_complete else '预览明细，不能据此判断未展示类别不存在'}",
     ]
+    semantic_assets = result.semantic_assets or {}
+    matched_assets = semantic_assets.get("matched") if isinstance(semantic_assets.get("matched"), list) else []
+    if matched_assets:
+        asset_names = [
+            f"{item.get('name')}({item.get('type')})"
+            for item in matched_assets[:8]
+            if isinstance(item, dict) and item.get("name")
+        ]
+        lines.append(f"- 语义资产：已注入 {len(matched_assets)} 个，{', '.join(asset_names)}")
+    else:
+        lines.append("- 语义资产：本轮未命中，SQL 未获得度量值/维度正文约束")
+    if result.stage_timings:
+        total_seconds = (result.stage_timings.get("total_ms") or 0) / 1000
+        sql_seconds = (result.stage_timings.get("sql_execution_ms") or 0) / 1000
+        generation_seconds = (result.stage_timings.get("sql_generation_ms") or 0) / 1000
+        semantic_seconds = (result.stage_timings.get("semantic_assets_ms") or 0) / 1000
+        lines.append(
+            f"- 耗时：总计 {total_seconds:.2f}s，语义资产 {semantic_seconds:.2f}s，"
+            f"SQL生成 {generation_seconds:.2f}s，SQL执行 {sql_seconds:.2f}s"
+        )
     if execution.result_id:
         lines.extend(
             [
@@ -296,7 +355,7 @@ class DatabaseKnowledgeQueryTool(BaseTool):
                 limit=limit,
             )
         except DatabaseKnowledgeQueryError as exc:
-            return f"🧮 数据库问数失败：{exc}"
+            return _format_query_error(exc)
         except Exception as exc:
             return f"🧮 数据库问数失败：{type(exc).__name__}: {exc}"
 
