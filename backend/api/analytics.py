@@ -11,6 +11,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from analytics.semantic_assets import SemanticAssetError, get_semantic_asset_registry
 from analytics.nl2sql.entity_candidates import recommend_entity_candidates
+from analytics.nl2sql.guardrails import (
+    RULE_TYPE_DEFINITIONS,
+    delete_guardrail_rule,
+    list_guardrail_rules,
+    replace_guardrail_rules,
+    reset_guardrail_rules,
+    upsert_guardrail_rule,
+)
 from analytics.nl2sql.result_store import (
     QueryResultStoreError,
     export_query_result_csv,
@@ -36,6 +44,22 @@ class SemanticAssetCreateRequest(BaseModel):
     slug: str | None = None
 
 
+class SqlGuardrailRuleRequest(BaseModel):
+    id: str
+    name: str
+    enabled: bool = True
+    type: str
+    scope: dict[str, object] = Field(default_factory=dict)
+    params: dict[str, object] = Field(default_factory=dict)
+    action: dict[str, object] = Field(default_factory=dict)
+    document_body: str | None = None
+    document_content: str | None = None
+
+
+class SqlGuardrailRulesReplaceRequest(BaseModel):
+    guardrails: list[SqlGuardrailRuleRequest] = Field(default_factory=list)
+
+
 @router.get("/semantic-assets")
 async def list_semantic_assets():
     try:
@@ -50,6 +74,56 @@ async def refresh_semantic_assets():
         return get_semantic_asset_registry(BASE_DIR).refresh()
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Failed to refresh semantic assets: {exc}") from exc
+
+
+@router.get("/sql-guardrail-types")
+async def list_sql_guardrail_types():
+    return {"types": RULE_TYPE_DEFINITIONS}
+
+
+@router.get("/sql-guardrails")
+async def list_sql_guardrails():
+    try:
+        return list_guardrail_rules()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to list SQL guardrails: {exc}") from exc
+
+
+@router.put("/sql-guardrails")
+async def replace_sql_guardrails(request: SqlGuardrailRulesReplaceRequest):
+    try:
+        return replace_guardrail_rules([rule.model_dump(mode="json") for rule in request.guardrails])
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to save SQL guardrails: {exc}") from exc
+
+
+@router.post("/sql-guardrails")
+async def upsert_sql_guardrail(request: SqlGuardrailRuleRequest):
+    try:
+        return {"rule": upsert_guardrail_rule(request.model_dump(mode="json")), "status": "saved"}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to save SQL guardrail: {exc}") from exc
+
+
+@router.delete("/sql-guardrails/{rule_id}")
+async def delete_sql_guardrail(rule_id: str):
+    try:
+        deleted = delete_guardrail_rule(rule_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="SQL guardrail not found")
+        return {"status": "deleted"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to delete SQL guardrail: {exc}") from exc
+
+
+@router.post("/sql-guardrails/reset")
+async def reset_sql_guardrails():
+    try:
+        return reset_guardrail_rules()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to reset SQL guardrails: {exc}") from exc
 
 
 @router.post("/semantic-assets")

@@ -142,6 +142,8 @@ class SessionManager:
         reasoning_content: str | None = None,                  # 思考链内容（工具调用回合必须回传）
         timeline: list[dict[str, Any]] | None = None,         # 前端时间轴（reasoning/tool 交错顺序）
         segments: list[dict[str, Any]] | None = None,         # UI 分段（每轮模型调用为一个 segment）
+        interrupted: bool = False,                            # 本轮是否由用户主动停止
+        interruption_notice: str | None = None,                # 用户可见的停止提示
     ) -> None:
         """追加一条消息到会话历史"""
         data = self._read_file(session_id)        # 读取现有数据
@@ -166,10 +168,52 @@ class SessionManager:
             msg["sources"] = sources
         if citations:
             msg["citations"] = citations
+        if interrupted:
+            msg["interrupted"] = True
+        if interruption_notice:
+            msg["interruption_notice"] = interruption_notice
         data["messages"].append(msg)              # 追加到消息列表末尾
         if isinstance(data.get("display_messages"), list):
             data["display_messages"].append(dict(msg))
         self._write_file(session_id, data)        # 写回磁盘
+
+    @staticmethod
+    def _tool_result_context(
+        tool_calls: list[dict[str, Any]],
+        *,
+        max_total_chars: int = 10000,
+        max_output_chars: int = 600,
+    ) -> str:
+        """Build LLM-only context from persisted tool outputs without replaying tool_calls."""
+
+        lines: list[str] = []
+        total = 0
+        for index, tool_call in enumerate(tool_calls, start=1):
+            output = tool_call.get("output") or tool_call.get("raw_output") or ""
+            if not output:
+                continue
+            tool = str(tool_call.get("tool") or tool_call.get("name") or "unknown_tool")
+            tool_input = tool_call.get("input") or tool_call.get("args") or ""
+            if isinstance(tool_input, (dict, list)):
+                tool_input_text = json.dumps(tool_input, ensure_ascii=False)
+            else:
+                tool_input_text = str(tool_input)
+            output_text = str(output)
+            if len(output_text) > max_output_chars:
+                output_text = f"{output_text[:max_output_chars]}... [truncated]"
+            block = (
+                f"- 工具 {index}: {tool}\n"
+                f"  Input: {tool_input_text[:500]}\n"
+                f"  Output: {output_text}"
+            )
+            if total + len(block) > max_total_chars:
+                lines.append("- 其余历史工具结果因长度限制已省略。")
+                break
+            lines.append(block)
+            total += len(block)
+        if not lines:
+            return ""
+        return "\n\n[历史工具结果摘要，仅用于理解已完成事实，不代表本轮新工具调用]\n" + "\n".join(lines)
 
     def rename_session(self, session_id: str, title: str) -> None:
         """重命名会话标题"""
@@ -645,7 +689,10 @@ class SessionManager:
             # 1. 我们的存储把 tool 结果合并到 assistant message，缺少独立 tool role 消息，
             #    直接回传会导致 OpenAI API 报 duplicate tool_call_id。
             # 2. 历史工具调用会在 LangGraph 流中重新被 emit，污染当前轮次时间轴。
-            # 上下文通过 assistant 文本内容和 reasoning_content 保留。
+            # 结构化 tool_calls 不回传，但已完成工具输出必须以普通文本摘要回传，
+            # 否则用户说“继续”时模型看不到中断前已经查到的事实。
+            if msg.get("tool_calls"):
+                entry["content"] += self._tool_result_context(msg.get("tool_calls") or [])
             # 思考模式下，assistant 消息的 reasoning_content 需要回传给 API（含工具调用时尤其关键）
             if msg.get("reasoning_content"):
                 entry["reasoning_content"] = msg["reasoning_content"]

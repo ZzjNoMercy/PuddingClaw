@@ -16,10 +16,12 @@ def test_launch_time_dimension_blocks_model_year_from_car_name() -> None:
         "references": [],
     }
 
-    conflicts = _detect_semantic_sql_conflicts(sql, semantic_trace)
+    route = SimpleNamespace(table_names=["vehicle_params"])
+
+    conflicts = _detect_semantic_sql_conflicts(sql, semantic_trace, route)
 
     assert conflicts
-    assert "car_name LIKE '26款%'" in conflicts[0]
+    assert "launch_time_no_car_name_year" in conflicts[0]
     assert "type_name = '上市时间'" in conflicts[0]
 
 
@@ -43,7 +45,9 @@ def test_air_suspension_reference_blocks_type_name_guess() -> None:
         ],
     }
 
-    conflicts = _detect_semantic_sql_conflicts(sql, semantic_trace)
+    route = SimpleNamespace(table_names=["vehicle_params"])
+
+    conflicts = _detect_semantic_sql_conflicts(sql, semantic_trace, route)
 
     assert conflicts
     assert "可调悬架种类" in conflicts[0]
@@ -99,10 +103,12 @@ def test_config_rate_blocks_eav_exists_distinct_slow_pattern() -> None:
         "references": [],
     }
 
-    conflicts = _detect_semantic_sql_conflicts(sql, semantic_trace)
+    route = SimpleNamespace(table_names=["vehicle_params"])
+
+    conflicts = _detect_semantic_sql_conflicts(sql, semantic_trace, route)
 
     assert conflicts
-    assert "BOOL_OR flags" in conflicts[0]
+    assert "config_rate_no_exists_distinct" in conflicts[0]
 
 
 def test_config_rate_allows_eav_flags_fallback_with_model_key_pattern() -> None:
@@ -200,7 +206,9 @@ def test_config_rate_blocks_eav_flags_grouped_only_by_car_name() -> None:
         "references": [],
     }
 
-    conflicts = _detect_semantic_sql_conflicts(sql, semantic_trace)
+    route = SimpleNamespace(table_names=["vehicle_params"])
+
+    conflicts = _detect_semantic_sql_conflicts(sql, semantic_trace, route)
 
     assert conflicts
-    assert "brand, serial_name, car_name" in conflicts[0]
+    assert "brand + serial_name + car_name" in conflicts[0]

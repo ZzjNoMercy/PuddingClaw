@@ -3510,7 +3510,11 @@ function databaseStageLabel(stage: string): string {
     vanna_references: "Vanna 资料",
     vanna_entities: "实体召回",
     sql_generation: "SQL 生成",
+    sql_generate: "SQL 生成",
+    sql_validate: "SQL 校验",
     sql_execution: "SQL 执行",
+    sql_execute: "SQL 执行",
+    schema_inspect: "结构检查",
   };
   return labels[stage] || stage;
 }
@@ -3529,17 +3533,31 @@ function databasePayloadSummary(stage: string, payload: Record<string, unknown>)
       { label: "injected", value: String(payload.prompt_injected ?? "-") },
     ].filter((item) => item.value !== "-");
   }
-  if (stage === "sql_generation") {
+  if (stage === "sql_generation" || stage === "sql_generate") {
     return [
       { label: "source", value: formatTraceSummaryValue(payload.source) },
-      { label: "tables", value: formatUnknownList(payload.tables) },
+      { label: "tables", value: formatUnknownList(payload.tables ?? objectFromUnknown(payload.route).selected_tables) },
     ].filter((item) => item.value !== "-");
   }
-  if (stage === "sql_execution") {
+  if (stage === "sql_validate") {
+    return [
+      { label: "source", value: formatTraceSummaryValue(payload.source) },
+      { label: "tables", value: formatUnknownList(payload.allowed_tables) },
+      { label: "valid", value: String(payload.valid ?? "-") },
+    ].filter((item) => item.value !== "-");
+  }
+  if (stage === "sql_execution" || stage === "sql_execute") {
     return [
       { label: "rows", value: String(payload.row_count ?? "-") },
       { label: "columns", value: formatUnknownList(payload.columns) },
       { label: "limited", value: String(payload.limited ?? "-") },
+    ].filter((item) => item.value !== "-");
+  }
+  if (stage === "schema_inspect") {
+    return [
+      { label: "mode", value: formatTraceSummaryValue(payload.mode) },
+      { label: "table", value: formatTraceSummaryValue(payload.table) },
+      { label: "rows", value: String(payload.row_count ?? "-") },
     ].filter((item) => item.value !== "-");
   }
   return [];

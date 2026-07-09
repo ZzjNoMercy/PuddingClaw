@@ -82,6 +82,20 @@ class DatabaseQueryResult:
     warning: str | None = None
 
 
+@dataclass(slots=True)
+class DatabaseSqlGenerationResult:
+    """SQL generation output before read-only execution."""
+
+    question: str
+    sql: str
+    source: dict[str, Any]
+    route: TableRoute
+    references: dict[str, Any] = field(default_factory=dict)
+    semantic_assets: dict[str, Any] = field(default_factory=dict)
+    stage_timings: dict[str, float] = field(default_factory=dict)
+    guardrail_note: str = ""
+
+
 def to_plain_dict(value: Any) -> Any:
     """Convert dataclass contracts to JSON-serializable Python structures."""
 

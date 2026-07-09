@@ -15,6 +15,7 @@ export default function ChatPanel() {
   }, [messages, maintenanceStatus]);
 
   const lastAssistantId = [...messages].reverse().find((m) => m.role === "assistant")?.id;
+  const lastMessageId = messages[messages.length - 1]?.id;
 
   return (
     <div className="flex flex-col h-full">
@@ -43,6 +44,7 @@ export default function ChatPanel() {
                 key={msg.id}
                 message={msg}
                 isStreaming={isStreaming && msg.id === lastAssistantId}
+                showInterruptionNotice={msg.id === lastMessageId}
               />
             ))}
             {maintenanceStatus && (

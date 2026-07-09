@@ -242,6 +242,43 @@ def test_cancelled_agent_stream_rejects_pending_permissions_and_cleans_checkpoin
 
     class FakeDeepAgent:
         async def astream(self, *_args, **_kwargs):
+            yield (
+                "updates",
+                {
+                    "model": {
+                        "messages": [
+                            AIMessage(
+                                content="",
+                                tool_calls=[
+                                    {
+                                        "name": "read_file",
+                                        "args": {"path": "/workspace/report.md"},
+                                        "id": "call_read_cancel",
+                                    }
+                                ],
+                            )
+                        ]
+                    }
+                },
+            )
+            yield (
+                "updates",
+                {
+                    "tools": {
+                        "messages": [
+                            ToolMessage(
+                                content="报告里已经完成的内容",
+                                tool_call_id="call_read_cancel",
+                                name="read_file",
+                            )
+                        ]
+                    }
+                },
+            )
+            yield (
+                "messages",
+                (AIMessageChunk(content="已经读取了报告。"), {"langgraph_node": "model"}),
+            )
             raise asyncio.CancelledError
             yield  # pragma: no cover
 
@@ -281,7 +318,321 @@ def test_cancelled_agent_stream_rejects_pending_permissions_and_cleans_checkpoin
         raise AssertionError("CancelledError should propagate")
 
     assert rejected == [("cancel-session", "Agent stream was cancelled by the client.")]
-    assert deleted == ["cancel-session"]
+    assert len(deleted) == 1
+    assert deleted[0].startswith("cancel-session:query-")
+    history = session_manager.load_session("cancel-session")
+    assert [message["role"] for message in history] == ["user", "assistant"]
+    assert history[0]["content"] == "会被取消"
+    assert "已经读取了报告" in history[1]["content"]
+    assert "本轮已被用户停止" not in history[1]["content"]
+    assert history[1]["interrupted"] is True
+    assert "本轮已被用户停止" in history[1]["interruption_notice"]
+    assert history[1]["tool_calls"][0]["tool"] == "read_file"
+    assert history[1]["tool_calls"][0]["output"] == "报告里已经完成的内容"
+    timeline_tool = next(item for item in history[1]["timeline"] if item["type"] == "tool")
+    assert timeline_tool["tool_call"]["status"] == "completed"
+
+
+def test_cancelled_agent_stream_persists_pending_tool_as_interrupted(tmp_path, monkeypatch):
+    """A started tool with no tool_end should restore as an interrupted record, not running."""
+
+    from graph import deepagents_manager as manager_module
+    from graph.session_manager import session_manager
+    from projects.registry import project_registry
+
+    session_manager.initialize(tmp_path)
+    project_registry.initialize(tmp_path)
+    session_manager.create_session("cancel-pending-session")
+
+    class FakeDeepAgent:
+        async def astream(self, *_args, **_kwargs):
+            yield (
+                "updates",
+                {
+                    "model": {
+                        "messages": [
+                            AIMessage(
+                                content="",
+                                tool_calls=[
+                                    {
+                                        "name": "database_knowledge_query",
+                                        "args": {"question": "统计纯电车型"},
+                                        "id": "call_db_pending",
+                                    }
+                                ],
+                            )
+                        ]
+                    }
+                },
+            )
+            raise asyncio.CancelledError
+            yield  # pragma: no cover
+
+    monkeypatch.setattr(manager_module, "create_deep_agent", lambda **_kwargs: FakeDeepAgent())
+    monkeypatch.setattr(manager_module.permission_resume_registry, "reject_session", lambda *_args, **_kwargs: 0)
+
+    runtime = manager_module.DeepAgentsAgentManager()
+    runtime.initialize(Path(tmp_path))
+
+    async def fake_delete(_thread_id: str):
+        return None
+
+    runtime._delete_checkpoint_thread = fake_delete  # type: ignore[method-assign]
+
+    async def run():
+        async for _event in runtime.astream(
+            message="查一下纯电",
+            session_id="cancel-pending-session",
+            project_id=None,
+            user_id="test-user",
+        ):
+            pass
+
+    try:
+        asyncio.run(run())
+    except asyncio.CancelledError:
+        pass
+    else:
+        raise AssertionError("CancelledError should propagate")
+
+    history = session_manager.load_session("cancel-pending-session")
+    assistant = history[1]
+    assert assistant["interrupted"] is True
+    assert "本轮已被用户停止" in assistant["interruption_notice"]
+    tool_call = assistant["tool_calls"][0]
+    assert tool_call["tool"] == "database_knowledge_query"
+    assert tool_call["is_error"] is True
+    assert tool_call["summary_source"] == "stream_cancelled"
+    assert "interrupted" in tool_call["output"].lower()
+    timeline_tool = next(item for item in assistant["timeline"] if item["type"] == "tool")
+    assert timeline_tool["tool_call"]["status"] == "error"
+
+
+def test_cancelled_agent_stream_persists_reasoning_only_partial(tmp_path, monkeypatch):
+    """A cancellation during visible reasoning should still create an assistant history item."""
+
+    from graph import deepagents_manager as manager_module
+    from graph.session_manager import session_manager
+    from projects.registry import project_registry
+
+    session_manager.initialize(tmp_path)
+    project_registry.initialize(tmp_path)
+    session_manager.create_session("cancel-reasoning-session")
+
+    class FakeDeepAgent:
+        async def astream(self, *_args, **_kwargs):
+            yield (
+                "messages",
+                (
+                    AIMessageChunk(content="", additional_kwargs={"reasoning_content": "我正在拆解问题。"}),
+                    {"langgraph_node": "model"},
+                ),
+            )
+            raise asyncio.CancelledError
+            yield  # pragma: no cover
+
+    monkeypatch.setattr(manager_module.config, "load_config", lambda: {"thinking_mode": True})
+    monkeypatch.setattr(manager_module, "create_deep_agent", lambda **_kwargs: FakeDeepAgent())
+    monkeypatch.setattr(manager_module.permission_resume_registry, "reject_session", lambda *_args, **_kwargs: 0)
+
+    runtime = manager_module.DeepAgentsAgentManager()
+    runtime.initialize(Path(tmp_path))
+
+    async def fake_delete(_thread_id: str):
+        return None
+
+    runtime._delete_checkpoint_thread = fake_delete  # type: ignore[method-assign]
+
+    async def run():
+        async for _event in runtime.astream(
+            message="先想一下",
+            session_id="cancel-reasoning-session",
+            project_id=None,
+            user_id="test-user",
+        ):
+            pass
+
+    try:
+        asyncio.run(run())
+    except asyncio.CancelledError:
+        pass
+    else:
+        raise AssertionError("CancelledError should propagate")
+
+    history = session_manager.load_session("cancel-reasoning-session")
+    assert [message["role"] for message in history] == ["user", "assistant"]
+    assistant = history[1]
+    assert assistant["content"] == ""
+    assert assistant["reasoning_content"] == "我正在拆解问题。"
+    assert assistant["interrupted"] is True
+    timeline_reasoning = next(item for item in assistant["timeline"] if item["type"] == "reasoning")
+    assert timeline_reasoning["content"] == "我正在拆解问题。"
+
+
+def test_historical_tool_messages_are_not_reemitted_on_followup(tmp_path, monkeypatch):
+    """Tool messages from session history are context, not current-turn UI events."""
+
+    from graph import deepagents_manager as manager_module
+    from graph.session_manager import session_manager
+    from projects.registry import project_registry
+
+    session_manager.initialize(tmp_path)
+    project_registry.initialize(tmp_path)
+    session_manager.create_session("followup-session")
+    session_manager.save_message("followup-session", "user", "先查资料")
+    session_manager.save_message(
+        "followup-session",
+        "assistant",
+        "已完成旧查询。",
+        tool_calls=[
+            {
+                "tool": "database_knowledge_query",
+                "input": '{"question": "旧问题"}',
+                "id": "call_old_db",
+                "output": "旧工具结果",
+            }
+        ],
+        timeline=[
+            {
+                "type": "tool",
+                "id": "call_old_db",
+                "tool_call": {
+                    "tool": "database_knowledge_query",
+                    "input": '{"question": "旧问题"}',
+                    "id": "call_old_db",
+                    "output": "旧工具结果",
+                    "status": "completed",
+                },
+            }
+        ],
+    )
+
+    class FakeDeepAgent:
+        async def astream(self, graph_input, **kwargs):
+            assert kwargs["config"]["configurable"]["thread_id"].startswith("followup-session:query-")
+            assert graph_input["messages"][-1].content == "继续"
+            historical_tools = [
+                msg for msg in graph_input["messages"]
+                if getattr(msg, "type", "") == "tool" and getattr(msg, "tool_call_id", "") == "call_old_db"
+            ]
+            assert historical_tools
+            assert "旧工具结果" in historical_tools[0].content
+            yield (
+                "updates",
+                {
+                    "model": {
+                        "messages": [
+                            AIMessage(
+                                content="",
+                                tool_calls=[
+                                    {
+                                        "name": "database_knowledge_query",
+                                        "args": {"question": "旧问题"},
+                                        "id": "call_old_db",
+                                    }
+                                ],
+                            )
+                        ]
+                    }
+                },
+            )
+            yield (
+                "updates",
+                {
+                    "tools": {
+                        "messages": [
+                            ToolMessage(
+                                content="旧工具结果",
+                                tool_call_id="call_old_db",
+                                name="database_knowledge_query",
+                            )
+                        ]
+                    }
+                },
+            )
+            yield (
+                "messages",
+                (AIMessageChunk(content="继续回答。"), {"langgraph_node": "model"}),
+            )
+            yield ("values", {"messages": [AIMessage(content="继续回答。")]})
+
+    monkeypatch.setattr(manager_module, "create_deep_agent", lambda **_kwargs: FakeDeepAgent())
+    monkeypatch.setattr(manager_module, "_generate_title", lambda _session_id: None)
+
+    runtime = manager_module.DeepAgentsAgentManager()
+    runtime.initialize(Path(tmp_path))
+
+    async def collect():
+        return [
+            event
+            async for event in runtime.astream(
+                message="继续",
+                session_id="followup-session",
+                project_id=None,
+                user_id="test-user",
+            )
+        ]
+
+    events = asyncio.run(collect())
+    event_names = [event["event"] for event in events]
+    assert "tool_start" not in event_names
+    assert "tool_end" not in event_names
+    history = session_manager.load_session("followup-session")
+    assert history[-1]["role"] == "assistant"
+    assert history[-1]["content"] == "继续回答。"
+    assert "tool_calls" not in history[-1]
+
+
+def test_agent_stream_persists_user_message_before_first_event(tmp_path, monkeypatch):
+    """New runs should be visible in session history as soon as streaming starts."""
+
+    from graph import deepagents_manager as manager_module
+    from graph.session_manager import session_manager
+    from projects.registry import project_registry
+
+    session_manager.initialize(tmp_path)
+    project_registry.initialize(tmp_path)
+    session_manager.create_session("immediate-session")
+
+    class FakeDeepAgent:
+        async def astream(self, graph_input, **_kwargs):
+            persisted = session_manager.load_session("immediate-session")
+            assert [message["role"] for message in persisted] == ["user"]
+            assert persisted[0]["content"] == "立刻落盘"
+            user_messages = [
+                msg for msg in graph_input["messages"]
+                if getattr(msg, "type", "") == "human" and getattr(msg, "content", "") == "立刻落盘"
+            ]
+            assert len(user_messages) == 1
+            yield (
+                "messages",
+                (AIMessageChunk(content="收到。"), {"langgraph_node": "model"}),
+            )
+            yield ("values", {"messages": [AIMessage(content="收到。")]})
+
+    monkeypatch.setattr(manager_module, "create_deep_agent", lambda **_kwargs: FakeDeepAgent())
+    monkeypatch.setattr(manager_module, "_generate_title", lambda _session_id: None)
+
+    runtime = manager_module.DeepAgentsAgentManager()
+    runtime.initialize(Path(tmp_path))
+
+    async def collect():
+        return [
+            event
+            async for event in runtime.astream(
+                message="立刻落盘",
+                session_id="immediate-session",
+                project_id=None,
+                user_id="test-user",
+            )
+        ]
+
+    events = asyncio.run(collect())
+    assert any(event["event"] == "done" for event in events)
+    history = session_manager.load_session("immediate-session")
+    assert [message["role"] for message in history] == ["user", "assistant"]
+    assert history[0]["content"] == "立刻落盘"
+    assert history[1]["content"] == "收到。"
 
 
 def test_build_backend_resolves_workspace_and_skills(tmp_path, monkeypatch):
@@ -819,13 +1170,17 @@ def test_deepagents_manager_persists_reasoning_for_tool_call_turns(tmp_path, mon
     )
     assert assistant["reasoning_content"] == "查看日期结果后回答。"
 
-    # 验证下轮重建消息时同时包含 tool_calls 与 reasoning_content
+    # 验证下轮重建消息时使用协议化 AIMessage(tool_calls)+ToolMessage
     built = runtime._build_messages(history, "明天呢")  # noqa: SLF001
     assistant_entry = next(
-        msg for msg in built if msg["role"] == "assistant" and msg.get("tool_calls")
+        msg for msg in built if getattr(msg, "type", "") == "ai" and getattr(msg, "tool_calls", None)
     )
-    assert assistant_entry["reasoning_content"] == "查看日期结果后回答。"
-    assert assistant_entry["tool_calls"][0]["function"]["name"] == "terminal"
+    tool_entry = next(
+        msg for msg in built if getattr(msg, "type", "") == "tool" and getattr(msg, "tool_call_id", "") == "call_date"
+    )
+    assert getattr(assistant_entry, "reasoning_content", None) == "查看日期结果后回答。"
+    assert assistant_entry.tool_calls[0]["name"] == "terminal"
+    assert "2026-06-26" in tool_entry.content
 
 
 def test_deepagents_manager_adds_puddingclaw_terminal_scoped_to_workspace(tmp_path):
@@ -845,7 +1200,15 @@ def test_deepagents_manager_adds_puddingclaw_terminal_scoped_to_workspace(tmp_pa
     assert "terminal" in by_name
     assert by_name["terminal"].root_dir == str(workspace)
     assert by_name["terminal"].path_aliases["/skills"] == str(Path(__file__).resolve().parent.parent / "skills")
+    assert by_name["terminal"].path_aliases["/sql-guardrails"] == str(Path(__file__).resolve().parent.parent / "sql-guardrails")
     assert "fetch_url" in by_name
+    assert "database_knowledge_query" not in by_name
+    assert "database_sql_generate" in by_name
+    assert "database_sql_validate" in by_name
+    assert "database_sql_execute" in by_name
+    assert "database_schema_inspect" in by_name
+    assert "database_query_trace_inspect" in by_name
+    assert "database_query_result_page" in by_name
     assert "read_file" not in by_name
     assert "write_file" not in by_name
     assert "execute_skill" not in by_name

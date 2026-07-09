@@ -40,6 +40,40 @@ def test_load_session_for_agent_includes_reasoning_for_tool_calls(tmp_path):
     assert assistant["reasoning_content"] == "我需要先列出目录内容。"
 
 
+def test_load_session_for_agent_includes_tool_output_context_without_tool_calls(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("agent-tool-output-session")
+
+    session_manager.save_message(
+        "agent-tool-output-session",
+        "assistant",
+        "现在查询比亚迪 2023 年 5 月销量。",
+        tool_calls=[
+            *[
+                {
+                    "tool": "pandas_knowledge_query",
+                    "input": f'{{"query": "前置长输出 {idx}"}}',
+                    "output": "前置工具输出。" * 120,
+                }
+                for idx in range(5)
+            ],
+            {
+                "tool": "pandas_knowledge_query",
+                "input": '{"query": "比亚迪汽车 2023年5月 销量"}',
+                "output": "筛选比亚迪汽车且月份为5后，2023年销量总和为205390。",
+            },
+        ],
+    )
+
+    messages = session_manager.load_session_for_agent("agent-tool-output-session")
+    assistant = messages[0]
+    assert assistant["role"] == "assistant"
+    assert "tool_calls" not in assistant
+    assert "历史工具结果摘要" in assistant["content"]
+    assert "205390" in assistant["content"]
+    assert "pandas_knowledge_query" in assistant["content"]
+
+
 def test_reasoning_content_saved_for_plain_assistant(tmp_path):
     session_manager.initialize(tmp_path)
     session_manager.create_session("plain-session")

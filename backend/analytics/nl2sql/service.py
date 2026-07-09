@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from time import perf_counter
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from analytics.nl2sql.runtime import build_vanna_client_from_app_config
-from analytics.nl2sql.schemas import DatabaseQueryRequest, DatabaseQueryResult
+from analytics.nl2sql.guardrails import (
+    GuardrailConflict,
+    conflicts_to_messages,
+    detect_guardrail_conflicts,
+)
+from analytics.nl2sql.schemas import DatabaseQueryRequest, DatabaseQueryResult, DatabaseSqlGenerationResult
 from analytics.nl2sql.result_store import persist_query_result
 from analytics.nl2sql.sql_runner import SqlRunnerError, extract_sql, run_readonly_sql
 from analytics.nl2sql.table_router import TableRouterError, route_database_tables, summarize_table_route
@@ -36,11 +40,6 @@ logger = logging.getLogger(__name__)
 
 VANNA_REFERENCE_TOP_K = 5
 VANNA_ENTITY_TOP_K_PER_TYPE = 10
-_CAR_NAME_MODEL_YEAR_RE = re.compile(
-    r"\bcar_name\b\s+(?:LIKE|ILIKE)\s+['\"]\d{2}款%",
-    re.IGNORECASE,
-)
-
 _EAV_CONFIG_RATE_SQL_TEMPLATE = """
 当允许表包含 vehicle_params_wide 时，配置率、配备率、搭载率等问题必须优先使用
 vehicle_params_wide 计算分母和常用维度筛选，再 JOIN vehicle_params 判断配置明细。
@@ -143,6 +142,7 @@ def _compose_vanna_question(question: str, route_context: str, semantic_context:
         "- 不要对聚合结果使用 LIMIT 来近似回答；只有用户明确要求 top-N 时才在聚合后 ORDER BY ... LIMIT。\n"
         "- 用户明确要求列出、明细、所有记录、价格表时，生成明细 SELECT；不要为了减少结果而擅自加 LIMIT，执行层会处理计数、预览、分页和导出。\n"
         "- 当用户按月份查询 ISO 日期字符串时，优先使用日期函数或 '-MM-' 形式匹配，不要只使用中文月份字符串如 '%6月%'。\n"
+        "- PostgreSQL 中 COUNT(DISTINCT (right.col1, right.col2, ...)) 会把 LEFT JOIN 未命中的全 NULL 元组当作一个 distinct 值；LEFT JOIN 后统计右表命中数时必须加 FILTER (WHERE right.key IS NOT NULL)、COUNT(right.key)，或先在非空子查询/CTE 中去重计数。\n"
         "- vehicle_params 的配置率/配备率/搭载率等多条件分析，优先一次扫描所需 type_name 并按 brand, serial_name, car_name 聚合成 flags；不要生成多层 EXISTS/NOT EXISTS 自关联。\n"
         "- 只返回 SQL，不要返回解释。"
     )
@@ -161,84 +161,29 @@ def _compose_guardrail_rewrite_question(original_question: str, sql: str, confli
     )
 
 
-def _semantic_asset_ids(semantic_trace: dict[str, Any]) -> set[str]:
-    ids: set[str] = set()
-    for key in ("matched", "references"):
-        items = semantic_trace.get(key)
-        if not isinstance(items, list):
-            continue
-        for item in items:
-            if isinstance(item, dict) and item.get("id"):
-                ids.add(str(item["id"]))
-    return ids
-
-
 def _detect_semantic_sql_conflicts(sql: str, semantic_trace: dict[str, Any], route: Any | None = None) -> list[str]:
-    """Return hard semantic conflicts that must not be executed.
+    """Compatibility wrapper for tests and callers that expect plain messages."""
 
-    These checks live after SQL generation because LLM prompts are advisory.
-    Business semantics such as "上市时间" must be enforced before execution.
-    """
+    conflicts = detect_guardrail_conflicts(
+        sql,
+        source_name="",
+        route=route,
+        semantic_trace=semantic_trace,
+    )
+    return conflicts_to_messages(conflicts)
 
-    conflicts: list[str] = []
-    asset_ids = _semantic_asset_ids(semantic_trace)
-    compact_sql = " ".join(str(sql or "").split())
-    lowered = compact_sql.lower()
-    route_tables = _route_table_names(route) if route is not None else set()
 
-    if "dimension:launch_time" in asset_ids:
-        uses_model_year_from_name = bool(_CAR_NAME_MODEL_YEAR_RE.search(compact_sql))
-        uses_launch_time_dimension = "type_name = '上市时间'" in compact_sql or 'type_name = "上市时间"' in compact_sql
-        if uses_model_year_from_name and not uses_launch_time_dimension:
-            conflicts.append(
-                "命中语义资产“上市时间”，但 SQL 使用 car_name LIKE '26款%' 等款型名称推断上市年份。"
-                "必须改用 type_name = '上市时间' 的 type_value 过滤真实上市日期。"
-            )
+def _detect_sql_guardrail_conflicts(sql: str, *, source_name: str, route: Any, semantic_trace: dict[str, Any]) -> list[GuardrailConflict]:
+    return detect_guardrail_conflicts(
+        sql,
+        source_name=source_name,
+        route=route,
+        semantic_trace=semantic_trace,
+    )
 
-    if "measure:config_rate:references/air_suspension" in asset_ids:
-        uses_air_reference = "type_name = '可调悬架种类'" in compact_sql or 'type_name = "可调悬架种类"' in compact_sql
-        uses_air_type_name_guess = (
-            ("type_name like '%空气悬架%'" in lowered or "type_name ilike '%空气悬架%'" in lowered)
-            or ("type_name like '%空气悬挂%'" in lowered or "type_name ilike '%空气悬挂%'" in lowered)
-        )
-        if uses_air_type_name_guess and not uses_air_reference:
-            conflicts.append(
-                "命中空气悬架配置率 reference，但 SQL 仍用 type_name 模糊匹配空气悬架。"
-                "必须改用 type_name = '可调悬架种类' 且 type_value 包含 '空气悬架'。"
-            )
 
-    if "measure:config_rate" in asset_ids:
-        route_has_wide = "vehicle_params_wide" in route_tables
-        sql_uses_wide = re.search(r"\b(?:from|join)\s+vehicle_params_wide\b", lowered) is not None
-        sql_uses_eav = re.search(r"\b(?:from|join)\s+vehicle_params\b", lowered) is not None
-        if route_has_wide and sql_uses_eav and not sql_uses_wide:
-            conflicts.append(
-                "命中配置率语义资产且路由包含 vehicle_params_wide，但 SQL 只使用 vehicle_params 计算分母。"
-                "必须使用 vehicle_params_wide 先筛选分母款型，再 JOIN vehicle_params 判断配置明细。"
-            )
-
-        uses_car_name_only_group = re.search(r"\bgroup\s+by\s+(?:[\w.]+)?car_name\b", lowered) is not None
-        uses_model_key_group = re.search(
-            r"\bgroup\s+by\b(?=[^;]*\bbrand\b)(?=[^;]*\bserial_name\b)(?=[^;]*\bcar_name\b)",
-            lowered,
-        ) is not None
-        if sql_uses_eav and uses_car_name_only_group and not uses_model_key_group:
-            conflicts.append(
-                "命中配置率语义资产，但 EAV flags 只按 car_name 分组。"
-                "默认款型颗粒度必须按 brand, serial_name, car_name 分组，避免合并不同品牌或车系下的同名款型。"
-            )
-
-        exists_count = len(re.findall(r"\b(?:not\s+)?exists\s*\(", lowered))
-        has_vehicle_params = re.search(r"\bfrom\s+vehicle_params\b|\bjoin\s+vehicle_params\b", lowered) is not None
-        has_count_distinct = "count(distinct" in lowered
-        has_distinct_car_name = re.search(r"\bselect\s+distinct\s+[\w.]*car_name\b", lowered) is not None
-        if has_vehicle_params and has_count_distinct and exists_count >= 2 and has_distinct_car_name:
-            conflicts.append(
-                "命中配置率语义资产，但 SQL 使用 DISTINCT car_name + 多层 EXISTS/NOT EXISTS 自关联 vehicle_params。"
-                "这类 EAV 配置率查询容易在大表上超时，必须改为一次扫描相关 type_name，按 brand, serial_name, car_name GROUP BY 聚合 BOOL_OR flags 后再统计。"
-            )
-
-    return conflicts
+def _guardrail_messages(conflicts: list[GuardrailConflict]) -> list[str]:
+    return conflicts_to_messages(conflicts)
 
 
 def _vanna_llm_context(vanna: Any) -> dict[str, str]:
@@ -574,8 +519,24 @@ async def query_database_knowledge(
                 "请检查该 OpenAI-compatible 地址的 /chat/completions 路由、Higress/Provider 配置和本机网络连通性。"
             ) from exc
         sql = extract_sql(raw_sql)
-        semantic_conflicts = _detect_semantic_sql_conflicts(sql, semantic_trace, route)
-        if semantic_conflicts:
+        guardrail_conflicts = _detect_sql_guardrail_conflicts(
+            sql,
+            source_name=route.source_name,
+            route=route,
+            semantic_trace=semantic_trace,
+        )
+        warn_conflicts = [conflict for conflict in guardrail_conflicts if conflict.action == "warn"]
+        blocking_conflicts = [conflict for conflict in guardrail_conflicts if conflict.action in {"rewrite", "block"}]
+        if warn_conflicts:
+            guardrail_note = "SQL guardrail warning：" + "；".join(_guardrail_messages(warn_conflicts))
+        if any(conflict.action == "block" for conflict in blocking_conflicts):
+            raise DatabaseKnowledgeQueryError(
+                "生成 SQL 命中 SQL guardrail 阻断规则，已拦截执行："
+                + "；".join(_guardrail_messages(blocking_conflicts)),
+                sql=sql,
+            )
+        if blocking_conflicts:
+            semantic_conflicts = _guardrail_messages(blocking_conflicts)
             logger.warning(
                 "[nl2sql-service] sql_guardrail_conflict_retry source=%s tables=%s conflicts=%s sql=%s",
                 route.source_name,
@@ -590,14 +551,23 @@ async def query_database_knowledge(
             finally:
                 record_stage("sql_regeneration_ms", stage_started)
             rewritten_sql = extract_sql(raw_sql)
-            rewritten_conflicts = _detect_semantic_sql_conflicts(rewritten_sql, semantic_trace, route)
-            if rewritten_conflicts:
+            rewritten_guardrail_conflicts = _detect_sql_guardrail_conflicts(
+                rewritten_sql,
+                source_name=route.source_name,
+                route=route,
+                semantic_trace=semantic_trace,
+            )
+            rewritten_blocking_conflicts = [
+                conflict for conflict in rewritten_guardrail_conflicts if conflict.action in {"rewrite", "block"}
+            ]
+            if rewritten_blocking_conflicts:
                 raise DatabaseKnowledgeQueryError(
-                    "生成 SQL 与语义资产硬规则冲突，已拦截执行："
-                    + "；".join(rewritten_conflicts),
+                    "生成 SQL 与 SQL guardrail 规则冲突，已拦截执行："
+                    + "；".join(_guardrail_messages(rewritten_blocking_conflicts)),
                     sql=rewritten_sql,
                 )
-            guardrail_note = "SQL guardrail 已拦截首版 SQL 并重写一次：" + "；".join(semantic_conflicts)
+            rewrite_note = "SQL guardrail 已拦截首版 SQL 并重写一次：" + "；".join(semantic_conflicts)
+            guardrail_note = f"{guardrail_note}；{rewrite_note}" if guardrail_note else rewrite_note
             sql = rewritten_sql
         logger.info(
             "[nl2sql-service] sql_generated source=%s tables=%s sql=%s",
@@ -687,6 +657,163 @@ async def query_database_knowledge(
             references=references,
             semantic_assets=semantic_trace,
             stage_timings=stage_timings,
+        )
+    except DatabaseKnowledgeQueryError:
+        raise
+    except (TableRouterError, SqlRunnerError) as exc:
+        raise DatabaseKnowledgeQueryError(str(exc), sql=getattr(exc, "sql", None)) from exc
+    except Exception as exc:
+        raise DatabaseKnowledgeQueryError(f"{type(exc).__name__}: {exc}") from exc
+
+
+async def generate_database_sql(
+    session: AsyncSession,
+    request: DatabaseQueryRequest,
+) -> DatabaseSqlGenerationResult:
+    """Run table routing, semantic context loading, Vanna SQL generation, and SQL guardrails only."""
+
+    stage_timings: dict[str, float] = {}
+    total_started = perf_counter()
+
+    def record_stage(name: str, started: float) -> None:
+        stage_timings[name] = round((perf_counter() - started) * 1000, 2)
+
+    try:
+        stage_started = perf_counter()
+        route = await route_database_tables(session, request)
+        record_stage("router_ms", stage_started)
+
+        stage_started = perf_counter()
+        semantic_resolution = await asyncio.to_thread(
+            resolve_semantic_assets,
+            request.question,
+            requested_ids=request.measure_ids,
+        )
+        semantic_trace = semantic_resolution_to_trace(semantic_resolution)
+        semantic_context = format_semantic_assets_for_prompt(semantic_resolution)
+        record_stage("semantic_assets_ms", stage_started)
+
+        stage_started = perf_counter()
+        vanna = build_vanna_client_from_app_config()
+        record_stage("setup_ms", stage_started)
+
+        routed_question = _compose_vanna_question(request.question, route.prompt_context, semantic_context)
+        guardrail_note = ""
+        stage_started = perf_counter()
+        references = await asyncio.to_thread(_collect_vanna_references, vanna, routed_question, route)
+        record_stage("vanna_references_ms", stage_started)
+        prompt_entities = references.pop("_prompt_entities", [])
+        entities_summary = references.get("entities") or {}
+        entity_types = entities_summary.get("entity_types") or []
+        top_k_config = entities_summary.get("top_k") or {}
+
+        logger.info(
+            "[nl2sql-service] generate_sql_only question=%r route=%s semantic_assets=%s entity_types=%s entity_prompt_items=%s",
+            request.question[:160],
+            summarize_table_route(route),
+            semantic_trace.get("matched_count", 0),
+            entity_types,
+            len(prompt_entities),
+        )
+
+        def _generate_sql_blocking(question: str) -> str:
+            return vanna.generate_sql(
+                question=question,
+                allow_llm_to_see_data=request.allow_llm_to_see_data,
+                entity_types=entity_types,
+                entity_list=prompt_entities,
+                entity_top_k_per_type=max(1, int(top_k_config.get("default") or VANNA_ENTITY_TOP_K_PER_TYPE)),
+                entity_top_k_by_type=top_k_config.get("by_type") or {},
+            )
+
+        try:
+            stage_started = perf_counter()
+            raw_sql = await asyncio.to_thread(_generate_sql_blocking, routed_question)
+            record_stage("sql_generation_ms", stage_started)
+        except Exception as exc:
+            record_stage("sql_generation_ms", stage_started)
+            llm_context = _vanna_llm_context(vanna)
+            raise DatabaseKnowledgeQueryError(
+                "Vanna SQL 生成阶段调用 LLM 失败："
+                f"{type(exc).__name__}: {exc}。"
+                f" 当前 Vanna LLM 配置 model={llm_context['model'] or '<empty>'}, "
+                f"base_url={llm_context['base_url'] or '<empty>'}。"
+                "请检查该 OpenAI-compatible 地址的 /chat/completions 路由、Higress/Provider 配置和本机网络连通性。"
+            ) from exc
+
+        sql = extract_sql(raw_sql)
+        guardrail_conflicts = _detect_sql_guardrail_conflicts(
+            sql,
+            source_name=route.source_name,
+            route=route,
+            semantic_trace=semantic_trace,
+        )
+        warn_conflicts = [conflict for conflict in guardrail_conflicts if conflict.action == "warn"]
+        blocking_conflicts = [conflict for conflict in guardrail_conflicts if conflict.action in {"rewrite", "block"}]
+        if warn_conflicts:
+            guardrail_note = "SQL guardrail warning：" + "；".join(_guardrail_messages(warn_conflicts))
+        if any(conflict.action == "block" for conflict in blocking_conflicts):
+            raise DatabaseKnowledgeQueryError(
+                "生成 SQL 命中 SQL guardrail 阻断规则，已拦截执行："
+                + "；".join(_guardrail_messages(blocking_conflicts)),
+                sql=sql,
+            )
+        if blocking_conflicts:
+            semantic_conflicts = _guardrail_messages(blocking_conflicts)
+            logger.warning(
+                "[nl2sql-service] sql_guardrail_conflict_retry source=%s tables=%s conflicts=%s sql=%s",
+                route.source_name,
+                ",".join(route.table_names),
+                semantic_conflicts,
+                " ".join(sql.split())[:500],
+            )
+            rewrite_question = _compose_guardrail_rewrite_question(routed_question, sql, semantic_conflicts)
+            stage_started = perf_counter()
+            try:
+                raw_sql = await asyncio.to_thread(_generate_sql_blocking, rewrite_question)
+            finally:
+                record_stage("sql_regeneration_ms", stage_started)
+            rewritten_sql = extract_sql(raw_sql)
+            rewritten_guardrail_conflicts = _detect_sql_guardrail_conflicts(
+                rewritten_sql,
+                source_name=route.source_name,
+                route=route,
+                semantic_trace=semantic_trace,
+            )
+            rewritten_blocking_conflicts = [
+                conflict for conflict in rewritten_guardrail_conflicts if conflict.action in {"rewrite", "block"}
+            ]
+            if rewritten_blocking_conflicts:
+                raise DatabaseKnowledgeQueryError(
+                    "生成 SQL 与 SQL guardrail 规则冲突，已拦截执行："
+                    + "；".join(_guardrail_messages(rewritten_blocking_conflicts)),
+                    sql=rewritten_sql,
+                )
+            rewrite_note = "SQL guardrail 已拦截首版 SQL 并重写一次：" + "；".join(semantic_conflicts)
+            guardrail_note = f"{guardrail_note}；{rewrite_note}" if guardrail_note else rewrite_note
+            sql = rewritten_sql
+
+        logger.info(
+            "[nl2sql-service] sql_generated_only source=%s tables=%s sql=%s",
+            route.source_name,
+            ",".join(route.table_names),
+            " ".join(sql.split())[:500],
+        )
+        stage_timings["total_ms"] = round((perf_counter() - total_started) * 1000, 2)
+        return DatabaseSqlGenerationResult(
+            question=request.question,
+            sql=sql,
+            source={
+                "id": route.database_source_id,
+                "name": route.source_name,
+                "database": route.database,
+                "dialect": route.dialect,
+            },
+            route=route,
+            references=references,
+            semantic_assets=semantic_trace,
+            stage_timings=stage_timings,
+            guardrail_note=guardrail_note,
         )
     except DatabaseKnowledgeQueryError:
         raise

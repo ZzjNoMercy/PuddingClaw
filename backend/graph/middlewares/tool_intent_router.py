@@ -31,15 +31,16 @@ _DEFAULT_INTENT_REGISTRY: dict[str, dict[str, Any]] = {
             "数据库表", "表结构", "ddl", "实体字典", "结构化数据库",
             "问数 agent", "智能问数",
         ],
-        "preferred_tools": ["database_knowledge_query"],
+        "preferred_tools": ["database_sql_generate", "database_sql_validate", "database_sql_execute"],
         "tool_categories": ["table"],
         "routing_prompt": (
             "用户意图为结构化数据库问数。只要问题涉及已配置数据库源、数据库表、SQL、"
             "Vanna/NL2SQL、实体字典、DDL、表结构，或用户明确在问数据库里的业务数据，"
-            "必须优先调用 database_knowledge_query。对于业务问数，直接把用户原问题交给 "
-            "database_knowledge_query；该工具内部会执行表 Router、加载 DDL/文档/实体并生成 SQL。"
-            "不要先调用 database_knowledge_query 去列出表、探查 schema、枚举品牌/字段/type_name，"
-            "除非用户明确要求查看这些元数据。Excel/CSV 文件仍使用 pandas_knowledge_query。"
+            "必须优先调用 database_sql_generate 生成 SQL，再用 database_sql_validate 或 "
+            "database_sql_execute 校验/执行。对于业务问数，先把用户原问题交给 database_sql_generate；"
+            "该工具会执行表 Router、加载语义资产、召回 Vanna 资料并生成 SQL，但不会执行。"
+            "不要先探查 schema、枚举品牌/字段/type_name，除非用户明确要求查看这些元数据；"
+            "需要元数据时使用 database_schema_inspect。Excel/CSV 文件仍使用 pandas_knowledge_query。"
         ),
     },
     "table_analysis": {
@@ -53,15 +54,16 @@ _DEFAULT_INTENT_REGISTRY: dict[str, dict[str, Any]] = {
             "销量", "周销量", "月销量", "环比", "同比", "占比", "配置率", "渗透率",
             "品牌", "车型", "车系", "款型", "价格段", "终端", "批发", "零售",
         ],
-        "preferred_tools": ["pandas_knowledge_query", "database_knowledge_query"],
+        "preferred_tools": ["pandas_knowledge_query", "database_sql_generate", "database_sql_execute"],
         "tool_categories": ["table"],
         "routing_prompt": (
             "用户意图为表格问数。只要问题涉及已导入 Excel/CSV/TSV、刚才导入的表格、字段/列名、"
             "行数、筛选、排序、分组、聚合、趋势、Top N、数据分析/问数/报表，"
             "或销量/环比/同比/占比/配置率等业务指标，应优先使用结构化问数工具。"
             "如果上下文是 Excel/CSV/TSV 或用户说“导入的表格/Excel”，调用 pandas_knowledge_query；"
-            "如果上下文是数据库源/数据库表/SQL/Vanna，调用 database_knowledge_query。"
-            "调用 database_knowledge_query 处理业务问数时，应直接传入用户原问题，不要先用它探查表结构或字段。"
+            "如果上下文是数据库源/数据库表/SQL/Vanna，先调用 database_sql_generate，再调用 "
+            "database_sql_execute 执行确认过的 SQL。处理业务问数时，应直接传入用户原问题生成 SQL，"
+            "不要先探查表结构或字段，除非用户明确要求元数据。"
             "不要先调用 llamaindex_knowledge_query、glob 或 grep 来查结构化数据。"
         ),
     },

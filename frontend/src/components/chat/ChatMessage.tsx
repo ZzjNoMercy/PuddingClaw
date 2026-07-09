@@ -3,7 +3,7 @@
 import { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
-import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, FileText, Key, KeyRound, Sparkles } from "lucide-react";
+import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, FileText, Key, KeyRound, PauseCircle, Sparkles } from "lucide-react";
 import { denyPermissionRequest, grantExternalFileRead, type PermissionRequest } from "@/lib/api";
 import { markdownRemarkPlugins } from "@/lib/markdown";
 import { useApp, type ChatMessage as ChatMessageType, type SourceRecord, type TimelineItem } from "@/lib/store";
@@ -13,6 +13,7 @@ import RetrievalCard from "./RetrievalCard";
 interface Props {
   message: ChatMessageType;
   isStreaming?: boolean;
+  showInterruptionNotice?: boolean;
 }
 
 function formatTime(ts: number): string {
@@ -31,7 +32,7 @@ function isAuthError(content: string): boolean {
   return has401 || hasApiKeyError || hasAuthFail;
 }
 
-export default function ChatMessage({ message, isStreaming = false }: Props) {
+export default function ChatMessage({ message, isStreaming = false, showInterruptionNotice = false }: Props) {
   const isUser = message.role === "user";
   const hasAuthError = !isUser && isAuthError(message.content);
   const renderedContent = renderCitationMarkers(message);
@@ -154,6 +155,10 @@ export default function ChatMessage({ message, isStreaming = false }: Props) {
                 </>
               )}
 
+              {showInterruptionNotice && message.interrupted && message.interruptionNotice ? (
+                <InterruptionNotice text={message.interruptionNotice} />
+              ) : null}
+
               {/* Typing indicator — only when nothing else is visible yet */}
               {isStreaming && !message.content && !message.reasoning && !message.timeline?.length ? (
                 <div className="workspace-message-card inline-flex items-center gap-2 rounded-2xl px-4 py-3 text-[12px] text-slate-500">
@@ -169,6 +174,15 @@ export default function ChatMessage({ message, isStreaming = false }: Props) {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+function InterruptionNotice({ text }: { text: string }) {
+  return (
+    <div className="mt-3 inline-flex max-w-full items-start gap-2 rounded-xl border border-amber-200 bg-amber-50/80 px-3 py-1.5 text-[12px] font-medium leading-relaxed text-amber-800 shadow-sm shadow-amber-900/[0.03]">
+      <PauseCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-600" />
+      <span className="min-w-0 break-words">{text}</span>
     </div>
   );
 }

@@ -17,6 +17,7 @@ import {
   Loader2,
   RefreshCw,
   Search,
+  ShieldCheck,
   Sigma,
   Upload,
   X,
@@ -45,12 +46,17 @@ import {
   listKnowledgeDatabaseSourceTables,
   listKnowledgeDatabaseSources,
   listSemanticAssets,
+  listSqlGuardrails,
+  listSqlGuardrailTypes,
   listTableAssets,
   readFile,
   refreshSemanticAssets,
   refreshTableAssetProfiles,
   saveFile,
+  saveSqlGuardrail,
   saveKnowledgeDatabaseSource,
+  deleteSqlGuardrail,
+  resetSqlGuardrails,
   testKnowledgeDatabaseSource,
   trainKnowledgeDatabaseSourceVanna,
   type DatabaseQueryResultPage,
@@ -60,6 +66,10 @@ import {
   type SemanticAssetFile,
   type SemanticAssetSummary,
   type SemanticAssetType,
+  type SqlGuardrailAction,
+  type SqlGuardrailActionType,
+  type SqlGuardrailRule,
+  type SqlGuardrailTypeDefinition,
   type TableAsset,
   type TableEntityCandidate,
   type VannaEntityListResult,
@@ -70,7 +80,7 @@ import {
 import { getSettings, updateSettings } from "@/lib/settingsApi";
 import { useApp } from "@/lib/store";
 
-type AnalyticsSection = "results" | "assets" | "models" | "measures" | "agent";
+type AnalyticsSection = "results" | "assets" | "models" | "measures" | "guardrails" | "agent";
 type TrainingStatus = { type: "success" | "error"; message: string; jobId?: string | null };
 type ActionDialog = { type: "success" | "error"; title: string; message: string };
 const ENTITY_PAGE_SIZE = 10;
@@ -174,6 +184,7 @@ export default function AnalyticsWorkbenchPage() {
   const [databaseModalStatus, setDatabaseModalStatus] = useState<{ type: "success" | "error" | "info"; message: string } | null>(null);
   const [vannaTrainingTarget, setVannaTrainingTarget] = useState<{ source: KnowledgeDatabaseSource; table: string } | null>(null);
   const [toast, setToast] = useState<{ type: "success" | "error"; message: string } | null>(null);
+  const [actionDialog, setActionDialog] = useState<ActionDialog | null>(null);
   const [activeSection, setActiveSection] = useState<AnalyticsSection>("assets");
   const [queryResults, setQueryResults] = useState<DatabaseQueryResultSummary[]>([]);
   const [selectedQueryResultId, setSelectedQueryResultId] = useState("");
@@ -195,6 +206,11 @@ export default function AnalyticsWorkbenchPage() {
   const [semanticAssetEditorOriginal, setSemanticAssetEditorOriginal] = useState("");
   const [semanticAssetEditorLoading, setSemanticAssetEditorLoading] = useState(false);
   const [semanticAssetEditorSaving, setSemanticAssetEditorSaving] = useState(false);
+  const [sqlGuardrails, setSqlGuardrails] = useState<SqlGuardrailRule[]>([]);
+  const [sqlGuardrailTypes, setSqlGuardrailTypes] = useState<Record<string, SqlGuardrailTypeDefinition>>({});
+  const [sqlGuardrailsLoading, setSqlGuardrailsLoading] = useState(false);
+  const [sqlGuardrailBusy, setSqlGuardrailBusy] = useState(false);
+  const [sqlGuardrailEditor, setSqlGuardrailEditor] = useState<SqlGuardrailRule | null>(null);
 
   useEffect(() => setMounted(true), []);
 
@@ -296,6 +312,86 @@ export default function AnalyticsWorkbenchPage() {
       void loadSemanticAssets();
     }
   }, [activeSection, loadSemanticAssets]);
+
+  const loadSqlGuardrails = useCallback(async () => {
+    setSqlGuardrailsLoading(true);
+    try {
+      const [types, rules] = await Promise.all([listSqlGuardrailTypes(), listSqlGuardrails()]);
+      setSqlGuardrailTypes(types);
+      setSqlGuardrails(rules);
+      return true;
+    } catch (error) {
+      setToast({ type: "error", message: errorMessage(error) });
+      return false;
+    } finally {
+      setSqlGuardrailsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (activeSection === "guardrails") {
+      void loadSqlGuardrails();
+      if (semanticAssets.length === 0) {
+        void loadSemanticAssets();
+      }
+    }
+  }, [activeSection, loadSemanticAssets, loadSqlGuardrails, semanticAssets.length]);
+
+  useEffect(() => {
+    void loadSqlGuardrails();
+  }, [loadSqlGuardrails]);
+
+  const handleSaveSqlGuardrail = useCallback(
+    async (rule: SqlGuardrailRule) => {
+      setSqlGuardrailBusy(true);
+      try {
+        await saveSqlGuardrail(rule);
+        await loadSqlGuardrails();
+        setSqlGuardrailEditor(null);
+        setActionDialog({
+          type: "success",
+          title: "SQL 守卫文档已保存",
+          message: `规则“${rule.name}”已写入 guardrail.md，后端会从 frontmatter 编译执行。`,
+        });
+      } catch (error) {
+        setToast({ type: "error", message: errorMessage(error) });
+      } finally {
+        setSqlGuardrailBusy(false);
+      }
+    },
+    [loadSqlGuardrails]
+  );
+
+  const handleDeleteSqlGuardrail = useCallback(
+    async (rule: SqlGuardrailRule) => {
+      setSqlGuardrailBusy(true);
+      try {
+        await deleteSqlGuardrail(rule.id);
+        await loadSqlGuardrails();
+        setToast({ type: "success", message: `已删除 SQL 守卫：${rule.name}` });
+      } catch (error) {
+        setToast({ type: "error", message: errorMessage(error) });
+      } finally {
+        setSqlGuardrailBusy(false);
+      }
+    },
+    [loadSqlGuardrails]
+  );
+
+  const handleResetSqlGuardrails = useCallback(async () => {
+    setSqlGuardrailBusy(true);
+    try {
+      const rules = await resetSqlGuardrails();
+      const types = Object.keys(sqlGuardrailTypes).length ? sqlGuardrailTypes : await listSqlGuardrailTypes();
+      setSqlGuardrails(rules);
+      setSqlGuardrailTypes(types);
+      setToast({ type: "success", message: "SQL 守卫已恢复默认规则" });
+    } catch (error) {
+      setToast({ type: "error", message: errorMessage(error) });
+    } finally {
+      setSqlGuardrailBusy(false);
+    }
+  }, [sqlGuardrailTypes]);
 
   const handleCreateSemanticAsset = useCallback(
     async (payload: {
@@ -633,6 +729,13 @@ export default function AnalyticsWorkbenchPage() {
                       onClick={() => setActiveSection("measures")}
                     />
                     <AnalyticsNavButton
+                      active={activeSection === "guardrails"}
+                      icon={ShieldCheck}
+                      title="SQL 守卫"
+                      description={`${sqlGuardrails.length} 条规则`}
+                      onClick={() => setActiveSection("guardrails")}
+                    />
+                    <AnalyticsNavButton
                       active={activeSection === "models"}
                       icon={Layers3}
                       title="数据模型"
@@ -796,6 +899,21 @@ export default function AnalyticsWorkbenchPage() {
                         description="下一步会把数据源选择、模型 reference 和默认字段提示放到这里。模型不是传统关系建模器，而是 AI Native BI 的业务上下文。"
                       />
                     </WorkbenchSection>
+                  ) : null}
+
+                  {activeSection === "guardrails" ? (
+                    <SqlGuardrailsSection
+                      rules={sqlGuardrails}
+                      types={sqlGuardrailTypes}
+                      loading={sqlGuardrailsLoading}
+                      busy={sqlGuardrailBusy}
+                      onRefresh={loadSqlGuardrails}
+                      onReset={handleResetSqlGuardrails}
+                      onCreate={() => setSqlGuardrailEditor(createEmptySqlGuardrail(Object.keys(sqlGuardrailTypes)[0] || "require_group_by"))}
+                      onEdit={setSqlGuardrailEditor}
+                      onToggle={(rule) => handleSaveSqlGuardrail({ ...rule, enabled: !rule.enabled })}
+                      onDelete={handleDeleteSqlGuardrail}
+                    />
                   ) : null}
 
                   {activeSection === "measures" ? (
@@ -1095,6 +1213,20 @@ export default function AnalyticsWorkbenchPage() {
           onSave={saveSemanticAssetFile}
         />
       ) : null}
+
+      {sqlGuardrailEditor ? (
+        <SqlGuardrailEditorModal
+          rule={sqlGuardrailEditor}
+          types={sqlGuardrailTypes}
+          databaseSources={databaseSources}
+          semanticAssets={semanticAssets}
+          busy={sqlGuardrailBusy}
+          onClose={() => setSqlGuardrailEditor(null)}
+          onSave={handleSaveSqlGuardrail}
+        />
+      ) : null}
+
+      {actionDialog ? <ActionFeedbackDialog dialog={actionDialog} onClose={() => setActionDialog(null)} /> : null}
     </div>
   );
 }
@@ -1327,6 +1459,166 @@ function EmptyWorkbenchState({ title, description }: { title: string; descriptio
   );
 }
 
+function createEmptySqlGuardrail(type: string): SqlGuardrailRule {
+  return {
+    id: `rule_${Date.now()}`,
+    name: "新建 SQL 守卫",
+    enabled: true,
+    type,
+    scope: {
+      table_scope: {
+        mode: "any",
+        values: [],
+      },
+      semantic_assets: [],
+    },
+    params: {},
+    action: {
+      type: "rewrite",
+      message: "",
+    },
+    document_path: `sql-guardrails/rules/rule_${Date.now()}/guardrail.md`,
+    document_body: "# 新建 SQL 守卫\n\n## 业务约束\n\n在这里描述这条守卫保护的业务口径。\n\n## 禁止写法\n\n```sql\n-- 可选：写出禁止的 SQL 形态。\n```\n\n## 推荐写法\n\n```sql\n-- 可选：写出推荐 SQL 形态。\n```\n\n## 风险说明\n\n- 说明可能误伤或不能覆盖的场景。\n",
+  };
+}
+
+function cloneSqlGuardrail(rule: SqlGuardrailRule): SqlGuardrailRule {
+  return JSON.parse(JSON.stringify(rule)) as SqlGuardrailRule;
+}
+
+function formatScope(rule: SqlGuardrailRule): string {
+  const parts = [
+    rule.scope.table_scope?.values?.length
+      ? `tables:${rule.scope.table_scope.mode}:${rule.scope.table_scope.values.join(",")}`
+      : "",
+    rule.scope.semantic_assets?.length ? `semantic:${rule.scope.semantic_assets.join(",")}` : "",
+  ].filter(Boolean);
+  return parts.join(" · ") || "全局";
+}
+
+function sqlGuardrailParamSummary(rule: SqlGuardrailRule): string {
+  const entries = Object.entries(rule.params || {});
+  if (!entries.length) return "未配置参数";
+  return entries
+    .slice(0, 4)
+    .map(([key, value]) => `${key}=${Array.isArray(value) ? value.join(",") : String(value)}`)
+    .join(" · ");
+}
+
+function SqlGuardrailsSection({
+  rules,
+  types,
+  loading,
+  busy,
+  onRefresh,
+  onReset,
+  onCreate,
+  onEdit,
+  onToggle,
+  onDelete,
+}: {
+  rules: SqlGuardrailRule[];
+  types: Record<string, SqlGuardrailTypeDefinition>;
+  loading: boolean;
+  busy: boolean;
+  onRefresh: () => void;
+  onReset: () => void;
+  onCreate: () => void;
+  onEdit: (rule: SqlGuardrailRule) => void;
+  onToggle: (rule: SqlGuardrailRule) => void;
+  onDelete: (rule: SqlGuardrailRule) => void;
+}) {
+  return (
+    <WorkbenchSection
+      icon={ShieldCheck}
+      title="SQL 守卫"
+      subtitle="结构化配置 NL2SQL 的口径和性能拦截规则。规则按 type 分发到后端 detector，命中后可重写、阻断或仅告警。"
+      primaryAction="新增规则"
+      onPrimaryAction={onCreate}
+      secondaryAction="恢复默认"
+      secondaryIcon={RefreshCw}
+      onSecondaryAction={onReset}
+      tertiaryAction="刷新规则"
+      tertiaryIcon={RefreshCw}
+      tertiaryLoading={loading}
+      onTertiaryAction={onRefresh}
+    >
+      {loading ? (
+        <div className="flex items-center justify-center rounded-3xl border border-dashed border-black/[0.08] py-14 text-sm text-gray-400">
+          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+          正在读取 SQL 守卫…
+        </div>
+      ) : rules.length === 0 ? (
+        <EmptyWorkbenchState title="还没有 SQL 守卫" description="可以新建规则，或恢复默认配置。" />
+      ) : (
+        <div className="space-y-3">
+          {rules.map((rule) => {
+            const typeDef = types[rule.type];
+            return (
+              <article key={rule.id} className="rounded-3xl border border-black/[0.06] bg-white p-4 shadow-sm">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${rule.enabled ? "bg-emerald-50 text-emerald-700" : "bg-gray-100 text-gray-500"}`}>
+                        {rule.enabled ? "启用" : "停用"}
+                      </span>
+                      <span className="rounded-full bg-[#002fa7]/10 px-2.5 py-1 text-xs font-semibold text-[#002fa7]">
+                        {typeDef?.label || rule.type}
+                      </span>
+                      <h3 className="truncate text-sm font-semibold text-gray-950">{rule.name}</h3>
+                    </div>
+                    <p className="mt-2 font-mono text-xs text-gray-400">{rule.id}</p>
+                    <p className="mt-2 line-clamp-2 text-sm text-gray-500">{rule.action.message || typeDef?.description || "未填写动作说明。"}</p>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => onToggle(rule)}
+                      disabled={busy}
+                      className="h-9 rounded-2xl border border-black/[0.08] px-3 text-xs font-semibold text-gray-600 transition hover:bg-gray-50 disabled:opacity-50"
+                    >
+                      {rule.enabled ? "停用" : "启用"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onEdit(cloneSqlGuardrail(rule))}
+                      className="h-9 rounded-2xl bg-[#002fa7] px-3 text-xs font-semibold text-white transition hover:bg-[#001f7a]"
+                    >
+                      编辑
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onDelete(rule)}
+                      disabled={busy}
+                      className="h-9 rounded-2xl border border-red-500/20 px-3 text-xs font-semibold text-red-600 transition hover:bg-red-50 disabled:opacity-50"
+                    >
+                      删除
+                    </button>
+                  </div>
+                </div>
+                <div className="mt-4 grid gap-3 text-xs md:grid-cols-3">
+                  <div className="rounded-2xl bg-gray-50 p-3">
+                    <p className="font-semibold text-gray-500">Scope</p>
+                    <p className="mt-1 break-all text-gray-600">{formatScope(rule)}</p>
+                  </div>
+                  <div className="rounded-2xl bg-gray-50 p-3">
+                    <p className="font-semibold text-gray-500">Params</p>
+                    <p className="mt-1 break-all text-gray-600">{sqlGuardrailParamSummary(rule)}</p>
+                  </div>
+                  <div className="rounded-2xl bg-gray-50 p-3">
+                    <p className="font-semibold text-gray-500">Action</p>
+                    <p className="mt-1 text-gray-600">{rule.action.type}</p>
+                  </div>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      )}
+    </WorkbenchSection>
+  );
+}
+
 function SemanticAssetCard({ asset, onOpen }: { asset: SemanticAssetSummary; onOpen: (asset: SemanticAssetSummary) => void }) {
   const typeLabel = asset.type === "measure" ? "度量值" : asset.type === "grain" ? "颗粒度" : "维度";
   return (
@@ -1370,6 +1662,542 @@ function splitTokenList(value: string): string[] {
     .split(/[,\n，、]/)
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function getParamValue(rule: SqlGuardrailRule, path: string): unknown {
+  const key = path.replace(/^params\./, "");
+  return rule.params?.[key];
+}
+
+function setParamValue(rule: SqlGuardrailRule, path: string, value: unknown): SqlGuardrailRule {
+  const key = path.replace(/^params\./, "");
+  return { ...rule, params: { ...(rule.params || {}), [key]: value } };
+}
+
+function SqlGuardrailEditorModal({
+  rule,
+  types,
+  databaseSources,
+  semanticAssets,
+  busy,
+  onClose,
+  onSave,
+}: {
+  rule: SqlGuardrailRule;
+  types: Record<string, SqlGuardrailTypeDefinition>;
+  databaseSources: KnowledgeDatabaseSource[];
+  semanticAssets: SemanticAssetSummary[];
+  busy: boolean;
+  onClose: () => void;
+  onSave: (rule: SqlGuardrailRule) => void;
+}) {
+  const [draft, setDraft] = useState<SqlGuardrailRule>(() => cloneSqlGuardrail(rule));
+  const [sourceFilter, setSourceFilter] = useState("");
+  const [editMode, setEditMode] = useState<"structured" | "markdown">("structured");
+  const [markdownContent, setMarkdownContent] = useState(rule.document_content || "");
+  const typeDef = types[draft.type];
+  const availableTypes = Object.keys(types);
+  const sourceOptions = useMemo(
+    () => databaseSources.map((source) => ({ value: source.name, label: source.name || source.id, hint: source.database })),
+    [databaseSources]
+  );
+  const tableOptions = useMemo(() => {
+    const seen = new Set<string>();
+    const options: { value: string; label: string; hint?: string }[] = [];
+    databaseSources.forEach((source) => {
+      if (sourceFilter && source.name !== sourceFilter) {
+        return;
+      }
+      (source.selected_tables || []).forEach((table) => {
+        if (seen.has(table)) return;
+        seen.add(table);
+        options.push({ value: table, label: table, hint: source.name });
+      });
+    });
+    return options;
+  }, [databaseSources, sourceFilter]);
+  const semanticAssetOptions = useMemo(
+    () => semanticAssets.map((asset) => ({ value: asset.id, label: asset.id, hint: `${asset.name} · ${asset.type}` })),
+    [semanticAssets]
+  );
+
+  const updateSemanticAssets = (value: string[]) => {
+    setDraft((current) => ({
+      ...current,
+      scope: {
+        ...current.scope,
+        semantic_assets: value,
+      },
+    }));
+  };
+
+  const updateAction = (updates: Partial<SqlGuardrailAction>) => {
+    setDraft((current) => ({ ...current, action: { ...current.action, ...updates } }));
+  };
+
+  return (
+    <div className="fixed inset-0 z-[130] flex items-center justify-center bg-black/35 px-4 py-6 backdrop-blur-sm">
+      <div className="flex max-h-[90vh] w-full max-w-5xl flex-col overflow-hidden rounded-[28px] bg-white shadow-2xl ring-1 ring-black/[0.08]">
+        <div className="flex items-start justify-between gap-4 border-b border-black/[0.06] px-6 py-5">
+          <div>
+            <h3 className="text-lg font-semibold text-gray-950">编辑 SQL 守卫</h3>
+            <p className="mt-1 text-sm text-gray-500">SQL 守卫以 guardrail.md 保存；frontmatter 编译为后端 detector，正文用于审核和 LLM 理解。</p>
+            <p className="mt-2 font-mono text-xs text-gray-400">{draft.document_path || `sql-guardrails/rules/${draft.id}/guardrail.md`}</p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-full p-2 text-gray-400 transition hover:bg-black/[0.04] hover:text-gray-900"
+            aria-label="关闭"
+          >
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        <div className="grid flex-1 min-h-0 gap-5 overflow-y-auto p-6 lg:grid-cols-[minmax(0,1fr)_360px]">
+          <div className="space-y-5">
+            <div className="inline-grid grid-cols-2 rounded-2xl bg-gray-100 p-1">
+              {[
+                { value: "structured", label: "结构化录入" },
+                { value: "markdown", label: "原始 Markdown" },
+              ].map((item) => (
+                <button
+                  key={item.value}
+                  type="button"
+                  onClick={() => setEditMode(item.value as "structured" | "markdown")}
+                  className={`h-10 rounded-xl px-4 text-sm font-semibold transition ${
+                    editMode === item.value ? "bg-white text-[#002fa7] shadow-sm" : "text-gray-500 hover:text-gray-800"
+                  }`}
+                >
+                  {item.label}
+                </button>
+              ))}
+            </div>
+
+            {editMode === "structured" ? (
+              <>
+            <section className="rounded-3xl border border-black/[0.06] p-4">
+              <h4 className="text-sm font-semibold text-gray-950">基础信息</h4>
+              <div className="mt-4 grid items-start gap-4 md:grid-cols-2">
+                <LabeledInput
+                  label="ID"
+                  value={draft.id}
+                  onChange={(value) => setDraft((current) => ({ ...current, id: value.trim() }))}
+                  placeholder="config_rate_model_key_group"
+                />
+                <LabeledInput
+                  label="名称"
+                  value={draft.name}
+                  onChange={(value) => setDraft((current) => ({ ...current, name: value }))}
+                  placeholder="配置率款型颗粒度分组"
+                />
+                <label className="block min-h-[86px]">
+                  <span className="text-xs font-semibold text-gray-500">类型</span>
+                  <select
+                    value={draft.type}
+                    onChange={(event) =>
+                      setDraft((current) => ({
+                        ...current,
+                        type: event.target.value,
+                        params: {},
+                      }))
+                    }
+                    className="mt-1 h-12 w-full rounded-2xl border border-black/[0.08] bg-white px-3 text-sm outline-none focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/[0.08]"
+                  >
+                    {(availableTypes.length ? availableTypes : [draft.type]).map((type) => (
+                      <option key={type} value={type}>
+                        {types[type]?.label || type}
+                      </option>
+                    ))}
+                  </select>
+                  <span className="mt-1 block text-xs text-gray-400">规则命中 SQL 后触发，可配置例外片段。</span>
+                </label>
+                <label className="block min-h-[86px]">
+                  <span className="text-xs font-semibold text-gray-500">启用</span>
+                  <span className="mt-1 flex h-12 items-center justify-between rounded-2xl border border-black/[0.08] bg-white px-3">
+                    <span className="text-sm font-medium text-gray-700">{draft.enabled ? "已启用" : "已停用"}</span>
+                    <input
+                      type="checkbox"
+                      checked={draft.enabled}
+                      onChange={(event) => setDraft((current) => ({ ...current, enabled: event.target.checked }))}
+                      className="h-5 w-5 accent-[#002fa7]"
+                    />
+                  </span>
+                  <span className="mt-1 block text-xs text-gray-400">关闭后只保存，不参与检测。</span>
+                </label>
+              </div>
+              {typeDef ? <p className="mt-3 text-xs leading-5 text-gray-500">{typeDef.description}</p> : null}
+            </section>
+
+            <section className="rounded-3xl border border-black/[0.06] p-4">
+              <h4 className="text-sm font-semibold text-gray-950">Scope</h4>
+              <p className="mt-1 text-xs text-gray-500">规则只按路由表和语义资产命中；表范围里的数据源下拉只帮助筛表，不会写入规则。</p>
+              <div className="mt-4 grid gap-4 md:grid-cols-2">
+                <div className="min-h-[170px] rounded-2xl border border-black/[0.06] p-3">
+                  <span className="text-xs font-semibold text-gray-500">表匹配方式</span>
+                  <div className="mt-2 grid grid-cols-2 gap-2 rounded-2xl bg-gray-100 p-1">
+                    {[
+                      { value: "any", label: "任意命中" },
+                      { value: "all", label: "全部命中" },
+                    ].map((item) => (
+                      <button
+                        key={item.value}
+                        type="button"
+                        onClick={() =>
+                          setDraft((current) => ({
+                            ...current,
+                            scope: {
+                              ...current.scope,
+                              table_scope: {
+                                ...(current.scope.table_scope || { values: [] }),
+                                mode: item.value as "any" | "all",
+                              },
+                            },
+                          }))
+                        }
+                        className={`h-10 rounded-xl text-sm font-semibold transition ${
+                          draft.scope.table_scope?.mode === item.value ? "bg-white text-[#002fa7] shadow-sm" : "text-gray-500 hover:text-gray-800"
+                        }`}
+                      >
+                        {item.label}
+                      </button>
+                    ))}
+                  </div>
+                  <p className="mt-3 text-xs leading-5 text-gray-500">
+                    任意命中表示路由包含任一表即生效；全部命中表示路由必须同时包含所有表。
+                  </p>
+                </div>
+                <MultiSelectField
+                  className="md:col-span-2"
+                  label="表范围 table_scope.values"
+                  values={draft.scope.table_scope?.values || []}
+                  options={tableOptions}
+                  emptyText={sourceFilter ? "所选数据源没有已选表" : "暂无已选表"}
+                  filter={{
+                    label: "筛表",
+                    value: sourceFilter,
+                    options: sourceOptions,
+                    placeholder: "全部数据源",
+                    onChange: setSourceFilter,
+                  }}
+                  onChange={(values) =>
+                    setDraft((current) => ({
+                      ...current,
+                      scope: {
+                        ...current.scope,
+                        table_scope: {
+                          ...(current.scope.table_scope || { mode: "any" }),
+                          values,
+                        },
+                      },
+                    }))
+                  }
+                />
+                <MultiSelectField
+                  className="md:col-span-2"
+                  label="语义资产 semantic_assets"
+                  values={draft.scope.semantic_assets || []}
+                  options={semanticAssetOptions}
+                  emptyText="暂无语义资产"
+                  onChange={updateSemanticAssets}
+                />
+              </div>
+            </section>
+
+            <section className="rounded-3xl border border-black/[0.06] p-4">
+              <h4 className="text-sm font-semibold text-gray-950">Params</h4>
+              <div className="mt-4 grid gap-3 md:grid-cols-2">
+                {(typeDef?.fields || []).map((field) => {
+                  const value = getParamValue(draft, field.path);
+                  if (field.type === "string_array") {
+                    return (
+                      <LabeledTextarea
+                        key={field.path}
+                        label={`${field.label}${field.required ? " *" : ""}`}
+                        value={Array.isArray(value) ? value.join(", ") : String(value || "")}
+                        onChange={(nextValue) => setDraft((current) => setParamValue(current, field.path, splitTokenList(nextValue)))}
+                      />
+                    );
+                  }
+                  if (field.type === "number") {
+                    return (
+                      <LabeledInput
+                        key={field.path}
+                        label={`${field.label}${field.required ? " *" : ""}`}
+                        value={String(value ?? "")}
+                        onChange={(nextValue) =>
+                          setDraft((current) => setParamValue(current, field.path, Number.parseInt(nextValue, 10) || 0))
+                        }
+                        inputType="number"
+                      />
+                    );
+                  }
+                  return (
+                    <LabeledInput
+                      key={field.path}
+                      label={`${field.label}${field.required ? " *" : ""}`}
+                      value={String(value ?? "")}
+                      onChange={(nextValue) => setDraft((current) => setParamValue(current, field.path, nextValue))}
+                    />
+                  );
+                })}
+                {!typeDef?.fields?.length ? (
+                  <p className="text-sm text-gray-400">这个规则类型没有声明参数字段。</p>
+                ) : null}
+              </div>
+            </section>
+
+            <section className="rounded-3xl border border-black/[0.06] p-4">
+              <h4 className="text-sm font-semibold text-gray-950">Action</h4>
+              <div className="mt-4 grid gap-3 md:grid-cols-[180px_minmax(0,1fr)]">
+                <label className="block">
+                  <span className="text-xs font-semibold text-gray-500">动作</span>
+                  <select
+                    value={draft.action.type}
+                    onChange={(event) => updateAction({ type: event.target.value as SqlGuardrailActionType })}
+                    className="mt-1 h-10 w-full rounded-2xl border border-black/[0.08] bg-white px-3 text-sm outline-none focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/[0.08]"
+                  >
+                    <option value="rewrite">rewrite</option>
+                    <option value="block">block</option>
+                    <option value="warn">warn</option>
+                  </select>
+                </label>
+                <LabeledTextarea
+                  label="提示信息"
+                  value={draft.action.message || ""}
+                  onChange={(value) => updateAction({ message: value })}
+                  placeholder="命中后写入重写 prompt 或错误信息。"
+                />
+              </div>
+            </section>
+            <section className="rounded-3xl border border-black/[0.06] p-4">
+              <h4 className="text-sm font-semibold text-gray-950">文档说明</h4>
+              <p className="mt-1 text-xs text-gray-500">保存到 guardrail.md 的正文。这里给用户和 LLM 看，不直接作为 detector 参数。</p>
+              <textarea
+                value={draft.document_body || ""}
+                onChange={(event) => setDraft((current) => ({ ...current, document_body: event.target.value }))}
+                rows={14}
+                className="mt-4 w-full resize-y rounded-2xl border border-black/[0.08] bg-white px-3 py-3 font-mono text-xs leading-5 outline-none focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/[0.08]"
+                placeholder="# 守卫说明..."
+              />
+            </section>
+              </>
+            ) : (
+              <section className="rounded-3xl border border-black/[0.06] p-4">
+                <h4 className="text-sm font-semibold text-gray-950">原始 guardrail.md</h4>
+                <p className="mt-1 text-xs text-gray-500">直接编辑完整 Markdown。保存时后端会重新解析 frontmatter 并编译为 GuardrailRule。</p>
+                <textarea
+                  value={markdownContent}
+                  onChange={(event) => setMarkdownContent(event.target.value)}
+                  rows={32}
+                  className="mt-4 w-full resize-y rounded-2xl border border-black/[0.08] bg-white px-3 py-3 font-mono text-xs leading-5 outline-none focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/[0.08]"
+                />
+              </section>
+            )}
+          </div>
+
+          <aside className="min-w-0">
+            <div className="sticky top-0 rounded-3xl bg-gray-950 p-4 text-gray-100">
+              <p className="text-sm font-semibold">GuardrailRule 预览</p>
+              <pre className="mt-3 max-h-[62vh] overflow-auto text-xs leading-5 text-gray-200">
+                {JSON.stringify(draft, null, 2)}
+              </pre>
+            </div>
+          </aside>
+        </div>
+
+        <div className="flex justify-end gap-2 border-t border-black/[0.06] px-6 py-4">
+          <button
+            type="button"
+            onClick={onClose}
+            className="h-10 rounded-2xl border border-black/[0.08] px-4 text-sm font-semibold text-gray-700 transition hover:bg-gray-50"
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            onClick={() => onSave(editMode === "markdown" ? { ...draft, document_content: markdownContent } : draft)}
+            disabled={busy || (editMode === "structured" && (!draft.id.trim() || !draft.name.trim())) || (editMode === "markdown" && !markdownContent.trim())}
+            className="inline-flex h-10 items-center gap-2 rounded-2xl bg-[#002fa7] px-4 text-sm font-semibold text-white transition hover:bg-[#001f7a] disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+            保存
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LabeledInput({
+  label,
+  value,
+  onChange,
+  placeholder = "",
+  inputType = "text",
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  placeholder?: string;
+  inputType?: string;
+}) {
+  return (
+    <label className="block">
+      <span className="text-xs font-semibold text-gray-500">{label}</span>
+      <input
+        type={inputType}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        placeholder={placeholder}
+        className="mt-1 h-10 w-full rounded-2xl border border-black/[0.08] bg-white px-3 text-sm outline-none focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/[0.08]"
+      />
+    </label>
+  );
+}
+
+function LabeledTextarea({
+  label,
+  value,
+  onChange,
+  placeholder = "",
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  placeholder?: string;
+}) {
+  return (
+    <label className="block">
+      <span className="text-xs font-semibold text-gray-500">{label}</span>
+      <textarea
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        placeholder={placeholder}
+        rows={3}
+        className="mt-1 w-full resize-y rounded-2xl border border-black/[0.08] bg-white px-3 py-2 text-sm outline-none focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/[0.08]"
+      />
+    </label>
+  );
+}
+
+function MultiSelectField({
+  label,
+  values,
+  options,
+  emptyText,
+  onChange,
+  className = "",
+  filter,
+}: {
+  label: string;
+  values: string[];
+  options: { value: string; label: string; hint?: string }[];
+  emptyText: string;
+  onChange: (values: string[]) => void;
+  className?: string;
+  filter?: {
+    label: string;
+    value: string;
+    options: { value: string; label: string; hint?: string }[];
+    placeholder: string;
+    onChange: (value: string) => void;
+  };
+}) {
+  const normalizedValues = values.filter(Boolean);
+  const optionValues = new Set(options.map((option) => option.value));
+  const missingValues = normalizedValues.filter((value) => !optionValues.has(value));
+  const visibleOptions = [
+    ...options,
+    ...missingValues.map((value) => ({ value, label: value, hint: "当前配置" })),
+  ];
+
+  const toggle = (value: string) => {
+    if (normalizedValues.includes(value)) {
+      onChange(normalizedValues.filter((item) => item !== value));
+    } else {
+      onChange([...normalizedValues, value]);
+    }
+  };
+
+  return (
+    <div className={`min-h-[170px] rounded-2xl border border-black/[0.06] p-3 ${className}`}>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className="text-xs font-semibold text-gray-500">{label}</span>
+        <div className="flex items-center gap-2">
+          {filter ? (
+            <label className="flex items-center gap-1 text-[11px] font-semibold text-gray-400">
+              <span>{filter.label}</span>
+              <select
+                value={filter.value}
+                onChange={(event) => filter.onChange(event.target.value)}
+                className="h-7 rounded-full border border-black/[0.08] bg-white pl-2 pr-7 text-[11px] font-semibold text-gray-500 outline-none focus:border-[#002fa7]/40 focus:ring-2 focus:ring-[#002fa7]/[0.08]"
+              >
+                <option value="">{filter.placeholder}</option>
+                {filter.options.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                    {option.hint ? ` · ${option.hint}` : ""}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
+          {normalizedValues.length ? (
+            <button
+              type="button"
+              onClick={() => onChange([])}
+              className="text-xs font-semibold text-gray-400 transition hover:text-red-600"
+            >
+              清空
+            </button>
+          ) : null}
+        </div>
+      </div>
+      <div className="mt-2 flex min-h-7 flex-wrap gap-1.5">
+        {normalizedValues.length ? (
+          normalizedValues.map((value) => (
+            <span key={value} className="inline-flex max-w-full items-center gap-1 rounded-full bg-[#002fa7]/10 px-2 py-1 text-[11px] font-semibold text-[#002fa7]">
+              <span className="truncate">{value}</span>
+              <button type="button" onClick={() => toggle(value)} className="text-[#002fa7]/70 hover:text-[#002fa7]" aria-label={`移除 ${value}`}>
+                ×
+              </button>
+            </span>
+          ))
+        ) : (
+          <span className="text-xs text-gray-400">不限制</span>
+        )}
+      </div>
+      <div className="mt-3 max-h-40 space-y-1 overflow-y-auto rounded-xl bg-gray-50 p-2">
+        {visibleOptions.length ? (
+          visibleOptions.map((option) => {
+            const checked = normalizedValues.includes(option.value);
+            return (
+              <label
+                key={option.value}
+                className={`flex cursor-pointer items-center justify-between gap-2 rounded-xl px-2 py-2 text-xs transition ${
+                  checked ? "bg-white text-[#002fa7] shadow-sm" : "text-gray-600 hover:bg-white"
+                }`}
+              >
+                <span className="min-w-0">
+                  <span className="block truncate font-semibold">{option.label}</span>
+                  {option.hint ? <span className="mt-0.5 block truncate text-[11px] text-gray-400">{option.hint}</span> : null}
+                </span>
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  onChange={() => toggle(option.value)}
+                  className="h-4 w-4 shrink-0 accent-[#002fa7]"
+                />
+              </label>
+            );
+          })
+        ) : (
+          <p className="px-2 py-4 text-center text-xs text-gray-400">{emptyText}</p>
+        )}
+      </div>
+    </div>
+  );
 }
 
 function SemanticAssetCreateModal({

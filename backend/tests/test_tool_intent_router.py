@@ -10,7 +10,7 @@ def test_vehicle_sales_metric_routes_to_pandas_table_tool() -> None:
     assert decision["matched"] is True
     assert decision["intents"] == ["table_analysis"]
     assert decision["preferred_tools"][0] == "pandas_knowledge_query"
-    assert "database_knowledge_query" in decision["preferred_tools"]
+    assert "database_sql_generate" in decision["preferred_tools"]
 
 
 def test_news_intent_still_routes_to_web_search() -> None:
@@ -26,9 +26,9 @@ def test_database_business_question_routes_directly_without_schema_probe() -> No
 
     assert decision["matched"] is True
     assert decision["intents"] == ["database_analysis"]
-    assert decision["preferred_tools"] == ["database_knowledge_query"]
-    assert "直接把用户原问题交给 database_knowledge_query" in decision["routing_prompt"]
-    assert "不要先调用 database_knowledge_query 去列出表、探查 schema" in decision["routing_prompt"]
+    assert decision["preferred_tools"] == ["database_sql_generate", "database_sql_validate", "database_sql_execute"]
+    assert "先把用户原问题交给 database_sql_generate" in decision["routing_prompt"]
+    assert "需要元数据时使用 database_schema_inspect" in decision["routing_prompt"]
 
 
 def test_database_tool_schema_discourages_metadata_probe_for_business_questions() -> None:
@@ -47,7 +47,7 @@ def test_table_metric_wins_over_generic_knowledge_words() -> None:
     assert decision["matched"] is True
     assert decision["intents"] == ["table_analysis"]
     assert decision["preferred_tools"][0] == "pandas_knowledge_query"
-    assert "database_knowledge_query" in decision["preferred_tools"]
+    assert "database_sql_generate" in decision["preferred_tools"]
 
 
 def test_data_analysis_wins_over_knowledge_rag() -> None:
@@ -56,7 +56,7 @@ def test_data_analysis_wins_over_knowledge_rag() -> None:
     assert decision["matched"] is True
     assert decision["intents"] == ["table_analysis"]
     assert decision["preferred_tools"][0] == "pandas_knowledge_query"
-    assert "database_knowledge_query" in decision["preferred_tools"]
+    assert "database_sql_generate" in decision["preferred_tools"]
 
 
 def test_document_knowledge_request_still_routes_to_llamaindex() -> None:

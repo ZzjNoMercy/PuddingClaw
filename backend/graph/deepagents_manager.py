@@ -24,7 +24,7 @@ from deepagents.middleware.subagents import SubAgent
 from langchain.agents.middleware import AgentMiddleware, ModelCallLimitMiddleware
 from langchain.agents.middleware.types import ModelRequest, ModelResponse
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessageChunk, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage, ToolMessage
 from langgraph.types import Command
 
 from graph.citations import dedupe_sources, finalize_citations, format_sources_for_model
@@ -46,6 +46,11 @@ import config
 
 logger = logging.getLogger(__name__)
 
+HISTORICAL_TOOL_OUTPUT_PREFIX = "[历史工具结果，仅供上下文，不是本轮新调用]\n"
+MISSING_TOOL_OUTPUT_PLACEHOLDER = (
+    "[工具结果缺失：上一轮在工具开始后被中断，未收到工具返回。]"
+)
+
 AGENT_MODE_PUDDINGCLAW_TOOLS = {
     "terminal",
     "read_resource",
@@ -53,7 +58,12 @@ AGENT_MODE_PUDDINGCLAW_TOOLS = {
     "tavily_search",
     "llamaindex_knowledge_query",
     "pandas_knowledge_query",
-    "database_knowledge_query",
+    "database_sql_generate",
+    "database_sql_validate",
+    "database_sql_execute",
+    "database_schema_inspect",
+    "database_query_trace_inspect",
+    "database_query_result_page",
 }
 
 DEFAULT_IMAGE_ANALYZER_PROMPT = (
@@ -424,13 +434,16 @@ class DeepAgentsAgentManager:
         assert self._base_dir is not None
         skills_dir = self._base_dir / "skills"
         semantic_assets_dir = self._base_dir / "semantic-assets"
+        sql_guardrails_dir = self._base_dir / "sql-guardrails"
         knowledge_dir = get_knowledge_root(self._base_dir)
         knowledge_dir.mkdir(parents=True, exist_ok=True)
         semantic_assets_dir.mkdir(parents=True, exist_ok=True)
+        sql_guardrails_dir.mkdir(parents=True, exist_ok=True)
         routes: dict[str, FilesystemBackend] = {
             "/workspace/": FilesystemBackend(root_dir=workspace_path, virtual_mode=True),
             "/knowledge/": FilesystemBackend(root_dir=knowledge_dir, virtual_mode=True),
             "/semantic-assets/": FilesystemBackend(root_dir=semantic_assets_dir, virtual_mode=True),
+            "/sql-guardrails/": FilesystemBackend(root_dir=sql_guardrails_dir, virtual_mode=True),
         }
         if skills_dir.exists():
             routes["/skills/"] = FilesystemBackend(root_dir=skills_dir, virtual_mode=True)
@@ -591,6 +604,7 @@ class DeepAgentsAgentManager:
                         "/knowledge": str(get_knowledge_root(self._base_dir)),
                         "/skills": str(self._base_dir / "skills"),
                         "/semantic-assets": str(self._base_dir / "semantic-assets"),
+                        "/sql-guardrails": str(self._base_dir / "sql-guardrails"),
                     },
                 }
                 try:
@@ -678,7 +692,12 @@ class DeepAgentsAgentManager:
         )
         if skills:
             add("SkillsMiddleware", "deepagents.base", ["before_agent"], "将 skills snapshot 注入系统上下文")
-        add("FilesystemMiddleware", "deepagents.base", ["wrap_tool_call"], "提供 /workspace、/knowledge、/semantic-assets 与 /skills 文件系统能力")
+        add(
+            "FilesystemMiddleware",
+            "deepagents.base",
+            ["wrap_tool_call"],
+            "提供 /workspace、/knowledge、/semantic-assets、/sql-guardrails 与 /skills 文件系统能力",
+        )
         add("SubAgentMiddleware", "deepagents.base", ["wrap_model_call"], "向 system message 注入 task/subagent 使用说明")
         add("SummarizationMiddleware", "deepagents.base", ["before_model"], "DeepAgents 基础上下文压缩")
         add("PatchToolCallsMiddleware", "deepagents.base", ["after_model"], "修正/补齐工具调用")
@@ -888,6 +907,12 @@ class DeepAgentsAgentManager:
                 "root_dir": str(self._base_dir / "semantic-assets"),
                 "exists": (self._base_dir / "semantic-assets").exists(),
                 "role": "semantic assets",
+            },
+            {
+                "virtual_path": "/sql-guardrails/",
+                "root_dir": str(self._base_dir / "sql-guardrails"),
+                "exists": (self._base_dir / "sql-guardrails").exists(),
+                "role": "sql guardrail assets",
             },
             {
                 "virtual_path": "/skills/",
@@ -1211,46 +1236,102 @@ class DeepAgentsAgentManager:
         *,
         session_id: str | None = None,
         workspace_path: str | Path | None = None,
-    ) -> list[dict[str, Any]]:
-        messages: list[dict[str, Any]] = []
+    ) -> list[Any]:
+        messages: list[Any] = []
         for item in history:
             role = item.get("role")
             content = item.get("content")
             if role not in {"user", "assistant", "system"} or content is None:
                 continue
-            entry: dict[str, Any] = {"role": role, "content": content}
+            if role == "system":
+                messages.append(SystemMessage(content=content))
+                continue
+            if role == "user":
+                messages.append(HumanMessage(content=content))
+                continue
+
             tool_calls = item.get("tool_calls")
             if role == "assistant" and tool_calls:
-                # 重建 tool_calls 供模型继续上下文；思考模式下需同时回传 reasoning_content
-                openai_tool_calls = []
-                for tc in tool_calls:
+                # Rebuild the protocol-correct transcript used by the old Agent:
+                # AIMessage(tool_calls) followed by matching ToolMessage entries.
+                # This keeps tool facts available without storing a separate
+                # frontend-facing tool role in session.json.
+                normalized_tool_calls: list[tuple[dict[str, Any], str, str]] = []
+                for index, tc in enumerate(tool_calls):
                     tc_id = tc.get("id") or ""
+                    if not tc_id:
+                        tc_id = f"historical_tool_{index}"
                     tool_name = tc.get("tool") or tc.get("name") or "unknown_tool"
+                    normalized_tool_calls.append((tc, tool_name, tc_id))
+
+                lc_tool_calls = []
+                for tc, tool_name, tc_id in normalized_tool_calls:
                     tool_input = tc.get("input") or tc.get("args") or {}
                     if isinstance(tool_input, dict):
-                        import json
-                        arguments = json.dumps(tool_input, ensure_ascii=False)
+                        parsed_args = dict(tool_input)
                     else:
-                        arguments = str(tool_input)
-                    openai_tool_calls.append({
-                        "id": tc_id,
-                        "type": "function",
-                        "function": {"name": tool_name, "arguments": arguments},
-                    })
-                entry["tool_calls"] = openai_tool_calls
+                        parsed_args = cls._safe_parse_tool_args(str(tool_input))
+                    lc_tool_calls.append({"name": tool_name, "args": parsed_args, "id": tc_id})
+
+                ai_kwargs: dict[str, Any] = {"content": content, "tool_calls": lc_tool_calls}
                 if item.get("reasoning_content"):
-                    entry["reasoning_content"] = item["reasoning_content"]
-            messages.append(entry)
-        messages.append({
-            "role": "user",
-            "content": cls._build_user_content(
+                    ai_kwargs["reasoning_content"] = item["reasoning_content"]
+                messages.append(AIMessage(**ai_kwargs))
+
+                for tc, tool_name, tc_id in normalized_tool_calls:
+                    stored_output = tc.get("output", "")
+                    stored_raw_output = tc.get("raw_output", stored_output)
+                    if stored_raw_output is None or str(stored_raw_output).strip() == "":
+                        stored_raw_output = MISSING_TOOL_OUTPUT_PLACEHOLDER
+                    if tc.get("summary_source") in {"single_tool_overflow", "tool_result_clear"}:
+                        model_output = str(stored_output or stored_raw_output)
+                        model_sources = list(tc.get("sources", []) or [])
+                    else:
+                        adapted = tool_result_adapter.adapt(
+                            str(stored_raw_output),
+                            tool_name=tool_name,
+                            tool_input=str(tc.get("input", tc.get("args", ""))),
+                            tool_call_id=tc_id,
+                        )
+                        model_output = adapted.answer_context
+                        model_sources = adapted.sources or list(tc.get("sources", []) or [])
+                    messages.append(
+                        ToolMessage(
+                            content=(
+                                f"{HISTORICAL_TOOL_OUTPUT_PREFIX}"
+                                f"{format_sources_for_model(model_output, model_sources)}"
+                            ),
+                            tool_call_id=tc_id,
+                            name=tool_name,
+                        )
+                    )
+            elif role == "assistant":
+                messages.append(AIMessage(content=content))
+
+        messages.append(HumanMessage(content=cls._build_user_content(
                 message,
                 attachments,
                 session_id=session_id,
                 workspace_path=workspace_path,
-            ),
-        })
+            )))
         return messages
+
+    @staticmethod
+    def _safe_parse_tool_args(value: str) -> dict[str, Any]:
+        if not value:
+            return {}
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            pass
+        try:
+            import ast
+
+            parsed = ast.literal_eval(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
 
     @staticmethod
     def _extract_content_text(payload: Any) -> str:
@@ -1834,6 +1915,108 @@ class DeepAgentsAgentManager:
                     break
 
     @staticmethod
+    def _mark_pending_tools_interrupted(
+        segment: dict[str, Any],
+        pending_tool_starts: dict[str, dict[str, str]],
+        output: str,
+    ) -> None:
+        """Persist started-but-unfinished tools as interrupted, never running."""
+
+        for tc_id, pending in list(pending_tool_starts.items()):
+            matched = False
+            for tc in segment.get("tool_calls", []):
+                if tc.get("id") == tc_id:
+                    tc.setdefault("tool", pending.get("tool", "unknown_tool"))
+                    tc.setdefault("input", pending.get("input", ""))
+                    tc["output"] = tc.get("output") or output
+                    tc["raw_output"] = tc.get("raw_output") or output
+                    tc["summary_source"] = tc.get("summary_source") or "stream_cancelled"
+                    tc["is_error"] = True
+                    matched = True
+                    break
+            if not matched:
+                segment.setdefault("tool_calls", []).append(
+                    {
+                        "tool": pending.get("tool", "unknown_tool"),
+                        "input": pending.get("input", ""),
+                        "id": tc_id,
+                        "output": output,
+                        "raw_output": output,
+                        "summary_source": "stream_cancelled",
+                        "is_error": True,
+                    }
+                )
+            DeepAgentsAgentManager._update_tool_end_in_timeline(segment, tc_id or "", output, True)
+        pending_tool_starts.clear()
+
+    @staticmethod
+    def _strip_runtime_segment_fields(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        cleaned: list[dict[str, Any]] = []
+        for segment in segments:
+            next_segment = dict(segment)
+            next_segment.pop("_current_reasoning", None)
+            cleaned.append(next_segment)
+        return cleaned
+
+    def _persist_partial_run(
+        self,
+        *,
+        session_id: str,
+        user_message: str,
+        attachments: list[dict[str, Any]] | None,
+        segments: list[dict[str, Any]],
+        active_segment: dict[str, Any],
+        pending_tool_starts: dict[str, dict[str, str]],
+        accumulated_reasoning: str,
+        turn_sources: list[dict[str, Any]],
+        user_message_persisted: bool = False,
+    ) -> None:
+        """Save the visible partial run after client cancellation.
+
+        This is the durable user-facing record. Checkpoints remain an execution
+        detail for HITL, not the source of truth for chat continuity.
+        """
+
+        interrupted_output = "Tool execution was interrupted because the user stopped the run."
+        self._mark_pending_tools_interrupted(active_segment, pending_tool_starts, interrupted_output)
+        interruption_notice = "本轮已被用户停止，以上为中断前已完成的部分结果。"
+
+        cleaned_segments = self._strip_runtime_segment_fields(segments)
+        full_content = "\n\n".join(
+            str(seg.get("content") or "") for seg in cleaned_segments if seg.get("content")
+        )
+        all_tool_calls = [tc for seg in cleaned_segments for tc in seg.get("tool_calls", [])]
+        all_timeline = [item for seg in cleaned_segments for item in seg.get("timeline", [])]
+        final_citations = finalize_citations(full_content, turn_sources)
+
+        if not user_message_persisted:
+            session_manager.save_message(
+                session_id,
+                "user",
+                self._display_message_with_attachments(user_message, attachments),
+            )
+        if (
+            full_content
+            or all_tool_calls
+            or accumulated_reasoning
+            or all_timeline
+            or turn_sources
+        ):
+            session_manager.save_message(
+                session_id,
+                "assistant",
+                full_content,
+                tool_calls=all_tool_calls or None,
+                sources=dedupe_sources(turn_sources) or None,
+                citations=final_citations or None,
+                reasoning_content=accumulated_reasoning or None,
+                timeline=all_timeline or None,
+                segments=cleaned_segments or None,
+                interrupted=True,
+                interruption_notice=interruption_notice,
+            )
+
+    @staticmethod
     def _last_ai_content(state: dict[str, Any] | None) -> str:
         if not state:
             return ""
@@ -1861,6 +2044,14 @@ class DeepAgentsAgentManager:
         query_id = f"query-{uuid.uuid4().hex[:12]}"
         trace_collector: TraceCollector | None = None
         trace_context_active = False
+        segments: list[dict[str, Any]] = []
+        active_segment: dict[str, Any] = {}
+        pending_tool_starts: dict[str, dict[str, str]] = {}
+        accumulated_reasoning = ""
+        turn_sources: list[dict[str, Any]] = []
+        run_messages_persisted = False
+        user_message_persisted = False
+        checkpoint_thread_id = f"{session_id}:{query_id}"
         try:
             thinking_enabled = bool(config.load_config().get("thinking_mode", False))
             logger.info("Agent stream thinking_mode=%s for session=%s", thinking_enabled, session_id)
@@ -1871,10 +2062,11 @@ class DeepAgentsAgentManager:
             )
             session_manager.update_metadata(session_id, metadata)
 
+            raw_history = session_manager.load_session(session_id)
             history = session_manager.load_session_for_agent(session_id)
             is_first_message = not any(item.get("role") == "user" for item in history)
             messages = self._build_messages(
-                history,
+                raw_history,
                 message,
                 attachments,
                 session_id=session_id,
@@ -1882,10 +2074,16 @@ class DeepAgentsAgentManager:
             )
             historical_tool_call_ids = {
                 tc.get("id")
-                for msg in messages
+                for msg in raw_history
                 for tc in msg.get("tool_calls") or []
                 if tc.get("id")
             }
+            session_manager.save_message(
+                session_id,
+                "user",
+                self._display_message_with_attachments(message, attachments),
+            )
+            user_message_persisted = True
 
             # Restore persisted todos so the Agent resumes from white-box state
             # instead of relying on checkpoint black-box.
@@ -1928,8 +2126,8 @@ class DeepAgentsAgentManager:
             final_state: dict[str, Any] | None = None
             tools_just_finished = False
             emitted_tool_starts: set[str] = set()
-            pending_tool_starts: dict[str, dict[str, str]] = {}
-            turn_sources: list[dict[str, Any]] = []
+            pending_tool_starts = {}
+            turn_sources = []
             # Buffer trace events emitted synchronously by TraceCollector so they
             # can be yielded asynchronously through the SSE stream.
             pending_trace_events: list[dict[str, str]] = []
@@ -1966,7 +2164,7 @@ class DeepAgentsAgentManager:
                     "_current_reasoning": None,
                 }
 
-            segments: list[dict[str, Any]] = [new_segment()]
+            segments = [new_segment()]
             active_segment = segments[0]
             chunk_count = 0
             emitted_reasoning = False
@@ -1977,7 +2175,7 @@ class DeepAgentsAgentManager:
             previous_todos: list[dict[str, Any]] = list(persisted_todos)
 
             agent_config: dict[str, Any] = {
-                "configurable": {"thread_id": session_id, "user_id": user_id}
+                "configurable": {"thread_id": checkpoint_thread_id, "user_id": user_id}
             }
             langsmith_callbacks = self._langsmith_callbacks()
             if langsmith_callbacks:
@@ -2002,8 +2200,8 @@ class DeepAgentsAgentManager:
                     yield pending_trace_events.pop(0)
 
                 chunk_count += 1
-                if chunk_count <= 5 or chunk_count % 20 == 0:
-                    logger.info(
+                if logger.isEnabledFor(logging.DEBUG) and (chunk_count <= 5 or chunk_count % 20 == 0):
+                    logger.debug(
                         "Received stream chunk #%d for session=%s: %s",
                         chunk_count,
                         session_id,
@@ -2115,6 +2313,12 @@ class DeepAgentsAgentManager:
                         if node_name == "tools":
                             for tool_msg in node_messages:
                                 tc_id = str(getattr(tool_msg, "tool_call_id", "") or "")
+                                if tc_id and tc_id in historical_tool_call_ids:
+                                    # LangGraph may echo tool messages that came
+                                    # from the input history/checkpoint. They are
+                                    # model context, not new work in this turn.
+                                    pending_tool_starts.pop(tc_id, None)
+                                    continue
                                 tool_name = self._tool_message_name(tool_msg, pending_tool_starts)
                                 original_output = self._tool_message_output(tool_msg)
                                 pending_tool = pending_tool_starts.get(tc_id, {})
@@ -2350,7 +2554,6 @@ class DeepAgentsAgentManager:
             while pending_trace_events:
                 yield pending_trace_events.pop(0)
 
-            session_manager.save_message(session_id, "user", self._display_message_with_attachments(message, attachments))
             # Build the single assistant message content by concatenating segment
             # text, and persist the segments array for the UI.
             full_content = "\n\n".join(
@@ -2396,6 +2599,7 @@ class DeepAgentsAgentManager:
                     timeline=all_timeline or None,
                     segments=segments or None,
                 )
+            run_messages_persisted = True
             yield self._sse(
                 "citations_finalized",
                 {
@@ -2422,6 +2626,21 @@ class DeepAgentsAgentManager:
         except asyncio.CancelledError:
             logger.info("Agent stream cancelled for session=%s", session_id)
             try:
+                if not run_messages_persisted and segments and active_segment:
+                    self._persist_partial_run(
+                        session_id=session_id,
+                        user_message=message,
+                        attachments=attachments,
+                        segments=segments,
+                        active_segment=active_segment,
+                        pending_tool_starts=pending_tool_starts,
+                        accumulated_reasoning=accumulated_reasoning,
+                        turn_sources=turn_sources,
+                        user_message_persisted=user_message_persisted,
+                    )
+            except Exception:
+                logger.warning("Failed to persist partial cancelled run for session=%s", session_id, exc_info=True)
+            try:
                 permission_resume_registry.reject_session(
                     session_id,
                     "Agent stream was cancelled by the client.",
@@ -2429,7 +2648,7 @@ class DeepAgentsAgentManager:
             except Exception:
                 logger.debug("Failed to reject pending permission requests for session=%s", session_id, exc_info=True)
             try:
-                await self._delete_checkpoint_thread(session_id)
+                await self._delete_checkpoint_thread(checkpoint_thread_id)
             except Exception:
                 logger.debug("Failed to clean cancelled checkpoint for session=%s", session_id, exc_info=True)
             try:

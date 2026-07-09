@@ -109,6 +109,8 @@ export interface ChatMessage {
   sources?: SourceRecord[];
   citations?: CitationRef[];
   permissionRequests?: PermissionRequest[];
+  interrupted?: boolean;
+  interruptionNotice?: string;
   timestamp: number;
 }
 
@@ -272,6 +274,8 @@ function parseHistoryMessages(
     segments?: Array<{ content?: string; reasoning_content?: string; tool_calls?: ToolCall[]; timeline?: TimelineItem[] }>;
     sources?: SourceRecord[];
     citations?: CitationRef[];
+    interrupted?: boolean;
+    interruption_notice?: string;
   }>
 ): ChatMessage[] {
   const loaded: ChatMessage[] = [];
@@ -333,6 +337,8 @@ function parseHistoryMessages(
         segments,
         sources: msg.sources,
         citations: msg.citations,
+        interrupted: Boolean(msg.interrupted),
+        interruptionNotice: msg.interruption_notice,
         timestamp: Date.now() - (backendMessages.length - msgIndex) * 1000,
       });
     }
@@ -438,6 +444,14 @@ function finalizeRunningToolsInMessage(message: ChatMessage, output: string): Ch
     toolCalls,
     timeline,
     segments,
+  };
+}
+
+function markMessageInterrupted(message: ChatMessage): ChatMessage {
+  return {
+    ...message,
+    interrupted: true,
+    interruptionNotice: message.interruptionNotice || "本轮已被用户停止，以上为中断前已完成的部分结果。",
   };
 }
 
@@ -1228,7 +1242,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       updateSessionMessages(sessionId, (prev) =>
         prev.map((message) =>
           message.role === "assistant" && (!targetAssistantId || message.id === targetAssistantId)
-            ? finalizeRunningToolsInMessage(message, "Stream cancelled before this tool returned a result.")
+            ? markMessageInterrupted(
+                finalizeRunningToolsInMessage(message, "Stream cancelled before this tool returned a result.")
+              )
             : message
         )
       );
@@ -1253,12 +1269,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       // session (e.g. after the user clicked "New Chat" or triggered a skill
       // from another page). Normal follow-up messages in an existing session
       // must stay in that session.
-      if (sessionIdRef.current === "default") {
-        await createSession();
+      let sendSessionId = sessionIdRef.current;
+      if (sendSessionId === "default") {
+        const createdSessionId = await createSession();
+        if (!createdSessionId) return;
+        sendSessionId = createdSessionId;
       }
 
       // Capture the sessionId at send time (stable for entire SSE lifecycle)
-      const sendSessionId = sessionIdRef.current;
 
       // Slash command processing
       // Only treat tokens like "/skill-name" as skill invocations; ignore
@@ -1865,18 +1883,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             const updated = [...prev];
             const idx = updated.findIndex((m) => m.id === targetId);
             if (idx !== -1) {
-              // If no token arrived yet, replace the empty placeholder so the
-              // typing indicator disappears; otherwise append the stop marker.
-              const marker = "*— 已停止生成 —*";
-              updated[idx] = {
-                ...finalizeRunningToolsInMessage(
+              updated[idx] = markMessageInterrupted(
+                finalizeRunningToolsInMessage(
                   updated[idx],
                   "Stream cancelled before this tool returned a result."
-                ),
-                content: updated[idx].content
-                  ? updated[idx].content + "\n\n" + marker
-                  : marker,
-              };
+                )
+              );
             }
             return updated;
           });

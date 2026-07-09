@@ -1055,6 +1055,103 @@ export async function importSemanticAssets(files: File[]): Promise<SemanticAsset
   };
 }
 
+export type SqlGuardrailActionType = "rewrite" | "block" | "warn";
+
+export interface SqlGuardrailScope {
+  table_scope: {
+    mode: "any" | "all";
+    values: string[];
+  };
+  semantic_assets: string[];
+}
+
+export interface SqlGuardrailAction {
+  type: SqlGuardrailActionType;
+  message: string;
+}
+
+export interface SqlGuardrailRule {
+  id: string;
+  name: string;
+  enabled: boolean;
+  type: string;
+  scope: SqlGuardrailScope;
+  params: Record<string, unknown>;
+  action: SqlGuardrailAction;
+  document_path?: string;
+  document_body?: string;
+  document_content?: string;
+}
+
+export interface SqlGuardrailFieldDefinition {
+  path: string;
+  label: string;
+  type: "string" | "string_array" | "number" | string;
+  required?: boolean;
+}
+
+export interface SqlGuardrailTypeDefinition {
+  label: string;
+  description: string;
+  fields: SqlGuardrailFieldDefinition[];
+}
+
+export interface SqlGuardrailRulesResult {
+  guardrails: SqlGuardrailRule[];
+}
+
+export async function listSqlGuardrailTypes(): Promise<Record<string, SqlGuardrailTypeDefinition>> {
+  const response = await fetch(`${API_BASE}/analytics/sql-guardrail-types`, { cache: "no-store" });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to load SQL guardrail types: ${response.status}`));
+  }
+  const payload = await response.json();
+  return payload.types || {};
+}
+
+export async function listSqlGuardrails(): Promise<SqlGuardrailRule[]> {
+  const response = await fetch(`${API_BASE}/analytics/sql-guardrails`, { cache: "no-store" });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to load SQL guardrails: ${response.status}`));
+  }
+  const payload = await response.json();
+  return Array.isArray(payload.guardrails) ? payload.guardrails : [];
+}
+
+export async function saveSqlGuardrail(rule: SqlGuardrailRule): Promise<SqlGuardrailRule> {
+  const response = await fetch(`${API_BASE}/analytics/sql-guardrails`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(rule),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to save SQL guardrail: ${response.status}`));
+  }
+  const payload = await response.json();
+  return payload.rule;
+}
+
+export async function deleteSqlGuardrail(ruleId: string): Promise<void> {
+  const response = await fetch(`${API_BASE}/analytics/sql-guardrails/${encodeURIComponent(ruleId)}`, { method: "DELETE" });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to delete SQL guardrail: ${response.status}`));
+  }
+}
+
+export async function resetSqlGuardrails(): Promise<SqlGuardrailRule[]> {
+  const response = await fetch(`${API_BASE}/analytics/sql-guardrails/reset`, { method: "POST" });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to reset SQL guardrails: ${response.status}`));
+  }
+  const payload = await response.json();
+  return Array.isArray(payload.guardrails) ? payload.guardrails : [];
+}
+
 export interface DatabaseQueryResultSummary {
   result_id: string;
   session_id?: string;
