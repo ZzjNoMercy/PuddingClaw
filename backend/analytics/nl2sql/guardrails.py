@@ -31,6 +31,7 @@ class GuardrailTableScope(BaseModel):
 class GuardrailScope(BaseModel):
     table_scope: GuardrailTableScope = Field(default_factory=GuardrailTableScope)
     semantic_assets: list[str] = Field(default_factory=list)
+    intent_any: list[str] = Field(default_factory=list)
 
 
 class GuardrailAction(BaseModel):
@@ -145,6 +146,7 @@ DEFAULT_GUARDRAILS = GuardrailRuleSet(
             scope=GuardrailScope(
                 table_scope=GuardrailTableScope(mode="all", values=["vehicle_params", "vehicle_params_wide"]),
                 semantic_assets=["measure:config_rate"],
+                intent_any=["配置率", "搭载率", "渗透率", "配备率", "占比"],
             ),
             params={"required_table": "vehicle_params_wide", "fallback_table": "vehicle_params"},
             action=GuardrailAction(
@@ -159,6 +161,7 @@ DEFAULT_GUARDRAILS = GuardrailRuleSet(
             scope=GuardrailScope(
                 table_scope=GuardrailTableScope(mode="any", values=["vehicle_params"]),
                 semantic_assets=["measure:config_rate"],
+                intent_any=["配置率", "搭载率", "渗透率", "配备率", "占比"],
             ),
             params={
                 "forbidden_columns_only": ["car_name"],
@@ -175,6 +178,7 @@ DEFAULT_GUARDRAILS = GuardrailRuleSet(
             scope=GuardrailScope(
                 table_scope=GuardrailTableScope(mode="any", values=["vehicle_params"]),
                 semantic_assets=["measure:config_rate"],
+                intent_any=["配置率", "搭载率", "渗透率", "配备率", "占比"],
             ),
             params={"table": "vehicle_params", "distinct_column": "car_name", "min_exists_count": 2},
             action=GuardrailAction(
@@ -302,6 +306,7 @@ def _rule_document_payload(rule: GuardrailRule, path: Path, body: str, content: 
 def _guardrail_body(rule: GuardrailRule) -> str:
     table_values = rule.scope.table_scope.values
     semantic_assets = rule.scope.semantic_assets
+    intent_any = rule.scope.intent_any
     params_preview = yaml.safe_dump(rule.params, allow_unicode=True, sort_keys=False).strip() or "{}"
     return (
         f"# {rule.name}\n\n"
@@ -310,6 +315,7 @@ def _guardrail_body(rule: GuardrailRule) -> str:
         "## 命中范围\n\n"
         f"- 表范围：{rule.scope.table_scope.mode} / {', '.join(table_values) if table_values else '不限制'}\n"
         f"- 语义资产：{', '.join(semantic_assets) if semantic_assets else '不限制'}\n\n"
+        f"- 问题意图：{' / '.join(intent_any) if intent_any else '不限制'}\n\n"
         "## Detector 参数\n\n"
         "```yaml\n"
         f"{params_preview}\n"
@@ -479,7 +485,14 @@ def reset_guardrail_rules() -> dict[str, Any]:
     return list_guardrail_rules()
 
 
-def scope_matches(rule: GuardrailRule, *, source_name: str, route: Any, semantic_trace: dict[str, Any]) -> bool:
+def scope_matches(
+    rule: GuardrailRule,
+    *,
+    source_name: str,
+    route: Any,
+    semantic_trace: dict[str, Any],
+    question: str = "",
+) -> bool:
     scope = rule.scope
     route_tables = _route_table_names(route)
     asset_ids = semantic_asset_ids(semantic_trace)
@@ -493,6 +506,10 @@ def scope_matches(rule: GuardrailRule, *, source_name: str, route: Any, semantic
             return False
     if scope.semantic_assets and not set(scope.semantic_assets).issubset(asset_ids):
         return False
+    if scope.intent_any:
+        normalized_question = str(question or "").lower()
+        if not any(str(intent).strip().lower() in normalized_question for intent in scope.intent_any if str(intent).strip()):
+            return False
     return True
 
 
@@ -615,6 +632,7 @@ def detect_guardrail_conflicts(
     source_name: str,
     route: Any,
     semantic_trace: dict[str, Any],
+    question: str = "",
     rules: list[GuardrailRule] | None = None,
 ) -> list[GuardrailConflict]:
     active_rules = rules if rules is not None else load_guardrail_rules().guardrails
@@ -622,7 +640,13 @@ def detect_guardrail_conflicts(
     for rule in active_rules:
         if not rule.enabled:
             continue
-        if not scope_matches(rule, source_name=source_name, route=route, semantic_trace=semantic_trace):
+        if not scope_matches(
+            rule,
+            source_name=source_name,
+            route=route,
+            semantic_trace=semantic_trace,
+            question=question,
+        ):
             continue
         detector = DETECTORS.get(rule.type)
         if detector is None:

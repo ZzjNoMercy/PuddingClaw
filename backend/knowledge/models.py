@@ -187,3 +187,67 @@ class KnowledgeImportEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
     job: Mapped[KnowledgeImportJob] = relationship(back_populates="events")
+
+
+class SemanticDimensionBuildJob(Base):
+    __tablename__ = "semantic_dimension_build_jobs"
+    __table_args__ = (
+        Index("ix_semantic_dimension_build_jobs_status_created", "status", "created_at"),
+        Index("ix_semantic_dimension_build_jobs_dimension_created", "dimension_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: new_id("sdb"))
+    session_id: Mapped[str] = mapped_column(String(120), nullable=False, default="")
+    query_id: Mapped[str] = mapped_column(String(120), nullable=False, default="")
+    dimension_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    adapter: Mapped[str] = mapped_column(String(160), nullable=False)
+    requested_scope: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    input_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(60), nullable=False, default="queued")
+    current_step: Mapped[str] = mapped_column(String(80), nullable=False, default="queued")
+    progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    staging_path: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    published_reference_path: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    result_summary: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    events: Mapped[list["SemanticDimensionBuildEvent"]] = relationship(back_populates="job", cascade="all, delete-orphan")
+
+
+class SemanticDimensionBuildEvent(Base):
+    __tablename__ = "semantic_dimension_build_events"
+    __table_args__ = (Index("ix_semantic_dimension_build_events_job_created", "job_id", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: new_id("sde"))
+    job_id: Mapped[str] = mapped_column(String(64), ForeignKey("semantic_dimension_build_jobs.id"), nullable=False)
+    level: Mapped[str] = mapped_column(String(20), nullable=False, default="info")
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    event_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    job: Mapped[SemanticDimensionBuildJob] = relationship(back_populates="events")
+
+
+class TaskNotification(Base):
+    """A unified task-center notification without merging the underlying job tables."""
+
+    __tablename__ = "task_notifications"
+    __table_args__ = (
+        Index("ix_task_notifications_unread_created", "read_at", "created_at"),
+        Index("ix_task_notifications_subject_created", "subject_type", "subject_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: new_id("ntf"))
+    category: Mapped[str] = mapped_column(String(80), nullable=False, default="task")
+    subject_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    subject_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(String(300), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

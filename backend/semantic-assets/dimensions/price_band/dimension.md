@@ -14,6 +14,16 @@ tags:
   - vehicle_params_wide
   - 价格
 version: 0.1.0
+resolution_mode: derived
+resolution:
+  mode: derived
+  bindings:
+    - asset_ref: dbs_77982e981bac4a6fa8.vehicle_params_wide
+      display_name: insight_data · vehicle_params_wide
+      fields:
+        value: price
+  source_fields: [price]
+  expression: 按厂商指导价（万元）划分价格区间；优先读取已固化的 price_band。
 created: 2026-07-08 00:00:00
 updated_at: 2026-07-09 00:00:00
 ---

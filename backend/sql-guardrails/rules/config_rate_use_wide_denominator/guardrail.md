@@ -13,6 +13,12 @@ scope:
     - vehicle_params_wide
   semantic_assets:
   - measure:config_rate
+  intent_any:
+  - 配置率
+  - 搭载率
+  - 渗透率
+  - 配备率
+  - 占比
 params:
   required_table: vehicle_params_wide
   fallback_table: vehicle_params

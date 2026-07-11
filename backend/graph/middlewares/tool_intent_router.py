@@ -25,17 +25,54 @@ _ROUTER_HINT_MARKER = "[系统路由提示]"
 
 
 _DEFAULT_INTENT_REGISTRY: dict[str, dict[str, Any]] = {
+    "semantic_dimension_build": {
+        "keywords": [
+            "刷新车系维度", "刷新维度", "重建维度", "构建维度", "构建语义维度",
+            "全量构建车系", "全量刷新车系", "刷新所有品牌车系", "刷新全部车系",
+            "刷新全部车系维度", "全部车系维度", "crosswalk 刷新",
+        ],
+        "preferred_tools": ["enqueue_semantic_dimension_build", "get_semantic_dimension_build_job"],
+        "tool_categories": ["table"],
+        "routing_prompt": (
+            "用户意图为耗时的语义维度构建或刷新。不要同步运行构建脚本、不要读取全量 Crosswalk。"
+            "若用户明确要求刷新全部/所有车系维度（包括 /build-semantic-dimension），这是已注册的固定构建："
+            "直接且只调用一次 enqueue_semantic_dimension_build，参数为 dimension_id='vehicle_series'、"
+            "adapter='vehicle_series_full'、requested_scope={'brands':'all'}。不要在入队前调用 read_file、"
+            "read_resource、ls/glob/find、database_schema_inspect、pandas_knowledge_query、"
+            "llamaindex_knowledge_query 或 get_semantic_dimension_build_job，也不要先解释或询问确认。"
+            "拿到 job_id 后简要说明任务已后台运行并结束本轮。"
+            "用户后续询问状态或要求发布时，先调用 get_semantic_dimension_build_job；构建完成只表示 staging 已就绪，"
+            "发布仍须用户在原对话明确确认，并按 build-semantic-dimension Skill 的受控发布步骤执行。"
+        ),
+    },
+    "knowledge_catalog": {
+        "keywords": [
+            "有哪些文件", "有哪些表格文件", "可用的表格文件", "所有可用的表格文件",
+            "导入了哪些", "导入的数据集", "文件清单", "目录清单", "资产清单",
+            "知识库文件", "知识库中所有", "当前知识库中所有",
+        ],
+        "preferred_tools": [],
+        "tool_categories": ["filesystem"],
+        "routing_prompt": (
+            "用户意图为知识库文件/资产目录查询。不要调用 pandas_knowledge_query 或 "
+            "llamaindex_knowledge_query；应使用文件系统 ls/glob 查看 /knowledge 下的文件和目录。"
+        ),
+    },
     "database_analysis": {
         "keywords": [
             "数据库", "数据源", "postgres", "postgresql", "sql", "vanna", "nl2sql",
             "数据库表", "表结构", "ddl", "实体字典", "结构化数据库",
             "问数 agent", "智能问数",
+            # 汽车产品配置分析默认落在业务数据库，不先走 Excel/Pandas 或 schema 探测。
+            "产品配置", "汽车配置", "配置分析", "配置率", "搭载率", "配备率", "装配率",
+            "空气悬架", "空气悬挂", "激光雷达", "充电倍率", "能源类型", "车型级别",
         ],
         "preferred_tools": ["database_sql_generate", "database_sql_validate", "database_sql_execute"],
         "tool_categories": ["table"],
         "routing_prompt": (
             "用户意图为结构化数据库问数。只要问题涉及已配置数据库源、数据库表、SQL、"
             "Vanna/NL2SQL、实体字典、DDL、表结构，或用户明确在问数据库里的业务数据，"
+            "或涉及汽车产品配置分析、配置率/搭载率/配备率、空气悬架、激光雷达、充电倍率等指标，"
             "必须优先调用 database_sql_generate 生成 SQL，再用 database_sql_validate 或 "
             "database_sql_execute 校验/执行。对于业务问数，先把用户原问题交给 database_sql_generate；"
             "该工具会执行表 Router、加载语义资产、召回 Vanna 资料并生成 SQL，但不会执行。"
@@ -60,6 +97,8 @@ _DEFAULT_INTENT_REGISTRY: dict[str, dict[str, Any]] = {
             "用户意图为表格问数。只要问题涉及已导入 Excel/CSV/TSV、刚才导入的表格、字段/列名、"
             "行数、筛选、排序、分组、聚合、趋势、Top N、数据分析/问数/报表，"
             "或销量/环比/同比/占比/配置率等业务指标，应优先使用结构化问数工具。"
+            "如果用户是在问当前知识库有哪些文件、有哪些表格文件、导入了哪些数据集、文件清单、目录清单或资产清单，"
+            "不要调用 pandas_knowledge_query；应使用文件系统 ls/glob 查看 /knowledge。"
             "如果上下文是 Excel/CSV/TSV 或用户说“导入的表格/Excel”，调用 pandas_knowledge_query；"
             "如果上下文是数据库源/数据库表/SQL/Vanna，先调用 database_sql_generate，再调用 "
             "database_sql_execute 执行确认过的 SQL。处理业务问数时，应直接传入用户原问题生成 SQL，"
@@ -159,6 +198,17 @@ class ToolIntentRouterMiddleware(AgentMiddleware):
 
         if not matched_intents:
             return {"matched": False, "intents": [], "preferred_tools": [], "routing_prompt": ""}
+
+        # 资产目录查询优先于表格问数：避免“有哪些表格文件”被 pandas 当成单表分析。
+        if "semantic_dimension_build" in matched_intents and len(matched_intents) > 1:
+            matched_intents = ["semantic_dimension_build"]
+            routing_prompts = [self.intent_registry["semantic_dimension_build"]["routing_prompt"]]
+            preferred_tools = list(self.intent_registry["semantic_dimension_build"].get("preferred_tools", []))
+
+        if "knowledge_catalog" in matched_intents and len(matched_intents) > 1:
+            matched_intents = ["knowledge_catalog"]
+            routing_prompts = [self.intent_registry["knowledge_catalog"]["routing_prompt"]]
+            preferred_tools = list(self.intent_registry["knowledge_catalog"].get("preferred_tools", []))
 
         # 数据库问数优先级最高：避免结构化数据库问题被 Excel/PDF/Web 路由抢走。
         if "database_analysis" in matched_intents and len(matched_intents) > 1:

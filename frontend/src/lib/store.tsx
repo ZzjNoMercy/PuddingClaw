@@ -35,6 +35,7 @@ import {
   TraceMiddlewareInvocation,
   GraphStructure,
   PermissionRequest,
+  DimensionBuildRuleRequest,
   AgentAttachment,
 } from "./api";
 import {
@@ -109,8 +110,10 @@ export interface ChatMessage {
   sources?: SourceRecord[];
   citations?: CitationRef[];
   permissionRequests?: PermissionRequest[];
+  dimensionBuildRuleRequests?: DimensionBuildRuleRequest[];
   interrupted?: boolean;
   interruptionNotice?: string;
+  errorNotice?: string;
   timestamp: number;
 }
 
@@ -148,6 +151,8 @@ interface AppState {
   setRuntimeMode: (mode: "agent" | "chat") => void;
   currentProjectId: string | null;
   setCurrentProjectId: (id: string | null) => void;
+  analyticsModelId: string | null;
+  setAnalyticsModelId: (id: string | null) => void;
   projects: ProjectMeta[];
   loadProjects: () => void;
   registerProject: (path: string) => Promise<ProjectMeta | null>;
@@ -276,6 +281,7 @@ function parseHistoryMessages(
     citations?: CitationRef[];
     interrupted?: boolean;
     interruption_notice?: string;
+    error_notice?: string;
   }>
 ): ChatMessage[] {
   const loaded: ChatMessage[] = [];
@@ -339,6 +345,7 @@ function parseHistoryMessages(
         citations: msg.citations,
         interrupted: Boolean(msg.interrupted),
         interruptionNotice: msg.interruption_notice,
+        errorNotice: msg.error_notice,
         timestamp: Date.now() - (backendMessages.length - msgIndex) * 1000,
       });
     }
@@ -452,6 +459,13 @@ function markMessageInterrupted(message: ChatMessage): ChatMessage {
     ...message,
     interrupted: true,
     interruptionNotice: message.interruptionNotice || "本轮已被用户停止，以上为中断前已完成的部分结果。",
+  };
+}
+
+function markMessageError(message: ChatMessage, notice: string): ChatMessage {
+  return {
+    ...message,
+    errorNotice: notice,
   };
 }
 
@@ -595,6 +609,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [runtimeMode, setRuntimeModeRaw] = useState<"agent" | "chat">("chat");
   const [runtimeReady, setRuntimeReady] = useState(false);
   const [currentProjectId, setCurrentProjectIdRaw] = useState<string | null>(null);
+  const [analyticsModelId, setAnalyticsModelId] = useState<string | null>(null);
   const [projects, setProjects] = useState<ProjectMeta[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [inspectorFile, setInspectorFileRaw] = useState<string | null>(null);
@@ -1065,11 +1080,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (sessions.length === 0) return;
 
-    if (!restoredSessionRef.current) {
+    const isInitialRestore = !restoredSessionRef.current;
+    if (isInitialRestore) {
       restoredSessionRef.current = true;
       try {
         const saved = sessionStorage.getItem("puddingclaw_session_id");
-        if (saved && (saved === "default" || sessions.some((s) => s.id === saved))) {
+        if (saved && saved !== "default" && sessions.some((s) => s.id === saved)) {
           setSessionId(saved);
           return;
         }
@@ -1080,7 +1096,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
     // Fallback: don't auto-switch away from the placeholder "default" session;
     // the user may have clicked "New Chat" and expects to start a fresh conversation.
-    if (sessionIdRef.current === "default") return;
+    if (!isInitialRestore && sessionIdRef.current === "default") return;
     // If the current session already exists in the loaded list, keep it.
     if (sessions.some((s) => s.id === sessionIdRef.current)) return;
     const latest = [...sessions].sort((a, b) => b.updated_at - a.updated_at)[0];
@@ -1438,7 +1454,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
       try {
         const eventStream = runtimeMode === "agent"
-          ? streamAgent(processedText, sendSessionId, currentProjectId, controller.signal, userId, attachments)
+          ? streamAgent(processedText, sendSessionId, currentProjectId, controller.signal, userId, attachments, analyticsModelId)
           : streamChat(processedText, sendSessionId, controller.signal, userId);
 
         for await (const event of eventStream) {
@@ -1657,6 +1673,41 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             continue;
           }
 
+          if (event.event === "dimension_build_rule_required") {
+            const targetId = getAssistantId();
+            const request = event.data as unknown as DimensionBuildRuleRequest;
+            updateMsgs((prev) => {
+              const updated = [...prev];
+              const idx = updated.findIndex((message) => message.id === targetId);
+              if (idx === -1) return prev;
+              const message = { ...updated[idx] };
+              const existing = message.dimensionBuildRuleRequests || [];
+              message.dimensionBuildRuleRequests = existing.some((item) => item.id === request.id)
+                ? existing.map((item) => item.id === request.id ? request : item)
+                : [...existing, request];
+              updated[idx] = message;
+              return updated;
+            });
+            continue;
+          }
+
+          if (event.event === "dimension_build_rule_resolved") {
+            const targetId = getAssistantId();
+            const requestId = String(event.data.request_id || "");
+            updateMsgs((prev) => {
+              const updated = [...prev];
+              const idx = updated.findIndex((message) => message.id === targetId);
+              if (idx === -1 || !requestId) return prev;
+              const message = { ...updated[idx] };
+              message.dimensionBuildRuleRequests = (message.dimensionBuildRuleRequests || []).map((item) =>
+                item.id === requestId ? { ...item, status: "resolved" } : item
+              );
+              updated[idx] = message;
+              return updated;
+            });
+            continue;
+          }
+
           // Agent white-box state: execution trace update
           if (event.event === "trace_updated") {
             const nextTrace = (event.data.trace || null) as AgentTrace | null;
@@ -1862,9 +1913,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                     (event.data.message as string) ||
                     (event.data.error as string) ||
                     "Agent 运行失败，请查看后端日志。";
-                  msg.content = msg.content
-                    ? `${msg.content}\n\n**Agent error:** ${message}`
-                    : `**Agent error:** ${message}`;
+                  Object.assign(msg, markMessageError(msg, message));
                 }
                 break;
             }
@@ -1898,15 +1947,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             const updated = [...prev];
             const idx = updated.findIndex((m) => m.id === targetId);
             if (idx !== -1) {
-              updated[idx] = {
-                ...finalizeRunningToolsInMessage(
+              updated[idx] = markMessageError(
+                finalizeRunningToolsInMessage(
                   updated[idx],
                   "Connection closed before this tool returned a result."
                 ),
-                content:
-                  updated[idx].content +
-                  `\n\n**Connection error:** ${err instanceof Error ? err.message : "Unknown"}`,
-              };
+                `连接中断：${err instanceof Error ? err.message : "Unknown"}。已保留中断前完成的内容。`
+              );
             }
             return updated;
           });
@@ -1947,6 +1994,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       updateSessionMessages,
       runtimeMode,
       currentProjectId,
+      analyticsModelId,
     ]
   );
 
@@ -1966,6 +2014,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setRuntimeMode,
         currentProjectId,
         setCurrentProjectId,
+        analyticsModelId,
+        setAnalyticsModelId,
         projects,
         loadProjects,
         registerProject,

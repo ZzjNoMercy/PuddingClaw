@@ -1,14 +1,36 @@
 # Tool Guides
 
+## Database Analysis
+
+Use `database_sql_generate` first for configured PostgreSQL / NL2SQL business questions.
+
+This includes automotive product configuration analysis and metrics such as 配置率, 搭载率, 配备率, 装配率, 空气悬架, 空气悬挂, 激光雷达, 充电倍率, 能源类型, 车型级别, 上市时间, and price-band analysis over configured database tables.
+
+For these database-backed business metric questions, pass the user's original question to `database_sql_generate` first. Then use `database_sql_validate` or `database_sql_execute` for validation / execution. Do not first search the knowledge base, inspect schema, enumerate fields, or call `pandas_knowledge_query`, unless the user explicitly says the data is from an imported Excel/CSV/TSV file.
+
+Use `database_schema_inspect` only when the user explicitly asks for metadata such as available tables, columns, or EAV `type_name` values.
+
+## Semantic Dimension Builds
+
+When the user explicitly asks to refresh, rebuild, or fully construct a reusable semantic dimension/Crosswalk, use `enqueue_semantic_dimension_build`. These builds may read large assets and must run in the background; do not use `terminal`, `execute_skill`, or `read_file` to run or inspect a full Crosswalk in the chat turn. Reply with the returned job id and state that the build is running.
+
+When the user asks to build or append a cross-source dimension from one or more files/tables, first call `inspect_dimension_build_input` for each candidate. Attachments are valid temporary build inputs and do not need knowledge-base import. For a **new dimension** or explicit **baseline rebuild**, call `request_dimension_build_rule` with `operation="refresh"`; wait for the HITL choice of canonical input and key fields. For **adding an attachment/table to an already published dimension**, call it with `operation="append_source"`: the tool locks the existing `active_crosswalk.json` as the canonical universe, and the HITL card only maps the new source. For every source candidate, provide a stable `suggested_source_id` and `suggested_source_name`: use a reusable business source family such as `insurance_sales` / `乘用车上险量` or `orders` / `终端订单`, never an attachment id or month-specific filename. The card lets the user append a registered source or create a new source. Only after it resumes with a confirmed `build_rule`, enqueue `adapter="entity_crosswalk_v1"` with `input_snapshot={"build_rule": <confirmed rule>}`. An append must never replace the canonical baseline or create baseline-change review.
+
+For the registered request "刷新全部车系维度" (or equivalent "刷新所有品牌车系", including `/build-semantic-dimension`), do not perform discovery. Call `enqueue_semantic_dimension_build` exactly once with `dimension_id="vehicle_series"`, `adapter="vehicle_series_full"`, and `requested_scope={"brands":"all"}`. Do not inspect the dimension directory, read `dimension.md`, list assets, inspect database schema, run Pandas/RAG, or query job progress before enqueueing. The builder owns source-profile loading and validation.
+
+Use `get_semantic_dimension_build_job` only for progress, error review, or when the user explicitly asks to publish a completed build. A `waiting_for_publish_confirmation` result is staged and validated but not active. Only after explicit user approval, call `publish_semantic_dimension_build`; it atomically activates the staged Crosswalk, updates `dimension.md` in Beijing time, and records the published Job status. In the publication reply, use `published_summary` as the only active-runtime fact; `result_summary` describes the staged build and may contain raw file-instance diagnostics. Never compare an attachment-instance count with the UI's logical source-contract count. Never use `write_file` for this publication flow.
+
 ## Table Analysis
 
 Use `pandas_knowledge_query` first for imported Excel / CSV / TSV table questions.
 
 This includes: "刚才导入的 Excel", row count, columns / fields, sheet summary, filtering, grouping, aggregation, pivot-style analysis, trends, top/bottom ranking, and calculations.
 
-Business metric questions such as sales volume, weekly/monthly sales, 环比, 同比, 占比, 配置率, 渗透率, brand/model/series comparisons, or price-band analysis should also try `pandas_knowledge_query` first when imported table data may exist. Do not jump to web search unless the user explicitly asks for news, public web data, or the latest online information.
+Do not use `pandas_knowledge_query` to answer catalog questions such as "当前知识库有哪些文件", "有哪些表格文件", "导入了哪些数据集", "列出文件清单", "目录清单", or "资产清单". These are filesystem/catalog questions; use filesystem listing tools such as `ls` / `glob` under `/knowledge` instead.
 
-For data analysis / 问数 / 指标计算 / 报表 style requests, `pandas_knowledge_query` has higher priority than `llamaindex_knowledge_query`, even if the user says "知识库". LlamaIndex RAG is for document semantic retrieval, not spreadsheet calculation.
+Business metric questions over explicitly imported Excel/CSV/TSV files, such as sales volume, weekly/monthly sales, 环比, 同比, 占比, brand/model/series comparisons, or spreadsheet price-band analysis, should use `pandas_knowledge_query`. Do not jump to web search unless the user explicitly asks for news, public web data, or the latest online information.
+
+For imported-file data analysis / 问数 / 指标计算 / 报表 style requests, `pandas_knowledge_query` has higher priority than `llamaindex_knowledge_query`, even if the user says "知识库". LlamaIndex RAG is for document semantic retrieval, not spreadsheet calculation.
 
 Do not call `llamaindex_knowledge_query`, `glob`, or `grep` before `pandas_knowledge_query` for table questions. Those tools are for document retrieval and exact file lookup; they cannot reliably read spreadsheet structure.
 

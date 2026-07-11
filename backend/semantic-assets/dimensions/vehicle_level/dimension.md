@@ -14,6 +14,14 @@ tags:
   - vehicle_params_wide
   - 级别
 version: 0.1.0
+resolution_mode: source_field
+resolution:
+  mode: source_field
+  bindings:
+    - asset_ref: dbs_77982e981bac4a6fa8.vehicle_params_wide
+      display_name: insight_data · vehicle_params_wide
+      fields:
+        value: vehicle_level
 created: 2026-07-08 00:00:00
 updated_at: 2026-07-09 00:00:00
 ---

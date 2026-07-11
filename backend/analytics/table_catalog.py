@@ -7,6 +7,7 @@ Pandas tool do not repeatedly scan `/knowledge`.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ from utils.table_engine.profiler import profile_dataframe
 
 TABLE_SUFFIXES = {".xlsx", ".xls", ".csv", ".tsv"}
 IGNORED_TOP_LEVEL_DIRS = {".puddingclaw", ".tasks", "tasks", "originals", "assets"}
+PROFILE_SAMPLE_ROWS = 20000
 
 
 def _utc_datetime(timestamp: float) -> datetime:
@@ -102,7 +104,10 @@ class TableAssetCatalog:
             await self.ensure_catalog_populated(session, limit=limit)
         stmt = (
             select(KnowledgeTableAsset)
-            .where(KnowledgeTableAsset.knowledge_base_id == DEFAULT_KNOWLEDGE_BASE_ID)
+            .where(
+                KnowledgeTableAsset.knowledge_base_id == DEFAULT_KNOWLEDGE_BASE_ID,
+                KnowledgeTableAsset.reference_status != "removed",
+            )
             .order_by(KnowledgeTableAsset.updated_at.desc(), KnowledgeTableAsset.file_name.asc())
             .limit(max(1, min(limit, 2000)))
         )
@@ -114,48 +119,77 @@ class TableAssetCatalog:
         if asset is None:
             await self.ensure_catalog_populated(session, limit=2000)
             asset = await session.get(KnowledgeTableAsset, asset_id)
-        if asset is None:
+        if asset is None or asset.reference_status == "removed":
             raise TableCatalogError("Table asset not found.")
         return self._asset_to_dict(asset, include_profile=include_profile)
+
+    async def remove_asset(self, session: AsyncSession, asset_id: str) -> dict[str, Any]:
+        """Detach one uploaded workbook/flat file from analytics without deleting its KB file."""
+        asset = await session.get(KnowledgeTableAsset, asset_id)
+        if asset is None or asset.reference_status == "removed":
+            raise TableCatalogError("Table asset not found.")
+
+        siblings = list(
+            (
+                await session.execute(
+                    select(KnowledgeTableAsset).where(
+                        KnowledgeTableAsset.knowledge_base_id == asset.knowledge_base_id,
+                        KnowledgeTableAsset.storage_path == asset.storage_path,
+                        KnowledgeTableAsset.reference_status != "removed",
+                    )
+                )
+            ).scalars()
+        )
+        removed_ids: list[str] = []
+        for sibling in siblings:
+            profile_path = Path(sibling.profile_path) if sibling.profile_path else self.profile_path(sibling.asset_id)
+            if profile_path.is_file() and self.profile_path(sibling.asset_id).parent in profile_path.parents:
+                await asyncio.to_thread(profile_path.unlink, missing_ok=True)
+            sibling.reference_status = "removed"
+            sibling.profile_status = "missing"
+            sibling.profile_path = ""
+            sibling.rows = None
+            sibling.columns_count = None
+            sibling.columns = []
+            removed_ids.append(sibling.asset_id)
+        await session.commit()
+        return {
+            "asset_id": asset_id,
+            "removed_asset_ids": removed_ids,
+            "file_name": asset.file_name,
+            "storage_path": asset.storage_path,
+            "source_file_preserved": True,
+        }
 
     async def load_dataframe_for_asset(self, session: AsyncSession, asset_id: str):
         asset = await session.get(KnowledgeTableAsset, asset_id)
         if asset is None:
             await self.ensure_catalog_populated(session, limit=2000)
             asset = await session.get(KnowledgeTableAsset, asset_id)
-        if asset is None:
+        if asset is None or asset.reference_status == "removed":
             raise TableCatalogError("Table asset not found.")
         return asset, self._load_dataframe(self._ref_from_model(asset))
 
-    async def generate_profile(self, session: AsyncSession, asset_id: str) -> dict[str, Any]:
+    async def generate_profile(
+        self,
+        session: AsyncSession,
+        asset_id: str,
+        *,
+        include_profile: bool = True,
+    ) -> dict[str, Any]:
         asset = await session.get(KnowledgeTableAsset, asset_id)
         if asset is None:
             await self.ensure_catalog_populated(session, limit=2000)
             asset = await session.get(KnowledgeTableAsset, asset_id)
-        if asset is None:
+        if asset is None or asset.reference_status == "removed":
             raise TableCatalogError("Table asset not found.")
 
         ref = self._ref_from_model(asset)
-        df = self._load_dataframe(ref)
-        base_profile = profile_dataframe(df, preview_rows=8)
-        profile = {
-            "asset_id": asset.asset_id,
-            "kind": "table_asset_profile",
-            "source_type": asset.source_type,
-            "file_name": asset.file_name,
-            "virtual_path": asset.virtual_path,
-            "sheet_name": asset.sheet_name,
-            "size_bytes": asset.size_bytes,
-            "modified_at": _iso(asset.modified_at),
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "shape": base_profile.get("shape"),
-            "columns": self._column_profiles(df, base_profile),
-            "dtypes": base_profile.get("dtypes", {}),
-            "preview": base_profile.get("preview", []),
-        }
+        profile = await asyncio.to_thread(self._build_profile, asset, ref)
         profile_path = self.profile_path(asset.asset_id)
         profile_path.parent.mkdir(parents=True, exist_ok=True)
-        profile_path.write_text(json.dumps(profile, ensure_ascii=False, indent=2, default=_json_default), encoding="utf-8")
+        profile_json = json.dumps(profile, ensure_ascii=False, indent=2, default=_json_default)
+        await asyncio.to_thread(profile_path.write_text, profile_json, encoding="utf-8")
 
         shape = profile.get("shape") if isinstance(profile.get("shape"), list) else []
         columns = [column.get("name") for column in profile.get("columns", []) if isinstance(column, dict)]
@@ -170,7 +204,34 @@ class TableAssetCatalog:
         }
         await session.commit()
         await session.refresh(asset)
-        return self._asset_to_dict(asset, include_profile=True)
+        return self._asset_to_dict(asset, include_profile=include_profile)
+
+    def _build_profile(self, asset: KnowledgeTableAsset, ref: TableAssetRef) -> dict[str, Any]:
+        """Build a sampled table profile off the event loop."""
+
+        df = self._load_dataframe(ref, sample_rows=PROFILE_SAMPLE_ROWS)
+        base_profile = profile_dataframe(df, preview_rows=8)
+        actual_shape = self._table_shape(ref, sample_df=df)
+        sampled_rows = int(df.shape[0])
+        total_rows = int(actual_shape[0]) if actual_shape and actual_shape[0] is not None else sampled_rows
+        return {
+            "asset_id": asset.asset_id,
+            "kind": "table_asset_profile",
+            "sampled": sampled_rows < total_rows,
+            "sample_rows": sampled_rows,
+            "profile_sample_limit": PROFILE_SAMPLE_ROWS,
+            "source_type": asset.source_type,
+            "file_name": asset.file_name,
+            "virtual_path": asset.virtual_path,
+            "sheet_name": asset.sheet_name,
+            "size_bytes": asset.size_bytes,
+            "modified_at": _iso(asset.modified_at),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "shape": actual_shape or base_profile.get("shape"),
+            "columns": self._column_profiles(df, base_profile),
+            "dtypes": base_profile.get("dtypes", {}),
+            "preview": base_profile.get("preview", []),
+        }
 
     async def refresh_profiles(self, session: AsyncSession, *, limit: int = 200) -> dict[str, Any]:
         await self.ensure_catalog_populated(session, limit=limit)
@@ -451,16 +512,47 @@ class TableAssetCatalog:
         )
 
     @staticmethod
-    def _load_dataframe(asset: TableAssetRef):
+    @staticmethod
+    def _load_dataframe(asset: TableAssetRef, *, sample_rows: int | None = None):
         import pandas as pd
 
+        nrows = max(1, sample_rows) if sample_rows else None
         if asset.source_type == "excel":
-            return pd.read_excel(asset.path, sheet_name=asset.sheet_name)
+            return pd.read_excel(asset.path, sheet_name=asset.sheet_name, nrows=nrows)
         sep = "\t" if asset.source_type == "tsv" else ","
         try:
-            return pd.read_csv(asset.path, sep=sep)
+            return pd.read_csv(asset.path, sep=sep, nrows=nrows)
         except UnicodeDecodeError:
-            return pd.read_csv(asset.path, sep=sep, encoding="gb18030")
+            return pd.read_csv(asset.path, sep=sep, encoding="gb18030", nrows=nrows)
+
+    @staticmethod
+    def _table_shape(asset: TableAssetRef, *, sample_df: Any) -> list[int] | None:
+        """Return actual table shape without fully materializing large files when possible."""
+
+        if asset.source_type == "excel" and asset.path.suffix.lower() == ".xlsx":
+            try:
+                from openpyxl import load_workbook
+
+                workbook = load_workbook(asset.path, read_only=True, data_only=True)
+                try:
+                    sheet = workbook[asset.sheet_name] if asset.sheet_name else workbook.active
+                    rows = max(int(sheet.max_row or 0) - 1, 0)
+                    columns = int(sheet.max_column or sample_df.shape[1])
+                    return [rows, columns]
+                finally:
+                    workbook.close()
+            except Exception:
+                return [int(sample_df.shape[0]), int(sample_df.shape[1])]
+
+        if asset.source_type in {"csv", "tsv"}:
+            try:
+                with asset.path.open("rb") as handle:
+                    rows = sum(1 for _ in handle)
+                return [max(rows - 1, 0), int(sample_df.shape[1])]
+            except Exception:
+                return [int(sample_df.shape[0]), int(sample_df.shape[1])]
+
+        return [int(sample_df.shape[0]), int(sample_df.shape[1])]
 
     @staticmethod
     def _column_profiles(df: Any, base_profile: dict[str, Any]) -> list[dict[str, Any]]:

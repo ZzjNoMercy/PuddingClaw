@@ -28,6 +28,12 @@ ASSET_TYPES = {
     "dimension": ("dimensions", "dimension.md"),
     "grain": ("grains", "grain.md"),
 }
+DIMENSION_RESOLUTION_MODES = {
+    "source_field": "直接字段",
+    "derived": "推导规则",
+    "entity_lookup": "实体匹配",
+    "calendar_lookup": "日历映射",
+}
 SAFE_EXTRA_SUFFIXES = {".md", ".txt", ".json", ".yaml", ".yml", ".csv", ".tsv"}
 SLUG_RE = re.compile(r"[^0-9A-Za-z_\-\u4e00-\u9fff]+")
 
@@ -42,6 +48,8 @@ class SemanticAsset:
     aliases: tuple[str, ...] = ()
     tags: tuple[str, ...] = ()
     formatter: str = "semantic-asset"
+    resolution_mode: str = ""
+    resolution_label: str = ""
     mtime: float = 0.0
     size_bytes: int = 0
     body: str = ""
@@ -57,6 +65,8 @@ class SemanticAsset:
             "aliases": list(self.aliases),
             "tags": list(self.tags),
             "formatter": self.formatter,
+            "resolution_mode": self.resolution_mode,
+            "resolution_label": self.resolution_label,
             "mtime": self.mtime,
             "size_bytes": self.size_bytes,
         }
@@ -96,6 +106,89 @@ def _list_from_meta(value: object) -> tuple[str, ...]:
 def _slugify(value: str) -> str:
     slug = SLUG_RE.sub("-", value.strip()).strip("-_").lower()
     return slug or "semantic_asset"
+
+
+def _plain_string(value: object) -> str:
+    return str(value or "").strip()
+
+
+def _string_list(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [item.strip() for item in value.replace("\n", ",").split(",") if item.strip()]
+    if isinstance(value, list):
+        return [_plain_string(item) for item in value if _plain_string(item)]
+    return []
+
+
+def _normalize_dimension_definition(value: object) -> tuple[str, dict[str, Any]]:
+    """Return a portable, intentionally small contract for dimension resolution.
+
+    The definition is declarative. It records how a value is obtained, but does
+    not make a handwritten SQL expression executable by itself.
+    """
+    raw = value if isinstance(value, dict) else {}
+    mode = _plain_string(raw.get("mode") or raw.get("resolution_mode") or "source_field").lower()
+    if mode not in DIMENSION_RESOLUTION_MODES:
+        raise SemanticAssetError(
+            "dimension resolution_mode must be source_field, derived, entity_lookup or calendar_lookup"
+        )
+
+    bindings: list[dict[str, Any]] = []
+    for item in raw.get("bindings") or raw.get("source_bindings") or []:
+        if not isinstance(item, dict):
+            continue
+        fields_raw = item.get("fields")
+        fields = {str(key).strip(): _plain_string(field) for key, field in fields_raw.items()} if isinstance(fields_raw, dict) else {}
+        bindings.append(
+            {
+                "asset_ref": _plain_string(item.get("asset_ref")),
+                "display_name": _plain_string(item.get("display_name")),
+                "fields": {key: field for key, field in fields.items() if key and field},
+            }
+        )
+
+    definition: dict[str, Any] = {"mode": mode}
+    if mode == "source_field":
+        definition["bindings"] = bindings
+    elif mode == "derived":
+        definition.update(
+            {
+                "bindings": bindings,
+                "source_fields": _string_list(raw.get("source_fields")),
+                "expression": _plain_string(raw.get("expression")),
+            }
+        )
+    elif mode == "entity_lookup":
+        canonical_raw = raw.get("canonical") if isinstance(raw.get("canonical"), dict) else {}
+        definition.update(
+            {
+                "canonical": {
+                    "key": _plain_string(canonical_raw.get("key") or "entity_key"),
+                    "fields": _string_list(canonical_raw.get("fields")),
+                },
+                "bindings": bindings,
+                "reference_path": _plain_string(raw.get("reference_path")),
+            }
+        )
+    else:
+        definition.update(
+            {
+                "bindings": bindings,
+                "date_field": _plain_string(raw.get("date_field")),
+                "week_start_day": _plain_string(raw.get("week_start_day") or "monday").lower(),
+                "timezone": _plain_string(raw.get("timezone") or "Asia/Shanghai"),
+            }
+        )
+    return mode, definition
+
+
+def _dimension_resolution_summary(meta: dict[str, Any]) -> tuple[str, str]:
+    mode = _plain_string(meta.get("resolution_mode"))
+    resolution = meta.get("resolution") if isinstance(meta.get("resolution"), dict) else {}
+    if not mode:
+        mode = _plain_string(resolution.get("mode"))
+    label = DIMENSION_RESOLUTION_MODES.get(mode, "未配置")
+    return mode or "unconfigured", label
 
 
 def _ensure_under_root(root: Path, target: Path) -> Path:
@@ -201,6 +294,7 @@ class SemanticAssetRegistry:
         tags: list[str] | None = None,
         version: str = "0.1.0",
         slug: str | None = None,
+        dimension_definition: dict[str, Any] | None = None,
     ) -> dict:
         asset_type = asset_type.strip().lower()
         if asset_type not in ASSET_TYPES:
@@ -216,6 +310,9 @@ class SemanticAssetRegistry:
         if target.exists():
             raise SemanticAssetError(f"Semantic asset already exists: {asset_slug}")
         asset_dir.mkdir(parents=True, exist_ok=True)
+        normalized_definition: dict[str, Any] | None = None
+        if asset_type == "dimension":
+            _mode, normalized_definition = _normalize_dimension_definition(dimension_definition)
         target.write_text(
             self._template(
                 name=clean_name,
@@ -224,11 +321,64 @@ class SemanticAssetRegistry:
                 aliases=aliases or [],
                 tags=tags or [],
                 version=version.strip() or "0.1.0",
+                dimension_definition=normalized_definition,
             ),
             encoding="utf-8",
         )
         self.refresh()
         return self.get_asset(f"{asset_type}:{asset_dir.relative_to(self.root_dir / subdir).as_posix()}")
+
+    def update_dimension_definition(
+        self,
+        asset_id: str,
+        definition: dict[str, Any],
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        aliases: list[str] | None = None,
+        tags: list[str] | None = None,
+        version: str | None = None,
+    ) -> dict:
+        """Update the structured fields of a dimension.
+
+        Preserve the authored Markdown body and any advanced metadata such as a
+        build-skill declaration. This keeps structured editing and direct file
+        editing as equal maintenance paths.
+        """
+        with self._lock:
+            asset = self._assets.get(asset_id)
+        if asset is None:
+            self.refresh()
+            with self._lock:
+                asset = self._assets.get(asset_id)
+        if asset is None:
+            raise SemanticAssetError(f"Semantic asset not found: {asset_id}")
+        if asset.type != "dimension":
+            raise SemanticAssetError("Only dimensions have a resolution definition")
+
+        path = _ensure_under_root(self.root_dir, self.base_dir / asset.path)
+        metadata, body = _parse_frontmatter(path.read_text(encoding="utf-8"))
+        mode, normalized = _normalize_dimension_definition(definition)
+        if name is not None:
+            clean_name = name.strip()
+            if not clean_name:
+                raise SemanticAssetError("name is required")
+            metadata["name"] = clean_name
+        if description is not None:
+            metadata["description"] = description.strip()
+        if aliases is not None:
+            metadata["aliases"] = [item.strip() for item in aliases if item and item.strip()]
+        if tags is not None:
+            metadata["tags"] = [item.strip() for item in tags if item and item.strip()]
+        if version is not None:
+            metadata["version"] = version.strip() or "0.1.0"
+        metadata["resolution_mode"] = mode
+        metadata["resolution"] = normalized
+        metadata["updated_at"] = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        frontmatter = yaml.safe_dump(metadata, allow_unicode=True, sort_keys=False).strip()
+        path.write_text(f"---\n{frontmatter}\n---\n\n{body}", encoding="utf-8")
+        self.refresh()
+        return self.get_asset(asset_id)
 
     def import_zip(self, fileobj: BinaryIO) -> dict:
         data = fileobj.read()
@@ -283,6 +433,7 @@ class SemanticAssetRegistry:
         subdir, _ = ASSET_TYPES[asset_type]
         relative_dir = path.parent.relative_to(self.root_dir / subdir).as_posix()
         stat = path.stat()
+        resolution_mode, resolution_label = _dimension_resolution_summary(meta) if asset_type == "dimension" else ("", "")
         return SemanticAsset(
             id=f"{asset_type}:{relative_dir}",
             name=str(meta.get("name") or path.parent.name),
@@ -292,6 +443,8 @@ class SemanticAssetRegistry:
             aliases=_list_from_meta(meta.get("aliases")),
             tags=_list_from_meta(meta.get("tags")),
             formatter=str(meta.get("formatter") or "semantic-asset"),
+            resolution_mode=resolution_mode,
+            resolution_label=resolution_label,
             mtime=stat.st_mtime,
             size_bytes=stat.st_size,
             body=body,
@@ -328,6 +481,7 @@ class SemanticAssetRegistry:
         aliases: list[str],
         tags: list[str],
         version: str,
+        dimension_definition: dict[str, Any] | None = None,
     ) -> str:
         now_text = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         metadata = {
@@ -341,6 +495,10 @@ class SemanticAssetRegistry:
             "created": now_text,
             "updated_at": now_text,
         }
+        if asset_type == "dimension":
+            mode, definition = _normalize_dimension_definition(dimension_definition)
+            metadata["resolution_mode"] = mode
+            metadata["resolution"] = definition
         frontmatter = yaml.safe_dump(metadata, allow_unicode=True, sort_keys=False).strip()
         type_titles = {"measure": "度量值", "dimension": "维度", "grain": "颗粒度"}
         title = type_titles.get(asset_type, asset_type)
@@ -351,11 +509,20 @@ class SemanticAssetRegistry:
                 "如某些业务对象存在专用识别规则，请放在本度量值目录的 `references/` 下。\n\n"
                 "分析过程中，命中本度量值后必须继续检索 `references/`，并优先遵守匹配 reference。\n\n"
             )
+        dimension_section = ""
+        if asset_type == "dimension":
+            mode = str(metadata.get("resolution_mode") or "")
+            label = DIMENSION_RESOLUTION_MODES.get(mode, mode)
+            dimension_section = (
+                f"## 创建方式\n\n{label}（`{mode}`）\n\n"
+                "前置的 `resolution` 是机器可读定义；下方补充业务解释、适用边界与禁止规则。\n\n"
+            )
         return (
             f"---\n{frontmatter}\n---\n\n"
             f"# {name}\n\n"
             f"## 类型\n\n{title}\n\n"
             f"## 业务口径\n\n{description or '在这里描述自然语言口径、适用数据资产、字段要求和计算规则。'}\n\n"
+            f"{dimension_section}"
             f"{references_section}"
             "## 查询规则\n\n"
             "- 明确需要使用的字段或 type_name 口径。\n"

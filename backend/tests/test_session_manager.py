@@ -74,6 +74,36 @@ def test_load_session_for_agent_includes_tool_output_context_without_tool_calls(
     assert "pandas_knowledge_query" in assistant["content"]
 
 
+def test_upsert_assistant_message_replaces_same_query_draft(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("draft-session")
+
+    session_manager.save_message("draft-session", "user", "查一下销量")
+    session_manager.upsert_assistant_message(
+        "draft-session",
+        query_id="query-1",
+        content="先查到一部分",
+        tool_calls=[{"id": "call-1", "tool": "database_knowledge_query", "output": "100"}],
+        status="running",
+    )
+    session_manager.upsert_assistant_message(
+        "draft-session",
+        query_id="query-1",
+        content="最终结果",
+        tool_calls=[{"id": "call-1", "tool": "database_knowledge_query", "output": "100"}],
+        error_notice="模型连接中断",
+        status="error",
+    )
+
+    history = session_manager.load_session("draft-session")
+    assert [message["role"] for message in history] == ["user", "assistant"]
+    assistant = history[1]
+    assert assistant["query_id"] == "query-1"
+    assert assistant["content"] == "最终结果"
+    assert assistant["status"] == "error"
+    assert assistant["error_notice"] == "模型连接中断"
+
+
 def test_reasoning_content_saved_for_plain_assistant(tmp_path):
     session_manager.initialize(tmp_path)
     session_manager.create_session("plain-session")

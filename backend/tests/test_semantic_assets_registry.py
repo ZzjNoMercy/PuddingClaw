@@ -40,6 +40,98 @@ def test_semantic_asset_registry_create_and_refresh(tmp_path) -> None:
     assert grain["path"].endswith("semantic-assets/grains/款型颗粒度/grain.md")
 
 
+def test_dimension_creation_preserves_resolution_contract(tmp_path) -> None:
+    registry = SemanticAssetRegistry(tmp_path)
+
+    asset = registry.create_asset(
+        name="自然周",
+        asset_type="dimension",
+        description="将业务日期映射到周一开始的自然周。",
+        dimension_definition={
+            "mode": "calendar_lookup",
+            "bindings": [
+                {
+                    "asset_ref": "table_asset:orders",
+                    "display_name": "订单表",
+                    "fields": {"date": "order_date"},
+                }
+            ],
+            "date_field": "order_date",
+            "week_start_day": "monday",
+            "timezone": "Asia/Shanghai",
+        },
+    )
+
+    assert asset["resolution_mode"] == "calendar_lookup"
+    assert asset["resolution_label"] == "日历映射"
+    detail = registry.get_asset("dimension:自然周")
+    assert detail["frontmatter"]["resolution"]["date_field"] == "order_date"
+    assert "日历映射" in detail["body"]
+
+
+def test_entity_lookup_dimension_keeps_multiple_source_bindings(tmp_path) -> None:
+    registry = SemanticAssetRegistry(tmp_path)
+    asset = registry.create_asset(
+        name="车系",
+        asset_type="dimension",
+        dimension_definition={
+            "mode": "entity_lookup",
+            "canonical": {"key": "entity_key", "fields": ["canonical_brand", "canonical_series"]},
+            "bindings": [
+                {"asset_ref": "table_asset:sales", "fields": {"brand": "品牌", "series": "1-子车型"}},
+                {"asset_ref": "dbs:config.series", "fields": {"brand": "brand", "series": "serial_name"}},
+            ],
+            "reference_path": "references/crosswalk.json",
+        },
+    )
+
+    assert asset["resolution_mode"] == "entity_lookup"
+    detail = registry.get_asset("dimension:车系")
+    resolution = detail["frontmatter"]["resolution"]
+    assert resolution["canonical"]["key"] == "entity_key"
+    assert len(resolution["bindings"]) == 2
+
+
+def test_update_dimension_definition_preserves_body_and_custom_metadata(tmp_path) -> None:
+    registry = SemanticAssetRegistry(tmp_path)
+    created = registry.create_asset(
+        name="车系",
+        asset_type="dimension",
+        description="跨源车系。",
+        dimension_definition={"mode": "source_field"},
+    )
+    document = tmp_path / created["path"]
+    document.write_text(
+        document.read_text(encoding="utf-8").replace(
+            "updated_at:",
+            "build_skill:\n  name: build-semantic-dimension\n  adapter: vehicle_series_demo\nupdated_at:",
+        )
+        + "\n## AI 使用规则\n\n- 只使用已审核绑定。\n",
+        encoding="utf-8",
+    )
+
+    updated = registry.update_dimension_definition(
+        "dimension:车系",
+        {
+            "mode": "entity_lookup",
+            "canonical": {"key": "entity_key", "fields": ["brand", "series"]},
+            "bindings": [{"asset_ref": "table_asset:sales", "fields": {"brand": "品牌", "series": "车系"}}],
+        },
+        name="车系（已编辑）",
+        description="已更新的跨源车系。",
+        aliases=["车系名称"],
+        tags=["跨源"],
+        version="0.2.0",
+    )
+
+    assert updated["resolution_mode"] == "entity_lookup"
+    assert updated["name"] == "车系（已编辑）"
+    text = document.read_text(encoding="utf-8")
+    assert "build_skill:" in text
+    assert "只使用已审核绑定" in text
+    assert "version: 0.2.0" in text
+
+
 def test_semantic_asset_registry_import_zip_keeps_asset_folder(tmp_path) -> None:
     archive_bytes = io.BytesIO()
     with zipfile.ZipFile(archive_bytes, "w") as archive:

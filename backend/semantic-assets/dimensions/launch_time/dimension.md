@@ -12,6 +12,16 @@ tags:
   - vehicle_params
   - vehicle_params_wide
 version: 0.1.0
+resolution_mode: derived
+resolution:
+  mode: derived
+  bindings:
+    - asset_ref: dbs_77982e981bac4a6fa8.vehicle_params_wide
+      display_name: insight_data · vehicle_params_wide
+      fields:
+        value: launch_date
+  source_fields: [launch_date]
+  expression: 基于上市日期派生上市年份和上市月份；不得从 car_name 推断。
 created: 2026-07-08 00:00:00
 updated_at: 2026-07-09 00:00:00
 ---

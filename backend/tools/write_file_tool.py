@@ -22,7 +22,7 @@ class SandboxedWriteFileTool(BaseTool):
     name: str = "write_file"
     description: str = (
         "Write content to a local file. Path is relative to the project root. "
-        "Only files in skills/, semantic-assets/, sql-guardrails/, workspace/, and memory/ directories can be modified. "
+        "Only files in skills/, semantic-assets/, sql-guardrails/, analytics-models/, workspace/, and memory/ directories can be modified. "
         "Use this to update SKILL.md files, memory files, or workspace documents. "
         "Example: write_file('skills/skill-creator/SKILL.md', '---\\nname: skill-creator\\n...')"
     )
@@ -42,11 +42,18 @@ class SandboxedWriteFileTool(BaseTool):
             normalized = file_path.replace("\\", "/").lstrip("./")
 
             # Whitelist check: only allow curated project authoring roots.
-            ALLOWED_PREFIXES = ["skills/", "semantic-assets/", "sql-guardrails/", "workspace/", "memory/"]
+            ALLOWED_PREFIXES = [
+                "skills/",
+                "semantic-assets/",
+                "sql-guardrails/",
+                "analytics-models/",
+                "workspace/",
+                "memory/",
+            ]
             if not any(normalized.startswith(prefix) for prefix in ALLOWED_PREFIXES):
                 return (
                     f"❌ Access denied: {file_path} "
-                    "(only skills/, semantic-assets/, sql-guardrails/, workspace/, memory/ allowed)"
+                    "(only skills/, semantic-assets/, sql-guardrails/, analytics-models/, workspace/, memory/ allowed)"
                 )
 
             full_path = (root / normalized).resolve()
@@ -61,6 +68,13 @@ class SandboxedWriteFileTool(BaseTool):
             # Write file with UTF-8 encoding
             full_path.write_text(content, encoding="utf-8")
             file_cache.put(full_path, content)
+            if normalized.startswith("analytics-models/"):
+                try:
+                    from analytics.models import get_analytics_model_registry
+
+                    get_analytics_model_registry(root).refresh()
+                except Exception:
+                    pass
 
             return f"✅ File saved: {file_path} ({len(content)} characters)"
 

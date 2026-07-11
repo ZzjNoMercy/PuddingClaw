@@ -2,12 +2,13 @@
 
 ## Goal
 
-用户手动中断 Agent/DeepAgents 流式运行后，刷新页面仍能看到已经发生的内容：
+用户手动中断或模型/API 连接异常导致 Agent/DeepAgents 流式运行提前结束后，刷新页面仍能看到已经发生的内容：
 
 - 用户本轮问题
 - 已输出的 assistant 文本和 reasoning
 - 已开始、已完成、被中断的工具调用
 - trace 的 cancelled 状态
+- 错误退出时的用户可见错误提示
 
 后续用户输入“继续”时，不依赖 LangGraph checkpoint replay 旧事件，而是作为普通新一轮基于 session 历史继续推进。Checkpoint 保留为 HITL/permission interrupt 的执行恢复机制，不作为聊天连续性的主存储。
 
@@ -15,10 +16,11 @@
 
 1. 用户已经在 UI 看到的事实必须成为 durable session record。
 2. 前端内存、SSE 连接、LangGraph checkpoint 都不能作为用户可见历史的唯一来源。
-3. 普通 stop 与 HITL interrupt 是不同语义：
+3. 模型连接错误、浏览器刷新、用户停止在持久化层都是“未完整完成的 partial run”，差别只体现在状态和提示文案。
+4. 普通 stop 与 HITL interrupt 是不同语义：
    - 普通 stop：本轮执行被用户暂停/中断，partial output 应落盘，checkpoint 应作废，避免下轮 replay。
    - HITL approve/reject：同一活跃 run 内用 `Command(resume=...)` 精确恢复。
-4. session 历史是“继续”的语义边界；checkpoint 是内部执行恢复边界。
+5. session 历史是“继续”的语义边界；checkpoint 是内部执行恢复边界。
 
 ## Implementation Checklist
 
@@ -36,6 +38,10 @@
 - [x] 前端发送新对话时直接使用 `createSession()` 返回的 session id，避免 React 状态切换竞态。
 - [x] 历史 `tool_calls` 仍不按结构化工具消息回传，但将已完成工具输出压缩为 LLM-only 文本摘要，保证“继续”能看到中断前查到的事实。
 - [x] DeepAgents 历史输入改为沿用旧 Agent 的协议化思路：从 raw session history 重建 `AIMessage(tool_calls)` + `ToolMessage(tool_call_id)`，避免只靠摘要续上下文。
+- [x] DeepAgents 运行中按 `query_id` upsert assistant draft，工具开始/结束强制落盘，文本/推理节流落盘。
+- [x] 异常分支保存 partial assistant、已完成工具输出和 `error_notice`，并通过 SSE `error` 展示给前端。
+- [x] 前端将运行错误作为结构化 `errorNotice` 渲染，不污染 assistant 正文。
+- [x] 刷新页面时忽略持久化的 `default` 占位 session，首次恢复自动回到最新真实 session，避免 token 统计请求 `/tokens/session/default` 显示 0。
 - [x] 运行 targeted backend tests 与 frontend build。
 
 ## Implementation Notes
@@ -53,6 +59,10 @@
 - 工具输出摘要使用每个工具短截断 + 总预算控制，避免前几个长输出挤掉后续关键结果；已用 `session-14a1b471414b` 验证 `205390` 会进入 LLM 历史上下文。
 - 根因复盘：早期 Agent runtime 有 `_build_messages()` 重建 `AIMessage + ToolMessage`；DeepAgents 集成规划也写了必须复用或抽公共函数。但实际 DeepAgents first pass 走了单独 dict builder，随后 `load_session_for_agent()` 又为避免历史工具 replay 剥离 `tool_calls`，两处叠加导致 DeepAgents follow-up 看不到历史工具输出。这不是 DeepAgents 的硬性限制，而是实现分叉。
 - DeepAgents 当前修复：`session.json` 仍保持前端友好的聚合结构；运行时输入从 raw history 重建 LangChain protocol messages，并继续用 `historical_tool_call_ids` 过滤历史工具 echo，避免 UI 重放旧工具。
+- `upsert_assistant_message(query_id=...)` 是 dynamic partial run 的核心：同一轮 query 的 assistant 草稿反复覆盖，不追加重复消息；正常完成写 `status=completed`，模型/API 异常写 `status=error` 与 `error_notice`。
+- 流式运行中，tool_start/tool_end 立即强制 snapshot；content/reasoning 最多约 2 秒写一次；取消/异常/完成时最后强制写一次。
+- 最新 `session-d005fc3157c1` 复盘显示，前一轮 16 个工具没有进入 session JSON；结合 `openai.APIConnectionError` 堆栈，根因不是“继续时读漏工具输出”，而是异常退出没有把已完成 partial run 落盘。
+- token 统计本身后端正常：最新真实 session `session-9ce92ef6fbfb` 返回 `message_tokens=8026`；刷新后显示 0 的原因是前端恢复到了 `default` 占位 session。
 
 ## Verification
 
@@ -66,6 +76,10 @@
 - `backend/.venv/bin/python -m pytest tests/test_session_manager.py tests/test_deepagents_manager.py` -> 29 passed after LLM-only tool output context fix
 - Latest session `session-14a1b471414b`: `load_session_for_agent()` contains `205390`.
 - `backend/.venv/bin/python -m pytest tests/test_deepagents_manager.py tests/test_session_manager.py` -> 29 passed after DeepAgents protocol-history reconstruction.
+- `backend/.venv/bin/python -m pytest tests/test_deepagents_manager.py tests/test_session_manager.py` -> 31 passed after dynamic assistant draft upsert and error persistence.
+- `backend/.venv/bin/python -m py_compile graph/deepagents_manager.py graph/session_manager.py` -> passed.
+- `frontend/npm run build` -> passed after structured error notice rendering.
+- Browser smoke: click `新对话` -> `0%`, reload -> restored `空气悬架搭载率趋势`, token badge `2%`.
 
 ## Acceptance Criteria
 
@@ -89,3 +103,6 @@
 - 如果立即落盘 user 后再构造模型输入，是否会让模型看到重复的当前 user query？
 - 如果 partial assistant 正文只是“现在查询...”，而准确数值只在 tool output 中，下一轮“继续”是否还能看到这些工具事实？
 - 如果前几个工具输出很长，后续关键工具结果是否会被摘要预算截断掉？
+- 如果模型连接在 tool_end 后、最终回答前报错，已完成 tool output 是否已经 upsert 到 session？
+- 如果后端发出 SSE error，前端是否展示结构化错误提示，而不是只在控制台/日志可见？
+- 如果刷新前停在 `default` 占位 session，刷新后是否会恢复真实 session 而不是继续用 token=0 的 default？

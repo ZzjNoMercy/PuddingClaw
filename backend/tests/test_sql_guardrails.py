@@ -36,6 +36,39 @@ def test_scope_matches_semantic_asset_and_table() -> None:
     assert scope_matches(rule, source_name="insight_data", route=route, semantic_trace=semantic_trace)
 
 
+def test_scope_requires_metric_intent_when_configured() -> None:
+    rule = GuardrailRule.model_validate(
+        {
+            "id": "config_rate_use_wide_denominator",
+            "name": "配置率优先使用宽表分母",
+            "type": "require_table_when_available",
+            "scope": {
+                "table_scope": {"mode": "all", "values": ["vehicle_params", "vehicle_params_wide"]},
+                "semantic_assets": ["measure:config_rate"],
+                "intent_any": ["配置率", "搭载率", "渗透率", "配备率", "占比"],
+            },
+            "params": {"required_table": "vehicle_params_wide", "fallback_table": "vehicle_params"},
+        }
+    )
+    route = SimpleNamespace(table_names=["vehicle_params", "vehicle_params_wide"])
+    semantic_trace = {"matched": [{"id": "measure:config_rate"}], "references": []}
+
+    assert not scope_matches(
+        rule,
+        source_name="insight_data",
+        route=route,
+        semantic_trace=semantic_trace,
+        question="列出汉新上市车型有哪些配置",
+    )
+    assert scope_matches(
+        rule,
+        source_name="insight_data",
+        route=route,
+        semantic_trace=semantic_trace,
+        question="2026年空气悬架配置率是多少",
+    )
+
+
 def test_require_group_by_rule_blocks_car_name_only() -> None:
     rule = GuardrailRule.model_validate(
         {

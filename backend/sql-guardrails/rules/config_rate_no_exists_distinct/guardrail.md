@@ -12,6 +12,12 @@ scope:
     - vehicle_params
   semantic_assets:
   - measure:config_rate
+  intent_any:
+  - 配置率
+  - 搭载率
+  - 渗透率
+  - 配备率
+  - 占比
 params:
   table: vehicle_params
   distinct_column: car_name

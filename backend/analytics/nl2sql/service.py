@@ -173,12 +173,20 @@ def _detect_semantic_sql_conflicts(sql: str, semantic_trace: dict[str, Any], rou
     return conflicts_to_messages(conflicts)
 
 
-def _detect_sql_guardrail_conflicts(sql: str, *, source_name: str, route: Any, semantic_trace: dict[str, Any]) -> list[GuardrailConflict]:
+def _detect_sql_guardrail_conflicts(
+    sql: str,
+    *,
+    source_name: str,
+    route: Any,
+    semantic_trace: dict[str, Any],
+    question: str,
+) -> list[GuardrailConflict]:
     return detect_guardrail_conflicts(
         sql,
         source_name=source_name,
         route=route,
         semantic_trace=semantic_trace,
+        question=question,
     )
 
 
@@ -524,6 +532,7 @@ async def query_database_knowledge(
             source_name=route.source_name,
             route=route,
             semantic_trace=semantic_trace,
+            question=request.question,
         )
         warn_conflicts = [conflict for conflict in guardrail_conflicts if conflict.action == "warn"]
         blocking_conflicts = [conflict for conflict in guardrail_conflicts if conflict.action in {"rewrite", "block"}]
@@ -556,6 +565,7 @@ async def query_database_knowledge(
                 source_name=route.source_name,
                 route=route,
                 semantic_trace=semantic_trace,
+                question=request.question,
             )
             rewritten_blocking_conflicts = [
                 conflict for conflict in rewritten_guardrail_conflicts if conflict.action in {"rewrite", "block"}
@@ -747,6 +757,7 @@ async def generate_database_sql(
             source_name=route.source_name,
             route=route,
             semantic_trace=semantic_trace,
+            question=request.question,
         )
         warn_conflicts = [conflict for conflict in guardrail_conflicts if conflict.action == "warn"]
         blocking_conflicts = [conflict for conflict in guardrail_conflicts if conflict.action in {"rewrite", "block"}]
@@ -779,6 +790,7 @@ async def generate_database_sql(
                 source_name=route.source_name,
                 route=route,
                 semantic_trace=semantic_trace,
+                question=request.question,
             )
             rewritten_blocking_conflicts = [
                 conflict for conflict in rewritten_guardrail_conflicts if conflict.action in {"rewrite", "block"}

@@ -320,3 +320,41 @@ async def list_database_tables(source: KnowledgeDatabaseSource | dict[str, Any])
             return tables
     finally:
         await engine.dispose()
+
+
+async def list_database_table_columns(
+    source: KnowledgeDatabaseSource | dict[str, Any],
+    table_name: str,
+) -> list[str]:
+    """Return columns for one configured table without exposing arbitrary schema browsing."""
+
+    normalized_table = str(table_name or "").strip()
+    selected_tables = database_source_selected_tables(source)
+    if normalized_table not in selected_tables:
+        raise KnowledgeDatabaseSourceError("只能读取数据源已登记表的字段。")
+
+    if "." in normalized_table:
+        schema, table = normalized_table.split(".", 1)
+    else:
+        schema, table = "public", normalized_table
+    if not schema or not table:
+        raise KnowledgeDatabaseSourceError("表名无效。")
+
+    engine = create_async_engine(_source_url(_connection_source(source)), pool_pre_ping=True)
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                text(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = :schema
+                      AND table_name = :table
+                    ORDER BY ordinal_position
+                    """
+                ),
+                {"schema": schema, "table": table},
+            )
+            return [str(row.column_name) for row in result]
+    finally:
+        await engine.dispose()

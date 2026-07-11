@@ -4,19 +4,27 @@ name: 能源类型
 type: dimension
 description: 车型能源类型的标准取值口径，优先使用 vehicle_params_wide。
 aliases:
-  - 动力类型
-  - 能源形式
-  - 新能源
-  - 燃油
-  - 纯电
+- 动力类型
+- 能源形式
+- 新能源
+- 燃油
+- 纯电
 tags:
-  - 汽车产品配置
-  - vehicle_params
-  - vehicle_params_wide
-  - 能源
+- 汽车产品配置
+- vehicle_params
+- vehicle_params_wide
+- 能源
 version: 0.1.0
+resolution_mode: source_field
+resolution:
+  mode: source_field
+  bindings:
+  - asset_ref: dbs_77982e981bac4a6fa8.vehicle_params_wide
+    display_name: insight_data · vehicle_params_wide
+    fields:
+      value: energy_type
 created: 2026-07-08 00:00:00
-updated_at: 2026-07-09 00:00:00
+updated_at: '2026-07-10 07:10:41'
 ---
 
 # 能源类型

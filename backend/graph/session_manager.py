@@ -99,6 +99,14 @@ class SessionManager:
         self._write_file(session_id, data)
         return self._metadata_from_data(session_id, data)
 
+    def get_metadata(self, session_id: str) -> dict[str, Any]:
+        """Return session metadata without mutating the session."""
+
+        data = self._read_file(session_id)
+        if not data:
+            return {"id": session_id, "title": session_id, "runtime_mode": "chat"}
+        return self._metadata_from_data(session_id, data)
+
     def load_session(self, session_id: str) -> list[dict[str, Any]]:
         """加载指定会话的消息列表，自动合并 archive/ 中的归档消息。
 
@@ -144,6 +152,7 @@ class SessionManager:
         segments: list[dict[str, Any]] | None = None,         # UI 分段（每轮模型调用为一个 segment）
         interrupted: bool = False,                            # 本轮是否由用户主动停止
         interruption_notice: str | None = None,                # 用户可见的停止提示
+        error_notice: str | None = None,                       # 用户可见的错误提示
     ) -> None:
         """追加一条消息到会话历史"""
         data = self._read_file(session_id)        # 读取现有数据
@@ -155,14 +164,51 @@ class SessionManager:
                 "updated_at": now,                # 更新时间
                 "messages": [],                   # 空消息列表
             }
-        msg: dict[str, Any] = {"role": role, "content": content}  # 构造消息字典
-        if tool_calls:                                            # 有工具调用则附加
+        msg = self._build_message_payload(
+            role,
+            content,
+            tool_calls=tool_calls,
+            sources=sources,
+            citations=citations,
+            reasoning_content=reasoning_content,
+            timeline=timeline,
+            segments=segments,
+            interrupted=interrupted,
+            interruption_notice=interruption_notice,
+            error_notice=error_notice,
+        )
+        data["messages"].append(msg)              # 追加到消息列表末尾
+        if isinstance(data.get("display_messages"), list):
+            data["display_messages"].append(dict(msg))
+        self._write_file(session_id, data)        # 写回磁盘
+
+    @staticmethod
+    def _build_message_payload(
+        role: str,
+        content: str,
+        *,
+        tool_calls: list[dict[str, Any]] | None = None,
+        sources: list[dict[str, Any]] | None = None,
+        citations: list[dict[str, Any]] | None = None,
+        reasoning_content: str | None = None,
+        timeline: list[dict[str, Any]] | None = None,
+        segments: list[dict[str, Any]] | None = None,
+        interrupted: bool = False,
+        interruption_notice: str | None = None,
+        error_notice: str | None = None,
+        query_id: str | None = None,
+        status: str | None = None,
+    ) -> dict[str, Any]:
+        """Build the persisted message shape shared by append and upsert paths."""
+
+        msg: dict[str, Any] = {"role": role, "content": content}
+        if tool_calls:
             msg["tool_calls"] = tool_calls
-        if reasoning_content:                                     # 思考链内容持久化，支持历史回看与 API 回传
+        if reasoning_content:
             msg["reasoning_content"] = reasoning_content
-        if timeline:                                              # 保留真实 reasoning/tool 交错顺序
+        if timeline:
             msg["timeline"] = timeline
-        if segments:                                              # UI 分段信息
+        if segments:
             msg["segments"] = segments
         if sources:
             msg["sources"] = sources
@@ -172,10 +218,95 @@ class SessionManager:
             msg["interrupted"] = True
         if interruption_notice:
             msg["interruption_notice"] = interruption_notice
-        data["messages"].append(msg)              # 追加到消息列表末尾
+        if error_notice:
+            msg["error_notice"] = error_notice
+        if query_id:
+            msg["query_id"] = query_id
+        if status:
+            msg["status"] = status
+        return msg
+
+    def upsert_assistant_message(
+        self,
+        session_id: str,
+        *,
+        query_id: str,
+        content: str,
+        tool_calls: list[dict[str, Any]] | None = None,
+        sources: list[dict[str, Any]] | None = None,
+        citations: list[dict[str, Any]] | None = None,
+        reasoning_content: str | None = None,
+        timeline: list[dict[str, Any]] | None = None,
+        segments: list[dict[str, Any]] | None = None,
+        interrupted: bool = False,
+        interruption_notice: str | None = None,
+        error_notice: str | None = None,
+        status: str = "running",
+    ) -> None:
+        """Create or replace the assistant draft for a query.
+
+        Agent mode streams partial work over SSE. This method makes the session
+        file the durable source of truth while a run is still in progress, so
+        refreshes and later "继续" turns can see completed tool results.
+        """
+
+        data = self._read_file(session_id)
+        if not data:
+            now = time.time()
+            data = {
+                "title": "New Chat",
+                "created_at": now,
+                "updated_at": now,
+                "runtime_mode": "agent",
+                "messages": [],
+            }
+
+        msg = self._build_message_payload(
+            "assistant",
+            content,
+            tool_calls=tool_calls,
+            sources=sources,
+            citations=citations,
+            reasoning_content=reasoning_content,
+            timeline=timeline,
+            segments=segments,
+            interrupted=interrupted,
+            interruption_notice=interruption_notice,
+            error_notice=error_notice,
+            query_id=query_id,
+            status=status,
+        )
+
+        messages = data.setdefault("messages", [])
+        replaced = False
+        for index, existing in enumerate(messages):
+            if (
+                isinstance(existing, dict)
+                and existing.get("role") == "assistant"
+                and existing.get("query_id") == query_id
+            ):
+                messages[index] = msg
+                replaced = True
+                break
+        if not replaced:
+            messages.append(msg)
+
         if isinstance(data.get("display_messages"), list):
-            data["display_messages"].append(dict(msg))
-        self._write_file(session_id, data)        # 写回磁盘
+            display_messages = data["display_messages"]
+            display_replaced = False
+            for index, existing in enumerate(display_messages):
+                if (
+                    isinstance(existing, dict)
+                    and existing.get("role") == "assistant"
+                    and existing.get("query_id") == query_id
+                ):
+                    display_messages[index] = dict(msg)
+                    display_replaced = True
+                    break
+            if not display_replaced:
+                display_messages.append(dict(msg))
+
+        self._write_file(session_id, data)
 
     @staticmethod
     def _tool_result_context(

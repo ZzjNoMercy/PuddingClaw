@@ -16,13 +16,14 @@ import {
   FileSpreadsheet,
   FileText,
   ImagePlus,
+  Layers3,
   Paperclip,
   X,
   type LucideIcon,
 } from "lucide-react";
 import { useApp } from "@/lib/store";
 import { useProjectFolderPicker } from "@/components/projects/useProjectFolderPicker";
-import { listSkills, getSessionTokenCount, uploadAgentAttachments, type AgentAttachment } from "@/lib/api";
+import { listAnalyticsModels, listSkills, getSessionTokenCount, uploadAgentAttachments, type AgentAttachment, type AnalyticsModelSummary } from "@/lib/api";
 
 function formatTokens(n: number): string {
   return `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k`;
@@ -100,12 +101,17 @@ export default function ChatInput() {
     registerProject,
     thinkingMode,
     setThinkingMode,
+    analyticsModelId,
+    setAnalyticsModelId,
   } = useApp();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
   const projectMenuRef = useRef<HTMLDivElement>(null);
+  const analyticsModelMenuRef = useRef<HTMLDivElement>(null);
   const disabled = isStreaming || isCompressing;
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
+  const [analyticsModelMenuOpen, setAnalyticsModelMenuOpen] = useState(false);
+  const [analyticsModels, setAnalyticsModels] = useState<AnalyticsModelSummary[]>([]);
   const detectedImagePaths = useMemo(() => {
     const matches = text.match(/(?:~|\/|[A-Za-z]:[\\/])(?:[^\s'"<>]|\\ )+\.(?:png|jpe?g|webp|gif|bmp|tiff?)/gi);
     return Array.from(new Set(matches || [])).slice(0, 4);
@@ -174,6 +180,17 @@ export default function ChatInput() {
     () => projects.find((project) => project.project_id === currentProjectId) || null,
     [projects, currentProjectId]
   );
+  const selectedAnalyticsModel = useMemo(
+    () => analyticsModels.find((model) => model.id === analyticsModelId) || null,
+    [analyticsModelId, analyticsModels]
+  );
+
+  useEffect(() => {
+    if (runtimeMode !== "agent") return;
+    listAnalyticsModels()
+      .then((result) => setAnalyticsModels(result.models))
+      .catch(() => setAnalyticsModels([]));
+  }, [runtimeMode]);
 
   useEffect(() => {
     if (!projectMenuOpen) return;
@@ -185,6 +202,17 @@ export default function ChatInput() {
     document.addEventListener("mousedown", handler);
     return () => document.removeEventListener("mousedown", handler);
   }, [projectMenuOpen]);
+
+  useEffect(() => {
+    if (!analyticsModelMenuOpen) return;
+    const handler = (event: MouseEvent) => {
+      if (analyticsModelMenuRef.current && !analyticsModelMenuRef.current.contains(event.target as Node)) {
+        setAnalyticsModelMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [analyticsModelMenuOpen]);
 
   // Track IME composition so Enter to confirm pinyin/hiragana doesn't submit (fixes IME-1)
   const isComposingRef = useRef(false);
@@ -515,6 +543,87 @@ export default function ChatInput() {
                       <XCircle className="h-4 w-4" />
                       不使用项目，作为 Agent 对话
                     </button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {runtimeMode === "agent" && (
+              <div className="relative" ref={analyticsModelMenuRef}>
+                <button
+                  type="button"
+                  onClick={() => setAnalyticsModelMenuOpen((open) => !open)}
+                  className={`flex h-8 max-w-[240px] items-center gap-1.5 rounded-full border px-3 text-[12px] transition-all ${
+                    selectedAnalyticsModel
+                      ? "border-[#002fa7]/15 bg-[#e8edff] text-[#002fa7] hover:bg-[#dfe7ff]"
+                      : "border-black/[0.06] bg-white/42 text-gray-600 hover:bg-white/70 hover:text-gray-900"
+                  }`}
+                  title={selectedAnalyticsModel?.description || "选择分析模型"}
+                >
+                  <Layers3 className="h-3.5 w-3.5 shrink-0" />
+                  <span className="truncate">
+                    {selectedAnalyticsModel ? selectedAnalyticsModel.name : "分析模型"}
+                  </span>
+                  <ChevronDown className="h-3.5 w-3.5 shrink-0" />
+                </button>
+
+                {analyticsModelMenuOpen && (
+                  <div className="absolute bottom-full left-0 z-50 mb-2 w-80 rounded-2xl border border-black/[0.10] bg-white p-2 shadow-2xl shadow-slate-900/15 animate-fade-in-scale">
+                    <div className="px-3 pb-2 pt-1">
+                      <p className="text-[11px] font-semibold text-gray-500">分析模型</p>
+                      <p className="mt-0.5 text-[11px] leading-relaxed text-gray-400">
+                        选中后会把 model.md 作为本轮问数/分析的强上下文注入。
+                      </p>
+                    </div>
+
+                    <div className="max-h-56 overflow-y-auto py-1">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setAnalyticsModelId(null);
+                          setAnalyticsModelMenuOpen(false);
+                        }}
+                        className={`flex w-full items-start gap-2 rounded-xl px-3 py-2 text-left transition-colors ${
+                          !analyticsModelId ? "bg-[#002fa7]/[0.07] text-[#002fa7]" : "text-gray-700 hover:bg-black/[0.04] hover:text-gray-950"
+                        }`}
+                      >
+                        <Layers3 className="mt-0.5 h-4 w-4 shrink-0" />
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-[13px] font-medium">不使用分析模型</span>
+                          <span className="block truncate text-[11px] text-gray-400">按通用 Agent 上下文执行</span>
+                        </span>
+                        {!analyticsModelId && <Check className="mt-0.5 h-4 w-4 shrink-0" />}
+                      </button>
+
+                      {analyticsModels.length > 0 ? (
+                        analyticsModels.map((model) => (
+                          <button
+                            type="button"
+                            key={model.id}
+                            onClick={() => {
+                              setAnalyticsModelId(model.id);
+                              setAnalyticsModelMenuOpen(false);
+                            }}
+                            className={`flex w-full items-start gap-2 rounded-xl px-3 py-2 text-left transition-colors ${
+                              analyticsModelId === model.id
+                                ? "bg-[#002fa7]/[0.07] text-[#002fa7]"
+                                : "text-gray-700 hover:bg-black/[0.04] hover:text-gray-950"
+                            }`}
+                          >
+                            <Layers3 className="mt-0.5 h-4 w-4 shrink-0" />
+                            <span className="min-w-0 flex-1">
+                              <span className="block truncate text-[13px] font-medium">{model.name}</span>
+                              <span className="block truncate text-[11px] text-gray-400">{model.id}</span>
+                            </span>
+                            {analyticsModelId === model.id && <Check className="mt-0.5 h-4 w-4 shrink-0" />}
+                          </button>
+                        ))
+                      ) : (
+                        <p className="px-3 py-3 text-[12px] text-gray-400">
+                          还没有分析模型，可在智能问数工作台创建或导入。
+                        </p>
+                      )}
+                    </div>
                   </div>
                 )}
               </div>

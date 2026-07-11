@@ -9,6 +9,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from graph.session_manager import session_manager
 from projects.project_context import ensure_project_context, read_project_context, write_project_context
 from projects.registry import project_registry
 
@@ -27,6 +28,11 @@ class UpdateProjectRequest(BaseModel):
 
 class UpdateProjectContextRequest(BaseModel):
     content: str
+
+
+class OpenLocalFileRequest(BaseModel):
+    path: str
+    session_id: str
 
 
 @router.get("/projects")
@@ -89,6 +95,32 @@ async def open_project(project_id: str):
         raise HTTPException(status_code=500, detail=f"Failed to open project: {exc}") from exc
 
     return {"ok": True, "project_id": project_id, "path": str(project_path)}
+
+
+@router.post("/local-files/open")
+async def open_local_file(request: OpenLocalFileRequest):
+    """Open a file generated inside the current Agent workspace."""
+
+    metadata = session_manager.get_metadata(request.session_id)
+    workspace_path = metadata.get("workspace_path")
+    if not workspace_path:
+        raise HTTPException(status_code=400, detail="Session has no workspace_path")
+
+    workspace = Path(str(workspace_path)).expanduser().resolve()
+    target = Path(request.path.removeprefix("file://")).expanduser().resolve()
+    if not _is_relative_to(target, workspace):
+        raise HTTPException(status_code=403, detail="File is outside the session workspace")
+    if not target.exists():
+        raise HTTPException(status_code=404, detail=f"File not found: {target}")
+
+    try:
+        _open_in_file_manager(target)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to open file: {exc}") from exc
+
+    return {"ok": True, "path": str(target)}
 
 
 @router.get("/projects/{project_id}/context")
@@ -155,3 +187,11 @@ def _open_in_file_manager(path: Path) -> None:
         subprocess.Popen(command, **popen_kwargs)
     except FileNotFoundError as exc:
         raise RuntimeError(f"System file manager command not found: {command[0]}") from exc
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False

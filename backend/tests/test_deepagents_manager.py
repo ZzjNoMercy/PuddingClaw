@@ -206,7 +206,7 @@ def test_permission_resume_helper_continues_after_decision(tmp_path):
     async def run():
         with TraceCollector(session_id="resume-session", query_id="query-resume") as trace:
             events = []
-            async for item in runtime._astream_with_permission_resume(
+            async for item in runtime._astream_with_hitl_resume(
                 agent,
                 {"messages": []},
                 stream_mode=["messages", "updates", "custom", "values"],
@@ -225,6 +225,67 @@ def test_permission_resume_helper_continues_after_decision(tmp_path):
     assert [event.get("event") for event in events if isinstance(event, dict)] == [
         "permission_required",
         "permission_resolved",
+    ]
+    assert isinstance(agent.inputs[-1], Command)
+
+
+def test_dimension_build_rule_interrupt_resumes_same_graph_stream(tmp_path):
+    """Generic dimension HITL must use the same resumable Agent stream as permissions."""
+
+    import asyncio
+
+    from graph.deepagents_manager import DeepAgentsAgentManager
+    from graph.dimension_build_resume import dimension_build_resume_registry
+    from graph.trace_collector import TraceCollector
+    from langgraph.types import Command, Interrupt
+
+    request = {
+        "id": "dim-rule-test",
+        "type": "semantic_dimension_build_rule",
+        "session_id": "dimension-session",
+        "query_id": "dimension-query",
+        "tool_call_id": "call-rule",
+        "dimension_id": "vehicle_series",
+    }
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self.inputs = []
+
+        async def astream(self, graph_input, **_kwargs):
+            self.inputs.append(graph_input)
+            if len(self.inputs) == 1:
+                yield {"__interrupt__": (Interrupt(value={"type": "dimension_build_rule_request", "request": request}, id="i1"),)}
+                return
+            yield ("messages", ("resumed", {"langgraph_node": "model"}))
+
+    runtime = DeepAgentsAgentManager()
+    runtime.initialize(tmp_path)
+    agent = FakeAgent()
+
+    async def run():
+        with TraceCollector(session_id="dimension-session", query_id="dimension-query") as trace:
+            events = []
+            async for item in runtime._astream_with_hitl_resume(
+                agent,
+                {"messages": []},
+                stream_mode=["messages", "updates", "custom", "values"],
+                config={"configurable": {"thread_id": "dimension-session"}},
+                context={"session_id": "dimension-session", "query_id": "dimension-query"},
+                trace_collector=trace,
+            ):
+                events.append(item)
+                if isinstance(item, dict) and item.get("event") == "dimension_build_rule_required":
+                    future = asyncio.get_running_loop().create_future()
+                    dimension_build_resume_registry._pending["dim-rule-test"] = future
+                    dimension_build_resume_registry._requests["dim-rule-test"] = {**request, "status": "pending"}
+                    future.set_result({"action": "confirm", "build_rule": {"dimension_id": "vehicle_series"}})
+            return events
+
+    events = asyncio.run(run())
+    assert [event.get("event") for event in events if isinstance(event, dict)] == [
+        "dimension_build_rule_required",
+        "dimension_build_rule_resolved",
     ]
     assert isinstance(agent.inputs[-1], Command)
 
@@ -467,6 +528,82 @@ def test_cancelled_agent_stream_persists_reasoning_only_partial(tmp_path, monkey
     assert assistant["interrupted"] is True
     timeline_reasoning = next(item for item in assistant["timeline"] if item["type"] == "reasoning")
     assert timeline_reasoning["content"] == "我正在拆解问题。"
+
+
+def test_failed_agent_stream_persists_completed_tool_output(tmp_path, monkeypatch):
+    """Model/API failures after tools should keep completed tool results for follow-up turns."""
+
+    from graph import deepagents_manager as manager_module
+    from graph.session_manager import session_manager
+    from projects.registry import project_registry
+
+    session_manager.initialize(tmp_path)
+    project_registry.initialize(tmp_path)
+    session_manager.create_session("failed-partial-session")
+
+    class FakeDeepAgent:
+        async def astream(self, *_args, **_kwargs):
+            yield (
+                "updates",
+                {
+                    "model": {
+                        "messages": [
+                            AIMessage(
+                                content="",
+                                tool_calls=[
+                                    {
+                                        "name": "database_sql_execute",
+                                        "args": {"sql": "select 205390"},
+                                        "id": "call_sales",
+                                    }
+                                ],
+                            )
+                        ]
+                    }
+                },
+            )
+            yield (
+                "updates",
+                {
+                    "tools": {
+                        "messages": [
+                            ToolMessage(
+                                content="2023 年 5 月销量为 205390",
+                                tool_call_id="call_sales",
+                                name="database_sql_execute",
+                            )
+                        ]
+                    }
+                },
+            )
+            raise RuntimeError("Connection error.")
+            yield  # pragma: no cover
+
+    monkeypatch.setattr(manager_module, "create_deep_agent", lambda **_kwargs: FakeDeepAgent())
+
+    runtime = manager_module.DeepAgentsAgentManager()
+    runtime.initialize(Path(tmp_path))
+
+    async def collect():
+        return [
+            event
+            async for event in runtime.astream(
+                message="查比亚迪销量",
+                session_id="failed-partial-session",
+                project_id=None,
+                user_id="test-user",
+            )
+        ]
+
+    events = asyncio.run(collect())
+    assert any(event["event"] == "error" for event in events)
+    history = session_manager.load_session("failed-partial-session")
+    assert [message["role"] for message in history] == ["user", "assistant"]
+    assistant = history[1]
+    assert assistant["status"] == "error"
+    assert "Connection error" in assistant["error_notice"]
+    assert assistant["tool_calls"][0]["tool"] == "database_sql_execute"
+    assert assistant["tool_calls"][0]["output"] == "2023 年 5 月销量为 205390"
 
 
 def test_historical_tool_messages_are_not_reemitted_on_followup(tmp_path, monkeypatch):
@@ -886,6 +1023,56 @@ def test_deepagents_manager_emits_sources_citations_and_title(tmp_path, monkeypa
     assert tool_message["tool_calls"][0]["raw_output"].startswith("[scripts/aihot_query.py]")
     assert final_message["sources"][0]["source_id"] == "src_aihot_demo"
     assert final_message["citations"][0]["source_id"] == "src_aihot_demo"
+
+
+def test_deepagents_manager_generates_title_when_user_was_pre_persisted(tmp_path, monkeypatch):
+    """Pre-persisting the current user message must still count as the first turn."""
+
+    from graph import deepagents_manager as manager_module
+    from graph.session_manager import session_manager
+    from projects.registry import project_registry
+
+    session_manager.initialize(tmp_path)
+    project_registry.initialize(tmp_path)
+    session_id = "agent-title-prepersist-session"
+    session_manager.create_session(session_id)
+    session_manager.save_message(session_id, "user", "重建车系维度校验")
+
+    class FakeDeepAgent:
+        async def astream(self, *_args, **_kwargs):
+            yield ("messages", (AIMessageChunk(content="已完成校验。"), {"langgraph_node": "model"}))
+            yield ("values", {"messages": [AIMessage(content="已完成校验。")]})
+
+    monkeypatch.setattr(manager_module, "create_deep_agent", lambda **_kwargs: FakeDeepAgent())
+
+    async def fake_generate_title(title_session_id: str):
+        session_manager.update_title(title_session_id, "车系维度校验")
+        return "车系维度校验"
+
+    monkeypatch.setattr(manager_module, "_generate_title", fake_generate_title)
+
+    runtime = manager_module.DeepAgentsAgentManager()
+    runtime.initialize(Path(tmp_path))
+
+    async def collect():
+        return [
+            event
+            async for event in runtime.astream(
+                message="重建车系维度校验",
+                session_id=session_id,
+                project_id=None,
+                user_id="test-user",
+                user_message_already_persisted=True,
+            )
+        ]
+
+    events = asyncio.run(collect())
+    title_event = next(event for event in events if event["event"] == "title")
+    history = session_manager.load_session(session_id)
+
+    assert json.loads(title_event["data"])["title"] == "车系维度校验"
+    assert [message["role"] for message in history].count("user") == 1
+    assert session_manager.get_raw_messages(session_id)["title"] == "车系维度校验"
 
 
 def test_deepagents_manager_separates_reasoning_from_final_answer(tmp_path, monkeypatch):

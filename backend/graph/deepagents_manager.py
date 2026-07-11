@@ -35,12 +35,14 @@ from graph.session_manager import session_manager
 from knowledge.paths import get_knowledge_root
 from graph.permission_middleware import ExternalFilePermissionMiddleware
 from graph.permission_resume import permission_resume_registry
+from graph.dimension_build_resume import dimension_build_resume_registry
 from graph.tool_result_adapter import tool_result_adapter
 from graph.trace_collector import TraceCollector, TraceSpan
 from graph.middleware_trace_proxy import wrap_middlewares_for_trace
 from knowledge.paths import get_knowledge_root
 from llm.model_client import ModelClientChatModel
 from projects.registry import project_registry
+from analytics.models import get_analytics_model_registry
 from tools import get_all_tools
 import config
 
@@ -62,6 +64,12 @@ AGENT_MODE_PUDDINGCLAW_TOOLS = {
     "database_sql_validate",
     "database_sql_execute",
     "database_schema_inspect",
+    "semantic_entity_lookup",
+    "enqueue_semantic_dimension_build",
+    "get_semantic_dimension_build_job",
+    "publish_semantic_dimension_build",
+    "request_dimension_build_rule",
+    "inspect_dimension_build_input",
     "database_query_trace_inspect",
     "database_query_result_page",
 }
@@ -435,15 +443,18 @@ class DeepAgentsAgentManager:
         skills_dir = self._base_dir / "skills"
         semantic_assets_dir = self._base_dir / "semantic-assets"
         sql_guardrails_dir = self._base_dir / "sql-guardrails"
+        analytics_models_dir = self._base_dir / "analytics-models"
         knowledge_dir = get_knowledge_root(self._base_dir)
         knowledge_dir.mkdir(parents=True, exist_ok=True)
         semantic_assets_dir.mkdir(parents=True, exist_ok=True)
         sql_guardrails_dir.mkdir(parents=True, exist_ok=True)
+        analytics_models_dir.mkdir(parents=True, exist_ok=True)
         routes: dict[str, FilesystemBackend] = {
             "/workspace/": FilesystemBackend(root_dir=workspace_path, virtual_mode=True),
             "/knowledge/": FilesystemBackend(root_dir=knowledge_dir, virtual_mode=True),
             "/semantic-assets/": FilesystemBackend(root_dir=semantic_assets_dir, virtual_mode=True),
             "/sql-guardrails/": FilesystemBackend(root_dir=sql_guardrails_dir, virtual_mode=True),
+            "/analytics-models/": FilesystemBackend(root_dir=analytics_models_dir, virtual_mode=True),
         }
         if skills_dir.exists():
             routes["/skills/"] = FilesystemBackend(root_dir=skills_dir, virtual_mode=True)
@@ -605,6 +616,7 @@ class DeepAgentsAgentManager:
                         "/skills": str(self._base_dir / "skills"),
                         "/semantic-assets": str(self._base_dir / "semantic-assets"),
                         "/sql-guardrails": str(self._base_dir / "sql-guardrails"),
+                        "/analytics-models": str(self._base_dir / "analytics-models"),
                     },
                 }
                 try:
@@ -621,6 +633,13 @@ class DeepAgentsAgentManager:
                     tool = tool.model_copy(update=resource_updates)
                 except Exception:
                     for key, value in resource_updates.items():
+                        setattr(tool, key, value)
+            elif getattr(tool, "name", "") in {"request_dimension_build_rule", "inspect_dimension_build_input", "enqueue_semantic_dimension_build"}:
+                request_updates = {"session_id": session_id}
+                try:
+                    tool = tool.model_copy(update=request_updates)
+                except Exception:
+                    for key, value in request_updates.items():
                         setattr(tool, key, value)
 
             tools.append(tool)
@@ -696,7 +715,7 @@ class DeepAgentsAgentManager:
             "FilesystemMiddleware",
             "deepagents.base",
             ["wrap_tool_call"],
-            "提供 /workspace、/knowledge、/semantic-assets、/sql-guardrails 与 /skills 文件系统能力",
+            "提供 /workspace、/knowledge、/semantic-assets、/sql-guardrails、/analytics-models 与 /skills 文件系统能力",
         )
         add("SubAgentMiddleware", "deepagents.base", ["wrap_model_call"], "向 system message 注入 task/subagent 使用说明")
         add("SummarizationMiddleware", "deepagents.base", ["before_model"], "DeepAgents 基础上下文压缩")
@@ -913,6 +932,12 @@ class DeepAgentsAgentManager:
                 "root_dir": str(self._base_dir / "sql-guardrails"),
                 "exists": (self._base_dir / "sql-guardrails").exists(),
                 "role": "sql guardrail assets",
+            },
+            {
+                "virtual_path": "/analytics-models/",
+                "root_dir": str(self._base_dir / "analytics-models"),
+                "exists": (self._base_dir / "analytics-models").exists(),
+                "role": "analytics model playbooks",
             },
             {
                 "virtual_path": "/skills/",
@@ -1227,6 +1252,96 @@ class DeepAgentsAgentManager:
         suffix = "\n\n[附件]\n" + "\n".join(f"- {name}" for name in attachment_names)
         return f"{message}{suffix}"
 
+    @staticmethod
+    def _workspace_artifact_links(content: str, workspace_path: Path) -> str:
+        """Return markdown links for /workspace artifacts mentioned in content.
+
+        Keep the virtual path in the assistant text for follow-up turns, and add
+        host-local file links only as a user-facing convenience.
+        """
+
+        if not content or "/workspace/" not in content:
+            return ""
+        # Stop at whitespace and common markdown/list/table delimiters. This
+        # intentionally targets generated artifacts, not arbitrary prose.
+        pattern = re.compile(r"(?<![\w/])(/workspace/[^\s`'\"<>\\|)]+)")
+        seen: set[str] = set()
+        links: list[str] = []
+        for match in pattern.finditer(content):
+            virtual_path = match.group(1).rstrip("，。；：、,.!?]")
+            if virtual_path in seen:
+                continue
+            seen.add(virtual_path)
+            relative = virtual_path.removeprefix("/workspace/").lstrip("/")
+            if not relative or ".." in Path(relative).parts:
+                continue
+            local_path = (workspace_path / relative).resolve()
+            try:
+                local_path.relative_to(workspace_path.resolve())
+            except ValueError:
+                continue
+            name = local_path.name or virtual_path
+            if local_path.exists():
+                links.append(f"- [打开 {name}]({local_path.as_uri()})")
+            else:
+                links.append(f"- {name}  \n  `{local_path}`（文件暂未找到）")
+        if not links:
+            return ""
+        return "\n\n本地文件：\n" + "\n".join(links)
+
+    def _analytics_model_context(self, analytics_model_id: str | None) -> tuple[str, dict[str, Any] | None]:
+        if not analytics_model_id:
+            return "", None
+        assert self._base_dir is not None
+        try:
+            model = get_analytics_model_registry(self._base_dir).get_model_context(analytics_model_id)
+        except Exception as exc:
+            payload = {
+                "id": analytics_model_id,
+                "loaded": False,
+                "error": str(exc),
+            }
+            return (
+                "\n\n"
+                "<analytics_model_context>\n"
+                f"请求的分析模型 `{analytics_model_id}` 加载失败：{exc}\n"
+                "本轮必须明确告知用户模型加载失败，并按通用 Agent 行为继续。\n"
+                "</analytics_model_context>\n",
+                payload,
+            )
+
+        frontmatter = model.get("frontmatter") or {}
+        body = str(model.get("body") or "").strip()
+        body_preview = body[:12000] + ("\n...[truncated]" if len(body) > 12000 else "")
+        yaml_text = json.dumps(frontmatter, ensure_ascii=False, indent=2)
+        rel_path = str(model.get("path") or "").strip()
+        virtual_path = f"/{rel_path}" if rel_path.startswith("analytics-models/") else rel_path
+        payload = {
+            "id": model.get("id"),
+            "name": model.get("name"),
+            "version": model.get("version"),
+            "path": model.get("path"),
+            "loaded": True,
+            "missing_references": model.get("missing_references") or [],
+        }
+        prompt = (
+            "\n\n"
+            "<analytics_model_context>\n"
+            "当前用户已选择一个分析模型。它是本轮任务的强上下文，不是底层 LLM 模型。\n"
+            "你必须优先遵守该模型的业务边界、Playbook、数据资产、语义资产、守卫和输出要求。\n"
+            "如果用户问题与该模型冲突或缺少关键参数，先说明冲突或追问，不要静默忽略模型。\n\n"
+            f"模型 ID：{model.get('id')}\n"
+            f"模型名称：{model.get('name')}\n"
+            f"版本：{model.get('version')}\n"
+            f"文件路径：{virtual_path}\n\n"
+            "机器可读 metadata：\n"
+            f"```json\n{yaml_text}\n```\n\n"
+            "模型 Playbook：\n"
+            f"{body_preview}\n"
+            "</analytics_model_context>\n"
+        )
+        return prompt, payload
+
     @classmethod
     def _build_messages(
         cls,
@@ -1468,7 +1583,7 @@ class DeepAgentsAgentManager:
         }
 
     @staticmethod
-    def _extract_permission_interrupt(item: Any) -> dict[str, Any] | None:
+    def _extract_hitl_interrupt(item: Any) -> tuple[str, dict[str, Any]] | None:
         payload = item[1] if isinstance(item, tuple) and len(item) == 2 else item
         if not isinstance(payload, dict):
             return None
@@ -1479,13 +1594,13 @@ class DeepAgentsAgentManager:
             interrupts = [interrupts]
         for interrupt_item in interrupts:
             value = getattr(interrupt_item, "value", interrupt_item)
-            if isinstance(value, dict) and value.get("type") == "permission_request":
+            if isinstance(value, dict) and value.get("type") in {"permission_request", "dimension_build_rule_request"}:
                 request = value.get("request")
                 if isinstance(request, dict):
-                    return request
+                    return str(value["type"]), request
         return None
 
-    async def _astream_with_permission_resume(
+    async def _astream_with_hitl_resume(
         self,
         agent: Any,
         initial_input: Any,
@@ -1498,16 +1613,20 @@ class DeepAgentsAgentManager:
         graph_input = initial_input
         while True:
             interrupted_request: dict[str, Any] | None = None
+            interrupted_type = ""
             async for item in agent.astream(
                 graph_input,
                 stream_mode=stream_mode,
                 config=config,
                 context=context,
             ):
-                request = self._extract_permission_interrupt(item)
-                if request is not None:
-                    interrupted_request = request
-                    yield self._sse("permission_required", request)
+                hitl = self._extract_hitl_interrupt(item)
+                if hitl is not None:
+                    interrupted_type, interrupted_request = hitl
+                    yield self._sse(
+                        "permission_required" if interrupted_type == "permission_request" else "dimension_build_rule_required",
+                        interrupted_request,
+                    )
                     break
                 yield item
 
@@ -1515,29 +1634,33 @@ class DeepAgentsAgentManager:
                 return
 
             request_id = str(interrupted_request.get("id") or "")
-            decision = await permission_resume_registry.wait(request_id)
+            decision = (
+                await permission_resume_registry.wait(request_id)
+                if interrupted_type == "permission_request"
+                else await dimension_build_resume_registry.wait(request_id)
+            )
             trace_collector.add_custom_span(
-                "permission.decision",
+                "permission.decision" if interrupted_type == "permission_request" else "dimension_build_rule.decision",
                 {"request_id": request_id, "decision": decision},
-                span_type="permission",
+                span_type="permission" if interrupted_type == "permission_request" else "hitl",
                 metadata={
                     "harness": {
                         "mechanism": "permission",
                         "pillars": [{"name": "architectural_constraints", "role": "primary"}],
                     },
-                    "permission": {
+                    "hitl": {
                         "request_id": request_id,
                         "type": interrupted_request.get("type"),
-                        "decision": decision.get("type"),
-                        "outcome": "approved" if decision.get("type") == "approve" else "rejected",
+                        "decision": decision.get("type") or decision.get("action"),
+                        "outcome": "approved" if decision.get("type") == "approve" or decision.get("action") == "confirm" else "rejected",
                     },
                 },
             )
             yield self._sse(
-                "permission_resolved",
+                "permission_resolved" if interrupted_type == "permission_request" else "dimension_build_rule_resolved",
                 {"request_id": request_id, "decision": decision},
             )
-            graph_input = Command(resume={"decisions": [decision]})
+            graph_input = Command(resume={"decisions": [decision]}) if interrupted_type == "permission_request" else Command(resume=decision)
 
     @staticmethod
     def _tool_call_id(tool_call: Any) -> str:
@@ -1962,6 +2085,7 @@ class DeepAgentsAgentManager:
         self,
         *,
         session_id: str,
+        query_id: str,
         user_message: str,
         attachments: list[dict[str, Any]] | None,
         segments: list[dict[str, Any]],
@@ -1970,6 +2094,10 @@ class DeepAgentsAgentManager:
         accumulated_reasoning: str,
         turn_sources: list[dict[str, Any]],
         user_message_persisted: bool = False,
+        status: str = "cancelled",
+        interruption_notice: str | None = None,
+        error_notice: str | None = None,
+        pending_tool_output: str = "Tool execution was interrupted because the user stopped the run.",
     ) -> None:
         """Save the visible partial run after client cancellation.
 
@@ -1977,17 +2105,8 @@ class DeepAgentsAgentManager:
         detail for HITL, not the source of truth for chat continuity.
         """
 
-        interrupted_output = "Tool execution was interrupted because the user stopped the run."
-        self._mark_pending_tools_interrupted(active_segment, pending_tool_starts, interrupted_output)
-        interruption_notice = "本轮已被用户停止，以上为中断前已完成的部分结果。"
-
-        cleaned_segments = self._strip_runtime_segment_fields(segments)
-        full_content = "\n\n".join(
-            str(seg.get("content") or "") for seg in cleaned_segments if seg.get("content")
-        )
-        all_tool_calls = [tc for seg in cleaned_segments for tc in seg.get("tool_calls", [])]
-        all_timeline = [item for seg in cleaned_segments for item in seg.get("timeline", [])]
-        final_citations = finalize_citations(full_content, turn_sources)
+        self._mark_pending_tools_interrupted(active_segment, pending_tool_starts, pending_tool_output)
+        interruption_notice = interruption_notice or "本轮已被用户停止，以上为中断前已完成的部分结果。"
 
         if not user_message_persisted:
             session_manager.save_message(
@@ -1995,26 +2114,58 @@ class DeepAgentsAgentManager:
                 "user",
                 self._display_message_with_attachments(user_message, attachments),
             )
-        if (
-            full_content
-            or all_tool_calls
-            or accumulated_reasoning
-            or all_timeline
-            or turn_sources
-        ):
-            session_manager.save_message(
-                session_id,
-                "assistant",
-                full_content,
-                tool_calls=all_tool_calls or None,
-                sources=dedupe_sources(turn_sources) or None,
-                citations=final_citations or None,
-                reasoning_content=accumulated_reasoning or None,
-                timeline=all_timeline or None,
-                segments=cleaned_segments or None,
-                interrupted=True,
-                interruption_notice=interruption_notice,
-            )
+        self._persist_assistant_snapshot(
+            session_id=session_id,
+            query_id=query_id,
+            segments=segments,
+            accumulated_reasoning=accumulated_reasoning,
+            turn_sources=turn_sources,
+            interrupted=True,
+            interruption_notice=interruption_notice,
+            error_notice=error_notice,
+            status=status,
+        )
+
+    def _persist_assistant_snapshot(
+        self,
+        *,
+        session_id: str,
+        query_id: str,
+        segments: list[dict[str, Any]],
+        accumulated_reasoning: str,
+        turn_sources: list[dict[str, Any]],
+        interrupted: bool = False,
+        interruption_notice: str | None = None,
+        error_notice: str | None = None,
+        status: str = "running",
+    ) -> bool:
+        """Persist the current assistant draft without duplicating the turn."""
+
+        cleaned_segments = self._strip_runtime_segment_fields(segments)
+        full_content = "\n\n".join(
+            str(seg.get("content") or "") for seg in cleaned_segments if seg.get("content")
+        )
+        all_tool_calls = [tc for seg in cleaned_segments for tc in seg.get("tool_calls", [])]
+        all_timeline = [item for seg in cleaned_segments for item in seg.get("timeline", [])]
+        if not (full_content or all_tool_calls or accumulated_reasoning or all_timeline or turn_sources):
+            return False
+        final_citations = finalize_citations(full_content, turn_sources)
+        session_manager.upsert_assistant_message(
+            session_id,
+            query_id=query_id,
+            content=full_content,
+            tool_calls=all_tool_calls or None,
+            sources=dedupe_sources(turn_sources) or None,
+            citations=final_citations or None,
+            reasoning_content=accumulated_reasoning or None,
+            timeline=all_timeline or None,
+            segments=cleaned_segments or None,
+            interrupted=interrupted,
+            interruption_notice=interruption_notice,
+            error_notice=error_notice,
+            status=status,
+        )
+        return True
 
     @staticmethod
     def _last_ai_content(state: dict[str, Any] | None) -> str:
@@ -2036,8 +2187,10 @@ class DeepAgentsAgentManager:
         message: str,
         session_id: str,
         project_id: str | None = None,
+        analytics_model_id: str | None = None,
         user_id: str = "default_user",
         attachments: list[dict[str, Any]] | None = None,
+        user_message_already_persisted: bool = False,
     ) -> AsyncGenerator[dict[str, str], None]:
         """Stream Agent-mode SSE events compatible with the existing frontend."""
 
@@ -2050,7 +2203,7 @@ class DeepAgentsAgentManager:
         accumulated_reasoning = ""
         turn_sources: list[dict[str, Any]] = []
         run_messages_persisted = False
-        user_message_persisted = False
+        user_message_persisted = user_message_already_persisted
         checkpoint_thread_id = f"{session_id}:{query_id}"
         try:
             thinking_enabled = bool(config.load_config().get("thinking_mode", False))
@@ -2060,11 +2213,15 @@ class DeepAgentsAgentManager:
                 session_id=session_id,
                 project_id=project_id,
             )
+            if analytics_model_id:
+                metadata["analytics_model_id"] = analytics_model_id
             session_manager.update_metadata(session_id, metadata)
 
             raw_history = session_manager.load_session(session_id)
             history = session_manager.load_session_for_agent(session_id)
-            is_first_message = not any(item.get("role") == "user" for item in history)
+            persisted_current_user_count = 1 if user_message_already_persisted else 0
+            historical_user_count = sum(1 for item in history if item.get("role") == "user")
+            is_first_message = historical_user_count <= persisted_current_user_count
             messages = self._build_messages(
                 raw_history,
                 message,
@@ -2078,12 +2235,13 @@ class DeepAgentsAgentManager:
                 for tc in msg.get("tool_calls") or []
                 if tc.get("id")
             }
-            session_manager.save_message(
-                session_id,
-                "user",
-                self._display_message_with_attachments(message, attachments),
-            )
-            user_message_persisted = True
+            if not user_message_persisted:
+                session_manager.save_message(
+                    session_id,
+                    "user",
+                    self._display_message_with_attachments(message, attachments),
+                )
+                user_message_persisted = True
 
             # Restore persisted todos so the Agent resumes from white-box state
             # instead of relying on checkpoint black-box.
@@ -2101,10 +2259,15 @@ class DeepAgentsAgentManager:
                 workspace_path=workspace_path,
                 checkpointer=self._checkpointer_info,
             )
+            analytics_model_prompt, analytics_model_payload = self._analytics_model_context(analytics_model_id)
+            if analytics_model_payload:
+                runtime_inventory["analytics_model"] = analytics_model_payload
             traced_middlewares = wrap_middlewares_for_trace(agent_middlewares)
             logger.info("Building DeepAgents agent for session=%s project=%s", session_id, project_id)
             subagents = _build_subagents(agent_tools, agent_skills)
             system_prompt = build_deepagents_system_prompt(self._base_dir, workspace_path)
+            if analytics_model_prompt:
+                system_prompt += analytics_model_prompt
             agent = create_deep_agent(
                 model=model,
                 tools=agent_tools,
@@ -2173,6 +2336,61 @@ class DeepAgentsAgentManager:
             REASONING_LOG_INTERVAL = 500
             # Track todo state across stream values for white-box persistence.
             previous_todos: list[dict[str, Any]] = list(persisted_todos)
+            last_snapshot_at = 0.0
+            last_snapshot_signature = ""
+
+            def persist_assistant_snapshot(
+                *,
+                force: bool = False,
+                status: str = "running",
+                interrupted: bool = False,
+                interruption_notice: str | None = None,
+                error_notice: str | None = None,
+            ) -> None:
+                nonlocal last_snapshot_at, last_snapshot_signature
+                now = time.time()
+                cleaned = self._strip_runtime_segment_fields(segments)
+                tool_fingerprint = [
+                    (
+                        tc.get("id"),
+                        tc.get("tool"),
+                        bool(tc.get("output")),
+                        bool(tc.get("is_error")),
+                    )
+                    for seg in cleaned
+                    for tc in seg.get("tool_calls", [])
+                ]
+                signature = json.dumps(
+                    {
+                        "content_lengths": [len(str(seg.get("content") or "")) for seg in cleaned],
+                        "reasoning_len": len(accumulated_reasoning),
+                        "tools": tool_fingerprint,
+                        "sources": len(turn_sources),
+                        "status": status,
+                        "interrupted": interrupted,
+                        "interruption_notice": interruption_notice,
+                        "error_notice": error_notice,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                if not force and signature == last_snapshot_signature:
+                    return
+                if not force and now - last_snapshot_at < 2:
+                    return
+                if self._persist_assistant_snapshot(
+                    session_id=session_id,
+                    query_id=query_id,
+                    segments=segments,
+                    accumulated_reasoning=accumulated_reasoning,
+                    turn_sources=turn_sources,
+                    interrupted=interrupted,
+                    interruption_notice=interruption_notice,
+                    error_notice=error_notice,
+                    status=status,
+                ):
+                    last_snapshot_at = now
+                    last_snapshot_signature = signature
 
             agent_config: dict[str, Any] = {
                 "configurable": {"thread_id": checkpoint_thread_id, "user_id": user_id}
@@ -2183,7 +2401,7 @@ class DeepAgentsAgentManager:
 
             initial_state: dict[str, Any] = {"messages": messages, "todos": persisted_todos}
 
-            async for item in self._astream_with_permission_resume(
+            async for item in self._astream_with_hitl_resume(
                 agent,
                 initial_state,
                 stream_mode=["messages", "updates", "custom", "values"],
@@ -2275,6 +2493,7 @@ class DeepAgentsAgentManager:
                                     "chars": len(reasoning_text),
                                 },
                             )
+                            persist_assistant_snapshot()
                     if text:
                         if (
                             isinstance(message_payload, AIMessageChunk)
@@ -2304,6 +2523,7 @@ class DeepAgentsAgentManager:
                         active_segment["content"] += text
                         emitted_text += text
                         yield self._sse("token", {"content": text})
+                        persist_assistant_snapshot()
                 elif mode == "updates" and isinstance(payload, dict):
                     for node_name, node_data in payload.items():
                         node_messages = node_data.get("messages") if isinstance(node_data, dict) else None
@@ -2402,6 +2622,7 @@ class DeepAgentsAgentManager:
                                         "sources": sources,
                                     },
                                 )
+                                persist_assistant_snapshot(force=True)
                                 tools_just_finished = True
                         else:
                             for agent_msg in node_messages:
@@ -2453,6 +2674,7 @@ class DeepAgentsAgentManager:
                                             "id": tc_id,
                                         },
                                     )
+                                    persist_assistant_snapshot(force=True)
                 elif mode == "custom" and isinstance(payload, dict):
                     event_type = str(payload.get("type") or "")
                     if event_type:
@@ -2519,6 +2741,16 @@ class DeepAgentsAgentManager:
                 final_content = diagnostic
                 yield self._sse("token", {"content": diagnostic})
 
+            artifact_links = self._workspace_artifact_links(
+                active_segment.get("content", "") or final_content or "",
+                workspace_path,
+            )
+            if artifact_links and artifact_links not in active_segment.get("content", ""):
+                active_segment["content"] += artifact_links
+                emitted_text += artifact_links
+                final_content = f"{final_content or ''}{artifact_links}"
+                yield self._sse("token", {"content": artifact_links})
+
             for tc_id, pending in list(pending_tool_starts.items()):
                 failed_output = "Tool execution did not return a result before the agent finished."
                 active_segment["tool_calls"].append(
@@ -2549,6 +2781,8 @@ class DeepAgentsAgentManager:
                         "sources": [],
                     },
                 )
+            if pending_tool_starts:
+                persist_assistant_snapshot(force=True)
 
             # Drain any remaining synchronous trace events before building the final trace.
             while pending_trace_events:
@@ -2588,16 +2822,17 @@ class DeepAgentsAgentManager:
                 len(segments),
             )
             if self._segment_has_payload({"content": full_content, "tool_calls": all_tool_calls}):
-                session_manager.save_message(
+                session_manager.upsert_assistant_message(
                     session_id,
-                    "assistant",
-                    full_content,
+                    query_id=query_id,
+                    content=full_content,
                     tool_calls=all_tool_calls or None,
                     sources=dedupe_sources(turn_sources) or None,
                     citations=final_citations or None,
                     reasoning_content=accumulated_reasoning or None,
                     timeline=all_timeline or None,
                     segments=segments or None,
+                    status="completed",
                 )
             run_messages_persisted = True
             yield self._sse(
@@ -2629,6 +2864,7 @@ class DeepAgentsAgentManager:
                 if not run_messages_persisted and segments and active_segment:
                     self._persist_partial_run(
                         session_id=session_id,
+                        query_id=query_id,
                         user_message=message,
                         attachments=attachments,
                         segments=segments,
@@ -2637,11 +2873,18 @@ class DeepAgentsAgentManager:
                         accumulated_reasoning=accumulated_reasoning,
                         turn_sources=turn_sources,
                         user_message_persisted=user_message_persisted,
+                        status="cancelled",
+                        interruption_notice="本轮已被用户停止，以上为中断前已完成的部分结果。",
+                        pending_tool_output="Tool execution was interrupted because the user stopped the run.",
                     )
             except Exception:
                 logger.warning("Failed to persist partial cancelled run for session=%s", session_id, exc_info=True)
             try:
                 permission_resume_registry.reject_session(
+                    session_id,
+                    "Agent stream was cancelled by the client.",
+                )
+                dimension_build_resume_registry.reject_session(
                     session_id,
                     "Agent stream was cancelled by the client.",
                 )
@@ -2664,6 +2907,27 @@ class DeepAgentsAgentManager:
             logger.exception("Agent stream failed for session=%s: %s", session_id, exc)
             traceback.print_exc()
             error_msg = str(exc) or exc.__class__.__name__
+            error_notice = f"本轮执行中断：{error_msg}。已保留中断前完成的内容，可修复连接后输入“继续”。"
+            try:
+                if not run_messages_persisted and segments and active_segment:
+                    self._persist_partial_run(
+                        session_id=session_id,
+                        query_id=query_id,
+                        user_message=message,
+                        attachments=attachments,
+                        segments=segments,
+                        active_segment=active_segment,
+                        pending_tool_starts=pending_tool_starts,
+                        accumulated_reasoning=accumulated_reasoning,
+                        turn_sources=turn_sources,
+                        user_message_persisted=user_message_persisted,
+                        status="error",
+                        interruption_notice=None,
+                        error_notice=error_notice,
+                        pending_tool_output="Tool execution was interrupted because the agent run failed.",
+                    )
+            except Exception:
+                logger.warning("Failed to persist partial failed run for session=%s", session_id, exc_info=True)
             try:
                 if trace_collector is not None:
                     trace = trace_collector.finish(status="error", error=error_msg)
@@ -2672,7 +2936,7 @@ class DeepAgentsAgentManager:
                 pass
             if trace_context_active and trace_collector is not None:
                 trace_collector.__exit__(type(exc), exc, exc.__traceback__)
-            yield self._sse("error", {"error": error_msg, "message": error_msg})
+            yield self._sse("error", {"error": error_msg, "message": error_notice})
 
 
 deepagents_agent_manager = DeepAgentsAgentManager()

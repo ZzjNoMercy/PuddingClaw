@@ -85,3 +85,10 @@ class DatabaseQueryResultPageInput(BaseModel):
     result_id: str = Field(description="Persisted database query result id returned by database_knowledge_query.")
     page: int = Field(default=1, ge=1, description="1-based page number.")
     page_size: int | None = Field(default=None, ge=1, le=5000, description="Optional page size.")
+
+
+class SemanticEntityLookupInput(BaseModel):
+    dimension_id: str = Field(description="Entity-lookup dimension id, for example 'vehicle_series' or 'dimension:vehicle_series'.")
+    source_ref: str = Field(description="Source asset reference declared by the active Crosswalk binding.")
+    keys: list[dict[str, str]] = Field(description="One or more source key objects using the binding field names.")
+    include_non_joinable: bool = Field(default=False, description="Include candidate and unmatched mappings for diagnosis only.")

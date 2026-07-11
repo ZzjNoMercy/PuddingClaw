@@ -48,6 +48,7 @@ Agent 根据用户问题动态决定查哪些、跳过哪些、补查哪些、�
 - [ ] 增加模型目录和 registry。
 - [ ] 支持模型引用数据资产、语义资产、SQL 守卫和模板。
 - [ ] 支持前端创建、导入、编辑、刷新、选择模型。
+- [ ] 支持在 Agent 输入框通过“+ / 分析模型”选择当前模型。
 - [ ] 支持主 Agent / 问数 Agent 在运行时加载已选模型。
 - [ ] 支持模型 Playbook 进入上下文，指导 Agent 做动态分析。
 - [ ] 支持 Trace 显示本轮加载了哪个模型、哪些资产、哪些模板。
@@ -132,6 +133,20 @@ backend/analytics-models/
 ```
 
 这样 Agent 和 skill 可以像读写语义资产、SQL 守卫一样读写模型文件。
+
+### FS Backend 要求
+
+模型包目录必须进入与 `/skills/`、`/semantic-assets/`、`/sql-guardrails/` 同级的文件系统能力。
+
+需要改造的入口：
+
+- DeepAgents `FilesystemBackend` 挂载 `/analytics-models/`。
+- Terminal path alias 暴露 `/analytics-models`，便于 Trace 和工具提示展示真实可访问路径。
+- `/api/files` 允许读写 `analytics-models/`。
+- `write_file` 允许写入 `analytics-models/`，用于后续 skill 创建或编辑模型包。
+- Trace runtime inventory 展示 `/analytics-models/` 的 `virtual_path`、`root_dir`、`exists`。
+
+这一步的目的不是让模型变成普通知识库文件，而是让 Agent、skill 和前端编辑器使用同一套文件访问边界，保证模型包可迁移、可审计、可手工修复。
 
 ## model.md 格式
 
@@ -327,7 +342,7 @@ Playbook：...
 
 执行链路：
 
-1. 前端记录当前选中的 `model_id`。
+1. 前端记录当前选中的 `analytics_model_id`。
 2. 发送 Agent 请求时带上 `analytics_model_id`。
 3. 后端加载模型 registry。
 4. 根据 `model_id` 读取 `model.md`。
@@ -336,6 +351,27 @@ Playbook：...
 7. 将模型引用的语义资产作为优先注入资产。
 8. 将模型引用的 SQL 守卫作为本轮启用范围。
 9. Trace 记录模型加载情况。
+
+### 选择模型后的上下文注入原则
+
+模型选择是强上下文信号，不是普通附件。
+
+- 如果用户选择了模型，后端必须把 `model.md` 的 YAML metadata 和正文 Playbook 注入本轮 Agent 系统上下文。
+- 模型引用的数据表、语义资产、守卫和模板应进入结构化 state，供问数工具、SQL 生成、Trace 使用。
+- 模型正文负责指导分析流程；语义资产仍是度量值、维度、颗粒度的口径来源。
+- 如果模型引用的语义资产或守卫不存在，不能静默忽略，Trace 需要显示 missing reference。
+- 不选择模型时，保持当前通用 Agent / 通用问数行为。
+
+推荐请求字段：
+
+```json
+{
+  "message": "刷新产品配置分析",
+  "analytics_model_id": "product_config_analysis"
+}
+```
+
+第一版只支持一个当前模型。多模型组合、冲突合并和模型继承都不进入第一版。
 
 ## Trace 要求
 
@@ -356,7 +392,10 @@ Trace 中需要能证明模型真的生效：
       "dimensions": ["launch_time", "energy_type"]
     },
     "guardrails": ["config_rate_use_wide_denominator"],
-    "templates": ["refresh"]
+    "templates": ["refresh"],
+    "context_injected": true,
+    "prompt_tokens_estimate": 1800,
+    "missing_references": []
   }
 }
 ```
@@ -369,7 +408,7 @@ Trace 中需要能证明模型真的生效：
 
 ## 前端交互
 
-智能问数页面增加“模型”分类，和数据资产、语义资产、问数 Agent 并列。
+智能问数页面增加“分析模型”分类，和数据资产、语义资产、SQL 守卫、任务中心并列。分析模型本身就是问数 Agent 的业务上下文包，不再维护独立的“问数 Agent”管理入口。
 
 模型页能力：
 
@@ -386,10 +425,35 @@ Trace 中需要能证明模型真的生效：
 
 问数 Agent 对话入口：
 
-- 支持选择当前模型。
-- 展示当前模型名称。
+- 输入框左侧 “+” 菜单增加“分析模型”。
+- 点击“分析模型”后展示可选模型列表，支持搜索模型名称和标签。
+- 选择后在输入框区域展示当前模型 chip，例如 `产品配置分析`。
+- chip 可移除，移除后本轮恢复通用 Agent 行为。
 - 用户不选择模型时，保持现有通用问数逻辑。
 - 用户选择模型后，Agent 回答时应优先遵守模型上下文。
+- 发送消息时把当前模型写入请求 payload：`analytics_model_id`。
+
+模型选择的 UI 语义：
+
+- 这是“分析上下文选择”，不是切换底层大模型。
+- 不要使用“模型供应商”“LLM 模型”一类文案。
+- 推荐入口名称：`分析模型`。
+- 推荐占位说明：`选择产品配置分析、上险量分析等业务模型`。
+
+### 输入框模型选择流程
+
+```text
+用户点击 +
+  -> 选择 分析模型
+  -> 弹出模型选择面板
+  -> 搜索 / 选择模型
+  -> 输入框出现模型 chip
+  -> 用户输入自然语言任务
+  -> 请求携带 analytics_model_id
+  -> 后端注入 model.md
+```
+
+选择模型后，不要求用户按模板填写参数。Agent 应根据模型 Playbook 从自然语言里识别参数，缺失关键参数时再追问。
 
 ## 后端模块建议
 
@@ -426,6 +490,24 @@ POST /api/analytics/models/import
 - `write_file` 允许写 `analytics-models/`。
 - DeepAgents `FilesystemBackend` 挂载 `/analytics-models/`。
 - Trace runtime inventory 显示 `/analytics-models/` 是否 mounted。
+
+涉及现有代码位置：
+
+- `backend/graph/deepagents_manager.py`
+  - `_build_backend` 增加 `/analytics-models/` route。
+  - terminal path aliases 增加 `/analytics-models`。
+  - runtime inventory mounts 增加 `/analytics-models/`。
+- `backend/api/files.py`
+  - `ALLOWED_PREFIXES` 增加 `analytics-models/`。
+  - 路径解析增加 `backend/analytics-models`。
+- `backend/tools/write_file_tool.py`
+  - `ALLOWED_PREFIXES` 增加 `analytics-models/`。
+  - description 和错误提示同步更新。
+- `frontend/src/app/analytics/page.tsx`
+  - 模型管理页复用语义资产、SQL 守卫的文件编辑体验。
+- Agent 请求层
+  - 增加 `analytics_model_id` 字段。
+  - 后端在构建 Agent 上下文时加载模型。
 
 ## 与现有资产的关系
 
@@ -475,12 +557,16 @@ POST /api/analytics/models/import
 - [ ] 允许 Agent / skill 读写模型文件。
 - [ ] 前端增加模型页。
 - [ ] 支持创建、导入、编辑、保存、刷新。
+- [ ] 输入框 “+” 菜单增加“分析模型”入口。
+- [ ] 选择模型后显示模型 chip。
+- [ ] 发送消息时携带 `analytics_model_id`。
 
 ### 阶段 3：Agent 上下文注入
 
 - [ ] 对话请求支持 `analytics_model_id`。
 - [ ] 主 Agent / 问数 Agent 加载模型上下文。
 - [ ] `database_knowledge_query` 能看到当前模型的表范围、语义资产和守卫。
+- [ ] 拆分后的 `database_sql_generate` / `database_sql_validate` / `database_sql_execute` 能读取当前模型上下文。
 - [ ] Trace 展示模型加载和注入情况。
 
 ### 阶段 4：真实模型验证
@@ -532,4 +618,3 @@ POST /api/analytics/models/import
 - Trace 能看到模型已加载。
 - “刷新产品配置分析”能读取模型 Playbook 和模板。
 - 问数结果能体现模型引用的语义资产和守卫。
-

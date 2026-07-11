@@ -307,6 +307,18 @@ export interface TableAsset {
   profile?: TableAssetProfile;
 }
 
+export interface TableAssetProfileJob {
+  job_id: string;
+  asset_id: string;
+  status: "queued" | "running" | "succeeded" | "failed" | string;
+  created_at: number;
+  updated_at: number;
+  started_at?: number | null;
+  finished_at?: number | null;
+  error?: string | null;
+  asset?: TableAsset;
+}
+
 export interface KnowledgeDatabaseSource {
   id: string;
   type: "postgresql" | string;
@@ -481,6 +493,19 @@ export async function listKnowledgeDatabaseSourceTables(sourceId: string): Promi
   }
   const payload = await response.json();
   return Array.isArray(payload.tables) ? payload.tables : [];
+}
+
+export async function listKnowledgeDatabaseSourceTableColumns(sourceId: string, tableName: string): Promise<string[]> {
+  const response = await fetch(
+    `${API_BASE}/knowledge/database-sources/${encodeURIComponent(sourceId)}/tables/${encodeURIComponent(tableName)}/columns`,
+    { cache: "no-store" }
+  );
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to load database table columns: ${response.status}`));
+  }
+  const payload = await response.json();
+  return Array.isArray(payload.columns) ? payload.columns.map(String) : [];
 }
 
 export async function deleteKnowledgeDatabaseSource(sourceId: string): Promise<void> {
@@ -893,11 +918,20 @@ export async function getTableAsset(assetId: string, includeProfile = true): Pro
     const text = await response.text().catch(() => "");
     throw new Error(apiErrorMessage(text, `Failed to load table asset: ${response.status}`));
   }
-  const payload = await response.json();
-  return payload.asset;
+  const responsePayload = await response.json();
+  return responsePayload.asset;
 }
 
-export async function generateTableAssetProfile(assetId: string): Promise<TableAsset> {
+export async function removeTableAsset(assetId: string): Promise<{ asset_id: string; removed_asset_ids: string[]; file_name: string; source_file_preserved: boolean }> {
+  const response = await fetch(`${API_BASE}/analytics/table-assets/${encodeURIComponent(assetId)}`, { method: "DELETE" });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to remove table asset: ${response.status}`));
+  }
+  return response.json();
+}
+
+export async function generateTableAssetProfile(assetId: string): Promise<TableAssetProfileJob> {
   const response = await fetch(`${API_BASE}/analytics/table-assets/${encodeURIComponent(assetId)}/profile`, {
     method: "POST",
   });
@@ -906,7 +940,19 @@ export async function generateTableAssetProfile(assetId: string): Promise<TableA
     throw new Error(apiErrorMessage(text, `Failed to generate table profile: ${response.status}`));
   }
   const payload = await response.json();
-  return payload.asset;
+  return payload.job;
+}
+
+export async function getTableAssetProfileJob(jobId: string): Promise<TableAssetProfileJob> {
+  const response = await fetch(`${API_BASE}/analytics/table-assets/profile-jobs/${encodeURIComponent(jobId)}`, {
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to load table profile job: ${response.status}`));
+  }
+  const payload = await response.json();
+  return payload.job;
 }
 
 export async function refreshTableAssetProfiles(): Promise<{ generated: TableAsset[]; errors: Record<string, string>[]; total: number }> {
@@ -933,6 +979,34 @@ export async function listTableAssetEntityCandidates(assetId: string, limit = 12
 }
 
 export type SemanticAssetType = "measure" | "dimension" | "grain";
+export type DimensionResolutionMode = "source_field" | "derived" | "entity_lookup" | "calendar_lookup";
+
+export interface DimensionBindingDefinition {
+  asset_ref?: string;
+  display_name?: string;
+  fields?: Record<string, string>;
+}
+
+export interface DimensionDefinition {
+  mode: DimensionResolutionMode;
+  bindings?: DimensionBindingDefinition[];
+  source_fields?: string[];
+  expression?: string;
+  canonical?: { key?: string; fields?: string[] };
+  reference_path?: string;
+  date_field?: string;
+  week_start_day?: string;
+  timezone?: string;
+}
+
+export interface SemanticDimensionUpdatePayload {
+  name: string;
+  description: string;
+  aliases: string[];
+  tags: string[];
+  version: string;
+  dimension_definition: DimensionDefinition;
+}
 
 export interface SemanticAssetSummary {
   id: string;
@@ -943,6 +1017,8 @@ export interface SemanticAssetSummary {
   aliases?: string[];
   tags?: string[];
   formatter?: string;
+  resolution_mode?: string;
+  resolution_label?: string;
   mtime?: number;
   size_bytes?: number;
 }
@@ -963,12 +1039,222 @@ export interface SemanticAssetDetail extends SemanticAssetSummary {
   files?: SemanticAssetFile[];
 }
 
+export interface SemanticDimensionSourceBinding {
+  source_id?: string;
+  source_kind?: string;
+  source_ref?: string;
+  source_name?: string;
+  table_or_sheet?: string;
+  key_fields?: Record<string, unknown>;
+}
+
+export interface SemanticDimensionMatchRow {
+  entity_key?: string | null;
+  canonical_label?: string;
+  canonical?: { entity_key?: string; canonical_brand?: string; canonical_serial_name?: string } | null;
+  status?: string;
+  binding?: SemanticDimensionSourceBinding | null;
+  manual?: boolean;
+  override_id?: string;
+}
+
+export interface SemanticDimensionSourceRegistryEntry {
+  id: string;
+  name: string;
+  kind?: string;
+  table_or_sheet?: string;
+  identity_fields?: string[];
+  mapping?: Array<Record<string, unknown>>;
+}
+
+export interface SemanticDimensionMatchingView {
+  dimension_id: string;
+  version: string;
+  generated_at_display?: string;
+  summary: {
+    canonical_entities: number;
+    manual_overrides: number;
+    manual_entity_overrides?: number;
+    sources: number;
+    status_counts: Record<string, number>;
+    published_manual_overrides?: number;
+    has_unpublished_changes?: boolean;
+  };
+  sources: SemanticDimensionSourceRegistryEntry[];
+  entity_options: Array<{ entity_key: string; label: string }>;
+  rows: SemanticDimensionMatchRow[];
+  count: number;
+  offset: number;
+  limit: number;
+}
+
+export interface SemanticDimensionMatchingOverviewRow {
+  entity_key: string;
+  canonical_label: string;
+  status?: string;
+  source_cells: Record<string, Array<{
+    source_ref: string;
+    source_key: Record<string, unknown>;
+    manual?: boolean;
+  }>>;
+}
+
+export interface SemanticDimensionMatchingOverview {
+  dimension_id: string;
+  version: string;
+  has_unpublished_changes?: boolean;
+  summary: {
+    canonical_entities: number;
+    manual_overrides: number;
+    manual_entity_overrides?: number;
+    published_manual_overrides?: number;
+    sources: number;
+  };
+  sources: SemanticDimensionSourceRegistryEntry[];
+  rows: SemanticDimensionMatchingOverviewRow[];
+  count: number;
+  offset: number;
+  limit: number;
+}
+
+export interface SemanticDimensionBaselineChange {
+  job: SemanticDimensionBuildJob;
+  baseline_delta: {
+    added?: Array<{ entity_key: string; label?: string }>;
+    removed?: Array<{ entity_key: string; label?: string }>;
+  };
+}
+
+export interface SemanticDimensionOverridePayload {
+  source_ref: string;
+  source_key: Record<string, unknown>;
+  source_id?: string;
+  scope?: "source_id" | "source_ref";
+  action: "bind" | "exclude";
+  target_entity_key?: string;
+  reason?: string;
+  source_name?: string;
+  source_kind?: string;
+  table_or_sheet?: string;
+}
+
+export interface SemanticDimensionEntityLifecyclePayload {
+  entity_key: string;
+  action: "active" | "inactive" | "remove";
+  reason?: string;
+}
+
 export interface SemanticAssetListResult {
   assets: SemanticAssetSummary[];
   count: number;
   type_counts?: Record<string, number>;
   root_dir?: string;
   last_scanned_at?: string | null;
+}
+
+export interface TaskNotification {
+  id: string;
+  category: string;
+  subject_type: string;
+  subject_id: string;
+  title: string;
+  body: string;
+  payload?: Record<string, unknown>;
+  created_at?: string | null;
+  read_at?: string | null;
+}
+
+export interface SemanticDimensionBuildJob {
+  id: string;
+  session_id: string;
+  query_id: string;
+  dimension_id: string;
+  adapter: string;
+  status: string;
+  current_step: string;
+  progress: number;
+  staging_path: string;
+  published_reference_path: string;
+  result_summary?: Record<string, unknown>;
+  error_message?: string | null;
+  retry_count: number;
+  created_at?: string | null;
+  updated_at?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+}
+
+export interface TaskJobEvent {
+  id: string;
+  job_id: string;
+  level: string;
+  message: string;
+  metadata?: Record<string, unknown>;
+  created_at?: string | null;
+}
+
+export interface SemanticDimensionBuildJobDetail {
+  job: SemanticDimensionBuildJob;
+  events: TaskJobEvent[];
+}
+
+export interface TaskCenterItem {
+  task_type: "semantic_dimension_build" | "knowledge_import" | string;
+  title: string;
+  job: { id?: string; status?: string; current_step?: string; progress?: number; [key: string]: unknown };
+  created_at?: string | null;
+}
+
+export async function listTaskNotifications(unreadOnly = false, limit = 20): Promise<TaskNotification[]> {
+  const params = new URLSearchParams({ unread_only: String(unreadOnly), limit: String(limit) });
+  const response = await fetchWithTimeout(`${API_BASE}/analytics/task-notifications?${params.toString()}`, { cache: "no-store" }, 4000);
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to load task notifications: ${response.status}`));
+  }
+  const payload = await response.json();
+  return Array.isArray(payload.notifications) ? payload.notifications : [];
+}
+
+export async function markTaskNotificationRead(notificationId: string): Promise<TaskNotification> {
+  const response = await fetch(`${API_BASE}/analytics/task-notifications/${encodeURIComponent(notificationId)}/read`, { method: "POST" });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to mark task notification read: ${response.status}`));
+  }
+  const payload = await response.json();
+  return payload.notification;
+}
+
+export async function listTaskCenter(limit = 20): Promise<TaskCenterItem[]> {
+  const response = await fetchWithTimeout(`${API_BASE}/analytics/task-center?limit=${limit}`, { cache: "no-store" }, 4000);
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to load task center: ${response.status}`));
+  }
+  const payload = await response.json();
+  return Array.isArray(payload.tasks) ? payload.tasks : [];
+}
+
+export async function getSemanticDimensionBuildJob(
+  jobId: string,
+  includeEvents = true
+): Promise<SemanticDimensionBuildJobDetail> {
+  const params = new URLSearchParams({ include_events: String(includeEvents) });
+  const response = await fetchWithTimeout(
+    `${API_BASE}/analytics/semantic-dimension-jobs/${encodeURIComponent(jobId)}?${params.toString()}`,
+    { cache: "no-store" },
+    includeEvents ? 8000 : 3000
+  );
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to load semantic dimension job: ${response.status}`));
+  }
+  const payload = await response.json();
+  return {
+    job: payload.job,
+    events: Array.isArray(payload.events) ? payload.events : [],
+  };
 }
 
 export interface SemanticAssetCreatePayload {
@@ -979,6 +1265,7 @@ export interface SemanticAssetCreatePayload {
   tags?: string[];
   version?: string;
   slug?: string;
+  dimension_definition?: DimensionDefinition;
 }
 
 export async function listSemanticAssets(): Promise<SemanticAssetListResult> {
@@ -1033,6 +1320,144 @@ export async function getSemanticAsset(assetId: string): Promise<SemanticAssetDe
   return payload.asset;
 }
 
+export async function updateSemanticDimensionDefinition(
+  assetId: string,
+  payload: SemanticDimensionUpdatePayload
+): Promise<SemanticAssetDetail> {
+  const response = await fetch(`${API_BASE}/analytics/semantic-assets/${encodeURIComponent(assetId)}/dimension-definition`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to save dimension definition: ${response.status}`));
+  }
+  const responsePayload = await response.json();
+  return responsePayload.asset;
+}
+
+export async function getSemanticDimensionMatching(
+  dimensionId: string,
+  options: { status?: string; sourceRef?: string; query?: string; offset?: number; limit?: number } = {}
+): Promise<SemanticDimensionMatchingView> {
+  const params = new URLSearchParams();
+  if (options.status) params.set("status", options.status);
+  if (options.sourceRef) params.set("source_ref", options.sourceRef);
+  if (options.query) params.set("query", options.query);
+  params.set("offset", String(options.offset || 0));
+  params.set("limit", String(options.limit || 100));
+  const response = await fetchWithTimeout(
+    `${API_BASE}/analytics/semantic-dimensions/${encodeURIComponent(dimensionId)}/matching?${params.toString()}`,
+    { cache: "no-store" },
+    10000
+  );
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to load semantic dimension matching: ${response.status}`));
+  }
+  return response.json();
+}
+
+export async function getSemanticDimensionMatchingOverview(
+  dimensionId: string,
+  options: { query?: string; offset?: number; limit?: number } = {}
+): Promise<SemanticDimensionMatchingOverview> {
+  const params = new URLSearchParams();
+  if (options.query) params.set("query", options.query);
+  params.set("offset", String(options.offset || 0));
+  params.set("limit", String(options.limit || 100));
+  const response = await fetchWithTimeout(
+    `${API_BASE}/analytics/semantic-dimensions/${encodeURIComponent(dimensionId)}/matching/overview?${params.toString()}`,
+    { cache: "no-store" },
+    10000
+  );
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to load semantic dimension overview: ${response.status}`));
+  }
+  return response.json();
+}
+
+export async function getSemanticDimensionBaselineChange(dimensionId: string): Promise<SemanticDimensionBaselineChange | null> {
+  const response = await fetchWithTimeout(
+    `${API_BASE}/analytics/semantic-dimensions/${encodeURIComponent(dimensionId)}/matching/baseline-changes`,
+    { cache: "no-store" },
+    10000
+  );
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to load semantic dimension baseline change: ${response.status}`));
+  }
+  const payload = await response.json();
+  return payload.change || null;
+}
+
+export async function resolveSemanticDimensionBaselineChange(
+  jobId: string,
+  action: "inactive" | "remove" | "cancel"
+): Promise<void> {
+  const response = await fetch(`${API_BASE}/analytics/semantic-dimension-jobs/${encodeURIComponent(jobId)}/baseline-change/resolve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action }),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to resolve semantic dimension baseline change: ${response.status}`));
+  }
+}
+
+export async function publishSemanticDimensionMatching(dimensionId: string): Promise<{ version: string; published_at_display?: string }> {
+  const response = await fetch(`${API_BASE}/analytics/semantic-dimensions/${encodeURIComponent(dimensionId)}/matching/publish`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to publish semantic dimension matching: ${response.status}`));
+  }
+  return response.json();
+}
+
+export async function saveSemanticDimensionOverride(
+  dimensionId: string,
+  payload: SemanticDimensionOverridePayload
+): Promise<void> {
+  const response = await fetch(`${API_BASE}/analytics/semantic-dimensions/${encodeURIComponent(dimensionId)}/matching/overrides`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to save semantic dimension override: ${response.status}`));
+  }
+}
+
+export async function deleteSemanticDimensionOverride(dimensionId: string, overrideId: string): Promise<void> {
+  const response = await fetch(`${API_BASE}/analytics/semantic-dimensions/${encodeURIComponent(dimensionId)}/matching/overrides/${encodeURIComponent(overrideId)}`, { method: "DELETE" });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to delete semantic dimension override: ${response.status}`));
+  }
+}
+
+export async function saveSemanticDimensionEntityLifecycle(
+  dimensionId: string,
+  payload: SemanticDimensionEntityLifecyclePayload
+): Promise<void> {
+  const response = await fetch(`${API_BASE}/analytics/semantic-dimensions/${encodeURIComponent(dimensionId)}/matching/entities/lifecycle`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to save semantic dimension lifecycle: ${response.status}`));
+  }
+}
+
 export async function importSemanticAssets(files: File[]): Promise<SemanticAssetListResult> {
   const form = new FormData();
   files.forEach((file) => {
@@ -1051,6 +1476,133 @@ export async function importSemanticAssets(files: File[]): Promise<SemanticAsset
   return {
     ...payload,
     assets: Array.isArray(payload.assets) ? payload.assets : [],
+    count: typeof payload.count === "number" ? payload.count : 0,
+  };
+}
+
+export interface AnalyticsModelFile {
+  name: string;
+  path: string;
+  relative_path: string;
+  size_bytes?: number;
+  mtime?: number;
+  editable?: boolean;
+  main?: boolean;
+}
+
+export interface AnalyticsModelSummary {
+  id: string;
+  name: string;
+  path: string;
+  description?: string;
+  version?: string;
+  tags?: string[];
+  formatter?: string;
+  data_assets?: Record<string, unknown>;
+  semantic_assets?: Record<string, unknown>;
+  guardrails?: string[];
+  templates?: Record<string, unknown>;
+  default_template?: string | null;
+  mtime?: number;
+  size_bytes?: number;
+}
+
+export interface AnalyticsModelDetail extends AnalyticsModelSummary {
+  body: string;
+  frontmatter: Record<string, unknown>;
+  files?: AnalyticsModelFile[];
+}
+
+export interface AnalyticsModelListResult {
+  models: AnalyticsModelSummary[];
+  count: number;
+  root_dir?: string;
+  last_scanned_at?: string | null;
+}
+
+export interface AnalyticsModelCreatePayload {
+  name: string;
+  description?: string;
+  version?: string;
+  tags?: string[];
+  slug?: string;
+  data_assets?: Record<string, unknown>;
+  semantic_assets?: Record<string, unknown>;
+  guardrails?: string[];
+  templates?: Record<string, unknown>;
+  default_template?: string | null;
+}
+
+export async function listAnalyticsModels(): Promise<AnalyticsModelListResult> {
+  const response = await fetch(`${API_BASE}/analytics/models`, { cache: "no-store" });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to load analytics models: ${response.status}`));
+  }
+  const payload = await response.json();
+  return {
+    ...payload,
+    models: Array.isArray(payload.models) ? payload.models : [],
+    count: typeof payload.count === "number" ? payload.count : 0,
+  };
+}
+
+export async function refreshAnalyticsModels(): Promise<AnalyticsModelListResult> {
+  const response = await fetch(`${API_BASE}/analytics/models/refresh`, { method: "POST" });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to refresh analytics models: ${response.status}`));
+  }
+  const payload = await response.json();
+  return {
+    ...payload,
+    models: Array.isArray(payload.models) ? payload.models : [],
+    count: typeof payload.count === "number" ? payload.count : 0,
+  };
+}
+
+export async function createAnalyticsModel(payload: AnalyticsModelCreatePayload): Promise<AnalyticsModelDetail> {
+  const response = await fetch(`${API_BASE}/analytics/models`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to create analytics model: ${response.status}`));
+  }
+  const data = await response.json();
+  return data.model;
+}
+
+export async function getAnalyticsModel(modelId: string): Promise<AnalyticsModelDetail> {
+  const response = await fetch(`${API_BASE}/analytics/models/${encodeURIComponent(modelId)}`, { cache: "no-store" });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to load analytics model: ${response.status}`));
+  }
+  const payload = await response.json();
+  return payload.model;
+}
+
+export async function importAnalyticsModels(files: File[]): Promise<AnalyticsModelListResult> {
+  const form = new FormData();
+  files.forEach((file) => {
+    const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath;
+    form.append("files", file, relativePath || file.name);
+  });
+  const response = await fetch(`${API_BASE}/analytics/models/import`, {
+    method: "POST",
+    body: form,
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to import analytics models: ${response.status}`));
+  }
+  const payload = await response.json();
+  return {
+    ...payload,
+    models: Array.isArray(payload.models) ? payload.models : [],
     count: typeof payload.count === "number" ? payload.count : 0,
   };
 }
@@ -1427,6 +1979,65 @@ export interface PermissionRequest {
   status?: string;
 }
 
+export interface DimensionBuildInputCandidate {
+  id: string;
+  display_name: string;
+  input: {
+    kind: "attachment" | "table_asset" | "database_table" | string;
+    attachment_id?: string;
+    asset_id?: string;
+    source_id?: string;
+    table?: string;
+  };
+  fields: string[];
+  suggested_key_fields?: string[];
+  suggested_output_fields?: string[];
+  suggested_source_id?: string;
+  suggested_source_name?: string;
+}
+
+export interface DimensionBuildRuleRequest {
+  id: string;
+  type: string;
+  session_id: string;
+  query_id?: string;
+  tool_call_id?: string;
+  status?: string;
+  dimension_id: string;
+  title: string;
+  reason: string;
+  operation: string;
+  locked_canonical_candidate_id?: string;
+  candidates: DimensionBuildInputCandidate[];
+  registered_sources?: Array<{ id: string; name: string; identity_fields?: string[] }>;
+  rule_template?: {
+    dimension_id?: string;
+    adapter?: string;
+    reference_path?: string;
+  };
+}
+
+export async function resolveDimensionBuildRuleRequest(
+  requestId: string,
+  payload: {
+    action: "confirm" | "cancel";
+    canonical_candidate_id?: string;
+    bindings?: Array<{ candidate_id: string; key_fields: string[]; output_fields: string[]; source_id?: string; source_name?: string; source_mode?: "new" | "append" }>;
+    conflict_policy?: string;
+  }
+): Promise<{ request_id: string; decision: Record<string, unknown>; resumed: boolean }> {
+  const response = await fetch(`${API_BASE}/analytics/dimension-build-requests/${encodeURIComponent(requestId)}/resolve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, "Failed to resolve dimension build rule request"));
+  }
+  return response.json();
+}
+
 /**
  * Stream chat messages via POST SSE.
  * Yields parsed SSE events as they arrive.
@@ -1499,7 +2110,8 @@ export async function* streamAgent(
   projectId?: string | null,
   signal?: AbortSignal,
   userId?: string,
-  attachments?: AgentAttachment[]
+  attachments?: AgentAttachment[],
+  analyticsModelId?: string | null
 ): AsyncGenerator<SSEEvent> {
   const response = await fetch(`${API_BASE}/agent`, {
     method: "POST",
@@ -1509,6 +2121,7 @@ export async function* streamAgent(
       session_id: sessionId,
       user_id: userId || "default_user",
       project_id: projectId || null,
+      analytics_model_id: analyticsModelId || null,
       attachments: attachments || [],
       stream: true
     }),
@@ -1645,6 +2258,18 @@ export async function openProject(projectId: string): Promise<void> {
     method: "POST",
   });
   if (!resp.ok) throw new Error(`Failed to open project: ${resp.status}`);
+}
+
+export async function openLocalFile(path: string, sessionId: string): Promise<void> {
+  const resp = await fetch(`${API_BASE}/local-files/open`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, session_id: sessionId }),
+  });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(apiErrorMessage(text, `Failed to open file: ${resp.status}`));
+  }
 }
 
 export async function updateProject(

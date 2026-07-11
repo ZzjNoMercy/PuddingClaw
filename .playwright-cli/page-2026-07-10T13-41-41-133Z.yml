@@ -1,0 +1,248 @@
+- generic [ref=e1]:
+  - generic [ref=e2]:
+    - button "切换侧栏" [ref=e5] [cursor=pointer]
+    - generic [ref=e8]:
+      - complementary [ref=e13]:
+        - generic [ref=e14]:
+          - generic [ref=e15]:
+            - button "Agent" [ref=e16] [cursor=pointer]
+            - button "Chat" [ref=e20] [cursor=pointer]
+          - button "新对话" [ref=e24] [cursor=pointer]
+          - button "搜索" [ref=e26] [cursor=pointer]
+          - link "知识库" [ref=e30] [cursor=pointer]:
+            - /url: /knowledge
+          - link "智能问数" [ref=e35] [cursor=pointer]:
+            - /url: /analytics
+          - link "扩展" [ref=e38] [cursor=pointer]:
+            - /url: /skills
+          - button "定时任务" [ref=e41] [cursor=pointer]
+        - generic [ref=e49]:
+          - paragraph [ref=e50]: 对话
+          - generic [ref=e197]:
+            - button "比亚迪最新动态" [ref=e198] [cursor=pointer]
+            - button [ref=e203] [cursor=pointer]
+          - generic [ref=e208]:
+            - button "AI热点查询" [ref=e209] [cursor=pointer]
+            - button [ref=e214] [cursor=pointer]
+          - generic [ref=e219]:
+            - button "比亚迪大唐发布会核心" [ref=e220] [cursor=pointer]
+            - button [ref=e225] [cursor=pointer]
+          - generic [ref=e230]:
+            - button "安装AI技能" [ref=e231] [cursor=pointer]
+            - button [ref=e236] [cursor=pointer]
+        - generic [ref=e53]:
+          - link "GitHub" [ref=e54] [cursor=pointer]:
+            - /url: https://github.com/ZzjNoMercy/PuddingClaw
+          - link "设置" [ref=e62] [cursor=pointer]:
+            - /url: /settings
+      - main [ref=e66]:
+        - generic [ref=e68]:
+          - generic [ref=e69]:
+            - generic [ref=e70]:
+              - heading "智能问数" [level=1] [ref=e71]
+              - paragraph [ref=e72]: 管理 Excel / CSV / TSV、数据库源等数据资产，生成 Profile，并为分析模型、度量值和自然语言问数做好准备。 文件上传仍统一在知识库入口完成。
+            - link "上传文件" [ref=e74] [cursor=pointer]:
+              - /url: /knowledge
+          - generic [ref=e78]:
+            - complementary [ref=e79]:
+              - generic [ref=e80]:
+                - paragraph [ref=e81]: 问数工作台
+                - paragraph [ref=e82]: 资产、模型、语义资产和问数入口放在同一层管理。
+              - navigation [ref=e83]:
+                - button "数据资产 6 个资产" [ref=e241] [cursor=pointer]:
+                  - generic [ref=e90]:
+                    - generic [ref=e91]: 数据资产
+                    - generic [ref=e92]: 6 个资产
+                - button "语义资产 度量值 / 维度" [ref=e93] [cursor=pointer]:
+                  - generic [ref=e97]:
+                    - generic [ref=e98]: 语义资产
+                    - generic [ref=e99]: 度量值 / 维度
+                - button "SQL 守卫 6 条规则" [ref=e192] [cursor=pointer]:
+                  - generic [ref=e105]:
+                    - generic [ref=e106]: SQL 守卫
+                    - generic [ref=e107]: 6 条规则
+                - button "分析模型 1 个模型" [ref=e193] [cursor=pointer]:
+                  - generic [ref=e114]:
+                    - generic [ref=e115]: 分析模型
+                    - generic [ref=e116]: 1 个模型
+                - button "任务中心 14 个任务" [active] [ref=e242] [cursor=pointer]:
+                  - generic [ref=e122]:
+                    - generic [ref=e123]: 任务中心
+                    - generic [ref=e124]: 14 个任务
+                - button "查询结果 分页明细" [ref=e125] [cursor=pointer]:
+                  - generic [ref=e131]:
+                    - generic [ref=e132]: 查询结果
+                    - generic [ref=e133]: 分页明细
+            - generic [ref=e371]:
+              - generic [ref=e372]:
+                - generic [ref=e378]:
+                  - heading "任务中心" [level=2] [ref=e379]
+                  - paragraph [ref=e380]: 统一查看后台任务的状态和进度。知识导入、语义维度构建各自保持独立执行，这里只做集中查看。
+                - button "刷新任务" [ref=e381] [cursor=pointer]
+              - generic [ref=e387]:
+                - generic [ref=e388]:
+                  - paragraph [ref=e393]: 全部任务
+                  - paragraph [ref=e394]: "14"
+                - generic [ref=e395]:
+                  - paragraph [ref=e399]: 进行中
+                  - paragraph [ref=e400]: "0"
+                - generic [ref=e401]:
+                  - paragraph [ref=e406]: 等待发布
+                  - paragraph [ref=e407]: "1"
+              - generic [ref=e408]:
+                - button "语义维度 等待发布确认 构建语义维度：vehicle_series sdb_7bd2ecd9e1114403b148a2a0 100% 2026/7/10 20:08:37 构建产物已落在 staging，尚未影响活跃维度。请回到原对话明确要求发布。" [ref=e409] [cursor=pointer]:
+                  - generic [ref=e410]:
+                    - generic [ref=e411]:
+                      - generic [ref=e412]:
+                        - generic [ref=e413]: 语义维度
+                        - generic [ref=e414]: 等待发布确认
+                      - heading "构建语义维度：vehicle_series" [level=3] [ref=e415]
+                      - paragraph [ref=e416]: sdb_7bd2ecd9e1114403b148a2a0
+                    - generic [ref=e417]:
+                      - generic [ref=e418]: 100%
+                      - generic [ref=e419]: 2026/7/10 20:08:37
+                  - paragraph [ref=e422]: 构建产物已落在 staging，尚未影响活跃维度。请回到原对话明确要求发布。
+                - button "知识导入 已完成 2023年1-5月乘用车市场上险量 job_5c6c5edcfe0b49a887caafdd 100% 2026/7/9 19:43:08" [ref=e423] [cursor=pointer]:
+                  - generic [ref=e424]:
+                    - generic [ref=e425]:
+                      - generic [ref=e426]:
+                        - generic [ref=e427]: 知识导入
+                        - generic [ref=e428]: 已完成
+                      - heading "2023年1-5月乘用车市场上险量" [level=3] [ref=e429]
+                      - paragraph [ref=e430]: job_5c6c5edcfe0b49a887caafdd
+                    - generic [ref=e431]:
+                      - generic [ref=e432]: 100%
+                      - generic [ref=e433]: 2026/7/9 19:43:08
+                - button "知识导入 已完成 2022年乘用车市场上险量_宽表 job_b1fa4de80b50464bb6b955f9 100% 2026/7/9 19:43:00" [ref=e436] [cursor=pointer]:
+                  - generic [ref=e437]:
+                    - generic [ref=e438]:
+                      - generic [ref=e439]:
+                        - generic [ref=e440]: 知识导入
+                        - generic [ref=e441]: 已完成
+                      - heading "2022年乘用车市场上险量_宽表" [level=3] [ref=e442]
+                      - paragraph [ref=e443]: job_b1fa4de80b50464bb6b955f9
+                    - generic [ref=e444]:
+                      - generic [ref=e445]: 100%
+                      - generic [ref=e446]: 2026/7/9 19:43:00
+                - button "知识导入 已完成 vehicle_params.brand 实体导入 job_20fd3e5056364eaeb1386cd2 100% 2026/7/8 11:35:08" [ref=e449] [cursor=pointer]:
+                  - generic [ref=e450]:
+                    - generic [ref=e451]:
+                      - generic [ref=e452]:
+                        - generic [ref=e453]: 知识导入
+                        - generic [ref=e454]: 已完成
+                      - heading "vehicle_params.brand 实体导入" [level=3] [ref=e455]
+                      - paragraph [ref=e456]: job_20fd3e5056364eaeb1386cd2
+                    - generic [ref=e457]:
+                      - generic [ref=e458]: 100%
+                      - generic [ref=e459]: 2026/7/8 11:35:08
+                - button "知识导入 已完成 vehicle_params.car_name 实体导入 job_876bdb3bb4174bb491143ec4 100% 2026/7/8 00:33:33" [ref=e462] [cursor=pointer]:
+                  - generic [ref=e463]:
+                    - generic [ref=e464]:
+                      - generic [ref=e465]:
+                        - generic [ref=e466]: 知识导入
+                        - generic [ref=e467]: 已完成
+                      - heading "vehicle_params.car_name 实体导入" [level=3] [ref=e468]
+                      - paragraph [ref=e469]: job_876bdb3bb4174bb491143ec4
+                    - generic [ref=e470]:
+                      - generic [ref=e471]: 100%
+                      - generic [ref=e472]: 2026/7/8 00:33:33
+                - button "知识导入 已完成 vehicle_params.category 实体导入 job_82c9f69862874d13a1d72aaf 100% 2026/7/7 23:42:06" [ref=e475] [cursor=pointer]:
+                  - generic [ref=e476]:
+                    - generic [ref=e477]:
+                      - generic [ref=e478]:
+                        - generic [ref=e479]: 知识导入
+                        - generic [ref=e480]: 已完成
+                      - heading "vehicle_params.category 实体导入" [level=3] [ref=e481]
+                      - paragraph [ref=e482]: job_82c9f69862874d13a1d72aaf
+                    - generic [ref=e483]:
+                      - generic [ref=e484]: 100%
+                      - generic [ref=e485]: 2026/7/7 23:42:06
+                - button "知识导入 已完成 vehicle_params.serial_name 实体导入 job_47aad6fb64844130b2b08856 100% 2026/7/7 23:10:20" [ref=e488] [cursor=pointer]:
+                  - generic [ref=e489]:
+                    - generic [ref=e490]:
+                      - generic [ref=e491]:
+                        - generic [ref=e492]: 知识导入
+                        - generic [ref=e493]: 已完成
+                      - heading "vehicle_params.serial_name 实体导入" [level=3] [ref=e494]
+                      - paragraph [ref=e495]: job_47aad6fb64844130b2b08856
+                    - generic [ref=e496]:
+                      - generic [ref=e497]: 100%
+                      - generic [ref=e498]: 2026/7/7 23:10:20
+                - button "知识导入 已完成 vehicle_params.type_name 实体导入 job_45464afab1d94ad68c76fc5f 100% 2026/7/7 20:46:27" [ref=e501] [cursor=pointer]:
+                  - generic [ref=e502]:
+                    - generic [ref=e503]:
+                      - generic [ref=e504]:
+                        - generic [ref=e505]: 知识导入
+                        - generic [ref=e506]: 已完成
+                      - heading "vehicle_params.type_name 实体导入" [level=3] [ref=e507]
+                      - paragraph [ref=e508]: job_45464afab1d94ad68c76fc5f
+                    - generic [ref=e509]:
+                      - generic [ref=e510]: 100%
+                      - generic [ref=e511]: 2026/7/7 20:46:27
+                - button "知识导入 已完成 五菱周度_乘用车w45_2024 job_67d32a90e96b44b7ab083a13 100% 2026/7/6 16:58:15" [ref=e514] [cursor=pointer]:
+                  - generic [ref=e515]:
+                    - generic [ref=e516]:
+                      - generic [ref=e517]:
+                        - generic [ref=e518]: 知识导入
+                        - generic [ref=e519]: 已完成
+                      - heading "五菱周度_乘用车w45_2024" [level=3] [ref=e520]
+                      - paragraph [ref=e521]: job_67d32a90e96b44b7ab083a13
+                    - generic [ref=e522]:
+                      - generic [ref=e523]: 100%
+                      - generic [ref=e524]: 2026/7/6 16:58:15
+                - button "知识导入 已完成 五菱周度_乘用车w46_2024 job_4aa5ede1ece241c88d7a1a41 100% 2026/7/6 15:10:45" [ref=e527] [cursor=pointer]:
+                  - generic [ref=e528]:
+                    - generic [ref=e529]:
+                      - generic [ref=e530]:
+                        - generic [ref=e531]: 知识导入
+                        - generic [ref=e532]: 已完成
+                      - heading "五菱周度_乘用车w46_2024" [level=3] [ref=e533]
+                      - paragraph [ref=e534]: job_4aa5ede1ece241c88d7a1a41
+                    - generic [ref=e535]:
+                      - generic [ref=e536]: 100%
+                      - generic [ref=e537]: 2026/7/6 15:10:45
+                - button "知识导入 已完成 AI原生应用架构白皮书 job_1649c78e71f6459aae4b406e 100% 2026/7/3 15:19:32" [ref=e540] [cursor=pointer]:
+                  - generic [ref=e541]:
+                    - generic [ref=e542]:
+                      - generic [ref=e543]:
+                        - generic [ref=e544]: 知识导入
+                        - generic [ref=e545]: 已完成
+                      - heading "AI原生应用架构白皮书" [level=3] [ref=e546]
+                      - paragraph [ref=e547]: job_1649c78e71f6459aae4b406e
+                    - generic [ref=e548]:
+                      - generic [ref=e549]: 100%
+                      - generic [ref=e550]: 2026/7/3 15:19:32
+                - button "知识导入 已完成 AI原生应用架构白皮书 job_c4bd7d58b53846fc940b5ae6 100% 2026/7/3 15:07:24" [ref=e553] [cursor=pointer]:
+                  - generic [ref=e554]:
+                    - generic [ref=e555]:
+                      - generic [ref=e556]:
+                        - generic [ref=e557]: 知识导入
+                        - generic [ref=e558]: 已完成
+                      - heading "AI原生应用架构白皮书" [level=3] [ref=e559]
+                      - paragraph [ref=e560]: job_c4bd7d58b53846fc940b5ae6
+                    - generic [ref=e561]:
+                      - generic [ref=e562]: 100%
+                      - generic [ref=e563]: 2026/7/3 15:07:24
+                - button "知识导入 已完成 AI原生应用架构白皮书 job_21b1d4beff0542b0827371f9 100% 2026/7/3 14:32:10" [ref=e566] [cursor=pointer]:
+                  - generic [ref=e567]:
+                    - generic [ref=e568]:
+                      - generic [ref=e569]:
+                        - generic [ref=e570]: 知识导入
+                        - generic [ref=e571]: 已完成
+                      - heading "AI原生应用架构白皮书" [level=3] [ref=e572]
+                      - paragraph [ref=e573]: job_21b1d4beff0542b0827371f9
+                    - generic [ref=e574]:
+                      - generic [ref=e575]: 100%
+                      - generic [ref=e576]: 2026/7/3 14:32:10
+                - button "知识导入 已完成 AI原生应用架构白皮书.pdf job_181e41da56c349a48b27845b 100% 2026/7/2 22:45:50" [ref=e579] [cursor=pointer]:
+                  - generic [ref=e580]:
+                    - generic [ref=e581]:
+                      - generic [ref=e582]:
+                        - generic [ref=e583]: 知识导入
+                        - generic [ref=e584]: 已完成
+                      - heading "AI原生应用架构白皮书.pdf" [level=3] [ref=e585]
+                      - paragraph [ref=e586]: job_181e41da56c349a48b27845b
+                    - generic [ref=e587]:
+                      - generic [ref=e588]: 100%
+                      - generic [ref=e589]: 2026/7/2 22:45:50
+  - alert [ref=e189]

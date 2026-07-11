@@ -1,0 +1,91 @@
+- generic [active] [ref=e1]:
+  - generic [ref=e2]:
+    - button "切换侧栏" [ref=e5] [cursor=pointer]
+    - generic [ref=e8]:
+      - complementary [ref=e13]:
+        - generic [ref=e14]:
+          - generic [ref=e15]:
+            - button "Agent" [ref=e16] [cursor=pointer]
+            - button "Chat" [ref=e20] [cursor=pointer]
+          - button "新对话" [ref=e24] [cursor=pointer]
+          - button "搜索" [ref=e26] [cursor=pointer]
+          - link "知识库" [ref=e30] [cursor=pointer]:
+            - /url: /knowledge
+          - link "智能问数" [ref=e35] [cursor=pointer]:
+            - /url: /analytics
+          - link "扩展" [ref=e38] [cursor=pointer]:
+            - /url: /skills
+          - button "定时任务" [ref=e41] [cursor=pointer]
+        - generic [ref=e49]:
+          - paragraph [ref=e50]: 对话
+          - paragraph [ref=e51]: 暂无对话
+        - generic [ref=e53]:
+          - link "GitHub" [ref=e54] [cursor=pointer]:
+            - /url: https://github.com/ZzjNoMercy/PuddingClaw
+          - link "设置" [ref=e62] [cursor=pointer]:
+            - /url: /settings
+      - main [ref=e66]:
+        - generic [ref=e68]:
+          - generic [ref=e69]:
+            - generic [ref=e70]:
+              - heading "智能问数" [level=1] [ref=e71]
+              - paragraph [ref=e72]: 管理 Excel / CSV / TSV、数据库源等数据资产，生成 Profile，并为分析模型、度量值和自然语言问数做好准备。 文件上传仍统一在知识库入口完成。
+            - link "上传文件" [ref=e74] [cursor=pointer]:
+              - /url: /knowledge
+          - generic [ref=e78]:
+            - complementary [ref=e79]:
+              - generic [ref=e80]:
+                - paragraph [ref=e81]: 问数工作台
+                - paragraph [ref=e82]: 资产、模型、语义资产和问数入口放在同一层管理。
+              - navigation [ref=e83]:
+                - button "数据资产 0 个资产" [ref=e84] [cursor=pointer]:
+                  - generic [ref=e90]:
+                    - generic [ref=e91]: 数据资产
+                    - generic [ref=e92]: 0 个资产
+                - button "语义资产 度量值 / 维度" [ref=e93] [cursor=pointer]:
+                  - generic [ref=e97]:
+                    - generic [ref=e98]: 语义资产
+                    - generic [ref=e99]: 度量值 / 维度
+                - button "SQL 守卫 0 条规则" [ref=e100] [cursor=pointer]:
+                  - generic [ref=e105]:
+                    - generic [ref=e106]: SQL 守卫
+                    - generic [ref=e107]: 0 条规则
+                - button "分析模型 0 个模型" [ref=e108] [cursor=pointer]:
+                  - generic [ref=e114]:
+                    - generic [ref=e115]: 分析模型
+                    - generic [ref=e116]: 0 个模型
+                - button "任务中心 0 个任务" [ref=e117] [cursor=pointer]:
+                  - generic [ref=e122]:
+                    - generic [ref=e123]: 任务中心
+                    - generic [ref=e124]: 0 个任务
+                - button "查询结果 分页明细" [ref=e125] [cursor=pointer]:
+                  - generic [ref=e131]:
+                    - generic [ref=e132]: 查询结果
+                    - generic [ref=e133]: 分页明细
+            - generic [ref=e135]:
+              - generic [ref=e136]:
+                - generic [ref=e137]:
+                  - heading "数据资产" [level=2] [ref=e138]
+                  - paragraph [ref=e139]: 表格文件和数据库源统一在这里管理；Profile 是分析模型和自然语言问数理解字段的机器画像。
+                - generic [ref=e140]:
+                  - button "刷新数据资产" [ref=e141] [cursor=pointer]
+                  - button "生成全部 Profile" [disabled] [ref=e147]
+              - generic [ref=e152]:
+                - generic [ref=e153]:
+                  - paragraph [ref=e159]: 数据资产
+                  - paragraph [ref=e160]: "0"
+                - generic [ref=e161]:
+                  - paragraph [ref=e166]: 表格文件
+                  - paragraph [ref=e167]: "0"
+                - generic [ref=e168]:
+                  - paragraph [ref=e173]: Profile 可用
+                  - paragraph [ref=e174]: "0"
+                - generic [ref=e175]:
+                  - paragraph [ref=e179]: 待生成
+                  - paragraph [ref=e180]: "0"
+              - generic [ref=e182]:
+                - paragraph [ref=e183]: 还没有识别到数据资产。
+                - paragraph [ref=e184]: 先去知识库上传表格文件，或配置数据库源。
+                - link "去上传" [ref=e185] [cursor=pointer]:
+                  - /url: /knowledge
+  - alert [ref=e189]

@@ -15,7 +15,15 @@ router = APIRouter()
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Whitelist of editable directories (relative to backend/)
-ALLOWED_PREFIXES = ["workspace/", "memory/", "skills/", "knowledge/", "semantic-assets/", "sql-guardrails/"]
+ALLOWED_PREFIXES = [
+    "workspace/",
+    "memory/",
+    "skills/",
+    "knowledge/",
+    "semantic-assets/",
+    "sql-guardrails/",
+    "analytics-models/",
+]
 
 # Whitelist of specific root-level files that can be accessed
 ALLOWED_ROOT_FILES = {"SKILLS_SNAPSHOT.md"}
@@ -88,6 +96,13 @@ async def save_file(request: FileSaveRequest):
             from analytics.nl2sql.guardrails import load_guardrail_rules
 
             load_guardrail_rules()
+        except Exception:
+            pass
+    elif normalized.startswith("analytics-models/"):
+        try:
+            from analytics.models import get_analytics_model_registry
+
+            get_analytics_model_registry(BASE_DIR).refresh()
         except Exception:
             pass
 

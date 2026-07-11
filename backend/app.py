@@ -24,6 +24,7 @@ async def lifespan(app: FastAPI):
     from graph.attachment_store import attachment_store
     from graph.memory_indexer import get_memory_indexer
     from knowledge.import_worker import knowledge_import_worker_manager
+    from knowledge.semantic_dimension_worker import semantic_dimension_build_worker_manager
     from projects.registry import project_registry
     from analytics.semantic_assets import get_semantic_asset_registry
     import capabilities
@@ -37,6 +38,7 @@ async def lifespan(app: FastAPI):
     if db_ready:
         print("🗄️ Knowledge catalog database ready")
         knowledge_import_worker_manager.start(BASE_DIR)
+        semantic_dimension_build_worker_manager.start(BASE_DIR)
     else:
         print("⚠️ Knowledge catalog database unavailable; knowledge management API will report degraded status")
     caps = await capabilities.detect_capabilities(force=True)
@@ -69,6 +71,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await semantic_dimension_build_worker_manager.stop()
         await knowledge_import_worker_manager.stop()
 
 
@@ -108,6 +111,7 @@ from api.permissions import router as permissions_router
 from api.attachments import router as attachments_router
 from api.knowledge import router as knowledge_router
 from api.analytics import router as analytics_router
+from api.dimension_build_rules import router as dimension_build_rules_router
 
 app.include_router(chat_router, prefix="/api")
 app.include_router(agent_router, prefix="/api")
@@ -126,6 +130,7 @@ app.include_router(permissions_router, prefix="/api")
 app.include_router(attachments_router, prefix="/api")
 app.include_router(knowledge_router, prefix="/api")
 app.include_router(analytics_router, prefix="/api")
+app.include_router(dimension_build_rules_router, prefix="/api")
 
 
 @app.get("/")

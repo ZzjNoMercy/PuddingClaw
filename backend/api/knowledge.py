@@ -29,6 +29,7 @@ from knowledge.database_sources import (
     KnowledgeDatabaseSourceError,
     delete_database_source,
     get_database_source,
+    list_database_table_columns,
     list_database_sources,
     list_database_tables,
     test_database_source,
@@ -248,6 +249,23 @@ async def list_knowledge_database_source_tables(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Failed to list database tables: {exc}") from exc
+
+
+@router.get("/database-sources/{source_id}/tables/{table_name:path}/columns")
+async def list_knowledge_database_source_table_columns(
+    source_id: str,
+    table_name: str,
+    knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        source = await get_database_source(session, source_id, knowledge_base_id=knowledge_base_id)
+        columns = await list_database_table_columns(source, table_name)
+        return {"columns": columns, "count": len(columns)}
+    except KnowledgeDatabaseSourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to list database table columns: {exc}") from exc
 
 
 @router.delete("/database-sources/{source_id}")
