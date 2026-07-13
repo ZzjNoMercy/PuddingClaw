@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import json
 import time
 import uuid
@@ -64,6 +65,9 @@ from knowledge.semantic_dimension_crosswalk import (
 )
 from knowledge.models import SemanticDimensionBuildJob
 from knowledge.import_jobs import job_to_list_dict, list_import_jobs
+
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -148,17 +152,54 @@ async def _enqueue_profile_job(asset_id: str) -> dict[str, Any]:
 
 class SemanticAssetCreateRequest(BaseModel):
     name: str
-    type: str = Field(pattern="^(measure|dimension|grain)$")
+    type: str = Field(pattern="^(measure|dimension|grain|relation)$")
     description: str = ""
     aliases: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
     version: str = "0.1.0"
     slug: str | None = None
     dimension_definition: dict[str, object] = Field(default_factory=dict)
+    relation_definition: dict[str, object] = Field(default_factory=dict)
+
+
+class ConcatDatasetCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+    description: str = Field(default="", max_length=1000)
+    tags: list[str] = Field(default_factory=list, max_length=20)
+    source_asset_ids: list[str] = Field(min_length=2, max_length=120)
+    schema_mode: str = Field(default="strict", pattern="^(strict|baseline_fill_missing|union_fill_missing)$")
+    preferred_intents: list[str] = Field(default_factory=list, max_length=12)
+    direct_source_allowed: bool = True
+
+
+class ConcatDatasetPreviewRequest(BaseModel):
+    source_asset_ids: list[str] = Field(min_length=2, max_length=120)
+
+
+class ConcatDatasetAppendRequest(BaseModel):
+    source_asset_ids: list[str] = Field(min_length=1, max_length=120)
+    schema_mode: str = Field(default="strict", pattern="^(strict|baseline_fill_missing|union_fill_missing)$")
+
+
+class LogicalDatasetDefinitionUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=160)
+    description: str | None = Field(default=None, max_length=1000)
+    tags: list[str] | None = Field(default=None, max_length=20)
+    preferred_intents: list[str] | None = Field(default=None, max_length=12)
+    direct_source_allowed: bool | None = None
 
 
 class SemanticDimensionDefinitionUpdateRequest(BaseModel):
     dimension_definition: dict[str, object] = Field(default_factory=dict)
+    name: str | None = None
+    description: str | None = None
+    aliases: list[str] | None = None
+    tags: list[str] | None = None
+    version: str | None = None
+
+
+class SemanticRelationDefinitionUpdateRequest(BaseModel):
+    relation_definition: dict[str, object] = Field(default_factory=dict)
     name: str | None = None
     description: str | None = None
     aliases: list[str] | None = None
@@ -174,6 +215,7 @@ class AnalyticsModelCreateRequest(BaseModel):
     slug: str | None = None
     data_assets: dict[str, object] = Field(default_factory=dict)
     semantic_assets: dict[str, object] = Field(default_factory=dict)
+    asset_relations: list[str] = Field(default_factory=list)
     guardrails: list[str] = Field(default_factory=list)
     templates: dict[str, object] = Field(default_factory=dict)
     default_template: str | None = None
@@ -626,6 +668,7 @@ async def create_semantic_asset(request: SemanticAssetCreateRequest):
             version=request.version,
             slug=request.slug,
             dimension_definition=request.dimension_definition,
+            relation_definition=request.relation_definition,
         )
         return {"asset": asset, "status": "created"}
     except SemanticAssetError as exc:
@@ -676,6 +719,27 @@ async def update_semantic_dimension_definition(asset_id: str, request: SemanticD
         raise HTTPException(status_code=503, detail=f"Failed to save dimension definition: {exc}") from exc
 
 
+@router.patch("/semantic-assets/{asset_id:path}/relation-definition")
+async def update_semantic_relation_definition(asset_id: str, request: SemanticRelationDefinitionUpdateRequest):
+    try:
+        asset = get_semantic_asset_registry(BASE_DIR).update_relation_definition(
+            asset_id,
+            dict(request.relation_definition),
+            name=request.name,
+            description=request.description,
+            aliases=request.aliases,
+            tags=request.tags,
+            version=request.version,
+        )
+        return {"asset": asset, "status": "saved"}
+    except SemanticAssetError as exc:
+        message = str(exc)
+        status_code = 404 if "not found" in message else 400
+        raise HTTPException(status_code=status_code, detail=message) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to save relation definition: {exc}") from exc
+
+
 @router.get("/models")
 async def list_analytics_models():
     try:
@@ -703,6 +767,7 @@ async def create_analytics_model(request: AnalyticsModelCreateRequest):
             slug=request.slug,
             data_assets=request.data_assets,
             semantic_assets=request.semantic_assets,
+            asset_relations=request.asset_relations,
             guardrails=request.guardrails,
             templates=request.templates,
             default_template=request.default_template,
@@ -835,6 +900,106 @@ async def list_table_assets(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Failed to list table assets: {exc}") from exc
+
+
+@router.post("/table-assets/concat-datasets")
+async def create_concat_dataset(
+    request: ConcatDatasetCreateRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        asset = await TableAssetCatalog(BASE_DIR).create_concat_dataset(
+            session,
+            name=request.name,
+            description=request.description,
+            tags=request.tags,
+            source_asset_ids=request.source_asset_ids,
+            schema_mode=request.schema_mode,
+            routing={"preferred_intents": request.preferred_intents, "direct_source_allowed": request.direct_source_allowed},
+        )
+        return {"asset": asset, "status": "created"}
+    except TableCatalogError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Failed to create logical concat dataset")
+        raise HTTPException(status_code=503, detail=f"Failed to create logical dataset: {exc}") from exc
+
+
+@router.post("/table-assets/concat-datasets/preview")
+async def preview_concat_dataset(
+    request: ConcatDatasetPreviewRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        return await TableAssetCatalog(BASE_DIR).preview_concat_dataset(
+            session,
+            source_asset_ids=request.source_asset_ids,
+        )
+    except TableCatalogError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Failed to preview logical concat dataset")
+        raise HTTPException(status_code=503, detail=f"Failed to inspect logical dataset fields: {exc}") from exc
+
+
+@router.post("/table-assets/{asset_id}/refresh-concat")
+async def refresh_concat_dataset(
+    asset_id: str,
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        asset = await TableAssetCatalog(BASE_DIR).refresh_concat_dataset(session, asset_id)
+        return {"asset": asset, "status": "refreshed"}
+    except TableCatalogError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Failed to refresh logical concat dataset %s", asset_id)
+        raise HTTPException(status_code=503, detail=f"Failed to refresh logical dataset: {exc}") from exc
+
+
+@router.post("/table-assets/{asset_id}/concat-sources")
+async def append_concat_dataset_sources(
+    asset_id: str,
+    request: ConcatDatasetAppendRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        asset = await TableAssetCatalog(BASE_DIR).append_concat_dataset_sources(
+            session,
+            asset_id=asset_id,
+            source_asset_ids=request.source_asset_ids,
+            schema_mode=request.schema_mode,
+        )
+        return {"asset": asset, "status": "sources_appended"}
+    except TableCatalogError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Failed to append sources to logical concat dataset %s", asset_id)
+        raise HTTPException(status_code=503, detail=f"Failed to append logical dataset sources: {exc}") from exc
+
+
+@router.patch("/table-assets/{asset_id}/logical-definition")
+async def update_logical_dataset_definition(
+    asset_id: str,
+    request: LogicalDatasetDefinitionUpdateRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        asset = await TableAssetCatalog(BASE_DIR).update_logical_dataset_definition(
+            session,
+            asset_id=asset_id,
+            name=request.name,
+            description=request.description,
+            tags=request.tags,
+            preferred_intents=request.preferred_intents,
+            direct_source_allowed=request.direct_source_allowed,
+        )
+        return {"asset": asset, "status": "definition_updated"}
+    except TableCatalogError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Failed to update logical dataset definition %s", asset_id)
+        raise HTTPException(status_code=503, detail=f"Failed to update logical dataset definition: {exc}") from exc
 
 
 @router.post("/table-assets/refresh-profiles")

@@ -189,7 +189,7 @@ def test_trace_collector_records_memory_middleware_before_agent():
                 "content": (
                     "System prompt\n"
                     "<agent_memory>\n"
-                    "/AGENTS.md\n"
+                    "/MEMORY.md\n"
                     "# Project Memory\n\n"
                     "/gstack/AGENTS.md\n"
                     "# gstack\n"
@@ -206,7 +206,7 @@ def test_trace_collector_records_memory_middleware_before_agent():
     assert [item["hook"] for item in effects] == ["before_agent", "wrap_model_call"]
     assert all(item["middleware"] == ["MemoryMiddleware"] for item in effects)
     assert effects[0]["after"]["agent_memory_present"] is True
-    assert effects[0]["after"]["matched_sources"] == ["/AGENTS.md", "/gstack/AGENTS.md"]
+    assert effects[0]["after"]["matched_sources"] == ["/MEMORY.md", "/gstack/AGENTS.md"]
     assert effects[1]["title"] == "Memory injected into system prompt"
     assert effects[1]["after"]["agent_memory_present"] is True
     before_agent_invocation = next(
@@ -323,7 +323,7 @@ def test_trace_collector_orders_before_agent_invocations_by_middleware_stack():
                 "content": (
                     "skills/aihot/SKILL.md\n"
                     "<agent_memory>\n"
-                    "/AGENTS.md\n"
+                    "/MEMORY.md\n"
                     "# Project Memory\n"
                     "</agent_memory>"
                 ),

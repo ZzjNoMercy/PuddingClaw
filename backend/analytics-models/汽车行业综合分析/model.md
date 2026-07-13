@@ -7,17 +7,19 @@ version: "0.1.0"
 description: "分析汽车行业销量、产品规划、技术规划、发展趋势等"
 tags: ["汽车销量","汽车产品配置分析"]
 data_assets:
-  tables: ["table_asset:tbl_73d53d94a3a29ff425235dfa","table_asset:tbl_23fff15978050fdc18330ab2","table_asset:tbl_1f91a7f33e5d61f0e2276fcb","table_asset:tbl_1e047f8b862aa1892521863a","dbs_77982e981bac4a6fa8.vehicle_params","dbs_77982e981bac4a6fa8.vehicle_params_wide"]
+  tables: ["table_asset:tbl_23fff15978050fdc18330ab2","dbs_77982e981bac4a6fa8.vehicle_params","dbs_77982e981bac4a6fa8.vehicle_params_wide","table_asset:tbl_concat_847eed5f3f93dd93e4cb7111"]
 semantic_assets:
-  measures: ["measure:measure:charging_c_rate","measure:measure:config_rate","measure:measure:销量"]
-  dimensions: ["dimension:dimension:launch_time","dimension:dimension:price_band","dimension:dimension:brand","dimension:dimension:energy_type","dimension:dimension:vehicle_level","dimension:vehicle_series","dimension:dimension:vehicle_series"]
-  grains: ["grain:grain:car_model","grain:grain:series"]
+  measures: ["measure:charging_c_rate","measure:config_rate","measure:销量"]
+  dimensions: ["dimension:launch_time","dimension:price_band","dimension:brand","dimension:energy_type","dimension:vehicle_level","dimension:vehicle_series"]
+  grains: ["grain:car_model","grain:series"]
+asset_relations: []
 guardrails: ["air_suspension_reference_type_value","config_rate_model_key_group","config_rate_no_exists_distinct","config_rate_use_wide_denominator","launch_time_no_car_name_year","postgres_count_distinct_nullable_tuple_after_left_join"]
 templates: {}
 default_template: null
 created: "2026-07-09 15:42:24"
-updated_at: "2026-07-10 16:24:26"
+updated_at: "2026-07-13 10:06:23"
 ---
+
 
 
 

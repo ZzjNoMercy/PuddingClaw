@@ -1,10 +1,10 @@
 """SessionManager — 短期记忆管理器，基于 JSON 文件持久化会话历史"""
 
-import json      # JSON 序列化/反序列化
-import time      # 获取时间戳
+import json
+import time
 import uuid
-from pathlib import Path      # 路径操作
-from typing import Any        # 类型注解
+from pathlib import Path
+from typing import Any
 
 # 压缩摘要的固定前缀标识，agent.py 和本模块共用，用于识别摘要消息
 COMPRESSED_CONTEXT_PREFIX = "[历史对话摘要]"
@@ -106,6 +106,80 @@ class SessionManager:
         if not data:
             return {"id": session_id, "title": session_id, "runtime_mode": "chat"}
         return self._metadata_from_data(session_id, data)
+
+    @staticmethod
+    def _loaded_skill_ids_from_traces(data: dict[str, Any]) -> set[str]:
+        """Recover successful authoritative Skill reads from legacy trace snapshots."""
+
+        loaded: set[str] = set()
+        traces = data.get("traces")
+        if not isinstance(traces, dict):
+            return loaded
+        for trace in traces.values():
+            if not isinstance(trace, dict):
+                continue
+            effects = trace.get("middleware_effects")
+            if not isinstance(effects, list):
+                continue
+            for effect in effects:
+                if not isinstance(effect, dict):
+                    continue
+                for boundary_name in ("before", "after"):
+                    boundary = effect.get(boundary_name)
+                    recent = boundary.get("recent_messages") if isinstance(boundary, dict) else None
+                    if not isinstance(recent, list):
+                        continue
+                    for index, message in enumerate(recent[:-1]):
+                        if not isinstance(message, dict) or message.get("role") != "ai":
+                            continue
+                        next_message = recent[index + 1]
+                        if (
+                            not isinstance(next_message, dict)
+                            or next_message.get("role") != "tool"
+                            or next_message.get("name") != "read_file"
+                        ):
+                            continue
+                        preview = str(next_message.get("preview") or "").lower()
+                        if any(marker in preview for marker in ("error", "not found", "失败", "不存在")):
+                            continue
+                        for tool_call in message.get("tool_calls") or []:
+                            if not isinstance(tool_call, dict) or tool_call.get("name") != "read_file":
+                                continue
+                            args = tool_call.get("args") or {}
+                            path = str(args.get("file_path") or args.get("path") or "").replace("\\", "/")
+                            parts = path.split("/")
+                            if len(parts) == 4 and parts[1] == "skills" and parts[3] == "SKILL.md":
+                                loaded.add(parts[2])
+        return loaded
+
+    def get_loaded_skill_ids(self, session_id: str) -> list[str]:
+        """Return session-scoped Skill activations, migrating legacy traces once."""
+
+        data = self._read_file(session_id)
+        if not data:
+            return []
+        stored = {str(item) for item in data.get("loaded_skill_ids") or [] if str(item)}
+        if "loaded_skill_ids" in data:
+            return sorted(stored)
+        inferred = self._loaded_skill_ids_from_traces(data)
+        loaded = sorted(stored | inferred)
+        if loaded != sorted(stored):
+            data["loaded_skill_ids"] = loaded
+            self._write_file(session_id, data)
+        return loaded
+
+    def add_loaded_skill_ids(self, session_id: str, skill_ids: list[str]) -> list[str]:
+        """Persist newly loaded Skills for subsequent turns in the same session."""
+
+        data = self._read_file(session_id)
+        if not data:
+            return []
+        current = {str(item) for item in data.get("loaded_skill_ids") or [] if str(item)}
+        current.update(str(item) for item in skill_ids if str(item))
+        loaded = sorted(current)
+        data["loaded_skill_ids"] = loaded
+        self._write_file(session_id, data)
+        return loaded
 
     def load_session(self, session_id: str) -> list[dict[str, Any]]:
         """加载指定会话的消息列表，自动合并 archive/ 中的归档消息。

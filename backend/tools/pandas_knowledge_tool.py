@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Type
 
@@ -17,9 +17,9 @@ from db import get_sessionmaker
 from knowledge.models import KnowledgeTableAsset
 from knowledge.paths import get_knowledge_root
 from utils.table_engine import PuddingClawPandasQueryEngine
-from analytics.table_catalog import IGNORED_TOP_LEVEL_DIRS, TableAssetCatalog
+from analytics.table_catalog import IGNORED_TOP_LEVEL_DIRS, LOGICAL_CONCAT_SOURCE_TYPE, TableAssetCatalog
 
-TABLE_SUFFIXES = {".xlsx", ".xls", ".csv", ".tsv"}
+TABLE_SUFFIXES = {".xlsx", ".xls", ".csv", ".tsv", ".parquet"}
 
 
 class PandasKnowledgeInput(BaseModel):
@@ -41,6 +41,9 @@ class TableAsset:
     columns: list[str]
     rows: int | None
     score: int
+    asset_id: str = ""
+    logical_sources: list["TableAsset"] = field(default_factory=list)
+    canonical_columns: list[str] = field(default_factory=list)
 
 
 def _normalize_text(value: str | None) -> str:
@@ -98,14 +101,50 @@ class PandasKnowledgeQueryTool(BaseTool):
                     .limit(2000)
                 )
                 result = await session.execute(stmt)
+                catalog_items = list(result.scalars())
+                by_id = {item.asset_id: item for item in catalog_items}
+
+                def to_asset(item: KnowledgeTableAsset, *, allow_virtual: bool = True) -> TableAsset | None:
+                    path = Path(item.storage_path)
+                    logical = (item.asset_metadata or {}).get("logical_dataset") if isinstance(item.asset_metadata, dict) else None
+                    if item.source_type == LOGICAL_CONCAT_SOURCE_TYPE and allow_virtual:
+                        source_ids = logical.get("source_asset_ids") if isinstance(logical, dict) else []
+                        source_assets = [to_asset(by_id[source_id], allow_virtual=False) for source_id in source_ids if source_id in by_id]
+                        source_assets = [source for source in source_assets if source is not None]
+                        if len(source_assets) < 2:
+                            return None
+                        return TableAsset(
+                            asset_id=item.asset_id,
+                            path=path,
+                            virtual_path=item.virtual_path,
+                            sheet_name=None,
+                            source_type=item.source_type,
+                            columns=[str(column) for column in (item.columns or [])],
+                            rows=item.rows,
+                            score=0,
+                            logical_sources=source_assets,
+                            canonical_columns=[str(column) for column in logical.get("canonical_columns") or []],
+                        )
+                    if not path.exists() or path.suffix.lower() not in TABLE_SUFFIXES:
+                        return None
+                    return TableAsset(
+                        asset_id=item.asset_id,
+                        path=path,
+                        virtual_path=item.virtual_path,
+                        sheet_name=item.sheet_name,
+                        source_type=item.source_type,
+                        columns=[str(column) for column in (item.columns or [])],
+                        rows=item.rows,
+                        score=0,
+                    )
+
                 assets: list[TableAsset] = []
-                for item in result.scalars():
+                for item in catalog_items:
                     if sheet_name and item.sheet_name and _normalize_text(sheet_name) != _normalize_text(item.sheet_name):
                         continue
-                    path = Path(item.storage_path)
-                    if not path.exists() or path.suffix.lower() not in TABLE_SUFFIXES:
+                    asset = to_asset(item)
+                    if asset is None:
                         continue
-                    columns = [str(column) for column in (item.columns or [])]
                     score = self._score_asset(
                         query=query,
                         file_hint=file_hint,
@@ -113,19 +152,9 @@ class PandasKnowledgeQueryTool(BaseTool):
                         file_name=item.file_name,
                         virtual_path=item.virtual_path,
                         sheet=item.sheet_name,
-                        columns=columns,
+                        columns=asset.columns,
                     )
-                    assets.append(
-                        TableAsset(
-                            path=path,
-                            virtual_path=item.virtual_path,
-                            sheet_name=item.sheet_name,
-                            source_type=item.source_type,
-                            columns=columns,
-                            rows=item.rows,
-                            score=score,
-                        )
-                    )
+                    assets.append(TableAsset(**{**asset.__dict__, "score": score}))
                 return sorted(assets, key=lambda item: (item.score, item.path.stat().st_mtime_ns), reverse=True)
 
         try:
@@ -226,7 +255,23 @@ class PandasKnowledgeQueryTool(BaseTool):
     def _load_dataframe(asset: TableAsset):
         import pandas as pd
 
+        if asset.source_type == LOGICAL_CONCAT_SOURCE_TYPE:
+            frames = []
+            for source in asset.logical_sources:
+                frame = PandasKnowledgeQueryTool._load_dataframe(source)
+                frame.columns = [str(column).strip() for column in frame.columns]
+                frame = frame.reindex(columns=asset.canonical_columns)
+                frame["_pc_source_asset_id"] = source.asset_id
+                frame["_pc_source_file_name"] = source.path.name
+                frame["_pc_source_sheet_name"] = source.sheet_name or ""
+                frame["_pc_source_virtual_path"] = source.virtual_path
+                frames.append(frame)
+            if not frames:
+                raise ValueError("虚拟逻辑数据集没有可读取的来源。")
+            return pd.concat(frames, ignore_index=True, copy=False)
         suffix = asset.path.suffix.lower()
+        if suffix == ".parquet":
+            return pd.read_parquet(asset.path)
         if suffix in {".xlsx", ".xls"}:
             return pd.read_excel(asset.path, sheet_name=asset.sheet_name)
         sep = "\t" if suffix == ".tsv" else ","

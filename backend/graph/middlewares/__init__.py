@@ -1,4 +1,4 @@
-"""Cache + Compression + ToolIntentRouter + Write middlewares for create_agent."""
+"""Shared cache, compression, Skill intent, Toolset and write middleware exports."""
 from graph.middlewares.cache import (
     DeepSeekCacheBoundaryMiddleware,
     TailTrimMiddleware,
@@ -17,10 +17,8 @@ from graph.middlewares.compression import (
     SUMMARY_PREFIX,
     COMPRESSED_CONTEXT_PREFIX,
 )
-from graph.middlewares.tool_intent_router import (
-    ToolIntentRouterMiddleware,
-    build_tool_intent_router_middlewares,
-)
+from graph.middlewares.skill_intent_router import SkillIntentRouterMiddleware
+from graph.middlewares.toolset import ToolsetMiddleware, discover_skill_toolsets
 from graph.middlewares.task_state import (
     TaskStateMiddleware,
     build_write_middlewares,
@@ -43,9 +41,10 @@ __all__ = [
     "SUMMARIZATION_PROMPT_ZH",
     "SUMMARY_PREFIX",
     "COMPRESSED_CONTEXT_PREFIX",
-    # Select / Route (Ch3)
-    "ToolIntentRouterMiddleware",
-    "build_tool_intent_router_middlewares",
+    # Skill intent / toolset boundary
+    "SkillIntentRouterMiddleware",
+    "ToolsetMiddleware",
+    "discover_skill_toolsets",
     # Write (Ch2)
     "TaskStateMiddleware",
     "build_write_middlewares",

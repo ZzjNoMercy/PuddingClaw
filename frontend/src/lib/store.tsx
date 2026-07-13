@@ -36,6 +36,8 @@ import {
   GraphStructure,
   PermissionRequest,
   DimensionBuildRuleRequest,
+  LogicalDatasetRuleRequest,
+  DatabaseSqlRevisionRequest,
   AgentAttachment,
 } from "./api";
 import {
@@ -102,6 +104,7 @@ export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
+  attachments?: AgentAttachment[];
   reasoning?: string;
   toolCalls?: ToolCall[];
   timeline?: TimelineItem[];
@@ -111,6 +114,8 @@ export interface ChatMessage {
   citations?: CitationRef[];
   permissionRequests?: PermissionRequest[];
   dimensionBuildRuleRequests?: DimensionBuildRuleRequest[];
+  logicalDatasetRuleRequests?: LogicalDatasetRuleRequest[];
+  databaseSqlRevisionRequests?: DatabaseSqlRevisionRequest[];
   interrupted?: boolean;
   interruptionNotice?: string;
   errorNotice?: string;
@@ -261,6 +266,24 @@ interface AppState {
 const AppContext = createContext<AppState | null>(null);
 
 // ── Helper: parse backend history into ChatMessage[] ────────
+function splitPersistedUserMessage(content: string): { content: string; attachments?: AgentAttachment[] } {
+  const marker = "\n\n[附件]\n";
+  const markerIndex = content.lastIndexOf(marker);
+  if (markerIndex < 0) return { content };
+
+  const attachments = content
+    .slice(markerIndex + marker.length)
+    .split("\n")
+    .map((line) => line.replace(/^-\s*/, "").trim())
+    .filter(Boolean)
+    .map((name) => ({ type: "file" as const, name }));
+
+  return {
+    content: content.slice(0, markerIndex),
+    attachments: attachments.length ? attachments : undefined,
+  };
+}
+
 function parseHistoryMessages(
   backendMessages: Array<{
     role: string;
@@ -288,10 +311,12 @@ function parseHistoryMessages(
   let msgIndex = 0;
   for (const msg of backendMessages) {
     if (msg.role === "user") {
+      const userMessage = splitPersistedUserMessage(msg.content);
       loaded.push({
         id: `hist-user-${msgIndex++}`,
         role: "user",
-        content: msg.content,
+        content: userMessage.content,
+        attachments: userMessage.attachments,
         timestamp: Date.now() - (backendMessages.length - msgIndex) * 1000,
       });
     } else if (msg.role === "assistant") {
@@ -1324,9 +1349,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const userMsg: ChatMessage = {
         id: `user-${Date.now()}`,
         role: "user",
-        content: attachments.length
-          ? `${text}\n\n[附件]\n${attachments.map((item) => `- ${item.name || item.path || item.id || "attachment"}`).join("\n")}`
-          : text,
+        content: text.trim(),
+        attachments: attachments.length ? attachments : undefined,
         timestamp: Date.now(),
       };
 
@@ -1691,6 +1715,42 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             continue;
           }
 
+          if (event.event === "logical_dataset_rule_required") {
+            const targetId = getAssistantId();
+            const request = event.data as unknown as LogicalDatasetRuleRequest;
+            updateMsgs((prev) => {
+              const updated = [...prev];
+              const idx = updated.findIndex((message) => message.id === targetId);
+              if (idx === -1) return prev;
+              const message = { ...updated[idx] };
+              const existing = message.logicalDatasetRuleRequests || [];
+              message.logicalDatasetRuleRequests = existing.some((item) => item.id === request.id)
+                ? existing.map((item) => item.id === request.id ? request : item)
+                : [...existing, request];
+              updated[idx] = message;
+              return updated;
+            });
+            continue;
+          }
+
+          if (event.event === "database_sql_revision_required") {
+            const targetId = getAssistantId();
+            const request = event.data as unknown as DatabaseSqlRevisionRequest;
+            updateMsgs((prev) => {
+              const updated = [...prev];
+              const idx = updated.findIndex((message) => message.id === targetId);
+              if (idx === -1) return prev;
+              const message = { ...updated[idx] };
+              const existing = message.databaseSqlRevisionRequests || [];
+              message.databaseSqlRevisionRequests = existing.some((item) => item.id === request.id)
+                ? existing.map((item) => item.id === request.id ? request : item)
+                : [...existing, request];
+              updated[idx] = message;
+              return updated;
+            });
+            continue;
+          }
+
           if (event.event === "dimension_build_rule_resolved") {
             const targetId = getAssistantId();
             const requestId = String(event.data.request_id || "");
@@ -1701,6 +1761,40 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               const message = { ...updated[idx] };
               message.dimensionBuildRuleRequests = (message.dimensionBuildRuleRequests || []).map((item) =>
                 item.id === requestId ? { ...item, status: "resolved" } : item
+              );
+              updated[idx] = message;
+              return updated;
+            });
+            continue;
+          }
+
+          if (event.event === "logical_dataset_rule_resolved") {
+            const targetId = getAssistantId();
+            const requestId = String(event.data.request_id || "");
+            updateMsgs((prev) => {
+              const updated = [...prev];
+              const idx = updated.findIndex((message) => message.id === targetId);
+              if (idx === -1 || !requestId) return prev;
+              const message = { ...updated[idx] };
+              message.logicalDatasetRuleRequests = (message.logicalDatasetRuleRequests || []).map((request) =>
+                request.id === requestId ? { ...request, status: "resolved" } : request
+              );
+              updated[idx] = message;
+              return updated;
+            });
+            continue;
+          }
+
+          if (event.event === "database_sql_revision_resolved") {
+            const targetId = getAssistantId();
+            const requestId = String(event.data.request_id || "");
+            updateMsgs((prev) => {
+              const updated = [...prev];
+              const idx = updated.findIndex((message) => message.id === targetId);
+              if (idx === -1 || !requestId) return prev;
+              const message = { ...updated[idx] };
+              message.databaseSqlRevisionRequests = (message.databaseSqlRevisionRequests || []).map((request) =>
+                request.id === requestId ? { ...request, status: "resolved" } : request
               );
               updated[idx] = message;
               return updated;

@@ -18,7 +18,7 @@ def test_middleware_inventory_uses_actual_hook_overrides(tmp_path):
 
     middleware = MemoryMiddleware(
         backend=FilesystemBackend(root_dir=tmp_path, virtual_mode=True),
-        sources=["/AGENTS.md"],
+        sources=["/MEMORY.md"],
     )
 
     hooks = DeepAgentsAgentManager._middleware_hooks(middleware)
@@ -1401,8 +1401,8 @@ def test_deepagents_manager_adds_puddingclaw_terminal_scoped_to_workspace(tmp_pa
     assert "execute_skill" not in by_name
 
 
-def test_memory_dir_and_agents_md_creation(tmp_path):
-    """Project memory should live under data/deepagents-memory and auto-create AGENTS.md."""
+def test_memory_dir_and_memory_md_creation(tmp_path):
+    """Project memory should live under data/deepagents-memory and auto-create MEMORY.md."""
 
     from graph.deepagents_manager import DeepAgentsAgentManager
 
@@ -1415,9 +1415,26 @@ def test_memory_dir_and_agents_md_creation(tmp_path):
     global_memory = runtime._memory_dir_for(None)  # noqa: SLF001
     assert global_memory == tmp_path / "data" / "deepagents-memory" / "global"
 
-    agents_md = runtime._ensure_agents_md(project_memory)  # noqa: SLF001
-    assert agents_md.exists()
-    assert "Project Memory" in agents_md.read_text(encoding="utf-8")
+    memory_md = runtime._ensure_memory_md(project_memory)  # noqa: SLF001
+    assert memory_md.exists()
+    assert "Project Memory" in memory_md.read_text(encoding="utf-8")
+
+
+def test_memory_file_migrates_legacy_agents_md_without_copy(tmp_path):
+    from graph.deepagents_manager import DeepAgentsAgentManager
+
+    runtime = DeepAgentsAgentManager()
+    runtime.initialize(tmp_path)
+    memory_dir = runtime._memory_dir_for("proj_abc123")  # noqa: SLF001
+    memory_dir.mkdir(parents=True)
+    legacy = memory_dir / "AGENTS.md"
+    legacy.write_text("# Existing Project Memory\n", encoding="utf-8")
+
+    memory_md = runtime._ensure_memory_md(memory_dir)  # noqa: SLF001
+
+    assert memory_md.name == "MEMORY.md"
+    assert memory_md.read_text(encoding="utf-8") == "# Existing Project Memory\n"
+    assert not legacy.exists()
 
 
 def test_memory_middleware_includes_project_and_gstack(tmp_path):
@@ -1441,7 +1458,7 @@ def test_memory_middleware_includes_project_and_gstack(tmp_path):
     assert len(memory_middlewares) == 1
     mw = memory_middlewares[0]
     assert isinstance(mw, MemoryMiddleware)
-    assert "/AGENTS.md" in mw.sources
+    assert "/MEMORY.md" in mw.sources
     assert "/gstack/AGENTS.md" in mw.sources
 
 

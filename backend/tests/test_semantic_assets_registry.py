@@ -92,6 +92,49 @@ def test_entity_lookup_dimension_keeps_multiple_source_bindings(tmp_path) -> Non
     assert len(resolution["bindings"]) == 2
 
 
+def test_relation_asset_preserves_machine_readable_definition(tmp_path) -> None:
+    registry = SemanticAssetRegistry(tmp_path)
+    registry.create_asset(name="车系", asset_type="dimension")
+
+    created = registry.create_asset(
+        name="上险量关联车系",
+        asset_type="relation",
+        description="将上险量来源映射到规范车系。",
+        relation_definition={
+            "type": "dimension_binding",
+            "asset": {"ref": "table_asset:insurance_sales", "key_fields": ["品牌", "1-子车型"]},
+            "dimension": {"ref": "dimension:车系", "output_key": "entity_key"},
+            "grain": ["月份", "品牌", "1-子车型"],
+        },
+    )
+
+    assert created["type"] == "relation"
+    assert created["relation_type"] == "dimension_binding"
+    summary = registry.list_assets()["assets"][-1]
+    assert summary["relation_definition"]["asset"]["ref"] == "table_asset:insurance_sales"
+    detail = registry.get_asset(created["id"])
+    assert detail["frontmatter"]["relation"]["dimension"]["ref"] == "dimension:车系"
+
+
+def test_relation_assets_are_not_free_text_retrieved(tmp_path) -> None:
+    registry = SemanticAssetRegistry(tmp_path)
+    registry.create_asset(name="车系", asset_type="dimension")
+    registry.create_asset(
+        name="上险量关联车系",
+        asset_type="relation",
+        aliases=["上险量关联"],
+        relation_definition={
+            "type": "dimension_binding",
+            "asset": {"ref": "table_asset:sales", "key_fields": ["品牌"]},
+            "dimension": {"ref": "dimension:车系"},
+        },
+    )
+    registry.refresh()
+
+    resolution = resolve_semantic_assets("查询上险量关联", base_dir=tmp_path)
+    assert all(item.type != "relation" for item in resolution["matched"])
+
+
 def test_update_dimension_definition_preserves_body_and_custom_metadata(tmp_path) -> None:
     registry = SemanticAssetRegistry(tmp_path)
     created = registry.create_asset(

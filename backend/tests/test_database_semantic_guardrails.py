@@ -5,6 +5,38 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from analytics.nl2sql.service import _detect_semantic_sql_conflicts
+from tools.database.sql_generate_tool import _format_semantic_contract
+
+
+def test_sql_generate_semantic_contract_exposes_authoritative_measure_and_reference_rules() -> None:
+    semantic_trace = {
+        "matched": [
+            {
+                "id": "measure:config_rate",
+                "name": "配置率",
+                "type": "measure",
+                "path": "semantic-assets/measures/config_rate/measure.md",
+                "body_preview": "配置率默认排除车型级别为皮卡的车型。除非用户明确要求包含皮卡。",
+            }
+        ],
+        "references": [
+            {
+                "id": "measure:config_rate:references/air_suspension",
+                "name": "air suspension",
+                "type": "measure_reference",
+                "path": "semantic-assets/measures/config_rate/references/air_suspension.md",
+                "body_preview": "空气悬架应使用 type_name = '可调悬架种类'，type_value 包含空气悬架。",
+            }
+        ],
+    }
+
+    output = "\n".join(_format_semantic_contract(semantic_trace))
+
+    assert "权威语义口径" in output
+    assert "不得凭字段名或常识直接覆盖" in output
+    assert "可调悬架种类" in output
+    assert "默认排除车型级别为皮卡" in output
+    assert "air_suspension.md" in output
 
 
 def test_launch_time_dimension_blocks_model_year_from_car_name() -> None:

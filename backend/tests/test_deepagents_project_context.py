@@ -4,7 +4,7 @@ from pathlib import Path
 def _write_prompt_templates(base_dir: Path) -> None:
     prompt_dir = base_dir / "prompts" / "deepagents"
     prompt_dir.mkdir(parents=True)
-    (prompt_dir / "BASE.md").write_text("BASE PROMPT", encoding="utf-8")
+    (prompt_dir / "AGENTS.md").write_text("AGENTS PROMPT", encoding="utf-8")
     (prompt_dir / "PROJECT_CONTEXT.md").write_text("DEFAULT PROJECT CONTEXT", encoding="utf-8")
     (prompt_dir / "TOOL_GUIDES.md").write_text("TOOL GUIDES", encoding="utf-8")
 
@@ -40,7 +40,7 @@ def test_deepagents_prompt_builder_uses_project_local_context(tmp_path):
 
     prompt = build_deepagents_system_prompt(tmp_path, project)
 
-    assert "BASE PROMPT" in prompt
+    assert "AGENTS PROMPT" in prompt
     assert "LOCAL PROJECT CONTEXT" in prompt
     assert "DEFAULT PROJECT CONTEXT" not in prompt
     assert "TOOL GUIDES" in prompt

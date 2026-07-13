@@ -1,6 +1,9 @@
 ---
 name: build-semantic-dimension
 description: Build or refresh a reusable semantic dimension from one or more data assets. Use when a user needs cross-source entity normalization, a lookup/crosswalk, a calendar dimension, or an intermediate dimension table for analytics, such as matching sales series to product configuration series, unifying customers, stores, SKUs, channels, or dates across tables.
+toolsets:
+  - semantic_dimension_build
+  - semantic_lookup
 ---
 
 # Build Semantic Dimension

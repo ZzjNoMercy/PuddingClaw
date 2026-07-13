@@ -9,7 +9,6 @@ from typing import Any
 
 from .registry import get_semantic_asset_registry
 
-
 TOKEN_RE = re.compile(r"[0-9A-Za-z_\u4e00-\u9fff]+")
 MAX_MATCHED_ASSETS = 8
 MAX_BODY_CHARS = 2400
@@ -78,7 +77,7 @@ class ResolvedSemanticAsset:
             "aliases": self.aliases,
             "tags": self.tags,
             "parent_id": self.parent_id,
-            "body_preview": self.body[:500],
+            "body_preview": self.body[:1200],
             "body_chars": len(self.body),
         }
 
@@ -238,6 +237,10 @@ def resolve_semantic_assets(
 
     for summary in snapshot.get("assets") or []:
         asset_id = str(summary.get("id") or "")
+        # Asset relations are model-scoped graph edges. They are resolved only
+        # through the selected analytics model, never by free-text retrieval.
+        if str(summary.get("type") or "") == "relation":
+            continue
         try:
             detail = registry.get_asset(asset_id)
         except Exception:

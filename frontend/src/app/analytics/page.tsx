@@ -15,6 +15,7 @@ import {
   Layers3,
   ListTodo,
   Loader2,
+  MoreHorizontal,
   RefreshCw,
   Search,
   ShieldCheck,
@@ -31,6 +32,9 @@ import Sidebar from "@/components/layout/Sidebar";
 import {
   databaseQueryResultExportCsvUrl,
   createAnalyticsModel,
+  createConcatDataset,
+  appendConcatDatasetSources,
+  previewConcatDataset,
   createSemanticAsset,
   deleteKnowledgeDatabaseSource,
   generateTableAssetProfile,
@@ -65,13 +69,16 @@ import {
   listTaskCenter,
   readFile,
   refreshAnalyticsModels,
+  refreshConcatDataset,
   refreshSemanticAssets,
   refreshTableAssetProfiles,
   removeTableAsset,
+  updateLogicalDatasetDefinition,
   saveFile,
   saveSqlGuardrail,
   saveKnowledgeDatabaseSource,
   updateSemanticDimensionDefinition,
+  updateSemanticRelationDefinition,
   saveSemanticDimensionOverride,
   saveSemanticDimensionEntityLifecycle,
   resolveSemanticDimensionBaselineChange,
@@ -84,6 +91,8 @@ import {
   type AnalyticsModelDetail,
   type AnalyticsModelFile,
   type AnalyticsModelSummary,
+  type AssetRelationDefinition,
+  type ConcatDatasetPreview,
   type DatabaseQueryResultPage,
   type DatabaseQueryResultSummary,
   type DimensionDefinition,
@@ -185,6 +194,8 @@ function sourceTypeLabel(asset: TableAsset): string {
   if (asset.source_type === "excel") return asset.sheet_name ? `Excel · ${asset.sheet_name}` : "Excel";
   if (asset.source_type === "csv") return "CSV";
   if (asset.source_type === "tsv") return "TSV";
+  if (asset.source_type === "logical_concat") return "逻辑数据集 · 虚拟纵向合并";
+  if (asset.source_type === "derived_concat") return "逻辑数据集 · 已物化缓存";
   return asset.source_type;
 }
 
@@ -212,7 +223,13 @@ export default function AnalyticsWorkbenchPage() {
   const [profilingAssetId, setProfilingAssetId] = useState<string | null>(null);
   const [refreshingProfiles, setRefreshingProfiles] = useState(false);
   const [profileAsset, setProfileAsset] = useState<TableAsset | null>(null);
+  const [logicalDefinitionAsset, setLogicalDefinitionAsset] = useState<TableAsset | null>(null);
+  const [logicalDefinitionEditor, setLogicalDefinitionEditor] = useState<TableAsset | null>(null);
   const [assetPendingRemoval, setAssetPendingRemoval] = useState<TableAsset | null>(null);
+  const [concatDatasetModalOpen, setConcatDatasetModalOpen] = useState(false);
+  const [concatDatasetBusy, setConcatDatasetBusy] = useState(false);
+  const [concatAppendTarget, setConcatAppendTarget] = useState<TableAsset | null>(null);
+  const [refreshingConcatDatasetId, setRefreshingConcatDatasetId] = useState<string | null>(null);
   const [removingAssetId, setRemovingAssetId] = useState<string | null>(null);
   const [databaseSourcePendingRemoval, setDatabaseSourcePendingRemoval] = useState<KnowledgeDatabaseSource | null>(null);
   const [removingDatabaseSourceId, setRemovingDatabaseSourceId] = useState<string | null>(null);
@@ -226,7 +243,7 @@ export default function AnalyticsWorkbenchPage() {
   const [databaseBusy, setDatabaseBusy] = useState(false);
   const [databaseModalStatus, setDatabaseModalStatus] = useState<{ type: "success" | "error" | "info"; message: string } | null>(null);
   const [vannaTrainingTarget, setVannaTrainingTarget] = useState<{ source: KnowledgeDatabaseSource; table: string } | null>(null);
-  const [toast, setToast] = useState<{ type: "success" | "error"; message: string } | null>(null);
+  const [toast, setToast] = useState<{ type: "success" | "warning" | "error"; message: string } | null>(null);
   const [actionDialog, setActionDialog] = useState<ActionDialog | null>(null);
   const [activeSection, setActiveSection] = useState<AnalyticsSection>("assets");
   const [queryResults, setQueryResults] = useState<DatabaseQueryResultSummary[]>([]);
@@ -254,6 +271,7 @@ export default function AnalyticsWorkbenchPage() {
   const [semanticAssetEditorLoading, setSemanticAssetEditorLoading] = useState(false);
   const [semanticAssetEditorSaving, setSemanticAssetEditorSaving] = useState(false);
   const [semanticDimensionDefinitionEditor, setSemanticDimensionDefinitionEditor] = useState<SemanticAssetDetail | null>(null);
+  const [semanticRelationDefinitionEditor, setSemanticRelationDefinitionEditor] = useState<SemanticAssetDetail | null>(null);
   const [semanticDimensionDefinitionInitialTab, setSemanticDimensionDefinitionInitialTab] = useState<"settings" | "matching" | "markdown">("settings");
   const [semanticDimensionDefinitionSaving, setSemanticDimensionDefinitionSaving] = useState(false);
   const [analyticsModels, setAnalyticsModels] = useState<AnalyticsModelSummary[]>([]);
@@ -552,6 +570,7 @@ export default function AnalyticsWorkbenchPage() {
       tags: string[];
       version: string;
       dimension_definition?: DimensionDefinition;
+      relation_definition?: AssetRelationDefinition;
     }) => {
       setSemanticAssetsBusy(true);
       try {
@@ -800,6 +819,28 @@ export default function AnalyticsWorkbenchPage() {
     }
   }, [loadSemanticAssets, semanticDimensionDefinitionEditor]);
 
+  const saveSemanticRelationDefinition = useCallback(async (payload: {
+    name: string;
+    description: string;
+    aliases: string[];
+    tags: string[];
+    version: string;
+    relation_definition: AssetRelationDefinition;
+  }) => {
+    if (!semanticRelationDefinitionEditor) return;
+    setSemanticDimensionDefinitionSaving(true);
+    try {
+      await updateSemanticRelationDefinition(semanticRelationDefinitionEditor.id, payload);
+      setSemanticRelationDefinitionEditor(null);
+      await loadSemanticAssets(true);
+      setToast({ type: "success", message: "资产关联已保存，语义资产 registry 已刷新" });
+    } catch (error) {
+      setToast({ type: "error", message: errorMessage(error) });
+    } finally {
+      setSemanticDimensionDefinitionSaving(false);
+    }
+  }, [loadSemanticAssets, semanticRelationDefinitionEditor]);
+
   const saveAnalyticsModelFile = useCallback(async (contentOverride?: string) => {
     if (!analyticsModelSelectedFile) return;
     const nextContent = contentOverride ?? analyticsModelEditorContent;
@@ -874,7 +915,19 @@ export default function AnalyticsWorkbenchPage() {
         }
         const updated = job.asset || await getTableAsset(asset.asset_id, false);
         setAssets((current) => current.map((item) => (item.asset_id === updated.asset_id ? updated : item)));
-        setToast({ type: "success", message: "Profile 已生成" });
+        if (updated.source_type === "logical_concat") {
+          const status = updated.profile_status;
+          setToast({
+            type: status === "ready" ? "success" : status === "partial" ? "warning" : "error",
+            message: status === "ready"
+              ? "逻辑数据集 Profile 已就绪"
+              : status === "partial"
+                ? "逻辑数据集摘要已更新，但仍有来源 Profile 待补充"
+                : "逻辑数据集 Profile 未生成，请检查来源表",
+          });
+        } else {
+          setToast({ type: "success", message: "Profile 已生成" });
+        }
       } catch (error) {
         setToast({ type: "error", message: errorMessage(error) });
       } finally {
@@ -899,6 +952,85 @@ export default function AnalyticsWorkbenchPage() {
       setToast({ type: "error", message: errorMessage(error) });
     } finally {
       setRefreshingProfiles(false);
+    }
+  }, []);
+
+  const createLogicalConcatDataset = useCallback(async (payload: {
+    name: string;
+    description: string;
+    tags: string[];
+    sourceAssetIds: string[];
+    schemaMode: "strict" | "baseline_fill_missing" | "union_fill_missing";
+    preferredIntents: string[];
+    directSourceAllowed: boolean;
+  }) => {
+    setConcatDatasetBusy(true);
+    try {
+      const asset = await createConcatDataset({ name: payload.name, description: payload.description, tags: payload.tags, source_asset_ids: payload.sourceAssetIds, schema_mode: payload.schemaMode, preferred_intents: payload.preferredIntents, direct_source_allowed: payload.directSourceAllowed });
+      setAssets((current) => [asset, ...current]);
+      setConcatDatasetModalOpen(false);
+      setToast({ type: "success", message: `已创建逻辑数据集：${asset.file_name}` });
+    } catch (error) {
+      setToast({ type: "error", message: errorMessage(error) });
+    } finally {
+      setConcatDatasetBusy(false);
+    }
+  }, []);
+
+  const refreshLogicalConcatDataset = useCallback(async (asset: TableAsset) => {
+    setRefreshingConcatDatasetId(asset.asset_id);
+    try {
+      const refreshed = await refreshConcatDataset(asset.asset_id);
+      setAssets((current) => current.map((item) => item.asset_id === refreshed.asset_id ? refreshed : item));
+      setToast({ type: "success", message: `已刷新逻辑数据集：${refreshed.file_name}` });
+    } catch (error) {
+      setToast({ type: "error", message: errorMessage(error) });
+    } finally {
+      setRefreshingConcatDatasetId(null);
+    }
+  }, []);
+
+  const saveLogicalDatasetDefinition = useCallback(async (asset: TableAsset, payload: {
+    name: string;
+    description: string;
+    tags: string[];
+    preferredIntents: string[];
+    directSourceAllowed: boolean;
+  }) => {
+    setConcatDatasetBusy(true);
+    try {
+      const updated = await updateLogicalDatasetDefinition(asset.asset_id, {
+        name: payload.name,
+        description: payload.description,
+        tags: payload.tags,
+        preferred_intents: payload.preferredIntents,
+        direct_source_allowed: payload.directSourceAllowed,
+      });
+      setAssets((current) => current.map((item) => item.asset_id === updated.asset_id ? updated : item));
+      setLogicalDefinitionEditor(null);
+      setLogicalDefinitionAsset((current) => current?.asset_id === updated.asset_id ? updated : current);
+      setToast({ type: "success", message: `已更新逻辑数据集定义：${updated.file_name}` });
+    } catch (error) {
+      setToast({ type: "error", message: errorMessage(error) });
+    } finally {
+      setConcatDatasetBusy(false);
+    }
+  }, []);
+
+  const appendLogicalConcatSources = useCallback(async (payload: { asset: TableAsset; sourceAssetIds: string[]; schemaMode: "strict" | "baseline_fill_missing" | "union_fill_missing" }) => {
+    setConcatDatasetBusy(true);
+    try {
+      const updated = await appendConcatDatasetSources(payload.asset.asset_id, {
+        source_asset_ids: payload.sourceAssetIds,
+        schema_mode: payload.schemaMode,
+      });
+      setAssets((current) => current.map((item) => item.asset_id === updated.asset_id ? updated : item));
+      setConcatAppendTarget(null);
+      setToast({ type: "success", message: `已追加 ${payload.sourceAssetIds.length} 张来源表：${updated.file_name}` });
+    } catch (error) {
+      setToast({ type: "error", message: errorMessage(error) });
+    } finally {
+      setConcatDatasetBusy(false);
     }
   }, []);
 
@@ -934,7 +1066,7 @@ export default function AnalyticsWorkbenchPage() {
   }, []);
 
   const openProfile = useCallback(async (asset: TableAsset) => {
-    if (asset.profile_status !== "ready") {
+    if (asset.profile_status === "missing") {
       setToast({ type: "error", message: "这个表还没有生成 Profile。" });
       return;
     }
@@ -1074,10 +1206,13 @@ export default function AnalyticsWorkbenchPage() {
 
               {toast ? (
                 <div
-                  className={`flex items-start gap-2 rounded-2xl border px-4 py-3 text-sm ${
+                  role="status"
+                  className={`fixed right-6 top-6 z-[300] flex max-w-md items-start gap-2 rounded-2xl border px-4 py-3 text-sm shadow-xl ${
                     toast.type === "success"
                       ? "border-emerald-500/15 bg-emerald-50 text-emerald-700"
-                      : "border-red-500/15 bg-red-50 text-red-600"
+                      : toast.type === "warning"
+                        ? "border-amber-500/20 bg-amber-50 text-amber-800"
+                        : "border-red-500/15 bg-red-50 text-red-600"
                   }`}
                 >
                   {toast.type === "success" ? <CheckCircle2 className="mt-0.5 h-4 w-4" /> : <AlertCircle className="mt-0.5 h-4 w-4" />}
@@ -1196,6 +1331,15 @@ export default function AnalyticsWorkbenchPage() {
                           </button>
                           <button
                             type="button"
+                            onClick={() => setConcatDatasetModalOpen(true)}
+                            disabled={assets.filter((asset) => asset.source_type !== "derived_concat" && asset.source_type !== "logical_concat").length < 2}
+                            className="inline-flex h-10 items-center gap-2 rounded-2xl border border-[#002fa7]/20 bg-[#002fa7]/[0.04] px-4 text-sm font-semibold text-[#002fa7] shadow-sm transition hover:bg-[#002fa7]/[0.08] disabled:cursor-not-allowed disabled:opacity-45"
+                          >
+                            <Layers3 className="h-4 w-4" />
+                            合并表格
+                          </button>
+                          <button
+                            type="button"
                             onClick={generateAllProfiles}
                             disabled={refreshingProfiles || assets.length === 0}
                             className="inline-flex h-10 items-center gap-2 rounded-2xl bg-[#002fa7] px-4 text-sm font-semibold text-white shadow-sm transition hover:bg-[#001f7a] disabled:cursor-not-allowed disabled:opacity-45"
@@ -1264,7 +1408,11 @@ export default function AnalyticsWorkbenchPage() {
                                     profileLoadingId={profileLoadingId}
                                     profilingAssetId={profilingAssetId}
                                     onOpenProfile={openProfile}
+                                    onOpenDefinition={(item) => setLogicalDefinitionAsset(item)}
                                     onGenerateProfile={generateOneProfile}
+                                    onRefreshConcat={refreshLogicalConcatDataset}
+                                    onAppendConcat={(item) => setConcatAppendTarget(item)}
+                                    refreshingConcat={refreshingConcatDatasetId === asset.asset_id}
                                     onRemove={(asset) => setAssetPendingRemoval(asset)}
                                   />
                                 ))}
@@ -1373,6 +1521,7 @@ export default function AnalyticsWorkbenchPage() {
                             { value: "measure", label: "度量值" },
                             { value: "grain", label: "颗粒度" },
                             { value: "dimension", label: "维度" },
+                            { value: "relation", label: "资产关联" },
                           ].map((item) => (
                             <button
                               key={item.value}
@@ -1564,6 +1713,22 @@ export default function AnalyticsWorkbenchPage() {
         </div>
       ) : null}
 
+      {logicalDefinitionAsset?.logical_dataset ? (
+        <LogicalDatasetDefinitionModal
+          asset={logicalDefinitionAsset}
+          onClose={() => setLogicalDefinitionAsset(null)}
+          onEdit={() => setLogicalDefinitionEditor(logicalDefinitionAsset)}
+        />
+      ) : null}
+      {logicalDefinitionEditor?.logical_dataset ? (
+        <LogicalDatasetDefinitionEditorModal
+          asset={logicalDefinitionEditor}
+          busy={concatDatasetBusy}
+          onClose={() => setLogicalDefinitionEditor(null)}
+          onSave={saveLogicalDatasetDefinition}
+        />
+      ) : null}
+
       {databaseModalOpen ? (
         <DatabaseSourceModal
           draft={databaseDraft}
@@ -1595,8 +1760,10 @@ export default function AnalyticsWorkbenchPage() {
           busy={semanticAssetsBusy}
           tableAssets={assets}
           databaseSources={databaseSources}
+          initialType={semanticAssetTypeFilter === "all" ? "measure" : semanticAssetTypeFilter}
           onClose={() => setSemanticAssetModal(null)}
           onCreate={handleCreateSemanticAsset}
+          semanticAssets={semanticAssets}
         />
       ) : null}
 
@@ -1672,6 +1839,7 @@ export default function AnalyticsWorkbenchPage() {
           onChangeContent={setSemanticAssetEditorContent}
           onSave={saveSemanticAssetFile}
           onEditDimensionDefinition={(asset) => setSemanticDimensionDefinitionEditor(asset)}
+          onEditRelationDefinition={(asset) => setSemanticRelationDefinitionEditor(asset)}
         />
       ) : null}
 
@@ -1685,6 +1853,18 @@ export default function AnalyticsWorkbenchPage() {
           onClose={() => setSemanticDimensionDefinitionEditor(null)}
           onSave={saveSemanticDimensionDefinition}
           onSaveMarkdown={saveSemanticDimensionMarkdown}
+        />
+      ) : null}
+
+      {semanticRelationDefinitionEditor ? (
+        <RelationDefinitionEditorModal
+          asset={semanticRelationDefinitionEditor}
+          tableAssets={assets}
+          databaseSources={databaseSources}
+          semanticAssets={semanticAssets}
+          busy={semanticDimensionDefinitionSaving}
+          onClose={() => setSemanticRelationDefinitionEditor(null)}
+          onSave={saveSemanticRelationDefinition}
         />
       ) : null}
 
@@ -1710,6 +1890,23 @@ export default function AnalyticsWorkbenchPage() {
       ) : null}
 
       {actionDialog ? <ActionFeedbackDialog dialog={actionDialog} onClose={() => setActionDialog(null)} /> : null}
+      {concatDatasetModalOpen ? (
+        <ConcatDatasetModal
+          assets={assets.filter((asset) => asset.source_type !== "derived_concat" && asset.source_type !== "logical_concat")}
+          busy={concatDatasetBusy}
+          onClose={() => setConcatDatasetModalOpen(false)}
+          onCreate={createLogicalConcatDataset}
+        />
+      ) : null}
+      {concatAppendTarget ? (
+        <AppendConcatDatasetSourcesModal
+          dataset={concatAppendTarget}
+          assets={assets.filter((asset) => asset.source_type !== "derived_concat" && asset.source_type !== "logical_concat")}
+          busy={concatDatasetBusy}
+          onClose={() => setConcatAppendTarget(null)}
+          onAppend={appendLogicalConcatSources}
+        />
+      ) : null}
       {assetPendingRemoval ? (
         <RemoveTableAssetDialog
           asset={assetPendingRemoval}
@@ -2119,7 +2316,7 @@ function SqlGuardrailsSection({
 }
 
 function SemanticAssetCard({ asset, onOpen }: { asset: SemanticAssetSummary; onOpen: (asset: SemanticAssetSummary) => void }) {
-  const typeLabel = asset.type === "measure" ? "度量值" : asset.type === "grain" ? "颗粒度" : "维度";
+  const typeLabel = asset.type === "measure" ? "度量值" : asset.type === "grain" ? "颗粒度" : asset.type === "relation" ? "资产关联" : "维度";
   return (
     <button
       type="button"
@@ -2133,6 +2330,11 @@ function SemanticAssetCard({ asset, onOpen }: { asset: SemanticAssetSummary; onO
         {asset.type === "dimension" && asset.resolution_label ? (
           <span className="rounded-full bg-violet-50 px-2.5 py-1 text-xs font-semibold text-violet-700">
             {asset.resolution_label}
+          </span>
+        ) : null}
+        {asset.type === "relation" && asset.relation_type ? (
+          <span className="rounded-full bg-violet-50 px-2.5 py-1 text-xs font-semibold text-violet-700">
+            {asset.relation_type === "dimension_binding" ? "关联维度" : "字段关联"}
           </span>
         ) : null}
         <h3 className="min-w-0 flex-1 truncate text-sm font-semibold text-gray-950" title={asset.name}>
@@ -2755,18 +2957,31 @@ function ModelOptionPicker({
   options,
   values,
   onToggle,
+  onToggleAll,
 }: {
   title: string;
   emptyText: string;
   options: Array<{ value: string; label: string; hint?: string }>;
   values: string[];
   onToggle: (value: string) => void;
+  onToggleAll: (nextValues: string[]) => void;
 }) {
+  const allSelected = options.length > 0 && options.every((option) => values.includes(option.value));
   return (
     <section className="rounded-3xl border border-black/[0.06] p-4">
       <div className="flex items-center justify-between gap-3">
         <h4 className="text-sm font-semibold text-gray-950">{title}</h4>
-        <span className="text-xs font-semibold text-gray-400">{values.length} 已选</span>
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-semibold text-gray-400">{values.length} 已选</span>
+          <button
+            type="button"
+            disabled={options.length === 0}
+            onClick={() => onToggleAll(allSelected ? [] : options.map((option) => option.value))}
+            className="h-7 rounded-lg border border-[#002fa7]/20 px-2 text-[11px] font-semibold text-[#002fa7] transition hover:bg-[#002fa7]/[0.04] disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            {allSelected ? "全不选" : "全选"}
+          </button>
+        </div>
       </div>
       <div className="mt-3 max-h-44 space-y-1 overflow-y-auto rounded-2xl bg-gray-50 p-2">
         {options.length ? (
@@ -2833,6 +3048,7 @@ function AnalyticsModelCreateModal({
     data_assets: Record<string, unknown>;
     semantic_assets: Record<string, unknown>;
     guardrails: string[];
+    asset_relations?: string[];
     templates: Record<string, unknown>;
     default_template: string | null;
   }) => void;
@@ -2845,6 +3061,7 @@ function AnalyticsModelCreateModal({
   const [selectedMeasures, setSelectedMeasures] = useState<string[]>([]);
   const [selectedDimensions, setSelectedDimensions] = useState<string[]>([]);
   const [selectedGrains, setSelectedGrains] = useState<string[]>([]);
+  const [selectedRelations, setSelectedRelations] = useState<string[]>([]);
   const [selectedGuardrails, setSelectedGuardrails] = useState<string[]>([]);
   const [defaultTemplate, setDefaultTemplate] = useState("");
 
@@ -2877,8 +3094,72 @@ function AnalyticsModelCreateModal({
   const measures = semanticAssets.filter((asset) => asset.type === "measure");
   const dimensions = semanticAssets.filter((asset) => asset.type === "dimension");
   const grains = semanticAssets.filter((asset) => asset.type === "grain");
+  const relationAssets = semanticAssets.filter((asset) => asset.type === "relation");
+  const availableRelations = relationAssets.filter((asset) => {
+    const relation = asset.relation_definition;
+    if (!relation) return false;
+    if (asset.relation_type === "dimension_binding") {
+      const assetRef = relation.asset?.ref;
+      const dimensionRef = relation.dimension?.ref;
+      return Boolean(selectedTables.length > 1 && assetRef && dimensionRef && selectedTables.includes(assetRef));
+    }
+    if (asset.relation_type === "direct_join") {
+      const leftRef = relation.left?.ref;
+      const rightRef = relation.right?.ref;
+      return Boolean(leftRef && rightRef && selectedTables.includes(leftRef) && selectedTables.includes(rightRef));
+    }
+    return false;
+  });
+  useEffect(() => {
+    const valid = new Set(availableRelations.map((asset) => asset.id));
+    setSelectedRelations((current) => current.filter((relationId) => valid.has(relationId)));
+  }, [selectedTables, semanticAssets]);
   const toggle = (values: string[], value: string, setter: (next: string[]) => void) => {
     setter(values.includes(value) ? values.filter((item) => item !== value) : [...values, value]);
+  };
+  const toggleDimension = (dimensionId: string) => {
+    if (!selectedDimensions.includes(dimensionId)) {
+      setSelectedDimensions([...selectedDimensions, dimensionId]);
+      return;
+    }
+    setSelectedDimensions(selectedDimensions.filter((item) => item !== dimensionId));
+    const boundRelationIds = new Set(
+      relationAssets
+        .filter((asset) => asset.relation_type === "dimension_binding" && asset.relation_definition?.dimension?.ref === dimensionId)
+        .map((asset) => asset.id)
+    );
+    setSelectedRelations((current) => current.filter((relationId) => !boundRelationIds.has(relationId)));
+  };
+  const toggleRelation = (relationId: string) => {
+    if (selectedRelations.includes(relationId)) {
+      setSelectedRelations(selectedRelations.filter((item) => item !== relationId));
+      return;
+    }
+    const relation = relationAssets.find((asset) => asset.id === relationId);
+    const dimensionRef = relation?.relation_type === "dimension_binding" ? relation.relation_definition?.dimension?.ref : undefined;
+    if (dimensionRef && !selectedDimensions.includes(dimensionRef)) {
+      setSelectedDimensions([...selectedDimensions, dimensionRef]);
+    }
+    setSelectedRelations([...selectedRelations, relationId]);
+  };
+  const setAllDimensions = (nextDimensions: string[]) => {
+    const selected = new Set(nextDimensions);
+    setSelectedDimensions(nextDimensions);
+    setSelectedRelations((current) => current.filter((relationId) => {
+      const relation = relationAssets.find((asset) => asset.id === relationId);
+      const dimensionRef = relation?.relation_type === "dimension_binding" ? relation.relation_definition?.dimension?.ref : undefined;
+      return !dimensionRef || selected.has(dimensionRef);
+    }));
+  };
+  const setAllRelations = (nextRelations: string[]) => {
+    setSelectedRelations(nextRelations);
+    const requiredDimensions = relationAssets
+      .filter((asset) => nextRelations.includes(asset.id) && asset.relation_type === "dimension_binding")
+      .map((asset) => asset.relation_definition?.dimension?.ref)
+      .filter((value): value is string => Boolean(value));
+    if (requiredDimensions.length) {
+      setSelectedDimensions((current) => Array.from(new Set([...current, ...requiredDimensions])));
+    }
   };
 
   const templatePreview = `---
@@ -2895,6 +3176,7 @@ semantic_assets:
   dimensions: ${JSON.stringify(selectedDimensions)}
   grains: ${JSON.stringify(selectedGrains)}
 guardrails: ${JSON.stringify(selectedGuardrails)}
+asset_relations: ${JSON.stringify(selectedRelations)}
 templates: {}
 default_template: ${JSON.stringify(defaultTemplate.trim() || null)}
 created: YYYY-MM-DD HH:mm:ss
@@ -2971,29 +3253,41 @@ updated_at: YYYY-MM-DD HH:mm:ss
               options={tableOptions}
               values={selectedTables}
               onToggle={(value) => toggle(selectedTables, value, setSelectedTables)}
+              onToggleAll={setSelectedTables}
             />
           </div>
           <div className="space-y-4">
             <ModelOptionPicker
               title="度量值"
               emptyText="暂无度量值。"
-              options={measures.map((asset) => ({ value: `measure:${asset.id}`, label: asset.name, hint: asset.id }))}
+              options={measures.map((asset) => ({ value: asset.id, label: asset.name, hint: asset.id }))}
               values={selectedMeasures}
               onToggle={(value) => toggle(selectedMeasures, value, setSelectedMeasures)}
+              onToggleAll={setSelectedMeasures}
             />
             <ModelOptionPicker
               title="维度"
               emptyText="暂无维度。"
-              options={dimensions.map((asset) => ({ value: `dimension:${asset.id}`, label: asset.name, hint: asset.id }))}
+              options={dimensions.map((asset) => ({ value: asset.id, label: asset.name, hint: asset.id }))}
               values={selectedDimensions}
-              onToggle={(value) => toggle(selectedDimensions, value, setSelectedDimensions)}
+              onToggle={toggleDimension}
+              onToggleAll={setAllDimensions}
             />
             <ModelOptionPicker
               title="颗粒度"
               emptyText="暂无颗粒度。"
-              options={grains.map((asset) => ({ value: `grain:${asset.id}`, label: asset.name, hint: asset.id }))}
+              options={grains.map((asset) => ({ value: asset.id, label: asset.name, hint: asset.id }))}
               values={selectedGrains}
               onToggle={(value) => toggle(selectedGrains, value, setSelectedGrains)}
+              onToggleAll={setSelectedGrains}
+            />
+            <ModelOptionPicker
+              title="资产关联"
+              emptyText={selectedTables.length > 1 ? "所选数据资产之间没有可用的已发布关联。" : "选择至少两个数据资产后显示可用关联。"}
+              options={availableRelations.map((asset) => ({ value: asset.id, label: asset.name, hint: asset.relation_type === "dimension_binding" ? "关联维度" : "字段关联" }))}
+              values={selectedRelations}
+              onToggle={toggleRelation}
+              onToggleAll={setAllRelations}
             />
             <ModelOptionPicker
               title="SQL 守卫"
@@ -3001,6 +3295,7 @@ updated_at: YYYY-MM-DD HH:mm:ss
               options={sqlGuardrails.map((rule) => ({ value: rule.id, label: rule.name, hint: rule.type }))}
               values={selectedGuardrails}
               onToggle={(value) => toggle(selectedGuardrails, value, setSelectedGuardrails)}
+              onToggleAll={setSelectedGuardrails}
             />
           </div>
           <div className="rounded-3xl bg-gray-950 p-4 text-xs text-gray-100">
@@ -3028,6 +3323,7 @@ updated_at: YYYY-MM-DD HH:mm:ss
                   grains: selectedGrains,
                 },
                 guardrails: selectedGuardrails,
+                asset_relations: selectedRelations,
                 templates: {},
                 default_template: defaultTemplate.trim() || null,
               })
@@ -3161,6 +3457,7 @@ function buildAnalyticsModelContent(
     measures: string[];
     dimensions: string[];
     grains: string[];
+    assetRelations: string[];
     guardrails: string[];
     defaultTemplate: string;
   },
@@ -3184,6 +3481,7 @@ function buildAnalyticsModelContent(
     `  measures: ${yamlArray(draft.measures)}`,
     `  dimensions: ${yamlArray(draft.dimensions)}`,
     `  grains: ${yamlArray(draft.grains)}`,
+    `asset_relations: ${yamlArray(draft.assetRelations)}`,
     `guardrails: ${yamlArray(draft.guardrails)}`,
     "templates: {}",
     `default_template: ${draft.defaultTemplate.trim() ? yamlScalar(draft.defaultTemplate.trim()) : "null"}`,
@@ -3237,6 +3535,7 @@ function AnalyticsModelDetailModal({
   const [draftMeasures, setDraftMeasures] = useState<string[]>([]);
   const [draftDimensions, setDraftDimensions] = useState<string[]>([]);
   const [draftGrains, setDraftGrains] = useState<string[]>([]);
+  const [draftRelations, setDraftRelations] = useState<string[]>([]);
   const [draftGuardrails, setDraftGuardrails] = useState<string[]>([]);
   const [draftDefaultTemplate, setDraftDefaultTemplate] = useState("");
 
@@ -3253,6 +3552,7 @@ function AnalyticsModelDetailModal({
     setDraftMeasures(Array.isArray(semantic?.measures) ? semantic.measures.map(String) : []);
     setDraftDimensions(Array.isArray(semantic?.dimensions) ? semantic.dimensions.map(String) : []);
     setDraftGrains(Array.isArray(semantic?.grains) ? semantic.grains.map(String) : []);
+    setDraftRelations(Array.isArray(model.asset_relations) ? model.asset_relations.map(String) : []);
     setDraftGuardrails(Array.isArray(model.guardrails) ? model.guardrails.map(String) : []);
     setDraftDefaultTemplate(model.default_template || "");
   }, [model]);
@@ -3277,8 +3577,68 @@ function AnalyticsModelDetailModal({
   const measures = semanticAssets.filter((asset) => asset.type === "measure");
   const dimensions = semanticAssets.filter((asset) => asset.type === "dimension");
   const grains = semanticAssets.filter((asset) => asset.type === "grain");
+  const relationAssets = semanticAssets.filter((asset) => asset.type === "relation");
+  const availableRelations = relationAssets.filter((asset) => {
+    const relation = asset.relation_definition;
+    if (!relation) return false;
+    if (asset.relation_type === "dimension_binding") {
+      return Boolean(draftTables.length > 1 && relation.asset?.ref && relation.dimension?.ref && draftTables.includes(relation.asset.ref));
+    }
+    if (asset.relation_type === "direct_join") {
+      return Boolean(relation.left?.ref && relation.right?.ref && draftTables.includes(relation.left.ref) && draftTables.includes(relation.right.ref));
+    }
+    return false;
+  });
+  useEffect(() => {
+    const valid = new Set(availableRelations.map((asset) => asset.id));
+    setDraftRelations((current) => current.filter((relationId) => valid.has(relationId)));
+  }, [draftTables, semanticAssets]);
   const toggle = (values: string[], value: string, setter: (next: string[]) => void) => {
     setter(values.includes(value) ? values.filter((item) => item !== value) : [...values, value]);
+  };
+  const toggleDimension = (dimensionId: string) => {
+    if (!draftDimensions.includes(dimensionId)) {
+      setDraftDimensions([...draftDimensions, dimensionId]);
+      return;
+    }
+    setDraftDimensions(draftDimensions.filter((item) => item !== dimensionId));
+    const boundRelationIds = new Set(
+      relationAssets
+        .filter((asset) => asset.relation_type === "dimension_binding" && asset.relation_definition?.dimension?.ref === dimensionId)
+        .map((asset) => asset.id)
+    );
+    setDraftRelations((current) => current.filter((relationId) => !boundRelationIds.has(relationId)));
+  };
+  const toggleRelation = (relationId: string) => {
+    if (draftRelations.includes(relationId)) {
+      setDraftRelations(draftRelations.filter((item) => item !== relationId));
+      return;
+    }
+    const relation = relationAssets.find((asset) => asset.id === relationId);
+    const dimensionRef = relation?.relation_type === "dimension_binding" ? relation.relation_definition?.dimension?.ref : undefined;
+    if (dimensionRef && !draftDimensions.includes(dimensionRef)) {
+      setDraftDimensions([...draftDimensions, dimensionRef]);
+    }
+    setDraftRelations([...draftRelations, relationId]);
+  };
+  const setAllDraftDimensions = (nextDimensions: string[]) => {
+    const selected = new Set(nextDimensions);
+    setDraftDimensions(nextDimensions);
+    setDraftRelations((current) => current.filter((relationId) => {
+      const relation = relationAssets.find((asset) => asset.id === relationId);
+      const dimensionRef = relation?.relation_type === "dimension_binding" ? relation.relation_definition?.dimension?.ref : undefined;
+      return !dimensionRef || selected.has(dimensionRef);
+    }));
+  };
+  const setAllDraftRelations = (nextRelations: string[]) => {
+    setDraftRelations(nextRelations);
+    const requiredDimensions = relationAssets
+      .filter((asset) => nextRelations.includes(asset.id) && asset.relation_type === "dimension_binding")
+      .map((asset) => asset.relation_definition?.dimension?.ref)
+      .filter((value): value is string => Boolean(value));
+    if (requiredDimensions.length) {
+      setDraftDimensions((current) => Array.from(new Set([...current, ...requiredDimensions])));
+    }
   };
   const saveConfig = () => {
     if (!model) return;
@@ -3293,6 +3653,7 @@ function AnalyticsModelDetailModal({
         measures: draftMeasures,
         dimensions: draftDimensions,
         grains: draftGrains,
+        assetRelations: draftRelations,
         guardrails: draftGuardrails,
         defaultTemplate: draftDefaultTemplate,
       },
@@ -3424,29 +3785,41 @@ function AnalyticsModelDetailModal({
                     options={tableOptions}
                     values={draftTables}
                     onToggle={(value) => toggle(draftTables, value, setDraftTables)}
+                    onToggleAll={setDraftTables}
                   />
                 </section>
                 <section className="space-y-4">
                   <ModelOptionPicker
                     title="度量值"
                     emptyText="暂无度量值。"
-                    options={measures.map((asset) => ({ value: `measure:${asset.id}`, label: asset.name, hint: asset.id }))}
+                    options={measures.map((asset) => ({ value: asset.id, label: asset.name, hint: asset.id }))}
                     values={draftMeasures}
                     onToggle={(value) => toggle(draftMeasures, value, setDraftMeasures)}
+                    onToggleAll={setDraftMeasures}
                   />
                   <ModelOptionPicker
                     title="维度"
                     emptyText="暂无维度。"
-                    options={dimensions.map((asset) => ({ value: `dimension:${asset.id}`, label: asset.name, hint: asset.id }))}
+                    options={dimensions.map((asset) => ({ value: asset.id, label: asset.name, hint: asset.id }))}
                     values={draftDimensions}
-                    onToggle={(value) => toggle(draftDimensions, value, setDraftDimensions)}
+                    onToggle={toggleDimension}
+                    onToggleAll={setAllDraftDimensions}
                   />
                   <ModelOptionPicker
                     title="颗粒度"
                     emptyText="暂无颗粒度。"
-                    options={grains.map((asset) => ({ value: `grain:${asset.id}`, label: asset.name, hint: asset.id }))}
+                    options={grains.map((asset) => ({ value: asset.id, label: asset.name, hint: asset.id }))}
                     values={draftGrains}
                     onToggle={(value) => toggle(draftGrains, value, setDraftGrains)}
+                    onToggleAll={setDraftGrains}
+                  />
+                  <ModelOptionPicker
+                    title="资产关联"
+                    emptyText={draftTables.length > 1 ? "所选数据资产之间没有可用的已发布关联。" : "选择至少两个数据资产后显示可用关联。"}
+                    options={availableRelations.map((asset) => ({ value: asset.id, label: asset.name, hint: asset.relation_type === "dimension_binding" ? "关联维度" : "字段关联" }))}
+                    values={draftRelations}
+                    onToggle={toggleRelation}
+                    onToggleAll={setAllDraftRelations}
                   />
                   <ModelOptionPicker
                     title="SQL 守卫"
@@ -3454,6 +3827,7 @@ function AnalyticsModelDetailModal({
                     options={sqlGuardrails.map((rule) => ({ value: rule.id, label: rule.name, hint: rule.type }))}
                     values={draftGuardrails}
                     onToggle={(value) => toggle(draftGuardrails, value, setDraftGuardrails)}
+                    onToggleAll={setDraftGuardrails}
                   />
                 </section>
               </div>
@@ -3516,12 +3890,16 @@ function SemanticAssetCreateModal({
   busy,
   tableAssets,
   databaseSources,
+  semanticAssets,
+  initialType,
   onClose,
   onCreate,
 }: {
   busy: boolean;
   tableAssets: TableAsset[];
   databaseSources: KnowledgeDatabaseSource[];
+  semanticAssets: SemanticAssetSummary[];
+  initialType: SemanticAssetType;
   onClose: () => void;
   onCreate: (payload: {
     name: string;
@@ -3531,9 +3909,10 @@ function SemanticAssetCreateModal({
     tags: string[];
     version: string;
     dimension_definition?: DimensionDefinition;
+    relation_definition?: AssetRelationDefinition;
   }) => void;
 }) {
-  const [type, setType] = useState<SemanticAssetType>("measure");
+  const [type, setType] = useState<SemanticAssetType>(initialType);
   const [name, setName] = useState("");
   const [version, setVersion] = useState("0.1.0");
   const [description, setDescription] = useState("");
@@ -3548,8 +3927,18 @@ function SemanticAssetCreateModal({
   const [referencePath, setReferencePath] = useState("");
   const [weekStartDay, setWeekStartDay] = useState("monday");
   const [timezone, setTimezone] = useState("Asia/Shanghai");
-  const typeLabel = type === "measure" ? "度量值" : type === "grain" ? "颗粒度" : "维度";
+  const [relationType, setRelationType] = useState<"dimension_binding" | "direct_join">("dimension_binding");
+  const [relationAssetRef, setRelationAssetRef] = useState("");
+  const [relationAssetFields, setRelationAssetFields] = useState<string[]>([]);
+  const [relationDimensionRef, setRelationDimensionRef] = useState("");
+  const [relationLeftRef, setRelationLeftRef] = useState("");
+  const [relationLeftFields, setRelationLeftFields] = useState<string[]>([]);
+  const [relationRightRef, setRelationRightRef] = useState("");
+  const [relationRightFields, setRelationRightFields] = useState<string[]>([]);
+  const [relationCardinality, setRelationCardinality] = useState<AssetRelationDefinition["cardinality"]>("many_to_one");
+  const typeLabel = type === "measure" ? "度量值" : type === "grain" ? "颗粒度" : type === "relation" ? "资产关联" : "维度";
   const isDimension = type === "dimension";
+  const isRelation = type === "relation";
   const sourceOptions = [
     ...tableAssets.map((asset) => ({ value: `table_asset:${asset.asset_id}`, label: `${asset.file_name}${asset.sheet_name ? ` · ${asset.sheet_name}` : ""}` })),
     ...databaseSources.flatMap((source) =>
@@ -3559,12 +3948,38 @@ function SemanticAssetCreateModal({
     ),
   ];
   const { columnsByAsset, loadingByAsset, reloadColumns } = useDimensionBindingColumns(
-    dimensionMode === "entity_lookup" ? [] : bindings,
+    [
+      ...(dimensionMode === "entity_lookup" ? [] : bindings),
+      { asset_ref: relationAssetRef },
+      { asset_ref: relationLeftRef },
+      { asset_ref: relationRightRef },
+    ],
     tableAssets,
     databaseSources
   );
   const updateBinding = (index: number, changes: Partial<{ asset_ref: string; display_name: string; fields: string }>) => {
     setBindings((current) => current.map((item, itemIndex) => (itemIndex === index ? { ...item, ...changes } : item)));
+  };
+  const buildRelationDefinition = (): AssetRelationDefinition => {
+    if (relationType === "dimension_binding") {
+      return {
+        type: relationType,
+        asset: { ref: relationAssetRef, display_name: sourceOptions.find((item) => item.value === relationAssetRef)?.label, key_fields: relationAssetFields },
+        dimension: { ref: relationDimensionRef, display_name: semanticAssets.find((item) => item.id === relationDimensionRef)?.name, output_key: "entity_key" },
+        cardinality: "many_to_one",
+        grain: relationAssetFields,
+        use_statuses: ["auto_matched", "accepted"],
+      };
+    }
+    return {
+      type: relationType,
+      left: { ref: relationLeftRef, display_name: sourceOptions.find((item) => item.value === relationLeftRef)?.label, key_fields: relationLeftFields },
+      right: { ref: relationRightRef, display_name: sourceOptions.find((item) => item.value === relationRightRef)?.label, key_fields: relationRightFields },
+      field_mapping: { left: relationLeftFields, right: relationRightFields },
+      cardinality: relationCardinality,
+      join_type: "left",
+      grain: { left: relationLeftFields, right: relationRightFields },
+    };
   };
   const buildDimensionDefinition = (): DimensionDefinition => {
     const activeBindings = dimensionMode === "entity_lookup" ? bindings : bindings.slice(0, 1);
@@ -3601,7 +4016,7 @@ type: ${type}
 description: ${description || "在这里描述业务口径"}
 aliases: []
 tags: []
-${isDimension ? `resolution_mode: ${dimensionMode}\nresolution:\n  mode: ${dimensionMode}\n` : ""}version: ${version || "0.1.0"}
+${isDimension ? `resolution_mode: ${dimensionMode}\nresolution:\n  mode: ${dimensionMode}\n` : ""}${isRelation ? `relation_type: ${relationType}\nrelation: {}\n` : ""}version: ${version || "0.1.0"}
 created: YYYY-MM-DD HH:mm:ss
 updated_at: YYYY-MM-DD HH:mm:ss
 ---`;
@@ -3612,7 +4027,7 @@ updated_at: YYYY-MM-DD HH:mm:ss
         <div className="flex items-start justify-between gap-4 border-b border-black/[0.06] px-6 py-5">
           <div>
             <h3 className="text-lg font-semibold text-gray-950">新建语义资产</h3>
-            <p className="mt-1 text-sm text-gray-500">生成 measure.md、grain.md 或 dimension.md，后端会立即刷新 registry。</p>
+            <p className="mt-1 text-sm text-gray-500">生成 measure.md、grain.md、dimension.md 或 relation.md，后端会立即刷新 registry。</p>
           </div>
           <button type="button" onClick={onClose} className="rounded-full p-2 text-gray-400 transition hover:bg-black/[0.04] hover:text-gray-900">
             <X className="h-5 w-5" />
@@ -3630,6 +4045,7 @@ updated_at: YYYY-MM-DD HH:mm:ss
                 <option value="measure">度量值 measure</option>
                 <option value="grain">颗粒度 grain</option>
                 <option value="dimension">维度 dimension</option>
+                <option value="relation">资产关联 relation</option>
               </select>
             </label>
             {isDimension ? (
@@ -3655,6 +4071,15 @@ updated_at: YYYY-MM-DD HH:mm:ss
                 onWeekStartDayChange={setWeekStartDay}
                 onTimezoneChange={setTimezone}
               />
+            ) : null}
+            {isRelation ? (
+              <div className="space-y-3 rounded-2xl border border-[#002fa7]/15 bg-[#002fa7]/[0.025] p-4">
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <button type="button" onClick={() => setRelationType("dimension_binding")} className={`rounded-xl border p-3 text-left ${relationType === "dimension_binding" ? "border-[#002fa7] bg-white text-[#002fa7]" : "border-black/[0.08] bg-white text-slate-600"}`}><p className="font-semibold">关联维度</p><p className="mt-1 text-xs leading-5">一张资产接入已发布维度</p></button>
+                  <button type="button" onClick={() => setRelationType("direct_join")} className={`rounded-xl border p-3 text-left ${relationType === "direct_join" ? "border-[#002fa7] bg-white text-[#002fa7]" : "border-black/[0.08] bg-white text-slate-600"}`}><p className="font-semibold">字段关联</p><p className="mt-1 text-xs leading-5">两张资产使用稳定业务键</p></button>
+                </div>
+                {relationType === "dimension_binding" ? <div className="grid gap-3 sm:grid-cols-2"><label className="text-xs font-semibold text-slate-600">数据资产<select value={relationAssetRef} onChange={(event) => { setRelationAssetRef(event.target.value); setRelationAssetFields([]); }} className="mt-1.5 h-10 w-full rounded-xl border border-black/[0.1] bg-white px-3 text-sm font-normal"><option value="">选择资产</option>{sourceOptions.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></label><FieldMultiSelect label="来源键字段" values={relationAssetFields} disabled={!relationAssetRef || loadingByAsset[relationAssetRef]} options={(columnsByAsset[relationAssetRef] || []).map((field) => ({ value: field, label: field }))} onChange={setRelationAssetFields} /><label className="sm:col-span-2 text-xs font-semibold text-slate-600">已发布维度<select value={relationDimensionRef} onChange={(event) => setRelationDimensionRef(event.target.value)} className="mt-1.5 h-10 w-full rounded-xl border border-black/[0.1] bg-white px-3 text-sm font-normal"><option value="">选择维度</option>{semanticAssets.filter((item) => item.type === "dimension").map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label></div> : <div className="space-y-3"><div className="grid gap-3 sm:grid-cols-2"><label className="text-xs font-semibold text-slate-600">左侧资产<select value={relationLeftRef} onChange={(event) => { setRelationLeftRef(event.target.value); setRelationLeftFields([]); }} className="mt-1.5 h-10 w-full rounded-xl border border-black/[0.1] bg-white px-3 text-sm font-normal"><option value="">选择资产</option>{sourceOptions.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></label><FieldMultiSelect label="左侧键字段" values={relationLeftFields} disabled={!relationLeftRef || loadingByAsset[relationLeftRef]} options={(columnsByAsset[relationLeftRef] || []).map((field) => ({ value: field, label: field }))} onChange={setRelationLeftFields} /><label className="text-xs font-semibold text-slate-600">右侧资产<select value={relationRightRef} onChange={(event) => { setRelationRightRef(event.target.value); setRelationRightFields([]); }} className="mt-1.5 h-10 w-full rounded-xl border border-black/[0.1] bg-white px-3 text-sm font-normal"><option value="">选择资产</option>{sourceOptions.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></label><FieldMultiSelect label="右侧键字段" values={relationRightFields} disabled={!relationRightRef || loadingByAsset[relationRightRef]} options={(columnsByAsset[relationRightRef] || []).map((field) => ({ value: field, label: field }))} onChange={setRelationRightFields} /></div><label className="block text-xs font-semibold text-slate-600">基数<select value={relationCardinality} onChange={(event) => setRelationCardinality(event.target.value as AssetRelationDefinition["cardinality"])} className="mt-1.5 h-10 w-full rounded-xl border border-black/[0.1] bg-white px-3 text-sm font-normal"><option value="one_to_one">一对一</option><option value="one_to_many">一对多</option><option value="many_to_one">多对一</option><option value="many_to_many">多对多</option></select></label></div>}
+              </div>
             ) : null}
             <label className="block text-sm font-semibold text-gray-700">
               名称
@@ -3723,6 +4148,7 @@ updated_at: YYYY-MM-DD HH:mm:ss
                 tags: splitTokenList(tags),
                 version: version.trim() || "0.1.0",
                 dimension_definition: isDimension ? buildDimensionDefinition() : undefined,
+                relation_definition: isRelation ? buildRelationDefinition() : undefined,
               })
             }
             className="inline-flex h-10 items-center gap-2 rounded-2xl bg-[#002fa7] px-4 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-45"
@@ -4365,6 +4791,102 @@ function SemanticAssetImportModal({
   );
 }
 
+function RelationDefinitionEditorModal({
+  asset,
+  tableAssets,
+  databaseSources,
+  semanticAssets,
+  busy,
+  onClose,
+  onSave,
+}: {
+  asset: SemanticAssetDetail;
+  tableAssets: TableAsset[];
+  databaseSources: KnowledgeDatabaseSource[];
+  semanticAssets: SemanticAssetSummary[];
+  busy: boolean;
+  onClose: () => void;
+  onSave: (payload: { name: string; description: string; aliases: string[]; tags: string[]; version: string; relation_definition: AssetRelationDefinition }) => void;
+}) {
+  const existing = (asset.frontmatter?.relation as Record<string, unknown> | undefined) || {};
+  const initialType = (asset.relation_type || "dimension_binding") as AssetRelationDefinition["type"];
+  const endpoint = (value: unknown) => (value && typeof value === "object" ? value as { ref?: string; key_fields?: string[] } : {});
+  const initialAsset = endpoint(existing.asset);
+  const initialDimension = endpoint(existing.dimension);
+  const initialLeft = endpoint(existing.left);
+  const initialRight = endpoint(existing.right);
+  const mapping = existing.field_mapping && typeof existing.field_mapping === "object" ? existing.field_mapping as { left?: string[]; right?: string[] } : {};
+  const [type, setType] = useState<AssetRelationDefinition["type"]>(initialType);
+  const [name, setName] = useState(asset.name);
+  const [description, setDescription] = useState(asset.description || "");
+  const [aliases, setAliases] = useState((asset.aliases || []).join(", "));
+  const [tags, setTags] = useState((asset.tags || []).join(", "));
+  const [version, setVersion] = useState(String(asset.frontmatter?.version || "0.1.0"));
+  const [assetRef, setAssetRef] = useState(String(initialAsset.ref || ""));
+  const [assetFields, setAssetFields] = useState<string[]>(initialAsset.key_fields || []);
+  const [dimensionRef, setDimensionRef] = useState(String(initialDimension.ref || ""));
+  const [leftRef, setLeftRef] = useState(String(initialLeft.ref || ""));
+  const [leftFields, setLeftFields] = useState<string[]>(mapping.left || initialLeft.key_fields || []);
+  const [rightRef, setRightRef] = useState(String(initialRight.ref || ""));
+  const [rightFields, setRightFields] = useState<string[]>(mapping.right || initialRight.key_fields || []);
+  const [cardinality, setCardinality] = useState<AssetRelationDefinition["cardinality"]>((String(existing.cardinality || "many_to_one")) as AssetRelationDefinition["cardinality"]);
+  const sourceOptions = [
+    ...tableAssets.map((item) => ({ value: `table_asset:${item.asset_id}`, label: `${item.file_name}${item.sheet_name ? ` · ${item.sheet_name}` : ""}` })),
+    ...databaseSources.flatMap((source) => source.selected_tables.length
+      ? source.selected_tables.map((table) => ({ value: `${source.id}.${table}`, label: `${source.name} · ${table}` }))
+      : [{ value: `database_source:${source.id}`, label: `${source.name} · 未选择表` }]),
+  ];
+  const { columnsByAsset, loadingByAsset } = useDimensionBindingColumns(
+    [{ asset_ref: assetRef }, { asset_ref: leftRef }, { asset_ref: rightRef }],
+    tableAssets,
+    databaseSources
+  );
+  const fields = (ref: string) => columnsByAsset[ref] || [];
+  const relationDefinition = (): AssetRelationDefinition => type === "dimension_binding"
+    ? {
+        type,
+        asset: { ref: assetRef, display_name: sourceOptions.find((item) => item.value === assetRef)?.label, key_fields: assetFields },
+        dimension: { ref: dimensionRef, display_name: semanticAssets.find((item) => item.id === dimensionRef)?.name, output_key: "entity_key" },
+        cardinality: "many_to_one",
+        grain: assetFields,
+        use_statuses: ["auto_matched", "accepted"],
+      }
+    : {
+        type,
+        left: { ref: leftRef, display_name: sourceOptions.find((item) => item.value === leftRef)?.label, key_fields: leftFields },
+        right: { ref: rightRef, display_name: sourceOptions.find((item) => item.value === rightRef)?.label, key_fields: rightFields },
+        field_mapping: { left: leftFields, right: rightFields },
+        cardinality,
+        join_type: "left",
+        grain: { left: leftFields, right: rightFields },
+      };
+
+  return <div className="fixed inset-0 z-[145] flex items-center justify-center bg-black/40 px-4 py-6 backdrop-blur-sm">
+    <div className="flex max-h-[90vh] w-full max-w-4xl flex-col overflow-hidden rounded-[28px] bg-white shadow-2xl ring-1 ring-black/[0.08]">
+      <div className="flex items-start justify-between gap-4 border-b border-black/[0.06] px-6 py-5"><div><h3 className="text-lg font-semibold text-gray-950">编辑资产关联</h3><p className="mt-1 text-sm text-gray-500">关系是可复用语义资产；保存后模型只能在已选择它时使用这条路径。</p></div><button type="button" onClick={onClose} className="rounded-full p-2 text-gray-400 hover:bg-black/[0.04]"><X className="h-5 w-5" /></button></div>
+      <div className="min-h-0 flex-1 space-y-5 overflow-y-auto px-6 py-5">
+        <section className="rounded-3xl border border-black/[0.06] p-4"><h4 className="text-sm font-semibold text-gray-950">基础信息</h4><div className="mt-3 grid gap-3 sm:grid-cols-2"><LabeledInput label="名称" value={name} onChange={setName} placeholder="上险量关联车系" /><LabeledInput label="版本" value={version} onChange={setVersion} placeholder="0.1.0" /><LabeledTextarea label="描述" value={description} onChange={setDescription} placeholder="说明业务键、适用边界与重复计数风险。" /><div className="grid gap-3 sm:grid-cols-2"><LabeledInput label="别名" value={aliases} onChange={setAliases} placeholder="逗号分隔" /><LabeledInput label="标签" value={tags} onChange={setTags} placeholder="逗号分隔" /></div></div></section>
+        <section className="rounded-3xl border border-black/[0.06] p-4"><h4 className="text-sm font-semibold text-gray-950">关联方式</h4><div className="mt-3 grid gap-3 sm:grid-cols-2">{(["dimension_binding", "direct_join"] as const).map((value) => <button type="button" key={value} onClick={() => setType(value)} className={`rounded-2xl border p-4 text-left ${type === value ? "border-[#002fa7] bg-[#002fa7]/[0.03]" : "border-black/[0.08] hover:bg-slate-50"}`}><p className="font-semibold text-slate-900">{value === "dimension_binding" ? "关联维度" : "字段关联"}</p><p className="mt-1 text-xs text-slate-500">{value === "dimension_binding" ? "资产字段映射到已发布维度" : "两张资产通过稳定业务键联合"}</p></button>)}</div>
+          {type === "dimension_binding" ? <div className="mt-4 grid gap-3 sm:grid-cols-3"><FieldSelect label="数据资产" value={assetRef} options={sourceOptions} onChange={(value) => { setAssetRef(value); setAssetFields([]); }} /><FieldMultiSelect label="来源键字段" values={assetFields} disabled={!assetRef || loadingByAsset[assetRef]} options={fields(assetRef).map((value) => ({ value, label: value }))} onChange={setAssetFields} /><FieldSelect label="已发布维度" value={dimensionRef} options={semanticAssets.filter((item) => item.type === "dimension").map((item) => ({ value: item.id, label: item.name }))} onChange={setDimensionRef} /></div> : <div className="mt-4 space-y-3"><div className="grid gap-3 sm:grid-cols-2"><FieldSelect label="左侧资产" value={leftRef} options={sourceOptions} onChange={(value) => { setLeftRef(value); setLeftFields([]); }} /><FieldMultiSelect label="左侧键字段" values={leftFields} disabled={!leftRef || loadingByAsset[leftRef]} options={fields(leftRef).map((value) => ({ value, label: value }))} onChange={setLeftFields} /><FieldSelect label="右侧资产" value={rightRef} options={sourceOptions} onChange={(value) => { setRightRef(value); setRightFields([]); }} /><FieldMultiSelect label="右侧键字段" values={rightFields} disabled={!rightRef || loadingByAsset[rightRef]} options={fields(rightRef).map((value) => ({ value, label: value }))} onChange={setRightFields} /></div><FieldSelect label="基数" value={cardinality} options={[{ value: "one_to_one", label: "一对一" }, { value: "one_to_many", label: "一对多" }, { value: "many_to_one", label: "多对一" }, { value: "many_to_many", label: "多对多" }]} onChange={(value) => setCardinality(value as AssetRelationDefinition["cardinality"])} /></div>}</section>
+      </div>
+      <div className="flex justify-end gap-2 border-t border-black/[0.06] px-6 py-4"><button type="button" onClick={onClose} className="h-10 rounded-2xl border border-black/[0.08] px-4 text-sm font-semibold text-slate-600">取消</button><button type="button" disabled={busy || !name.trim()} onClick={() => onSave({ name, description, aliases: splitTokenList(aliases), tags: splitTokenList(tags), version: version.trim() || "0.1.0", relation_definition: relationDefinition() })} className="inline-flex h-10 items-center gap-2 rounded-2xl bg-[#002fa7] px-4 text-sm font-semibold text-white disabled:opacity-45">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}保存关联</button></div>
+    </div>
+  </div>;
+}
+
+function FieldSelect({ label, value, options, onChange, disabled = false }: { label: string; value: string; options: Array<{ value: string; label: string }>; onChange: (value: string) => void; disabled?: boolean }) {
+  return <label className="block text-xs font-semibold text-slate-600">{label}<select value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)} className="mt-1.5 h-10 w-full rounded-xl border border-black/[0.1] bg-white px-3 text-sm font-normal text-slate-800 outline-none focus:border-[#002fa7] disabled:bg-slate-50"><option value="">选择{label}</option>{options.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></label>;
+}
+
+function FieldMultiSelect({ label, values, options, onChange, disabled = false }: { label: string; values: string[]; options: Array<{ value: string; label: string }>; onChange: (values: string[]) => void; disabled?: boolean }) {
+  const selected = new Set(values);
+  const toggle = (value: string) => {
+    if (disabled) return;
+    onChange(selected.has(value) ? values.filter((item) => item !== value) : [...values, value]);
+  };
+  return <fieldset className="min-w-0 text-xs font-semibold text-slate-600"><legend>{label}</legend><div className="mt-1.5 flex min-h-10 max-h-28 flex-wrap content-start gap-1.5 overflow-y-auto rounded-xl border border-black/[0.1] bg-white p-2 disabled:bg-slate-50">{options.length ? options.map((item) => <label key={item.value} className={`inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-lg px-2 text-xs font-medium ${selected.has(item.value) ? "bg-[#002fa7]/10 text-[#002fa7]" : "bg-slate-50 text-slate-600"}`}><input type="checkbox" checked={selected.has(item.value)} disabled={disabled} onChange={() => toggle(item.value)} className="accent-[#002fa7]" />{item.label}</label>) : <span className="px-1 py-1 text-slate-400">{disabled ? "先选择资产" : "暂无字段"}</span>}</div><p className="mt-1 text-[11px] font-normal text-slate-400">可选择多个字段组成复合业务键。</p></fieldset>;
+}
+
 function SemanticAssetDetailModal({
   asset,
   loading,
@@ -4378,6 +4900,7 @@ function SemanticAssetDetailModal({
   onChangeContent,
   onSave,
   onEditDimensionDefinition,
+  onEditRelationDefinition,
 }: {
   asset: SemanticAssetDetail | null;
   loading: boolean;
@@ -4391,10 +4914,11 @@ function SemanticAssetDetailModal({
   onChangeContent: (value: string) => void;
   onSave: () => void;
   onEditDimensionDefinition: (asset: SemanticAssetDetail) => void;
+  onEditRelationDefinition: (asset: SemanticAssetDetail) => void;
 }) {
   const files = asset?.files || [];
   const dirty = editorContent !== editorOriginal;
-  const typeLabel = asset?.type === "dimension" ? "维度" : asset?.type === "grain" ? "颗粒度" : "度量值";
+  const typeLabel = asset?.type === "dimension" ? "维度" : asset?.type === "grain" ? "颗粒度" : asset?.type === "relation" ? "资产关联" : "度量值";
 
   return (
     <div className="fixed inset-0 z-[130] flex items-center justify-center bg-black/35 px-4 py-6 backdrop-blur-sm">
@@ -4420,6 +4944,15 @@ function SemanticAssetDetailModal({
                 className="h-9 rounded-2xl border border-[#002fa7]/15 bg-[#002fa7]/[0.04] px-3 text-xs font-semibold text-[#002fa7] transition hover:bg-[#002fa7]/[0.08]"
               >
                 编辑维度设置
+              </button>
+            ) : null}
+            {asset?.type === "relation" ? (
+              <button
+                type="button"
+                onClick={() => onEditRelationDefinition(asset)}
+                className="h-9 rounded-2xl border border-[#002fa7]/15 bg-[#002fa7]/[0.04] px-3 text-xs font-semibold text-[#002fa7] transition hover:bg-[#002fa7]/[0.08]"
+              >
+                编辑关联设置
               </button>
             ) : null}
             <button type="button" onClick={onClose} className="rounded-full p-2 text-gray-400 transition hover:bg-black/[0.04] hover:text-gray-900">
@@ -6485,21 +7018,164 @@ function RemoveDatabaseSourceDialog({
   );
 }
 
+function ConcatDatasetModal({
+  assets,
+  busy,
+  onClose,
+  onCreate,
+}: {
+  assets: TableAsset[];
+  busy: boolean;
+  onClose: () => void;
+  onCreate: (payload: { name: string; description: string; tags: string[]; sourceAssetIds: string[]; schemaMode: "strict" | "baseline_fill_missing" | "union_fill_missing"; preferredIntents: string[]; directSourceAllowed: boolean }) => void;
+}) {
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [tagsText, setTagsText] = useState("");
+  const [selected, setSelected] = useState<string[]>([]);
+  const [preview, setPreview] = useState<ConcatDatasetPreview | null>(null);
+  const [schemaMode, setSchemaMode] = useState<"baseline_fill_missing" | "union_fill_missing">("union_fill_missing");
+  const [previewing, setPreviewing] = useState(false);
+  const [error, setError] = useState("");
+  const toggle = (assetId: string) => setSelected((current) => current.includes(assetId) ? current.filter((item) => item !== assetId) : [...current, assetId]);
+  const inspect = async () => {
+    setPreviewing(true);
+    setError("");
+    try {
+      setPreview(await previewConcatDataset(selected));
+    } catch (nextError) {
+      setPreview(null);
+      setError(errorMessage(nextError));
+    } finally {
+      setPreviewing(false);
+    }
+  };
+  const resetPreview = () => {
+    setPreview(null);
+    setError("");
+  };
+  return <div className="fixed inset-0 z-[150] flex items-center justify-center bg-black/40 px-4 py-6 backdrop-blur-sm">
+    <div className="flex max-h-[88vh] w-full max-w-3xl flex-col overflow-hidden rounded-[28px] bg-white shadow-2xl ring-1 ring-black/[0.08]">
+      <div className="flex items-start justify-between gap-4 border-b border-black/[0.06] px-6 py-5"><div><h3 className="text-lg font-semibold text-gray-950">合并表格为逻辑数据集</h3><p className="mt-1 text-sm text-gray-500">适用于月度、周度等同口径表。先检查字段差异；确认后缺失字段补空，额外字段保留。</p></div><button type="button" onClick={onClose} disabled={busy || previewing} className="rounded-full p-2 text-gray-400 hover:bg-black/[0.04]"><X className="h-5 w-5" /></button></div>
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-6 py-5">
+        <div className="grid gap-3 sm:grid-cols-2"><label className="block text-sm font-semibold text-slate-700">逻辑数据集名称<input value={name} onChange={(event) => { setName(event.target.value); resetPreview(); }} placeholder="例如：2023年乘用车上险量" className="mt-2 h-11 w-full rounded-2xl border border-black/[0.1] px-3 text-sm font-normal outline-none focus:border-[#002fa7]" /></label><label className="block text-sm font-semibold text-slate-700">标签<input value={tagsText} onChange={(event) => setTagsText(event.target.value)} placeholder="销量, 上险量, 月度" className="mt-2 h-11 w-full rounded-2xl border border-black/[0.1] px-3 text-sm font-normal outline-none focus:border-[#002fa7]" /></label></div>
+        <label className="block text-sm font-semibold text-slate-700">业务定义与使用说明<textarea value={description} onChange={(event) => setDescription(event.target.value)} placeholder="说明数据集包含什么；什么问题应优先使用它；何时可直接查询原始来源；哪些场景不适用。" className="mt-2 min-h-24 w-full resize-y rounded-2xl border border-black/[0.1] px-3 py-2 text-sm font-normal outline-none focus:border-[#002fa7]" /></label>
+        <div className="rounded-2xl border border-[#002fa7]/15 bg-[#002fa7]/[0.03] px-4 py-3 text-xs leading-5 text-[#00246f]">创建时仅保存来源、字段策略和行级溯源规则，不会读取全量数据或生成 Parquet。后续分析命中它时才按需联合这些来源；以后只需绑定一次车系等维度。</div>
+        <section className="overflow-hidden rounded-2xl border border-black/[0.08]"><div className="flex items-center justify-between bg-slate-50 px-4 py-3"><p className="text-sm font-semibold text-slate-800">选择来源表</p><span className="text-xs text-slate-500">已选 {selected.length} 张</span></div><div className="max-h-72 divide-y divide-black/[0.05] overflow-auto">{assets.map((asset) => <label key={asset.asset_id} className="flex cursor-pointer items-center gap-3 px-4 py-3 hover:bg-slate-50"><input type="checkbox" checked={selected.includes(asset.asset_id)} onChange={() => { toggle(asset.asset_id); resetPreview(); }} className="h-4 w-4 accent-[#002fa7]" /><div className="min-w-0 flex-1"><p className="truncate text-sm font-semibold text-slate-800">{asset.file_name}</p><p className="mt-1 text-xs text-slate-400">{sourceTypeLabel(asset)} · {asset.columns_count ?? "-"} 列 · {typeof asset.rows === "number" ? `${asset.rows} 行` : "行数待 Profile"}</p></div></label>)}{assets.length === 0 ? <p className="px-4 py-10 text-center text-sm text-slate-400">没有可用于合并的原始表格资产。</p> : null}</div></section>
+        {error ? <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div> : null}
+        {preview ? <ConcatDatasetSchemaPreview preview={preview} schemaMode={schemaMode} onSchemaModeChange={setSchemaMode} /> : null}
+      </div>
+      <div className="flex justify-end gap-2 border-t border-black/[0.06] px-6 py-4"><button type="button" onClick={onClose} disabled={busy || previewing} className="h-10 rounded-2xl border border-black/[0.08] px-4 text-sm font-semibold text-slate-600">取消</button>{!preview ? <button type="button" disabled={previewing || !name.trim() || selected.length < 2} onClick={() => void inspect()} className="inline-flex h-10 items-center gap-2 rounded-2xl bg-[#002fa7] px-4 text-sm font-semibold text-white disabled:opacity-45">{previewing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}检查字段</button> : <button type="button" disabled={busy} onClick={() => onCreate({ name, description, tags: tagsText.split(/[,，]/).map((item) => item.trim()).filter(Boolean), sourceAssetIds: selected, schemaMode: preview.has_schema_drift ? schemaMode : "strict", preferredIntents: [], directSourceAllowed: true })} className="inline-flex h-10 items-center gap-2 rounded-2xl bg-[#002fa7] px-4 text-sm font-semibold text-white disabled:opacity-45">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Layers3 className="h-4 w-4" />}确认创建</button>}</div>
+    </div>
+  </div>;
+}
+
+function ConcatDatasetSchemaPreview({ preview, schemaMode, onSchemaModeChange }: { preview: ConcatDatasetPreview; schemaMode: "baseline_fill_missing" | "union_fill_missing"; onSchemaModeChange: (value: "baseline_fill_missing" | "union_fill_missing") => void }) {
+  const changed = preview.sources.filter((source) => source.missing_from_baseline.length || source.extra_vs_baseline.length);
+  if (!preview.has_schema_drift) return <div className="rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">字段一致，共 {preview.canonical_columns.length} 个字段；可以直接合并。</div>;
+  return <section className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-4"><p className="text-sm font-semibold text-amber-900">发现字段差异</p><p className="mt-1 text-xs leading-5 text-amber-800">请选择多出字段的处理方式。无论哪种方式，缺少的保留字段都会在对应来源行置空；原始文件不会被修改。</p><div className="mt-3 grid gap-2 sm:grid-cols-2"><button type="button" onClick={() => onSchemaModeChange("union_fill_missing")} className={`rounded-xl border p-3 text-left ${schemaMode === "union_fill_missing" ? "border-[#002fa7] bg-white text-[#00246f]" : "border-amber-200 bg-white/60 text-slate-600"}`}><span className="block text-sm font-semibold">保留多余字段并补空</span><span className="mt-1 block text-xs leading-5">字段并集进入逻辑数据集；其他表该字段为空。</span></button><button type="button" onClick={() => onSchemaModeChange("baseline_fill_missing")} className={`rounded-xl border p-3 text-left ${schemaMode === "baseline_fill_missing" ? "border-[#002fa7] bg-white text-[#00246f]" : "border-amber-200 bg-white/60 text-slate-600"}`}><span className="block text-sm font-semibold">丢弃多余字段</span><span className="mt-1 block text-xs leading-5">只保留基准表字段；缺少的基准字段补空。</span></button></div><div className="mt-3 space-y-2">{changed.map((source) => <div key={source.asset_id} className="rounded-xl bg-white/80 px-3 py-2 text-xs text-slate-700"><span className="font-semibold">{source.file_name}</span>{source.missing_from_baseline.length ? <p className="mt-1">缺少：{source.missing_from_baseline.join("、")}</p> : null}{source.extra_vs_baseline.length ? <p className="mt-1">多出：{source.extra_vs_baseline.join("、")}</p> : null}</div>)}</div></section>;
+}
+
+function AppendConcatDatasetSourcesModal({
+  dataset,
+  assets,
+  busy,
+  onClose,
+  onAppend,
+}: {
+  dataset: TableAsset;
+  assets: TableAsset[];
+  busy: boolean;
+  onClose: () => void;
+  onAppend: (payload: { asset: TableAsset; sourceAssetIds: string[]; schemaMode: "strict" | "baseline_fill_missing" | "union_fill_missing" }) => void;
+}) {
+  const existingIds = dataset.logical_dataset?.source_asset_ids ?? [];
+  const [selected, setSelected] = useState<string[]>([]);
+  const [preview, setPreview] = useState<ConcatDatasetPreview | null>(null);
+  const [previewing, setPreviewing] = useState(false);
+  const [schemaMode, setSchemaMode] = useState<"baseline_fill_missing" | "union_fill_missing">("union_fill_missing");
+  const [error, setError] = useState("");
+  const toggle = (assetId: string) => {
+    setSelected((current) => current.includes(assetId) ? current.filter((item) => item !== assetId) : [...current, assetId]);
+    setPreview(null);
+    setError("");
+  };
+  const inspect = async () => {
+    setPreviewing(true);
+    setError("");
+    try {
+      setPreview(await previewConcatDataset([...existingIds, ...selected]));
+    } catch (nextError) {
+      setPreview(null);
+      setError(errorMessage(nextError));
+    } finally {
+      setPreviewing(false);
+    }
+  };
+  const selectableAssets = assets.filter((asset) => !existingIds.includes(asset.asset_id));
+  return <div className="fixed inset-0 z-[150] flex items-center justify-center bg-black/40 px-4 py-6 backdrop-blur-sm">
+    <div className="flex max-h-[88vh] w-full max-w-3xl flex-col overflow-hidden rounded-[28px] bg-white shadow-2xl ring-1 ring-black/[0.08]">
+      <div className="flex items-start justify-between gap-4 border-b border-black/[0.06] px-6 py-5"><div><h3 className="text-lg font-semibold text-gray-950">追加来源表</h3><p className="mt-1 text-sm text-gray-500">追加到“{dataset.file_name}”，会保留现有来源与行级溯源。</p></div><button type="button" onClick={onClose} disabled={busy || previewing} className="rounded-full p-2 text-gray-400 hover:bg-black/[0.04]"><X className="h-5 w-5" /></button></div>
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-6 py-5">
+        <div className="rounded-2xl border border-[#002fa7]/15 bg-[#002fa7]/[0.03] px-4 py-3 text-xs leading-5 text-[#00246f]">当前已登记 {existingIds.length} 张来源表。先检查“现有 + 新增”全部字段，再确认追加；不会修改任何原始文件。</div>
+        <section className="overflow-hidden rounded-2xl border border-black/[0.08]"><div className="flex items-center justify-between bg-slate-50 px-4 py-3"><p className="text-sm font-semibold text-slate-800">选择新来源表</p><span className="text-xs text-slate-500">已选 {selected.length} 张</span></div><div className="max-h-72 divide-y divide-black/[0.05] overflow-auto">{selectableAssets.map((asset) => <label key={asset.asset_id} className="flex cursor-pointer items-center gap-3 px-4 py-3 hover:bg-slate-50"><input type="checkbox" checked={selected.includes(asset.asset_id)} onChange={() => toggle(asset.asset_id)} className="h-4 w-4 accent-[#002fa7]" /><div className="min-w-0 flex-1"><p className="truncate text-sm font-semibold text-slate-800">{asset.file_name}</p><p className="mt-1 text-xs text-slate-400">{sourceTypeLabel(asset)} · {asset.columns_count ?? "-"} 列</p></div></label>)}{selectableAssets.length === 0 ? <p className="px-4 py-10 text-center text-sm text-slate-400">没有可追加的原始表格资产。</p> : null}</div></section>
+        {error ? <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div> : null}
+        {preview ? <ConcatDatasetSchemaPreview preview={preview} schemaMode={schemaMode} onSchemaModeChange={setSchemaMode} /> : null}
+      </div>
+      <div className="flex justify-end gap-2 border-t border-black/[0.06] px-6 py-4"><button type="button" onClick={onClose} disabled={busy || previewing} className="h-10 rounded-2xl border border-black/[0.08] px-4 text-sm font-semibold text-slate-600">取消</button>{!preview ? <button type="button" disabled={previewing || selected.length === 0} onClick={() => void inspect()} className="inline-flex h-10 items-center gap-2 rounded-2xl bg-[#002fa7] px-4 text-sm font-semibold text-white disabled:opacity-45">{previewing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}检查字段</button> : <button type="button" disabled={busy} onClick={() => onAppend({ asset: dataset, sourceAssetIds: selected, schemaMode: preview.has_schema_drift ? schemaMode : "strict" })} className="inline-flex h-10 items-center gap-2 rounded-2xl bg-[#002fa7] px-4 text-sm font-semibold text-white disabled:opacity-45">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Layers3 className="h-4 w-4" />}确认追加来源</button>}</div>
+    </div>
+  </div>;
+}
+
 function TableAssetCard({
   asset,
   profileLoadingId,
   profilingAssetId,
   onOpenProfile,
+  onOpenDefinition,
   onGenerateProfile,
+  onRefreshConcat,
+  onAppendConcat,
+  refreshingConcat,
   onRemove,
 }: {
   asset: TableAsset;
   profileLoadingId: string | null;
   profilingAssetId: string | null;
   onOpenProfile: (asset: TableAsset) => void;
+  onOpenDefinition: (asset: TableAsset) => void;
   onGenerateProfile: (asset: TableAsset) => void;
+  onRefreshConcat: (asset: TableAsset) => void;
+  onAppendConcat: (asset: TableAsset) => void;
+  refreshingConcat: boolean;
   onRemove: (asset: TableAsset) => void;
 }) {
+  const isVirtualLogicalDataset = asset.source_type === "logical_concat";
+  const [moreActionsOpen, setMoreActionsOpen] = useState(false);
+  const moreActionsRef = useRef<HTMLDetailsElement>(null);
+  const primaryActionClass = "inline-flex h-9 items-center gap-1.5 rounded-xl bg-[#002fa7] px-3 text-xs font-semibold text-white transition hover:bg-[#00246f] disabled:cursor-wait disabled:opacity-60";
+  const secondaryActionClass = "inline-flex h-9 items-center gap-1.5 rounded-xl border border-[#002fa7]/20 bg-white px-3 text-xs font-semibold text-[#002fa7] transition hover:bg-[#002fa7]/[0.04] disabled:cursor-wait disabled:opacity-60";
+
+  useEffect(() => {
+    if (!moreActionsOpen) return;
+
+    const closeOnOutsideInteraction = (event: PointerEvent) => {
+      if (!moreActionsRef.current?.contains(event.target as Node)) {
+        setMoreActionsOpen(false);
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setMoreActionsOpen(false);
+    };
+
+    document.addEventListener("pointerdown", closeOnOutsideInteraction);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsideInteraction);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [moreActionsOpen]);
+
   return (
     <article className="rounded-3xl border border-black/[0.06] bg-white px-4 py-4 shadow-sm transition hover:border-[#002fa7]/20 hover:bg-[#002fa7]/[0.015]">
       <div className="flex items-start justify-between gap-4">
@@ -6516,28 +7192,50 @@ function TableAssetCard({
               className={`rounded-full px-2.5 py-1 text-xs font-medium ${
                 asset.profile_status === "ready"
                   ? "bg-emerald-50 text-emerald-700"
-                  : "bg-orange-50 text-orange-700"
+                  : asset.profile_status === "partial"
+                    ? "bg-amber-50 text-amber-700"
+                    : "bg-orange-50 text-orange-700"
               }`}
             >
-              {asset.profile_status === "ready" ? "Profile 可用" : "待生成 Profile"}
+              {asset.profile_status === "ready"
+                ? "Profile 可用"
+                : asset.profile_status === "partial"
+                  ? "Profile 待补充"
+                  : "Profile 待生成"}
             </span>
           </div>
-          <p className="mt-2 break-all text-xs text-gray-400">{asset.virtual_path}</p>
+          <p className="mt-2 break-all text-xs text-gray-400">
+            {isVirtualLogicalDataset
+              ? `系统托管的 dataset.json 定义，不复制来源数据${asset.logical_dataset?.source_asset_ids?.length ? ` · ${asset.logical_dataset.source_asset_ids.length} 个来源` : ""}`
+              : asset.virtual_path}
+          </p>
           <div className="mt-3 flex flex-wrap gap-2 text-xs text-gray-500">
             <span>{formatBytes(asset.size_bytes)}</span>
             {typeof asset.rows === "number" ? <span>{asset.rows} 行</span> : null}
             {typeof asset.columns_count === "number" ? <span>{asset.columns_count} 列</span> : null}
             {asset.columns?.length ? <span>字段：{asset.columns.slice(0, 5).join("、")}</span> : null}
+            {asset.logical_dataset?.source_asset_ids?.length ? <span>来源：{asset.logical_dataset.source_asset_ids.length} 张表</span> : null}
           </div>
         </div>
-        <div className="flex shrink-0 flex-col gap-2 sm:flex-row">
-          {asset.profile_status === "ready" ? (
+        <div className="flex shrink-0 items-start gap-2">
+          {isVirtualLogicalDataset ? (
+            <button
+              type="button"
+              onClick={() => onOpenDefinition(asset)}
+              className={primaryActionClass}
+            >
+              <FileText className="h-3.5 w-3.5" />
+              管理
+            </button>
+          ) : null}
+          {!isVirtualLogicalDataset && asset.profile_status === "ready" ? (
             <button
               type="button"
               onClick={() => onOpenProfile(asset)}
               disabled={profileLoadingId === asset.asset_id}
-              className="rounded-2xl bg-[#002fa7]/10 px-3.5 py-2 text-xs font-semibold text-[#002fa7] transition hover:bg-[#002fa7]/15 disabled:cursor-wait disabled:opacity-60"
+              className={primaryActionClass}
             >
+              <FileText className="h-3.5 w-3.5" />
               {profileLoadingId === asset.asset_id ? "打开中" : "查看 Profile"}
             </button>
           ) : null}
@@ -6545,23 +7243,91 @@ function TableAssetCard({
             type="button"
             onClick={() => onGenerateProfile(asset)}
             disabled={profilingAssetId === asset.asset_id}
-            className="rounded-2xl border border-black/[0.08] bg-white px-3.5 py-2 text-xs font-semibold text-gray-700 shadow-sm transition hover:bg-gray-50 disabled:cursor-wait disabled:opacity-60"
+            className={secondaryActionClass}
           >
-            {profilingAssetId === asset.asset_id ? "生成中" : asset.profile_status === "ready" ? "重新生成" : "生成"}
+            <RefreshCw className={`h-3.5 w-3.5 ${profilingAssetId === asset.asset_id ? "animate-spin" : ""}`} />
+            {profilingAssetId === asset.asset_id ? "更新中" : isVirtualLogicalDataset ? "更新 Profile" : asset.profile_status === "ready" ? "重新生成" : "生成"}
           </button>
-          <button
-            type="button"
-            onClick={() => onRemove(asset)}
-            className="inline-flex h-9 w-9 items-center justify-center rounded-xl text-gray-400 transition hover:bg-red-50 hover:text-red-600"
-            title="从智能问数移除"
-            aria-label={`从智能问数移除 ${asset.file_name}`}
-          >
-            <Trash2 className="h-4 w-4" />
-          </button>
+          <details ref={moreActionsRef} open={moreActionsOpen} className="relative">
+            <summary onClick={(event) => { event.preventDefault(); setMoreActionsOpen((open) => !open); }} className="flex h-9 w-9 cursor-pointer list-none items-center justify-center rounded-xl border border-black/[0.08] text-gray-500 transition hover:bg-slate-50 [&::-webkit-details-marker]:hidden" title="更多操作" aria-label={`更多操作：${asset.file_name}`} aria-expanded={moreActionsOpen}>
+              <MoreHorizontal className="h-4 w-4" />
+            </summary>
+            <div className="absolute right-0 z-30 mt-2 w-40 overflow-hidden rounded-xl border border-black/[0.08] bg-white p-1 shadow-xl">
+              {isVirtualLogicalDataset && asset.profile_status !== "missing" ? <button type="button" onClick={() => { setMoreActionsOpen(false); onOpenProfile(asset); }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-medium text-gray-700 hover:bg-slate-50"><FileText className="h-3.5 w-3.5" />查看 Profile</button> : null}
+              {asset.source_type === "derived_concat" || asset.source_type === "logical_concat" ? <button type="button" onClick={() => { setMoreActionsOpen(false); onAppendConcat(asset); }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-medium text-gray-700 hover:bg-slate-50"><Layers3 className="h-3.5 w-3.5" />追加来源</button> : null}
+              {asset.source_type === "derived_concat" || asset.source_type === "logical_concat" ? <button type="button" onClick={() => { setMoreActionsOpen(false); onRefreshConcat(asset); }} disabled={refreshingConcat} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-medium text-gray-700 hover:bg-slate-50 disabled:opacity-50"><RefreshCw className={`h-3.5 w-3.5 ${refreshingConcat ? "animate-spin" : ""}`} />{asset.source_type === "logical_concat" ? "刷新定义" : "刷新合并"}</button> : null}
+              <button type="button" onClick={() => { setMoreActionsOpen(false); onRemove(asset); }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-medium text-red-600 hover:bg-red-50"><Trash2 className="h-3.5 w-3.5" />从智能问数移除</button>
+            </div>
+          </details>
         </div>
       </div>
     </article>
   );
+}
+
+function LogicalDatasetDefinitionModal({ asset, onClose, onEdit }: { asset: TableAsset; onClose: () => void; onEdit: () => void }) {
+  const definition = asset.logical_dataset!;
+  const fields = definition.schema?.fields ?? definition.canonical_columns ?? [];
+  const sources = definition.sources ?? [];
+  const coverage = definition.coverage ?? [];
+  const profile = definition.profile;
+  return (
+    <div className="fixed inset-0 z-[150] flex items-center justify-center bg-black/40 px-4 py-6 backdrop-blur-sm">
+      <section className="flex max-h-[88vh] w-full max-w-5xl flex-col overflow-hidden rounded-[20px] bg-white shadow-2xl" role="dialog" aria-modal="true" aria-label="逻辑数据集定义">
+        <header className="flex items-start justify-between gap-4 border-b border-black/[0.06] px-6 py-5">
+          <div className="min-w-0">
+            <p className="text-sm font-semibold text-[#002fa7]">虚拟逻辑数据集定义</p>
+            <h2 className="mt-1 truncate text-xl font-semibold text-gray-950">{asset.file_name}</h2>
+            <p className="mt-1 text-sm text-gray-500">系统托管的 dataset.json；创建时不复制来源数据。</p>
+          </div>
+          <div className="flex items-center gap-2"><button type="button" onClick={onEdit} className="h-9 rounded-xl border border-[#002fa7]/20 px-3 text-xs font-semibold text-[#002fa7] hover:bg-[#002fa7]/[0.04]">编辑定义</button><button type="button" onClick={onClose} className="rounded-full p-2 text-gray-400 hover:bg-black/[0.04]" aria-label="关闭"><X className="h-5 w-5" /></button></div>
+        </header>
+        <div className="min-h-0 flex-1 space-y-5 overflow-y-auto px-6 py-5">
+          <div className="grid gap-3 sm:grid-cols-3">
+            <DefinitionStat label="来源表" value={`${definition.statistics?.source_count ?? sources.length} 张`} />
+            <DefinitionStat label="行数估计" value={typeof definition.statistics?.rows_estimate === "number" ? definition.statistics.rows_estimate.toLocaleString() : "待来源 Profile"} />
+            <DefinitionStat label="字段策略" value={definition.schema_mode === "strict" ? "字段严格一致" : definition.schema_mode === "union_fill_missing" ? "保留全部字段" : "仅保留基准字段"} />
+          </div>
+          <section className="rounded-lg border border-black/[0.08] bg-slate-50 p-4">
+            <div className="flex flex-wrap items-center justify-between gap-3"><div><h3 className="text-sm font-semibold text-gray-950">Profile 与新鲜度</h3><p className="mt-1 text-xs text-gray-500">不物化合并表；统计由各来源 Profile 汇总。</p></div><span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${profile?.status === "ready" ? "bg-emerald-50 text-emerald-700" : profile?.status === "partial" ? "bg-amber-50 text-amber-700" : "bg-slate-200 text-slate-600"}`}>{profile?.status === "ready" ? "全部来源已就绪" : profile?.status === "partial" ? "部分来源待更新" : "尚未生成"}</span></div>
+            <div className="mt-3 grid gap-3 sm:grid-cols-3"><DefinitionStat label="已生成 Profile" value={`${profile?.profiled_source_count ?? 0}/${profile?.source_count ?? sources.length} 个来源`} /><DefinitionStat label="新鲜来源" value={`${profile?.fresh_source_count ?? 0}/${profile?.source_count ?? sources.length} 个来源`} /><DefinitionStat label="覆盖字段" value={coverage.length ? `${coverage.length} 个来源含时间覆盖` : "待来源 Profile"} /></div>
+            {profile?.profile_refreshed_at || definition.profile_refreshed_at ? <p className="mt-3 text-xs text-gray-500">摘要更新时间：{formatDateTime(profile?.profile_refreshed_at || definition.profile_refreshed_at || "")}</p> : null}
+          </section>
+          <section className="pb-4">
+            <h3 className="text-sm font-semibold text-gray-950">业务定义与使用说明</h3>
+            <p className="mt-2 text-sm leading-6 text-gray-600">{definition.description || "尚未填写。请说明这个数据集包含什么、哪些问题应优先使用、何时可以直接查询原始来源，以及不适用的场景。"}</p>
+            {definition.tags?.length ? <div className="mt-3 flex flex-wrap gap-2">{definition.tags.map((tag) => <span key={tag} className="rounded-full bg-[#002fa7]/[0.07] px-2.5 py-1 text-xs text-[#00246f]">{tag}</span>)}</div> : null}
+          </section>
+          <section className="border-y border-black/[0.06] py-4">
+            <h3 className="text-sm font-semibold text-gray-950">字段契约</h3>
+            <p className="mt-1 text-xs text-gray-500">查询时每张来源都会按此字段集合对齐，并自动附加行级溯源字段。</p>
+            <div className="mt-3 flex flex-wrap gap-2">{fields.map((field) => <span key={field} className="rounded-lg bg-slate-100 px-2.5 py-1 text-xs text-slate-700">{field}</span>)}</div>
+          </section>
+          <section className="border-b border-black/[0.06] pb-4">
+            <h3 className="text-sm font-semibold text-gray-950">已登记来源</h3>
+            <div className="mt-3 divide-y divide-black/[0.05] rounded-lg border border-black/[0.08]">
+              {sources.map((source) => <div key={source.asset_id} className="flex items-center justify-between gap-4 px-4 py-3"><div className="min-w-0"><p className="truncate text-sm font-medium text-gray-800">{source.name || source.asset_id}</p><p className="mt-1 text-xs text-gray-400">{source.sheet_name || "默认表"} · {source.fields?.length ?? 0} 列</p></div><span className="shrink-0 text-xs text-gray-500">{typeof source.rows_estimate === "number" ? `${source.rows_estimate.toLocaleString()} 行` : "行数待 Profile"}</span></div>)}
+            </div>
+          </section>
+          <section className="border-b border-black/[0.06] pb-4"><h3 className="text-sm font-semibold text-gray-950">时间覆盖</h3>{coverage.length ? <div className="mt-3 space-y-2">{coverage.map((entry, index) => <div key={`${String(entry.source_asset_id ?? index)}`} className="rounded-lg border border-black/[0.06] px-3 py-2 text-xs text-gray-600"><span className="font-semibold text-gray-800">{String(entry.source_name ?? entry.source_asset_id ?? "来源")}</span>{Array.isArray(entry.dimensions) ? entry.dimensions.map((dimension: any) => <p key={`${dimension.field}-${dimension.min}`} className="mt-1">{dimension.field}：{dimension.min} 至 {dimension.max} <span className="text-gray-400">（{dimension.basis === "profile_sample" ? "Profile 样本" : dimension.basis}）</span></p>) : null}</div>)}</div> : <p className="mt-2 text-sm text-gray-500">尚无可确认的时间字段覆盖。点击“更新 Profile”后，系统会从来源 Profile 汇总可识别的时间范围。</p>}</section>
+          <details className="rounded-lg border border-black/[0.08] p-4"><summary className="cursor-pointer text-sm font-semibold text-[#002fa7]">查看原始 dataset.json</summary><pre className="mt-3 max-h-72 overflow-auto rounded-lg bg-gray-950 p-4 text-xs leading-5 text-gray-100">{JSON.stringify(definition, null, 2)}</pre></details>
+        </div>
+        <footer className="flex justify-end border-t border-black/[0.06] px-6 py-4"><button type="button" onClick={onClose} className="h-10 rounded-xl border border-black/[0.08] px-4 text-sm font-semibold text-gray-700">关闭</button></footer>
+      </section>
+    </div>
+  );
+}
+
+function LogicalDatasetDefinitionEditorModal({ asset, busy, onClose, onSave }: { asset: TableAsset; busy: boolean; onClose: () => void; onSave: (asset: TableAsset, payload: { name: string; description: string; tags: string[]; preferredIntents: string[]; directSourceAllowed: boolean }) => void }) {
+  const definition = asset.logical_dataset!;
+  const [name, setName] = useState(asset.file_name);
+  const [description, setDescription] = useState(definition.description || "");
+  const [tagsText, setTagsText] = useState((definition.tags || []).join(", "));
+  return <div className="fixed inset-0 z-[160] flex items-center justify-center bg-black/40 px-4 py-6 backdrop-blur-sm"><section className="flex max-h-[88vh] w-full max-w-2xl flex-col overflow-hidden rounded-[20px] bg-white shadow-2xl" role="dialog" aria-modal="true" aria-label="编辑逻辑数据集定义"><header className="flex items-start justify-between gap-4 border-b border-black/[0.06] px-6 py-5"><div><p className="text-sm font-semibold text-[#002fa7]">编辑逻辑数据集定义</p><p className="mt-1 text-sm text-gray-500">填写业务定义和使用边界；不改变来源表、字段契约或原始数据。</p></div><button type="button" onClick={onClose} disabled={busy} className="rounded-full p-2 text-gray-400 hover:bg-black/[0.04]"><X className="h-5 w-5" /></button></header><div className="min-h-0 flex-1 space-y-5 overflow-y-auto px-6 py-5"><label className="block text-sm font-semibold text-slate-700">名称<input value={name} onChange={(event) => setName(event.target.value)} className="mt-2 h-11 w-full rounded-xl border border-black/[0.1] px-3 text-sm font-normal outline-none focus:border-[#002fa7]" /></label><label className="block text-sm font-semibold text-slate-700">业务定义与使用说明<textarea value={description} onChange={(event) => setDescription(event.target.value)} placeholder="说明数据集包含什么；什么问题应优先使用它；何时可直接查询原始来源；哪些场景不适用。" className="mt-2 min-h-32 w-full rounded-xl border border-black/[0.1] px-3 py-2 text-sm font-normal outline-none focus:border-[#002fa7]" /></label><label className="block text-sm font-semibold text-slate-700">标签<input value={tagsText} onChange={(event) => setTagsText(event.target.value)} placeholder="销量, 上险量, 月度" className="mt-2 h-11 w-full rounded-xl border border-black/[0.1] px-3 text-sm font-normal outline-none focus:border-[#002fa7]" /></label><p className="rounded-xl border border-[#002fa7]/15 bg-[#002fa7]/[0.03] px-3 py-2 text-xs leading-5 text-[#00246f]">系统保留通用的跨来源分析默认策略；Agent 会优先读取上述说明判断何时使用此数据集，不需要维护不断膨胀的路由选项。</p></div><footer className="flex justify-end gap-2 border-t border-black/[0.06] px-6 py-4"><button type="button" onClick={onClose} disabled={busy} className="h-10 rounded-xl border border-black/[0.08] px-4 text-sm font-semibold text-gray-700">取消</button><button type="button" disabled={busy || !name.trim()} onClick={() => onSave(asset, { name: name.trim(), description, tags: tagsText.split(/[,，]/).map((item) => item.trim()).filter(Boolean), preferredIntents: definition.routing?.preferred_intents || [], directSourceAllowed: definition.routing?.direct_source_allowed !== false })} className="inline-flex h-10 items-center gap-2 rounded-xl bg-[#002fa7] px-4 text-sm font-semibold text-white disabled:opacity-50">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}保存定义</button></footer></section></div>;
+}
+
+function DefinitionStat({ label, value }: { label: string; value: string }) {
+  return <div className="rounded-lg bg-slate-50 px-4 py-3"><p className="text-xs text-gray-500">{label}</p><p className="mt-1 text-sm font-semibold text-gray-900">{value}</p></div>;
 }
 
 function WorkbenchCard({

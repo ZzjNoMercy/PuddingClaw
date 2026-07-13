@@ -304,7 +304,54 @@ export interface TableAsset {
   columns_count?: number | null;
   columns?: string[];
   reference_status?: string;
+  logical_dataset?: {
+    kind: "vertical_concat" | string;
+    formatter?: string;
+    version?: string;
+    description?: string;
+    tags?: string[];
+    materialization?: string;
+    schema_mode?: string;
+    source_asset_ids?: string[];
+    canonical_columns?: string[];
+    row_lineage_columns?: string[];
+    sources?: Array<{ asset_id?: string; name?: string; sheet_name?: string | null; rows_estimate?: number | null; fields?: string[] }>;
+    schema?: { fields?: string[]; lineage_fields?: string[] };
+    coverage?: Array<Record<string, unknown>>;
+    statistics?: { source_count?: number; rows_estimate?: number | null };
+    routing?: { preferred_intents?: string[]; direct_source_allowed?: boolean; direct_source_when?: string[] };
+    profile?: {
+      status?: "ready" | "partial" | "missing" | "stale" | string;
+      generated_at?: string;
+      profile_refreshed_at?: string;
+      source_count?: number;
+      profiled_source_count?: number;
+      fresh_source_count?: number;
+      note?: string;
+    };
+    profile_refreshed_at?: string;
+    refreshed_at?: string;
+  };
   profile?: TableAssetProfile;
+}
+
+export interface ConcatDatasetPreviewSource {
+  asset_id: string;
+  file_name: string;
+  sheet_name?: string | null;
+  columns: string[];
+  missing_from_baseline: string[];
+  extra_vs_baseline: string[];
+  missing_from_union: string[];
+}
+
+export interface ConcatDatasetPreview {
+  baseline_columns: string[];
+  canonical_columns: string[];
+  baseline_asset_id: string;
+  baseline_file_name: string;
+  has_schema_drift: boolean;
+  sources: ConcatDatasetPreviewSource[];
 }
 
 export interface TableAssetProfileJob {
@@ -931,6 +978,73 @@ export async function removeTableAsset(assetId: string): Promise<{ asset_id: str
   return response.json();
 }
 
+export async function previewConcatDataset(sourceAssetIds: string[]): Promise<ConcatDatasetPreview> {
+  const response = await fetch(`${API_BASE}/analytics/table-assets/concat-datasets/preview`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ source_asset_ids: sourceAssetIds }),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to inspect logical dataset fields: ${response.status}`));
+  }
+  return response.json();
+}
+
+export async function createConcatDataset(payload: { name: string; description?: string; tags?: string[]; source_asset_ids: string[]; schema_mode?: "strict" | "baseline_fill_missing" | "union_fill_missing"; preferred_intents?: string[]; direct_source_allowed?: boolean }): Promise<TableAsset> {
+  const response = await fetch(`${API_BASE}/analytics/table-assets/concat-datasets`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to create logical dataset: ${response.status}`));
+  }
+  return (await response.json()).asset;
+}
+
+export async function refreshConcatDataset(assetId: string): Promise<TableAsset> {
+  const response = await fetch(`${API_BASE}/analytics/table-assets/${encodeURIComponent(assetId)}/refresh-concat`, { method: "POST" });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to refresh logical dataset: ${response.status}`));
+  }
+  return (await response.json()).asset;
+}
+
+export async function appendConcatDatasetSources(
+  assetId: string,
+  payload: { source_asset_ids: string[]; schema_mode: "strict" | "baseline_fill_missing" | "union_fill_missing" }
+): Promise<TableAsset> {
+  const response = await fetch(`${API_BASE}/analytics/table-assets/${encodeURIComponent(assetId)}/concat-sources`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to append logical dataset sources: ${response.status}`));
+  }
+  return (await response.json()).asset;
+}
+
+export async function updateLogicalDatasetDefinition(
+  assetId: string,
+  payload: { name?: string; description?: string; tags?: string[]; preferred_intents?: string[]; direct_source_allowed?: boolean }
+): Promise<TableAsset> {
+  const response = await fetch(`${API_BASE}/analytics/table-assets/${encodeURIComponent(assetId)}/logical-definition`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to update logical dataset definition: ${response.status}`));
+  }
+  return (await response.json()).asset;
+}
+
 export async function generateTableAssetProfile(assetId: string): Promise<TableAssetProfileJob> {
   const response = await fetch(`${API_BASE}/analytics/table-assets/${encodeURIComponent(assetId)}/profile`, {
     method: "POST",
@@ -978,8 +1092,23 @@ export async function listTableAssetEntityCandidates(assetId: string, limit = 12
   return Array.isArray(payload.candidates) ? payload.candidates : [];
 }
 
-export type SemanticAssetType = "measure" | "dimension" | "grain";
+export type SemanticAssetType = "measure" | "dimension" | "grain" | "relation";
 export type DimensionResolutionMode = "source_field" | "derived" | "entity_lookup" | "calendar_lookup";
+export type AssetRelationType = "dimension_binding" | "direct_join";
+
+export interface AssetRelationDefinition {
+  type: AssetRelationType;
+  asset?: { ref: string; display_name?: string; key_fields: string[] };
+  dimension?: { ref: string; display_name?: string; output_key?: string };
+  left?: { ref: string; display_name?: string; key_fields: string[] };
+  right?: { ref: string; display_name?: string; key_fields: string[] };
+  field_mapping?: { left: string[]; right: string[] };
+  cardinality: "one_to_one" | "one_to_many" | "many_to_one" | "many_to_many";
+  join_type?: "inner" | "left" | "right" | "full";
+  grain?: string[] | { left: string[]; right: string[] };
+  use_statuses?: string[];
+  rules?: string[];
+}
 
 export interface DimensionBindingDefinition {
   asset_ref?: string;
@@ -1019,6 +1148,8 @@ export interface SemanticAssetSummary {
   formatter?: string;
   resolution_mode?: string;
   resolution_label?: string;
+  relation_type?: AssetRelationType | string;
+  relation_definition?: AssetRelationDefinition;
   mtime?: number;
   size_bytes?: number;
 }
@@ -1266,6 +1397,7 @@ export interface SemanticAssetCreatePayload {
   version?: string;
   slug?: string;
   dimension_definition?: DimensionDefinition;
+  relation_definition?: AssetRelationDefinition;
 }
 
 export async function listSemanticAssets(): Promise<SemanticAssetListResult> {
@@ -1335,6 +1467,29 @@ export async function updateSemanticDimensionDefinition(
   }
   const responsePayload = await response.json();
   return responsePayload.asset;
+}
+
+export async function updateSemanticRelationDefinition(
+  assetId: string,
+  payload: {
+    name: string;
+    description: string;
+    aliases: string[];
+    tags: string[];
+    version: string;
+    relation_definition: AssetRelationDefinition;
+  }
+): Promise<SemanticAssetDetail> {
+  const response = await fetch(`${API_BASE}/analytics/semantic-assets/${encodeURIComponent(assetId)}/relation-definition`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to save relation definition: ${response.status}`));
+  }
+  return (await response.json()).asset;
 }
 
 export async function getSemanticDimensionMatching(
@@ -1500,6 +1655,7 @@ export interface AnalyticsModelSummary {
   formatter?: string;
   data_assets?: Record<string, unknown>;
   semantic_assets?: Record<string, unknown>;
+  asset_relations?: string[];
   guardrails?: string[];
   templates?: Record<string, unknown>;
   default_template?: string | null;
@@ -1528,6 +1684,7 @@ export interface AnalyticsModelCreatePayload {
   slug?: string;
   data_assets?: Record<string, unknown>;
   semantic_assets?: Record<string, unknown>;
+  asset_relations?: string[];
   guardrails?: string[];
   templates?: Record<string, unknown>;
   default_template?: string | null;
@@ -2034,6 +2191,69 @@ export async function resolveDimensionBuildRuleRequest(
   if (!response.ok) {
     const text = await response.text().catch(() => "");
     throw new Error(apiErrorMessage(text, "Failed to resolve dimension build rule request"));
+  }
+  return response.json();
+}
+
+export interface LogicalDatasetRuleRequest {
+  id: string;
+  type: string;
+  session_id: string;
+  status?: string;
+  title: string;
+  reason: string;
+  suggested_name?: string;
+  operation: "create" | "append" | string;
+  target_asset_id?: string;
+  target?: { asset_id: string; display_name: string; fields: string[]; rows?: number | null; sheet_name?: string | null } | null;
+  candidates: Array<{ asset_id: string; display_name: string; fields: string[]; rows?: number | null; sheet_name?: string | null }>;
+}
+
+export async function resolveLogicalDatasetRuleRequest(
+  requestId: string,
+  payload: { action: "confirm" | "cancel"; name?: string; description?: string; tags?: string[]; baseline_asset_id?: string; source_asset_ids?: string[]; schema_mode?: "strict" | "baseline_fill_missing" | "union_fill_missing"; preferred_intents?: string[]; direct_source_allowed?: boolean }
+): Promise<{ request_id: string; decision: Record<string, unknown>; resumed: boolean }> {
+  const response = await fetch(`${API_BASE}/analytics/logical-dataset-requests/${encodeURIComponent(requestId)}/resolve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, "Failed to resolve logical dataset rule request"));
+  }
+  return response.json();
+}
+
+export interface DatabaseSqlRevisionRequest {
+  id: string;
+  type: string;
+  session_id: string;
+  query_id?: string;
+  tool_call_id?: string;
+  status?: string;
+  generation_id: string;
+  original_question: string;
+  original_sql: string;
+  proposed_revision_instruction: string;
+  semantic_assets?: {
+    matched?: Array<Record<string, unknown>>;
+    references?: Array<Record<string, unknown>>;
+  };
+}
+
+export async function resolveDatabaseSqlRevisionRequest(
+  requestId: string,
+  payload: { action: "agree" | "reject" | "modify"; revision_instruction?: string }
+): Promise<{ request_id: string; decision: Record<string, unknown>; resumed: boolean }> {
+  const response = await fetch(`${API_BASE}/analytics/database-sql-revision-requests/${encodeURIComponent(requestId)}/resolve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, "Failed to resolve database SQL revision request"));
   }
   return response.json();
 }

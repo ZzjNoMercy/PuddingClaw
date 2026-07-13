@@ -1,5 +1,7 @@
 ---
 name: tavily-search
+toolsets:
+  - web_research
 description: "Web search via Tavily API (alternative to Brave). Use when the user asks to search the web / look up sources / find links and Brave web_search is unavailable or undesired. Returns a small set of relevant results (title, url, snippet) and can optionally include short answer summaries."
 ---
 

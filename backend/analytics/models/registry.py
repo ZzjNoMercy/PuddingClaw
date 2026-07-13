@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import re
 import zipfile
 from dataclasses import dataclass
@@ -32,6 +33,7 @@ class AnalyticsModel:
     tags: tuple[str, ...] = ()
     data_assets: dict[str, Any] | None = None
     semantic_assets: dict[str, Any] | None = None
+    asset_relations: tuple[str, ...] = ()
     guardrails: tuple[str, ...] = ()
     templates: dict[str, Any] | None = None
     default_template: str = ""
@@ -52,6 +54,7 @@ class AnalyticsModel:
             "formatter": self.formatter,
             "data_assets": self.data_assets or {},
             "semantic_assets": self.semantic_assets or {},
+            "asset_relations": list(self.asset_relations),
             "guardrails": list(self.guardrails),
             "templates": self.templates or {},
             "default_template": self.default_template,
@@ -93,6 +96,37 @@ def _list_from_meta(value: object) -> tuple[str, ...]:
 
 def _dict_from_meta(value: object) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _canonical_semantic_ref(value: object, asset_type: str) -> str:
+    """Keep model semantic references aligned with registry asset IDs.
+
+    Registry IDs already include their type prefix (for example,
+    ``dimension:vehicle_series``). Older UI payloads added that prefix a second
+    time, so normalize repeated prefixes here at the persistence boundary.
+    """
+    ref = str(value).strip()
+    prefix = f"{asset_type}:"
+    while ref.startswith(prefix + prefix):
+        ref = ref[len(prefix) :]
+    if ref and not ref.startswith(prefix):
+        ref = prefix + ref
+    return ref
+
+
+def _normalize_semantic_assets(value: dict[str, Any] | None) -> dict[str, list[str]]:
+    raw = value or {}
+    normalized: dict[str, list[str]] = {}
+    for field, asset_type in (("measures", "measure"), ("dimensions", "dimension"), ("grains", "grain")):
+        seen: set[str] = set()
+        items: list[str] = []
+        for item in raw.get(field) or []:
+            ref = _canonical_semantic_ref(item, asset_type)
+            if ref and ref not in seen:
+                seen.add(ref)
+                items.append(ref)
+        normalized[field] = items
+    return normalized
 
 
 def _slugify(value: str) -> str:
@@ -178,6 +212,75 @@ class AnalyticsModelRegistry:
     def get_model_context(self, model_id: str) -> dict[str, Any]:
         model = self.get_model(model_id)
         missing_references: list[str] = []
+        relation_context: list[dict[str, Any]] = []
+        binding_assets_by_dimension: dict[str, list[str]] = {}
+        relation_ids = [str(item).strip() for item in (model.get("asset_relations") or []) if str(item).strip()]
+        if relation_ids:
+            from analytics.semantic_assets import get_semantic_asset_registry
+
+            assets = get_semantic_asset_registry(self.base_dir)
+            for relation_id in relation_ids:
+                try:
+                    relation = assets.get_asset(relation_id)
+                    metadata = relation.get("frontmatter") or {}
+                    definition = metadata.get("relation") or {}
+                    relation_type = metadata.get("relation_type")
+                    relation_context.append(
+                        {
+                            "id": relation_id,
+                            "name": relation.get("name"),
+                            "type": relation_type,
+                            "definition": definition,
+                        }
+                    )
+                    if relation_type == "dimension_binding" and isinstance(definition, dict):
+                        dimension_ref = str((definition.get("dimension") or {}).get("ref") or "").strip()
+                        asset_ref = str((definition.get("asset") or {}).get("ref") or "").strip()
+                        if dimension_ref and asset_ref:
+                            binding_assets_by_dimension.setdefault(dimension_ref, []).append(asset_ref)
+                except Exception:
+                    missing_references.append(relation_id)
+        derived_dimension_paths = [
+            {
+                "dimension": dimension_ref,
+                "assets": sorted(set(asset_refs)),
+                "rule": "这些资产通过同一已选维度关联；联合分析必须经由该维度的规范键。",
+            }
+            for dimension_ref, asset_refs in sorted(binding_assets_by_dimension.items())
+            if len(set(asset_refs)) >= 2
+        ]
+        logical_dataset_context: list[dict[str, Any]] = []
+        table_refs = [str(item).strip() for item in ((model.get("frontmatter") or {}).get("data_assets") or {}).get("tables") or []]
+        for table_ref in table_refs:
+            asset_id = table_ref.removeprefix("table_asset:").strip()
+            if not asset_id or "/" in asset_id or "\\" in asset_id:
+                continue
+            definition_path = self.base_dir / "data" / "analytics-concat-datasets" / asset_id / "dataset.json"
+            try:
+                definition = json.loads(definition_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(definition, dict) or definition.get("formatter") != "logical-data-asset":
+                continue
+            logical_dataset_context.append(
+                {
+                    "asset_id": asset_id,
+                    "name": definition.get("name"),
+                    "description": definition.get("description") or "",
+                    "tags": definition.get("tags") or [],
+                    "kind": definition.get("kind"),
+                    "materialization": definition.get("materialization"),
+                    "schema": definition.get("schema"),
+                    "coverage": definition.get("coverage"),
+                    "statistics": definition.get("statistics"),
+                    "routing": definition.get("routing"),
+                    "sources": [
+                        {"asset_id": source.get("asset_id"), "name": source.get("name"), "sheet_name": source.get("sheet_name")}
+                        for source in definition.get("sources") or []
+                        if isinstance(source, dict)
+                    ],
+                }
+            )
         return {
             "id": model["id"],
             "name": model["name"],
@@ -188,6 +291,9 @@ class AnalyticsModelRegistry:
             "body": model.get("body") or "",
             "files": model.get("files") or [],
             "missing_references": missing_references,
+            "asset_relations": relation_context,
+            "derived_dimension_paths": derived_dimension_paths,
+            "logical_datasets": logical_dataset_context,
         }
 
     def create_model(
@@ -200,6 +306,7 @@ class AnalyticsModelRegistry:
         tags: list[str] | None = None,
         data_assets: dict[str, Any] | None = None,
         semantic_assets: dict[str, Any] | None = None,
+        asset_relations: list[str] | None = None,
         guardrails: list[str] | None = None,
         templates: dict[str, Any] | None = None,
         default_template: str | None = None,
@@ -215,6 +322,12 @@ class AnalyticsModelRegistry:
         model_dir.mkdir(parents=True, exist_ok=True)
         (model_dir / "templates").mkdir(exist_ok=True)
         (model_dir / "examples").mkdir(exist_ok=True)
+        normalized_semantic_assets = _normalize_semantic_assets(semantic_assets)
+        self._validate_asset_graph(
+            data_assets=data_assets or {},
+            semantic_assets=normalized_semantic_assets,
+            asset_relations=asset_relations or [],
+        )
         target.write_text(
             self._template(
                 model_id=model_slug,
@@ -223,7 +336,8 @@ class AnalyticsModelRegistry:
                 version=version.strip() or "0.1.0",
                 tags=tags or [],
                 data_assets=data_assets or {},
-                semantic_assets=semantic_assets or {},
+                semantic_assets=normalized_semantic_assets,
+                asset_relations=asset_relations or [],
                 guardrails=guardrails or [],
                 templates=templates or {},
                 default_template=default_template or "",
@@ -291,6 +405,7 @@ class AnalyticsModelRegistry:
             tags=_list_from_meta(meta.get("tags")),
             data_assets=_dict_from_meta(meta.get("data_assets")),
             semantic_assets=_dict_from_meta(meta.get("semantic_assets")),
+            asset_relations=_list_from_meta(meta.get("asset_relations")),
             guardrails=_list_from_meta(meta.get("guardrails")),
             templates=_dict_from_meta(meta.get("templates")),
             default_template=str(meta.get("default_template") or "").strip(),
@@ -332,6 +447,7 @@ class AnalyticsModelRegistry:
         tags: list[str],
         data_assets: dict[str, Any],
         semantic_assets: dict[str, Any],
+        asset_relations: list[str],
         guardrails: list[str],
         templates: dict[str, Any],
         default_template: str,
@@ -351,6 +467,7 @@ class AnalyticsModelRegistry:
                 "dimensions": semantic_assets.get("dimensions") or [],
                 "grains": semantic_assets.get("grains") or [],
             },
+            "asset_relations": asset_relations,
             "guardrails": guardrails,
             "templates": templates,
             "default_template": default_template,
@@ -373,6 +490,63 @@ class AnalyticsModelRegistry:
             "- 输出核心结论、数据证据和异常说明。\n"
             "- 如果引用模板，按模板组织最终结果。\n"
         )
+
+    def _validate_asset_graph(
+        self,
+        *,
+        data_assets: dict[str, Any],
+        semantic_assets: dict[str, Any],
+        asset_relations: list[str],
+    ) -> None:
+        tables = {str(item).strip() for item in data_assets.get("tables") or [] if str(item).strip()}
+        dimensions = {str(item).strip() for item in semantic_assets.get("dimensions") or [] if str(item).strip()}
+        if len(tables) <= 1:
+            return
+        if not asset_relations:
+            raise AnalyticsModelError("多数据资产模型必须选择资产关联，或缩小为单一数据资产")
+
+        from analytics.semantic_assets import get_semantic_asset_registry
+
+        registry = get_semantic_asset_registry(self.base_dir)
+        adjacency: dict[str, set[str]] = {ref: set() for ref in [*tables, *dimensions]}
+        for relation_id in asset_relations:
+            try:
+                relation = registry.get_asset(str(relation_id))
+            except Exception as exc:
+                raise AnalyticsModelError(f"资产关联不存在: {relation_id}") from exc
+            if relation.get("type") != "relation":
+                raise AnalyticsModelError(f"不是资产关联: {relation_id}")
+            metadata = relation.get("frontmatter") or {}
+            definition = metadata.get("relation") if isinstance(metadata.get("relation"), dict) else {}
+            relation_type = str(metadata.get("relation_type") or "").strip()
+            if relation_type == "dimension_binding":
+                asset_ref = str((definition.get("asset") or {}).get("ref") or "").strip()
+                dimension_ref = str((definition.get("dimension") or {}).get("ref") or "").strip()
+                if asset_ref not in tables or dimension_ref not in dimensions:
+                    raise AnalyticsModelError(f"关联 {relation_id} 的资产和维度必须均已被模型选择")
+                adjacency.setdefault(asset_ref, set()).add(dimension_ref)
+                adjacency.setdefault(dimension_ref, set()).add(asset_ref)
+            elif relation_type == "direct_join":
+                left_ref = str((definition.get("left") or {}).get("ref") or "").strip()
+                right_ref = str((definition.get("right") or {}).get("ref") or "").strip()
+                if left_ref not in tables or right_ref not in tables:
+                    raise AnalyticsModelError(f"关联 {relation_id} 的两端资产必须均已被模型选择")
+                adjacency.setdefault(left_ref, set()).add(right_ref)
+                adjacency.setdefault(right_ref, set()).add(left_ref)
+            else:
+                raise AnalyticsModelError(f"资产关联类型无效: {relation_id}")
+
+        reachable: set[str] = set()
+        stack = [next(iter(tables))]
+        while stack:
+            node = stack.pop()
+            if node in reachable:
+                continue
+            reachable.add(node)
+            stack.extend(adjacency.get(node, set()) - reachable)
+        disconnected = sorted(tables - reachable)
+        if disconnected:
+            raise AnalyticsModelError(f"模型数据资产未形成连通语义图: {', '.join(disconnected)}")
 
 
 _REGISTRIES: dict[Path, AnalyticsModelRegistry] = {}

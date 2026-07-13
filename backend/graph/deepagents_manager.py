@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import json
 import logging
 import os
 import re
-import base64
-import asyncio
 import time
 import traceback
 import uuid
@@ -27,24 +27,28 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage, ToolMessage
 from langgraph.types import Command
 
-from graph.citations import dedupe_sources, finalize_citations, format_sources_for_model
-from graph.deepagents_prompt_builder import build_deepagents_system_prompt
+import config
+from analytics.models import get_analytics_model_registry
 from graph.attachment_store import attachment_store
+from graph.citations import dedupe_sources, finalize_citations, format_sources_for_model
+from graph.database_sql_revision_resume import database_sql_revision_resume_registry
+from graph.deepagents_prompt_builder import build_deepagents_system_prompt
+from graph.dimension_build_resume import dimension_build_resume_registry
+from graph.logical_dataset_resume import logical_dataset_resume_registry
 from graph.managed_paths import is_managed_resource_path
-from graph.session_manager import session_manager
-from knowledge.paths import get_knowledge_root
+from graph.middleware_trace_proxy import wrap_middlewares_for_trace
+from graph.middlewares.skill_intent_router import SkillIntentRouterMiddleware
+from graph.middlewares.toolset import ToolsetMiddleware, discover_skill_toolsets
 from graph.permission_middleware import ExternalFilePermissionMiddleware
 from graph.permission_resume import permission_resume_registry
-from graph.dimension_build_resume import dimension_build_resume_registry
+from graph.session_manager import session_manager
 from graph.tool_result_adapter import tool_result_adapter
 from graph.trace_collector import TraceCollector, TraceSpan
-from graph.middleware_trace_proxy import wrap_middlewares_for_trace
 from knowledge.paths import get_knowledge_root
 from llm.model_client import ModelClientChatModel
 from projects.registry import project_registry
-from analytics.models import get_analytics_model_registry
 from tools import get_all_tools
-import config
+from tools.toolsets import agent_custom_tool_names
 
 logger = logging.getLogger(__name__)
 
@@ -52,27 +56,6 @@ HISTORICAL_TOOL_OUTPUT_PREFIX = "[历史工具结果，仅供上下文，不是�
 MISSING_TOOL_OUTPUT_PLACEHOLDER = (
     "[工具结果缺失：上一轮在工具开始后被中断，未收到工具返回。]"
 )
-
-AGENT_MODE_PUDDINGCLAW_TOOLS = {
-    "terminal",
-    "read_resource",
-    "fetch_url",
-    "tavily_search",
-    "llamaindex_knowledge_query",
-    "pandas_knowledge_query",
-    "database_sql_generate",
-    "database_sql_validate",
-    "database_sql_execute",
-    "database_schema_inspect",
-    "semantic_entity_lookup",
-    "enqueue_semantic_dimension_build",
-    "get_semantic_dimension_build_job",
-    "publish_semantic_dimension_build",
-    "request_dimension_build_rule",
-    "inspect_dimension_build_input",
-    "database_query_trace_inspect",
-    "database_query_result_page",
-}
 
 DEFAULT_IMAGE_ANALYZER_PROMPT = (
     "You are an image analysis specialist. When given an image, describe its contents in detail "
@@ -113,9 +96,10 @@ def _resolve_subagent_model(model_name: str) -> str | BaseChatModel:
         return model_name
 
     try:
-        from higress_config_reader import get_higress_routed_models
-        from capabilities import get_effective_gateway_url
         from langchain_openai import ChatOpenAI
+
+        from capabilities import get_effective_gateway_url
+        from higress_config_reader import get_higress_routed_models
 
         routed = set(get_higress_routed_models())
         if model_name in routed:
@@ -267,7 +251,12 @@ class AttachmentImageContentMiddleware(AgentMiddleware[Any, Any, Any]):
         return await handler(self._request_with_images(request))
 
 
-def _build_subagent_item(item: dict[str, Any], default_tools: list[Any], default_skills: list[str]) -> SubAgent:
+def _build_subagent_item(
+    item: dict[str, Any],
+    default_tools: list[Any],
+    default_skills: list[str],
+    middleware_factory: Callable[[], list[Any]] | None = None,
+) -> SubAgent:
     """Build a single SubAgent spec from a settings item."""
     name = item.get("name", "subagent") or "subagent"
     model_name = item.get("model", "") or ""
@@ -314,22 +303,39 @@ def _build_subagent_item(item: dict[str, Any], default_tools: list[Any], default
         spec["model"] = model
     if skills:
         spec["skills"] = skills
+    middlewares = middleware_factory() if middleware_factory else []
     if is_image_analyzer:
-        spec["middleware"] = [AttachmentImageContentMiddleware()]
+        middlewares.append(AttachmentImageContentMiddleware())
+    if middlewares:
+        spec["middleware"] = middlewares
     return spec
 
 
-def _build_subagents(default_tools: list[Any], default_skills: list[str]) -> list[SubAgent]:
+def _build_subagents(
+    default_tools: list[Any],
+    default_skills: list[str],
+    middleware_factory: Callable[[], list[Any]] | None = None,
+) -> list[SubAgent]:
     """Build declarative subagents from normalized settings config."""
     items = config.get_settings_for_display().get("subagents", {}).get("items", [])
-    if not items:
-        return []
-
     subagents: list[SubAgent] = []
+    # Declare this ourselves rather than rely on DeepAgents' implicit
+    # general-purpose subagent. It receives the same Toolset boundary as the
+    # parent, so delegation cannot bypass Skill-gated business tools.
+    subagents.append(
+        {
+            "name": "general-purpose",
+            "description": "General-purpose subagent for isolated multi-step work.",
+            "system_prompt": "Complete the delegated task concisely. Read an applicable project Skill before using its business tools.",
+            "tools": default_tools,
+            "skills": list(default_skills),
+            "middleware": middleware_factory() if middleware_factory else [],
+        }
+    )
     for item in items:
         if not item.get("enabled", False):
             continue
-        subagents.append(_build_subagent_item(item, default_tools, default_skills))
+        subagents.append(_build_subagent_item(item, default_tools, default_skills, middleware_factory))
     return subagents
 
 
@@ -413,7 +419,7 @@ class DeepAgentsAgentManager:
         }
 
     def _memory_dir_for(self, project_id: str | None) -> Path:
-        """Return the on-disk directory that holds AGENTS.md for a project."""
+        """Return the on-disk directory that holds runtime project memory."""
 
         assert self._base_dir is not None
         memory_root = self._base_dir / "data" / "deepagents-memory"
@@ -421,13 +427,16 @@ class DeepAgentsAgentManager:
             return memory_root / "projects" / project_id
         return memory_root / "global"
 
-    def _ensure_agents_md(self, memory_dir: Path) -> Path:
-        """Create memory directory and a starter AGENTS.md if missing."""
+    def _ensure_memory_md(self, memory_dir: Path) -> Path:
+        """Create or migrate the runtime MEMORY.md file for a project."""
 
         memory_dir.mkdir(parents=True, exist_ok=True)
-        agents_md = memory_dir / "AGENTS.md"
-        if not agents_md.exists():
-            agents_md.write_text(
+        memory_md = memory_dir / "MEMORY.md"
+        legacy_agents_md = memory_dir / "AGENTS.md"
+        if not memory_md.exists() and legacy_agents_md.exists():
+            legacy_agents_md.replace(memory_md)
+        if not memory_md.exists():
+            memory_md.write_text(
                 "# Project Memory\n\n"
                 "<!--\n"
                 "This file is injected into the Agent's system prompt via DeepAgents MemoryMiddleware.\n"
@@ -436,7 +445,7 @@ class DeepAgentsAgentManager:
                 "-->\n",
                 encoding="utf-8",
             )
-        return agents_md
+        return memory_md
 
     def _build_backend(self, workspace_path: Path):
         assert self._base_dir is not None
@@ -463,7 +472,12 @@ class DeepAgentsAgentManager:
             routes=routes,
         )
 
-    def _build_middlewares(self, project_id: str | None) -> list[Any]:
+    def _build_middlewares(
+        self,
+        project_id: str | None,
+        *,
+        skill_toolsets: dict[str, set[str]] | None = None,
+    ) -> list[Any]:
         """Build user-provided DeepAgents middlewares.
 
         create_deep_agent() automatically injects TodoListMiddleware and other
@@ -474,9 +488,9 @@ class DeepAgentsAgentManager:
 
         assert self._base_dir is not None
 
-        # 1) Project-scoped or global AGENTS.md
+        # 1) Project-scoped or global runtime MEMORY.md
         memory_dir = self._memory_dir_for(project_id)
-        self._ensure_agents_md(memory_dir)
+        self._ensure_memory_md(memory_dir)
 
         # 2) Optional gstack skill index
         gstack_path = (self._base_dir / "gstack" / "AGENTS.md").resolve()
@@ -491,7 +505,7 @@ class DeepAgentsAgentManager:
 
         # Use a single MemoryMiddleware with a composite backend to avoid
         # DeepAgents' "duplicate middleware instances" assertion.
-        sources = ["/AGENTS.md", *gstack_sources]
+        sources = ["/MEMORY.md", *gstack_sources]
         if gstack_route is not None:
             memory_backend: FilesystemBackend | CompositeBackend = CompositeBackend(
                 default=FilesystemBackend(root_dir=memory_dir, virtual_mode=True),
@@ -500,9 +514,15 @@ class DeepAgentsAgentManager:
         else:
             memory_backend = FilesystemBackend(root_dir=memory_dir, virtual_mode=True)
 
+        toolset_mapping = skill_toolsets or discover_skill_toolsets(self._base_dir / "skills")
         middlewares: list[Any] = [
             MemoryMiddleware(backend=memory_backend, sources=sources),
             ExternalFilePermissionMiddleware(),
+            SkillIntentRouterMiddleware(),
+            ToolsetMiddleware(
+                skills_dir=self._base_dir / "skills",
+                toolsets_by_skill=toolset_mapping,
+            ),
         ]
         model_call_limit_cfg = config.load_config().get("harness", {}).get("model_call_limit", {})
         if model_call_limit_cfg.get("enabled", True):
@@ -595,13 +615,14 @@ class DeepAgentsAgentManager:
                 )
                 return
 
-    def _build_tools(self, workspace_path: Path, session_id: str = "") -> list[Any]:
+    def _build_tools(self, workspace_path: Path, session_id: str = "", query_id: str = "") -> list[Any]:
         """Return PuddingClaw tools that do not overlap DeepAgents built-ins."""
 
         assert self._base_dir is not None
         tools = []
+        registered_tool_names = agent_custom_tool_names()
         for tool in get_all_tools(self._base_dir):
-            if getattr(tool, "name", "") not in AGENT_MODE_PUDDINGCLAW_TOOLS:
+            if getattr(tool, "name", "") not in registered_tool_names:
                 continue
             if getattr(tool, "name", "") == "terminal":
                 # In Agent mode, terminal should follow the same workspace
@@ -634,12 +655,23 @@ class DeepAgentsAgentManager:
                 except Exception:
                     for key, value in resource_updates.items():
                         setattr(tool, key, value)
-            elif getattr(tool, "name", "") in {"request_dimension_build_rule", "inspect_dimension_build_input", "enqueue_semantic_dimension_build"}:
+            elif getattr(tool, "name", "") in {"request_dimension_build_rule", "inspect_dimension_build_input", "enqueue_semantic_dimension_build", "request_logical_dataset_rule", "ensure_attachment_table_asset"}:
                 request_updates = {"session_id": session_id}
                 try:
                     tool = tool.model_copy(update=request_updates)
                 except Exception:
                     for key, value in request_updates.items():
+                        setattr(tool, key, value)
+            elif getattr(tool, "name", "") in {
+                "database_sql_generate",
+                "database_sql_validate",
+                "database_sql_execute",
+            }:
+                database_updates = {"session_id": session_id, "query_id": query_id}
+                try:
+                    tool = tool.model_copy(update=database_updates)
+                except Exception:
+                    for key, value in database_updates.items():
                         setattr(tool, key, value)
 
             tools.append(tool)
@@ -1323,19 +1355,34 @@ class DeepAgentsAgentManager:
             "path": model.get("path"),
             "loaded": True,
             "missing_references": model.get("missing_references") or [],
+            "asset_relations": model.get("asset_relations") or [],
+            "derived_dimension_paths": model.get("derived_dimension_paths") or [],
+            "logical_datasets": model.get("logical_datasets") or [],
         }
+        relation_context = model.get("asset_relations") or []
+        relation_text = json.dumps(relation_context, ensure_ascii=False, indent=2)
+        derived_path_text = json.dumps(model.get("derived_dimension_paths") or [], ensure_ascii=False, indent=2)
+        logical_dataset_text = json.dumps(model.get("logical_datasets") or [], ensure_ascii=False, indent=2)
         prompt = (
             "\n\n"
             "<analytics_model_context>\n"
             "当前用户已选择一个分析模型。它是本轮任务的强上下文，不是底层 LLM 模型。\n"
             "你必须优先遵守该模型的业务边界、Playbook、数据资产、语义资产、守卫和输出要求。\n"
             "如果用户问题与该模型冲突或缺少关键参数，先说明冲突或追问，不要静默忽略模型。\n\n"
+            "跨资产分析只能沿已发布的资产关联，或由已选资产共同绑定的维度路径进行；不得仅凭同名字段猜测 Join。\n\n"
             f"模型 ID：{model.get('id')}\n"
             f"模型名称：{model.get('name')}\n"
             f"版本：{model.get('version')}\n"
             f"文件路径：{virtual_path}\n\n"
             "机器可读 metadata：\n"
             f"```json\n{yaml_text}\n```\n\n"
+            "已解析资产关联：\n"
+            f"```json\n{relation_text}\n```\n\n"
+            "已推导共同维度路径：\n"
+            f"```json\n{derived_path_text}\n```\n\n"
+            "已选虚拟逻辑数据集摘要：\n"
+            "跨期趋势、环比、同比或跨来源汇总优先使用这里的资产；指定原始文件或单期明细时可使用原始来源。\n"
+            f"```json\n{logical_dataset_text}\n```\n\n"
             "模型 Playbook：\n"
             f"{body_preview}\n"
             "</analytics_model_context>\n"
@@ -1594,7 +1641,12 @@ class DeepAgentsAgentManager:
             interrupts = [interrupts]
         for interrupt_item in interrupts:
             value = getattr(interrupt_item, "value", interrupt_item)
-            if isinstance(value, dict) and value.get("type") in {"permission_request", "dimension_build_rule_request"}:
+            if isinstance(value, dict) and value.get("type") in {
+                "permission_request",
+                "dimension_build_rule_request",
+                "logical_dataset_rule_request",
+                "database_sql_revision_request",
+            }:
                 request = value.get("request")
                 if isinstance(request, dict):
                     return str(value["type"]), request
@@ -1623,10 +1675,13 @@ class DeepAgentsAgentManager:
                 hitl = self._extract_hitl_interrupt(item)
                 if hitl is not None:
                     interrupted_type, interrupted_request = hitl
-                    yield self._sse(
-                        "permission_required" if interrupted_type == "permission_request" else "dimension_build_rule_required",
-                        interrupted_request,
-                    )
+                    required_events = {
+                        "permission_request": "permission_required",
+                        "dimension_build_rule_request": "dimension_build_rule_required",
+                        "logical_dataset_rule_request": "logical_dataset_rule_required",
+                        "database_sql_revision_request": "database_sql_revision_required",
+                    }
+                    yield self._sse(required_events[interrupted_type], interrupted_request)
                     break
                 yield item
 
@@ -1634,13 +1689,25 @@ class DeepAgentsAgentManager:
                 return
 
             request_id = str(interrupted_request.get("id") or "")
-            decision = (
-                await permission_resume_registry.wait(request_id)
-                if interrupted_type == "permission_request"
-                else await dimension_build_resume_registry.wait(request_id)
+            resume_registries = {
+                "permission_request": permission_resume_registry,
+                "dimension_build_rule_request": dimension_build_resume_registry,
+                "logical_dataset_rule_request": logical_dataset_resume_registry,
+                "database_sql_revision_request": database_sql_revision_resume_registry,
+            }
+            decision = await resume_registries[interrupted_type].wait(request_id)
+            span_names = {
+                "permission_request": "permission.decision",
+                "dimension_build_rule_request": "dimension_build_rule.decision",
+                "logical_dataset_rule_request": "logical_dataset_rule.decision",
+                "database_sql_revision_request": "database_sql_revision.decision",
+            }
+            approved = (
+                decision.get("type") == "approve"
+                or decision.get("action") in {"confirm", "agree", "modify"}
             )
             trace_collector.add_custom_span(
-                "permission.decision" if interrupted_type == "permission_request" else "dimension_build_rule.decision",
+                span_names[interrupted_type],
                 {"request_id": request_id, "decision": decision},
                 span_type="permission" if interrupted_type == "permission_request" else "hitl",
                 metadata={
@@ -1652,14 +1719,17 @@ class DeepAgentsAgentManager:
                         "request_id": request_id,
                         "type": interrupted_request.get("type"),
                         "decision": decision.get("type") or decision.get("action"),
-                        "outcome": "approved" if decision.get("type") == "approve" or decision.get("action") == "confirm" else "rejected",
+                        "outcome": "approved" if approved else "rejected",
                     },
                 },
             )
-            yield self._sse(
-                "permission_resolved" if interrupted_type == "permission_request" else "dimension_build_rule_resolved",
-                {"request_id": request_id, "decision": decision},
-            )
+            resolved_events = {
+                "permission_request": "permission_resolved",
+                "dimension_build_rule_request": "dimension_build_rule_resolved",
+                "logical_dataset_rule_request": "logical_dataset_rule_resolved",
+                "database_sql_revision_request": "database_sql_revision_resolved",
+            }
+            yield self._sse(resolved_events[interrupted_type], {"request_id": request_id, "decision": decision})
             graph_input = Command(resume={"decisions": [decision]}) if interrupted_type == "permission_request" else Command(resume=decision)
 
     @staticmethod
@@ -2248,9 +2318,10 @@ class DeepAgentsAgentManager:
             persisted_todos = session_manager.get_todos(session_id)
 
             model = ModelClientChatModel(role="agent", streaming=True)
-            agent_tools = self._build_tools(workspace_path, session_id=session_id)
+            agent_tools = self._build_tools(workspace_path, session_id=session_id, query_id=query_id)
             agent_skills = ["/skills/"]
-            agent_middlewares = self._build_middlewares(project_id)
+            skill_toolsets = discover_skill_toolsets(self._base_dir / "skills")
+            agent_middlewares = self._build_middlewares(project_id, skill_toolsets=skill_toolsets)
             checkpointer = await self._build_checkpointer()
             runtime_inventory = self._runtime_inventory(
                 tools=agent_tools,
@@ -2264,7 +2335,18 @@ class DeepAgentsAgentManager:
                 runtime_inventory["analytics_model"] = analytics_model_payload
             traced_middlewares = wrap_middlewares_for_trace(agent_middlewares)
             logger.info("Building DeepAgents agent for session=%s project=%s", session_id, project_id)
-            subagents = _build_subagents(agent_tools, agent_skills)
+            subagents = _build_subagents(
+                agent_tools,
+                agent_skills,
+                middleware_factory=lambda: [
+                    ExternalFilePermissionMiddleware(),
+                    SkillIntentRouterMiddleware(),
+                    ToolsetMiddleware(
+                        skills_dir=self._base_dir / "skills",
+                        toolsets_by_skill=skill_toolsets,
+                    ),
+                ],
+            )
             system_prompt = build_deepagents_system_prompt(self._base_dir, workspace_path)
             if analytics_model_prompt:
                 system_prompt += analytics_model_prompt
@@ -2885,6 +2967,14 @@ class DeepAgentsAgentManager:
                     "Agent stream was cancelled by the client.",
                 )
                 dimension_build_resume_registry.reject_session(
+                    session_id,
+                    "Agent stream was cancelled by the client.",
+                )
+                logical_dataset_resume_registry.reject_session(
+                    session_id,
+                    "Agent stream was cancelled by the client.",
+                )
+                database_sql_revision_resume_registry.reject_session(
                     session_id,
                     "Agent stream was cancelled by the client.",
                 )

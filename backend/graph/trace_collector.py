@@ -594,7 +594,7 @@ class TraceCollector:
         system_text = self._system_text(preview)
         if not system_text:
             return
-        source_candidates = ["/AGENTS.md", "/gstack/AGENTS.md"]
+        source_candidates = ["/MEMORY.md", "/gstack/AGENTS.md"]
         matched_sources = [source for source in source_candidates if source in system_text]
         agent_memory_present = "<agent_memory>" in system_text and "</agent_memory>" in system_text
         if not agent_memory_present and not matched_sources:

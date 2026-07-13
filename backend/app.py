@@ -112,6 +112,8 @@ from api.attachments import router as attachments_router
 from api.knowledge import router as knowledge_router
 from api.analytics import router as analytics_router
 from api.dimension_build_rules import router as dimension_build_rules_router
+from api.logical_dataset_rules import router as logical_dataset_rules_router
+from api.database_sql_revisions import router as database_sql_revisions_router
 
 app.include_router(chat_router, prefix="/api")
 app.include_router(agent_router, prefix="/api")
@@ -131,6 +133,8 @@ app.include_router(attachments_router, prefix="/api")
 app.include_router(knowledge_router, prefix="/api")
 app.include_router(analytics_router, prefix="/api")
 app.include_router(dimension_build_rules_router, prefix="/api")
+app.include_router(logical_dataset_rules_router, prefix="/api")
+app.include_router(database_sql_revisions_router, prefix="/api")
 
 
 @app.get("/")

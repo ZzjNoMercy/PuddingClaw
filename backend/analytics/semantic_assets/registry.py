@@ -27,7 +27,11 @@ ASSET_TYPES = {
     "measure": ("measures", "measure.md"),
     "dimension": ("dimensions", "dimension.md"),
     "grain": ("grains", "grain.md"),
+    "relation": ("relations", "relation.md"),
 }
+RELATION_TYPES = {"dimension_binding", "direct_join"}
+RELATION_CARDINALITIES = {"one_to_one", "one_to_many", "many_to_one", "many_to_many"}
+JOIN_TYPES = {"inner", "left", "right", "full"}
 DIMENSION_RESOLUTION_MODES = {
     "source_field": "直接字段",
     "derived": "推导规则",
@@ -50,6 +54,8 @@ class SemanticAsset:
     formatter: str = "semantic-asset"
     resolution_mode: str = ""
     resolution_label: str = ""
+    relation_type: str = ""
+    relation_definition: dict | None = None
     mtime: float = 0.0
     size_bytes: int = 0
     body: str = ""
@@ -67,6 +73,8 @@ class SemanticAsset:
             "formatter": self.formatter,
             "resolution_mode": self.resolution_mode,
             "resolution_label": self.resolution_label,
+            "relation_type": self.relation_type,
+            "relation_definition": self.relation_definition or {},
             "mtime": self.mtime,
             "size_bytes": self.size_bytes,
         }
@@ -182,6 +190,72 @@ def _normalize_dimension_definition(value: object) -> tuple[str, dict[str, Any]]
     return mode, definition
 
 
+def _relation_endpoint(value: object, label: str, *, require_fields: bool = False) -> dict[str, Any]:
+    raw = value if isinstance(value, dict) else {}
+    ref = _plain_string(raw.get("ref"))
+    if not ref:
+        raise SemanticAssetError(f"{label}.ref is required")
+    fields = _string_list(raw.get("key_fields") or raw.get("fields"))
+    if require_fields and not fields:
+        raise SemanticAssetError(f"{label}.fields is required")
+    return {
+        "ref": ref,
+        "display_name": _plain_string(raw.get("display_name")),
+        "key_fields": fields,
+    }
+
+
+def _normalize_relation_definition(value: object) -> tuple[str, dict[str, Any]]:
+    raw = value if isinstance(value, dict) else {}
+    relation_type = _plain_string(raw.get("type") or raw.get("relation_type")).lower()
+    if relation_type not in RELATION_TYPES:
+        raise SemanticAssetError("relation type must be dimension_binding or direct_join")
+
+    if relation_type == "dimension_binding":
+        asset = _relation_endpoint(raw.get("asset"), "asset", require_fields=True)
+        dimension = _relation_endpoint(raw.get("dimension"), "dimension")
+        if not dimension["ref"].startswith("dimension:"):
+            raise SemanticAssetError("dimension.ref must reference a dimension asset")
+        cardinality = _plain_string(raw.get("cardinality") or "many_to_one")
+        if cardinality != "many_to_one":
+            raise SemanticAssetError("dimension_binding cardinality must be many_to_one")
+        return relation_type, {
+            "asset": asset,
+            "dimension": {
+                **dimension,
+                "output_key": _plain_string(raw.get("dimension", {}).get("output_key") if isinstance(raw.get("dimension"), dict) else "") or "entity_key",
+            },
+            "cardinality": cardinality,
+            "grain": _string_list(raw.get("grain")),
+            "use_statuses": _string_list(raw.get("use_statuses")) or ["auto_matched", "accepted"],
+            "rules": _string_list(raw.get("rules")),
+        }
+
+    left = _relation_endpoint(raw.get("left"), "left", require_fields=True)
+    right = _relation_endpoint(raw.get("right"), "right", require_fields=True)
+    mapping_raw = raw.get("field_mapping") if isinstance(raw.get("field_mapping"), dict) else {}
+    left_fields = _string_list(mapping_raw.get("left"))
+    right_fields = _string_list(mapping_raw.get("right"))
+    if not left_fields or len(left_fields) != len(right_fields):
+        raise SemanticAssetError("field_mapping.left and field_mapping.right must have the same non-zero length")
+    cardinality = _plain_string(raw.get("cardinality"))
+    if cardinality not in RELATION_CARDINALITIES:
+        raise SemanticAssetError("direct_join cardinality must be one_to_one, one_to_many, many_to_one or many_to_many")
+    join_type = _plain_string(raw.get("join_type") or "left")
+    if join_type not in JOIN_TYPES:
+        raise SemanticAssetError("direct_join join_type must be inner, left, right or full")
+    grain_raw = raw.get("grain") if isinstance(raw.get("grain"), dict) else {}
+    return relation_type, {
+        "left": left,
+        "right": right,
+        "field_mapping": {"left": left_fields, "right": right_fields},
+        "cardinality": cardinality,
+        "join_type": join_type,
+        "grain": {"left": _string_list(grain_raw.get("left")), "right": _string_list(grain_raw.get("right"))},
+        "rules": _string_list(raw.get("rules")),
+    }
+
+
 def _dimension_resolution_summary(meta: dict[str, Any]) -> tuple[str, str]:
     mode = _plain_string(meta.get("resolution_mode"))
     resolution = meta.get("resolution") if isinstance(meta.get("resolution"), dict) else {}
@@ -213,7 +287,7 @@ def _semantic_relative_path(original_path: str) -> Path | None:
     if not parts:
         return None
 
-    if parts[0] in {"measures", "dimensions", "grains"}:
+    if parts[0] in {"measures", "dimensions", "grains", "relations"}:
         return Path(*parts)
 
     stripped = parts[1:] if len(parts) > 2 else parts
@@ -226,6 +300,8 @@ def _semantic_relative_path(original_path: str) -> Path | None:
         return Path("dimensions", *stripped)
     if filename == "grain.md":
         return Path("grains", *stripped)
+    if filename == "relation.md":
+        return Path("relations", *stripped)
 
     return None
 
@@ -295,10 +371,11 @@ class SemanticAssetRegistry:
         version: str = "0.1.0",
         slug: str | None = None,
         dimension_definition: dict[str, Any] | None = None,
+        relation_definition: dict[str, Any] | None = None,
     ) -> dict:
         asset_type = asset_type.strip().lower()
         if asset_type not in ASSET_TYPES:
-            raise SemanticAssetError("type must be measure, dimension or grain")
+            raise SemanticAssetError("type must be measure, dimension, grain or relation")
         clean_name = name.strip()
         if not clean_name:
             raise SemanticAssetError("name is required")
@@ -313,6 +390,8 @@ class SemanticAssetRegistry:
         normalized_definition: dict[str, Any] | None = None
         if asset_type == "dimension":
             _mode, normalized_definition = _normalize_dimension_definition(dimension_definition)
+        if asset_type == "relation":
+            _normalize_relation_definition(relation_definition)
         target.write_text(
             self._template(
                 name=clean_name,
@@ -322,6 +401,7 @@ class SemanticAssetRegistry:
                 tags=tags or [],
                 version=version.strip() or "0.1.0",
                 dimension_definition=normalized_definition,
+                relation_definition=relation_definition,
             ),
             encoding="utf-8",
         )
@@ -380,6 +460,51 @@ class SemanticAssetRegistry:
         self.refresh()
         return self.get_asset(asset_id)
 
+    def update_relation_definition(
+        self,
+        asset_id: str,
+        definition: dict[str, Any],
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        aliases: list[str] | None = None,
+        tags: list[str] | None = None,
+        version: str | None = None,
+    ) -> dict:
+        with self._lock:
+            asset = self._assets.get(asset_id)
+        if asset is None:
+            self.refresh()
+            with self._lock:
+                asset = self._assets.get(asset_id)
+        if asset is None:
+            raise SemanticAssetError(f"Semantic asset not found: {asset_id}")
+        if asset.type != "relation":
+            raise SemanticAssetError("Only relations have a relation definition")
+
+        path = _ensure_under_root(self.root_dir, self.base_dir / asset.path)
+        metadata, body = _parse_frontmatter(path.read_text(encoding="utf-8"))
+        relation_type, normalized = _normalize_relation_definition(definition)
+        if name is not None:
+            if not name.strip():
+                raise SemanticAssetError("name is required")
+            metadata["name"] = name.strip()
+        if description is not None:
+            metadata["description"] = description.strip()
+        if aliases is not None:
+            metadata["aliases"] = [item.strip() for item in aliases if item and item.strip()]
+        if tags is not None:
+            metadata["tags"] = [item.strip() for item in tags if item and item.strip()]
+        if version is not None:
+            metadata["version"] = version.strip() or "0.1.0"
+        metadata["relation_type"] = relation_type
+        metadata["relation"] = normalized
+        metadata["updated_at"] = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        frontmatter = yaml.safe_dump(metadata, allow_unicode=True, sort_keys=False).strip()
+        path.write_text(f"---\n{frontmatter}\n---\n\n{body}", encoding="utf-8")
+        self.refresh()
+        return self.get_asset(asset_id)
+
     def import_zip(self, fileobj: BinaryIO) -> dict:
         data = fileobj.read()
         try:
@@ -419,8 +544,8 @@ class SemanticAssetRegistry:
         return self._finish_import(imported)
 
     def _finish_import(self, imported: list[str]) -> dict:
-        if not any(path.endswith("measure.md") or path.endswith("dimension.md") or path.endswith("grain.md") for path in imported):
-            raise SemanticAssetError("Import must contain at least one measure.md, dimension.md or grain.md")
+        if not any(path.endswith(("measure.md", "dimension.md", "grain.md", "relation.md")) for path in imported):
+            raise SemanticAssetError("Import must contain at least one measure.md, dimension.md, grain.md or relation.md")
         snapshot = self.refresh()
         return {"imported": sorted(set(imported)), "imported_count": len(set(imported)), **snapshot}
 
@@ -434,6 +559,8 @@ class SemanticAssetRegistry:
         relative_dir = path.parent.relative_to(self.root_dir / subdir).as_posix()
         stat = path.stat()
         resolution_mode, resolution_label = _dimension_resolution_summary(meta) if asset_type == "dimension" else ("", "")
+        relation_meta = meta.get("relation") if isinstance(meta.get("relation"), dict) else {}
+        relation_type = _plain_string(meta.get("relation_type") or relation_meta.get("type"))
         return SemanticAsset(
             id=f"{asset_type}:{relative_dir}",
             name=str(meta.get("name") or path.parent.name),
@@ -445,6 +572,8 @@ class SemanticAssetRegistry:
             formatter=str(meta.get("formatter") or "semantic-asset"),
             resolution_mode=resolution_mode,
             resolution_label=resolution_label,
+            relation_type=relation_type,
+            relation_definition=relation_meta or None,
             mtime=stat.st_mtime,
             size_bytes=stat.st_size,
             body=body,
@@ -482,6 +611,7 @@ class SemanticAssetRegistry:
         tags: list[str],
         version: str,
         dimension_definition: dict[str, Any] | None = None,
+        relation_definition: dict[str, Any] | None = None,
     ) -> str:
         now_text = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         metadata = {
@@ -499,8 +629,13 @@ class SemanticAssetRegistry:
             mode, definition = _normalize_dimension_definition(dimension_definition)
             metadata["resolution_mode"] = mode
             metadata["resolution"] = definition
+        if asset_type == "relation":
+            relation_type, relation = _normalize_relation_definition(relation_definition)
+            metadata["formatter"] = "asset-relation"
+            metadata["relation_type"] = relation_type
+            metadata["relation"] = relation
         frontmatter = yaml.safe_dump(metadata, allow_unicode=True, sort_keys=False).strip()
-        type_titles = {"measure": "度量值", "dimension": "维度", "grain": "颗粒度"}
+        type_titles = {"measure": "度量值", "dimension": "维度", "grain": "颗粒度", "relation": "资产关联"}
         title = type_titles.get(asset_type, asset_type)
         references_section = ""
         if asset_type == "measure":
@@ -517,12 +652,20 @@ class SemanticAssetRegistry:
                 f"## 创建方式\n\n{label}（`{mode}`）\n\n"
                 "前置的 `resolution` 是机器可读定义；下方补充业务解释、适用边界与禁止规则。\n\n"
             )
+        relation_section = ""
+        if asset_type == "relation":
+            relation_type = str(metadata.get("relation_type") or "")
+            relation_section = (
+                f"## 关联方式\n\n{relation_type}\n\n"
+                "前置的 `relation` 是机器可读定义；下方补充业务边界、基数、粒度和重复计数风险。\n\n"
+            )
         return (
             f"---\n{frontmatter}\n---\n\n"
             f"# {name}\n\n"
             f"## 类型\n\n{title}\n\n"
             f"## 业务口径\n\n{description or '在这里描述自然语言口径、适用数据资产、字段要求和计算规则。'}\n\n"
             f"{dimension_section}"
+            f"{relation_section}"
             f"{references_section}"
             "## 查询规则\n\n"
             "- 明确需要使用的字段或 type_name 口径。\n"

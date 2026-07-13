@@ -18,7 +18,7 @@ Move the current inline DeepAgents system prompt into durable, editable prompt f
 
 ### Phase 3 - Runtime Assembly
 
-- [x] Replace the inline DeepAgents prompt with a builder that assembles `BASE.md`, project-level `PROJECT_CONTEXT.md`, and `TOOL_GUIDES.md`.
+- [x] Replace the inline DeepAgents prompt with a builder that assembles `AGENTS.md`, project-level `PROJECT_CONTEXT.md`, and `TOOL_GUIDES.md`.
 - [x] Fall back to the template context for unscoped workspaces or missing project context files.
 
 ### Phase 4 - Frontend Editing

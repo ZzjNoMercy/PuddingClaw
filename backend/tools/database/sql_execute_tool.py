@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Type
 
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel
 
 from analytics.nl2sql.sql_runner import SqlRunnerError, run_readonly_sql, validate_readonly_sql
+from graph.database_sql_revision_resume import database_sql_revision_resume_registry
 
 from .formatting import format_profile, markdown_table
 from .models import DatabaseSqlExecuteInput
@@ -20,10 +20,16 @@ class DatabaseSqlExecuteTool(BaseTool):
     name: str = "database_sql_execute"
     description: str = (
         "Execute explicit read-only PostgreSQL SQL against a configured database source. "
-        "Use only after SQL is generated or manually written and ready to run. This tool does not call Vanna."
+        "Use only after database_sql_generate. In Agent mode, generation_id is mandatory and the SQL must exactly "
+        "match the registered generation; semantic changes must go through the natural-language revision HITL flow."
     )
-    args_schema: Type[BaseModel] = DatabaseSqlExecuteInput
+    args_schema: type[BaseModel] = DatabaseSqlExecuteInput
     risk_level: str = "moderate"
+    session_id: str = ""
+
+    @staticmethod
+    def _normalized_sql(sql: str) -> str:
+        return " ".join(sql.strip().rstrip(";").split())
 
     class Config:
         arbitrary_types_allowed = True
@@ -31,11 +37,28 @@ class DatabaseSqlExecuteTool(BaseTool):
     async def _arun(
         self,
         sql: str,
+        generation_id: str = "",
         database_source_id: str | None = None,
         table_names: list[str] | None = None,
         limit: int = 100,
         timeout_ms: int | None = None,
     ) -> str:
+        if self.session_id:
+            generation = database_sql_revision_resume_registry.get_generation(
+                generation_id,
+                session_id=self.session_id,
+            )
+            if generation is None:
+                return "🧮 SQL 执行失败：Agent 模式必须提供当前会话有效的 generation_id。请先调用 database_sql_generate。"
+            if self._normalized_sql(sql) != self._normalized_sql(generation.result.sql):
+                return (
+                    "🧮 SQL 执行拒绝：SQL 与 generation_id 登记结果不一致，禁止执行手写改动。"
+                    "如需调整，请调用 database_sql_generate(parent_generation_id='"
+                    f"{generation.id}', revision_instruction='<自然语言修改说明>')。"
+                )
+            sql = generation.result.sql
+            database_source_id = generation.request.get("database_source_id")
+            table_names = list(generation.request.get("table_names") or generation.result.route.table_names)
         try:
             source, public_source, allowed_tables = await resolve_database_source_scope(database_source_id, table_names)
             execution = await run_readonly_sql(
@@ -83,6 +106,7 @@ class DatabaseSqlExecuteTool(BaseTool):
     def _run(
         self,
         sql: str,
+        generation_id: str = "",
         database_source_id: str | None = None,
         table_names: list[str] | None = None,
         limit: int = 100,
@@ -94,6 +118,7 @@ class DatabaseSqlExecuteTool(BaseTool):
             return asyncio.run(
                 self._arun(
                     sql=sql,
+                    generation_id=generation_id,
                     database_source_id=database_source_id,
                     table_names=table_names,
                     limit=limit,

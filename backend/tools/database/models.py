@@ -48,16 +48,38 @@ class DatabaseSqlGenerateInput(BaseModel):
         default_factory=list,
         description="Optional semantic asset ids to force into SQL-generation context.",
     )
+    parent_generation_id: str | None = Field(
+        default=None,
+        description=(
+            "Generation id returned by an earlier database_sql_generate call. Set this only when proposing "
+            "a semantic change to that SQL; the user must approve the natural-language change before regeneration."
+        ),
+    )
+    revision_instruction: str | None = Field(
+        default=None,
+        description=(
+            "Natural-language description of the proposed semantic change. Never put SQL here. "
+            "Requires parent_generation_id and triggers the agree/reject/modify HITL flow."
+        ),
+    )
 
 
 class DatabaseSqlValidateInput(BaseModel):
     sql: str = Field(description="Read-only SQL to validate. This tool does not execute SQL.")
+    generation_id: str = Field(
+        default="",
+        description="Generation id returned by database_sql_generate. Required in Agent mode.",
+    )
     database_source_id: str | None = Field(default=None, description="Optional configured database source id.")
     table_names: list[str] = Field(default_factory=list, description="Optional authorized table names.")
 
 
 class DatabaseSqlExecuteInput(BaseModel):
     sql: str = Field(description="Explicit read-only SQL to execute.")
+    generation_id: str = Field(
+        default="",
+        description="Generation id returned by database_sql_generate. Required in Agent mode.",
+    )
     database_source_id: str | None = Field(default=None, description="Optional configured database source id.")
     table_names: list[str] = Field(default_factory=list, description="Optional authorized table names.")
     limit: int = Field(default=100, ge=1, le=5000, description="Maximum preview rows returned to the model.")
