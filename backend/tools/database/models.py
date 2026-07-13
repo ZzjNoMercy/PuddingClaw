@@ -104,7 +104,9 @@ class DatabaseQueryTraceInspectInput(BaseModel):
 
 
 class DatabaseQueryResultPageInput(BaseModel):
-    result_id: str = Field(description="Persisted database query result id returned by database_knowledge_query.")
+    result_id: str = Field(
+        description="Persisted database query result id returned by database_knowledge_query or database_sql_execute."
+    )
     page: int = Field(default=1, ge=1, description="1-based page number.")
     page_size: int | None = Field(default=None, ge=1, le=5000, description="Optional page size.")
 

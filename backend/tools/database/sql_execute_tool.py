@@ -7,10 +7,12 @@ import asyncio
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel
 
+from analytics.nl2sql.result_store import attach_persisted_query_result
 from analytics.nl2sql.sql_runner import SqlRunnerError, run_readonly_sql, validate_readonly_sql
+from db import get_sessionmaker
 from graph.database_sql_revision_resume import database_sql_revision_resume_registry
 
-from .formatting import format_profile, markdown_table
+from .formatting import format_actions, format_profile, markdown_table
 from .models import DatabaseSqlExecuteInput
 from .scope import resolve_database_source_scope
 from .spans import emit_database_span, preview_rows
@@ -21,7 +23,9 @@ class DatabaseSqlExecuteTool(BaseTool):
     description: str = (
         "Execute explicit read-only PostgreSQL SQL against a configured database source. "
         "Use only after database_sql_generate. In Agent mode, generation_id is mandatory and the SQL must exactly "
-        "match the registered generation; semantic changes must go through the natural-language revision HITL flow."
+        "match the registered generation; semantic changes must go through the natural-language revision HITL flow. "
+        "When the result is preview-only, the full materialized rows are persisted and returned with a result_id; "
+        "use database_query_result_page to fetch subsequent pages."
     )
     args_schema: type[BaseModel] = DatabaseSqlExecuteInput
     risk_level: str = "moderate"
@@ -43,6 +47,7 @@ class DatabaseSqlExecuteTool(BaseTool):
         limit: int = 100,
         timeout_ms: int | None = None,
     ) -> str:
+        question = "显式 SQL 执行"
         if self.session_id:
             generation = database_sql_revision_resume_registry.get_generation(
                 generation_id,
@@ -57,6 +62,7 @@ class DatabaseSqlExecuteTool(BaseTool):
                     f"{generation.id}', revision_instruction='<自然语言修改说明>')。"
                 )
             sql = generation.result.sql
+            question = generation.result.question
             database_source_id = generation.request.get("database_source_id")
             table_names = list(generation.request.get("table_names") or generation.result.route.table_names)
         try:
@@ -73,6 +79,28 @@ class DatabaseSqlExecuteTool(BaseTool):
         except Exception as exc:
             return f"🧮 SQL 执行失败：{type(exc).__name__}: {exc}"
 
+        persistence_error = ""
+        if not execution.is_complete:
+            try:
+                sessionmaker = get_sessionmaker()
+                async with sessionmaker() as session:
+                    await attach_persisted_query_result(
+                        session,
+                        execution,
+                        question=question,
+                        sql=sql,
+                        session_id=self.session_id,
+                    )
+            except Exception as exc:
+                persistence_error = type(exc).__name__
+                execution.actions = [
+                    {
+                        "type": "fetch_page",
+                        "available": False,
+                        "reason": "result_store_error",
+                    }
+                ]
+
         emit_database_span(
             "sql_execute",
             {
@@ -81,10 +109,15 @@ class DatabaseSqlExecuteTool(BaseTool):
                 "sql": sql,
                 "columns": execution.columns,
                 "row_count": execution.row_count,
+                "total_row_count": execution.total_row_count or execution.row_count,
                 "preview_count": execution.preview_count,
+                "omitted_count": execution.omitted_count,
                 "is_complete": execution.is_complete,
                 "rows_preview": preview_rows(execution.rows, limit=20),
                 "profile": execution.profile,
+                "result_id": execution.result_id,
+                "result_store": execution.result_store,
+                "actions": execution.actions,
             },
             metadata={"database_source_id": public_source.get("id")},
         )
@@ -98,7 +131,18 @@ class DatabaseSqlExecuteTool(BaseTool):
             f"- 授权表：{', '.join(allowed_tables)}",
             f"- 结果：{result_size}",
         ]
+        if execution.result_id:
+            lines.extend(
+                [
+                    f"- result_id：{execution.result_id}",
+                    f"- 持久化：{execution.result_store.get('artifact_path')}"
+                    f"（过期时间：{execution.result_store.get('expires_at')}）",
+                ]
+            )
+        elif persistence_error:
+            lines.append(f"- 持久化失败：{persistence_error}，本次只能返回预览结果")
         lines.extend(format_profile(execution.profile))
+        lines.extend(format_actions(execution.actions))
         lines.extend(["", "```sql", validate_readonly_sql(sql, allowed_tables=allowed_tables), "```", ""])
         lines.extend(markdown_table(execution.rows, execution.columns, max_rows=len(execution.rows) or 20))
         return "\n".join(lines)

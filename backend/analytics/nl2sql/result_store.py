@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import json
 import csv
 import io
-from datetime import timedelta
+import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -15,12 +15,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from config import get_database_qa_config
 from knowledge.models import AnalyticsQueryResult, new_id, utcnow
 
+from .schemas import SqlExecutionResult
+
 BASE_DIR = Path(__file__).resolve().parents[2]
 RESULT_DIR = BASE_DIR / "data" / "database-query-results"
 
 
 class QueryResultStoreError(RuntimeError):
     """Raised when persisted query results cannot be read."""
+
+
+def _is_expired(expires_at: datetime) -> bool:
+    """Compare catalog timestamps consistently across SQLite and PostgreSQL."""
+
+    normalized = expires_at if expires_at.tzinfo is not None else expires_at.replace(tzinfo=timezone.utc)
+    return normalized <= utcnow()
 
 
 def _json_default(value: Any) -> str:
@@ -83,6 +92,66 @@ async def persist_query_result(
     } | {"result_id": result_id}
 
 
+async def attach_persisted_query_result(
+    session: AsyncSession,
+    execution: SqlExecutionResult,
+    *,
+    question: str,
+    sql: str,
+    session_id: str = "",
+    tool_call_id: str = "",
+) -> bool:
+    """Attach the shared result-store contract to an incomplete SQL execution.
+
+    Both the all-in-one database query service and the explicit
+    generate/validate/execute workflow use this helper so preview pagination
+    behaves consistently across both paths.
+    """
+
+    if execution.is_complete:
+        return False
+
+    config = get_database_qa_config()
+    if (
+        config.get("result_store_enabled", True)
+        and execution.materialized_all
+        and execution.materialized_rows
+    ):
+        store_contract = await persist_query_result(
+            session,
+            question=question,
+            sql=sql,
+            columns=execution.columns,
+            rows=execution.materialized_rows,
+            profile=execution.profile,
+            session_id=session_id,
+            tool_call_id=tool_call_id,
+        )
+        execution.result_id = store_contract.get("result_id")
+        execution.result_store = {key: value for key, value in store_contract.items() if key != "result_id"}
+        execution.actions = [
+            {
+                "type": "fetch_page",
+                "available": True,
+                "page_size": config.get("default_page_size", 100),
+            },
+            {
+                "type": "export",
+                "available": bool(config.get("export_enabled", True)),
+            },
+        ]
+        return True
+
+    execution.actions = [
+        {
+            "type": "fetch_page",
+            "available": False,
+            "reason": "result_not_fully_materialized",
+        }
+    ]
+    return False
+
+
 async def get_query_result_page(
     session: AsyncSession,
     result_id: str,
@@ -101,7 +170,7 @@ async def get_query_result_page(
     if record is None:
         raise QueryResultStoreError("查询结果不存在或已清理。")
 
-    expired = record.expires_at <= utcnow()
+    expired = _is_expired(record.expires_at)
     artifact = BASE_DIR / record.artifact_path
     if expired or not artifact.exists():
         return {
@@ -148,7 +217,7 @@ async def get_query_result_page(
 def _record_to_summary(record: AnalyticsQueryResult, *, include_profile: bool = True) -> dict[str, Any]:
     config = get_database_qa_config()
     artifact = BASE_DIR / record.artifact_path
-    expired = record.expires_at <= utcnow()
+    expired = _is_expired(record.expires_at)
     summary = {
         "result_id": record.id,
         "session_id": record.session_id,
@@ -212,7 +281,7 @@ async def export_query_result_csv(session: AsyncSession, result_id: str) -> tupl
     record = await session.get(AnalyticsQueryResult, result_id)
     if record is None:
         raise QueryResultStoreError("查询结果不存在或已清理。")
-    if record.expires_at <= utcnow():
+    if _is_expired(record.expires_at):
         raise QueryResultStoreError("持久化结果已过期，请重新执行问数。")
     artifact = BASE_DIR / record.artifact_path
     if not artifact.exists():

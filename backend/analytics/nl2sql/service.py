@@ -9,14 +9,14 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from analytics.nl2sql.runtime import build_vanna_client_from_app_config
 from analytics.nl2sql.guardrails import (
     GuardrailConflict,
     conflicts_to_messages,
     detect_guardrail_conflicts,
 )
+from analytics.nl2sql.result_store import attach_persisted_query_result
+from analytics.nl2sql.runtime import build_vanna_client_from_app_config
 from analytics.nl2sql.schemas import DatabaseQueryRequest, DatabaseQueryResult, DatabaseSqlGenerationResult
-from analytics.nl2sql.result_store import persist_query_result
 from analytics.nl2sql.sql_runner import SqlRunnerError, extract_sql, run_readonly_sql
 from analytics.nl2sql.table_router import TableRouterError, route_database_tables, summarize_table_route
 from analytics.semantic_assets.resolver import (
@@ -24,7 +24,7 @@ from analytics.semantic_assets.resolver import (
     resolve_semantic_assets,
     semantic_resolution_to_trace,
 )
-from config import get_database_qa_config, get_vanna_config
+from config import get_vanna_config
 from knowledge.database_sources import get_database_source
 
 
@@ -607,44 +607,14 @@ async def query_database_knowledge(
                 " ".join(sql.split())[:500],
             )
             raise
-        database_qa_config = get_database_qa_config()
-        if (
-            database_qa_config.get("result_store_enabled", True)
-            and not execution.is_complete
-            and execution.materialized_all
-            and execution.materialized_rows
+        stage_started = perf_counter()
+        if await attach_persisted_query_result(
+            session,
+            execution,
+            question=request.question,
+            sql=sql,
         ):
-            stage_started = perf_counter()
-            store_contract = await persist_query_result(
-                session,
-                question=request.question,
-                sql=sql,
-                columns=execution.columns,
-                rows=execution.materialized_rows,
-                profile=execution.profile,
-            )
             record_stage("result_store_ms", stage_started)
-            execution.result_id = store_contract.get("result_id")
-            execution.result_store = {key: value for key, value in store_contract.items() if key != "result_id"}
-            execution.actions = [
-                {
-                    "type": "fetch_page",
-                    "available": True,
-                    "page_size": database_qa_config.get("default_page_size", 100),
-                },
-                {
-                    "type": "export",
-                    "available": bool(database_qa_config.get("export_enabled", True)),
-                },
-            ]
-        elif not execution.is_complete:
-            execution.actions = [
-                {
-                    "type": "fetch_page",
-                    "available": False,
-                    "reason": "result_not_fully_materialized",
-                }
-            ]
         logger.info(
             "[nl2sql-service] sql_executed source=%s tables=%s rows=%s limited=%s",
             route.source_name,

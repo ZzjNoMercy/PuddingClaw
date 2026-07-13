@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Type
 
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel
@@ -18,10 +17,11 @@ from .result_store import QueryResultStoreError, read_query_result_page
 class DatabaseQueryResultPageTool(BaseTool):
     name: str = "database_query_result_page"
     description: str = (
-        "Fetch a page from a persisted database_knowledge_query result_id. "
-        "Use this after database_knowledge_query returns preview-only detail rows and the user asks for row-level details."
+        "Fetch a page from a persisted database query result_id. "
+        "Use this after database_knowledge_query or database_sql_execute returns preview-only detail rows "
+        "and the user asks for row-level details."
     )
-    args_schema: Type[BaseModel] = DatabaseQueryResultPageInput
+    args_schema: type[BaseModel] = DatabaseQueryResultPageInput
     risk_level: str = "safe"
 
     class Config:

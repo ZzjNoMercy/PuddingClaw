@@ -3,13 +3,13 @@ formatter: analytics-model
 id: "汽车行业综合分析"
 name: "汽车行业综合分析"
 type: analysis_model
-version: "0.1.0"
+version: "0.2.0"
 description: "分析汽车行业销量、产品规划、技术规划、发展趋势等"
 tags: ["汽车销量","汽车产品配置分析"]
 data_assets:
   tables: ["table_asset:tbl_23fff15978050fdc18330ab2","dbs_77982e981bac4a6fa8.vehicle_params","dbs_77982e981bac4a6fa8.vehicle_params_wide","table_asset:tbl_concat_847eed5f3f93dd93e4cb7111"]
 semantic_assets:
-  measures: ["measure:charging_c_rate","measure:config_rate","measure:销量"]
+  measures: ["measure:charging_c_rate","measure:config_rate","measure:launch_cycle","measure:launch_update_count","measure:销量"]
   dimensions: ["dimension:launch_time","dimension:price_band","dimension:brand","dimension:energy_type","dimension:vehicle_level","dimension:vehicle_series"]
   grains: ["grain:car_model","grain:series"]
 asset_relations: []

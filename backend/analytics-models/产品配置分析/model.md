@@ -1,52 +1,25 @@
 ---
 formatter: analytics-model
-id: 产品配置分析
-name: 产品配置分析
+id: "产品配置分析"
+name: "产品配置分析"
 type: analysis_model
-version: 0.2.0
-description: 汽车行业已上市车型的配置分析，当用户询问单一车型的配置、多车型的配置对比以及行业的配置率发展趋势等场景使用。
-tags:
-- 汽车产品配置
-- 配置率
-- 行业趋势报告
-- ECharts
+version: "0.2.0"
+description: "汽车行业已上市车型的配置分析，当用户询问单一车型的配置、多车型的配置对比以及行业的配置率发展趋势等场景使用。"
+tags: ["汽车产品配置","配置率","行业趋势报告","ECharts"]
 data_assets:
-  tables:
-  - dbs_77982e981bac4a6fa8.vehicle_params
-  - dbs_77982e981bac4a6fa8.vehicle_params_wide
+  tables: ["dbs_77982e981bac4a6fa8.vehicle_params","dbs_77982e981bac4a6fa8.vehicle_params_wide"]
 semantic_assets:
-  measures:
-  - measure:charging_c_rate
-  - measure:config_rate
-  dimensions:
-  - dimension:launch_time
-  - dimension:price_band
-  - dimension:brand
-  - dimension:energy_type
-  - dimension:vehicle_level
-  - dimension:vehicle_series
-  grains:
-  - grain:car_model
-  - grain:series
-asset_relations:
-- relation:车系配置关联
-- relation:1111
-guardrails:
-- air_suspension_reference_type_value
-- config_rate_model_key_group
-- config_rate_no_exists_distinct
-- config_rate_use_wide_denominator
-- launch_time_no_car_name_year
-- postgres_count_distinct_nullable_tuple_after_left_join
-templates:
-  product_config_report_html:
-    path: ../../../designs/product-configuration-analysis/产品配置分析模型模板 v2.html
-    reference: references/report-generation.md
-    renderer: echarts
-default_template: product_config_report_html
-created: '2026-07-13 06:25:03'
-updated_at: '2026-07-13 17:10:00'
+  measures: ["measure:charging_c_rate","measure:config_rate","measure:launch_update_count","measure:launch_cycle"]
+  dimensions: ["dimension:launch_time","dimension:price_band","dimension:brand","dimension:energy_type","dimension:vehicle_level","dimension:vehicle_series"]
+  grains: ["grain:car_model","grain:series"]
+asset_relations: ["relation:车系配置关联","relation:1111"]
+guardrails: ["air_suspension_reference_type_value","config_rate_model_key_group","config_rate_no_exists_distinct","config_rate_use_wide_denominator","launch_time_no_car_name_year","postgres_count_distinct_nullable_tuple_after_left_join"]
+templates: {}
+default_template: "product_config_report_html"
+created: "2026-07-13 06:25:03"
+updated_at: "2026-07-13 22:32:19"
 ---
+
 
 # 产品配置分析
 
