@@ -2133,6 +2133,8 @@ export interface PermissionRequest {
   path?: string;
   target_kind?: string;
   capabilities?: string[];
+  operation?: string;
+  change_preview?: Record<string, string>;
   status?: string;
 }
 
@@ -2432,6 +2434,7 @@ export async function listSessions(): Promise<
     project_path?: string | null;
     workspace_type?: string;
     workspace_path?: string;
+    analytics_model_id?: string | null;
   }>
 > {
   const resp = await fetch(`${API_BASE}/sessions`);
@@ -2538,7 +2541,7 @@ export async function listSessionPermissions(sessionId: string): Promise<Permiss
   return data.grants || [];
 }
 
-export async function grantExternalFileRead(
+export async function grantExternalFilePermission(
   sessionId: string,
   targetKind: "exact_file" | "all_external_files",
   path?: string,
@@ -2584,10 +2587,27 @@ export async function createSession(): Promise<{
   created_at?: number;
   updated_at?: number;
   runtime_mode?: "agent" | "chat";
+  analytics_model_id?: string | null;
 }> {
   const resp = await fetch(`${API_BASE}/sessions`, { method: "POST" });
   if (!resp.ok) throw new Error(`Failed to create session: ${resp.status}`);
   return resp.json();
+}
+
+/** Persist or clear the analytics model selected for a session. */
+export async function updateSessionAnalyticsModel(
+  sessionId: string,
+  analyticsModelId: string | null
+): Promise<void> {
+  const resp = await fetch(
+    `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/analytics-model`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ analytics_model_id: analyticsModelId }),
+    }
+  );
+  if (!resp.ok) throw new Error(`Failed to update session analytics model: ${resp.status}`);
 }
 
 /**

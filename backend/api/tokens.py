@@ -9,7 +9,11 @@ from pydantic import BaseModel
 
 from graph.session_manager import session_manager
 from graph.prompt_builder import build_system_prompt
-from config import get_rag_mode, get_compaction_trigger_tokens
+from config import (
+    get_compaction_trigger_tokens,
+    get_deepagents_summarization_config,
+    get_rag_mode,
+)
 
 router = APIRouter()
 
@@ -61,12 +65,24 @@ async def get_session_token_count(session_id: str) -> dict[str, Any]:
 
     message_tokens += tool_output_tokens
 
-    context_usage_peak = session_manager.get_context_usage_peak(session_id)
-    if context_usage_peak > system_tokens + message_tokens:
-        message_tokens = context_usage_peak - system_tokens
-
-    compaction_trigger = get_compaction_trigger_tokens()
-    total_tokens = system_tokens + message_tokens
+    metadata = session_manager.get_metadata(session_id)
+    is_agent = metadata.get("runtime_mode") == "agent"
+    if is_agent:
+        # Agent keeps the complete transcript for the UI, but DeepAgents may
+        # send a much smaller summarized context to the model. Never replace
+        # that current value with the historical peak/full transcript size.
+        current_usage = session_manager.get_agent_context_usage(session_id)
+        total_tokens = current_usage or (system_tokens + message_tokens)
+        message_tokens = max(0, total_tokens - system_tokens)
+        compaction_trigger = int(
+            get_deepagents_summarization_config().get("trigger_tokens", 500000)
+        )
+    else:
+        context_usage_peak = session_manager.get_context_usage_peak(session_id)
+        if context_usage_peak > system_tokens + message_tokens:
+            message_tokens = context_usage_peak - system_tokens
+        compaction_trigger = get_compaction_trigger_tokens()
+        total_tokens = system_tokens + message_tokens
     return {
         "system_tokens": system_tokens,
         "message_tokens": message_tokens,

@@ -27,8 +27,8 @@ resolution:
       fields:
         brand: 品牌
         series: 1-子车型
-    - asset_ref: dbs_77982e981bac4a6fa8.vehicle_params_wide
-      display_name: insight_data · vehicle_params_wide
+    - asset_ref: dbs_77982e981bac4a6fa8.vehicle_model_base
+      display_name: insight_data · vehicle_model_base
       fields:
         brand: brand
         series: serial_name
@@ -67,7 +67,7 @@ canonical_series: 秦PLUS
 
 `canonical_series` 单独不是唯一键。所有跨源 Join 必须使用 `entity_key`，或完整使用 `canonical_brand + canonical_series`。
 
-`canonical_brand` 与 `canonical_series` 必须逐字取自产品配置表 `vehicle_params_wide.brand` 和 `vehicle_params_wide.serial_name`。`entity_key` 也只由这对配置表原始值派生：`normalize(brand) + "::" + normalize(serial_name)`。来源表不参与三者的生成，只能提供绑定证据；它们不从销量、上险量或其他来源改写。
+`canonical_brand` 与 `canonical_series` 必须逐字取自产品配置表 `vehicle_model_base.brand` 和 `vehicle_model_base.serial_name`。`entity_key` 也只由这对配置表原始值派生：`normalize(brand) + "::" + normalize(serial_name)`。来源表不参与三者的生成，只能提供绑定证据；它们不从销量、上险量或其他来源改写。
 
 ## 来源键契约
 
@@ -85,7 +85,7 @@ example:
 
 ```yaml
 source_kind: database_table
-table: vehicle_params_wide
+table: vehicle_model_base
 key_fields: [brand, serial_name]
 example:
   brand: 比亚迪
@@ -136,7 +136,7 @@ example:
     },
     {
       "source_kind": "database_table",
-      "table_or_sheet": "vehicle_params_wide",
+      "table_or_sheet": "vehicle_model_base",
       "key_fields": {"brand": "比亚迪", "serial_name": "秦PLUS"}
     }
   ],

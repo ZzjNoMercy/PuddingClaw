@@ -172,7 +172,7 @@ S0 解析任务
 
 | 数据表 | 颗粒度 | 用途 |
 | --- | --- | --- |
-| `vehicle_params_wide` | 一行一个款型 | 分母、时间/品牌/车系/能源/级别/价格/销售状态筛选 |
+| `vehicle_model_base` | 一行一个款型 | 分母、时间/品牌/车系/能源/级别/轴距/电机总功率/价格/销售状态筛选 |
 | `vehicle_params` | 一行一个款型配置项 | 判断具体配置、配置值、配置供应商或硬件型号 |
 
 ### 标准键
@@ -184,7 +184,7 @@ S0 解析任务
 
 ### 配置查询路径
 
-1. 用 `vehicle_params_wide` 形成唯一款型分母。
+1. 用 `vehicle_model_base` 形成唯一款型分母。
 2. 用完整款型键连接 `vehicle_params`。
 3. 按目标配置的 `type_name + type_value` 规则生成搭载标记。
 4. 先在款型颗粒度去重，再聚合到车系、品牌、价格带或年份。
@@ -207,12 +207,14 @@ S0 解析任务
 
 | 逻辑维度 | 首选字段 | 回退规则 |
 | --- | --- | --- |
-| 品牌 | `vehicle_params_wide.brand` | `vehicle_params.brand` |
-| 车系 | `vehicle_params_wide.serial_name` | `vehicle_params.serial_name` |
-| 款型 | `vehicle_params_wide.car_name` | `vehicle_params.car_name` |
+| 品牌 | `vehicle_model_base.brand` | `vehicle_params.brand` |
+| 车系 | `vehicle_model_base.serial_name` | `vehicle_params.serial_name` |
+| 款型 | `vehicle_model_base.car_name` | `vehicle_params.car_name` |
 | 上市日期/年/月 | `launch_date / launch_year / launch_month` | EAV `type_name='上市时间'` 后解析 |
 | 能源类型 | `energy_type` | EAV `type_name='能源类型'` |
 | 车型级别 | `vehicle_level` | EAV `type_name='级别'` |
+| 轴距/轴距段 | `wheelbase_mm` + `dimension:wheelbase` | EAV `type_name='轴距[mm]'` 后数值化 |
+| 电机总功率/功率段 | `motor_power_kw` + `dimension:motor_power` | EAV `type_name='电动机总功率[kW]'` 后数值化；不得由前后电机功率相加 |
 | 指导价/价格带 | `price / price_band` | EAV `type_name='厂商指导价'` 后数值化 |
 | 销售状态 | `sale_status` | 无可靠值时标记未知 |
 | 配置类别 | `vehicle_params.category` | 不可从 `type_name` 猜测 |
@@ -238,10 +240,10 @@ S0 解析任务
 当前模型已注册：
 
 - 度量：`measure:config_rate`、`measure:charging_c_rate`
-- 维度：`dimension:launch_time`、`dimension:price_band`、`dimension:brand`、`dimension:energy_type`、`dimension:vehicle_level`、`dimension:vehicle_series`
+- 维度：`dimension:launch_time`、`dimension:price_band`、`dimension:wheelbase`、`dimension:motor_power`、`dimension:brand`、`dimension:energy_type`、`dimension:vehicle_level`、`dimension:vehicle_series`
 - 颗粒度：`grain:car_model`、`grain:series`
 
-这些资产足以支持基础配置率查询，但不足以单独表达完整行业报告。下列“报告级逻辑字段”必须在查询结果中显式计算；在对应语义资产正式创建前，不要写入模型 `semantic_assets` 列表。
+这些资产足以支持基础配置率、轴距和电机功率分析，但不足以单独表达完整行业报告。下表中已注册的维度必须优先使用其语义资产；其余报告级逻辑字段需要在查询结果中显式计算，在正式创建对应语义资产前不要写入模型 `semantic_assets` 列表。
 
 ### 最低必需维度
 
@@ -250,8 +252,8 @@ S0 解析任务
 | 款型 | 2025 款某配置版 | 使用 `grain:car_model` 与完整款型键 |
 | 配置类别/配置项/配置值 | 智能驾驶 / 激光雷达 / 1 个 | EAV `category/type_name/type_value` |
 | 更新类型 | 新增、改款、换代 | 由同车系上市序列派生，需保留规则说明 |
-| 轴距段 | 2800–2850mm | 从轴距配置值数值化并分箱 |
-| 电机功率段 | 150–200kW | 从电机总功率数值化并分箱 |
+| 轴距段 | 2800–2850mm | 使用 `dimension:wheelbase` |
+| 电机功率段 | 150–200kW | 使用 `dimension:motor_power` |
 | 排量段 | 1.5L、2.0L | 从发动机排量标准化 |
 | 电压平台 | 400V、800V、900V | 从平台电压/电池电压配置标准化 |
 | 智驾能力 | L2、L2+、高速 NOA、城市 NOA | 按配置识别规则派生，不只匹配名称 |

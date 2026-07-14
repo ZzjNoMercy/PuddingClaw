@@ -3,6 +3,26 @@
 from graph.session_manager import session_manager
 
 
+def test_analytics_model_id_round_trips_in_session_metadata(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session(
+        "analytics-model-session",
+        metadata={"analytics_model_id": "产品配置分析"},
+    )
+
+    assert session_manager.get_metadata("analytics-model-session")["analytics_model_id"] == "产品配置分析"
+    listed = {item["id"]: item for item in session_manager.list_sessions()}
+    assert listed["analytics-model-session"]["analytics_model_id"] == "产品配置分析"
+
+    cleared = session_manager.update_metadata(
+        "analytics-model-session",
+        {"analytics_model_id": None},
+    )
+    assert "analytics_model_id" in cleared
+    assert cleared["analytics_model_id"] is None
+    assert session_manager.get_metadata("analytics-model-session")["analytics_model_id"] is None
+
+
 def test_save_and_load_reasoning_content_for_tool_call_turn(tmp_path):
     session_manager.initialize(tmp_path)
     session_manager.create_session("reasoning-session")

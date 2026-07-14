@@ -12,9 +12,9 @@ tags:
   - 汽车产品
   - 车系上新
   - vehicle_params
-version: 0.6.0
+version: 0.7.0
 created: 2026-07-13 00:00:00
-updated_at: 2026-07-13 00:00:00
+updated_at: 2026-07-14 00:00:00
 ---
 
 # 上市周期
@@ -97,7 +97,7 @@ WHERE launch_cycle_year BETWEEN 2020 AND 2026;
 
 ## 字段口径
 
-数据必须从 `vehicle_params` 的上市时间明细中提取，不使用 `vehicle_params_wide.launch_date` 计算本度量值：
+数据必须从 `vehicle_params` 的上市时间明细中提取，不使用 `vehicle_model_base.launch_date` 计算本度量值：
 
 - 品牌：`brand`。
 - 车系：`serial_name`。
@@ -106,7 +106,7 @@ WHERE launch_cycle_year BETWEEN 2020 AND 2026;
 
 `type_value` 必须先转换为有效日期，再参与排序和日期差计算。无法转换为日期的值应排除，并在结果中说明数据质量问题。
 
-`vehicle_params_wide` 是款型级物化快照，适合按上市时间筛选款型，但本度量值需要从 `vehicle_params` 汇集同一车系下全部上市时间并重建车系上市事件序列。
+`vehicle_model_base` 是款型级物化快照，适合按上市时间筛选款型，但本度量值需要从 `vehicle_params` 汇集同一车系下全部上市时间并重建车系上市事件序列。
 
 ## 计算规则
 
@@ -149,23 +149,55 @@ launch_sequence AS (
       ORDER BY launch_date
     ) AS previous_launch_date
   FROM launch_events
+),
+cycle_calc AS (
+  SELECT
+    brand,
+    serial_name,
+    launch_date,
+    EXTRACT(YEAR FROM launch_date) AS launch_cycle_year,
+    previous_launch_date,
+    launch_date - previous_launch_date AS launch_cycle_days
+  FROM launch_sequence
 )
 SELECT
   brand,
   serial_name,
   launch_date,
-  EXTRACT(YEAR FROM launch_date) AS launch_cycle_year,
+  launch_cycle_year,
   previous_launch_date,
-  launch_date - previous_launch_date AS launch_cycle_days
-FROM launch_sequence
-WHERE previous_launch_date IS NOT NULL;
+  launch_cycle_days
+FROM cycle_calc
+WHERE launch_cycle_days IS NOT NULL;
 ```
+
+年度平均聚合必须保留有效周期数，并直接对非空周期求平均：
+
+```sql
+SELECT
+  launch_cycle_year,
+  COUNT(*) AS valid_cycle_count,
+  SUM(launch_cycle_days) AS cycle_days_sum,
+  AVG(launch_cycle_days) AS avg_launch_cycle_days
+FROM cycle_calc
+WHERE launch_cycle_days IS NOT NULL
+GROUP BY launch_cycle_year;
+```
+
+`valid_cycle_count` 是平均上市周期的分母；`measure:launch_update_count` 统计的全部上市事件数应单独输出，不得替代该分母。
 
 ## 聚合规则
 
 用户要求按品牌、车系、时间范围等维度汇总时，应先逐个上市事件计算上市周期，再对周期结果进行聚合。
 
-平均上市周期根据分析场景使用以下两种明确口径，不得混用。
+年度、车系、品牌和能源分组的平均上市周期统一使用同一口径：
+
+```text
+平均上市周期
+= 有效周期天数之和 / 有效周期记录数
+```
+
+有效周期是 `previous_launch_date IS NOT NULL` 且周期天数有效的上市事件。首次上市没有上次上市时间，周期为空，不进入平均值的分子和分母。首次上市仍计入 `measure:launch_update_count`，但更新次数不是平均上市周期的分母。
 
 ### 按车系统计
 
@@ -188,30 +220,38 @@ WHERE previous_launch_date IS NOT NULL;
 
 ### 按年份统计
 
-计算某一年的平均上市周期时，分母使用该年份全部去重后的上市次数，包括各车系在数据中的首次上市：
+计算某一年的平均上市周期时，先在完整历史序列中计算周期并按本次上市年份归属，再只对归属于该年份的有效周期求平均：
 
 ```text
 年度平均上市周期
-= 归属于该年份的周期天数之和 / 该年份上市次数
+= 归属于该年份的有效周期天数之和 / 归属于该年份的有效周期记录数
 ```
 
-首次上市没有上次上市时间，明细周期仍为空；但在年度均值口径中计入该年份上市次数分母，其周期天数对分子贡献按 0 处理。不得把首次上市的明细周期改写成 0。
+首次上市没有上次上市时间，周期为空，年度平均时必须排除。不得使用 `COALESCE(cycle_days, 0)` 把首次上市转换成 0 后参与平均。
 
-例如某车系在 2025 年上市一次、2026 年上市一次，则跨年周期归属于 2026 年。2025 年和 2026 年的上市事件都分别计入各自年度的上市次数分母；2025 年首次上市对周期天数分子的贡献为 0。
+例如某车系在 2025 年首次上市、2026 年再次上市，则跨年周期归属于 2026 年。2025 年没有有效周期，不计算该车系的年度平均周期；2026 年的跨年周期进入 2026 年平均周期的分子和分母。
 
 按传统能源、新能源等能源大类计算年度趋势时，在每个 `year + energy_group` 内分别使用：
 
 ```text
 年度分能源平均上市周期
-= 该年份该能源组的周期天数之和 / 该年份该能源组的上市次数
+= 该年份该能源组的有效周期天数之和 / 该年份该能源组的有效周期记录数
+```
+
+示例：某品牌 2024 年有 5 次上市事件，其中 2 次为首发，另外 3 次的周期分别为 387、387、211 天，则：
+
+```text
+更新次数 = 5
+有效周期数 = 3
+平均上市周期 = (387 + 387 + 211) / 3 = 328.33 天
 ```
 
 - “车系平均上市周期”：有效周期天数之和除以该车系上市次数减 1。
-- “年度平均上市周期”：归属于该年的周期天数之和除以该年全部上市次数。
+- “年度平均上市周期”：归属于该年的有效周期天数之和除以该年有效周期记录数。
 - “最长上市周期”：取有效上市周期最大值。
 - “最短上市周期”：取有效上市周期最小值。
 - “某年上市周期”：以本次上市时间所在年份归属；跨年间隔整体计入本次上市年份。
-- “按能源大类的年度平均上市周期”：在各能源大类自己的车系事件序列内计算周期，按本次上市年份归属后，以该年该能源组全部上市次数为分母。
+- “按能源大类的年度平均上市周期”：在各能源大类自己的车系事件序列内计算周期，按本次上市年份归属后，只对该年该能源组的有效周期求平均。
 - 用户未指定聚合方式且问题要求明细时，返回每次上市事件对应的上市周期，不自动求和。
 
 上市周期是时间间隔，不得直接求和作为车系的常规指标。
@@ -219,7 +259,7 @@ WHERE previous_launch_date IS NOT NULL;
 ## 禁止规则
 
 - 不要执行或生成 DAX。
-- 不要使用 `vehicle_params_wide.launch_date` 计算上市周期；必须从 `vehicle_params` 获取同一车系下全部 `type_name = '上市时间'` 的明细。
+- 不要使用 `vehicle_model_base.launch_date` 计算上市周期；必须从 `vehicle_params` 获取同一车系下全部 `type_name = '上市时间'` 的明细。
 - 不要假设 `vehicle_params` 中存在“上次上市时间”字段，必须根据同一车系的上市事件顺序计算。
 - 不要跨品牌或跨车系寻找上次上市时间。
 - 不要直接按款型明细计算，否则同一上市事件可能被重复统计。
@@ -233,5 +273,6 @@ WHERE previous_launch_date IS NOT NULL;
 - 任何出现在 `LAG(launch_date)` 上游 CTE 中的年份范围过滤都属于口径错误，即使当前数据结果碰巧没有变化也不得接受。
 - 按能源大类分析时，不要跨能源大类寻找上次上市事件。
 - 汇总多个车系或能源组时，不要用上市总次数统一减 1；必须对每个独立事件序列分别减 1。
-- 按年份汇总时，不要用当年上市次数减 1，也不要只用有效周期数作分母；必须使用当年全部去重上市次数作分母。
-- 首次上市的周期明细必须保持为空；仅在年度平均周期的分子求和中按 0 贡献处理。
+- 按年份汇总时，不要使用当年上市次数或当年上市次数减 1 作为分母；必须使用归属于当年的实际有效周期记录数。
+- 首次上市的周期必须保持为空，并从所有平均上市周期计算的分子和分母中排除。
+- 不要使用 `AVG(COALESCE(cycle_days, 0))` 或等价写法计算平均上市周期；应使用 `AVG(cycle_days)`，让空周期自然排除。

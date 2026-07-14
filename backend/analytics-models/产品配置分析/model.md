@@ -3,21 +3,21 @@ formatter: analytics-model
 id: "产品配置分析"
 name: "产品配置分析"
 type: analysis_model
-version: "0.2.0"
+version: "0.3.1"
 description: "汽车行业已上市车型的配置分析，当用户询问单一车型的配置、多车型的配置对比以及行业的配置率发展趋势等场景使用。"
 tags: ["汽车产品配置","配置率","行业趋势报告","ECharts"]
 data_assets:
-  tables: ["dbs_77982e981bac4a6fa8.vehicle_params","dbs_77982e981bac4a6fa8.vehicle_params_wide"]
+  tables: ["dbs_77982e981bac4a6fa8.vehicle_params","dbs_77982e981bac4a6fa8.vehicle_model_base"]
 semantic_assets:
   measures: ["measure:charging_c_rate","measure:config_rate","measure:launch_update_count","measure:launch_cycle"]
-  dimensions: ["dimension:launch_time","dimension:price_band","dimension:brand","dimension:energy_type","dimension:vehicle_level","dimension:vehicle_series"]
+  dimensions: ["dimension:launch_time","dimension:price_band","dimension:wheelbase","dimension:motor_power","dimension:brand","dimension:energy_type","dimension:vehicle_level","dimension:vehicle_series"]
   grains: ["grain:car_model","grain:series"]
 asset_relations: ["relation:车系配置关联","relation:1111"]
-guardrails: ["air_suspension_reference_type_value","config_rate_model_key_group","config_rate_no_exists_distinct","config_rate_use_wide_denominator","launch_time_no_car_name_year","postgres_count_distinct_nullable_tuple_after_left_join"]
+guardrails: ["air_suspension_reference_type_value","config_rate_model_key_group","config_rate_no_exists_distinct","config_rate_use_model_base_denominator","launch_time_no_car_name_year","postgres_count_distinct_nullable_tuple_after_left_join"]
 templates: {}
 default_template: "product_config_report_html"
 created: "2026-07-13 06:25:03"
-updated_at: "2026-07-13 22:32:19"
+updated_at: "2026-07-14 00:00:00"
 ---
 
 
@@ -36,10 +36,18 @@ updated_at: "2026-07-13 22:32:19"
 
 ## 分析原则
 
-- 优先用 `vehicle_params_wide` 筛选款型分母，再回连 `vehicle_params` 判断具体配置。
+- 优先用 `vehicle_model_base` 筛选款型分母，再回连 `vehicle_params` 判断具体配置。
 - 默认款型键为 `brand + serial_name + car_name`，不得只按 `car_name` 去重。
 - 配置率、覆盖率、内部占比和市场占比必须分别说明分子、分母与颗粒度。
 - 对未注册为语义资产的报告逻辑字段，按 reference 的字段映射查询，不得把逻辑字段名当作数据库物理列。
+
+## 默认分析范围
+
+- 默认分析中国狭义乘用车。
+- 用户未明确要求“包含皮卡”或“只看皮卡”时，必须排除车型级别为 `皮卡` 的车型。
+- 该默认范围适用于配置查询、更新次数、上市周期、行业趋势和报告生成。
+- 使用 `vehicle_model_base` 时按 `vehicle_level` 排除；回退到 `vehicle_params` 时，必须在款型聚合中读取 `type_name = '级别'` 并排除 `type_value = '皮卡'`。
+- 用户明确指定车型范围时，以用户要求为准。
 
 ## 报告生成规范
 

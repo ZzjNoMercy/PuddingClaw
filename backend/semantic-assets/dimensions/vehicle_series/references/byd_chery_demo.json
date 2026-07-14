@@ -26,7 +26,7 @@
     },
     "configuration": {
       "source_ref": "dbs_77982e981bac4a6fa8",
-      "table": "vehicle_params_wide",
+      "table": "vehicle_model_base",
       "key_fields": [
         "brand",
         "serial_name"
@@ -61,7 +61,7 @@
           "source_kind": "database_table",
           "source_ref": "dbs_77982e981bac4a6fa8",
           "source_name": "产品配置 PostgreSQL",
-          "table_or_sheet": "vehicle_params_wide",
+          "table_or_sheet": "vehicle_model_base",
           "key_fields": {
             "brand": "比亚迪",
             "serial_name": "秦PLUS"
@@ -105,7 +105,7 @@
           "source_kind": "database_table",
           "source_ref": "dbs_77982e981bac4a6fa8",
           "source_name": "产品配置 PostgreSQL",
-          "table_or_sheet": "vehicle_params_wide",
+          "table_or_sheet": "vehicle_model_base",
           "key_fields": {
             "brand": "比亚迪",
             "serial_name": "宋PLUS"
@@ -149,7 +149,7 @@
           "source_kind": "database_table",
           "source_ref": "dbs_77982e981bac4a6fa8",
           "source_name": "产品配置 PostgreSQL",
-          "table_or_sheet": "vehicle_params_wide",
+          "table_or_sheet": "vehicle_model_base",
           "key_fields": {
             "brand": "比亚迪",
             "serial_name": "海豚"
@@ -193,7 +193,7 @@
           "source_kind": "database_table",
           "source_ref": "dbs_77982e981bac4a6fa8",
           "source_name": "产品配置 PostgreSQL",
-          "table_or_sheet": "vehicle_params_wide",
+          "table_or_sheet": "vehicle_model_base",
           "key_fields": {
             "brand": "比亚迪",
             "serial_name": "元PLUS"
@@ -237,7 +237,7 @@
           "source_kind": "database_table",
           "source_ref": "dbs_77982e981bac4a6fa8",
           "source_name": "产品配置 PostgreSQL",
-          "table_or_sheet": "vehicle_params_wide",
+          "table_or_sheet": "vehicle_model_base",
           "key_fields": {
             "brand": "比亚迪",
             "serial_name": "汉"
@@ -281,7 +281,7 @@
           "source_kind": "database_table",
           "source_ref": "dbs_77982e981bac4a6fa8",
           "source_name": "产品配置 PostgreSQL",
-          "table_or_sheet": "vehicle_params_wide",
+          "table_or_sheet": "vehicle_model_base",
           "key_fields": {
             "brand": "比亚迪",
             "serial_name": "唐"
@@ -325,7 +325,7 @@
           "source_kind": "database_table",
           "source_ref": "dbs_77982e981bac4a6fa8",
           "source_name": "产品配置 PostgreSQL",
-          "table_or_sheet": "vehicle_params_wide",
+          "table_or_sheet": "vehicle_model_base",
           "key_fields": {
             "brand": "比亚迪",
             "serial_name": "宋Pro"
@@ -369,7 +369,7 @@
           "source_kind": "database_table",
           "source_ref": "dbs_77982e981bac4a6fa8",
           "source_name": "产品配置 PostgreSQL",
-          "table_or_sheet": "vehicle_params_wide",
+          "table_or_sheet": "vehicle_model_base",
           "key_fields": {
             "brand": "比亚迪",
             "serial_name": "秦"
@@ -413,7 +413,7 @@
           "source_kind": "database_table",
           "source_ref": "dbs_77982e981bac4a6fa8",
           "source_name": "产品配置 PostgreSQL",
-          "table_or_sheet": "vehicle_params_wide",
+          "table_or_sheet": "vehicle_model_base",
           "key_fields": {
             "brand": "比亚迪",
             "serial_name": "护卫舰07"
@@ -457,7 +457,7 @@
           "source_kind": "database_table",
           "source_ref": "dbs_77982e981bac4a6fa8",
           "source_name": "产品配置 PostgreSQL",
-          "table_or_sheet": "vehicle_params_wide",
+          "table_or_sheet": "vehicle_model_base",
           "key_fields": {
             "brand": "比亚迪",
             "serial_name": "海豹"
@@ -501,7 +501,7 @@
           "source_kind": "database_table",
           "source_ref": "dbs_77982e981bac4a6fa8",
           "source_name": "产品配置 PostgreSQL",
-          "table_or_sheet": "vehicle_params_wide",
+          "table_or_sheet": "vehicle_model_base",
           "key_fields": {
             "brand": "比亚迪",
             "serial_name": "驱逐舰05"
@@ -545,7 +545,7 @@
           "source_kind": "database_table",
           "source_ref": "dbs_77982e981bac4a6fa8",
           "source_name": "产品配置 PostgreSQL",
-          "table_or_sheet": "vehicle_params_wide",
+          "table_or_sheet": "vehicle_model_base",
           "key_fields": {
             "brand": "比亚迪",
             "serial_name": "海鸥"
@@ -589,7 +589,7 @@
           "source_kind": "database_table",
           "source_ref": "dbs_77982e981bac4a6fa8",
           "source_name": "产品配置 PostgreSQL",
-          "table_or_sheet": "vehicle_params_wide",
+          "table_or_sheet": "vehicle_model_base",
           "key_fields": {
             "brand": "比亚迪",
             "serial_name": "比亚迪e2"
@@ -633,7 +633,7 @@
           "source_kind": "database_table",
           "source_ref": "dbs_77982e981bac4a6fa8",
           "source_name": "产品配置 PostgreSQL",
-          "table_or_sheet": "vehicle_params_wide",
+          "table_or_sheet": "vehicle_model_base",
           "key_fields": {
             "brand": "比亚迪",
             "serial_name": "宋MAX"
@@ -677,7 +677,7 @@
           "source_kind": "database_table",
           "source_ref": "dbs_77982e981bac4a6fa8",
           "source_name": "产品配置 PostgreSQL",
-          "table_or_sheet": "vehicle_params_wide",
+          "table_or_sheet": "vehicle_model_base",
           "key_fields": {
             "brand": "比亚迪",
             "serial_name": "比亚迪e3"
@@ -721,7 +721,7 @@
           "source_kind": "database_table",
           "source_ref": "dbs_77982e981bac4a6fa8",
           "source_name": "产品配置 PostgreSQL",
-          "table_or_sheet": "vehicle_params_wide",
+          "table_or_sheet": "vehicle_model_base",
           "key_fields": {
             "brand": "比亚迪",
             "serial_name": "比亚迪e6"
@@ -765,7 +765,7 @@
           "source_kind": "database_table",
           "source_ref": "dbs_77982e981bac4a6fa8",
           "source_name": "产品配置 PostgreSQL",
-          "table_or_sheet": "vehicle_params_wide",
+          "table_or_sheet": "vehicle_model_base",
           "key_fields": {
             "brand": "比亚迪",
             "serial_name": "比亚迪D1"
@@ -839,7 +839,7 @@
           "source_kind": "database_table",
           "source_ref": "dbs_77982e981bac4a6fa8",
           "source_name": "产品配置 PostgreSQL",
-          "table_or_sheet": "vehicle_params_wide",
+          "table_or_sheet": "vehicle_model_base",
           "key_fields": {
             "brand": "比亚迪",
             "serial_name": "秦Pro"
@@ -913,7 +913,7 @@
           "source_kind": "database_table",
           "source_ref": "dbs_77982e981bac4a6fa8",
           "source_name": "产品配置 PostgreSQL",
-          "table_or_sheet": "vehicle_params_wide",
+          "table_or_sheet": "vehicle_model_base",
           "key_fields": {
             "brand": "比亚迪",
             "serial_name": "比亚迪F3"
@@ -957,7 +957,7 @@
           "source_kind": "database_table",
           "source_ref": "dbs_77982e981bac4a6fa8",
           "source_name": "产品配置 PostgreSQL",
-          "table_or_sheet": "vehicle_params_wide",
+          "table_or_sheet": "vehicle_model_base",
           "key_fields": {
             "brand": "比亚迪",
             "serial_name": "宋"

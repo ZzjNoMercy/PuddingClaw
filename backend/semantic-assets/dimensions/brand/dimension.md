@@ -2,7 +2,7 @@
 formatter: semantic-asset
 name: 品牌
 type: dimension
-description: 品牌维度的标准取值口径，优先使用 vehicle_params_wide。
+description: 品牌维度的标准取值口径，优先使用 vehicle_model_base。
 aliases:
   - 厂牌
   - 汽车品牌
@@ -12,53 +12,81 @@ aliases:
 tags:
   - 汽车产品配置
   - vehicle_params
-  - vehicle_params_wide
+  - vehicle_model_base
   - 品牌
-version: 0.1.0
+version: 0.2.0
 resolution_mode: source_field
 resolution:
   mode: source_field
   bindings:
-    - asset_ref: dbs_77982e981bac4a6fa8.vehicle_params_wide
-      display_name: insight_data · vehicle_params_wide
+    - asset_ref: dbs_77982e981bac4a6fa8.vehicle_model_base
+      display_name: insight_data · vehicle_model_base
       fields:
         value: brand
 created: 2026-07-09 00:00:00
-updated_at: 2026-07-09 00:00:00
+updated_at: 2026-07-14 00:00:00
 ---
 
 # 品牌
 
 ## 字段口径
 
-优先使用 `vehicle_params_wide.brand`。
+优先使用 `vehicle_model_base.brand`。
 
-只有当查询的表范围没有 `vehicle_params_wide`，或需要回查原始明细时，才使用 `vehicle_params.brand`。
+只有当查询的表范围没有 `vehicle_model_base`，或需要回查原始明细时，才使用 `vehicle_params.brand`。
 
 如果某些导入数据没有独立 `brand` 字段，应先补充数据资产或实体字典，不要从 `car_name`、`serial_name` 或款型名称中猜测品牌。
 
+## 品牌集团强制展开规则
+
+当用户使用下列集团主品牌名称进行查询、筛选、分组、对比或汇总，且未明确要求“仅主品牌”时，必须展开为对应的数据库精确品牌集合：
+
+| 用户口径 | 数据库 `brand` 精确值集合 |
+| --- | --- |
+| 比亚迪 | `比亚迪`、`腾势`、`方程豹` |
+| 长安 | `长安`、`深蓝汽车`、`长安启源` |
+| 奇瑞 | `奇瑞`、`星途` |
+| 长城 | `长城`、`长城汽车`、`哈弗`、`魏牌`、`坦克` |
+
+对应 SQL：
+
+```sql
+-- 比亚迪集团口径
+brand IN ('比亚迪', '腾势', '方程豹')
+
+-- 长安集团口径
+brand IN ('长安', '深蓝汽车', '长安启源')
+
+-- 奇瑞集团口径
+brand IN ('奇瑞', '星途')
+
+-- 长城集团口径
+brand IN ('长城', '长城汽车', '哈弗', '魏牌', '坦克')
+```
+
+规则说明：
+
+- 用户只说“比亚迪”“长安”“奇瑞”或“长城”时，默认使用上表集团口径。
+- 用户明确说“仅比亚迪品牌”“只看长安主品牌”等限制语句时，才只使用对应主品牌精确值。
+- 用户单独查询 `腾势`、`方程豹`、`深蓝汽车`、`长安启源`、`星途`、`哈弗`、`魏牌` 或 `坦克` 时，只查询该品牌，不反向展开到整个集团。
+- 分组展示集团结果时，应保留用户口径作为展示名称，例如将集合 `('长安', '深蓝汽车', '长安启源')` 汇总显示为“长安”。
+- 未列入上表的品牌不得根据常识自动加入集团。`仰望` 当前不在“比亚迪”集团统计口径内，除非用户明确要求包含。
+
 ## 常用规则
 
-查询单一品牌时：
+查询不命中上述集团展开规则的单一品牌，或用户明确要求“仅主品牌”时：
 
 ```sql
 brand = '<品牌名称>'
 ```
 
-查询多个品牌或集团下属品牌时，必须显式使用品牌集合：
+查询多个品牌或集团下属品牌时，必须显式使用品牌集合，不得只筛选主品牌：
 
 ```sql
-brand IN ('比亚迪', '腾势', '方程豹', '仰望')
+brand IN ('比亚迪', '腾势', '方程豹')
 ```
 
-如果用户说“比亚迪及下属品牌”，默认至少包括：
-
-- `比亚迪`
-- `腾势`
-- `方程豹`
-- `仰望`
-
-如用户补充其他品牌，以用户指定集合为准。
+如用户显式指定不同的品牌集合，以用户本轮明确指定的集合为准。
 
 ## 与配置率组合
 
@@ -66,10 +94,12 @@ brand IN ('比亚迪', '腾势', '方程豹', '仰望')
 
 对于 `vehicle_params` 配置率查询，推荐先按 `car_name` 聚合配置 flags，再保留或聚合品牌维度。不要因为一个款型有多行配置而重复计数。
 
-如果可用表中包含 `vehicle_params_wide`，配置率的品牌筛选和分组优先在 `vehicle_params_wide` 完成。
+如果可用表中包含 `vehicle_model_base`，配置率的品牌筛选和分组优先在 `vehicle_model_base` 完成。
 
 ## 禁止规则
 
 - 不要从 `car_name` 推断品牌。
 - 不要只召回或统计主品牌后忽略用户明确提到的下属品牌。
+- 命中品牌集团强制展开规则时，不要只使用主品牌的等值条件。
+- 不要把简称直接写入 SQL；例如应使用 `深蓝汽车` 和 `长安启源`，不要使用数据库中不存在的 `深蓝` 或 `启源`。
 - 不要用预览行中的品牌分布推断全量结果品牌分布。

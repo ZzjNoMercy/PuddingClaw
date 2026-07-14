@@ -2,7 +2,7 @@
 formatter: semantic-asset
 name: 能源类型
 type: dimension
-description: 车型能源类型的标准取值口径，优先使用 vehicle_params_wide。
+description: 车型能源类型的标准取值口径，优先使用 vehicle_model_base。
 aliases:
 - 动力类型
 - 能源形式
@@ -12,15 +12,15 @@ aliases:
 tags:
 - 汽车产品配置
 - vehicle_params
-- vehicle_params_wide
+- vehicle_model_base
 - 能源
 version: 0.2.0
 resolution_mode: source_field
 resolution:
   mode: source_field
   bindings:
-  - asset_ref: dbs_77982e981bac4a6fa8.vehicle_params_wide
-    display_name: insight_data · vehicle_params_wide
+  - asset_ref: dbs_77982e981bac4a6fa8.vehicle_model_base
+    display_name: insight_data · vehicle_model_base
     fields:
       value: energy_type
 created: 2026-07-08 00:00:00
@@ -31,9 +31,9 @@ updated_at: '2026-07-13 00:00:00'
 
 ## 字段口径
 
-优先使用 `vehicle_params_wide.energy_type`。
+优先使用 `vehicle_model_base.energy_type`。
 
-只有当查询的表范围没有 `vehicle_params_wide`，或需要回查原始明细时，才回退到 `vehicle_params`。
+只有当查询的表范围没有 `vehicle_model_base`，或需要回查原始明细时，才回退到 `vehicle_params`。
 
 能源类型取 `vehicle_params` 表中 `type_name = '能源类型'` 的 `type_value`。
 
@@ -72,7 +72,7 @@ updated_at: '2026-07-13 00:00:00'
 
 查询单一能源类型时，必须同时限定：
 
-如果使用 `vehicle_params_wide`：
+如果使用 `vehicle_model_base`：
 
 ```sql
 energy_type = '<精确能源类型>'
@@ -85,13 +85,13 @@ type_name = '能源类型'
 AND type_value = '<精确能源类型>'
 ```
 
-使用 `vehicle_params_wide` 查询新能源时，默认使用：
+使用 `vehicle_model_base` 查询新能源时，默认使用：
 
 ```sql
 energy_type IN ('纯电', '插电混合', '增程式纯电动')
 ```
 
-使用 `vehicle_params_wide` 查询传统能源时，默认使用：
+使用 `vehicle_model_base` 查询传统能源时，默认使用：
 
 ```sql
 energy_type IN ('汽油', '汽油+48V轻混系统', '油电混合', '汽油电驱', '汽油+24V轻混系统')
@@ -119,4 +119,4 @@ type_value IN ('汽油', '汽油+48V轻混系统', '油电混合', '汽油电驱
 - 不要把 `插电混合` 写成 `插电混动` 或 `PHEV`。
 - 不要用 `LIKE '%纯电%'` 查询纯电车型，这会误匹配 `增程式纯电动`。
 - 不要只写 `type_value = '纯电'`，必须同时写 `type_name = '能源类型'`。
-- 如果可用表中包含 `vehicle_params_wide`，不要回到 `vehicle_params` 用 EAV 自关联计算能源类型，应直接使用 `energy_type`。
+- 如果可用表中包含 `vehicle_model_base`，不要回到 `vehicle_params` 用 EAV 自关联计算能源类型，应直接使用 `energy_type`。

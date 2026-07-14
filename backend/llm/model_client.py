@@ -20,8 +20,73 @@ from langchain_core.runnables.config import var_child_runnable_config
 import capabilities
 from config import get_fallback_llm_config, get_gateway_config, get_gateway_llm_config
 from graph.token_usage_store import record_token_usage
+from langgraph.config import get_stream_writer
 
 logger = logging.getLogger(__name__)
+
+INTERNAL_CALL_MARKER = "_puddingclaw_internal_call"
+CONTEXT_SUMMARY_CALL = "context_summary"
+
+
+def _message_text(message: BaseMessage) -> str:
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            str(block.get("text") or block.get("content") or "")
+            for block in content
+            if isinstance(block, dict)
+        )
+    return ""
+
+
+def _internal_call_kind(messages: list[BaseMessage]) -> str | None:
+    """Identify middleware-owned model calls that must not enter user SSE text."""
+
+    for message in messages:
+        text = _message_text(message)
+        if (
+            "<role>\nContext Extraction Assistant\n</role>" in text
+            and "## SESSION INTENT" in text
+            and "<messages>\nMessages to summarize:" in text
+        ):
+            return CONTEXT_SUMMARY_CALL
+    return None
+
+
+def _mark_internal_message(message: BaseMessage, kind: str | None) -> BaseMessage:
+    if not kind:
+        return message
+    additional = dict(getattr(message, "additional_kwargs", None) or {})
+    additional[INTERNAL_CALL_MARKER] = kind
+    message.additional_kwargs = additional
+    return message
+
+
+def _emit_internal_call_status(kind: str | None, status: str) -> None:
+    """Surface context compression without exposing its generated summary."""
+
+    if kind != CONTEXT_SUMMARY_CALL:
+        return
+    try:
+        writer = get_stream_writer()
+        writer(
+            {
+                "type": "context_maintenance",
+                "status": status,
+                "phase": "deepagents_summarization",
+                **(
+                    {"message": "上下文达到压缩阈值，正在压缩，完成后将继续生成..."}
+                    if status == "start"
+                    else {}
+                ),
+            }
+        )
+    except (KeyError, RuntimeError):
+        # Title generation, tests and direct ModelClient calls may run outside
+        # a LangGraph streaming context.
+        return
 
 
 def _patch_openai_reasoning_extraction() -> None:
@@ -500,8 +565,14 @@ class ModelClientChatModel(BaseChatModel):
             capture_boundary="ModelClientChatModel._generate",
         )
         config = _child_callback_config(run_manager)
-        response = self._client.invoke(messages, config=config, stop=stop, **kwargs)
-        return ChatResult(generations=[ChatGeneration(message=response)])
+        internal_call = _internal_call_kind(messages)
+        _emit_internal_call_status(internal_call, "start")
+        try:
+            response = self._client.invoke(messages, config=config, stop=stop, **kwargs)
+            _mark_internal_message(response, internal_call)
+            return ChatResult(generations=[ChatGeneration(message=response)])
+        finally:
+            _emit_internal_call_status(internal_call, "done")
 
     async def _agenerate(
         self,
@@ -518,8 +589,14 @@ class ModelClientChatModel(BaseChatModel):
             capture_boundary="ModelClientChatModel._agenerate",
         )
         config = _child_callback_config(run_manager)
-        response = await self._client.ainvoke(messages, config=config, stop=stop, **kwargs)
-        return ChatResult(generations=[ChatGeneration(message=response)])
+        internal_call = _internal_call_kind(messages)
+        _emit_internal_call_status(internal_call, "start")
+        try:
+            response = await self._client.ainvoke(messages, config=config, stop=stop, **kwargs)
+            _mark_internal_message(response, internal_call)
+            return ChatResult(generations=[ChatGeneration(message=response)])
+        finally:
+            _emit_internal_call_status(internal_call, "done")
 
     def _stream(
         self,
@@ -541,11 +618,15 @@ class ModelClientChatModel(BaseChatModel):
         # config=None is not enough because LangChain also inherits callbacks
         # through var_child_runnable_config.
         token = var_child_runnable_config.set(None)
+        internal_call = _internal_call_kind(messages)
+        _emit_internal_call_status(internal_call, "start")
         try:
             for chunk in self._client.stream(messages, config=None, stop=stop, **kwargs):
+                _mark_internal_message(chunk, internal_call)
                 yield ChatGenerationChunk(message=chunk)
         finally:
             var_child_runnable_config.reset(token)
+            _emit_internal_call_status(internal_call, "done")
 
     async def _astream(
         self,
@@ -563,11 +644,15 @@ class ModelClientChatModel(BaseChatModel):
         )
         # See _stream: nested streaming callbacks duplicate token deltas.
         token = var_child_runnable_config.set(None)
+        internal_call = _internal_call_kind(messages)
+        _emit_internal_call_status(internal_call, "start")
         try:
             async for chunk in self._client.astream(messages, config=None, stop=stop, **kwargs):
+                _mark_internal_message(chunk, internal_call)
                 yield ChatGenerationChunk(message=chunk)
         finally:
             var_child_runnable_config.reset(token)
+            _emit_internal_call_status(internal_call, "done")
 
     def bind_tools(
         self,

@@ -213,7 +213,36 @@ class AnalyticsModelRegistry:
         model = self.get_model(model_id)
         missing_references: list[str] = []
         relation_context: list[dict[str, Any]] = []
+        semantic_asset_context: list[dict[str, Any]] = []
         binding_assets_by_dimension: dict[str, list[str]] = {}
+        semantic_assets_meta = ((model.get("frontmatter") or {}).get("semantic_assets") or {})
+        if isinstance(semantic_assets_meta, dict):
+            from analytics.semantic_assets import get_semantic_asset_registry
+
+            assets = get_semantic_asset_registry(self.base_dir)
+            for asset_group in ("measures", "dimensions", "grains"):
+                for raw_asset_id in semantic_assets_meta.get(asset_group) or []:
+                    asset_id = str(raw_asset_id).strip()
+                    if not asset_id:
+                        continue
+                    try:
+                        asset = assets.get_asset(asset_id)
+                    except Exception:
+                        missing_references.append(asset_id)
+                        continue
+                    frontmatter = json.loads(
+                        json.dumps(asset.get("frontmatter") or {}, ensure_ascii=False, default=str)
+                    )
+                    semantic_asset_context.append(
+                        {
+                            "id": asset_id,
+                            "name": asset.get("name"),
+                            "type": asset.get("type"),
+                            "description": asset.get("description") or "",
+                            "path": asset.get("path"),
+                            "frontmatter": frontmatter,
+                        }
+                    )
         relation_ids = [str(item).strip() for item in (model.get("asset_relations") or []) if str(item).strip()]
         if relation_ids:
             from analytics.semantic_assets import get_semantic_asset_registry
@@ -290,7 +319,8 @@ class AnalyticsModelRegistry:
             "frontmatter": model.get("frontmatter") or {},
             "body": model.get("body") or "",
             "files": model.get("files") or [],
-            "missing_references": missing_references,
+            "missing_references": list(dict.fromkeys(missing_references)),
+            "semantic_assets": semantic_asset_context,
             "asset_relations": relation_context,
             "derived_dimension_paths": derived_dimension_paths,
             "logical_datasets": logical_dataset_context,

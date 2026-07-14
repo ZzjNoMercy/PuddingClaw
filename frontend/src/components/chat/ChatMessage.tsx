@@ -4,7 +4,7 @@ import { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Database, FileSpreadsheet, FileText, Key, KeyRound, Layers3, PauseCircle, Plus, Sparkles, Trash2 } from "lucide-react";
-import { denyPermissionRequest, grantExternalFileRead, openLocalFile, resolveDatabaseSqlRevisionRequest, resolveDimensionBuildRuleRequest, resolveLogicalDatasetRuleRequest, type AgentAttachment, type DatabaseSqlRevisionRequest, type DimensionBuildRuleRequest, type LogicalDatasetRuleRequest, type PermissionRequest } from "@/lib/api";
+import { denyPermissionRequest, grantExternalFilePermission, openLocalFile, resolveDatabaseSqlRevisionRequest, resolveDimensionBuildRuleRequest, resolveLogicalDatasetRuleRequest, type AgentAttachment, type DatabaseSqlRevisionRequest, type DimensionBuildRuleRequest, type LogicalDatasetRuleRequest, type PermissionRequest } from "@/lib/api";
 import { markdownRemarkPlugins, markdownUrlTransform } from "@/lib/markdown";
 import { useApp, type ChatMessage as ChatMessageType, type SourceRecord, type TimelineItem } from "@/lib/store";
 import ThoughtChain from "./ThoughtChain";
@@ -267,12 +267,13 @@ function ExternalFilePermissionCard({
   const [error, setError] = useState("");
   const path = request.path || "";
   const name = path.split("/").filter(Boolean).pop() || "外部文件";
+  const isWrite = request.type === "external_file_write";
 
   const grant = async (targetKind: "exact_file" | "all_external_files") => {
     setStatus("loading");
     setError("");
     try {
-      await grantExternalFileRead(
+      await grantExternalFilePermission(
         sessionId,
         targetKind,
         targetKind === "exact_file" ? path : undefined,
@@ -290,7 +291,11 @@ function ExternalFilePermissionCard({
     setStatus("loading");
     setError("");
     try {
-      await denyPermissionRequest(sessionId, request.id, "User denied external file read permission.");
+      await denyPermissionRequest(
+        sessionId,
+        request.id,
+        isWrite ? "User denied external file write permission." : "User denied external file read permission."
+      );
       setStatus("denied");
       window.dispatchEvent(new CustomEvent("puddingclaw:permissions-changed"));
     } catch (err) {
@@ -307,7 +312,9 @@ function ExternalFilePermissionCard({
         </div>
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
-            <h3 className="text-[15px] font-bold text-slate-950">允许读取外部文件</h3>
+            <h3 className="text-[15px] font-bold text-slate-950">
+              {isWrite ? "允许修改外部文件" : "允许读取外部文件"}
+            </h3>
             {status === "granted" ? (
               <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700">
                 已授权
@@ -321,6 +328,18 @@ function ExternalFilePermissionCard({
               <div className="mt-0.5 truncate font-mono text-[11px] text-slate-500">{path}</div>
             </div>
           </div>
+          {isWrite && request.change_preview ? (
+            <div className="mt-2 space-y-2 rounded-xl border border-amber-100 bg-amber-50/70 px-3 py-2">
+              {Object.entries(request.change_preview).map(([key, value]) => (
+                <div key={key}>
+                  <div className="text-[10px] font-semibold uppercase tracking-wide text-amber-700">{key}</div>
+                  <pre className="mt-1 max-h-28 overflow-auto whitespace-pre-wrap break-words text-[11px] leading-relaxed text-slate-700">
+                    {value}
+                  </pre>
+                </div>
+              ))}
+            </div>
+          ) : null}
           {status !== "granted" && status !== "denied" ? (
             <div className="mt-3 flex flex-wrap items-center gap-2">
               <button
@@ -329,16 +348,18 @@ function ExternalFilePermissionCard({
                 onClick={() => grant("exact_file")}
                 className="rounded-full bg-[#002fa7] px-3.5 py-2 text-[12px] font-semibold text-white shadow-sm transition hover:bg-[#00298f] disabled:cursor-default disabled:opacity-60"
               >
-                允许此文件
+                {isWrite ? "允许修改此文件" : "允许此文件"}
               </button>
-              <button
-                type="button"
-                disabled={status === "loading"}
-                onClick={() => grant("all_external_files")}
-                className="rounded-full bg-white px-3.5 py-2 text-[12px] font-semibold text-slate-700 shadow-sm ring-1 ring-black/[0.08] transition hover:bg-slate-50 disabled:cursor-default disabled:opacity-60"
-              >
-                本 session 允许所有外部文件
-              </button>
+              {!isWrite ? (
+                <button
+                  type="button"
+                  disabled={status === "loading"}
+                  onClick={() => grant("all_external_files")}
+                  className="rounded-full bg-white px-3.5 py-2 text-[12px] font-semibold text-slate-700 shadow-sm ring-1 ring-black/[0.08] transition hover:bg-slate-50 disabled:cursor-default disabled:opacity-60"
+                >
+                  本 session 允许所有外部文件
+                </button>
+              ) : null}
               <button
                 type="button"
                 disabled={status === "loading"}

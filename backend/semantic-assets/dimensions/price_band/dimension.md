@@ -2,7 +2,7 @@
 formatter: semantic-asset
 name: 价格段
 type: dimension
-description: 基于厂商指导价划分价格区间，优先使用 vehicle_params_wide。
+description: 基于厂商指导价划分价格区间，优先使用 vehicle_model_base。
 aliases:
   - 价格区间
   - 价位
@@ -11,15 +11,15 @@ aliases:
 tags:
   - 汽车产品配置
   - vehicle_params
-  - vehicle_params_wide
+  - vehicle_model_base
   - 价格
 version: 0.1.0
 resolution_mode: derived
 resolution:
   mode: derived
   bindings:
-    - asset_ref: dbs_77982e981bac4a6fa8.vehicle_params_wide
-      display_name: insight_data · vehicle_params_wide
+    - asset_ref: dbs_77982e981bac4a6fa8.vehicle_model_base
+      display_name: insight_data · vehicle_model_base
       fields:
         value: price
   source_fields: [price]
@@ -32,12 +32,12 @@ updated_at: 2026-07-09 00:00:00
 
 ## 字段口径
 
-优先使用 `vehicle_params_wide`：
+优先使用 `vehicle_model_base`：
 
-- 指导价：`vehicle_params_wide.price`
-- 价格段：`vehicle_params_wide.price_band`
+- 指导价：`vehicle_model_base.price`
+- 价格段：`vehicle_model_base.price_band`
 
-只有当查询的表范围没有 `vehicle_params_wide`，或需要回查原始明细时，才回退到 `vehicle_params`。
+只有当查询的表范围没有 `vehicle_model_base`，或需要回查原始明细时，才回退到 `vehicle_params`。
 
 价格段基于 `vehicle_params` 表中 `type_name = '厂商指导价'` 的 `type_value` 划分。
 
@@ -63,7 +63,7 @@ updated_at: 2026-07-09 00:00:00
 
 ## SQL Hint
 
-如果使用 `vehicle_params_wide`：
+如果使用 `vehicle_model_base`：
 
 ```sql
 WHERE price_band = '<价格段>'
@@ -88,4 +88,4 @@ WHERE type_name = '厂商指导价'
 - 不要把厂商指导价当成元，数据库单位是万元。
 - 不要直接用字符串比较价格大小。
 - 不要在车系颗粒度下默认使用所有款型价格段重复计入，除非用户明确要求按款型展开。
-- 如果可用表中包含 `vehicle_params_wide`，不要回到 `vehicle_params` 用 EAV 自关联计算价格段，应直接使用 `price` / `price_band`。
+- 如果可用表中包含 `vehicle_model_base`，不要回到 `vehicle_params` 用 EAV 自关联计算价格段，应直接使用 `price` / `price_band`。

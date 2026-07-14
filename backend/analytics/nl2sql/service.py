@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from time import perf_counter
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from analytics.models.registry import get_analytics_model_registry
 from analytics.nl2sql.guardrails import (
     GuardrailConflict,
     conflicts_to_messages,
@@ -22,6 +24,7 @@ from analytics.nl2sql.table_router import TableRouterError, route_database_table
 from analytics.semantic_assets.resolver import (
     format_semantic_assets_for_prompt,
     resolve_semantic_assets,
+    resolve_semantic_assets_by_ids,
     semantic_resolution_to_trace,
 )
 from config import get_vanna_config
@@ -40,15 +43,15 @@ logger = logging.getLogger(__name__)
 
 VANNA_REFERENCE_TOP_K = 5
 VANNA_ENTITY_TOP_K_PER_TYPE = 10
-_EAV_CONFIG_RATE_SQL_TEMPLATE = """
-当允许表包含 vehicle_params_wide 时，配置率、配备率、搭载率等问题必须优先使用
-vehicle_params_wide 计算分母和常用维度筛选，再 JOIN vehicle_params 判断配置明细。
+_CONFIG_RATE_SQL_TEMPLATE = """
+当允许表包含 vehicle_model_base 时，配置率、配备率、搭载率等问题必须优先使用
+vehicle_model_base 计算分母和常用维度筛选，再 JOIN vehicle_params 判断配置明细。
 
 推荐模板：
 
 WITH denominator AS (
   SELECT brand, serial_name, car_name
-  FROM vehicle_params_wide
+  FROM vehicle_model_base
   WHERE launch_year = 2026
     AND energy_type = '纯电'
     AND vehicle_level IS DISTINCT FROM '皮卡'
@@ -71,7 +74,7 @@ SELECT
   ROUND((SELECT COUNT(*) FROM numerator) * 100.0 / NULLIF(COUNT(*), 0), 2) AS equip_rate_pct
 FROM denominator;
 
-如果允许表不包含 vehicle_params_wide，才回退使用 vehicle_params EAV flags。vehicle_params 是 EAV 风格配置明细表。
+如果允许表不包含 vehicle_model_base，才回退使用 vehicle_params EAV flags。vehicle_params 是 EAV 风格配置明细表。
 配置率、多条件车型筛选、配备率等问题不要使用多层 EXISTS / NOT EXISTS 反复自关联 vehicle_params，
 也不要用 COUNT(DISTINCT ...) 在多层子查询上直接统计。
 
@@ -148,6 +151,39 @@ def _compose_vanna_question(question: str, route_context: str, semantic_context:
     )
 
 
+def _format_analytics_model_for_sql_prompt(model_id: str | None) -> tuple[str, dict[str, Any]]:
+    """Load the selected model's global playbook into the inner SQL generator."""
+    normalized_id = str(model_id or "").strip()
+    if not normalized_id:
+        return "", {}
+
+    model = get_analytics_model_registry().get_model_context(normalized_id)
+    frontmatter = model.get("frontmatter") or {}
+    body = str(model.get("body") or "").strip()
+    prompt = (
+        "<analytics_model_sql_context>\n"
+        "当前 SQL 属于用户已选择的分析模型，必须遵守模型正文中的全局业务边界和默认分析范围。\n"
+        "规则优先级：用户明确要求 > 具体 Measure/Reference > 模型全局规则 > Dimension/通用 SQL 规则。\n"
+        "只应用与本次 SQL 有关的模型规则；报告布局、HTML 和输出工作流不属于 SQL 生成任务。\n\n"
+        f"模型 ID：{model.get('id')}\n"
+        f"模型名称：{model.get('name')}\n"
+        f"模型路径：{model.get('path')}\n\n"
+        "模型 Frontmatter：\n"
+        f"```json\n{json.dumps(frontmatter, ensure_ascii=False, indent=2)}\n```\n\n"
+        "模型正文：\n"
+        f"{body}\n"
+        "</analytics_model_sql_context>"
+    )
+    trace = {
+        "id": model.get("id"),
+        "name": model.get("name"),
+        "version": model.get("version"),
+        "path": model.get("path"),
+        "body_preview": body[:2000] + ("...[truncated]" if len(body) > 2000 else ""),
+    }
+    return prompt, trace
+
+
 def _compose_guardrail_rewrite_question(original_question: str, sql: str, conflicts: list[str]) -> str:
     return (
         f"{original_question.strip()}\n\n"
@@ -157,11 +193,17 @@ def _compose_guardrail_rewrite_question(original_question: str, sql: str, confli
         + "\n\n原 SQL：\n```sql\n"
         + sql.strip()
         + "\n```\n\n请只重写 SQL，不要解释。\n\n"
-        + _EAV_CONFIG_RATE_SQL_TEMPLATE
+        + _CONFIG_RATE_SQL_TEMPLATE
     )
 
 
-def _detect_semantic_sql_conflicts(sql: str, semantic_trace: dict[str, Any], route: Any | None = None) -> list[str]:
+def _detect_semantic_sql_conflicts(
+    sql: str,
+    semantic_trace: dict[str, Any],
+    route: Any | None = None,
+    *,
+    question: str = "",
+) -> list[str]:
     """Compatibility wrapper for tests and callers that expect plain messages."""
 
     conflicts = detect_guardrail_conflicts(
@@ -169,6 +211,7 @@ def _detect_semantic_sql_conflicts(sql: str, semantic_trace: dict[str, Any], rou
         source_name="",
         route=route,
         semantic_trace=semantic_trace,
+        question=question,
     )
     return conflicts_to_messages(conflicts)
 
@@ -470,13 +513,27 @@ async def query_database_knowledge(
         record_stage("router_ms", stage_started)
 
         stage_started = perf_counter()
+        resolver = resolve_semantic_assets_by_ids if request.model_id else resolve_semantic_assets
         semantic_resolution = await asyncio.to_thread(
-            resolve_semantic_assets,
+            resolver,
             request.question,
             requested_ids=request.measure_ids,
         )
         semantic_trace = semantic_resolution_to_trace(semantic_resolution)
-        semantic_context = format_semantic_assets_for_prompt(semantic_resolution)
+        model_context, model_trace = await asyncio.to_thread(
+            _format_analytics_model_for_sql_prompt,
+            request.model_id,
+        )
+        if model_trace:
+            semantic_trace["analytics_model"] = model_trace
+        semantic_context = "\n\n".join(
+            item
+            for item in (
+                model_context,
+                format_semantic_assets_for_prompt(semantic_resolution),
+            )
+            if item
+        )
         record_stage("semantic_assets_ms", stage_started)
 
         stage_started = perf_counter()
@@ -664,13 +721,27 @@ async def generate_database_sql(
         record_stage("router_ms", stage_started)
 
         stage_started = perf_counter()
+        resolver = resolve_semantic_assets_by_ids if request.model_id else resolve_semantic_assets
         semantic_resolution = await asyncio.to_thread(
-            resolve_semantic_assets,
+            resolver,
             request.question,
             requested_ids=request.measure_ids,
         )
         semantic_trace = semantic_resolution_to_trace(semantic_resolution)
-        semantic_context = format_semantic_assets_for_prompt(semantic_resolution)
+        model_context, model_trace = await asyncio.to_thread(
+            _format_analytics_model_for_sql_prompt,
+            request.model_id,
+        )
+        if model_trace:
+            semantic_trace["analytics_model"] = model_trace
+        semantic_context = "\n\n".join(
+            item
+            for item in (
+                model_context,
+                format_semantic_assets_for_prompt(semantic_resolution),
+            )
+            if item
+        )
         record_stage("semantic_assets_ms", stage_started)
 
         stage_started = perf_counter()

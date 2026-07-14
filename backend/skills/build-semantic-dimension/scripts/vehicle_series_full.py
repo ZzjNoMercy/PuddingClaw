@@ -36,7 +36,7 @@ BASE_DIR = Path(__file__).resolve().parents[3]
 PROJECT_DIR = BASE_DIR.parent
 DEFAULT_SALES_FILE_NAME = "2023年1-5月乘用车市场上险量.xlsx"
 DEFAULT_SOURCE_ID = "dbs_77982e981bac4a6fa8"
-CONFIGURATION_TABLE = "vehicle_params_wide"
+CONFIGURATION_TABLE = "vehicle_model_base"
 SEMANTIC_REFERENCE_PATH = (
     BASE_DIR / "semantic-assets" / "dimensions" / "vehicle_series" / "references" / "byd_chery_demo.json"
 )
@@ -261,7 +261,7 @@ async def load_all_config_series(source_id: str) -> list[dict[str, str]]:
     statement = text(
         """
         SELECT DISTINCT brand, serial_name
-        FROM vehicle_params_wide
+        FROM vehicle_model_base
         WHERE serial_name IS NOT NULL
           AND btrim(serial_name) <> ''
         ORDER BY brand, serial_name

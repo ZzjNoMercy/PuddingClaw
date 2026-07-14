@@ -46,9 +46,9 @@ scope:
     mode: all
     values:
       - vehicle_params
-      - vehicle_params_wide
+      - vehicle_model_base
 params:
-  required_table: vehicle_params_wide
+  required_table: vehicle_model_base
   fallback_table: vehicle_params
 ```
 

@@ -134,13 +134,13 @@ export default function SourcesPanel() {
       <div className="workspace-side-card overflow-hidden rounded-[28px] px-5 py-3">
         <ProgressCard
           active={inspectorActiveTab === "progress"}
-          onActivate={() => setInspectorActiveTab("progress")}
+          onActivate={() => setInspectorActiveTab(inspectorActiveTab === "progress" ? null : "progress")}
           todos={displayTodos as Array<{ content: string; status: TodoStatus }>}
         />
         <PanelDivider />
         <PermissionsCard
           active={inspectorActiveTab === "permissions"}
-          onActivate={() => setInspectorActiveTab("permissions")}
+          onActivate={() => setInspectorActiveTab(inspectorActiveTab === "permissions" ? null : "permissions")}
           grants={permissionGrants}
           onRevoke={async (grantId) => {
             await revokePermissionGrant(sessionId, grantId);
@@ -151,7 +151,7 @@ export default function SourcesPanel() {
         <PanelDivider />
         <SourcesCard
           active={inspectorActiveTab === "sources"}
-          onActivate={() => setInspectorActiveTab("sources")}
+          onActivate={() => setInspectorActiveTab(inspectorActiveTab === "sources" ? null : "sources")}
           cited={cited}
           retrieved={retrieved}
           isStreaming={isStreaming && hasSources}
@@ -242,9 +242,10 @@ function PermissionsCard({
         <div className="mt-4 space-y-3 pb-5">
           {grants.map((grant) => {
             const target = grant.target_kind === "all_external_files" ? "所有外部文件" : grant.target;
+            const canWrite = grant.capabilities.includes("write") || grant.type === "external_file_write";
             const name =
               grant.target_kind === "all_external_files"
-                ? "本 session 外部文件读取"
+                ? `本 session 外部文件${canWrite ? "写入" : "读取"}`
                 : grant.target.split("/").filter(Boolean).pop() || "外部文件";
             return (
               <div key={grant.id} className="rounded-2xl border border-black/[0.06] bg-white/70 p-3">
@@ -277,8 +278,12 @@ function PermissionsCard({
                       <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-500">
                         Session
                       </span>
-                      <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-500">
-                        Read only
+                      <span
+                        className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${
+                          canWrite ? "bg-amber-50 text-amber-700" : "bg-slate-100 text-slate-500"
+                        }`}
+                      >
+                        {canWrite ? "Write" : "Read only"}
                       </span>
                     </div>
                   </div>

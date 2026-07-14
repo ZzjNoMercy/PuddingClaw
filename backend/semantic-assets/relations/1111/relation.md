@@ -1,8 +1,8 @@
 ---
 formatter: asset-relation
-name: '车系配置关联_宽表'
+name: '车系款型基础表关联'
 type: relation
-description: 从车系维度查找产品配置明细，车系一对一产品配置宽表
+description: 将款型基础表按品牌和车系关联到规范车系维度
 aliases: []
 tags: []
 version: 0.1.0
@@ -11,8 +11,8 @@ updated_at: '2026-07-13 05:14:35'
 relation_type: dimension_binding
 relation:
   asset:
-    ref: dbs_77982e981bac4a6fa8.vehicle_params_wide
-    display_name: insight_data · vehicle_params_wide
+    ref: dbs_77982e981bac4a6fa8.vehicle_model_base
+    display_name: insight_data · vehicle_model_base
     key_fields:
     - brand
     - serial_name
@@ -39,7 +39,7 @@ relation:
 
 ## 业务口径
 
-从车系维度查找产品配置明细，车系一对一产品配置宽表
+将 `vehicle_model_base` 的每个款型按 `brand + serial_name` 关联到规范车系维度。同一车系可以包含多个款型，禁止把该关系理解为车系与款型一对一。
 
 ## 关联方式
 

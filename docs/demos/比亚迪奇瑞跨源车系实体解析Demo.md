@@ -24,7 +24,7 @@
 | 数据源 | 实体字段 | 示例 |
 | --- | --- | --- |
 | 2023 年 1-5 月乘用车市场上险量 Excel | `品牌` + `1-子车型` | `比亚迪` + `比亚迪秦PLUS` |
-| PostgreSQL `vehicle_params_wide` | `brand` + `serial_name` | `比亚迪` + `秦PLUS` |
+| PostgreSQL `vehicle_model_base` | `brand` + `serial_name` | `比亚迪` + `秦PLUS` |
 
 `销量` 只用于聚合和计算覆盖率；`1-brandcn车型`只作为原始样例证据，不参与匹配主键。
 

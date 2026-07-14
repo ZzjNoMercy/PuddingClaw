@@ -42,7 +42,7 @@ export default function Navbar({
   compact = false,
 }: NavbarProps) {
   const router = useRouter();
-  const { setSessionId } = useApp();
+  const { setSessionId, hasActiveRun, runtimeMode } = useApp();
   const [notifications, setNotifications] = useState<TaskNotification[]>([]);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const notificationMenuRef = useRef<HTMLDivElement>(null);
@@ -171,12 +171,23 @@ export default function Navbar({
       </div>
 
       {/* Center — Title */}
-      <div className="flex-1 flex items-center justify-center min-w-0 px-4">
+      <div className="flex min-w-0 flex-1 items-center justify-center gap-2 px-4">
         {title ? (
           <button className="flex items-center gap-1.5 text-[14px] font-medium text-gray-800 hover:bg-black/[0.04] px-3 py-1.5 rounded-lg transition-colors">
             <span className="truncate">{title}</span>
             <ChevronDown className="w-[14px] h-[14px] text-gray-400" />
           </button>
+        ) : null}
+        {hasActiveRun ? (
+          <div
+            role="status"
+            aria-live="polite"
+            className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-full bg-[#002fa7]/[0.08] px-2.5 text-[11px] font-semibold text-[#002fa7]"
+            title={runtimeMode === "agent" ? "Agent 正在运行" : "正在生成回复"}
+          >
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            <span>{runtimeMode === "agent" ? "Agent 运行中" : "正在生成"}</span>
+          </div>
         ) : null}
       </div>
 

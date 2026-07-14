@@ -53,5 +53,23 @@ def test_default_tool_guides_route_product_config_metrics_to_database() -> None:
 
     assert "Use `database_sql_generate` first" in prompt
     assert "配置率, 搭载率, 配备率" in prompt
+    assert "Do not add physical table names" in prompt
+    assert "Do not request a revision merely" in prompt
+    assert "injected automatically from trusted runtime state" in prompt
+    assert "with `generation_id` only; omit `sql`" in prompt
+    assert "never launch multiple revision requests in parallel" in prompt
     assert "Do not first search the knowledge base, inspect schema" in prompt
     assert "Business metric questions such as sales volume" not in prompt
+
+
+def test_default_tool_guides_use_virtual_filesystem_for_semantic_assets() -> None:
+    prompt = (Path(__file__).resolve().parent.parent / "prompts" / "deepagents" / "TOOL_GUIDES.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'read_file("/semantic-assets/...", limit=1000)' in prompt
+    assert "never pass it to `read_resource`" in prompt
+    assert "Do not use `read_resource` for `/skills/`, `/semantic-assets/`" in prompt
+    assert "convert it to the equivalent `/workspace/<relative-path>`" in prompt
+    assert "call the built-in `edit_file` or `write_file` with that exact path" in prompt
+    assert "Do not fall back to `terminal`" in prompt

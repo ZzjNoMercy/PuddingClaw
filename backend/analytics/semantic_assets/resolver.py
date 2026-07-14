@@ -53,7 +53,7 @@ class ResolvedSemanticAsset:
     tags: list[str]
     parent_id: str = ""
 
-    def to_prompt_block(self) -> str:
+    def to_prompt_block(self, *, full_body: bool = False) -> str:
         labels = {
             "measure": "度量值",
             "dimension": "维度",
@@ -62,7 +62,7 @@ class ResolvedSemanticAsset:
         }
         label = labels.get(self.type, self.type)
         body = self.body.strip()
-        if len(body) > MAX_BODY_CHARS:
+        if not full_body and len(body) > MAX_BODY_CHARS:
             body = body[:MAX_BODY_CHARS].rstrip() + "\n...（已截断）"
         return f"[{label}：{self.name}]\n路径：{self.path}\n命中原因：{self.match_reason}\n\n{body}"
 
@@ -322,6 +322,67 @@ def resolve_semantic_assets(
     }
 
 
+def resolve_semantic_assets_by_ids(
+    question: str,
+    *,
+    requested_ids: list[str],
+    base_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Load only explicitly selected assets, preserving complete definitions."""
+
+    registry = get_semantic_asset_registry(base_dir)
+    resolved_base_dir = (base_dir or Path(__file__).resolve().parents[2]).resolve()
+    snapshot = registry.list_assets()
+    matched: list[ResolvedSemanticAsset] = []
+    unmatched_requested: list[str] = []
+    for asset_id in dict.fromkeys(item.strip() for item in requested_ids if item and item.strip()):
+        try:
+            detail = registry.get_asset(asset_id)
+        except Exception:
+            unmatched_requested.append(asset_id)
+            continue
+        if str(detail.get("type") or "") == "relation":
+            unmatched_requested.append(asset_id)
+            continue
+        matched.append(
+            ResolvedSemanticAsset(
+                id=str(detail.get("id") or ""),
+                name=str(detail.get("name") or ""),
+                type=str(detail.get("type") or ""),
+                path=str(detail.get("path") or ""),
+                match_score=100.0,
+                match_reason="selected from analytics model metadata",
+                body=str(detail.get("body") or ""),
+                aliases=[str(item) for item in detail.get("aliases") or []],
+                tags=[str(item) for item in detail.get("tags") or []],
+            )
+        )
+
+    references: list[ResolvedSemanticAsset] = []
+    for asset in matched:
+        if asset.type == "measure":
+            references.extend(
+                _resolve_measure_references(
+                    question,
+                    base_dir=resolved_base_dir,
+                    measure=asset,
+                    registry=registry,
+                )
+            )
+
+    return {
+        "matched": matched,
+        "references": references,
+        "matched_count": len(matched),
+        "reference_count": len(references),
+        "available_count": snapshot.get("count", 0),
+        "type_counts": snapshot.get("type_counts") or {},
+        "unmatched_requested_ids": unmatched_requested,
+        "full_body": True,
+        "resolution_mode": "selected_ids",
+    }
+
+
 def format_semantic_assets_for_prompt(resolution: dict[str, Any]) -> str:
     matched = resolution.get("matched") or []
     references = resolution.get("references") or []
@@ -330,8 +391,9 @@ def format_semantic_assets_for_prompt(resolution: dict[str, Any]) -> str:
             "语义资产定义：本轮未命中任何度量值、颗粒度、维度或度量值 references。\n"
             "如果问题涉及业务口径，请不要自行从字段名或款型名称猜测；必要时生成保守 SQL 或要求补充定义。"
         )
-    blocks = [asset.to_prompt_block() for asset in matched]
-    reference_blocks = [asset.to_prompt_block() for asset in references]
+    full_body = bool(resolution.get("full_body"))
+    blocks = [asset.to_prompt_block(full_body=full_body) for asset in matched]
+    reference_blocks = [asset.to_prompt_block(full_body=full_body) for asset in references]
     if reference_blocks:
         blocks.extend(reference_blocks)
     return (
@@ -353,9 +415,11 @@ def semantic_resolution_to_trace(resolution: dict[str, Any]) -> dict[str, Any]:
         "matched": [asset.to_trace() for asset in matched],
         "references": [asset.to_trace() for asset in references],
         "matched_count": len(matched),
+        "resolution_mode": resolution.get("resolution_mode") or "fuzzy",
+        "full_body": bool(resolution.get("full_body")),
+        "unmatched_requested_ids": resolution.get("unmatched_requested_ids") or [],
         "reference_count": len(references),
         "available_count": resolution.get("available_count", 0),
         "type_counts": resolution.get("type_counts") or {},
-        "unmatched_requested_ids": resolution.get("unmatched_requested_ids") or [],
         "prompt_injected": bool(matched or references),
     }

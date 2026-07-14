@@ -22,8 +22,8 @@ class DatabaseSqlExecuteTool(BaseTool):
     name: str = "database_sql_execute"
     description: str = (
         "Execute explicit read-only PostgreSQL SQL against a configured database source. "
-        "Use only after database_sql_generate. In Agent mode, generation_id is mandatory and the SQL must exactly "
-        "match the registered generation; semantic changes must go through the natural-language revision HITL flow. "
+        "Use only after database_sql_generate. In Agent mode, generation_id is mandatory and its registered SQL is "
+        "loaded server-side; omit the SQL argument. Semantic changes must go through the natural-language revision HITL flow. "
         "When the result is preview-only, the full materialized rows are persisted and returned with a result_id; "
         "use database_query_result_page to fetch subsequent pages."
     )
@@ -31,16 +31,12 @@ class DatabaseSqlExecuteTool(BaseTool):
     risk_level: str = "moderate"
     session_id: str = ""
 
-    @staticmethod
-    def _normalized_sql(sql: str) -> str:
-        return " ".join(sql.strip().rstrip(";").split())
-
     class Config:
         arbitrary_types_allowed = True
 
     async def _arun(
         self,
-        sql: str,
+        sql: str = "",
         generation_id: str = "",
         database_source_id: str | None = None,
         table_names: list[str] | None = None,
@@ -55,12 +51,6 @@ class DatabaseSqlExecuteTool(BaseTool):
             )
             if generation is None:
                 return "🧮 SQL 执行失败：Agent 模式必须提供当前会话有效的 generation_id。请先调用 database_sql_generate。"
-            if self._normalized_sql(sql) != self._normalized_sql(generation.result.sql):
-                return (
-                    "🧮 SQL 执行拒绝：SQL 与 generation_id 登记结果不一致，禁止执行手写改动。"
-                    "如需调整，请调用 database_sql_generate(parent_generation_id='"
-                    f"{generation.id}', revision_instruction='<自然语言修改说明>')。"
-                )
             sql = generation.result.sql
             question = generation.result.question
             database_source_id = generation.request.get("database_source_id")
@@ -129,8 +119,10 @@ class DatabaseSqlExecuteTool(BaseTool):
             "🧮 SQL 执行结果",
             f"- 数据源：{public_source.get('name')} ({public_source.get('id')})",
             f"- 授权表：{', '.join(allowed_tables)}",
-            f"- 结果：{result_size}",
         ]
+        if self.session_id:
+            lines.append("- SQL 来源：generation_id 登记结果")
+        lines.append(f"- 结果：{result_size}")
         if execution.result_id:
             lines.extend(
                 [
@@ -149,7 +141,7 @@ class DatabaseSqlExecuteTool(BaseTool):
 
     def _run(
         self,
-        sql: str,
+        sql: str = "",
         generation_id: str = "",
         database_source_id: str | None = None,
         table_names: list[str] | None = None,

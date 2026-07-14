@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
+from langchain.tools import ToolRuntime
 from langchain_core.tools import BaseTool
 from langgraph.types import interrupt
 from pydantic import BaseModel
@@ -21,26 +22,37 @@ from .formatting import format_query_error
 from .models import DatabaseSqlGenerateInput
 from .spans import emit_database_span
 
-_SEMANTIC_CONTRACT_MAX_ITEMS = 8
 _SEMANTIC_CONTRACT_PREVIEW_CHARS = 700
 
 
 def _format_semantic_contract(semantic_assets: dict[str, object]) -> list[str]:
     """Expose the semantic evidence already used by the SQL generator."""
+    analytics_model = semantic_assets.get("analytics_model")
     matched = semantic_assets.get("matched")
     references = semantic_assets.get("references")
     ordered = [
         *([item for item in references if isinstance(item, dict)] if isinstance(references, list) else []),
         *([item for item in matched if isinstance(item, dict)] if isinstance(matched, list) else []),
     ]
-    if not ordered:
+    if not ordered and not isinstance(analytics_model, dict):
         return []
 
     lines = [
         "- 权威语义口径：以下摘要来自生成器已加载的 Measure/Reference，当前 SQL 已按这些规则生成。",
         "  外层 Agent 不得凭字段名或常识直接覆盖；如用户明确改变口径，须携带新约束重新调用 database_sql_generate。",
     ]
-    for item in ordered[:_SEMANTIC_CONTRACT_MAX_ITEMS]:
+    if isinstance(analytics_model, dict):
+        lines.append(
+            "  - analysis_model:"
+            f"{analytics_model.get('id') or analytics_model.get('name')} (analysis_model)"
+            + (f"，路径：{analytics_model.get('path')}" if analytics_model.get("path") else "")
+        )
+        preview = " ".join(str(analytics_model.get("body_preview") or "").split())
+        if len(preview) > _SEMANTIC_CONTRACT_PREVIEW_CHARS:
+            preview = preview[:_SEMANTIC_CONTRACT_PREVIEW_CHARS].rstrip() + "..."
+        if preview:
+            lines.append(f"    模型全局规则摘要：{preview}")
+    for item in ordered:
         asset_id = str(item.get("id") or item.get("name") or "unknown")
         asset_type = str(item.get("type") or "semantic_asset")
         path = str(item.get("path") or "")
@@ -62,7 +74,7 @@ def _format_generation(
     matched_assets = result.semantic_assets.get("matched") if isinstance(result.semantic_assets.get("matched"), list) else []
     asset_names = [
         f"{item.get('id') or item.get('name')}({item.get('type')})"
-        for item in matched_assets[:8]
+        for item in matched_assets
         if isinstance(item, dict)
     ]
     title = "🧮 SQL 生成结果（未执行）"
@@ -83,8 +95,8 @@ def _format_generation(
             [
                 "- HITL 状态：已完成（resolved）",
                 "- 用户决策：reject；保留原 generation 和原 SQL",
-                "- 下一步：不要再次询问用户选择。立即将下方未改动 SQL 与 generation_id "
-                "传给 database_sql_validate，再调用 database_sql_execute。",
+                "- 下一步：不要再次询问用户选择。立即仅使用 generation_id 调用 "
+                "database_sql_validate，再调用 database_sql_execute。",
             ]
         )
     elif disposition == "approved_revision":
@@ -104,7 +116,7 @@ def _format_generation(
     lines.extend(_format_semantic_contract(result.semantic_assets))
     lines.append(
         "- 执行约束：database_sql_validate/database_sql_execute 必须携带此 generation_id；"
-        "不得传入手写改动后的 SQL。"
+        "Agent 模式无需回传 SQL，工具会从 generation_id 加载登记结果。"
     )
     lines.extend(["", "```sql", result.sql, "```"])
     return "\n".join(lines)
@@ -135,16 +147,38 @@ class DatabaseSqlGenerateTool(BaseTool):
         table_names: list[str] | None = None,
         model_id: str | None = None,
         measure_ids: list[str] | None = None,
+        semantic_asset_ids: list[str] | None = None,
+        selected_semantic_asset_ids: list[str] | None = None,
         parent_generation_id: str | None = None,
         revision_instruction: str | None = None,
         tool_call_id: str = "",
+        runtime: ToolRuntime | None = None,
     ) -> str:
+        state_model_id = ""
+        if runtime is not None and isinstance(runtime.state, dict):
+            state_model_id = str(runtime.state.get("analytics_model_id") or "").strip()
+        effective_model_id = state_model_id or model_id
+        selected_asset_ids = list(
+            dict.fromkeys(selected_semantic_asset_ids or semantic_asset_ids or measure_ids or [])
+        )
+        if state_model_id and runtime is not None and isinstance(runtime.state, dict):
+            allowed_asset_ids = {
+                str(item).strip()
+                for item in runtime.state.get("allowed_semantic_asset_ids") or []
+                if str(item).strip()
+            }
+            invalid_asset_ids = [item for item in selected_asset_ids if item not in allowed_asset_ids]
+            if invalid_asset_ids:
+                return (
+                    "🧮 SQL 生成失败：以下语义资产不属于当前分析模型或已被删除："
+                    + ", ".join(invalid_asset_ids)
+                )
         request_payload = {
             "question": question,
             "database_source_id": database_source_id,
             "table_names": table_names or [],
-            "model_id": model_id,
-            "measure_ids": measure_ids or [],
+            "model_id": effective_model_id,
+            "measure_ids": selected_asset_ids,
         }
         parent: RegisteredDatabaseSqlGeneration | None = None
         disposition = "generated"
@@ -245,8 +279,11 @@ class DatabaseSqlGenerateTool(BaseTool):
         table_names: list[str] | None = None,
         model_id: str | None = None,
         measure_ids: list[str] | None = None,
+        semantic_asset_ids: list[str] | None = None,
+        selected_semantic_asset_ids: list[str] | None = None,
         parent_generation_id: str | None = None,
         revision_instruction: str | None = None,
+        runtime: ToolRuntime | None = None,
     ) -> str:
         try:
             asyncio.get_running_loop()
@@ -258,8 +295,11 @@ class DatabaseSqlGenerateTool(BaseTool):
                     table_names=table_names,
                     model_id=model_id,
                     measure_ids=measure_ids,
+                    semantic_asset_ids=semantic_asset_ids,
+                    selected_semantic_asset_ids=selected_semantic_asset_ids,
                     parent_generation_id=parent_generation_id,
                     revision_instruction=revision_instruction,
+                    runtime=runtime,
                 )
             )
         return "🧮 SQL 生成失败：当前运行环境不支持同步调用，请使用异步工具调用。"

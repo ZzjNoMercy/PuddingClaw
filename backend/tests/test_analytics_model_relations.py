@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import pytest
 import json
+
+import pytest
 
 from analytics.models.registry import AnalyticsModelError, AnalyticsModelRegistry
 from analytics.semantic_assets.registry import SemanticAssetRegistry
@@ -27,7 +28,7 @@ def _prepare_relations(tmp_path) -> tuple[str, str]:
         relation_definition={
             "type": "direct_join",
             "left": {"ref": "table_asset:orders", "key_fields": ["order_id"]},
-            "right": {"ref": "insight_data.vehicle_params_wide", "key_fields": ["order_id"]},
+            "right": {"ref": "insight_data.vehicle_model_base", "key_fields": ["order_id"]},
             "field_mapping": {"left": ["order_id"], "right": ["order_id"]},
             "cardinality": "many_to_one",
             "join_type": "left",
@@ -43,14 +44,14 @@ def test_model_requires_connected_selected_relation(tmp_path) -> None:
     with pytest.raises(AnalyticsModelError, match="必须选择资产关联"):
         models.create_model(
             name="无关系模型",
-            data_assets={"tables": ["table_asset:sales", "insight_data.vehicle_params_wide"]},
+            data_assets={"tables": ["table_asset:sales", "insight_data.vehicle_model_base"]},
             semantic_assets={"dimensions": ["dimension:车系"]},
         )
 
     with pytest.raises(AnalyticsModelError, match="资产和维度必须均已被模型选择"):
         models.create_model(
             name="缺维度模型",
-            data_assets={"tables": ["table_asset:sales", "insight_data.vehicle_params_wide"]},
+            data_assets={"tables": ["table_asset:sales", "insight_data.vehicle_model_base"]},
             semantic_assets={"dimensions": []},
             asset_relations=[binding],
         )
@@ -61,7 +62,7 @@ def test_model_context_resolves_published_relation(tmp_path) -> None:
     models = AnalyticsModelRegistry(tmp_path)
     created = models.create_model(
         name="订单产品分析",
-        data_assets={"tables": ["table_asset:orders", "insight_data.vehicle_params_wide"]},
+        data_assets={"tables": ["table_asset:orders", "insight_data.vehicle_model_base"]},
         semantic_assets={},
         asset_relations=[direct],
     )
@@ -70,6 +71,33 @@ def test_model_context_resolves_published_relation(tmp_path) -> None:
     assert context["missing_references"] == []
     assert context["asset_relations"][0]["type"] == "direct_join"
     assert context["asset_relations"][0]["definition"]["cardinality"] == "many_to_one"
+
+
+def test_model_context_expands_selected_semantic_asset_frontmatter(tmp_path) -> None:
+    assets = SemanticAssetRegistry(tmp_path)
+    measure = assets.create_asset(
+        name="上市周期",
+        asset_type="measure",
+        description="使用完整上市事件序列计算相邻间隔。",
+    )
+    dimension = assets.create_asset(name="上市时间", asset_type="dimension")
+    models = AnalyticsModelRegistry(tmp_path)
+    created = models.create_model(
+        name="产品配置分析",
+        semantic_assets={
+            "measures": [measure["id"]],
+            "dimensions": [dimension["id"]],
+        },
+    )
+
+    context = models.get_model_context(created["id"])
+
+    assert [item["id"] for item in context["semantic_assets"]] == [measure["id"], dimension["id"]]
+    assert context["semantic_assets"][0]["description"] == "使用完整上市事件序列计算相邻间隔。"
+    assert context["semantic_assets"][0]["frontmatter"]["name"] == "上市周期"
+    json.dumps(context["semantic_assets"][0]["frontmatter"])
+    assert "body" not in context["semantic_assets"][0]
+    assert context["missing_references"] == []
 
 
 def test_model_context_derives_common_dimension_path(tmp_path) -> None:
@@ -89,14 +117,14 @@ def test_model_context_derives_common_dimension_path(tmp_path) -> None:
         asset_type="relation",
         relation_definition={
             "type": "dimension_binding",
-            "asset": {"ref": "insight_data.vehicle_params_wide", "key_fields": ["brand", "serial_name"]},
+            "asset": {"ref": "insight_data.vehicle_model_base", "key_fields": ["brand", "serial_name"]},
             "dimension": {"ref": "dimension:车系"},
         },
     )
     models = AnalyticsModelRegistry(tmp_path)
     created = models.create_model(
         name="销量配置联合分析",
-        data_assets={"tables": ["table_asset:sales", "insight_data.vehicle_params_wide"]},
+        data_assets={"tables": ["table_asset:sales", "insight_data.vehicle_model_base"]},
         semantic_assets={"dimensions": ["dimension:车系"]},
         asset_relations=[sales["id"], config["id"]],
     )
@@ -105,7 +133,7 @@ def test_model_context_derives_common_dimension_path(tmp_path) -> None:
     assert context["derived_dimension_paths"] == [
         {
             "dimension": "dimension:车系",
-            "assets": ["insight_data.vehicle_params_wide", "table_asset:sales"],
+            "assets": ["insight_data.vehicle_model_base", "table_asset:sales"],
             "rule": "这些资产通过同一已选维度关联；联合分析必须经由该维度的规范键。",
         }
     ]

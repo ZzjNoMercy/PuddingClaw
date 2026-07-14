@@ -11,7 +11,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 from langchain_core.runnables.config import var_child_runnable_config
 from pydantic import BaseModel, Field
 
-from llm.model_client import ModelClient, ModelClientChatModel
+from llm.model_client import INTERNAL_CALL_MARKER, ModelClient, ModelClientChatModel
 
 
 class FakeBoundModel:
@@ -226,6 +226,52 @@ def test_model_client_chat_model_uses_base_chat_model_input_conversion_and_kwarg
     assert call["messages"][0].content == "hello"
     assert call["stop"] == ["END"]
     assert call["kwargs"] == {"timeout": 3}
+
+
+def test_model_client_chat_model_marks_context_summary_as_internal():
+    """DeepAgents' context compressor output must be distinguishable from user text."""
+
+    fake = FakeBoundModel(content="## SESSION INTENT\ninternal summary")
+    model = ModelClientChatModel(force_direct=True, streaming=False)
+    summary_prompt = (
+        "<role>\nContext Extraction Assistant\n</role>\n"
+        "## SESSION INTENT\n"
+        "<messages>\nMessages to summarize:\nhello\n</messages>"
+    )
+
+    writer = mock.Mock()
+    with mock.patch("llm.model_client.ModelClient._direct_model", return_value=fake):
+        with mock.patch("llm.model_client.get_stream_writer", return_value=writer):
+            result = model.invoke(summary_prompt)
+
+    assert result.additional_kwargs[INTERNAL_CALL_MARKER] == "context_summary"
+    assert writer.call_args_list == [
+        mock.call(
+            {
+                "type": "context_maintenance",
+                "status": "start",
+                "phase": "deepagents_summarization",
+                "message": "上下文达到压缩阈值，正在压缩，完成后将继续生成...",
+            }
+        ),
+        mock.call(
+            {
+                "type": "context_maintenance",
+                "status": "done",
+                "phase": "deepagents_summarization",
+            }
+        ),
+    ]
+
+
+def test_model_client_chat_model_does_not_mark_regular_answer_as_internal():
+    fake = FakeBoundModel(content="regular answer")
+    model = ModelClientChatModel(force_direct=True, streaming=False)
+
+    with mock.patch("llm.model_client.ModelClient._direct_model", return_value=fake):
+        result = model.invoke("hello")
+
+    assert INTERNAL_CALL_MARKER not in result.additional_kwargs
 
 
 def test_model_client_chat_model_with_structured_output_parses_pydantic_schema():

@@ -211,6 +211,16 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         "ratio": 0.5,
         # Must be less than MAX_HISTORY_MESSAGES (50) so compression fires before truncation
         "trigger_count": 15,
+        # Agent/DeepAgents uses its own built-in history offload + summarization
+        # lifecycle. Keep this separate from the legacy Chat middleware stack.
+        "deepagents": {
+            "summarization": {
+                "enabled": True,
+                "trigger_tokens": 500000,
+                "keep_messages": 20,
+                "summary_input_tokens": 400000,
+            },
+        },
         "middleware": {
             "enabled": True,
             # 工具结果摘要：保留最近 10 条完整 tool output，且只摘要 >=500 字符的历史 tool output
@@ -1371,3 +1381,22 @@ def get_context_window() -> int:
 def get_compaction_trigger_tokens() -> int:
     """获取 CompactionMiddleware 触发阈值（前端进度条分母）。"""
     return load_config().get("compression", {}).get("middleware", {}).get("compaction", {}).get("trigger_tokens", 500000)
+
+
+def get_deepagents_summarization_config() -> dict[str, Any]:
+    """Return Agent-mode summarization settings, isolated from legacy Chat."""
+
+    return dict(
+        load_config()
+        .get("compression", {})
+        .get("deepagents", {})
+        .get(
+            "summarization",
+            {
+                "enabled": True,
+                "trigger_tokens": 500000,
+                "keep_messages": 20,
+                "summary_input_tokens": 400000,
+            },
+        )
+    )

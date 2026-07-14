@@ -23,24 +23,35 @@ class PermissionResumeRegistry:
         query_id: str,
         tool_call_id: str,
         path: Path,
+        access: str = "read",
+        operation: str = "",
+        change_preview: dict[str, str] | None = None,
     ) -> dict[str, Any]:
+        if access not in {"read", "write"}:
+            raise ValueError(f"Unsupported external file access: {access}")
         request_id = f"perm-req-{uuid.uuid4().hex[:12]}"
+        request_type = f"external_file_{access}"
         request = {
             "id": request_id,
-            "type": "external_file_read",
+            "type": request_type,
             "session_id": session_id,
             "query_id": query_id,
             "tool_call_id": tool_call_id,
             "path": str(path),
             "target_kind": "exact_file",
-            "capabilities": ["read", "external_path"],
+            "capabilities": [access, "external_path"],
             "status": "pending",
             "created_at": time.time(),
-            "options": [
-                "exact_file_session",
-                "all_external_files_session",
-            ],
+            "options": (
+                ["exact_file_session", "all_external_files_session"]
+                if access == "read"
+                else ["exact_file_session"]
+            ),
         }
+        if operation:
+            request["operation"] = operation
+        if change_preview:
+            request["change_preview"] = change_preview
         self._requests[request_id] = request
         self._pending[request_id] = asyncio.get_running_loop().create_future()
         return dict(request)

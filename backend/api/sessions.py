@@ -22,6 +22,10 @@ class RenameRequest(BaseModel):
     title: str
 
 
+class SessionAnalyticsModelRequest(BaseModel):
+    analytics_model_id: str | None = None
+
+
 # ── Endpoints ───────────────────────────────────────────────
 
 @router.get("/sessions")
@@ -47,6 +51,19 @@ async def rename_session(session_id: str, req: RenameRequest):
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Session not found")
     return {"id": session_id, "title": req.title}
+
+
+@router.patch("/sessions/{session_id}/analytics-model")
+async def update_session_analytics_model(
+    session_id: str,
+    req: SessionAnalyticsModelRequest,
+):
+    """Persist or clear the analytics model selected for one session."""
+    meta = session_manager.update_metadata(
+        session_id,
+        {"analytics_model_id": req.analytics_model_id},
+    )
+    return meta
 
 
 @router.delete("/sessions/{session_id}")

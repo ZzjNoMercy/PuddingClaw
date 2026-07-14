@@ -28,14 +28,14 @@ def _crosswalk(*, include_han: bool = True) -> dict:
     records = [
         {
             "entity": {"entity_key": "byd::qinplus", "canonical_brand": "比亚迪", "canonical_serial_name": "秦PLUS"},
-            "bindings": [{"source_kind": "database_table", "source_ref": "database:insight:vehicle_params_wide", "key_fields": {"brand": "比亚迪", "serial_name": "秦PLUS"}}],
+            "bindings": [{"source_kind": "database_table", "source_ref": "database:insight:vehicle_model_base", "key_fields": {"brand": "比亚迪", "serial_name": "秦PLUS"}}],
             "resolution": {"status": "auto_matched", "join_eligible": True},
         }
     ]
     if include_han:
         records.append({
             "entity": {"entity_key": "byd::han", "canonical_brand": "比亚迪", "canonical_serial_name": "汉"},
-            "bindings": [{"source_kind": "database_table", "source_ref": "database:insight:vehicle_params_wide", "key_fields": {"brand": "比亚迪", "serial_name": "汉"}}],
+            "bindings": [{"source_kind": "database_table", "source_ref": "database:insight:vehicle_model_base", "key_fields": {"brand": "比亚迪", "serial_name": "汉"}}],
             "resolution": {"status": "auto_matched", "join_eligible": True},
         })
     return {

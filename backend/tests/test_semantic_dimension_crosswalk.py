@@ -30,7 +30,7 @@ def _crosswalk() -> dict:
             {
                 "entity": {"entity_key": "byd::qinplus", "canonical_brand": "比亚迪", "canonical_serial_name": "秦PLUS"},
                 "bindings": [
-                    {"source_kind": "database_table", "source_ref": "database:db:vehicle_params_wide", "source_name": "insight", "key_fields": {"brand": "比亚迪", "serial_name": "秦PLUS"}},
+                    {"source_kind": "database_table", "source_ref": "database:db:vehicle_model_base", "source_name": "insight", "key_fields": {"brand": "比亚迪", "serial_name": "秦PLUS"}},
                     {"source_kind": "attachment", "source_ref": "attachment:sales-jan", "source_name": "1月上险量", "key_fields": {"品牌": "比亚迪", "1-子车型": "秦PLUS"}},
                 ],
                 "resolution": {"status": "auto_matched", "join_eligible": True},
@@ -38,7 +38,7 @@ def _crosswalk() -> dict:
             {
                 "entity": {"entity_key": "byd::han", "canonical_brand": "比亚迪", "canonical_serial_name": "汉"},
                 "bindings": [
-                    {"source_kind": "database_table", "source_ref": "database:db:vehicle_params_wide", "source_name": "insight", "key_fields": {"brand": "比亚迪", "serial_name": "汉"}},
+                    {"source_kind": "database_table", "source_ref": "database:db:vehicle_model_base", "source_name": "insight", "key_fields": {"brand": "比亚迪", "serial_name": "汉"}},
                 ],
                 "resolution": {"status": "canonical_only", "join_eligible": False},
             },

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from langchain.tools import ToolRuntime
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class DatabaseKnowledgeInput(BaseModel):
@@ -37,16 +38,35 @@ class DatabaseKnowledgeInput(BaseModel):
 
 
 class DatabaseSqlGenerateInput(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     question: str = Field(description="Natural-language question used only to generate SQL. The SQL is not executed.")
     database_source_id: str | None = Field(default=None, description="Optional configured database source id.")
     table_names: list[str] = Field(
         default_factory=list,
         description="Optional allowed table names. Explicit table names win over router-selected tables.",
     )
-    model_id: str | None = Field(default=None, description="Optional analytics model id. Reserved for model routing.")
+    model_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional analytics model fallback for non-Agent callers. In Agent mode, the UI-selected model from "
+            "trusted runtime state takes precedence."
+        ),
+    )
     measure_ids: list[str] = Field(
         default_factory=list,
-        description="Optional semantic asset ids to force into SQL-generation context.",
+        description="Deprecated alias for selected_semantic_asset_ids.",
+    )
+    semantic_asset_ids: list[str] = Field(
+        default_factory=list,
+        description="Deprecated alias for selected_semantic_asset_ids.",
+    )
+    selected_semantic_asset_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Exact ids selected from the current analytics model's semantic-asset metadata index. "
+            "Pass only assets relevant to the current question."
+        ),
     )
     parent_generation_id: str | None = Field(
         default=None,
@@ -62,10 +82,17 @@ class DatabaseSqlGenerateInput(BaseModel):
             "Requires parent_generation_id and triggers the agree/reject/modify HITL flow."
         ),
     )
+    runtime: ToolRuntime
 
 
 class DatabaseSqlValidateInput(BaseModel):
-    sql: str = Field(description="Read-only SQL to validate. This tool does not execute SQL.")
+    sql: str = Field(
+        default="",
+        description=(
+            "Optional read-only SQL for non-Agent callers. In Agent mode, omit this field; the authoritative SQL "
+            "is loaded server-side from generation_id."
+        ),
+    )
     generation_id: str = Field(
         default="",
         description="Generation id returned by database_sql_generate. Required in Agent mode.",
@@ -75,7 +102,13 @@ class DatabaseSqlValidateInput(BaseModel):
 
 
 class DatabaseSqlExecuteInput(BaseModel):
-    sql: str = Field(description="Explicit read-only SQL to execute.")
+    sql: str = Field(
+        default="",
+        description=(
+            "Optional explicit SQL for non-Agent callers. In Agent mode, omit this field; the authoritative SQL "
+            "is loaded server-side from generation_id."
+        ),
+    )
     generation_id: str = Field(
         default="",
         description="Generation id returned by database_sql_generate. Required in Agent mode.",

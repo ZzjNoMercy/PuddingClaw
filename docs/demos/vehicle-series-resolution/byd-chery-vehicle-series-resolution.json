@@ -16,7 +16,7 @@
       "rows": 839093
     },
     "configuration_source_id": "dbs_77982e981bac4a6fa8",
-    "configuration_table": "vehicle_params_wide"
+    "configuration_table": "vehicle_model_base"
   },
   "rules": {
     "brand": "配置库 brand 仅作为本 Demo 的输出规范名；销量侧品牌先做 NFKC、大小写、标点及受约束尾缀归一。",

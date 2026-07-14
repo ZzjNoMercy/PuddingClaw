@@ -278,7 +278,7 @@ def test_registered_source_must_be_appended() -> None:
         "registered_sources": [{"id": "insurance_sales", "name": "乘用车上险量"}],
         "rule_template": {"adapter": "entity_crosswalk_v1", "reference_path": "references/active_crosswalk.json"},
         "candidates": [
-            {"id": "canonical", "display_name": "配置", "input": {"kind": "database_table", "table": "vehicle_params_wide"}, "fields": ["brand"]},
+            {"id": "canonical", "display_name": "配置", "input": {"kind": "database_table", "table": "vehicle_model_base"}, "fields": ["brand"]},
             {"id": "monthly", "display_name": "11月上险量", "input": {"kind": "attachment", "attachment_id": "att_monthly"}, "fields": ["品牌"], "suggested_source_id": "insurance_sales"},
         ],
     }
@@ -300,7 +300,7 @@ def test_worker_revalidation_preserves_confirmed_registered_append_source() -> N
         "registered_sources": [{"id": "insurance_sales", "name": "乘用车上险量", "identity_fields": ["品牌", "1-子车型"]}],
         "rule_template": {"adapter": "entity_crosswalk_v1", "reference_path": "references/active_crosswalk.json"},
         "candidates": [
-            {"id": "canonical", "display_name": "配置", "input": {"kind": "database_table", "table": "vehicle_params_wide"}, "fields": ["brand", "serial_name"]},
+            {"id": "canonical", "display_name": "配置", "input": {"kind": "database_table", "table": "vehicle_model_base"}, "fields": ["brand", "serial_name"]},
             {"id": "monthly", "display_name": "11月上险量", "input": {"kind": "attachment", "attachment_id": "att_monthly"}, "fields": ["品牌", "1-子车型"]},
         ],
     }

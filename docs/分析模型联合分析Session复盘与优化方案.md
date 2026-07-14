@@ -34,14 +34,14 @@
 1. 读取模型元数据，看到数据资产：
    - `table_asset:tbl_...`
    - `dbs_77982e981bac4a6fa8.vehicle_params`
-   - `dbs_77982e981bac4a6fa8.vehicle_params_wide`
+   - `dbs_77982e981bac4a6fa8.vehicle_model_base`
 
 2. 先调用 `database_sql_generate` 生成“上险量 Top 20” SQL。
    - 返回：无法生成，因为当前数据库只提供产品配置表，缺少上险量事实表。
    - 这是合理失败，但本不应发生。模型已绑定 table asset，系统应告诉 Agent 销量数据在 table asset 里。
 
 3. 调用 `database_schema_inspect` 查看数据库表。
-   - 只看到 `vehicle_params` 和 `vehicle_params_wide`。
+   - 只看到 `vehicle_params` 和 `vehicle_model_base`。
    - 这说明数据库工具是正常的，但它天然看不到知识库表格资产。
 
 4. 调用多次 `ls /knowledge` 找 Excel 文件。
@@ -61,7 +61,7 @@
      - `可调悬架种类` 等。
 
 7. 生成并执行空气悬架 SQL。
-   - 第一版用 Excel 里的车系名直接 join `vehicle_params_wide.serial_name`，出现大量 `未知`。
+   - 第一版用 Excel 里的车系名直接 join `vehicle_model_base.serial_name`，出现大量 `未知`。
    - 原因：Excel 车系名带品牌前缀，例如 `特斯拉Model Y`，而配置库中是 `brand=特斯拉, serial_name=Model Y`。
 
 8. Agent 查询配置库里的实际命名并手动修正映射。
@@ -135,7 +135,7 @@ join_contracts:
       asset: table_asset:sales
       fields: [品牌, 1-子车型]
     right:
-      asset: dbs_77982e981bac4a6fa8.vehicle_params_wide
+      asset: dbs_77982e981bac4a6fa8.vehicle_model_base
       fields: [brand, serial_name]
     strategy:
       - exact: 品牌 -> brand
@@ -176,7 +176,7 @@ join_contracts:
    - 关键列: 年份, 月份, 品牌, 1-子车型, 销量, 燃料种类_细分, 价格段
 
 2. 产品配置宽表
-   - ref: dbs_77982e981bac4a6fa8.vehicle_params_wide
+   - ref: dbs_77982e981bac4a6fa8.vehicle_model_base
    - 工具: database_schema_inspect / database_sql_execute
    - join key: brand + serial_name + car_name
 ```
@@ -228,7 +228,7 @@ table_asset_inspect(asset_id)
 join_contracts:
   - id: sales_series_to_config_series
     left_asset: table_asset:tbl_...
-    right_asset: dbs_77982e981bac4a6fa8.vehicle_params_wide
+    right_asset: dbs_77982e981bac4a6fa8.vehicle_model_base
     grain: series
     left_fields: [品牌, 1-子车型]
     right_fields: [brand, serial_name]

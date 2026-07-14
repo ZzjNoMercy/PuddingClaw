@@ -48,13 +48,18 @@ class SessionManager:
             return {}
 
     def _write_file(self, session_id: str, data: dict[str, Any]) -> None:
-        """将会话数据写入磁盘，自动更新 updated_at 时间戳"""
+        """原子写入会话数据，避免读者观察到半截 JSON。"""
         data["updated_at"] = time.time()                                   # 每次写入都刷新更新时间
         path = self._session_path(session_id)                              # 获取文件路径
-        path.write_text(                                                   # 写入 JSON 文件
-            json.dumps(data, ensure_ascii=False, indent=2),                # 中文不转义，缩进 2 格
-            encoding="utf-8",                                              # UTF-8 编码
-        )
+        temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temp_path.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temp_path.replace(path)
+        finally:
+            temp_path.unlink(missing_ok=True)
 
     def create_session(self, session_id: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         """创建空会话，返回元数据（id/title/时间戳）"""
@@ -85,6 +90,7 @@ class SessionManager:
             "project_path",
             "workspace_type",
             "workspace_path",
+            "analytics_model_id",
         ):
             if key in data:
                 meta[key] = data.get(key)
@@ -589,6 +595,7 @@ class SessionManager:
                     "project_path",
                     "workspace_type",
                     "workspace_path",
+                    "analytics_model_id",
                 ):
                     if key in raw:
                         meta[key] = raw.get(key)
@@ -759,6 +766,59 @@ class SessionManager:
             return 0
         return data.get("context_usage_peak", 0) or 0
 
+    def update_agent_context_usage(self, session_id: str, used_tokens: int) -> None:
+        """Persist the current effective Agent context (not its historical peak)."""
+        data = self._read_file(session_id)
+        if not data:
+            return
+        data["agent_context_usage"] = max(0, int(used_tokens))
+        self._write_file(session_id, data)
+
+    def get_agent_context_usage(self, session_id: str) -> int:
+        """Return the latest effective Agent context size."""
+        data = self._read_file(session_id)
+        if not data:
+            return 0
+        return int(data.get("agent_context_usage", 0) or 0)
+
+    def update_agent_context_messages(
+        self,
+        session_id: str,
+        messages: list[dict[str, Any]],
+    ) -> None:
+        """Persist DeepAgents' compact model context separately from UI history."""
+        data = self._read_file(session_id)
+        if not data:
+            return
+        data["agent_context_messages"] = messages
+        self._write_file(session_id, data)
+
+    def get_agent_context_messages(self, session_id: str) -> list[dict[str, Any]]:
+        """Load the compact model context saved by a previous Agent turn."""
+        data = self._read_file(session_id)
+        if not data:
+            return []
+        messages = data.get("agent_context_messages")
+        if not isinstance(messages, list):
+            return []
+        return [item for item in messages if isinstance(item, dict)]
+
+    def update_agent_context_state(
+        self,
+        session_id: str,
+        *,
+        used_tokens: int,
+        messages: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Atomically persist Agent usage and, when compacted, its model context."""
+        data = self._read_file(session_id)
+        if not data:
+            return
+        data["agent_context_usage"] = max(0, int(used_tokens))
+        if messages is not None:
+            data["agent_context_messages"] = messages
+        self._write_file(session_id, data)
+
     # ── Permission grants ─────────────────────────────────────────────────────
 
     def list_permission_grants(self, session_id: str) -> list[dict[str, Any]]:
@@ -851,6 +911,18 @@ class SessionManager:
             if target_kind == "all_external_files":
                 return True
             if target_kind == "exact_file" and grant.get("target") == resolved:
+                return True
+        return False
+
+    def has_external_file_write_permission(self, session_id: str, path: Path) -> bool:
+        """Return whether the session may write the given exact external file."""
+        resolved = str(path.expanduser().resolve())
+        for grant in self.list_permission_grants(session_id):
+            if grant.get("type") != "external_file_write":
+                continue
+            if "write" not in (grant.get("capabilities") or []):
+                continue
+            if grant.get("target_kind") == "exact_file" and grant.get("target") == resolved:
                 return True
         return False
 

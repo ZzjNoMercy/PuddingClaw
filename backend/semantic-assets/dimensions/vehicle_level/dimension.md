@@ -2,7 +2,7 @@
 formatter: semantic-asset
 name: 车型级别
 type: dimension
-description: 车型级别的标准取值口径，优先使用 vehicle_params_wide。
+description: 车型级别的标准取值口径，优先使用 vehicle_model_base。
 aliases:
   - 级别
   - 车型等级
@@ -11,15 +11,15 @@ aliases:
 tags:
   - 汽车产品配置
   - vehicle_params
-  - vehicle_params_wide
+  - vehicle_model_base
   - 级别
 version: 0.1.0
 resolution_mode: source_field
 resolution:
   mode: source_field
   bindings:
-    - asset_ref: dbs_77982e981bac4a6fa8.vehicle_params_wide
-      display_name: insight_data · vehicle_params_wide
+    - asset_ref: dbs_77982e981bac4a6fa8.vehicle_model_base
+      display_name: insight_data · vehicle_model_base
       fields:
         value: vehicle_level
 created: 2026-07-08 00:00:00
@@ -30,9 +30,9 @@ updated_at: 2026-07-09 00:00:00
 
 ## 字段口径
 
-优先使用 `vehicle_params_wide.vehicle_level`。
+优先使用 `vehicle_model_base.vehicle_level`。
 
-只有当查询的表范围没有 `vehicle_params_wide`，或需要回查原始明细时，才回退到 `vehicle_params`。
+只有当查询的表范围没有 `vehicle_model_base`，或需要回查原始明细时，才回退到 `vehicle_params`。
 
 车型级别取 `vehicle_params` 表中 `type_name = '级别'` 的 `type_value`。
 
@@ -63,7 +63,7 @@ updated_at: 2026-07-09 00:00:00
 
 查询某个车型级别时，必须同时限定：
 
-如果使用 `vehicle_params_wide`：
+如果使用 `vehicle_model_base`：
 
 ```sql
 vehicle_level = '<精确车型级别>'
@@ -88,4 +88,4 @@ type_value IN ('小型SUV', '紧凑型SUV', '中型SUV', '中大型SUV', '大型
 - 不要把数据库不存在的英文或简称值写入 SQL。
 - 不要只写 `type_value = '皮卡'`，必须同时写 `type_name = '级别'`。
 - 不要用 `car_name LIKE '%皮卡%'` 代替车型级别筛选。
-- 如果可用表中包含 `vehicle_params_wide`，不要回到 `vehicle_params` 用 EAV 自关联计算车型级别，应直接使用 `vehicle_level`。
+- 如果可用表中包含 `vehicle_model_base`，不要回到 `vehicle_params` 用 EAV 自关联计算车型级别，应直接使用 `vehicle_level`。

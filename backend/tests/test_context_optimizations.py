@@ -61,6 +61,18 @@ class TestContextEngineeringConfig:
         assert cm["keep_recent"] == 8
         assert cm["compact_budget_tokens"] == 120000
 
+    def test_deepagents_summarization_is_independent_at_500k(self):
+        from config import _DEFAULT_CONFIG
+
+        agent_summary = _DEFAULT_CONFIG["compression"]["deepagents"]["summarization"]
+        chat_middleware = _DEFAULT_CONFIG["compression"]["middleware"]
+
+        assert agent_summary["trigger_tokens"] == 500000
+        assert agent_summary["keep_messages"] == 20
+        # Legacy Chat keeps its existing two-stage policy.
+        assert chat_middleware["summarization"]["trigger_tokens"] == 200000
+        assert chat_middleware["compaction"]["trigger_tokens"] == 500000
+
     def test_chat_preannounces_pending_tool_result_clear(self):
         from api.chat import _should_preannounce_tool_result_clear
 
@@ -793,6 +805,24 @@ class TestSessionManagerPersistence:
         mgr.update_context_usage_peak(sid, 500)
         assert mgr.get_context_usage_peak(sid) == 1000
 
+    def test_agent_context_state_tracks_current_usage_and_messages(self, tmp_path):
+        from graph.session_manager import SessionManager
+
+        mgr = SessionManager()
+        mgr.initialize(tmp_path)
+        sid = "agent-context"
+        mgr.create_session(sid, metadata={"runtime_mode": "agent"})
+        compact_messages = [{"type": "human", "data": {"content": "summary"}}]
+
+        mgr.update_agent_context_state(
+            sid,
+            used_tokens=6800,
+            messages=compact_messages,
+        )
+
+        assert mgr.get_agent_context_usage(sid) == 6800
+        assert mgr.get_agent_context_messages(sid) == compact_messages
+
     def test_load_session_merges_archive(self, tmp_path):
         from graph.session_manager import SessionManager
         import json
@@ -960,3 +990,25 @@ class TestTokensAPI:
         assert result["message_tokens"] == 999998
         assert result["total_tokens"] == 999999
         assert result["compaction_trigger"] == 500000
+
+    @pytest.mark.asyncio
+    async def test_agent_uses_current_effective_context_not_full_history_or_peak(self, tmp_path):
+        from api.tokens import get_session_token_count
+        from graph.session_manager import session_manager
+        from config import CONFIG_FILE
+
+        with patch("config.CONFIG_FILE", tmp_path / "nonexistent_config.json"):
+            session_manager.initialize(tmp_path)
+            sid = "agent-tokens-test"
+            session_manager.create_session(sid, metadata={"runtime_mode": "agent"})
+            session_manager.save_message(sid, "user", "x" * 10000)
+            session_manager.update_context_usage_peak(sid, 205000)
+            session_manager.update_agent_context_usage(sid, 6800)
+
+            with patch("api.tokens.build_system_prompt", return_value="sys"):
+                with patch("api.tokens._count_tokens", return_value=10000):
+                    result = await get_session_token_count(sid)
+
+        assert result["total_tokens"] == 6800
+        assert result["compaction_trigger"] == 500000
+        assert result["percentage"] == 1.4

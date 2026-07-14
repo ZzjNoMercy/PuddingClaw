@@ -3,17 +3,17 @@ formatter: analytics-model
 id: "汽车行业综合分析"
 name: "汽车行业综合分析"
 type: analysis_model
-version: "0.2.0"
+version: "0.2.1"
 description: "分析汽车行业销量、产品规划、技术规划、发展趋势等"
 tags: ["汽车销量","汽车产品配置分析"]
 data_assets:
-  tables: ["table_asset:tbl_23fff15978050fdc18330ab2","dbs_77982e981bac4a6fa8.vehicle_params","dbs_77982e981bac4a6fa8.vehicle_params_wide","table_asset:tbl_concat_847eed5f3f93dd93e4cb7111"]
+  tables: ["table_asset:tbl_23fff15978050fdc18330ab2","dbs_77982e981bac4a6fa8.vehicle_params","dbs_77982e981bac4a6fa8.vehicle_model_base","table_asset:tbl_concat_847eed5f3f93dd93e4cb7111"]
 semantic_assets:
   measures: ["measure:charging_c_rate","measure:config_rate","measure:launch_cycle","measure:launch_update_count","measure:销量"]
-  dimensions: ["dimension:launch_time","dimension:price_band","dimension:brand","dimension:energy_type","dimension:vehicle_level","dimension:vehicle_series"]
+  dimensions: ["dimension:launch_time","dimension:price_band","dimension:wheelbase","dimension:brand","dimension:energy_type","dimension:vehicle_level","dimension:vehicle_series"]
   grains: ["grain:car_model","grain:series"]
 asset_relations: []
-guardrails: ["air_suspension_reference_type_value","config_rate_model_key_group","config_rate_no_exists_distinct","config_rate_use_wide_denominator","launch_time_no_car_name_year","postgres_count_distinct_nullable_tuple_after_left_join"]
+guardrails: ["air_suspension_reference_type_value","config_rate_model_key_group","config_rate_no_exists_distinct","config_rate_use_model_base_denominator","launch_time_no_car_name_year","postgres_count_distinct_nullable_tuple_after_left_join"]
 templates: {}
 default_template: null
 created: "2026-07-09 15:42:24"

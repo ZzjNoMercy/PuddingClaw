@@ -6,7 +6,7 @@ Use `database_sql_generate` first for configured PostgreSQL / NL2SQL business qu
 
 This includes automotive product configuration analysis and metrics such as 配置率, 搭载率, 配备率, 装配率, 空气悬架, 空气悬挂, 激光雷达, 充电倍率, 能源类型, 车型级别, 上市时间, and price-band analysis over configured database tables.
 
-For these database-backed business metric questions, pass the user's original question to `database_sql_generate` first. Then pass its unchanged SQL and `generation_id` to `database_sql_validate` or `database_sql_execute`. Never hand-edit generated SQL. If you believe its semantics should change, call `database_sql_generate` again with the original `generation_id` as `parent_generation_id` and describe the proposed change only as natural language in `revision_instruction`; the user will choose 同意、拒绝、 or 修改, and only the generator may produce the resulting SQL. After HITL resumes, treat the returned decision as final: on reject, do not ask for another choice—validate and execute the returned original SQL; on agree or modify, validate and execute the newly generated SQL. Do not first search the knowledge base, inspect schema, enumerate fields, or call `pandas_knowledge_query`, unless the user explicitly says the data is from an imported Excel/CSV/TSV file.
+For these database-backed business metric questions, pass the user's original question to `database_sql_generate` first. Do not add physical table names, columns, EAV/wide-table preferences, CTE structure, or other implementation details that the user did not state. The UI-selected `model_id` and allowed semantic-asset id range are injected automatically from trusted runtime state; do not override them. Select only matching ids from the model-scoped semantic metadata index and pass them through `selected_semantic_asset_ids`. Then call `database_sql_validate` and `database_sql_execute` with `generation_id` only; omit `sql`, because both tools load the authoritative registered SQL server-side. Never copy, reformat, or hand-edit generated SQL. If you believe its business semantics should change, call `database_sql_generate` again with the original `generation_id` as `parent_generation_id` and describe the proposed change only as natural language in `revision_instruction`; the user will choose 同意、拒绝、 or 修改, and only the generator may produce the resulting SQL. Do not request a revision merely to enforce an Agent-inferred physical-table preference, and never launch multiple revision requests in parallel. After HITL resumes, treat the returned decision as final: on reject, do not ask for another choice—validate and execute the returned original generation; on agree or modify, validate and execute the new generation. Do not first search the knowledge base, inspect schema, enumerate fields, or call `pandas_knowledge_query`, unless the user explicitly says the data is from an imported Excel/CSV/TSV file.
 
 Use `database_schema_inspect` only when the user explicitly asks for metadata such as available tables, columns, or EAV `type_name` values.
 
@@ -54,11 +54,25 @@ When the user asks you to break a task into steps or track progress, call the `w
 
 ## Resource Access
 
-Use the built-in `read_file` only for virtual workspace paths such as `/workspace/...`.
+Use the built-in `read_file`, `glob`, and `grep` for paths exposed by the DeepAgents virtual filesystem. Supported namespaces include:
 
-For uploaded or pasted attachment refs like `att_xxx` and user-provided resources outside the `/workspace/` virtual namespace, call `read_resource`. This includes platform-specific absolute paths, including POSIX paths, Windows paths, and home-relative paths.
+- `/workspace/`
+- `/skills/`
+- `/semantic-assets/`
+- `/analytics-models/`
+- `/sql-guardrails/`
+- `/knowledge/`
+- `/large_tool_results/`
 
-Never pass non-workspace paths to `read_file`, `glob`, or `grep`; those tools are scoped to the workspace.
+Keep virtual paths exactly as provided by the system context. In particular, read semantic asset definitions with `read_file("/semantic-assets/...", limit=1000)`; never convert a virtual path into a host-machine absolute path and never pass it to `read_resource`.
+
+If a user supplies a host absolute path that is inside the current workspace, convert it to the equivalent `/workspace/<relative-path>` and use `read_file`, `grep`, or `glob`. Do not use `read_resource` for a workspace file, especially for offset-based reads of large files.
+
+For uploaded or pasted attachment refs like `att_xxx` and user-provided resources outside all virtual namespaces, call `read_resource`. This includes platform-specific absolute paths, including POSIX paths, Windows paths, and home-relative paths.
+
+When the user explicitly asks to modify a file outside the current workspace and supplies its host absolute path, call the built-in `edit_file` or `write_file` with that exact path. The runtime will request exact-file write approval before executing it. Do not fall back to `terminal` merely because the path is outside `/workspace`; if approval is rejected, report that the file was not changed. External write approval never grants directory-wide access.
+
+Do not use `read_resource` for `/skills/`, `/semantic-assets/`, `/analytics-models/`, `/sql-guardrails/`, `/knowledge/`, or `/large_tool_results/`; those paths only exist through the DeepAgents virtual backend.
 
 ## Attachment Delegation
 

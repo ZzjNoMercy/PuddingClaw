@@ -140,18 +140,18 @@ DEFAULT_GUARDRAILS = GuardrailRuleSet(
             ),
         ),
         GuardrailRule(
-            id="config_rate_use_wide_denominator",
-            name="配置率优先使用宽表分母",
+            id="config_rate_use_model_base_denominator",
+            name="配置率优先使用款型基础表分母",
             type="require_table_when_available",
             scope=GuardrailScope(
-                table_scope=GuardrailTableScope(mode="all", values=["vehicle_params", "vehicle_params_wide"]),
+                table_scope=GuardrailTableScope(mode="all", values=["vehicle_params", "vehicle_model_base"]),
                 semantic_assets=["measure:config_rate"],
                 intent_any=["配置率", "搭载率", "渗透率", "配备率", "占比"],
             ),
-            params={"required_table": "vehicle_params_wide", "fallback_table": "vehicle_params"},
+            params={"required_table": "vehicle_model_base", "fallback_table": "vehicle_params"},
             action=GuardrailAction(
                 type="rewrite",
-                message="配置率必须使用 vehicle_params_wide 先筛选分母款型，再 JOIN vehicle_params 判断配置明细。",
+                message="配置率必须使用 vehicle_model_base 先筛选分母款型，再 JOIN vehicle_params 判断配置明细。",
             ),
         ),
         GuardrailRule(

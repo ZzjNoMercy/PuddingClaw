@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import analytics.nl2sql.result_store as result_store_module
+import analytics.nl2sql.service as nl2sql_service
 import tools.database.sql_execute_tool as sql_execute_module
 from analytics.nl2sql.schemas import DatabaseSqlGenerationResult, SqlExecutionResult, TableRoute
 from analytics.nl2sql.service import DatabaseKnowledgeQueryError
@@ -23,6 +24,38 @@ from graph.database_sql_revision_resume import database_sql_revision_resume_regi
 from knowledge.models import Base
 from tools.database.sql_execute_tool import DatabaseSqlExecuteTool
 from tools.database_knowledge_tool import _format_query_error
+
+
+def test_sql_generator_loads_selected_analytics_model_body(monkeypatch) -> None:
+    class _Registry:
+        @staticmethod
+        def get_model_context(model_id: str) -> dict[str, Any]:
+            assert model_id == "产品配置分析"
+            return {
+                "id": model_id,
+                "name": model_id,
+                "version": "0.2.0",
+                "path": "analytics-models/产品配置分析/model.md",
+                "frontmatter": {"data_assets": {"tables": ["db.vehicle_params"]}},
+                "body": "## 默认分析范围\n\n- 默认排除车型级别为 `皮卡` 的车型。",
+            }
+
+    monkeypatch.setattr(nl2sql_service, "get_analytics_model_registry", lambda: _Registry())
+
+    prompt, trace = nl2sql_service._format_analytics_model_for_sql_prompt("产品配置分析")
+
+    assert "默认排除车型级别为 `皮卡`" in prompt
+    assert "用户明确要求 > 具体 Measure/Reference > 模型全局规则" in prompt
+    assert trace["id"] == "产品配置分析"
+    assert trace["path"] == "analytics-models/产品配置分析/model.md"
+
+
+def test_product_configuration_model_declares_default_pickup_exclusion() -> None:
+    prompt, _ = nl2sql_service._format_analytics_model_for_sql_prompt("产品配置分析")
+
+    assert "默认分析中国狭义乘用车" in prompt
+    assert "必须排除车型级别为 `皮卡`" in prompt
+    assert "type_name = '级别'" in prompt
 
 
 class _FakeSessionMaker:
@@ -116,6 +149,40 @@ def test_validate_readonly_sql_does_not_treat_extract_from_to_date_as_table() ->
     clean_sql = validate_readonly_sql(sql, allowed_tables=["vehicle_params"])
 
     assert "to_date" in clean_sql
+
+
+def test_validate_readonly_sql_recognizes_commented_chained_ctes() -> None:
+    sql = """WITH model_base AS (
+      SELECT brand FROM vehicle_params
+    ),
+    -- 筛选有效款型
+    valid_models AS (
+      SELECT brand FROM model_base
+    ),
+    /* 去重上市事件 */
+    events AS (
+      SELECT DISTINCT brand FROM valid_models
+    ),
+    event_sequence AS (
+      SELECT brand FROM events
+    )
+    SELECT brand FROM event_sequence"""
+
+    clean_sql = validate_readonly_sql(sql, allowed_tables=["vehicle_params"])
+
+    assert clean_sql == sql
+
+
+def test_validate_readonly_sql_ignores_table_like_text_inside_comments() -> None:
+    sql = """WITH events AS (
+      SELECT brand FROM vehicle_params
+      -- FROM unauthorized_debug_table
+    )
+    SELECT brand FROM events"""
+
+    clean_sql = validate_readonly_sql(sql, allowed_tables=["vehicle_params"])
+
+    assert clean_sql == sql
 
 
 def test_database_query_error_format_includes_generated_sql() -> None:

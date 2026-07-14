@@ -6,7 +6,11 @@ import io
 import zipfile
 
 from analytics.semantic_assets.registry import SemanticAssetRegistry
-from analytics.semantic_assets.resolver import format_semantic_assets_for_prompt, resolve_semantic_assets
+from analytics.semantic_assets.resolver import (
+    format_semantic_assets_for_prompt,
+    resolve_semantic_assets,
+    resolve_semantic_assets_by_ids,
+)
 
 
 def test_semantic_asset_registry_create_and_refresh(tmp_path) -> None:
@@ -222,6 +226,30 @@ def test_semantic_asset_resolver_injects_dimension_guardrail(tmp_path) -> None:
     assert resolution["matched"][0].id == "dimension:上市时间"
     assert "type_name='上市时间'" in prompt
     assert "不要从 car_name" in prompt
+
+
+def test_selected_model_assets_are_exact_and_not_truncated(tmp_path) -> None:
+    registry = SemanticAssetRegistry(tmp_path)
+    selected = registry.create_asset(name="电机功率", asset_type="dimension", description="电机功率分段。")
+    registry.create_asset(name="价格段", asset_type="dimension", description="价格分段。")
+    selected_path = tmp_path / selected["path"]
+    marker = "完整正文末尾规则"
+    selected_path.write_text(
+        selected_path.read_text(encoding="utf-8") + "\n" + ("规则内容" * 700) + marker,
+        encoding="utf-8",
+    )
+    registry.refresh()
+
+    resolution = resolve_semantic_assets_by_ids(
+        "按电机功率统计价格趋势",
+        requested_ids=[selected["id"]],
+        base_dir=tmp_path,
+    )
+    prompt = format_semantic_assets_for_prompt(resolution)
+
+    assert [asset.id for asset in resolution["matched"]] == [selected["id"]]
+    assert marker in prompt
+    assert "已截断" not in prompt
 
 
 def test_measure_reference_is_resolved_after_measure_match(tmp_path) -> None:

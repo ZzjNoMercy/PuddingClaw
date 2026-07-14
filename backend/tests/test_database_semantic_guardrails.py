@@ -137,7 +137,7 @@ def test_config_rate_blocks_eav_exists_distinct_slow_pattern() -> None:
 
     route = SimpleNamespace(table_names=["vehicle_params"])
 
-    conflicts = _detect_semantic_sql_conflicts(sql, semantic_trace, route)
+    conflicts = _detect_semantic_sql_conflicts(sql, semantic_trace, route, question="配置率")
 
     assert conflicts
     assert "config_rate_no_exists_distinct" in conflicts[0]
@@ -171,10 +171,10 @@ def test_config_rate_allows_eav_flags_fallback_with_model_key_pattern() -> None:
         "references": [],
     }
 
-    assert _detect_semantic_sql_conflicts(sql, semantic_trace) == []
+    assert _detect_semantic_sql_conflicts(sql, semantic_trace, question="配置率") == []
 
 
-def test_config_rate_blocks_eav_denominator_when_wide_table_is_routed() -> None:
+def test_config_rate_blocks_eav_denominator_when_model_base_table_is_routed() -> None:
     sql = """
     WITH car_flags AS (
       SELECT
@@ -206,12 +206,12 @@ def test_config_rate_blocks_eav_denominator_when_wide_table_is_routed() -> None:
         ],
         "references": [],
     }
-    route = SimpleNamespace(table_names=["vehicle_params_wide", "vehicle_params"])
+    route = SimpleNamespace(table_names=["vehicle_model_base", "vehicle_params"])
 
-    conflicts = _detect_semantic_sql_conflicts(sql, semantic_trace, route)
+    conflicts = _detect_semantic_sql_conflicts(sql, semantic_trace, route, question="配置率")
 
     assert conflicts
-    assert "vehicle_params_wide" in conflicts[0]
+    assert "vehicle_model_base" in conflicts[0]
 
 
 def test_config_rate_blocks_eav_flags_grouped_only_by_car_name() -> None:
@@ -240,7 +240,7 @@ def test_config_rate_blocks_eav_flags_grouped_only_by_car_name() -> None:
 
     route = SimpleNamespace(table_names=["vehicle_params"])
 
-    conflicts = _detect_semantic_sql_conflicts(sql, semantic_trace, route)
+    conflicts = _detect_semantic_sql_conflicts(sql, semantic_trace, route, question="配置率")
 
     assert conflicts
     assert "brand + serial_name + car_name" in conflicts[0]

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 
 
 def test_session_external_file_permission_grants(tmp_path):
@@ -37,6 +36,164 @@ def test_session_external_file_permission_grants(tmp_path):
     )
 
     assert session_manager.has_external_file_read_permission("permission-session", external_file)
+
+
+def test_session_external_file_write_grant_is_exact_file_only(tmp_path):
+    from graph.session_manager import session_manager
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("write-permission-session")
+    first = tmp_path / "outside" / "first.txt"
+    second = tmp_path / "outside" / "second.txt"
+    first.parent.mkdir()
+    first.write_text("before", encoding="utf-8")
+    second.write_text("before", encoding="utf-8")
+
+    grant = session_manager.add_permission_grant(
+        "write-permission-session",
+        grant_type="external_file_write",
+        target_kind="exact_file",
+        target=str(first.resolve()),
+        capabilities=["write", "external_path"],
+    )
+
+    assert session_manager.has_external_file_write_permission("write-permission-session", first)
+    assert not session_manager.has_external_file_write_permission("write-permission-session", second)
+    assert not session_manager.has_external_file_read_permission("write-permission-session", first)
+    assert session_manager.revoke_permission_grant("write-permission-session", grant["id"])
+    assert not session_manager.has_external_file_write_permission("write-permission-session", first)
+
+
+def test_permissioned_backend_edits_only_approved_external_file(tmp_path):
+    from deepagents.backends import FilesystemBackend
+
+    from graph.permissioned_filesystem_backend import PermissionedCompositeBackend
+    from graph.session_manager import session_manager
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("backend-write-session")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    external = tmp_path / "external" / "note.txt"
+    external.parent.mkdir()
+    external.write_text("before", encoding="utf-8")
+    workspace_backend = FilesystemBackend(root_dir=workspace, virtual_mode=True)
+    backend = PermissionedCompositeBackend(
+        default=workspace_backend,
+        routes={"/workspace/": workspace_backend},
+        session_id="backend-write-session",
+    )
+
+    denied = backend.edit(str(external), "before", "denied")
+    assert denied.error
+    assert external.read_text(encoding="utf-8") == "before"
+
+    session_manager.add_permission_grant(
+        "backend-write-session",
+        grant_type="external_file_write",
+        target_kind="exact_file",
+        target=str(external.resolve()),
+        capabilities=["write", "external_path"],
+    )
+    allowed = backend.edit(str(external), "before", "after")
+
+    assert allowed.error is None
+    assert allowed.path == str(external.resolve())
+    assert external.read_text(encoding="utf-8") == "after"
+
+
+def test_external_write_request_contains_change_preview(tmp_path):
+    from graph.permission_middleware import ExternalFilePermissionMiddleware
+    from graph.permission_resume import permission_resume_registry
+
+    async def create_request():
+        return permission_resume_registry.create_external_file_request(
+            session_id="preview-session",
+            query_id="query-preview",
+            tool_call_id="call-edit",
+            path=tmp_path / "outside.txt",
+            access="write",
+            operation="edit_file",
+            change_preview={"old_string": "before", "new_string": "after"},
+        )
+
+    request = asyncio.run(create_request())
+
+    assert request["type"] == "external_file_write"
+    assert request["capabilities"] == ["write", "external_path"]
+    assert request["options"] == ["exact_file_session"]
+    assert request["operation"] == "edit_file"
+    assert request["change_preview"]["new_string"] == "after"
+    assert ExternalFilePermissionMiddleware._external_write_path(
+        str(tmp_path / "outside.txt"),
+        str(tmp_path / "workspace"),
+    ) == (tmp_path / "outside.txt").resolve()
+    assert ExternalFilePermissionMiddleware._external_write_path(
+        "/workspace/report.md",
+        str(tmp_path / "workspace"),
+    ) is None
+
+
+def test_permission_middleware_interrupts_external_edit_file(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from langchain_core.messages import AIMessage
+
+    import graph.permission_middleware as permission_middleware_module
+    from graph.permission_middleware import ExternalFilePermissionMiddleware
+    from graph.session_manager import session_manager
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("middleware-write-session")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    external = tmp_path / "external" / "chart.js"
+    external.parent.mkdir()
+    external.write_text("before", encoding="utf-8")
+    captured = {}
+
+    def fake_interrupt(payload):
+        captured.update(payload)
+        return {"decisions": [{"type": "reject"}]}
+
+    monkeypatch.setattr(permission_middleware_module, "interrupt", fake_interrupt)
+    state = {
+        "messages": [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "edit_file",
+                        "args": {
+                            "file_path": str(external),
+                            "old_string": "before",
+                            "new_string": "after",
+                        },
+                        "id": "call-edit-external",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
+    }
+    runtime = SimpleNamespace(
+        context={
+            "session_id": "middleware-write-session",
+            "query_id": "query-write",
+            "workspace_path": str(workspace),
+        }
+    )
+
+    async def invoke():
+        return ExternalFilePermissionMiddleware().after_model(state, runtime)
+
+    assert asyncio.run(invoke()) is None
+    request = captured["request"]
+    assert captured["type"] == "permission_request"
+    assert request["type"] == "external_file_write"
+    assert request["path"] == str(external.resolve())
+    assert request["tool_call_id"] == "call-edit-external"
+    assert request["change_preview"] == {"old_string": "before", "new_string": "after"}
 
 
 def test_read_external_file_tool_requires_permission_and_records_trace(tmp_path):
@@ -148,3 +305,50 @@ def test_deny_permission_request_resumes_pending_run():
     assert future.result() == {"type": "reject", "message": "No thanks."}
     assert permission_resume_registry.get("perm-req-deny-test")["decision"]["type"] == "reject"
     loop.close()
+
+
+def test_permission_api_grants_exact_external_write_from_pending_request(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from app import app
+    from graph.permission_resume import permission_resume_registry
+    from graph.session_manager import session_manager
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("write-api-session")
+    target = (tmp_path / "outside" / "report.html").resolve()
+    target.parent.mkdir()
+    target.write_text("before", encoding="utf-8")
+    request_id = "perm-req-write-test"
+    permission_resume_registry._requests[request_id] = {
+        "id": request_id,
+        "type": "external_file_write",
+        "session_id": "write-api-session",
+        "path": str(target),
+        "status": "pending",
+    }
+
+    client = TestClient(app)
+    response = client.post(
+        "/api/sessions/write-api-session/permissions/external-files",
+        json={
+            "target_kind": "exact_file",
+            "path": str(target),
+            "permission_request_id": request_id,
+        },
+    )
+
+    assert response.status_code == 200
+    grant = response.json()["grant"]
+    assert grant["type"] == "external_file_write"
+    assert grant["capabilities"] == ["write", "external_path"]
+    assert session_manager.has_external_file_write_permission("write-api-session", target)
+
+    broad_response = client.post(
+        "/api/sessions/write-api-session/permissions/external-files",
+        json={
+            "target_kind": "all_external_files",
+            "permission_request_id": request_id,
+        },
+    )
+    assert broad_response.status_code == 400

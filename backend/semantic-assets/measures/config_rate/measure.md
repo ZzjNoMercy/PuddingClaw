@@ -10,7 +10,7 @@ aliases:
 tags:
   - 汽车产品配置
   - vehicle_params
-  - vehicle_params_wide
+  - vehicle_model_base
 version: 0.1.0
 created: 2026-07-08 00:00:00
 updated_at: 2026-07-09 00:00:00
@@ -30,11 +30,11 @@ updated_at: 2026-07-09 00:00:00
 
 排除皮卡时必须使用车型级别维度口径。
 
-如果可用表中包含 `vehicle_params_wide`，分母和常用维度筛选必须优先使用 `vehicle_params_wide`，例如上市时间、能源类型、车型级别、品牌、车系、价格、价格段、销售状态。
+如果可用表中包含 `vehicle_model_base`，分母和常用维度筛选必须优先使用 `vehicle_model_base`，例如上市时间、能源类型、车型级别、品牌、车系、价格、价格段、销售状态。
 
 只有目标配置是否搭载这种配置明细判断，才回到 `vehicle_params` 读取 `type_name` / `type_value`。
 
-对于没有 `vehicle_params_wide` 的回退场景，才允许在 `vehicle_params` 这种 EAV 明细表中用同一个 `car_flags` CTE 聚合出 `is_pickup`，再在分子和分母里统一排除：
+对于没有 `vehicle_model_base` 的回退场景，才允许在 `vehicle_params` 这种 EAV 明细表中用同一个 `car_flags` CTE 聚合出 `is_pickup`，再在分子和分母里统一排除：
 
 ```sql
 WITH car_flags AS (
@@ -58,12 +58,12 @@ FROM car_flags
 
 满足当前筛选条件的统计对象数量，默认排除车型级别为 `皮卡` 的统计对象。
 
-如果问题涉及上市时间、能源类型、车型级别、品牌、车系、价格、价格段、销售状态等常用维度，分母必须优先来自 `vehicle_params_wide`：
+如果问题涉及上市时间、能源类型、车型级别、品牌、车系、价格、价格段、销售状态等常用维度，分母必须优先来自 `vehicle_model_base`：
 
 ```sql
 WITH denominator AS (
   SELECT brand, serial_name, car_name
-  FROM vehicle_params_wide
+  FROM vehicle_model_base
   WHERE launch_year = 2026
     AND energy_type = '纯电'
     AND vehicle_level IS DISTINCT FROM '皮卡'
@@ -81,12 +81,12 @@ SELECT COUNT(*) FROM denominator;
 
 分子必须继承分母的全部筛选条件，包括默认排除皮卡规则。不得出现分母排除皮卡、分子未排除皮卡，或分子排除皮卡、分母未排除皮卡的口径不一致。
 
-当分母使用 `vehicle_params_wide` 时，分子应从分母 CTE 出发 join `vehicle_params`，不要重新在 `vehicle_params` 上计算上市时间、能源类型、级别、品牌、价格段等维度：
+当分母使用 `vehicle_model_base` 时，分子应从分母 CTE 出发 join `vehicle_params`，不要重新在 `vehicle_params` 上计算上市时间、能源类型、级别、品牌、价格段等维度：
 
 ```sql
 WITH denominator AS (
   SELECT brand, serial_name, car_name
-  FROM vehicle_params_wide
+  FROM vehicle_model_base
   WHERE launch_year = 2026
     AND energy_type = '纯电'
     AND vehicle_level IS DISTINCT FROM '皮卡'
@@ -127,9 +127,9 @@ FROM denominator;
 
 ## SQL 生成要求
 
-在可用表包含 `vehicle_params_wide` 时，配置率 SQL 必须采用“宽表分母 + 配置明细分子”的结构：
+在可用表包含 `vehicle_model_base` 时，配置率 SQL 必须采用“款型基础表分母 + 配置明细分子”的结构：
 
-1. `denominator` CTE 从 `vehicle_params_wide` 取目标统计对象。
+1. `denominator` CTE 从 `vehicle_model_base` 取目标统计对象。
 2. `numerator` CTE 从 `denominator` join `vehicle_params` 判断目标配置。
 3. 最终从 `denominator` 计算分母，从 `numerator` 计算分子。
 
@@ -138,7 +138,7 @@ FROM denominator;
 ```sql
 WITH denominator AS (
   SELECT brand, serial_name, car_name
-  FROM vehicle_params_wide
+  FROM vehicle_model_base
   WHERE launch_year = 2026
     AND energy_type = '纯电'
     AND vehicle_level IS DISTINCT FROM '皮卡'
@@ -162,7 +162,7 @@ SELECT
 FROM denominator;
 ```
 
-回退场景：如果没有 `vehicle_params_wide`，在 `vehicle_params` 上同时筛选上市时间、能源类型、级别、品牌、价格段、配置项等多个条件时，不要使用多层 `EXISTS` / `NOT EXISTS` 自关联，也不要用 `COUNT(DISTINCT ...)` 在多层子查询上直接统计。
+回退场景：如果没有 `vehicle_model_base`，在 `vehicle_params` 上同时筛选上市时间、能源类型、级别、品牌、价格段、配置项等多个条件时，不要使用多层 `EXISTS` / `NOT EXISTS` 自关联，也不要用 `COUNT(DISTINCT ...)` 在多层子查询上直接统计。
 
 推荐一次扫描相关 `type_name`，按 `brand + serial_name + car_name` 聚合成 flags，再用 `COUNT(*) FILTER (...)` 计算分母、分子和配置率：
 
@@ -213,4 +213,4 @@ FROM car_flags;
 - 不要在聚合结果上使用 `LIMIT` 近似回答。
 - 除非用户明确要求包含皮卡，不要把车型级别为 `皮卡` 的统计对象计入配置率分母或分子。
 - 不要用 `car_name LIKE '%皮卡%'` 判断皮卡，必须使用车型级别维度：`type_name = '级别' AND type_value = '皮卡'`。
-- 如果可用表中包含 `vehicle_params_wide`，不要用 `vehicle_params` 的 EAV flags 计算上市时间、能源类型、级别、品牌、价格段等分母维度。
+- 如果可用表中包含 `vehicle_model_base`，不要用 `vehicle_params` 的 EAV flags 计算上市时间、能源类型、级别、品牌、价格段等分母维度。

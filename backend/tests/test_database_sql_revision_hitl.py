@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from analytics.nl2sql.schemas import DatabaseSqlGenerationResult, TableRoute
+from analytics.nl2sql.schemas import DatabaseSqlGenerationResult, SqlExecutionResult, TableRoute
 from graph.database_sql_revision_resume import DatabaseSqlRevisionResumeRegistry
 from tools.database.sql_execute_tool import DatabaseSqlExecuteTool
 from tools.database.sql_generate_tool import DatabaseSqlGenerateTool
@@ -32,6 +33,64 @@ def _result(question: str, sql: str = "SELECT 1") -> DatabaseSqlGenerationResult
         ),
         semantic_assets={"matched": [], "references": []},
     )
+
+
+def test_database_sql_generate_runtime_is_hidden_from_llm_schema() -> None:
+    tool = DatabaseSqlGenerateTool()
+
+    assert "runtime" in tool.get_input_schema().model_fields
+    assert "runtime" not in tool.tool_call_schema.model_fields
+
+
+@pytest.mark.asyncio
+async def test_database_sql_generate_uses_selected_model_from_runtime_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.database.sql_generate_tool as module
+
+    requests: list[Any] = []
+
+    async def fake_generate(_session: object, request: Any) -> DatabaseSqlGenerationResult:
+        requests.append(request)
+        return _result(request.question)
+
+    monkeypatch.setattr(module, "get_sessionmaker", lambda: _FakeSessionMaker())
+    monkeypatch.setattr(module, "generate_database_sql", fake_generate)
+    runtime = SimpleNamespace(
+        state={
+            "analytics_model_id": "产品配置分析",
+            "allowed_semantic_asset_ids": ["measure:launch_cycle"],
+        }
+    )
+
+    await DatabaseSqlGenerateTool()._arun(
+        question="上市周期",
+        model_id="Agent误传的模型",
+        selected_semantic_asset_ids=["measure:launch_cycle"],
+        runtime=runtime,
+    )
+
+    assert requests[0].model_id == "产品配置分析"
+    assert requests[0].measure_ids == ["measure:launch_cycle"]
+
+
+@pytest.mark.asyncio
+async def test_database_sql_generate_rejects_asset_outside_selected_model() -> None:
+    runtime = SimpleNamespace(
+        state={
+            "analytics_model_id": "产品配置分析",
+            "allowed_semantic_asset_ids": ["dimension:motor_power"],
+        }
+    )
+
+    result = await DatabaseSqlGenerateTool()._arun(
+        question="电机功率趋势",
+        selected_semantic_asset_ids=["dimension:price_band"],
+        runtime=runtime,
+    )
+
+    assert "不属于当前分析模型" in result
+    assert "dimension:price_band" in result
 
 
 @pytest.mark.asyncio
@@ -161,7 +220,11 @@ async def test_rejected_revision_reuses_original_generation_without_regeneration
 
 
 @pytest.mark.asyncio
-async def test_agent_mode_validate_and_execute_reject_handwritten_sql() -> None:
+async def test_agent_mode_validate_and_execute_use_registered_sql(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.database.sql_execute_tool as execute_module
+    import tools.database.sql_validate_tool as validate_module
     from graph.database_sql_revision_resume import database_sql_revision_resume_registry
 
     generation = database_sql_revision_resume_registry.register_generation(
@@ -170,16 +233,29 @@ async def test_agent_mode_validate_and_execute_reject_handwritten_sql() -> None:
         result=_result("原问题", sql="SELECT 1"),
         request={"question": "原问题", "table_names": ["vehicle_params"]},
     )
+    executed_sql: list[str] = []
+
+    async def fake_resolve(_source_id: str | None, _tables: list[str] | None) -> tuple[dict, dict, list[str]]:
+        return {}, {"id": "source-1", "name": "测试库", "database": "test"}, ["vehicle_params"]
+
+    async def fake_run(_source: object, sql: str, **_kwargs: object) -> SqlExecutionResult:
+        executed_sql.append(sql)
+        return SqlExecutionResult(columns=[], rows=[], row_count=0, limited=False)
+
+    monkeypatch.setattr(validate_module, "resolve_database_source_scope", fake_resolve)
+    monkeypatch.setattr(execute_module, "resolve_database_source_scope", fake_resolve)
+    monkeypatch.setattr(execute_module, "run_readonly_sql", fake_run)
+
     validate_output = await DatabaseSqlValidateTool(session_id="session-block")._arun(
         sql="SELECT 2",
         generation_id=generation.id,
     )
     execute_output = await DatabaseSqlExecuteTool(session_id="session-block")._arun(
-        sql="SELECT 2",
         generation_id=generation.id,
     )
 
-    assert "禁止校验手写改动" in validate_output
-    assert "禁止执行手写改动" in execute_output
-    assert "revision_instruction='<自然语言修改说明>'" in validate_output
-    assert "revision_instruction='<自然语言修改说明>'" in execute_output
+    assert "SQL 校验通过" in validate_output
+    assert "SELECT 1" in validate_output
+    assert "SELECT 2" not in validate_output
+    assert "SQL 执行结果" in execute_output
+    assert executed_sql == ["SELECT 1"]

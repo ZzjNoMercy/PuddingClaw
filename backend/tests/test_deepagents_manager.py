@@ -7,7 +7,31 @@ import json
 from pathlib import Path
 
 from deepagents.middleware.memory import MemoryMiddleware
-from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
+
+
+def test_effective_agent_messages_uses_summary_and_preserved_tail():
+    from graph.deepagents_manager import _effective_agent_messages
+
+    original = [HumanMessage(content=f"old-{index}") for index in range(5)]
+    summary = HumanMessage(
+        content="condensed context",
+        additional_kwargs={"lc_source": "summarization"},
+    )
+
+    effective = _effective_agent_messages({
+        "messages": original,
+        "_summarization_event": {
+            "summary_message": summary,
+            "cutoff_index": 3,
+        },
+    })
+
+    assert [message.content for message in effective] == [
+        "condensed context",
+        "old-3",
+        "old-4",
+    ]
 
 
 def test_middleware_inventory_uses_actual_hook_overrides(tmp_path):
@@ -102,6 +126,50 @@ def test_runtime_inventory_lists_skills_for_system_prompt(tmp_path):
         }
     ]
     assert inventory["checkpointer"] == {}
+
+
+def test_semantic_asset_middleware_owns_model_frontmatter_index(tmp_path):
+    from analytics.models.registry import AnalyticsModelRegistry
+    from analytics.semantic_assets.registry import SemanticAssetRegistry
+    from graph.deepagents_manager import DeepAgentsAgentManager
+    from graph.middlewares.semantic_assets import SemanticAssetsMiddleware
+
+    assets = SemanticAssetRegistry(tmp_path)
+    measure = assets.create_asset(
+        name="上市周期",
+        asset_type="measure",
+        description="计算相邻上市事件的自然日间隔。",
+    )
+    models = AnalyticsModelRegistry(tmp_path)
+    model = models.create_model(
+        name="产品配置分析",
+        semantic_assets={"measures": [measure["id"]]},
+    )
+    manager = DeepAgentsAgentManager()
+    manager.initialize(tmp_path)
+
+    prompt, payload = manager._analytics_model_context(model["id"])
+
+    assert "模型语义资产索引（渐进加载）" not in prompt
+    assert payload is not None
+    assert payload["semantic_assets"] == [
+        {
+            "id": measure["id"],
+            "name": "上市周期",
+            "type": "measure",
+            "path": measure["path"],
+            "frontmatter": measure["frontmatter"],
+        }
+    ]
+
+    middleware = SemanticAssetsMiddleware(base_dir=tmp_path)
+    update = middleware.before_agent({"analytics_model_id": model["id"]}, runtime=None)
+    assert update["semantic_assets_model_id"] == model["id"]
+    assert update["allowed_semantic_asset_ids"] == [measure["id"]]
+    assert update["semantic_assets_metadata"][0]["frontmatter"] == measure["frontmatter"]
+    formatted = middleware._format_assets(update["semantic_assets_metadata"])
+    assert f"### {measure['id']} | 上市周期" in formatted
+    assert f"Canonical path: `/{measure['path']}`" in formatted
 
 
 def test_runtime_inventory_lists_subagents_for_mount_panel(tmp_path, monkeypatch):
@@ -288,6 +356,79 @@ def test_dimension_build_rule_interrupt_resumes_same_graph_stream(tmp_path):
         "dimension_build_rule_resolved",
     ]
     assert isinstance(agent.inputs[-1], Command)
+
+
+def test_multiple_database_revision_interrupts_resume_by_interrupt_id(tmp_path):
+    """Parallel HITL requests must resume with an interrupt-id decision map."""
+
+    import asyncio
+
+    from graph.database_sql_revision_resume import database_sql_revision_resume_registry
+    from graph.deepagents_manager import DeepAgentsAgentManager
+    from graph.trace_collector import TraceCollector
+    from langgraph.types import Command, Interrupt
+
+    requests = [
+        {"id": "sql-revision-a", "type": "database_sql_revision", "tool_call_id": "call-a"},
+        {"id": "sql-revision-b", "type": "database_sql_revision", "tool_call_id": "call-b"},
+    ]
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self.inputs = []
+
+        async def astream(self, graph_input, **_kwargs):
+            self.inputs.append(graph_input)
+            if len(self.inputs) == 1:
+                yield {
+                    "__interrupt__": tuple(
+                        Interrupt(
+                            value={"type": "database_sql_revision_request", "request": request},
+                            id=f"interrupt-{index}",
+                        )
+                        for index, request in enumerate(requests, start=1)
+                    )
+                }
+                return
+            yield ("messages", ("resumed", {"langgraph_node": "model"}))
+
+    runtime = DeepAgentsAgentManager()
+    runtime.initialize(tmp_path)
+    agent = FakeAgent()
+
+    async def run():
+        with TraceCollector(session_id="multi-session", query_id="multi-query") as trace:
+            events = []
+            async for item in runtime._astream_with_hitl_resume(
+                agent,
+                {"messages": []},
+                stream_mode=["messages", "updates", "custom", "values"],
+                config={"configurable": {"thread_id": "multi-session"}},
+                context={"session_id": "multi-session", "query_id": "multi-query"},
+                trace_collector=trace,
+            ):
+                events.append(item)
+                if isinstance(item, dict) and item.get("event") == "database_sql_revision_required":
+                    payload = json.loads(item["data"])
+                    request_id = payload["id"]
+                    future = asyncio.get_running_loop().create_future()
+                    database_sql_revision_resume_registry._pending[request_id] = future
+                    future.set_result({"action": "reject"})
+            return events
+
+    events = asyncio.run(run())
+
+    assert [event.get("event") for event in events if isinstance(event, dict)] == [
+        "database_sql_revision_required",
+        "database_sql_revision_required",
+        "database_sql_revision_resolved",
+        "database_sql_revision_resolved",
+    ]
+    assert isinstance(agent.inputs[-1], Command)
+    assert agent.inputs[-1].resume == {
+        "interrupt-1": {"action": "reject"},
+        "interrupt-2": {"action": "reject"},
+    }
 
 
 def test_cancelled_agent_stream_rejects_pending_permissions_and_cleans_checkpoint(tmp_path, monkeypatch):
@@ -799,6 +940,7 @@ def test_build_backend_resolves_workspace_and_skills(tmp_path, monkeypatch):
     backend = manager._build_backend(workspace)
 
     assert backend.read("/workspace/dashboard.html").file_data["content"] == "dashboard"
+    assert backend.read(str(workspace / "dashboard.html")).file_data["content"] == "dashboard"
     assert backend.read("/skills/design-html/SKILL.md").file_data["content"] == "skill doc"
     assert backend.read("/knowledge/test.md").file_data["content"] == "kb doc"
     # Bare root is an alias for workspace.
@@ -1039,11 +1181,15 @@ def test_deepagents_manager_generates_title_when_user_was_pre_persisted(tmp_path
     session_manager.save_message(session_id, "user", "重建车系维度校验")
 
     class FakeDeepAgent:
-        async def astream(self, *_args, **_kwargs):
+        initial_state = None
+
+        async def astream(self, graph_input, **_kwargs):
+            self.initial_state = graph_input
             yield ("messages", (AIMessageChunk(content="已完成校验。"), {"langgraph_node": "model"}))
             yield ("values", {"messages": [AIMessage(content="已完成校验。")]})
 
-    monkeypatch.setattr(manager_module, "create_deep_agent", lambda **_kwargs: FakeDeepAgent())
+    fake_agent = FakeDeepAgent()
+    monkeypatch.setattr(manager_module, "create_deep_agent", lambda **_kwargs: fake_agent)
 
     async def fake_generate_title(title_session_id: str):
         session_manager.update_title(title_session_id, "车系维度校验")
@@ -1072,6 +1218,13 @@ def test_deepagents_manager_generates_title_when_user_was_pre_persisted(tmp_path
 
     assert json.loads(title_event["data"])["title"] == "车系维度校验"
     assert [message["role"] for message in history].count("user") == 1
+    model_human_messages = [
+        item
+        for item in fake_agent.initial_state["messages"]
+        if getattr(item, "type", None) == "human"
+    ]
+    assert len(model_human_messages) == 1
+    assert model_human_messages[0].content == "重建车系维度校验"
     assert session_manager.get_raw_messages(session_id)["title"] == "车系维度校验"
 
 
@@ -1134,6 +1287,102 @@ def test_deepagents_manager_separates_reasoning_from_final_answer(tmp_path, monk
     assert "模型本轮只返回了 reasoning_content" in json.loads(token["data"])["content"]
     assert "模型内部推理" not in json.loads(token["data"])["content"]
     assert "模型内部推理" not in assistant["content"]
+
+
+def test_deepagents_manager_ignores_internal_context_summary_chunks(tmp_path, monkeypatch):
+    """Middleware summary calls must never be emitted or persisted as assistant text."""
+
+    from graph import deepagents_manager as manager_module
+    from graph.session_manager import session_manager
+    from llm.model_client import INTERNAL_CALL_MARKER
+    from projects.registry import project_registry
+
+    monkeypatch.setattr(manager_module.config, "load_config", lambda: {"thinking_mode": False})
+    session_manager.initialize(tmp_path)
+    project_registry.initialize(tmp_path)
+    session_manager.create_session("agent-summary-filter-session")
+
+    class FakeDeepAgent:
+        async def astream(self, *_args, **_kwargs):
+            yield (
+                "messages",
+                (
+                    AIMessageChunk(
+                        content="## SESSION INTENT\ninternal summary",
+                        additional_kwargs={INTERNAL_CALL_MARKER: "context_summary"},
+                    ),
+                    {"langgraph_node": "model"},
+                ),
+            )
+            yield (
+                "messages",
+                (AIMessageChunk(content="正式回答。"), {"langgraph_node": "model"}),
+            )
+            yield ("values", {"messages": [AIMessage(content="正式回答。")]})
+
+    monkeypatch.setattr(manager_module, "create_deep_agent", lambda **_kwargs: FakeDeepAgent())
+
+    async def no_title(_session_id: str):
+        return None
+
+    monkeypatch.setattr(manager_module, "_generate_title", no_title)
+    runtime = manager_module.DeepAgentsAgentManager()
+    runtime.initialize(Path(tmp_path))
+
+    async def collect():
+        return [
+            event
+            async for event in runtime.astream(
+                message="继续",
+                session_id="agent-summary-filter-session",
+                project_id=None,
+                user_id="test-user",
+            )
+        ]
+
+    events = asyncio.run(collect())
+    visible_text = "".join(
+        json.loads(event["data"])["content"]
+        for event in events
+        if event["event"] == "token"
+    )
+    assistant = next(
+        message
+        for message in session_manager.load_session("agent-summary-filter-session")
+        if message["role"] == "assistant"
+    )
+
+    assert visible_text == "正式回答。"
+    assert assistant["content"] == "正式回答。"
+    assert "SESSION INTENT" not in assistant["content"]
+
+
+def test_deepagents_summarization_uses_agent_only_500k_policy(monkeypatch):
+    from deepagents.backends import StateBackend
+    from graph import deepagents_manager as manager_module
+    from llm.model_client import ModelClientChatModel
+
+    monkeypatch.setattr(
+        manager_module.config,
+        "get_deepagents_summarization_config",
+        lambda: {
+            "enabled": True,
+            "trigger_tokens": 500000,
+            "keep_messages": 20,
+            "summary_input_tokens": 400000,
+        },
+    )
+
+    middleware = manager_module._build_deepagents_summarization(
+        ModelClientChatModel(),
+        StateBackend(),
+    )
+
+    assert middleware is not None
+    assert middleware.name == "PuddingClawSummarizationMiddleware"
+    assert middleware._lc_helper.trigger == ("tokens", 500000)
+    assert middleware._lc_helper.keep == ("messages", 20)
+    assert middleware._lc_helper.trim_tokens_to_summarize == 400000
 
 
 def test_deepagents_manager_extracts_reasoning_from_thinking_blocks(tmp_path, monkeypatch):

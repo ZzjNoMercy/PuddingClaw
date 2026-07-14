@@ -28,6 +28,11 @@ import { listAnalyticsModels, listSkills, getSessionTokenCount, uploadAgentAttac
 function formatTokens(n: number): string {
   return `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k`;
 }
+
+function formatContextPercentage(percentage: number, used: number): string {
+  if (used > 0 && percentage < 1) return "<1%";
+  return `${percentage.toFixed(0)}%`;
+}
 import SlashCommandMenu from "./SlashCommandMenu";
 
 type AttachmentKind = AgentAttachment["type"];
@@ -119,15 +124,15 @@ export default function ChatInput() {
 
   // Fetch token count on mount, when session changes, and after a streaming
   // response finishes (so newly loaded messages are reflected immediately).
-  // 背景信息窗口进度条显示的是「对话内容 + 工具输出」占 compaction_trigger 的比例，
-  // 不包含固定的 system prompt，否则无论对话长短都会显示系统提示的 6.6k 底数。
+  // Keep the same full-context definition as the live context_usage events:
+  // system prompt + messages + tool outputs (or the recorded runtime peak).
   const refreshContextUsage = useCallback(() => {
     if (!sessionId) return;
     getSessionTokenCount(sessionId)
       .then((data) => {
-        const used = data.message_tokens;
+        const used = data.total_tokens;
         const total = data.compaction_trigger;
-        const percentage = total > 0 ? Math.min(100, (used / total) * 100) : 0;
+        const percentage = Math.min(100, data.percentage);
         setContextUsage({
           used,
           total,
@@ -732,6 +737,7 @@ function ContextUsageTooltip({
   usage: { used: number; total: number; percentage: number };
 }) {
   const [open, setOpen] = useState(false);
+  const formattedPercentage = formatContextPercentage(usage.percentage, usage.used);
   const color =
     usage.percentage >= 90 ? "text-red-500" : usage.percentage >= 70 ? "text-amber-500" : "text-gray-400";
 
@@ -748,13 +754,13 @@ function ContextUsageTooltip({
         className={`flex h-7 items-center gap-1 rounded-full border border-black/[0.06] bg-white/50 px-2.5 text-[11px] font-medium transition-colors hover:bg-white/80 ${color}`}
       >
         <Activity className="h-3 w-3" />
-        {usage.percentage.toFixed(0)}%
+        {formattedPercentage}
       </button>
       {open && (
         <div className="absolute bottom-full right-0 mb-2 w-56 rounded-xl bg-[#1f2937] px-3.5 py-2.5 text-[12px] text-white shadow-xl animate-fade-in-scale z-50">
           <p className="font-medium text-gray-200">背景信息窗口</p>
           <p className="mt-1 text-[16px] font-semibold">
-            {usage.percentage.toFixed(0)}% 已用
+            {formattedPercentage} 已用
           </p>
           <p className="mt-1 text-[11px] text-gray-400">
             已用 {formatTokens(usage.used)}，共 {formatTokens(usage.total)}

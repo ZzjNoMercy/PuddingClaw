@@ -2,7 +2,7 @@
 formatter: semantic-asset
 name: 上市时间
 type: dimension
-description: 车型上市时间的标准取值口径，优先使用 vehicle_params_wide。
+description: 车型上市时间的标准取值口径，优先使用 vehicle_model_base。
 aliases:
   - 上市日期
   - 上市年份
@@ -10,14 +10,14 @@ aliases:
 tags:
   - 汽车产品配置
   - vehicle_params
-  - vehicle_params_wide
+  - vehicle_model_base
 version: 0.1.0
 resolution_mode: derived
 resolution:
   mode: derived
   bindings:
-    - asset_ref: dbs_77982e981bac4a6fa8.vehicle_params_wide
-      display_name: insight_data · vehicle_params_wide
+    - asset_ref: dbs_77982e981bac4a6fa8.vehicle_model_base
+      display_name: insight_data · vehicle_model_base
       fields:
         value: launch_date
   source_fields: [launch_date]
@@ -30,13 +30,13 @@ updated_at: 2026-07-09 00:00:00
 
 ## 字段口径
 
-优先使用 `vehicle_params_wide`：
+优先使用 `vehicle_model_base`：
 
-- 上市日期：`vehicle_params_wide.launch_date`
-- 上市年份：`vehicle_params_wide.launch_year`
-- 上市月份：`vehicle_params_wide.launch_month`
+- 上市日期：`vehicle_model_base.launch_date`
+- 上市年份：`vehicle_model_base.launch_year`
+- 上市月份：`vehicle_model_base.launch_month`
 
-只有当查询的表范围没有 `vehicle_params_wide`，或需要回查原始明细时，才回退到 `vehicle_params`。
+只有当查询的表范围没有 `vehicle_model_base`，或需要回查原始明细时，才回退到 `vehicle_params`。
 
 上市时间取 `vehicle_params` 表中 `type_name = '上市时间'` 的 `type_value`，格式为`yyyy-mm-dd`
 
@@ -51,6 +51,6 @@ updated_at: 2026-07-09 00:00:00
 ## 禁止规则
 
 - 不要从 `car_name` 中的 `21款`、`25款`、`26款` 推断上市年份。
-- 如果可用表中包含 `vehicle_params_wide`，不要回到 `vehicle_params` 用 `type_name = '上市时间'` 自关联计算上市年份，应直接使用 `launch_year` / `launch_date`。
+- 如果可用表中包含 `vehicle_model_base`，不要回到 `vehicle_params` 用 `type_name = '上市时间'` 自关联计算上市年份，应直接使用 `launch_year` / `launch_date`。
 - 不要从款型名称推断真实上市日期。
 - 如果 `type_name = '上市时间'` 没有有效值，应把该车型视为上市时间未知，而不是用款型年份兜底。

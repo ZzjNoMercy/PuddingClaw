@@ -27,6 +27,7 @@ import {
   registerProject as apiRegisterProject,
   updateProject as apiUpdateProject,
   removeProject as apiRemoveProject,
+  updateSessionAnalyticsModel as apiUpdateSessionAnalyticsModel,
   ProjectMeta,
   TodoItem,
   AgentTrace,
@@ -63,6 +64,27 @@ export interface ToolCall {
 export type TimelineItem =
   | { type: "reasoning"; content: string; id: string }
   | { type: "tool"; toolCall: ToolCall; id: string };
+
+type InspectorActiveTab = "progress" | "sources" | "permissions" | null;
+const INSPECTOR_ACTIVE_TAB_STORAGE_KEY = "puddingclaw_inspector_active_tab";
+const ACTIVE_RUNS_STORAGE_KEY = "puddingclaw_active_runs";
+const ACTIVE_RUNS_HEARTBEAT_MS = 5_000;
+const ACTIVE_RUNS_STALE_MS = 15_000;
+
+type ActiveRunRegistry = Record<string, { sessions: string[]; updatedAt: number }>;
+
+function readActiveRunRegistry(): ActiveRunRegistry {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(ACTIVE_RUNS_STORAGE_KEY) || "{}") as ActiveRunRegistry;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function activeRunSessions(registry: ActiveRunRegistry): Set<string> {
+  return new Set(Object.values(registry).flatMap((entry) => entry.sessions));
+}
 
 export interface RetrievalResult {
   text: string;
@@ -131,6 +153,7 @@ export interface SessionMeta {
   project_path?: string | null;
   workspace_type?: string;
   workspace_path?: string;
+  analytics_model_id?: string | null;
 }
 
 export interface RawMessage {
@@ -167,6 +190,7 @@ interface AppState {
   // Chat
   messages: ChatMessage[];
   isStreaming: boolean;
+  hasActiveRun: boolean;
   sendMessage: (text: string, attachments?: AgentAttachment[]) => Promise<void>;
   stopStreaming: () => void;
 
@@ -196,8 +220,8 @@ interface AppState {
   inspectorOpen: boolean;
   setInspectorOpen: (open: boolean) => void;
   toggleInspector: () => void;
-  inspectorActiveTab: "progress" | "sources" | "permissions";
-  setInspectorActiveTab: (tab: "progress" | "sources" | "permissions") => void;
+  inspectorActiveTab: InspectorActiveTab;
+  setInspectorActiveTab: (tab: InspectorActiveTab) => void;
 
   // Right panel tab
   rightTab: "memory" | "skills" | "mcp";
@@ -589,6 +613,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const selectedTraceQueryMapRef = useRef<Record<string, string | null>>({});
   const graphsMapRef = useRef<Record<string, GraphStructure | null>>({});
   const graphActiveNodesRef = useRef<Record<string, string | null>>({});
+  const analyticsModelIdsMapRef = useRef<Record<string, string | null>>({});
   const abortControllersRef = useRef<Map<string, AbortController>>(new Map());
   const assistantIdsRef = useRef<Map<string, string>>(new Map());
   const sessionIdRef = useRef("default"); // tracks current sessionId for SSE callbacks
@@ -628,18 +653,94 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
   const [streamingSessions, setStreamingSessions] = useState<Set<string>>(new Set());
+  const [sharedStreamingSessions, setSharedStreamingSessions] = useState<Set<string>>(new Set());
   const [sessionId, setSessionIdRaw] = useState("default");
   const [userId] = useState(() => getOrCreateUserId());
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
   const [runtimeMode, setRuntimeModeRaw] = useState<"agent" | "chat">("chat");
   const [runtimeReady, setRuntimeReady] = useState(false);
   const [currentProjectId, setCurrentProjectIdRaw] = useState<string | null>(null);
-  const [analyticsModelId, setAnalyticsModelId] = useState<string | null>(null);
+  const [analyticsModelId, setAnalyticsModelIdRaw] = useState<string | null>(null);
   const [projects, setProjects] = useState<ProjectMeta[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [inspectorFile, setInspectorFileRaw] = useState<string | null>(null);
   const [inspectorOpen, setInspectorOpen] = useState(false);
-  const [inspectorActiveTab, setInspectorActiveTab] = useState<"progress" | "sources" | "permissions">("progress");
+  const [inspectorActiveTab, setInspectorActiveTabRaw] = useState<InspectorActiveTab>("progress");
+  const setInspectorActiveTab = useCallback((tab: InspectorActiveTab) => {
+    try {
+      localStorage.setItem(INSPECTOR_ACTIVE_TAB_STORAGE_KEY, tab || "collapsed");
+    } catch {
+      // Keep the panel usable when browser storage is unavailable.
+    }
+    setInspectorActiveTabRaw(tab);
+  }, []);
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(INSPECTOR_ACTIVE_TAB_STORAGE_KEY);
+      if (saved === "progress" || saved === "sources" || saved === "permissions") {
+        setInspectorActiveTabRaw(saved);
+      } else if (saved === "collapsed") {
+        setInspectorActiveTabRaw(null);
+      }
+    } catch {
+      // Default to Progress when browser storage is unavailable.
+    }
+  }, []);
+
+  // Each browser window has its own React store. Share a small heartbeat
+  // registry so the current session can reflect work started in another one.
+  useEffect(() => {
+    let windowId = "";
+    try {
+      windowId = sessionStorage.getItem("puddingclaw_window_id") || crypto.randomUUID();
+      sessionStorage.setItem("puddingclaw_window_id", windowId);
+    } catch {
+      windowId = `window-${Math.random().toString(36).slice(2)}`;
+    }
+
+    const sync = (removeCurrentWindow = false) => {
+      const now = Date.now();
+      const registry = readActiveRunRegistry();
+      const freshRegistry = Object.fromEntries(
+        Object.entries(registry).filter(([, entry]) =>
+          entry && Array.isArray(entry.sessions) && now - entry.updatedAt < ACTIVE_RUNS_STALE_MS
+        )
+      ) as ActiveRunRegistry;
+
+      if (removeCurrentWindow || streamingSessions.size === 0) {
+        delete freshRegistry[windowId];
+      } else {
+        freshRegistry[windowId] = {
+          sessions: Array.from(streamingSessions),
+          updatedAt: now,
+        };
+      }
+
+      try {
+        localStorage.setItem(ACTIVE_RUNS_STORAGE_KEY, JSON.stringify(freshRegistry));
+      } catch {
+        // Keep the current window indicator working even if storage is blocked.
+      }
+      setSharedStreamingSessions(activeRunSessions(freshRegistry));
+    };
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key !== ACTIVE_RUNS_STORAGE_KEY) return;
+      setSharedStreamingSessions(activeRunSessions(readActiveRunRegistry()));
+    };
+    const handleBeforeUnload = () => sync(true);
+
+    sync();
+    const heartbeat = window.setInterval(sync, ACTIVE_RUNS_HEARTBEAT_MS);
+    window.addEventListener("storage", handleStorage);
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => {
+      window.clearInterval(heartbeat);
+      window.removeEventListener("storage", handleStorage);
+      window.removeEventListener("beforeunload", handleBeforeUnload);
+      sync(true);
+    };
+  }, [streamingSessions]);
   const [rightTab, setRightTab] = useState<"memory" | "skills" | "mcp">("memory");
   const [mcpServers, setMcpServers] = useState<Array<{ key: string; name: string; url: string; transport: string }>>([]);
   const [rawMessages, setRawMessages] = useState<RawMessage[] | null>(null);
@@ -660,8 +761,28 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const [activeSourceId, setActiveSourceId] = useState<string | null>(null);
 
+  const setAnalyticsModelId = useCallback((id: string | null) => {
+    const sid = sessionIdRef.current;
+    analyticsModelIdsMapRef.current[sid] = id;
+    setAnalyticsModelIdRaw(id);
+
+    if (sid === "default") return;
+    setSessions((prev) =>
+      prev.map((session) =>
+        session.id === sid ? { ...session, analytics_model_id: id } : session
+      )
+    );
+    apiUpdateSessionAnalyticsModel(sid, id).catch(() => {
+      // Keep the optimistic session-local selection. A subsequent Agent turn
+      // also persists the same value through its request metadata.
+    });
+  }, []);
+
   // Derived: is the CURRENT session streaming?
   const isStreaming = streamingSessions.has(sessionId);
+  // The navbar is global, so it must also reflect work that continues after
+  // switching away from the session that initiated it.
+  const hasActiveRun = streamingSessions.has(sessionId) || sharedStreamingSessions.has(sessionId);
 
   const setRuntimeMode = useCallback((mode: "agent" | "chat") => {
     setRuntimeModeRaw(mode);
@@ -941,7 +1062,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const loadSessions = useCallback(() => {
     apiListSessions()
-      .then((list) => setSessions(list))
+      .then((list) => {
+        for (const session of list) {
+          if (!Object.prototype.hasOwnProperty.call(analyticsModelIdsMapRef.current, session.id)) {
+            analyticsModelIdsMapRef.current[session.id] = session.analytics_model_id ?? null;
+          }
+        }
+        setSessions(list);
+      })
       .catch(() => {});
   }, []);
 
@@ -1023,6 +1151,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }
       setSessionIdRaw(id);
       setRawMessages(null);
+
+      if (id === "default") {
+        analyticsModelIdsMapRef.current.default = null;
+        setAnalyticsModelIdRaw(null);
+      } else {
+        setAnalyticsModelIdRaw(analyticsModelIdsMapRef.current[id] ?? null);
+      }
 
       // Restore cached Agent white-box state if available
       const cachedTodos = todosMapRef.current[id];
@@ -1132,13 +1267,19 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const createSession = useCallback(async (): Promise<string | null> => {
     try {
+      const pendingAnalyticsModelId =
+        sessionIdRef.current === "default"
+          ? analyticsModelIdsMapRef.current.default ?? null
+          : null;
       const meta = await apiCreateSession();
+      analyticsModelIdsMapRef.current[meta.id] = pendingAnalyticsModelId;
       setSessions((prev) => [
         {
           id: meta.id,
           title: meta.title,
           updated_at: meta.updated_at || Date.now() / 1000,
           runtime_mode: meta.runtime_mode || "chat",
+          analytics_model_id: pendingAnalyticsModelId,
         },
         ...prev,
       ]);
@@ -1147,6 +1288,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       // history fetch.
       messagesMapRef.current[meta.id] = [];
       setSessionId(meta.id);
+      if (pendingAnalyticsModelId !== null) {
+        apiUpdateSessionAnalyticsModel(meta.id, pendingAnalyticsModelId).catch(() => {});
+      }
       return meta.id;
     } catch {
       // ignore
@@ -1185,6 +1329,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         }
         // Clean up map entries
         delete messagesMapRef.current[id];
+        delete analyticsModelIdsMapRef.current[id];
         assistantIdsRef.current.delete(id);
         setStreamingSessions((prev) => {
           const next = new Set(prev);
@@ -1984,15 +2129,41 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 const timeline = msg.timeline ? [...msg.timeline] : [];
                 updateToolInTimeline(timeline, tcId, event.data.tool as string, updates);
                 msg.timeline = timeline;
-                // Also update the current segment's timeline.
+                // A HITL interrupt can insert a segment break before the resumed
+                // tool emits its tool_end event. Update the segment that owns the
+                // tool call instead of assuming it is still the last segment;
+                // otherwise the top-level call finishes while the visible
+                // per-segment row remains stuck in "running".
                 const segments = msg.segments ? [...msg.segments] : undefined;
                 if (segments) {
-                  const lastSegIdx = segments.length - 1;
-                  const segTimeline = segments[lastSegIdx].timeline
-                    ? [...segments[lastSegIdx].timeline]
-                    : [];
-                  updateToolInTimeline(segTimeline, tcId, event.data.tool as string, updates);
-                  segments[lastSegIdx] = { ...segments[lastSegIdx], timeline: segTimeline };
+                  let segmentIdx = tcId
+                    ? segments.findIndex((segment) =>
+                        segment.timeline?.some(
+                          (item) => item.type === "tool" && item.toolCall.id === tcId
+                        )
+                      )
+                    : -1;
+                  if (segmentIdx === -1) {
+                    for (let i = segments.length - 1; i >= 0; i--) {
+                      if (
+                        segments[i].timeline?.some(
+                          (item) =>
+                            item.type === "tool" &&
+                            item.toolCall.tool === event.data.tool &&
+                            item.toolCall.status === "running"
+                        )
+                      ) {
+                        segmentIdx = i;
+                        break;
+                      }
+                    }
+                  }
+                  if (segmentIdx !== -1) {
+                    const segment = segments[segmentIdx];
+                    const segTimeline = segment.timeline ? [...segment.timeline] : [];
+                    updateToolInTimeline(segTimeline, tcId, event.data.tool as string, updates);
+                    segments[segmentIdx] = { ...segment, timeline: segTimeline };
+                  }
                   msg.segments = segments;
                 }
                 break;
@@ -2117,6 +2288,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         removeProject,
         messages,
         isStreaming,
+        hasActiveRun,
         sendMessage,
         stopStreaming,
         sessionId,

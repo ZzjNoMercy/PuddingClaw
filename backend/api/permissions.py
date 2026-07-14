@@ -33,25 +33,36 @@ async def list_permissions(session_id: str) -> dict[str, Any]:
 
 
 @router.post("/sessions/{session_id}/permissions/external-files")
-async def grant_external_file_read(
+async def grant_external_file_permission(
     session_id: str,
     req: ExternalFileGrantRequest,
 ) -> dict[str, Any]:
-    """Grant read access to one external file or all explicitly provided external files."""
+    """Grant the read/write capability declared by a pending external-file request."""
+
+    pending = permission_resume_registry.get(req.permission_request_id) if req.permission_request_id else None
+    if req.permission_request_id and pending is None:
+        raise HTTPException(status_code=404, detail="permission request not found")
+    if pending is not None and pending.get("session_id") != session_id:
+        raise HTTPException(status_code=400, detail="permission request belongs to another session")
+    access = "write" if pending and pending.get("type") == "external_file_write" else "read"
+    if access == "write" and req.target_kind != "exact_file":
+        raise HTTPException(status_code=400, detail="external write permission only supports exact_file")
 
     if req.target_kind == "exact_file":
         if not req.path:
             raise HTTPException(status_code=400, detail="path is required for exact_file grants")
         target = str(Path(req.path).expanduser().resolve())
+        if pending is not None and target != str(Path(str(pending.get("path") or "")).expanduser().resolve()):
+            raise HTTPException(status_code=400, detail="path does not match the pending permission request")
     else:
         target = "*"
 
     grant = session_manager.add_permission_grant(
         session_id,
-        grant_type="external_file_read",
+        grant_type=f"external_file_{access}",
         target_kind=req.target_kind,
         target=target,
-        capabilities=["read", "external_path"],
+        capabilities=[access, "external_path"],
         scope="session",
         source="user",
     )

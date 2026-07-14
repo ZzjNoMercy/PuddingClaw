@@ -14,6 +14,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
+from analytics.models import AnalyticsModelError, get_analytics_model_registry
 from analytics.nl2sql.schemas import DatabaseQueryRequest, TableCandidate, TableRoute
 from knowledge.database_sources import (
     KnowledgeDatabaseSourceError,
@@ -93,6 +94,7 @@ def _semantic_table_boost(question: str, table_name: str, columns: list[str]) ->
         "皮卡",
         "价格",
         "价位",
+        "轴距",
         "品牌",
         "车系",
         "在售",
@@ -104,14 +106,24 @@ def _semantic_table_boost(question: str, table_name: str, columns: list[str]) ->
         "launch_date",
         "energy_type",
         "vehicle_level",
+        "wheelbase_mm",
         "price_band",
         "brand",
         "serial_name",
         "sale_status",
     } <= column_set
-    if normalized_table == "vehicle_params_wide" and has_model_dimension_columns and _has_any(question, dimension_terms):
+    if normalized_table == "vehicle_model_base" and has_model_dimension_columns and _has_any(question, dimension_terms):
         score += 18.0
-        reasons.append("语义命中：款型基础维度宽表")
+        reasons.append("语义命中：款型基础表")
+
+    motor_power_terms = ("电机功率", "电机总功率", "电动机总功率", "功率段")
+    if (
+        normalized_table == "vehicle_model_base"
+        and "motor_power_kw" in column_set
+        and _has_any(question, motor_power_terms)
+    ):
+        score += 18.0
+        reasons.append("语义命中：款型基础表电机功率")
 
     config_terms = (
         "配置率",
@@ -151,6 +163,36 @@ def _match_requested_tables(requested: list[str], available: list[str]) -> list[
     if missing:
         raise TableRouterError(f"以下数据表未在当前数据源的已选表中：{', '.join(missing)}")
     return matched
+
+
+def _model_database_tables_by_source(model_id: str | None) -> dict[str, list[str]]:
+    """Return database tables declared by an analytics model, grouped by source.
+
+    Model table references use ``<database_source_id>.<table_name>``. Logical
+    ``table_asset:`` references belong to the file/table runtime and are not
+    part of database NL2SQL routing.
+    """
+
+    clean_model_id = str(model_id or "").strip()
+    if not clean_model_id:
+        return {}
+    try:
+        model = get_analytics_model_registry().get_model(clean_model_id)
+    except AnalyticsModelError as exc:
+        raise TableRouterError(str(exc)) from exc
+
+    table_refs = (((model.get("frontmatter") or {}).get("data_assets") or {}).get("tables") or [])
+    grouped: dict[str, list[str]] = {}
+    for raw_ref in table_refs:
+        ref = str(raw_ref or "").strip()
+        if not ref or ref.startswith("table_asset:") or "." not in ref:
+            continue
+        source_id, table_name = ref.split(".", 1)
+        source_id = source_id.strip()
+        table_name = table_name.strip()
+        if source_id and table_name and table_name not in grouped.setdefault(source_id, []):
+            grouped[source_id].append(table_name)
+    return grouped
 
 
 async def _load_columns(source: KnowledgeDatabaseSource | dict[str, Any], table_names: list[str]) -> dict[str, list[str]]:
@@ -298,8 +340,12 @@ async def route_database_tables(session: AsyncSession, request: DatabaseQueryReq
         raise TableRouterError("问题不能为空。")
 
     source_records = await list_database_sources(session)
+    model_tables_by_source = _model_database_tables_by_source(request.model_id)
     if request.database_source_id:
         source_ids = [request.database_source_id]
+    elif model_tables_by_source:
+        available_source_ids = {str(source.get("id")) for source in source_records if source.get("id")}
+        source_ids = [source_id for source_id in model_tables_by_source if source_id in available_source_ids]
     else:
         source_ids = [str(source.get("id")) for source in source_records if source.get("id")]
 
@@ -314,7 +360,8 @@ async def route_database_tables(session: AsyncSession, request: DatabaseQueryReq
                 route_errors.append(f"{source_id}: 未选择可问数数据表")
                 continue
 
-            table_names = _match_requested_tables(request.table_names, selected_tables)
+            model_table_names = model_tables_by_source.get(source_id, []) if not request.table_names else []
+            table_names = _match_requested_tables(request.table_names or model_table_names, selected_tables)
             if not table_names and len(selected_tables) == 1:
                 table_names = selected_tables[:1]
 
@@ -331,7 +378,7 @@ async def route_database_tables(session: AsyncSession, request: DatabaseQueryReq
 
             selected_candidates = [item for item in candidates if item.name in set(table_names)]
             top_score = max((item.score for item in selected_candidates), default=0.0)
-            confidence = 1.0 if request.table_names else min(0.95, 0.45 + top_score / 20)
+            confidence = 1.0 if request.table_names or model_table_names else min(0.95, 0.45 + top_score / 20)
             if len(selected_tables) == 1:
                 confidence = max(confidence, 0.8)
 
@@ -347,9 +394,13 @@ async def route_database_tables(session: AsyncSession, request: DatabaseQueryReq
                 candidates=_route_candidates_for_prompt(candidates, table_names),
                 confidence=confidence,
                 reason=(
-                    "用户显式指定表"
+                    "调用方显式指定表"
                     if request.table_names
-                    else ("单表数据源" if len(selected_tables) == 1 else "按问题与已选表/字段轻量匹配")
+                    else (
+                        "分析模型声明的数据资产"
+                        if model_table_names
+                        else ("单表数据源" if len(selected_tables) == 1 else "按问题与已选表/字段轻量匹配")
+                    )
                 ),
                 prompt_context="",
             )

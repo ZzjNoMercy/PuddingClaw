@@ -8,10 +8,10 @@ Each builder accepts explicit bindings, never a blind database scan:
 source_bindings:
   - asset_ref: table_asset:tbl_xxx
     key_fields: [品牌, 1-子车型]
-  - asset_ref: dbs_xxx.vehicle_params_wide
+  - asset_ref: dbs_xxx.vehicle_model_base
     key_fields: [brand, serial_name]
 canonical:
-  source_of_truth: dbs_xxx.vehicle_params_wide
+  source_of_truth: dbs_xxx.vehicle_model_base
   key: entity_key
   fields: [canonical_brand, canonical_series]
 ```

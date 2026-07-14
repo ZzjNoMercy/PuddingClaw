@@ -39,18 +39,18 @@ def test_scope_matches_semantic_asset_and_table() -> None:
 def test_scope_requires_metric_intent_when_configured() -> None:
     rule = GuardrailRule.model_validate(
         {
-            "id": "config_rate_use_wide_denominator",
-            "name": "配置率优先使用宽表分母",
+            "id": "config_rate_use_model_base_denominator",
+            "name": "配置率优先使用款型基础表分母",
             "type": "require_table_when_available",
             "scope": {
-                "table_scope": {"mode": "all", "values": ["vehicle_params", "vehicle_params_wide"]},
+                "table_scope": {"mode": "all", "values": ["vehicle_params", "vehicle_model_base"]},
                 "semantic_assets": ["measure:config_rate"],
                 "intent_any": ["配置率", "搭载率", "渗透率", "配备率", "占比"],
             },
-            "params": {"required_table": "vehicle_params_wide", "fallback_table": "vehicle_params"},
+            "params": {"required_table": "vehicle_model_base", "fallback_table": "vehicle_params"},
         }
     )
-    route = SimpleNamespace(table_names=["vehicle_params", "vehicle_params_wide"])
+    route = SimpleNamespace(table_names=["vehicle_params", "vehicle_model_base"])
     semantic_trace = {"matched": [{"id": "measure:config_rate"}], "references": []}
 
     assert not scope_matches(
@@ -164,7 +164,7 @@ def test_require_group_by_rule_allows_year_rollup_after_model_key_ctes() -> None
     sql = """
     WITH denominator AS (
       SELECT DISTINCT brand, serial_name, car_name, launch_year
-      FROM vehicle_params_wide
+      FROM vehicle_model_base
       WHERE launch_year BETWEEN 2020 AND 2026
     ),
     numerator AS (
@@ -197,7 +197,7 @@ def test_require_group_by_rule_allows_year_rollup_after_model_key_ctes() -> None
     GROUP BY launch_year
     ORDER BY launch_year
     """
-    route = SimpleNamespace(table_names=["vehicle_params_wide", "vehicle_params"])
+    route = SimpleNamespace(table_names=["vehicle_model_base", "vehicle_params"])
     semantic_trace = {"matched": [{"id": "measure:config_rate"}], "references": []}
 
     conflicts = detect_guardrail_conflicts(
@@ -233,7 +233,7 @@ def test_global_guardrail_blocks_count_distinct_nullable_tuple_after_left_join()
      AND r.serial_name = d.serial_name
      AND r.car_name = d.car_name
     """
-    route = SimpleNamespace(table_names=["vehicle_params_wide", "vehicle_params"])
+    route = SimpleNamespace(table_names=["vehicle_model_base", "vehicle_params"])
     semantic_trace = {"matched": [], "references": []}
 
     conflicts = detect_guardrail_conflicts(
@@ -274,7 +274,7 @@ def test_global_guardrail_allows_left_join_with_filtered_tuple_count_distinct() 
      AND r.serial_name = d.serial_name
      AND r.car_name = d.car_name
     """
-    route = SimpleNamespace(table_names=["vehicle_params_wide", "vehicle_params"])
+    route = SimpleNamespace(table_names=["vehicle_model_base", "vehicle_params"])
     semantic_trace = {"matched": [], "references": []}
 
     conflicts = detect_guardrail_conflicts(

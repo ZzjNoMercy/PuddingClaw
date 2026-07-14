@@ -5,7 +5,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from sqlalchemy import exc as sa_exc, text
+from sqlalchemy import exc as sa_exc
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from analytics.nl2sql.schemas import SqlExecutionResult
@@ -125,6 +126,69 @@ def _normalize_identifier(value: str) -> str:
     return ".".join(part.strip().strip('"').lower() for part in value.split(".") if part.strip())
 
 
+def _strip_sql_comments(sql: str) -> str:
+    """Remove SQL comments while preserving quoted strings and line layout."""
+
+    output: list[str] = []
+    index = 0
+    in_single = False
+    in_double = False
+    while index < len(sql):
+        char = sql[index]
+        next_char = sql[index + 1] if index + 1 < len(sql) else ""
+        if in_single:
+            output.append(char)
+            if char == "'" and next_char == "'":
+                output.append(next_char)
+                index += 2
+                continue
+            if char == "'":
+                in_single = False
+            index += 1
+            continue
+        if in_double:
+            output.append(char)
+            if char == '"' and next_char == '"':
+                output.append(next_char)
+                index += 2
+                continue
+            if char == '"':
+                in_double = False
+            index += 1
+            continue
+        if char == "'":
+            in_single = True
+            output.append(char)
+            index += 1
+            continue
+        if char == '"':
+            in_double = True
+            output.append(char)
+            index += 1
+            continue
+        if char == "-" and next_char == "-":
+            output.extend((" ", " "))
+            index += 2
+            while index < len(sql) and sql[index] not in "\r\n":
+                output.append(" ")
+                index += 1
+            continue
+        if char == "/" and next_char == "*":
+            output.extend((" ", " "))
+            index += 2
+            while index < len(sql):
+                if sql[index] == "*" and index + 1 < len(sql) and sql[index + 1] == "/":
+                    output.extend((" ", " "))
+                    index += 2
+                    break
+                output.append("\n" if sql[index] == "\n" else " ")
+                index += 1
+            continue
+        output.append(char)
+        index += 1
+    return "".join(output)
+
+
 def _table_aliases(table_name: str) -> set[str]:
     normalized = _normalize_identifier(table_name)
     if not normalized:
@@ -137,8 +201,9 @@ def _table_aliases(table_name: str) -> set[str]:
 
 def _referenced_tables(sql: str) -> set[str]:
     tables: set[str] = set()
-    for match in _TABLE_REF_RE.finditer(sql):
-        if _is_function_argument_from(sql, match.start()):
+    parse_sql = _strip_sql_comments(sql)
+    for match in _TABLE_REF_RE.finditer(parse_sql):
+        if _is_function_argument_from(parse_sql, match.start()):
             continue
         ref = match.group(1).strip()
         if ref.startswith("("):
@@ -171,10 +236,10 @@ def _is_function_argument_from(sql: str, from_index: int) -> bool:
 
 
 def _cte_names(sql: str) -> set[str]:
-    if not sql.lstrip().lower().startswith("with"):
+    parse_sql = _strip_sql_comments(sql)
+    if not parse_sql.lstrip().lower().startswith("with"):
         return set()
-    prefix = sql[:4000]
-    return {_normalize_identifier(match.group(1)) for match in _CTE_NAME_RE.finditer(prefix)}
+    return {_normalize_identifier(match.group(1)) for match in _CTE_NAME_RE.finditer(parse_sql)}
 
 
 def validate_readonly_sql(sql: str, *, allowed_tables: list[str]) -> str:
