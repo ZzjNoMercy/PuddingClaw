@@ -60,6 +60,7 @@ type HarnessSection = {
 
 const HARNESS_SECTIONS: HarnessSection[] = [
   { id: "subagent", label: "SubAgent", description: "子代理注册与状态", icon: Bot },
+  { id: "context", label: "上下文工程", description: "摘要与工具上下文压缩", icon: Brain },
   { id: "runtime", label: "运行保护", description: "运行保护与权限策略", icon: ShieldCheck },
 ];
 
@@ -230,6 +231,13 @@ export default function SettingsPage() {
   // Compression
   const [compRatio, setCompRatio] = useState(0.5);
 
+  // Harness context engineering (DeepAgents only)
+  const [contextSummaryTriggerTokens, setContextSummaryTriggerTokens] = useState("200000");
+  const [toolContextEnabled, setToolContextEnabled] = useState(true);
+  const [singleToolTriggerTokens, setSingleToolTriggerTokens] = useState("8000");
+  const [backgroundMinResultTokens, setBackgroundMinResultTokens] = useState("1000");
+  const [keepRecentToolResults, setKeepRecentToolResults] = useState("12");
+
   // Harness runtime policy
   const [modelCallLimitEnabled, setModelCallLimitEnabled] = useState(true);
   const [modelCallRunLimit, setModelCallRunLimit] = useState("50");
@@ -346,6 +354,19 @@ export default function SettingsPage() {
         setKbImageCollection(s.knowledge?.multimodal_index?.image_collection || "puddingclaw_knowledge_image");
         // Compression
         setCompRatio(s.compression.ratio);
+        setContextSummaryTriggerTokens(
+          String(s.compression.deepagents?.summarization?.trigger_tokens ?? 200000)
+        );
+        setToolContextEnabled(s.compression.deepagents?.tool_context?.enabled ?? true);
+        setSingleToolTriggerTokens(
+          String(s.compression.deepagents?.tool_context?.single_tool_trigger_tokens ?? 8000)
+        );
+        setBackgroundMinResultTokens(
+          String(s.compression.deepagents?.tool_context?.background_min_result_tokens ?? 1000)
+        );
+        setKeepRecentToolResults(
+          String(s.compression.deepagents?.tool_context?.keep_recent_tool_results ?? 12)
+        );
         // Harness runtime policy
         const modelLimit = s.harness?.model_call_limit;
         setModelCallLimitEnabled(modelLimit?.enabled ?? true);
@@ -419,6 +440,22 @@ export default function SettingsPage() {
   const handleSave = useCallback(async () => {
     setSaving(true);
     try {
+      const summaryTrigger = positiveIntOrNull(contextSummaryTriggerTokens) ?? 200000;
+      const singleToolTrigger = positiveIntOrNull(singleToolTriggerTokens) ?? 8000;
+      const backgroundMinimum = positiveIntOrNull(backgroundMinResultTokens) ?? 1000;
+      const keepRecentResults = positiveIntOrNull(keepRecentToolResults) ?? 12;
+      if (summaryTrigger < 10000 || summaryTrigger > 1000000) {
+        throw new Error("全局摘要阈值必须在 10,000 到 1,000,000 tokens 之间");
+      }
+      if (singleToolTrigger < 1000 || singleToolTrigger > 100000) {
+        throw new Error("执行中单条工具阈值必须在 1,000 到 100,000 tokens 之间");
+      }
+      if (backgroundMinimum < 100 || backgroundMinimum >= singleToolTrigger) {
+        throw new Error("静默压缩单条下限必须至少为 100 且小于执行中单条工具阈值");
+      }
+      if (keepRecentResults < 1 || keepRecentResults > 100) {
+        throw new Error("保留最近工具结果必须在 1 到 100 条之间");
+      }
       await updateSettings({
         ai_gateway: {
           base_url: gatewayBaseUrl,
@@ -512,6 +549,17 @@ export default function SettingsPage() {
         },
         compression: {
           ratio: compRatio,
+          deepagents: {
+            summarization: {
+              trigger_tokens: summaryTrigger,
+            },
+            tool_context: {
+              enabled: toolContextEnabled,
+              single_tool_trigger_tokens: singleToolTrigger,
+              background_min_result_tokens: backgroundMinimum,
+              keep_recent_tool_results: keepRecentResults,
+            },
+          },
         },
         harness: {
           model_call_limit: {
@@ -523,7 +571,7 @@ export default function SettingsPage() {
         },
         subagents: subagentItemsToConfig(subagentItems),
       });
-      showToast("success", "设置已保存");
+      showToast("success", "设置已保存，将从下一次 Agent 运行生效");
       // Clear raw keys after save
       setLlmApiKey("");
       setEmbApiKey("");
@@ -542,7 +590,7 @@ export default function SettingsPage() {
     } finally {
       setSaving(false);
     }
-  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaQueryTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmModel, mmDimension, mmApiKey, knowledgeRootDir, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, subagentItems, showToast]);
+  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaQueryTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmModel, mmDimension, mmApiKey, knowledgeRootDir, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, toolContextEnabled, singleToolTriggerTokens, backgroundMinResultTokens, keepRecentToolResults, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, subagentItems, showToast]);
 
   const handleDatabaseModeChange = useCallback((mode: "bundled" | "external") => {
     setDatabaseMode(mode);
@@ -1900,6 +1948,111 @@ export default function SettingsPage() {
                             </div>
                           )}
                         </div>
+                      </div>
+                    </SettingsCard>
+                  </section>
+
+                  <section id="harness-section-context" className="scroll-mt-6">
+                    <SettingsCard title="上下文工程" icon={Brain} color="#002fa7">
+                      <div className="space-y-4">
+                        <div className="rounded-xl border border-black/[0.06] bg-white/55 px-3.5 py-3">
+                          <div className="mb-4">
+                            <p className="text-[13px] font-semibold text-gray-900">DeepAgents 全局摘要</p>
+                            <p className="mt-1 text-[11px] leading-relaxed text-gray-500">
+                              当模型上下文达到阈值时，由内置摘要中间件压缩历史；摘要输入预算由后端根据当前模型上下文窗口自动计算。
+                            </p>
+                          </div>
+                          <FormField label="全局摘要触发阈值（tokens）">
+                            <input
+                              type="number"
+                              min={10000}
+                              max={1000000}
+                              step={10000}
+                              value={contextSummaryTriggerTokens}
+                              onChange={(e) => setContextSummaryTriggerTokens(e.target.value)}
+                              className="form-input"
+                            />
+                          </FormField>
+                        </div>
+
+                        <div className="rounded-xl border border-black/[0.06] bg-white/55 px-3.5 py-3">
+                          <div className="flex items-center justify-between gap-4">
+                            <div>
+                              <p className="text-[13px] font-semibold text-gray-900">工具上下文压缩</p>
+                              <p className="mt-1 text-[11px] leading-relaxed text-gray-500">
+                                开启时注册 DeepAgents Tool Context 中间件。关闭后不注册中间件、不创建新任务，模型直接使用原始工具结果。
+                              </p>
+                            </div>
+                            <SwitchButton
+                              checked={toolContextEnabled}
+                              onChange={setToolContextEnabled}
+                              ariaLabel="启用工具上下文压缩"
+                            />
+                          </div>
+                          {!toolContextEnabled && (
+                            <p className="mt-3 rounded-lg bg-amber-50 px-3 py-2 text-[10px] leading-relaxed text-amber-700">
+                              工具上下文中间件将不注册；DeepAgents 的 200k 全局摘要仍然生效。
+                            </p>
+                          )}
+
+                          <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
+                            <FormField label="执行中单条阈值">
+                              <input
+                                type="number"
+                                min={1000}
+                                max={100000}
+                                step={1000}
+                                value={singleToolTriggerTokens}
+                                onChange={(e) => setSingleToolTriggerTokens(e.target.value)}
+                                className="form-input"
+                                disabled={!toolContextEnabled}
+                              />
+                              <p className="mt-1 text-[10px] text-gray-400">默认 8,000 tokens；只保护超限的单条结果。</p>
+                            </FormField>
+                            <FormField label="静默压缩单条下限">
+                              <input
+                                type="number"
+                                min={100}
+                                step={100}
+                                value={backgroundMinResultTokens}
+                                onChange={(e) => setBackgroundMinResultTokens(e.target.value)}
+                                className="form-input"
+                                disabled={!toolContextEnabled}
+                              />
+                              <p className="mt-1 text-[10px] text-gray-400">默认 1,000 tokens；更短结果保持原样。</p>
+                            </FormField>
+                            <FormField label="保留最近完整结果">
+                              <input
+                                type="number"
+                                min={1}
+                                max={100}
+                                value={keepRecentToolResults}
+                                onChange={(e) => setKeepRecentToolResults(e.target.value)}
+                                className="form-input"
+                                disabled={!toolContextEnabled}
+                              />
+                              <p className="mt-1 text-[10px] text-gray-400">默认 12 条已完成 Tool Result 不参与事后压缩。</p>
+                            </FormField>
+                          </div>
+                        </div>
+
+                        <SpecPreview
+                          spec={{
+                            compression: {
+                              deepagents: {
+                                summarization: {
+                                  trigger_tokens: positiveIntOrNull(contextSummaryTriggerTokens) ?? 200000,
+                                },
+                                tool_context: {
+                                  enabled: toolContextEnabled,
+                                  single_tool_trigger_tokens: positiveIntOrNull(singleToolTriggerTokens) ?? 8000,
+                                  background_min_result_tokens: positiveIntOrNull(backgroundMinResultTokens) ?? 1000,
+                                  keep_recent_tool_results: positiveIntOrNull(keepRecentToolResults) ?? 12,
+                                },
+                              },
+                            },
+                          }}
+                        />
                       </div>
                     </SettingsCard>
                   </section>

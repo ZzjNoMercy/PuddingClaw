@@ -73,3 +73,13 @@ def test_default_tool_guides_use_virtual_filesystem_for_semantic_assets() -> Non
     assert "convert it to the equivalent `/workspace/<relative-path>`" in prompt
     assert "call the built-in `edit_file` or `write_file` with that exact path" in prompt
     assert "Do not fall back to `terminal`" in prompt
+
+
+def test_default_agent_prompt_requires_chinese_user_visible_output() -> None:
+    prompt = (Path(__file__).resolve().parent.parent / "prompts" / "deepagents" / "AGENTS.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "所有对用户可见的输出必须使用中文" in prompt
+    assert "工具调用前后的过渡语" in prompt
+    assert "内部隐藏推理可以使用英文" in prompt

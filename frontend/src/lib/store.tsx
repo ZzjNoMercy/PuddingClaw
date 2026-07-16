@@ -11,11 +11,14 @@ import React, {
 import {
   streamChat,
   streamAgent,
+  getSessionTokenCount,
+  getToolContextJobStatus,
   listSessions as apiListSessions,
   createSession as apiCreateSession,
   renameSession as apiRenameSession,
   deleteSession as apiDeleteSession,
   getRawMessages as apiGetRawMessages,
+  getSessionTraces as apiGetSessionTraces,
   getSessionHistory as apiGetSessionHistory,
   compressSession as apiCompressSession,
   clearSession as apiClearSession,
@@ -752,12 +755,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [thinkingMode, setThinkingModeRaw] = useState(false);
   const [contextUsage, setContextUsage] = useState<ContextUsage>({
     used: 0,
-    total: 500000,
+    total: 200000,
     percentage: 0,
   });
   const [pendingInput, setPendingInput] = useState<string | null>(null);
   const [maintenanceStatus, setMaintenanceStatus] =
     useState<ContextMaintenanceStatus | null>(null);
+  const toolContextPollingJobsRef = useRef<Set<string>>(new Set());
 
   const [activeSourceId, setActiveSourceId] = useState<string | null>(null);
 
@@ -1202,38 +1206,34 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           });
       }
 
-      // Load persisted todos / trace / graph for Agent sessions
-      apiGetRawMessages(id)
-        .then((data) => {
-          if (data.todos) {
-            todosMapRef.current[id] = data.todos;
-            if (sessionIdRef.current === id) setTodos(data.todos);
-          }
-          if (data.trace) {
-            tracesMapRef.current[id] = data.trace;
-            if (sessionIdRef.current === id) setTrace(data.trace);
-          }
-          if (data.traces) {
-            traceHistoriesMapRef.current[id] = data.traces;
-            const selected = data.latest_query_id || data.trace?.query_id || null;
-            selectedTraceQueryMapRef.current[id] = selected;
-            if (sessionIdRef.current === id) {
-              setTraceHistory(data.traces);
-              setSelectedTraceQueryId(selected);
-              if (selected && data.traces[selected]) setTrace(data.traces[selected]);
-            }
-          }
-          if (data.graph) {
-            graphsMapRef.current[id] = data.graph as GraphStructure;
-            if (sessionIdRef.current === id) setGraph(data.graph as GraphStructure);
-          }
-        })
-        .catch(() => {
-          // ignore
-        });
     },
     []
   );
+
+  // Trace history is intentionally lazy: switching conversations reads only
+  // messages. The large sidecar is fetched when the user opens Trace 看板.
+  useEffect(() => {
+    if (workspaceView !== "trace" || !sessionId) return;
+    if (traceHistoriesMapRef.current[sessionId] !== undefined) return;
+    apiGetSessionTraces(sessionId)
+      .then((data) => {
+        const histories = data.traces || {};
+        const selected = data.latest_query_id || data.trace?.query_id || null;
+        traceHistoriesMapRef.current[sessionId] = histories;
+        selectedTraceQueryMapRef.current[sessionId] = selected;
+        tracesMapRef.current[sessionId] = data.trace || (selected ? histories[selected] : null) || null;
+        if (data.todos) todosMapRef.current[sessionId] = data.todos;
+        if (data.graph) graphsMapRef.current[sessionId] = data.graph;
+        if (sessionIdRef.current === sessionId) {
+          setTraceHistory(histories);
+          setSelectedTraceQueryId(selected);
+          setTrace(tracesMapRef.current[sessionId]);
+          if (data.todos) setTodos(data.todos);
+          if (data.graph) setGraph(data.graph);
+        }
+      })
+      .catch(() => {});
+  }, [workspaceView, sessionId]);
 
   // On mount/refresh, restore the last viewed session from storage.
   const restoredSessionRef = useRef(false);
@@ -1698,6 +1698,68 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 phase: payload.phase || "context",
                 message: payload.message || "正在维护上下文...",
               });
+              const jobId = String(event.data.job_id || "");
+              const maintenanceSessionId = String(event.data.session_id || sendSessionId);
+              if (
+                payload.phase === "tool_context_compaction" &&
+                jobId &&
+                !toolContextPollingJobsRef.current.has(jobId)
+              ) {
+                toolContextPollingJobsRef.current.add(jobId);
+                void (async () => {
+                  let reachedTerminalState = false;
+                  try {
+                    // The worker may process several bounded batches. Keep the
+                    // lightweight status poll alive for up to five minutes.
+                    for (let attempt = 0; attempt < 600; attempt += 1) {
+                      await new Promise((resolve) => setTimeout(resolve, 500));
+                      const status = await getToolContextJobStatus(maintenanceSessionId);
+                      if (!status.id || status.id !== jobId) continue;
+                      if (["completed", "completed_with_errors", "failed", "expired"].includes(status.status)) {
+                        reachedTerminalState = true;
+                        if (sessionIdRef.current === maintenanceSessionId) {
+                          if (status.status === "failed" || status.status === "expired") {
+                            setMaintenanceStatus(null);
+                          } else {
+                            try {
+                              const usage = await getSessionTokenCount(maintenanceSessionId);
+                              if (sessionIdRef.current === maintenanceSessionId) {
+                                setContextUsage({
+                                  used: usage.total_tokens,
+                                  total: usage.compaction_trigger,
+                                  percentage: Math.min(100, usage.percentage),
+                                });
+                              }
+                            } catch {
+                              // The status itself is authoritative; a meter refresh
+                              // failure must not turn maintenance into a chat error.
+                            }
+                            setMaintenanceStatus({
+                              phase: "tool_context_compaction_done",
+                              message: "上下文已优化，后续对话将继续使用精简上下文。",
+                            });
+                            setTimeout(() => {
+                              if (sessionIdRef.current === maintenanceSessionId) {
+                                setMaintenanceStatus(null);
+                              }
+                            }, 1400);
+                          }
+                        }
+                        break;
+                      }
+                    }
+                  } catch {
+                    if (sessionIdRef.current === maintenanceSessionId) {
+                      setMaintenanceStatus(null);
+                    }
+                  } finally {
+                    if (!reachedTerminalState && sessionIdRef.current === maintenanceSessionId) {
+                      setMaintenanceStatus(null);
+                    }
+                    toolContextPollingJobsRef.current.delete(jobId);
+                  }
+                })();
+              }
             } else {
               setMaintenanceStatus(null);
             }
@@ -2116,6 +2178,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                   }
                 }
                 const updates: Partial<ToolCall> = {
+                  // Reflect backend execution routing in the visible tool card.
+                  tool: event.data.tool as string,
                   output: event.data.output as string,
                   status: "done",
                   endedAt: Date.now(),

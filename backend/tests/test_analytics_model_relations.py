@@ -182,6 +182,8 @@ def test_model_context_injects_selected_virtual_dataset_summary(tmp_path) -> Non
         {
             "asset_id": "tbl_sales_2023",
             "name": "2023月度上险量",
+            "description": "",
+            "tags": [],
             "kind": "vertical_union",
             "materialization": "virtual",
             "schema": {"fields": ["年份", "月份", "销量"]},
@@ -191,3 +193,67 @@ def test_model_context_injects_selected_virtual_dataset_summary(tmp_path) -> Non
             "sources": [{"asset_id": "tbl_jan", "name": "1月", "sheet_name": None}],
         }
     ]
+
+
+def test_model_context_injects_raw_table_profile_and_database_table(tmp_path, monkeypatch) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    monkeypatch.setenv("PUDDINGCLAW_KNOWLEDGE_DIR", str(knowledge_root))
+    profile_dir = knowledge_root / ".puddingclaw" / "table_profiles"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "tbl_sales_2022.profile.json").write_text(
+        json.dumps(
+            {
+                "asset_id": "tbl_sales_2022",
+                "kind": "table_asset_profile",
+                "source_type": "excel",
+                "file_name": "2022年乘用车市场上险量_宽表.xlsx",
+                "virtual_path": "/knowledge/imported/2022年乘用车市场上险量_宽表.xlsx",
+                "sheet_name": "Sheet1",
+                "size_bytes": 1234,
+                "shape": [464069, 40],
+                "columns": [
+                    {"name": "年份", "dtype": "int64", "sample_values": [2022]},
+                    {"name": "品牌", "dtype": "str", "sample_values": ["比亚迪"]},
+                    {"name": "10", "dtype": "int64", "sample_values": [1]},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    models = AnalyticsModelRegistry(tmp_path)
+    created = models.create_model(
+        name="跨年销量分析",
+        data_assets={"tables": ["table_asset:tbl_sales_2022"]},
+    )
+
+    context = models.get_model_context(created["id"])
+
+    assert context["missing_data_assets"] == []
+    assert context["data_assets"][0] == {
+        "ref": "table_asset:tbl_sales_2022",
+        "asset_id": "tbl_sales_2022",
+        "asset_type": "raw_table",
+        "name": "2022年乘用车市场上险量_宽表.xlsx",
+        "source_type": "excel",
+        "virtual_path": "/knowledge/imported/2022年乘用车市场上险量_宽表.xlsx",
+        "sheet_name": "Sheet1",
+        "schema": {
+            "fields": ["年份", "品牌", "10"],
+            "field_types": {"年份": "int64", "品牌": "str", "10": "int64"},
+        },
+        "coverage": {"years": ["2022"], "month_fields": ["10"]},
+        "statistics": {"shape": [464069, 40], "size_bytes": 1234},
+    }
+    database_model = models.create_model(
+        name="数据库资产分析",
+        data_assets={"tables": ["dbs_demo.vehicle_model_base"]},
+    )
+    database_context = models.get_model_context(database_model["id"])
+    assert database_context["data_assets"][0] == {
+        "ref": "dbs_demo.vehicle_model_base",
+        "asset_type": "database_table",
+        "name": "vehicle_model_base",
+        "database_source_id": "dbs_demo",
+        "table_name": "vehicle_model_base",
+    }

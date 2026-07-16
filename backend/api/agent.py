@@ -65,3 +65,10 @@ async def agent(request: AgentRequest):
 
             final_content = json.loads(event.get("data", "{}")).get("content", "")
     return {"reply": final_content, "session_id": request.session_id, "project_id": request.project_id}
+
+
+@router.get("/agent/tool-context/status/{session_id}")
+async def tool_context_status(session_id: str):
+    """Return the persisted status of the silent Tool Context background job."""
+
+    return session_manager.get_tool_context_status(session_id)

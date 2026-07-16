@@ -82,7 +82,13 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
 
         for tool_call in last_ai_msg.tool_calls:
             tool_name = str(tool_call.get("name") or "")
-            if tool_name not in {"read_external_file", "read_resource", "edit_file", "write_file"}:
+            if tool_name not in {
+                "read_external_file",
+                "read_resource",
+                "read_file",
+                "edit_file",
+                "write_file",
+            }:
                 continue
             args = tool_call.get("args") or {}
             raw_path = str(args.get("path") or args.get("resource") or args.get("file_path") or "").strip()
@@ -101,6 +107,18 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                 change_preview = self._change_preview(tool_name, args)
             else:
                 requested = Path(raw_path).expanduser().resolve()
+                if tool_name == "read_file":
+                    if raw_path.replace("\\", "/").startswith(self._VIRTUAL_PREFIXES):
+                        continue
+                    if not Path(raw_path).expanduser().is_absolute():
+                        continue
+                    if workspace_path:
+                        workspace = Path(workspace_path).expanduser().resolve()
+                        try:
+                            requested.relative_to(workspace)
+                            continue
+                        except ValueError:
+                            pass
                 access = "read"
                 if session_manager.has_external_file_read_permission(session_id, requested):
                     continue

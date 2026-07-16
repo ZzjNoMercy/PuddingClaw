@@ -196,6 +196,86 @@ def test_permission_middleware_interrupts_external_edit_file(tmp_path, monkeypat
     assert request["change_preview"] == {"old_string": "before", "new_string": "after"}
 
 
+def test_permission_middleware_interrupts_misrouted_external_read_file(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from langchain_core.messages import AIMessage
+
+    import graph.permission_middleware as permission_middleware_module
+    from graph.permission_middleware import ExternalFilePermissionMiddleware
+    from graph.session_manager import session_manager
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("middleware-read-route-session")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    external = tmp_path / "external" / "report.html"
+    external.parent.mkdir()
+    external.write_text("outside", encoding="utf-8")
+    captured = {}
+
+    monkeypatch.setattr(
+        permission_middleware_module,
+        "interrupt",
+        lambda payload: captured.update(payload),
+    )
+    state = {
+        "messages": [
+            AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "read_file",
+                    "args": {"file_path": str(external), "offset": 100, "limit": 200},
+                    "id": "call-read-external",
+                    "type": "tool_call",
+                }],
+            )
+        ]
+    }
+    runtime = SimpleNamespace(context={
+        "session_id": "middleware-read-route-session",
+        "query_id": "query-read-route",
+        "workspace_path": str(workspace),
+    })
+
+    async def invoke():
+        return ExternalFilePermissionMiddleware().after_model(state, runtime)
+
+    assert asyncio.run(invoke()) is None
+    request = captured["request"]
+    assert request["type"] == "external_file_read"
+    assert request["path"] == str(external.resolve())
+    assert request["operation"] == "read_file"
+
+
+def test_read_resource_supports_line_pagination(tmp_path):
+    from graph.session_manager import session_manager
+    from tools.read_resource_tool import ReadResourceTool
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("resource-pagination-session")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    external = tmp_path / "external" / "large.html"
+    external.parent.mkdir()
+    external.write_text("\n".join(f"line-{index}" for index in range(20)), encoding="utf-8")
+    session_manager.add_permission_grant(
+        "resource-pagination-session",
+        grant_type="external_file_read",
+        target_kind="exact_file",
+        target=str(external.resolve()),
+        capabilities=["read", "external_path"],
+    )
+
+    content = ReadResourceTool(
+        session_id="resource-pagination-session",
+        workspace_path=str(workspace),
+    ).invoke({"resource": str(external), "offset": 5, "limit": 3})
+
+    assert content.startswith("line-5\nline-6\nline-7")
+    assert "Continue with offset=8" in content
+
+
 def test_read_external_file_tool_requires_permission_and_records_trace(tmp_path):
     from graph.session_manager import session_manager
     from graph.trace_collector import TraceCollector

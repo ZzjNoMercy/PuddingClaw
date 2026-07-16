@@ -12,6 +12,7 @@ from graph.prompt_builder import build_system_prompt
 from config import (
     get_compaction_trigger_tokens,
     get_deepagents_summarization_config,
+    get_deepagents_tool_context_config,
     get_rag_mode,
 )
 
@@ -50,7 +51,8 @@ async def get_session_token_count(session_id: str) -> dict[str, Any]:
 
     若存在 context_usage_peak 且大于静态统计，则优先使用峰值，
     因为 session 中的 tool output 可能已被摘要或截断，峰值更能反映 LLM 实际消耗。
-    返回的 total_tokens 分母使用 compaction_trigger（默认 500K），便于前端显示压缩进度。
+    返回的 total_tokens 分母按运行时选择：Chat 使用原 compact 阈值，
+    DeepAgents 使用其独立的全局 summarize 阈值（默认 200K）。
     """
     system_prompt = build_system_prompt(BASE_DIR, rag_mode=get_rag_mode())
     system_tokens = _count_tokens(system_prompt)
@@ -71,11 +73,17 @@ async def get_session_token_count(session_id: str) -> dict[str, Any]:
         # Agent keeps the complete transcript for the UI, but DeepAgents may
         # send a much smaller summarized context to the model. Never replace
         # that current value with the historical peak/full transcript size.
-        current_usage = session_manager.get_agent_context_usage(session_id)
+        tool_context_enabled = bool(
+            get_deepagents_tool_context_config().get("enabled", True)
+        )
+        current_usage = session_manager.get_effective_agent_context_usage(
+            session_id,
+            use_tool_context=tool_context_enabled,
+        )
         total_tokens = current_usage or (system_tokens + message_tokens)
         message_tokens = max(0, total_tokens - system_tokens)
         compaction_trigger = int(
-            get_deepagents_summarization_config().get("trigger_tokens", 500000)
+            get_deepagents_summarization_config().get("trigger_tokens", 200000)
         )
     else:
         context_usage_peak = session_manager.get_context_usage_peak(session_id)

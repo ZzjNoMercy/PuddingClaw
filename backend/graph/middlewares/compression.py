@@ -79,11 +79,15 @@ def _encode_text(text: str) -> int:
 def count_tokens_tiktoken(messages) -> int:
     """Count tokens across messages, using deepseek tokenizer if available else tiktoken cl100k_base.
 
-    升级点：额外计入 tool_calls 的 token（修复 V5 遗漏）。
+    Besides content and tool calls, account for the chat envelope around each
+    message. Without this fixed overhead the offline rough encoder materially
+    under-counts short-message conversations and can skip configured compaction
+    thresholds entirely.
     """
     import json
-    total = 0
+    total = 2  # assistant priming / conversation envelope
     for m in messages:
+        total += 4  # role/name/message framing
         content = m.content if hasattr(m, "content") else str(m)
         if isinstance(content, list):
             content = "".join(

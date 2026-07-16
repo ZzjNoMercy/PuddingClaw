@@ -44,6 +44,31 @@ export interface SSEEvent {
   data: Record<string, unknown>;
 }
 
+export interface ToolContextJobStatus {
+  id?: string;
+  status:
+    | "idle"
+    | "pending"
+    | "running"
+    | "completed"
+    | "completed_with_errors"
+    | "failed"
+    | "expired";
+  completed_count?: number;
+  failed_count?: number;
+  error?: string;
+  revision?: number;
+}
+
+export async function getToolContextJobStatus(sessionId: string): Promise<ToolContextJobStatus> {
+  const response = await fetchWithTimeout(
+    `${API_BASE}/agent/tool-context/status/${encodeURIComponent(sessionId)}`,
+    { cache: "no-store" },
+  );
+  if (!response.ok) throw new Error(`Failed to get Tool Context status: ${response.status}`);
+  return response.json();
+}
+
 export interface AgentAttachment {
   type: "image" | "pdf" | "spreadsheet" | "markdown" | "text" | "document" | "file";
   id?: string;
@@ -2642,16 +2667,31 @@ export async function getRawMessages(
   title: string;
   messages: Array<{ role: string; content: string }>;
   todos?: TodoItem[];
-  trace?: AgentTrace | null;
-  traces?: Record<string, AgentTrace>;
-  latest_query_id?: string;
-  latest_trace_id?: string;
   graph?: GraphStructure | null;
 }> {
   const resp = await fetch(
     `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/messages`
   );
   if (!resp.ok) throw new Error(`Failed to get raw messages: ${resp.status}`);
+  return resp.json();
+}
+
+/** Load heavyweight Agent traces on demand, separately from chat history. */
+export async function getSessionTraces(
+  sessionId: string
+): Promise<{
+  session_id: string;
+  trace?: AgentTrace | null;
+  traces: Record<string, AgentTrace>;
+  latest_query_id?: string | null;
+  latest_trace_id?: string | null;
+  todos?: TodoItem[];
+  graph?: GraphStructure | null;
+}> {
+  const resp = await fetch(
+    `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/traces`
+  );
+  if (!resp.ok) throw new Error(`Failed to get session traces: ${resp.status}`);
   return resp.json();
 }
 

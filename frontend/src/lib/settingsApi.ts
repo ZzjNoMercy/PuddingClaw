@@ -11,6 +11,7 @@ export interface FallbackLlmSettings {
   api_key_masked: string;
   temperature: number;
   max_tokens: number;
+  context_window?: number;
 }
 
 export interface GatewayLlmSettings {
@@ -137,6 +138,19 @@ export interface DatabaseSettings {
 
 export interface CompressionSettings {
   ratio: number;
+  deepagents?: {
+    summarization?: {
+      enabled?: boolean;
+      trigger_tokens?: number;
+      keep_messages?: number;
+    };
+    tool_context?: {
+      enabled?: boolean;
+      single_tool_trigger_tokens?: number;
+      background_min_result_tokens?: number;
+      keep_recent_tool_results?: number;
+    };
+  };
 }
 
 export interface HarnessSettings {

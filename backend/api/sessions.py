@@ -1,15 +1,16 @@
 """Session CRUD API — list / create / rename / delete / raw messages / generate title."""
 
-import os
 import uuid
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
-from graph.session_manager import session_manager
-from graph.prompt_builder import build_system_prompt
 from config import get_rag_mode
+from graph.prompt_builder import build_system_prompt
+from graph.session_manager import session_manager
 
 router = APIRouter()
 
@@ -31,7 +32,7 @@ class SessionAnalyticsModelRequest(BaseModel):
 @router.get("/sessions")
 async def list_sessions():
     """List all sessions with title and metadata."""
-    sessions = session_manager.list_sessions()
+    sessions = await run_in_threadpool(session_manager.list_sessions)
     return {"sessions": sessions}
 
 
@@ -75,8 +76,8 @@ async def delete_session(session_id: str):
 
 @router.get("/sessions/{session_id}/messages")
 async def get_raw_messages(session_id: str):
-    """Get complete raw messages including system prompt, plus Agent runtime state."""
-    data = session_manager.get_raw_messages(session_id)
+    """Get raw conversation messages without reading execution traces."""
+    data = await run_in_threadpool(session_manager.get_raw_messages, session_id)
     system_prompt = build_system_prompt(BASE_DIR, rag_mode=get_rag_mode())
     # Prepend system prompt as the first message
     all_messages = [{"role": "system", "content": system_prompt}] + data.get("messages", [])
@@ -87,23 +88,29 @@ async def get_raw_messages(session_id: str):
     }
     if "todos" in data:
         result["todos"] = data["todos"]
-    if "trace" in data:
-        result["trace"] = data["trace"]
-    if "traces" in data:
-        result["traces"] = data["traces"]
-    if "latest_query_id" in data:
-        result["latest_query_id"] = data["latest_query_id"]
-    if "latest_trace_id" in data:
-        result["latest_trace_id"] = data["latest_trace_id"]
     if "graph" in data:
         result["graph"] = data["graph"]
     return result
 
 
+@router.get("/sessions/{session_id}/traces")
+async def get_session_traces(session_id: str):
+    """Load heavyweight Agent traces only when the trace workspace requests them."""
+    data = await run_in_threadpool(session_manager.get_trace_state, session_id)
+    latest_query_id = data.get("latest_query_id")
+    traces = data.get("traces") or {}
+    latest = traces.get(latest_query_id) if isinstance(latest_query_id, str) else None
+    return {
+        "session_id": session_id,
+        "trace": latest,
+        **data,
+    }
+
+
 @router.get("/sessions/{session_id}/history")
 async def get_session_history(session_id: str):
     """Get conversation history for display (no system prompt, includes tool_calls)."""
-    messages = session_manager.load_session(session_id)
+    messages = await run_in_threadpool(session_manager.load_session, session_id)
     return {"session_id": session_id, "messages": messages}
 
 
@@ -130,6 +137,7 @@ async def generate_title(session_id: str):
 
     try:
         from langchain_core.messages import HumanMessage as HM
+
         from llm.model_client import ModelClient
 
         llm = ModelClient(role="title", temperature=0.3)
@@ -146,7 +154,7 @@ async def generate_title(session_id: str):
         session_manager.update_title(session_id, title)
         return {"session_id": session_id, "title": title}
 
-    except Exception as e:
+    except Exception:
         # Fallback: use first few chars of user message
         fallback_title = first_user[:10].strip()
         session_manager.update_title(session_id, fallback_title)

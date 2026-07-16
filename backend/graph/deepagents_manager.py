@@ -51,6 +51,17 @@ from graph.middleware_trace_proxy import wrap_middlewares_for_trace
 from graph.middlewares.skill_intent_router import SkillIntentRouterMiddleware
 from graph.middlewares.semantic_assets import SemanticAssetsMiddleware
 from graph.middlewares.toolset import ToolsetMiddleware, discover_skill_toolsets
+from graph.middlewares.tool_context_compaction import (
+    CONTEXT_METHOD_ARTIFACT_KEY,
+    CONTEXT_OUTPUT_ARTIFACT_KEY,
+    CONTEXT_POLICY_ARTIFACT_KEY,
+    POLICY_VERSION as TOOL_CONTEXT_POLICY_VERSION,
+    RAW_OUTPUT_ARTIFACT_KEY,
+    ToolContextCompactionMiddleware,
+    ToolContextConfig,
+    tool_context_compaction_service,
+)
+from graph.middlewares.workspace_path_router import WorkspacePathRouterMiddleware
 from graph.permission_middleware import ExternalFilePermissionMiddleware
 from graph.permission_resume import permission_resume_registry
 from graph.permissioned_filesystem_backend import PermissionedCompositeBackend
@@ -90,9 +101,9 @@ def _build_deepagents_summarization(model: BaseChatModel, backend: Any) -> Puddi
     return PuddingClawSummarizationMiddleware(
         model=model,
         backend=backend,
-        trigger=("tokens", max(1, int(cfg.get("trigger_tokens", 500000)))),
+        trigger=("tokens", max(1, int(cfg.get("trigger_tokens", 200000)))),
         keep=("messages", max(1, int(cfg.get("keep_messages", 20)))),
-        trim_tokens_to_summarize=max(1, int(cfg.get("summary_input_tokens", 400000))),
+        trim_tokens_to_summarize=max(1, int(cfg.get("summary_input_tokens", 800000))),
         truncate_args_settings=None,
     )
 
@@ -120,6 +131,22 @@ def _estimate_agent_context_tokens(messages: list[Any], system_prompt: str) -> i
     return message_tokens + system_tokens
 
 
+def _serialize_agent_context_messages(messages: list[Any]) -> list[dict[str, Any]]:
+    """Serialize model-only context without duplicating raw Tool evidence."""
+
+    serialized: list[dict[str, Any]] = []
+    for message in messages:
+        payload = message_to_dict(message)
+        data = payload.get("data")
+        artifact = data.get("artifact") if isinstance(data, dict) else None
+        if isinstance(artifact, dict) and RAW_OUTPUT_ARTIFACT_KEY in artifact:
+            sanitized_artifact = dict(artifact)
+            sanitized_artifact.pop(RAW_OUTPUT_ARTIFACT_KEY, None)
+            data["artifact"] = sanitized_artifact or None
+        serialized.append(payload)
+    return serialized
+
+
 class PuddingClawAgentState(DeepAgentState):
     """DeepAgent state extended with the UI-selected analytics model."""
 
@@ -127,6 +154,7 @@ class PuddingClawAgentState(DeepAgentState):
     semantic_assets_model_id: NotRequired[str]
     semantic_assets_metadata: NotRequired[list[dict[str, Any]]]
     allowed_semantic_asset_ids: NotRequired[list[str]]
+    tool_context_enqueue: NotRequired[bool]
 
 HISTORICAL_TOOL_OUTPUT_PREFIX = "[历史工具结果，仅供上下文，不是本轮新调用]\n"
 MISSING_TOOL_OUTPUT_PLACEHOLDER = (
@@ -382,7 +410,7 @@ def _build_subagent_item(
     middlewares = middleware_factory() if middleware_factory else []
     if model:
         # Explicit-model subagents keep their provider-native DeepAgents
-        # summarizer. The PuddingClaw 500K policy belongs to inherited
+        # summarizer. The configured PuddingClaw policy belongs to inherited
         # ModelClientChatModel agents only.
         middlewares = [
             middleware
@@ -608,12 +636,18 @@ class DeepAgentsAgentManager:
             MemoryMiddleware(backend=memory_backend, sources=sources),
             SemanticAssetsMiddleware(base_dir=self._base_dir),
             ExternalFilePermissionMiddleware(),
+            WorkspacePathRouterMiddleware(),
             SkillIntentRouterMiddleware(),
             ToolsetMiddleware(
                 skills_dir=self._base_dir / "skills",
                 toolsets_by_skill=toolset_mapping,
             ),
         ]
+        tool_context_cfg = ToolContextConfig.from_mapping(
+            config.get_deepagents_tool_context_config()
+        )
+        if tool_context_cfg.enabled:
+            middlewares.append(ToolContextCompactionMiddleware(tool_context_cfg))
         model_call_limit_cfg = config.load_config().get("harness", {}).get("model_call_limit", {})
         if model_call_limit_cfg.get("enabled", True):
             run_limit = model_call_limit_cfg.get("run_limit")
@@ -1445,6 +1479,8 @@ class DeepAgentsAgentManager:
             "path": model.get("path"),
             "loaded": True,
             "missing_references": model.get("missing_references") or [],
+            "missing_data_assets": model.get("missing_data_assets") or [],
+            "data_assets": model.get("data_assets") or [],
             "semantic_assets": [
                 {
                     "id": item.get("id"),
@@ -1462,7 +1498,7 @@ class DeepAgentsAgentManager:
         relation_context = model.get("asset_relations") or []
         relation_text = json.dumps(relation_context, ensure_ascii=False, indent=2)
         derived_path_text = json.dumps(model.get("derived_dimension_paths") or [], ensure_ascii=False, indent=2)
-        logical_dataset_text = json.dumps(model.get("logical_datasets") or [], ensure_ascii=False, indent=2)
+        data_asset_text = json.dumps(model.get("data_assets") or [], ensure_ascii=False, indent=2)
         prompt = (
             "\n\n"
             "<analytics_model_context>\n"
@@ -1480,9 +1516,11 @@ class DeepAgentsAgentManager:
             f"```json\n{relation_text}\n```\n\n"
             "已推导共同维度路径：\n"
             f"```json\n{derived_path_text}\n```\n\n"
-            "已选虚拟逻辑数据集摘要：\n"
-            "跨期趋势、环比、同比或跨来源汇总优先使用这里的资产；指定原始文件或单期明细时可使用原始来源。\n"
-            f"```json\n{logical_dataset_text}\n```\n\n"
+            "已选数据资产摘要：\n"
+            "这里统一列出数据库表、普通导入表和虚拟逻辑数据集。跨期趋势、环比、同比或跨来源汇总"
+            "优先使用覆盖范围合适的逻辑数据集；逻辑数据集未覆盖目标期间时，使用模型已选的原始资产补足，"
+            "不得因为某一个数据集缺少年份就断言模型没有该年份数据。\n"
+            f"```json\n{data_asset_text}\n```\n\n"
             "模型 Playbook：\n"
             f"{body_preview}\n"
             "</analytics_model_context>\n"
@@ -1913,6 +1951,52 @@ class DeepAgentsAgentManager:
             return str(content)
 
     @staticmethod
+    def _tool_message_artifact(tool_msg: Any) -> dict[str, Any]:
+        artifact = getattr(tool_msg, "artifact", None)
+        return dict(artifact) if isinstance(artifact, dict) else {}
+
+    @classmethod
+    def _tool_message_original_output(cls, tool_msg: Any) -> str:
+        artifact = cls._tool_message_artifact(tool_msg)
+        value = artifact.get(RAW_OUTPUT_ARTIFACT_KEY)
+        return str(value) if value is not None else cls._tool_message_output(tool_msg)
+
+    @classmethod
+    def _tool_message_context_fields(
+        cls,
+        tool_msg: Any,
+        *,
+        session_id: str,
+        tool_call_id: str,
+        original_output: str,
+    ) -> dict[str, Any]:
+        artifact = cls._tool_message_artifact(tool_msg)
+        context_output = artifact.get(CONTEXT_OUTPUT_ARTIFACT_KEY)
+        if not context_output or not tool_call_id:
+            return {}
+        source_hash = session_manager._tool_context_source_hash(original_output)
+        return {
+            "context_output": str(context_output),
+            "raw_output_ref": session_manager._tool_context_raw_ref(
+                session_id,
+                tool_call_id,
+                original_output,
+                source_hash,
+            ),
+            "context_compaction": {
+                "status": "ready",
+                "source_hash": source_hash,
+                "policy_version": str(
+                    artifact.get(CONTEXT_POLICY_ARTIFACT_KEY) or TOOL_CONTEXT_POLICY_VERSION
+                ),
+                "method": str(
+                    artifact.get(CONTEXT_METHOD_ARTIFACT_KEY) or "immediate_head_tail"
+                ),
+                "compacted_at": time.time(),
+            },
+        }
+
+    @staticmethod
     def _is_tool_error(tool_msg: Any, output: str) -> bool:
         status = getattr(tool_msg, "status", None)
         if status == "error":
@@ -2255,9 +2339,9 @@ class DeepAgentsAgentManager:
                     tc.setdefault("tool", pending.get("tool", "unknown_tool"))
                     tc.setdefault("input", pending.get("input", ""))
                     tc["output"] = tc.get("output") or output
-                    tc["raw_output"] = tc.get("raw_output") or output
                     tc["summary_source"] = tc.get("summary_source") or "stream_cancelled"
                     tc["is_error"] = True
+                    tc["completed_at"] = tc.get("completed_at") or time.time()
                     matched = True
                     break
             if not matched:
@@ -2267,9 +2351,9 @@ class DeepAgentsAgentManager:
                         "input": pending.get("input", ""),
                         "id": tc_id,
                         "output": output,
-                        "raw_output": output,
                         "summary_source": "stream_cancelled",
                         "is_error": True,
+                        "completed_at": time.time(),
                     }
                 )
             DeepAgentsAgentManager._update_tool_end_in_timeline(segment, tc_id or "", output, True)
@@ -2421,6 +2505,7 @@ class DeepAgentsAgentManager:
             metadata["analytics_model_id"] = analytics_model_id
             session_manager.update_metadata(session_id, metadata)
 
+            session_manager.ensure_tool_call_ids(session_id)
             raw_history = session_manager.load_session(session_id)
             history = session_manager.load_session_for_agent(session_id)
             persisted_current_user_count = 1 if user_message_already_persisted else 0
@@ -2566,12 +2651,10 @@ class DeepAgentsAgentManager:
 
             def _trace_emit(event: str, payload: dict[str, Any]) -> None:
                 pending_trace_events.append(self._sse(event, payload))
-                if trace_collector is None:
-                    return
-                try:
-                    session_manager.update_trace(session_id, trace_collector.snapshot(), query_id=query_id)
-                except Exception:
-                    logger.debug("Failed to persist incremental trace for session=%s", session_id, exc_info=True)
+                # The live trace already reaches the UI over SSE. Persisting a
+                # growing snapshot for every span used to rewrite tens of MB on
+                # the event loop and stall unrelated session reads. Completed,
+                # cancelled and failed traces are persisted once below.
 
             trace_collector = TraceCollector(
                 session_id=session_id,
@@ -2826,7 +2909,8 @@ class DeepAgentsAgentManager:
                                     pending_tool_starts.pop(tc_id, None)
                                     continue
                                 tool_name = self._tool_message_name(tool_msg, pending_tool_starts)
-                                original_output = self._tool_message_output(tool_msg)
+                                model_tool_output = self._tool_message_output(tool_msg)
+                                original_output = self._tool_message_original_output(tool_msg)
                                 pending_tool = pending_tool_starts.get(tc_id, {})
                                 adapted = tool_result_adapter.adapt(
                                     original_output,
@@ -2844,7 +2928,12 @@ class DeepAgentsAgentManager:
                                 )
                                 if sources:
                                     try:
-                                        tool_msg.content = format_sources_for_model(raw_output, sources)
+                                        tool_msg.content = format_sources_for_model(
+                                            model_tool_output
+                                            if model_tool_output != original_output
+                                            else raw_output,
+                                            sources,
+                                        )
                                     except Exception:
                                         pass
                                     turn_sources = dedupe_sources(turn_sources + sources)
@@ -2865,14 +2954,29 @@ class DeepAgentsAgentManager:
                                 pending_tool_starts.pop(tc_id, None)
 
                                 matched = False
+                                context_fields = self._tool_message_context_fields(
+                                    tool_msg,
+                                    session_id=session_id,
+                                    tool_call_id=tc_id,
+                                    original_output=original_output,
+                                )
                                 if tc_id:
                                     for tc in active_segment["tool_calls"]:
                                         if tc.get("id") == tc_id and "output" not in tc:
+                                            # Execution middleware may route a model-selected
+                                            # tool to a safer effective tool (for example,
+                                            # external read_file -> read_resource).
+                                            tc["tool"] = tool_name
                                             tc["output"] = raw_output
-                                            tc["raw_output"] = original_output
+                                            if original_output != raw_output:
+                                                tc["raw_output"] = original_output
+                                            else:
+                                                tc.pop("raw_output", None)
                                             tc["is_error"] = is_error
+                                            tc["completed_at"] = time.time()
                                             if sources:
                                                 tc["sources"] = sources
+                                            tc.update(context_fields)
                                             matched = True
                                             break
                                 if not matched:
@@ -2882,8 +2986,14 @@ class DeepAgentsAgentManager:
                                             "input": "",
                                             "id": tc_id,
                                             "output": raw_output,
-                                            "raw_output": original_output,
                                             "is_error": is_error,
+                                            "completed_at": time.time(),
+                                            **context_fields,
+                                            **(
+                                                {"raw_output": original_output}
+                                                if original_output != raw_output
+                                                else {}
+                                            ),
                                             **({"sources": sources} if sources else {}),
                                         }
                                     )
@@ -2977,7 +3087,7 @@ class DeepAgentsAgentManager:
                         last_context_usage = current_context_usage
                         trigger_tokens = int(
                             config.get_deepagents_summarization_config().get(
-                                "trigger_tokens", 500000
+                                "trigger_tokens", 200000
                             )
                         )
                         yield self._sse(
@@ -3002,9 +3112,7 @@ class DeepAgentsAgentManager:
                             session_manager.update_agent_context_state(
                                 session_id,
                                 used_tokens=current_context_usage,
-                                messages=[
-                                    message_to_dict(item) for item in effective_messages
-                                ],
+                                messages=_serialize_agent_context_messages(effective_messages),
                             )
                             persisted_summary_cutoff = summary_cutoff
                         except Exception:
@@ -3090,9 +3198,9 @@ class DeepAgentsAgentManager:
                         "input": pending.get("input", ""),
                         "id": tc_id,
                         "output": failed_output,
-                        "raw_output": failed_output,
                         "summary_source": "missing_tool_output",
                         "is_error": True,
+                        "completed_at": time.time(),
                     }
                 )
                 trace_collector.finish_tool_span(
@@ -3134,7 +3242,12 @@ class DeepAgentsAgentManager:
             # rebuilding segment spans here because that duplicates simple
             # turns such as "你好" as two model calls.
             trace = trace_collector.finish(status="completed")
-            session_manager.update_trace(session_id, trace, query_id=query_id)
+            await asyncio.to_thread(
+                session_manager.update_trace,
+                session_id,
+                trace,
+                query_id,
+            )
             yield self._sse(
                 "trace_updated",
                 {"trace": trace, "session_id": session_id, "query_id": query_id},
@@ -3163,9 +3276,9 @@ class DeepAgentsAgentManager:
                     final_state.get("_summarization_event"), dict
                 ):
                     try:
-                        serialized_context = [
-                            message_to_dict(item) for item in effective_context_messages
-                        ]
+                        serialized_context = _serialize_agent_context_messages(
+                            effective_context_messages
+                        )
                     except Exception:
                         logger.warning(
                             "Failed to serialize compact Agent context for session=%s",
@@ -3191,6 +3304,25 @@ class DeepAgentsAgentManager:
                     status="completed",
                 )
             run_messages_persisted = True
+            if final_state and final_state.get("tool_context_enqueue"):
+                tool_context_cfg = ToolContextConfig.from_mapping(
+                    config.get_deepagents_tool_context_config()
+                )
+                job_id = await tool_context_compaction_service.enqueue(
+                    session_id,
+                    tool_context_cfg,
+                )
+                if job_id:
+                    yield self._sse(
+                        "context_maintenance",
+                        {
+                            "status": "start",
+                            "phase": "tool_context_compaction",
+                            "message": "正在后台优化历史工具上下文…",
+                            "job_id": job_id,
+                            "session_id": session_id,
+                        },
+                    )
             yield self._sse(
                 "citations_finalized",
                 {
@@ -3236,6 +3368,23 @@ class DeepAgentsAgentManager:
             except Exception:
                 logger.warning("Failed to persist partial cancelled run for session=%s", session_id, exc_info=True)
             try:
+                cancelled_tool_context_cfg = ToolContextConfig.from_mapping(
+                    config.get_deepagents_tool_context_config()
+                )
+                if cancelled_tool_context_cfg.enabled:
+                    await asyncio.shield(
+                        tool_context_compaction_service.enqueue(
+                            session_id,
+                            cancelled_tool_context_cfg,
+                        )
+                    )
+            except Exception:
+                logger.debug(
+                    "Failed to enqueue Tool Context maintenance after cancellation for session=%s",
+                    session_id,
+                    exc_info=True,
+                )
+            try:
                 permission_resume_registry.reject_session(
                     session_id,
                     "Agent stream was cancelled by the client.",
@@ -3261,7 +3410,12 @@ class DeepAgentsAgentManager:
             try:
                 if trace_collector is not None:
                     trace = trace_collector.finish(status="cancelled", error="client_cancelled")
-                    session_manager.update_trace(session_id, trace, query_id=query_id)
+                    await asyncio.to_thread(
+                        session_manager.update_trace,
+                        session_id,
+                        trace,
+                        query_id,
+                    )
             except Exception:
                 pass
             if trace_context_active and trace_collector is not None:
@@ -3293,9 +3447,39 @@ class DeepAgentsAgentManager:
             except Exception:
                 logger.warning("Failed to persist partial failed run for session=%s", session_id, exc_info=True)
             try:
+                failed_tool_context_cfg = ToolContextConfig.from_mapping(
+                    config.get_deepagents_tool_context_config()
+                )
+                failed_job_id = await tool_context_compaction_service.enqueue(
+                    session_id,
+                    failed_tool_context_cfg,
+                )
+                if failed_job_id:
+                    yield self._sse(
+                        "context_maintenance",
+                        {
+                            "status": "start",
+                            "phase": "tool_context_compaction",
+                            "message": "正在后台优化历史工具上下文…",
+                            "job_id": failed_job_id,
+                            "session_id": session_id,
+                        },
+                    )
+            except Exception:
+                logger.debug(
+                    "Failed to enqueue Tool Context maintenance after error for session=%s",
+                    session_id,
+                    exc_info=True,
+                )
+            try:
                 if trace_collector is not None:
                     trace = trace_collector.finish(status="error", error=error_msg)
-                    session_manager.update_trace(session_id, trace, query_id=query_id)
+                    await asyncio.to_thread(
+                        session_manager.update_trace,
+                        session_id,
+                        trace,
+                        query_id,
+                    )
             except Exception:
                 pass
             if trace_context_active and trace_collector is not None:

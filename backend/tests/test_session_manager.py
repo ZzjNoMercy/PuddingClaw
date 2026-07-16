@@ -179,13 +179,19 @@ def test_update_and_get_trace(tmp_path):
     assert loaded == trace
 
     raw = session_manager.get_raw_messages("trace-session")
-    assert raw["trace"] == trace
-    assert raw["latest_query_id"] == "query-1"
-    assert raw["latest_trace_id"] == "trace-1"
-    assert raw["traces"]["query-1"] == trace
+    assert "trace" not in raw
+    assert "traces" not in raw
+
+    persisted_session = session_manager._read_file("trace-session")
+    assert "trace" not in persisted_session
+    assert "traces" not in persisted_session
+    trace_state = session_manager.get_trace_state("trace-session")
+    assert trace_state["latest_query_id"] == "query-1"
+    assert trace_state["latest_trace_id"] == "trace-1"
+    assert trace_state["traces"]["query-1"] == trace
 
 
-def test_update_trace_keeps_latest_trace_compatible(tmp_path):
+def test_update_trace_keeps_history_without_duplicating_latest_trace(tmp_path):
     session_manager.initialize(tmp_path)
     session_manager.create_session("trace-session-2")
 
@@ -215,3 +221,68 @@ def test_update_trace_keeps_latest_trace_compatible(tmp_path):
     traces = session_manager.get_traces("trace-session-2")
     assert traces["query-1"] == first
     assert traces["query-2"] == second
+    trace_sidecar = session_manager._read_trace_file("trace-session-2")
+    assert "trace" not in trace_sidecar
+
+
+def test_legacy_embedded_traces_are_migrated_once(tmp_path):
+    import json
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("legacy-trace-session")
+    path = session_manager._session_path("legacy-trace-session")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    trace = {
+        "trace_id": "legacy-trace-1",
+        "query_id": "legacy-query-1",
+        "session_id": "legacy-trace-session",
+        "spans": [{"id": "root", "type": "root"}],
+    }
+    data.update({
+        "trace": trace,
+        "traces": {"legacy-query-1": trace},
+        "latest_query_id": "legacy-query-1",
+        "latest_trace_id": "legacy-trace-1",
+    })
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+    assert session_manager.list_sessions()[0]["id"] == "legacy-trace-session"
+    assert session_manager.load_session("legacy-trace-session") == []
+    migrated = json.loads(path.read_text(encoding="utf-8"))
+    assert "trace" not in migrated
+    assert "traces" not in migrated
+    assert session_manager.get_trace("legacy-trace-session") == trace
+    sidecar = json.loads(
+        session_manager._trace_path("legacy-trace-session").read_text(encoding="utf-8")
+    )
+    assert "trace" not in sidecar
+    assert sidecar["traces"] == {"legacy-query-1": trace}
+
+
+def test_conversation_history_does_not_read_trace_sidecar(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("fast-history-session")
+    session_manager.save_message("fast-history-session", "user", "只读取消息")
+    session_manager.update_trace(
+        "fast-history-session",
+        {"trace_id": "trace-large", "query_id": "query-large", "spans": []},
+        query_id="query-large",
+    )
+    trace_path = session_manager._trace_path("fast-history-session")
+    original_read_text = Path.read_text
+
+    def guarded_read_text(path, *args, **kwargs):
+        if path == trace_path:
+            raise AssertionError("conversation history must not read the trace sidecar")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded_read_text)
+
+    assert session_manager.load_session("fast-history-session") == [
+        {"role": "user", "content": "只读取消息"}
+    ]
+    assert session_manager.get_raw_messages("fast-history-session")["messages"] == [
+        {"role": "user", "content": "只读取消息"}
+    ]

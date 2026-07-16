@@ -11,6 +11,7 @@
 """
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -61,17 +62,53 @@ class TestContextEngineeringConfig:
         assert cm["keep_recent"] == 8
         assert cm["compact_budget_tokens"] == 120000
 
-    def test_deepagents_summarization_is_independent_at_500k(self):
+    def test_deepagents_summarization_is_independent_at_200k(self):
         from config import _DEFAULT_CONFIG
 
         agent_summary = _DEFAULT_CONFIG["compression"]["deepagents"]["summarization"]
         chat_middleware = _DEFAULT_CONFIG["compression"]["middleware"]
 
-        assert agent_summary["trigger_tokens"] == 500000
+        assert agent_summary["trigger_tokens"] == 200000
+        assert "summary_input_tokens" not in agent_summary
         assert agent_summary["keep_messages"] == 20
         # Legacy Chat keeps its existing two-stage policy.
         assert chat_middleware["summarization"]["trigger_tokens"] == 200000
         assert chat_middleware["compaction"]["trigger_tokens"] == 500000
+
+    def test_deepagents_summary_input_budget_uses_model_context_window(self, tmp_path, monkeypatch):
+        import config
+
+        config_path = tmp_path / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "fallback_llm": {"context_window": 500000},
+                    "compression": {
+                        "deepagents": {
+                            "summarization": {
+                                "trigger_tokens": 120000,
+                                "summary_input_tokens": 1,
+                            }
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(config, "CONFIG_FILE", config_path)
+
+        runtime = config.get_deepagents_summarization_config()
+        displayed = config.get_settings_for_display()
+        assert runtime["trigger_tokens"] == 120000
+        assert runtime["summary_input_tokens"] == 400000
+        assert "summary_input_tokens" not in displayed["compression"]["deepagents"]["summarization"]
+
+        config.update_settings(
+            {"compression": {"deepagents": {"summarization": {"trigger_tokens": 130000}}}}
+        )
+        saved = json.loads(config_path.read_text(encoding="utf-8"))
+        assert saved["compression"]["deepagents"]["summarization"]["trigger_tokens"] == 130000
+        assert "summary_input_tokens" not in saved["compression"]["deepagents"]["summarization"]
 
     def test_chat_preannounces_pending_tool_result_clear(self):
         from api.chat import _should_preannounce_tool_result_clear
@@ -1010,5 +1047,5 @@ class TestTokensAPI:
                     result = await get_session_token_count(sid)
 
         assert result["total_tokens"] == 6800
-        assert result["compaction_trigger"] == 500000
-        assert result["percentage"] == 1.4
+        assert result["compaction_trigger"] == 200000
+        assert result["percentage"] == 3.4

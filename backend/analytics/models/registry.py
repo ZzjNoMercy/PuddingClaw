@@ -14,6 +14,8 @@ from typing import Any, BinaryIO
 
 import yaml
 
+from knowledge.paths import get_knowledge_root
+
 
 class AnalyticsModelError(ValueError):
     """Raised when analytics model input or filesystem state is invalid."""
@@ -278,21 +280,34 @@ class AnalyticsModelRegistry:
             for dimension_ref, asset_refs in sorted(binding_assets_by_dimension.items())
             if len(set(asset_refs)) >= 2
         ]
+        data_asset_context: list[dict[str, Any]] = []
         logical_dataset_context: list[dict[str, Any]] = []
+        missing_data_assets: list[str] = []
         table_refs = [str(item).strip() for item in ((model.get("frontmatter") or {}).get("data_assets") or {}).get("tables") or []]
         for table_ref in table_refs:
+            if not table_ref.startswith("table_asset:"):
+                database_source_id, separator, table_name = table_ref.rpartition(".")
+                data_asset_context.append(
+                    {
+                        "ref": table_ref,
+                        "asset_type": "database_table",
+                        "name": table_name if separator else table_ref,
+                        "database_source_id": database_source_id if separator else "",
+                        "table_name": table_name if separator else table_ref,
+                    }
+                )
+                continue
             asset_id = table_ref.removeprefix("table_asset:").strip()
             if not asset_id or "/" in asset_id or "\\" in asset_id:
+                missing_data_assets.append(table_ref)
                 continue
             definition_path = self.base_dir / "data" / "analytics-concat-datasets" / asset_id / "dataset.json"
             try:
                 definition = json.loads(definition_path.read_text(encoding="utf-8"))
             except Exception:
-                continue
-            if not isinstance(definition, dict) or definition.get("formatter") != "logical-data-asset":
-                continue
-            logical_dataset_context.append(
-                {
+                definition = None
+            if isinstance(definition, dict) and definition.get("formatter") == "logical-data-asset":
+                logical_summary = {
                     "asset_id": asset_id,
                     "name": definition.get("name"),
                     "description": definition.get("description") or "",
@@ -309,6 +324,68 @@ class AnalyticsModelRegistry:
                         if isinstance(source, dict)
                     ],
                 }
+                logical_dataset_context.append(logical_summary)
+                data_asset_context.append(
+                    {"ref": table_ref, "asset_type": "logical_dataset", **logical_summary}
+                )
+                continue
+
+            profile_path = (
+                get_knowledge_root(self.base_dir)
+                / ".puddingclaw"
+                / "table_profiles"
+                / f"{asset_id}.profile.json"
+            )
+            try:
+                profile = json.loads(profile_path.read_text(encoding="utf-8"))
+            except Exception:
+                profile = None
+            if not isinstance(profile, dict):
+                missing_data_assets.append(table_ref)
+                data_asset_context.append(
+                    {
+                        "ref": table_ref,
+                        "asset_id": asset_id,
+                        "asset_type": "table_asset",
+                        "status": "metadata_missing",
+                    }
+                )
+                continue
+
+            columns = [item for item in profile.get("columns") or [] if isinstance(item, dict)]
+            year_column = next((item for item in columns if str(item.get("name") or "") == "年份"), None)
+            year_values = [str(item) for item in (year_column or {}).get("sample_values") or []]
+            month_fields = [
+                str(item.get("name"))
+                for item in columns
+                if str(item.get("name") or "").isdigit()
+                and 1 <= int(str(item.get("name"))) <= 12
+            ]
+            data_asset_context.append(
+                {
+                    "ref": table_ref,
+                    "asset_id": asset_id,
+                    "asset_type": "raw_table",
+                    "name": profile.get("file_name") or asset_id,
+                    "source_type": profile.get("source_type"),
+                    "virtual_path": profile.get("virtual_path"),
+                    "sheet_name": profile.get("sheet_name"),
+                    "schema": {
+                        "fields": [str(item.get("name") or "") for item in columns],
+                        "field_types": {
+                            str(item.get("name") or ""): str(item.get("dtype") or "")
+                            for item in columns
+                        },
+                    },
+                    "coverage": {
+                        "years": year_values,
+                        "month_fields": month_fields,
+                    },
+                    "statistics": {
+                        "shape": profile.get("shape"),
+                        "size_bytes": profile.get("size_bytes"),
+                    },
+                }
             )
         return {
             "id": model["id"],
@@ -323,6 +400,8 @@ class AnalyticsModelRegistry:
             "semantic_assets": semantic_asset_context,
             "asset_relations": relation_context,
             "derived_dimension_paths": derived_dimension_paths,
+            "data_assets": data_asset_context,
+            "missing_data_assets": list(dict.fromkeys(missing_data_assets)),
             "logical_datasets": logical_dataset_context,
         }
 

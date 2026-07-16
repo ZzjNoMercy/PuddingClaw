@@ -468,6 +468,67 @@ def test_settings_api_persists_harness_model_call_limit(tmp_path, monkeypatch):
     assert displayed["harness"]["model_call_limit"]["thread_limit"] == 100
 
 
+def test_settings_api_persists_deepagents_context_engineering_without_touching_chat(
+    tmp_path, monkeypatch
+):
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
+    chat_before = config.load_config()["compression"]["middleware"]
+    payload = {
+        "compression": {
+            "deepagents": {
+                "summarization": {"trigger_tokens": 260000},
+                "tool_context": {
+                    "enabled": False,
+                    "single_tool_trigger_tokens": 9000,
+                    "background_min_result_tokens": 1100,
+                    "keep_recent_tool_results": 15,
+                },
+            }
+        }
+    }
+
+    client = TestClient(app)
+    response = client.put("/api/settings", json=payload)
+    assert response.status_code == 200, response.text
+    displayed = client.get("/api/settings").json()
+    deepagents = displayed["compression"]["deepagents"]
+    assert deepagents["summarization"]["trigger_tokens"] == 260000
+    assert "summary_input_tokens" not in deepagents["summarization"]
+    assert deepagents["tool_context"] == {
+        **deepagents["tool_context"],
+        "enabled": False,
+        "single_tool_trigger_tokens": 9000,
+        "background_min_result_tokens": 1100,
+        "keep_recent_tool_results": 15,
+    }
+    assert displayed["compression"]["middleware"] == chat_before
+
+
+def test_settings_api_rejects_invalid_tool_context_threshold_relation(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
+
+    client = TestClient(app)
+    response = client.put(
+        "/api/settings",
+        json={
+            "compression": {
+                "deepagents": {
+                    "tool_context": {
+                        "single_tool_trigger_tokens": 8000,
+                        "background_min_result_tokens": 8000,
+                    }
+                }
+            }
+        },
+    )
+    assert response.status_code == 400
+    assert "小于执行中单条工具阈值" in response.json()["detail"]
+
+
 def test_settings_api_migrates_legacy_subagent_items_to_keyed_config(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     config_path.write_text("{}", encoding="utf-8")
@@ -588,9 +649,9 @@ def test_agent_messages_do_not_inline_images_for_main_agent():
         [{"id": "att_1", "type": "image", "name": "diagram.png"}],
     )
 
-    assert isinstance(messages[-1]["content"], str)
-    assert "image_analyzer" in messages[-1]["content"]
-    assert "subagent_type=image_analyzer" in messages[-1]["content"]
+    assert isinstance(messages[-1].content, str)
+    assert "image_analyzer" in messages[-1].content
+    assert "subagent_type=image_analyzer" in messages[-1].content
 
 
 def test_agent_collects_image_inputs_for_native_task_subagent(tmp_path):

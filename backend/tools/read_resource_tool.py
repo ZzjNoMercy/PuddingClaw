@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Type
 
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
@@ -26,6 +25,8 @@ class ReadResourceInput(BaseModel):
             "Do not pass /workspace virtual paths here."
         )
     )
+    offset: int = Field(default=0, ge=0, description="Zero-based line offset for text files")
+    limit: int = Field(default=2000, ge=1, le=2000, description="Maximum text lines to return")
 
 
 class ReadResourceTool(BaseTool):
@@ -35,7 +36,7 @@ class ReadResourceTool(BaseTool):
         "(`att_xxx`), `/knowledge/...` virtual paths, and user-provided paths outside the `/workspace/` virtual namespace. "
         "Never use read_file for non-workspace paths; read_file is only for `/workspace/...` virtual paths."
     )
-    args_schema: Type[BaseModel] = ReadResourceInput
+    args_schema: type[BaseModel] = ReadResourceInput
     risk_level: str = "moderate"
     session_id: str = ""
     workspace_path: str = ""
@@ -124,7 +125,7 @@ class ReadResourceTool(BaseTool):
             return None
         return path
 
-    def _run(self, resource: str) -> str:
+    def _run(self, resource: str, offset: int = 0, limit: int = 2000) -> str:
         value = resource.strip()
         if not value:
             return "❌ Missing resource."
@@ -139,7 +140,7 @@ class ReadResourceTool(BaseTool):
         return ReadExternalFileTool(
             session_id=self.session_id,
             workspace_path=self.workspace_path,
-        ).invoke({"path": value})
+        ).invoke({"path": value, "offset": offset, "limit": limit})
 
 
 def create_read_resource_tool(base_dir: Path) -> ReadResourceTool:

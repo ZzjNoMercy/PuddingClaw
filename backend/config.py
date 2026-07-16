@@ -2,12 +2,14 @@
 
 import json
 import logging
+import copy
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 CONFIG_FILE = Path(__file__).resolve().parent / "config.json"
+DEEPAGENTS_SUMMARY_INPUT_CONTEXT_RATIO = 0.8
 
 # Ch5 迁移提示标记：legacy summarization 阈值检测只提示一次（防日志噪声）
 _LEGACY_WARN_SHOWN: bool = False
@@ -216,9 +218,18 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         "deepagents": {
             "summarization": {
                 "enabled": True,
-                "trigger_tokens": 500000,
+                "trigger_tokens": 200000,
                 "keep_messages": 20,
-                "summary_input_tokens": 400000,
+            },
+            "tool_context": {
+                "enabled": True,
+                "single_tool_trigger_tokens": 8000,
+                "background_min_result_tokens": 1000,
+                "keep_recent_tool_results": 12,
+                "batch_size": 6,
+                "max_concurrency": 4,
+                "job_timeout_seconds": 120,
+                "max_candidates_per_job": 48,
             },
         },
         "middleware": {
@@ -309,13 +320,27 @@ _DEFAULT_CONFIG: dict[str, Any] = {
 
 def _deep_merge(base: dict, override: dict) -> dict:
     """Deep merge override into base, preserving nested defaults."""
-    result = dict(base)
+    # Callers mutate the returned settings object. A shallow copy would retain
+    # references into _DEFAULT_CONFIG whenever an override omits a nested key,
+    # making one settings save silently change process-wide defaults.
+    result = copy.deepcopy(base)
     for key, value in override.items():
         if key in result and isinstance(result[key], dict) and isinstance(value, dict):
             result[key] = _deep_merge(result[key], value)
         else:
             result[key] = value
     return result
+
+
+def _deepagents_summary_input_tokens(config: dict[str, Any]) -> int:
+    """Derive the summary-call input ceiling from the configured model window."""
+
+    raw_context_window = config.get("fallback_llm", {}).get("context_window", 1000000)
+    try:
+        context_window = max(1, int(raw_context_window))
+    except (TypeError, ValueError):
+        context_window = 1000000
+    return max(1, int(context_window * DEEPAGENTS_SUMMARY_INPUT_CONTEXT_RATIO))
 
 
 def _migrate_legacy_config(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -343,6 +368,10 @@ def _migrate_legacy_config(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         if canonical != data["subagents"]:
             data["subagents"] = canonical
             migrated = True
+    summarization = data.get("compression", {}).get("deepagents", {}).get("summarization", {})
+    if isinstance(summarization, dict) and "summary_input_tokens" in summarization:
+        summarization.pop("summary_input_tokens", None)
+        migrated = True
     if migrated:
         logger.info("[config] 已迁移 legacy llm/embedding -> fallback_llm/fallback_embedding")
     return data, migrated
@@ -1161,9 +1190,14 @@ def update_settings(updates: dict[str, Any]) -> None:
         llm_update = updates["fallback_llm"]
         if "fallback_llm" not in config:
             config["fallback_llm"] = {}
-        for key in ("provider", "model", "base_url", "temperature", "max_tokens"):
+        for key in ("provider", "model", "base_url", "temperature", "max_tokens", "context_window"):
             if key in llm_update:
                 config["fallback_llm"][key] = llm_update[key]
+        if "context_window" in llm_update:
+            context_window = int(llm_update["context_window"])
+            if not 10000 <= context_window <= 10000000:
+                raise ValueError("模型上下文窗口必须在 10,000 到 10,000,000 tokens 之间")
+            config["fallback_llm"]["context_window"] = context_window
         if "thinking" in llm_update:
             config["fallback_llm"]["thinking"] = llm_update["thinking"]
         # Only update API key if a non-empty value is provided
@@ -1342,6 +1376,41 @@ def update_settings(updates: dict[str, Any]) -> None:
             config["compression"]["ratio"] = comp_update["ratio"]
         if "trigger_count" in comp_update:
             config["compression"]["trigger_count"] = comp_update["trigger_count"]
+        if "deepagents" in comp_update:
+            deepagents_update = comp_update["deepagents"]
+            if not isinstance(deepagents_update, dict):
+                raise ValueError("compression.deepagents must be an object")
+            summary_update = deepagents_update.get("summarization")
+            if isinstance(summary_update, dict):
+                summary_update = dict(summary_update)
+                summary_update.pop("summary_input_tokens", None)
+                if "trigger_tokens" in summary_update:
+                    trigger = int(summary_update["trigger_tokens"])
+                    if not 10000 <= trigger <= 1000000:
+                        raise ValueError("全局摘要阈值必须在 10,000 到 1,000,000 tokens 之间")
+                    summary_update["trigger_tokens"] = trigger
+                deepagents_update = dict(deepagents_update)
+                deepagents_update["summarization"] = summary_update
+            tool_context_update = deepagents_update.get("tool_context")
+            if isinstance(tool_context_update, dict):
+                current_tool_context = (
+                    config["compression"].get("deepagents", {}).get("tool_context", {})
+                )
+                merged_tool_context = _deep_merge(current_tool_context, tool_context_update)
+                single = int(merged_tool_context.get("single_tool_trigger_tokens", 8000))
+                background = int(merged_tool_context.get("background_min_result_tokens", 1000))
+                keep_recent = int(merged_tool_context.get("keep_recent_tool_results", 12))
+                if not 1000 <= single <= 100000:
+                    raise ValueError("执行中单条工具阈值必须在 1,000 到 100,000 tokens 之间")
+                if not 100 <= background < single:
+                    raise ValueError("静默压缩单条下限必须至少为 100 且小于执行中单条工具阈值")
+                if not 1 <= keep_recent <= 100:
+                    raise ValueError("保留最近工具结果必须在 1 到 100 条之间")
+            existing_deepagents = config["compression"].get("deepagents", {})
+            config["compression"]["deepagents"] = _deep_merge(existing_deepagents, deepagents_update)
+            config["compression"]["deepagents"].setdefault("summarization", {}).pop(
+                "summary_input_tokens", None
+            )
         if "middleware" in comp_update:
             existing_mw = config["compression"].get("middleware", {})
             config["compression"]["middleware"] = _deep_merge(existing_mw, comp_update["middleware"])
@@ -1386,17 +1455,42 @@ def get_compaction_trigger_tokens() -> int:
 def get_deepagents_summarization_config() -> dict[str, Any]:
     """Return Agent-mode summarization settings, isolated from legacy Chat."""
 
-    return dict(
-        load_config()
+    config = load_config()
+    result = dict(
+        config
         .get("compression", {})
         .get("deepagents", {})
         .get(
             "summarization",
             {
                 "enabled": True,
-                "trigger_tokens": 500000,
+                "trigger_tokens": 200000,
                 "keep_messages": 20,
-                "summary_input_tokens": 400000,
+            },
+        )
+    )
+    result["summary_input_tokens"] = _deepagents_summary_input_tokens(config)
+    return result
+
+
+def get_deepagents_tool_context_config() -> dict[str, Any]:
+    """Return DeepAgents-only Tool Context settings."""
+
+    return dict(
+        load_config()
+        .get("compression", {})
+        .get("deepagents", {})
+        .get(
+            "tool_context",
+            {
+                "enabled": True,
+                "single_tool_trigger_tokens": 8000,
+                "background_min_result_tokens": 1000,
+                "keep_recent_tool_results": 12,
+                "batch_size": 6,
+                "max_concurrency": 4,
+                "job_timeout_seconds": 120,
+                "max_candidates_per_job": 48,
             },
         )
     )

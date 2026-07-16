@@ -73,6 +73,8 @@ async def put_settings(request: SettingsUpdateRequest):
         import capabilities
         capabilities.invalidate_capabilities()
         return {"success": True, "message": "Settings saved"}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save settings: {e}")
 

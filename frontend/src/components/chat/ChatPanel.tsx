@@ -51,7 +51,11 @@ export default function ChatPanel() {
               <div className="animate-fade-in px-4 py-1.5">
                 <div className="mx-auto w-full max-w-[900px]">
                   <div className="inline-flex items-center gap-2 rounded-full border border-black/[0.05] bg-white/70 px-3 py-1.5 text-[12px] text-gray-500 shadow-sm">
-                    <Loader2 className="h-3.5 w-3.5 animate-spin text-[#002fa7]" />
+                    {maintenanceStatus.phase.endsWith("_done") ? (
+                      <Sparkles className="h-3.5 w-3.5 text-emerald-500" />
+                    ) : (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin text-[#002fa7]" />
+                    )}
                     <span>{maintenanceStatus.message}</span>
                   </div>
                 </div>

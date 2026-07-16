@@ -1059,6 +1059,7 @@ def test_deepagents_manager_emits_and_persists_tool_events(tmp_path, monkeypatch
     assert json.loads(done["data"])["content"] == "已读取。"
     assert assistant_with_tool["tool_calls"][0]["tool"] == "read_file"
     assert assistant_with_tool["tool_calls"][0]["output"] == "README content"
+    assert "raw_output" not in assistant_with_tool["tool_calls"][0]
 
 
 def test_deepagents_manager_emits_sources_citations_and_title(tmp_path, monkeypatch):
@@ -1357,7 +1358,7 @@ def test_deepagents_manager_ignores_internal_context_summary_chunks(tmp_path, mo
     assert "SESSION INTENT" not in assistant["content"]
 
 
-def test_deepagents_summarization_uses_agent_only_500k_policy(monkeypatch):
+def test_deepagents_summarization_uses_agent_only_configured_policy(monkeypatch):
     from deepagents.backends import StateBackend
     from graph import deepagents_manager as manager_module
     from llm.model_client import ModelClientChatModel

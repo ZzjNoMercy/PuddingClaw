@@ -1,8 +1,12 @@
 """SessionManager — 短期记忆管理器，基于 JSON 文件持久化会话历史"""
 
 import json
+import hashlib
+import re
+import threading
 import time
 import uuid
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -11,22 +15,157 @@ COMPRESSED_CONTEXT_PREFIX = "[历史对话摘要]"
 MIDDLE_TRIM_CONTEXT_PREFIX = "[中段历史摘要]"
 
 
+def _session_write_locked(method):
+    """Serialize a complete read-modify-write transaction per Session."""
+
+    @wraps(method)
+    def wrapped(self, session_id: str, *args, **kwargs):
+        with self._tool_context_lock(session_id):
+            return method(self, session_id, *args, **kwargs)
+
+    return wrapped
+
+
 class SessionManager:
     """短期记忆核心类：将每个会话的消息历史存为 sessions/{id}.json 文件"""
 
+    # Background services may receive distinct SessionManager instances in
+    # tests or future in-process workers. Key locks by the persisted file path
+    # so the complete read-modify-write transaction remains serialized.
+    _shared_session_locks: dict[str, threading.RLock] = {}
+    _shared_session_locks_guard = threading.Lock()
+
     def __init__(self) -> None:
         self._sessions_dir: Path | None = None  # 会话文件存储目录，initialize() 时设置
+        self._traces_dir: Path | None = None
+
+    def _tool_context_lock(self, session_id: str) -> threading.RLock:
+        """Return the per-session lock used by background context maintenance."""
+
+        if self._sessions_dir is None:
+            key = session_id
+        else:
+            key = str(self._session_path(session_id).resolve())
+        with type(self)._shared_session_locks_guard:
+            return type(self)._shared_session_locks.setdefault(key, threading.RLock())
 
     def initialize(self, base_dir: Path) -> None:
         """初始化：设置存储目录为 base_dir/sessions/，不存在则创建"""
         self._sessions_dir = base_dir / "sessions"  # 拼接会话目录路径
         self._sessions_dir.mkdir(exist_ok=True)      # 目录不存在时自动创建
+        self._traces_dir = self._sessions_dir / "traces"
+        self._traces_dir.mkdir(exist_ok=True)
 
     def _session_path(self, session_id: str) -> Path:
         """根据 session_id 生成对应的 JSON 文件路径"""
         assert self._sessions_dir is not None                                    # 确保已初始化
         safe_id = "".join(c for c in session_id if c.isalnum() or c in "-_")     # 过滤特殊字符防路径注入
         return self._sessions_dir / f"{safe_id}.json"                            # 返回完整文件路径
+
+    def _trace_path(self, session_id: str) -> Path:
+        """Return the sidecar path used for heavyweight execution traces."""
+        assert self._traces_dir is not None
+        safe_id = "".join(c for c in session_id if c.isalnum() or c in "-_")
+        return self._traces_dir / f"{safe_id}.json"
+
+    @staticmethod
+    def _atomic_write_json(path: Path, data: Any, *, indent: int | None = None) -> None:
+        """Atomically replace a JSON file.
+
+        Trace sidecars deliberately use compact JSON: trace payloads contain many
+        nested snapshots and indentation alone previously consumed tens of MB.
+        """
+        temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temp_path.write_text(
+                json.dumps(
+                    data,
+                    ensure_ascii=False,
+                    indent=indent,
+                    separators=None if indent is not None else (",", ":"),
+                ),
+                encoding="utf-8",
+            )
+            temp_path.replace(path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+    def _migrate_legacy_traces(self, session_id: str, data: dict[str, Any]) -> bool:
+        """Move embedded v2 traces into one non-duplicated sidecar.
+
+        Returns True when the main session object was changed. Migration is lazy,
+        so existing installations pay the large-file parse cost only once.
+        """
+        legacy_traces = data.get("traces")
+        legacy_latest = data.get("trace")
+        if not isinstance(legacy_traces, dict) and not isinstance(legacy_latest, dict):
+            return False
+
+        sidecar = self._read_trace_file(session_id, migrate=False)
+        sidecar_traces = sidecar.get("traces")
+        traces: dict[str, Any] = {}
+        if isinstance(legacy_traces, dict):
+            traces.update(
+                {
+                    str(query_id): trace
+                    for query_id, trace in legacy_traces.items()
+                    if isinstance(trace, dict)
+                }
+            )
+        if isinstance(sidecar_traces, dict):
+            # A sidecar may already contain a newer completed trace if a prior
+            # migration was interrupted before the main-file rewrite.
+            traces.update(
+                {
+                    str(query_id): trace
+                    for query_id, trace in sidecar_traces.items()
+                    if isinstance(trace, dict)
+                }
+            )
+
+        latest_query_id = data.get("latest_query_id") or sidecar.get("latest_query_id")
+        if isinstance(legacy_latest, dict):
+            fallback_id = legacy_latest.get("query_id") or data.get("latest_trace_id")
+            if not latest_query_id and isinstance(fallback_id, str):
+                latest_query_id = fallback_id
+            if isinstance(latest_query_id, str) and latest_query_id not in traces:
+                traces[latest_query_id] = legacy_latest
+
+        if "loaded_skill_ids" not in data:
+            inferred_skill_ids = self._loaded_skill_ids_from_traces({"traces": traces})
+            if inferred_skill_ids:
+                data["loaded_skill_ids"] = sorted(inferred_skill_ids)
+
+        migrated = {"traces": traces}
+        if isinstance(latest_query_id, str):
+            migrated["latest_query_id"] = latest_query_id
+        latest_trace_id = data.get("latest_trace_id") or sidecar.get("latest_trace_id")
+        if isinstance(latest_trace_id, str):
+            migrated["latest_trace_id"] = latest_trace_id
+        self._write_trace_file(session_id, migrated)
+
+        for key in ("trace", "traces", "latest_query_id", "latest_trace_id"):
+            data.pop(key, None)
+        return True
+
+    def _read_trace_file(self, session_id: str, *, migrate: bool = True) -> dict[str, Any]:
+        path = self._trace_path(session_id)
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                return data if isinstance(data, dict) else {}
+            except Exception:
+                return {}
+        if migrate:
+            # Reading the main file here is only a legacy fallback. New sessions
+            # never touch session.json when a trace is requested or updated.
+            self._read_file(session_id)
+            if path.exists():
+                return self._read_trace_file(session_id, migrate=False)
+        return {}
+
+    def _write_trace_file(self, session_id: str, data: dict[str, Any]) -> None:
+        self._atomic_write_json(self._trace_path(session_id), data)
 
     def _read_file(self, session_id: str) -> dict[str, Any]:
         """从磁盘读取会话文件，自动兼容 v1(纯列表) → v2(带元数据的字典) 格式"""
@@ -43,6 +182,8 @@ class SessionManager:
                     "updated_at": now,                           # 更新时间设为当前
                     "messages": data,                            # 原始消息列表保留
                 }
+            if isinstance(data, dict) and self._migrate_legacy_traces(session_id, data):
+                self._write_file(session_id, data)
             return data                                          # v2 格式直接返回
         except (json.JSONDecodeError, Exception):                # JSON 解析失败返回空
             return {}
@@ -51,16 +192,9 @@ class SessionManager:
         """原子写入会话数据，避免读者观察到半截 JSON。"""
         data["updated_at"] = time.time()                                   # 每次写入都刷新更新时间
         path = self._session_path(session_id)                              # 获取文件路径
-        temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-        try:
-            temp_path.write_text(
-                json.dumps(data, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            temp_path.replace(path)
-        finally:
-            temp_path.unlink(missing_ok=True)
+        self._atomic_write_json(path, data, indent=2)
 
+    @_session_write_locked
     def create_session(self, session_id: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         """创建空会话，返回元数据（id/title/时间戳）"""
         now = time.time()                    # 当前时间戳
@@ -96,6 +230,7 @@ class SessionManager:
                 meta[key] = data.get(key)
         return meta
 
+    @_session_write_locked
     def update_metadata(self, session_id: str, metadata: dict[str, Any]) -> dict[str, Any]:
         """Merge metadata into a session, creating the session if needed."""
         data = self._read_file(session_id)
@@ -174,6 +309,7 @@ class SessionManager:
             self._write_file(session_id, data)
         return loaded
 
+    @_session_write_locked
     def add_loaded_skill_ids(self, session_id: str, skill_ids: list[str]) -> list[str]:
         """Persist newly loaded Skills for subsequent turns in the same session."""
 
@@ -219,6 +355,7 @@ class SessionManager:
 
         return messages
 
+    @_session_write_locked
     def save_message(
         self,
         session_id: str,                                      # 会话 ID
@@ -306,6 +443,7 @@ class SessionManager:
             msg["status"] = status
         return msg
 
+    @_session_write_locked
     def upsert_assistant_message(
         self,
         session_id: str,
@@ -359,17 +497,41 @@ class SessionManager:
 
         messages = data.setdefault("messages", [])
         replaced = False
+        previous_context_signature: tuple[tuple[str, str, str], ...] = ()
+
+        def context_signature(message: dict[str, Any]) -> tuple[tuple[str, str, str], ...]:
+            entries: list[tuple[str, str, str]] = []
+            for tool_call in message.get("tool_calls") or []:
+                if not isinstance(tool_call, dict) or not tool_call.get("context_output"):
+                    continue
+                metadata = tool_call.get("context_compaction")
+                if not isinstance(metadata, dict) or metadata.get("status") != "ready":
+                    continue
+                entries.append(
+                    (
+                        str(tool_call.get("id") or ""),
+                        str(metadata.get("source_hash") or ""),
+                        str(tool_call.get("context_output") or ""),
+                    )
+                )
+            return tuple(entries)
+
         for index, existing in enumerate(messages):
             if (
                 isinstance(existing, dict)
                 and existing.get("role") == "assistant"
                 and existing.get("query_id") == query_id
             ):
+                previous_context_signature = context_signature(existing)
                 messages[index] = msg
                 replaced = True
                 break
         if not replaced:
             messages.append(msg)
+
+        next_context_signature = context_signature(msg)
+        if next_context_signature and next_context_signature != previous_context_signature:
+            data["tool_context_revision"] = int(data.get("tool_context_revision", 0) or 0) + 1
 
         if isinstance(data.get("display_messages"), list):
             display_messages = data["display_messages"]
@@ -426,6 +588,7 @@ class SessionManager:
             return ""
         return "\n\n[历史工具结果摘要，仅用于理解已完成事实，不代表本轮新工具调用]\n" + "\n".join(lines)
 
+    @_session_write_locked
     def rename_session(self, session_id: str, title: str) -> None:
         """重命名会话标题"""
         data = self._read_file(session_id)                             # 读取会话数据
@@ -442,6 +605,7 @@ class SessionManager:
         todos = data.get("todos")
         return list(todos) if isinstance(todos, list) else []
 
+    @_session_write_locked
     def update_todos(
         self,
         session_id: str,
@@ -457,21 +621,18 @@ class SessionManager:
 
     def get_trace(self, session_id: str) -> dict[str, Any] | None:
         """Return the latest persisted execution trace for a session."""
-        data = self._read_file(session_id)
-        if not data:
-            return None
+        data = self._read_trace_file(session_id)
         latest_query_id = data.get("latest_query_id")
         traces = data.get("traces")
         if isinstance(latest_query_id, str) and isinstance(traces, dict):
             trace = traces.get(latest_query_id)
             if isinstance(trace, dict):
                 return dict(trace)
-        trace = data.get("trace")
-        return dict(trace) if isinstance(trace, dict) else None
+        return None
 
     def get_traces(self, session_id: str) -> dict[str, dict[str, Any]]:
         """Return all query-scoped traces for a session."""
-        data = self._read_file(session_id)
+        data = self._read_trace_file(session_id)
         traces = data.get("traces") if data else None
         if not isinstance(traces, dict):
             return {}
@@ -487,14 +648,10 @@ class SessionManager:
         trace: dict[str, Any],
         query_id: str | None = None,
     ) -> dict[str, Any]:
-        """Persist the execution trace and return the saved trace.
-
-        ``trace`` is still saved at the legacy ``trace`` key for current UI
-        compatibility, while ``traces[query_id]`` keeps per-request history.
-        """
-        data = self._read_file(session_id)
-        if not data:
+        """Persist a query trace in its sidecar without duplicating the latest trace."""
+        if not self._session_path(session_id).exists():
             return trace
+        data = self._read_trace_file(session_id)
         saved = dict(trace)
         effective_query_id = query_id or saved.get("query_id")
         if isinstance(effective_query_id, str) and effective_query_id:
@@ -505,12 +662,32 @@ class SessionManager:
             traces[effective_query_id] = saved
             data["traces"] = traces
             data["latest_query_id"] = effective_query_id
-        data["trace"] = saved
         if saved.get("trace_id"):
             data["latest_trace_id"] = saved.get("trace_id")
-        self._write_file(session_id, data)
+        self._write_trace_file(session_id, data)
         return dict(saved)
 
+    def get_trace_state(self, session_id: str) -> dict[str, Any]:
+        """Return trace history and its selection metadata for the trace UI."""
+        data = self._read_trace_file(session_id)
+        session = self._read_file(session_id)
+        traces = data.get("traces")
+        result = {
+            "traces": {
+                str(query_id): dict(trace)
+                for query_id, trace in traces.items()
+                if isinstance(trace, dict)
+            } if isinstance(traces, dict) else {},
+            "latest_query_id": data.get("latest_query_id"),
+            "latest_trace_id": data.get("latest_trace_id"),
+        }
+        if isinstance(session.get("todos"), list):
+            result["todos"] = list(session["todos"])
+        if isinstance(session.get("graph"), dict):
+            result["graph"] = dict(session["graph"])
+        return result
+
+    @_session_write_locked
     def update_graph(self, session_id: str, graph: dict[str, Any]) -> dict[str, Any]:
         """Persist the compiled LangGraph structure for trace inspection."""
 
@@ -522,6 +699,7 @@ class SessionManager:
         self._write_file(session_id, data)
         return dict(saved)
 
+    @_session_write_locked
     def update_title(self, session_id: str, title: str) -> None:
         """更新标题（rename_session 的别名，供 API 层调用）"""
         self.rename_session(session_id, title)
@@ -531,27 +709,21 @@ class SessionManager:
         path = self._session_path(session_id)    # 获取文件路径
         if path.exists():                        # 存在则删除
             path.unlink()
+        self._trace_path(session_id).unlink(missing_ok=True)
 
     def get_raw_messages(self, session_id: str) -> dict[str, Any]:
-        """返回完整会话数据（含标题、时间戳、所有消息、todos、trace），供前端展示"""
+        """Return session data without loading heavyweight trace sidecars."""
         data = self._read_file(session_id)                     # 读取会话文件
         if not data:                                           # 不存在返回空结构
             return {"title": "", "messages": []}
         data = dict(data)
         data["messages"] = self.load_session(session_id)
-        # Expose runtime state for white-box Agent sessions.
+        # Lightweight runtime state remains available, but trace data has a
+        # dedicated lazy endpoint and is never read by the conversation view.
         if isinstance(data.get("todos"), list):
             data["todos"] = list(data["todos"])
         else:
             data.pop("todos", None)
-        if isinstance(data.get("trace"), dict):
-            data["trace"] = dict(data["trace"])
-        else:
-            data.pop("trace", None)
-        if isinstance(data.get("traces"), dict):
-            data["traces"] = self.get_traces(session_id)
-        else:
-            data.pop("traces", None)
         if isinstance(data.get("graph"), dict):
             data["graph"] = dict(data["graph"])
         else:
@@ -572,7 +744,9 @@ class SessionManager:
         for f in sorted(self._sessions_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):  # 遍历所有 JSON 文件，按修改时间倒序
             raw: Any = None
             try:
-                raw = json.loads(f.read_text(encoding="utf-8"))         # 解析 JSON
+                # Reuse the canonical reader so legacy embedded traces are
+                # migrated once instead of slowing every sidebar refresh.
+                raw = self._read_file(f.stem)
                 if isinstance(raw, dict):                               # v2 格式
                     title = raw.get("title", f.stem)                    # 取标题，缺省用文件名
                     updated_at = raw.get("updated_at", f.stat().st_mtime)  # 取更新时间
@@ -604,6 +778,7 @@ class SessionManager:
 
     # ── 短期记忆压缩（核心机制）────────────────────────────────────────────────
 
+    @_session_write_locked
     def compress_history(
         self, session_id: str, summary: str, num_to_remove: int
     ) -> None:
@@ -648,6 +823,7 @@ class SessionManager:
             return None
         return data.get("compressed_context")           # 返回摘要字段
 
+    @_session_write_locked
     def middle_trim_history(
         self,
         session_id: str,
@@ -722,6 +898,7 @@ class SessionManager:
             return None
         return data.get("middle_trim_context")
 
+    @_session_write_locked
     def update_tool_call_output(
         self,
         session_id: str,
@@ -749,6 +926,458 @@ class SessionManager:
                     return True
         return False
 
+    # ── DeepAgents Tool Context compaction ──────────────────────────────────
+
+    @staticmethod
+    def _tool_context_source(tool_call: dict[str, Any]) -> str:
+        value = tool_call.get("raw_output")
+        if value is None or str(value).strip() == "":
+            value = tool_call.get("output", "")
+        return str(value or "")
+
+    @staticmethod
+    def _tool_context_source_hash(output: str) -> str:
+        normalized = output.replace("\r\n", "\n").replace("\r", "\n")
+        return f"sha256:{hashlib.sha256(normalized.encode('utf-8')).hexdigest()}"
+
+    @staticmethod
+    def _tool_context_tokens(output: str) -> int:
+        # Keep selection deterministic and cheap. Runtime/model accounting uses
+        # the normal tokenizer approximation at the actual model boundary.
+        return max(1, (len(output) + 3) // 4) if output else 0
+
+    @staticmethod
+    def _tool_context_result_id(output: str) -> str | None:
+        patterns = (
+            r'"result_id"\s*:\s*"([^"\\]+)"',
+            r"\bresult[_ -]?id\s*[:=]\s*([A-Za-z0-9_.:-]+)",
+            r"\b(result-[A-Za-z0-9_-]+)\b",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, output, flags=re.IGNORECASE)
+            if match:
+                return str(match.group(1))
+        return None
+
+    @classmethod
+    def _tool_context_raw_ref(
+        cls,
+        session_id: str,
+        tool_call_id: str,
+        output: str,
+        source_hash: str,
+    ) -> dict[str, Any]:
+        result_id = cls._tool_context_result_id(output)
+        session_ref = {
+            "kind": "session_tool_call",
+            "session_id": session_id,
+            "tool_call_id": tool_call_id,
+            "source_hash": source_hash,
+        }
+        if result_id:
+            # Query result artifacts currently have a TTL. Keep a Session-local
+            # evidence fallback so an expired result_id never makes the UI's
+            # “完整结果” reference irrecoverable.
+            return {"kind": "result_id", "value": result_id, "fallback": session_ref}
+        return session_ref
+
+    @staticmethod
+    def _iter_persisted_tool_calls(data: dict[str, Any]):
+        for message_index, message in enumerate(data.get("messages") or []):
+            if not isinstance(message, dict):
+                continue
+            for tool_index, tool_call in enumerate(message.get("tool_calls") or []):
+                if isinstance(tool_call, dict):
+                    yield message_index, tool_index, message, tool_call
+
+    @classmethod
+    def _tool_call_ids(cls, data: dict[str, Any]) -> list[str]:
+        return [
+            str(tool_call.get("id") or "")
+            for _, _, _, tool_call in cls._iter_persisted_tool_calls(data)
+        ]
+
+    def _migrate_missing_tool_call_ids(self, session_id: str, data: dict[str, Any]) -> bool:
+        """Persist deterministic IDs for legacy Tool Results that lacked one."""
+
+        changed = False
+        used = {item for item in self._tool_call_ids(data) if item}
+        for message_index, tool_index, _message, tool_call in self._iter_persisted_tool_calls(data):
+            if str(tool_call.get("id") or ""):
+                continue
+            seed = json.dumps(
+                {
+                    "session_id": session_id,
+                    "message_index": message_index,
+                    "tool_index": tool_index,
+                    "tool": tool_call.get("tool") or tool_call.get("name"),
+                    "input": tool_call.get("input") or tool_call.get("args"),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+            base = f"historical_tool_{hashlib.sha256(seed.encode('utf-8')).hexdigest()[:20]}"
+            stable_id = base
+            suffix = 1
+            while stable_id in used:
+                suffix += 1
+                stable_id = f"{base}_{suffix}"
+            tool_call["id"] = stable_id
+            display_messages = data.get("display_messages")
+            if isinstance(display_messages, list) and message_index < len(display_messages):
+                display_message = display_messages[message_index]
+                display_tool_calls = (
+                    display_message.get("tool_calls") if isinstance(display_message, dict) else None
+                )
+                if isinstance(display_tool_calls, list) and tool_index < len(display_tool_calls):
+                    display_tool_call = display_tool_calls[tool_index]
+                    if isinstance(display_tool_call, dict) and not display_tool_call.get("id"):
+                        display_tool_call["id"] = stable_id
+            used.add(stable_id)
+            changed = True
+        return changed
+
+    def select_tool_context_candidates(
+        self,
+        session_id: str,
+        *,
+        min_result_tokens: int,
+        keep_recent: int,
+        policy_version: str,
+    ) -> list[dict[str, Any]]:
+        """Return immutable background candidates without changing visible output."""
+
+        with self._tool_context_lock(session_id):
+            data = self._read_file(session_id)
+            if not data:
+                return []
+            migrated = self._migrate_missing_tool_call_ids(session_id, data)
+            ids = self._tool_call_ids(data)
+            nonempty_ids = [item for item in ids if item]
+            if len(nonempty_ids) != len(set(nonempty_ids)):
+                data["tool_context_job"] = {
+                    "status": "failed",
+                    "error": "duplicate_tool_call_id",
+                    "updated_at": time.time(),
+                }
+                self._write_file(session_id, data)
+                return []
+
+            completed: list[tuple[dict[str, Any], str, str, int, float]] = []
+            for _, _, _, tool_call in self._iter_persisted_tool_calls(data):
+                tool_call_id = str(tool_call.get("id") or "")
+                output = self._tool_context_source(tool_call)
+                if not tool_call_id or not output:
+                    continue
+                source_hash = self._tool_context_source_hash(output)
+                completed_at = tool_call.get("completed_at")
+                try:
+                    completion_order = float(completed_at)
+                except (TypeError, ValueError):
+                    # Legacy calls have no timestamp. Their persisted protocol
+                    # order is stable and necessarily predates new timestamped calls.
+                    completion_order = float(len(completed))
+                completed.append(
+                    (
+                        tool_call,
+                        tool_call_id,
+                        source_hash,
+                        self._tool_context_tokens(output),
+                        completion_order,
+                    )
+                )
+
+            protected_ids = {
+                item[1]
+                for item in sorted(completed, key=lambda item: item[4])[
+                    -max(0, int(keep_recent)) :
+                ]
+            } if keep_recent > 0 else set()
+            candidates: list[dict[str, Any]] = []
+            cache_hit_count = 0
+            for tool_call, tool_call_id, source_hash, estimated_tokens, completion_order in completed:
+                if tool_call_id in protected_ids or estimated_tokens < max(1, int(min_result_tokens)):
+                    continue
+                metadata = tool_call.get("context_compaction")
+                if (
+                    isinstance(metadata, dict)
+                    and metadata.get("status") == "ready"
+                    and metadata.get("source_hash") == source_hash
+                    and metadata.get("policy_version") == policy_version
+                    and tool_call.get("context_output")
+                ):
+                    cache_hit_count += 1
+                    continue
+                candidates.append(
+                    {
+                        "tool_call_id": tool_call_id,
+                        "tool": str(tool_call.get("tool") or tool_call.get("name") or "unknown_tool"),
+                        "input": tool_call.get("input") or tool_call.get("args") or "",
+                        "output": self._tool_context_source(tool_call),
+                        "source_hash": source_hash,
+                        "estimated_tokens": estimated_tokens,
+                        "completed_at": completion_order,
+                        "is_error": bool(tool_call.get("is_error")),
+                        "user_referenced": bool(
+                            tool_call.get("user_referenced")
+                            or tool_call.get("referenced_by_user")
+                        ),
+                        "raw_output_ref": self._tool_context_raw_ref(
+                            session_id,
+                            tool_call_id,
+                            self._tool_context_source(tool_call),
+                            source_hash,
+                        ),
+                    }
+                )
+            candidates.sort(
+                key=lambda item: (
+                    int(bool(item.get("is_error") or item.get("user_referenced"))),
+                    -int(item.get("estimated_tokens") or 0),
+                    float(item.get("completed_at") or 0),
+                )
+            )
+            if candidates:
+                candidates[0]["scan_cache_hit_count"] = cache_hit_count
+            if migrated:
+                self._write_file(session_id, data)
+            return candidates
+
+    def ensure_tool_call_ids(self, session_id: str) -> bool:
+        """Persist stable IDs for legacy tool calls before model reconstruction."""
+
+        with self._tool_context_lock(session_id):
+            data = self._read_file(session_id)
+            if not data or not self._migrate_missing_tool_call_ids(session_id, data):
+                return False
+            self._write_file(session_id, data)
+            return True
+
+    def begin_tool_context_job(
+        self,
+        session_id: str,
+        *,
+        job_id: str,
+        candidates: list[dict[str, Any]],
+        policy_version: str,
+        lease_timeout_seconds: int = 300,
+    ) -> bool:
+        """Mark a candidate snapshot pending and persist one session-scoped job."""
+
+        if not candidates:
+            return False
+        with self._tool_context_lock(session_id):
+            data = self._read_file(session_id)
+            if not data:
+                return False
+            existing = data.get("tool_context_job")
+            now = time.time()
+            if isinstance(existing, dict) and existing.get("status") in {"pending", "running"}:
+                updated_at = float(existing.get("updated_at") or existing.get("created_at") or 0)
+                if now - updated_at < max(1, int(lease_timeout_seconds)):
+                    return False
+                existing["status"] = "expired"
+                existing["error"] = "job_lease_expired"
+                existing["updated_at"] = now
+            before_ids = self._tool_call_ids(data)
+            by_id = {str(item["tool_call_id"]): item for item in candidates}
+            marked = 0
+            for _, _, _, tool_call in self._iter_persisted_tool_calls(data):
+                tool_call_id = str(tool_call.get("id") or "")
+                candidate = by_id.get(tool_call_id)
+                if not candidate:
+                    continue
+                if self._tool_context_source_hash(self._tool_context_source(tool_call)) != candidate["source_hash"]:
+                    continue
+                tool_call["raw_output_ref"] = dict(candidate["raw_output_ref"])
+                tool_call["context_compaction"] = {
+                    "status": "pending",
+                    "source_hash": candidate["source_hash"],
+                    "policy_version": policy_version,
+                    "job_id": job_id,
+                    "updated_at": now,
+                }
+                marked += 1
+            after_ids = self._tool_call_ids(data)
+            if before_ids != after_ids or marked == 0:
+                return False
+            data["tool_context_job"] = {
+                "id": job_id,
+                "status": "pending",
+                "policy_version": policy_version,
+                "candidate_count": marked,
+                "completed_count": 0,
+                "failed_count": 0,
+                "created_at": now,
+                "updated_at": now,
+                "base_revision": int(data.get("tool_context_revision", 0) or 0),
+            }
+            self._write_file(session_id, data)
+            return True
+
+    def update_tool_context_job(
+        self,
+        session_id: str,
+        job_id: str,
+        *,
+        status: str,
+        completed_count: int | None = None,
+        failed_count: int | None = None,
+        metrics: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> bool:
+        with self._tool_context_lock(session_id):
+            data = self._read_file(session_id)
+            job = data.get("tool_context_job") if data else None
+            if not isinstance(job, dict) or job.get("id") != job_id:
+                return False
+            job["status"] = status
+            job["updated_at"] = time.time()
+            if completed_count is not None:
+                job["completed_count"] = int(completed_count)
+            if failed_count is not None:
+                job["failed_count"] = int(failed_count)
+            if metrics is not None:
+                job["metrics"] = dict(metrics)
+            if error:
+                job["error"] = error
+            self._write_file(session_id, data)
+            return True
+
+    def complete_tool_context_compaction(
+        self,
+        session_id: str,
+        *,
+        job_id: str,
+        tool_call_id: str,
+        source_hash: str,
+        policy_version: str,
+        context_output: str,
+        method: str,
+    ) -> bool:
+        """CAS one result to ready without changing output or tool_call_id."""
+
+        with self._tool_context_lock(session_id):
+            data = self._read_file(session_id)
+            if not data:
+                return False
+            before_ids = self._tool_call_ids(data)
+            nonempty_ids = [item for item in before_ids if item]
+            if len(nonempty_ids) != len(before_ids) or len(nonempty_ids) != len(set(nonempty_ids)):
+                return False
+            updated = False
+            stale = False
+            for _, _, _, tool_call in self._iter_persisted_tool_calls(data):
+                if str(tool_call.get("id") or "") != tool_call_id:
+                    continue
+                current_hash = self._tool_context_source_hash(self._tool_context_source(tool_call))
+                metadata = tool_call.get("context_compaction")
+                if (
+                    current_hash != source_hash
+                    or not isinstance(metadata, dict)
+                    or metadata.get("job_id") != job_id
+                ):
+                    if isinstance(metadata, dict):
+                        metadata["status"] = "stale"
+                        metadata["updated_at"] = time.time()
+                        stale = True
+                    break
+                tool_call["context_output"] = context_output
+                tool_call["context_compaction"] = {
+                    "status": "ready",
+                    "source_hash": source_hash,
+                    "policy_version": policy_version,
+                    "method": method,
+                    "job_id": job_id,
+                    "compacted_at": time.time(),
+                }
+                updated = True
+                break
+            after_ids = self._tool_call_ids(data)
+            if before_ids != after_ids:
+                return False
+            if updated:
+                data["tool_context_revision"] = int(data.get("tool_context_revision", 0) or 0) + 1
+                self._write_file(session_id, data)
+            elif stale:
+                self._write_file(session_id, data)
+            return updated
+
+    def persist_immediate_tool_context(
+        self,
+        session_id: str,
+        *,
+        tool_call_id: str,
+        source_output: str,
+        context_output: str,
+        method: str,
+        policy_version: str,
+    ) -> bool:
+        """Attach current-turn immediate compaction after the visible result is persisted."""
+
+        with self._tool_context_lock(session_id):
+            data = self._read_file(session_id)
+            if not data:
+                return False
+            source_hash = self._tool_context_source_hash(source_output)
+            before_ids = self._tool_call_ids(data)
+            nonempty_ids = [item for item in before_ids if item]
+            if len(nonempty_ids) != len(before_ids) or len(nonempty_ids) != len(set(nonempty_ids)):
+                return False
+            for _, _, _, tool_call in self._iter_persisted_tool_calls(data):
+                if str(tool_call.get("id") or "") != tool_call_id:
+                    continue
+                if self._tool_context_source_hash(self._tool_context_source(tool_call)) != source_hash:
+                    return False
+                tool_call["context_output"] = context_output
+                tool_call["raw_output_ref"] = self._tool_context_raw_ref(
+                    session_id, tool_call_id, source_output, source_hash
+                )
+                tool_call["context_compaction"] = {
+                    "status": "ready",
+                    "source_hash": source_hash,
+                    "policy_version": policy_version,
+                    "method": method,
+                    "compacted_at": time.time(),
+                }
+                if before_ids != self._tool_call_ids(data):
+                    return False
+                data["tool_context_revision"] = int(data.get("tool_context_revision", 0) or 0) + 1
+                self._write_file(session_id, data)
+                return True
+            return False
+
+    def get_ready_tool_context_outputs(self, session_id: str) -> dict[str, str]:
+        """Return only valid ready outputs; pending/running entries stay raw."""
+
+        with self._tool_context_lock(session_id):
+            data = self._read_file(session_id)
+            if not data:
+                return {}
+            ready: dict[str, str] = {}
+            for _, _, _, tool_call in self._iter_persisted_tool_calls(data):
+                tool_call_id = str(tool_call.get("id") or "")
+                context_output = tool_call.get("context_output")
+                metadata = tool_call.get("context_compaction")
+                if not tool_call_id or not context_output or not isinstance(metadata, dict):
+                    continue
+                if metadata.get("status") != "ready":
+                    continue
+                current_hash = self._tool_context_source_hash(self._tool_context_source(tool_call))
+                if metadata.get("source_hash") != current_hash:
+                    continue
+                ready[tool_call_id] = str(context_output)
+            return ready
+
+    def get_tool_context_status(self, session_id: str) -> dict[str, Any]:
+        data = self._read_file(session_id)
+        job = data.get("tool_context_job") if data else None
+        if not isinstance(job, dict):
+            return {"status": "idle", "revision": int(data.get("tool_context_revision", 0) or 0) if data else 0}
+        return {**job, "revision": int(data.get("tool_context_revision", 0) or 0)}
+
+    @_session_write_locked
     def update_context_usage_peak(self, session_id: str, used_tokens: int) -> None:
         """更新 session 的 context_usage_peak（运行时 token 用量峰值）。"""
         data = self._read_file(session_id)
@@ -766,6 +1395,7 @@ class SessionManager:
             return 0
         return data.get("context_usage_peak", 0) or 0
 
+    @_session_write_locked
     def update_agent_context_usage(self, session_id: str, used_tokens: int) -> None:
         """Persist the current effective Agent context (not its historical peak)."""
         data = self._read_file(session_id)
@@ -781,6 +1411,66 @@ class SessionManager:
             return 0
         return int(data.get("agent_context_usage", 0) or 0)
 
+    def get_effective_agent_context_usage(
+        self,
+        session_id: str,
+        *,
+        use_tool_context: bool,
+    ) -> int:
+        """Estimate the current model context after ready Tool Context replacements.
+
+        The saved Agent context remains lossless so disabling the middleware can
+        immediately restore raw ToolMessage content. For the context meter only,
+        apply the same ready-only replacement delta that the middleware applies
+        before the model call.
+        """
+
+        with self._tool_context_lock(session_id):
+            data = self._read_file(session_id)
+            if not data:
+                return 0
+            usage = int(data.get("agent_context_usage", 0) or 0)
+            if not use_tool_context or usage <= 0:
+                return usage
+
+            ready: dict[str, str] = {}
+            for _, _, _, tool_call in self._iter_persisted_tool_calls(data):
+                tool_call_id = str(tool_call.get("id") or "")
+                context_output = tool_call.get("context_output")
+                metadata = tool_call.get("context_compaction")
+                if not tool_call_id or not context_output or not isinstance(metadata, dict):
+                    continue
+                if metadata.get("status") != "ready":
+                    continue
+                source_hash = self._tool_context_source_hash(self._tool_context_source(tool_call))
+                if metadata.get("source_hash") == source_hash:
+                    ready[tool_call_id] = str(context_output)
+            if not ready:
+                return usage
+
+            delta = 0
+            messages = data.get("agent_context_messages")
+            if not isinstance(messages, list):
+                return usage
+            for message in messages:
+                if not isinstance(message, dict) or message.get("type") != "tool":
+                    continue
+                payload = message.get("data")
+                if not isinstance(payload, dict):
+                    continue
+                tool_call_id = str(payload.get("tool_call_id") or "")
+                replacement = ready.get(tool_call_id)
+                if replacement is None:
+                    continue
+                content = payload.get("content", "")
+                if isinstance(content, str):
+                    original = content
+                else:
+                    original = json.dumps(content, ensure_ascii=False, default=str)
+                delta += self._tool_context_tokens(replacement) - self._tool_context_tokens(original)
+            return max(0, usage + delta)
+
+    @_session_write_locked
     def update_agent_context_messages(
         self,
         session_id: str,
@@ -803,6 +1493,7 @@ class SessionManager:
             return []
         return [item for item in messages if isinstance(item, dict)]
 
+    @_session_write_locked
     def update_agent_context_state(
         self,
         session_id: str,
@@ -834,6 +1525,7 @@ class SessionManager:
             if isinstance(grant, dict) and not grant.get("revoked_at")
         ]
 
+    @_session_write_locked
     def add_permission_grant(
         self,
         session_id: str,
@@ -881,6 +1573,7 @@ class SessionManager:
         self._write_file(session_id, data)
         return dict(grant)
 
+    @_session_write_locked
     def revoke_permission_grant(self, session_id: str, grant_id: str) -> bool:
         """Mark a session permission grant as revoked."""
         data = self._read_file(session_id)
@@ -999,6 +1692,7 @@ class SessionManager:
             return 0
         return len(data.get("messages", []))        # 返回消息数量
 
+    @_session_write_locked
     def clear_messages(self, session_id: str) -> None:
         """清空会话消息，但保留标题等元数据"""
         data = self._read_file(session_id)          # 读取会话数据

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Type
 
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
@@ -15,6 +14,8 @@ from graph.trace_collector import get_current_trace_collector
 
 class ReadExternalFileInput(BaseModel):
     path: str = Field(description="Absolute path of the external file to read")
+    offset: int = Field(default=0, ge=0, description="Zero-based line offset")
+    limit: int = Field(default=2000, ge=1, le=2000, description="Maximum lines to return")
 
 
 class ReadExternalFileTool(BaseTool):
@@ -25,7 +26,7 @@ class ReadExternalFileTool(BaseTool):
         "paths pasted by the user, such as files under Downloads or Documents. "
         "For workspace files, use the normal read_file tool."
     )
-    args_schema: Type[BaseModel] = ReadExternalFileInput
+    args_schema: type[BaseModel] = ReadExternalFileInput
     risk_level: str = "moderate"
     session_id: str = ""
     workspace_path: str = ""
@@ -72,7 +73,19 @@ class ReadExternalFileTool(BaseTool):
             metadata=metadata,
         )
 
-    def _run(self, path: str) -> str:
+    @staticmethod
+    def _read_page(path: Path, offset: int, limit: int) -> str:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        selected = lines[offset : offset + limit]
+        content = "\n".join(selected)
+        if offset + limit < len(lines):
+            content += (
+                f"\n\n[Showing lines {offset + 1}-{offset + len(selected)} of {len(lines)}. "
+                f"Continue with offset={offset + limit}.]"
+            )
+        return content
+
+    def _run(self, path: str, offset: int = 0, limit: int = 2000) -> str:
         raw_path = path.strip()
         if not raw_path:
             return "❌ Permission required: missing external file path."
@@ -110,9 +123,7 @@ class ReadExternalFileTool(BaseTool):
 
             base_dir = Path(__file__).resolve().parent.parent
             if is_managed_resource_path(requested, base_dir):
-                content = requested.read_text(encoding="utf-8", errors="replace")
-                if len(content) > 20000:
-                    content = content[:20000] + "\n...[truncated]"
+                content = self._read_page(requested, offset, limit)
                 self._record_permission_span(
                     action="enforce",
                     path=str(requested),
@@ -165,9 +176,7 @@ class ReadExternalFileTool(BaseTool):
                     'with {"target_kind":"all_external_files"}'
                 )
 
-            content = requested.read_text(encoding="utf-8", errors="replace")
-            if len(content) > 20000:
-                content = content[:20000] + "\n...[truncated]"
+            content = self._read_page(requested, offset, limit)
             self._record_permission_span(
                 action="enforce",
                 path=str(requested),

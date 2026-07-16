@@ -72,6 +72,23 @@
     "ratio": 0.5,
     "trigger_count": 20,
     "max_history_messages": 100,
+    "deepagents": {
+      "summarization": {
+        "enabled": true,
+        "trigger_tokens": 200000,
+        "keep_messages": 20
+      },
+      "tool_context": {
+        "enabled": true,
+        "single_tool_trigger_tokens": 8000,
+        "background_min_result_tokens": 1000,
+        "keep_recent_tool_results": 12,
+        "batch_size": 6,
+        "max_concurrency": 4,
+        "job_timeout_seconds": 120,
+        "max_candidates_per_job": 48
+      }
+    },
     "middleware": {
       "enabled": true,
       "tool_clear": {
