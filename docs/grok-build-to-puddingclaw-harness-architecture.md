@@ -389,7 +389,7 @@ Harness Settings UI 至少提供：
 - 启用/关闭 Docker Sandbox；
 - 自动检测 Docker CLI、daemon、context、OS/arch 和镜像状态；
 - 测试连接、测试启动 Sandbox；
-- 默认展示不可编辑的 PuddingClaw 托管镜像；仅在“使用自定义镜像（高级）”开启后显示 image reference 输入框；
+- 默认展示不可编辑的 PuddingClaw 托管镜像；“使用自定义镜像（高级）”、说明与 image reference 输入框包装在独立卡片中，开启后在卡片内部展开输入框；
 - CPU 核数与内存使用固定预设下拉框（2/4/8/16 核，2/4/8/16 GB），另提供进程数、超时和默认网络开关；
 - 可选的项目 manifest/lockfile 依赖准备高级开关放在运行时说明之后的独立警示区域，默认关闭；历史隐式开启配置一次性迁移回关闭；
 - Docker 不可用时“降级为本机受控模式”或“拒绝执行”；

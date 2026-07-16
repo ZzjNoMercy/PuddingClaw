@@ -2428,23 +2428,34 @@ export default function SettingsPage() {
                               <input type="checkbox" checked={dockerNetworkEnabled} onChange={(event) => setDockerNetworkEnabled(event.target.checked)} />
                               允许容器常驻网络
                             </label>
-                            <label className="flex items-center gap-2 pl-7 pt-6 text-[12px] text-gray-600">
+                          </div>
+
+                          <div className="mt-3 rounded-xl border border-black/[0.07] bg-slate-50/80 px-3.5 py-3">
+                            <label className="flex items-start gap-2 text-[12px] text-slate-800">
                               <input
                                 type="checkbox"
                                 checked={dockerUseCustomImage}
                                 onChange={(event) => setDockerUseCustomImage(event.target.checked)}
+                                className="mt-0.5"
                               />
-                              使用自定义镜像（高级）
+                              <span>
+                                <span className="font-semibold">使用自定义镜像（高级）</span>
+                                <span className="mt-0.5 block text-[10px] leading-4 text-slate-500">
+                                  默认使用 PuddingClaw 托管镜像。自定义镜像必须同时提供 Python 与 Node.js 基础运行时。
+                                </span>
+                              </span>
                             </label>
                             {dockerUseCustomImage && (
-                              <FormField label="自定义镜像引用">
-                                <input
-                                  value={dockerImage}
-                                  onChange={(event) => setDockerImage(event.target.value)}
-                                  className="form-input"
-                                  placeholder="例如 my-company/puddingclaw-sandbox:latest"
-                                />
-                              </FormField>
+                              <div className="mt-3 pl-7">
+                                <FormField label="自定义镜像引用">
+                                  <input
+                                    value={dockerImage}
+                                    onChange={(event) => setDockerImage(event.target.value)}
+                                    className="form-input"
+                                    placeholder="例如 my-company/puddingclaw-sandbox:latest"
+                                  />
+                                </FormField>
+                              </div>
                             )}
                           </div>
 
