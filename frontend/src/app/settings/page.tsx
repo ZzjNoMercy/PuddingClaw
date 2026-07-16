@@ -2428,7 +2428,7 @@ export default function SettingsPage() {
                               <input type="checkbox" checked={dockerNetworkEnabled} onChange={(event) => setDockerNetworkEnabled(event.target.checked)} />
                               允许容器常驻网络
                             </label>
-                            <label className="flex items-center gap-2 pt-6 text-[12px] text-gray-600">
+                            <label className="flex items-center gap-2 pl-7 pt-6 text-[12px] text-gray-600">
                               <input
                                 type="checkbox"
                                 checked={dockerUseCustomImage}
