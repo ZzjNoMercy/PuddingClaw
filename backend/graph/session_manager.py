@@ -6,6 +6,7 @@ import re
 import threading
 import time
 import uuid
+from copy import deepcopy
 from functools import wraps
 from pathlib import Path
 from typing import Any
@@ -619,6 +620,246 @@ class SessionManager:
         self._write_file(session_id, data)
         return list(todos)
 
+    def get_harness_state(self, session_id: str) -> dict[str, Any]:
+        """Return the product-level Run/Goal state stored in Session JSON."""
+
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        if not isinstance(harness, dict):
+            return {"runs": {}, "run_order": [], "goals": {}, "goal_order": []}
+        result = deepcopy(harness)
+        result.setdefault("runs", {})
+        result.setdefault("run_order", [])
+        result.setdefault("goals", {})
+        result.setdefault("goal_order", [])
+        return result
+
+    def get_run_state(
+        self,
+        session_id: str,
+        run_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return one persisted Run, defaulting to the latest Run."""
+
+        harness = self.get_harness_state(session_id)
+        effective_id = run_id or harness.get("latest_run_id")
+        runs = harness.get("runs")
+        if not isinstance(effective_id, str) or not isinstance(runs, dict):
+            return None
+        run = runs.get(effective_id)
+        return deepcopy(run) if isinstance(run, dict) else None
+
+    @_session_write_locked
+    def upsert_run_state(
+        self,
+        session_id: str,
+        run: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist one Run while preserving the first committed terminal state."""
+
+        run_id = str(run.get("run_id") or "").strip()
+        if not run_id:
+            raise ValueError("run_id is required")
+        persisted_session_id = str(run.get("session_id") or "").strip()
+        if persisted_session_id != session_id:
+            raise ValueError("Run session_id does not match persistence session")
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        harness = data.setdefault("harness", {})
+        runs = harness.setdefault("runs", {})
+        existing = runs.get(run_id)
+        terminal_statuses = {
+            "completed",
+            "cancelled",
+            "failed",
+            "blocked",
+            "budget_exceeded",
+            "verification_failed",
+        }
+        if isinstance(existing, dict) and existing.get("status") in terminal_statuses:
+            if existing != run:
+                raise ValueError(
+                    f"Run {run_id} already has terminal outcome "
+                    f"{existing.get('outcome') or existing.get('status')}"
+                )
+
+        saved = deepcopy(run)
+        runs[run_id] = saved
+        run_order = harness.setdefault("run_order", [])
+        if run_id not in run_order:
+            run_order.append(run_id)
+        harness["latest_run_id"] = run_id
+        self._write_file(session_id, data)
+        return deepcopy(saved)
+
+    @_session_write_locked
+    def start_harness_run(
+        self,
+        session_id: str,
+        run: dict[str, Any],
+        goal: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """Atomically persist a new Run and its optional attached Goal."""
+
+        run_id = str(run.get("run_id") or "").strip()
+        if not run_id or run.get("session_id") != session_id:
+            raise ValueError("Run identity does not match persistence session")
+        goal_id = str(goal.get("goal_id") or "").strip() if goal else ""
+        if goal is not None and (
+            not goal_id or goal.get("session_id") != session_id
+        ):
+            raise ValueError("Goal identity does not match persistence session")
+        if goal is not None and run.get("goal_id") != goal_id:
+            raise ValueError("Run goal_id does not match attached Goal")
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        harness = data.setdefault("harness", {})
+        runs = harness.setdefault("runs", {})
+        if run_id in runs:
+            raise ValueError(f"Run {run_id} already exists")
+        terminal_run_statuses = {
+            "completed",
+            "cancelled",
+            "failed",
+            "blocked",
+            "budget_exceeded",
+            "verification_failed",
+        }
+        active_run = next(
+            (
+                item
+                for item in runs.values()
+                if isinstance(item, dict)
+                and item.get("status") not in terminal_run_statuses
+            ),
+            None,
+        )
+        if active_run is not None:
+            raise ValueError(
+                f"Session {session_id} already has active Run "
+                f"{active_run.get('run_id')}"
+            )
+
+        saved_goal: dict[str, Any] | None = None
+        if goal is not None:
+            goals = harness.setdefault("goals", {})
+            active_goal_id = harness.get("active_goal_id")
+            if (
+                isinstance(active_goal_id, str)
+                and active_goal_id != goal_id
+                and isinstance(goals.get(active_goal_id), dict)
+                and goals[active_goal_id].get("status") == "active"
+            ):
+                raise ValueError(
+                    f"Session {session_id} already has active Goal {active_goal_id}"
+                )
+            existing_goal = goals.get(goal_id)
+            if isinstance(existing_goal, dict) and existing_goal.get("status") in {
+                "achieved",
+                "cancelled",
+                "budget_exceeded",
+            }:
+                raise ValueError(f"Goal {goal_id} is already terminal")
+            saved_goal = deepcopy(goal)
+            goals[goal_id] = saved_goal
+            goal_order = harness.setdefault("goal_order", [])
+            if goal_id not in goal_order:
+                goal_order.append(goal_id)
+            if saved_goal.get("status") == "active":
+                harness["active_goal_id"] = goal_id
+
+        saved_run = deepcopy(run)
+        runs[run_id] = saved_run
+        run_order = harness.setdefault("run_order", [])
+        run_order.append(run_id)
+        harness["latest_run_id"] = run_id
+        self._write_file(session_id, data)
+        return deepcopy(saved_run), deepcopy(saved_goal)
+
+    def get_goal_state(
+        self,
+        session_id: str,
+        goal_id: str,
+    ) -> dict[str, Any] | None:
+        """Return one persisted Goal from Session JSON."""
+
+        goals = self.get_harness_state(session_id).get("goals")
+        if not isinstance(goals, dict):
+            return None
+        goal = goals.get(goal_id)
+        return deepcopy(goal) if isinstance(goal, dict) else None
+
+    def get_active_goal_state(self, session_id: str) -> dict[str, Any] | None:
+        """Return the single active Goal for a Session, if present."""
+
+        harness = self.get_harness_state(session_id)
+        active_goal_id = harness.get("active_goal_id")
+        goals = harness.get("goals")
+        if not isinstance(active_goal_id, str) or not isinstance(goals, dict):
+            return None
+        goal = goals.get(active_goal_id)
+        if not isinstance(goal, dict) or goal.get("status") != "active":
+            return None
+        return deepcopy(goal)
+
+    @_session_write_locked
+    def upsert_goal_state(
+        self,
+        session_id: str,
+        goal: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist one Goal and enforce at most one active Goal per Session."""
+
+        goal_id = str(goal.get("goal_id") or "").strip()
+        if not goal_id:
+            raise ValueError("goal_id is required")
+        persisted_session_id = str(goal.get("session_id") or "").strip()
+        if persisted_session_id != session_id:
+            raise ValueError("Goal session_id does not match persistence session")
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        harness = data.setdefault("harness", {})
+        goals = harness.setdefault("goals", {})
+        status = str(goal.get("status") or "")
+        active_goal_id = harness.get("active_goal_id")
+        existing = goals.get(goal_id)
+        if isinstance(existing, dict) and existing.get("status") in {
+            "achieved",
+            "cancelled",
+            "budget_exceeded",
+        } and existing != goal:
+            raise ValueError(
+                f"Goal {goal_id} is already terminal ({existing.get('status')})"
+            )
+        if (
+            status == "active"
+            and isinstance(active_goal_id, str)
+            and active_goal_id != goal_id
+        ):
+            active = goals.get(active_goal_id)
+            if isinstance(active, dict) and active.get("status") == "active":
+                raise ValueError(
+                    f"Session {session_id} already has active Goal {active_goal_id}"
+                )
+
+        saved = deepcopy(goal)
+        goals[goal_id] = saved
+        goal_order = harness.setdefault("goal_order", [])
+        if goal_id not in goal_order:
+            goal_order.append(goal_id)
+        if status == "active":
+            harness["active_goal_id"] = goal_id
+        elif active_goal_id == goal_id:
+            harness.pop("active_goal_id", None)
+        self._write_file(session_id, data)
+        return deepcopy(saved)
+
     def get_trace(self, session_id: str) -> dict[str, Any] | None:
         """Return the latest persisted execution trace for a session."""
         data = self._read_trace_file(session_id)
@@ -728,6 +969,10 @@ class SessionManager:
             data["graph"] = dict(data["graph"])
         else:
             data.pop("graph", None)
+        if isinstance(data.get("harness"), dict):
+            data["harness"] = deepcopy(data["harness"])
+        else:
+            data.pop("harness", None)
         return data                                            # 返回完整数据
 
     def get_active_messages(self, session_id: str) -> list[dict[str, Any]]:
@@ -1619,6 +1864,36 @@ class SessionManager:
                 return True
         return False
 
+    @_session_write_locked
+    def consume_tool_action_permission(
+        self,
+        session_id: str,
+        fingerprint: str,
+    ) -> bool:
+        """Consume a matching once/session grant for one managed Tool action."""
+
+        data = self._read_file(session_id)
+        permissions = data.get("permissions") if data else None
+        grants = permissions.get("grants") if isinstance(permissions, dict) else None
+        if not isinstance(grants, list):
+            return False
+        for grant in grants:
+            if (
+                not isinstance(grant, dict)
+                or grant.get("revoked_at")
+                or grant.get("type") != "tool_action"
+                or grant.get("target_kind") != "fingerprint"
+                or grant.get("target") != fingerprint
+                or "execute" not in (grant.get("capabilities") or [])
+            ):
+                continue
+            if grant.get("scope") == "once":
+                grant["revoked_at"] = time.time()
+                grant["consumed_at"] = grant["revoked_at"]
+                self._write_file(session_id, data)
+            return True
+        return False
+
     # ── 为 Agent（LLM）准备消息 ─────────────────────────────────────────────────
 
     def load_session_for_agent(self, session_id: str) -> list[dict[str, Any]]:
@@ -1705,6 +1980,8 @@ class SessionManager:
             del data["compressed_context"]
         if "middle_trim_context" in data:
             del data["middle_trim_context"]
+        if "harness" in data:
+            del data["harness"]
         self._write_file(session_id, data)          # 写回磁盘
 
 

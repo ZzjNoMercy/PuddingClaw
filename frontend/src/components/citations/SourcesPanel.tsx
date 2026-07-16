@@ -3,6 +3,8 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   BookOpen,
+  AlertTriangle,
+  Ban,
   CheckCircle2,
   ChevronDown,
   Circle,
@@ -10,11 +12,22 @@ import {
   FileText,
   KeyRound,
   ListChecks,
+  Pause,
+  Play,
   ShieldCheck,
+  Target,
   Timer,
   X,
 } from "lucide-react";
-import { listSessionPermissions, rawKnowledgeFileUrl, revokePermissionGrant, type PermissionGrant } from "@/lib/api";
+import {
+  listSessionPermissions,
+  rawKnowledgeFileUrl,
+  revokePermissionGrant,
+  type HarnessGoal,
+  type HarnessRun,
+  type PermissionGrant,
+  type RubricEvaluationReport,
+} from "@/lib/api";
 import { useApp, type SourceRecord, type ToolCall } from "@/lib/store";
 
 type TodoStatus = "completed" | "in_progress" | "pending";
@@ -28,6 +41,12 @@ export default function SourcesPanel() {
     activeSourceId,
     inspectorActiveTab,
     setInspectorActiveTab,
+    activeGoal,
+    currentRun,
+    verificationReport,
+    pauseActiveGoal,
+    resumeActiveGoal,
+    cancelActiveGoal,
   } = useApp();
   const [permissionGrants, setPermissionGrants] = useState<PermissionGrant[]>([]);
 
@@ -132,6 +151,33 @@ export default function SourcesPanel() {
   return (
     <div className="h-full overflow-y-auto px-5 py-5">
       <div className="workspace-side-card overflow-hidden rounded-[28px] px-5 py-3">
+        {activeGoal && (
+          <>
+            <GoalCard
+              active={inspectorActiveTab === "goal"}
+              onActivate={() => setInspectorActiveTab(inspectorActiveTab === "goal" ? null : "goal")}
+              goal={activeGoal}
+              run={currentRun}
+              onPause={pauseActiveGoal}
+              onResume={resumeActiveGoal}
+              onCancel={cancelActiveGoal}
+            />
+            <PanelDivider />
+          </>
+        )}
+        {verificationReport && (
+          <>
+            <VerificationCard
+              active={inspectorActiveTab === "verification"}
+              onActivate={() =>
+                setInspectorActiveTab(inspectorActiveTab === "verification" ? null : "verification")
+              }
+              report={verificationReport}
+              run={currentRun}
+            />
+            <PanelDivider />
+          </>
+        )}
         <ProgressCard
           active={inspectorActiveTab === "progress"}
           onActivate={() => setInspectorActiveTab(inspectorActiveTab === "progress" ? null : "progress")}
@@ -163,6 +209,205 @@ export default function SourcesPanel() {
 
 function PanelDivider() {
   return <div className="mx-1 h-px bg-black/[0.06]" />;
+}
+
+const goalStatusLabel: Record<HarnessGoal["status"], string> = {
+  active: "进行中",
+  paused: "已暂停",
+  blocked: "受阻",
+  achieved: "已完成",
+  cancelled: "已取消",
+  budget_exceeded: "预算已耗尽",
+};
+
+function GoalCard({
+  active,
+  onActivate,
+  goal,
+  run,
+  onPause,
+  onResume,
+  onCancel,
+}: {
+  active: boolean;
+  onActivate: () => void;
+  goal: HarnessGoal;
+  run: HarnessRun | null;
+  onPause: () => Promise<void>;
+  onResume: () => Promise<void>;
+  onCancel: () => Promise<void>;
+}) {
+  const [actionError, setActionError] = useState("");
+  const runIsActive = Boolean(
+    run && ![
+      "completed",
+      "cancelled",
+      "failed",
+      "blocked",
+      "budget_exceeded",
+      "verification_failed",
+    ].includes(run.status)
+  );
+  const performAction = async (action: () => Promise<void>) => {
+    setActionError("");
+    try {
+      await action();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "目标状态更新失败");
+    }
+  };
+  return (
+    <section>
+      <SectionHeader
+        icon={<Target className="h-4 w-4" />}
+        title="目标"
+        metric={goalStatusLabel[goal.status]}
+        open={active}
+        onToggle={onActivate}
+      />
+      {active && (
+        <div className="pb-4">
+          <p className="text-[13px] leading-6 text-slate-700">{goal.objective}</p>
+          <div className="mt-3 grid grid-cols-3 gap-2 text-[11px] text-slate-500">
+            <div className="rounded-xl bg-black/[0.035] px-3 py-2">
+              Run
+              <span className="mt-0.5 block font-semibold text-slate-700">
+                {goal.round}/{goal.max_rounds}
+              </span>
+            </div>
+            <div className="rounded-xl bg-black/[0.035] px-3 py-2">
+              当前状态
+              <span className="mt-0.5 block font-semibold text-slate-700">
+                {run?.status || goalStatusLabel[goal.status]}
+              </span>
+            </div>
+            <div className="rounded-xl bg-black/[0.035] px-3 py-2">
+              模型调用
+              <span className="mt-0.5 block font-semibold text-slate-700">
+                {goal.model_call_count || 0}
+              </span>
+            </div>
+          </div>
+          {goal.budget_exhaustion_reason && (
+            <p className="mt-2 text-[11px] text-amber-700">
+              预算原因：{goal.budget_exhaustion_reason}
+            </p>
+          )}
+          {goal.gaps.length > 0 && (
+            <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5">
+              <div className="flex items-center gap-1.5 text-[11px] font-semibold text-amber-800">
+                <AlertTriangle className="h-3.5 w-3.5" />
+                尚待补齐
+              </div>
+              <ul className="mt-1.5 space-y-1 text-[11px] leading-5 text-amber-800/90">
+                {goal.gaps.map((gap, index) => <li key={`${gap}-${index}`}>• {gap}</li>)}
+              </ul>
+            </div>
+          )}
+          <div className="mt-3 flex flex-wrap gap-2">
+            {goal.status === "active" && (
+              <button
+                type="button"
+                disabled={runIsActive}
+                title={runIsActive ? "请先停止当前 Run" : "暂停目标"}
+                onClick={() => void performAction(onPause)}
+                className="flex items-center gap-1 rounded-lg border border-black/[0.08] px-2.5 py-1.5 text-[11px] text-slate-600 hover:bg-black/[0.035] disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <Pause className="h-3 w-3" />暂停
+              </button>
+            )}
+            {(goal.status === "paused" || goal.status === "blocked") && (
+              <button
+                type="button"
+                onClick={() => void performAction(onResume)}
+                className="flex items-center gap-1 rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-[11px] text-emerald-700 hover:bg-emerald-100"
+              >
+                <Play className="h-3 w-3" />恢复
+              </button>
+            )}
+            {!["achieved", "cancelled", "budget_exceeded"].includes(goal.status) && (
+              <button
+                type="button"
+                disabled={runIsActive}
+                title={runIsActive ? "请先停止当前 Run" : "取消目标"}
+                onClick={() => void performAction(onCancel)}
+                className="flex items-center gap-1 rounded-lg border border-rose-200 px-2.5 py-1.5 text-[11px] text-rose-600 hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <Ban className="h-3 w-3" />取消目标
+              </button>
+            )}
+          </div>
+          {runIsActive && (
+            <p className="mt-2 text-[11px] text-slate-400">
+              当前 Run 结束或停止后，才能暂停或取消 Goal。
+            </p>
+          )}
+          {actionError && (
+            <p className="mt-2 rounded-lg bg-rose-50 px-2.5 py-2 text-[11px] text-rose-700">
+              {actionError}
+            </p>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function VerificationCard({
+  active,
+  onActivate,
+  report,
+  run,
+}: {
+  active: boolean;
+  onActivate: () => void;
+  report: RubricEvaluationReport;
+  run: HarnessRun | null;
+}) {
+  const passed = report.status === "satisfied" || report.status === "not_required";
+  return (
+    <section>
+      <SectionHeader
+        icon={passed ? <CheckCircle2 className="h-4 w-4" /> : <AlertTriangle className="h-4 w-4" />}
+        title="验收"
+        metric={passed ? "通过" : "待修正"}
+        open={active}
+        onToggle={onActivate}
+      />
+      {active && (
+        <div className="space-y-2 pb-4">
+          <p className="text-[11px] text-slate-500">
+            Run {run?.run_id?.slice(-8) || report.run_id.slice(-8)} · {report.status}
+          </p>
+          {report.evaluations.map((evaluation) => (
+            <div
+              key={`${evaluation.criterion_id}-${evaluation.name}`}
+              className={`rounded-xl border px-3 py-2.5 ${
+                evaluation.passed
+                  ? "border-emerald-100 bg-emerald-50/70"
+                  : "border-amber-200 bg-amber-50"
+              }`}
+            >
+              <div className="flex items-start gap-2 text-[12px] font-medium text-slate-700">
+                {evaluation.passed
+                  ? <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-600" />
+                  : <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-600" />}
+                <span>{evaluation.name}</span>
+              </div>
+              {evaluation.gap && (
+                <p className="mt-1 pl-5 text-[11px] leading-5 text-amber-800">{evaluation.gap}</p>
+              )}
+            </div>
+          ))}
+          {report.evaluations.length === 0 && report.gaps.map((gap, index) => (
+            <p key={`${gap}-${index}`} className="rounded-xl bg-amber-50 px-3 py-2 text-[11px] text-amber-800">
+              {gap}
+            </p>
+          ))}
+        </div>
+      )}
+    </section>
+  );
 }
 
 function SectionHeader({

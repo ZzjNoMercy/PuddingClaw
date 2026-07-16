@@ -125,12 +125,57 @@ class ReadResourceTool(BaseTool):
             return None
         return path
 
+    def _resolve_workspace_virtual_path(self, value: str) -> Path | None:
+        if not value.startswith("/workspace/") or not self.workspace_path:
+            return None
+        workspace = Path(self.workspace_path).expanduser().resolve()
+        relative = value.removeprefix("/workspace/").lstrip("/")
+        path = (workspace / relative).resolve()
+        try:
+            path.relative_to(workspace)
+        except ValueError:
+            return None
+        return path
+
+    def _read_workspace_path(
+        self,
+        path: Path,
+        *,
+        offset: int,
+        limit: int,
+    ) -> str:
+        if not path.exists():
+            return f"❌ File not found: {path}"
+        if not path.is_file():
+            return f"❌ Not a file: {path}"
+        image_marker = self._read_image_path_marker(str(path))
+        if image_marker is not None:
+            return image_marker
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception as exc:
+            return f"❌ Error reading workspace resource: {exc}"
+        selected = lines[offset : offset + limit]
+        suffix = (
+            f"\n...[{len(lines) - offset - len(selected)} more lines]"
+            if offset + len(selected) < len(lines)
+            else ""
+        )
+        return "\n".join(selected) + suffix
+
     def _run(self, resource: str, offset: int = 0, limit: int = 2000) -> str:
         value = resource.strip()
         if not value:
             return "❌ Missing resource."
         if value.startswith("att_"):
             return self._read_attachment(value)
+        workspace_path = self._resolve_workspace_virtual_path(value)
+        if workspace_path is not None:
+            return self._read_workspace_path(
+                workspace_path,
+                offset=offset,
+                limit=limit,
+            )
         knowledge_path = self._resolve_knowledge_virtual_path(value)
         if knowledge_path is not None:
             value = str(knowledge_path)

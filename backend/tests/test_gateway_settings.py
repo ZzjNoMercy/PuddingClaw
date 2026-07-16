@@ -11,6 +11,7 @@ from app import app
 from graph.attachment_store import attachment_store
 from graph.deepagents_manager import AttachmentImageContentMiddleware, DeepAgentsAgentManager, _build_subagent_item
 from langchain_core.messages import ToolMessage
+import pytest
 
 
 def _stored_image_attachment(tmp_path, session_id: str = "session-attachments"):
@@ -22,6 +23,90 @@ def _stored_image_attachment(tmp_path, session_id: str = "session-attachments"):
         source="upload",
         stream=BytesIO(b"\x89PNG\r\n\x1a\n"),
     )
+
+
+def test_harness_settings_freeze_explicit_goal_and_validate_rules(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
+
+    config.update_settings({
+        "harness": {
+            "goals": {
+                "enabled": True,
+                "activation": "automatic",
+                "default_enabled": True,
+                "auto_promote_from_run": True,
+                "max_rounds": 5,
+            },
+            "completion": {
+                "rubric": {
+                    "enabled": True,
+                    "model": "  grader-model  ",
+                    "max_iterations": 3,
+                    "custom_rules": [{
+                        "id": "quantified",
+                        "statement": "原因必须给出影响量级",
+                        "required": True,
+                        "verifier": "analytics",
+                    }],
+                },
+            },
+        },
+    })
+
+    saved = json.loads(config_path.read_text(encoding="utf-8"))["harness"]
+    assert saved["goals"]["activation"] == "explicit_user_only"
+    assert saved["goals"]["default_enabled"] is False
+    assert saved["goals"]["auto_promote_from_run"] is False
+    assert saved["completion"]["rubric"]["custom_rules"][0]["statement"] == "原因必须给出影响量级"
+    assert saved["completion"]["rubric"]["model"] == "grader-model"
+
+    with pytest.raises(ValueError, match="verifier is not registered"):
+        config.update_settings({
+            "harness": {
+                "completion": {
+                    "rubric": {
+                        "custom_rules": [{
+                            "statement": "run shell",
+                            "verifier": "shell",
+                        }],
+                    },
+                },
+            },
+        })
+
+    with pytest.raises(ValueError, match="verifier is not registered"):
+        config.update_settings({
+            "harness": {
+                "completion": {
+                    "rubric": {
+                        "custom_rules": [{
+                            "statement": "自然语言不能冒充代码验证器",
+                            "verifier": "deterministic",
+                        }],
+                    },
+                },
+            },
+        })
+
+
+def test_docker_probe_endpoint_reports_daemon_status(monkeypatch):
+    from harness.workspace_backends import ProjectSandboxManager
+
+    monkeypatch.setattr(
+        ProjectSandboxManager,
+        "probe",
+        lambda self: (True, "27.0.1"),
+    )
+    response = TestClient(app).post(
+        "/api/settings/harness/docker/probe",
+        json={"connection": "", "context": "desktop-linux"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["available"] is True
+    assert response.json()["detail"] == "27.0.1"
 
 
 def test_gateway_has_no_key_and_provider_key_is_masked(tmp_path, monkeypatch):
@@ -358,6 +443,17 @@ def test_thinking_mode_switches_to_thinking_model(tmp_path, monkeypatch):
     assert displayed["thinking_mode"] is True
     saved = json.loads(config_path.read_text(encoding="utf-8"))
     assert saved["thinking_mode"] is True
+
+    rubric_fallback = config.get_fallback_llm_config(
+        thinking_enabled_override=False,
+    )
+    rubric_gateway = config.get_gateway_llm_config(
+        thinking_enabled_override=False,
+    )
+    assert rubric_fallback["reasoning_effort"] is None
+    assert rubric_fallback["extra_body"] is None
+    assert rubric_gateway["reasoning_effort"] is None
+    assert rubric_gateway["extra_body"] is None
 
 
 def test_settings_api_accepts_thinking_mode(tmp_path, monkeypatch):
@@ -811,3 +907,13 @@ def test_agent_user_content_routes_pasted_absolute_file_path_to_read_resource(tm
     assert "read_resource(resource=原始路径)" in content
     assert "不要调用 read_file" in content
     assert str(external_file) in content
+
+
+def test_agent_user_content_keeps_virtual_workspace_path_as_managed_input(tmp_path):
+    content = DeepAgentsAgentManager._build_user_content(
+        "确认 /workspace/e2e-goal-report.md 的内容",
+        session_id="session-virtual-path",
+        workspace_path=tmp_path,
+    )
+
+    assert content == "确认 /workspace/e2e-goal-report.md 的内容"

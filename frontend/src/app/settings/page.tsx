@@ -23,6 +23,8 @@ import {
   Braces,
   RefreshCw,
   FolderOpen,
+  Box,
+  Target,
   X,
 } from "lucide-react";
 import {
@@ -32,6 +34,7 @@ import {
   testConnection,
   testDatabaseConnection,
   getCapabilities,
+  probeHarnessDocker,
   type SystemSettings,
   type Capabilities,
   type SubAgentItem,
@@ -61,6 +64,8 @@ type HarnessSection = {
 const HARNESS_SECTIONS: HarnessSection[] = [
   { id: "subagent", label: "SubAgent", description: "子代理注册与状态", icon: Bot },
   { id: "context", label: "上下文工程", description: "摘要与工具上下文压缩", icon: Brain },
+  { id: "completion", label: "Goal 与验收", description: "Run Rubric 与显式 Goal", icon: Target },
+  { id: "sandbox", label: "终端与沙箱", description: "Docker 后端与受控降级", icon: Box },
   { id: "runtime", label: "运行保护", description: "运行保护与权限策略", icon: ShieldCheck },
 ];
 
@@ -243,6 +248,29 @@ export default function SettingsPage() {
   const [modelCallRunLimit, setModelCallRunLimit] = useState("50");
   const [modelCallThreadLimit, setModelCallThreadLimit] = useState("");
   const [modelCallExitBehavior, setModelCallExitBehavior] = useState<"end" | "error">("end");
+  const [rubricEnabled, setRubricEnabled] = useState(true);
+  const [rubricMaxIterations, setRubricMaxIterations] = useState("2");
+  const [customRubricRulesEnabled, setCustomRubricRulesEnabled] = useState(false);
+  const [customRubricRules, setCustomRubricRules] = useState<Array<{
+    id: string;
+    enabled: boolean;
+    statement: string;
+    required: boolean;
+    verifier: "analytics" | "llm_grader";
+  }>>([]);
+  const [goalsEnabled, setGoalsEnabled] = useState(true);
+  const [goalMaxRounds, setGoalMaxRounds] = useState("8");
+  const [dockerEnabled, setDockerEnabled] = useState(false);
+  const [dockerOnUnavailable, setDockerOnUnavailable] = useState<"fallback" | "deny">("fallback");
+  const [dockerConnection, setDockerConnection] = useState("");
+  const [dockerContext, setDockerContext] = useState("");
+  const [dockerImage, setDockerImage] = useState("python:3.12-slim");
+  const [dockerCpuLimit, setDockerCpuLimit] = useState("2");
+  const [dockerMemoryLimitMb, setDockerMemoryLimitMb] = useState("2048");
+  const [dockerPidsLimit, setDockerPidsLimit] = useState("256");
+  const [dockerNetworkEnabled, setDockerNetworkEnabled] = useState(false);
+  const [dockerProbeStatus, setDockerProbeStatus] = useState<"idle" | "loading" | "ok" | "error">("idle");
+  const [dockerProbeDetail, setDockerProbeDetail] = useState("");
 
   // Harness left-right anchor layout
   const [harnessFilter, setHarnessFilter] = useState("");
@@ -373,6 +401,30 @@ export default function SettingsPage() {
         setModelCallRunLimit(modelLimit?.run_limit ? String(modelLimit.run_limit) : "50");
         setModelCallThreadLimit(modelLimit?.thread_limit ? String(modelLimit.thread_limit) : "");
         setModelCallExitBehavior(modelLimit?.exit_behavior === "error" ? "error" : "end");
+        const rubric = s.harness?.completion?.rubric;
+        setRubricEnabled(rubric?.enabled ?? true);
+        setRubricMaxIterations(String(rubric?.max_iterations ?? 2));
+        setCustomRubricRulesEnabled(rubric?.custom_rules_enabled ?? false);
+        setCustomRubricRules(
+          Array.isArray(rubric?.custom_rules)
+            ? rubric.custom_rules.map((rule) => ({
+                ...rule,
+                verifier: rule.verifier === "analytics" ? "analytics" : "llm_grader",
+              }))
+            : []
+        );
+        setGoalsEnabled(s.harness?.goals?.enabled ?? true);
+        setGoalMaxRounds(String(s.harness?.goals?.max_rounds ?? 8));
+        const terminal = s.harness?.terminal;
+        setDockerEnabled(terminal?.docker_enabled ?? false);
+        setDockerOnUnavailable(terminal?.on_unavailable === "deny" ? "deny" : "fallback");
+        setDockerConnection(terminal?.docker?.connection || "");
+        setDockerContext(terminal?.docker?.context || "");
+        setDockerImage(terminal?.docker?.image || "python:3.12-slim");
+        setDockerCpuLimit(terminal?.docker?.cpu_limit || "2");
+        setDockerMemoryLimitMb(String(terminal?.docker?.memory_limit_mb ?? 2048));
+        setDockerPidsLimit(String(terminal?.docker?.pids_limit ?? 256));
+        setDockerNetworkEnabled(terminal?.docker?.network_enabled ?? false);
         // SubAgent
         const items = s.subagents?.items || s.subagent?.items;
         if (Array.isArray(items) && items.length > 0) {
@@ -568,6 +620,37 @@ export default function SettingsPage() {
             thread_limit: positiveIntOrNull(modelCallThreadLimit),
             exit_behavior: modelCallExitBehavior,
           },
+          completion: {
+            rubric: {
+              enabled: rubricEnabled,
+              max_iterations: positiveIntOrNull(rubricMaxIterations) ?? 2,
+              custom_rules_enabled: customRubricRulesEnabled,
+              custom_rules: customRubricRules.filter((rule) => rule.statement.trim()),
+            },
+          },
+          goals: {
+            enabled: goalsEnabled,
+            activation: "explicit_user_only",
+            default_enabled: false,
+            auto_promote_from_run: false,
+            max_rounds: positiveIntOrNull(goalMaxRounds) ?? 8,
+          },
+          terminal: {
+            docker_enabled: dockerEnabled,
+            on_unavailable: dockerOnUnavailable,
+            default_timeout_seconds: 120,
+            docker: {
+              connection: dockerConnection,
+              context: dockerContext,
+              image: dockerImage,
+              cpu_limit: dockerCpuLimit,
+              memory_limit_mb: positiveIntOrNull(dockerMemoryLimitMb) ?? 2048,
+              pids_limit: positiveIntOrNull(dockerPidsLimit) ?? 256,
+              network_enabled: dockerNetworkEnabled,
+              lifecycle: "project",
+              idle_stop_minutes: 30,
+            },
+          },
         },
         subagents: subagentItemsToConfig(subagentItems),
       });
@@ -590,7 +673,7 @@ export default function SettingsPage() {
     } finally {
       setSaving(false);
     }
-  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaQueryTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmModel, mmDimension, mmApiKey, knowledgeRootDir, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, toolContextEnabled, singleToolTriggerTokens, backgroundMinResultTokens, keepRecentToolResults, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, subagentItems, showToast]);
+  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaQueryTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmModel, mmDimension, mmApiKey, knowledgeRootDir, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, toolContextEnabled, singleToolTriggerTokens, backgroundMinResultTokens, keepRecentToolResults, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, dockerEnabled, dockerOnUnavailable, dockerConnection, dockerContext, dockerImage, dockerCpuLimit, dockerMemoryLimitMb, dockerPidsLimit, dockerNetworkEnabled, subagentItems, showToast]);
 
   const handleDatabaseModeChange = useCallback((mode: "bundled" | "external") => {
     setDatabaseMode(mode);
@@ -649,6 +732,22 @@ export default function SettingsPage() {
       setDatabaseTesting(false);
     }
   }, [databaseConnectionPayload, databaseName, showToast]);
+
+  const handleProbeDocker = useCallback(async () => {
+    setDockerProbeStatus("loading");
+    setDockerProbeDetail("");
+    try {
+      const result = await probeHarnessDocker({
+        connection: dockerConnection,
+        context: dockerContext,
+      });
+      setDockerProbeStatus(result.available ? "ok" : "error");
+      setDockerProbeDetail(result.detail || (result.available ? "Docker 可用" : "Docker 不可用"));
+    } catch (err) {
+      setDockerProbeStatus("error");
+      setDockerProbeDetail(err instanceof Error ? err.message : "Docker 探测失败");
+    }
+  }, [dockerConnection, dockerContext]);
 
   const handleResetVectorCollections = useCallback(async () => {
     const confirmed = window.confirm(
@@ -2053,6 +2152,257 @@ export default function SettingsPage() {
                             },
                           }}
                         />
+                      </div>
+                    </SettingsCard>
+                  </section>
+
+                  <section id="harness-section-completion" className="scroll-mt-6">
+                    <SettingsCard title="Goal 与验收" icon={Target} color="#002fa7">
+                      <div className="space-y-4">
+                        <div className="rounded-xl border border-black/[0.06] bg-white/55 px-3.5 py-3">
+                          <div className="flex items-center justify-between gap-4">
+                            <div>
+                              <p className="text-[13px] font-semibold text-gray-900">Run Rubric 验收</p>
+                              <p className="mt-1 text-[11px] leading-relaxed text-gray-500">
+                                Rubric 属于 Run。即使未开启 Goal，有明确产物或分析结果的 Run 仍可自动验收。
+                              </p>
+                            </div>
+                            <SwitchButton
+                              checked={rubricEnabled}
+                              onChange={setRubricEnabled}
+                              ariaLabel="启用 Run Rubric"
+                            />
+                          </div>
+                          <div className="mt-4 max-w-xs">
+                            <FormField label="单 Run 最大修正轮数">
+                              <input
+                                type="number"
+                                min={1}
+                                max={20}
+                                value={rubricMaxIterations}
+                                onChange={(event) => setRubricMaxIterations(event.target.value)}
+                                className="form-input"
+                                disabled={!rubricEnabled}
+                              />
+                            </FormField>
+                          </div>
+                        </div>
+
+                        <div className="rounded-xl border border-black/[0.06] bg-white/55 px-3.5 py-3">
+                          <div className="flex items-center justify-between gap-4">
+                            <div>
+                              <p className="text-[13px] font-semibold text-gray-900">显式 Goal Mode</p>
+                              <p className="mt-1 text-[11px] leading-relaxed text-gray-500">
+                                Goal 默认关闭，只有用户在输入区主动勾选才创建。系统不会因任务复杂或 Run 失败自动升级。
+                              </p>
+                            </div>
+                            <SwitchButton
+                              checked={goalsEnabled}
+                              onChange={setGoalsEnabled}
+                              ariaLabel="允许用户开启 Goal Mode"
+                            />
+                          </div>
+                          <div className="mt-4 max-w-xs">
+                            <FormField label="单 Goal 最大 Run 数">
+                              <input
+                                type="number"
+                                min={1}
+                                max={100}
+                                value={goalMaxRounds}
+                                onChange={(event) => setGoalMaxRounds(event.target.value)}
+                                className="form-input"
+                                disabled={!goalsEnabled}
+                              />
+                              <p className="mt-1 text-[10px] leading-relaxed text-gray-400">
+                                当前 Goal 总预算按跨 Run 轮数控制；模型调用次数限制是单 Run
+                                的即时熔断器，不等同于 Goal token 预算。
+                              </p>
+                            </FormField>
+                          </div>
+                        </div>
+
+                        <div className="rounded-xl border border-black/[0.06] bg-white/55 px-3.5 py-3">
+                          <div className="flex items-center justify-between gap-4">
+                            <div>
+                              <p className="text-[13px] font-semibold text-gray-900">高级自定义验收规则</p>
+                              <p className="mt-1 text-[11px] leading-relaxed text-gray-500">
+                                可追加或强化规则，不能关闭系统的数据正确性、安全和证据底线。
+                              </p>
+                            </div>
+                            <SwitchButton
+                              checked={customRubricRulesEnabled}
+                              onChange={setCustomRubricRulesEnabled}
+                              ariaLabel="启用高级自定义 Rubric 规则"
+                            />
+                          </div>
+                          {customRubricRulesEnabled && (
+                            <div className="mt-4 space-y-3">
+                              {customRubricRules.map((rule, index) => (
+                                <div key={rule.id || index} className="rounded-xl border border-black/[0.07] bg-white p-3">
+                                  <div className="flex items-start gap-2">
+                                    <textarea
+                                      value={rule.statement}
+                                      onChange={(event) =>
+                                        setCustomRubricRules((current) =>
+                                          current.map((item, itemIndex) =>
+                                            itemIndex === index
+                                              ? { ...item, statement: event.target.value }
+                                              : item
+                                          )
+                                        )
+                                      }
+                                      className="form-input min-h-20 flex-1 resize-y"
+                                      placeholder="例如：主要原因必须给出贡献量或影响量级"
+                                    />
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        setCustomRubricRules((current) =>
+                                          current.filter((_, itemIndex) => itemIndex !== index)
+                                        )
+                                      }
+                                      className="rounded-lg p-2 text-gray-400 hover:bg-red-50 hover:text-red-600"
+                                      title="删除规则"
+                                    >
+                                      <X className="h-4 w-4" />
+                                    </button>
+                                  </div>
+                                  <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                                    <FormField label="验证器">
+                                      <select
+                                        value={rule.verifier}
+                                        onChange={(event) =>
+                                          setCustomRubricRules((current) =>
+                                            current.map((item, itemIndex) =>
+                                              itemIndex === index
+                                                ? {
+                                                    ...item,
+                                                    verifier: event.target.value as
+                                                      | "analytics"
+                                                      | "llm_grader",
+                                                  }
+                                                : item
+                                            )
+                                          )
+                                        }
+                                        className="form-select"
+                                      >
+                                        <option value="llm_grader">LLM Grader</option>
+                                        <option value="analytics">Analytics Check</option>
+                                      </select>
+                                    </FormField>
+                                    <label className="flex items-center gap-2 pt-6 text-[12px] text-gray-600">
+                                      <input
+                                        type="checkbox"
+                                        checked={rule.required}
+                                        onChange={(event) =>
+                                          setCustomRubricRules((current) =>
+                                            current.map((item, itemIndex) =>
+                                              itemIndex === index
+                                                ? { ...item, required: event.target.checked }
+                                                : item
+                                            )
+                                          )
+                                        }
+                                      />
+                                      required
+                                    </label>
+                                  </div>
+                                </div>
+                              ))}
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setCustomRubricRules((current) => [
+                                    ...current,
+                                    {
+                                      id: `custom_${Date.now()}`,
+                                      enabled: true,
+                                      statement: "",
+                                      required: true,
+                                      verifier: "llm_grader",
+                                    },
+                                  ])
+                                }
+                                className="rounded-xl border border-dashed border-[#002fa7]/30 px-3 py-2 text-[12px] font-medium text-[#002fa7] hover:bg-[#002fa7]/[0.04]"
+                              >
+                                + 新增验收规则
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </SettingsCard>
+                  </section>
+
+                  <section id="harness-section-sandbox" className="scroll-mt-6">
+                    <SettingsCard title="终端与沙箱" icon={Box} color="#002fa7">
+                      <div className="space-y-4">
+                        <div className="rounded-xl border border-black/[0.06] bg-white/55 px-3.5 py-3">
+                          <div className="flex items-center justify-between gap-4">
+                            <div>
+                              <p className="text-[13px] font-semibold text-gray-900">Docker 项目沙箱</p>
+                              <p className="mt-1 text-[11px] leading-relaxed text-gray-500">
+                                每个项目复用一个容器，项目目录挂载到 /workspace。Docker 只提供隔离，命令仍经过权限管线。
+                              </p>
+                            </div>
+                            <SwitchButton
+                              checked={dockerEnabled}
+                              onChange={setDockerEnabled}
+                              ariaLabel="启用 Docker 项目沙箱"
+                            />
+                          </div>
+
+                          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                            <FormField label="Docker connection / DOCKER_HOST">
+                              <input value={dockerConnection} onChange={(event) => setDockerConnection(event.target.value)} className="form-input" placeholder="留空使用本机默认" />
+                            </FormField>
+                            <FormField label="Docker context">
+                              <input value={dockerContext} onChange={(event) => setDockerContext(event.target.value)} className="form-input" placeholder="留空使用当前 context" />
+                            </FormField>
+                            <FormField label="容器镜像">
+                              <input value={dockerImage} onChange={(event) => setDockerImage(event.target.value)} className="form-input" />
+                            </FormField>
+                            <FormField label="Docker 不可用时">
+                              <select value={dockerOnUnavailable} onChange={(event) => setDockerOnUnavailable(event.target.value === "deny" ? "deny" : "fallback")} className="form-select">
+                                <option value="fallback">降级到受控 Host Terminal</option>
+                                <option value="deny">拒绝命令执行</option>
+                              </select>
+                            </FormField>
+                            <FormField label="CPU 限额">
+                              <input value={dockerCpuLimit} onChange={(event) => setDockerCpuLimit(event.target.value)} className="form-input" />
+                            </FormField>
+                            <FormField label="内存限额（MB）">
+                              <input type="number" min={128} value={dockerMemoryLimitMb} onChange={(event) => setDockerMemoryLimitMb(event.target.value)} className="form-input" />
+                            </FormField>
+                            <FormField label="进程数上限">
+                              <input type="number" min={16} value={dockerPidsLimit} onChange={(event) => setDockerPidsLimit(event.target.value)} className="form-input" />
+                            </FormField>
+                            <label className="flex items-center gap-2 pt-6 text-[12px] text-gray-600">
+                              <input type="checkbox" checked={dockerNetworkEnabled} onChange={(event) => setDockerNetworkEnabled(event.target.checked)} />
+                              允许容器网络
+                            </label>
+                          </div>
+
+                          <div className="mt-4 flex flex-wrap items-center gap-3">
+                            <button
+                              type="button"
+                              onClick={() => void handleProbeDocker()}
+                              disabled={dockerProbeStatus === "loading"}
+                              className="rounded-xl border border-black/[0.08] bg-white px-3 py-2 text-[12px] font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-60"
+                            >
+                              {dockerProbeStatus === "loading" ? "正在探测…" : "探测 Docker"}
+                            </button>
+                            {dockerProbeStatus !== "idle" && (
+                              <span className={`text-[11px] ${dockerProbeStatus === "ok" ? "text-emerald-700" : "text-rose-600"}`}>
+                                {dockerProbeDetail}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                        <p className="rounded-xl bg-amber-50 px-3 py-2 text-[11px] leading-5 text-amber-800">
+                          未启用或不可用时，Restricted Host 只是 best-effort 降级，不会在 UI/Trace 中宣称为真沙箱。sudo、Docker 控制和宿主 workspace 外路径始终硬拒绝。
+                        </p>
                       </div>
                     </SettingsCard>
                   </section>

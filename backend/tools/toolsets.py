@@ -64,7 +64,7 @@ DEFAULT_TOOLSETS = frozenset({*NATIVE_TOOLSETS, *UNCONDITIONAL_EXTENSION_TOOLSET
 # Explicit PuddingClaw extensions that remain available without loading a
 # business Skill. They are not DeepAgents-native and keep their own permission
 # policies (for example, read_resource's external-file HITL gate).
-DEFAULT_CUSTOM_TOOL_NAMES = frozenset({"terminal", "read_resource"}).union(
+DEFAULT_CUSTOM_TOOL_NAMES = frozenset({"read_resource"}).union(
     *UNCONDITIONAL_EXTENSION_TOOLSETS.values()
 )
 NATIVE_TOOL_NAMES = frozenset().union(*NATIVE_TOOLSETS.values())

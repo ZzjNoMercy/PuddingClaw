@@ -1,6 +1,6 @@
 # 从 Grok Build 反推 PuddingClaw Harness：差距分析与演进架构
 
-状态：**优化方案待用户审核；尚未进入开发，禁止据此直接修改生产代码**
+状态：**方案已审核，第一阶段实现位于 `codex/harness-control-plane`；后端 492 项测试、前端生产构建、Goal/Rubric UI E2E 与真实 Docker Backend E2E 已通过**
 日期：2026-07-16
 Grok Build 源码：<code>b189869b7755d2b482969acf6c92da3ecfeffd36</code>
 PuddingClaw 基线提交：<code>7fb380f43be9c9b13fd3478bb28ef1a637fe6203</code>
@@ -19,7 +19,7 @@ PuddingClaw 基线提交：<code>7fb380f43be9c9b13fd3478bb28ef1a637fe6203</code>
 - 不拆分现有 <code>DeepAgentsAgentManager</code>；
 - 不修改现有 Session JSON、Trace、LangGraph checkpoint 的权威边界；
 - 不开发多 Skeptic；
-- 用户审核通过前不进入生产代码开发。
+- 不在本轮抽取通用 Agent 基座；先让智能问数 Agent 的 Harness 闭环稳定。
 
 ### 0.2 已同意进入审核的三个控制面
 
@@ -40,6 +40,25 @@ PuddingClaw 基线提交：<code>7fb380f43be9c9b13fd3478bb28ef1a637fe6203</code>
 - **[PuddingClaw 延续]**：项目已经明确或实现的设计，不归因于 Grok Build；
 - **[本方案新增]**：结合 PuddingClaw 产品边界提出的协调或抽象；
 - **[暂不采用]**：机制有参考价值，但不进入本轮开发范围。
+
+### 0.4 2026-07-16 实现进度
+
+本轮已经落地：
+
+- <code>ToolExecutionPipeline</code>：所有 Agent Tool 先经过显式分类；未知或未分类 Tool 默认拒绝，网络 Tool 与高风险命令进入 HITL；
+- <code>DockerWorkspaceBackend</code> / <code>RestrictedHostWorkspaceBackend</code>：同一 Backend 协议，Docker 按项目复用、项目级命令串行、空闲自动停止；
+- <code>HarnessRunCoordinator</code> / <code>GoalCoordinator</code>：Session JSON 是跨 Run 唯一产品状态权威，同一 Session 只允许一个非终态 Run 和一个 active Goal；
+- <code>PuddingClawRubricMiddleware</code>：执行顺序为 Todo/产物 deterministic gate → 单 Grader 严格 JSON 验收 → RunOutcome；复用 DeepAgents 的回跳与有限迭代，但不依赖供应商 function calling；
+- Goal 前后端：输入区显式开关、Session 级 Goal/Run/Verification 状态、暂停/恢复/取消与右侧面板；
+- Harness Settings：Goal/Rubric 高级规则、Docker 配置与 daemon probe；
+- ModelCallLimit 已映射为 Run 级 <code>budget_exceeded</code>，不会在 Goal 尚有 Run 预算时误终止整个 Goal。
+- 显式 Goal 无条件生成并冻结 Goal contract；后续“继续”“确认”等短消息继承原合同，不能通过关键词启发式绕过验收。
+
+本轮尚未宣称完成：
+
+- Goal 的跨 Run token/cost/wall-time 组合预算；当前默认 Goal 总预算只按 <code>max_rounds</code>；
+- 更完整的智能问数 analytics verifier（指标口径、Join、时间范围、数据覆盖）；
+- 多 evaluator / skeptic panel。
 
 ## 1. 结论先行
 
@@ -652,21 +671,22 @@ PuddingClaw 当前持久化 todos：
 - <code>backend/graph/session_manager.py:600</code>
 - <code>backend/graph/session_manager.py:609</code>
 
-也在 stream 中同步 DeepAgents state，但当前源码没有统一的 Run Completion Gate，也没有用户显式开启后才生效的 GoalTracker。模型自然停止后，DeepAgents 就结束；PuddingClaw 没有独立判断“本 Run 的任务是否真的完成”。
+也在 stream 中同步 DeepAgents state。基线源码原本没有统一的 Run Completion Gate，也没有用户显式开启后才生效的 GoalTracker；本分支已经补入上述控制面。
 
-ModelCallLimit 只防 runaway：
+基线中的 ModelCallLimit 只防 runaway：
 
 - <code>backend/graph/deepagents_manager.py:664</code>
 
-它不能解决 premature completion。
+它不能解决 premature completion。本分支保留它作为 Run 内熔断器，并把其终态接入 Run/Goal 预算状态，但完成质量仍由 deterministic gate + Rubric 负责。
 
 ## 7. Completion Control：不移植 Grok skeptic panel，先复用 DeepAgents Rubric
 
 来源：**[Grok Build 借鉴] + [DeepAgents 复用] + [本方案新增]**。
 
 - Grok Build 借鉴：Generator–Evaluator 分离、Goal gaps/continuation、预算与完成权由 Harness 持有；
-- DeepAgents 复用：<code>RubricMiddleware</code> 的单 Grader、needs_revision 回跳、有限迭代；
+- DeepAgents 复用：<code>RubricMiddleware</code> 的状态字段、needs_revision 回跳、有限迭代与终态语义；
 - 本方案新增：在 Rubric 前加入智能问数 deterministic checks，并由 <code>CompletionVerificationCoordinator</code> 将验收结果映射为 RunOutcome；只有请求携带 active Goal 时，再由 <code>GoalCoordinator</code> 更新 GoalState；
+- PuddingClaw 适配：Grader 使用无 Tool 的严格 JSON 协议，不使用 DeepAgents 默认 <code>response_format</code> 所触发的强制 <code>tool_choice</code>。原因是部分 thinking 模型即使切换“非思考模型名”仍拒绝 function-calling structured output；
 - 暂不采用：Grok Build 多 Skeptic majority-refute。
 
 当前安装的 DeepAgents 0.6.12 已提供 <code>RubricMiddleware</code>：
@@ -698,6 +718,22 @@ RubricMiddleware 文档明确指出：grader_error、failed、max_iterations_rea
 5. 通过 SSE/Trace 向 UI 呈现“已验证、未通过、验证器异常”；
 6. 非 satisfied 不得一律发普通 <code>done</code>。
 
+### 7.1.1 为什么不直接照搬默认 structured-output grader
+
+真实 E2E 暴露了两个供应商适配问题：
+
+1. Gateway 与 direct provider 都可能把配置中的基础模型路由为 thinking 模式，并拒绝 <code>tool_choice=any</code>；
+2. <code>ModelClientChatModel(streaming=False)</code> 若未同步设置 LangChain 的 <code>disable_streaming</code>，回调环境仍可能错误进入 <code>_astream</code>。
+
+当前实现因此采用：
+
+- Rubric 模型显式 <code>thinking_enabled=false</code>，默认使用 <code>fallback_llm.model</code>；
+- Grader 直接调用模型，要求只返回一个 JSON object，再用 DeepAgents 的 <code>GraderResponse</code> schema 校验；
+- Grader 不绑定 Tool，trace 中最终成功请求的 <code>tool_choice=null</code>；
+- non-streaming wrapper 同时设置 provider streaming 与 LangChain <code>disable_streaming</code>。
+
+保留 DeepAgents RubricMiddleware 的 evaluator loop，不等于必须保留其 provider-specific structured-output transport。
+
 ### 7.2 验证分级
 
 | 等级 | 任务 | 验证方式 |
@@ -725,6 +761,8 @@ RubricMiddleware 文档明确指出：grader_error、failed、max_iterations_rea
 ~~~
 
 高级用户可以在 Harness Settings 中追加或强化验收规则，但不能从零接管整个 Rubric，也不能关闭系统的数据正确性、安全和证据底线。
+
+第一版高级文本规则只允许选择 <code>llm_grader</code> 或已注册的 <code>analytics</code> verifier。不能把一段自然语言规则标成 <code>deterministic</code>；真正的 deterministic verifier 必须由代码注册，否则只是伪确定性。
 
 建议设置模型：
 
@@ -857,18 +895,46 @@ Run 与 Goal 的关系：
 - 用户取消 Run 不等于取消 Goal；
 - verifier_error 不等于 achieved。
 
-审核通过后的建议组件边界（当前只记录，不创建文件）：
+### 8.1 Goal Budget 与 ModelCallLimit 的边界
+
+两者不是同一个预算：
+
+- <code>ModelCallLimit</code> 是单 Run 的即时熔断器，当前可限制 <code>run_limit</code> / <code>thread_limit</code>；
+- <code>Goal Budget</code> 是跨 Run 累计账本，当前第一阶段以 <code>max_rounds</code> 作为默认总预算；
+- Rubric 的 <code>max_iterations</code> 是单 Run 内的验收修正上限，也不等于 Goal 预算。
+
+当前实现已经做到：
+
+- ModelCallLimit 触发时，Run 终态为 <code>budget_exceeded</code>，并记录 <code>run_model_call_limit</code> 或 <code>thread_model_call_limit</code>；
+- 若 Goal 仍有剩余 Run，Goal 保持 active，可由用户下一次显式继续；
+- 最后一个允许的 Run 仍未完成时，Goal 立即进入 <code>budget_exceeded</code>，原因是 <code>goal_max_runs</code>；
+- Goal 面板展示累计模型调用数，但这不代表已经实现完整 token 预算。
+
+后续组合预算建议：
+
+~~~yaml
+goals:
+  budget:
+    max_runs: 8
+    max_total_model_calls: null
+    max_total_tokens: null
+    max_elapsed_minutes: null
+~~~
+
+所有可计费模型调用（主 Agent、Rubric grader、子 Agent）最终都应进入 Run usage，再聚合到 Goal usage。该账本必须写入 Session JSON；Trace 只能记录，不作为恢复或预算权威。
+
+当前 <code>model_call_count</code> 主要来自主 Agent 的 ModelCallLimit 状态；Rubric grader 由独立的 <code>max_iterations</code> 有界控制，但尚未并入 Goal 的统一 token/call/cost 总账。这是后续组合预算工作，不应把当前 UI 数字解释为完整计费模型调用量。
+
+审核通过后的组件边界与当前实现映射：
 
 | 模块 | 职责 |
 |---|---|
-| <code>backend/harness/run_verification.py</code> | RunVerificationState、Run Rubric 终态和 RunOutcome |
-| <code>backend/harness/completion_verification.py</code> | deterministic checks + RubricMiddleware 结果汇总 |
-| <code>backend/harness/goal_state.py</code> | 类型、序列化、状态迁移 |
-| <code>backend/harness/goal_coordinator.py</code> | 仅在 Goal Mode 开启时负责 create/resume/advance/complete/block/budget |
-| <code>backend/harness/rubric_contract.py</code> | 类型化 Rubric criterion、来源、verifier、版本 |
+| <code>backend/harness/models.py</code> | Run/Goal/Verification 类型、序列化、合法迁移与 RunOutcome |
+| <code>backend/harness/coordinators.py</code> | HarnessRunCoordinator、GoalCoordinator、CompletionVerificationCoordinator |
+| <code>backend/harness/deterministic_checks.py</code> | Todo reconciliation、artifact existence 等代码验证器 |
 | <code>backend/harness/rubric_compiler.py</code> | 合并 system/managed/settings/user/task criteria 并生成 DeepAgents rubric string |
-| <code>backend/harness/verification_report.py</code> | 汇总 criterion、evidence、gaps 和最终状态 |
-| <code>backend/harness/completion_gate.py</code> | Todo/Run 自然停止后的统一门 |
+| <code>backend/graph/deepagents_manager.py</code> | PuddingClawRubricMiddleware 执行 deterministic gate → Rubric，并把事件接入 Run 生命周期 |
+| <code>backend/graph/session_manager.py</code> | Session JSON 中 Run/Goal/permission 的原子权威写路径 |
 
 ## 9. Lifecycle Control：在既定权威边界上补齐 HarnessRunCoordinator
 
@@ -973,7 +1039,7 @@ Run 与 Goal 必须分离：
 
 ### 10.1 Goal Mode 当前状态与产品边界
 
-截至本方案审核阶段，PuddingClaw **尚未实现 Goal Mode**。当前只有架构设计，后端没有可运行的 <code>GoalState</code> / <code>GoalCoordinator</code>，前端也没有 Goal 开关、Goal 状态或验证报告。
+PuddingClaw 当前分支已经实现 Goal Mode 的第一阶段前后端闭环：后端具有可运行的 <code>GoalRecord</code> / <code>GoalCoordinator</code>，前端具有默认关闭的 Goal 开关、Session 隔离状态、GoalCard 与 VerificationCard。
 
 Goal Mode 必须作为一项前后端同时交付、且由用户主动开启的产品能力，不能只在后端增加状态字段：
 
@@ -1030,7 +1096,7 @@ Goal Mode 必须作为一项前后端同时交付、且由用户主动开启的�
 
 ### 10.3 Frontend State、API 与 SSE 契约
 
-<code>frontend/src/lib/store.tsx</code> 需要增加按 Session 隔离的 Goal 产品状态，不能把它混入 Todo 或 Trace：
+<code>frontend/src/lib/store.tsx</code> 已增加按 Session 隔离的 Goal 产品状态，并保持它不混入 Todo 或 Trace：
 
 ```ts
 type GoalStatus =
@@ -1181,7 +1247,7 @@ Harness Settings 的前端同时增加 Goal / Rubric 高级设置区：
 5. 每个需要验收的 Run 固化 <code>rubric_version</code>、<code>contract_hash</code> 和 criterion source；Goal Mode 开启时再固化 Goal contract；
 6. 加入 TodoCompletionGate，最多有限次数 nudging；
 7. 先运行 SQL validation、指标口径、Join 路径、时间范围、数据覆盖、引用等 deterministic/analytics checks；
-8. 只把 <code>llm_grader</code> criterion 编译成字符串交给 DeepAgents RubricMiddleware；
+8. 只把 <code>llm_grader</code> criterion 编译成 Rubric string；由 PuddingClaw 的无 Tool JSON grader 执行，DeepAgents RubricMiddleware 负责迭代与状态；
 9. final_state 严格处理 rubric 终态；
 10. 由 CompletionVerificationCoordinator 汇总为 <code>RubricEvaluationReport</code> 和 RunOutcome；
 11. 仅当请求关联 <code>goal_id</code> 时，由 GoalCoordinator 消费报告并生成 GoalDecision；
@@ -1280,7 +1346,7 @@ RunOutcome =
 
 ## 14. 配置面建议
 
-当前 Harness Settings 已有 subagents、model call limit、context engineering。下一步增加：
+当前 Harness Settings 已有 subagents、model call limit、context engineering，并已加入第一阶段 Goal/Rubric/Docker 设置。完整目标配置面如下：
 
 ~~~text
 harness:
@@ -1405,7 +1471,9 @@ harness:
 - Run Rubric 的 needs_revision 只在同一 Run 内有限回跳，不创建第二个 Run；
 - 非 Goal Run 验证耗尽时返回 verification_failed + gaps，不自动升级为 Goal；
 - Goal Mode 开启后的首条消息创建 Goal，响应 goal_id 回填 active chip；
+- 显式 Goal 即使任务不命中 L1/L2 关键词，也必须生成最小 <code>task_fulfillment + todo_reconciliation</code> 合同；
 - active Goal 后续 Run 携带同一个 goal_id；
+- active Goal 后续短消息继承冻结的 <code>goal_contract</code>，不能退化为 <code>not_required</code>；
 - 同一 Session 首版不能并行创建两个 active Goal；
 - 切换 Session 后恢复各自的 active Goal，不发生串线；
 - SSE 重连或重复事件不会重复创建 Goal 或覆盖较新的状态；
@@ -1423,6 +1491,7 @@ harness:
 - rubric satisfied → completed；
 - needs_revision → 注入 gaps 并继续；
 - grader_error → verification_failed；
+- thinking 模式开启时，Rubric 请求不携带 Tool schema / 强制 tool_choice，仍能返回并解析严格 JSON；
 - max iterations → 非 completed；
 - todo 未完成 → 有界 nudge；
 - token/model/tool budget 任一耗尽 → budget_exceeded。
@@ -1473,7 +1542,7 @@ harness:
 | Tool Context output/UI evidence 分离 | **[PuddingClaw 延续]** | 保持当前即时保护和后台压缩 | 已有 |
 | TodoGate / 未完成任务 nudge | **[Grok Build 借鉴]** | 结合 DeepAgents Todo，做有限次数 Analytics Completion Gate | 待审核 |
 | Goal status、budget、gaps、continuation | **[Grok Build 借鉴]** | 仅用户显式开启 Goal Mode 时，由 Analytics GoalState 与 GoalCoordinator 跨 Run 推进 | 待审核 |
-| 单 Rubric grader | **[DeepAgents 复用]** | Run 级使用 RubricMiddleware，不要求存在 Goal，不自行实现 grader loop | 待审核 |
+| 单 Rubric grader | **[DeepAgents 复用] + [本方案适配]** | 复用 RubricMiddleware 的迭代/状态机；PuddingClaw 使用无 Tool 严格 JSON transport，避免 thinking/tool_choice 冲突 | 已实现并 E2E |
 | 智能问数 deterministic checks | **[本方案新增]** | SQL、指标、Join、时间、覆盖、引用检查先于 Rubric | 待审核 |
 | RubricCompiler 与 criterion source 合并 | **[本方案新增]** | 合并 system/managed/settings/user/task criteria，严格者胜出 | 待审核 |
 | Harness Settings 高级 Rubric 规则 | **[本方案新增]** | 普通用户零维护；高级用户只能追加/强化并选择注册 verifier | 待审核 |

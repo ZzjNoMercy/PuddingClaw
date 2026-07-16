@@ -6,6 +6,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from config import (
     get_fallback_embedding_config,
@@ -99,6 +100,27 @@ class DatabaseConnectionRequest(BaseModel):
     username: str = "puddingclaw"
     password: str = ""
     create_if_missing: bool = False
+
+
+class DockerProbeRequest(BaseModel):
+    connection: str = ""
+    context: str = ""
+
+
+@router.post("/settings/harness/docker/probe")
+async def probe_harness_docker(request: DockerProbeRequest):
+    """Probe the user-configured Docker daemon without creating a container."""
+
+    from harness.workspace_backends import ProjectSandboxManager
+
+    manager = ProjectSandboxManager(request.model_dump())
+    available, detail = await run_in_threadpool(manager.probe)
+    return {
+        "available": available,
+        "detail": detail,
+        "connection": request.connection,
+        "context": request.context,
+    }
 
 
 @router.post("/settings/test-connection")

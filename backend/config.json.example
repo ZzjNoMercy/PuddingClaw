@@ -147,6 +147,38 @@
       "run_limit": 50,
       "thread_limit": null,
       "exit_behavior": "end"
+    },
+    "completion": {
+      "rubric": {
+        "enabled": true,
+        "model": "",
+        "max_iterations": 2,
+        "custom_rules_enabled": false,
+        "custom_rules": []
+      }
+    },
+    "goals": {
+      "enabled": true,
+      "activation": "explicit_user_only",
+      "default_enabled": false,
+      "auto_promote_from_run": false,
+      "max_rounds": 8
+    },
+    "terminal": {
+      "docker_enabled": false,
+      "on_unavailable": "fallback",
+      "default_timeout_seconds": 120,
+      "docker": {
+        "connection": "",
+        "context": "",
+        "image": "python:3.12-slim",
+        "cpu_limit": "2",
+        "memory_limit_mb": 2048,
+        "pids_limit": 256,
+        "network_enabled": false,
+        "lifecycle": "project",
+        "idle_stop_minutes": 30
+      }
     }
   },
   "mcp": {

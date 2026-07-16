@@ -196,6 +196,67 @@ def test_permission_middleware_interrupts_external_edit_file(tmp_path, monkeypat
     assert request["change_preview"] == {"old_string": "before", "new_string": "after"}
 
 
+def test_permission_middleware_accepts_virtual_workspace_read_resource(
+    tmp_path,
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from langchain_core.messages import AIMessage
+
+    import graph.permission_middleware as permission_middleware_module
+    from graph.permission_middleware import ExternalFilePermissionMiddleware
+
+    def fail_interrupt(_payload):
+        raise AssertionError("virtual workspace path must not request permission")
+
+    monkeypatch.setattr(
+        permission_middleware_module,
+        "interrupt",
+        fail_interrupt,
+    )
+    state = {
+        "messages": [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_resource",
+                        "args": {"resource": "/workspace/report.md"},
+                        "id": "call-read-virtual",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
+    }
+    runtime = SimpleNamespace(
+        context={
+            "session_id": "virtual-read-session",
+            "query_id": "query-read",
+            "workspace_path": str(tmp_path),
+        }
+    )
+
+    assert ExternalFilePermissionMiddleware().after_model(state, runtime) is None
+
+
+def test_read_resource_maps_virtual_workspace_path(tmp_path):
+    from tools.read_resource_tool import ReadResourceTool
+
+    report = tmp_path / "report.md"
+    report.write_text("E2E_GOAL_OK", encoding="utf-8")
+    tool = ReadResourceTool(
+        session_id="virtual-read-session",
+        workspace_path=str(tmp_path),
+    )
+
+    result = tool.invoke({"resource": "/workspace/report.md"})
+
+    assert "E2E_GOAL_OK" in result
+    assert "Permission required" not in result
+
+
 def test_permission_middleware_interrupts_misrouted_external_read_file(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
@@ -367,6 +428,7 @@ def test_deny_permission_request_resumes_pending_run():
     permission_resume_registry._pending["perm-req-deny-test"] = future
     permission_resume_registry._requests["perm-req-deny-test"] = {
         "id": "perm-req-deny-test",
+        "session_id": "permission-session",
         "status": "pending",
     }
 
@@ -387,6 +449,73 @@ def test_deny_permission_request_resumes_pending_run():
     loop.close()
 
 
+def test_deny_permission_request_rejects_cross_session_resolution():
+    from fastapi.testclient import TestClient
+
+    from app import app
+    from graph.permission_resume import permission_resume_registry
+
+    loop = asyncio.new_event_loop()
+    future = loop.create_future()
+    request_id = "perm-req-cross-session"
+    permission_resume_registry._pending[request_id] = future
+    permission_resume_registry._requests[request_id] = {
+        "id": request_id,
+        "session_id": "owner-session",
+        "status": "pending",
+    }
+
+    response = TestClient(app).post(
+        "/api/sessions/attacker-session/permissions/deny",
+        json={"permission_request_id": request_id},
+    )
+
+    assert response.status_code == 400
+    assert not future.done()
+    permission_resume_registry.resolve(
+        request_id,
+        {"type": "reject", "message": "test cleanup"},
+    )
+    loop.close()
+
+
+def test_tool_action_grant_cannot_be_replayed(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from app import app
+    from graph.permission_resume import permission_resume_registry
+    from graph.session_manager import session_manager
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("tool-action-session")
+    loop = asyncio.new_event_loop()
+    future = loop.create_future()
+    request_id = "perm-req-tool-action"
+    permission_resume_registry._pending[request_id] = future
+    permission_resume_registry._requests[request_id] = {
+        "id": request_id,
+        "type": "tool_action",
+        "session_id": "tool-action-session",
+        "status": "pending",
+        "fingerprint": "sha256:test",
+    }
+    client = TestClient(app)
+
+    first = client.post(
+        "/api/sessions/tool-action-session/permissions/tool-actions",
+        json={"permission_request_id": request_id, "scope": "once"},
+    )
+    replay = client.post(
+        "/api/sessions/tool-action-session/permissions/tool-actions",
+        json={"permission_request_id": request_id, "scope": "once"},
+    )
+
+    assert first.status_code == 200
+    assert replay.status_code == 409
+    assert len(session_manager.list_permission_grants("tool-action-session")) == 1
+    loop.close()
+
+
 def test_permission_api_grants_exact_external_write_from_pending_request(tmp_path):
     from fastapi.testclient import TestClient
 
@@ -400,6 +529,8 @@ def test_permission_api_grants_exact_external_write_from_pending_request(tmp_pat
     target.parent.mkdir()
     target.write_text("before", encoding="utf-8")
     request_id = "perm-req-write-test"
+    loop = asyncio.new_event_loop()
+    permission_resume_registry._pending[request_id] = loop.create_future()
     permission_resume_registry._requests[request_id] = {
         "id": request_id,
         "type": "external_file_write",
@@ -424,11 +555,25 @@ def test_permission_api_grants_exact_external_write_from_pending_request(tmp_pat
     assert grant["capabilities"] == ["write", "external_path"]
     assert session_manager.has_external_file_write_permission("write-api-session", target)
 
+    broad_request_id = "perm-req-write-broad-test"
+    permission_resume_registry._pending[broad_request_id] = loop.create_future()
+    permission_resume_registry._requests[broad_request_id] = {
+        "id": broad_request_id,
+        "type": "external_file_write",
+        "session_id": "write-api-session",
+        "path": str(target),
+        "status": "pending",
+    }
     broad_response = client.post(
         "/api/sessions/write-api-session/permissions/external-files",
         json={
             "target_kind": "all_external_files",
-            "permission_request_id": request_id,
+            "permission_request_id": broad_request_id,
         },
     )
+    permission_resume_registry.resolve(
+        broad_request_id,
+        {"type": "reject", "message": "test cleanup"},
+    )
+    loop.close()
     assert broad_response.status_code == 400

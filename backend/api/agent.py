@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sse_starlette.sse import EventSourceResponse
 
 from graph.deepagents_manager import deepagents_agent_manager
@@ -19,7 +19,15 @@ class AgentRequest(BaseModel):
     project_id: str | None = None
     analytics_model_id: str | None = None
     attachments: list[dict] = Field(default_factory=list)
+    goal_mode: bool = False
+    goal_id: str | None = None
     stream: bool = True
+
+    @model_validator(mode="after")
+    def validate_goal_activation(self):
+        if self.goal_id and not self.goal_mode:
+            raise ValueError("goal_id requires goal_mode=true")
+        return self
 
 
 @router.post("/agent")
@@ -47,11 +55,14 @@ async def agent(request: AgentRequest):
                 user_id=request.user_id,
                 attachments=request.attachments,
                 user_message_already_persisted=persisted_user_message,
+                goal_mode=request.goal_mode,
+                goal_id=request.goal_id,
             )
         )
 
     # Non-streaming fallback: consume the event stream and return the final content.
     final_content = ""
+    run_outcome: dict = {}
     async for event in deepagents_agent_manager.astream(
         message=request.message,
         session_id=request.session_id,
@@ -59,12 +70,23 @@ async def agent(request: AgentRequest):
         analytics_model_id=request.analytics_model_id,
         user_id=request.user_id,
         attachments=request.attachments,
+        goal_mode=request.goal_mode,
+        goal_id=request.goal_id,
     ):
+        if event.get("event") == "run_outcome":
+            import json
+
+            run_outcome = json.loads(event.get("data", "{}"))
         if event.get("event") == "done":
             import json
 
             final_content = json.loads(event.get("data", "{}")).get("content", "")
-    return {"reply": final_content, "session_id": request.session_id, "project_id": request.project_id}
+    return {
+        "reply": final_content,
+        "session_id": request.session_id,
+        "project_id": request.project_id,
+        **run_outcome,
+    }
 
 
 @router.get("/agent/tool-context/status/{session_id}")

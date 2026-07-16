@@ -11,10 +11,13 @@ from starlette.concurrency import run_in_threadpool
 from config import get_rag_mode
 from graph.prompt_builder import build_system_prompt
 from graph.session_manager import session_manager
+from harness.coordinators import GoalActivationError, GoalCoordinator
+from harness.models import HarnessStateError
 
 router = APIRouter()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+goal_coordinator = GoalCoordinator(session_manager)
 
 
 # ── Request models ──────────────────────────────────────────
@@ -90,7 +93,57 @@ async def get_raw_messages(session_id: str):
         result["todos"] = data["todos"]
     if "graph" in data:
         result["graph"] = data["graph"]
+    if "harness" in data:
+        result["harness"] = data["harness"]
     return result
+
+
+@router.get("/sessions/{session_id}/harness")
+async def get_session_harness_state(session_id: str):
+    """Return lightweight Run/Goal product state without reading Trace."""
+
+    return {
+        "session_id": session_id,
+        **await run_in_threadpool(session_manager.get_harness_state, session_id),
+    }
+
+
+@router.get("/sessions/{session_id}/goals/{goal_id}")
+async def get_session_goal(session_id: str, goal_id: str):
+    goal = await run_in_threadpool(
+        session_manager.get_goal_state,
+        session_id,
+        goal_id,
+    )
+    if goal is None:
+        raise HTTPException(status_code=404, detail="Goal not found")
+    return goal
+
+
+async def _transition_goal(session_id: str, goal_id: str, action: str):
+    try:
+        method = getattr(goal_coordinator, action)
+        goal = await run_in_threadpool(method, session_id, goal_id)
+        return goal.model_dump(mode="json")
+    except GoalActivationError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except HarnessStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/sessions/{session_id}/goals/{goal_id}/pause")
+async def pause_session_goal(session_id: str, goal_id: str):
+    return await _transition_goal(session_id, goal_id, "pause")
+
+
+@router.post("/sessions/{session_id}/goals/{goal_id}/resume")
+async def resume_session_goal(session_id: str, goal_id: str):
+    return await _transition_goal(session_id, goal_id, "resume")
+
+
+@router.post("/sessions/{session_id}/goals/{goal_id}/cancel")
+async def cancel_session_goal(session_id: str, goal_id: str):
+    return await _transition_goal(session_id, goal_id, "cancel")
 
 
 @router.get("/sessions/{session_id}/traces")

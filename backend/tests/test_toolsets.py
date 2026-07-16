@@ -58,7 +58,7 @@ def test_toolset_activates_only_after_successfully_reading_skill_file(tmp_path) 
     assert tools_for_toolsets({"database_analysis", "semantic_lookup"}) | UNCONDITIONAL_TOOL_NAMES >= {
         "database_sql_generate",
         "semantic_entity_lookup",
-        "terminal",
+        "execute",
     }
 
 
@@ -67,10 +67,10 @@ def test_unloaded_business_tools_are_hidden_from_model_request(tmp_path) -> None
         skills_dir=tmp_path,
         toolsets_by_skill={"database-analysis": {"database_analysis"}},
     )
-    tools = [{"name": "read_file"}, {"name": "terminal"}, {"name": "database_sql_generate"}]
+    tools = [{"name": "read_file"}, {"name": "execute"}, {"name": "database_sql_generate"}]
     request = ModelRequest(model=None, messages=[], tools=tools, state={"messages": []})
 
-    assert [tool["name"] for tool in middleware._visible_tools(request)] == ["read_file", "terminal"]
+    assert [tool["name"] for tool in middleware._visible_tools(request)] == ["read_file", "execute"]
 
 
 def test_prior_turn_skill_reads_remain_active_in_same_session(tmp_path) -> None:
@@ -207,7 +207,7 @@ def test_native_and_explicit_base_tools_are_unconditionally_visible_and_executab
         {"name": "read_file"},
         {"name": "write_file"},
         {"name": "task"},
-        {"name": "terminal"},
+        {"name": "execute"},
         {"name": "read_resource"},
         {"name": "tavily_search"},
         {"name": "fetch_url"},
@@ -219,14 +219,14 @@ def test_native_and_explicit_base_tools_are_unconditionally_visible_and_executab
         "read_file",
         "write_file",
         "task",
-        "terminal",
+        "execute",
         "read_resource",
         "tavily_search",
         "fetch_url",
     ]
 
     calls: list[str] = []
-    for tool_name in ("terminal", "tavily_search", "fetch_url"):
+    for tool_name in ("execute", "tavily_search", "fetch_url"):
         tool_request = ToolCallRequest(
             tool_call={"name": tool_name, "args": {}, "id": tool_name, "type": "tool_call"},
             tool=None,
@@ -243,7 +243,7 @@ def test_native_and_explicit_base_tools_are_unconditionally_visible_and_executab
                 status="success",
             ),
         )
-    assert calls == ["terminal", "tavily_search", "fetch_url"]
+    assert calls == ["execute", "tavily_search", "fetch_url"]
 
 
 def test_active_skill_state_survives_message_compaction(tmp_path) -> None:

@@ -191,9 +191,17 @@ class ModelClient:
         tools: list[Any] | None = None,
         bind_tools_kwargs: dict[str, Any] | None = None,
         record_usage: bool = True,
+        thinking_enabled: bool | None = None,
+        model_override: str | None = None,
     ) -> None:
         self.role = role
-        self.cfg = get_fallback_llm_config()
+        self.thinking_enabled = thinking_enabled
+        self.model_override = str(model_override or "").strip() or None
+        self.cfg = get_fallback_llm_config(
+            thinking_enabled_override=thinking_enabled,
+        )
+        if self.model_override is not None:
+            self.cfg["model"] = self.model_override
         self.temperature = temperature if temperature is not None else self.cfg.get("temperature", 0.7)
         self.streaming = streaming
         self.force_direct = force_direct
@@ -255,8 +263,13 @@ class ModelClient:
         from langchain_openai import ChatOpenAI
 
         gateway_url = capabilities.get_effective_gateway_url()
-        gateway_cfg = get_gateway_llm_config()
-        gateway_model = gateway_cfg.get("model", self.cfg["model"])
+        gateway_cfg = get_gateway_llm_config(
+            thinking_enabled_override=self.thinking_enabled,
+        )
+        gateway_model = self.model_override or gateway_cfg.get(
+            "model",
+            self.cfg["model"],
+        )
         thinking_kwargs = self._thinking_kwargs(gateway_cfg)
         logger.info(
             "[ModelClient] using AI Gateway: url=%s model=%s thinking=%s",
@@ -525,8 +538,14 @@ class ModelClientChatModel(BaseChatModel):
         force_direct: bool = False,
         tools: list[Any] | None = None,
         bind_tools_kwargs: dict[str, Any] | None = None,
+        thinking_enabled: bool | None = None,
+        model_override: str | None = None,
     ) -> None:
-        super().__init__()
+        # BaseChatModel otherwise may route ``ainvoke`` through ``_astream``
+        # when callbacks request streaming, even though the wrapped provider
+        # was constructed with streaming=False. A non-streaming provider can
+        # return a full AIMessage there, which is not a BaseMessageChunk.
+        super().__init__(disable_streaming=not streaming)
         self._client = ModelClient(
             role=role,
             temperature=temperature,
@@ -535,6 +554,8 @@ class ModelClientChatModel(BaseChatModel):
             tools=tools,
             bind_tools_kwargs=bind_tools_kwargs,
             record_usage=False,
+            thinking_enabled=thinking_enabled,
+            model_override=model_override,
         )
 
     @property
@@ -667,6 +688,8 @@ class ModelClientChatModel(BaseChatModel):
             force_direct=self._client.force_direct,
             tools=tools,
             bind_tools_kwargs=kwargs,
+            thinking_enabled=self._client.thinking_enabled,
+            model_override=self._client.model_override,
         )
 
     def _model_trace_params(self) -> dict[str, Any]:
@@ -676,6 +699,8 @@ class ModelClientChatModel(BaseChatModel):
             "temperature": self._client.temperature,
             "streaming": self._client.streaming,
             "force_direct": self._client.force_direct,
+            "thinking_enabled": self._client.thinking_enabled,
+            "model_override": self._client.model_override,
             "tool_choice": self._client.bind_tools_kwargs.get("tool_choice"),
             "strict": self._client.bind_tools_kwargs.get("strict"),
         }

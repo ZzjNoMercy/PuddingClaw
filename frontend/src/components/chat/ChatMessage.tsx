@@ -3,8 +3,8 @@
 import { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
-import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Database, FileSpreadsheet, FileText, Key, KeyRound, Layers3, PauseCircle, Plus, Sparkles, Trash2 } from "lucide-react";
-import { denyPermissionRequest, grantExternalFilePermission, openLocalFile, resolveDatabaseSqlRevisionRequest, resolveDimensionBuildRuleRequest, resolveLogicalDatasetRuleRequest, type AgentAttachment, type DatabaseSqlRevisionRequest, type DimensionBuildRuleRequest, type LogicalDatasetRuleRequest, type PermissionRequest } from "@/lib/api";
+import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Database, FileSpreadsheet, FileText, Key, KeyRound, Layers3, PauseCircle, Plus, Sparkles, SquareTerminal, Trash2 } from "lucide-react";
+import { denyPermissionRequest, grantExternalFilePermission, grantToolActionPermission, openLocalFile, resolveDatabaseSqlRevisionRequest, resolveDimensionBuildRuleRequest, resolveLogicalDatasetRuleRequest, type AgentAttachment, type DatabaseSqlRevisionRequest, type DimensionBuildRuleRequest, type LogicalDatasetRuleRequest, type PermissionRequest } from "@/lib/api";
 import { markdownRemarkPlugins, markdownUrlTransform } from "@/lib/markdown";
 import { useApp, type ChatMessage as ChatMessageType, type SourceRecord, type TimelineItem } from "@/lib/store";
 import ThoughtChain from "./ThoughtChain";
@@ -102,7 +102,7 @@ export default function ChatMessage({ message, isStreaming = false, showInterrup
                     <RetrievalCard retrievals={message.retrievals} />
                   )}
                   {pendingPermissionRequests.map((request) => (
-                    <ExternalFilePermissionCard
+                    <PermissionRequestCard
                       key={request.id}
                       request={request}
                       sessionId={sessionId}
@@ -166,7 +166,7 @@ export default function ChatMessage({ message, isStreaming = false, showInterrup
                         {contentBlock}
                         {hasTools && thoughtChain}
                         {pendingPermissionRequests.map((request) => (
-                          <ExternalFilePermissionCard
+                          <PermissionRequestCard
                             key={request.id}
                             request={request}
                             sessionId={sessionId}
@@ -373,6 +373,114 @@ function ExternalFilePermissionCard({
           {status === "loading" ? <div className="mt-2 text-[11px] text-slate-500">处理中...</div> : null}
           {status === "denied" ? <div className="mt-2 text-[11px] text-slate-500">已拒绝</div> : null}
           {status === "error" ? <div className="mt-2 text-[11px] text-rose-600">{error}</div> : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PermissionRequestCard({
+  request,
+  sessionId,
+}: {
+  request: PermissionRequest;
+  sessionId: string;
+}) {
+  if (request.type === "tool_action") {
+    return <ToolActionPermissionCard request={request} sessionId={sessionId} />;
+  }
+  return <ExternalFilePermissionCard request={request} sessionId={sessionId} />;
+}
+
+function ToolActionPermissionCard({
+  request,
+  sessionId,
+}: {
+  request: PermissionRequest;
+  sessionId: string;
+}) {
+  const [status, setStatus] = useState<"idle" | "loading" | "granted" | "denied" | "error">("idle");
+  const [error, setError] = useState("");
+
+  const grant = async (scope: "once" | "session") => {
+    setStatus("loading");
+    setError("");
+    try {
+      await grantToolActionPermission(sessionId, request.id, scope);
+      setStatus("granted");
+      window.dispatchEvent(new CustomEvent("puddingclaw:permissions-changed"));
+    } catch (err) {
+      setStatus("error");
+      setError(err instanceof Error ? err.message : "授权失败");
+    }
+  };
+
+  const deny = async () => {
+    setStatus("loading");
+    setError("");
+    try {
+      await denyPermissionRequest(
+        sessionId,
+        request.id,
+        "User denied managed Tool execution.",
+      );
+      setStatus("denied");
+    } catch (err) {
+      setStatus("error");
+      setError(err instanceof Error ? err.message : "拒绝失败");
+    }
+  };
+
+  return (
+    <div className="mb-3 max-w-[760px] rounded-2xl border border-amber-200 bg-amber-50/75 p-4 shadow-sm shadow-amber-950/[0.04]">
+      <div className="flex gap-3">
+        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-amber-100 text-amber-700">
+          {status === "granted"
+            ? <CheckCircle2 className="h-5 w-5" />
+            : <SquareTerminal className="h-5 w-5" />}
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <h3 className="text-[15px] font-bold text-slate-950">允许执行受控命令</h3>
+            <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-800">
+              {request.risk || "managed"}
+            </span>
+          </div>
+          <p className="mt-1 text-[12px] text-slate-500">
+            Harness 规则：{request.reason || "需要人工确认"}
+          </p>
+          <pre className="mt-3 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-xl bg-slate-950 px-3 py-2.5 font-mono text-[12px] leading-5 text-slate-100">
+            {request.command || ""}
+          </pre>
+          {status === "idle" || status === "error" ? (
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => void grant("once")}
+                className="rounded-full bg-[#002fa7] px-3.5 py-2 text-[12px] font-semibold text-white hover:bg-[#00298f]"
+              >
+                仅允许本次
+              </button>
+              <button
+                type="button"
+                onClick={() => void grant("session")}
+                className="rounded-full bg-white px-3.5 py-2 text-[12px] font-semibold text-slate-700 ring-1 ring-black/[0.08] hover:bg-slate-50"
+              >
+                本 Session 允许相同命令
+              </button>
+              <button
+                type="button"
+                onClick={() => void deny()}
+                className="rounded-full px-3 py-2 text-[12px] font-semibold text-slate-500 hover:bg-white/70"
+              >
+                拒绝
+              </button>
+            </div>
+          ) : null}
+          {status === "loading" ? <p className="mt-2 text-[11px] text-slate-500">处理中...</p> : null}
+          {status === "granted" ? <p className="mt-2 text-[11px] text-emerald-700">已授权，Agent 将继续执行。</p> : null}
+          {status === "denied" ? <p className="mt-2 text-[11px] text-slate-500">已拒绝。</p> : null}
+          {status === "error" ? <p className="mt-2 text-[11px] text-rose-600">{error}</p> : null}
         </div>
       </div>
     </div>

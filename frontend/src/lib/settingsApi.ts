@@ -160,6 +160,60 @@ export interface HarnessSettings {
     thread_limit: number | null;
     exit_behavior: "end" | "error";
   };
+  completion?: {
+    rubric?: {
+      enabled?: boolean;
+      model?: string;
+      max_iterations?: number;
+      custom_rules_enabled?: boolean;
+      custom_rules?: Array<{
+        id: string;
+        enabled: boolean;
+        statement: string;
+        required: boolean;
+        verifier: "analytics" | "llm_grader";
+      }>;
+    };
+  };
+  goals?: {
+    enabled?: boolean;
+    activation?: "explicit_user_only";
+    default_enabled?: false;
+    auto_promote_from_run?: false;
+    max_rounds?: number;
+  };
+  terminal?: {
+    docker_enabled?: boolean;
+    on_unavailable?: "fallback" | "deny";
+    default_timeout_seconds?: number;
+    docker?: {
+      connection?: string;
+      context?: string;
+      image?: string;
+      cpu_limit?: string;
+      memory_limit_mb?: number;
+      pids_limit?: number;
+      network_enabled?: boolean;
+      lifecycle?: "project";
+      idle_stop_minutes?: number;
+    };
+  };
+}
+
+export async function probeHarnessDocker(input: {
+  connection?: string;
+  context?: string;
+}): Promise<{ available: boolean; detail: string }> {
+  const resp = await fetch(`${API_BASE}/settings/harness/docker/probe`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      connection: input.connection || "",
+      context: input.context || "",
+    }),
+  });
+  if (!resp.ok) throw new Error(`Failed to probe Docker: ${resp.status}`);
+  return resp.json();
 }
 
 export interface SubAgentItem {

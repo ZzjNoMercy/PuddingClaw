@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import time
 import uuid
 from pathlib import Path
@@ -15,6 +17,28 @@ class PermissionResumeRegistry:
     def __init__(self) -> None:
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._requests: dict[str, dict[str, Any]] = {}
+
+    @staticmethod
+    def tool_action_fingerprint(
+        *,
+        tool_name: str,
+        command: str,
+        reason: str,
+    ) -> str:
+        # Preserve whitespace inside quoted/script content. Collapsing all
+        # whitespace can make semantically different commands share a grant.
+        normalized = command.strip()
+        return "sha256:" + hashlib.sha256(
+            json.dumps(
+                {
+                    "tool": tool_name,
+                    "command": normalized,
+                    "reason": reason,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
 
     def create_external_file_request(
         self,
@@ -52,6 +76,44 @@ class PermissionResumeRegistry:
             request["operation"] = operation
         if change_preview:
             request["change_preview"] = change_preview
+        self._requests[request_id] = request
+        self._pending[request_id] = asyncio.get_running_loop().create_future()
+        return dict(request)
+
+    def create_tool_action_request(
+        self,
+        *,
+        session_id: str,
+        query_id: str,
+        tool_call_id: str,
+        tool_name: str,
+        command: str,
+        reason: str,
+        risk: str,
+    ) -> dict[str, Any]:
+        fingerprint = self.tool_action_fingerprint(
+            tool_name=tool_name,
+            command=command,
+            reason=reason,
+        )
+        request_id = f"perm-req-{uuid.uuid4().hex[:12]}"
+        request = {
+            "id": request_id,
+            "type": "tool_action",
+            "session_id": session_id,
+            "query_id": query_id,
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "command": command,
+            "reason": reason,
+            "risk": risk,
+            "fingerprint": fingerprint,
+            "target_kind": "fingerprint",
+            "capabilities": ["execute"],
+            "status": "pending",
+            "created_at": time.time(),
+            "options": ["once", "session"],
+        }
         self._requests[request_id] = request
         self._pending[request_id] = asyncio.get_running_loop().create_future()
         return dict(request)

@@ -44,6 +44,111 @@ export interface SSEEvent {
   data: Record<string, unknown>;
 }
 
+export type GoalStatus =
+  | "active"
+  | "paused"
+  | "blocked"
+  | "achieved"
+  | "cancelled"
+  | "budget_exceeded";
+
+export type RunStatus =
+  | "preparing"
+  | "running"
+  | "waiting_hitl"
+  | "evaluating"
+  | "completed"
+  | "cancelled"
+  | "failed"
+  | "blocked"
+  | "budget_exceeded"
+  | "verification_failed";
+
+export interface VerificationCriterion {
+  id: string;
+  statement: string;
+  source: string;
+  verifier: string;
+  required: boolean;
+}
+
+export interface RunVerificationContract {
+  contract_id: string;
+  version: string;
+  task_type: string;
+  criteria: VerificationCriterion[];
+  rubric: string;
+  created_at: number;
+}
+
+export interface CriterionEvaluation {
+  criterion_id: string;
+  name: string;
+  passed: boolean;
+  verifier: string;
+  evidence: Array<Record<string, unknown>>;
+  gap?: string | null;
+}
+
+export interface RubricEvaluationReport {
+  report_id: string;
+  run_id: string;
+  status: string;
+  contract_id?: string | null;
+  contract_version?: string | null;
+  evaluations: CriterionEvaluation[];
+  gaps: string[];
+  explanation: string;
+  iteration_count: number;
+  created_at: number;
+}
+
+export interface HarnessRun {
+  run_id: string;
+  query_id: string;
+  session_id: string;
+  objective: string;
+  goal_id?: string | null;
+  status: RunStatus;
+  outcome?: string | null;
+  verification_contract?: RunVerificationContract | null;
+  verification_report?: RubricEvaluationReport | null;
+  model_call_count: number;
+  budget_exhaustion_reason?: string | null;
+  error?: string | null;
+  created_at: number;
+  updated_at: number;
+  completed_at?: number | null;
+}
+
+export interface HarnessGoal {
+  goal_id: string;
+  session_id: string;
+  objective: string;
+  status: GoalStatus;
+  current_run_id?: string | null;
+  run_ids: string[];
+  gaps: string[];
+  latest_verification_report_id?: string | null;
+  round: number;
+  max_rounds: number;
+  model_call_count: number;
+  budget_exhaustion_reason?: string | null;
+  created_at: number;
+  updated_at: number;
+  completed_at?: number | null;
+}
+
+export interface SessionHarnessState {
+  session_id: string;
+  runs: Record<string, HarnessRun>;
+  run_order: string[];
+  latest_run_id?: string | null;
+  goals: Record<string, HarnessGoal>;
+  goal_order: string[];
+  active_goal_id?: string | null;
+}
+
 export interface ToolContextJobStatus {
   id?: string;
   status:
@@ -2159,6 +2264,12 @@ export interface PermissionRequest {
   target_kind?: string;
   capabilities?: string[];
   operation?: string;
+  tool_name?: string;
+  command?: string;
+  reason?: string;
+  risk?: string;
+  fingerprint?: string;
+  options?: string[];
   change_preview?: Record<string, string>;
   status?: string;
 }
@@ -2358,7 +2469,9 @@ export async function* streamAgent(
   signal?: AbortSignal,
   userId?: string,
   attachments?: AgentAttachment[],
-  analyticsModelId?: string | null
+  analyticsModelId?: string | null,
+  goalMode = false,
+  goalId?: string | null,
 ): AsyncGenerator<SSEEvent> {
   const response = await fetch(`${API_BASE}/agent`, {
     method: "POST",
@@ -2370,6 +2483,8 @@ export async function* streamAgent(
       project_id: projectId || null,
       analytics_model_id: analyticsModelId || null,
       attachments: attachments || [],
+      goal_mode: goalMode,
+      goal_id: goalMode ? goalId || null : null,
       stream: true
     }),
     signal,
@@ -2403,6 +2518,44 @@ export async function* streamAgent(
     }
   }
 }
+
+export async function getSessionHarnessState(
+  sessionId: string,
+): Promise<SessionHarnessState> {
+  const response = await fetch(
+    `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/harness`,
+    { cache: "no-store" },
+  );
+  if (!response.ok) {
+    throw new Error(`Failed to get Harness state: ${response.status}`);
+  }
+  return response.json();
+}
+
+async function transitionGoal(
+  sessionId: string,
+  goalId: string,
+  action: "pause" | "resume" | "cancel",
+): Promise<HarnessGoal> {
+  const response = await fetch(
+    `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/goals/${encodeURIComponent(goalId)}/${action}`,
+    { method: "POST" },
+  );
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(apiErrorMessage(text, `Failed to ${action} Goal: ${response.status}`));
+  }
+  return response.json();
+}
+
+export const pauseGoal = (sessionId: string, goalId: string) =>
+  transitionGoal(sessionId, goalId, "pause");
+
+export const resumeGoal = (sessionId: string, goalId: string) =>
+  transitionGoal(sessionId, goalId, "resume");
+
+export const cancelGoal = (sessionId: string, goalId: string) =>
+  transitionGoal(sessionId, goalId, "cancel");
 
 function parseSSEFrame(frame: string): SSEEvent | null {
   let event = "message";
@@ -2578,6 +2731,30 @@ export async function grantExternalFilePermission(
     body: JSON.stringify({ target_kind: targetKind, path, permission_request_id: permissionRequestId }),
   });
   if (!resp.ok) throw new Error(`Failed to grant external file permission: ${resp.status}`);
+  const data = await resp.json();
+  return data.grant;
+}
+
+export async function grantToolActionPermission(
+  sessionId: string,
+  permissionRequestId: string,
+  scope: "once" | "session",
+): Promise<PermissionGrant> {
+  const resp = await fetch(
+    `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/permissions/tool-actions`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        permission_request_id: permissionRequestId,
+        scope,
+      }),
+    },
+  );
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(apiErrorMessage(text, `Failed to grant Tool permission: ${resp.status}`));
+  }
   const data = await resp.json();
   return data.grant;
 }

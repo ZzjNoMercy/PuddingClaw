@@ -96,6 +96,8 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                 continue
             if raw_path.startswith("att_"):
                 continue
+            if raw_path.replace("\\", "/").startswith(self._VIRTUAL_PREFIXES):
+                continue
 
             if tool_name in {"edit_file", "write_file"}:
                 requested = self._external_write_path(raw_path, workspace_path)
@@ -108,8 +110,6 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
             else:
                 requested = Path(raw_path).expanduser().resolve()
                 if tool_name == "read_file":
-                    if raw_path.replace("\\", "/").startswith(self._VIRTUAL_PREFIXES):
-                        continue
                     if not Path(raw_path).expanduser().is_absolute():
                         continue
                     if workspace_path:

@@ -228,6 +228,48 @@ def test_model_client_chat_model_uses_base_chat_model_input_conversion_and_kwarg
     assert call["kwargs"] == {"timeout": 3}
 
 
+def test_bind_tools_preserves_explicit_non_thinking_mode():
+    wrapped = ModelClientChatModel(
+        force_direct=True,
+        streaming=False,
+        thinking_enabled=False,
+        model_override="deepseek-v4-flash",
+    ).bind_tools(
+        [{"type": "function", "function": {"name": "grade"}}],
+        tool_choice="required",
+    )
+
+    assert wrapped._client.thinking_enabled is False
+    assert wrapped._client.model_override == "deepseek-v4-flash"
+    assert wrapped._client.cfg.get("model") == "deepseek-v4-flash"
+    assert wrapped.disable_streaming is True
+    assert wrapped._client.cfg.get("reasoning_effort") is None
+    assert wrapped._client.cfg.get("extra_body") is None
+
+
+def test_gateway_model_override_wins_over_gateway_default(monkeypatch):
+    client = ModelClient(
+        thinking_enabled=False,
+        model_override="structured-output-model",
+    )
+    monkeypatch.setattr(
+        "llm.model_client.get_gateway_llm_config",
+        lambda **_kwargs: {
+            "model": "thinking-only-model",
+            "reasoning_effort": None,
+            "extra_body": None,
+        },
+    )
+
+    with mock.patch("capabilities.get_effective_gateway_url", return_value="http://gateway/v1"):
+        with mock.patch("langchain_openai.ChatOpenAI") as chat_openai:
+            client._gateway_model()
+
+    assert chat_openai.call_args.kwargs["model"] == "structured-output-model"
+    assert "reasoning_effort" not in chat_openai.call_args.kwargs
+    assert "extra_body" not in chat_openai.call_args.kwargs
+
+
 def test_model_client_chat_model_marks_context_summary_as_internal():
     """DeepAgents' context compressor output must be distinguishable from user text."""
 

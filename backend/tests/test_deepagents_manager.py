@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
 from deepagents.middleware.memory import MemoryMiddleware
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 
@@ -91,11 +93,106 @@ def test_build_middlewares_includes_model_call_limit(tmp_path, monkeypatch):
     manager.initialize(tmp_path)
 
     middlewares = manager._build_middlewares(project_id=None)
-    limiter = next(item for item in middlewares if item.__class__.__name__ == "ModelCallLimitMiddleware")
+    limiter = next(
+        item
+        for item in middlewares
+        if item.__class__.__name__ == "ObservableModelCallLimitMiddleware"
+    )
 
     assert limiter.run_limit == 7
     assert limiter.thread_limit is None
     assert limiter.exit_behavior == "end"
+
+
+def test_completion_gate_loops_before_rubric_grader(tmp_path):
+    from graph.deepagents_manager import PuddingClawRubricMiddleware
+    from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
+
+    contract = RunRubricCompiler.compile(
+        RubricBuildContext(user_message="生成销量报告")
+    )
+    assert contract is not None
+    middleware = PuddingClawRubricMiddleware(
+        model=SimpleNamespace(),
+        max_iterations=2,
+    )
+    events: list[dict] = []
+    state = {
+        "messages": [AIMessage(content="报告完成")],
+        "todos": [{"id": "todo-1", "content": "生成报告", "status": "in_progress"}],
+        "rubric": contract.rubric,
+        "verification_contract": contract.model_dump(mode="json"),
+    }
+
+    update = middleware._completion_gate_update(
+        state,
+        SimpleNamespace(
+            context={"workspace_path": str(tmp_path)},
+            stream_writer=events.append,
+        ),
+    )
+
+    assert update is not None
+    assert update["jump_to"] == "model"
+    assert update["_completion_gate_status"] == "needs_revision"
+    assert "todo_reconciliation" in update["messages"][0].content
+    assert events[-1]["type"] == "deterministic_checks_completed"
+
+
+def test_rubric_grader_parses_plain_json_without_tool_binding():
+    from graph.deepagents_manager import PuddingClawRubricMiddleware
+
+    response = AIMessage(
+        content=(
+            "```json\n"
+            '{"result":"satisfied","explanation":"全部通过",'
+            '"criteria":[{"name":"task_fulfillment","passed":true}]}\n'
+            "```"
+        )
+    )
+
+    graded = PuddingClawRubricMiddleware._parse_grader_response(response)
+
+    assert graded.result == "satisfied"
+    assert graded.criteria[0]["name"] == "task_fulfillment"
+    assert graded.criteria[0]["passed"] is True
+
+
+def test_rubric_grader_rejects_non_json_output():
+    from graph.deepagents_manager import PuddingClawRubricMiddleware
+
+    with pytest.raises(ValueError, match="JSON object"):
+        PuddingClawRubricMiddleware._parse_grader_response(
+            AIMessage(content="任务看起来完成了")
+        )
+
+
+def test_model_call_limit_emits_typed_budget_event():
+    from graph.deepagents_manager import ObservableModelCallLimitMiddleware
+
+    events: list[dict] = []
+    middleware = ObservableModelCallLimitMiddleware(
+        run_limit=2,
+        exit_behavior="end",
+    )
+
+    update = middleware.before_model(
+        {"messages": [], "run_model_call_count": 2},
+        SimpleNamespace(stream_writer=events.append),
+    )
+
+    assert update is not None
+    assert update["_model_call_limit_exceeded"]["reason"] == "run_model_call_limit"
+    assert events == [
+        {
+            "type": "model_call_limit_exceeded",
+            "reason": "run_model_call_limit",
+            "run_count": 2,
+            "run_limit": 2,
+            "thread_count": 0,
+            "thread_limit": None,
+        }
+    ]
 
 
 def test_runtime_inventory_lists_skills_for_system_prompt(tmp_path):
@@ -126,6 +223,35 @@ def test_runtime_inventory_lists_skills_for_system_prompt(tmp_path):
         }
     ]
     assert inventory["checkpointer"] == {}
+
+
+def test_runtime_inventory_exposes_effective_execution_backend(tmp_path):
+    from graph.deepagents_manager import DeepAgentsAgentManager
+
+    manager = DeepAgentsAgentManager()
+    manager.initialize(tmp_path)
+    backend = SimpleNamespace(
+        execution_mode="restricted_host",
+        execution_backend_id="restricted-host-test",
+        execution_fallback_reason="docker unavailable",
+    )
+
+    inventory = manager._runtime_inventory(
+        tools=[],
+        middleware=[],
+        skills=[],
+        workspace_path=tmp_path,
+        execution_backend=backend,
+    )
+
+    assert inventory["execution"] == {
+        "mode": "restricted_host",
+        "backend_id": "restricted-host-test",
+        "fallback_reason": "docker unavailable",
+        "workspace_path": str(tmp_path),
+        "policy": "ToolExecutionPipeline",
+        "authorization_independent_from_sandbox": True,
+    }
 
 
 def test_semantic_asset_middleware_owns_model_frontmatter_index(tmp_path):
@@ -1620,9 +1746,10 @@ def test_deepagents_manager_persists_reasoning_for_tool_call_turns(tmp_path, mon
     assert "2026-06-26" in tool_entry.content
 
 
-def test_deepagents_manager_adds_puddingclaw_terminal_scoped_to_workspace(tmp_path):
-    """Agent mode keeps DeepAgents fs tools but adds PuddingClaw terminal."""
+def test_deepagents_manager_uses_backend_execute_instead_of_custom_terminal(tmp_path):
+    """Agent mode exposes one command tool through the execution backend."""
 
+    from deepagents.backends.protocol import SandboxBackendProtocol
     from graph.deepagents_manager import DeepAgentsAgentManager
 
     workspace = tmp_path / "workspace"
@@ -1634,10 +1761,10 @@ def test_deepagents_manager_adds_puddingclaw_terminal_scoped_to_workspace(tmp_pa
     tools = runtime._build_tools(workspace)  # noqa: SLF001 - intentional contract test
     by_name = {tool.name: tool for tool in tools}
 
-    assert "terminal" in by_name
-    assert by_name["terminal"].root_dir == str(workspace)
-    assert by_name["terminal"].path_aliases["/skills"] == str(Path(__file__).resolve().parent.parent / "skills")
-    assert by_name["terminal"].path_aliases["/sql-guardrails"] == str(Path(__file__).resolve().parent.parent / "sql-guardrails")
+    assert "terminal" not in by_name
+    backend = runtime._build_backend(workspace, session_id="session-1")  # noqa: SLF001
+    assert isinstance(backend.default, SandboxBackendProtocol)
+    assert backend.execution_mode == "restricted_host"
     assert "fetch_url" in by_name
     assert "database_knowledge_query" not in by_name
     assert "database_sql_generate" in by_name

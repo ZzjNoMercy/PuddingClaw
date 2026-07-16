@@ -18,6 +18,7 @@ import {
   ImagePlus,
   Layers3,
   Paperclip,
+  Target,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -108,6 +109,11 @@ export default function ChatInput() {
     setThinkingMode,
     analyticsModelId,
     setAnalyticsModelId,
+    goalModeEnabled,
+    setGoalModeEnabled,
+    activeGoal,
+    setInspectorOpen,
+    setInspectorActiveTab,
   } = useApp();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
@@ -632,6 +638,47 @@ export default function ChatInput() {
                   </div>
                 )}
               </div>
+            )}
+
+            {runtimeMode === "agent" && (
+              <button
+                type="button"
+                onClick={() => {
+                  if (activeGoal) {
+                    setInspectorOpen(true);
+                    setInspectorActiveTab("goal");
+                    return;
+                  }
+                  setGoalModeEnabled(!goalModeEnabled);
+                }}
+                title={
+                  activeGoal
+                    ? "查看当前 Goal；暂停、恢复和取消请在右侧 Goal 面板操作"
+                    : goalModeEnabled
+                      ? "本次发送将创建跨 Run Goal"
+                      : "开启后，本次发送将创建可跨 Run 推进的 Goal"
+                }
+                className={`flex h-8 items-center gap-1.5 rounded-full border px-3 text-[12px] transition-all ${
+                  goalModeEnabled || activeGoal
+                    ? "border-emerald-600/15 bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+                    : "border-black/[0.06] bg-white/42 text-gray-600 hover:bg-white/70 hover:text-gray-900"
+                }`}
+              >
+                <Target className="h-3.5 w-3.5 shrink-0" />
+                <span className="truncate">
+                  {activeGoal
+                    ? activeGoal.status === "active"
+                      ? "目标进行中"
+                      : activeGoal.status === "paused"
+                        ? "目标已暂停"
+                        : activeGoal.status === "achieved"
+                          ? "目标已完成"
+                          : "目标"
+                    : goalModeEnabled
+                      ? "目标已开启"
+                      : "目标"}
+                </span>
+              </button>
             )}
 
             <button

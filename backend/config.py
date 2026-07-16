@@ -280,6 +280,40 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "thread_limit": None,
             "exit_behavior": "end",
         },
+        "completion": {
+            "rubric": {
+                "enabled": True,
+                # Empty means: use fallback_llm.model with thinking disabled.
+                # Structured grading must not inherit a thinking-only gateway model.
+                "model": "",
+                "max_iterations": 2,
+                "custom_rules_enabled": False,
+                "custom_rules": [],
+            },
+        },
+        "goals": {
+            "enabled": True,
+            "activation": "explicit_user_only",
+            "default_enabled": False,
+            "auto_promote_from_run": False,
+            "max_rounds": 8,
+        },
+        "terminal": {
+            "docker_enabled": False,
+            "on_unavailable": "fallback",
+            "default_timeout_seconds": 120,
+            "docker": {
+                "connection": "",
+                "context": "",
+                "image": "python:3.12-slim",
+                "cpu_limit": "2",
+                "memory_limit_mb": 2048,
+                "pids_limit": 256,
+                "network_enabled": False,
+                "lifecycle": "project",
+                "idle_stop_minutes": 30,
+            },
+        },
     },
     "mem0": {
         "user_id": "default_user",
@@ -644,7 +678,10 @@ def get_gateway_config() -> dict[str, Any]:
     }
 
 
-def get_fallback_llm_config() -> dict[str, Any]:
+def get_fallback_llm_config(
+    *,
+    thinking_enabled_override: bool | None = None,
+) -> dict[str, Any]:
     """从 config.json 读取 fallback LLM 直连配置，fallback 到环境变量。
 
     返回 model/api_key/base_url 三个字段。
@@ -655,7 +692,11 @@ def get_fallback_llm_config() -> dict[str, Any]:
     config = load_config()
     llm = config.get("fallback_llm", {})
     thinking = llm.get("thinking", {})
-    thinking_enabled = bool(config.get("thinking_mode", False))
+    thinking_enabled = (
+        bool(config.get("thinking_mode", False))
+        if thinking_enabled_override is None
+        else thinking_enabled_override
+    )
     base_model = llm.get("model") or os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
     effective_model = thinking["model"] if thinking_enabled and thinking.get("model") else base_model
     return {
@@ -670,7 +711,10 @@ def get_fallback_llm_config() -> dict[str, Any]:
     }
 
 
-def get_gateway_llm_config() -> dict[str, Any]:
+def get_gateway_llm_config(
+    *,
+    thinking_enabled_override: bool | None = None,
+) -> dict[str, Any]:
     """读取 Gateway 模式下的 LLM 模型配置。
 
     与 fallback_llm 配置分离，避免 fallback 直连参数和网关路由模型混淆。
@@ -680,8 +724,14 @@ def get_gateway_llm_config() -> dict[str, Any]:
     config = load_config()
     gateway_llm = config.get("gateway_llm", {})
     thinking = gateway_llm.get("thinking", {})
-    thinking_enabled = bool(config.get("thinking_mode", False))
-    fallback_model = get_fallback_llm_config().get("model", "deepseek-chat")
+    thinking_enabled = (
+        bool(config.get("thinking_mode", False))
+        if thinking_enabled_override is None
+        else thinking_enabled_override
+    )
+    fallback_model = get_fallback_llm_config(
+        thinking_enabled_override=thinking_enabled_override,
+    ).get("model", "deepseek-chat")
     base_model = gateway_llm.get("model") or fallback_model
     effective_model = thinking["model"] if thinking_enabled and thinking.get("model") else base_model
     return {
@@ -1426,7 +1476,10 @@ def update_settings(updates: dict[str, Any]) -> None:
 
     if "harness" in updates:
         existing = config.get("harness", {})
-        config["harness"] = _deep_merge(existing, updates["harness"])
+        config["harness"] = _deep_merge(
+            existing,
+            _normalize_harness_update(updates["harness"]),
+        )
 
     sub_update = updates.get("subagents", updates.get("subagent"))
     if sub_update is not None:
@@ -1435,6 +1488,129 @@ def update_settings(updates: dict[str, Any]) -> None:
             config.pop("subagent", None)
 
     save_config(config)
+
+
+def _normalize_harness_update(value: Any) -> dict[str, Any]:
+    """Validate user-editable Harness settings and freeze managed invariants."""
+
+    if not isinstance(value, dict):
+        raise ValueError("harness settings must be an object")
+    result = copy.deepcopy(value)
+
+    goals = result.get("goals")
+    if goals is not None:
+        if not isinstance(goals, dict):
+            raise ValueError("harness.goals must be an object")
+        goals["activation"] = "explicit_user_only"
+        goals["default_enabled"] = False
+        goals["auto_promote_from_run"] = False
+        max_rounds = goals.get("max_rounds", 8)
+        if (
+            not isinstance(max_rounds, int)
+            or isinstance(max_rounds, bool)
+            or not 1 <= max_rounds <= 100
+        ):
+            raise ValueError("harness.goals.max_rounds must be in [1, 100]")
+
+    completion = result.get("completion")
+    if completion is not None:
+        if not isinstance(completion, dict):
+            raise ValueError("harness.completion must be an object")
+        rubric = completion.get("rubric")
+        if rubric is not None:
+            if not isinstance(rubric, dict):
+                raise ValueError("harness.completion.rubric must be an object")
+            max_iterations = rubric.get("max_iterations", 2)
+            if (
+                not isinstance(max_iterations, int)
+                or isinstance(max_iterations, bool)
+                or not 1 <= max_iterations <= 20
+            ):
+                raise ValueError(
+                    "harness.completion.rubric.max_iterations must be in [1, 20]"
+                )
+            model = rubric.get("model", "")
+            if not isinstance(model, str) or len(model.strip()) > 200:
+                raise ValueError(
+                    "harness.completion.rubric.model must be a string of at most 200 characters"
+                )
+            rubric["model"] = model.strip()
+            rules = rubric.get("custom_rules", [])
+            if not isinstance(rules, list) or len(rules) > 50:
+                raise ValueError(
+                    "harness.completion.rubric.custom_rules must contain at most 50 rules"
+                )
+            # Natural-language settings cannot create executable deterministic
+            # logic. Deterministic verifiers are code-registered managed rules.
+            allowed_verifiers = {"analytics", "llm_grader"}
+            normalized_rules: list[dict[str, Any]] = []
+            for index, rule in enumerate(rules):
+                if not isinstance(rule, dict):
+                    raise ValueError(f"custom_rules[{index}] must be an object")
+                statement = str(rule.get("statement") or "").strip()
+                if not statement or len(statement) > 1000:
+                    raise ValueError(
+                        f"custom_rules[{index}].statement must contain 1-1000 characters"
+                    )
+                verifier = str(rule.get("verifier") or "llm_grader")
+                if verifier not in allowed_verifiers:
+                    raise ValueError(
+                        f"custom_rules[{index}].verifier is not registered"
+                    )
+                normalized_rules.append(
+                    {
+                        "id": str(rule.get("id") or f"custom_{index + 1}")[:100],
+                        "enabled": bool(rule.get("enabled", True)),
+                        "statement": statement,
+                        "required": bool(rule.get("required", True)),
+                        "verifier": verifier,
+                    }
+                )
+            rubric["custom_rules"] = normalized_rules
+
+    terminal = result.get("terminal")
+    if terminal is not None:
+        if not isinstance(terminal, dict):
+            raise ValueError("harness.terminal must be an object")
+        if terminal.get("on_unavailable", "fallback") not in {"fallback", "deny"}:
+            raise ValueError(
+                "harness.terminal.on_unavailable must be fallback or deny"
+            )
+        timeout = terminal.get("default_timeout_seconds", 120)
+        if (
+            not isinstance(timeout, int)
+            or isinstance(timeout, bool)
+            or not 1 <= timeout <= 3600
+        ):
+            raise ValueError(
+                "harness.terminal.default_timeout_seconds must be in [1, 3600]"
+            )
+        docker = terminal.get("docker")
+        if docker is not None:
+            if not isinstance(docker, dict):
+                raise ValueError("harness.terminal.docker must be an object")
+            docker["lifecycle"] = "project"
+            for key, minimum, maximum in (
+                ("memory_limit_mb", 128, 131072),
+                ("pids_limit", 16, 4096),
+                ("idle_stop_minutes", 1, 10080),
+            ):
+                item = docker.get(key)
+                if item is not None and (
+                    not isinstance(item, int)
+                    or isinstance(item, bool)
+                    or not minimum <= item <= maximum
+                ):
+                    raise ValueError(
+                        f"harness.terminal.docker.{key} must be in "
+                        f"[{minimum}, {maximum}]"
+                    )
+            image = str(docker.get("image") or "").strip()
+            if not image:
+                raise ValueError("harness.terminal.docker.image cannot be empty")
+            docker["image"] = image
+
+    return result
 
 
 def get_max_history_messages() -> int:

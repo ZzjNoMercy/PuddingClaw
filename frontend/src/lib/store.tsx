@@ -31,6 +31,10 @@ import {
   updateProject as apiUpdateProject,
   removeProject as apiRemoveProject,
   updateSessionAnalyticsModel as apiUpdateSessionAnalyticsModel,
+  getSessionHarnessState as apiGetSessionHarnessState,
+  pauseGoal as apiPauseGoal,
+  resumeGoal as apiResumeGoal,
+  cancelGoal as apiCancelGoal,
   ProjectMeta,
   TodoItem,
   AgentTrace,
@@ -43,6 +47,9 @@ import {
   LogicalDatasetRuleRequest,
   DatabaseSqlRevisionRequest,
   AgentAttachment,
+  HarnessGoal,
+  HarnessRun,
+  RubricEvaluationReport,
 } from "./api";
 import {
   getSettings as apiGetSettings,
@@ -68,7 +75,7 @@ export type TimelineItem =
   | { type: "reasoning"; content: string; id: string }
   | { type: "tool"; toolCall: ToolCall; id: string };
 
-type InspectorActiveTab = "progress" | "sources" | "permissions" | null;
+type InspectorActiveTab = "progress" | "goal" | "verification" | "sources" | "permissions" | null;
 const INSPECTOR_ACTIVE_TAB_STORAGE_KEY = "puddingclaw_inspector_active_tab";
 const ACTIVE_RUNS_STORAGE_KEY = "puddingclaw_active_runs";
 const ACTIVE_RUNS_HEARTBEAT_MS = 5_000;
@@ -196,6 +203,14 @@ interface AppState {
   hasActiveRun: boolean;
   sendMessage: (text: string, attachments?: AgentAttachment[]) => Promise<void>;
   stopStreaming: () => void;
+  goalModeEnabled: boolean;
+  setGoalModeEnabled: (enabled: boolean) => void;
+  activeGoal: HarnessGoal | null;
+  currentRun: HarnessRun | null;
+  verificationReport: RubricEvaluationReport | null;
+  pauseActiveGoal: () => Promise<void>;
+  resumeActiveGoal: () => Promise<void>;
+  cancelActiveGoal: () => Promise<void>;
 
   // Sessions
   sessionId: string;
@@ -617,6 +632,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const graphsMapRef = useRef<Record<string, GraphStructure | null>>({});
   const graphActiveNodesRef = useRef<Record<string, string | null>>({});
   const analyticsModelIdsMapRef = useRef<Record<string, string | null>>({});
+  const activeGoalsMapRef = useRef<Record<string, HarnessGoal | null>>({});
+  const currentRunsMapRef = useRef<Record<string, HarnessRun | null>>({});
+  const verificationReportsMapRef = useRef<Record<string, RubricEvaluationReport | null>>({});
   const abortControllersRef = useRef<Map<string, AbortController>>(new Map());
   const assistantIdsRef = useRef<Map<string, string>>(new Map());
   const sessionIdRef = useRef("default"); // tracks current sessionId for SSE callbacks
@@ -664,6 +682,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [runtimeReady, setRuntimeReady] = useState(false);
   const [currentProjectId, setCurrentProjectIdRaw] = useState<string | null>(null);
   const [analyticsModelId, setAnalyticsModelIdRaw] = useState<string | null>(null);
+  const [goalModeEnabled, setGoalModeEnabled] = useState(false);
+  const [activeGoal, setActiveGoal] = useState<HarnessGoal | null>(null);
+  const [currentRun, setCurrentRun] = useState<HarnessRun | null>(null);
+  const [verificationReport, setVerificationReport] = useState<RubricEvaluationReport | null>(null);
   const [projects, setProjects] = useState<ProjectMeta[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [inspectorFile, setInspectorFileRaw] = useState<string | null>(null);
@@ -680,7 +702,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     try {
       const saved = localStorage.getItem(INSPECTOR_ACTIVE_TAB_STORAGE_KEY);
-      if (saved === "progress" || saved === "sources" || saved === "permissions") {
+      if (
+        saved === "progress" ||
+        saved === "goal" ||
+        saved === "verification" ||
+        saved === "sources" ||
+        saved === "permissions"
+      ) {
         setInspectorActiveTabRaw(saved);
       } else if (saved === "collapsed") {
         setInspectorActiveTabRaw(null);
@@ -1159,8 +1187,49 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       if (id === "default") {
         analyticsModelIdsMapRef.current.default = null;
         setAnalyticsModelIdRaw(null);
+        setGoalModeEnabled(false);
+        setActiveGoal(null);
+        setCurrentRun(null);
+        setVerificationReport(null);
       } else {
         setAnalyticsModelIdRaw(analyticsModelIdsMapRef.current[id] ?? null);
+        const cachedGoal = activeGoalsMapRef.current[id] ?? null;
+        setActiveGoal(cachedGoal);
+        setGoalModeEnabled(Boolean(cachedGoal && cachedGoal.status === "active"));
+        setCurrentRun(currentRunsMapRef.current[id] ?? null);
+        setVerificationReport(verificationReportsMapRef.current[id] ?? null);
+        apiGetSessionHarnessState(id)
+          .then((data) => {
+            const latestGoalId = [...(data.goal_order || [])]
+              .reverse()
+              .find((goalId) =>
+                ["active", "paused", "blocked"].includes(data.goals[goalId]?.status)
+              );
+            const loadedGoal =
+              data.active_goal_id && data.goals[data.active_goal_id]
+                ? data.goals[data.active_goal_id]
+                : latestGoalId
+                  ? data.goals[latestGoalId]
+                  : null;
+            const loadedRun =
+              data.latest_run_id && data.runs[data.latest_run_id]
+                ? data.runs[data.latest_run_id]
+                : null;
+            const loadedReport =
+              loadedRun?.verification_report?.status === "not_required"
+                ? null
+                : loadedRun?.verification_report || null;
+            activeGoalsMapRef.current[id] = loadedGoal;
+            currentRunsMapRef.current[id] = loadedRun;
+            verificationReportsMapRef.current[id] = loadedReport;
+            if (sessionIdRef.current === id) {
+              setActiveGoal(loadedGoal);
+              setGoalModeEnabled(Boolean(loadedGoal && loadedGoal.status === "active"));
+              setCurrentRun(loadedRun);
+              setVerificationReport(loadedReport);
+            }
+          })
+          .catch(() => {});
       }
 
       // Restore cached Agent white-box state if available
@@ -1402,12 +1471,19 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       tracesMapRef.current[sessionId] = null;
       traceHistoriesMapRef.current[sessionId] = {};
       selectedTraceQueryMapRef.current[sessionId] = null;
+      activeGoalsMapRef.current[sessionId] = null;
+      currentRunsMapRef.current[sessionId] = null;
+      verificationReportsMapRef.current[sessionId] = null;
       if (sessionIdRef.current === sessionId) {
         setMessages([]);
         setTodos([]);
         setTrace(null);
         setTraceHistory({});
         setSelectedTraceQueryId(null);
+        setGoalModeEnabled(false);
+        setActiveGoal(null);
+        setCurrentRun(null);
+        setVerificationReport(null);
       }
       setRawMessages(null);
     } catch {
@@ -1443,6 +1519,30 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       });
     }
   }, [sessionId, updateSessionMessages]);
+
+  const pauseActiveGoal = useCallback(async () => {
+    if (!activeGoal) return;
+    const next = await apiPauseGoal(sessionId, activeGoal.goal_id);
+    activeGoalsMapRef.current[sessionId] = next;
+    setActiveGoal(next);
+    setGoalModeEnabled(false);
+  }, [activeGoal, sessionId]);
+
+  const resumeActiveGoal = useCallback(async () => {
+    if (!activeGoal) return;
+    const next = await apiResumeGoal(sessionId, activeGoal.goal_id);
+    activeGoalsMapRef.current[sessionId] = next;
+    setActiveGoal(next);
+    setGoalModeEnabled(true);
+  }, [activeGoal, sessionId]);
+
+  const cancelActiveGoal = useCallback(async () => {
+    if (!activeGoal) return;
+    await apiCancelGoal(sessionId, activeGoal.goal_id);
+    activeGoalsMapRef.current[sessionId] = null;
+    setActiveGoal(null);
+    setGoalModeEnabled(false);
+  }, [activeGoal, sessionId]);
 
   // ── Send message ───────────────────────────────────
 
@@ -1622,8 +1722,24 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       };
 
       try {
+        const goalForRun =
+          activeGoalsMapRef.current[sendSessionId] ||
+          (sessionIdRef.current === sendSessionId ? activeGoal : null);
+        const goalModeForRun =
+          runtimeMode === "agent" &&
+          (goalModeEnabled || goalForRun?.status === "active");
         const eventStream = runtimeMode === "agent"
-          ? streamAgent(processedText, sendSessionId, currentProjectId, controller.signal, userId, attachments, analyticsModelId)
+          ? streamAgent(
+              processedText,
+              sendSessionId,
+              currentProjectId,
+              controller.signal,
+              userId,
+              attachments,
+              analyticsModelId,
+              goalModeForRun,
+              goalModeForRun ? goalForRun?.goal_id || null : null,
+            )
           : streamChat(processedText, sendSessionId, controller.signal, userId);
 
         for await (const event of eventStream) {
@@ -1833,6 +1949,89 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             continue;
           }
 
+          if (event.event === "run_started") {
+            const run = event.data.run as unknown as HarnessRun;
+            if (run?.run_id) {
+              currentRunsMapRef.current[sendSessionId] = run;
+              verificationReportsMapRef.current[sendSessionId] = null;
+              if (sessionIdRef.current === sendSessionId) {
+                setCurrentRun(run);
+                setVerificationReport(null);
+              }
+            }
+            continue;
+          }
+
+          if (
+            event.event === "goal_created" ||
+            event.event === "goal_updated" ||
+            event.event === "goal_status_changed"
+          ) {
+            const goal = event.data.goal as unknown as HarnessGoal;
+            if (goal?.goal_id) {
+              activeGoalsMapRef.current[sendSessionId] = goal;
+              if (sessionIdRef.current === sendSessionId) {
+                setActiveGoal(goal);
+                setGoalModeEnabled(goal.status === "active");
+                setInspectorOpen(true);
+                setInspectorActiveTab("goal");
+              }
+            }
+            continue;
+          }
+
+          if (event.event === "verification_started") {
+            const current = currentRunsMapRef.current[sendSessionId];
+            if (current) {
+              const next = { ...current, status: "evaluating" as const };
+              currentRunsMapRef.current[sendSessionId] = next;
+              if (sessionIdRef.current === sendSessionId) setCurrentRun(next);
+            }
+            continue;
+          }
+
+          if (event.event === "verification_report") {
+            const report = event.data.report as unknown as RubricEvaluationReport;
+            if (report?.report_id) {
+              if (report.status === "not_required") {
+                verificationReportsMapRef.current[sendSessionId] = null;
+                if (sessionIdRef.current === sendSessionId) {
+                  setVerificationReport(null);
+                }
+                continue;
+              }
+              verificationReportsMapRef.current[sendSessionId] = report;
+              const current = currentRunsMapRef.current[sendSessionId];
+              if (current) {
+                currentRunsMapRef.current[sendSessionId] = {
+                  ...current,
+                  verification_report: report,
+                };
+              }
+              if (sessionIdRef.current === sendSessionId) {
+                setVerificationReport(report);
+                setInspectorOpen(true);
+                setInspectorActiveTab("verification");
+              }
+            }
+            continue;
+          }
+
+          if (event.event === "run_outcome") {
+            const current = currentRunsMapRef.current[sendSessionId];
+            if (current) {
+              const next: HarnessRun = {
+                ...current,
+                status: (event.data.status as HarnessRun["status"]) || current.status,
+                outcome: (event.data.outcome as string) || current.outcome,
+                error: (event.data.error as string) || current.error,
+              };
+              currentRunsMapRef.current[sendSessionId] = next;
+              if (sessionIdRef.current === sendSessionId) setCurrentRun(next);
+            }
+            continue;
+          }
+
           if (event.event === "permission_required") {
             const targetId = getAssistantId();
             const permissionRequest = event.data as unknown as PermissionRequest;
@@ -1844,11 +2043,22 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               const idx = updated.findIndex((m) => m.id === targetId);
               if (idx === -1) return prev;
               const msg = { ...updated[idx] };
-              const output = `Permission required\nPath: ${permissionRequest.path || ""}`;
+              const permissionTarget =
+                permissionRequest.type === "tool_action"
+                  ? `Command: ${permissionRequest.command || ""}`
+                  : `Path: ${permissionRequest.path || ""}`;
+              const output = `Permission required\n${permissionTarget}`;
               const calls = [...(msg.toolCalls || [])];
               let callIdx = toolCallId ? calls.findIndex((call) => call.id === toolCallId) : -1;
               if (callIdx === -1) {
-                callIdx = calls.findIndex((call) => call.tool === "read_external_file" && call.status === "running");
+                callIdx = calls.findIndex(
+                  (call) =>
+                    call.tool ===
+                      (permissionRequest.tool_name ||
+                        permissionRequest.operation ||
+                        "read_external_file") &&
+                    call.status === "running"
+                );
               }
               if (callIdx !== -1) {
                 calls[callIdx] = {
@@ -1863,7 +2073,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 ? existingRequests.map((request) => request.id === permissionRequest.id ? permissionRequest : request)
                 : [...existingRequests, permissionRequest];
               const timeline = msg.timeline ? [...msg.timeline] : [];
-              updateToolInTimeline(timeline, toolCallId, "read_external_file", {
+              const permissionTool =
+                permissionRequest.tool_name ||
+                permissionRequest.operation ||
+                "read_external_file";
+              updateToolInTimeline(timeline, toolCallId, permissionTool, {
                 output,
                 permissionRequest,
               });
@@ -1874,7 +2088,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 const segTimeline = segments[lastSegIdx].timeline
                   ? [...segments[lastSegIdx].timeline]
                   : [];
-                updateToolInTimeline(segTimeline, toolCallId, "read_external_file", {
+                updateToolInTimeline(segTimeline, toolCallId, permissionTool, {
                   output,
                   permissionRequest,
                 });
@@ -2324,6 +2538,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       runtimeMode,
       currentProjectId,
       analyticsModelId,
+      goalModeEnabled,
+      activeGoal,
     ]
   );
 
@@ -2355,6 +2571,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         hasActiveRun,
         sendMessage,
         stopStreaming,
+        goalModeEnabled,
+        setGoalModeEnabled,
+        activeGoal,
+        currentRun,
+        verificationReport,
+        pauseActiveGoal,
+        resumeActiveGoal,
+        cancelActiveGoal,
         sessionId,
         setSessionId,
         sessions,
