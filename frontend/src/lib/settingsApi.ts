@@ -195,6 +195,7 @@ export interface HarnessSettings {
       pids_limit?: number;
       network_enabled?: boolean;
       dependency_setup_enabled?: boolean;
+      dependency_setup_opt_in_version?: number;
       lifecycle?: "project";
       idle_stop_minutes?: number;
     };

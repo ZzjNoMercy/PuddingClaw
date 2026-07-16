@@ -122,11 +122,42 @@ def test_legacy_python_only_sandbox_image_migrates_to_managed_runtime(
     docker = loaded["harness"]["terminal"]["docker"]
     assert docker["image"] == "puddingclaw/sandbox:python3.12-node22-v2"
     assert docker["dependency_setup_enabled"] is False
+    assert docker["dependency_setup_opt_in_version"] == 1
     persisted = json.loads(config_path.read_text(encoding="utf-8"))
     assert (
         persisted["harness"]["terminal"]["docker"]["image"]
         == "puddingclaw/sandbox:python3.12-node22-v2"
     )
+
+
+def test_legacy_implicit_project_dependency_setup_is_reset_to_clean_default(
+    tmp_path,
+    monkeypatch,
+):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "harness": {
+                    "terminal": {
+                        "docker": {
+                            "image": "puddingclaw/sandbox:python3.12-node22-v1",
+                            "dependency_setup_enabled": True,
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
+
+    loaded = config.load_config()
+
+    docker = loaded["harness"]["terminal"]["docker"]
+    assert docker["image"] == "puddingclaw/sandbox:python3.12-node22-v2"
+    assert docker["dependency_setup_enabled"] is False
+    assert docker["dependency_setup_opt_in_version"] == 1
 
 
 def test_docker_probe_endpoint_reports_daemon_status(monkeypatch):

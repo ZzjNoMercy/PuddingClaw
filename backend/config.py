@@ -1,8 +1,8 @@
 """Global configuration management — JSON-based persistence."""
 
+import copy
 import json
 import logging
-import copy
 from pathlib import Path
 from typing import Any
 
@@ -311,6 +311,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
                 "pids_limit": 256,
                 "network_enabled": False,
                 "dependency_setup_enabled": False,
+                "dependency_setup_opt_in_version": 1,
                 "lifecycle": "project",
                 "idle_stop_minutes": 30,
             },
@@ -415,6 +416,19 @@ def _migrate_legacy_config(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         docker["image"] = "puddingclaw/sandbox:python3.12-node22-v2"
         docker.setdefault("dependency_setup_enabled", False)
         migrated = True
+    if isinstance(docker, dict):
+        if (
+            docker.get("dependency_setup_enabled") is True
+            and docker.get("dependency_setup_opt_in_version") != 1
+        ):
+            # Early development builds briefly defaulted project dependency
+            # preparation to true. Reset that legacy implicit opt-in once so
+            # existing users return to the clean Python+Node sandbox default.
+            docker["dependency_setup_enabled"] = False
+            migrated = True
+        if docker.get("dependency_setup_opt_in_version") != 1:
+            docker["dependency_setup_opt_in_version"] = 1
+            migrated = True
     if migrated:
         logger.info("[config] 已完成 legacy 配置迁移")
     return data, migrated
@@ -1622,6 +1636,7 @@ def _normalize_harness_update(value: Any) -> dict[str, Any]:
                 docker["dependency_setup_enabled"] = bool(
                     docker["dependency_setup_enabled"]
                 )
+                docker["dependency_setup_opt_in_version"] = 1
 
     return result
 

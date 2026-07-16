@@ -92,6 +92,11 @@ const EMBEDDING_PROVIDERS = [
 
 const SETTINGS_CATEGORY_KEY = "settings:activeCategory";
 const MANAGED_DOCKER_IMAGE = "puddingclaw/sandbox:python3.12-node22-v2";
+const LEGACY_MANAGED_DOCKER_IMAGES = new Set([
+  MANAGED_DOCKER_IMAGE,
+  "puddingclaw/sandbox:python3.12-node22-v1",
+  "python:3.12-slim",
+]);
 const DOCKER_CPU_OPTIONS = ["2", "4", "8", "16"];
 const DOCKER_MEMORY_OPTIONS = [
   { value: "2048", label: "2 GB" },
@@ -431,7 +436,7 @@ export default function SettingsPage() {
         setDockerConnection(terminal?.docker?.connection || "");
         setDockerContext(terminal?.docker?.context || "");
         const configuredDockerImage = terminal?.docker?.image || MANAGED_DOCKER_IMAGE;
-        const usesCustomDockerImage = configuredDockerImage !== MANAGED_DOCKER_IMAGE;
+        const usesCustomDockerImage = !LEGACY_MANAGED_DOCKER_IMAGES.has(configuredDockerImage);
         setDockerUseCustomImage(usesCustomDockerImage);
         setDockerImage(usesCustomDockerImage ? configuredDockerImage : "");
         const configuredCpuLimit = terminal?.docker?.cpu_limit || "2";
@@ -444,7 +449,10 @@ export default function SettingsPage() {
         );
         setDockerPidsLimit(String(terminal?.docker?.pids_limit ?? 256));
         setDockerNetworkEnabled(terminal?.docker?.network_enabled ?? false);
-        setDockerDependencySetupEnabled(terminal?.docker?.dependency_setup_enabled ?? false);
+        setDockerDependencySetupEnabled(
+          terminal?.docker?.dependency_setup_enabled === true
+          && terminal?.docker?.dependency_setup_opt_in_version === 1
+        );
         // SubAgent
         const items = s.subagents?.items || s.subagent?.items;
         if (Array.isArray(items) && items.length > 0) {
@@ -673,6 +681,7 @@ export default function SettingsPage() {
               pids_limit: positiveIntOrNull(dockerPidsLimit) ?? 256,
               network_enabled: dockerNetworkEnabled,
               dependency_setup_enabled: dockerDependencySetupEnabled,
+              dependency_setup_opt_in_version: 1,
               lifecycle: "project",
               idle_stop_minutes: 30,
             },
@@ -2422,14 +2431,6 @@ export default function SettingsPage() {
                             <label className="flex items-center gap-2 pt-6 text-[12px] text-gray-600">
                               <input
                                 type="checkbox"
-                                checked={dockerDependencySetupEnabled}
-                                onChange={(event) => setDockerDependencySetupEnabled(event.target.checked)}
-                              />
-                              按项目 lockfile 准备依赖（高级）
-                            </label>
-                            <label className="flex items-center gap-2 pt-6 text-[12px] text-gray-600">
-                              <input
-                                type="checkbox"
                                 checked={dockerUseCustomImage}
                                 onChange={(event) => setDockerUseCustomImage(event.target.checked)}
                               />
@@ -2453,6 +2454,23 @@ export default function SettingsPage() {
                             自定义镜像填写的是本机 Docker tag 或 registry image reference，不需要上传镜像文件。
                             未开启常驻网络时，批准的安装命令只会临时联网，结束后自动断开。
                           </p>
+
+                          <div className="mt-3 rounded-xl border border-amber-200/70 bg-amber-50/70 px-3.5 py-3">
+                            <label className="flex items-start gap-2 text-[12px] text-amber-950">
+                              <input
+                                type="checkbox"
+                                checked={dockerDependencySetupEnabled}
+                                onChange={(event) => setDockerDependencySetupEnabled(event.target.checked)}
+                                className="mt-0.5"
+                              />
+                              <span>
+                                <span className="font-semibold">按项目 lockfile 准备依赖（高级）</span>
+                                <span className="mt-0.5 block text-[10px] leading-4 text-amber-800">
+                                  默认关闭以保持纯净沙箱。仅当确实需要运行项目脚本或测试时主动开启。
+                                </span>
+                              </span>
+                            </label>
+                          </div>
 
                           <div className="mt-4 flex flex-wrap items-center gap-3">
                             <button

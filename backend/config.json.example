@@ -177,6 +177,7 @@
         "pids_limit": 256,
         "network_enabled": false,
         "dependency_setup_enabled": false,
+        "dependency_setup_opt_in_version": 1,
         "lifecycle": "project",
         "idle_stop_minutes": 30
       }
