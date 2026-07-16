@@ -498,6 +498,10 @@ def test_tool_action_grant_cannot_be_replayed(tmp_path):
         "session_id": "tool-action-session",
         "status": "pending",
         "fingerprint": "sha256:test",
+        "tool_name": "execute",
+        "command": "python3 --version",
+        "reason": "arbitrary_interpreter:python3",
+        "risk": "high",
     }
     client = TestClient(app)
 
@@ -512,7 +516,14 @@ def test_tool_action_grant_cannot_be_replayed(tmp_path):
 
     assert first.status_code == 200
     assert replay.status_code == 409
-    assert len(session_manager.list_permission_grants("tool-action-session")) == 1
+    grants = session_manager.list_permission_grants("tool-action-session")
+    assert len(grants) == 1
+    assert grants[0]["metadata"] == {
+        "tool_name": "execute",
+        "command": "python3 --version",
+        "reason": "arbitrary_interpreter:python3",
+        "risk": "high",
+    }
     loop.close()
 
 

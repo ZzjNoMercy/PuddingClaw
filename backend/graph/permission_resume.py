@@ -152,5 +152,19 @@ class PermissionResumeRegistry:
         request = self._requests.get(request_id)
         return dict(request) if request else None
 
+    def find_tool_action_request(
+        self,
+        fingerprint: str,
+    ) -> dict[str, Any] | None:
+        """Return the newest Tool-action request matching a persisted grant."""
+
+        for request in reversed(list(self._requests.values())):
+            if (
+                request.get("type") == "tool_action"
+                and request.get("fingerprint") == fingerprint
+            ):
+                return dict(request)
+        return None
+
 
 permission_resume_registry = PermissionResumeRegistry()

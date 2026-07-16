@@ -15,6 +15,7 @@ import {
   Pause,
   Play,
   ShieldCheck,
+  SquareTerminal,
   Target,
   Timer,
   X,
@@ -486,17 +487,46 @@ function PermissionsCard({
       ) : active ? (
         <div className="mt-4 space-y-3 pb-5">
           {grants.map((grant) => {
-            const target = grant.target_kind === "all_external_files" ? "所有外部文件" : grant.target;
+            const isToolAction =
+              grant.type === "tool_action" || grant.target_kind === "fingerprint";
+            const command = String(grant.metadata?.command || "").trim();
+            const target = isToolAction
+              ? command || `命令指纹 ${grant.target.slice(0, 20)}…`
+              : grant.target_kind === "all_external_files"
+                ? "所有外部文件"
+                : grant.target;
             const canWrite = grant.capabilities.includes("write") || grant.type === "external_file_write";
-            const name =
-              grant.target_kind === "all_external_files"
+            const commandExecutable = command
+              .split(/&&|\|\||[;|]/)
+              .map((segment) => segment.trim().replace(/^\(+/, "").split(/\s+/)[0] || "")
+              .map((item) => item.split("/").pop() || "")
+              .find((item) => item && !["cd", "mkdir", "printf"].includes(item));
+            const risk = String(grant.metadata?.risk || "");
+            const riskLabel = risk
+              ? (
+                  {
+                    high: "高风险",
+                    network: "联网",
+                    package_install: "依赖安装",
+                    managed_write: "受控写入",
+                    critical: "关键风险",
+                  } as Record<string, string>
+                )[risk] || risk
+              : "";
+            const name = isToolAction
+              ? commandExecutable
+                ? `${commandExecutable} 命令授权`
+                : "受控命令授权"
+              : grant.target_kind === "all_external_files"
                 ? `本 session 外部文件${canWrite ? "写入" : "读取"}`
                 : grant.target.split("/").filter(Boolean).pop() || "外部文件";
             return (
               <div key={grant.id} className="rounded-2xl border border-black/[0.06] bg-white/70 p-3">
                 <div className="flex items-start gap-2.5">
                   <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[#002fa7]/10 text-[#002fa7]">
-                    <KeyRound className="h-4 w-4" />
+                    {isToolAction
+                      ? <SquareTerminal className="h-4 w-4" />
+                      : <KeyRound className="h-4 w-4" />}
                   </div>
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center justify-between gap-2">
@@ -518,18 +548,40 @@ function PermissionsCard({
                         <X className="h-3.5 w-3.5" />
                       </button>
                     </div>
-                    <div className="mt-1 truncate font-mono text-[10.5px] text-slate-500">{target}</div>
+                    <div
+                      className={`mt-1 text-[10.5px] text-slate-500 ${
+                        isToolAction
+                          ? "line-clamp-2 break-all font-mono leading-4"
+                          : "truncate font-mono"
+                      }`}
+                      title={target}
+                    >
+                      {target}
+                    </div>
                     <div className="mt-2 flex flex-wrap gap-1.5">
                       <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-500">
-                        Session
+                        {grant.scope === "once" ? "仅本次" : "本 Session"}
                       </span>
-                      <span
-                        className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${
-                          canWrite ? "bg-amber-50 text-amber-700" : "bg-slate-100 text-slate-500"
-                        }`}
-                      >
-                        {canWrite ? "Write" : "Read only"}
-                      </span>
+                      {isToolAction ? (
+                        <>
+                          <span className="rounded-full bg-blue-50 px-2 py-0.5 text-[10px] font-medium text-blue-700">
+                            命令执行
+                          </span>
+                          {riskLabel && (
+                            <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700">
+                              {riskLabel}
+                            </span>
+                          )}
+                        </>
+                      ) : (
+                        <span
+                          className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${
+                            canWrite ? "bg-amber-50 text-amber-700" : "bg-slate-100 text-slate-500"
+                          }`}
+                        >
+                          {canWrite ? "Write" : "Read only"}
+                        </span>
+                      )}
                     </div>
                   </div>
                 </div>

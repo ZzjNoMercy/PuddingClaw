@@ -2252,6 +2252,12 @@ export interface PermissionGrant {
   source?: string;
   created_at?: number;
   revoked_at?: number;
+  metadata?: {
+    tool_name?: string;
+    command?: string;
+    reason?: string;
+    risk?: string;
+  };
 }
 
 export interface PermissionRequest {

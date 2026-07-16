@@ -1,7 +1,7 @@
 """SessionManager — 短期记忆管理器，基于 JSON 文件持久化会话历史"""
 
-import json
 import hashlib
+import json
 import re
 import threading
 import time
@@ -1781,6 +1781,7 @@ class SessionManager:
         capabilities: list[str],
         scope: str = "session",
         source: str = "user",
+        metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Persist a session permission grant and return it."""
         data = self._read_file(session_id)
@@ -1812,6 +1813,8 @@ class SessionManager:
             "source": source,
             "created_at": now,
         }
+        if metadata:
+            grant["metadata"] = dict(metadata)
         grants.append(grant)
         permissions["grants"] = grants
         data["permissions"] = permissions

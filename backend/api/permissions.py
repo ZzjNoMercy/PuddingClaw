@@ -34,7 +34,21 @@ class ToolActionGrantRequest(BaseModel):
 async def list_permissions(session_id: str) -> dict[str, Any]:
     """List active permission grants for a session."""
 
-    return {"session_id": session_id, "grants": session_manager.list_permission_grants(session_id)}
+    grants = session_manager.list_permission_grants(session_id)
+    for grant in grants:
+        if grant.get("type") != "tool_action" or grant.get("metadata"):
+            continue
+        request = permission_resume_registry.find_tool_action_request(
+            str(grant.get("target") or "")
+        )
+        if request is not None:
+            grant["metadata"] = {
+                "tool_name": request.get("tool_name"),
+                "command": request.get("command"),
+                "reason": request.get("reason"),
+                "risk": request.get("risk"),
+            }
+    return {"session_id": session_id, "grants": grants}
 
 
 @router.post("/sessions/{session_id}/permissions/external-files")
@@ -160,6 +174,12 @@ async def grant_tool_action_permission(
         capabilities=["execute"],
         scope=req.scope,
         source="user",
+        metadata={
+            "tool_name": pending.get("tool_name"),
+            "command": pending.get("command"),
+            "reason": pending.get("reason"),
+            "risk": pending.get("risk"),
+        },
     )
     resumed = permission_resume_registry.resolve(
         req.permission_request_id,
