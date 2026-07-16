@@ -2457,14 +2457,13 @@ export default function SettingsPage() {
                                 </FormField>
                               </div>
                             )}
+                            <p className="mt-3 rounded-lg bg-blue-50 px-3 py-2 text-[10px] leading-relaxed text-blue-700">
+                              默认托管镜像只提供 Python 3.12 + pip 与 Node.js 22 + npm/corepack。
+                              默认不安装项目依赖；第三方 Skill 执行中缺包时才请求 package/network 权限并动态安装。
+                              自定义镜像填写的是本机 Docker tag 或 registry image reference，不需要上传镜像文件。
+                              未开启常驻网络时，批准的安装命令只会临时联网，结束后自动断开。
+                            </p>
                           </div>
-
-                          <p className="mt-3 rounded-lg bg-blue-50 px-3 py-2 text-[10px] leading-relaxed text-blue-700">
-                            默认托管镜像只提供 Python 3.12 + pip 与 Node.js 22 + npm/corepack。
-                            默认不安装项目依赖；第三方 Skill 执行中缺包时才请求 package/network 权限并动态安装。
-                            自定义镜像填写的是本机 Docker tag 或 registry image reference，不需要上传镜像文件。
-                            未开启常驻网络时，批准的安装命令只会临时联网，结束后自动断开。
-                          </p>
 
                           <div className="mt-3 rounded-xl border border-amber-200/70 bg-amber-50/70 px-3.5 py-3">
                             <label className="flex items-start gap-2 text-[12px] text-amber-950">
