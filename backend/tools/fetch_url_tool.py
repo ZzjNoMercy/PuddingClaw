@@ -1,7 +1,5 @@
 """FetchURLTool — Fetch a URL and return cleaned Markdown content."""
 
-from typing import Type
-
 import html2text
 import requests
 from langchain_core.tools import BaseTool
@@ -19,7 +17,7 @@ class FetchURLTool(BaseTool):
         "Use this to retrieve information from the internet. "
         "Input should be a valid URL (starting with http:// or https://)."
     )
-    args_schema: Type[BaseModel] = FetchURLInput
+    args_schema: type[BaseModel] = FetchURLInput
     risk_level: str = "safe"
 
     def _run(self, url: str) -> str:
@@ -34,10 +32,10 @@ class FetchURLTool(BaseTool):
 
             # If JSON, return directly
             if "application/json" in content_type:
-                text = resp.text
-                if len(text) > 5000:
-                    text = text[:5000] + "\n...[truncated]"
-                return text
+                # Return the complete payload. DeepAgents FilesystemMiddleware
+                # owns context-size eviction and will persist genuinely large
+                # tool results under /large_tool_results with an exact path.
+                return resp.text
 
             # requests falls back to ISO-8859-1 for some HTML responses even
             # when the body is UTF-8/GBK. Prefer detected encoding in that case
@@ -54,8 +52,6 @@ class FetchURLTool(BaseTool):
             converter.body_width = 0
             markdown = converter.handle(resp.text)
 
-            if len(markdown) > 5000:
-                markdown = markdown[:5000] + "\n...[truncated]"
             return markdown
 
         except requests.Timeout:

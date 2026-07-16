@@ -223,6 +223,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             },
             "tool_context": {
                 "enabled": True,
+                "immediate_compaction_enabled": False,
                 "single_tool_trigger_tokens": 8000,
                 "background_min_result_tokens": 1000,
                 "keep_recent_tool_results": 12,
@@ -1470,15 +1471,22 @@ def update_settings(updates: dict[str, Any]) -> None:
                     config["compression"].get("deepagents", {}).get("tool_context", {})
                 )
                 merged_tool_context = _deep_merge(current_tool_context, tool_context_update)
+                immediate_enabled = bool(
+                    merged_tool_context.get("immediate_compaction_enabled", False)
+                )
                 single = int(merged_tool_context.get("single_tool_trigger_tokens", 8000))
                 background = int(merged_tool_context.get("background_min_result_tokens", 1000))
                 keep_recent = int(merged_tool_context.get("keep_recent_tool_results", 12))
-                if not 1000 <= single <= 100000:
-                    raise ValueError("执行中单条工具阈值必须在 1,000 到 100,000 tokens 之间")
-                if not 100 <= background < single:
-                    raise ValueError("静默压缩单条下限必须至少为 100 且小于执行中单条工具阈值")
+                if not 1000 <= single <= 20000:
+                    raise ValueError("执行中单条工具阈值必须在 1,000 到 20,000 tokens 之间")
+                if not 100 <= background <= 100000:
+                    raise ValueError("静默压缩单条下限必须在 100 到 100,000 tokens 之间")
                 if not 1 <= keep_recent <= 100:
                     raise ValueError("保留最近工具结果必须在 1 到 100 条之间")
+                tool_context_update = dict(tool_context_update)
+                tool_context_update["immediate_compaction_enabled"] = immediate_enabled
+                deepagents_update = dict(deepagents_update)
+                deepagents_update["tool_context"] = tool_context_update
             existing_deepagents = config["compression"].get("deepagents", {})
             config["compression"]["deepagents"] = _deep_merge(existing_deepagents, deepagents_update)
             config["compression"]["deepagents"].setdefault("summarization", {}).pop(
@@ -1688,6 +1696,7 @@ def get_deepagents_tool_context_config() -> dict[str, Any]:
             "tool_context",
             {
                 "enabled": True,
+                "immediate_compaction_enabled": False,
                 "single_tool_trigger_tokens": 8000,
                 "background_min_result_tokens": 1000,
                 "keep_recent_tool_results": 12,

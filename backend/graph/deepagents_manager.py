@@ -959,7 +959,12 @@ class DeepAgentsAgentManager:
             )
         return memory_md
 
-    def _build_backend(self, workspace_path: Path, session_id: str = ""):
+    def _build_backend(
+        self,
+        workspace_path: Path,
+        session_id: str = "",
+        query_id: str = "",
+    ):
         assert self._base_dir is not None
         skills_dir = self._base_dir / "skills"
         semantic_assets_dir = self._base_dir / "semantic-assets"
@@ -970,6 +975,14 @@ class DeepAgentsAgentManager:
         semantic_assets_dir.mkdir(parents=True, exist_ok=True)
         sql_guardrails_dir.mkdir(parents=True, exist_ok=True)
         analytics_models_dir.mkdir(parents=True, exist_ok=True)
+        large_tool_results_dir = (
+            workspace_path
+            / ".puddingclaw"
+            / "large_tool_results"
+            / (session_id or "anonymous-session")
+            / (query_id or "unscoped-query")
+        )
+        large_tool_results_dir.mkdir(parents=True, exist_ok=True)
         terminal_config = (
             config.load_config().get("harness", {}).get("terminal", {})
         )
@@ -996,6 +1009,10 @@ class DeepAgentsAgentManager:
             "/semantic-assets/": FilesystemBackend(root_dir=semantic_assets_dir, virtual_mode=True),
             "/sql-guardrails/": FilesystemBackend(root_dir=sql_guardrails_dir, virtual_mode=True),
             "/analytics-models/": FilesystemBackend(root_dir=analytics_models_dir, virtual_mode=True),
+            "/large_tool_results/": FilesystemBackend(
+                root_dir=large_tool_results_dir,
+                virtual_mode=True,
+            ),
         }
         workspace_host_prefix = f"{workspace_path.resolve().as_posix().rstrip('/')}/"
         routes[workspace_host_prefix] = workspace_backend
@@ -3146,7 +3163,11 @@ class DeepAgentsAgentManager:
             agent_tools = self._build_tools(workspace_path, session_id=session_id, query_id=query_id)
             agent_skills = ["/skills/"]
             skill_toolsets = discover_skill_toolsets(self._base_dir / "skills")
-            agent_backend = self._build_backend(workspace_path, session_id=session_id)
+            agent_backend = self._build_backend(
+                workspace_path,
+                session_id=session_id,
+                query_id=query_id,
+            )
             backend_mode = str(
                 getattr(agent_backend, "execution_mode", "restricted_host")
             )

@@ -252,6 +252,7 @@ export default function SettingsPage() {
   // Harness context engineering (DeepAgents only)
   const [contextSummaryTriggerTokens, setContextSummaryTriggerTokens] = useState("200000");
   const [toolContextEnabled, setToolContextEnabled] = useState(true);
+  const [immediateToolCompactionEnabled, setImmediateToolCompactionEnabled] = useState(false);
   const [singleToolTriggerTokens, setSingleToolTriggerTokens] = useState("8000");
   const [backgroundMinResultTokens, setBackgroundMinResultTokens] = useState("1000");
   const [keepRecentToolResults, setKeepRecentToolResults] = useState("12");
@@ -401,6 +402,9 @@ export default function SettingsPage() {
           String(s.compression.deepagents?.summarization?.trigger_tokens ?? 200000)
         );
         setToolContextEnabled(s.compression.deepagents?.tool_context?.enabled ?? true);
+        setImmediateToolCompactionEnabled(
+          s.compression.deepagents?.tool_context?.immediate_compaction_enabled ?? false
+        );
         setSingleToolTriggerTokens(
           String(s.compression.deepagents?.tool_context?.single_tool_trigger_tokens ?? 8000)
         );
@@ -527,11 +531,11 @@ export default function SettingsPage() {
       if (summaryTrigger < 10000 || summaryTrigger > 1000000) {
         throw new Error("全局摘要阈值必须在 10,000 到 1,000,000 tokens 之间");
       }
-      if (singleToolTrigger < 1000 || singleToolTrigger > 100000) {
-        throw new Error("执行中单条工具阈值必须在 1,000 到 100,000 tokens 之间");
+      if (singleToolTrigger < 1000 || singleToolTrigger > 20000) {
+        throw new Error("执行中单条工具阈值必须在 1,000 到 20,000 tokens 之间");
       }
-      if (backgroundMinimum < 100 || backgroundMinimum >= singleToolTrigger) {
-        throw new Error("静默压缩单条下限必须至少为 100 且小于执行中单条工具阈值");
+      if (backgroundMinimum < 100 || backgroundMinimum > 100000) {
+        throw new Error("静默压缩单条下限必须在 100 到 100,000 tokens 之间");
       }
       if (keepRecentResults < 1 || keepRecentResults > 100) {
         throw new Error("保留最近工具结果必须在 1 到 100 条之间");
@@ -638,6 +642,7 @@ export default function SettingsPage() {
             },
             tool_context: {
               enabled: toolContextEnabled,
+              immediate_compaction_enabled: immediateToolCompactionEnabled,
               single_tool_trigger_tokens: singleToolTrigger,
               background_min_result_tokens: backgroundMinimum,
               keep_recent_tool_results: keepRecentResults,
@@ -708,7 +713,7 @@ export default function SettingsPage() {
     } finally {
       setSaving(false);
     }
-  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaQueryTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmModel, mmDimension, mmApiKey, knowledgeRootDir, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, toolContextEnabled, singleToolTriggerTokens, backgroundMinResultTokens, keepRecentToolResults, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, dockerEnabled, dockerOnUnavailable, dockerConnection, dockerContext, dockerUseCustomImage, dockerImage, dockerCpuLimit, dockerMemoryLimitMb, dockerPidsLimit, dockerNetworkEnabled, dockerDependencySetupEnabled, subagentItems, showToast]);
+  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaQueryTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmModel, mmDimension, mmApiKey, knowledgeRootDir, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, toolContextEnabled, immediateToolCompactionEnabled, singleToolTriggerTokens, backgroundMinResultTokens, keepRecentToolResults, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, dockerEnabled, dockerOnUnavailable, dockerConnection, dockerContext, dockerUseCustomImage, dockerImage, dockerCpuLimit, dockerMemoryLimitMb, dockerPidsLimit, dockerNetworkEnabled, dockerDependencySetupEnabled, subagentItems, showToast]);
 
   const handleDatabaseModeChange = useCallback((mode: "bundled" | "external") => {
     setDatabaseMode(mode);
@@ -2114,7 +2119,7 @@ export default function SettingsPage() {
                             <div>
                               <p className="text-[13px] font-semibold text-gray-900">工具上下文压缩</p>
                               <p className="mt-1 text-[11px] leading-relaxed text-gray-500">
-                                开启时注册 DeepAgents Tool Context 中间件。关闭后不注册中间件、不创建新任务，模型直接使用原始工具结果。
+                                管理历史 Tool Result 的后台摘要，并控制是否允许开启当前轮即时压缩。
                               </p>
                             </div>
                             <SwitchButton
@@ -2129,20 +2134,47 @@ export default function SettingsPage() {
                             </p>
                           )}
 
-                          <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
-                            <FormField label="执行中单条阈值">
-                              <input
-                                type="number"
-                                min={1000}
-                                max={100000}
-                                step={1000}
-                                value={singleToolTriggerTokens}
-                                onChange={(e) => setSingleToolTriggerTokens(e.target.value)}
-                                className="form-input"
+                          <div className="mt-3 rounded-lg border border-blue-100 bg-blue-50/70 px-3 py-2 text-[10px] leading-relaxed text-blue-700">
+                            PuddingClaw 基于 DeepAgents 提供单条结果超过 20,000 tokens 的无损落盘机制：
+                            完整内容写入 <code>/large_tool_results/</code>，Agent 只接收预览和精确读取路径。
+                            该机制始终生效，不依赖下面的可选即时压缩。
+                          </div>
+
+                          <div className="mt-3 rounded-lg border border-black/[0.05] bg-white/70 px-3 py-3">
+                            <div className="flex items-center justify-between gap-4">
+                              <div>
+                                <p className="text-[11px] font-semibold text-gray-800">执行中单条即时压缩</p>
+                                <p className="mt-0.5 text-[10px] leading-relaxed text-gray-400">
+                                  可选。达到阈值时先裁成 head/tail；默认关闭，优先保留当前轮完整证据。
+                                </p>
+                              </div>
+                              <SwitchButton
+                                checked={immediateToolCompactionEnabled}
+                                onChange={setImmediateToolCompactionEnabled}
+                                ariaLabel="启用执行中单条即时压缩"
                                 disabled={!toolContextEnabled}
                               />
-                              <p className="mt-1 text-[10px] text-gray-400">默认 8,000 tokens；只保护超限的单条结果。</p>
-                            </FormField>
+                            </div>
+                            <div className="mt-3 border-t border-black/[0.05] pt-3">
+                              <FormField label="即时压缩阈值">
+                                <input
+                                  type="number"
+                                  min={1000}
+                                  max={20000}
+                                  step={1000}
+                                  value={singleToolTriggerTokens}
+                                  onChange={(e) => setSingleToolTriggerTokens(e.target.value)}
+                                  className="form-input"
+                                  disabled={!toolContextEnabled || !immediateToolCompactionEnabled}
+                                />
+                                <p className="mt-1 text-[10px] text-gray-400">
+                                  1,000–20,000 tokens。不得超过 20,000；更大的结果会先被无损落盘。
+                                </p>
+                              </FormField>
+                            </div>
+                          </div>
+
+                          <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
                             <FormField label="静默压缩单条下限">
                               <input
                                 type="number"
@@ -2179,6 +2211,7 @@ export default function SettingsPage() {
                                 },
                                 tool_context: {
                                   enabled: toolContextEnabled,
+                                  immediate_compaction_enabled: immediateToolCompactionEnabled,
                                   single_tool_trigger_tokens: positiveIntOrNull(singleToolTriggerTokens) ?? 8000,
                                   background_min_result_tokens: positiveIntOrNull(backgroundMinResultTokens) ?? 1000,
                                   keep_recent_tool_results: positiveIntOrNull(keepRecentToolResults) ?? 12,
@@ -2752,13 +2785,17 @@ function SubAgentEditorPanel({
           >
             删除
           </button>
-          <button
-            type="button"
-            onClick={onClose}
-            className="rounded-lg p-1.5 text-gray-400 hover:bg-black/[0.04] hover:text-gray-600"
-          >
-            <X className="h-4 w-4" />
-          </button>
+          {isMobile && (
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-lg p-1.5 text-gray-400 hover:bg-black/[0.04] hover:text-gray-600"
+              title="关闭配置"
+              aria-label="关闭 SubAgent 配置"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          )}
         </div>
       </div>
 
@@ -2970,10 +3007,12 @@ function SwitchButton({
   checked,
   onChange,
   ariaLabel,
+  disabled = false,
 }: {
   checked: boolean;
   onChange: (checked: boolean) => void;
   ariaLabel: string;
+  disabled?: boolean;
 }) {
   return (
     <button
@@ -2981,8 +3020,12 @@ function SwitchButton({
       role="switch"
       aria-checked={checked}
       aria-label={ariaLabel}
+      aria-disabled={disabled}
+      disabled={disabled}
       onClick={() => onChange(!checked)}
-      className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#002fa7]/40 ${
+      className={`relative inline-flex h-6 w-11 shrink-0 rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#002fa7]/40 disabled:cursor-not-allowed disabled:opacity-50 ${
+        disabled ? "cursor-not-allowed" : "cursor-pointer"
+      } ${
         checked ? "bg-[#002fa7]" : "bg-gray-300"
       }`}
     >

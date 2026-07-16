@@ -146,6 +146,7 @@ export interface CompressionSettings {
     };
     tool_context?: {
       enabled?: boolean;
+      immediate_compaction_enabled?: boolean;
       single_tool_trigger_tokens?: number;
       background_min_result_tokens?: number;
       keep_recent_tool_results?: number;

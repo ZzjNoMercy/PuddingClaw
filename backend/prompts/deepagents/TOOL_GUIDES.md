@@ -74,6 +74,13 @@ When the user explicitly asks to modify a file outside the current workspace and
 
 Do not use `read_resource` for `/skills/`, `/semantic-assets/`, `/analytics-models/`, `/sql-guardrails/`, `/knowledge/`, or `/large_tool_results/`; those paths only exist through the DeepAgents virtual backend.
 
+Only inspect `/large_tool_results/...` when a tool result explicitly says that
+the complete output was saved there and provides the exact path. A plain
+`...[truncated]` marker without a saved path means the upstream tool truncated
+its own response; do not glob `/large_tool_results/*` or guess a file name.
+Retry with pagination or a smaller request instead. Offloaded results are scoped
+to the current session and query, so always use the exact returned virtual path.
+
 ## Attachment Delegation
 
 If the latest user message contains `[系统提示] 检测到附件输入` and the attachment refs include image items, you MUST call the native `task` tool with `subagent_type` set to `image_analyzer` before answering image-content questions.

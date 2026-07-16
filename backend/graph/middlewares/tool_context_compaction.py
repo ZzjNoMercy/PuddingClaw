@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -29,11 +28,17 @@ RAW_OUTPUT_ARTIFACT_KEY = "puddingclaw_raw_tool_output"
 CONTEXT_OUTPUT_ARTIFACT_KEY = "puddingclaw_context_output"
 CONTEXT_METHOD_ARTIFACT_KEY = "puddingclaw_context_method"
 CONTEXT_POLICY_ARTIFACT_KEY = "puddingclaw_context_policy"
+# Keep this boundary aligned with DeepAgents FilesystemMiddleware defaults:
+# 20,000 tokens at its fixed approximation of four characters per token.
+# Results above this character boundary must pass through unchanged so the
+# outer FilesystemMiddleware can persist them under /large_tool_results.
+DEEPAGENTS_FILESYSTEM_EVICT_CHARS = 20_000 * 4
 
 
 @dataclass(frozen=True)
 class ToolContextConfig:
     enabled: bool = True
+    immediate_compaction_enabled: bool = False
     single_tool_trigger_tokens: int = 8000
     background_min_result_tokens: int = 1000
     keep_recent_tool_results: int = 12
@@ -43,7 +48,7 @@ class ToolContextConfig:
     max_candidates_per_job: int = 48
 
     @classmethod
-    def from_mapping(cls, value: dict[str, Any] | None) -> "ToolContextConfig":
+    def from_mapping(cls, value: dict[str, Any] | None) -> ToolContextConfig:
         raw = value if isinstance(value, dict) else {}
 
         def positive(name: str, default: int) -> int:
@@ -55,6 +60,9 @@ class ToolContextConfig:
 
         return cls(
             enabled=bool(raw.get("enabled", True)),
+            immediate_compaction_enabled=bool(
+                raw.get("immediate_compaction_enabled", False)
+            ),
             single_tool_trigger_tokens=positive("single_tool_trigger_tokens", 8000),
             background_min_result_tokens=positive("background_min_result_tokens", 1000),
             keep_recent_tool_results=positive("keep_recent_tool_results", 12),
@@ -475,7 +483,11 @@ class ToolContextCompactionMiddleware(AgentMiddleware[Any, Any, Any]):
         result = await handler(request)
         if not isinstance(result, ToolMessage):
             return result
+        if not self.cfg.immediate_compaction_enabled:
+            return result
         raw = str(result.content or "")
+        if len(raw) > DEEPAGENTS_FILESYSTEM_EVICT_CHARS:
+            return result
         if estimate_text_tokens(raw) <= self.cfg.single_tool_trigger_tokens:
             return result
         compacted, method = compact_immediate_tool_output(

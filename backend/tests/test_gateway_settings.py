@@ -646,6 +646,7 @@ def test_settings_api_persists_deepagents_context_engineering_without_touching_c
                 "summarization": {"trigger_tokens": 260000},
                 "tool_context": {
                     "enabled": False,
+                    "immediate_compaction_enabled": True,
                     "single_tool_trigger_tokens": 9000,
                     "background_min_result_tokens": 1100,
                     "keep_recent_tool_results": 15,
@@ -664,6 +665,7 @@ def test_settings_api_persists_deepagents_context_engineering_without_touching_c
     assert deepagents["tool_context"] == {
         **deepagents["tool_context"],
         "enabled": False,
+        "immediate_compaction_enabled": True,
         "single_tool_trigger_tokens": 9000,
         "background_min_result_tokens": 1100,
         "keep_recent_tool_results": 15,
@@ -671,7 +673,9 @@ def test_settings_api_persists_deepagents_context_engineering_without_touching_c
     assert displayed["compression"]["middleware"] == chat_before
 
 
-def test_settings_api_rejects_invalid_tool_context_threshold_relation(tmp_path, monkeypatch):
+def test_settings_api_rejects_immediate_tool_threshold_above_offload_boundary(
+    tmp_path, monkeypatch
+):
     config_path = tmp_path / "config.json"
     config_path.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(config, "CONFIG_FILE", config_path)
@@ -683,15 +687,14 @@ def test_settings_api_rejects_invalid_tool_context_threshold_relation(tmp_path, 
             "compression": {
                 "deepagents": {
                     "tool_context": {
-                        "single_tool_trigger_tokens": 8000,
-                        "background_min_result_tokens": 8000,
+                        "single_tool_trigger_tokens": 20001,
                     }
                 }
             }
         },
     )
     assert response.status_code == 400
-    assert "小于执行中单条工具阈值" in response.json()["detail"]
+    assert "20,000" in response.json()["detail"]
 
 
 def test_settings_api_migrates_legacy_subagent_items_to_keyed_config(tmp_path, monkeypatch):

@@ -544,7 +544,10 @@ def test_enqueue_returns_while_background_summary_is_still_running(tmp_path: Pat
 
 
 def test_immediate_guard_only_compacts_single_oversized_result_and_keeps_id() -> None:
-    cfg = ToolContextConfig(single_tool_trigger_tokens=8000)
+    cfg = ToolContextConfig(
+        immediate_compaction_enabled=True,
+        single_tool_trigger_tokens=8000,
+    )
     middleware = ToolContextCompactionMiddleware(cfg)
 
     async def invoke(content: str) -> ToolMessage:
@@ -568,6 +571,50 @@ def test_immediate_guard_only_compacts_single_oversized_result_and_keeps_id() ->
     assert guarded.artifact[RAW_OUTPUT_ARTIFACT_KEY] == raw
     assert "important-line" in str(guarded.content)
     assert "final-line" in str(guarded.content)
+
+
+def test_immediate_guard_is_disabled_by_default() -> None:
+    middleware = ToolContextCompactionMiddleware(
+        ToolContextConfig(single_tool_trigger_tokens=8000)
+    )
+    raw = "x" * 40_000
+
+    async def invoke() -> ToolMessage:
+        request = SimpleNamespace(tool_call={"id": "call-default", "name": "terminal"})
+
+        async def handler(_request: Any) -> ToolMessage:
+            return ToolMessage(content=raw, tool_call_id="call-default", name="terminal")
+
+        result = await middleware.awrap_tool_call(request, handler)
+        assert isinstance(result, ToolMessage)
+        return result
+
+    untouched = asyncio.run(invoke())
+    assert untouched.content == raw
+    assert untouched.artifact is None
+
+
+def test_immediate_guard_defers_filesystem_sized_results() -> None:
+    cfg = ToolContextConfig(
+        immediate_compaction_enabled=True,
+        single_tool_trigger_tokens=8000,
+    )
+    middleware = ToolContextCompactionMiddleware(cfg)
+    raw = "x" * 80_001
+
+    async def invoke() -> ToolMessage:
+        request = SimpleNamespace(tool_call={"id": "call-large", "name": "fetch_url"})
+
+        async def handler(_request: Any) -> ToolMessage:
+            return ToolMessage(content=raw, tool_call_id="call-large", name="fetch_url")
+
+        result = await middleware.awrap_tool_call(request, handler)
+        assert isinstance(result, ToolMessage)
+        return result
+
+    deferred = asyncio.run(invoke())
+    assert deferred.content == raw
+    assert deferred.artifact is None
 
 
 def test_saved_agent_context_does_not_duplicate_raw_tool_artifact() -> None:
@@ -692,6 +739,7 @@ def test_deepagents_tool_context_switch_isolated_from_chat_config(tmp_path: Path
                     "summarization": {"trigger_tokens": 240000},
                     "tool_context": {
                         "enabled": False,
+                        "immediate_compaction_enabled": True,
                         "single_tool_trigger_tokens": 9000,
                         "background_min_result_tokens": 1200,
                         "keep_recent_tool_results": 9,
@@ -702,6 +750,10 @@ def test_deepagents_tool_context_switch_isolated_from_chat_config(tmp_path: Path
     )
     saved = config.load_config()
     assert saved["compression"]["deepagents"]["tool_context"]["enabled"] is False
+    assert (
+        saved["compression"]["deepagents"]["tool_context"]["immediate_compaction_enabled"]
+        is True
+    )
     assert "summary_input_tokens" not in saved["compression"]["deepagents"]["summarization"]
     assert saved["compression"]["middleware"] == chat_before
     assert config._DEFAULT_CONFIG == defaults_before

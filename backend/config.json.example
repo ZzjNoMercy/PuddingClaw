@@ -80,6 +80,7 @@
       },
       "tool_context": {
         "enabled": true,
+        "immediate_compaction_enabled": false,
         "single_tool_trigger_tokens": 8000,
         "background_min_result_tokens": 1000,
         "keep_recent_tool_results": 12,

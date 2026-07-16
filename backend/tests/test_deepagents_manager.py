@@ -1106,6 +1106,34 @@ def test_build_backend_resolves_workspace_and_skills(tmp_path, monkeypatch):
     assert backend.read("/dashboard.html").file_data["content"] == "dashboard"
 
 
+def test_large_tool_results_are_isolated_by_session_and_query(tmp_path, monkeypatch):
+    from graph import deepagents_manager as manager_module
+
+    manager = manager_module.DeepAgentsAgentManager()
+    manager.initialize(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    knowledge_dir = tmp_path / "knowledge"
+    knowledge_dir.mkdir()
+    monkeypatch.setattr(manager_module, "get_knowledge_root", lambda _base_dir: knowledge_dir)
+
+    first = manager._build_backend(
+        workspace,
+        session_id="session-1",
+        query_id="query-1",
+    )
+    second = manager._build_backend(
+        workspace,
+        session_id="session-1",
+        query_id="query-2",
+    )
+
+    assert first.write("/large_tool_results/call_reused", "first result").error is None
+    assert second.write("/large_tool_results/call_reused", "second result").error is None
+    assert first.read("/large_tool_results/call_reused").file_data["content"] == "first result"
+    assert second.read("/large_tool_results/call_reused").file_data["content"] == "second result"
+
+
 def test_deepagents_manager_emits_and_persists_tool_events(tmp_path, monkeypatch):
     """Agent mode should expose DeepAgents tool calls like Chat mode does."""
 

@@ -182,7 +182,8 @@ Tool Context 总开关关闭时不注册中间件，因此没有 `after_agent` �
 | --- | --- | ---: | --- |
 | 全局摘要触发阈值 | `compression.deepagents.summarization.trigger_tokens` | 200,000 tokens | DeepAgents 整体对话 summarize |
 | 工具结果压缩 | `compression.deepagents.tool_context.enabled` | 开启 | 控制执行中单条保护、事后静默压缩及模型是否使用 `context_output` |
-| 执行中单条工具阈值 | `compression.deepagents.tool_context.single_tool_trigger_tokens` | 8,000 tokens | 当前执行中，单条 Tool Result 即时保护 |
+| 执行中单条即时压缩 | `compression.deepagents.tool_context.immediate_compaction_enabled` | 关闭 | 可选开启当前轮单条 Tool Result 的即时裁剪 |
+| 执行中单条工具阈值 | `compression.deepagents.tool_context.single_tool_trigger_tokens` | 8,000 tokens | 即时压缩开启时生效，允许范围为 1,000–20,000 tokens |
 | 静默压缩单条下限 | `compression.deepagents.tool_context.background_min_result_tokens` | 1,000 tokens | `after_agent` 候选扫描；低于此值不处理 |
 | 保留最近工具结果 | `compression.deepagents.tool_context.keep_recent_tool_results` | 12 条 | 事后静默压缩保护窗口 |
 
@@ -203,7 +204,8 @@ Tool Context 总开关关闭时不注册中间件，因此没有 `after_agent` �
 - 每个字段显示单位、默认值、作用阶段和简短风险提示；
 - 总开关关闭时禁用其下属三个 Tool Context 参数输入，并提示“200k 全局摘要仍然生效”；
 - 保存时做正整数、合理上下界和阈值关系校验；
-- `background_min_result_tokens` 必须小于 `single_tool_trigger_tokens`；
+- `single_tool_trigger_tokens` 不得超过 20,000 tokens。DeepAgents 对超过 20,000 tokens 的单条工具结果执行无损落盘，完整内容保存到 `/large_tool_results/`，因此再配置更高的即时压缩阈值没有执行意义；
+- `background_min_result_tokens` 独立控制历史工具结果的后台压缩候选下限，不要求小于 `single_tool_trigger_tokens`；
 - 修改后明确提示“对下一次 Agent 运行生效”；
 - 设置 API 只读写 `compression.deepagents.*`，不得映射或同步到 Chat 的 `compression.middleware.*`；
 - 配置缺失时使用上述默认值，旧 Session 继续兼容。
