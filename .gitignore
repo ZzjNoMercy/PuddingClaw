@@ -53,6 +53,10 @@ backend/.pytest_cache/
 *.swo
 *~
 
+# Local dev tooling
+.playwright-cli/
+iterm2_workspace.iterm2arrangement
+
 # Logs
 *.log
 
