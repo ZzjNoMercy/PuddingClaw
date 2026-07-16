@@ -92,6 +92,13 @@ const EMBEDDING_PROVIDERS = [
 
 const SETTINGS_CATEGORY_KEY = "settings:activeCategory";
 const MANAGED_DOCKER_IMAGE = "puddingclaw/sandbox:python3.12-node22-v2";
+const DOCKER_CPU_OPTIONS = ["2", "4", "8", "16"];
+const DOCKER_MEMORY_OPTIONS = [
+  { value: "2048", label: "2 GB" },
+  { value: "4096", label: "4 GB" },
+  { value: "8192", label: "8 GB" },
+  { value: "16384", label: "16 GB" },
+];
 const DEFAULT_IMAGE_ANALYZER_PROMPT =
   "You are an image analysis specialist. When given an image, describe its contents in detail and answer any questions about it. Return your findings as concise, structured text.";
 
@@ -427,8 +434,14 @@ export default function SettingsPage() {
         const usesCustomDockerImage = configuredDockerImage !== MANAGED_DOCKER_IMAGE;
         setDockerUseCustomImage(usesCustomDockerImage);
         setDockerImage(usesCustomDockerImage ? configuredDockerImage : "");
-        setDockerCpuLimit(terminal?.docker?.cpu_limit || "2");
-        setDockerMemoryLimitMb(String(terminal?.docker?.memory_limit_mb ?? 2048));
+        const configuredCpuLimit = terminal?.docker?.cpu_limit || "2";
+        const configuredMemoryLimit = String(terminal?.docker?.memory_limit_mb ?? 2048);
+        setDockerCpuLimit(DOCKER_CPU_OPTIONS.includes(configuredCpuLimit) ? configuredCpuLimit : "2");
+        setDockerMemoryLimitMb(
+          DOCKER_MEMORY_OPTIONS.some((option) => option.value === configuredMemoryLimit)
+            ? configuredMemoryLimit
+            : "2048"
+        );
         setDockerPidsLimit(String(terminal?.docker?.pids_limit ?? 256));
         setDockerNetworkEnabled(terminal?.docker?.network_enabled ?? false);
         setDockerDependencySetupEnabled(terminal?.docker?.dependency_setup_enabled ?? false);
@@ -2385,11 +2398,19 @@ export default function SettingsPage() {
                                 <option value="deny">拒绝命令执行</option>
                               </select>
                             </FormField>
-                            <FormField label="CPU 限额">
-                              <input value={dockerCpuLimit} onChange={(event) => setDockerCpuLimit(event.target.value)} className="form-input" />
+                            <FormField label="CPU 核数">
+                              <select value={dockerCpuLimit} onChange={(event) => setDockerCpuLimit(event.target.value)} className="form-select">
+                                {DOCKER_CPU_OPTIONS.map((value) => (
+                                  <option key={value} value={value}>{value} 核</option>
+                                ))}
+                              </select>
                             </FormField>
-                            <FormField label="内存限额（MB）">
-                              <input type="number" min={128} value={dockerMemoryLimitMb} onChange={(event) => setDockerMemoryLimitMb(event.target.value)} className="form-input" />
+                            <FormField label="内存限额">
+                              <select value={dockerMemoryLimitMb} onChange={(event) => setDockerMemoryLimitMb(event.target.value)} className="form-select">
+                                {DOCKER_MEMORY_OPTIONS.map((option) => (
+                                  <option key={option.value} value={option.value}>{option.label}</option>
+                                ))}
+                              </select>
                             </FormField>
                             <FormField label="进程数上限">
                               <input type="number" min={16} value={dockerPidsLimit} onChange={(event) => setDockerPidsLimit(event.target.value)} className="form-input" />
