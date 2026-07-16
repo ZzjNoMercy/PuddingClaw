@@ -367,49 +367,257 @@ function VerificationCard({
   run: HarnessRun | null;
 }) {
   const passed = report.status === "satisfied" || report.status === "not_required";
+  const statusLabel = verificationStatusLabel(report.status);
+  const criteriaById = new Map(
+    (run?.verification_contract?.criteria || []).map((criterion) => [
+      criterion.id,
+      criterion,
+    ]),
+  );
   return (
     <section>
       <SectionHeader
         icon={passed ? <CheckCircle2 className="h-4 w-4" /> : <AlertTriangle className="h-4 w-4" />}
         title="验收"
-        metric={passed ? "通过" : "待修正"}
+        metric={verificationMetricLabel(report.status)}
         open={active}
         onToggle={onActivate}
       />
       {active && (
-        <div className="space-y-2 pb-4">
-          <p className="text-[11px] text-slate-500">
-            Run {run?.run_id?.slice(-8) || report.run_id.slice(-8)} · {report.status}
-          </p>
-          {report.evaluations.map((evaluation) => (
-            <div
-              key={`${evaluation.criterion_id}-${evaluation.name}`}
-              className={`rounded-xl border px-3 py-2.5 ${
-                evaluation.passed
-                  ? "border-emerald-100 bg-emerald-50/70"
-                  : "border-amber-200 bg-amber-50"
-              }`}
-            >
-              <div className="flex items-start gap-2 text-[12px] font-medium text-slate-700">
-                {evaluation.passed
-                  ? <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-600" />
-                  : <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-600" />}
-                <span>{evaluation.name}</span>
-              </div>
-              {evaluation.gap && (
-                <p className="mt-1 pl-5 text-[11px] leading-5 text-amber-800">{evaluation.gap}</p>
+        <div className="space-y-3 pb-4">
+          <div className="rounded-xl bg-slate-50 px-3 py-2.5">
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-slate-500">
+              <span>Run {run?.run_id?.slice(-8) || report.run_id.slice(-8)}</span>
+              <span className="text-slate-300">·</span>
+              <span className={passed ? "font-medium text-emerald-700" : "font-medium text-amber-700"}>
+                {statusLabel}
+              </span>
+              {report.iteration_count > 0 && (
+                <>
+                  <span className="text-slate-300">·</span>
+                  <span>第 {report.iteration_count} 轮验收</span>
+                </>
               )}
             </div>
-          ))}
+            <p className="mt-1.5 text-[11px] leading-5 text-slate-600">
+              {passed
+                ? "全部必需验收项均已通过。"
+                : `发现 ${Math.max(1, report.gaps.length, report.evaluations.filter((item) => !item.passed).length)} 个待修正问题。`}
+            </p>
+          </div>
+          {report.evaluations.map((evaluation) => {
+            const criterion = criteriaById.get(evaluation.criterion_id);
+            const presentation = verificationCriterionPresentation(
+              evaluation.criterion_id,
+              evaluation.name,
+              criterion?.statement,
+            );
+            const evidenceLines = evaluation.evidence.flatMap(formatVerificationEvidence);
+            return (
+              <details
+                key={`${evaluation.criterion_id}-${evaluation.name}`}
+                open={!evaluation.passed}
+                className={`group rounded-xl border ${
+                  evaluation.passed
+                    ? "border-emerald-100 bg-emerald-50/70"
+                    : "border-amber-200 bg-amber-50"
+                }`}
+              >
+                <summary className="flex cursor-pointer list-none items-start gap-2 px-3 py-2.5 [&::-webkit-details-marker]:hidden">
+                  {evaluation.passed
+                    ? <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
+                    : <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />}
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[12px] font-semibold text-slate-800">
+                        {presentation.title}
+                      </span>
+                      <div className="flex shrink-0 items-center gap-1.5">
+                        <span className={`text-[10px] font-medium ${
+                          evaluation.passed ? "text-emerald-700" : "text-amber-700"
+                        }`}>
+                          {evaluation.passed ? "通过" : "未通过"}
+                        </span>
+                        <span className="text-[10px] text-slate-400">查看明细</span>
+                      </div>
+                    </div>
+                    <p className="mt-1 text-[11px] leading-4 text-slate-500">
+                      {presentation.description}
+                    </p>
+                  </div>
+                  <ChevronDown className="mt-0.5 h-3.5 w-3.5 shrink-0 text-slate-400 transition-transform group-open:rotate-180" />
+                </summary>
+                <div className="border-t border-black/[0.05] px-3 pb-3 pt-2.5">
+                  {criterion?.statement && (
+                    <div className="mb-2.5">
+                      <p className="text-[10px] font-semibold text-slate-500">验收规则</p>
+                      <p className="mt-1 text-[11px] leading-5 text-slate-600">
+                        {criterion.statement}
+                      </p>
+                    </div>
+                  )}
+                  <div className="flex flex-wrap gap-1.5">
+                    <span className="rounded-full bg-white/80 px-2 py-0.5 text-[10px] font-medium text-slate-500">
+                      {verificationMethodLabel(evaluation.verifier)}
+                    </span>
+                    {criterion && (
+                      <span className="rounded-full bg-white/80 px-2 py-0.5 text-[10px] font-medium text-slate-500">
+                        {criterion.required ? "必需项" : "可选项"}
+                      </span>
+                    )}
+                  </div>
+                  {evaluation.gap && (
+                    <div className="mt-2.5">
+                      <p className="text-[10px] font-semibold text-amber-700">未通过原因</p>
+                      <p className="mt-1 text-[11px] leading-5 text-amber-800">{evaluation.gap}</p>
+                    </div>
+                  )}
+                  <div className="mt-2.5">
+                    <p className="text-[10px] font-semibold text-slate-500">判定依据</p>
+                    {evidenceLines.length > 0 ? (
+                      <ul className="mt-1 space-y-1 text-[11px] leading-5 text-slate-600">
+                        {evidenceLines.map((line, index) => (
+                          <li key={`${line}-${index}`} className="flex gap-1.5">
+                            <span className="text-slate-300">•</span>
+                            <span className="min-w-0 break-words">{line}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p className="mt-1 text-[11px] leading-5 text-slate-500">
+                        该项由{verificationMethodLabel(evaluation.verifier)}基于本轮回答、工具结果与运行上下文综合判定，当前未附结构化证据。
+                      </p>
+                    )}
+                  </div>
+                </div>
+              </details>
+            );
+          })}
           {report.evaluations.length === 0 && report.gaps.map((gap, index) => (
             <p key={`${gap}-${index}`} className="rounded-xl bg-amber-50 px-3 py-2 text-[11px] text-amber-800">
               {gap}
             </p>
           ))}
+          {report.explanation && (
+            <details className="group rounded-xl border border-black/[0.06] bg-white/70">
+              <summary className="flex cursor-pointer list-none items-center justify-between gap-2 px-3 py-2.5 text-[11px] font-semibold text-slate-600 [&::-webkit-details-marker]:hidden">
+                <span>模型验收说明</span>
+                <ChevronDown className="h-3.5 w-3.5 text-slate-400 transition-transform group-open:rotate-180" />
+              </summary>
+              <p className="border-t border-black/[0.05] px-3 py-2.5 text-[11px] leading-5 text-slate-600">
+                {report.explanation}
+              </p>
+            </details>
+          )}
         </div>
       )}
     </section>
   );
+}
+
+const VERIFICATION_CRITERIA: Record<string, { title: string; description: string }> = {
+  task_fulfillment: {
+    title: "任务完成度",
+    description: "是否真正完成本轮用户要求，而不是只给出计划或口头声明。",
+  },
+  todo_reconciliation: {
+    title: "待办收口",
+    description: "本轮产生的 Todo 是否全部完成或明确取消。",
+  },
+  metric_consistency: {
+    title: "指标口径一致性",
+    description: "指标名称、计算口径、维度和结论是否前后一致。",
+  },
+  evidence_traceability: {
+    title: "证据可追溯性",
+    description: "关键数据与结论是否能够追溯到工具结果、数据源或产物。",
+  },
+  time_scope: {
+    title: "数据时间范围",
+    description: "是否明确并遵守用户指定的数据期间。",
+  },
+  artifact_delivery: {
+    title: "产物交付",
+    description: "要求生成或更新的文件是否真实存在并提供了可定位路径。",
+  },
+  report_integrity: {
+    title: "报告完整性",
+    description: "报告结构、标题、图表和正文是否完整，且未破坏既有模板。",
+  },
+};
+
+function verificationCriterionPresentation(
+  criterionId: string,
+  rawName: string,
+  statement?: string,
+): { title: string; description: string } {
+  const known = VERIFICATION_CRITERIA[criterionId];
+  if (known) return known;
+  const technicalName = /^[a-z0-9_:-]+$/i.test(rawName);
+  return {
+    title: technicalName ? "自定义验收规则" : rawName,
+    description: statement || rawName || criterionId,
+  };
+}
+
+function verificationStatusLabel(status: string): string {
+  return (
+    {
+      not_required: "无需验收",
+      pending: "等待验收",
+      evaluating: "正在验收",
+      satisfied: "验收通过",
+      needs_revision: "需要修正",
+      failed: "验收失败",
+      max_iterations_reached: "已达最大验收轮次",
+      grader_error: "验收器异常",
+      budget_exceeded: "验收预算耗尽",
+    } as Record<string, string>
+  )[status] || status;
+}
+
+function verificationMetricLabel(status: string): string {
+  if (status === "satisfied") return "通过";
+  if (status === "not_required") return "无需验收";
+  if (status === "pending" || status === "evaluating") return "进行中";
+  return "待修正";
+}
+
+function verificationMethodLabel(verifier: string): string {
+  return (
+    {
+      deterministic: "确定性检查",
+      analytics: "分析验收",
+      llm_grader: "模型评审",
+    } as Record<string, string>
+  )[verifier] || "验收检查";
+}
+
+function formatVerificationEvidence(evidence: Record<string, unknown>): string[] {
+  if (evidence.kind === "todo_state") {
+    const total = Number(evidence.total || 0);
+    const incomplete = Number(evidence.incomplete || 0);
+    return [
+      total === 0
+        ? "本轮未创建 Todo，无待办需要收口。"
+        : `本轮共有 ${total} 个 Todo，其中 ${incomplete} 个未完成。`,
+    ];
+  }
+  if (evidence.kind === "workspace_artifact") {
+    const mentioned = Array.isArray(evidence.mentioned) ? evidence.mentioned.length : 0;
+    const existing = Array.isArray(evidence.existing) ? evidence.existing.length : 0;
+    const missing = Array.isArray(evidence.missing) ? evidence.missing.length : 0;
+    return [
+      `最终回答引用 ${mentioned} 个产物，确认存在 ${existing} 个，缺失 ${missing} 个。`,
+    ];
+  }
+  return Object.entries(evidence).map(([key, value]) => {
+    const rendered =
+      typeof value === "string"
+        ? value
+        : JSON.stringify(value, null, 0);
+    return `${key}：${rendered}`;
+  });
 }
 
 function SectionHeader({
