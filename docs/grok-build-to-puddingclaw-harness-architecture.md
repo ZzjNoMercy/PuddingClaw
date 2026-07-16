@@ -389,7 +389,8 @@ Harness Settings UI 至少提供：
 - 启用/关闭 Docker Sandbox；
 - 自动检测 Docker CLI、daemon、context、OS/arch 和镜像状态；
 - 测试连接、测试启动 Sandbox；
-- 镜像、CPU、内存、进程数、超时和默认网络开关；
+- 默认展示不可编辑的 PuddingClaw 托管镜像；仅在“使用自定义镜像（高级）”开启后显示 image reference 输入框；
+- CPU、内存、进程数、超时和默认网络开关；
 - 可选的项目 manifest/lockfile 依赖准备高级开关，默认关闭；
 - Docker 不可用时“降级为本机受控模式”或“拒绝执行”；
 - 项目 Sandbox 的运行状态、重启、停止和重置；
@@ -533,7 +534,7 @@ Node.js 22 + npm + corepack
 仅附带基础 POSIX shell 与 CA 证书
 ~~~
 
-用户可以配置自定义镜像，但 Backend preflight 会验证 <code>python3</code> 与 <code>node</code> 同时存在；不满足基础运行时契约时，按 <code>on_unavailable</code> 选择受控降级或拒绝。
+普通用户不需要选择或上传镜像。PuddingClaw 使用内置 Dockerfile 在本机 Docker daemon 中自动准备托管镜像。高级用户可以填写本机已有的 Docker tag 或 registry image reference；Backend preflight 会验证 <code>python3</code> 与 <code>node</code> 同时存在，不满足基础运行时契约时按 <code>on_unavailable</code> 选择受控降级或拒绝。
 
 PuddingClaw 默认不扫描或安装项目依赖，因为当前产品不是以执行任意项目脚本为主要目标。只有高级用户显式开启 <code>dependency_setup_enabled</code> 后，才扫描项目根及有限层级子目录中的实际配置：
 

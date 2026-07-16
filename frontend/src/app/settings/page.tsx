@@ -91,6 +91,7 @@ const EMBEDDING_PROVIDERS = [
 ];
 
 const SETTINGS_CATEGORY_KEY = "settings:activeCategory";
+const MANAGED_DOCKER_IMAGE = "puddingclaw/sandbox:python3.12-node22-v2";
 const DEFAULT_IMAGE_ANALYZER_PROMPT =
   "You are an image analysis specialist. When given an image, describe its contents in detail and answer any questions about it. Return your findings as concise, structured text.";
 
@@ -264,7 +265,8 @@ export default function SettingsPage() {
   const [dockerOnUnavailable, setDockerOnUnavailable] = useState<"fallback" | "deny">("fallback");
   const [dockerConnection, setDockerConnection] = useState("");
   const [dockerContext, setDockerContext] = useState("");
-  const [dockerImage, setDockerImage] = useState("puddingclaw/sandbox:python3.12-node22-v2");
+  const [dockerUseCustomImage, setDockerUseCustomImage] = useState(false);
+  const [dockerImage, setDockerImage] = useState("");
   const [dockerCpuLimit, setDockerCpuLimit] = useState("2");
   const [dockerMemoryLimitMb, setDockerMemoryLimitMb] = useState("2048");
   const [dockerPidsLimit, setDockerPidsLimit] = useState("256");
@@ -421,7 +423,10 @@ export default function SettingsPage() {
         setDockerOnUnavailable(terminal?.on_unavailable === "deny" ? "deny" : "fallback");
         setDockerConnection(terminal?.docker?.connection || "");
         setDockerContext(terminal?.docker?.context || "");
-        setDockerImage(terminal?.docker?.image || "puddingclaw/sandbox:python3.12-node22-v2");
+        const configuredDockerImage = terminal?.docker?.image || MANAGED_DOCKER_IMAGE;
+        const usesCustomDockerImage = configuredDockerImage !== MANAGED_DOCKER_IMAGE;
+        setDockerUseCustomImage(usesCustomDockerImage);
+        setDockerImage(usesCustomDockerImage ? configuredDockerImage : "");
         setDockerCpuLimit(terminal?.docker?.cpu_limit || "2");
         setDockerMemoryLimitMb(String(terminal?.docker?.memory_limit_mb ?? 2048));
         setDockerPidsLimit(String(terminal?.docker?.pids_limit ?? 256));
@@ -509,6 +514,9 @@ export default function SettingsPage() {
       }
       if (keepRecentResults < 1 || keepRecentResults > 100) {
         throw new Error("保留最近工具结果必须在 1 到 100 条之间");
+      }
+      if (dockerUseCustomImage && !dockerImage.trim()) {
+        throw new Error("启用自定义 Docker 镜像后必须填写镜像引用");
       }
       await updateSettings({
         ai_gateway: {
@@ -644,7 +652,9 @@ export default function SettingsPage() {
             docker: {
               connection: dockerConnection,
               context: dockerContext,
-              image: dockerImage,
+              image: dockerUseCustomImage
+                ? dockerImage.trim()
+                : MANAGED_DOCKER_IMAGE,
               cpu_limit: dockerCpuLimit,
               memory_limit_mb: positiveIntOrNull(dockerMemoryLimitMb) ?? 2048,
               pids_limit: positiveIntOrNull(dockerPidsLimit) ?? 256,
@@ -676,7 +686,7 @@ export default function SettingsPage() {
     } finally {
       setSaving(false);
     }
-  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaQueryTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmModel, mmDimension, mmApiKey, knowledgeRootDir, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, toolContextEnabled, singleToolTriggerTokens, backgroundMinResultTokens, keepRecentToolResults, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, dockerEnabled, dockerOnUnavailable, dockerConnection, dockerContext, dockerImage, dockerCpuLimit, dockerMemoryLimitMb, dockerPidsLimit, dockerNetworkEnabled, dockerDependencySetupEnabled, subagentItems, showToast]);
+  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaQueryTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmModel, mmDimension, mmApiKey, knowledgeRootDir, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, toolContextEnabled, singleToolTriggerTokens, backgroundMinResultTokens, keepRecentToolResults, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, dockerEnabled, dockerOnUnavailable, dockerConnection, dockerContext, dockerUseCustomImage, dockerImage, dockerCpuLimit, dockerMemoryLimitMb, dockerPidsLimit, dockerNetworkEnabled, dockerDependencySetupEnabled, subagentItems, showToast]);
 
   const handleDatabaseModeChange = useCallback((mode: "bundled" | "external") => {
     setDatabaseMode(mode);
@@ -2363,8 +2373,11 @@ export default function SettingsPage() {
                             <FormField label="Docker context">
                               <input value={dockerContext} onChange={(event) => setDockerContext(event.target.value)} className="form-input" placeholder="留空使用当前 context" />
                             </FormField>
-                            <FormField label="容器镜像">
-                              <input value={dockerImage} onChange={(event) => setDockerImage(event.target.value)} className="form-input" />
+                            <FormField label="运行时镜像">
+                              <div className="rounded-xl border border-black/[0.06] bg-slate-50 px-3 py-2.5">
+                                <p className="text-[12px] font-semibold text-slate-800">PuddingClaw 托管镜像</p>
+                                <p className="mt-0.5 text-[10px] text-slate-500">Python 3.12 + Node.js 22</p>
+                              </div>
                             </FormField>
                             <FormField label="Docker 不可用时">
                               <select value={dockerOnUnavailable} onChange={(event) => setDockerOnUnavailable(event.target.value === "deny" ? "deny" : "fallback")} className="form-select">
@@ -2393,11 +2406,30 @@ export default function SettingsPage() {
                               />
                               按项目 lockfile 准备依赖（高级）
                             </label>
+                            <label className="flex items-center gap-2 pt-6 text-[12px] text-gray-600">
+                              <input
+                                type="checkbox"
+                                checked={dockerUseCustomImage}
+                                onChange={(event) => setDockerUseCustomImage(event.target.checked)}
+                              />
+                              使用自定义镜像（高级）
+                            </label>
+                            {dockerUseCustomImage && (
+                              <FormField label="自定义镜像引用">
+                                <input
+                                  value={dockerImage}
+                                  onChange={(event) => setDockerImage(event.target.value)}
+                                  className="form-input"
+                                  placeholder="例如 my-company/puddingclaw-sandbox:latest"
+                                />
+                              </FormField>
+                            )}
                           </div>
 
                           <p className="mt-3 rounded-lg bg-blue-50 px-3 py-2 text-[10px] leading-relaxed text-blue-700">
                             默认托管镜像只提供 Python 3.12 + pip 与 Node.js 22 + npm/corepack。
                             默认不安装项目依赖；第三方 Skill 执行中缺包时才请求 package/network 权限并动态安装。
+                            自定义镜像填写的是本机 Docker tag 或 registry image reference，不需要上传镜像文件。
                             未开启常驻网络时，批准的安装命令只会临时联网，结束后自动断开。
                           </p>
 
