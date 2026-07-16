@@ -1990,6 +1990,22 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             continue;
           }
 
+          if (event.event === "verification_contract_updated") {
+            const contract = event.data.contract as unknown as HarnessRun["verification_contract"];
+            const current = currentRunsMapRef.current[sendSessionId];
+            if (current && contract) {
+              const next = {
+                ...current,
+                verification_contract: contract,
+              };
+              currentRunsMapRef.current[sendSessionId] = next;
+              if (sessionIdRef.current === sendSessionId) {
+                setCurrentRun(next);
+              }
+            }
+            continue;
+          }
+
           if (event.event === "verification_report") {
             const report = event.data.report as unknown as RubricEvaluationReport;
             if (report?.report_id) {

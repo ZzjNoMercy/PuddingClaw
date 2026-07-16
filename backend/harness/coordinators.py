@@ -17,11 +17,13 @@ from harness.models import (
     RunOutcome,
     RunRecord,
     RunStatus,
+    RunTaskProfile,
     RunVerificationContract,
     VerificationStatus,
     VerifierKind,
 )
 from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
+from harness.task_profiles import TaskProfileClassifier
 
 
 class GoalActivationError(HarnessStateError):
@@ -129,10 +131,18 @@ class GoalCoordinator:
         self,
         goal: GoalRecord,
         *,
+        run: RunRecord | None = None,
         gap: str | None = None,
     ) -> GoalRecord:
         """Detach a cancelled/failed Run without cancelling the Goal."""
 
+        if run is not None:
+            goal.goal_contract = RunRubricCompiler.merge_contracts(
+                base=goal.goal_contract,
+                expanded=run.verification_contract,
+                profile=run.task_profile,
+                message=goal.objective,
+            )
         goal.current_run_id = None
         if gap:
             goal.gaps = [gap]
@@ -208,6 +218,7 @@ class CompletionVerificationCoordinator:
         project_id: str | None,
         custom_rules: list[dict[str, Any]] | None = None,
         force_required: bool = False,
+        task_profile: RunTaskProfile | None = None,
     ) -> RunVerificationContract | None:
         return RunRubricCompiler.compile(
             RubricBuildContext(
@@ -216,6 +227,7 @@ class CompletionVerificationCoordinator:
                 project_id=project_id,
                 custom_rules=tuple(custom_rules or ()),
                 force_required=force_required,
+                task_profile=task_profile,
             )
         )
 
@@ -251,57 +263,122 @@ class CompletionVerificationCoordinator:
             item.statement: item for item in contract.criteria
         }
         criteria_by_id = {item.id: item for item in contract.criteria}
-        evaluations: list[CriterionEvaluation] = []
-        gaps: list[str] = []
-        for index, raw in enumerate(latest_criteria):
+        raw_by_id: dict[str, list[dict[str, Any]]] = {}
+        for raw in latest_criteria:
             if not isinstance(raw, dict):
                 continue
-            name = str(raw.get("name") or f"criterion_{index + 1}")
+            name = str(raw.get("name") or "").strip()
             configured = criteria_by_id.get(name) or criteria_by_statement.get(name)
-            criterion_id = configured.id if configured else name
+            if configured is None:
+                continue
+            raw_by_id.setdefault(configured.id, []).append(raw)
+
+        deterministic_evaluations = evaluate_deterministic_criteria(
+            contract,
+            state,
+        )
+        deterministic_by_id = {
+            item.criterion_id: item for item in deterministic_evaluations
+        }
+        context = state.get("_harness_context")
+        harness_context = context if isinstance(context, dict) else {}
+        raw_activations = harness_context.get(
+            "verification_activations",
+            state.get("verification_activations", []),
+        )
+        activations = raw_activations if isinstance(raw_activations, list) else []
+        analytics_evidence = [
+            evidence
+            for activation in activations
+            if isinstance(activation, dict)
+            and activation.get("status") == "succeeded"
+            and activation.get("pack") == "analytics"
+            for evidence in activation.get("evidence_refs") or []
+            if isinstance(evidence, dict)
+            and evidence.get("material", True) is not False
+        ]
+
+        evaluations: list[CriterionEvaluation] = []
+        gaps: list[str] = []
+        for configured in contract.criteria:
+            deterministic = deterministic_by_id.get(configured.id)
+            if deterministic is not None:
+                evaluations.append(deterministic)
+                if deterministic.gap:
+                    gaps.append(deterministic.gap)
+                continue
+            matches = raw_by_id.get(configured.id, [])
+            if not matches:
+                gap = f"验收器未返回必需标准 {configured.id} 的判定。"
+                evaluations.append(
+                    CriterionEvaluation(
+                        criterion_id=configured.id,
+                        name=configured.id,
+                        passed=False,
+                        verifier=configured.verifier,
+                        gap=gap,
+                    )
+                )
+                if configured.required:
+                    gaps.append(gap)
+                continue
+            if len(matches) > 1:
+                gap = f"验收器重复返回标准 {configured.id}，Harness 按 fail-closed 处理。"
+                evaluations.append(
+                    CriterionEvaluation(
+                        criterion_id=configured.id,
+                        name=configured.id,
+                        passed=False,
+                        verifier=configured.verifier,
+                        gap=gap,
+                    )
+                )
+                if configured.required:
+                    gaps.append(gap)
+                continue
+            raw = matches[0]
             gap = str(raw.get("gap") or "").strip() or None
-            if gap:
-                gaps.append(gap)
+            raw_evidence = raw.get("evidence")
+            evidence = (
+                [item for item in raw_evidence if isinstance(item, dict)]
+                if isinstance(raw_evidence, list)
+                else []
+            )
+            if configured.id == "metric_consistency":
+                evidence = [*evidence, *analytics_evidence]
+            passed = bool(raw.get("passed"))
+            if configured.verifier == VerifierKind.ANALYTICS and not evidence:
+                passed = False
+                gap = gap or (
+                    f"标准 {configured.id} 没有当前 Run 的结构化分析证据，"
+                    "不能仅凭模型判定通过。"
+                )
+            if configured.required and gap:
+                passed = False
             evaluations.append(
                 CriterionEvaluation(
-                    criterion_id=criterion_id,
-                    name=name,
-                    passed=bool(raw.get("passed")),
-                    verifier=(
-                        configured.verifier
-                        if configured is not None
-                        else VerifierKind.LLM_GRADER
-                    ),
+                    criterion_id=configured.id,
+                    name=str(raw.get("name") or configured.id),
+                    passed=passed,
+                    verifier=configured.verifier,
+                    evidence=evidence,
                     gap=gap,
                 )
             )
+            if configured.required and (not passed or gap):
+                gaps.append(gap or f"标准 {configured.id} 未通过。")
         explanation = (
             str(latest.get("explanation") or "")
             if isinstance(latest, dict)
             else ""
         )
-        deterministic_evaluations = evaluate_deterministic_criteria(
-            contract,
-            state,
-        )
-        if deterministic_evaluations:
-            deterministic_by_id = {
-                item.criterion_id: item for item in deterministic_evaluations
-            }
-            evaluations = [
-                deterministic_by_id.pop(item.criterion_id, item)
-                for item in evaluations
-            ]
-            evaluations.extend(deterministic_by_id.values())
-            deterministic_gaps = [
-                item.gap
-                for item in deterministic_evaluations
-                if not item.passed and item.gap
-            ]
-            if deterministic_gaps:
-                gaps = [*deterministic_gaps, *gaps]
-                if status == VerificationStatus.SATISFIED:
-                    status = VerificationStatus.NEEDS_REVISION
+        required_by_id = {item.id: item.required for item in contract.criteria}
+        if any(
+            (not item.passed or bool(item.gap))
+            and required_by_id.get(item.criterion_id, True)
+            for item in evaluations
+        ) and status == VerificationStatus.SATISFIED:
+            status = VerificationStatus.NEEDS_REVISION
         if status != VerificationStatus.SATISFIED and not gaps:
             gaps.append(
                 explanation
@@ -314,7 +391,7 @@ class CompletionVerificationCoordinator:
             contract_id=contract.contract_id,
             contract_version=contract.version,
             evaluations=evaluations,
-            gaps=gaps,
+            gaps=list(dict.fromkeys(gaps)),
             explanation=explanation,
             iteration_count=len(evaluations_payload),
         )
@@ -352,6 +429,10 @@ class HarnessRunCoordinator:
         goal_max_rounds: int = 8,
         custom_rubric_rules: list[dict[str, Any]] | None = None,
     ) -> tuple[RunRecord, GoalRecord | None]:
+        task_profile = TaskProfileClassifier.classify(
+            message=objective,
+            analytics_model_id=analytics_model_id,
+        )
         contract = (
             self.verification.compile_contract(
                 user_message=objective,
@@ -359,6 +440,7 @@ class HarnessRunCoordinator:
                 project_id=project_id,
                 custom_rules=custom_rubric_rules,
                 force_required=goal_mode,
+                task_profile=task_profile,
             )
             if verification_enabled
             else None
@@ -384,6 +466,11 @@ class HarnessRunCoordinator:
             goal_id=goal.goal_id if goal else None,
             project_id=project_id,
             analytics_model_id=analytics_model_id,
+            verification_enabled=verification_enabled,
+            task_profile=task_profile,
+            declared_verification_contract=(
+                contract.model_copy(deep=True) if contract is not None else None
+            ),
             verification_contract=contract,
             config_snapshot=dict(config_snapshot or {}),
         )
@@ -396,7 +483,22 @@ class HarnessRunCoordinator:
         )
         return run, goal
 
-    def transition(self, run: RunRecord, status: RunStatus) -> RunRecord:
+    def transition(
+        self,
+        run: RunRecord,
+        status: RunStatus,
+        *,
+        refresh_runtime: bool = True,
+    ) -> RunRecord:
+        if refresh_runtime:
+            self._refresh_runtime_fields(run)
+        if status == RunStatus.EVALUATING:
+            saved = self._sessions.prepare_run_evaluation(
+                run.session_id,
+                run.run_id,
+            )
+            self._replace_run(run, RunRecord.model_validate(saved))
+            return run
         run.transition(status)
         self._sessions.upsert_run_state(
             run.session_id,
@@ -410,23 +512,90 @@ class HarnessRunCoordinator:
         goal: GoalRecord | None,
         final_state: dict[str, Any] | None,
     ) -> tuple[RunRecord, GoalRecord | None, RubricEvaluationReport]:
+        self._refresh_runtime_fields(run)
         if run.status == RunStatus.RUNNING:
-            self.transition(run, RunStatus.EVALUATING)
+            self.transition(
+                run,
+                RunStatus.EVALUATING,
+                refresh_runtime=False,
+            )
+        state = dict(final_state or {})
+        context = state.get("_harness_context")
+        harness_context = dict(context) if isinstance(context, dict) else {}
+        if not str(harness_context.get("final_content") or "").strip():
+            harness_context["final_content"] = self._last_ai_content(
+                state.get("messages")
+            )
+        harness_context["verification_activations"] = [
+            item.model_dump(mode="json")
+            if hasattr(item, "model_dump")
+            else dict(item)
+            for item in run.verification_activations
+            if isinstance(item, dict) or hasattr(item, "model_dump")
+        ]
+        state["_harness_context"] = harness_context
         report = self.verification.report_from_final_state(
             run_id=run.run_id,
             contract=run.verification_contract,
-            final_state=final_state,
+            final_state=state,
         )
         outcome = self.verification.outcome_for_report(report)
         run.verification_report = report
         run.finish(outcome)
-        self._sessions.upsert_run_state(
+        saved = self._sessions.terminalize_run_state(
             run.session_id,
+            run.run_id,
             run.model_dump(mode="json"),
         )
+        self._replace_run(run, RunRecord.model_validate(saved))
         if goal is not None:
+            goal.goal_contract = RunRubricCompiler.merge_contracts(
+                base=goal.goal_contract,
+                expanded=run.verification_contract,
+                profile=run.task_profile,
+                message=goal.objective,
+            )
             goal = self.goals.apply_run_report(goal, run, report, outcome)
         return run, goal, report
+
+    def _refresh_runtime_fields(self, run: RunRecord) -> None:
+        persisted = self._sessions.get_run_state(run.session_id, run.run_id)
+        if not isinstance(persisted, dict):
+            return
+        current = RunRecord.model_validate(persisted)
+        run.verification_activations = list(current.verification_activations)
+        if current.verification_contract is not None:
+            run.verification_contract = current.verification_contract
+
+    @staticmethod
+    def _replace_run(target: RunRecord, source: RunRecord) -> None:
+        for field_name in RunRecord.model_fields:
+            setattr(target, field_name, getattr(source, field_name))
+
+    @staticmethod
+    def _last_ai_content(raw_messages: Any) -> str:
+        messages = raw_messages if isinstance(raw_messages, list) else []
+        for message in reversed(messages):
+            if isinstance(message, dict):
+                role = str(message.get("role") or message.get("type") or "").lower()
+                if role not in {"ai", "assistant"}:
+                    continue
+                content = message.get("content")
+            else:
+                message_type = str(getattr(message, "type", "") or "").lower()
+                if message_type not in {"ai", "assistant"}:
+                    continue
+                content = getattr(message, "content", "")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                return "\n".join(
+                    str(item.get("text") or item.get("content") or "")
+                    if isinstance(item, dict)
+                    else str(item)
+                    for item in content
+                )
+        return ""
 
     def complete_budget_exceeded(
         self,
@@ -441,6 +610,12 @@ class HarnessRunCoordinator:
 
         if run.status == RunStatus.RUNNING:
             self.transition(run, RunStatus.EVALUATING)
+        run.verification_contract = RunRubricCompiler.expand_for_activations(
+            contract=run.verification_contract,
+            profile=run.task_profile,
+            message=run.objective,
+            activations=list(run.verification_activations),
+        )
         report = RubricEvaluationReport(
             report_id=f"verification-{uuid.uuid4().hex[:16]}",
             run_id=run.run_id,
@@ -462,11 +637,19 @@ class HarnessRunCoordinator:
         run.budget_exhaustion_reason = reason
         run.verification_report = report
         run.finish(RunOutcome.BUDGET_EXCEEDED, error=detail)
-        self._sessions.upsert_run_state(
+        saved = self._sessions.terminalize_run_state(
             run.session_id,
+            run.run_id,
             run.model_dump(mode="json"),
         )
+        self._replace_run(run, RunRecord.model_validate(saved))
         if goal is not None:
+            goal.goal_contract = RunRubricCompiler.merge_contracts(
+                base=goal.goal_contract,
+                expanded=run.verification_contract,
+                profile=run.task_profile,
+                message=goal.objective,
+            )
             goal = self.goals.apply_run_report(
                 goal,
                 run,
@@ -482,9 +665,12 @@ class HarnessRunCoordinator:
         outcome: RunOutcome,
         error: str | None = None,
     ) -> RunRecord:
+        self._refresh_runtime_fields(run)
         run.finish(outcome, error=error)
-        self._sessions.upsert_run_state(
+        saved = self._sessions.terminalize_run_state(
             run.session_id,
+            run.run_id,
             run.model_dump(mode="json"),
         )
+        self._replace_run(run, RunRecord.model_validate(saved))
         return run

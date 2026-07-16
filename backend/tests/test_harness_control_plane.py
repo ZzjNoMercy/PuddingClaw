@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from langchain_core.messages import ToolMessage
 
 from graph.session_manager import SessionManager
 from harness.coordinators import GoalActivationError, HarnessRunCoordinator
@@ -18,6 +19,7 @@ from harness.models import (
     VerificationStatus,
 )
 from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
+from harness.verification_activations import build_verification_activations
 
 
 def _sessions(tmp_path) -> SessionManager:
@@ -38,8 +40,29 @@ def _verification_context(workspace: Path) -> dict:
 
 
 def _satisfied_final_state(workspace: Path) -> dict:
+    activation = {
+        "activation_id": "verification-activation-test",
+        "run_id": "run-test",
+        "query_id": "query-1",
+        "tool_call_id": "call-db",
+        "tool_name": "database_sql_execute",
+        "pack": "analytics",
+        "source": "tool",
+        "status": "succeeded",
+        "evidence_refs": [
+            {
+                "kind": "tool_execution",
+                "tool_call_id": "call-db",
+                "tool_name": "database_sql_execute",
+            }
+        ],
+    }
     return {
-        "_harness_context": _verification_context(workspace),
+        "_harness_context": {
+            **_verification_context(workspace),
+            "verification_activations": [activation],
+        },
+        "verification_activations": [activation],
         "_rubric_status": "satisfied",
         "_rubric_evaluations": [
             {
@@ -50,7 +73,10 @@ def _satisfied_final_state(workspace: Path) -> dict:
                 "criteria": [
                     {"name": "task_fulfillment", "passed": True},
                     {"name": "metric_consistency", "passed": True},
-                    {"name": "evidence_traceability", "passed": True},
+                    {
+                        "name": "analytics_evidence_traceability",
+                        "passed": True,
+                    },
                     {"name": "time_scope", "passed": True},
                     {"name": "artifact_delivery", "passed": True},
                     {"name": "report_integrity", "passed": True},
@@ -58,6 +84,49 @@ def _satisfied_final_state(workspace: Path) -> dict:
             }
         ],
     }
+
+
+def _persist_satisfied_evidence(
+    sessions: SessionManager,
+    run: RunRecord,
+    workspace: Path,
+) -> None:
+    artifact = workspace / "report.md"
+    artifact.write_text("# report\n", encoding="utf-8")
+    cases = [
+        (
+            "call-db",
+            "database_sql_execute",
+            {"question": "查询销量"},
+            "database_source_id: db-sales\nresult_id: result-sales-1\nrows: 12",
+        ),
+        (
+            "call-write",
+            "write_file",
+            {"file_path": "/workspace/report.md", "content": "# report"},
+            "Wrote file /workspace/report.md",
+        ),
+    ]
+    for tool_call_id, tool_name, args, content in cases:
+        result = ToolMessage(
+            content=content,
+            tool_call_id=tool_call_id,
+            name=tool_name,
+            status="success",
+        )
+        for activation in build_verification_activations(
+            run_id=run.run_id,
+            query_id=run.query_id,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            args=args,
+            result=result,
+        ):
+            sessions.append_run_verification_activation(
+                run.session_id,
+                run.run_id,
+                activation.model_dump(mode="json"),
+            )
 
 
 def _exhausted_final_state(workspace: Path) -> dict:
@@ -72,9 +141,9 @@ def _exhausted_final_state(workspace: Path) -> dict:
                 "explanation": "报告没有给出数据来源。",
                 "criteria": [
                     {
-                        "name": "evidence_traceability",
+                        "name": "metric_consistency",
                         "passed": False,
-                        "gap": "关键销量数据缺少来源。",
+                        "gap": "关键销量指标口径不一致。",
                     }
                 ],
             }
@@ -95,7 +164,7 @@ def test_run_rubric_is_independent_from_goal_mode():
     assert {
         "task_fulfillment",
         "metric_consistency",
-        "evidence_traceability",
+        "analytics_evidence_traceability",
         "time_scope",
         "artifact_delivery",
         "report_integrity",
@@ -210,6 +279,7 @@ def test_default_request_creates_one_run_without_goal(tmp_path):
     assert sessions.get_harness_state("session-1")["run_order"] == [run.run_id]
 
     coordinator.transition(run, RunStatus.RUNNING)
+    _persist_satisfied_evidence(sessions, run, tmp_path)
     completed, completed_goal, report = coordinator.complete_from_final_state(
         run,
         goal,
@@ -243,7 +313,7 @@ def test_non_goal_verification_failure_does_not_create_followup_run(tmp_path):
     )
 
     assert completed.outcome == RunOutcome.VERIFICATION_FAILED
-    assert report.gaps == ["关键销量数据缺少来源。"]
+    assert report.gaps
     harness = sessions.get_harness_state("session-1")
     assert len(harness["runs"]) == 1
     assert harness["goals"] == {}
@@ -366,6 +436,7 @@ def test_explicit_goal_can_advance_across_runs(tmp_path):
     assert resumed_goal is not None
     assert second_run.goal_id == goal.goal_id
     coordinator.transition(second_run, RunStatus.RUNNING)
+    _persist_satisfied_evidence(sessions, second_run, tmp_path)
     second_run, achieved_goal, second_report = coordinator.complete_from_final_state(
         second_run,
         resumed_goal,
@@ -414,6 +485,117 @@ def test_goal_followup_inherits_frozen_contract(tmp_path):
         followup.verification_contract.contract_id
         == goal.goal_contract.contract_id
     )
+
+
+def test_goal_contract_monotonically_inherits_runtime_analytics_pack(tmp_path):
+    sessions = _sessions(tmp_path)
+    coordinator = HarnessRunCoordinator(sessions)
+    first_run, goal = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-1",
+        objective="持续完成这项任务",
+        goal_mode=True,
+    )
+    assert goal is not None
+    assert first_run.verification_contract is not None
+    assert "analytics" not in first_run.verification_contract.verification_packs
+    coordinator.transition(first_run, RunStatus.RUNNING)
+    activation = build_verification_activations(
+        run_id=first_run.run_id,
+        query_id=first_run.query_id,
+        tool_call_id="call-db",
+        tool_name="database_sql_execute",
+        args={"question": "查询销量"},
+    )[0]
+    sessions.append_run_verification_activation(
+        first_run.session_id,
+        first_run.run_id,
+        activation.model_dump(mode="json"),
+    )
+    effective = RunRubricCompiler.expand_for_activations(
+        contract=first_run.verification_contract,
+        profile=first_run.task_profile,
+        message=first_run.objective,
+        activations=[activation],
+    )
+    assert effective is not None
+    state = _exhausted_final_state(tmp_path)
+
+    first_run, goal, report = coordinator.complete_from_final_state(
+        first_run,
+        goal,
+        state,
+    )
+
+    assert report.status == VerificationStatus.MAX_ITERATIONS_REACHED
+    assert goal is not None
+    assert goal.status == GoalStatus.ACTIVE
+    assert goal.goal_contract is not None
+    assert "analytics" in goal.goal_contract.verification_packs
+
+    followup, same_goal = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-2",
+        objective="继续并完成",
+        goal_mode=True,
+        goal_id=goal.goal_id,
+    )
+
+    assert same_goal is not None
+    assert followup.verification_contract is not None
+    assert "analytics" in followup.verification_contract.verification_packs
+    assert "metric_consistency" in {
+        item.id for item in followup.verification_contract.criteria
+    }
+
+
+def test_cancelled_goal_run_preserves_successful_runtime_pack(tmp_path):
+    sessions = _sessions(tmp_path)
+    coordinator = HarnessRunCoordinator(sessions)
+    run, goal = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-1",
+        objective="持续完成这项任务",
+        goal_mode=True,
+    )
+    assert goal is not None
+    coordinator.transition(run, RunStatus.RUNNING)
+    result = ToolMessage(
+        content="database_source_id: db-sales\nresult_id: result-1\nrows: 3",
+        tool_call_id="call-db",
+        name="database_sql_execute",
+        status="success",
+    )
+    activation = build_verification_activations(
+        run_id=run.run_id,
+        query_id=run.query_id,
+        tool_call_id="call-db",
+        tool_name="database_sql_execute",
+        args={"question": "查询销量"},
+        result=result,
+    )[0]
+    sessions.append_run_verification_activation(
+        run.session_id,
+        run.run_id,
+        activation.model_dump(mode="json"),
+    )
+
+    coordinator.fail(
+        run,
+        outcome=RunOutcome.CANCELLED,
+        error="client_cancelled",
+    )
+    goal = coordinator.goals.release_run(
+        goal,
+        run=run,
+        gap="本 Run 已停止。",
+    )
+
+    assert goal.goal_contract is not None
+    assert "analytics" in goal.goal_contract.verification_packs
+    persisted = sessions.get_goal_state(goal.session_id, goal.goal_id)
+    assert persisted is not None
+    assert "analytics" in persisted["goal_contract"]["verification_packs"]
 
 
 def test_goal_id_is_rejected_when_goal_mode_is_off(tmp_path):

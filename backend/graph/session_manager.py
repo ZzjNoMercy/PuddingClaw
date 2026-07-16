@@ -686,11 +686,204 @@ class SessionManager:
                 )
 
         saved = deepcopy(run)
+        if isinstance(existing, dict):
+            for immutable_field in (
+                "run_id",
+                "query_id",
+                "session_id",
+                "objective",
+                "goal_id",
+                "project_id",
+                "analytics_model_id",
+                "verification_enabled",
+                "task_profile",
+                "declared_verification_contract",
+                "created_at",
+            ):
+                if immutable_field in existing:
+                    saved[immutable_field] = deepcopy(existing[immutable_field])
+            existing_activations = existing.get("verification_activations")
+            incoming_activations = saved.get("verification_activations")
+            merged_activations: list[dict[str, Any]] = []
+            seen_activation_ids: set[str] = set()
+            for raw in (
+                existing_activations if isinstance(existing_activations, list) else []
+            ) + (
+                incoming_activations if isinstance(incoming_activations, list) else []
+            ):
+                if not isinstance(raw, dict):
+                    continue
+                activation_id = str(raw.get("activation_id") or "")
+                if activation_id and activation_id in seen_activation_ids:
+                    continue
+                if activation_id:
+                    seen_activation_ids.add(activation_id)
+                merged_activations.append(deepcopy(raw))
+            saved["verification_activations"] = merged_activations
+
+            existing_contract = existing.get("verification_contract")
+            if isinstance(existing_contract, dict):
+                saved["verification_contract"] = deepcopy(existing_contract)
         runs[run_id] = saved
         run_order = harness.setdefault("run_order", [])
         if run_id not in run_order:
             run_order.append(run_id)
         harness["latest_run_id"] = run_id
+        self._write_file(session_id, data)
+        return deepcopy(saved)
+
+    @_session_write_locked
+    def append_run_verification_activation(
+        self,
+        session_id: str,
+        run_id: str,
+        activation: dict[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        """Append one idempotent current-Run verification activation."""
+
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        run = runs.get(run_id) if isinstance(runs, dict) else None
+        if not isinstance(run, dict):
+            raise ValueError(f"Run {run_id} does not exist in session {session_id}")
+        if str(activation.get("run_id") or "") != run_id:
+            raise ValueError("Verification activation run_id mismatch")
+        if str(activation.get("query_id") or "") != str(run.get("query_id") or ""):
+            raise ValueError("Verification activation query_id mismatch")
+        if str(activation.get("status") or "") != "succeeded":
+            raise ValueError("Only successful Tool results may activate verification packs")
+        if str(run.get("status") or "") in {
+            "evaluating",
+            "completed",
+            "cancelled",
+            "failed",
+            "blocked",
+            "budget_exceeded",
+            "verification_failed",
+        }:
+            raise ValueError(
+                "Evaluating or terminal Runs cannot accept verification activations"
+            )
+        activations = run.get("verification_activations")
+        if not isinstance(activations, list):
+            activations = []
+        activation_id = str(activation.get("activation_id") or "")
+        if not activation_id:
+            raise ValueError("Verification activation_id is required")
+        for existing in activations:
+            if isinstance(existing, dict) and existing.get("activation_id") == activation_id:
+                return deepcopy(existing), False
+        saved = deepcopy(activation)
+        activations.append(saved)
+        run["verification_activations"] = activations
+        run["updated_at"] = time.time()
+        self._write_file(session_id, data)
+        return deepcopy(saved), True
+
+    @_session_write_locked
+    def prepare_run_evaluation(
+        self,
+        session_id: str,
+        run_id: str,
+    ) -> dict[str, Any]:
+        """Freeze the current Tool ledger and atomically enter evaluation."""
+
+        from harness.models import RunRecord, RunStatus
+        from harness.rubric_compiler import RunRubricCompiler
+
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        raw_run = runs.get(run_id) if isinstance(runs, dict) else None
+        if not isinstance(raw_run, dict):
+            raise ValueError(f"Run {run_id} does not exist in session {session_id}")
+        run = RunRecord.model_validate(raw_run)
+        if run.status == RunStatus.EVALUATING:
+            return deepcopy(raw_run)
+        if run.terminal:
+            raise ValueError(f"Terminal Run {run_id} cannot enter evaluation")
+        if run.verification_enabled:
+            run.verification_contract = RunRubricCompiler.expand_for_activations(
+                contract=run.verification_contract,
+                profile=run.task_profile,
+                message=run.objective,
+                activations=list(run.verification_activations),
+            )
+        run.transition(RunStatus.EVALUATING)
+        saved = run.model_dump(mode="json")
+        runs[run_id] = saved
+        harness["latest_run_id"] = run_id
+        self._write_file(session_id, data)
+        return deepcopy(saved)
+
+    @_session_write_locked
+    def terminalize_run_state(
+        self,
+        session_id: str,
+        run_id: str,
+        terminal_run: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Commit a terminal Run without allowing stale callers to replace authority."""
+
+        from harness.models import RunRecord
+        from harness.rubric_compiler import RunRubricCompiler
+
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        raw_current = runs.get(run_id) if isinstance(runs, dict) else None
+        if not isinstance(raw_current, dict):
+            raise ValueError(f"Run {run_id} does not exist in session {session_id}")
+        incoming = RunRecord.model_validate(terminal_run)
+        if incoming.run_id != run_id or incoming.session_id != session_id:
+            raise ValueError("Terminal Run identity does not match persistence session")
+        if incoming.outcome is None:
+            raise ValueError("Terminal Run outcome is required")
+
+        current = RunRecord.model_validate(raw_current)
+        if current.terminal:
+            if current.outcome != incoming.outcome:
+                raise ValueError(
+                    f"Run {run_id} already has terminal outcome {current.outcome}"
+                )
+            return deepcopy(raw_current)
+
+        if current.verification_enabled:
+            current.verification_contract = RunRubricCompiler.expand_for_activations(
+                contract=current.verification_contract,
+                profile=current.task_profile,
+                message=current.objective,
+                activations=list(current.verification_activations),
+            )
+        current.verification_report = incoming.verification_report
+        current.model_call_count = incoming.model_call_count
+        current.budget_exhaustion_reason = incoming.budget_exhaustion_reason
+        current.finish(incoming.outcome, error=incoming.error)
+        saved = current.model_dump(mode="json")
+        runs[run_id] = saved
+        harness["latest_run_id"] = run_id
+        self._write_file(session_id, data)
+        return deepcopy(saved)
+
+    @_session_write_locked
+    def update_run_verification_contract(
+        self,
+        session_id: str,
+        run_id: str,
+        contract: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Atomically update only the effective contract, preserving Tool ledger."""
+
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        run = runs.get(run_id) if isinstance(runs, dict) else None
+        if not isinstance(run, dict):
+            raise ValueError(f"Run {run_id} does not exist in session {session_id}")
+        saved = deepcopy(contract)
+        run["verification_contract"] = saved
+        run["updated_at"] = time.time()
         self._write_file(session_id, data)
         return deepcopy(saved)
 

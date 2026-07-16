@@ -289,13 +289,42 @@ def test_semantic_asset_middleware_owns_model_frontmatter_index(tmp_path):
     ]
 
     middleware = SemanticAssetsMiddleware(base_dir=tmp_path)
-    update = middleware.before_agent({"analytics_model_id": model["id"]}, runtime=None)
+    update = middleware.before_agent(
+        {
+            "analytics_model_id": model["id"],
+            "task_profile": {"initial_packs": ["core", "analytics"]},
+        },
+        runtime=None,
+    )
     assert update["semantic_assets_model_id"] == model["id"]
     assert update["allowed_semantic_asset_ids"] == [measure["id"]]
     assert update["semantic_assets_metadata"][0]["frontmatter"] == measure["frontmatter"]
     formatted = middleware._format_assets(update["semantic_assets_metadata"])
     assert f"### {measure['id']} | 上市周期" in formatted
     assert f"Canonical path: `/{measure['path']}`" in formatted
+
+    unrelated = middleware.before_agent(
+        {
+            "analytics_model_id": model["id"],
+            "task_profile": {"initial_packs": ["core", "web_research"]},
+        },
+        runtime=None,
+    )
+    assert unrelated["semantic_assets_model_id"] == ""
+    assert unrelated["semantic_assets_metadata"] == []
+
+    inherited_goal = middleware.before_agent(
+        {
+            "analytics_model_id": model["id"],
+            "task_profile": {"initial_packs": ["core"]},
+            "verification_contract": {
+                "verification_packs": ["core", "analytics"],
+            },
+        },
+        runtime=None,
+    )
+    assert inherited_goal["semantic_assets_model_id"] == model["id"]
+    assert inherited_goal["allowed_semantic_asset_ids"] == [measure["id"]]
 
 
 def test_runtime_inventory_lists_subagents_for_mount_panel(tmp_path, monkeypatch):
@@ -890,7 +919,7 @@ def test_historical_tool_messages_are_not_reemitted_on_followup(tmp_path, monkey
         "已完成旧查询。",
         tool_calls=[
             {
-                "tool": "database_knowledge_query",
+                "tool": "database_sql_execute",
                 "input": '{"question": "旧问题"}',
                 "id": "call_old_db",
                 "output": "旧工具结果",
@@ -901,7 +930,7 @@ def test_historical_tool_messages_are_not_reemitted_on_followup(tmp_path, monkey
                 "type": "tool",
                 "id": "call_old_db",
                 "tool_call": {
-                    "tool": "database_knowledge_query",
+                    "tool": "database_sql_execute",
                     "input": '{"question": "旧问题"}',
                     "id": "call_old_db",
                     "output": "旧工具结果",
@@ -930,7 +959,7 @@ def test_historical_tool_messages_are_not_reemitted_on_followup(tmp_path, monkey
                                 content="",
                                 tool_calls=[
                                     {
-                                        "name": "database_knowledge_query",
+                                        "name": "database_sql_execute",
                                         "args": {"question": "旧问题"},
                                         "id": "call_old_db",
                                     }
@@ -948,7 +977,7 @@ def test_historical_tool_messages_are_not_reemitted_on_followup(tmp_path, monkey
                             ToolMessage(
                                 content="旧工具结果",
                                 tool_call_id="call_old_db",
-                                name="database_knowledge_query",
+                                name="database_sql_execute",
                             )
                         ]
                     }
@@ -985,6 +1014,10 @@ def test_historical_tool_messages_are_not_reemitted_on_followup(tmp_path, monkey
     assert history[-1]["role"] == "assistant"
     assert history[-1]["content"] == "继续回答。"
     assert "tool_calls" not in history[-1]
+    current_run = session_manager.get_run_state("followup-session")
+    assert current_run is not None
+    assert current_run["verification_activations"] == []
+    assert current_run["verification_contract"] is None
 
 
 def test_agent_stream_persists_user_message_before_first_event(tmp_path, monkeypatch):

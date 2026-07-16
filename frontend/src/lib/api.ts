@@ -78,6 +78,30 @@ export interface RunVerificationContract {
   task_type: string;
   criteria: VerificationCriterion[];
   rubric: string;
+  verification_packs?: string[];
+  activation_reasons?: Record<string, string[]>;
+  base_contract_id?: string | null;
+  created_at: number;
+}
+
+export interface RunTaskProfile {
+  primary_intent: string;
+  intents: string[];
+  initial_packs: string[];
+  available_context_refs: string[];
+  reasons: string[];
+}
+
+export interface VerificationActivation {
+  activation_id: string;
+  run_id: string;
+  query_id: string;
+  tool_call_id: string;
+  tool_name: string;
+  pack: string;
+  source: string;
+  status: string;
+  evidence_refs: Array<Record<string, unknown>>;
   created_at: number;
 }
 
@@ -109,9 +133,13 @@ export interface HarnessRun {
   session_id: string;
   objective: string;
   goal_id?: string | null;
+  verification_enabled?: boolean;
+  task_profile?: RunTaskProfile;
   status: RunStatus;
   outcome?: string | null;
+  declared_verification_contract?: RunVerificationContract | null;
   verification_contract?: RunVerificationContract | null;
+  verification_activations?: VerificationActivation[];
   verification_report?: RubricEvaluationReport | null;
   model_call_count: number;
   budget_exhaustion_reason?: string | null;

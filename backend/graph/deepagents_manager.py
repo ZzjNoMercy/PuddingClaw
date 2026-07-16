@@ -93,9 +93,13 @@ from harness.models import (
     RunOutcome,
     RunRecord,
     RunStatus,
+    RunTaskProfile,
     RunVerificationContract,
+    VerificationActivation,
 )
+from harness.rubric_compiler import RunRubricCompiler
 from harness.tool_execution import ToolExecutionPipeline
+from harness.verification_activations import VerificationActivationMiddleware
 from harness.workspace_backends import build_workspace_execution_backend
 from knowledge.paths import get_knowledge_root
 from llm.model_client import INTERNAL_CALL_MARKER, ModelClientChatModel
@@ -185,7 +189,11 @@ class PuddingClawAgentState(DeepAgentState):
     allowed_semantic_asset_ids: NotRequired[list[str]]
     tool_context_enqueue: NotRequired[bool]
     rubric: NotRequired[str]
+    task_profile: NotRequired[dict[str, Any]]
     verification_contract: NotRequired[dict[str, Any]]
+    verification_activations: NotRequired[
+        Annotated[list[dict[str, Any]], PrivateStateAttr]
+    ]
     _completion_gate_iterations: NotRequired[
         Annotated[int, PrivateStateAttr]
     ]
@@ -218,6 +226,8 @@ The object must follow this shape:
   ]
 }
 Use "satisfied" only when every required criterion passes.
+Return one criteria item for every required rubric criterion. Write explanation
+and gaps in Chinese. Missing criteria are treated as failed by Harness.
 """.strip()
 
     @staticmethod
@@ -313,6 +323,9 @@ Use "satisfied" only when every required criterion passes.
             "todos": list(state.get("todos") or []),
             "final_content": self._last_ai_text(state),
             "workspace_path": str(context.get("workspace_path") or ""),
+            "verification_activations": list(
+                state.get("verification_activations") or []
+            ),
         }
         evaluations = evaluate_deterministic_criteria(contract, check_state)
         required_by_id = {
@@ -369,16 +382,98 @@ Use "satisfied" only when every required criterion passes.
         update["jump_to"] = "model"
         return update
 
+    @staticmethod
+    def _effective_contract_update(
+        state: dict[str, Any],
+        runtime: Any,
+    ) -> dict[str, Any]:
+        runtime_context = getattr(runtime, "context", None)
+        context = runtime_context if isinstance(runtime_context, dict) else {}
+        session_id = str(context.get("session_id") or "")
+        run_id = str(context.get("run_id") or "")
+        query_id = str(context.get("query_id") or "")
+        if not all((session_id, run_id, query_id)):
+            return {}
+        persisted = session_manager.get_run_state(session_id, run_id)
+        if not isinstance(persisted, dict):
+            return {}
+        if persisted.get("verification_enabled") is False:
+            return {}
+        profile_payload = persisted.get("task_profile")
+        profile = RunTaskProfile.model_validate(profile_payload or {})
+        raw_activations = persisted.get("verification_activations")
+        activations = [
+            VerificationActivation.model_validate(item)
+            for item in raw_activations
+            if isinstance(item, dict) and item.get("query_id") == query_id
+        ] if isinstance(raw_activations, list) else []
+        contract_payload = (
+            persisted.get("verification_contract")
+            or persisted.get("declared_verification_contract")
+        )
+        contract = (
+            RunVerificationContract.model_validate(contract_payload)
+            if isinstance(contract_payload, dict)
+            else None
+        )
+        effective = RunRubricCompiler.expand_for_activations(
+            contract=contract,
+            profile=profile,
+            message=str(persisted.get("objective") or ""),
+            activations=activations,
+        )
+        if effective is None:
+            return {
+                "task_profile": profile.model_dump(mode="json"),
+                "verification_activations": [
+                    item.model_dump(mode="json") for item in activations
+                ],
+            }
+        changed = contract is None or (
+            effective.model_dump(mode="json")
+            != contract.model_dump(mode="json")
+        )
+        if changed:
+            session_manager.update_run_verification_contract(
+                session_id,
+                run_id,
+                effective.model_dump(mode="json"),
+            )
+            writer = getattr(runtime, "stream_writer", None)
+            if writer is not None:
+                writer(
+                    {
+                        "type": "verification_contract_updated",
+                        "run_id": run_id,
+                        "query_id": query_id,
+                        "contract": effective.model_dump(mode="json"),
+                    }
+                )
+        return {
+            "task_profile": profile.model_dump(mode="json"),
+            "verification_contract": effective.model_dump(mode="json"),
+            "verification_activations": [
+                item.model_dump(mode="json") for item in activations
+            ],
+            "rubric": effective.rubric,
+        }
+
     @hook_config(can_jump_to=["model"])
     def after_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:
-        gate_update = self._completion_gate_update(state, runtime)
+        effective_update = self._effective_contract_update(dict(state), runtime)
+        effective_state = {**dict(state), **effective_update}
+        gate_update = self._completion_gate_update(effective_state, runtime)
         if gate_update and (
             gate_update.get("jump_to") == "model"
             or gate_update.get("_completion_gate_status") == "max_iterations_reached"
         ):
-            return gate_update
-        rubric_update = super().after_agent(state, runtime)
-        return {**(gate_update or {}), **(rubric_update or {})} or None
+            return {**effective_update, **gate_update}
+        rubric_update = super().after_agent(effective_state, runtime)
+        return {
+            **effective_update,
+            **(gate_update or {}),
+            **(rubric_update or {}),
+        } or None
 
     @hook_config(can_jump_to=["model"])
     async def aafter_agent(
@@ -386,14 +481,20 @@ Use "satisfied" only when every required criterion passes.
         state: Any,
         runtime: Any,
     ) -> dict[str, Any] | None:
-        gate_update = self._completion_gate_update(state, runtime)
+        effective_update = self._effective_contract_update(dict(state), runtime)
+        effective_state = {**dict(state), **effective_update}
+        gate_update = self._completion_gate_update(effective_state, runtime)
         if gate_update and (
             gate_update.get("jump_to") == "model"
             or gate_update.get("_completion_gate_status") == "max_iterations_reached"
         ):
-            return gate_update
-        rubric_update = await super().aafter_agent(state, runtime)
-        return {**(gate_update or {}), **(rubric_update or {})} or None
+            return {**effective_update, **gate_update}
+        rubric_update = await super().aafter_agent(effective_state, runtime)
+        return {
+            **effective_update,
+            **(gate_update or {}),
+            **(rubric_update or {}),
+        } or None
 
 
 class ObservableModelCallLimitMiddleware(ModelCallLimitMiddleware):
@@ -962,6 +1063,7 @@ class DeepAgentsAgentManager:
             SemanticAssetsMiddleware(base_dir=self._base_dir),
             ExternalFilePermissionMiddleware(),
             WorkspacePathRouterMiddleware(),
+            VerificationActivationMiddleware(),
             ToolExecutionPipeline(
                 known_tools=set(known_tools or ()),
                 backend_mode=backend_mode,
@@ -3071,7 +3173,26 @@ class DeepAgentsAgentManager:
                 checkpointer=self._checkpointer_info,
                 execution_backend=agent_backend,
             )
-            analytics_model_prompt, analytics_model_payload = self._analytics_model_context(analytics_model_id)
+            analytics_contract_active = (
+                run_record.verification_contract is not None
+                and "analytics"
+                in run_record.verification_contract.verification_packs
+            )
+            if analytics_contract_active:
+                analytics_model_prompt, analytics_model_payload = (
+                    self._analytics_model_context(analytics_model_id)
+                )
+            else:
+                analytics_model_prompt = ""
+                analytics_model_payload = (
+                    {
+                        "id": analytics_model_id,
+                        "loaded": False,
+                        "deferred": True,
+                    }
+                    if analytics_model_id
+                    else None
+                )
             if analytics_model_payload:
                 runtime_inventory["analytics_model"] = analytics_model_payload
             traced_middlewares = wrap_middlewares_for_trace(agent_middlewares)
@@ -3080,6 +3201,7 @@ class DeepAgentsAgentManager:
             def build_subagent_middlewares() -> list[Any]:
                 middlewares: list[Any] = [
                     ExternalFilePermissionMiddleware(),
+                    VerificationActivationMiddleware(),
                     ToolExecutionPipeline(
                         known_tools={
                             str(getattr(tool, "name", ""))
@@ -3110,7 +3232,10 @@ class DeepAgentsAgentManager:
             )
             if dependency_prompt:
                 system_prompt += f"\n\n{dependency_prompt}"
-            if analytics_model_prompt:
+            if (
+                analytics_model_prompt
+                and analytics_contract_active
+            ):
                 system_prompt += analytics_model_prompt
             agent = create_deep_agent(
                 model=model,
@@ -3260,6 +3385,7 @@ class DeepAgentsAgentManager:
                 "messages": messages,
                 "todos": persisted_todos,
                 "analytics_model_id": analytics_model_id,
+                "task_profile": run_record.task_profile.model_dump(mode="json"),
             }
             if (
                 run_record.verification_contract is not None
@@ -3290,6 +3416,7 @@ class DeepAgentsAgentManager:
                 context={
                     "session_id": session_id,
                     "query_id": query_id,
+                    "run_id": run_record.run_id,
                     "user_id": user_id,
                     "workspace_path": str(workspace_path),
                 },
@@ -4055,6 +4182,7 @@ class DeepAgentsAgentManager:
                     if goal_record is not None:
                         self._run_coordinator.goals.release_run(
                             goal_record,
+                            run=run_record,
                             gap="本 Run 已被用户停止，Goal 保持 active。",
                         )
             except Exception:
@@ -4185,6 +4313,7 @@ class DeepAgentsAgentManager:
                     ):
                         goal_record = self._run_coordinator.goals.release_run(
                             goal_record,
+                            run=run_record,
                             gap=error_notice,
                         )
                     if goal_record is not None:

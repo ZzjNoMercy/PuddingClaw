@@ -404,6 +404,21 @@ function VerificationCard({
                 ? "全部必需验收项均已通过。"
                 : `发现 ${Math.max(1, report.gaps.length, report.evaluations.filter((item) => !item.passed).length)} 个待修正问题。`}
             </p>
+            {run?.task_profile && (
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                <span className="rounded-full bg-white px-2 py-0.5 text-[10px] font-medium text-slate-500">
+                  本轮类型：{taskIntentLabel(run.task_profile.primary_intent)}
+                </span>
+                {(run.verification_contract?.verification_packs || []).map((pack) => (
+                  <span
+                    key={pack}
+                    className="rounded-full bg-[#002fa7]/[0.06] px-2 py-0.5 text-[10px] font-medium text-[#002fa7]"
+                  >
+                    {verificationPackLabel(pack)}
+                  </span>
+                ))}
+              </div>
+            )}
           </div>
           {report.evaluations.map((evaluation) => {
             const criterion = criteriaById.get(evaluation.criterion_id);
@@ -485,7 +500,7 @@ function VerificationCard({
                       </ul>
                     ) : (
                       <p className="mt-1 text-[11px] leading-5 text-slate-500">
-                        该项由{verificationMethodLabel(evaluation.verifier)}基于本轮回答、工具结果与运行上下文综合判定，当前未附结构化证据。
+                        该项仅由{verificationMethodLabel(evaluation.verifier)}基于本轮上下文判断，当前未附结构化证据，不属于确定性验证。
                       </p>
                     )}
                   </div>
@@ -528,9 +543,13 @@ const VERIFICATION_CRITERIA: Record<string, { title: string; description: string
     title: "指标口径一致性",
     description: "指标名称、计算口径、维度和结论是否前后一致。",
   },
-  evidence_traceability: {
-    title: "证据可追溯性",
-    description: "关键数据与结论是否能够追溯到工具结果、数据源或产物。",
+  web_evidence_traceability: {
+    title: "网页来源可追溯",
+    description: "网页结论是否引用了本轮真实检索得到的来源或链接。",
+  },
+  analytics_evidence_traceability: {
+    title: "分析证据可追溯",
+    description: "关键数据是否关联本轮查询结果、数据源、结果 ID 或查询轨迹。",
   },
   time_scope: {
     title: "数据时间范围",
@@ -539,6 +558,10 @@ const VERIFICATION_CRITERIA: Record<string, { title: string; description: string
   artifact_delivery: {
     title: "产物交付",
     description: "要求生成或更新的文件是否真实存在并提供了可定位路径。",
+  },
+  code_validation: {
+    title: "代码验证",
+    description: "是否执行并通过与代码改动相称的测试、构建或静态检查。",
   },
   report_integrity: {
     title: "报告完整性",
@@ -593,6 +616,35 @@ function verificationMethodLabel(verifier: string): string {
   )[verifier] || "验收检查";
 }
 
+function taskIntentLabel(intent: string): string {
+  return (
+    {
+      general: "通用任务",
+      ai_insights: "AI 资讯",
+      web_research: "网页研究",
+      knowledge_search: "知识检索",
+      database_analysis: "数据库分析",
+      table_analysis: "表格分析",
+      semantic_dimension: "语义维度",
+      logical_dataset: "逻辑数据集",
+      artifact: "产物生成",
+      code: "代码任务",
+    } as Record<string, string>
+  )[intent] || intent;
+}
+
+function verificationPackLabel(pack: string): string {
+  return (
+    {
+      core: "基础验收",
+      web_research: "来源验收",
+      analytics: "分析验收",
+      artifact: "产物验收",
+      code: "代码验收",
+    } as Record<string, string>
+  )[pack] || pack;
+}
+
 function formatVerificationEvidence(evidence: Record<string, unknown>): string[] {
   if (evidence.kind === "todo_state") {
     const total = Number(evidence.total || 0);
@@ -609,6 +661,14 @@ function formatVerificationEvidence(evidence: Record<string, unknown>): string[]
     const missing = Array.isArray(evidence.missing) ? evidence.missing.length : 0;
     return [
       `最终回答引用 ${mentioned} 个产物，确认存在 ${existing} 个，缺失 ${missing} 个。`,
+    ];
+  }
+  if (evidence.kind === "tool_execution") {
+    const toolName = String(evidence.tool_name || "未知工具");
+    const toolCallId = String(evidence.tool_call_id || "");
+    const inputPreview = String(evidence.input_preview || "");
+    return [
+      `${toolName} 已成功执行${toolCallId ? `（${toolCallId}）` : ""}${inputPreview ? `：${inputPreview}` : ""}`,
     ];
   }
   return Object.entries(evidence).map(([key, value]) => {

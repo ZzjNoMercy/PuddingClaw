@@ -180,6 +180,31 @@ class VerificationCriterion(BaseModel):
     required: bool = True
 
 
+class RunTaskProfile(BaseModel):
+    """Run-local task classification independent from selected model context."""
+
+    primary_intent: str = "general"
+    intents: list[str] = Field(default_factory=list)
+    initial_packs: list[str] = Field(default_factory=list)
+    available_context_refs: list[str] = Field(default_factory=list)
+    reasons: list[str] = Field(default_factory=list)
+
+
+class VerificationActivation(BaseModel):
+    """One successful current-Run action that activates a verification pack."""
+
+    activation_id: str
+    run_id: str
+    query_id: str
+    tool_call_id: str
+    tool_name: str
+    pack: str
+    source: str = "tool"
+    status: str = "succeeded"
+    evidence_refs: list[dict[str, Any]] = Field(default_factory=list)
+    created_at: float = Field(default_factory=time.time)
+
+
 class CriterionEvaluation(BaseModel):
     criterion_id: str
     name: str
@@ -195,6 +220,9 @@ class RunVerificationContract(BaseModel):
     task_type: str
     criteria: list[VerificationCriterion] = Field(default_factory=list)
     rubric: str = ""
+    verification_packs: list[str] = Field(default_factory=list)
+    activation_reasons: dict[str, list[str]] = Field(default_factory=dict)
+    base_contract_id: str | None = None
     created_at: float = Field(default_factory=time.time)
 
     @property
@@ -223,9 +251,13 @@ class RunRecord(BaseModel):
     goal_id: str | None = None
     project_id: str | None = None
     analytics_model_id: str | None = None
+    verification_enabled: bool = True
+    task_profile: RunTaskProfile = Field(default_factory=RunTaskProfile)
     status: RunStatus = RunStatus.PREPARING
     outcome: RunOutcome | None = None
+    declared_verification_contract: RunVerificationContract | None = None
     verification_contract: RunVerificationContract | None = None
+    verification_activations: list[VerificationActivation] = Field(default_factory=list)
     verification_report: RubricEvaluationReport | None = None
     model_call_count: int = 0
     budget_exhaustion_reason: str | None = None

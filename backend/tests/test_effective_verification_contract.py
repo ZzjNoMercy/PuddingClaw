@@ -1,0 +1,1007 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+from langchain.agents.middleware.types import ToolCallRequest
+from langchain_core.messages import ToolMessage
+from langgraph.types import Command
+
+from graph.session_manager import SessionManager
+from harness.coordinators import CompletionVerificationCoordinator
+from harness.models import (
+    RunOutcome,
+    RunStatus,
+    VerificationActivation,
+    VerificationStatus,
+)
+from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
+from harness.task_profiles import TaskProfileClassifier
+from harness.verification_activations import (
+    VerificationActivationMiddleware,
+    build_verification_activations,
+    tool_result_succeeded,
+    verification_packs_for_tool,
+)
+
+
+def _criterion_ids(contract) -> set[str]:
+    return {item.id for item in contract.criteria} if contract else set()
+
+
+@pytest.mark.parametrize(
+    ("message", "intent", "expected_pack"),
+    [
+        ("分析今天 OpenAI 和 Anthropic 的新闻，附来源", "ai_insights", "web_research"),
+        ("修改数据结构代码并运行 pytest", "code", "code"),
+        ("解释一下 RubricMiddleware 是什么", "general", None),
+    ],
+)
+def test_selected_analytics_model_is_context_not_task_intent(
+    message,
+    intent,
+    expected_pack,
+):
+    profile = TaskProfileClassifier.classify(
+        message=message,
+        analytics_model_id="汽车行业分析模型",
+    )
+
+    assert profile.primary_intent == intent
+    assert "analytics" not in profile.initial_packs
+    assert profile.available_context_refs == ["analytics_model:汽车行业分析模型"]
+    if expected_pack:
+        assert expected_pack in profile.initial_packs
+
+
+def test_selected_model_does_not_change_contract_semantics():
+    message = "分析今天 AI 新闻并附来源"
+    without_model = RunRubricCompiler.compile(
+        RubricBuildContext(user_message=message)
+    )
+    with_model = RunRubricCompiler.compile(
+        RubricBuildContext(
+            user_message=message,
+            analytics_model_id="model-1",
+        )
+    )
+
+    assert without_model is not None
+    assert with_model is not None
+    assert with_model.verification_packs == without_model.verification_packs
+    assert _criterion_ids(with_model) == _criterion_ids(without_model)
+    assert with_model.contract_id == without_model.contract_id
+    assert "metric_consistency" not in _criterion_ids(with_model)
+
+
+def test_negated_analytics_intent_does_not_activate_analytics():
+    profile = TaskProfileClassifier.classify(
+        message="不要查询数据库，也不要分析数据，只总结这段新闻",
+        analytics_model_id="selected-model",
+    )
+
+    assert "analytics" not in profile.initial_packs
+
+
+def test_explicit_analytics_intent_does_not_require_selected_model():
+    contract = RunRubricCompiler.compile(
+        RubricBuildContext(
+            user_message="查询 6 月销量同比下降原因，并明确计算口径"
+        )
+    )
+
+    assert contract is not None
+    assert "analytics" in contract.verification_packs
+    assert {"metric_consistency", "analytics_evidence_traceability"} <= _criterion_ids(
+        contract
+    )
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "database_sql_execute",
+        "pandas_knowledge_query",
+        "semantic_entity_lookup",
+    ],
+)
+def test_successful_analytics_tools_activate_analytics(tool_name):
+    profile = TaskProfileClassifier.classify(message="继续处理这个任务")
+    activations = build_verification_activations(
+        run_id="run-1",
+        query_id="query-1",
+        tool_call_id="call-1",
+        tool_name=tool_name,
+        args={},
+    )
+
+    effective = RunRubricCompiler.expand_for_activations(
+        contract=None,
+        profile=profile,
+        message="继续处理这个任务",
+        activations=activations,
+    )
+
+    assert effective is not None
+    assert "analytics" in effective.verification_packs
+    assert {"metric_consistency", "analytics_evidence_traceability"} <= _criterion_ids(
+        effective
+    )
+
+
+def test_fetch_url_activates_web_research_only():
+    profile = TaskProfileClassifier.classify(message="继续整理")
+    effective = RunRubricCompiler.expand_for_activations(
+        contract=None,
+        profile=profile,
+        message="继续整理",
+        activations=build_verification_activations(
+            run_id="run-1",
+            query_id="query-1",
+            tool_call_id="call-web",
+            tool_name="fetch_url",
+            args={"url": "https://example.com/news"},
+        ),
+    )
+
+    assert effective is not None
+    assert "web_research" in effective.verification_packs
+    assert "analytics" not in effective.verification_packs
+    assert "metric_consistency" not in _criterion_ids(effective)
+
+
+def test_aihot_skill_command_activates_web_research():
+    assert verification_packs_for_tool(
+        "execute",
+        {"command": "python3 /skills/aihot/scripts/aihot_query.py --limit 10"},
+    ) == ["web_research"]
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("/workspace/app.py", {"code"}),
+        ("/workspace/report.md", {"artifact"}),
+        ("/workspace/dashboard.html", {"code", "artifact"}),
+    ],
+)
+def test_successful_workspace_writes_activate_matching_packs(path, expected):
+    assert set(
+        verification_packs_for_tool("write_file", {"file_path": path})
+    ) == expected
+
+
+def test_sql_generation_activates_analytics_but_is_not_material_evidence():
+    activation = build_verification_activations(
+        run_id="run-1",
+        query_id="query-1",
+        tool_call_id="call-generate",
+        tool_name="database_sql_generate",
+        args={"question": "查询销量"},
+    )[0]
+
+    assert activation.pack == "analytics"
+    assert activation.evidence_refs[0]["material"] is False
+
+
+def test_effective_contract_is_order_independent_and_idempotent():
+    profile = TaskProfileClassifier.classify(message="继续")
+    db = build_verification_activations(
+        run_id="run-1",
+        query_id="query-1",
+        tool_call_id="call-db",
+        tool_name="database_sql_execute",
+        args={},
+    )[0]
+    web = build_verification_activations(
+        run_id="run-1",
+        query_id="query-1",
+        tool_call_id="call-web",
+        tool_name="fetch_url",
+        args={"url": "https://example.com"},
+    )[0]
+
+    first = RunRubricCompiler.expand_for_activations(
+        contract=None,
+        profile=profile,
+        message="继续",
+        activations=[db, web, db],
+    )
+    second = RunRubricCompiler.expand_for_activations(
+        contract=None,
+        profile=profile,
+        message="继续",
+        activations=[web, db],
+    )
+
+    assert first is not None and second is not None
+    assert set(first.verification_packs) == set(second.verification_packs)
+    assert _criterion_ids(first) == _criterion_ids(second)
+    assert first.contract_id == second.contract_id
+    assert first.activation_reasons == second.activation_reasons
+    assert len(_criterion_ids(first)) == len(first.criteria)
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    ["database_sql_execute_fake", "my_database_sql_execute", "fetch_url_v2", ""],
+)
+def test_similar_or_unknown_tool_names_do_not_activate(tool_name):
+    assert verification_packs_for_tool(tool_name, {}) == []
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        ToolMessage(
+            content="Error: database connection refused",
+            tool_call_id="call-1",
+            name="database_sql_execute",
+            status="error",
+        ),
+        ToolMessage(
+            content="Traceback: failed",
+            tool_call_id="call-1",
+            name="database_sql_execute",
+        ),
+    ],
+)
+def test_unsuccessful_tool_results_do_not_activate(message):
+    assert tool_result_succeeded(message) is False
+
+
+def test_activation_ledger_is_current_run_scoped_and_idempotent(tmp_path):
+    sessions = SessionManager()
+    sessions.initialize(tmp_path)
+    sessions.create_session("session-1")
+    run = {
+        "run_id": "run-1",
+        "query_id": "query-current",
+        "session_id": "session-1",
+        "objective": "继续",
+        "task_profile": {},
+        "verification_activations": [],
+    }
+    sessions.start_harness_run("session-1", run)
+    activation = build_verification_activations(
+        run_id="run-1",
+        query_id="query-current",
+        tool_call_id="call-1",
+        tool_name="database_sql_execute",
+        args={},
+    )[0]
+
+    _, created = sessions.append_run_verification_activation(
+        "session-1",
+        "run-1",
+        activation.model_dump(mode="json"),
+    )
+    _, replay_created = sessions.append_run_verification_activation(
+        "session-1",
+        "run-1",
+        activation.model_dump(mode="json"),
+    )
+
+    assert created is True
+    assert replay_created is False
+    forged = activation.model_copy(update={"query_id": "query-old"})
+    with pytest.raises(ValueError, match="query_id mismatch"):
+        sessions.append_run_verification_activation(
+            "session-1",
+            "run-1",
+            forged.model_dump(mode="json"),
+        )
+
+    sessions.update_run_verification_contract(
+        "session-1",
+        "run-1",
+        {"contract_id": "effective-contract"},
+    )
+    persisted = sessions.get_run_state("session-1", "run-1")
+    assert persisted is not None
+    assert persisted["verification_contract"]["contract_id"] == "effective-contract"
+    assert len(persisted["verification_activations"]) == 1
+
+
+def test_stale_run_upsert_cannot_erase_concurrent_activation(tmp_path):
+    sessions = SessionManager()
+    sessions.initialize(tmp_path)
+    sessions.create_session("session-1")
+    stale = {
+        "run_id": "run-1",
+        "query_id": "query-current",
+        "session_id": "session-1",
+        "objective": "继续",
+        "status": "running",
+        "task_profile": {},
+        "verification_activations": [],
+    }
+    sessions.start_harness_run("session-1", stale)
+    activation = build_verification_activations(
+        run_id="run-1",
+        query_id="query-current",
+        tool_call_id="call-1",
+        tool_name="database_sql_execute",
+        args={},
+    )[0]
+    sessions.append_run_verification_activation(
+        "session-1",
+        "run-1",
+        activation.model_dump(mode="json"),
+    )
+
+    stale["status"] = "waiting_hitl"
+    sessions.upsert_run_state("session-1", stale)
+    persisted = sessions.get_run_state("session-1", "run-1")
+
+    assert persisted is not None
+    assert len(persisted["verification_activations"]) == 1
+
+
+def test_evaluation_freezes_activation_ledger(tmp_path):
+    from harness.coordinators import HarnessRunCoordinator
+
+    sessions = SessionManager()
+    sessions.initialize(tmp_path)
+    sessions.create_session("session-1")
+    coordinator = HarnessRunCoordinator(sessions)
+    run, _ = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-current",
+        objective="继续",
+        goal_mode=False,
+    )
+    coordinator.transition(run, RunStatus.RUNNING)
+    coordinator.transition(run, RunStatus.EVALUATING)
+    activation = build_verification_activations(
+        run_id=run.run_id,
+        query_id=run.query_id,
+        tool_call_id="call-late",
+        tool_name="database_sql_execute",
+        args={},
+    )[0]
+
+    with pytest.raises(ValueError, match="cannot accept"):
+        sessions.append_run_verification_activation(
+            run.session_id,
+            run.run_id,
+            activation.model_dump(mode="json"),
+        )
+
+
+def test_middleware_does_not_record_failed_tool(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "harness.verification_activations.session_manager.append_run_verification_activation",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "id": "call-1",
+            "name": "database_sql_execute",
+            "args": {},
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(
+            context={
+                "session_id": "session-1",
+                "run_id": "run-1",
+                "query_id": "query-1",
+            },
+            stream_writer=None,
+        ),
+    )
+
+    result = VerificationActivationMiddleware().wrap_tool_call(
+        request,
+        lambda _request: ToolMessage(
+            content="Error: refused",
+            tool_call_id="call-1",
+            name="database_sql_execute",
+            status="error",
+        ),
+    )
+
+    assert result.status == "error"
+    assert calls == []
+
+
+def test_general_subagent_inherits_verification_activation_middleware():
+    from graph.deepagents_manager import _build_subagents
+
+    subagents = _build_subagents(
+        default_tools=[],
+        default_skills=[],
+        middleware_factory=lambda: [VerificationActivationMiddleware()],
+    )
+
+    assert subagents
+    assert any(
+        isinstance(item, VerificationActivationMiddleware)
+        for item in subagents[0].get("middleware", [])
+    )
+
+
+def test_evidence_traceability_fails_closed_without_structured_evidence():
+    contract = RunRubricCompiler.compile(
+        RubricBuildContext(user_message="分析 6 月销量下降原因")
+    )
+    assert contract is not None
+    report = CompletionVerificationCoordinator.report_from_final_state(
+        run_id="run-1",
+        contract=contract,
+        final_state={
+            "_rubric_status": "satisfied",
+            "_rubric_evaluations": [
+                {
+                    "result": "satisfied",
+                    "criteria": [
+                        {"name": "task_fulfillment", "passed": True},
+                        {"name": "metric_consistency", "passed": True},
+                        {
+                            "name": "analytics_evidence_traceability",
+                            "passed": True,
+                        },
+                    ],
+                }
+            ],
+            "_harness_context": {
+                "todos": [],
+                "verification_activations": [],
+            },
+        },
+    )
+
+    evidence = next(
+        item
+        for item in report.evaluations
+        if item.criterion_id == "analytics_evidence_traceability"
+    )
+    assert evidence.passed is False
+    assert evidence.evidence == []
+    assert "查询结果" in str(evidence.gap)
+    assert report.status == VerificationStatus.NEEDS_REVISION
+
+
+def test_web_source_must_be_cited_in_final_answer():
+    contract = RunRubricCompiler.compile(
+        RubricBuildContext(user_message="搜索最新 AI 新闻并附来源")
+    )
+    assert contract is not None
+    activation = build_verification_activations(
+        run_id="run-1",
+        query_id="query-1",
+        tool_call_id="call-web",
+        tool_name="fetch_url",
+        args={"url": "https://example.com/news"},
+    )[0].model_dump(mode="json")
+
+    report = CompletionVerificationCoordinator.report_from_final_state(
+        run_id="run-1",
+        contract=contract,
+        final_state={
+            "_rubric_status": "satisfied",
+            "_rubric_evaluations": [
+                {
+                    "result": "satisfied",
+                    "criteria": [
+                        {"name": "task_fulfillment", "passed": True},
+                        {"name": "web_evidence_traceability", "passed": True},
+                        {"name": "time_scope", "passed": True},
+                    ],
+                }
+            ],
+            "_harness_context": {
+                "todos": [],
+                "final_content": "今天发布了一个新模型。",
+                "verification_activations": [activation],
+            },
+        },
+    )
+
+    evidence = next(
+        item
+        for item in report.evaluations
+        if item.criterion_id == "web_evidence_traceability"
+    )
+    assert evidence.passed is False
+    assert "最终回答没有引用" in str(evidence.gap)
+
+
+def test_grader_cannot_omit_required_criteria_and_claim_satisfied():
+    contract = RunRubricCompiler.compile(
+        RubricBuildContext(user_message="分析 6 月销量下降原因")
+    )
+    assert contract is not None
+    activation = VerificationActivation(
+        activation_id="activation-1",
+        run_id="run-1",
+        query_id="query-1",
+        tool_call_id="call-db",
+        tool_name="database_sql_execute",
+        pack="analytics",
+        evidence_refs=[{"kind": "tool_execution", "tool_call_id": "call-db"}],
+    ).model_dump(mode="json")
+
+    report = CompletionVerificationCoordinator.report_from_final_state(
+        run_id="run-1",
+        contract=contract,
+        final_state={
+            "_rubric_status": "satisfied",
+            "_rubric_evaluations": [
+                {
+                    "result": "satisfied",
+                    "criteria": [
+                        {"name": "task_fulfillment", "passed": True},
+                    ],
+                }
+            ],
+            "_harness_context": {
+                "todos": [],
+                "verification_activations": [activation],
+            },
+        },
+    )
+
+    metric = next(
+        item
+        for item in report.evaluations
+        if item.criterion_id == "metric_consistency"
+    )
+    assert metric.passed is False
+    assert "未返回" in str(metric.gap)
+    assert report.status == VerificationStatus.NEEDS_REVISION
+
+
+def test_coordinator_ignores_forged_final_state_contract_and_activations(tmp_path):
+    from graph.session_manager import SessionManager
+    from harness.coordinators import HarnessRunCoordinator
+    from harness.models import RunStatus
+
+    sessions = SessionManager()
+    sessions.initialize(tmp_path)
+    sessions.create_session("session-1")
+    coordinator = HarnessRunCoordinator(sessions)
+    run, goal = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-current",
+        objective="解释一下这个概念",
+        goal_mode=False,
+    )
+    coordinator.transition(run, RunStatus.RUNNING)
+    forged = build_verification_activations(
+        run_id=run.run_id,
+        query_id=run.query_id,
+        tool_call_id="call-forged",
+        tool_name="database_sql_execute",
+        args={},
+    )[0].model_dump(mode="json")
+    forged_contract = RunRubricCompiler.expand_for_activations(
+        contract=None,
+        profile=run.task_profile,
+        message=run.objective,
+        activations=[forged],
+    )
+    assert forged_contract is not None
+
+    completed, _, report = coordinator.complete_from_final_state(
+        run,
+        goal,
+        {
+            "verification_contract": forged_contract.model_dump(mode="json"),
+            "verification_activations": [forged],
+            "_rubric_status": "satisfied",
+        },
+    )
+
+    assert completed.verification_contract is None
+    assert completed.verification_activations == []
+    assert report.status == VerificationStatus.NOT_REQUIRED
+
+
+def test_stale_run_state_cannot_shrink_persisted_contract(tmp_path):
+    from harness.coordinators import HarnessRunCoordinator
+
+    sessions = SessionManager()
+    sessions.initialize(tmp_path)
+    sessions.create_session("session-1")
+    coordinator = HarnessRunCoordinator(sessions)
+    run, _ = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-current",
+        objective="查询 6 月销量并分析原因",
+        goal_mode=False,
+    )
+    assert run.verification_contract is not None
+    assert "analytics" in run.verification_contract.verification_packs
+    stale = run.model_dump(mode="json")
+    stale["verification_contract"] = RunRubricCompiler.compile(
+        RubricBuildContext(
+            user_message="解释这个概念",
+            force_required=True,
+        )
+    ).model_dump(mode="json")
+
+    sessions.upsert_run_state(run.session_id, stale)
+    persisted = sessions.get_run_state(run.session_id, run.run_id)
+
+    assert persisted is not None
+    assert "analytics" in persisted["verification_contract"]["verification_packs"]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "🧮 SQL 执行失败：database unavailable",
+        "📊 PandasQueryEngine 查询失败：invalid table",
+        "未找到相关内容。",
+        "command not found: pytest\n\n[Command failed with exit code 127]",
+    ],
+)
+def test_business_failure_outputs_cannot_activate_verification(content):
+    message = ToolMessage(
+        content=content,
+        tool_call_id="call-current",
+        name="database_sql_execute",
+        status="success",
+    )
+
+    assert (
+        tool_result_succeeded(message, expected_call_id="call-current") is False
+    )
+
+
+def test_unrelated_success_message_cannot_mask_current_tool_failure():
+    result = Command(
+        update={
+            "messages": [
+                ToolMessage(
+                    content="Error: current call failed",
+                    tool_call_id="call-current",
+                    name="database_sql_execute",
+                    status="error",
+                ),
+                ToolMessage(
+                    content="query completed",
+                    tool_call_id="call-other",
+                    name="database_sql_execute",
+                    status="success",
+                ),
+            ]
+        }
+    )
+
+    assert (
+        tool_result_succeeded(result, expected_call_id="call-current") is False
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "pytest tests/test_pandas_knowledge.py",
+        "rg pandas requirements.txt",
+        "ls fixtures/demo.csv",
+        "rg 'select x from y' docs",
+        "echo pytest",
+        "pytest nonexistent || true",
+    ],
+)
+def test_non_analytics_or_fake_validation_commands_do_not_overactivate(command):
+    packs = verification_packs_for_tool("execute", {"command": command})
+
+    assert "analytics" not in packs
+    if command in {"echo pytest", "pytest nonexistent || true"}:
+        assert "code" not in packs
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "分析 Python 的数据结构实现",
+        "修改销量页面的 CSS 代码",
+        "解释 SQL 注入漏洞，不查询数据库",
+        "生成一段 SQL 示例，不执行",
+        "写一个网页页面",
+    ],
+)
+def test_task_profile_does_not_confuse_domain_words_with_analytics(message):
+    profile = TaskProfileClassifier.classify(
+        message=message,
+        analytics_model_id="selected-model",
+    )
+
+    assert "analytics" not in profile.initial_packs
+
+
+def test_required_grader_gap_forces_needs_revision():
+    contract = RunRubricCompiler.compile(
+        RubricBuildContext(user_message="解释 RubricMiddleware")
+    )
+    assert contract is None
+    contract = RunRubricCompiler.compile(
+        RubricBuildContext(
+            user_message="解释 RubricMiddleware",
+            force_required=True,
+        )
+    )
+    assert contract is not None
+
+    report = CompletionVerificationCoordinator.report_from_final_state(
+        run_id="run-1",
+        contract=contract,
+        final_state={
+            "_rubric_status": "satisfied",
+            "_rubric_evaluations": [
+                {
+                    "result": "satisfied",
+                    "criteria": [
+                        {
+                            "name": "task_fulfillment",
+                            "passed": True,
+                            "gap": "尚未解释 verify 触发时机。",
+                        },
+                        {"name": "todo_reconciliation", "passed": True},
+                    ],
+                }
+            ],
+            "_harness_context": {"todos": []},
+        },
+    )
+
+    task = next(
+        item
+        for item in report.evaluations
+        if item.criterion_id == "task_fulfillment"
+    )
+    assert task.passed is False
+    assert report.status == VerificationStatus.NEEDS_REVISION
+
+
+def _web_report(final_content: str, *, cited_source_id: str | None = None):
+    contract = RunRubricCompiler.compile(
+        RubricBuildContext(user_message="搜索最新 AI 新闻并附来源")
+    )
+    assert contract is not None
+    result = ToolMessage(
+        content="# News\nA new model launched.",
+        tool_call_id="call-web",
+        name="fetch_url",
+        status="success",
+    )
+    activation = build_verification_activations(
+        run_id="run-1",
+        query_id="query-1",
+        tool_call_id="call-web",
+        tool_name="fetch_url",
+        args={"url": "https://example.com/news"},
+        result=result,
+    )[0]
+    source_ref = next(
+        item
+        for item in activation.evidence_refs
+        if item.get("kind") == "source"
+    )
+    if cited_source_id is None:
+        cited_source_id = str(source_ref["source_id"])
+    report = CompletionVerificationCoordinator.report_from_final_state(
+        run_id="run-1",
+        contract=contract,
+        final_state={
+            "_rubric_status": "satisfied",
+            "_rubric_evaluations": [
+                {
+                    "result": "satisfied",
+                    "criteria": [
+                        {"name": "task_fulfillment", "passed": True},
+                        {"name": "todo_reconciliation", "passed": True},
+                        {"name": "web_evidence_traceability", "passed": True},
+                    ],
+                }
+            ],
+            "_harness_context": {
+                "todos": [],
+                "final_content": final_content.format(source_id=cited_source_id),
+                "verification_activations": [
+                    activation.model_dump(mode="json")
+                ],
+            },
+        },
+    )
+    return report
+
+
+def test_current_run_verified_citation_passes():
+    report = _web_report("新闻结论。[^{source_id}]")
+
+    evidence = next(
+        item
+        for item in report.evaluations
+        if item.criterion_id == "web_evidence_traceability"
+    )
+    assert evidence.passed is True
+    assert report.status == VerificationStatus.SATISFIED
+
+
+def test_forged_source_id_is_rejected():
+    report = _web_report("新闻结论。[^{source_id}]", cited_source_id="src_fake")
+
+    evidence = next(
+        item
+        for item in report.evaluations
+        if item.criterion_id == "web_evidence_traceability"
+    )
+    assert evidence.passed is False
+    assert report.status == VerificationStatus.NEEDS_REVISION
+
+
+def test_web_activation_cannot_satisfy_analytics_evidence():
+    contract = RunRubricCompiler.compile(
+        RubricBuildContext(
+            user_message="搜索行业新闻，并查询销量分析变化原因"
+        )
+    )
+    assert contract is not None
+    result = ToolMessage(
+        content="# News\nA new model launched.",
+        tool_call_id="call-web",
+        name="fetch_url",
+        status="success",
+    )
+    activation = build_verification_activations(
+        run_id="run-1",
+        query_id="query-1",
+        tool_call_id="call-web",
+        tool_name="fetch_url",
+        args={"url": "https://example.com/news"},
+        result=result,
+    )[0]
+    report = CompletionVerificationCoordinator.report_from_final_state(
+        run_id="run-1",
+        contract=contract,
+        final_state={
+            "_rubric_status": "satisfied",
+            "_rubric_evaluations": [
+                {
+                    "result": "satisfied",
+                    "criteria": [
+                        {"name": item.id, "passed": True}
+                        for item in contract.criteria
+                    ],
+                }
+            ],
+            "_harness_context": {
+                "todos": [],
+                "final_content": "行业新闻。https://example.com/news",
+                "verification_activations": [
+                    activation.model_dump(mode="json")
+                ],
+            },
+        },
+    )
+
+    analytics = next(
+        item
+        for item in report.evaluations
+        if item.criterion_id == "analytics_evidence_traceability"
+    )
+    assert analytics.passed is False
+    assert report.status == VerificationStatus.NEEDS_REVISION
+
+
+def test_failed_run_terminalization_preserves_authoritative_activation(tmp_path):
+    from harness.coordinators import HarnessRunCoordinator
+
+    sessions = SessionManager()
+    sessions.initialize(tmp_path)
+    sessions.create_session("session-1")
+    coordinator = HarnessRunCoordinator(sessions)
+    run, _ = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-1",
+        objective="继续处理",
+        goal_mode=False,
+    )
+    coordinator.transition(run, RunStatus.RUNNING)
+    result = ToolMessage(
+        content="database_source_id: db-sales\nresult_id: result-1\nrows: 3",
+        tool_call_id="call-db",
+        name="database_sql_execute",
+        status="success",
+    )
+    activation = build_verification_activations(
+        run_id=run.run_id,
+        query_id=run.query_id,
+        tool_call_id="call-db",
+        tool_name="database_sql_execute",
+        args={"question": "查询销量"},
+        result=result,
+    )[0]
+    sessions.append_run_verification_activation(
+        run.session_id,
+        run.run_id,
+        activation.model_dump(mode="json"),
+    )
+
+    coordinator.fail(run, outcome=RunOutcome.FAILED, error="boom")
+    persisted = sessions.get_run_state(run.session_id, run.run_id)
+
+    assert persisted is not None
+    assert len(persisted["verification_activations"]) == 1
+    assert "analytics" in persisted["verification_contract"]["verification_packs"]
+
+
+def test_contract_id_changes_when_custom_rule_semantics_change():
+    first = RunRubricCompiler.compile(
+        RubricBuildContext(
+            user_message="解释这个概念",
+            force_required=True,
+            custom_rules=(
+                {
+                    "id": "custom_rule",
+                    "statement": "必须解释状态边界。",
+                    "required": True,
+                },
+            ),
+        )
+    )
+    second = RunRubricCompiler.compile(
+        RubricBuildContext(
+            user_message="解释这个概念",
+            force_required=True,
+            custom_rules=(
+                {
+                    "id": "custom_rule",
+                    "statement": "可以不解释状态边界。",
+                    "required": False,
+                },
+            ),
+        )
+    )
+
+    assert first is not None and second is not None
+    assert first.contract_id != second.contract_id
+
+
+def test_runtime_pack_expansion_preserves_custom_rules():
+    profile = TaskProfileClassifier.classify(message="解释这个概念")
+    declared = RunRubricCompiler.compile(
+        RubricBuildContext(
+            user_message="解释这个概念",
+            force_required=True,
+            task_profile=profile,
+            custom_rules=(
+                {
+                    "id": "advanced_custom_rule",
+                    "statement": "必须说明权威状态边界。",
+                    "required": True,
+                    "verifier": "llm_grader",
+                    "source": "settings",
+                },
+            ),
+        )
+    )
+    assert declared is not None
+    activation = build_verification_activations(
+        run_id="run-1",
+        query_id="query-1",
+        tool_call_id="call-db",
+        tool_name="database_sql_execute",
+        args={},
+    )[0]
+
+    effective = RunRubricCompiler.expand_for_activations(
+        contract=declared,
+        profile=profile,
+        message="解释这个概念",
+        activations=[activation],
+    )
+
+    assert effective is not None
+    custom = next(
+        item for item in effective.criteria if item.id == "advanced_custom_rule"
+    )
+    assert custom.statement == "必须说明权威状态边界。"
+    assert custom.required is True
+    assert custom.source.value == "settings"

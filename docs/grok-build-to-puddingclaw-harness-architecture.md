@@ -1,6 +1,6 @@
 # 从 Grok Build 反推 PuddingClaw Harness：差距分析与演进架构
 
-状态：**方案已审核，第一阶段实现位于 `codex/harness-control-plane`；后端 492 项测试、前端生产构建、Goal/Rubric UI E2E 与真实 Docker Backend E2E 已通过**
+状态：**方案已审核并持续实现于 `codex/harness-control-plane`；后端 574 项测试、前端生产构建、TaskProfile/Effective Contract、Manager 级动态问数、Goal/Rubric UI 与真实 Docker Backend E2E 已通过**
 日期：2026-07-16
 Grok Build 源码：<code>b189869b7755d2b482969acf6c92da3ecfeffd36</code>
 PuddingClaw 基线提交：<code>7fb380f43be9c9b13fd3478bb28ef1a637fe6203</code>
@@ -834,10 +834,11 @@ RubricMiddleware 文档明确指出：grader_error、failed、max_iterations_rea
 
 ~~~text
 用户本次 Run 的任务与约束
-  → AnalyticsTaskContractBuilder 提取任务类型和显式要求
-  → RubricCompiler 注入系统强制标准与智能问数模板
+  → TaskProfileClassifier 只根据本轮请求识别任务类型
+  → RunRubricCompiler 选择 core / web_research / analytics / artifact / code pack
   → 自动分配 deterministic / analytics / llm verifier
-  → 固化为 Run verification contract
+  → 固化 declared Run verification contract
+  → 当前 Run 成功 Tool 事件单调扩展 Effective Verification Contract
   → 若用户已开启 Goal，再关联 Goal contract
 ~~~
 
@@ -901,6 +902,47 @@ RubricCompiler 合并时采用“更严格者胜出”：
 - 自定义 LLM criterion 可以使用 <code>llm_grader</code>，但不能修改 grader system prompt；
 - 高级用户关闭自定义规则不影响 system mandatory 和 managed policy；
 - 自定义规则数量、LLM verifier 数量和验证预算必须有上限。
+
+### 7.4 模型选择、任务画像与 Effective Contract 必须解耦
+
+来源：**[本方案新增，经过对抗性审查]**。
+
+用户在项目中选中分析模型，只表示该模型上下文对 Agent **可用**，不能直接证明本轮是智能问数任务：
+
+~~~text
+selected analytics model = available context
+current user request       = Run TaskProfile
+successful current tools   = runtime activation ledger
+
+Effective Verification Contract
+  = declared TaskProfile packs
+  ∪ current-Run successful Tool packs
+~~~
+
+当前实现遵守以下不变量：
+
+1. <code>analytics_model_id</code> 不参与 TaskProfile 与 contract hash；同一任务选中或不选中模型，验收语义必须一致；
+2. 任务画像只读取当前 Run 的用户请求，不读取 Session 历史 Skill 或历史 ToolMessage；
+3. 只有当前 <code>query_id</code> 下成功完成的精确 Tool 事件可以激活 runtime pack；失败、pending、非零退出码、伪造近似名称和历史事件都不能激活；
+4. <code>VerificationActivationMiddleware</code> 同时安装在主 Agent 与 Subagent，写入 Session JSON 中的 Run-local 幂等账本；Trace 继续只记录，不作为恢复权威；
+5. activation 只表示“本轮实际使用了某种能力”，不能直接充当 acceptance evidence；验收证据还必须带当前 Tool call 的输出摘要/hash、source/result 引用、成功退出码或产物写入路径；
+6. 网页与分析证据拆成 <code>web_evidence_traceability</code> 和 <code>analytics_evidence_traceability</code>，逐 pack fail-closed，网页来源不能冒充分析查询结果；
+7. Rubric Grader 运行前，<code>PuddingClawRubricMiddleware</code> 必须从该账本生成并写入 Effective Contract，再开始 deterministic gate 和 LLM grader；
+8. Run 进入 evaluating 时原子冻结 Tool ledger 并物化 Effective Contract；正常完成、失败、取消和预算终止都通过 Session 原子 terminalize，stale graph state 不得覆盖权威 ledger；
+9. required criterion 只要缺失、重复、未通过或仍带 gap，整体状态就不能是 <code>satisfied</code>；
+10. Goal 冻结基础接受标准，但其有效 pack 只能跨 Run 单调增加；即使某一 Run 失败或被取消，已经成功形成的 runtime pack 也不会从 Goal contract 丢失；
+11. 分析模型的完整语义资产与 system prompt 仅在 analytics 路径激活时加载；普通新闻、代码和通用任务只保留“模型可用”事实，不支付完整上下文税；
+12. 用户关闭本 Run 验收时，TaskProfile 仍可用于路由，但 runtime activation 不得重新隐式开启 Rubric。
+
+典型兼容场景：
+
+| 已选分析模型 | 本轮任务 | 初始 Pack | 运行时变化 |
+|---|---|---|---|
+| 是 | AI 最新新闻 | core + web_research | fetch/AIHOT 成功后补来源证据，不加入 analytics |
+| 是 | 修改代码并运行测试 | core + code | 测试/构建成功形成 code evidence，不加入 analytics |
+| 是 | 普通解释/翻译 | 无 Rubric 或 Goal 指定的 core | 不注入完整分析模型上下文 |
+| 是/否 | “继续处理”，随后读取问数 Skill 并实际执行 SQL | 初始 general | 成功数据库 Tool 在 Grader 前激活 analytics；所选模型本身不改变验收 |
+| 任意 | 生成报告并分析指标 | core + analytics + artifact | Tool 账本补分析证据和产物确定性检查 |
 
 ## 8. Run Verification 与可选 Analytics GoalState
 

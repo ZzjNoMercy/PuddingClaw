@@ -1,44 +1,22 @@
-"""Compile a deterministic first-pass Run rubric from task context."""
+"""Compile declared and effective Run verification contracts."""
 
 from __future__ import annotations
 
 import hashlib
 import re
 from dataclasses import dataclass
+from typing import Any
 
 from harness.models import (
     CriterionSource,
+    RunTaskProfile,
     RunVerificationContract,
+    VerificationActivation,
     VerificationCriterion,
     VerifierKind,
 )
+from harness.task_profiles import INTENT_REGISTRY, TaskProfileClassifier
 
-_ANALYTICS_TERMS = (
-    "分析",
-    "原因",
-    "趋势",
-    "销量",
-    "收入",
-    "毛利",
-    "指标",
-    "数据",
-    "同比",
-    "环比",
-    "占比",
-    "贡献",
-)
-_ARTIFACT_TERMS = (
-    "创建",
-    "报告",
-    "模板",
-    "文档",
-    "表格",
-    "图表",
-    "文件",
-    "刷新",
-    "更新",
-    "生成",
-)
 _TIME_PATTERN = re.compile(
     r"(?:20\d{2}[-/.年]\s*\d{1,2}(?:月)?|"
     r"\d{1,2}\s*月|"
@@ -55,156 +33,387 @@ class RubricBuildContext:
     project_id: str | None = None
     custom_rules: tuple[dict, ...] = ()
     force_required: bool = False
+    task_profile: RunTaskProfile | None = None
+
+
+def _criterion(
+    criterion_id: str,
+    statement: str,
+    *,
+    source: CriterionSource,
+    verifier: VerifierKind,
+) -> VerificationCriterion:
+    return VerificationCriterion(
+        id=criterion_id,
+        statement=statement,
+        source=source,
+        verifier=verifier,
+    )
+
+
+_PACK_CRITERIA: dict[str, tuple[VerificationCriterion, ...]] = {
+    "core": (
+        _criterion(
+            "task_fulfillment",
+            "最终结果必须完成用户本次 Run 明确提出的任务，不能只给计划或声称已完成。",
+            source=CriterionSource.TASK,
+            verifier=VerifierKind.LLM_GRADER,
+        ),
+        _criterion(
+            "todo_reconciliation",
+            "若本 Run 使用了 Todo，结束时所有 Todo 必须已完成或明确取消。",
+            source=CriterionSource.MANAGED,
+            verifier=VerifierKind.DETERMINISTIC,
+        ),
+    ),
+    "web_research": (
+        _criterion(
+            "web_evidence_traceability",
+            "关键事实与结论必须能追溯到本 Run 成功完成的检索工具或知识来源。",
+            source=CriterionSource.SYSTEM,
+            verifier=VerifierKind.DETERMINISTIC,
+        ),
+    ),
+    "analytics": (
+        _criterion(
+            "metric_consistency",
+            "指标名称、计算口径、维度和结论必须前后一致；未知口径必须明确说明。",
+            source=CriterionSource.SYSTEM,
+            verifier=VerifierKind.LLM_GRADER,
+        ),
+        _criterion(
+            "analytics_evidence_traceability",
+            "关键数据与结论必须能追溯到本 Run 成功完成的查询、数据源或产物证据。",
+            source=CriterionSource.SYSTEM,
+            verifier=VerifierKind.DETERMINISTIC,
+        ),
+    ),
+    "artifact": (
+        _criterion(
+            "artifact_delivery",
+            "要求生成或更新的产物必须真实存在，并在最终回答中给出可定位的路径或引用。",
+            source=CriterionSource.TASK,
+            verifier=VerifierKind.DETERMINISTIC,
+        ),
+    ),
+    "code": (
+        _criterion(
+            "code_validation",
+            "代码修改任务必须给出并通过与改动相称的测试、构建或静态检查。",
+            source=CriterionSource.SYSTEM,
+            verifier=VerifierKind.DETERMINISTIC,
+        ),
+    ),
+}
+_PACK_ORDER = ("core", "web_research", "analytics", "artifact", "code")
 
 
 class RunRubricCompiler:
-    """Build a typed, versioned Run contract without requiring user upkeep."""
+    """Build immutable declared contracts and monotonic effective contracts."""
 
-    VERSION = "analytics-run-v1"
+    VERSION = "run-task-profile-v2"
+
+    @classmethod
+    def classify(cls, context: RubricBuildContext) -> RunTaskProfile:
+        return context.task_profile or TaskProfileClassifier.classify(
+            message=context.user_message,
+            analytics_model_id=context.analytics_model_id,
+        )
 
     @classmethod
     def should_verify(cls, context: RubricBuildContext) -> bool:
-        message = context.user_message.strip()
-        if not message:
+        if not context.user_message.strip():
             return False
-        if context.force_required:
-            return True
-        if context.analytics_model_id:
-            return True
-        return any(term in message for term in (*_ANALYTICS_TERMS, *_ARTIFACT_TERMS))
+        profile = cls.classify(context)
+        return bool(
+            context.force_required
+            or profile.initial_packs
+            or any(
+                isinstance(rule, dict)
+                and rule.get("enabled", True)
+                and str(rule.get("statement") or "").strip()
+                for rule in context.custom_rules
+            )
+        )
 
     @classmethod
     def compile(cls, context: RubricBuildContext) -> RunVerificationContract | None:
-        message = context.user_message.strip()
+        profile = cls.classify(context)
         if not cls.should_verify(context):
             return None
-
-        criteria: list[VerificationCriterion] = [
-            VerificationCriterion(
-                id="task_fulfillment",
-                statement="最终结果必须完成用户本次 Run 明确提出的任务，不能只给计划或声称已完成。",
-                source=CriterionSource.TASK,
-                verifier=VerifierKind.LLM_GRADER,
-            ),
-            VerificationCriterion(
-                id="todo_reconciliation",
-                statement="若本 Run 使用了 Todo，结束时所有 Todo 必须已完成或明确取消。",
-                source=CriterionSource.MANAGED,
-                verifier=VerifierKind.DETERMINISTIC,
-            ),
-        ]
-        analytics_task = bool(
-            context.analytics_model_id
-            or any(term in message for term in _ANALYTICS_TERMS)
+        packs = list(profile.initial_packs)
+        if "core" not in packs:
+            packs.insert(0, "core")
+        packs = cls._normalize_packs(packs)
+        criteria = cls._criteria_for(
+            packs=packs,
+            message=context.user_message,
+            custom_rules=context.custom_rules,
         )
-        artifact_task = any(term in message for term in _ARTIFACT_TERMS)
+        reasons = {
+            pack: [
+                reason
+                for reason in profile.reasons
+                if cls._reason_matches_pack(reason, pack)
+            ]
+            or ["goal_mode" if context.force_required else "task_profile"]
+            for pack in packs
+        }
+        return cls._build_contract(
+            message=context.user_message,
+            profile=profile,
+            packs=packs,
+            criteria=criteria,
+            activation_reasons=reasons,
+        )
 
-        if analytics_task:
-            criteria.extend(
-                [
-                    VerificationCriterion(
-                        id="metric_consistency",
-                        statement="指标名称、计算口径、维度和结论必须前后一致；未知口径必须明确说明。",
-                        source=CriterionSource.SYSTEM,
-                        verifier=VerifierKind.ANALYTICS,
-                    ),
-                    VerificationCriterion(
-                        id="evidence_traceability",
-                        statement="关键数据与结论必须能追溯到本 Run 的工具结果、数据源或产物证据。",
-                        source=CriterionSource.SYSTEM,
-                        verifier=VerifierKind.ANALYTICS,
-                    ),
-                ]
+    @classmethod
+    def expand_for_activations(
+        cls,
+        *,
+        contract: RunVerificationContract | None,
+        profile: RunTaskProfile,
+        message: str,
+        activations: list[VerificationActivation | dict[str, Any]],
+    ) -> RunVerificationContract | None:
+        normalized = [
+            item
+            if isinstance(item, VerificationActivation)
+            else VerificationActivation.model_validate(item)
+            for item in activations
+        ]
+        successful = [item for item in normalized if item.status == "succeeded"]
+        packs = list(contract.verification_packs if contract is not None else profile.initial_packs)
+        for activation in successful:
+            if activation.pack not in packs:
+                packs.append(activation.pack)
+        if not packs:
+            return contract
+        if "core" not in packs:
+            packs.insert(0, "core")
+        packs = cls._normalize_packs(packs)
+
+        existing_custom = []
+        if contract is not None:
+            registered_ids = {
+                criterion.id
+                for pack in _PACK_CRITERIA.values()
+                for criterion in pack
+            } | {"time_scope", "report_integrity"}
+            existing_custom = [
+                criterion.model_dump(mode="json")
+                for criterion in contract.criteria
+                if criterion.id not in registered_ids
+            ]
+        criteria = cls._criteria_for(
+            packs=packs,
+            message=message,
+            custom_rules=tuple(existing_custom),
+        )
+        reasons = {
+            key: list(values)
+            for key, values in (contract.activation_reasons if contract else {}).items()
+        }
+        for activation in successful:
+            reason = f"tool:{activation.tool_name}:{activation.tool_call_id}"
+            reasons.setdefault(activation.pack, [])
+            if reason not in reasons[activation.pack]:
+                reasons[activation.pack].append(reason)
+        for pack in packs:
+            reasons.setdefault(pack, ["task_profile"])
+        reasons = {
+            pack: sorted(dict.fromkeys(reasons.get(pack, [])))
+            for pack in packs
+        }
+
+        effective = cls._build_contract(
+            message=message,
+            profile=profile,
+            packs=packs,
+            criteria=criteria,
+            activation_reasons=reasons,
+            base_contract_id=(
+                contract.base_contract_id or contract.contract_id
+                if contract is not None
+                else None
+            ),
+        )
+        if (
+            contract is not None
+            and effective.verification_packs == contract.verification_packs
+            and effective.criteria == contract.criteria
+            and effective.activation_reasons == contract.activation_reasons
+        ):
+            return contract
+        return effective
+
+    @classmethod
+    def merge_contracts(
+        cls,
+        *,
+        base: RunVerificationContract | None,
+        expanded: RunVerificationContract | None,
+        profile: RunTaskProfile,
+        message: str,
+    ) -> RunVerificationContract | None:
+        if expanded is None:
+            return base
+        if base is None:
+            return expanded
+        synthetic = [
+            VerificationActivation(
+                activation_id=f"contract-pack-{pack}",
+                run_id="contract-merge",
+                query_id="contract-merge",
+                tool_call_id=f"contract-pack-{pack}",
+                tool_name="goal_contract",
+                pack=pack,
+                source="goal",
             )
-        if _TIME_PATTERN.search(message):
+            for pack in expanded.verification_packs
+            if pack not in base.verification_packs
+        ]
+        return cls.expand_for_activations(
+            contract=base,
+            profile=profile,
+            message=message,
+            activations=synthetic,
+        )
+
+    @classmethod
+    def _criteria_for(
+        cls,
+        *,
+        packs: list[str],
+        message: str,
+        custom_rules: tuple[dict, ...],
+    ) -> list[VerificationCriterion]:
+        criteria: list[VerificationCriterion] = []
+        seen: set[str] = set()
+        for pack in packs:
+            for configured in _PACK_CRITERIA.get(pack, ()):
+                if configured.id in seen:
+                    continue
+                criteria.append(configured.model_copy(deep=True))
+                seen.add(configured.id)
+        if _TIME_PATTERN.search(message) and (
+            "analytics" in packs or "web_research" in packs
+        ):
             criteria.append(
-                VerificationCriterion(
-                    id="time_scope",
-                    statement="必须明确并遵守用户要求的数据时间范围，不能用其他期间替代。",
+                _criterion(
+                    "time_scope",
+                    "必须明确并遵守用户要求的数据或信息时间范围，不能用其他期间替代。",
                     source=CriterionSource.USER,
-                    verifier=VerifierKind.ANALYTICS,
+                    verifier=VerifierKind.LLM_GRADER,
                 )
             )
-        if artifact_task:
+            seen.add("time_scope")
+        if "artifact" in packs and ("报告" in message or "模板" in message):
             criteria.append(
-                VerificationCriterion(
-                    id="artifact_delivery",
-                    statement="要求生成或更新的产物必须真实存在，并在最终回答中给出可定位的路径或引用。",
-                    source=CriterionSource.TASK,
-                    verifier=VerifierKind.DETERMINISTIC,
-                )
-            )
-        if "报告" in message or "模板" in message:
-            criteria.append(
-                VerificationCriterion(
-                    id="report_integrity",
-                    statement="报告的既定结构、标题、图表与正文必须保持完整，更新内容不能破坏模板。",
+                _criterion(
+                    "report_integrity",
+                    "报告的既定结构、标题、图表与正文必须保持完整，更新内容不能破坏模板。",
                     source=CriterionSource.TASK,
                     verifier=VerifierKind.LLM_GRADER,
                 )
             )
-        existing_ids = {criterion.id for criterion in criteria}
-        for index, rule in enumerate(context.custom_rules):
+            seen.add("report_integrity")
+        for index, rule in enumerate(custom_rules):
             if not isinstance(rule, dict) or not rule.get("enabled", True):
                 continue
             rule_id = str(rule.get("id") or f"custom_{index + 1}")
-            if rule_id in existing_ids:
+            if rule_id in seen:
                 continue
             statement = str(rule.get("statement") or "").strip()
             if not statement:
                 continue
-            verifier_value = str(rule.get("verifier") or "llm_grader")
             try:
-                verifier = VerifierKind(verifier_value)
+                verifier = VerifierKind(str(rule.get("verifier") or "llm_grader"))
+                source = CriterionSource(str(rule.get("source") or "settings"))
             except ValueError:
                 continue
             criteria.append(
                 VerificationCriterion(
                     id=rule_id,
                     statement=statement,
-                    source=CriterionSource.SETTINGS,
+                    source=source,
                     verifier=verifier,
                     required=bool(rule.get("required", True)),
                 )
             )
-            existing_ids.add(rule_id)
+            seen.add(rule_id)
+        return criteria
 
+    @classmethod
+    def _build_contract(
+        cls,
+        *,
+        message: str,
+        profile: RunTaskProfile,
+        packs: list[str],
+        criteria: list[VerificationCriterion],
+        activation_reasons: dict[str, list[str]],
+        base_contract_id: str | None = None,
+    ) -> RunVerificationContract:
         rubric_lines = [
-            "逐项审查以下标准；只有全部 required 标准有正面证据时才能判定 satisfied："
+            "逐项审查以下标准；每个 required 标准都必须明确返回，缺失视为未通过："
         ]
         rubric_lines.extend(
             f"- [{criterion.id}] {criterion.statement}" for criterion in criteria
+        )
+        canonical_criteria = "\n".join(
+            "|".join(
+                (
+                    criterion.id,
+                    criterion.statement,
+                    criterion.source.value,
+                    criterion.verifier.value,
+                    str(criterion.required),
+                )
+            )
+            for criterion in criteria
         )
         digest = hashlib.sha256(
             (
                 cls.VERSION
                 + "\n"
-                + message
+                + message.strip()
                 + "\n"
-                + str(context.analytics_model_id or "")
+                + "\n".join(packs)
                 + "\n"
-                + str(context.force_required)
-                + "\n"
-                + "\n".join(item.id for item in criteria)
+                + canonical_criteria
             ).encode("utf-8")
         ).hexdigest()[:20]
         return RunVerificationContract(
             contract_id=f"run-contract-{digest}",
             version=cls.VERSION,
-            task_type=cls._task_type(
-                analytics_task=analytics_task,
-                artifact_task=artifact_task,
-            ),
+            task_type=cls._task_type(packs, profile.primary_intent),
             criteria=criteria,
             rubric="\n".join(rubric_lines),
+            verification_packs=packs,
+            activation_reasons=activation_reasons,
+            base_contract_id=base_contract_id,
         )
 
     @staticmethod
-    def _task_type(*, analytics_task: bool, artifact_task: bool) -> str:
-        if analytics_task and artifact_task:
-            return "analytics_artifact"
-        if analytics_task:
-            return "analytics"
-        if artifact_task:
-            return "artifact"
-        return "general"
+    def _task_type(packs: list[str], primary_intent: str) -> str:
+        task_packs = [pack for pack in packs if pack != "core"]
+        if not task_packs:
+            return primary_intent
+        return "_".join(task_packs)
+
+    @staticmethod
+    def _reason_matches_pack(reason: str, pack: str) -> bool:
+        intent_id = reason.removeprefix("intent:")
+        definition = INTENT_REGISTRY.get(intent_id)
+        return bool(definition and pack in definition.get("packs", []))
+
+    @staticmethod
+    def _normalize_packs(packs: list[str]) -> list[str]:
+        unique = set(packs)
+        ordered = [pack for pack in _PACK_ORDER if pack in unique]
+        ordered.extend(sorted(unique - set(_PACK_ORDER)))
+        return ordered
+
+
+__all__ = ["RubricBuildContext", "RunRubricCompiler"]
