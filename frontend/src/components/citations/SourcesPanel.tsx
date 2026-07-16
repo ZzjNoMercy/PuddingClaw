@@ -10,6 +10,7 @@ import {
   Circle,
   ExternalLink,
   FileText,
+  Globe2,
   KeyRound,
   ListChecks,
   Pause,
@@ -488,10 +489,14 @@ function PermissionsCard({
         <div className="mt-4 space-y-3 pb-5">
           {grants.map((grant) => {
             const isToolAction =
-              grant.type === "tool_action" || grant.target_kind === "fingerprint";
+              grant.type === "tool_action"
+              || ["fingerprint", "network_origin", "tool_name"].includes(grant.target_kind);
             const command = String(grant.metadata?.command || "").trim();
+            const sessionTarget = String(grant.metadata?.session_target || "").trim();
             const target = isToolAction
-              ? command || `命令指纹 ${grant.target.slice(0, 20)}…`
+              ? sessionTarget
+                || command
+                || `命令指纹 ${grant.target.slice(0, 20)}…`
               : grant.target_kind === "all_external_files"
                 ? "所有外部文件"
                 : grant.target;
@@ -514,7 +519,11 @@ function PermissionsCard({
                 )[risk] || risk
               : "";
             const name = isToolAction
-              ? commandExecutable
+              ? grant.target_kind === "network_origin"
+                ? "网站访问授权"
+                : grant.target_kind === "tool_name"
+                  ? "联网搜索授权"
+                  : commandExecutable
                 ? `${commandExecutable} 命令授权`
                 : "受控命令授权"
               : grant.target_kind === "all_external_files"
@@ -525,7 +534,9 @@ function PermissionsCard({
                 <div className="flex items-start gap-2.5">
                   <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[#002fa7]/10 text-[#002fa7]">
                     {isToolAction
-                      ? <SquareTerminal className="h-4 w-4" />
+                      ? grant.target_kind === "network_origin" || grant.target_kind === "tool_name"
+                        ? <Globe2 className="h-4 w-4" />
+                        : <SquareTerminal className="h-4 w-4" />
                       : <KeyRound className="h-4 w-4" />}
                   </div>
                   <div className="min-w-0 flex-1">
@@ -565,7 +576,11 @@ function PermissionsCard({
                       {isToolAction ? (
                         <>
                           <span className="rounded-full bg-blue-50 px-2 py-0.5 text-[10px] font-medium text-blue-700">
-                            命令执行
+                            {grant.target_kind === "network_origin"
+                              ? "网站访问"
+                              : grant.target_kind === "tool_name"
+                                ? "联网搜索"
+                                : "命令执行"}
                           </span>
                           {riskLabel && (
                             <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700">

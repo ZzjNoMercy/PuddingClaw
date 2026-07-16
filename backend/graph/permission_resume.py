@@ -90,6 +90,9 @@ class PermissionResumeRegistry:
         command: str,
         reason: str,
         risk: str,
+        session_target_kind: str | None = None,
+        session_target: str | None = None,
+        session_scope_label: str | None = None,
     ) -> dict[str, Any]:
         fingerprint = self.tool_action_fingerprint(
             tool_name=tool_name,
@@ -114,6 +117,11 @@ class PermissionResumeRegistry:
             "created_at": time.time(),
             "options": ["once", "session"],
         }
+        if session_target_kind and session_target:
+            request["session_target_kind"] = session_target_kind
+            request["session_target"] = session_target
+        if session_scope_label:
+            request["session_scope_label"] = session_scope_label
         self._requests[request_id] = request
         self._pending[request_id] = asyncio.get_running_loop().create_future()
         return dict(request)

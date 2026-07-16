@@ -166,20 +166,31 @@ async def grant_tool_action_permission(
     fingerprint = str(pending.get("fingerprint") or "")
     if not fingerprint:
         raise HTTPException(status_code=400, detail="permission fingerprint missing")
+    session_target_kind = str(pending.get("session_target_kind") or "")
+    session_target = str(pending.get("session_target") or "")
+    use_reusable_scope = (
+        req.scope == "session" and session_target_kind and session_target
+    )
+    target_kind = session_target_kind if use_reusable_scope else "fingerprint"
+    target = session_target if use_reusable_scope else fingerprint
+    metadata = {
+        "tool_name": pending.get("tool_name"),
+        "command": pending.get("command"),
+        "reason": pending.get("reason"),
+        "risk": pending.get("risk"),
+    }
+    if use_reusable_scope:
+        metadata["session_scope_label"] = pending.get("session_scope_label")
+        metadata["session_target"] = session_target
     grant = session_manager.add_permission_grant(
         session_id,
         grant_type="tool_action",
-        target_kind="fingerprint",
-        target=fingerprint,
+        target_kind=target_kind,
+        target=target,
         capabilities=["execute"],
         scope=req.scope,
         source="user",
-        metadata={
-            "tool_name": pending.get("tool_name"),
-            "command": pending.get("command"),
-            "reason": pending.get("reason"),
-            "risk": pending.get("risk"),
-        },
+        metadata=metadata,
     )
     resumed = permission_resume_registry.resolve(
         req.permission_request_id,

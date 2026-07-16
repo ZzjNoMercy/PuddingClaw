@@ -1872,6 +1872,9 @@ class SessionManager:
         self,
         session_id: str,
         fingerprint: str,
+        *,
+        session_target_kind: str | None = None,
+        session_target: str | None = None,
     ) -> bool:
         """Consume a matching once/session grant for one managed Tool action."""
 
@@ -1885,10 +1888,21 @@ class SessionManager:
                 not isinstance(grant, dict)
                 or grant.get("revoked_at")
                 or grant.get("type") != "tool_action"
-                or grant.get("target_kind") != "fingerprint"
-                or grant.get("target") != fingerprint
                 or "execute" not in (grant.get("capabilities") or [])
             ):
+                continue
+            exact_match = (
+                grant.get("target_kind") == "fingerprint"
+                and grant.get("target") == fingerprint
+            )
+            reusable_session_match = (
+                grant.get("scope") == "session"
+                and session_target_kind
+                and session_target
+                and grant.get("target_kind") == session_target_kind
+                and grant.get("target") == session_target
+            )
+            if not exact_match and not reusable_session_match:
                 continue
             if grant.get("scope") == "once":
                 grant["revoked_at"] = time.time()

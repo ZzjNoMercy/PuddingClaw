@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ToolCallRequest
@@ -605,7 +606,15 @@ class ToolExecutionPipeline(AgentMiddleware):
             command=command,
             reason=result.reason,
         )
-        if session_manager.consume_tool_action_permission(session_id, fingerprint):
+        session_scope = self._session_grant_scope(request)
+        if session_manager.consume_tool_action_permission(
+            session_id,
+            fingerprint,
+            session_target_kind=(
+                str(session_scope["target_kind"]) if session_scope else None
+            ),
+            session_target=str(session_scope["target"]) if session_scope else None,
+        ):
             return await handler(request)
         preview = permission_resume_registry.create_tool_action_request(
             session_id=session_id,
@@ -615,6 +624,13 @@ class ToolExecutionPipeline(AgentMiddleware):
             command=command,
             reason=result.reason,
             risk=result.risk,
+            session_target_kind=(
+                str(session_scope["target_kind"]) if session_scope else None
+            ),
+            session_target=str(session_scope["target"]) if session_scope else None,
+            session_scope_label=(
+                str(session_scope["label"]) if session_scope else None
+            ),
         )
         interrupt(
             {
@@ -689,6 +705,46 @@ class ToolExecutionPipeline(AgentMiddleware):
         except (TypeError, ValueError):
             rendered = str(args)
         return rendered[:4000]
+
+    @classmethod
+    def _session_grant_scope(
+        cls,
+        request: ToolCallRequest,
+    ) -> dict[str, str] | None:
+        """Return the narrow reusable scope for a Session-level approval."""
+
+        tool_name = str(request.tool_call.get("name") or "")
+        if tool_name == "tavily_search":
+            return {
+                "target_kind": "tool_name",
+                "target": tool_name,
+                "label": "本 Session 允许联网搜索",
+            }
+        if tool_name != "fetch_url":
+            return None
+
+        args = request.tool_call.get("args") or {}
+        raw_url = str(args.get("url") or "").strip()
+        try:
+            parsed = urlsplit(raw_url)
+            scheme = parsed.scheme.lower()
+            hostname = (parsed.hostname or "").lower()
+            port = parsed.port
+        except ValueError:
+            return None
+        if scheme not in {"http", "https"} or not hostname:
+            return None
+
+        default_port = 80 if scheme == "http" else 443
+        host = f"[{hostname}]" if ":" in hostname else hostname
+        origin = f"{scheme}://{host}"
+        if port is not None and port != default_port:
+            origin += f":{port}"
+        return {
+            "target_kind": "network_origin",
+            "target": origin,
+            "label": f"本 Session 允许访问 {origin}",
+        }
 
     @staticmethod
     def _denied_message(

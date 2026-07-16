@@ -3,7 +3,7 @@
 import { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
-import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Database, FileSpreadsheet, FileText, Key, KeyRound, Layers3, PauseCircle, Plus, Sparkles, SquareTerminal, Trash2 } from "lucide-react";
+import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Database, FileSpreadsheet, FileText, Globe2, Key, KeyRound, Layers3, PauseCircle, Plus, Sparkles, SquareTerminal, Trash2 } from "lucide-react";
 import { denyPermissionRequest, grantExternalFilePermission, grantToolActionPermission, openLocalFile, resolveDatabaseSqlRevisionRequest, resolveDimensionBuildRuleRequest, resolveLogicalDatasetRuleRequest, type AgentAttachment, type DatabaseSqlRevisionRequest, type DimensionBuildRuleRequest, type LogicalDatasetRuleRequest, type PermissionRequest } from "@/lib/api";
 import { markdownRemarkPlugins, markdownUrlTransform } from "@/lib/markdown";
 import { useApp, type ChatMessage as ChatMessageType, type SourceRecord, type TimelineItem } from "@/lib/store";
@@ -401,6 +401,14 @@ function ToolActionPermissionCard({
 }) {
   const [status, setStatus] = useState<"idle" | "loading" | "granted" | "denied" | "error">("idle");
   const [error, setError] = useState("");
+  const isFetchUrl = request.tool_name === "fetch_url";
+  const isSearch = request.tool_name === "tavily_search";
+  const isNetworkTool = isFetchUrl || isSearch;
+  const title = isFetchUrl
+    ? "允许访问网站"
+    : isSearch
+      ? "允许联网搜索"
+      : "允许执行受控命令";
 
   const grant = async (scope: "once" | "session") => {
     setStatus("loading");
@@ -437,11 +445,13 @@ function ToolActionPermissionCard({
         <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-amber-100 text-amber-700">
           {status === "granted"
             ? <CheckCircle2 className="h-5 w-5" />
-            : <SquareTerminal className="h-5 w-5" />}
+            : isNetworkTool
+              ? <Globe2 className="h-5 w-5" />
+              : <SquareTerminal className="h-5 w-5" />}
         </div>
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
-            <h3 className="text-[15px] font-bold text-slate-950">允许执行受控命令</h3>
+            <h3 className="text-[15px] font-bold text-slate-950">{title}</h3>
             <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-800">
               {request.risk || "managed"}
             </span>
@@ -466,7 +476,7 @@ function ToolActionPermissionCard({
                 onClick={() => void grant("session")}
                 className="rounded-full bg-white px-3.5 py-2 text-[12px] font-semibold text-slate-700 ring-1 ring-black/[0.08] hover:bg-slate-50"
               >
-                本 Session 允许相同命令
+                {request.session_scope_label || "本 Session 允许相同命令"}
               </button>
               <button
                 type="button"

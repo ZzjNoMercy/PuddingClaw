@@ -168,6 +168,55 @@ def test_network_tool_requires_hitl_and_fingerprints_arguments(tmp_path):
     assert "example.com/private" in pipeline._action_preview(request)
 
 
+@pytest.mark.parametrize(
+    ("url", "target"),
+    [
+        ("https://Example.com/private?token=1", "https://example.com"),
+        ("https://example.com:443/other", "https://example.com"),
+        ("http://example.com:80/report", "http://example.com"),
+        ("https://example.com:8443/report", "https://example.com:8443"),
+        ("https://[2001:db8::1]/report", "https://[2001:db8::1]"),
+    ],
+)
+def test_fetch_url_session_scope_uses_normalized_origin(tmp_path, url, target):
+    request = ToolCallRequest(
+        tool_call={
+            "id": "call-1",
+            "name": "fetch_url",
+            "args": {"url": url},
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+
+    scope = ToolExecutionPipeline._session_grant_scope(request)
+
+    assert scope is not None
+    assert scope["target_kind"] == "network_origin"
+    assert scope["target"] == target
+    assert scope["label"] == f"本 Session 允许访问 {target}"
+
+
+def test_search_session_scope_reuses_network_search_tool(tmp_path):
+    request = ToolCallRequest(
+        tool_call={
+            "id": "call-1",
+            "name": "tavily_search",
+            "args": {"query": "first query"},
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+
+    assert ToolExecutionPipeline._session_grant_scope(request) == {
+        "target_kind": "tool_name",
+        "target": "tavily_search",
+        "label": "本 Session 允许联网搜索",
+    }
+
+
 def test_tool_action_fingerprint_preserves_semantic_whitespace():
     first = PermissionResumeRegistry.tool_action_fingerprint(
         tool_name="execute",
@@ -225,6 +274,39 @@ def test_session_tool_grant_remains_available(tmp_path):
 
     assert sessions.consume_tool_action_permission("session-1", fingerprint) is True
     assert sessions.consume_tool_action_permission("session-1", fingerprint) is True
+
+
+def test_network_origin_session_grant_reuses_paths_but_not_other_origins(tmp_path):
+    sessions = SessionManager()
+    sessions.initialize(tmp_path)
+    sessions.create_session("session-1")
+    sessions.add_permission_grant(
+        "session-1",
+        grant_type="tool_action",
+        target_kind="network_origin",
+        target="https://example.com",
+        capabilities=["execute"],
+        scope="session",
+    )
+
+    assert sessions.consume_tool_action_permission(
+        "session-1",
+        "sha256:first-path",
+        session_target_kind="network_origin",
+        session_target="https://example.com",
+    )
+    assert sessions.consume_tool_action_permission(
+        "session-1",
+        "sha256:second-path",
+        session_target_kind="network_origin",
+        session_target="https://example.com",
+    )
+    assert not sessions.consume_tool_action_permission(
+        "session-1",
+        "sha256:other-origin",
+        session_target_kind="network_origin",
+        session_target="https://api.example.com",
+    )
 
 
 def test_restricted_host_backend_has_sanitized_environment(tmp_path):

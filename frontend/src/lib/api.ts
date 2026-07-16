@@ -2257,6 +2257,8 @@ export interface PermissionGrant {
     command?: string;
     reason?: string;
     risk?: string;
+    session_scope_label?: string;
+    session_target?: string;
   };
 }
 
@@ -2275,6 +2277,9 @@ export interface PermissionRequest {
   reason?: string;
   risk?: string;
   fingerprint?: string;
+  session_target_kind?: string;
+  session_target?: string;
+  session_scope_label?: string;
   options?: string[];
   change_preview?: Record<string, string>;
   status?: string;

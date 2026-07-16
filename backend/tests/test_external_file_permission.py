@@ -527,6 +527,103 @@ def test_tool_action_grant_cannot_be_replayed(tmp_path):
     loop.close()
 
 
+def test_fetch_url_session_grant_persists_network_origin(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from app import app
+    from graph.permission_resume import permission_resume_registry
+    from graph.session_manager import session_manager
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("fetch-url-session")
+    loop = asyncio.new_event_loop()
+    future = loop.create_future()
+    request_id = "perm-req-fetch-url"
+    permission_resume_registry._pending[request_id] = future
+    permission_resume_registry._requests[request_id] = {
+        "id": request_id,
+        "type": "tool_action",
+        "session_id": "fetch-url-session",
+        "status": "pending",
+        "fingerprint": "sha256:exact-url",
+        "tool_name": "fetch_url",
+        "command": '{"url": "https://example.com/report?month=1"}',
+        "reason": "network_access:fetch_url",
+        "risk": "network",
+        "session_target_kind": "network_origin",
+        "session_target": "https://example.com",
+        "session_scope_label": "本 Session 允许访问 example.com",
+    }
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/sessions/fetch-url-session/permissions/tool-actions",
+        json={"permission_request_id": request_id, "scope": "session"},
+    )
+
+    assert response.status_code == 200
+    grant = response.json()["grant"]
+    assert grant["target_kind"] == "network_origin"
+    assert grant["target"] == "https://example.com"
+    assert grant["scope"] == "session"
+    assert grant["metadata"]["session_target"] == "https://example.com"
+    assert session_manager.consume_tool_action_permission(
+        "fetch-url-session",
+        "sha256:different-query",
+        session_target_kind="network_origin",
+        session_target="https://example.com",
+    )
+    assert not session_manager.consume_tool_action_permission(
+        "fetch-url-session",
+        "sha256:different-domain",
+        session_target_kind="network_origin",
+        session_target="https://other.example.com",
+    )
+    loop.close()
+
+
+def test_fetch_url_once_grant_stays_exact_fingerprint(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from app import app
+    from graph.permission_resume import permission_resume_registry
+    from graph.session_manager import session_manager
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("fetch-url-once-session")
+    loop = asyncio.new_event_loop()
+    request_id = "perm-req-fetch-url-once"
+    permission_resume_registry._pending[request_id] = loop.create_future()
+    permission_resume_registry._requests[request_id] = {
+        "id": request_id,
+        "type": "tool_action",
+        "session_id": "fetch-url-once-session",
+        "status": "pending",
+        "fingerprint": "sha256:exact-url",
+        "tool_name": "fetch_url",
+        "command": '{"url": "https://example.com/report?month=1"}',
+        "reason": "network_access:fetch_url",
+        "risk": "network",
+        "session_target_kind": "network_origin",
+        "session_target": "https://example.com",
+        "session_scope_label": "本 Session 允许访问 example.com",
+    }
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/sessions/fetch-url-once-session/permissions/tool-actions",
+        json={"permission_request_id": request_id, "scope": "once"},
+    )
+
+    assert response.status_code == 200
+    grant = response.json()["grant"]
+    assert grant["target_kind"] == "fingerprint"
+    assert grant["target"] == "sha256:exact-url"
+    assert grant["scope"] == "once"
+    assert "session_target" not in grant["metadata"]
+    loop.close()
+
+
 def test_permission_api_grants_exact_external_write_from_pending_request(tmp_path):
     from fastapi.testclient import TestClient
 
