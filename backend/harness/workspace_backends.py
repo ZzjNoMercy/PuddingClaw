@@ -17,6 +17,14 @@ from typing import Any
 from deepagents.backends import FilesystemBackend
 from deepagents.backends.protocol import ExecuteResponse, SandboxBackendProtocol
 
+from harness.dependency_setup import (
+    WorkspaceDependencyPlan,
+    detect_workspace_dependency_plan,
+)
+
+DEFAULT_SANDBOX_IMAGE = "puddingclaw/sandbox:python3.12-node22-v2"
+RUNTIME_CONTRACT = "python3.12+node22-v2"
+
 
 def _bounded_output(
     stdout: str,
@@ -177,6 +185,39 @@ class ProjectSandboxManager:
             env=self._env(),
         )
 
+    def ensure_image(self, image: str) -> None:
+        inspected = self._run(["image", "inspect", image])
+        if inspected.returncode == 0:
+            return
+        if image == DEFAULT_SANDBOX_IMAGE:
+            docker_dir = Path(__file__).resolve().parent / "docker"
+            built = self._run(
+                [
+                    "build",
+                    "--pull",
+                    "--tag",
+                    image,
+                    "--file",
+                    str(docker_dir / "Dockerfile"),
+                    str(docker_dir),
+                ],
+                timeout=900,
+            )
+            if built.returncode != 0:
+                raise RuntimeError(
+                    built.stderr.strip()
+                    or built.stdout.strip()
+                    or "failed to build PuddingClaw sandbox image"
+                )
+            return
+        pulled = self._run(["pull", image], timeout=900)
+        if pulled.returncode != 0:
+            raise RuntimeError(
+                pulled.stderr.strip()
+                or pulled.stdout.strip()
+                or f"failed to pull Docker image {image}"
+            )
+
     def probe(self) -> tuple[bool, str]:
         try:
             result = self._run(["version", "--format", "{{.Server.Version}}"])
@@ -191,16 +232,101 @@ class ProjectSandboxManager:
         digest = hashlib.sha256(str(workspace).encode("utf-8")).hexdigest()[:16]
         return f"puddingclaw-{digest}"
 
+    @staticmethod
+    def _dependency_volume_name(
+        workspace: Path,
+        *,
+        ecosystem: str,
+        working_directory: str,
+        image: str,
+    ) -> str:
+        digest = hashlib.sha256(
+            (
+                f"{workspace}:{ecosystem}:{working_directory}:"
+                f"{image}:{RUNTIME_CONTRACT}"
+            ).encode()
+        ).hexdigest()[:20]
+        return f"puddingclaw-deps-{ecosystem}-{digest}"
+
+    @staticmethod
+    def _runtime_home_volume_name(workspace: Path, *, image: str) -> str:
+        digest = hashlib.sha256(
+            f"{workspace}:{image}:{RUNTIME_CONTRACT}".encode()
+        ).hexdigest()[:20]
+        return f"puddingclaw-runtime-home-{digest}"
+
+    def _initialize_dependency_volume(
+        self,
+        *,
+        image: str,
+        volume_name: str,
+        uid: int | None,
+        gid: int | None,
+    ) -> None:
+        if uid is None or gid is None:
+            return
+        initialized = self._run(
+            [
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--user",
+                "0:0",
+                "--mount",
+                f"type=volume,src={volume_name},dst=/runtime",
+                "--entrypoint",
+                "sh",
+                image,
+                "-c",
+                f"mkdir -p /runtime && chown {uid}:{gid} /runtime",
+            ],
+            timeout=120,
+        )
+        if initialized.returncode != 0:
+            raise RuntimeError(
+                initialized.stderr.strip()
+                or initialized.stdout.strip()
+                or "failed to initialize dependency volume ownership"
+            )
+
+    def dependency_plan(self, workspace: Path) -> WorkspaceDependencyPlan | None:
+        return detect_workspace_dependency_plan(
+            workspace,
+            enabled=bool(self.config.get("dependency_setup_enabled", False)),
+        )
+
     def _spec(self, workspace: Path) -> dict[str, Any]:
+        plan = self.dependency_plan(workspace)
+        readonly_mounts = []
+        for item in self.config.get("_managed_readonly_mounts") or []:
+            if not isinstance(item, dict):
+                continue
+            source = Path(str(item.get("source") or "")).expanduser().resolve()
+            target = str(item.get("target") or "")
+            if source.is_dir() and target in {"/skills"}:
+                readonly_mounts.append(
+                    {
+                        "source": str(source),
+                        "target": target,
+                    }
+                )
         return {
             "workspace": str(workspace),
-            "image": str(self.config.get("image") or "python:3.12-slim"),
+            "image": str(self.config.get("image") or DEFAULT_SANDBOX_IMAGE),
             "network_enabled": bool(self.config.get("network_enabled", False)),
             "cpu_limit": str(self.config.get("cpu_limit") or "2"),
             "memory_limit_mb": int(self.config.get("memory_limit_mb") or 2048),
             "pids_limit": int(self.config.get("pids_limit") or 256),
             "uid": os.getuid() if hasattr(os, "getuid") else None,
             "gid": os.getgid() if hasattr(os, "getgid") else None,
+            "runtime_contract": RUNTIME_CONTRACT,
+            "readonly_mounts": readonly_mounts,
+            "runtime_mounts": (
+                [item.to_dict() for item in plan.runtime_mounts]
+                if plan is not None
+                else []
+            ),
         }
 
     def ensure_container(self, workspace: Path) -> tuple[str, str]:
@@ -211,6 +337,7 @@ class ProjectSandboxManager:
             json.dumps(spec, sort_keys=True).encode("utf-8")
         ).hexdigest()
         with self._lock(name):
+            self.ensure_image(spec["image"])
             inspect = self._run(
                 [
                     "inspect",
@@ -228,6 +355,7 @@ class ProjectSandboxManager:
                             removed.stderr.strip() or "failed to replace Docker sandbox"
                         )
                 elif running.strip().lower() == "true":
+                    self._validate_runtime(name)
                     self.mark_activity(name)
                     return name, spec_hash
                 else:
@@ -236,9 +364,98 @@ class ProjectSandboxManager:
                         raise RuntimeError(
                             started.stderr.strip() or "failed to start Docker sandbox"
                         )
+                    self._validate_runtime(name)
                     self.mark_activity(name)
                     return name, spec_hash
 
+            runtime_mount_args: list[str] = []
+            runtime_home_volume = self._runtime_home_volume_name(
+                workspace,
+                image=spec["image"],
+            )
+            runtime_home = self._run(
+                [
+                    "volume",
+                    "create",
+                    "--label",
+                    "com.puddingclaw.managed=true",
+                    "--label",
+                    f"com.puddingclaw.workspace={name}",
+                    runtime_home_volume,
+                ]
+            )
+            if runtime_home.returncode != 0:
+                raise RuntimeError(
+                    runtime_home.stderr.strip()
+                    or runtime_home.stdout.strip()
+                    or "failed to create sandbox runtime-home volume"
+                )
+            self._initialize_dependency_volume(
+                image=spec["image"],
+                volume_name=runtime_home_volume,
+                uid=spec["uid"],
+                gid=spec["gid"],
+            )
+            runtime_mount_args.extend(
+                [
+                    "--mount",
+                    (
+                        f"type=volume,src={runtime_home_volume},"
+                        "dst=/home/puddingclaw"
+                    ),
+                ]
+            )
+            for mount in spec["runtime_mounts"]:
+                volume_name = self._dependency_volume_name(
+                    workspace,
+                    ecosystem=str(mount["ecosystem"]),
+                    working_directory=str(mount["working_directory"]),
+                    image=spec["image"],
+                )
+                volume = self._run(
+                    [
+                        "volume",
+                        "create",
+                        "--label",
+                        "com.puddingclaw.managed=true",
+                        "--label",
+                        f"com.puddingclaw.workspace={name}",
+                        volume_name,
+                    ]
+                )
+                if volume.returncode != 0:
+                    raise RuntimeError(
+                        volume.stderr.strip()
+                        or volume.stdout.strip()
+                        or "failed to create dependency volume"
+                    )
+                self._initialize_dependency_volume(
+                    image=spec["image"],
+                    volume_name=volume_name,
+                    uid=spec["uid"],
+                    gid=spec["gid"],
+                )
+                relative = str(mount["working_directory"])
+                project_dir = "/workspace" if relative == "." else f"/workspace/{relative}"
+                runtime_mount_args.extend(
+                    [
+                        "--mount",
+                        (
+                            f"type=volume,src={volume_name},"
+                            f"dst={project_dir}/{mount['target_name']}"
+                        ),
+                    ]
+                )
+            for mount in spec["readonly_mounts"]:
+                runtime_mount_args.extend(
+                    [
+                        "--mount",
+                        (
+                            f"type=bind,src={mount['source']},"
+                            f"dst={mount['target']},readonly"
+                        ),
+                    ]
+                )
             create_args = [
                 "create",
                 "--name",
@@ -251,6 +468,7 @@ class ProjectSandboxManager:
                 "/workspace",
                 "--mount",
                 f"type=bind,src={workspace},dst=/workspace",
+                *runtime_mount_args,
                 "--cap-drop",
                 "ALL",
                 "--security-opt",
@@ -263,6 +481,28 @@ class ProjectSandboxManager:
                 spec["cpu_limit"],
                 "--network",
                 "bridge" if spec["network_enabled"] else "none",
+                "--env",
+                "HOME=/home/puddingclaw",
+                "--env",
+                "XDG_CACHE_HOME=/home/puddingclaw/.cache",
+                "--env",
+                "PIP_CACHE_DIR=/home/puddingclaw/.cache/pip",
+                "--env",
+                "UV_CACHE_DIR=/home/puddingclaw/.cache/uv",
+                "--env",
+                "npm_config_cache=/home/puddingclaw/.cache/npm",
+                "--env",
+                "PYTHONUSERBASE=/home/puddingclaw/.local",
+                "--env",
+                "npm_config_prefix=/home/puddingclaw/.npm-global",
+                "--env",
+                (
+                    "PATH=/home/puddingclaw/.local/bin:"
+                    "/home/puddingclaw/.npm-global/bin:"
+                    "/usr/local/bin:/usr/bin:/bin"
+                ),
+                "--env",
+                "NODE_PATH=/home/puddingclaw/.npm-global/lib/node_modules",
             ]
             if spec["uid"] is not None and spec["gid"] is not None:
                 create_args.extend(["--user", f"{spec['uid']}:{spec['gid']}"])
@@ -270,8 +510,12 @@ class ProjectSandboxManager:
                 [
                     spec["image"],
                     "sh",
-                    "-lc",
-                    "trap : TERM INT; sleep infinity & wait",
+                    "-c",
+                    (
+                        "mkdir -p \"$HOME\" \"$XDG_CACHE_HOME\" \"$PIP_CACHE_DIR\" "
+                        "\"$UV_CACHE_DIR\" \"$npm_config_cache\"; "
+                        "trap : TERM INT; sleep infinity & wait"
+                    ),
                 ]
             )
             created = self._run(create_args, timeout=120)
@@ -286,8 +530,32 @@ class ProjectSandboxManager:
                 raise RuntimeError(
                     started.stderr.strip() or "failed to start Docker sandbox"
                 )
+            try:
+                self._validate_runtime(name)
+            except Exception:
+                self._run(["rm", "-f", name])
+                raise
             self.mark_activity(name)
             return name, spec_hash
+
+    def _validate_runtime(self, container_name: str) -> None:
+        result = self._run(
+            [
+                "exec",
+                container_name,
+                "sh",
+                "-c",
+                (
+                    "python3 --version >/dev/null 2>&1 "
+                    "&& node --version >/dev/null 2>&1"
+                ),
+            ]
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                "Docker sandbox image must provide both python3 and node. "
+                + (result.stderr.strip() or result.stdout.strip())
+            )
 
     def mark_activity(self, container_name: str) -> None:
         """Re-arm the project container's idle-stop timer after use."""
@@ -350,6 +618,7 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         self.manager = manager
         self._default_timeout = timeout
         self._max_output_bytes = max_output_bytes
+        self.dependency_plan = manager.dependency_plan(self.workspace_path)
         self.container_name, self.spec_hash = manager.ensure_container(
             self.workspace_path
         )
@@ -375,19 +644,98 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
                 self.container_name, self.spec_hash = self.manager.ensure_container(
                     self.workspace_path
                 )
-                result = self.manager._run(
-                    [
-                        "exec",
-                        "--workdir",
-                        "/workspace",
-                        self.container_name,
-                        "sh",
-                        "-lc",
-                        command,
-                    ],
-                    timeout=effective_timeout,
-                )
-                self.manager.mark_activity(self.container_name)
+                temporary_network = False
+                cleanup_error = ""
+                from harness.tool_execution import ShellPolicyAnalyzer
+
+                if (
+                    not bool(self.manager.config.get("network_enabled", False))
+                    and ShellPolicyAnalyzer.requires_network(command)
+                ):
+                    isolated = self.manager._run(
+                        ["network", "disconnect", "none", self.container_name]
+                    )
+                    if isolated.returncode != 0:
+                        return ExecuteResponse(
+                            output=(
+                                "Error: approved command requires temporary Docker "
+                                "network access, but the sandbox could not leave "
+                                "the none network: "
+                                + (
+                                    isolated.stderr.strip()
+                                    or isolated.stdout.strip()
+                                )
+                            ),
+                            exit_code=1,
+                        )
+                    connected = self.manager._run(
+                        ["network", "connect", "bridge", self.container_name]
+                    )
+                    if connected.returncode != 0:
+                        restored = self.manager._run(
+                            ["network", "connect", "none", self.container_name]
+                        )
+                        if restored.returncode != 0:
+                            self.manager._run(["rm", "-f", self.container_name])
+                        return ExecuteResponse(
+                            output=(
+                                "Error: approved command requires temporary Docker "
+                                "network access, but bridge attachment failed: "
+                                + (
+                                    connected.stderr.strip()
+                                    or connected.stdout.strip()
+                                )
+                            ),
+                            exit_code=1,
+                        )
+                    temporary_network = True
+                try:
+                    result = self.manager._run(
+                        [
+                            "exec",
+                            "--workdir",
+                            "/workspace",
+                            self.container_name,
+                            "sh",
+                            "-c",
+                            command,
+                        ],
+                        timeout=effective_timeout,
+                    )
+                finally:
+                    if temporary_network:
+                        disconnected = self.manager._run(
+                            [
+                                "network",
+                                "disconnect",
+                                "--force",
+                                "bridge",
+                                self.container_name,
+                            ]
+                        )
+                        restored = self.manager._run(
+                            ["network", "connect", "none", self.container_name]
+                        )
+                        cleanup_errors: list[str] = []
+                        if disconnected.returncode != 0:
+                            cleanup_errors.append(
+                                disconnected.stderr.strip()
+                                or disconnected.stdout.strip()
+                                or "bridge disconnect failed"
+                            )
+                        if restored.returncode != 0:
+                            cleanup_errors.append(
+                                restored.stderr.strip()
+                                or restored.stdout.strip()
+                                or "none network restore failed"
+                            )
+                        if cleanup_errors:
+                            cleanup_error = "; ".join(cleanup_errors)
+                            # Fail closed: discard the container instead of
+                            # leaving it with network access after the grant.
+                            self.manager._run(["rm", "-f", self.container_name])
+                    if not cleanup_error:
+                        self.manager.mark_activity(self.container_name)
             output, truncated = _bounded_output(
                 result.stdout,
                 result.stderr,
@@ -395,6 +743,17 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
             )
             if result.returncode != 0:
                 output = f"{output.rstrip()}\n\nExit code: {result.returncode}"
+            if cleanup_error:
+                output = (
+                    f"{output.rstrip()}\n\n"
+                    "Security cleanup: container was removed because temporary "
+                    f"network detachment failed: {cleanup_error}"
+                )
+                return ExecuteResponse(
+                    output=output,
+                    exit_code=1,
+                    truncated=truncated,
+                )
             return ExecuteResponse(
                 output=output,
                 exit_code=result.returncode,
@@ -417,6 +776,7 @@ class WorkspaceBackendSelection:
     backend: RestrictedHostWorkspaceBackend | DockerWorkspaceBackend
     mode: str
     fallback_reason: str | None = None
+    dependency_plan: WorkspaceDependencyPlan | None = None
 
 
 def build_workspace_execution_backend(
@@ -432,14 +792,19 @@ def build_workspace_execution_backend(
         manager = ProjectSandboxManager(docker_config)
         available, reason = manager.probe()
         if available:
-            return WorkspaceBackendSelection(
-                backend=DockerWorkspaceBackend(
+            try:
+                backend = DockerWorkspaceBackend(
                     root_dir=workspace_path,
                     manager=manager,
                     timeout=timeout,
-                ),
-                mode="docker",
-            )
+                )
+                return WorkspaceBackendSelection(
+                    backend=backend,
+                    mode="docker",
+                    dependency_plan=backend.dependency_plan,
+                )
+            except Exception as exc:
+                reason = f"{type(exc).__name__}: {exc}"
         if str(terminal_config.get("on_unavailable") or "fallback") == "deny":
             raise RuntimeError(f"Docker sandbox is unavailable: {reason}")
         return WorkspaceBackendSelection(

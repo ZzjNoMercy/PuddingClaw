@@ -27,8 +27,8 @@ from deepagents import (
 from deepagents.backends import CompositeBackend, FilesystemBackend
 from deepagents.middleware.memory import MemoryMiddleware
 from deepagents.middleware.rubric import GraderResponse
-from deepagents.middleware.summarization import SummarizationMiddleware as DeepAgentsSummarizationMiddleware
 from deepagents.middleware.subagents import SubAgent
+from deepagents.middleware.summarization import SummarizationMiddleware as DeepAgentsSummarizationMiddleware
 from langchain.agents.middleware import AgentMiddleware, ModelCallLimitMiddleware
 from langchain.agents.middleware.model_call_limit import (
     ModelCallLimitExceededError,
@@ -63,19 +63,21 @@ from graph.dimension_build_resume import dimension_build_resume_registry
 from graph.logical_dataset_resume import logical_dataset_resume_registry
 from graph.managed_paths import is_managed_resource_path
 from graph.middleware_trace_proxy import wrap_middlewares_for_trace
-from graph.middlewares.skill_intent_router import SkillIntentRouterMiddleware
 from graph.middlewares.semantic_assets import SemanticAssetsMiddleware
-from graph.middlewares.toolset import ToolsetMiddleware, discover_skill_toolsets
+from graph.middlewares.skill_intent_router import SkillIntentRouterMiddleware
 from graph.middlewares.tool_context_compaction import (
     CONTEXT_METHOD_ARTIFACT_KEY,
     CONTEXT_OUTPUT_ARTIFACT_KEY,
     CONTEXT_POLICY_ARTIFACT_KEY,
-    POLICY_VERSION as TOOL_CONTEXT_POLICY_VERSION,
     RAW_OUTPUT_ARTIFACT_KEY,
     ToolContextCompactionMiddleware,
     ToolContextConfig,
     tool_context_compaction_service,
 )
+from graph.middlewares.tool_context_compaction import (
+    POLICY_VERSION as TOOL_CONTEXT_POLICY_VERSION,
+)
+from graph.middlewares.toolset import ToolsetMiddleware, discover_skill_toolsets
 from graph.middlewares.workspace_path_router import WorkspacePathRouterMiddleware
 from graph.permission_middleware import ExternalFilePermissionMiddleware
 from graph.permission_resume import permission_resume_registry
@@ -84,6 +86,7 @@ from graph.session_manager import session_manager
 from graph.tool_result_adapter import tool_result_adapter
 from graph.trace_collector import TraceCollector, TraceSpan
 from harness.coordinators import HarnessRunCoordinator
+from harness.dependency_setup import dependency_plan_prompt
 from harness.deterministic_checks import evaluate_deterministic_criteria
 from harness.models import (
     GoalRecord,
@@ -869,6 +872,18 @@ class DeepAgentsAgentManager:
         terminal_config = (
             config.load_config().get("harness", {}).get("terminal", {})
         )
+        terminal_config = {
+            **terminal_config,
+            "docker": {
+                **dict(terminal_config.get("docker") or {}),
+                "_managed_readonly_mounts": [
+                    {
+                        "source": str(skills_dir.resolve()),
+                        "target": "/skills",
+                    }
+                ],
+            },
+        }
         selection = build_workspace_execution_backend(
             workspace_path,
             terminal_config,
@@ -893,6 +908,7 @@ class DeepAgentsAgentManager:
         backend.execution_mode = selection.mode
         backend.execution_backend_id = workspace_backend.id
         backend.execution_fallback_reason = selection.fallback_reason
+        backend.execution_dependency_plan = selection.dependency_plan
         return backend
 
     def _build_middlewares(
@@ -1412,6 +1428,15 @@ class DeepAgentsAgentManager:
                 "policy": "ToolExecutionPipeline",
                 "authorization_independent_from_sandbox": True,
             }
+            dependency_plan = getattr(
+                execution_backend,
+                "execution_dependency_plan",
+                None,
+            )
+            if dependency_plan is not None:
+                inventory["execution"]["dependency_plan"] = (
+                    dependency_plan.to_dict()
+                )
         return inventory
 
     def _filesystem_inventory(self, workspace_path: Path) -> dict[str, Any]:
@@ -3080,6 +3105,11 @@ class DeepAgentsAgentManager:
                 middleware_factory=build_subagent_middlewares,
             )
             system_prompt = build_deepagents_system_prompt(self._base_dir, workspace_path)
+            dependency_prompt = dependency_plan_prompt(
+                getattr(agent_backend, "execution_dependency_plan", None)
+            )
+            if dependency_prompt:
+                system_prompt += f"\n\n{dependency_prompt}"
             if analytics_model_prompt:
                 system_prompt += analytics_model_prompt
             agent = create_deep_agent(

@@ -373,12 +373,13 @@ harness:
     docker:
       connection: auto                # auto | context
       context: desktop-linux
-      image: puddingclaw/analytics-sandbox:v1
+      image: puddingclaw/sandbox:python3.12-node22-v2
       cpu_limit: 2
       memory_limit_mb: 2048
       pids_limit: 128
       default_timeout_seconds: 120
       network_enabled: false
+      dependency_setup_enabled: false
       lifecycle: project
       idle_stop_minutes: 30
 ~~~
@@ -389,6 +390,7 @@ Harness Settings UI 至少提供：
 - 自动检测 Docker CLI、daemon、context、OS/arch 和镜像状态；
 - 测试连接、测试启动 Sandbox；
 - 镜像、CPU、内存、进程数、超时和默认网络开关；
+- 可选的项目 manifest/lockfile 依赖准备高级开关，默认关闭；
 - Docker 不可用时“降级为本机受控模式”或“拒绝执行”；
 - 项目 Sandbox 的运行状态、重启、停止和重置；
 - 不提供可直接注入任意 <code>docker run</code> 参数的自由文本入口。
@@ -411,6 +413,8 @@ RunState 保存执行事实，而不是只保存用户设置：
 Docker 主动关闭时使用 <code>restricted_host</code>，这是用户选择，不叫 fallback。只有 Docker 已启用但 CLI、daemon、image 或安全运行条件不可用时，才记录 <code>fallback_reason</code>。
 
 自动降级只允许发生在命令执行前的 Backend preflight。某个 Run 已经在 Docker 中执行后，如果 Docker 中途故障，不能把失败命令静默转到宿主重放；应返回 <code>sandbox_unavailable</code>，由用户决定后续是否切换。
+
+用户选择项目并启用 Docker Backend 后，PuddingClaw 按项目生命周期自动准备默认托管镜像和项目容器；这是用户启用 Docker 后的 Backend provisioning，不要求额外进入设置页操作。Run 中 Agent 执行 <code>npm ci</code>、<code>uv sync</code>、<code>pip install</code> 等项目依赖安装命令时，仍必须进入 <code>ToolExecutionPipeline</code> 的 <code>package_install/network_access</code> HITL。
 
 ### 5.3 Docker 生命周期：当前采用“一项目一个容器”，不是“一 Run 一个容器”
 
@@ -516,6 +520,82 @@ pids/memory/cpu limit
 ~~~
 
 项目目录是 rw mount，因此 Docker 只能阻止命令影响项目外宿主资源，不能阻止删除整个项目。权限规则、HITL 和可选项目快照仍然必要。
+
+### 5.4.1 托管运行时与项目依赖准备
+
+来源：**[本方案新增]**。
+
+默认托管镜像至少保证：
+
+~~~text
+Python 3.12 + pip
+Node.js 22 + npm + corepack
+仅附带基础 POSIX shell 与 CA 证书
+~~~
+
+用户可以配置自定义镜像，但 Backend preflight 会验证 <code>python3</code> 与 <code>node</code> 同时存在；不满足基础运行时契约时，按 <code>on_unavailable</code> 选择受控降级或拒绝。
+
+PuddingClaw 默认不扫描或安装项目依赖，因为当前产品不是以执行任意项目脚本为主要目标。只有高级用户显式开启 <code>dependency_setup_enabled</code> 后，才扫描项目根及有限层级子目录中的实际配置：
+
+| 项目配置 | 确定性安装命令 |
+|---|---|
+| <code>pyproject.toml + uv.lock</code> | <code>uv sync --frozen</code> |
+| <code>pyproject.toml + poetry.lock</code> | 项目内 <code>.venv</code> + <code>poetry install</code> |
+| <code>Pipfile + Pipfile.lock</code> | 项目内 <code>.venv</code> + <code>pipenv sync</code> |
+| <code>requirements.txt</code> | 创建项目内 <code>.venv</code> 后安装 |
+| <code>package.json + package-lock.json</code> | <code>npm ci</code> |
+| <code>package.json + pnpm-lock.yaml</code> | <code>pnpm install --frozen-lockfile</code> |
+| <code>package.json + yarn.lock</code> | Yarn 对应的 frozen/immutable 安装 |
+
+manifest 内容、目录和安装命令共同生成 fingerprint。只有 fingerprint 对应的完成标记存在时，才认为该项目依赖已准备；lockfile 变化会自然产生新计划并重新要求安装。
+
+为避免 Linux 容器依赖污染宿主项目：
+
+~~~text
+Python: 项目 .venv      → Docker managed volume
+Node:   项目 node_modules → Docker managed volume
+源码与 lockfile          → host workspace bind mount
+~~~
+
+命名卷在容器创建前以无网络的一次性初始化容器修正为宿主 UID/GID，主项目容器继续以 non-root 用户运行。
+
+依赖下载的联网闭环：
+
+~~~text
+Agent 提交 manifest-derived 精确安装命令
+  → ToolExecutionPipeline 分类为 package_install / network_access
+  → 用户 allow-once 或 allow-session
+  → 默认 network=none 的项目容器临时 connect bridge
+  → docker exec 执行获批的原始命令
+  → finally disconnect bridge
+  → 断网失败则删除容器，避免授权结束后残留联网能力
+~~~
+
+即使用户开启“容器常驻网络”，网络类和包安装类命令仍需经过权限管线；这个开关只改变 Sandbox capability，不改变授权结果。
+
+第三方 Skill 的依赖属于运行中动态依赖，不并入项目启动时的 manifest 扫描：
+
+~~~text
+Agent 成功读取 /skills/<skill-id>/SKILL.md
+  → Skill 流程发现缺少 Python / Node 包
+  → 提交精确 pip / uv / npm / npx 命令
+  → ToolExecutionPipeline 分类为 package_install
+  → 当前对话直接 HITL 请求 package + network
+  → 批准后临时联网安装
+  → 回到原 Skill 流程继续执行
+~~~
+
+Docker Backend 将项目 Skills 只读挂载到 <code>/skills</code>，Skill 脚本可以直接执行但不能修改 Skill 源码。动态 Python user packages、Node global packages、CLI 与缓存写入项目专属的 Docker runtime-home volume：
+
+~~~text
+/home/puddingclaw/.local
+/home/puddingclaw/.npm-global
+/home/puddingclaw/.cache
+~~~
+
+该 volume 随项目沙箱复用，不污染宿主 Python/Node 环境，也不要求每个 Run 重装。<code>PATH</code>、<code>PYTHONUSERBASE</code>、<code>npm_config_prefix</code> 和 <code>NODE_PATH</code> 由 Backend 统一设置。Skill 自己要求修改项目 <code>package.json</code> 或项目虚拟环境时，仍写入项目依赖通道并受 workspace write policy 约束。
+
+后续可以为第三方 Skill 增加可选的机器可读 dependency manifest；在此之前，Skill 文档中的安装命令仍必须经过同一确定性权限管线，不能因“来自 Skill”而自动放行。
 
 项目级容器无法在运行后动态增加 bind mount，也不能把 Session 级外部文件 grant 永久暴露给共享容器。外部文件继续优先走类型化工具；确实要交给 Terminal 处理时，授权文件复制到：
 
@@ -1384,6 +1464,7 @@ harness:
       pids_limit
       default_timeout_seconds
       network_enabled
+      dependency_setup_enabled       # default false
       lifecycle                  # project
       idle_stop_minutes
   goals:

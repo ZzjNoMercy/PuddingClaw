@@ -11,12 +11,15 @@ from langchain.agents.middleware.types import ToolCallRequest
 
 from graph.permission_resume import PermissionResumeRegistry
 from graph.session_manager import SessionManager
+from harness.dependency_setup import detect_workspace_dependency_plan
 from harness.tool_execution import (
     PolicyDecision,
     ShellPolicyAnalyzer,
     ToolExecutionPipeline,
 )
 from harness.workspace_backends import (
+    DEFAULT_SANDBOX_IMAGE,
+    DockerWorkspaceBackend,
     ProjectSandboxManager,
     RestrictedHostWorkspaceBackend,
     build_workspace_execution_backend,
@@ -32,6 +35,12 @@ from harness.workspace_backends import (
         ("python -m pytest -q", PolicyDecision.ALLOW, "project_test"),
         ("curl https://example.com", PolicyDecision.ASK, "network_access:curl"),
         ("pip install pandas", PolicyDecision.ASK, "package_management:pip"),
+        (
+            "python3 -m pip install pandas",
+            PolicyDecision.ASK,
+            "package_management:python3",
+        ),
+        ("npm ci", PolicyDecision.ASK, "package_management"),
         ("rm -rf build", PolicyDecision.ASK, "managed_workspace_write:rm"),
         ("python script.py", PolicyDecision.ASK, "arbitrary_interpreter:python"),
         ("sudo ls", PolicyDecision.DENY, "hard_denied_command:sudo"),
@@ -66,6 +75,11 @@ def test_shell_chain_uses_strictest_segment(tmp_path):
     assert analyzer.analyze("ls && curl https://example.com").decision == PolicyDecision.ASK
     assert analyzer.analyze("ls > output.txt").reason == "shell_redirection"
     assert analyzer.analyze("echo $(cat secret)").reason == "complex_shell_expansion"
+    assert ShellPolicyAnalyzer.requires_network("npm ci") is True
+    assert ShellPolicyAnalyzer.requires_network("npx playwright install") is True
+    assert ShellPolicyAnalyzer.requires_network("uv sync --frozen") is True
+    assert ShellPolicyAnalyzer.requires_network("uvx ruff check .") is True
+    assert ShellPolicyAnalyzer.requires_network("git status") is False
 
 
 def test_restricted_host_denies_symlink_escape_for_reads_and_new_writes(tmp_path):
@@ -267,13 +281,83 @@ def test_docker_unavailable_can_fail_closed(tmp_path, monkeypatch):
         )
 
 
+def test_dependency_plan_detects_monorepo_manifests_and_isolated_mounts(tmp_path):
+    workspace = tmp_path / "project"
+    backend = workspace / "backend"
+    frontend = workspace / "frontend"
+    backend.mkdir(parents=True)
+    frontend.mkdir(parents=True)
+    (backend / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+    (backend / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+    (frontend / "package.json").write_text('{"name":"demo"}', encoding="utf-8")
+    (frontend / "package-lock.json").write_text('{"lockfileVersion":3}', encoding="utf-8")
+
+    plan = detect_workspace_dependency_plan(workspace)
+
+    assert plan is not None
+    assert [item.command for item in plan.steps] == [
+        "python3 -m pip install --user uv && uv sync --frozen",
+        "npm ci",
+    ]
+    assert {(item.working_directory, item.target_name) for item in plan.runtime_mounts} == {
+        ("backend", ".venv"),
+        ("frontend", "node_modules"),
+    }
+    assert (
+        "cd /workspace/backend && python3 -m pip install --user uv "
+        "&& uv sync --frozen"
+    ) in plan.install_command
+    assert "cd /workspace/frontend && npm ci" in plan.install_command
+    assert plan.installed is False
+    result = ShellPolicyAnalyzer(
+        workspace_path=str(workspace),
+        backend_mode="docker",
+    ).analyze(plan.install_command)
+    assert result.reason == "package_management:python3"
+    assert result.risk == "package_install"
+
+    marker = workspace / plan.marker_path.removeprefix("/workspace/")
+    marker.parent.mkdir(parents=True)
+    marker.write_text(plan.fingerprint, encoding="utf-8")
+    installed = detect_workspace_dependency_plan(workspace)
+    assert installed is not None
+    assert installed.installed is True
+
+
+def test_managed_sandbox_image_is_built_when_missing(monkeypatch):
+    manager = ProjectSandboxManager({})
+    calls: list[list[str]] = []
+
+    def fake_run(args, *, timeout=30):
+        calls.append(list(args))
+        if args[:2] == ["image", "inspect"]:
+            return subprocess.CompletedProcess(args, 1, "", "missing")
+        return subprocess.CompletedProcess(args, 0, "ok", "")
+
+    monkeypatch.setattr(manager, "_run", fake_run)
+
+    manager.ensure_image(DEFAULT_SANDBOX_IMAGE)
+
+    build = next(args for args in calls if args[0] == "build")
+    assert build[:4] == ["build", "--pull", "--tag", DEFAULT_SANDBOX_IMAGE]
+    assert build[-1].endswith("/harness/docker")
+
+
 def test_project_container_spec_has_no_docker_socket_or_host_home(tmp_path, monkeypatch):
     workspace = tmp_path / "project"
     workspace.mkdir()
+    (workspace / "package.json").write_text('{"name":"demo"}', encoding="utf-8")
+    (workspace / "package-lock.json").write_text('{"lockfileVersion":3}', encoding="utf-8")
     manager = ProjectSandboxManager(
         {
-            "image": "python:3.12-slim",
+            "image": DEFAULT_SANDBOX_IMAGE,
             "network_enabled": False,
+            "_managed_readonly_mounts": [
+                {
+                    "source": str(workspace),
+                    "target": "/skills",
+                }
+            ],
         }
     )
     calls: list[list[str]] = []
@@ -296,6 +380,56 @@ def test_project_container_spec_has_no_docker_socket_or_host_home(tmp_path, monk
     assert "--network none" in joined
     assert "--cap-drop ALL" in joined
     assert "no-new-privileges" in joined
+    assert "dst=/home/puddingclaw" in joined
+    assert f"src={workspace.resolve()},dst=/skills,readonly" in joined
+    assert "PYTHONUSERBASE=/home/puddingclaw/.local" in joined
+    assert "npm_config_prefix=/home/puddingclaw/.npm-global" in joined
+    assert "dst=/workspace/node_modules" not in joined
+    assert "HOME=/home/puddingclaw" in joined
+
+
+def test_docker_backend_temporarily_connects_network_for_approved_install(
+    tmp_path,
+    monkeypatch,
+):
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    manager = ProjectSandboxManager(
+        {
+            "network_enabled": False,
+            "dependency_setup_enabled": False,
+        }
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        manager,
+        "ensure_container",
+        lambda _workspace: ("puddingclaw-test", "spec-hash"),
+    )
+
+    def fake_run(args, *, timeout=30):
+        calls.append(list(args))
+        if args[0] == "exec":
+            return subprocess.CompletedProcess(args, 0, "installed", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(manager, "_run", fake_run)
+    backend = DockerWorkspaceBackend(root_dir=workspace, manager=manager)
+
+    result = backend.execute("npm ci")
+
+    assert result.exit_code == 0
+    assert calls[0] == ["network", "disconnect", "none", "puddingclaw-test"]
+    assert calls[1] == ["network", "connect", "bridge", "puddingclaw-test"]
+    assert calls[2][:4] == ["exec", "--workdir", "/workspace", "puddingclaw-test"]
+    assert calls[3] == [
+        "network",
+        "disconnect",
+        "--force",
+        "bridge",
+        "puddingclaw-test",
+    ]
+    assert calls[4] == ["network", "connect", "none", "puddingclaw-test"]
 
 
 def test_project_container_idle_stop_uses_generation_guard(monkeypatch):

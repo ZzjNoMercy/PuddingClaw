@@ -84,6 +84,9 @@ _PACKAGE_COMMANDS = frozenset(
         "poetry",
         "uv",
         "conda",
+        "pipenv",
+        "npx",
+        "uvx",
     }
 )
 _DESTRUCTIVE_OR_WRITE_COMMANDS = frozenset(
@@ -176,6 +179,50 @@ class ShellPolicyAnalyzer:
                 )
             )
         return self._strictest(decisions)
+
+    @classmethod
+    def requires_network(cls, command: str) -> bool:
+        """Return whether an already-authorized command needs temporary network."""
+
+        try:
+            segments, _has_redirect = cls._segments(command)
+        except ValueError:
+            return False
+        for raw_tokens in segments:
+            tokens = cls._unwrap(raw_tokens)
+            if not tokens:
+                continue
+            executable = Path(tokens[0]).name.lower()
+            args = [item.lower() for item in tokens[1:]]
+            if executable in _NETWORK_COMMANDS or executable in _PACKAGE_COMMANDS:
+                return True
+            if executable == "git":
+                subcommand = next(
+                    (item for item in args if not item.startswith("-")),
+                    "",
+                )
+                if subcommand in {"clone", "fetch", "pull", "push", "submodule"}:
+                    return True
+            if executable in {"npm", "npx", "pnpm", "yarn", "uvx"} and (
+                executable in {"npx", "uvx"}
+                or args[:1]
+                in (
+                    ["ci"],
+                    ["install"],
+                    ["add"],
+                    ["remove"],
+                    ["uninstall"],
+                )
+            ):
+                return True
+            if executable in {"python", "python3"} and args[:3] in (
+                ["-m", "pip", "install"],
+                ["-m", "pip", "uninstall"],
+            ):
+                return True
+            if executable == "corepack" and args[:1] in (["install"], ["prepare"]):
+                return True
+        return False
 
     def _check_absolute_paths(self, command: str) -> ToolPolicyResult | None:
         if self.backend_mode != "restricted_host":
@@ -304,6 +351,15 @@ class ShellPolicyAnalyzer:
                 "package_install",
             )
         if command in {"python", "python3", "node", "ruby", "perl", "php"}:
+            if command.startswith("python") and args[:3] in (
+                ["-m", "pip", "install"],
+                ["-m", "pip", "uninstall"],
+            ):
+                return ToolPolicyResult(
+                    PolicyDecision.ASK,
+                    f"package_management:{command}",
+                    "package_install",
+                )
             if command.startswith("python") and args[:2] == ["-m", "pytest"]:
                 return ToolPolicyResult(PolicyDecision.ALLOW, "project_test", "low")
             return ToolPolicyResult(
@@ -395,7 +451,13 @@ class ShellPolicyAnalyzer:
                 and normalized[1:2] in (["test"], ["build"], ["lint"], ["check"])
             ):
                 return ToolPolicyResult(PolicyDecision.ALLOW, "project_test", "low")
-            if normalized[:1] in (["install"], ["add"], ["remove"], ["uninstall"]):
+            if normalized[:1] in (
+                ["ci"],
+                ["install"],
+                ["add"],
+                ["remove"],
+                ["uninstall"],
+            ):
                 return ToolPolicyResult(PolicyDecision.ASK, "package_management", "package_install")
             return ToolPolicyResult(PolicyDecision.ASK, "node_command", "high")
         if command == "flutter" and args[:1] in (["test"], ["analyze"]):
@@ -445,7 +507,23 @@ class ShellPolicyAnalyzer:
             PolicyDecision.ASK: 1,
             PolicyDecision.DENY: 2,
         }
-        return max(results, key=lambda result: rank[result.decision])
+        risk_rank = {
+            "invalid": 0,
+            "low": 0,
+            "declared": 0,
+            "managed_write": 1,
+            "high": 2,
+            "network": 3,
+            "package_install": 3,
+            "critical": 4,
+        }
+        return max(
+            results,
+            key=lambda result: (
+                rank[result.decision],
+                risk_rank.get(result.risk, 2),
+            ),
+        )
 
 
 class ToolExecutionPipeline(AgentMiddleware):

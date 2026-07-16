@@ -4,14 +4,19 @@ import json
 from io import BytesIO
 from types import SimpleNamespace
 
+import pytest
+from fastapi.testclient import TestClient
+from langchain_core.messages import ToolMessage
+
 import config
 import higress_config_reader
-from fastapi.testclient import TestClient
 from app import app
 from graph.attachment_store import attachment_store
-from graph.deepagents_manager import AttachmentImageContentMiddleware, DeepAgentsAgentManager, _build_subagent_item
-from langchain_core.messages import ToolMessage
-import pytest
+from graph.deepagents_manager import (
+    AttachmentImageContentMiddleware,
+    DeepAgentsAgentManager,
+    _build_subagent_item,
+)
 
 
 def _stored_image_attachment(tmp_path, session_id: str = "session-attachments"):
@@ -89,6 +94,39 @@ def test_harness_settings_freeze_explicit_goal_and_validate_rules(tmp_path, monk
                 },
             },
         })
+
+
+def test_legacy_python_only_sandbox_image_migrates_to_managed_runtime(
+    tmp_path,
+    monkeypatch,
+):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "harness": {
+                    "terminal": {
+                        "docker": {
+                            "image": "python:3.12-slim",
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
+
+    loaded = config.load_config()
+
+    docker = loaded["harness"]["terminal"]["docker"]
+    assert docker["image"] == "puddingclaw/sandbox:python3.12-node22-v2"
+    assert docker["dependency_setup_enabled"] is False
+    persisted = json.loads(config_path.read_text(encoding="utf-8"))
+    assert (
+        persisted["harness"]["terminal"]["docker"]["image"]
+        == "puddingclaw/sandbox:python3.12-node22-v2"
+    )
 
 
 def test_docker_probe_endpoint_reports_daemon_status(monkeypatch):

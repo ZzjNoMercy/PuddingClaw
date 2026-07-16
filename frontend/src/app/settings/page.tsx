@@ -264,11 +264,12 @@ export default function SettingsPage() {
   const [dockerOnUnavailable, setDockerOnUnavailable] = useState<"fallback" | "deny">("fallback");
   const [dockerConnection, setDockerConnection] = useState("");
   const [dockerContext, setDockerContext] = useState("");
-  const [dockerImage, setDockerImage] = useState("python:3.12-slim");
+  const [dockerImage, setDockerImage] = useState("puddingclaw/sandbox:python3.12-node22-v2");
   const [dockerCpuLimit, setDockerCpuLimit] = useState("2");
   const [dockerMemoryLimitMb, setDockerMemoryLimitMb] = useState("2048");
   const [dockerPidsLimit, setDockerPidsLimit] = useState("256");
   const [dockerNetworkEnabled, setDockerNetworkEnabled] = useState(false);
+  const [dockerDependencySetupEnabled, setDockerDependencySetupEnabled] = useState(false);
   const [dockerProbeStatus, setDockerProbeStatus] = useState<"idle" | "loading" | "ok" | "error">("idle");
   const [dockerProbeDetail, setDockerProbeDetail] = useState("");
 
@@ -420,11 +421,12 @@ export default function SettingsPage() {
         setDockerOnUnavailable(terminal?.on_unavailable === "deny" ? "deny" : "fallback");
         setDockerConnection(terminal?.docker?.connection || "");
         setDockerContext(terminal?.docker?.context || "");
-        setDockerImage(terminal?.docker?.image || "python:3.12-slim");
+        setDockerImage(terminal?.docker?.image || "puddingclaw/sandbox:python3.12-node22-v2");
         setDockerCpuLimit(terminal?.docker?.cpu_limit || "2");
         setDockerMemoryLimitMb(String(terminal?.docker?.memory_limit_mb ?? 2048));
         setDockerPidsLimit(String(terminal?.docker?.pids_limit ?? 256));
         setDockerNetworkEnabled(terminal?.docker?.network_enabled ?? false);
+        setDockerDependencySetupEnabled(terminal?.docker?.dependency_setup_enabled ?? false);
         // SubAgent
         const items = s.subagents?.items || s.subagent?.items;
         if (Array.isArray(items) && items.length > 0) {
@@ -647,6 +649,7 @@ export default function SettingsPage() {
               memory_limit_mb: positiveIntOrNull(dockerMemoryLimitMb) ?? 2048,
               pids_limit: positiveIntOrNull(dockerPidsLimit) ?? 256,
               network_enabled: dockerNetworkEnabled,
+              dependency_setup_enabled: dockerDependencySetupEnabled,
               lifecycle: "project",
               idle_stop_minutes: 30,
             },
@@ -673,7 +676,7 @@ export default function SettingsPage() {
     } finally {
       setSaving(false);
     }
-  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaQueryTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmModel, mmDimension, mmApiKey, knowledgeRootDir, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, toolContextEnabled, singleToolTriggerTokens, backgroundMinResultTokens, keepRecentToolResults, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, dockerEnabled, dockerOnUnavailable, dockerConnection, dockerContext, dockerImage, dockerCpuLimit, dockerMemoryLimitMb, dockerPidsLimit, dockerNetworkEnabled, subagentItems, showToast]);
+  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaQueryTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmModel, mmDimension, mmApiKey, knowledgeRootDir, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, toolContextEnabled, singleToolTriggerTokens, backgroundMinResultTokens, keepRecentToolResults, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, dockerEnabled, dockerOnUnavailable, dockerConnection, dockerContext, dockerImage, dockerCpuLimit, dockerMemoryLimitMb, dockerPidsLimit, dockerNetworkEnabled, dockerDependencySetupEnabled, subagentItems, showToast]);
 
   const handleDatabaseModeChange = useCallback((mode: "bundled" | "external") => {
     setDatabaseMode(mode);
@@ -2380,9 +2383,23 @@ export default function SettingsPage() {
                             </FormField>
                             <label className="flex items-center gap-2 pt-6 text-[12px] text-gray-600">
                               <input type="checkbox" checked={dockerNetworkEnabled} onChange={(event) => setDockerNetworkEnabled(event.target.checked)} />
-                              允许容器网络
+                              允许容器常驻网络
+                            </label>
+                            <label className="flex items-center gap-2 pt-6 text-[12px] text-gray-600">
+                              <input
+                                type="checkbox"
+                                checked={dockerDependencySetupEnabled}
+                                onChange={(event) => setDockerDependencySetupEnabled(event.target.checked)}
+                              />
+                              按项目 lockfile 准备依赖（高级）
                             </label>
                           </div>
+
+                          <p className="mt-3 rounded-lg bg-blue-50 px-3 py-2 text-[10px] leading-relaxed text-blue-700">
+                            默认托管镜像只提供 Python 3.12 + pip 与 Node.js 22 + npm/corepack。
+                            默认不安装项目依赖；第三方 Skill 执行中缺包时才请求 package/network 权限并动态安装。
+                            未开启常驻网络时，批准的安装命令只会临时联网，结束后自动断开。
+                          </p>
 
                           <div className="mt-4 flex flex-wrap items-center gap-3">
                             <button

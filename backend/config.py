@@ -305,11 +305,12 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "docker": {
                 "connection": "",
                 "context": "",
-                "image": "python:3.12-slim",
+                "image": "puddingclaw/sandbox:python3.12-node22-v2",
                 "cpu_limit": "2",
                 "memory_limit_mb": 2048,
                 "pids_limit": 256,
                 "network_enabled": False,
+                "dependency_setup_enabled": False,
                 "lifecycle": "project",
                 "idle_stop_minutes": 30,
             },
@@ -406,8 +407,16 @@ def _migrate_legacy_config(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     if isinstance(summarization, dict) and "summary_input_tokens" in summarization:
         summarization.pop("summary_input_tokens", None)
         migrated = True
+    docker = data.get("harness", {}).get("terminal", {}).get("docker", {})
+    if isinstance(docker, dict) and docker.get("image") in {
+        "python:3.12-slim",
+        "puddingclaw/sandbox:python3.12-node22-v1",
+    }:
+        docker["image"] = "puddingclaw/sandbox:python3.12-node22-v2"
+        docker.setdefault("dependency_setup_enabled", False)
+        migrated = True
     if migrated:
-        logger.info("[config] 已迁移 legacy llm/embedding -> fallback_llm/fallback_embedding")
+        logger.info("[config] 已完成 legacy 配置迁移")
     return data, migrated
 
 
@@ -1609,6 +1618,10 @@ def _normalize_harness_update(value: Any) -> dict[str, Any]:
             if not image:
                 raise ValueError("harness.terminal.docker.image cannot be empty")
             docker["image"] = image
+            if "dependency_setup_enabled" in docker:
+                docker["dependency_setup_enabled"] = bool(
+                    docker["dependency_setup_enabled"]
+                )
 
     return result
 
