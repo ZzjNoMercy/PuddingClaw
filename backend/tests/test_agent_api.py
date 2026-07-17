@@ -7,6 +7,7 @@ def test_stream_agent_persists_user_message_before_stream(monkeypatch, tmp_path)
     from graph.session_manager import session_manager
 
     session_manager.initialize(tmp_path)
+    session_manager.create_session("agent-api-session")
 
     async def fake_astream(**kwargs):
         history = session_manager.load_session(kwargs["session_id"])
@@ -43,6 +44,7 @@ def test_agent_api_forwards_explicit_goal_mode(monkeypatch, tmp_path):
     from graph.session_manager import session_manager
 
     session_manager.initialize(tmp_path)
+    session_manager.create_session("goal-api-session")
 
     async def fake_astream(**kwargs):
         assert kwargs["goal_mode"] is True

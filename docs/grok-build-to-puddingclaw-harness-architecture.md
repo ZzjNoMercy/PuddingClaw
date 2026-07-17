@@ -1,7 +1,7 @@
 # 从 Grok Build 反推 PuddingClaw Harness：差距分析与演进架构
 
-状态：**方案已审核并持续实现于 `codex/harness-control-plane`；后端 574 项测试、前端生产构建、TaskProfile/Effective Contract、Manager 级动态问数、Goal/Rubric UI 与真实 Docker Backend E2E 已通过**
-日期：2026-07-16
+状态：**方案已审核并持续实现于 `main` 工作区；项目后端测试集 622 项、前端生产构建、TaskProfile/Effective Contract、Manager 级动态问数、Goal/Rubric UI 与真实 Docker Backend E2E 已通过**
+日期：2026-07-17
 Grok Build 源码：<code>b189869b7755d2b482969acf6c92da3ecfeffd36</code>
 PuddingClaw 基线提交：<code>7fb380f43be9c9b13fd3478bb28ef1a637fe6203</code>
 说明：PuddingClaw 分析包含当前工作区尚未提交的 Tool Context、Workspace Router、Session 持久化等改动。
@@ -53,6 +53,25 @@ PuddingClaw 基线提交：<code>7fb380f43be9c9b13fd3478bb28ef1a637fe6203</code>
 - Harness Settings：Goal/Rubric 高级规则、Docker 配置与 daemon probe；
 - ModelCallLimit 已映射为 Run 级 <code>budget_exceeded</code>，不会在 Goal 尚有 Run 预算时误终止整个 Goal。
 - 显式 Goal 无条件生成并冻结 Goal contract；后续“继续”“确认”等短消息继承原合同，不能通过关键词启发式绕过验收。
+
+### 0.5 2026-07-17 Action Control 与 Composer 收口
+
+本轮新增实现按来源区分如下：
+
+- **[Grok Build 借鉴]**：所有 Tool Call 统一进入 `ToolExecutionPipeline`；决策保持 `deny > ask > allow`，未知动作 fail-closed；授权与策略版本绑定，不依赖模型自觉遵守；
+- **[PuddingClaw 延续]**：Session JSON 仍是跨 Run 唯一产品状态权威，LangGraph checkpoint 只恢复同 Run HITL，Trace 只记录；
+- **[本方案新增]**：Session 提供 `strict` / `smart` 两种审批模式，默认 `strict`；Session 创建时与分析模型一起原子写入，Run 开始后冻结为不可变 `RunPermissionContext`；
+- **[本方案新增]**：授权携带 `run_id`、`policy_epoch`、`policy_version`、backend/workspace binding，Session 切换审批模式会递增 epoch 并撤销旧 Tool grant；活动 Run 存在时禁止切换；
+- **[本方案新增]**：`smart` 仅自动放行确定性低风险联网工具（Tavily、通过 SSRF 校验的公开网页抓取）；Docker 动态装包仍需用户审批，但可给当前 Session 的类型化安装能力；
+- **[本方案新增]**：动态依赖通过类型化 `install_packages` 工具进入一次性联网 installer 容器；长期项目容器保持 `network=none`，原始 Shell 安装命令不能继承这一可复用授权；
+- **[本方案新增]**：网页抓取执行公开地址校验、DNS 全地址校验、连接 IP 固定、HTTPS SNI/证书主机名校验、跳转重验、peer IP 校验、内容类型与解压后体积限制；
+- **[本方案新增]**：Docker runtime/dependency volume 绑定解析后的不可变 image ID，而不是可漂移 tag；默认镜像为 `puddingclaw/sandbox:python3.12-node22-v2`；
+- **[本方案新增]**：`/skills`、`/knowledge`、`/semantic-assets`、`/sql-guardrails`、`/analytics-models` 同时在 Docker mount 与 DeepAgents 虚拟文件路由层强制只读，外部写权限不能覆盖这一系统约束；
+- **[产品交互借鉴] + [本方案适配]**：Composer 外层只保留项目目录与审批模式；模型、附件、Goal 收入 `+`；思考模式移到右侧。Popover 互斥，Goal 是“下一 Run 意图”，只有收到 `run_started` 才消费。
+
+第二轮对抗式状态审查进一步补强：旧 Run 恢复时保留冻结的 policy version；删除 Session、message/trace/metadata 写入使用同一锁且写入口不再隐式重建 Session；metadata 只能更新显式白名单字段；外部文件审批 API 必须匹配 pending request 类型；Restricted Host identity 对 workspace 稳定；Permission HITL 持久化 `waiting_hitl → running`；LangGraph 重放使用确定性 permission request ID；Docker spec 在 Run 内变化时明确失败；终态 Run 的 verification contract 不可再改；Session 权威写入口校验 Run 初始状态与合法迁移。
+
+验收边界：`backend/tests` 为当前项目正式测试集，结果为 **622 passed**；本轮涉及核心文件 Ruff 通过；前端 Next.js production build 通过；Playwright 在 390×844 视口确认 Composer 为两行布局，审批菜单未越界。直接对整个 `backend` 目录运行 pytest/Ruff 会额外收集历史 `skills` 样例与 vendored `vanna`，目前存在既有同名测试模块收集冲突和 lint 基线，不能误报为本轮全仓通过。
 
 本轮尚未宣称完成：
 
@@ -367,7 +386,7 @@ harness:
   terminal:
     docker_enabled: true
     on_unavailable: restricted_host   # restricted_host | deny
-    permission_mode: standard         # standard | dont_ask | future_auto
+    permission_mode: strict           # strict | smart
     remember_session_approvals: true
 
     docker:
@@ -405,7 +424,9 @@ RunState 保存执行事实，而不是只保存用户设置：
   "sandbox_id": "puddingclaw-project-abc",
   "sandbox_generation": 3,
   "sandbox_strength": "container_isolated",
-  "policy_version": "terminal-policy-v1",
+  "approval_mode": "smart",
+  "policy_epoch": 3,
+  "policy_version": "tool-execution-v2",
   "image_digest": "sha256:...",
   "fallback_reason": null
 }
@@ -415,7 +436,7 @@ Docker 主动关闭时使用 <code>restricted_host</code>，这是用户选择�
 
 自动降级只允许发生在命令执行前的 Backend preflight。某个 Run 已经在 Docker 中执行后，如果 Docker 中途故障，不能把失败命令静默转到宿主重放；应返回 <code>sandbox_unavailable</code>，由用户决定后续是否切换。
 
-用户选择项目并启用 Docker Backend 后，PuddingClaw 按项目生命周期自动准备默认托管镜像和项目容器；这是用户启用 Docker 后的 Backend provisioning，不要求额外进入设置页操作。Run 中 Agent 执行 <code>npm ci</code>、<code>uv sync</code>、<code>pip install</code> 等项目依赖安装命令时，仍必须进入 <code>ToolExecutionPipeline</code> 的 <code>package_install/network_access</code> HITL。
+用户选择项目并启用 Docker Backend 后，PuddingClaw 在首次实际使用时按项目生命周期准备默认托管镜像和项目容器；这是 Backend provisioning，不要求用户再进入设置页执行“联网准备”。镜像缺失时 Docker 自行拉取或构建；第三方 Skill 缺包时，Agent 在当前对话中发起类型化安装请求并直接触发 HITL。
 
 ### 5.3 Docker 生命周期：当前采用“一项目一个容器”，不是“一 Run 一个容器”
 
@@ -522,6 +543,8 @@ pids/memory/cpu limit
 
 项目目录是 rw mount，因此 Docker 只能阻止命令影响项目外宿主资源，不能阻止删除整个项目。权限规则、HITL 和可选项目快照仍然必要。
 
+`ro` 不能只停留在 Docker mount。DeepAgents 文件工具仍可能通过宿主路由命中同一来源，因此 `/skills`、`/knowledge`、`/semantic-assets`、`/sql-guardrails`、`/analytics-models` 及其真实宿主根目录都属于 Harness managed resources：`write_file` / `edit_file` 必须在路由层硬拒绝，即使存在外部写 grant 也不能覆盖。
+
 ### 5.4.1 托管运行时与项目依赖准备
 
 来源：**[本方案新增]**。
@@ -534,7 +557,7 @@ Node.js 22 + npm + corepack
 仅附带基础 POSIX shell 与 CA 证书
 ~~~
 
-普通用户不需要选择或上传镜像。PuddingClaw 使用内置 Dockerfile 在本机 Docker daemon 中自动准备托管镜像。高级用户可以填写本机已有的 Docker tag 或 registry image reference；Backend preflight 会验证 <code>python3</code> 与 <code>node</code> 同时存在，不满足基础运行时契约时按 <code>on_unavailable</code> 选择受控降级或拒绝。
+普通用户不需要选择或上传镜像。PuddingClaw 默认使用 <code>puddingclaw/sandbox:python3.12-node22-v2</code>；高级用户可以填写本机已有 Docker tag 或 registry image reference，Docker 会按标准规则解析本地镜像或拉取 registry 镜像。Backend 在 Run 开始时把 tag 解析为不可变 image ID 并写入执行快照；项目容器和依赖 volume 都以该 image ID 为键，避免同名 tag 漂移后复用 ABI 不兼容的旧环境。自定义镜像仍必须提供 Python 与 Node.js 基础运行时。
 
 PuddingClaw 默认不扫描或安装项目依赖，因为当前产品不是以执行任意项目脚本为主要目标。只有高级用户显式开启 <code>dependency_setup_enabled</code> 后，才扫描项目根及有限层级子目录中的实际配置：
 
@@ -560,27 +583,28 @@ Node:   项目 node_modules → Docker managed volume
 
 命名卷在容器创建前以无网络的一次性初始化容器修正为宿主 UID/GID，主项目容器继续以 non-root 用户运行。
 
-依赖下载的联网闭环：
+动态包安装的当前联网闭环：
 
 ~~~text
-Agent 提交 manifest-derived 精确安装命令
-  → ToolExecutionPipeline 分类为 package_install / network_access
-  → 用户 allow-once 或 allow-session
-  → 默认 network=none 的项目容器临时 connect bridge
-  → docker exec 执行获批的原始命令
-  → finally disconnect bridge
-  → 断网失败则删除容器，避免授权结束后残留联网能力
+Agent 调用 install_packages(ecosystem, packages)
+  → schema 与 registry package syntax 确定性校验
+  → ToolExecutionPipeline 分类为 package_install + network_access
+  → strict：每次询问；smart：仍询问，但可批准当前 Session 的类型化安装能力
+  → 启动一次性 networked installer 容器
+  → workspace 只读，runtime/dependency volume 可写，使用 argv 执行而非 shell 拼接
+  → installer 容器退出并删除
+  → 长期项目容器始终保持 network=none
 ~~~
 
-即使用户开启“容器常驻网络”，网络类和包安装类命令仍需经过权限管线；这个开关只改变 Sandbox capability，不改变授权结果。
+当前审批保证的是“用户明确允许这次包安装联网”，不是 registry 域名级 egress 防火墙。顶层包引用拒绝 URL、Git、file/path 和命令选项，但包管理器的传递依赖与 lifecycle scripts 仍可能产生额外网络行为；需要更强供应链边界时，应增加 registry proxy、域名/IP egress allowlist、hash/lockfile 和禁用脚本策略。UI 与 Trace 不得把当前能力宣称成“只访问官方 registry”。
 
 第三方 Skill 的依赖属于运行中动态依赖，不并入项目启动时的 manifest 扫描：
 
 ~~~text
 Agent 成功读取 /skills/<skill-id>/SKILL.md
   → Skill 流程发现缺少 Python / Node 包
-  → 提交精确 pip / uv / npm / npx 命令
-  → ToolExecutionPipeline 分类为 package_install
+  → 调用类型化 install_packages，不提交任意 pip/npm shell 字符串
+  → ToolExecutionPipeline 分类为 package_install + network_access
   → 当前对话直接 HITL 请求 package + network
   → 批准后临时联网安装
   → 回到原 Skill 流程继续执行
@@ -594,7 +618,7 @@ Docker Backend 将项目 Skills 只读挂载到 <code>/skills</code>，Skill 脚
 /home/puddingclaw/.cache
 ~~~
 
-该 volume 随项目沙箱复用，不污染宿主 Python/Node 环境，也不要求每个 Run 重装。<code>PATH</code>、<code>PYTHONUSERBASE</code>、<code>npm_config_prefix</code> 和 <code>NODE_PATH</code> 由 Backend 统一设置。Skill 自己要求修改项目 <code>package.json</code> 或项目虚拟环境时，仍写入项目依赖通道并受 workspace write policy 约束。
+该 volume 按 workspace 与不可变 image ID 复用，不污染宿主 Python/Node 环境，也不要求每个 Run 重装。<code>PATH</code>、<code>PYTHONUSERBASE</code>、<code>npm_config_prefix</code> 和 <code>NODE_PATH</code> 由 Backend 统一设置。Skill 自己要求修改项目 <code>package.json</code> 或项目虚拟环境时，仍写入项目依赖通道并受 workspace write policy 约束。
 
 后续可以为第三方 Skill 增加可选的机器可读 dependency manifest；在此之前，Skill 文档中的安装命令仍必须经过同一确定性权限管线，不能因“来自 Skill”而自动放行。
 
@@ -737,6 +761,39 @@ execute Tool Call
 | privilege/device/docker/host process control | deny | deny |
 | workspace 外宿主路径 | deny，使用专用 Tool / staging | deny，使用专用 Tool |
 | 无法解析 | ask | ask |
+
+### 5.6.1 严格审批与智能审批
+
+来源：**[Grok Build managed policy 借鉴] + [本方案新增]**。
+
+审批模式是 Session 配置，不是模型提示词，也不是关闭 HITL 的总开关：
+
+| 模式 | 自动放行 | 仍需询问 | 永不放行 |
+|---|---|---|---|
+| `strict`（默认） | 确定性本地安全基线 | Tavily、公开网页抓取、Docker 动态装包、项目写入与其他风险动作 | privilege、Docker control、host control、宿主 workspace 外路径等 hard deny |
+| `smart` | strict 基线 + Tavily + 通过 SSRF 校验的公开标准端口 HTTP/S 抓取 | Docker 动态装包（可批准当前 Session 的类型化 package capability）、高风险写入等 | 与 strict 相同，hard deny 不因模式改变 |
+
+智能审批不使用 LLM 猜风险。它只减少“可被确定性验证”的低风险常用动作弹窗；`fetch_url` 的 URL 查询参数变化不会重复授权，因为批准对象是受安全校验的工具能力，而不是完整 URL fingerprint。Docker 装包之所以仍询问，是因为它会下载并执行第三方代码，风险显著高于只读检索。
+
+Session 与 Run 的权威关系：
+
+~~~text
+Session permission config
+  approval_mode + policy_epoch + policy_version
+        │ start_run（同一文件锁内）
+        ▼
+RunPermissionContext（不可变）
+  run_id + mode + epoch + version + backend_id + workspace_id
+        │
+        ├─ Tool policy decision
+        └─ grant exact bindings
+~~~
+
+- Session 创建时，分析模型与审批模式在一次 API 写入中原子落盘；metadata 无权注入 permissions；
+- Run 开始和审批模式切换使用同一 Session 锁，因此二者线性化：要么新模式先于 Run 生效，要么切换因 active Run 被拒绝；
+- Run 执行 backend 只允许在 `preparing` 阶段绑定一次，不能中途从 Docker 静默换到 Host；
+- grant 必须匹配当前 Run 的 policy/backend/workspace bindings；终态 Run、旧 epoch、已删除 Session 或并发已解决的请求都 fail-closed；
+- Session grant 是产品状态，不是恢复源；同 Run HITL 仍由 LangGraph checkpoint 恢复。
 
 Docker 与 HITL 是两回事：
 
@@ -1187,18 +1244,39 @@ Goal Mode 必须作为一项前后端同时交付、且由用户主动开启的�
 
 截图所示的“目标”入口可作为交互借鉴，但 PuddingClaw 不照搬其未知内部实现。该入口是 **[产品交互借鉴]**，Goal/Run/Rubric 契约是 **[本方案新增]**。
 
-### 10.2 输入区 Goal 交互
+### 10.2 输入区 Goal 与审批模式交互
 
-在现有 <code>frontend/src/components/chat/ChatInput.tsx</code> 底部工具栏增加“目标”入口，仅在 Agent 模式显示，与项目、分析模型和思考模式并列。
+当前 Composer 采用“高频上下文在外、低频配置收纳”的布局：
+
+~~~text
+左侧：+ ｜项目目录｜严格审批/智能审批       右侧：思考｜上下文｜发送
+
++ 菜单：附件｜分析模型｜目标
+~~~
+
+- 项目目录和审批模式持续可见，因为它们直接定义本 Run 的工作范围和权限边界；
+- 附件、分析模型和 Goal 收入 `+` 菜单，避免底栏横向拥挤；
+- 思考模式放到右侧并使用 `aria-pressed` 表达开关状态；
+- 所有 Popover 互斥，`Escape` 先关闭当前 Popover，只有没有弹层时才进入停止 Run 的快捷行为；
+- 390px 宽度下 Composer 自动分成上下两行，菜单不得越出视口。
 
 首版交互：
 
-1. 未开启时点击“目标”，打开轻量 Popover；
-2. 用户确认后，本次发送携带 <code>goal_mode=true</code>，后端创建 Goal；
+1. 未开启时从 `+` 菜单点击“目标”，设置“下一 Run 开启 Goal”的输入意图；
+2. 本次发送携带 <code>goal_mode=true</code>，后端创建 Goal；
 3. Goal 创建后，入口变为带状态的 active chip，例如“目标进行中”；
 4. 点击 active chip 可查看目标描述、当前状态、剩余预算、gaps，并执行暂停、恢复或取消；
 5. Goal 达成后显示“目标已完成”，下一次发送默认回到普通模式，除非用户新建 Goal；
 6. 用户取消当前 Run 时不自动取消 Goal；“停止本轮”和“取消目标”必须是两个不同操作。
+
+Goal intent 不能在点击开关或发起 HTTP 请求时提前消费。前端冻结本次发送的 model/project/runtime/goal/approval snapshot，只有收到后端 `run_started` 才清除“下一 Run”意图；网络失败或 Session 创建失败后用户可直接重试，不会静默丢失 Goal。Session 尚不存在时，分析模型与审批模式随 Session create 原子提交，避免先建默认 Session、随后 PATCH 造成首个 Run 使用错误配置。
+
+审批模式入口同样位于 Composer 外层：
+
+- `strict` 中文显示“严格审批”，`smart` 显示“智能审批”；
+- 菜单解释智能模式会自动放行只读网页检索，但 Docker 装包仍需审批；
+- 活动 Run 期间禁用模式切换；切换请求携带 `expected_epoch`，后端用乐观并发拒绝陈旧 UI；
+- 模式是 Session 级设置，而真正执行时使用 Run 冻结快照，前端展示不得暗示它会改变正在运行的 Run。
 
 未点击“目标”时，请求明确携带 <code>goal_mode=false</code> 或省略该字段，并保持“一次请求、一个 Run”的默认路径。即使该 Run 启用了 Rubric，也不显示 active Goal chip，不写 GoalState，不自动发起后续 Run。
 

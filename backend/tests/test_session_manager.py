@@ -1,6 +1,40 @@
 """SessionManager 持久化与 reasoning_content 处理测试。"""
 
+import pytest
+
 from graph.session_manager import session_manager
+
+
+def test_metadata_cannot_create_or_overwrite_control_plane_state(tmp_path):
+    session_manager.initialize(tmp_path)
+
+    with pytest.raises(FileNotFoundError):
+        session_manager.update_metadata("missing", {"runtime_mode": "agent"})
+
+    session_manager.create_session("protected")
+    with pytest.raises(ValueError, match="Unsupported Session metadata"):
+        session_manager.update_metadata(
+            "protected",
+            {"permissions": {"approval_mode": "smart"}},
+        )
+    assert session_manager.get_permission_policy("protected")["approval_mode"] == "strict"
+
+
+def test_deleted_session_cannot_be_recreated_by_message_writes(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("deleted")
+    session_manager.delete_session("deleted")
+
+    with pytest.raises(FileNotFoundError):
+        session_manager.save_message("deleted", "user", "must not reappear")
+    with pytest.raises(FileNotFoundError):
+        session_manager.upsert_assistant_message(
+            "deleted",
+            query_id="query-1",
+            content="must not reappear",
+        )
+
+    assert not (tmp_path / "sessions" / "deleted.json").exists()
 
 
 def test_analytics_model_id_round_trips_in_session_metadata(tmp_path):

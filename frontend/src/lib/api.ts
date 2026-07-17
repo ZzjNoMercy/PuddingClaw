@@ -2652,6 +2652,9 @@ export async function listSessions(): Promise<
     workspace_type?: string;
     workspace_path?: string;
     analytics_model_id?: string | null;
+    approval_mode?: ApprovalMode;
+    policy_epoch?: number;
+    policy_version?: string;
   }>
 > {
   const resp = await fetch(`${API_BASE}/sessions`);
@@ -2822,16 +2825,79 @@ export async function denyPermissionRequest(
 /**
  * Create a new session.
  */
-export async function createSession(): Promise<{
+export type ApprovalMode = "strict" | "smart";
+
+export interface CreateSessionOptions {
+  analytics_model_id?: string | null;
+  approval_mode?: ApprovalMode;
+}
+
+export interface PermissionModeState {
+  session_id: string;
+  approval_mode: ApprovalMode;
+  policy_epoch: number;
+  policy_version: string;
+}
+
+export async function createSession(options: CreateSessionOptions = {}): Promise<{
   id: string;
   title: string;
   created_at?: number;
   updated_at?: number;
   runtime_mode?: "agent" | "chat";
   analytics_model_id?: string | null;
+  approval_mode: ApprovalMode;
+  policy_epoch: number;
+  policy_version: string;
 }> {
-  const resp = await fetch(`${API_BASE}/sessions`, { method: "POST" });
+  const resp = await fetch(`${API_BASE}/sessions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(options),
+  });
   if (!resp.ok) throw new Error(`Failed to create session: ${resp.status}`);
+  return resp.json();
+}
+
+export async function getSessionApprovalMode(
+  sessionId: string,
+): Promise<PermissionModeState> {
+  const resp = await fetch(
+    `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/permissions/mode`,
+    { cache: "no-store" },
+  );
+  if (!resp.ok) throw new Error(`Failed to get approval mode: ${resp.status}`);
+  return resp.json();
+}
+
+export async function updateSessionApprovalMode(
+  sessionId: string,
+  approvalMode: ApprovalMode,
+  expectedEpoch?: number,
+): Promise<PermissionModeState> {
+  const resp = await fetch(
+    `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/permissions/mode`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        approval_mode: approvalMode,
+        expected_epoch: expectedEpoch,
+      }),
+    },
+  );
+  if (!resp.ok) {
+    const payload = await resp.json().catch(() => null) as { detail?: unknown } | null;
+    const detail = typeof payload?.detail === "string" ? payload.detail : "";
+    const localized = resp.status === 409
+      ? detail.toLowerCase().includes("active run")
+        ? "当前 Run 仍在进行，完成后才能切换授权模式。"
+        : "授权模式已在其他位置更新，请刷新后重试。"
+      : resp.status === 404
+        ? "当前会话已不存在，请新建会话后重试。"
+        : "授权模式更新失败，请稍后重试。";
+    throw new Error(localized);
+  }
   return resp.json();
 }
 

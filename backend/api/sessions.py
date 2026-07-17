@@ -2,13 +2,14 @@
 
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
 from config import get_rag_mode
+from graph.permission_resume import permission_resume_registry
 from graph.prompt_builder import build_system_prompt
 from graph.session_manager import session_manager
 from harness.coordinators import GoalActivationError, GoalCoordinator
@@ -22,6 +23,7 @@ goal_coordinator = GoalCoordinator(session_manager)
 
 # ── Request models ──────────────────────────────────────────
 
+
 class RenameRequest(BaseModel):
     title: str
 
@@ -30,7 +32,13 @@ class SessionAnalyticsModelRequest(BaseModel):
     analytics_model_id: str | None = None
 
 
+class SessionCreateRequest(BaseModel):
+    analytics_model_id: str | None = None
+    approval_mode: Literal["strict", "smart"] = "strict"
+
+
 # ── Endpoints ───────────────────────────────────────────────
+
 
 @router.get("/sessions")
 async def list_sessions():
@@ -40,10 +48,18 @@ async def list_sessions():
 
 
 @router.post("/sessions")
-async def create_session():
+async def create_session(req: SessionCreateRequest | None = None):
     """Create a new empty session."""
     session_id = f"session-{uuid.uuid4().hex[:12]}"
-    meta = session_manager.create_session(session_id)
+    payload = req or SessionCreateRequest()
+    try:
+        meta = session_manager.create_session(
+            session_id,
+            metadata={"analytics_model_id": payload.analytics_model_id},
+            approval_mode=payload.approval_mode,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return meta
 
 
@@ -63,16 +79,20 @@ async def update_session_analytics_model(
     req: SessionAnalyticsModelRequest,
 ):
     """Persist or clear the analytics model selected for one session."""
-    meta = session_manager.update_metadata(
-        session_id,
-        {"analytics_model_id": req.analytics_model_id},
-    )
+    try:
+        meta = session_manager.update_metadata(
+            session_id,
+            {"analytics_model_id": req.analytics_model_id},
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Session not found") from exc
     return meta
 
 
 @router.delete("/sessions/{session_id}")
 async def delete_session(session_id: str):
     """Delete a session."""
+    permission_resume_registry.reject_session(session_id, "Session was deleted.")
     session_manager.delete_session(session_id)
     return {"status": "deleted", "id": session_id}
 
@@ -202,7 +222,7 @@ async def generate_title(session_id: str):
         )
 
         result = await llm.ainvoke([HM(content=prompt)])
-        title = result.content.strip().strip('"\'""''')[:20]
+        title = result.content.strip().strip('"\'""')[:20]
 
         session_manager.update_title(session_id, title)
         return {"session_id": session_id, "title": title}

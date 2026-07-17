@@ -9,7 +9,7 @@ import traceback
 from pathlib import Path
 from typing import AsyncGenerator
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
@@ -954,16 +954,19 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
 
 @router.post("/chat")
 async def chat(request: ChatRequest):
-    session_manager.update_metadata(
-        request.session_id,
-        {
-            "runtime_mode": "chat",
-            "project_id": None,
-            "project_path": None,
-            "workspace_type": None,
-            "workspace_path": None,
-        },
-    )
+    try:
+        session_manager.update_metadata(
+            request.session_id,
+            {
+                "runtime_mode": "chat",
+                "project_id": None,
+                "project_path": None,
+                "workspace_type": None,
+                "workspace_path": None,
+            },
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Session not found") from exc
     if request.stream:
         return EventSourceResponse(
             event_generator(request.message, request.session_id, request.user_id)

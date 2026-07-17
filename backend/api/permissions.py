@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -30,17 +30,24 @@ class ToolActionGrantRequest(BaseModel):
     scope: str = Field(pattern="^(once|session)$")
 
 
+class ApprovalModeUpdateRequest(BaseModel):
+    approval_mode: Literal["strict", "smart"]
+    expected_epoch: int | None = Field(default=None, ge=1)
+
+
 @router.get("/sessions/{session_id}/permissions")
 async def list_permissions(session_id: str) -> dict[str, Any]:
     """List active permission grants for a session."""
 
-    grants = session_manager.list_permission_grants(session_id)
+    try:
+        session_manager.get_permission_policy(session_id)
+        grants = session_manager.list_permission_grants(session_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Session not found") from exc
     for grant in grants:
         if grant.get("type") != "tool_action" or grant.get("metadata"):
             continue
-        request = permission_resume_registry.find_tool_action_request(
-            str(grant.get("target") or "")
-        )
+        request = permission_resume_registry.find_tool_action_request(str(grant.get("target") or ""))
         if request is not None:
             grant["metadata"] = {
                 "tool_name": request.get("tool_name"),
@@ -49,6 +56,33 @@ async def list_permissions(session_id: str) -> dict[str, Any]:
                 "risk": request.get("risk"),
             }
     return {"session_id": session_id, "grants": grants}
+
+
+@router.get("/sessions/{session_id}/permissions/mode")
+async def get_approval_mode(session_id: str) -> dict[str, Any]:
+    try:
+        policy = session_manager.get_permission_policy(session_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Session not found") from exc
+    return {"session_id": session_id, **policy}
+
+
+@router.patch("/sessions/{session_id}/permissions/mode")
+async def update_approval_mode(
+    session_id: str,
+    req: ApprovalModeUpdateRequest,
+) -> dict[str, Any]:
+    try:
+        policy = session_manager.set_approval_mode_if_idle(
+            session_id,
+            req.approval_mode,
+            expected_epoch=req.expected_epoch,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Session not found") from exc
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"session_id": session_id, **policy}
 
 
 @router.post("/sessions/{session_id}/permissions/external-files")
@@ -65,6 +99,11 @@ async def grant_external_file_permission(
         raise HTTPException(status_code=400, detail="permission request belongs to another session")
     if pending is not None and pending.get("status") != "pending":
         raise HTTPException(status_code=409, detail="permission request is no longer pending")
+    if pending is not None and pending.get("type") not in {
+        "external_file_read",
+        "external_file_write",
+    }:
+        raise HTTPException(status_code=400, detail="permission request is not an external file action")
     access = "write" if pending and pending.get("type") == "external_file_write" else "read"
     if access == "write" and req.target_kind != "exact_file":
         raise HTTPException(status_code=400, detail="external write permission only supports exact_file")
@@ -78,15 +117,18 @@ async def grant_external_file_permission(
     else:
         target = "*"
 
-    grant = session_manager.add_permission_grant(
-        session_id,
-        grant_type=f"external_file_{access}",
-        target_kind=req.target_kind,
-        target=target,
-        capabilities=[access, "external_path"],
-        scope="session",
-        source="user",
-    )
+    try:
+        grant = session_manager.add_permission_grant(
+            session_id,
+            grant_type=f"external_file_{access}",
+            target_kind=req.target_kind,
+            target=target,
+            capabilities=[access, "external_path"],
+            scope="session",
+            source="user",
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Session not found") from exc
     resumed = False
     if req.permission_request_id:
         resumed = permission_resume_registry.resolve(
@@ -168,9 +210,7 @@ async def grant_tool_action_permission(
         raise HTTPException(status_code=400, detail="permission fingerprint missing")
     session_target_kind = str(pending.get("session_target_kind") or "")
     session_target = str(pending.get("session_target") or "")
-    use_reusable_scope = (
-        req.scope == "session" and session_target_kind and session_target
-    )
+    use_reusable_scope = req.scope == "session" and session_target_kind and session_target
     target_kind = session_target_kind if use_reusable_scope else "fingerprint"
     target = session_target if use_reusable_scope else fingerprint
     metadata = {
@@ -179,19 +219,27 @@ async def grant_tool_action_permission(
         "reason": pending.get("reason"),
         "risk": pending.get("risk"),
     }
+    if pending.get("run_id"):
+        metadata["run_id"] = pending.get("run_id")
     if use_reusable_scope:
         metadata["session_scope_label"] = pending.get("session_scope_label")
         metadata["session_target"] = session_target
-    grant = session_manager.add_permission_grant(
-        session_id,
-        grant_type="tool_action",
-        target_kind=target_kind,
-        target=target,
-        capabilities=["execute"],
-        scope=req.scope,
-        source="user",
-        metadata=metadata,
-    )
+    try:
+        grant = session_manager.add_permission_grant(
+            session_id,
+            grant_type="tool_action",
+            target_kind=target_kind,
+            target=target,
+            capabilities=[str(item) for item in (pending.get("capabilities") or ["execute"])],
+            scope=req.scope,
+            source="user",
+            metadata=metadata,
+            bindings=(dict(pending["grant_bindings"]) if isinstance(pending.get("grant_bindings"), dict) else None),
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Session not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     resumed = permission_resume_registry.resolve(
         req.permission_request_id,
         {"type": "approve", "grant_id": grant["id"]},

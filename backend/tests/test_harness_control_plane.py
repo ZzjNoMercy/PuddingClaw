@@ -189,20 +189,13 @@ def test_harness_custom_rule_is_compiled_with_settings_source():
     )
 
     assert contract is not None
-    criterion = next(
-        item for item in contract.criteria if item.id == "quantified_impact"
-    )
+    criterion = next(item for item in contract.criteria if item.id == "quantified_impact")
     assert criterion.source.value == "settings"
     assert criterion.verifier.value == "analytics"
 
 
 def test_plain_chat_does_not_pay_rubric_tax():
-    assert (
-        RunRubricCompiler.compile(
-            RubricBuildContext(user_message="你好，介绍一下你自己")
-        )
-        is None
-    )
+    assert RunRubricCompiler.compile(RubricBuildContext(user_message="你好，介绍一下你自己")) is None
 
 
 def test_explicit_goal_always_freezes_a_verification_contract(tmp_path):
@@ -223,23 +216,15 @@ def test_explicit_goal_always_freezes_a_verification_contract(tmp_path):
     assert {
         "task_fulfillment",
         "todo_reconciliation",
-    } <= {
-        item.id for item in run.verification_contract.criteria
-    }
+    } <= {item.id for item in run.verification_contract.criteria}
 
 
 def test_create_workspace_artifact_compiles_artifact_delivery():
-    contract = RunRubricCompiler.compile(
-        RubricBuildContext(
-            user_message="创建 /workspace/result.md 并引用该路径"
-        )
-    )
+    contract = RunRubricCompiler.compile(RubricBuildContext(user_message="创建 /workspace/result.md 并引用该路径"))
 
     assert contract is not None
     assert contract.task_type == "artifact"
-    assert "artifact_delivery" in {
-        item.id for item in contract.criteria
-    }
+    assert "artifact_delivery" in {item.id for item in contract.criteria}
 
 
 def test_verification_can_be_disabled_without_false_grader_error(tmp_path):
@@ -330,19 +315,13 @@ def test_deterministic_todo_gate_overrides_satisfied_grader(tmp_path):
     )
     coordinator.transition(run, RunStatus.RUNNING)
     state = _satisfied_final_state(tmp_path)
-    state["_harness_context"]["todos"] = [
-        {"id": "todo-1", "content": "补齐数据来源", "status": "in_progress"}
-    ]
+    state["_harness_context"]["todos"] = [{"id": "todo-1", "content": "补齐数据来源", "status": "in_progress"}]
 
     completed, _, report = coordinator.complete_from_final_state(run, goal, state)
 
     assert completed.outcome == RunOutcome.VERIFICATION_FAILED
     assert report.status == VerificationStatus.NEEDS_REVISION
-    todo_evaluation = next(
-        item
-        for item in report.evaluations
-        if item.criterion_id == "todo_reconciliation"
-    )
+    todo_evaluation = next(item for item in report.evaluations if item.criterion_id == "todo_reconciliation")
     assert todo_evaluation.passed is False
     assert "补齐数据来源" in str(todo_evaluation.gap)
 
@@ -363,9 +342,7 @@ def test_missing_artifact_overrides_satisfied_grader(tmp_path):
     completed, _, report = coordinator.complete_from_final_state(run, goal, state)
 
     assert completed.outcome == RunOutcome.VERIFICATION_FAILED
-    artifact_evaluation = next(
-        item for item in report.evaluations if item.criterion_id == "artifact_delivery"
-    )
+    artifact_evaluation = next(item for item in report.evaluations if item.criterion_id == "artifact_delivery")
     assert artifact_evaluation.passed is False
     assert "missing.md" in str(artifact_evaluation.gap)
 
@@ -481,10 +458,7 @@ def test_goal_followup_inherits_frozen_contract(tmp_path):
 
     assert same_goal is not None
     assert followup.verification_contract is not None
-    assert (
-        followup.verification_contract.contract_id
-        == goal.goal_contract.contract_id
-    )
+    assert followup.verification_contract.contract_id == goal.goal_contract.contract_id
 
 
 def test_goal_contract_monotonically_inherits_runtime_analytics_pack(tmp_path):
@@ -544,9 +518,7 @@ def test_goal_contract_monotonically_inherits_runtime_analytics_pack(tmp_path):
     assert same_goal is not None
     assert followup.verification_contract is not None
     assert "analytics" in followup.verification_contract.verification_packs
-    assert "metric_consistency" in {
-        item.id for item in followup.verification_contract.criteria
-    }
+    assert "metric_consistency" in {item.id for item in followup.verification_contract.criteria}
 
 
 def test_cancelled_goal_run_preserves_successful_runtime_pack(tmp_path):
@@ -648,6 +620,127 @@ def test_session_rejects_two_concurrent_runs(tmp_path):
         )
 
 
+def test_run_freezes_session_permission_policy_and_execution_backend(tmp_path):
+    sessions = _sessions(tmp_path)
+    policy = sessions.set_approval_mode_if_idle("session-1", "smart")
+    coordinator = HarnessRunCoordinator(sessions)
+
+    run, _ = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-permissions",
+        objective="查公开网页",
+        goal_mode=False,
+    )
+
+    assert run.config_snapshot["permissions"] == policy
+    assert run.config_snapshot["permissions"]["approval_mode"] == "smart"
+    coordinator.bind_execution_snapshot(
+        run,
+        {
+            "backend_mode": "docker",
+            "backend_id": "docker:project:spec",
+            "workspace_id": "sha256:workspace",
+        },
+    )
+    assert run.config_snapshot["execution"]["backend_mode"] == "docker"
+    persisted = sessions.get_run_state("session-1", run.run_id)
+    assert persisted is not None
+    assert persisted["config_snapshot"] == run.config_snapshot
+
+
+def test_mode_change_and_run_start_are_linearizable(tmp_path):
+    """Whichever lock wins, the Run snapshot must match the accepted policy."""
+
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    sessions = _sessions(tmp_path)
+    coordinator = HarnessRunCoordinator(sessions)
+    barrier = Barrier(2)
+
+    def start_run():
+        barrier.wait()
+        return coordinator.start_run(
+            session_id="session-1",
+            query_id="query-race",
+            objective="race",
+            goal_mode=False,
+        )[0]
+
+    def change_mode():
+        barrier.wait()
+        try:
+            return sessions.set_approval_mode_if_idle("session-1", "smart")
+        except RuntimeError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        run_future = executor.submit(start_run)
+        mode_future = executor.submit(change_mode)
+        run = run_future.result(timeout=5)
+        changed = mode_future.result(timeout=5)
+
+    frozen = run.config_snapshot["permissions"]
+    if changed is None:
+        assert frozen["approval_mode"] == "strict"
+    else:
+        assert changed["approval_mode"] == "smart"
+        assert frozen == changed
+
+
+def test_approval_mode_is_idempotent_and_blocked_by_active_run(tmp_path):
+    sessions = _sessions(tmp_path)
+    original = sessions.get_permission_policy("session-1")
+    unchanged = sessions.set_approval_mode_if_idle(
+        "session-1",
+        "strict",
+        expected_epoch=original["policy_epoch"],
+    )
+    assert unchanged == original
+
+    coordinator = HarnessRunCoordinator(sessions)
+    run, _ = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-active",
+        objective="active",
+        goal_mode=False,
+    )
+    with pytest.raises(RuntimeError, match=f"active Run {run.run_id}"):
+        sessions.set_approval_mode_if_idle("session-1", "smart")
+
+
+def test_execution_snapshot_is_single_assignment_and_config_is_immutable(tmp_path):
+    sessions = _sessions(tmp_path)
+    coordinator = HarnessRunCoordinator(sessions)
+    run, _ = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-bind",
+        objective="bind",
+        goal_mode=False,
+    )
+    execution = {
+        "backend_mode": "restricted_host",
+        "backend_id": "host:one",
+        "workspace_id": "sha256:one",
+    }
+    coordinator.bind_execution_snapshot(run, execution)
+    coordinator.bind_execution_snapshot(run, execution)
+    with pytest.raises(ValueError, match="already bound"):
+        sessions.bind_run_execution_snapshot(
+            "session-1",
+            run.run_id,
+            {**execution, "backend_id": "host:forged"},
+        )
+
+    stale = run.model_copy(deep=True)
+    stale.config_snapshot = {"permissions": {"approval_mode": "strict"}}
+    saved = sessions.upsert_run_state(
+        "session-1",
+        stale.model_dump(mode="json"),
+    )
+    assert saved["config_snapshot"] == run.config_snapshot
+
+
 def test_goal_cannot_pause_or_cancel_while_run_is_attached(tmp_path):
     sessions = _sessions(tmp_path)
     coordinator = HarnessRunCoordinator(sessions)
@@ -705,8 +798,9 @@ def test_first_terminal_run_outcome_is_authoritative(tmp_path):
         query_id="query-1",
         session_id="session-1",
         objective="task",
-        status=RunStatus.RUNNING,
     )
+    sessions.upsert_run_state("session-1", run.model_dump(mode="json"))
+    run.transition(RunStatus.RUNNING)
     sessions.upsert_run_state("session-1", run.model_dump(mode="json"))
     run.finish(RunOutcome.CANCELLED)
     sessions.upsert_run_state("session-1", run.model_dump(mode="json"))
@@ -719,6 +813,88 @@ def test_first_terminal_run_outcome_is_authoritative(tmp_path):
             "session-1",
             forged.model_dump(mode="json"),
         )
+
+
+def test_terminal_run_contract_is_immutable_and_new_run_must_prepare(tmp_path):
+    sessions = _sessions(tmp_path)
+    invalid = RunRecord(
+        run_id="run-invalid",
+        query_id="query-invalid",
+        session_id="session-1",
+        objective="task",
+        status=RunStatus.RUNNING,
+    )
+    with pytest.raises(ValueError, match="must start in preparing"):
+        sessions.start_harness_run(
+            "session-1",
+            invalid.model_dump(mode="json"),
+        )
+
+    coordinator = HarnessRunCoordinator(sessions)
+    run, _ = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-1",
+        objective="task",
+        goal_mode=False,
+    )
+    coordinator.bind_execution_snapshot(
+        run,
+        {
+            "backend_mode": "restricted_host",
+            "backend_id": "restricted-host:test",
+            "workspace_id": "workspace:test",
+        },
+    )
+    coordinator.transition(run, RunStatus.RUNNING)
+    run.finish(RunOutcome.CANCELLED)
+    sessions.terminalize_run_state(
+        "session-1",
+        run.run_id,
+        run.model_dump(mode="json"),
+    )
+
+    with pytest.raises(ValueError, match="Terminal Run"):
+        sessions.update_run_verification_contract(
+            "session-1",
+            run.run_id,
+            {"contract_id": "late"},
+        )
+
+
+def test_run_waiting_hitl_transition_round_trip(tmp_path):
+    sessions = _sessions(tmp_path)
+    coordinator = HarnessRunCoordinator(sessions)
+    run, _ = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-1",
+        objective="task",
+        goal_mode=False,
+    )
+    coordinator.bind_execution_snapshot(
+        run,
+        {
+            "backend_mode": "restricted_host",
+            "backend_id": "restricted-host:test",
+            "workspace_id": "workspace:test",
+        },
+    )
+    coordinator.transition(run, RunStatus.RUNNING)
+
+    waiting = sessions.transition_run_status(
+        "session-1",
+        run.run_id,
+        "waiting_hitl",
+        expected_statuses={"running"},
+    )
+    resumed = sessions.transition_run_status(
+        "session-1",
+        run.run_id,
+        "running",
+        expected_statuses={"waiting_hitl"},
+    )
+
+    assert waiting["status"] == "waiting_hitl"
+    assert resumed["status"] == "running"
 
 
 def test_terminal_goal_cannot_be_rewritten_through_persistence(tmp_path):

@@ -31,6 +31,8 @@ import {
   updateProject as apiUpdateProject,
   removeProject as apiRemoveProject,
   updateSessionAnalyticsModel as apiUpdateSessionAnalyticsModel,
+  getSessionApprovalMode as apiGetSessionApprovalMode,
+  updateSessionApprovalMode as apiUpdateSessionApprovalMode,
   getSessionHarnessState as apiGetSessionHarnessState,
   pauseGoal as apiPauseGoal,
   resumeGoal as apiResumeGoal,
@@ -50,6 +52,7 @@ import {
   HarnessGoal,
   HarnessRun,
   RubricEvaluationReport,
+  ApprovalMode,
 } from "./api";
 import {
   getSettings as apiGetSettings,
@@ -82,6 +85,19 @@ const ACTIVE_RUNS_HEARTBEAT_MS = 5_000;
 const ACTIVE_RUNS_STALE_MS = 15_000;
 
 type ActiveRunRegistry = Record<string, { sessions: string[]; updatedAt: number }>;
+const TERMINAL_RUN_STATUSES = new Set([
+  "completed",
+  "cancelled",
+  "failed",
+  "blocked",
+  "budget_exceeded",
+  "verification_failed",
+]);
+const CLOSED_GOAL_STATUSES = new Set(["achieved", "cancelled", "budget_exceeded"]);
+
+function runIsActive(run: HarnessRun | null | undefined): boolean {
+  return Boolean(run && !TERMINAL_RUN_STATUSES.has(run.status));
+}
 
 function readActiveRunRegistry(): ActiveRunRegistry {
   try {
@@ -164,6 +180,9 @@ export interface SessionMeta {
   workspace_type?: string;
   workspace_path?: string;
   analytics_model_id?: string | null;
+  approval_mode?: ApprovalMode;
+  policy_epoch?: number;
+  policy_version?: string;
 }
 
 export interface RawMessage {
@@ -201,10 +220,14 @@ interface AppState {
   messages: ChatMessage[];
   isStreaming: boolean;
   hasActiveRun: boolean;
-  sendMessage: (text: string, attachments?: AgentAttachment[]) => Promise<void>;
+  sendMessage: (text: string, attachments?: AgentAttachment[]) => Promise<boolean>;
   stopStreaming: () => void;
   goalModeEnabled: boolean;
   setGoalModeEnabled: (enabled: boolean) => void;
+  approvalMode: ApprovalMode;
+  approvalModeSaving: boolean;
+  approvalModeError: string | null;
+  setApprovalMode: (mode: ApprovalMode) => Promise<boolean>;
   activeGoal: HarnessGoal | null;
   currentRun: HarnessRun | null;
   verificationReport: RubricEvaluationReport | null;
@@ -632,6 +655,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const graphsMapRef = useRef<Record<string, GraphStructure | null>>({});
   const graphActiveNodesRef = useRef<Record<string, string | null>>({});
   const analyticsModelIdsMapRef = useRef<Record<string, string | null>>({});
+  const approvalModesMapRef = useRef<Record<string, ApprovalMode>>({ default: "strict" });
+  const approvalPolicyEpochsMapRef = useRef<Record<string, number>>({ default: 1 });
+  const nextRunGoalModeMapRef = useRef<Record<string, boolean>>({ default: false });
+  const createSessionPromisesRef = useRef<Map<string, Promise<string | null>>>(new Map());
+  const sendReservationsRef = useRef<Set<string>>(new Set());
+  const approvalModeSavingSessionsRef = useRef<Set<string>>(new Set());
+  const approvalModeErrorsMapRef = useRef<Record<string, string | null>>({});
   const activeGoalsMapRef = useRef<Record<string, HarnessGoal | null>>({});
   const currentRunsMapRef = useRef<Record<string, HarnessRun | null>>({});
   const verificationReportsMapRef = useRef<Record<string, RubricEvaluationReport | null>>({});
@@ -682,7 +712,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [runtimeReady, setRuntimeReady] = useState(false);
   const [currentProjectId, setCurrentProjectIdRaw] = useState<string | null>(null);
   const [analyticsModelId, setAnalyticsModelIdRaw] = useState<string | null>(null);
-  const [goalModeEnabled, setGoalModeEnabled] = useState(false);
+  const [goalModeEnabled, setGoalModeEnabledRaw] = useState(false);
+  const [approvalMode, setApprovalModeRaw] = useState<ApprovalMode>("strict");
+  const [approvalModeSaving, setApprovalModeSaving] = useState(false);
+  const [approvalModeError, setApprovalModeError] = useState<string | null>(null);
   const [activeGoal, setActiveGoal] = useState<HarnessGoal | null>(null);
   const [currentRun, setCurrentRun] = useState<HarnessRun | null>(null);
   const [verificationReport, setVerificationReport] = useState<RubricEvaluationReport | null>(null);
@@ -808,6 +841,64 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       // Keep the optimistic session-local selection. A subsequent Agent turn
       // also persists the same value through its request metadata.
     });
+  }, []);
+
+  const setGoalModeEnabled = useCallback((enabled: boolean) => {
+    const sid = sessionIdRef.current;
+    nextRunGoalModeMapRef.current[sid] = enabled;
+    setGoalModeEnabledRaw(enabled);
+  }, []);
+
+  const setApprovalMode = useCallback(async (mode: ApprovalMode): Promise<boolean> => {
+    const sid = sessionIdRef.current;
+    approvalModeErrorsMapRef.current[sid] = null;
+    setApprovalModeError(null);
+    if (sid === "default") {
+      approvalModesMapRef.current.default = mode;
+      setApprovalModeRaw(mode);
+      return true;
+    }
+    if (approvalModeSavingSessionsRef.current.has(sid) || runIsActive(currentRunsMapRef.current[sid])) {
+      const message = "当前 Run 进行中，完成后才能切换授权模式。";
+      approvalModeErrorsMapRef.current[sid] = message;
+      setApprovalModeError(message);
+      return false;
+    }
+    const expectedEpoch = approvalPolicyEpochsMapRef.current[sid];
+    if (!expectedEpoch) {
+      const message = "授权策略仍在加载，请稍后重试。";
+      approvalModeErrorsMapRef.current[sid] = message;
+      setApprovalModeError(message);
+      return false;
+    }
+    approvalModeSavingSessionsRef.current.add(sid);
+    setApprovalModeSaving(true);
+    try {
+      const result = await apiUpdateSessionApprovalMode(
+        sid,
+        mode,
+        expectedEpoch,
+      );
+      approvalModesMapRef.current[sid] = result.approval_mode;
+      approvalPolicyEpochsMapRef.current[sid] = result.policy_epoch;
+      setSessions((current) => current.map((session) =>
+        session.id === sid
+          ? { ...session, approval_mode: result.approval_mode }
+          : session
+      ));
+      if (sessionIdRef.current === sid) {
+        setApprovalModeRaw(result.approval_mode);
+      }
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "授权模式更新失败";
+      approvalModeErrorsMapRef.current[sid] = message;
+      if (sessionIdRef.current === sid) setApprovalModeError(message);
+      return false;
+    } finally {
+      approvalModeSavingSessionsRef.current.delete(sid);
+      if (sessionIdRef.current === sid) setApprovalModeSaving(false);
+    }
   }, []);
 
   // Derived: is the CURRENT session streaming?
@@ -1099,6 +1190,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           if (!Object.prototype.hasOwnProperty.call(analyticsModelIdsMapRef.current, session.id)) {
             analyticsModelIdsMapRef.current[session.id] = session.analytics_model_id ?? null;
           }
+          approvalModesMapRef.current[session.id] = session.approval_mode || "strict";
+          if (session.policy_epoch) {
+            approvalPolicyEpochsMapRef.current[session.id] = session.policy_epoch;
+          }
         }
         setSessions(list);
       })
@@ -1185,17 +1280,22 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       setRawMessages(null);
 
       if (id === "default") {
-        analyticsModelIdsMapRef.current.default = null;
-        setAnalyticsModelIdRaw(null);
-        setGoalModeEnabled(false);
+        setAnalyticsModelIdRaw(analyticsModelIdsMapRef.current.default ?? null);
+        setGoalModeEnabledRaw(nextRunGoalModeMapRef.current.default ?? false);
+        setApprovalModeRaw(approvalModesMapRef.current.default || "strict");
+        setApprovalModeSaving(approvalModeSavingSessionsRef.current.has("default"));
+        setApprovalModeError(approvalModeErrorsMapRef.current.default ?? null);
         setActiveGoal(null);
         setCurrentRun(null);
         setVerificationReport(null);
       } else {
         setAnalyticsModelIdRaw(analyticsModelIdsMapRef.current[id] ?? null);
+        setApprovalModeRaw(approvalModesMapRef.current[id] || "strict");
+        setApprovalModeSaving(approvalModeSavingSessionsRef.current.has(id));
+        setApprovalModeError(approvalModeErrorsMapRef.current[id] ?? null);
         const cachedGoal = activeGoalsMapRef.current[id] ?? null;
         setActiveGoal(cachedGoal);
-        setGoalModeEnabled(Boolean(cachedGoal && cachedGoal.status === "active"));
+        setGoalModeEnabledRaw(Boolean(nextRunGoalModeMapRef.current[id]));
         setCurrentRun(currentRunsMapRef.current[id] ?? null);
         setVerificationReport(verificationReportsMapRef.current[id] ?? null);
         apiGetSessionHarnessState(id)
@@ -1224,9 +1324,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             verificationReportsMapRef.current[id] = loadedReport;
             if (sessionIdRef.current === id) {
               setActiveGoal(loadedGoal);
-              setGoalModeEnabled(Boolean(loadedGoal && loadedGoal.status === "active"));
+              setGoalModeEnabledRaw(Boolean(nextRunGoalModeMapRef.current[id]));
               setCurrentRun(loadedRun);
               setVerificationReport(loadedReport);
+            }
+          })
+          .catch(() => {});
+        apiGetSessionApprovalMode(id)
+          .then((policy) => {
+            approvalModesMapRef.current[id] = policy.approval_mode;
+            approvalPolicyEpochsMapRef.current[id] = policy.policy_epoch;
+            if (sessionIdRef.current === id) {
+              setApprovalModeRaw(policy.approval_mode);
             }
           })
           .catch(() => {});
@@ -1335,36 +1444,59 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, [sessions, setSessionId]);
 
   const createSession = useCallback(async (): Promise<string | null> => {
-    try {
-      const pendingAnalyticsModelId =
-        sessionIdRef.current === "default"
-          ? analyticsModelIdsMapRef.current.default ?? null
-          : null;
-      const meta = await apiCreateSession();
-      analyticsModelIdsMapRef.current[meta.id] = pendingAnalyticsModelId;
-      setSessions((prev) => [
-        {
-          id: meta.id,
-          title: meta.title,
-          updated_at: meta.updated_at || Date.now() / 1000,
-          runtime_mode: meta.runtime_mode || "chat",
-          analytics_model_id: pendingAnalyticsModelId,
-        },
-        ...prev,
-      ]);
-      // Pre-populate the message cache so setSessionId shows the empty state
-      // immediately and doesn't overwrite locally-added messages with a later
-      // history fetch.
-      messagesMapRef.current[meta.id] = [];
-      setSessionId(meta.id);
-      if (pendingAnalyticsModelId !== null) {
-        apiUpdateSessionAnalyticsModel(meta.id, pendingAnalyticsModelId).catch(() => {});
+    const originSessionId = sessionIdRef.current;
+    const existing = createSessionPromisesRef.current.get(originSessionId);
+    if (existing) return existing;
+    const snapshot = {
+      analyticsModelId: analyticsModelIdsMapRef.current[originSessionId] ?? null,
+      approvalMode: (approvalModesMapRef.current[originSessionId] || "strict") as ApprovalMode,
+      goalModeEnabled: nextRunGoalModeMapRef.current[originSessionId] ?? false,
+    };
+    const creation = (async (): Promise<string | null> => {
+      try {
+        const meta = await apiCreateSession({
+          analytics_model_id: snapshot.analyticsModelId,
+          approval_mode: snapshot.approvalMode,
+        });
+        analyticsModelIdsMapRef.current[meta.id] = snapshot.analyticsModelId;
+        approvalModesMapRef.current[meta.id] = meta.approval_mode;
+        approvalPolicyEpochsMapRef.current[meta.id] = meta.policy_epoch;
+        nextRunGoalModeMapRef.current[meta.id] = snapshot.goalModeEnabled;
+        setSessions((prev) => [
+          {
+            id: meta.id,
+            title: meta.title,
+            updated_at: meta.updated_at || Date.now() / 1000,
+            runtime_mode: meta.runtime_mode || "chat",
+            analytics_model_id: snapshot.analyticsModelId,
+            approval_mode: meta.approval_mode,
+            policy_epoch: meta.policy_epoch,
+            policy_version: meta.policy_version,
+          },
+          ...prev,
+        ]);
+        // Pre-populate the message cache so setSessionId shows the empty state
+        // immediately and doesn't overwrite locally-added messages with a later
+        // history fetch.
+        messagesMapRef.current[meta.id] = [];
+        if (sessionIdRef.current === originSessionId) {
+          setSessionId(meta.id);
+        }
+        if (originSessionId === "default") {
+          analyticsModelIdsMapRef.current.default = null;
+          approvalModesMapRef.current.default = "strict";
+          approvalPolicyEpochsMapRef.current.default = 1;
+          nextRunGoalModeMapRef.current.default = false;
+        }
+        return meta.id;
+      } catch {
+        return null;
+      } finally {
+        createSessionPromisesRef.current.delete(originSessionId);
       }
-      return meta.id;
-    } catch {
-      // ignore
-      return null;
-    }
+    })();
+    createSessionPromisesRef.current.set(originSessionId, creation);
+    return creation;
   }, [setSessionId]);
 
   // ── Ensure a real session exists before sending ────────
@@ -1474,13 +1606,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       activeGoalsMapRef.current[sessionId] = null;
       currentRunsMapRef.current[sessionId] = null;
       verificationReportsMapRef.current[sessionId] = null;
+      nextRunGoalModeMapRef.current[sessionId] = false;
       if (sessionIdRef.current === sessionId) {
         setMessages([]);
         setTodos([]);
         setTrace(null);
         setTraceHistory({});
         setSelectedTraceQueryId(null);
-        setGoalModeEnabled(false);
+        setGoalModeEnabledRaw(false);
         setActiveGoal(null);
         setCurrentRun(null);
         setVerificationReport(null);
@@ -1525,7 +1658,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     const next = await apiPauseGoal(sessionId, activeGoal.goal_id);
     activeGoalsMapRef.current[sessionId] = next;
     setActiveGoal(next);
-    setGoalModeEnabled(false);
   }, [activeGoal, sessionId]);
 
   const resumeActiveGoal = useCallback(async () => {
@@ -1533,7 +1665,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     const next = await apiResumeGoal(sessionId, activeGoal.goal_id);
     activeGoalsMapRef.current[sessionId] = next;
     setActiveGoal(next);
-    setGoalModeEnabled(true);
   }, [activeGoal, sessionId]);
 
   const cancelActiveGoal = useCallback(async () => {
@@ -1541,24 +1672,45 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     await apiCancelGoal(sessionId, activeGoal.goal_id);
     activeGoalsMapRef.current[sessionId] = null;
     setActiveGoal(null);
-    setGoalModeEnabled(false);
   }, [activeGoal, sessionId]);
 
   // ── Send message ───────────────────────────────────
 
   const sendMessage = useCallback(
-    async (text: string, attachments: AgentAttachment[] = []) => {
+    async (text: string, attachments: AgentAttachment[] = []): Promise<boolean> => {
       // Guard: only check if CURRENT session is streaming (other sessions can be)
-      if ((!text.trim() && attachments.length === 0) || streamingSessions.has(sessionId) || isCompressing) return;
+      const originSendSessionId = sessionIdRef.current;
+      if (
+        (!text.trim() && attachments.length === 0) ||
+        streamingSessions.has(sessionId) ||
+        isCompressing ||
+        sendReservationsRef.current.has(originSendSessionId)
+      ) {
+        return false;
+      }
+      sendReservationsRef.current.add(originSendSessionId);
+
+      try {
 
       // Lazily create a session only when we are on the placeholder "default"
       // session (e.g. after the user clicked "New Chat" or triggered a skill
       // from another page). Normal follow-up messages in an existing session
       // must stay in that session.
       let sendSessionId = sessionIdRef.current;
+      // Freeze the options the user saw at submit time. Session creation,
+      // attachment upload and React renders may finish later, but this Run must
+      // not silently inherit a newer draft selection.
+      const runOptions = {
+        runtimeMode,
+        projectId: currentProjectId,
+        analyticsModelId:
+          analyticsModelIdsMapRef.current[sendSessionId] ?? analyticsModelId ?? null,
+        requestedGoalMode:
+          nextRunGoalModeMapRef.current[sendSessionId] ?? goalModeEnabled,
+      };
       if (sendSessionId === "default") {
         const createdSessionId = await createSession();
-        if (!createdSessionId) return;
+        if (!createdSessionId) return false;
         sendSessionId = createdSessionId;
       }
 
@@ -1726,17 +1878,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           activeGoalsMapRef.current[sendSessionId] ||
           (sessionIdRef.current === sendSessionId ? activeGoal : null);
         const goalModeForRun =
-          runtimeMode === "agent" &&
-          (goalModeEnabled || goalForRun?.status === "active");
-        const eventStream = runtimeMode === "agent"
+          runOptions.runtimeMode === "agent" &&
+          (runOptions.requestedGoalMode || goalForRun?.status === "active");
+        const eventStream = runOptions.runtimeMode === "agent"
           ? streamAgent(
               processedText,
               sendSessionId,
-              currentProjectId,
+              runOptions.projectId,
               controller.signal,
               userId,
               attachments,
-              analyticsModelId,
+              runOptions.analyticsModelId,
               goalModeForRun,
               goalModeForRun ? goalForRun?.goal_id || null : null,
             )
@@ -1986,12 +2138,20 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           ) {
             const goal = event.data.goal as unknown as HarnessGoal;
             if (goal?.goal_id) {
-              activeGoalsMapRef.current[sendSessionId] = goal;
+              if (event.event === "goal_created" && runOptions.requestedGoalMode) {
+                nextRunGoalModeMapRef.current[sendSessionId] = false;
+              }
+              const nextActiveGoal = CLOSED_GOAL_STATUSES.has(goal.status) ? null : goal;
+              activeGoalsMapRef.current[sendSessionId] = nextActiveGoal;
               if (sessionIdRef.current === sendSessionId) {
-                setActiveGoal(goal);
-                setGoalModeEnabled(goal.status === "active");
-                setInspectorOpen(true);
-                setInspectorActiveTab("goal");
+                setActiveGoal(nextActiveGoal);
+                setGoalModeEnabledRaw(
+                  nextRunGoalModeMapRef.current[sendSessionId] ?? false
+                );
+                if (nextActiveGoal) {
+                  setInspectorOpen(true);
+                  setInspectorActiveTab("goal");
+                }
               }
             }
             continue;
@@ -2558,7 +2718,29 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           next.delete(sendSessionId);
           return next;
         });
+        apiGetSessionHarnessState(sendSessionId)
+          .then((state) => {
+            const reconciledGoal =
+              state.active_goal_id && state.goals[state.active_goal_id]
+                ? state.goals[state.active_goal_id]
+                : null;
+            if (reconciledGoal) {
+              nextRunGoalModeMapRef.current[sendSessionId] = false;
+            }
+            activeGoalsMapRef.current[sendSessionId] = reconciledGoal;
+            if (sessionIdRef.current === sendSessionId) {
+              setActiveGoal(reconciledGoal);
+              setGoalModeEnabledRaw(
+                nextRunGoalModeMapRef.current[sendSessionId] ?? false
+              );
+            }
+          })
+          .catch(() => {});
         loadSessions();
+      }
+        return true;
+      } finally {
+        sendReservationsRef.current.delete(originSendSessionId);
       }
     },
     [
@@ -2606,6 +2788,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         stopStreaming,
         goalModeEnabled,
         setGoalModeEnabled,
+        approvalMode,
+        approvalModeSaving,
+        approvalModeError,
+        setApprovalMode,
         activeGoal,
         currentRun,
         verificationReport,

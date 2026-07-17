@@ -7,6 +7,7 @@ before both Docker and restricted-host execution.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
 import shlex
@@ -22,6 +23,7 @@ from langchain.agents.middleware.types import ToolCallRequest
 from langchain_core.messages import ToolMessage
 from langgraph.types import Command, interrupt
 
+from graph.permission_policy import RunPermissionContext
 from graph.permission_resume import permission_resume_registry
 from graph.session_manager import session_manager
 
@@ -407,9 +409,7 @@ class ShellPolicyAnalyzer:
                     f"managed_workspace_write:find:{matched_flag}",
                     "managed_write",
                 )
-        if command == "rg" and any(
-            arg == "--pre" or arg.startswith("--pre=") for arg in args
-        ):
+        if command == "rg" and any(arg == "--pre" or arg.startswith("--pre=") for arg in args):
             return ToolPolicyResult(
                 PolicyDecision.ASK,
                 "external_command_hook:rg",
@@ -419,10 +419,7 @@ class ShellPolicyAnalyzer:
             if any(arg == "--ext-diff" for arg in args) or any(
                 arg == "-c"
                 and index + 1 < len(args)
-                and (
-                    ".external=" in args[index + 1].lower()
-                    or "pager." in args[index + 1].lower()
-                )
+                and (".external=" in args[index + 1].lower() or "pager." in args[index + 1].lower())
                 for index, arg in enumerate(args)
             ):
                 return ToolPolicyResult(
@@ -448,8 +445,7 @@ class ShellPolicyAnalyzer:
         if command in {"npm", "pnpm", "yarn"}:
             normalized = [arg.lower() for arg in args]
             if normalized[:1] in (["test"], ["build"], ["lint"]) or (
-                normalized[:1] == ["run"]
-                and normalized[1:2] in (["test"], ["build"], ["lint"], ["check"])
+                normalized[:1] == ["run"] and normalized[1:2] in (["test"], ["build"], ["lint"], ["check"])
             ):
                 return ToolPolicyResult(PolicyDecision.ALLOW, "project_test", "low")
             if normalized[:1] in (
@@ -464,9 +460,7 @@ class ShellPolicyAnalyzer:
         if command == "flutter" and args[:1] in (["test"], ["analyze"]):
             return ToolPolicyResult(PolicyDecision.ALLOW, "project_test", "low")
         if command in _SAFE_READ_COMMANDS:
-            if command == "sort" and any(
-                arg == "-o" or arg.startswith("--output") for arg in args
-            ):
+            if command == "sort" and any(arg == "-o" or arg.startswith("--output") for arg in args):
                 return ToolPolicyResult(
                     PolicyDecision.ASK,
                     "managed_workspace_write:sort",
@@ -581,9 +575,16 @@ class ToolExecutionPipeline(AgentMiddleware):
         *,
         known_tools: set[str],
         backend_mode: str,
+        permission_context: RunPermissionContext | None = None,
     ) -> None:
         self.known_tools = set(known_tools) | set(self.BUILTIN_TOOLS)
         self.backend_mode = backend_mode
+        self.permission_context = permission_context or RunPermissionContext.from_config_snapshot(
+            {
+                "permissions": {"approval_mode": "strict"},
+                "execution": {"backend_mode": backend_mode},
+            }
+        )
 
     async def awrap_tool_call(
         self,
@@ -607,14 +608,23 @@ class ToolExecutionPipeline(AgentMiddleware):
             reason=result.reason,
         )
         session_scope = self._session_grant_scope(request)
+        required_capabilities = self._required_capabilities(request)
         if session_manager.consume_tool_action_permission(
             session_id,
             fingerprint,
-            session_target_kind=(
-                str(session_scope["target_kind"]) if session_scope else None
-            ),
+            session_target_kind=(str(session_scope["target_kind"]) if session_scope else None),
             session_target=str(session_scope["target"]) if session_scope else None,
+            required_bindings=self.permission_context.grant_bindings(),
+            required_capabilities=required_capabilities,
         ):
+            run_id = str(context.get("run_id") or "")
+            if run_id:
+                session_manager.transition_run_status(
+                    session_id,
+                    run_id,
+                    "running",
+                    expected_statuses={"running", "waiting_hitl"},
+                )
             return await handler(request)
         preview = permission_resume_registry.create_tool_action_request(
             session_id=session_id,
@@ -624,21 +634,45 @@ class ToolExecutionPipeline(AgentMiddleware):
             command=command,
             reason=result.reason,
             risk=result.risk,
-            session_target_kind=(
-                str(session_scope["target_kind"]) if session_scope else None
-            ),
+            session_target_kind=(str(session_scope["target_kind"]) if session_scope else None),
             session_target=str(session_scope["target"]) if session_scope else None,
-            session_scope_label=(
-                str(session_scope["label"]) if session_scope else None
-            ),
+            session_scope_label=(str(session_scope["label"]) if session_scope else None),
+            run_id=str(context.get("run_id") or ""),
+            grant_bindings=self.permission_context.grant_bindings(),
+            required_capabilities=required_capabilities,
         )
-        interrupt(
+        run_id = str(context.get("run_id") or "")
+        if run_id:
+            session_manager.transition_run_status(
+                session_id,
+                run_id,
+                "waiting_hitl",
+                expected_statuses={"running", "waiting_hitl"},
+            )
+        decision = interrupt(
             {
                 "type": "permission_request",
                 "request": preview,
                 "decisions": [{"type": "approve"}, {"type": "reject"}],
             }
         )
+        if run_id:
+            session_manager.transition_run_status(
+                session_id,
+                run_id,
+                "running",
+                expected_statuses={"running", "waiting_hitl"},
+            )
+        if isinstance(decision, dict) and decision.get("type") == "approve":
+            if session_manager.consume_tool_action_permission(
+                session_id,
+                fingerprint,
+                session_target_kind=(str(session_scope["target_kind"]) if session_scope else None),
+                session_target=str(session_scope["target"]) if session_scope else None,
+                required_bindings=self.permission_context.grant_bindings(),
+                required_capabilities=required_capabilities,
+            ):
+                return await handler(request)
         return self._denied_message(request, result)
 
     def wrap_tool_call(
@@ -666,10 +700,40 @@ class ToolExecutionPipeline(AgentMiddleware):
                 "declared",
             )
         if tool_name in self.NETWORK_TOOLS:
+            if self.permission_context.smart:
+                if tool_name == "tavily_search":
+                    return ToolPolicyResult(
+                        PolicyDecision.ALLOW,
+                        "smart_controlled_network:tavily_search",
+                        "network",
+                    )
+                if self._smart_fetch_candidate(request):
+                    return ToolPolicyResult(
+                        PolicyDecision.ALLOW,
+                        "smart_controlled_network:fetch_url",
+                        "network",
+                    )
+                return ToolPolicyResult(
+                    PolicyDecision.DENY,
+                    "unsafe_fetch_url",
+                    "critical",
+                )
             return ToolPolicyResult(
                 PolicyDecision.ASK,
                 f"network_access:{tool_name}",
                 "network",
+            )
+        if tool_name == "install_packages":
+            if self.permission_context.backend_mode != "docker":
+                return ToolPolicyResult(
+                    PolicyDecision.DENY,
+                    "package_install_requires_docker",
+                    "critical",
+                )
+            return ToolPolicyResult(
+                PolicyDecision.ASK,
+                "package_management:install_packages",
+                "package_install",
             )
         if tool_name != "execute":
             return ToolPolicyResult(
@@ -683,6 +747,31 @@ class ToolExecutionPipeline(AgentMiddleware):
             backend_mode=self.backend_mode,
         )
         return analyzer.analyze(self._command(request))
+
+    @staticmethod
+    def _smart_fetch_candidate(request: ToolCallRequest) -> bool:
+        args = request.tool_call.get("args") or {}
+        raw_url = str(args.get("url") or "").strip()
+        try:
+            parsed = urlsplit(raw_url)
+            port = parsed.port
+        except ValueError:
+            return False
+        if parsed.scheme.lower() not in {"http", "https"}:
+            return False
+        if not parsed.hostname or parsed.username or parsed.password:
+            return False
+        try:
+            literal = ipaddress.ip_address(parsed.hostname)
+        except ValueError:
+            literal = None
+        if literal is not None:
+            if getattr(literal, "ipv4_mapped", None) is not None:
+                literal = literal.ipv4_mapped
+            if not literal.is_global:
+                return False
+        expected_port = 80 if parsed.scheme.lower() == "http" else 443
+        return port in {None, expected_port}
 
     @staticmethod
     def _context(request: ToolCallRequest) -> dict[str, Any]:
@@ -706,9 +795,14 @@ class ToolExecutionPipeline(AgentMiddleware):
             rendered = str(args)
         return rendered[:4000]
 
-    @classmethod
+    @staticmethod
+    def _required_capabilities(request: ToolCallRequest) -> list[str]:
+        if str(request.tool_call.get("name") or "") == "install_packages":
+            return ["execute", "package_install", "temporary_network"]
+        return ["execute"]
+
     def _session_grant_scope(
-        cls,
+        self,
         request: ToolCallRequest,
     ) -> dict[str, str] | None:
         """Return the narrow reusable scope for a Session-level approval."""
@@ -719,6 +813,14 @@ class ToolExecutionPipeline(AgentMiddleware):
                 "target_kind": "tool_name",
                 "target": tool_name,
                 "label": "本 Session 允许联网搜索",
+            }
+        if tool_name == "install_packages":
+            if not self.permission_context.smart or self.permission_context.backend_mode != "docker":
+                return None
+            return {
+                "target_kind": "capability",
+                "target": "docker_package_install",
+                "label": "本 Session 允许在隔离安装器中安装 Skill 依赖",
             }
         if tool_name != "fetch_url":
             return None
@@ -753,10 +855,7 @@ class ToolExecutionPipeline(AgentMiddleware):
     ) -> ToolMessage:
         tool_name = str(request.tool_call.get("name") or "")
         return ToolMessage(
-            content=(
-                f"Tool `{tool_name}` was blocked by Harness policy: "
-                f"{result.reason} ({result.risk})."
-            ),
+            content=(f"Tool `{tool_name}` was blocked by Harness policy: {result.reason} ({result.risk})."),
             tool_call_id=str(request.tool_call.get("id") or ""),
             name=tool_name,
             status="error",

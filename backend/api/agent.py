@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, model_validator
 from sse_starlette.sse import EventSourceResponse
 
@@ -34,15 +34,18 @@ class AgentRequest(BaseModel):
 async def agent(request: AgentRequest):
     persisted_user_message = False
     if request.stream:
-        session_manager.update_metadata(request.session_id, {"runtime_mode": "agent"})
-        session_manager.save_message(
-            request.session_id,
-            "user",
-            deepagents_agent_manager._display_message_with_attachments(
-                request.message,
-                request.attachments,
-            ),
-        )
+        try:
+            session_manager.update_metadata(request.session_id, {"runtime_mode": "agent"})
+            session_manager.save_message(
+                request.session_id,
+                "user",
+                deepagents_agent_manager._display_message_with_attachments(
+                    request.message,
+                    request.attachments,
+                ),
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Session not found") from exc
         persisted_user_message = True
 
     if request.stream:

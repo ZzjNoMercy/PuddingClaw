@@ -11,6 +11,13 @@ from functools import wraps
 from pathlib import Path
 from typing import Any
 
+from graph.permission_policy import (
+    DEFAULT_APPROVAL_MODE,
+    RunPermissionContext,
+    normalize_approval_mode,
+    permission_policy_snapshot,
+)
+
 # 压缩摘要的固定前缀标识，agent.py 和本模块共用，用于识别摘要消息
 COMPRESSED_CONTEXT_PREFIX = "[历史对话摘要]"
 MIDDLE_TRIM_CONTEXT_PREFIX = "[中段历史摘要]"
@@ -53,15 +60,15 @@ class SessionManager:
     def initialize(self, base_dir: Path) -> None:
         """初始化：设置存储目录为 base_dir/sessions/，不存在则创建"""
         self._sessions_dir = base_dir / "sessions"  # 拼接会话目录路径
-        self._sessions_dir.mkdir(exist_ok=True)      # 目录不存在时自动创建
+        self._sessions_dir.mkdir(exist_ok=True)  # 目录不存在时自动创建
         self._traces_dir = self._sessions_dir / "traces"
         self._traces_dir.mkdir(exist_ok=True)
 
     def _session_path(self, session_id: str) -> Path:
         """根据 session_id 生成对应的 JSON 文件路径"""
-        assert self._sessions_dir is not None                                    # 确保已初始化
-        safe_id = "".join(c for c in session_id if c.isalnum() or c in "-_")     # 过滤特殊字符防路径注入
-        return self._sessions_dir / f"{safe_id}.json"                            # 返回完整文件路径
+        assert self._sessions_dir is not None  # 确保已初始化
+        safe_id = "".join(c for c in session_id if c.isalnum() or c in "-_")  # 过滤特殊字符防路径注入
+        return self._sessions_dir / f"{safe_id}.json"  # 返回完整文件路径
 
     def _trace_path(self, session_id: str) -> Path:
         """Return the sidecar path used for heavyweight execution traces."""
@@ -107,21 +114,13 @@ class SessionManager:
         traces: dict[str, Any] = {}
         if isinstance(legacy_traces, dict):
             traces.update(
-                {
-                    str(query_id): trace
-                    for query_id, trace in legacy_traces.items()
-                    if isinstance(trace, dict)
-                }
+                {str(query_id): trace for query_id, trace in legacy_traces.items() if isinstance(trace, dict)}
             )
         if isinstance(sidecar_traces, dict):
             # A sidecar may already contain a newer completed trace if a prior
             # migration was interrupted before the main-file rewrite.
             traces.update(
-                {
-                    str(query_id): trace
-                    for query_id, trace in sidecar_traces.items()
-                    if isinstance(trace, dict)
-                }
+                {str(query_id): trace for query_id, trace in sidecar_traces.items() if isinstance(trace, dict)}
             )
 
         latest_query_id = data.get("latest_query_id") or sidecar.get("latest_query_id")
@@ -168,47 +167,61 @@ class SessionManager:
     def _write_trace_file(self, session_id: str, data: dict[str, Any]) -> None:
         self._atomic_write_json(self._trace_path(session_id), data)
 
+    @_session_write_locked
     def _read_file(self, session_id: str) -> dict[str, Any]:
         """从磁盘读取会话文件，自动兼容 v1(纯列表) → v2(带元数据的字典) 格式"""
-        path = self._session_path(session_id)          # 获取文件路径
-        if not path.exists():                          # 文件不存在返回空字典
+        path = self._session_path(session_id)  # 获取文件路径
+        if not path.exists():  # 文件不存在返回空字典
             return {}
         try:
             data = json.loads(path.read_text(encoding="utf-8"))  # 读取并解析 JSON
-            if isinstance(data, list):                           # v1 格式：纯消息列表
-                now = time.time()                                # 获取当前时间戳
-                return {                                         # 转换为 v2 格式
-                    "title": session_id,                         # 用 session_id 作为默认标题
-                    "created_at": path.stat().st_ctime,          # 用文件创建时间作为会话创建时间
-                    "updated_at": now,                           # 更新时间设为当前
-                    "messages": data,                            # 原始消息列表保留
+            if isinstance(data, list):  # v1 格式：纯消息列表
+                now = time.time()  # 获取当前时间戳
+                return {  # 转换为 v2 格式
+                    "title": session_id,  # 用 session_id 作为默认标题
+                    "created_at": path.stat().st_ctime,  # 用文件创建时间作为会话创建时间
+                    "updated_at": now,  # 更新时间设为当前
+                    "messages": data,  # 原始消息列表保留
                 }
             if isinstance(data, dict) and self._migrate_legacy_traces(session_id, data):
                 self._write_file(session_id, data)
-            return data                                          # v2 格式直接返回
-        except (json.JSONDecodeError, Exception):                # JSON 解析失败返回空
+            return data  # v2 格式直接返回
+        except (json.JSONDecodeError, Exception):  # JSON 解析失败返回空
             return {}
 
     def _write_file(self, session_id: str, data: dict[str, Any]) -> None:
         """原子写入会话数据，避免读者观察到半截 JSON。"""
-        data["updated_at"] = time.time()                                   # 每次写入都刷新更新时间
-        path = self._session_path(session_id)                              # 获取文件路径
+        data["updated_at"] = time.time()  # 每次写入都刷新更新时间
+        path = self._session_path(session_id)  # 获取文件路径
         self._atomic_write_json(path, data, indent=2)
 
     @_session_write_locked
-    def create_session(self, session_id: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    def create_session(
+        self,
+        session_id: str,
+        metadata: dict[str, Any] | None = None,
+        *,
+        approval_mode: str | None = None,
+    ) -> dict[str, Any]:
         """创建空会话，返回元数据（id/title/时间戳）"""
-        now = time.time()                    # 当前时间戳
-        data: dict[str, Any] = {             # 初始会话结构
-            "title": "New Chat",             # 默认标题
-            "created_at": now,               # 创建时间
-            "updated_at": now,               # 更新时间
-            "runtime_mode": "chat",          # 默认会话运行时；Agent 路由会覆盖为 agent
-            "messages": [],                  # 空消息列表
+        now = time.time()  # 当前时间戳
+        data: dict[str, Any] = {  # 初始会话结构
+            "title": "New Chat",  # 默认标题
+            "created_at": now,  # 创建时间
+            "updated_at": now,  # 更新时间
+            "runtime_mode": "chat",  # 默认会话运行时；Agent 路由会覆盖为 agent
+            "messages": [],  # 空消息列表
+            "permissions": {
+                "approval_mode": normalize_approval_mode(approval_mode or DEFAULT_APPROVAL_MODE).value,
+                "policy_epoch": 1,
+                "grants": [],
+            },
         }
         if metadata:
-            data.update(metadata)
-        self._write_file(session_id, data)   # 写入磁盘
+            # Permission state is a control-plane authority and may not be
+            # injected through generic metadata.
+            data.update({key: value for key, value in metadata.items() if key != "permissions"})
+        self._write_file(session_id, data)  # 写入磁盘
         return self._metadata_from_data(session_id, data)
 
     def _metadata_from_data(self, session_id: str, data: dict[str, Any]) -> dict[str, Any]:
@@ -229,15 +242,98 @@ class SessionManager:
         ):
             if key in data:
                 meta[key] = data.get(key)
+        policy = permission_policy_snapshot(data.get("permissions"))
+        meta["approval_mode"] = policy["approval_mode"]
+        meta["policy_epoch"] = policy["policy_epoch"]
+        meta["policy_version"] = policy["policy_version"]
         return meta
+
+    def get_permission_policy(self, session_id: str) -> dict[str, Any]:
+        """Return the effective Session permission policy without Run state."""
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        return permission_policy_snapshot(data.get("permissions"))
+
+    @_session_write_locked
+    def set_approval_mode_if_idle(
+        self,
+        session_id: str,
+        mode: str,
+        *,
+        expected_epoch: int | None = None,
+    ) -> dict[str, Any]:
+        """Atomically change mode only when no non-terminal Run exists."""
+
+        requested = normalize_approval_mode(mode)
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        current = permission_policy_snapshot(data.get("permissions"))
+        if expected_epoch is not None and expected_epoch != current["policy_epoch"]:
+            raise ValueError("Permission policy changed concurrently; reload before retrying.")
+
+        harness = data.get("harness")
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        terminal_statuses = {
+            "completed",
+            "cancelled",
+            "failed",
+            "blocked",
+            "budget_exceeded",
+            "verification_failed",
+        }
+        active = next(
+            (
+                run
+                for run in (runs.values() if isinstance(runs, dict) else ())
+                if isinstance(run, dict) and run.get("status") not in terminal_statuses
+            ),
+            None,
+        )
+        if active is not None:
+            raise RuntimeError(
+                f"Session {session_id} has active Run {active.get('run_id')}; "
+                "approval mode is frozen until the Run finishes."
+            )
+        if requested.value == current["approval_mode"]:
+            return current
+
+        permissions = data.get("permissions")
+        if not isinstance(permissions, dict):
+            permissions = {}
+            data["permissions"] = permissions
+        permissions["approval_mode"] = requested.value
+        permissions["policy_epoch"] = current["policy_epoch"] + 1
+        now = time.time()
+        grants = permissions.get("grants")
+        if isinstance(grants, list):
+            for grant in grants:
+                if isinstance(grant, dict) and grant.get("type") == "tool_action" and not grant.get("revoked_at"):
+                    grant["revoked_at"] = now
+                    grant["revocation_reason"] = "permission_policy_changed"
+        self._write_file(session_id, data)
+        return permission_policy_snapshot(permissions)
 
     @_session_write_locked
     def update_metadata(self, session_id: str, metadata: dict[str, Any]) -> dict[str, Any]:
-        """Merge metadata into a session, creating the session if needed."""
+        """Merge non-authoritative metadata into an existing Session."""
         data = self._read_file(session_id)
         if not data:
-            return self.create_session(session_id, metadata=metadata)
-        data.update(metadata)
+            raise FileNotFoundError(f"Session {session_id} not found")
+        allowed_keys = {
+            "runtime_mode",
+            "project_id",
+            "project_path",
+            "workspace_type",
+            "workspace_path",
+            "analytics_model_id",
+        }
+        forbidden = set(metadata) - allowed_keys
+        if forbidden:
+            raise ValueError(f"Unsupported Session metadata fields: {sorted(forbidden)}")
+        data.update({key: metadata[key] for key in allowed_keys if key in metadata})
         self._write_file(session_id, data)
         return self._metadata_from_data(session_id, data)
 
@@ -294,6 +390,7 @@ class SessionManager:
                                 loaded.add(parts[2])
         return loaded
 
+    @_session_write_locked
     def get_loaded_skill_ids(self, session_id: str) -> list[str]:
         """Return session-scoped Skill activations, migrating legacy traces once."""
 
@@ -359,29 +456,23 @@ class SessionManager:
     @_session_write_locked
     def save_message(
         self,
-        session_id: str,                                      # 会话 ID
-        role: str,                                            # 角色：user 或 assistant
-        content: str,                                         # 消息内容
-        tool_calls: list[dict[str, Any]] | None = None,       # 可选的工具调用记录
-        sources: list[dict[str, Any]] | None = None,          # 用户可见的结构化来源
-        citations: list[dict[str, Any]] | None = None,        # 正文与来源的引用映射
-        reasoning_content: str | None = None,                  # 思考链内容（工具调用回合必须回传）
-        timeline: list[dict[str, Any]] | None = None,         # 前端时间轴（reasoning/tool 交错顺序）
-        segments: list[dict[str, Any]] | None = None,         # UI 分段（每轮模型调用为一个 segment）
-        interrupted: bool = False,                            # 本轮是否由用户主动停止
-        interruption_notice: str | None = None,                # 用户可见的停止提示
-        error_notice: str | None = None,                       # 用户可见的错误提示
+        session_id: str,  # 会话 ID
+        role: str,  # 角色：user 或 assistant
+        content: str,  # 消息内容
+        tool_calls: list[dict[str, Any]] | None = None,  # 可选的工具调用记录
+        sources: list[dict[str, Any]] | None = None,  # 用户可见的结构化来源
+        citations: list[dict[str, Any]] | None = None,  # 正文与来源的引用映射
+        reasoning_content: str | None = None,  # 思考链内容（工具调用回合必须回传）
+        timeline: list[dict[str, Any]] | None = None,  # 前端时间轴（reasoning/tool 交错顺序）
+        segments: list[dict[str, Any]] | None = None,  # UI 分段（每轮模型调用为一个 segment）
+        interrupted: bool = False,  # 本轮是否由用户主动停止
+        interruption_notice: str | None = None,  # 用户可见的停止提示
+        error_notice: str | None = None,  # 用户可见的错误提示
     ) -> None:
         """追加一条消息到会话历史"""
-        data = self._read_file(session_id)        # 读取现有数据
-        if not data:                              # 会话不存在则创建新的
-            now = time.time()                     # 当前时间戳
-            data = {                              # 初始化会话结构
-                "title": "New Chat",              # 默认标题
-                "created_at": now,                # 创建时间
-                "updated_at": now,                # 更新时间
-                "messages": [],                   # 空消息列表
-            }
+        data = self._read_file(session_id)  # 读取现有数据
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
         msg = self._build_message_payload(
             role,
             content,
@@ -395,10 +486,10 @@ class SessionManager:
             interruption_notice=interruption_notice,
             error_notice=error_notice,
         )
-        data["messages"].append(msg)              # 追加到消息列表末尾
+        data["messages"].append(msg)  # 追加到消息列表末尾
         if isinstance(data.get("display_messages"), list):
             data["display_messages"].append(dict(msg))
-        self._write_file(session_id, data)        # 写回磁盘
+        self._write_file(session_id, data)  # 写回磁盘
 
     @staticmethod
     def _build_message_payload(
@@ -471,14 +562,7 @@ class SessionManager:
 
         data = self._read_file(session_id)
         if not data:
-            now = time.time()
-            data = {
-                "title": "New Chat",
-                "created_at": now,
-                "updated_at": now,
-                "runtime_mode": "agent",
-                "messages": [],
-            }
+            raise FileNotFoundError(f"Session {session_id} not found")
 
         msg = self._build_message_payload(
             "assistant",
@@ -575,11 +659,7 @@ class SessionManager:
             output_text = str(output)
             if len(output_text) > max_output_chars:
                 output_text = f"{output_text[:max_output_chars]}... [truncated]"
-            block = (
-                f"- 工具 {index}: {tool}\n"
-                f"  Input: {tool_input_text[:500]}\n"
-                f"  Output: {output_text}"
-            )
+            block = f"- 工具 {index}: {tool}\n  Input: {tool_input_text[:500]}\n  Output: {output_text}"
             if total + len(block) > max_total_chars:
                 lines.append("- 其余历史工具结果因长度限制已省略。")
                 break
@@ -592,11 +672,11 @@ class SessionManager:
     @_session_write_locked
     def rename_session(self, session_id: str, title: str) -> None:
         """重命名会话标题"""
-        data = self._read_file(session_id)                             # 读取会话数据
-        if not data:                                                   # 会话不存在则报错
+        data = self._read_file(session_id)  # 读取会话数据
+        if not data:  # 会话不存在则报错
             raise FileNotFoundError(f"Session {session_id} not found")
-        data["title"] = title                                          # 更新标题
-        self._write_file(session_id, data)                             # 写回磁盘
+        data["title"] = title  # 更新标题
+        self._write_file(session_id, data)  # 写回磁盘
 
     def get_todos(self, session_id: str) -> list[dict[str, Any]]:
         """Return the persisted todo list for a session."""
@@ -664,12 +744,17 @@ class SessionManager:
         if persisted_session_id != session_id:
             raise ValueError("Run session_id does not match persistence session")
 
+        from harness.models import RunRecord, RunStatus
+
+        incoming = RunRecord.model_validate(run)
         data = self._read_file(session_id)
         if not data:
             raise FileNotFoundError(f"Session {session_id} not found")
         harness = data.setdefault("harness", {})
         runs = harness.setdefault("runs", {})
         existing = runs.get(run_id)
+        if not isinstance(existing, dict) and incoming.status != RunStatus.PREPARING:
+            raise ValueError("A new Run must start in preparing state")
         terminal_statuses = {
             "completed",
             "cancelled",
@@ -681,9 +766,12 @@ class SessionManager:
         if isinstance(existing, dict) and existing.get("status") in terminal_statuses:
             if existing != run:
                 raise ValueError(
-                    f"Run {run_id} already has terminal outcome "
-                    f"{existing.get('outcome') or existing.get('status')}"
+                    f"Run {run_id} already has terminal outcome {existing.get('outcome') or existing.get('status')}"
                 )
+        if isinstance(existing, dict):
+            current = RunRecord.model_validate(existing)
+            if current.status != incoming.status:
+                current.transition(incoming.status)
 
         saved = deepcopy(run)
         if isinstance(existing, dict):
@@ -698,6 +786,7 @@ class SessionManager:
                 "verification_enabled",
                 "task_profile",
                 "declared_verification_contract",
+                "config_snapshot",
                 "created_at",
             ):
                 if immutable_field in existing:
@@ -706,9 +795,7 @@ class SessionManager:
             incoming_activations = saved.get("verification_activations")
             merged_activations: list[dict[str, Any]] = []
             seen_activation_ids: set[str] = set()
-            for raw in (
-                existing_activations if isinstance(existing_activations, list) else []
-            ) + (
+            for raw in (existing_activations if isinstance(existing_activations, list) else []) + (
                 incoming_activations if isinstance(incoming_activations, list) else []
             ):
                 if not isinstance(raw, dict):
@@ -728,6 +815,37 @@ class SessionManager:
         run_order = harness.setdefault("run_order", [])
         if run_id not in run_order:
             run_order.append(run_id)
+        harness["latest_run_id"] = run_id
+        self._write_file(session_id, data)
+        return deepcopy(saved)
+
+    @_session_write_locked
+    def transition_run_status(
+        self,
+        session_id: str,
+        run_id: str,
+        status: str,
+        *,
+        expected_statuses: set[str] | None = None,
+    ) -> dict[str, Any]:
+        """Atomically apply one legal, idempotent Run status transition."""
+
+        from harness.models import RunRecord, RunStatus
+
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        raw_run = runs.get(run_id) if isinstance(runs, dict) else None
+        if not isinstance(raw_run, dict):
+            raise ValueError(f"Run {run_id} does not exist in session {session_id}")
+        run = RunRecord.model_validate(raw_run)
+        if expected_statuses is not None and run.status.value not in expected_statuses:
+            raise ValueError(
+                f"Run {run_id} is {run.status}; expected one of {sorted(expected_statuses)}"
+            )
+        run.transition(RunStatus(status))
+        saved = run.model_dump(mode="json")
+        runs[run_id] = saved
         harness["latest_run_id"] = run_id
         self._write_file(session_id, data)
         return deepcopy(saved)
@@ -762,9 +880,7 @@ class SessionManager:
             "budget_exceeded",
             "verification_failed",
         }:
-            raise ValueError(
-                "Evaluating or terminal Runs cannot accept verification activations"
-            )
+            raise ValueError("Evaluating or terminal Runs cannot accept verification activations")
         activations = run.get("verification_activations")
         if not isinstance(activations, list):
             activations = []
@@ -844,9 +960,7 @@ class SessionManager:
         current = RunRecord.model_validate(raw_current)
         if current.terminal:
             if current.outcome != incoming.outcome:
-                raise ValueError(
-                    f"Run {run_id} already has terminal outcome {current.outcome}"
-                )
+                raise ValueError(f"Run {run_id} already has terminal outcome {current.outcome}")
             return deepcopy(raw_current)
 
         if current.verification_enabled:
@@ -881,6 +995,15 @@ class SessionManager:
         run = runs.get(run_id) if isinstance(runs, dict) else None
         if not isinstance(run, dict):
             raise ValueError(f"Run {run_id} does not exist in session {session_id}")
+        if str(run.get("status") or "") in {
+            "completed",
+            "cancelled",
+            "failed",
+            "blocked",
+            "budget_exceeded",
+            "verification_failed",
+        }:
+            raise ValueError(f"Terminal Run {run_id} cannot update its verification contract")
         saved = deepcopy(contract)
         run["verification_contract"] = saved
         run["updated_at"] = time.time()
@@ -900,12 +1023,16 @@ class SessionManager:
         if not run_id or run.get("session_id") != session_id:
             raise ValueError("Run identity does not match persistence session")
         goal_id = str(goal.get("goal_id") or "").strip() if goal else ""
-        if goal is not None and (
-            not goal_id or goal.get("session_id") != session_id
-        ):
+        if goal is not None and (not goal_id or goal.get("session_id") != session_id):
             raise ValueError("Goal identity does not match persistence session")
         if goal is not None and run.get("goal_id") != goal_id:
             raise ValueError("Run goal_id does not match attached Goal")
+
+        from harness.models import RunRecord, RunStatus
+
+        incoming_run = RunRecord.model_validate(run)
+        if incoming_run.status != RunStatus.PREPARING or incoming_run.outcome is not None:
+            raise ValueError("A new Run must start in preparing state without an outcome")
 
         data = self._read_file(session_id)
         if not data:
@@ -926,16 +1053,12 @@ class SessionManager:
             (
                 item
                 for item in runs.values()
-                if isinstance(item, dict)
-                and item.get("status") not in terminal_run_statuses
+                if isinstance(item, dict) and item.get("status") not in terminal_run_statuses
             ),
             None,
         )
         if active_run is not None:
-            raise ValueError(
-                f"Session {session_id} already has active Run "
-                f"{active_run.get('run_id')}"
-            )
+            raise ValueError(f"Session {session_id} already has active Run {active_run.get('run_id')}")
 
         saved_goal: dict[str, Any] | None = None
         if goal is not None:
@@ -947,9 +1070,7 @@ class SessionManager:
                 and isinstance(goals.get(active_goal_id), dict)
                 and goals[active_goal_id].get("status") == "active"
             ):
-                raise ValueError(
-                    f"Session {session_id} already has active Goal {active_goal_id}"
-                )
+                raise ValueError(f"Session {session_id} already has active Goal {active_goal_id}")
             existing_goal = goals.get(goal_id)
             if isinstance(existing_goal, dict) and existing_goal.get("status") in {
                 "achieved",
@@ -966,12 +1087,48 @@ class SessionManager:
                 harness["active_goal_id"] = goal_id
 
         saved_run = deepcopy(run)
+        config_snapshot = saved_run.get("config_snapshot")
+        if not isinstance(config_snapshot, dict):
+            config_snapshot = {}
+        # The Session lock makes this the linearization point between a mode
+        # change and a new Run. Caller-supplied values can never override it.
+        config_snapshot["permissions"] = permission_policy_snapshot(data.get("permissions"))
+        saved_run["config_snapshot"] = config_snapshot
         runs[run_id] = saved_run
         run_order = harness.setdefault("run_order", [])
         run_order.append(run_id)
         harness["latest_run_id"] = run_id
         self._write_file(session_id, data)
         return deepcopy(saved_run), deepcopy(saved_goal)
+
+    @_session_write_locked
+    def bind_run_execution_snapshot(
+        self,
+        session_id: str,
+        run_id: str,
+        execution: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Bind the prepared Run to one effective workspace backend exactly once."""
+
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        raw_run = runs.get(run_id) if isinstance(runs, dict) else None
+        if not isinstance(raw_run, dict):
+            raise ValueError(f"Run {run_id} does not exist in session {session_id}")
+        if raw_run.get("status") != "preparing":
+            raise ValueError("Execution snapshot may only be bound while Run is preparing")
+        snapshot = deepcopy(execution)
+        config_snapshot = raw_run.setdefault("config_snapshot", {})
+        existing = config_snapshot.get("execution")
+        if existing is not None:
+            if existing != snapshot:
+                raise ValueError("Run execution snapshot is already bound")
+            return deepcopy(raw_run)
+        config_snapshot["execution"] = snapshot
+        raw_run["updated_at"] = time.time()
+        self._write_file(session_id, data)
+        return deepcopy(raw_run)
 
     def get_goal_state(
         self,
@@ -1022,24 +1179,21 @@ class SessionManager:
         status = str(goal.get("status") or "")
         active_goal_id = harness.get("active_goal_id")
         existing = goals.get(goal_id)
-        if isinstance(existing, dict) and existing.get("status") in {
-            "achieved",
-            "cancelled",
-            "budget_exceeded",
-        } and existing != goal:
-            raise ValueError(
-                f"Goal {goal_id} is already terminal ({existing.get('status')})"
-            )
         if (
-            status == "active"
-            and isinstance(active_goal_id, str)
-            and active_goal_id != goal_id
+            isinstance(existing, dict)
+            and existing.get("status")
+            in {
+                "achieved",
+                "cancelled",
+                "budget_exceeded",
+            }
+            and existing != goal
         ):
+            raise ValueError(f"Goal {goal_id} is already terminal ({existing.get('status')})")
+        if status == "active" and isinstance(active_goal_id, str) and active_goal_id != goal_id:
             active = goals.get(active_goal_id)
             if isinstance(active, dict) and active.get("status") == "active":
-                raise ValueError(
-                    f"Session {session_id} already has active Goal {active_goal_id}"
-                )
+                raise ValueError(f"Session {session_id} already has active Goal {active_goal_id}")
 
         saved = deepcopy(goal)
         goals[goal_id] = saved
@@ -1070,12 +1224,9 @@ class SessionManager:
         traces = data.get("traces") if data else None
         if not isinstance(traces, dict):
             return {}
-        return {
-            str(query_id): dict(trace)
-            for query_id, trace in traces.items()
-            if isinstance(trace, dict)
-        }
+        return {str(query_id): dict(trace) for query_id, trace in traces.items() if isinstance(trace, dict)}
 
+    @_session_write_locked
     def update_trace(
         self,
         session_id: str,
@@ -1107,11 +1258,9 @@ class SessionManager:
         session = self._read_file(session_id)
         traces = data.get("traces")
         result = {
-            "traces": {
-                str(query_id): dict(trace)
-                for query_id, trace in traces.items()
-                if isinstance(trace, dict)
-            } if isinstance(traces, dict) else {},
+            "traces": {str(query_id): dict(trace) for query_id, trace in traces.items() if isinstance(trace, dict)}
+            if isinstance(traces, dict)
+            else {},
             "latest_query_id": data.get("latest_query_id"),
             "latest_trace_id": data.get("latest_trace_id"),
         }
@@ -1138,17 +1287,18 @@ class SessionManager:
         """更新标题（rename_session 的别名，供 API 层调用）"""
         self.rename_session(session_id, title)
 
+    @_session_write_locked
     def delete_session(self, session_id: str) -> None:
         """删除会话文件"""
-        path = self._session_path(session_id)    # 获取文件路径
-        if path.exists():                        # 存在则删除
+        path = self._session_path(session_id)  # 获取文件路径
+        if path.exists():  # 存在则删除
             path.unlink()
         self._trace_path(session_id).unlink(missing_ok=True)
 
     def get_raw_messages(self, session_id: str) -> dict[str, Any]:
         """Return session data without loading heavyweight trace sidecars."""
-        data = self._read_file(session_id)                     # 读取会话文件
-        if not data:                                           # 不存在返回空结构
+        data = self._read_file(session_id)  # 读取会话文件
+        if not data:  # 不存在返回空结构
             return {"title": "", "messages": []}
         data = dict(data)
         data["messages"] = self.load_session(session_id)
@@ -1166,7 +1316,7 @@ class SessionManager:
             data["harness"] = deepcopy(data["harness"])
         else:
             data.pop("harness", None)
-        return data                                            # 返回完整数据
+        return data  # 返回完整数据
 
     def get_active_messages(self, session_id: str) -> list[dict[str, Any]]:
         """返回当前 session.json 中尚未归档的活跃消息。仅供 Agent 上下文优化使用。"""
@@ -1177,28 +1327,30 @@ class SessionManager:
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """列出所有会话的元数据（id/title/updated_at），按修改时间倒序"""
-        assert self._sessions_dir is not None                  # 确保已初始化
-        sessions: list[dict[str, Any]] = []                    # 结果列表
-        for f in sorted(self._sessions_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):  # 遍历所有 JSON 文件，按修改时间倒序
+        assert self._sessions_dir is not None  # 确保已初始化
+        sessions: list[dict[str, Any]] = []  # 结果列表
+        for f in sorted(
+            self._sessions_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True
+        ):  # 遍历所有 JSON 文件，按修改时间倒序
             raw: Any = None
             try:
                 # Reuse the canonical reader so legacy embedded traces are
                 # migrated once instead of slowing every sidebar refresh.
                 raw = self._read_file(f.stem)
-                if isinstance(raw, dict):                               # v2 格式
-                    title = raw.get("title", f.stem)                    # 取标题，缺省用文件名
+                if isinstance(raw, dict):  # v2 格式
+                    title = raw.get("title", f.stem)  # 取标题，缺省用文件名
                     updated_at = raw.get("updated_at", f.stat().st_mtime)  # 取更新时间
-                else:                                                   # v1 格式（纯列表）
-                    title = f.stem                                      # 用文件名作标题
-                    updated_at = f.stat().st_mtime                      # 用文件修改时间
-            except Exception:                                           # 解析失败兜底
-                title = f.stem                                          # 用文件名
-                updated_at = f.stat().st_mtime                          # 用文件修改时间
+                else:  # v1 格式（纯列表）
+                    title = f.stem  # 用文件名作标题
+                    updated_at = f.stat().st_mtime  # 用文件修改时间
+            except Exception:  # 解析失败兜底
+                title = f.stem  # 用文件名
+                updated_at = f.stat().st_mtime  # 用文件修改时间
 
             meta = {
-                "id": f.stem,                    # 会话 ID = 文件名（不含 .json）
-                "title": title,                  # 会话标题
-                "updated_at": updated_at,        # 最后更新时间
+                "id": f.stem,  # 会话 ID = 文件名（不含 .json）
+                "title": title,  # 会话标题
+                "updated_at": updated_at,  # 最后更新时间
                 "runtime_mode": raw.get("runtime_mode", "chat") if isinstance(raw, dict) else "chat",
             }
             if isinstance(raw, dict):
@@ -1211,55 +1363,53 @@ class SessionManager:
                 ):
                     if key in raw:
                         meta[key] = raw.get(key)
-            sessions.append(meta)                 # 追加到结果
-        return sessions                          # 返回所有会话列表
+            sessions.append(meta)  # 追加到结果
+        return sessions  # 返回所有会话列表
 
     # ── 短期记忆压缩（核心机制）────────────────────────────────────────────────
 
     @_session_write_locked
-    def compress_history(
-        self, session_id: str, summary: str, num_to_remove: int
-    ) -> None:
+    def compress_history(self, session_id: str, summary: str, num_to_remove: int) -> None:
         """压缩短期记忆：归档旧消息 + 保存 LLM 生成的摘要"""
-        assert self._sessions_dir is not None                  # 确保已初始化
-        data = self._read_file(session_id)                     # 读取当前会话
-        if not data:                                           # 会话不存在则跳过
+        assert self._sessions_dir is not None  # 确保已初始化
+        data = self._read_file(session_id)  # 读取当前会话
+        if not data:  # 会话不存在则跳过
             return
 
-        messages = data.get("messages", [])                    # 获取消息列表
-        archived_messages = messages[:num_to_remove]           # 取出要归档的前 N 条消息
+        messages = data.get("messages", [])  # 获取消息列表
+        archived_messages = messages[:num_to_remove]  # 取出要归档的前 N 条消息
 
         # 将被压缩的消息归档到 sessions/archive/ 目录（备份，不丢失原始数据）
-        archive_dir = self._sessions_dir / "archive"           # 归档目录路径
-        archive_dir.mkdir(exist_ok=True)                       # 不存在则创建
-        archive_data = {                                       # 归档数据结构
-            "session_id": session_id,                          # 所属会话
-            "archived_at": time.time(),                        # 归档时间戳
-            "messages": archived_messages,                     # 被归档的消息
+        archive_dir = self._sessions_dir / "archive"  # 归档目录路径
+        archive_dir.mkdir(exist_ok=True)  # 不存在则创建
+        archive_data = {  # 归档数据结构
+            "session_id": session_id,  # 所属会话
+            "archived_at": time.time(),  # 归档时间戳
+            "messages": archived_messages,  # 被归档的消息
         }
         archive_path = archive_dir / f"{session_id}_{int(time.time())}.json"  # 归档文件名含时间戳防重复
-        archive_path.write_text(                               # 写入归档文件
+        archive_path.write_text(  # 写入归档文件
             json.dumps(archive_data, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 
-        data["messages"] = messages[num_to_remove:]            # 从会话中删除已归档的消息
+        data["messages"] = messages[num_to_remove:]  # 从会话中删除已归档的消息
 
         # 将摘要追加到 compressed_context 字段（支持多次压缩，用 --- 分隔）
         existing_context = data.get("compressed_context", "")  # 读取已有摘要
-        if existing_context:                                   # 已有摘要则拼接
+        if existing_context:  # 已有摘要则拼接
             data["compressed_context"] = existing_context + "\n---\n" + summary
-        else:                                                  # 首次压缩直接写入
+        else:  # 首次压缩直接写入
             data["compressed_context"] = summary
 
-        self._write_file(session_id, data)                     # 写回磁盘
+        self._write_file(session_id, data)  # 写回磁盘
 
     def get_compressed_context(self, session_id: str) -> str | None:
         """获取压缩摘要（如果存在）"""
-        data = self._read_file(session_id)              # 读取会话数据
-        if not data:                                    # 不存在返回 None
+        data = self._read_file(session_id)  # 读取会话数据
+        if not data:  # 不存在返回 None
             return None
-        return data.get("compressed_context")           # 返回摘要字段
+        return data.get("compressed_context")  # 返回摘要字段
 
     @_session_write_locked
     def middle_trim_history(
@@ -1322,9 +1472,7 @@ class SessionManager:
             f"摘要：\n{summary.strip()}"
         )
         existing_context = data.get("middle_trim_context", "")
-        data["middle_trim_context"] = (
-            existing_context + "\n---\n" + block if existing_context else block
-        )
+        data["middle_trim_context"] = existing_context + "\n---\n" + block if existing_context else block
 
         self._write_file(session_id, data)
         return archive_name
@@ -1430,10 +1578,7 @@ class SessionManager:
 
     @classmethod
     def _tool_call_ids(cls, data: dict[str, Any]) -> list[str]:
-        return [
-            str(tool_call.get("id") or "")
-            for _, _, _, tool_call in cls._iter_persisted_tool_calls(data)
-        ]
+        return [str(tool_call.get("id") or "") for _, _, _, tool_call in cls._iter_persisted_tool_calls(data)]
 
     def _migrate_missing_tool_call_ids(self, session_id: str, data: dict[str, Any]) -> bool:
         """Persist deterministic IDs for legacy Tool Results that lacked one."""
@@ -1465,9 +1610,7 @@ class SessionManager:
             display_messages = data.get("display_messages")
             if isinstance(display_messages, list) and message_index < len(display_messages):
                 display_message = display_messages[message_index]
-                display_tool_calls = (
-                    display_message.get("tool_calls") if isinstance(display_message, dict) else None
-                )
+                display_tool_calls = display_message.get("tool_calls") if isinstance(display_message, dict) else None
                 if isinstance(display_tool_calls, list) and tool_index < len(display_tool_calls):
                     display_tool_call = display_tool_calls[tool_index]
                     if isinstance(display_tool_call, dict) and not display_tool_call.get("id"):
@@ -1526,12 +1669,11 @@ class SessionManager:
                     )
                 )
 
-            protected_ids = {
-                item[1]
-                for item in sorted(completed, key=lambda item: item[4])[
-                    -max(0, int(keep_recent)) :
-                ]
-            } if keep_recent > 0 else set()
+            protected_ids = (
+                {item[1] for item in sorted(completed, key=lambda item: item[4])[-max(0, int(keep_recent)) :]}
+                if keep_recent > 0
+                else set()
+            )
             candidates: list[dict[str, Any]] = []
             cache_hit_count = 0
             for tool_call, tool_call_id, source_hash, estimated_tokens, completion_order in completed:
@@ -1558,8 +1700,7 @@ class SessionManager:
                         "completed_at": completion_order,
                         "is_error": bool(tool_call.get("is_error")),
                         "user_referenced": bool(
-                            tool_call.get("user_referenced")
-                            or tool_call.get("referenced_by_user")
+                            tool_call.get("user_referenced") or tool_call.get("referenced_by_user")
                         ),
                         "raw_output_ref": self._tool_context_raw_ref(
                             session_id,
@@ -1711,11 +1852,7 @@ class SessionManager:
                     continue
                 current_hash = self._tool_context_source_hash(self._tool_context_source(tool_call))
                 metadata = tool_call.get("context_compaction")
-                if (
-                    current_hash != source_hash
-                    or not isinstance(metadata, dict)
-                    or metadata.get("job_id") != job_id
-                ):
+                if current_hash != source_hash or not isinstance(metadata, dict) or metadata.get("job_id") != job_id:
                     if isinstance(metadata, dict):
                         metadata["status"] = "stale"
                         metadata["updated_at"] = time.time()
@@ -1953,15 +2090,13 @@ class SessionManager:
     def list_permission_grants(self, session_id: str) -> list[dict[str, Any]]:
         """Return active session permission grants."""
         data = self._read_file(session_id)
-        permissions = data.get("permissions") if data else None
+        if not data:
+            return []
+        permissions = data.get("permissions")
         grants = permissions.get("grants") if isinstance(permissions, dict) else None
         if not isinstance(grants, list):
             return []
-        return [
-            dict(grant)
-            for grant in grants
-            if isinstance(grant, dict) and not grant.get("revoked_at")
-        ]
+        return [dict(grant) for grant in grants if isinstance(grant, dict) and not grant.get("revoked_at")]
 
     @_session_write_locked
     def add_permission_grant(
@@ -1975,18 +2110,12 @@ class SessionManager:
         scope: str = "session",
         source: str = "user",
         metadata: dict[str, Any] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Persist a session permission grant and return it."""
         data = self._read_file(session_id)
         if not data:
-            now = time.time()
-            data = {
-                "title": "New Chat",
-                "created_at": now,
-                "updated_at": now,
-                "runtime_mode": "agent",
-                "messages": [],
-            }
+            raise FileNotFoundError(f"Session {session_id} not found")
 
         permissions = data.get("permissions")
         if not isinstance(permissions, dict):
@@ -2008,6 +2137,30 @@ class SessionManager:
         }
         if metadata:
             grant["metadata"] = dict(metadata)
+        if bindings:
+            effective = permission_policy_snapshot(permissions)
+            if (
+                bindings.get("policy_epoch") != effective["policy_epoch"]
+                or bindings.get("policy_version") != effective["policy_version"]
+            ):
+                raise ValueError("Permission request belongs to a stale policy epoch")
+            run_id = str((metadata or {}).get("run_id") or "")
+            harness = data.get("harness")
+            runs = harness.get("runs") if isinstance(harness, dict) else None
+            run = runs.get(run_id) if run_id and isinstance(runs, dict) else None
+            if not isinstance(run, dict) or run.get("status") in {
+                "completed",
+                "cancelled",
+                "failed",
+                "blocked",
+                "budget_exceeded",
+                "verification_failed",
+            }:
+                raise ValueError("Permission request no longer belongs to an active Run")
+            expected_bindings = RunPermissionContext.from_config_snapshot(run.get("config_snapshot")).grant_bindings()
+            if bindings != expected_bindings:
+                raise ValueError("Permission request does not match the active Run")
+            grant["bindings"] = deepcopy(bindings)
         grants.append(grant)
         permissions["grants"] = grants
         data["permissions"] = permissions
@@ -2068,6 +2221,8 @@ class SessionManager:
         *,
         session_target_kind: str | None = None,
         session_target: str | None = None,
+        required_bindings: dict[str, Any] | None = None,
+        required_capabilities: list[str] | None = None,
     ) -> bool:
         """Consume a matching once/session grant for one managed Tool action."""
 
@@ -2084,10 +2239,13 @@ class SessionManager:
                 or "execute" not in (grant.get("capabilities") or [])
             ):
                 continue
-            exact_match = (
-                grant.get("target_kind") == "fingerprint"
-                and grant.get("target") == fingerprint
-            )
+            if required_bindings is not None and grant.get("bindings") != required_bindings:
+                continue
+            if required_capabilities is not None and not set(required_capabilities).issubset(
+                set(grant.get("capabilities") or [])
+            ):
+                continue
+            exact_match = grant.get("target_kind") == "fingerprint" and grant.get("target") == fingerprint
             reusable_session_match = (
                 grant.get("scope") == "session"
                 and session_target_kind
@@ -2113,32 +2271,36 @@ class SessionManager:
         1. 合并连续的普通 assistant 文本消息（保持 user/assistant 严格交替）
         2. 如有压缩摘要，在头部注入一条摘要消息让 LLM 保留历史上下文
         """
-        data = self._read_file(session_id)                              # 读取会话数据
-        messages = data.get("messages", []) if data else []             # 取消息列表
+        data = self._read_file(session_id)  # 读取会话数据
+        messages = data.get("messages", []) if data else []  # 取消息列表
 
-        merged: list[dict[str, Any]] = []                               # 合并后的结果列表
+        merged: list[dict[str, Any]] = []  # 合并后的结果列表
 
         # 如有压缩摘要，作为第一条 assistant 消息注入（让 LLM 知道之前聊了什么）
         compressed = data.get("compressed_context", "") if data else ""  # 读取摘要
-        if compressed:                                                   # 摘要存在则注入
-            merged.append({
-                "role": "assistant",                                     # 伪装为 assistant 消息
-                "content": f"{COMPRESSED_CONTEXT_PREFIX}\n{compressed}", # 前缀标识 + 摘要内容
-            })
+        if compressed:  # 摘要存在则注入
+            merged.append(
+                {
+                    "role": "assistant",  # 伪装为 assistant 消息
+                    "content": f"{COMPRESSED_CONTEXT_PREFIX}\n{compressed}",  # 前缀标识 + 摘要内容
+                }
+            )
 
         middle_trim_context = data.get("middle_trim_context", "") if data else ""
         if middle_trim_context:
-            merged.append({
-                "role": "assistant",
-                "content": (
-                    f"{MIDDLE_TRIM_CONTEXT_PREFIX}\n"
-                    "以下内容是因上下文裁剪移出活跃消息的历史任务状态摘要。"
-                    "它只用于理解历史完成情况，不代表当前任务结果，也不要在新任务中续写。\n"
-                    f"{middle_trim_context}"
-                ),
-            })
+            merged.append(
+                {
+                    "role": "assistant",
+                    "content": (
+                        f"{MIDDLE_TRIM_CONTEXT_PREFIX}\n"
+                        "以下内容是因上下文裁剪移出活跃消息的历史任务状态摘要。"
+                        "它只用于理解历史完成情况，不代表当前任务结果，也不要在新任务中续写。\n"
+                        f"{middle_trim_context}"
+                    ),
+                }
+            )
 
-        for msg in messages:                                             # 遍历所有消息
+        for msg in messages:  # 遍历所有消息
             entry: dict[str, Any] = {"role": msg["role"], "content": msg["content"]}
             # 历史 tool_calls 不再回传给模型：
             # 1. 我们的存储把 tool 结果合并到 assistant message，缺少独立 tool role 消息，
@@ -2155,44 +2317,44 @@ class SessionManager:
             msg_has_tool_calls = bool(msg.get("tool_calls"))
             prev_has_tool_calls = bool(merged[-1].get("_had_tool_calls")) if merged else False
             if (
-                merged                                                   # 列表非空
-                and merged[-1]["role"] == "assistant"                     # 上一条是 assistant
-                and msg["role"] == "assistant"                            # 当前也是 assistant
-                and not prev_has_tool_calls                                # 上一条也不能是 tool_call 消息
-                and not msg_has_tool_calls                                 # 当前消息无 tool_calls 才合并
+                merged  # 列表非空
+                and merged[-1]["role"] == "assistant"  # 上一条是 assistant
+                and msg["role"] == "assistant"  # 当前也是 assistant
+                and not prev_has_tool_calls  # 上一条也不能是 tool_call 消息
+                and not msg_has_tool_calls  # 当前消息无 tool_calls 才合并
             ):
-                merged[-1]["content"] += "\n" + msg["content"]           # 合并为一条（避免连续 assistant）
+                merged[-1]["content"] += "\n" + msg["content"]  # 合并为一条（避免连续 assistant）
             else:
-                entry["_had_tool_calls"] = msg_has_tool_calls            # 内部标记，用于下一轮合并判断
+                entry["_had_tool_calls"] = msg_has_tool_calls  # 内部标记，用于下一轮合并判断
                 merged.append(entry)
         # 移除内部标记后再返回
         for entry in merged:
             entry.pop("_had_tool_calls", None)
-        return merged                                                    # 返回格式化后的消息列表
+        return merged  # 返回格式化后的消息列表
 
     def get_message_count(self, session_id: str) -> int:
         """返回会话中的消息总数（用于判断是否触发自动压缩）"""
-        data = self._read_file(session_id)          # 读取会话数据
-        if not data:                                # 不存在返回 0
+        data = self._read_file(session_id)  # 读取会话数据
+        if not data:  # 不存在返回 0
             return 0
-        return len(data.get("messages", []))        # 返回消息数量
+        return len(data.get("messages", []))  # 返回消息数量
 
     @_session_write_locked
     def clear_messages(self, session_id: str) -> None:
         """清空会话消息，但保留标题等元数据"""
-        data = self._read_file(session_id)          # 读取会话数据
-        if not data:                                # 不存在则跳过
+        data = self._read_file(session_id)  # 读取会话数据
+        if not data:  # 不存在则跳过
             return
-        data["messages"] = []                       # 清空消息列表
+        data["messages"] = []  # 清空消息列表
         if "display_messages" in data:
             del data["display_messages"]
-        if "compressed_context" in data:            # 同时清除压缩摘要
+        if "compressed_context" in data:  # 同时清除压缩摘要
             del data["compressed_context"]
         if "middle_trim_context" in data:
             del data["middle_trim_context"]
         if "harness" in data:
             del data["harness"]
-        self._write_file(session_id, data)          # 写回磁盘
+        self._write_file(session_id, data)  # 写回磁盘
 
 
 # 全局单例，整个后端进程共用一个 SessionManager 实例

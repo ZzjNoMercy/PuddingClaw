@@ -51,17 +51,13 @@ class GoalCoordinator:
     ) -> GoalRecord | None:
         if not goal_mode:
             if goal_id:
-                raise GoalActivationError(
-                    "goal_id was supplied while goal_mode is disabled."
-                )
+                raise GoalActivationError("goal_id was supplied while goal_mode is disabled.")
             return None
 
         if goal_id:
             goal = self._load_goal(session_id, goal_id)
             if goal.status != GoalStatus.ACTIVE:
-                raise GoalActivationError(
-                    f"Goal {goal_id} is {goal.status}; resume it before starting a Run."
-                )
+                raise GoalActivationError(f"Goal {goal_id} is {goal.status}; resume it before starting a Run.")
             return goal
 
         active = self._sessions.get_active_goal_state(session_id)
@@ -98,10 +94,7 @@ class GoalCoordinator:
         goal.gaps = list(report.gaps)
         goal.current_run_id = None
         goal.model_call_count += max(0, run.model_call_count)
-        if (
-            outcome == RunOutcome.COMPLETED
-            and report.status == VerificationStatus.SATISFIED
-        ):
+        if outcome == RunOutcome.COMPLETED and report.status == VerificationStatus.SATISFIED:
             goal.transition(GoalStatus.ACHIEVED)
         elif (
             outcome == RunOutcome.COMPLETED
@@ -157,8 +150,7 @@ class GoalCoordinator:
         goal = self._load_goal(session_id, goal_id)
         if goal.current_run_id:
             raise HarnessStateError(
-                f"Goal {goal_id} has running Run {goal.current_run_id}; "
-                "stop the Run before pausing the Goal."
+                f"Goal {goal_id} has running Run {goal.current_run_id}; stop the Run before pausing the Goal."
             )
         return self._transition(session_id, goal_id, GoalStatus.PAUSED)
 
@@ -169,8 +161,7 @@ class GoalCoordinator:
         goal = self._load_goal(session_id, goal_id)
         if goal.current_run_id:
             raise HarnessStateError(
-                f"Goal {goal_id} has running Run {goal.current_run_id}; "
-                "stop the Run before cancelling the Goal."
+                f"Goal {goal_id} has running Run {goal.current_run_id}; stop the Run before cancelling the Goal."
             )
         return self._transition(session_id, goal_id, GoalStatus.CANCELLED)
 
@@ -188,14 +179,10 @@ class GoalCoordinator:
     def _load_goal(self, session_id: str, goal_id: str) -> GoalRecord:
         payload = self._sessions.get_goal_state(session_id, goal_id)
         if not payload:
-            raise GoalActivationError(
-                f"Goal {goal_id} does not exist in session {session_id}."
-            )
+            raise GoalActivationError(f"Goal {goal_id} does not exist in session {session_id}.")
         goal = GoalRecord.model_validate(payload)
         if goal.session_id != session_id:
-            raise GoalActivationError(
-                f"Goal {goal_id} belongs to a different session."
-            )
+            raise GoalActivationError(f"Goal {goal_id} belongs to a different session.")
         return goal
 
 
@@ -250,18 +237,12 @@ class CompletionVerificationCoordinator:
         raw_status = str(state.get("_rubric_status") or "")
         status = cls._STATUS_MAP.get(raw_status, VerificationStatus.GRADER_ERROR)
         raw_evaluations = state.get("_rubric_evaluations")
-        evaluations_payload = (
-            list(raw_evaluations) if isinstance(raw_evaluations, list) else []
-        )
+        evaluations_payload = list(raw_evaluations) if isinstance(raw_evaluations, list) else []
         latest = evaluations_payload[-1] if evaluations_payload else {}
         latest_criteria = (
-            latest.get("criteria")
-            if isinstance(latest, dict) and isinstance(latest.get("criteria"), list)
-            else []
+            latest.get("criteria") if isinstance(latest, dict) and isinstance(latest.get("criteria"), list) else []
         )
-        criteria_by_statement = {
-            item.statement: item for item in contract.criteria
-        }
+        criteria_by_statement = {item.statement: item for item in contract.criteria}
         criteria_by_id = {item.id: item for item in contract.criteria}
         raw_by_id: dict[str, list[dict[str, Any]]] = {}
         for raw in latest_criteria:
@@ -277,9 +258,7 @@ class CompletionVerificationCoordinator:
             contract,
             state,
         )
-        deterministic_by_id = {
-            item.criterion_id: item for item in deterministic_evaluations
-        }
+        deterministic_by_id = {item.criterion_id: item for item in deterministic_evaluations}
         context = state.get("_harness_context")
         harness_context = context if isinstance(context, dict) else {}
         raw_activations = harness_context.get(
@@ -294,8 +273,7 @@ class CompletionVerificationCoordinator:
             and activation.get("status") == "succeeded"
             and activation.get("pack") == "analytics"
             for evidence in activation.get("evidence_refs") or []
-            if isinstance(evidence, dict)
-            and evidence.get("material", True) is not False
+            if isinstance(evidence, dict) and evidence.get("material", True) is not False
         ]
 
         evaluations: list[CriterionEvaluation] = []
@@ -340,19 +318,14 @@ class CompletionVerificationCoordinator:
             gap = str(raw.get("gap") or "").strip() or None
             raw_evidence = raw.get("evidence")
             evidence = (
-                [item for item in raw_evidence if isinstance(item, dict)]
-                if isinstance(raw_evidence, list)
-                else []
+                [item for item in raw_evidence if isinstance(item, dict)] if isinstance(raw_evidence, list) else []
             )
             if configured.id == "metric_consistency":
                 evidence = [*evidence, *analytics_evidence]
             passed = bool(raw.get("passed"))
             if configured.verifier == VerifierKind.ANALYTICS and not evidence:
                 passed = False
-                gap = gap or (
-                    f"标准 {configured.id} 没有当前 Run 的结构化分析证据，"
-                    "不能仅凭模型判定通过。"
-                )
+                gap = gap or (f"标准 {configured.id} 没有当前 Run 的结构化分析证据，不能仅凭模型判定通过。")
             if configured.required and gap:
                 passed = False
             evaluations.append(
@@ -367,25 +340,18 @@ class CompletionVerificationCoordinator:
             )
             if configured.required and (not passed or gap):
                 gaps.append(gap or f"标准 {configured.id} 未通过。")
-        explanation = (
-            str(latest.get("explanation") or "")
-            if isinstance(latest, dict)
-            else ""
-        )
+        explanation = str(latest.get("explanation") or "") if isinstance(latest, dict) else ""
         required_by_id = {item.id: item.required for item in contract.criteria}
-        if any(
-            (not item.passed or bool(item.gap))
-            and required_by_id.get(item.criterion_id, True)
-            for item in evaluations
-        ) and status == VerificationStatus.SATISFIED:
-            status = VerificationStatus.NEEDS_REVISION
-        elif (
-            status == VerificationStatus.NEEDS_REVISION
-            and all(
-                (item.passed and not item.gap)
-                or not required_by_id.get(item.criterion_id, True)
+        if (
+            any(
+                (not item.passed or bool(item.gap)) and required_by_id.get(item.criterion_id, True)
                 for item in evaluations
             )
+            and status == VerificationStatus.SATISFIED
+        ):
+            status = VerificationStatus.NEEDS_REVISION
+        elif status == VerificationStatus.NEEDS_REVISION and all(
+            (item.passed and not item.gap) or not required_by_id.get(item.criterion_id, True) for item in evaluations
         ):
             # Deterministic checks are authoritative for their criteria.  A
             # grader may still return an overall needs_revision verdict for a
@@ -395,10 +361,7 @@ class CompletionVerificationCoordinator:
             # green criteria with a contradictory terminal status.
             status = VerificationStatus.SATISFIED
         if status != VerificationStatus.SATISFIED and not gaps:
-            gaps.append(
-                explanation
-                or f"Run verification ended with status {status.value}."
-            )
+            gaps.append(explanation or f"Run verification ended with status {status.value}.")
         return RubricEvaluationReport(
             report_id=f"verification-{uuid.uuid4().hex[:16]}",
             run_id=run_id,
@@ -483,20 +446,35 @@ class HarnessRunCoordinator:
             analytics_model_id=analytics_model_id,
             verification_enabled=verification_enabled,
             task_profile=task_profile,
-            declared_verification_contract=(
-                contract.model_copy(deep=True) if contract is not None else None
-            ),
+            declared_verification_contract=(contract.model_copy(deep=True) if contract is not None else None),
             verification_contract=contract,
             config_snapshot=dict(config_snapshot or {}),
         )
         if goal is not None:
             goal.attach_run(run.run_id)
-        self._sessions.start_harness_run(
+        saved_run, saved_goal = self._sessions.start_harness_run(
             session_id,
             run.model_dump(mode="json"),
             goal.model_dump(mode="json") if goal is not None else None,
         )
+        run = RunRecord.model_validate(saved_run)
+        goal = GoalRecord.model_validate(saved_goal) if saved_goal is not None else None
         return run, goal
+
+    def bind_execution_snapshot(
+        self,
+        run: RunRecord,
+        execution: dict[str, Any],
+    ) -> RunRecord:
+        """Finish PREPARING by freezing the effective backend identity."""
+
+        saved = self._sessions.bind_run_execution_snapshot(
+            run.session_id,
+            run.run_id,
+            execution,
+        )
+        self._replace_run(run, RunRecord.model_validate(saved))
+        return run
 
     def transition(
         self,
@@ -538,13 +516,9 @@ class HarnessRunCoordinator:
         context = state.get("_harness_context")
         harness_context = dict(context) if isinstance(context, dict) else {}
         if not str(harness_context.get("final_content") or "").strip():
-            harness_context["final_content"] = self._last_ai_content(
-                state.get("messages")
-            )
+            harness_context["final_content"] = self._last_ai_content(state.get("messages"))
         harness_context["verification_activations"] = [
-            item.model_dump(mode="json")
-            if hasattr(item, "model_dump")
-            else dict(item)
+            item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item)
             for item in run.verification_activations
             if isinstance(item, dict) or hasattr(item, "model_dump")
         ]
@@ -605,9 +579,7 @@ class HarnessRunCoordinator:
                 return content
             if isinstance(content, list):
                 return "\n".join(
-                    str(item.get("text") or item.get("content") or "")
-                    if isinstance(item, dict)
-                    else str(item)
+                    str(item.get("text") or item.get("content") or "") if isinstance(item, dict) else str(item)
                     for item in content
                 )
         return ""
@@ -635,16 +607,8 @@ class HarnessRunCoordinator:
             report_id=f"verification-{uuid.uuid4().hex[:16]}",
             run_id=run.run_id,
             status=VerificationStatus.BUDGET_EXCEEDED,
-            contract_id=(
-                run.verification_contract.contract_id
-                if run.verification_contract is not None
-                else None
-            ),
-            contract_version=(
-                run.verification_contract.version
-                if run.verification_contract is not None
-                else None
-            ),
+            contract_id=(run.verification_contract.contract_id if run.verification_contract is not None else None),
+            contract_version=(run.verification_contract.version if run.verification_contract is not None else None),
             gaps=[detail],
             explanation=detail,
         )

@@ -53,6 +53,10 @@ export default function SourcesPanel() {
   const [permissionGrants, setPermissionGrants] = useState<PermissionGrant[]>([]);
 
   const loadPermissions = React.useCallback(() => {
+    if (!sessionId || sessionId === "default") {
+      setPermissionGrants([]);
+      return;
+    }
     listSessionPermissions(sessionId)
       .then(setPermissionGrants)
       .catch(() => setPermissionGrants([]));

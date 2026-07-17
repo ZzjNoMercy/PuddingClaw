@@ -2,6 +2,25 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
+
+def test_permission_grant_cannot_recreate_a_deleted_session(tmp_path):
+    from graph.session_manager import session_manager
+
+    session_manager.initialize(tmp_path)
+
+    with pytest.raises(FileNotFoundError):
+        session_manager.add_permission_grant(
+            "missing-session",
+            grant_type="external_file_read",
+            target_kind="all_external_files",
+            target="*",
+            capabilities=["read", "external_path"],
+        )
+
+    assert not (tmp_path / "missing-session.json").exists()
+
 
 def test_session_external_file_permission_grants(tmp_path):
     from graph.session_manager import session_manager
@@ -102,6 +121,47 @@ def test_permissioned_backend_edits_only_approved_external_file(tmp_path):
     assert external.read_text(encoding="utf-8") == "after"
 
 
+def test_permissioned_backend_never_mutates_managed_resources(tmp_path):
+    from deepagents.backends import FilesystemBackend
+
+    from graph.permissioned_filesystem_backend import PermissionedCompositeBackend
+    from graph.session_manager import session_manager
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("managed-readonly-session")
+    workspace = tmp_path / "workspace"
+    skills = tmp_path / "skills"
+    workspace.mkdir()
+    skills.mkdir()
+    skill_file = skills / "SKILL.md"
+    skill_file.write_text("original", encoding="utf-8")
+    workspace_backend = FilesystemBackend(root_dir=workspace, virtual_mode=True)
+    skills_backend = FilesystemBackend(root_dir=skills, virtual_mode=True)
+    backend = PermissionedCompositeBackend(
+        default=workspace_backend,
+        routes={"/workspace/": workspace_backend, "/skills/": skills_backend},
+        session_id="managed-readonly-session",
+        managed_readonly_roots=(skills,),
+    )
+
+    virtual_write = backend.write("/skills/new.md", "forged")
+    virtual_edit = backend.edit("/skills/SKILL.md", "original", "forged")
+    session_manager.add_permission_grant(
+        "managed-readonly-session",
+        grant_type="external_file_write",
+        target_kind="exact_file",
+        target=str(skill_file.resolve()),
+        capabilities=["write", "external_path"],
+    )
+    absolute_edit = backend.edit(str(skill_file.resolve()), "original", "forged")
+
+    assert virtual_write.error == "Managed resource is read-only: /skills/new.md"
+    assert virtual_edit.error == "Managed resource is read-only: /skills/SKILL.md"
+    assert absolute_edit.error
+    assert not (skills / "new.md").exists()
+    assert skill_file.read_text(encoding="utf-8") == "original"
+
+
 def test_external_write_request_contains_change_preview(tmp_path):
     from graph.permission_middleware import ExternalFilePermissionMiddleware
     from graph.permission_resume import permission_resume_registry
@@ -124,14 +184,20 @@ def test_external_write_request_contains_change_preview(tmp_path):
     assert request["options"] == ["exact_file_session"]
     assert request["operation"] == "edit_file"
     assert request["change_preview"]["new_string"] == "after"
-    assert ExternalFilePermissionMiddleware._external_write_path(
-        str(tmp_path / "outside.txt"),
-        str(tmp_path / "workspace"),
-    ) == (tmp_path / "outside.txt").resolve()
-    assert ExternalFilePermissionMiddleware._external_write_path(
-        "/workspace/report.md",
-        str(tmp_path / "workspace"),
-    ) is None
+    assert (
+        ExternalFilePermissionMiddleware._external_write_path(
+            str(tmp_path / "outside.txt"),
+            str(tmp_path / "workspace"),
+        )
+        == (tmp_path / "outside.txt").resolve()
+    )
+    assert (
+        ExternalFilePermissionMiddleware._external_write_path(
+            "/workspace/report.md",
+            str(tmp_path / "workspace"),
+        )
+        is None
+    )
 
 
 def test_permission_middleware_interrupts_external_edit_file(tmp_path, monkeypatch):
@@ -284,20 +350,24 @@ def test_permission_middleware_interrupts_misrouted_external_read_file(tmp_path,
         "messages": [
             AIMessage(
                 content="",
-                tool_calls=[{
-                    "name": "read_file",
-                    "args": {"file_path": str(external), "offset": 100, "limit": 200},
-                    "id": "call-read-external",
-                    "type": "tool_call",
-                }],
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {"file_path": str(external), "offset": 100, "limit": 200},
+                        "id": "call-read-external",
+                        "type": "tool_call",
+                    }
+                ],
             )
         ]
     }
-    runtime = SimpleNamespace(context={
-        "session_id": "middleware-read-route-session",
-        "query_id": "query-read-route",
-        "workspace_path": str(workspace),
-    })
+    runtime = SimpleNamespace(
+        context={
+            "session_id": "middleware-read-route-session",
+            "query_id": "query-read-route",
+            "workspace_path": str(workspace),
+        }
+    )
 
     async def invoke():
         return ExternalFilePermissionMiddleware().after_model(state, runtime)

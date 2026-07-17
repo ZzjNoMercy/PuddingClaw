@@ -312,11 +312,13 @@ def test_stale_run_upsert_cannot_erase_concurrent_activation(tmp_path):
         "query_id": "query-current",
         "session_id": "session-1",
         "objective": "继续",
-        "status": "running",
+        "status": "preparing",
         "task_profile": {},
         "verification_activations": [],
     }
     sessions.start_harness_run("session-1", stale)
+    sessions.transition_run_status("session-1", "run-1", "running")
+    stale["status"] = "running"
     activation = build_verification_activations(
         run_id="run-1",
         query_id="query-current",
