@@ -759,6 +759,64 @@ def test_required_grader_gap_forces_needs_revision():
     assert report.status == VerificationStatus.NEEDS_REVISION
 
 
+def test_passing_effective_criteria_override_stale_needs_revision_status():
+    contract = RunRubricCompiler.compile(
+        RubricBuildContext(user_message="搜索最新 AI 新闻并附来源")
+    )
+    assert contract is not None
+    result = ToolMessage(
+        content="# News\nA new model launched.",
+        tool_call_id="call-web",
+        name="fetch_url",
+        status="success",
+    )
+    activation = build_verification_activations(
+        run_id="run-1",
+        query_id="query-1",
+        tool_call_id="call-web",
+        tool_name="fetch_url",
+        args={"url": "https://example.com/news"},
+        result=result,
+    )[0]
+    source = next(
+        item for item in activation.evidence_refs if item.get("kind") == "source"
+    )
+
+    report = CompletionVerificationCoordinator.report_from_final_state(
+        run_id="run-1",
+        contract=contract,
+        final_state={
+            "_rubric_status": "needs_revision",
+            "_rubric_evaluations": [
+                {
+                    "result": "needs_revision",
+                    "explanation": "模型误认为来源验收未通过。",
+                    "criteria": [
+                        {"name": "task_fulfillment", "passed": True},
+                        {"name": "time_scope", "passed": True},
+                        {
+                            "name": "web_evidence_traceability",
+                            "passed": False,
+                            "gap": "模型未识别引用。",
+                        },
+                    ],
+                }
+            ],
+            "_harness_context": {
+                "todos": [],
+                "final_content": f"新闻结论。[^{source['source_id']}]",
+                "verification_activations": [
+                    activation.model_dump(mode="json")
+                ],
+            },
+        },
+    )
+
+    assert all(item.passed for item in report.evaluations)
+    assert report.status == VerificationStatus.SATISFIED
+    assert report.gaps == []
+
+
 def _web_report(final_content: str, *, cited_source_id: str | None = None):
     contract = RunRubricCompiler.compile(
         RubricBuildContext(user_message="搜索最新 AI 新闻并附来源")

@@ -158,6 +158,33 @@ def test_rubric_grader_parses_plain_json_without_tool_binding():
     assert graded.criteria[0]["passed"] is True
 
 
+def test_rubric_grader_payload_is_scoped_to_current_run():
+    from graph.deepagents_manager import PuddingClawRubricMiddleware
+
+    middleware = PuddingClawRubricMiddleware(
+        model=SimpleNamespace(),
+        max_iterations=2,
+    )
+    payload = middleware._build_grader_payload(
+        {
+            "messages": [
+                HumanMessage(content="上一轮：总结 AI 新闻"),
+                AIMessage(content="上一轮新闻回答"),
+                HumanMessage(content="本轮：总结小鹏 L03"),
+                AIMessage(content="本轮 L03 回答"),
+            ],
+            "rubric": "完成本轮任务",
+            "_run_message_start_index": 2,
+        },
+        iteration=0,
+    )
+
+    assert "本轮：总结小鹏 L03" in payload
+    assert "本轮 L03 回答" in payload
+    assert "上一轮：总结 AI 新闻" not in payload
+    assert "上一轮新闻回答" not in payload
+
+
 def test_rubric_grader_rejects_non_json_output():
     from graph.deepagents_manager import PuddingClawRubricMiddleware
 
@@ -583,6 +610,80 @@ def test_multiple_database_revision_interrupts_resume_by_interrupt_id(tmp_path):
     assert agent.inputs[-1].resume == {
         "interrupt-1": {"action": "reject"},
         "interrupt-2": {"action": "reject"},
+    }
+
+
+def test_parallel_permissions_in_separate_stream_items_are_collected_before_resume(tmp_path):
+    """Parallel nodes may emit one interrupt per stream item, not one combined tuple."""
+
+    import asyncio
+
+    from graph.deepagents_manager import DeepAgentsAgentManager
+    from graph.permission_resume import permission_resume_registry
+    from graph.trace_collector import TraceCollector
+    from langgraph.types import Command, Interrupt
+
+    requests = [
+        {"id": "perm-parallel-a", "type": "network_access", "tool_call_id": "call-a"},
+        {"id": "perm-parallel-b", "type": "network_access", "tool_call_id": "call-b"},
+    ]
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self.inputs = []
+
+        async def astream(self, graph_input, **_kwargs):
+            self.inputs.append(graph_input)
+            if len(self.inputs) == 1:
+                first = Interrupt(
+                    value={"type": "permission_request", "request": requests[0]},
+                    id="permission-interrupt-a",
+                )
+                second = Interrupt(
+                    value={"type": "permission_request", "request": requests[1]},
+                    id="permission-interrupt-b",
+                )
+                yield ("updates", {"__interrupt__": (first,)})
+                yield ("values", {"__interrupt__": (first,)})  # duplicate stream mode echo
+                yield ("updates", {"__interrupt__": (second,)})
+                return
+            yield ("messages", ("resumed", {"langgraph_node": "model"}))
+
+    runtime = DeepAgentsAgentManager()
+    runtime.initialize(tmp_path)
+    agent = FakeAgent()
+
+    async def run():
+        with TraceCollector(session_id="parallel-session", query_id="parallel-query") as trace:
+            events = []
+            async for item in runtime._astream_with_hitl_resume(
+                agent,
+                {"messages": []},
+                stream_mode=["messages", "updates", "custom", "values"],
+                config={"configurable": {"thread_id": "parallel-session"}},
+                context={"session_id": "parallel-session", "query_id": "parallel-query"},
+                trace_collector=trace,
+            ):
+                events.append(item)
+                if isinstance(item, dict) and item.get("event") == "permission_required":
+                    request_id = json.loads(item["data"])["id"]
+                    future = asyncio.get_running_loop().create_future()
+                    permission_resume_registry._pending[request_id] = future
+                    future.set_result({"type": "approve"})
+            return events
+
+    events = asyncio.run(run())
+
+    assert [event.get("event") for event in events if isinstance(event, dict)] == [
+        "permission_required",
+        "permission_required",
+        "permission_resolved",
+        "permission_resolved",
+    ]
+    assert isinstance(agent.inputs[-1], Command)
+    assert agent.inputs[-1].resume == {
+        "permission-interrupt-a": {"decisions": [{"type": "approve"}]},
+        "permission-interrupt-b": {"decisions": [{"type": "approve"}]},
     }
 
 

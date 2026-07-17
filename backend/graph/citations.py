@@ -168,3 +168,29 @@ def finalize_citations(content: str, sources: list[dict[str, Any]]) -> list[dict
             "status": "verified",
         })
     return citations
+
+
+def resolve_message_citations(
+    content: str,
+    turn_sources: list[dict[str, Any]],
+    session_sources: list[dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Resolve one answer against new sources plus reusable session history.
+
+    Every source discovered in the current turn remains visible as a retrieval
+    result. Historical sources are copied onto the new message only when its
+    final text actually cites them, so source reuse works without duplicating
+    the complete session catalog into every answer.
+    """
+
+    current = dedupe_sources(turn_sources)
+    available = dedupe_sources(current + list(session_sources or []))
+    citations = finalize_citations(content, available)
+    cited_ids = {citation["source_id"] for citation in citations}
+    current_ids = {source["source_id"] for source in current}
+    reused = [
+        source
+        for source in available
+        if source["source_id"] in cited_ids and source["source_id"] not in current_ids
+    ]
+    return dedupe_sources(current + reused), citations

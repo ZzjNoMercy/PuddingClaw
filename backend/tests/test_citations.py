@@ -94,6 +94,35 @@ def test_finalize_citations_rejects_unknown_sources_and_reuses_index():
     assert {item["source_id"] for item in citations} == {source_id}
 
 
+def test_resolve_message_citations_reuses_only_cited_session_sources():
+    from graph.citations import normalize_source, resolve_message_citations
+
+    current = normalize_source({
+        "source_id": "src_current",
+        "title": "本轮检索结果",
+        "uri": "https://example.com/current",
+    })
+    reused = normalize_source({
+        "source_id": "src_reused",
+        "title": "历史引用来源",
+        "uri": "https://example.com/reused",
+    })
+    unrelated = normalize_source({
+        "source_id": "src_unrelated",
+        "title": "未被引用的历史来源",
+        "uri": "https://example.com/unrelated",
+    })
+
+    sources, citations = resolve_message_citations(
+        "本轮信息。[^src_current] 历史信息。[^src_reused]",
+        [current],
+        [reused, unrelated],
+    )
+
+    assert [source["source_id"] for source in sources] == ["src_current", "src_reused"]
+    assert [citation["source_id"] for citation in citations] == ["src_current", "src_reused"]
+
+
 def test_session_message_persists_sources_and_citations(tmp_path):
     from graph.session_manager import SessionManager
 

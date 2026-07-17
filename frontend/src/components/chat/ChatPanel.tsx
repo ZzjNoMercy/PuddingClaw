@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useRef } from "react";
-import { useApp } from "@/lib/store";
+import { useEffect, useMemo, useRef } from "react";
+import { useApp, type SourceRecord } from "@/lib/store";
 import ChatMessage from "./ChatMessage";
 import ChatInput from "./ChatInput";
 import { Loader2, Sparkles } from "lucide-react";
@@ -16,6 +16,15 @@ export default function ChatPanel() {
 
   const lastAssistantId = [...messages].reverse().find((m) => m.role === "assistant")?.id;
   const lastMessageId = messages[messages.length - 1]?.id;
+  const sessionSources = useMemo(() => {
+    const catalog = new Map<string, SourceRecord>();
+    for (const message of messages) {
+      for (const source of message.sources || []) {
+        catalog.set(source.source_id, { ...catalog.get(source.source_id), ...source });
+      }
+    }
+    return Array.from(catalog.values());
+  }, [messages]);
 
   return (
     <div className="flex flex-col h-full">
@@ -43,6 +52,7 @@ export default function ChatPanel() {
               <ChatMessage
                 key={msg.id}
                 message={msg}
+                sessionSources={sessionSources}
                 isStreaming={isStreaming && msg.id === lastAssistantId}
                 showInterruptionNotice={msg.id === lastMessageId}
               />

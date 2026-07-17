@@ -140,6 +140,42 @@ export default function SourcesPanel() {
     return { cited: citedSources, retrieved: retrievedSources, inferredTodos: latestTodos };
   }, [messages]);
 
+  // The default Sources list intentionally stays scoped to the latest turn.
+  // A citation in an older message can still be activated, though, so resolve
+  // that source from the full session history and show it separately instead
+  // of expanding every historical source into the normal list.
+  const selectedHistoricalSource = useMemo(() => {
+    if (!activeSourceId) return null;
+    const isInCurrentTurn = [...cited, ...retrieved].some(
+      ({ source }) => source.source_id === activeSourceId
+    );
+    if (isInCurrentTurn) return null;
+
+    const toolByCallId = new Map<string, string>();
+    for (const message of messages) {
+      for (const toolCall of message.toolCalls || []) {
+        if (toolCall.id) toolByCallId.set(toolCall.id, toolCall.tool);
+      }
+    }
+
+    let source: SourceRecord | undefined;
+    let citationIndex: number | undefined;
+    for (const message of messages) {
+      for (const candidate of message.sources || []) {
+        if (candidate.source_id !== activeSourceId) continue;
+        if (isLegacyFalsePositive(candidate, toolByCallId)) continue;
+        source = { ...source, ...candidate } as SourceRecord;
+      }
+      for (const citation of message.citations || []) {
+        if (citation.source_id === activeSourceId) {
+          citationIndex = citation.display_index;
+        }
+      }
+    }
+
+    return source ? { source, index: citationIndex } : null;
+  }, [activeSourceId, cited, messages, retrieved]);
+
   // Prefer persisted todos; fall back to todos inferred from the current turn
   // when persistence has not been populated yet.
   const displayTodos = useMemo(
@@ -202,6 +238,7 @@ export default function SourcesPanel() {
           onActivate={() => setInspectorActiveTab(inspectorActiveTab === "sources" ? null : "sources")}
           cited={cited}
           retrieved={retrieved}
+          selectedHistoricalSource={selectedHistoricalSource}
           isStreaming={isStreaming && hasSources}
         />
       </div>
@@ -420,6 +457,19 @@ function VerificationCard({
               </div>
             )}
           </div>
+          {!passed && report.gaps.length > 0 && (
+            <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5">
+              <p className="text-[11px] font-semibold text-amber-800">待修正问题</p>
+              <ul className="mt-1.5 space-y-1.5 text-[11px] leading-5 text-amber-900">
+                {report.gaps.map((gap, index) => (
+                  <li key={`${gap}-${index}`} className="flex gap-1.5">
+                    <span className="shrink-0 text-amber-500">{index + 1}.</span>
+                    <span className="min-w-0 break-words">{gap}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
           {report.evaluations.map((evaluation) => {
             const criterion = criteriaById.get(evaluation.criterion_id);
             const presentation = verificationCriterionPresentation(
@@ -508,11 +558,6 @@ function VerificationCard({
               </details>
             );
           })}
-          {report.evaluations.length === 0 && report.gaps.map((gap, index) => (
-            <p key={`${gap}-${index}`} className="rounded-xl bg-amber-50 px-3 py-2 text-[11px] text-amber-800">
-              {gap}
-            </p>
-          ))}
           {report.explanation && (
             <details className="group rounded-xl border border-black/[0.06] bg-white/70">
               <summary className="flex cursor-pointer list-none items-center justify-between gap-2 px-3 py-2.5 text-[11px] font-semibold text-slate-600 [&::-webkit-details-marker]:hidden">
@@ -769,11 +814,7 @@ function PermissionsCard({
                 ? "所有外部文件"
                 : grant.target;
             const canWrite = grant.capabilities.includes("write") || grant.type === "external_file_write";
-            const commandExecutable = command
-              .split(/&&|\|\||[;|]/)
-              .map((segment) => segment.trim().replace(/^\(+/, "").split(/\s+/)[0] || "")
-              .map((item) => item.split("/").pop() || "")
-              .find((item) => item && !["cd", "mkdir", "printf"].includes(item));
+            const commandExecutable = extractCommandExecutable(command);
             const risk = String(grant.metadata?.risk || "");
             const riskLabel = risk
               ? (
@@ -983,27 +1024,34 @@ function SourcesCard({
   onActivate,
   cited,
   retrieved,
+  selectedHistoricalSource,
   isStreaming,
 }: {
   active: boolean;
   onActivate: () => void;
   cited: Array<{ source: SourceRecord; index?: number }>;
   retrieved: Array<{ source: SourceRecord; index?: number }>;
+  selectedHistoricalSource: { source: SourceRecord; index?: number } | null;
   isStreaming: boolean;
 }) {
   const { activeSourceId } = useApp();
   const activeRef = useRef<HTMLDivElement>(null);
   const total = cited.length + retrieved.length;
+  const visibleTotal = total + (selectedHistoricalSource ? 1 : 0);
 
   useEffect(() => {
     if (!activeSourceId) return;
-    const allSources = [...cited, ...retrieved];
+    const allSources = [
+      ...(selectedHistoricalSource ? [selectedHistoricalSource] : []),
+      ...cited,
+      ...retrieved,
+    ];
     if (allSources.some(({ source }) => source.source_id === activeSourceId)) {
       window.setTimeout(() => {
         activeRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
       }, 50);
     }
-  }, [activeSourceId, cited, retrieved]);
+  }, [activeSourceId, cited, retrieved, selectedHistoricalSource]);
 
   return (
     <section>
@@ -1016,19 +1064,30 @@ function SourcesCard({
           isStreaming ? (
             <span className="inline-flex items-center gap-1.5 text-[#002fa7]">
               <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-[#002fa7]" />
-              {total}
+              {visibleTotal}
             </span>
-          ) : total > 0 ? (
-            <span>{total}</span>
+          ) : visibleTotal > 0 ? (
+            <span>{visibleTotal}</span>
           ) : (
             <span className="text-slate-300">0</span>
           )}
       />
 
-      {active && total === 0 ? (
+      {active && visibleTotal === 0 ? (
         <SourcesEmptyState />
       ) : active ? (
         <div className="pb-4 space-y-5">
+          {selectedHistoricalSource && (
+            <SourceSection title="历史引用" count={1}>
+              <SourceItem
+                source={selectedHistoricalSource.source}
+                citationIndex={selectedHistoricalSource.index}
+                isActive
+                ref={activeRef}
+              />
+            </SourceSection>
+          )}
+
           {cited.length > 0 && (
             <SourceSection title="已引用" count={cited.length}>
               {cited.map(({ source, index }) => (
@@ -1078,6 +1137,87 @@ function SourceSection({
       <div className="space-y-3">{children}</div>
     </div>
   );
+}
+
+function extractCommandExecutable(command: string): string {
+  const ignored = new Set(["cd", "mkdir", "printf", "export"]);
+  const tokens = tokenizeShellWords(command);
+  let atSegmentStart = true;
+  for (const token of tokens) {
+    if (token === "&&" || token === "||" || token === ";" || token === "|") {
+      atSegmentStart = true;
+      continue;
+    }
+    const normalized = token.replace(/^\(+/, "");
+    if (!normalized) continue;
+    if (atSegmentStart && /^[A-Za-z_][A-Za-z0-9_]*=/.test(normalized)) {
+      continue;
+    }
+    const executable = normalized.split("/").filter(Boolean).pop() || normalized;
+    if (ignored.has(executable)) {
+      atSegmentStart = true;
+      continue;
+    }
+    return executable;
+  }
+  return "";
+}
+
+function tokenizeShellWords(command: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | null = null;
+  let escaped = false;
+  const pushCurrent = () => {
+    if (current) {
+      tokens.push(current);
+      current = "";
+    }
+  };
+
+  for (let i = 0; i < command.length; i += 1) {
+    const ch = command[i];
+    const next = command[i + 1];
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) {
+        quote = null;
+      } else {
+        current += ch;
+      }
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      pushCurrent();
+      continue;
+    }
+    if ((ch === "&" && next === "&") || (ch === "|" && next === "|")) {
+      pushCurrent();
+      tokens.push(`${ch}${next}`);
+      i += 1;
+      continue;
+    }
+    if (ch === ";" || ch === "|") {
+      pushCurrent();
+      tokens.push(ch);
+      continue;
+    }
+    current += ch;
+  }
+  pushCurrent();
+  return tokens;
 }
 
 const SourceItem = React.forwardRef<HTMLDivElement, {

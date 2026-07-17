@@ -1928,11 +1928,28 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           if (event.event === "citations_finalized") {
             const targetId = getAssistantId();
             const citations = (event.data.citations || []) as unknown as CitationRef[];
+            const sources = (event.data.sources || []) as unknown as SourceRecord[];
             updateMsgs((prev) => {
               const updated = [...prev];
               const idx = updated.findIndex((m) => m.id === targetId);
               if (idx === -1) return prev;
-              updated[idx] = { ...updated[idx], citations };
+              const existingSources = updated[idx].sources || [];
+              const mergedSources = [...existingSources];
+              for (const source of sources) {
+                const sourceIndex = mergedSources.findIndex(
+                  (item) => item.source_id === source.source_id
+                );
+                if (sourceIndex >= 0) {
+                  mergedSources[sourceIndex] = { ...mergedSources[sourceIndex], ...source };
+                } else {
+                  mergedSources.push(source);
+                }
+              }
+              updated[idx] = {
+                ...updated[idx],
+                citations,
+                sources: mergedSources.length > 0 ? mergedSources : updated[idx].sources,
+              };
               return updated;
             });
             continue;

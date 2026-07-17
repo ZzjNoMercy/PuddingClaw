@@ -12,6 +12,7 @@ import RetrievalCard from "./RetrievalCard";
 
 interface Props {
   message: ChatMessageType;
+  sessionSources?: SourceRecord[];
   isStreaming?: boolean;
   showInterruptionNotice?: boolean;
 }
@@ -32,10 +33,11 @@ function isAuthError(content: string): boolean {
   return has401 || hasApiKeyError || hasAuthFail;
 }
 
-export default function ChatMessage({ message, isStreaming = false, showInterruptionNotice = false }: Props) {
+export default function ChatMessage({ message, sessionSources = [], isStreaming = false, showInterruptionNotice = false }: Props) {
   const isUser = message.role === "user";
   const hasAuthError = !isUser && isAuthError(message.content);
-  const renderedContent = renderCitationMarkers(message);
+  const renderedContent = renderCitationMarkers(message, sessionSources);
+  const availableSources = mergeSources(message.sources, sessionSources);
   const { sessionId, setActiveSourceId, setInspectorOpen } = useApp();
   const pendingPermissionRequests = (message.permissionRequests || []).filter(
     (request) => request.status !== "resolved"
@@ -55,7 +57,7 @@ export default function ChatMessage({ message, isStreaming = false, showInterrup
       <CitationLink
         {...props}
         sessionId={sessionId}
-        sources={message.sources}
+        sources={availableSources}
         onActivate={(sourceId) => {
           setActiveSourceId(sourceId);
           setInspectorOpen(true);
@@ -94,6 +96,7 @@ export default function ChatMessage({ message, isStreaming = false, showInterrup
                       key={`${message.id}-seg-${index}`}
                       segment={segment}
                       message={message}
+                      sessionSources={sessionSources}
                       isStreaming={isStreaming}
                       isLast={index === message.segments!.length - 1}
                     />
@@ -785,22 +788,25 @@ function LogicalDatasetRuleCard({ request }: { request: LogicalDatasetRuleReques
 function SegmentBlock({
   segment,
   message,
+  sessionSources,
   isStreaming,
   isLast,
 }: {
   segment: { content: string; reasoning?: string; timeline?: TimelineItem[] };
   message: ChatMessageType;
+  sessionSources: SourceRecord[];
   isStreaming?: boolean;
   isLast?: boolean;
 }) {
   const { sessionId, setActiveSourceId, setInspectorOpen } = useApp();
-  const rendered = renderCitationMarkersForSegment(message, segment.content);
+  const rendered = renderCitationMarkersForSegment(message, segment.content, sessionSources);
+  const availableSources = mergeSources(message.sources, sessionSources);
   const citationComponents: Components = {
     a: (props) => (
       <CitationLink
         {...props}
         sessionId={sessionId}
-        sources={message.sources}
+        sources={availableSources}
         onActivate={(sourceId) => {
           setActiveSourceId(sourceId);
           setInspectorOpen(true);
@@ -851,8 +857,10 @@ function SegmentBlock({
 
 function renderCitationMarkersForSegment(
   message: ChatMessageType,
-  content: string
+  content: string,
+  sessionSources: SourceRecord[] = []
 ): string {
+  const normalizedContent = stripCitationDefinitions(content);
   const indexes = new Map<string, number>();
   message.citations?.forEach((citation) => {
     indexes.set(citation.source_id, citation.display_index);
@@ -864,8 +872,17 @@ function renderCitationMarkersForSegment(
       indexes.set(source.source_id, nextIndex++);
     }
   });
-  if (indexes.size === 0) return content;
-  return content.replace(/\[\^(src_[A-Za-z0-9_-]+)\]/g, (marker, sourceId: string) => {
+  const sessionSourceIds = new Set(sessionSources.map((source) => source.source_id));
+  const historicalMarkerRe = /\[\^(src_[A-Za-z0-9_-]+)\]/g;
+  let historicalMatch: RegExpExecArray | null;
+  while ((historicalMatch = historicalMarkerRe.exec(normalizedContent)) !== null) {
+    const sourceId = historicalMatch[1];
+    if (sessionSourceIds.has(sourceId) && !indexes.has(sourceId)) {
+      indexes.set(sourceId, nextIndex++);
+    }
+  }
+  if (indexes.size === 0) return normalizedContent;
+  return normalizedContent.replace(/\[\^(src_[A-Za-z0-9_-]+)\]/g, (marker, sourceId: string) => {
     const index = indexes.get(sourceId);
     return index ? `[${index}](#source-${sourceId})` : marker;
   });
@@ -920,7 +937,8 @@ function ReasoningBlock({
   );
 }
 
-function renderCitationMarkers(message: ChatMessageType): string {
+function renderCitationMarkers(message: ChatMessageType, sessionSources: SourceRecord[] = []): string {
+  const normalizedContent = stripCitationDefinitions(message.content);
   const indexes = new Map<string, number>();
 
   // Citations carry the authoritative display index.
@@ -937,13 +955,38 @@ function renderCitationMarkers(message: ChatMessageType): string {
       indexes.set(source.source_id, nextIndex++);
     }
   });
+  const sessionSourceIds = new Set(sessionSources.map((source) => source.source_id));
+  const historicalMarkerRe = /\[\^(src_[A-Za-z0-9_-]+)\]/g;
+  let historicalMatch: RegExpExecArray | null;
+  while ((historicalMatch = historicalMarkerRe.exec(normalizedContent)) !== null) {
+    const sourceId = historicalMatch[1];
+    if (sessionSourceIds.has(sourceId) && !indexes.has(sourceId)) {
+      indexes.set(sourceId, nextIndex++);
+    }
+  }
 
-  if (indexes.size === 0) return message.content;
+  if (indexes.size === 0) return normalizedContent;
 
-  return message.content.replace(/\[\^(src_[A-Za-z0-9_-]+)\]/g, (marker, sourceId: string) => {
+  return normalizedContent.replace(/\[\^(src_[A-Za-z0-9_-]+)\]/g, (marker, sourceId: string) => {
     const index = indexes.get(sourceId);
     return index ? `[${index}](#source-${sourceId})` : marker;
   });
+}
+
+function stripCitationDefinitions(content: string): string {
+  return content.replace(/^[ \t]*\[\^src_[A-Za-z0-9_-]+\]:[^\n]*(?:\n|$)/gm, "");
+}
+
+function mergeSources(
+  primary: SourceRecord[] | undefined,
+  fallback: SourceRecord[]
+): SourceRecord[] {
+  const catalog = new Map<string, SourceRecord>();
+  for (const source of fallback) catalog.set(source.source_id, source);
+  for (const source of primary || []) {
+    catalog.set(source.source_id, { ...catalog.get(source.source_id), ...source });
+  }
+  return Array.from(catalog.values());
 }
 
 function CitationLink({

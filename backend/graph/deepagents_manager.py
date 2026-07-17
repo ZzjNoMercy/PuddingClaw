@@ -56,7 +56,11 @@ from typing_extensions import NotRequired
 import config
 from analytics.models import get_analytics_model_registry
 from graph.attachment_store import attachment_store
-from graph.citations import dedupe_sources, finalize_citations, format_sources_for_model
+from graph.citations import (
+    dedupe_sources,
+    format_sources_for_model,
+    resolve_message_citations,
+)
 from graph.database_sql_revision_resume import database_sql_revision_resume_registry
 from graph.deepagents_prompt_builder import build_deepagents_system_prompt
 from graph.dimension_build_resume import dimension_build_resume_registry
@@ -203,6 +207,7 @@ class PuddingClawAgentState(DeepAgentState):
     _deterministic_evaluations: NotRequired[
         Annotated[list[dict[str, Any]], PrivateStateAttr]
     ]
+    _run_message_start_index: NotRequired[Annotated[int, PrivateStateAttr]]
     run_model_call_count: NotRequired[Annotated[int, PrivateStateAttr]]
     thread_model_call_count: NotRequired[Annotated[int, PrivateStateAttr]]
     _model_call_limit_exceeded: NotRequired[
@@ -266,6 +271,24 @@ and gaps in Chinese. Missing criteria are treated as failed by Harness.
         model = resolve_model(self._model)
         self._pudding_plain_grader_model = model
         return model
+
+    def _build_grader_payload(self, state: Any, iteration: int) -> str:
+        """Grade only messages produced for the current Harness Run.
+
+        The main agent intentionally receives cross-Run session context, but a
+        completion verdict belongs to one Run.  DeepAgents' default rubric
+        payload grades the entire transcript, which can make an earlier user
+        request contaminate the current verdict.  The Run boundary is frozen
+        in initial state and remains stable across rubric revision loops.
+        """
+
+        messages = list(state.get("messages") or [])
+        start = state.get("_run_message_start_index")
+        if isinstance(start, int) and 0 <= start < len(messages):
+            scoped_state = dict(state)
+            scoped_state["messages"] = messages[start:]
+            return super()._build_grader_payload(scoped_state, iteration)
+        return super()._build_grader_payload(state, iteration)
 
     def _grade(self, state: Any, iteration: int) -> GraderResponse:
         payload = self._build_grader_payload(state, iteration)
@@ -2320,7 +2343,10 @@ class DeepAgentsAgentManager:
     ) -> AsyncGenerator[Any, None]:
         graph_input = initial_input
         while True:
-            pending_interrupts: list[tuple[str, dict[str, Any], str]] = []
+            # Parallel graph nodes may publish their interrupts in separate
+            # stream items. Drain this invocation completely and deduplicate
+            # the pause set before asking the user or constructing a resume.
+            pending_by_key: dict[str, tuple[str, dict[str, Any], str]] = {}
             async for item in agent.astream(
                 graph_input,
                 stream_mode=stream_mode,
@@ -2329,20 +2355,28 @@ class DeepAgentsAgentManager:
             ):
                 hitl_items = self._extract_hitl_interrupts(item)
                 if hitl_items:
-                    pending_interrupts = hitl_items
-                    required_events = {
-                        "permission_request": "permission_required",
-                        "dimension_build_rule_request": "dimension_build_rule_required",
-                        "logical_dataset_rule_request": "logical_dataset_rule_required",
-                        "database_sql_revision_request": "database_sql_revision_required",
-                    }
-                    for interrupted_type, interrupted_request, _interrupt_id in pending_interrupts:
-                        yield self._sse(required_events[interrupted_type], interrupted_request)
-                    break
+                    for interrupted_type, interrupted_request, interrupt_id in hitl_items:
+                        request_id = str(interrupted_request.get("id") or "")
+                        key = interrupt_id or f"{interrupted_type}:{request_id}"
+                        pending_by_key.setdefault(
+                            key,
+                            (interrupted_type, interrupted_request, interrupt_id),
+                        )
+                    continue
                 yield item
 
+            pending_interrupts = list(pending_by_key.values())
             if not pending_interrupts:
                 return
+
+            required_events = {
+                "permission_request": "permission_required",
+                "dimension_build_rule_request": "dimension_build_rule_required",
+                "logical_dataset_rule_request": "logical_dataset_rule_required",
+                "database_sql_revision_request": "database_sql_revision_required",
+            }
+            for interrupted_type, interrupted_request, _interrupt_id in pending_interrupts:
+                yield self._sse(required_events[interrupted_type], interrupted_request)
 
             resume_registries = {
                 "permission_request": permission_resume_registry,
@@ -2362,10 +2396,19 @@ class DeepAgentsAgentManager:
                 "logical_dataset_rule_request": "logical_dataset_rule_resolved",
                 "database_sql_revision_request": "database_sql_revision_resolved",
             }
+            decisions = await asyncio.gather(*(
+                resume_registries[interrupted_type].wait(
+                    str(interrupted_request.get("id") or "")
+                )
+                for interrupted_type, interrupted_request, _interrupt_id in pending_interrupts
+            ))
             resolved: list[tuple[str, dict[str, Any], str, dict[str, Any]]] = []
-            for interrupted_type, interrupted_request, interrupt_id in pending_interrupts:
+            for (interrupted_type, interrupted_request, interrupt_id), decision in zip(
+                pending_interrupts,
+                decisions,
+                strict=True,
+            ):
                 request_id = str(interrupted_request.get("id") or "")
-                decision = await resume_registries[interrupted_type].wait(request_id)
                 approved = (
                     decision.get("type") == "approve"
                     or decision.get("action") in {"confirm", "agree", "modify"}
@@ -2394,20 +2437,24 @@ class DeepAgentsAgentManager:
                 )
                 resolved.append((interrupted_type, interrupted_request, interrupt_id, decision))
 
+            if all(interrupt_id for _, _, interrupt_id, _ in resolved):
+                resume_by_interrupt_id: dict[str, Any] = {}
+                for interrupted_type, _request, interrupt_id, decision in resolved:
+                    resume_by_interrupt_id[interrupt_id] = (
+                        {"decisions": [decision]}
+                        if interrupted_type == "permission_request"
+                        else decision
+                    )
+                graph_input = Command(resume=resume_by_interrupt_id)
+                continue
+
             if len(resolved) == 1:
                 interrupted_type, _request, _interrupt_id, decision = resolved[0]
                 resume_value = {"decisions": [decision]} if interrupted_type == "permission_request" else decision
                 graph_input = Command(resume=resume_value)
                 continue
 
-            resume_by_interrupt_id: dict[str, Any] = {}
-            for interrupted_type, _request, interrupt_id, decision in resolved:
-                if not interrupt_id:
-                    raise RuntimeError("并行 HITL 恢复缺少 LangGraph interrupt id。")
-                resume_by_interrupt_id[interrupt_id] = (
-                    {"decisions": [decision]} if interrupted_type == "permission_request" else decision
-                )
-            graph_input = Command(resume=resume_by_interrupt_id)
+            raise RuntimeError("并行 HITL 恢复缺少 LangGraph interrupt id。")
 
     @staticmethod
     def _tool_call_id(tool_call: Any) -> str:
@@ -2927,6 +2974,7 @@ class DeepAgentsAgentManager:
         segments: list[dict[str, Any]],
         accumulated_reasoning: str,
         turn_sources: list[dict[str, Any]],
+        session_sources: list[dict[str, Any]] | None = None,
         interrupted: bool = False,
         interruption_notice: str | None = None,
         error_notice: str | None = None,
@@ -2942,13 +2990,17 @@ class DeepAgentsAgentManager:
         all_timeline = [item for seg in cleaned_segments for item in seg.get("timeline", [])]
         if not (full_content or all_tool_calls or accumulated_reasoning or all_timeline or turn_sources):
             return False
-        final_citations = finalize_citations(full_content, turn_sources)
+        message_sources, final_citations = resolve_message_citations(
+            full_content,
+            turn_sources,
+            session_sources,
+        )
         session_manager.upsert_assistant_message(
             session_id,
             query_id=query_id,
             content=full_content,
             tool_calls=all_tool_calls or None,
-            sources=dedupe_sources(turn_sources) or None,
+            sources=message_sources or None,
             citations=final_citations or None,
             reasoning_content=accumulated_reasoning or None,
             timeline=all_timeline or None,
@@ -2999,6 +3051,7 @@ class DeepAgentsAgentManager:
         pending_tool_starts: dict[str, dict[str, str]] = {}
         accumulated_reasoning = ""
         turn_sources: list[dict[str, Any]] = []
+        session_sources: list[dict[str, Any]] = []
         run_messages_persisted = False
         user_message_persisted = user_message_already_persisted
         checkpoint_thread_id = f"{session_id}:{query_id}"
@@ -3071,6 +3124,12 @@ class DeepAgentsAgentManager:
 
             session_manager.ensure_tool_call_ids(session_id)
             raw_history = session_manager.load_session(session_id)
+            session_sources = dedupe_sources([
+                source
+                for historical_message in raw_history
+                for source in historical_message.get("sources", []) or []
+                if isinstance(source, dict)
+            ])
             history = session_manager.load_session_for_agent(session_id)
             persisted_current_user_count = 1 if user_message_already_persisted else 0
             historical_user_count = sum(1 for item in history if item.get("role") == "user")
@@ -3387,6 +3446,7 @@ class DeepAgentsAgentManager:
                     segments=segments,
                     accumulated_reasoning=accumulated_reasoning,
                     turn_sources=turn_sources,
+                    session_sources=session_sources,
                     interrupted=interrupted,
                     interruption_notice=interruption_notice,
                     error_notice=error_notice,
@@ -3407,6 +3467,9 @@ class DeepAgentsAgentManager:
                 "todos": persisted_todos,
                 "analytics_model_id": analytics_model_id,
                 "task_profile": run_record.task_profile.model_dump(mode="json"),
+                # Session history is useful to the agent, while verification
+                # must remain authoritative for this Run only.
+                "_run_message_start_index": max(0, len(messages) - 1),
             }
             if (
                 run_record.verification_contract is not None
@@ -4071,7 +4134,11 @@ class DeepAgentsAgentManager:
             )
             all_tool_calls = [tc for seg in segments for tc in seg.get("tool_calls", [])]
             all_timeline = [item for seg in segments for item in seg.get("timeline", [])]
-            final_citations = finalize_citations(full_content, turn_sources)
+            message_sources, final_citations = resolve_message_citations(
+                full_content,
+                turn_sources,
+                session_sources,
+            )
             for seg in segments:
                 seg.pop("_current_reasoning", None)
 
@@ -4135,7 +4202,7 @@ class DeepAgentsAgentManager:
                     query_id=query_id,
                     content=full_content,
                     tool_calls=all_tool_calls or None,
-                    sources=dedupe_sources(turn_sources) or None,
+                    sources=message_sources or None,
                     citations=final_citations or None,
                     reasoning_content=accumulated_reasoning or None,
                     timeline=all_timeline or None,
@@ -4166,6 +4233,7 @@ class DeepAgentsAgentManager:
                 "citations_finalized",
                 {
                     "citations": final_citations,
+                    "sources": message_sources,
                     "cited_source_ids": list(dict.fromkeys(
                         citation["source_id"] for citation in final_citations
                     )),

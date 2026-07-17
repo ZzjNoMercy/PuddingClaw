@@ -379,6 +379,21 @@ class CompletionVerificationCoordinator:
             for item in evaluations
         ) and status == VerificationStatus.SATISFIED:
             status = VerificationStatus.NEEDS_REVISION
+        elif (
+            status == VerificationStatus.NEEDS_REVISION
+            and all(
+                (item.passed and not item.gap)
+                or not required_by_id.get(item.criterion_id, True)
+                for item in evaluations
+            )
+        ):
+            # Deterministic checks are authoritative for their criteria.  A
+            # grader may still return an overall needs_revision verdict for a
+            # criterion that was subsequently replaced by a passing
+            # deterministic evaluation.  Derive the effective aggregate from
+            # the merged per-criterion results so the report cannot show all
+            # green criteria with a contradictory terminal status.
+            status = VerificationStatus.SATISFIED
         if status != VerificationStatus.SATISFIED and not gaps:
             gaps.append(
                 explanation
