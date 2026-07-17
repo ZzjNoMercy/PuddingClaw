@@ -4,7 +4,7 @@
 日期：2026-07-17
 Grok Build 源码：<code>b189869b7755d2b482969acf6c92da3ecfeffd36</code>
 PuddingClaw 基线提交：<code>7fb380f43be9c9b13fd3478bb28ef1a637fe6203</code>
-说明：PuddingClaw 分析包含当前工作区尚未提交的 Tool Context、Workspace Router、Session 持久化等改动。
+说明：PuddingClaw 分析与实现以当前 `main` 工作区为准；Session、Checkpoint、Trace 的权威边界保持本文冻结结论。
 
 ## 0. 审核冻结说明
 
@@ -84,7 +84,7 @@ PuddingClaw 基线提交：<code>7fb380f43be9c9b13fd3478bb28ef1a637fe6203</code>
 
 Skill 生命周期不继续增加 Python 命令白名单。当前已提供类型化 `inspect_skill`：只读返回本地版本、文件清单、逐文件哈希与聚合哈希，不执行 Skill 代码，并可由 Harness 确定性放行。下一步 `refresh_skill` 必须建立在可信更新 manifest/source registry 上，固定展示来源域名、写入目标和依赖计划，再按 `network_access + managed_write + package_install` 能力审批；在这个协议完成前，不执行远端 `install.sh`，也不把“Python”整体视为低风险。
 
-验收边界：`backend/tests` 为当前项目正式测试集，结果为 **622 passed**；本轮涉及核心文件 Ruff 通过；前端 Next.js production build 通过；Playwright 在 390×844 视口确认 Composer 为两行布局，审批菜单未越界。直接对整个 `backend` 目录运行 pytest/Ruff 会额外收集历史 `skills` 样例与 vendored `vanna`，目前存在既有同名测试模块收集冲突和 lint 基线，不能误报为本轮全仓通过。
+验收边界：`backend/tests` 为当前项目正式测试集，结果为 **670 passed**；本轮涉及核心文件 Ruff 通过；前端 Next.js production build 通过；Playwright 在 390×844 视口确认 Composer 为两行布局，审批菜单未越界。直接对整个 `backend` 目录运行 pytest/Ruff 会额外收集历史 `skills` 样例与 vendored `vanna`，目前存在既有同名测试模块收集冲突和 lint 基线，不能误报为本轮全仓通过。
 
 本轮尚未宣称完成：
 
@@ -1628,7 +1628,7 @@ harness:
 - active Goal 固化独立的 Goal contract，设置变化不追溯修改；
 - Goal Mode 默认关闭且只能由用户显式开启，Run 失败或任务复杂度不得触发自动升级。
 
-## 15. 待审核的十个决策
+## 15. 已审核并冻结的十个决策
 
 1. **不重写 DeepAgents inner loop**：继续复用其 Todo、SubAgent、Summarization、HITL。
 2. **先修 Terminal 安全语义**：这是当前最明显的能力—约束不一致。
@@ -1739,35 +1739,35 @@ harness:
 | 机制 | 来源判定 | PuddingClaw 采用方式 | 本轮状态 |
 |---|---|---|---|
 | DeepAgents Model ↔ Tool 内循环 | **[DeepAgents 复用]** | 保持 <code>create_deep_agent</code>，不重写循环 | 保留 |
-| Tool 类型化结果、错误不吞、preflight | **[Grok Build 借鉴]** | 适配为 ToolExecutionPipeline 与统一 ToolResult | 待审核 |
-| AccessKind、managed policy、permission 分层 | **[Grok Build 借鉴]** | 结合现有 external-file permission 和 Toolset 硬门 | 待审核 |
-| allow/ask/deny、deny > ask > allow | **[Grok Build 借鉴]** | 实现 PuddingClaw CompiledPolicy | 待审核 |
-| Bash chained segment / wrapper / bash -c 解析 | **[Grok Build 借鉴]** | Python 侧 Shell AST analyzer，解析失败 ask | 待审核 |
-| Shell read/write/redirect/symlink 访问提取 | **[Grok Build 借鉴]** | 重新进入 filesystem permission policy | 待审核 |
-| Session command grant | **[Grok Build 借鉴] + [PuddingClaw 适配]** | 写入既有 Session permission 状态 | 待审核 |
+| Tool 类型化结果、错误不吞、preflight | **[Grok Build 借鉴]** | 适配为 ToolExecutionPipeline 与统一 ToolResult | 已实现并测试 |
+| AccessKind、managed policy、permission 分层 | **[Grok Build 借鉴]** | 以 ToolDescriptor、capability 与冻结的 RunPermissionContext 落地 | 已实现并测试 |
+| allow/ask/deny、deny > ask > allow | **[Grok Build 借鉴]** | 实现确定性 Tool/Shell policy，未知动作 fail-closed | 已实现并测试 |
+| Bash chained segment / wrapper / bash -c 解析 | **[Grok Build 借鉴]** | Python 侧 Shell analyzer，解析失败 ask | 已实现并对抗测试 |
+| Shell read/write/redirect/symlink 访问提取 | **[Grok Build 借鉴]** | 进入 filesystem permission 与 execution capability policy | 已实现并对抗测试 |
+| Session command grant | **[Grok Build 借鉴] + [PuddingClaw 适配]** | 写入既有 Session permission 状态，并绑定 policy/backend/workspace | 已实现并测试 |
 | LLM auto permission classifier / YOLO | **[Grok Build 借鉴候选]** | 第一阶段不采用 | 暂不采用 |
 | sandbox auto-allow bash | **[Grok Build 借鉴候选]** | 默认不采用；未来也必须晚于 hard policy/path analysis | 暂不采用 |
-| OS 级 sandbox profile 思想 | **[Grok Build 借鉴]** | 不复制 Rust nono；映射为 Docker mount/network/capability profile | 待审核 |
-| DeepAgents SandboxBackendProtocol | **[DeepAgents 复用]** | Workspace Backend 实现 id/execute/aexecute，启用内置 execute | 待审核 |
-| DockerWorkspaceBackend | **[本方案新增]** | FilesystemBackend + SandboxBackendProtocol hybrid adapter | 待审核 |
-| RestrictedHostWorkspaceBackend | **[本方案新增]** | 同一协议下的 best-effort fallback | 待审核 |
-| 一项目一个长生命周期容器 | **[本方案新增]** | project sandbox lease + idle stop + generation | 待审核 |
+| OS 级 sandbox profile 思想 | **[Grok Build 借鉴]** | 不复制 Rust nono；映射为 Docker mount/network/capability profile | 已实现并真实 Docker 验证 |
+| DeepAgents SandboxBackendProtocol | **[DeepAgents 复用]** | Workspace Backend 实现 id/execute/aexecute，启用内置 execute | 已实现 |
+| DockerWorkspaceBackend | **[本方案新增]** | FilesystemBackend + SandboxBackendProtocol hybrid adapter | 已实现并测试 |
+| RestrictedHostWorkspaceBackend | **[本方案新增]** | 同一协议下的 best-effort fallback | 已实现并测试 |
+| 一项目一个长生命周期容器 | **[本方案新增]** | project sandbox lease + idle stop + generation | 已实现并测试 |
 | effective tool manifest | **[PuddingClaw 延续] + [Grok Build 命名/呈现借鉴]** | 复用已有 model.input 最终 tool schemas，补顶层投影、UI 和 inventory 对账 | 核心机制已有，待产品化 |
 | Session JSON 跨 Run 权威 | **[PuddingClaw 延续]** | 保持现状，不重新设计 | 已冻结 |
 | LangGraph checkpoint 只负责同 Run HITL | **[PuddingClaw 延续] + [DeepAgents 复用]** | 保持 <code>session_id:query_id</code> | 已冻结 |
 | Trace 只记录、不恢复 | **[PuddingClaw 延续]** | 增加 RunOutcome/GoalDecision 观测，不参与控制 | 已冻结 |
 | Tool Context output/UI evidence 分离 | **[PuddingClaw 延续]** | 保持当前即时保护和后台压缩 | 已有 |
-| TodoGate / 未完成任务 nudge | **[Grok Build 借鉴]** | 结合 DeepAgents Todo，做有限次数 Analytics Completion Gate | 待审核 |
-| Goal status、budget、gaps、continuation | **[Grok Build 借鉴]** | 仅用户显式开启 Goal Mode 时，由 Analytics GoalState 与 GoalCoordinator 跨 Run 推进 | 待审核 |
+| TodoGate / 未完成任务 nudge | **[Grok Build 借鉴]** | 结合 DeepAgents Todo，做有限次数 Completion Gate | 已实现并测试 |
+| Goal status、budget、gaps、continuation | **[Grok Build 借鉴]** | 仅用户显式开启 Goal Mode 时，由 GoalState 与 GoalCoordinator 跨 Run 推进 | 基础版已实现；组合预算后续增强 |
 | 单 Rubric grader | **[DeepAgents 复用] + [本方案适配]** | 复用 RubricMiddleware 的迭代/状态机；PuddingClaw 使用无 Tool 严格 JSON transport，避免 thinking/tool_choice 冲突 | 已实现并 E2E |
-| 智能问数 deterministic checks | **[本方案新增]** | SQL、指标、Join、时间、覆盖、引用检查先于 Rubric | 待审核 |
-| RubricCompiler 与 criterion source 合并 | **[本方案新增]** | 合并 system/managed/settings/user/task criteria，严格者胜出 | 待审核 |
-| Harness Settings 高级 Rubric 规则 | **[本方案新增]** | 普通用户零维护；高级用户只能追加/强化并选择注册 verifier | 待审核 |
-| CompletionVerificationCoordinator / RubricEvaluationReport | **[本方案新增]** | 对每个需要验收的 Run 汇总 deterministic、analytics 与 LLM criterion evidence | 待审核 |
-| Agent 输入区“目标”模式与 active Goal chip | **[产品交互借鉴] + [本方案适配]** | 显式开启 Goal、查看状态并区分停止 Run/取消 Goal | 待审核 |
-| GoalCard / VerificationCard | **[本方案新增]** | GoalCard 仅 Goal Mode 显示；VerificationCard 可独立展示 Run 级验收 | 待审核 |
-| Goal SSE 与前端 Session 级状态 | **[本方案新增]** | done 只结束传输，由 RunOutcome/GoalDecision 决定完成语义 | 待审核 |
-| HarnessRunCoordinator | **[本方案新增，受 Grok 嵌套状态机启发]** | 协调既有 Session/Checkpoint/Trace，不创建新权威 | 待审核 |
+| 智能问数 deterministic checks | **[本方案新增]** | SQL、指标、Join、时间、覆盖、引用检查先于 Rubric | 基础版已实现；领域深度持续增强 |
+| RubricCompiler 与 criterion source 合并 | **[本方案新增]** | 合并 system/managed/settings/user/task criteria，严格者胜出 | 已实现并测试 |
+| Harness Settings 高级 Rubric 规则 | **[本方案新增]** | 普通用户零维护；高级用户只能追加/强化并选择注册 verifier | 已实现并构建验证 |
+| CompletionVerificationCoordinator / RubricEvaluationReport | **[本方案新增]** | 对每个需要验收的 Run 汇总 deterministic、analytics 与 LLM criterion evidence | 已实现并测试 |
+| Agent 输入区“目标”模式与 active Goal chip | **[产品交互借鉴] + [本方案适配]** | 显式开启 Goal、查看状态并区分停止 Run/取消 Goal | 已实现并构建验证 |
+| GoalCard / VerificationCard | **[本方案新增]** | GoalCard 仅 Goal Mode 显示；VerificationCard 可独立展示 Run 级验收 | 已实现并构建验证 |
+| Goal SSE 与前端 Session 级状态 | **[本方案新增]** | done 只结束传输，由 RunOutcome/GoalDecision 决定完成语义 | 已实现并测试 |
+| HarnessRunCoordinator | **[本方案新增，受 Grok 嵌套状态机启发]** | 协调既有 Session/Checkpoint/Trace，不创建新权威 | 已实现并测试 |
 | 多 Skeptic majority-refute | **[Grok Build 借鉴候选]** | 当前不采用，单 Grader 稳定后再评估 | 暂不采用 |
 | RunJournal/Event Sourcing | **[本方案讨论后否决]** | 当前 Session JSON 已是明确权威，不增加第二套事实源 | 不采用 |
 | 通用 Agent Profile / Domain Pack | **[未来可能抽象]** | 智能问数 Agent 完成且第二个产品出现后再提取 | 暂不采用 |
