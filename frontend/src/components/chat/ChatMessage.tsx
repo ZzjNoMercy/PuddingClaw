@@ -407,11 +407,36 @@ function ToolActionPermissionCard({
   const isFetchUrl = request.tool_name === "fetch_url";
   const isSearch = request.tool_name === "tavily_search";
   const isNetworkTool = isFetchUrl || isSearch;
+  const needsTemporaryNetwork = (request.capabilities || []).includes("temporary_network");
+  const needsNetwork = needsTemporaryNetwork || (request.capabilities || []).includes("network_access");
+  const installsPackages = (request.capabilities || []).includes("package_install");
+  const writesWorkspace = (request.capabilities || []).includes("managed_write");
+  const riskLabel = ({
+    high: "脚本执行 · 需确认",
+    network: "联网 · 需确认",
+    package_install: "安装依赖 · 需确认",
+    managed_write: "写入项目 · 需确认",
+    critical: "禁止级风险",
+  } as Record<string, string>)[request.risk || ""] || request.risk || "受控操作";
+  const reason = request.reason || "需要人工确认";
+  const reasonLabel = reason.startsWith("arbitrary_interpreter:")
+    ? "解释器可执行任意代码；Harness 会另外标明本次是否联网、写入或安装依赖。"
+    : reason.startsWith("network_access:")
+      ? "该命令需要访问互联网。"
+      : reason.startsWith("package_management")
+        ? "该操作会下载并安装运行时依赖。"
+        : reason.startsWith("managed_workspace_write")
+          ? "该命令会修改项目目录。"
+          : `Harness 规则：${reason}`;
   const title = isFetchUrl
     ? "允许访问网站"
     : isSearch
       ? "允许联网搜索"
-      : "允许执行受控命令";
+      : installsPackages
+        ? "允许在沙箱中安装依赖"
+        : needsNetwork
+          ? "允许命令联网执行"
+        : "允许执行受控命令";
 
   const grant = async (scope: "once" | "session") => {
     setStatus("loading");
@@ -448,7 +473,7 @@ function ToolActionPermissionCard({
         <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-amber-100 text-amber-700">
           {status === "granted"
             ? <CheckCircle2 className="h-5 w-5" />
-            : isNetworkTool
+            : isNetworkTool || needsNetwork
               ? <Globe2 className="h-5 w-5" />
               : <SquareTerminal className="h-5 w-5" />}
         </div>
@@ -456,12 +481,36 @@ function ToolActionPermissionCard({
           <div className="flex flex-wrap items-center gap-2">
             <h3 className="text-[15px] font-bold text-slate-950">{title}</h3>
             <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-800">
-              {request.risk || "managed"}
+              {riskLabel}
             </span>
           </div>
           <p className="mt-1 text-[12px] text-slate-500">
-            Harness 规则：{request.reason || "需要人工确认"}
+            {reasonLabel}
           </p>
+          {needsNetwork ? (
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              <span className="rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-semibold text-blue-800">
+                {needsTemporaryNetwork ? "临时联网" : "联网执行"}
+              </span>
+              <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-600">
+                {needsTemporaryNetwork ? "命令结束后自动断开" : "仍受当前 Backend 网络策略约束"}
+              </span>
+            </div>
+          ) : null}
+          {writesWorkspace || installsPackages ? (
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {writesWorkspace ? (
+                <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-800">
+                  写入项目
+                </span>
+              ) : null}
+              {installsPackages ? (
+                <span className="rounded-full bg-violet-100 px-2 py-0.5 text-[10px] font-semibold text-violet-800">
+                  安装依赖
+                </span>
+              ) : null}
+            </div>
+          ) : null}
           <pre className="mt-3 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-xl bg-slate-950 px-3 py-2.5 font-mono text-[12px] leading-5 text-slate-100">
             {request.command || ""}
           </pre>

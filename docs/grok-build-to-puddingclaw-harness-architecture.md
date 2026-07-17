@@ -1,6 +1,6 @@
 # 从 Grok Build 反推 PuddingClaw Harness：差距分析与演进架构
 
-状态：**方案已审核并持续实现于 `main` 工作区；项目后端测试集 622 项、前端生产构建、TaskProfile/Effective Contract、Manager 级动态问数、Goal/Rubric UI 与真实 Docker Backend E2E 已通过**
+状态：**方案已审核并持续实现于 `main` 工作区；项目后端测试集 670 项、前端生产构建、TaskProfile/Effective Contract、Manager 级动态问数、Goal/Rubric UI 与真实 Docker Backend E2E 已通过**
 日期：2026-07-17
 Grok Build 源码：<code>b189869b7755d2b482969acf6c92da3ecfeffd36</code>
 PuddingClaw 基线提交：<code>7fb380f43be9c9b13fd3478bb28ef1a637fe6203</code>
@@ -70,6 +70,19 @@ PuddingClaw 基线提交：<code>7fb380f43be9c9b13fd3478bb28ef1a637fe6203</code>
 - **[产品交互借鉴] + [本方案适配]**：Composer 外层只保留项目目录与审批模式；模型、附件、Goal 收入 `+`；思考模式移到右侧。Popover 互斥，Goal 是“下一 Run 意图”，只有收到 `run_started` 才消费。
 
 第二轮对抗式状态审查进一步补强：旧 Run 恢复时保留冻结的 policy version；删除 Session、message/trace/metadata 写入使用同一锁且写入口不再隐式重建 Session；metadata 只能更新显式白名单字段；外部文件审批 API 必须匹配 pending request 类型；Restricted Host identity 对 workspace 稳定；Permission HITL 持久化 `waiting_hitl → running`；LangGraph 重放使用确定性 permission request ID；Docker spec 在 Run 内变化时明确失败；终态 Run 的 verification contract 不可再改；Session 权威写入口校验 Run 初始状态与合法迁移。
+
+第三轮对抗式审查围绕“Python 联网失败”和“验收器异常”补强：
+
+- **[本方案新增]**：Shell policy 与 Docker backend 共用同一个 capability classifier，分别识别 `network_access`、`managed_write`、`package_install`；执行层不得在 policy 已经 allow 后再偷偷增加联网或写入能力；
+- **[本方案新增]**：普通联网 Python/Node 命令经用户批准后使用临时 bridge 容器；纯网络读取时 workspace 保持只读，只有分类结果明确包含写入时才给可写 mount；
+- **[本方案新增]**：单次 Tool grant 绑定发起它的 `run_id`；Session 级 grant 才允许在绑定一致的新 Run 中复用；
+- **[本方案新增]**：若 `/skills` 等系统只读资源同时位于 project workspace 内，Docker 增加 `/workspace/...` 嵌套只读 mount，DeepAgents 文件路由也拒绝该别名，避免通过第二条路径绕过；
+- **[DeepAgents 复用修复]**：Trace middleware proxy 保留 `__can_jump_to__`，确保 deterministic gate 的 `needs_revision → model` 真正形成 LangGraph 条件边；
+- **[本方案新增]**：`grader_error` 只表示 grader 实际失败；流程没有形成终态时使用 `verification_incomplete`，未执行 criterion 显示为“未执行”而不是“未通过”，并且内部流程失败不消耗 Goal 业务轮次；
+- **[本方案新增]**：deterministic gate 与 LLM grader 共用单一 `_verification_attempts` 计数；每次 natural stop 只计一次，不能通过两套独立计数把 `max_iterations=2` 实际扩成三轮；
+- **[本方案新增]**：verification pack 的“任务适用性”和 evidence 的“是否充分”分开；语义上发生了网页/分析动作就激活 pack，non-material evidence 由 deterministic verifier fail-closed。本地 Skill 哈希只因路径被提及时不会误激活 web pack。
+
+Skill 生命周期不继续增加 Python 命令白名单。当前已提供类型化 `inspect_skill`：只读返回本地版本、文件清单、逐文件哈希与聚合哈希，不执行 Skill 代码，并可由 Harness 确定性放行。下一步 `refresh_skill` 必须建立在可信更新 manifest/source registry 上，固定展示来源域名、写入目标和依赖计划，再按 `network_access + managed_write + package_install` 能力审批；在这个协议完成前，不执行远端 `install.sh`，也不把“Python”整体视为低风险。
 
 验收边界：`backend/tests` 为当前项目正式测试集，结果为 **622 passed**；本轮涉及核心文件 Ruff 通过；前端 Next.js production build 通过；Playwright 在 390×844 视口确认 Composer 为两行布局，审批菜单未越界。直接对整个 `backend` 目录运行 pytest/Ruff 会额外收集历史 `skills` 样例与 vendored `vanna`，目前存在既有同名测试模块收集冲突和 lint 基线，不能误报为本轮全仓通过。
 
@@ -775,6 +788,8 @@ execute Tool Call
 
 智能审批不使用 LLM 猜风险。它只减少“可被确定性验证”的低风险常用动作弹窗；`fetch_url` 的 URL 查询参数变化不会重复授权，因为批准对象是受安全校验的工具能力，而不是完整 URL fingerprint。Docker 装包之所以仍询问，是因为它会下载并执行第三方代码，风险显著高于只读检索。
 
+命令名不是最终授权边界。`python3`、`node`、`pytest` 之类入口先由 parser 提取实际能力：仅打印 URL 不获得网络；携带远端 base URL 的测试命令需要 `network_access`；`curl -o` 同时需要 `network_access + managed_write`；安装命令还需要 `package_install`。前端用中文展示这些能力，不再只显示无法解释的 `high`。
+
 Session 与 Run 的权威关系：
 
 ~~~text
@@ -851,9 +866,9 @@ RubricMiddleware 文档明确指出：grader_error、failed、max_iterations_rea
 
 1. 在 <code>PuddingClawAgentState</code> 暴露本 Run 的 rubric 字段；Goal 字段仅在 Goal Mode 开启时存在；
 2. 在 final_state 检查 <code>_rubric_status</code>；
-3. 将 satisfied、needs_revision exhausted、grader_error 映射为不同 RunOutcome；
+3. 将 satisfied、needs_revision exhausted、verification_incomplete、grader_error 映射为不同 RunOutcome；
 4. 将 Run verification report 写入 Session；仅当存在 <code>goal_id</code> 时再写 GoalState；
-5. 通过 SSE/Trace 向 UI 呈现“已验证、未通过、验证器异常”；
+5. 通过 SSE/Trace 向 UI 呈现“已验证、未通过、验收流程未完成、验收器异常”；
 6. 非 satisfied 不得一律发普通 <code>done</code>。
 
 ### 7.1.1 为什么不直接照搬默认 structured-output grader

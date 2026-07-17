@@ -2,7 +2,7 @@
 
 import asyncio
 
-from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware import AgentMiddleware, hook_config
 from langchain.agents.middleware.types import ModelRequest, ModelResponse
 from langchain_core.messages import AIMessage
 
@@ -521,6 +521,18 @@ def test_middleware_trace_proxy_records_direct_state_hook_attribution():
     ]
 
 
+def test_middleware_trace_proxy_preserves_jump_edge_metadata():
+    class DemoCompletionGate(AgentMiddleware):
+        @hook_config(can_jump_to=["model"])
+        def after_agent(self, state, runtime):
+            return {"jump_to": "model"}
+
+    proxied = wrap_middleware_for_trace(DemoCompletionGate())
+
+    assert proxied.after_agent({}, None) == {"jump_to": "model"}
+    assert proxied.__class__.after_agent.__can_jump_to__ == ["model"]
+
+
 def test_middleware_trace_proxy_records_model_call_index_per_before_model_call():
     class DemoBeforeModelMiddleware(AgentMiddleware):
         def before_model(self, state, runtime):
@@ -694,7 +706,7 @@ def test_trace_collector_emits_start_and_end_events():
         events.append((event, payload))
 
     collector = TraceCollector(session_id="session-emit", emit_callback=emit)
-    llm_id = collector.start_llm_span("model", input_data="hello")
+    collector.start_llm_span("model", input_data="hello")
     collector.finish_llm_span(output="done")
     trace = collector.finish(status="completed")
 

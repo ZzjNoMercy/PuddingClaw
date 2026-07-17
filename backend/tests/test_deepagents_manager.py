@@ -40,6 +40,7 @@ def test_middleware_inventory_uses_actual_hook_overrides(tmp_path):
     """Runtime inventory should not treat inherited no-op hooks as mounted hooks."""
 
     from deepagents.backends import FilesystemBackend
+
     from graph.deepagents_manager import DeepAgentsAgentManager
 
     middleware = MemoryMiddleware(
@@ -137,6 +138,117 @@ def test_completion_gate_loops_before_rubric_grader(tmp_path):
     assert update["_completion_gate_status"] == "needs_revision"
     assert "todo_reconciliation" in update["messages"][0].content
     assert events[-1]["type"] == "deterministic_checks_completed"
+
+
+def test_completion_gate_grades_task_at_deterministic_iteration_limit(tmp_path, monkeypatch):
+    from graph.deepagents_manager import PuddingClawRubricMiddleware
+    from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
+
+    contract = RunRubricCompiler.compile(
+        RubricBuildContext(user_message="生成销量报告")
+    )
+    assert contract is not None
+    middleware = PuddingClawRubricMiddleware(
+        model=SimpleNamespace(),
+        max_iterations=2,
+    )
+    graded = middleware._parse_grader_response(
+        AIMessage(
+            content=(
+                '{"result":"needs_revision","explanation":"任务没有完成",'
+                '"criteria":[{"name":"task_fulfillment","passed":false,'
+                '"gap":"没有生成报告"}]}'
+            )
+        )
+    )
+    monkeypatch.setattr(middleware, "_grade", lambda _state, _iteration: graded)
+    state = {
+        "messages": [AIMessage(content="报告还没生成")],
+        "todos": [{"id": "todo-1", "content": "生成报告", "status": "in_progress"}],
+        "rubric": contract.rubric,
+        "verification_contract": contract.model_dump(mode="json"),
+        "_completion_gate_iterations": 1,
+    }
+
+    update = middleware.after_agent(
+        state,
+        SimpleNamespace(context={"workspace_path": str(tmp_path)}, stream_writer=None),
+    )
+
+    assert update is not None
+    assert update["_completion_gate_status"] == "max_iterations_reached"
+    assert update["_rubric_status"] == "max_iterations_reached"
+    assert "jump_to" not in update
+    assert "messages" not in update
+    assert update["_rubric_evaluations"][-1]["criteria"][0]["name"] == "task_fulfillment"
+
+
+def test_deterministic_and_grader_share_one_verification_attempt_budget(tmp_path, monkeypatch):
+    from graph.deepagents_manager import PuddingClawRubricMiddleware
+    from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
+
+    contract = RunRubricCompiler.compile(
+        RubricBuildContext(user_message="完成任务", force_required=True)
+    )
+    assert contract is not None
+    middleware = PuddingClawRubricMiddleware(model=SimpleNamespace(), max_iterations=2)
+    verdicts = iter(
+        [
+            middleware._parse_grader_response(
+                AIMessage(
+                    content=(
+                        '{"result":"needs_revision","explanation":"仍需修正",'
+                        '"criteria":[{"name":"task_fulfillment","passed":false,"gap":"未完成"}]}'
+                    )
+                )
+            ),
+            middleware._parse_grader_response(
+                AIMessage(
+                    content=(
+                        '{"result":"satisfied","explanation":"模型认为完成",'
+                        '"criteria":[{"name":"task_fulfillment","passed":true,"gap":null}]}'
+                    )
+                )
+            ),
+        ]
+    )
+    grader_calls: list[int] = []
+
+    def grade(_state, iteration):
+        grader_calls.append(iteration)
+        return next(verdicts)
+
+    monkeypatch.setattr(middleware, "_grade", grade)
+    runtime = SimpleNamespace(context={"workspace_path": str(tmp_path)}, stream_writer=None)
+    initial = {
+        "messages": [AIMessage(content="报告初稿")],
+        "todos": [],
+        "rubric": contract.rubric,
+        "verification_contract": contract.model_dump(mode="json"),
+    }
+
+    first = middleware.after_agent(initial, runtime)
+    assert first is not None and first["jump_to"] == "model"
+    assert first["_verification_attempts"] == 1
+
+    second_state = {
+        **initial,
+        **first,
+        "todos": [{"id": "todo-1", "content": "完成报告", "status": "in_progress"}],
+    }
+    second = middleware.after_agent(second_state, runtime)
+    assert second is not None
+    assert second["_verification_attempts"] == 2
+    assert second["_rubric_status"] == "max_iterations_reached"
+    assert "jump_to" not in second
+
+    third = middleware.after_agent(
+        {**second_state, **second, "todos": []},
+        runtime,
+    )
+    assert third is not None
+    assert third["_rubric_status"] == "max_iterations_reached"
+    assert grader_calls == [0, 1]
 
 
 def test_rubric_grader_parses_plain_json_without_tool_binding():
@@ -413,10 +525,11 @@ def test_build_checkpointer_is_available_for_interrupt_resume(tmp_path):
     checkpointer = asyncio.run(manager._build_checkpointer())
 
     assert checkpointer is not None
-    assert manager._checkpointer_info
-    assert manager._checkpointer_info["type"] in {"async_sqlite", "memory"}
-    if manager._checkpointer_info["type"] == "async_sqlite":
-        assert manager._checkpointer_info["path"].endswith("data/checkpoints/deepagents.sqlite")
+    assert manager._checkpointer_info == {
+        "type": "memory",
+        "scope": "active_sse_run",
+    }
+    assert not (tmp_path / "data" / "checkpoints" / "deepagents.sqlite").exists()
 
 
 def test_permission_resume_helper_continues_after_decision(tmp_path):
@@ -424,10 +537,11 @@ def test_permission_resume_helper_continues_after_decision(tmp_path):
 
     import asyncio
 
+    from langgraph.types import Command, Interrupt
+
     from graph.deepagents_manager import DeepAgentsAgentManager
     from graph.permission_resume import permission_resume_registry
     from graph.trace_collector import TraceCollector
-    from langgraph.types import Command, Interrupt
 
     request = {
         "id": "perm-req-test",
@@ -479,15 +593,119 @@ def test_permission_resume_helper_continues_after_decision(tmp_path):
     assert isinstance(agent.inputs[-1], Command)
 
 
+def test_checkpoint_thread_survives_hitl_wait_and_is_deleted_after_resume(tmp_path, monkeypatch):
+    """The active HITL thread must live through the pause, then be released at Run end."""
+
+    from langgraph.types import Command, Interrupt
+
+    from graph import deepagents_manager as manager_module
+    from graph.session_manager import session_manager
+    from projects.registry import project_registry
+
+    session_manager.initialize(tmp_path)
+    project_registry.initialize(tmp_path)
+    session_manager.create_session("hitl-lifecycle-session")
+
+    request = {
+        "id": "perm-hitl-lifecycle",
+        "type": "external_file_read",
+        "session_id": "hitl-lifecycle-session",
+        "query_id": "query-hitl-lifecycle",
+        "tool_call_id": "call-hitl-lifecycle",
+        "path": "/tmp/example.md",
+    }
+
+    class FakeDeepAgent:
+        def __init__(self) -> None:
+            self.inputs: list[object] = []
+
+        async def astream(self, graph_input, **_kwargs):
+            self.inputs.append(graph_input)
+            if len(self.inputs) == 1:
+                yield (
+                    "updates",
+                    {
+                        "__interrupt__": (
+                            Interrupt(
+                                value={"type": "permission_request", "request": request},
+                                id="interrupt-hitl-lifecycle",
+                            ),
+                        )
+                    },
+                )
+                return
+            yield (
+                "messages",
+                (AIMessageChunk(content="已恢复并完成。"), {"langgraph_node": "model"}),
+            )
+            yield ("values", {"messages": [AIMessage(content="已恢复并完成。")]})
+
+    fake_agent = FakeDeepAgent()
+    monkeypatch.setattr(manager_module, "create_deep_agent", lambda **_kwargs: fake_agent)
+
+    async def no_title(_session_id: str):
+        return None
+
+    monkeypatch.setattr(manager_module, "_generate_title", no_title)
+
+    runtime = manager_module.DeepAgentsAgentManager()
+    runtime.initialize(Path(tmp_path))
+    deleted: list[str] = []
+
+    async def fake_delete(thread_id: str):
+        deleted.append(thread_id)
+
+    runtime._delete_checkpoint_thread = fake_delete  # type: ignore[method-assign]
+
+    async def run():
+        registry = manager_module.permission_resume_registry
+        registry._pending[request["id"]] = asyncio.get_running_loop().create_future()
+        registry._requests[request["id"]] = {**request, "status": "pending"}
+
+        async def approve_after_wait_starts():
+            await asyncio.sleep(0.01)
+            assert registry.resolve(request["id"], {"type": "approve"})
+
+        events = []
+        approval_task = None
+        try:
+            async for event in runtime.astream(
+                message="读取外部文件",
+                session_id="hitl-lifecycle-session",
+                project_id=None,
+                user_id="test-user",
+            ):
+                events.append(event)
+                if event["event"] == "permission_required":
+                    assert deleted == []
+                    approval_task = asyncio.create_task(approve_after_wait_starts())
+            if approval_task is not None:
+                await approval_task
+            return events
+        finally:
+            registry._pending.pop(request["id"], None)
+            registry._requests.pop(request["id"], None)
+
+    events = asyncio.run(run())
+
+    assert any(event["event"] == "permission_required" for event in events)
+    assert any(event["event"] == "permission_resolved" for event in events)
+    assert any(event["event"] == "done" for event in events)
+    assert isinstance(fake_agent.inputs[-1], Command)
+    assert len(deleted) == 1
+    assert deleted[0].startswith("hitl-lifecycle-session:query-")
+
+
 def test_dimension_build_rule_interrupt_resumes_same_graph_stream(tmp_path):
     """Generic dimension HITL must use the same resumable Agent stream as permissions."""
 
     import asyncio
 
+    from langgraph.types import Command, Interrupt
+
     from graph.deepagents_manager import DeepAgentsAgentManager
     from graph.dimension_build_resume import dimension_build_resume_registry
     from graph.trace_collector import TraceCollector
-    from langgraph.types import Command, Interrupt
 
     request = {
         "id": "dim-rule-test",
@@ -545,10 +763,11 @@ def test_multiple_database_revision_interrupts_resume_by_interrupt_id(tmp_path):
 
     import asyncio
 
+    from langgraph.types import Command, Interrupt
+
     from graph.database_sql_revision_resume import database_sql_revision_resume_registry
     from graph.deepagents_manager import DeepAgentsAgentManager
     from graph.trace_collector import TraceCollector
-    from langgraph.types import Command, Interrupt
 
     requests = [
         {"id": "sql-revision-a", "type": "database_sql_revision", "tool_call_id": "call-a"},
@@ -618,10 +837,11 @@ def test_parallel_permissions_in_separate_stream_items_are_collected_before_resu
 
     import asyncio
 
+    from langgraph.types import Command, Interrupt
+
     from graph.deepagents_manager import DeepAgentsAgentManager
     from graph.permission_resume import permission_resume_registry
     from graph.trace_collector import TraceCollector
-    from langgraph.types import Command, Interrupt
 
     requests = [
         {"id": "perm-parallel-a", "type": "network_access", "tool_call_id": "call-a"},
@@ -980,6 +1200,12 @@ def test_failed_agent_stream_persists_completed_tool_output(tmp_path, monkeypatc
 
     runtime = manager_module.DeepAgentsAgentManager()
     runtime.initialize(Path(tmp_path))
+    deleted: list[str] = []
+
+    async def fake_delete(thread_id: str):
+        deleted.append(thread_id)
+
+    runtime._delete_checkpoint_thread = fake_delete  # type: ignore[method-assign]
 
     async def collect():
         return [
@@ -1001,6 +1227,8 @@ def test_failed_agent_stream_persists_completed_tool_output(tmp_path, monkeypatc
     assert "Connection error" in assistant["error_notice"]
     assert assistant["tool_calls"][0]["tool"] == "database_sql_execute"
     assert assistant["tool_calls"][0]["output"] == "2023 年 5 月销量为 205390"
+    assert len(deleted) == 1
+    assert deleted[0].startswith("failed-partial-session:query-")
 
 
 def test_historical_tool_messages_are_not_reemitted_on_followup(tmp_path, monkeypatch):
@@ -1302,6 +1530,12 @@ def test_deepagents_manager_emits_and_persists_tool_events(tmp_path, monkeypatch
 
     runtime = manager_module.DeepAgentsAgentManager()
     runtime.initialize(Path(tmp_path))
+    deleted: list[str] = []
+
+    async def fake_delete(thread_id: str):
+        deleted.append(thread_id)
+
+    runtime._delete_checkpoint_thread = fake_delete  # type: ignore[method-assign]
 
     async def collect():
         return [
@@ -1348,6 +1582,8 @@ def test_deepagents_manager_emits_and_persists_tool_events(tmp_path, monkeypatch
     assert assistant_with_tool["tool_calls"][0]["tool"] == "read_file"
     assert assistant_with_tool["tool_calls"][0]["output"] == "README content"
     assert "raw_output" not in assistant_with_tool["tool_calls"][0]
+    assert len(deleted) == 1
+    assert deleted[0].startswith("agent-tool-session:query-")
 
 
 def test_deepagents_manager_emits_sources_citations_and_title(tmp_path, monkeypatch):
@@ -1648,6 +1884,7 @@ def test_deepagents_manager_ignores_internal_context_summary_chunks(tmp_path, mo
 
 def test_deepagents_summarization_uses_agent_only_configured_policy(monkeypatch):
     from deepagents.backends import StateBackend
+
     from graph import deepagents_manager as manager_module
     from llm.model_client import ModelClientChatModel
 
@@ -1912,6 +2149,7 @@ def test_deepagents_manager_uses_backend_execute_instead_of_custom_terminal(tmp_
     """Agent mode exposes one command tool through the execution backend."""
 
     from deepagents.backends.protocol import SandboxBackendProtocol
+
     from graph.deepagents_manager import DeepAgentsAgentManager
 
     workspace = tmp_path / "workspace"
@@ -2006,9 +2244,10 @@ def test_deepagents_manager_emits_graph_structure(tmp_path, monkeypatch):
 
     import asyncio
 
+    from langchain_core.messages import AIMessage, AIMessageChunk
+
     from graph import deepagents_manager as manager_module
     from graph.session_manager import session_manager
-    from langchain_core.messages import AIMessage, AIMessageChunk
     from projects.registry import project_registry
 
     session_manager.initialize(tmp_path)

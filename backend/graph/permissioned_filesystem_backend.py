@@ -29,17 +29,28 @@ class PermissionedCompositeBackend(CompositeBackend):
         routes: dict[str, Any],
         session_id: str,
         managed_readonly_roots: tuple[Path, ...] = (),
+        workspace_root: Path | None = None,
     ) -> None:
         super().__init__(default=default, routes=routes)
         self.session_id = session_id
         self.managed_readonly_roots = tuple(root.expanduser().resolve() for root in managed_readonly_roots)
+        resolved_workspace = workspace_root.expanduser().resolve() if workspace_root is not None else None
+        workspace_prefixes: list[str] = []
+        if resolved_workspace is not None:
+            for root in self.managed_readonly_roots:
+                try:
+                    relative = root.relative_to(resolved_workspace).as_posix().strip("/")
+                except ValueError:
+                    continue
+                if relative:
+                    workspace_prefixes.append(f"/workspace/{relative}/")
+        self._readonly_workspace_prefixes = tuple(workspace_prefixes)
 
-    @classmethod
-    def _readonly_virtual_path(cls, file_path: str) -> bool:
+    def _readonly_virtual_path(self, file_path: str) -> bool:
         normalized = file_path.replace("\\", "/")
         return any(
             normalized == prefix.rstrip("/") or normalized.startswith(prefix)
-            for prefix in cls._READONLY_VIRTUAL_PREFIXES
+            for prefix in (*self._READONLY_VIRTUAL_PREFIXES, *self._readonly_workspace_prefixes)
         )
 
     def _readonly_host_path(self, file_path: str) -> bool:

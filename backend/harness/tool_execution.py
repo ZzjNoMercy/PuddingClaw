@@ -41,6 +41,15 @@ class ToolPolicyResult:
     risk: str
 
 
+@dataclass(frozen=True)
+class ShellCapabilities:
+    """Capabilities implied by one shell command, independent of risk."""
+
+    network: bool = False
+    workspace_write: bool = False
+    package_install: bool = False
+
+
 _HARD_DENY_COMMANDS = frozenset(
     {
         "sudo",
@@ -137,7 +146,25 @@ _SAFE_READ_COMMANDS = frozenset(
 _WRAPPERS = frozenset({"command", "env", "timeout", "gtimeout", "nice", "nohup"})
 _SHELLS = frozenset({"sh", "bash", "zsh"})
 _SHELL_META_PATTERN = re.compile(r"(`|\$\(|\$\{|\n|<<)")
+_ENV_ASSIGNMENT_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", re.DOTALL)
 _ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![\w.-])(/[^\s;&|<>\"']+)")
+_NETWORK_URL_PATTERN = re.compile(r"\b(?:https?|wss?)://", re.IGNORECASE)
+_EMBEDDED_NETWORK_API_PATTERN = re.compile(
+    r"(?:urllib(?:\.request)?|urlopen\s*\(|requests\.|httpx\.|aiohttp|"
+    r"socket\.|http\.client|fetch\s*\(|axios\.|https?\.request\s*\(|node:https?)",
+    re.IGNORECASE,
+)
+_EMBEDDED_WRITE_API_PATTERN = re.compile(
+    r"(?:open\s*\([^)]*(?:,\s*|mode\s*=\s*)['\"][wax+]|"
+    r"urlretrieve\s*\(|\.write_(?:text|bytes)\s*\(|"
+    r"(?:os|shutil)\.(?:remove|unlink|rename|replace|mkdir|makedirs|rmtree|copy|move)\s*\(|"
+    r"(?:fs\.)?(?:writeFile|appendFile|unlink|rename|mkdir)\s*\()",
+    re.IGNORECASE,
+)
+_KNOWN_NETWORK_SKILL_ENTRYPOINT_PATTERN = re.compile(
+    r"(?:python3?|node)\s+/skills/(?:aihot|tavily-search)/[^\s\"']+",
+    re.IGNORECASE,
+)
 
 
 class ShellPolicyAnalyzer:
@@ -160,7 +187,7 @@ class ShellPolicyAnalyzer:
         if path_result is not None:
             return path_result
         try:
-            segments, has_redirect = self._segments(command)
+            segments, has_write_redirect = self._segments(command)
         except ValueError:
             return ToolPolicyResult(
                 PolicyDecision.ASK,
@@ -173,7 +200,7 @@ class ShellPolicyAnalyzer:
         if relative_path_result is not None:
             return relative_path_result
         decisions = [self._analyze_segment(segment) for segment in segments]
-        if has_redirect:
+        if has_write_redirect:
             decisions.append(
                 ToolPolicyResult(
                     PolicyDecision.ASK,
@@ -185,47 +212,204 @@ class ShellPolicyAnalyzer:
 
     @classmethod
     def requires_network(cls, command: str) -> bool:
-        """Return whether an already-authorized command needs temporary network."""
+        """Return whether an already-authorized command needs network access."""
+
+        return cls.capabilities(command).network
+
+    @classmethod
+    def parse_segments(cls, command: str) -> list[list[str]]:
+        """Return shell command segments for other deterministic classifiers.
+
+        Authorization, capability routing, and post-execution verification must
+        interpret wrapper and environment syntax the same way.  Callers should
+        pass each returned segment through :meth:`unwrap_command`.
+        """
+
+        segments, _ = cls._segments(command)
+        return segments
+
+    @classmethod
+    def unwrap_command(cls, tokens: list[str]) -> list[str]:
+        """Remove effect-neutral wrappers and leading environment assignments."""
+
+        return cls._unwrap(tokens)
+
+    @classmethod
+    def capabilities(cls, command: str) -> ShellCapabilities:
+        """Classify effects without treating authorization as an execution hint.
+
+        This method is shared by preflight and the backend router.  Therefore
+        an ALLOW decision cannot silently acquire network or write power after
+        policy evaluation.
+        """
 
         try:
-            segments, _has_redirect = cls._segments(command)
+            segments, has_write_redirect = cls._segments(command)
         except ValueError:
-            return False
+            return ShellCapabilities()
+        network = False
+        workspace_write = has_write_redirect
+        package_install = False
         for raw_tokens in segments:
             tokens = cls._unwrap(raw_tokens)
             if not tokens:
                 continue
             executable = Path(tokens[0]).name.lower()
             args = [item.lower() for item in tokens[1:]]
-            if executable in _NETWORK_COMMANDS or executable in _PACKAGE_COMMANDS:
-                return True
+            joined_args = " ".join(tokens[1:])
+            if executable in _SHELLS and len(tokens) >= 3 and args[0] in {"-c", "-lc"}:
+                nested = cls.capabilities(tokens[2])
+                network = network or nested.network
+                workspace_write = workspace_write or nested.workspace_write
+                package_install = package_install or nested.package_install
+                continue
+            if executable in _NETWORK_COMMANDS:
+                network = True
+                if executable == "wget" or (
+                    executable == "curl"
+                    and any(
+                        arg in {"-o", "-O", "--output", "--remote-name", "--remote-header-name", "-OJ"}
+                        or arg.startswith(("--output=", "-o", "-O"))
+                        for arg in tokens[1:]
+                    )
+                ):
+                    workspace_write = True
+            if executable in _DESTRUCTIVE_OR_WRITE_COMMANDS:
+                workspace_write = True
+            if executable == "sed" and any(arg == "-i" or arg.startswith("-i") for arg in args):
+                workspace_write = True
+            if executable == "sort" and any(arg == "-o" or arg.startswith("--output") for arg in args):
+                workspace_write = True
+            if executable == "uniq" and len([arg for arg in args if not arg.startswith("-")]) > 1:
+                workspace_write = True
+            if executable == "find":
+                write_flags = {
+                    "-delete",
+                    "-exec",
+                    "-execdir",
+                    "-ok",
+                    "-okdir",
+                    "-fprint",
+                    "-fprint0",
+                    "-fprintf",
+                }
+                matched = next((arg for arg in args if arg in write_flags), None)
+                if matched:
+                    workspace_write = True
+                if matched in {"-exec", "-execdir", "-ok", "-okdir"}:
+                    nested_tokens = tokens[tokens.index(matched) + 1 :]
+                    nested_tokens = [item for item in nested_tokens if item not in {"{}", ";", "+"}]
+                    if nested_tokens:
+                        nested = cls.capabilities(shlex.join(nested_tokens))
+                        network = network or nested.network
+                        workspace_write = workspace_write or nested.workspace_write
+                        package_install = package_install or nested.package_install
+            package_subcommands = {
+                "install",
+                "uninstall",
+                "add",
+                "remove",
+                "update",
+                "upgrade",
+                "sync",
+            }
+            package_action = next(
+                (item for item in args if not item.startswith("-")),
+                "",
+            )
+            if executable in {"apt", "apt-get", "apk", "dnf", "yum", "brew", "npx", "uvx"} or (
+                executable in {"pip", "pip3", "poetry", "conda", "pipenv", "uv"}
+                and package_action in package_subcommands | {"pip", "tool", "run"}
+            ):
+                package_install = True
+                network = True
+                workspace_write = True
             if executable == "git":
-                subcommand = next(
-                    (item for item in args if not item.startswith("-")),
-                    "",
-                )
+                subcommand = ""
+                skip_git_value = False
+                for item in args:
+                    if skip_git_value:
+                        skip_git_value = False
+                        continue
+                    if item in {"-c", "-C", "--git-dir", "--work-tree"}:
+                        skip_git_value = True
+                        continue
+                    if item.startswith("-"):
+                        continue
+                    subcommand = item
+                    break
                 if subcommand in {"clone", "fetch", "pull", "push", "submodule"}:
-                    return True
+                    network = True
+                if subcommand in {"clone", "fetch", "pull", "submodule"}:
+                    workspace_write = True
+            option_value_flags = {"--prefix", "--dir", "--cwd", "-c", "-C"}
+            normalized_subcommand = ""
+            skip_next = False
+            for item in args:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if item in option_value_flags:
+                    skip_next = True
+                    continue
+                if item.startswith("-"):
+                    continue
+                normalized_subcommand = item
+                break
             if executable in {"npm", "npx", "pnpm", "yarn", "uvx"} and (
                 executable in {"npx", "uvx"}
-                or args[:1]
-                in (
-                    ["ci"],
-                    ["install"],
-                    ["add"],
-                    ["remove"],
-                    ["uninstall"],
+                or normalized_subcommand in {"ci", "install", "add", "remove", "uninstall"}
+            ):
+                network = True
+                package_install = True
+                workspace_write = True
+            if executable in {"python", "python3"} and args[:2] == ["-m", "pip"] and any(
+                item in package_subcommands for item in args[2:]
+            ):
+                network = True
+                package_install = True
+                workspace_write = True
+            if executable == "corepack" and args[:1] in (["install"], ["prepare"]):
+                network = True
+                package_install = True
+                workspace_write = True
+            if executable in {"python", "python3", "node", "ruby", "perl", "php"} and (
+                _NETWORK_URL_PATTERN.search(joined_args)
+                or _EMBEDDED_NETWORK_API_PATTERN.search(joined_args)
+                or _KNOWN_NETWORK_SKILL_ENTRYPOINT_PATTERN.search(" ".join(tokens))
+                or any(
+                    item.startswith(("/skills/aihot/", "/skills/tavily-search/"))
+                    for item in args
                 )
             ):
-                return True
-            if executable in {"python", "python3"} and args[:3] in (
-                ["-m", "pip", "install"],
-                ["-m", "pip", "uninstall"],
+                network = True
+            if executable in {"python", "python3", "node", "ruby", "perl", "php"} and (
+                _EMBEDDED_WRITE_API_PATTERN.search(joined_args)
+                or any(
+                    not item.startswith("-")
+                    and item.lower().endswith((".py", ".js", ".mjs", ".cjs", ".rb", ".pl", ".php"))
+                    for item in tokens[1:]
+                )
             ):
-                return True
-            if executable == "corepack" and args[:1] in (["install"], ["prepare"]):
-                return True
-        return False
+                workspace_write = True
+            # Project tests can receive a remote base URL. They remain useful
+            # low-risk commands, but networking still needs an explicit grant.
+            if executable in {
+                "pytest",
+                "ruff",
+                "mypy",
+                "pyright",
+                "flutter",
+                "npm",
+                "pnpm",
+                "yarn",
+            } and _NETWORK_URL_PATTERN.search(joined_args):
+                network = True
+        return ShellCapabilities(
+            network=network,
+            workspace_write=workspace_write,
+            package_install=package_install,
+        )
 
     def _check_absolute_paths(self, command: str) -> ToolPolicyResult | None:
         if self.backend_mode != "restricted_host":
@@ -306,7 +490,7 @@ class ShellPolicyAnalyzer:
         tokens = list(lexer)
         segments: list[list[str]] = []
         current: list[str] = []
-        has_redirect = False
+        has_write_redirect = False
         for token in tokens:
             if token in {"&&", "||", ";", "|", "&"}:
                 if current:
@@ -317,12 +501,13 @@ class ShellPolicyAnalyzer:
                 ">",
                 "<",
             }:
-                has_redirect = True
+                if ">" in token:
+                    has_write_redirect = True
                 continue
             current.append(token)
         if current:
             segments.append(current)
-        return segments, has_redirect
+        return segments, has_write_redirect
 
     def _analyze_segment(self, tokens: list[str]) -> ToolPolicyResult:
         tokens = self._unwrap(tokens)
@@ -486,13 +671,21 @@ class ShellPolicyAnalyzer:
     @staticmethod
     def _unwrap(tokens: list[str]) -> list[str]:
         remaining = list(tokens)
-        while remaining and Path(remaining[0]).name.lower() in _WRAPPERS:
+        while remaining:
+            while remaining and _ENV_ASSIGNMENT_PATTERN.match(remaining[0]):
+                remaining.pop(0)
+            if not remaining or Path(remaining[0]).name.lower() not in _WRAPPERS:
+                break
             wrapper = Path(remaining.pop(0)).name.lower()
             while remaining and remaining[0].startswith("-"):
-                remaining.pop(0)
+                option = remaining.pop(0)
+                if wrapper == "nice" and option in {"-n", "--adjustment"} and remaining:
+                    remaining.pop(0)
             if wrapper == "env":
                 while remaining and "=" in remaining[0] and not remaining[0].startswith("="):
                     remaining.pop(0)
+            elif wrapper in {"timeout", "gtimeout"} and remaining:
+                remaining.pop(0)
         return remaining
 
     @staticmethod
@@ -548,6 +741,7 @@ class ToolExecutionPipeline(AgentMiddleware):
             "grep",
             "task",
             "read_resource",
+            "inspect_skill",
             "llamaindex_knowledge_query",
             "pandas_knowledge_query",
             "database_schema_inspect",
@@ -609,6 +803,7 @@ class ToolExecutionPipeline(AgentMiddleware):
         )
         session_scope = self._session_grant_scope(request)
         required_capabilities = self._required_capabilities(request)
+        run_id = str(context.get("run_id") or "")
         if session_manager.consume_tool_action_permission(
             session_id,
             fingerprint,
@@ -616,8 +811,8 @@ class ToolExecutionPipeline(AgentMiddleware):
             session_target=str(session_scope["target"]) if session_scope else None,
             required_bindings=self.permission_context.grant_bindings(),
             required_capabilities=required_capabilities,
+            current_run_id=run_id,
         ):
-            run_id = str(context.get("run_id") or "")
             if run_id:
                 session_manager.transition_run_status(
                     session_id,
@@ -641,7 +836,6 @@ class ToolExecutionPipeline(AgentMiddleware):
             grant_bindings=self.permission_context.grant_bindings(),
             required_capabilities=required_capabilities,
         )
-        run_id = str(context.get("run_id") or "")
         if run_id:
             session_manager.transition_run_status(
                 session_id,
@@ -671,6 +865,7 @@ class ToolExecutionPipeline(AgentMiddleware):
                 session_target=str(session_scope["target"]) if session_scope else None,
                 required_bindings=self.permission_context.grant_bindings(),
                 required_capabilities=required_capabilities,
+                current_run_id=run_id,
             ):
                 return await handler(request)
         return self._denied_message(request, result)
@@ -746,7 +941,16 @@ class ToolExecutionPipeline(AgentMiddleware):
             workspace_path=str(context.get("workspace_path") or "."),
             backend_mode=self.backend_mode,
         )
-        return analyzer.analyze(self._command(request))
+        command = self._command(request)
+        result = analyzer.analyze(command)
+        effects = analyzer.capabilities(command)
+        if effects.network and result.decision == PolicyDecision.ALLOW:
+            return ToolPolicyResult(
+                PolicyDecision.ASK,
+                "network_access:embedded_command",
+                "network",
+            )
+        return result
 
     @staticmethod
     def _smart_fetch_candidate(request: ToolCallRequest) -> bool:
@@ -795,11 +999,20 @@ class ToolExecutionPipeline(AgentMiddleware):
             rendered = str(args)
         return rendered[:4000]
 
-    @staticmethod
-    def _required_capabilities(request: ToolCallRequest) -> list[str]:
+    @classmethod
+    def _required_capabilities(cls, request: ToolCallRequest) -> list[str]:
         if str(request.tool_call.get("name") or "") == "install_packages":
             return ["execute", "package_install", "temporary_network"]
-        return ["execute"]
+        capabilities = ["execute"]
+        if str(request.tool_call.get("name") or "") == "execute":
+            effects = ShellPolicyAnalyzer.capabilities(cls._command(request))
+            if effects.network:
+                capabilities.append("network_access")
+            if effects.workspace_write:
+                capabilities.append("managed_write")
+            if effects.package_install:
+                capabilities.append("package_install")
+        return capabilities
 
     def _session_grant_scope(
         self,

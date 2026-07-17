@@ -2494,7 +2494,7 @@ export default function SettingsPage() {
                               默认托管镜像只提供 Python 3.12 + pip 与 Node.js 22 + npm/corepack。
                               默认不安装项目依赖；第三方 Skill 执行中缺包时才请求 package/network 权限并动态安装。
                               自定义镜像填写的是本机 Docker tag 或 registry image reference，不需要上传镜像文件。
-                              未开启常驻网络时，批准的安装命令只会临时联网，结束后自动断开。
+                              未开启常驻网络时，经权限管线批准的联网命令和依赖安装会在临时联网容器中执行，结束后自动断开。
                             </p>
                           </div>
 

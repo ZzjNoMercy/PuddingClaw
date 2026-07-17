@@ -57,6 +57,7 @@ class VerificationStatus(StrEnum):
     NEEDS_REVISION = "needs_revision"
     FAILED = "failed"
     MAX_ITERATIONS_REACHED = "max_iterations_reached"
+    INCOMPLETE = "verification_incomplete"
     GRADER_ERROR = "grader_error"
     BUDGET_EXCEEDED = "budget_exceeded"
 
@@ -208,7 +209,9 @@ class VerificationActivation(BaseModel):
 class CriterionEvaluation(BaseModel):
     criterion_id: str
     name: str
-    passed: bool
+    # None means the criterion was not evaluated because the verification
+    # control flow itself did not reach a valid terminal verdict.
+    passed: bool | None
     verifier: VerifierKind = VerifierKind.LLM_GRADER
     evidence: list[dict[str, Any]] = Field(default_factory=list)
     gap: str | None = None

@@ -408,6 +408,7 @@ function VerificationCard({
   run: HarnessRun | null;
 }) {
   const passed = report.status === "satisfied" || report.status === "not_required";
+  const controlError = report.status === "verification_incomplete" || report.status === "grader_error";
   const statusLabel = verificationStatusLabel(report.status);
   const criteriaById = new Map(
     (run?.verification_contract?.criteria || []).map((criterion) => [
@@ -443,6 +444,8 @@ function VerificationCard({
             <p className="mt-1.5 text-[11px] leading-5 text-slate-600">
               {passed
                 ? "全部必需验收项均已通过。"
+                : controlError
+                  ? "验收控制流程没有形成有效终态；这不代表用户任务本身未通过。"
                 : `发现 ${Math.max(1, report.gaps.length, report.evaluations.filter((item) => !item.passed).length)} 个待修正问题。`}
             </p>
             {run?.task_profile && (
@@ -463,7 +466,9 @@ function VerificationCard({
           </div>
           {!passed && report.gaps.length > 0 && (
             <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5">
-              <p className="text-[11px] font-semibold text-amber-800">待修正问题</p>
+              <p className="text-[11px] font-semibold text-amber-800">
+                {controlError ? "验收流程问题" : "待修正问题"}
+              </p>
               <ul className="mt-1.5 space-y-1.5 text-[11px] leading-5 text-amber-900">
                 {report.gaps.map((gap, index) => (
                   <li key={`${gap}-${index}`} className="flex gap-1.5">
@@ -482,20 +487,23 @@ function VerificationCard({
               criterion?.statement,
             );
             const evidenceLines = evaluation.evidence.flatMap(formatVerificationEvidence);
+            const notEvaluated = evaluation.passed === null;
             return (
               <details
                 key={`${evaluation.criterion_id}-${evaluation.name}`}
-                open={!evaluation.passed}
+                open={evaluation.passed !== true}
                 className={`group rounded-xl border ${
                   evaluation.passed
                     ? "border-emerald-100 bg-emerald-50/70"
+                    : notEvaluated
+                      ? "border-slate-200 bg-slate-50"
                     : "border-amber-200 bg-amber-50"
                 }`}
               >
                 <summary className="flex cursor-pointer list-none items-start gap-2 px-3 py-2.5 [&::-webkit-details-marker]:hidden">
                   {evaluation.passed
                     ? <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
-                    : <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />}
+                    : <AlertTriangle className={`mt-0.5 h-4 w-4 shrink-0 ${notEvaluated ? "text-slate-400" : "text-amber-600"}`} />}
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center justify-between gap-2">
                       <span className="text-[12px] font-semibold text-slate-800">
@@ -503,9 +511,13 @@ function VerificationCard({
                       </span>
                       <div className="flex shrink-0 items-center gap-1.5">
                         <span className={`text-[10px] font-medium ${
-                          evaluation.passed ? "text-emerald-700" : "text-amber-700"
+                          evaluation.passed
+                            ? "text-emerald-700"
+                            : notEvaluated
+                              ? "text-slate-500"
+                              : "text-amber-700"
                         }`}>
-                          {evaluation.passed ? "通过" : "未通过"}
+                          {evaluation.passed ? "通过" : notEvaluated ? "未执行" : "未通过"}
                         </span>
                         <span className="text-[10px] text-slate-400">查看明细</span>
                       </div>
@@ -537,8 +549,12 @@ function VerificationCard({
                   </div>
                   {evaluation.gap && (
                     <div className="mt-2.5">
-                      <p className="text-[10px] font-semibold text-amber-700">未通过原因</p>
-                      <p className="mt-1 text-[11px] leading-5 text-amber-800">{evaluation.gap}</p>
+                      <p className={`text-[10px] font-semibold ${notEvaluated ? "text-slate-600" : "text-amber-700"}`}>
+                        {notEvaluated ? "未执行原因" : "未通过原因"}
+                      </p>
+                      <p className={`mt-1 text-[11px] leading-5 ${notEvaluated ? "text-slate-600" : "text-amber-800"}`}>
+                        {evaluation.gap}
+                      </p>
                     </div>
                   )}
                   <div className="mt-2.5">
@@ -554,7 +570,9 @@ function VerificationCard({
                       </ul>
                     ) : (
                       <p className="mt-1 text-[11px] leading-5 text-slate-500">
-                        该项仅由{verificationMethodLabel(evaluation.verifier)}基于本轮上下文判断，当前未附结构化证据，不属于确定性验证。
+                        {notEvaluated
+                          ? "该项尚未进入评审，因此没有判定依据。"
+                          : `该项仅由${verificationMethodLabel(evaluation.verifier)}基于本轮上下文判断，当前未附结构化证据，不属于确定性验证。`}
                       </p>
                     )}
                   </div>
@@ -642,6 +660,7 @@ function verificationStatusLabel(status: string): string {
       needs_revision: "需要修正",
       failed: "验收失败",
       max_iterations_reached: "已达最大验收轮次",
+      verification_incomplete: "验收流程未完成",
       grader_error: "验收器异常",
       budget_exceeded: "验收预算耗尽",
     } as Record<string, string>
@@ -652,6 +671,7 @@ function verificationMetricLabel(status: string): string {
   if (status === "satisfied") return "通过";
   if (status === "not_required") return "无需验收";
   if (status === "pending" || status === "evaluating") return "进行中";
+  if (status === "verification_incomplete" || status === "grader_error") return "异常";
   return "待修正";
 }
 
@@ -778,6 +798,11 @@ function PermissionsCard({
   onRevoke: (grantId: string) => Promise<void>;
 }) {
   const [revoking, setRevoking] = useState<string | null>(null);
+  // One-shot grants are consumed immediately when the interrupted Run
+  // resumes. Showing the API race window here leaves a stale permission card;
+  // durable Session grants belong in this control panel, one-shot decisions
+  // remain visible in the message/trace audit trail.
+  const visibleGrants = grants.filter((grant) => grant.scope !== "once");
 
   return (
     <section>
@@ -787,15 +812,15 @@ function PermissionsCard({
         open={active}
         onToggle={onActivate}
         metric={
-          grants.length > 0 ? (
-            <span className="text-[#002fa7]">{grants.length}</span>
+          visibleGrants.length > 0 ? (
+            <span className="text-[#002fa7]">{visibleGrants.length}</span>
           ) : (
             <span className="text-slate-300">0</span>
           )
         }
       />
 
-      {active && grants.length === 0 ? (
+      {active && visibleGrants.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-9 text-center">
           <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-slate-50 text-slate-300">
             <KeyRound className="h-5 w-5" />
@@ -804,7 +829,7 @@ function PermissionsCard({
         </div>
       ) : active ? (
         <div className="mt-4 space-y-3 pb-5">
-          {grants.map((grant) => {
+          {visibleGrants.map((grant) => {
             const isToolAction =
               grant.type === "tool_action"
               || ["fingerprint", "network_origin", "tool_name"].includes(grant.target_kind);
@@ -823,7 +848,7 @@ function PermissionsCard({
             const riskLabel = risk
               ? (
                   {
-                    high: "高风险",
+                    high: "脚本执行",
                     network: "联网",
                     package_install: "依赖安装",
                     managed_write: "受控写入",
@@ -836,6 +861,8 @@ function PermissionsCard({
                 ? "网站访问授权"
                 : grant.target_kind === "tool_name"
                   ? "联网搜索授权"
+                  : grant.target_kind === "capability" && grant.capabilities.includes("package_install")
+                    ? "沙箱依赖安装授权"
                   : commandExecutable
                 ? `${commandExecutable} 命令授权`
                 : "受控命令授权"
@@ -898,6 +925,22 @@ function PermissionsCard({
                           {riskLabel && (
                             <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700">
                               {riskLabel}
+                            </span>
+                          )}
+                          {(grant.capabilities.includes("temporary_network") ||
+                            grant.capabilities.includes("network_access")) && (
+                            <span className="rounded-full bg-blue-50 px-2 py-0.5 text-[10px] font-medium text-blue-700">
+                              {grant.capabilities.includes("temporary_network") ? "临时联网" : "联网执行"}
+                            </span>
+                          )}
+                          {grant.capabilities.includes("managed_write") && (
+                            <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700">
+                              写入项目
+                            </span>
+                          )}
+                          {grant.capabilities.includes("package_install") && (
+                            <span className="rounded-full bg-violet-50 px-2 py-0.5 text-[10px] font-medium text-violet-700">
+                              安装依赖
                             </span>
                           )}
                         </>

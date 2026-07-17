@@ -91,9 +91,23 @@ class GoalCoordinator:
         outcome: RunOutcome,
     ) -> GoalRecord:
         goal.latest_verification_report_id = report.report_id
-        goal.gaps = list(report.gaps)
         goal.current_run_id = None
         goal.model_call_count += max(0, run.model_call_count)
+        if report.status in {
+            VerificationStatus.INCOMPLETE,
+            VerificationStatus.GRADER_ERROR,
+        }:
+            # An internal verification lifecycle failure is not a business
+            # correction attempt. Keep the Run for audit, but refund the Goal
+            # round so retrying cannot exhaust max_rounds.
+            goal.round = max(0, goal.round - 1)
+            goal.updated_at = time.time()
+            self._sessions.upsert_goal_state(
+                goal.session_id,
+                goal.model_dump(mode="json"),
+            )
+            return goal
+        goal.gaps = list(report.gaps)
         if outcome == RunOutcome.COMPLETED and report.status == VerificationStatus.SATISFIED:
             goal.transition(GoalStatus.ACHIEVED)
         elif (
@@ -194,6 +208,7 @@ class CompletionVerificationCoordinator:
         "needs_revision": VerificationStatus.NEEDS_REVISION,
         "failed": VerificationStatus.FAILED,
         "max_iterations_reached": VerificationStatus.MAX_ITERATIONS_REACHED,
+        "verification_incomplete": VerificationStatus.INCOMPLETE,
         "grader_error": VerificationStatus.GRADER_ERROR,
     }
 
@@ -234,8 +249,18 @@ class CompletionVerificationCoordinator:
             )
 
         state = final_state or {}
-        raw_status = str(state.get("_rubric_status") or "")
-        status = cls._STATUS_MAP.get(raw_status, VerificationStatus.GRADER_ERROR)
+        raw_status = str(
+            state.get("_rubric_status")
+            or state.get("_completion_gate_status")
+            or ""
+        )
+        # An absent terminal verdict means the verification lifecycle did not
+        # finish.  It is not evidence that the model grader itself failed.
+        status = (
+            VerificationStatus.INCOMPLETE
+            if raw_status in {"", "pending", "evaluating", "needs_revision"}
+            else cls._STATUS_MAP.get(raw_status, VerificationStatus.INCOMPLETE)
+        )
         raw_evaluations = state.get("_rubric_evaluations")
         evaluations_payload = list(raw_evaluations) if isinstance(raw_evaluations, list) else []
         latest = evaluations_payload[-1] if evaluations_payload else {}
@@ -287,12 +312,33 @@ class CompletionVerificationCoordinator:
                 continue
             matches = raw_by_id.get(configured.id, [])
             if not matches:
-                gap = f"验收器未返回必需标准 {configured.id} 的判定。"
+                if (
+                    configured.verifier == VerifierKind.LLM_GRADER
+                    and raw_status in {"needs_revision", "max_iterations_reached"}
+                    and not evaluations_payload
+                ):
+                    gap = (
+                        f"确定性检查尚未通过，标准 {configured.id} "
+                        "尚未进入模型评审。"
+                    )
+                elif status == VerificationStatus.INCOMPLETE:
+                    gap = (
+                        f"验收流程在形成终态判定前结束，标准 {configured.id} "
+                        "尚未完成评审。"
+                    )
+                elif status == VerificationStatus.GRADER_ERROR:
+                    gap = f"模型验收器执行异常，标准 {configured.id} 未完成评审。"
+                else:
+                    gap = f"验收器未返回必需标准 {configured.id} 的判定。"
                 evaluations.append(
                     CriterionEvaluation(
                         criterion_id=configured.id,
                         name=configured.id,
-                        passed=False,
+                        passed=(
+                            None
+                            if status in {VerificationStatus.INCOMPLETE, VerificationStatus.GRADER_ERROR}
+                            else False
+                        ),
                         verifier=configured.verifier,
                         gap=gap,
                     )
@@ -360,7 +406,9 @@ class CompletionVerificationCoordinator:
             # the merged per-criterion results so the report cannot show all
             # green criteria with a contradictory terminal status.
             status = VerificationStatus.SATISFIED
-        if status != VerificationStatus.SATISFIED and not gaps:
+        if status == VerificationStatus.INCOMPLETE:
+            gaps.append("验收控制流程未形成合法终态，请重试本 Run 或查看运行日志。")
+        elif status != VerificationStatus.SATISFIED and not gaps:
             gaps.append(explanation or f"Run verification ended with status {status.value}.")
         return RubricEvaluationReport(
             report_id=f"verification-{uuid.uuid4().hex[:16]}",
@@ -371,7 +419,11 @@ class CompletionVerificationCoordinator:
             evaluations=evaluations,
             gaps=list(dict.fromkeys(gaps)),
             explanation=explanation,
-            iteration_count=len(evaluations_payload),
+            iteration_count=max(
+                len(evaluations_payload),
+                int(state.get("_verification_attempts") or 0),
+                int(state.get("_completion_gate_iterations") or 0),
+            ),
         )
 
     @staticmethod
@@ -381,6 +433,8 @@ class CompletionVerificationCoordinator:
             VerificationStatus.SATISFIED,
         }:
             return RunOutcome.COMPLETED
+        if report.status == VerificationStatus.INCOMPLETE:
+            return RunOutcome.FAILED
         return RunOutcome.VERIFICATION_FAILED
 
 

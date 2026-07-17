@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import posixpath
 import re
 import shlex
 from collections.abc import Awaitable, Callable
@@ -17,6 +18,7 @@ from langgraph.types import Command
 from graph.session_manager import session_manager
 from graph.tool_result_adapter import tool_result_adapter
 from harness.models import VerificationActivation
+from harness.tool_execution import ShellPolicyAnalyzer
 
 _WEB_TOOLS = frozenset(
     {
@@ -115,8 +117,8 @@ _TEST_COMMAND_RE = re.compile(
     re.IGNORECASE,
 )
 _NETWORK_COMMAND_RE = re.compile(r"(?:^|\s)(?:curl|wget)\s+", re.IGNORECASE)
-_WEB_SKILL_COMMAND_RE = re.compile(
-    r"(?:/skills/(?:aihot|tavily-search)/|aihot_query\.py|tavily)",
+_WEB_SKILL_SCRIPT_RE = re.compile(
+    r"(?:^|/)(?:aihot|tavily-search)/(?:.+/)?[^/\s]+\.(?:py|js|mjs|cjs)$",
     re.IGNORECASE,
 )
 _ANALYTICS_COMMAND_RE = re.compile(
@@ -176,7 +178,7 @@ def verification_packs_for_tool(
         return []
     command = str((args or {}).get("command") or "")
     packs: list[str] = []
-    if _NETWORK_COMMAND_RE.search(command) or _WEB_SKILL_COMMAND_RE.search(command):
+    if _NETWORK_COMMAND_RE.search(command) or _command_executes_web_skill(command):
         packs.append("web_research")
     if _command_performs_analytics(command):
         packs.append("analytics")
@@ -190,6 +192,65 @@ def _command_tokens(command: str) -> list[str]:
         return shlex.split(command, posix=True)
     except ValueError:
         return []
+
+
+def _command_executes_web_skill(command: str) -> bool:
+    """Recognize an executed Skill entrypoint, not a path mentioned in code."""
+
+    return any(
+        _tokens_execute_web_skill(tokens, cwd=cwd)
+        for cwd, tokens in _effective_command_segments(command)
+    )
+
+
+def _effective_command_segments(
+    command: str,
+    *,
+    initial_cwd: str = "/workspace",
+) -> list[tuple[str, list[str]]]:
+    """Flatten wrappers/shells while carrying ``cd`` across command segments."""
+
+    try:
+        raw_segments = ShellPolicyAnalyzer.parse_segments(command)
+    except ValueError:
+        return []
+    cwd = initial_cwd
+    effective: list[tuple[str, list[str]]] = []
+    for raw_tokens in raw_segments:
+        tokens = ShellPolicyAnalyzer.unwrap_command(raw_tokens)
+        if not tokens:
+            continue
+        executable = tokens[0].rsplit("/", 1)[-1].lower()
+        if executable == "cd" and len(tokens) > 1:
+            target = tokens[1]
+            cwd = posixpath.normpath(
+                target if target.startswith("/") else posixpath.join(cwd, target)
+            )
+            continue
+        if executable in {"sh", "bash", "zsh"} and len(tokens) >= 3 and tokens[1] in {"-c", "-lc"}:
+            effective.extend(
+                _effective_command_segments(tokens[2], initial_cwd=cwd)
+            )
+            continue
+        effective.append((cwd, tokens))
+    return effective
+
+
+def _tokens_execute_web_skill(tokens: list[str], *, cwd: str) -> bool:
+    executable = tokens[0].rsplit("/", 1)[-1].lower()
+    if executable not in {"python", "python3", "node"}:
+        return False
+    for token in tokens[1:]:
+        if token.startswith("-"):
+            continue
+        resolved = posixpath.normpath(
+            token if token.startswith("/") else posixpath.join(cwd, token)
+        )
+        if resolved.startswith("/skills/") and _WEB_SKILL_SCRIPT_RE.search(
+            resolved.removeprefix("/skills/")
+        ):
+            return True
+    return False
 
 
 def _command_performs_analytics(command: str) -> bool:

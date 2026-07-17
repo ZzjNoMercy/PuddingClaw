@@ -255,6 +255,142 @@ Yuxi 的 Provider CRUD、远程模型发现、Chat/Embedding Adapter 和缓存�
 - API 响应只返回 `has_credential`，不返回密钥或 `credential_ref` 的敏感细节；
 - 连通性测试按具体 Endpoint + Model 执行。
 
+#### 设置页界面设计
+
+当前设置侧栏中的“AI 网关”改名为**模型服务**。这里管理的是 Provider 直连配置，不再出现 Higress、Gateway Console、网关健康检查或“Fallback 直连配置”等概念。
+
+页面沿用 PuddingData 现有设置页的左侧分类导航、白色卡片、钴蓝主色和紧凑桌面布局。信息层级采用“默认用途在前，基础设施在后”：普通用户先完成模型选择，高级用户再进入 Provider 细节。
+
+```text
+设置 / 模型服务                                      [刷新状态]
+管理模型来源、凭证和默认用途。凭证仅保存在本机。
+
+┌ 默认模型 ────────────────────────────────────────────┐
+│ 主对话模型          文本向量模型       多模态向量模型  │
+│ Qwen Plus           text-embedding-v4  mm-embedding-v1 │
+│ DashScope · 正常    1024 维 · 正常     图/文 · 正常    │
+│ [更换]              [更换]             [更换]          │
+└──────────────────────────────────────────────────────┘
+
+模型供应商                         [搜索供应商] [新增供应商]
+┌ DashScope ───────────────────────────────────────────┐
+│ 已启用 · 凭证已配置     3 个端点 · 8 个模型            │
+│ Chat · Text Embedding · Multimodal Embedding          │
+│ 默认用途：主对话 / 文本向量 / 多模态向量              │
+│                              [测试] [管理模型与端点]    │
+└──────────────────────────────────────────────────────┘
+```
+
+##### A. 默认模型区
+
+首屏固定展示三个 Binding 卡片：
+
+1. **主对话模型**：显示模型名、Provider、文本/图像输入能力和连接状态；
+2. **文本向量模型**：显示模型名、Provider、维度和连接状态；
+3. **多模态向量模型**：显示模型名、Provider、输入模态、维度和连接状态。
+
+点击“更换”打开统一模型选择器：
+
+- 只显示满足该 Binding 能力的已启用模型；
+- 支持按 Provider、模型名和模态筛选；
+- 模型行展示协议、上下文或维度、最近一次测试状态；
+- 选择后先显示影响说明，再明确保存；
+- 更换 Embedding 时若向量空间指纹变化，必须提示哪些索引会变为 `stale`，不能静默保存。
+
+这里不允许直接输入任意 Model ID；未登记模型必须先进入 Provider 管理添加。
+
+##### B. Provider 总览区
+
+参考 Yuxi 的 Provider 卡片、搜索和统计，但放在设置页内，不建立独立“管理员模型管理”产品页面。
+
+每张 Provider 卡片展示：
+
+- 图标、展示名和稳定 `provider_id`；
+- `已启用 / 已停用 / 凭证缺失 / 部分异常` 状态；
+- Endpoint 数、已启用模型数；
+- 能力摘要：Chat、Vision、Text Embedding、Multimodal Embedding；
+- 当前承载的默认 Binding；
+- 最近一次连接测试的时间与结果；
+- “测试”和“管理模型与端点”两个主要操作。
+
+页面顶部只保留“搜索供应商”“新增供应商”和“刷新状态”。不在首屏展示 Base URL、协议 JSON 或 API Key 输入框。
+
+##### C. 新增 Provider 流程
+
+使用分步抽屉，而不是把所有技术字段塞进一个大表单：
+
+1. **选择模板**：OpenAI、DeepSeek、DashScope、自定义 OpenAI-compatible；
+2. **配置凭证**：输入 API Key，保存后只显示“已配置”和末四位；
+3. **确认端点**：模板自动生成 Endpoint；自定义 Provider 才需要填写 Base URL 和协议；
+4. **测试并发现模型**：逐 Endpoint 测试，成功后获取远端候选模型；
+5. **启用模型**：勾选需要的模型，必要时填写无法发现的维度、模态等信息。
+
+创建成功后返回 Provider 总览。默认 Binding 不在向导中自动替换；用户需要在顶部默认模型区显式选择，避免新增 Provider 意外改变当前运行配置。
+
+##### D. Provider 管理抽屉
+
+点击“管理模型与端点”打开右侧宽抽屉，分为三个页签：
+
+**概览**
+
+- 展示名、Provider ID、启用状态；
+- 凭证状态，以及“替换凭证”“删除凭证”；
+- 该 Provider 承载的默认 Binding；
+- 删除 Provider 的危险操作。
+
+**端点**
+
+采用表格而不是多个散落的 Base URL 字段：
+
+| 用途 | 协议 | Base URL | 状态 | 操作 |
+| --- | --- | --- | --- | --- |
+| Chat | `openai_chat` | `…/compatible-mode/v1` | 正常 | 测试 / 编辑 |
+| Text Embedding | `openai_embeddings` | `…/compatible-mode/v1` | 正常 | 测试 / 编辑 |
+| Multimodal Embedding | `dashscope_multimodal_embedding` | `…/api/v1` | 正常 | 测试 / 编辑 |
+
+“新增端点”只在高级操作中出现。Headers、超时和扩展参数放入折叠的“高级配置”，普通模板无需用户处理。
+
+**模型**
+
+参考 Yuxi 的“已启用模型 + 远端候选模型”，但不再用上下堆叠的长列表：
+
+- 默认显示已启用模型表；
+- 工具栏提供搜索、类型筛选、“发现远端模型”和“手动添加”；
+- 远端发现结果使用独立选择弹窗，支持多选后一次添加；
+- 模型表列为：模型、类型、输入模态、Endpoint、上下文/维度、Binding、状态、操作；
+- 每个模型可测试、编辑、停用或移除；
+- 手动添加必须选择 Endpoint，并明确声明 `kind`、输入/输出 modalities；Embedding 必须提供或探测 dimension。
+
+##### E. 状态与保护规则
+
+- API Key 永不回显完整值，前端只能看到 `has_credential` 和可选末四位；
+- Provider 被默认 Binding 使用时，不能停用或删除，必须先更换 Binding；
+- 模型被默认 Binding 使用时，不能移除；
+- Endpoint 被启用模型引用时，不能删除；
+- “测试 Provider”实际逐个测试其启用 Endpoint，并分别返回结果，不用一个绿色状态掩盖局部故障；
+- “测试模型”必须调用确切的 Endpoint + Model，结果显示耗时、协议和错误摘要；
+- 环境变量覆盖存在时只读展示来源，不允许页面保存造成“看似成功、运行时未变化”；
+- 模型发现只生成候选项，必须经用户确认才能写入 Registry；
+- 任何默认模型切换、Embedding 指纹变化和跨模型 fallback 都需要明确提示。
+
+##### F. 从 Yuxi 借鉴与调整
+
+直接借鉴：
+
+- Provider 卡片总览、搜索、启停状态和模型数量；
+- 远端模型发现与手动添加两条路径；
+- 已启用模型的类型、上下文/维度和连接测试；
+- 默认模型使用中禁止删除的保护逻辑。
+
+针对 PuddingData 调整：
+
+- 管理入口放入设置页，并将名称从“AI 网关”改为“模型服务”；
+- 默认 Binding 提升到页面首屏，而不是藏在 Agent 或 Provider 配置中；
+- Provider、Endpoint、Model 三层分开，不使用 Provider 级单一 Base URL/Protocol；
+- 增加 Vision 和 Multimodal Embedding 的完整模态展示；
+- 凭证进入本机安全存储，不像 Yuxi 当前表单那样回填 API Key；
+- 模型管理采用宽抽屉和独立远端选择弹窗，避免一个 Modal 内同时堆两套长列表。
+
 ### Phase D：清理 Higress 运行依赖
 
 重点影响面包括：
@@ -501,6 +637,8 @@ EvaluationScore
 - `../Yuxi/backend/package/yuxi/agents/middlewares/subagent_task.py`
 - `../Yuxi/backend/package/yuxi/services/agent_invocation_service.py`
 - `../Yuxi/backend/package/yuxi/services/langfuse_service.py`
+- `../Yuxi/web/src/views/ModelManageView.vue`
+- `../Yuxi/web/src/components/model-management/ModelProviderManagePanel.vue`
 - `../Yuxi/docs/agents/subagents-management.md`
 - `../Yuxi/docs/agents/sandbox-architecture.md`
 - `../Yuxi/docs/agents/agent-evaluation.md`

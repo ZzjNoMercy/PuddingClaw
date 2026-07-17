@@ -307,10 +307,18 @@ class ProjectSandboxManager:
             source = Path(str(item.get("source") or "")).expanduser().resolve()
             target = str(item.get("target") or "")
             if source.is_dir() and target in {"/skills"}:
+                workspace_target = None
+                try:
+                    relative = source.relative_to(workspace.expanduser().resolve())
+                    if relative.parts:
+                        workspace_target = f"/workspace/{relative.as_posix()}"
+                except ValueError:
+                    pass
                 readonly_mounts.append(
                     {
                         "source": str(source),
                         "target": target,
+                        "workspace_target": workspace_target,
                     }
                 )
         return {
@@ -431,12 +439,16 @@ class ProjectSandboxManager:
                     ]
                 )
             for mount in spec["readonly_mounts"]:
-                runtime_mount_args.extend(
-                    [
-                        "--mount",
-                        (f"type=bind,src={mount['source']},dst={mount['target']},readonly"),
-                    ]
-                )
+                targets = [mount["target"]]
+                if mount.get("workspace_target"):
+                    targets.append(mount["workspace_target"])
+                for target in targets:
+                    runtime_mount_args.extend(
+                        [
+                            "--mount",
+                            (f"type=bind,src={mount['source']},dst={target},readonly"),
+                        ]
+                    )
             create_args = [
                 "create",
                 "--name",
@@ -518,8 +530,15 @@ class ProjectSandboxManager:
         argv: list[str],
         timeout: int,
         max_output_bytes: int,
+        workspace_writable: bool = False,
     ) -> ExecuteResponse:
-        """Run one approved argv in a disposable networked container."""
+        """Run one approved argv in a disposable networked container.
+
+        Raw terminal actions may need to download or update project files, so
+        their exact approved command gets a writable workspace. Typed package
+        installation keeps the workspace read-only and writes only persistent
+        runtime/dependency volumes.
+        """
 
         workspace = workspace.expanduser().resolve()
         spec = self._spec(workspace)
@@ -528,12 +547,26 @@ class ProjectSandboxManager:
             workspace,
             image=image_id,
         )
+        workspace_mount = f"type=bind,src={workspace},dst=/workspace"
+        if not workspace_writable:
+            workspace_mount += ",readonly"
         mount_args = [
             "--mount",
-            f"type=bind,src={workspace},dst=/workspace,readonly",
+            workspace_mount,
             "--mount",
             f"type=volume,src={runtime_home_volume},dst=/home/puddingclaw",
         ]
+        for mount in spec["readonly_mounts"]:
+            targets = [mount["target"]]
+            if mount.get("workspace_target"):
+                targets.append(mount["workspace_target"])
+            for target in targets:
+                mount_args.extend(
+                    [
+                        "--mount",
+                        f"type=bind,src={mount['source']},dst={target},readonly",
+                    ]
+                )
         for mount in spec["runtime_mounts"]:
             volume_name = self._dependency_volume_name(
                 workspace,
@@ -594,7 +627,7 @@ class ProjectSandboxManager:
             result = self._run(args, timeout=timeout)
         except subprocess.TimeoutExpired:
             return ExecuteResponse(
-                output=f"Error: Package installation timed out after {timeout} seconds.",
+                output=f"Error: Networked command timed out after {timeout} seconds.",
                 exit_code=124,
             )
         output, truncated = _bounded_output(
@@ -711,14 +744,14 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
                     )
                 from harness.tool_execution import ShellPolicyAnalyzer
 
-                if not bool(self.manager.config.get("network_enabled", False)) and ShellPolicyAnalyzer.requires_network(
-                    command
-                ):
+                effects = ShellPolicyAnalyzer.capabilities(command)
+                if not bool(self.manager.config.get("network_enabled", False)) and effects.network:
                     result = self.manager.run_ephemeral_network_command(
                         self.workspace_path,
                         argv=["sh", "-c", command],
                         timeout=effective_timeout,
                         max_output_bytes=self._max_output_bytes,
+                        workspace_writable=effects.workspace_write,
                     )
                     self.manager.mark_activity(self.container_name)
                     return result

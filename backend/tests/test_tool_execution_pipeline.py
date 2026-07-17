@@ -637,6 +637,8 @@ def test_managed_sandbox_image_is_built_when_missing(monkeypatch):
 def test_project_container_spec_has_no_docker_socket_or_host_home(tmp_path, monkeypatch):
     workspace = tmp_path / "project"
     workspace.mkdir()
+    skills = workspace / "backend" / "skills"
+    skills.mkdir(parents=True)
     (workspace / "package.json").write_text('{"name":"demo"}', encoding="utf-8")
     (workspace / "package-lock.json").write_text('{"lockfileVersion":3}', encoding="utf-8")
     manager = ProjectSandboxManager(
@@ -645,7 +647,7 @@ def test_project_container_spec_has_no_docker_socket_or_host_home(tmp_path, monk
             "network_enabled": False,
             "_managed_readonly_mounts": [
                 {
-                    "source": str(workspace),
+                    "source": str(skills),
                     "target": "/skills",
                 }
             ],
@@ -672,7 +674,8 @@ def test_project_container_spec_has_no_docker_socket_or_host_home(tmp_path, monk
     assert "--cap-drop ALL" in joined
     assert "no-new-privileges" in joined
     assert "dst=/home/puddingclaw" in joined
-    assert f"src={workspace.resolve()},dst=/skills,readonly" in joined
+    assert f"src={skills.resolve()},dst=/skills,readonly" in joined
+    assert f"src={skills.resolve()},dst=/workspace/backend/skills,readonly" in joined
     assert "PYTHONUSERBASE=/home/puddingclaw/.local" in joined
     assert "npm_config_prefix=/home/puddingclaw/.npm-global" in joined
     assert "dst=/workspace/node_modules" not in joined
@@ -718,7 +721,7 @@ def test_docker_backend_uses_ephemeral_container_for_approved_network_command(
     assert len(calls) == 1
     command = calls[0]
     assert command[:5] == ["run", "--rm", "--network", "bridge", "--read-only"]
-    assert f"type=bind,src={workspace.resolve()},dst=/workspace,readonly" in command
+    assert f"type=bind,src={workspace.resolve()},dst=/workspace" in command
     assert ["--entrypoint", "sh"] == command[command.index("--entrypoint") : command.index("--entrypoint") + 2]
     assert command[-3:] == ["sha256:immutable-image", "-c", "npm ci"]
     runtime_home = manager._runtime_home_volume_name(
@@ -727,6 +730,228 @@ def test_docker_backend_uses_ephemeral_container_for_approved_network_command(
     )
     assert f"type=volume,src={runtime_home},dst=/home/puddingclaw" in command
     assert all("network connect" not in " ".join(call) for call in calls)
+
+
+def test_docker_backend_gives_approved_python_network_command_real_network(
+    tmp_path,
+    monkeypatch,
+):
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    manager = ProjectSandboxManager(
+        {
+            "network_enabled": False,
+            "dependency_setup_enabled": False,
+            "_managed_readonly_mounts": [
+                {"source": str(skills), "target": "/skills"},
+            ],
+        }
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        manager,
+        "ensure_container",
+        lambda _workspace: ("puddingclaw-test", "spec-hash"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "ensure_image",
+        lambda _image: "sha256:immutable-image",
+    )
+
+    def fake_run(args, *, timeout=30):
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args, 0, "remote ok", "")
+
+    monkeypatch.setattr(manager, "_run", fake_run)
+    backend = DockerWorkspaceBackend(root_dir=workspace, manager=manager)
+
+    result = backend.execute(
+        'python3 -c "import urllib.request; '
+        "urllib.request.urlopen('https://aihot.virxact.com/aihot-skill/SKILL.md')\""
+    )
+
+    assert result.exit_code == 0
+    command = calls[0]
+    assert command[:5] == ["run", "--rm", "--network", "bridge", "--read-only"]
+    assert f"type=bind,src={workspace.resolve()},dst=/workspace,readonly" in command
+    assert f"type=bind,src={skills.resolve()},dst=/skills,readonly" in command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python3 -c \"import urllib.request; urllib.request.urlopen('https://example.com')\"",
+        "python3 -c \"import http.client; http.client.HTTPSConnection('example.com')\"",
+        "python3 /skills/aihot/scripts/aihot_query.py --user-query latest",
+        "python3 -u /skills/aihot/scripts/aihot_query.py --user-query latest",
+        "node -e \"fetch('https://example.com')\"",
+        "sh -c \"curl https://example.com\"",
+        "git -C repo pull",
+        "npm --prefix app install",
+        "python3 -m pip --disable-pip-version-check install requests",
+    ],
+)
+def test_embedded_network_clients_require_network_capability(tmp_path, command):
+    request = ToolCallRequest(
+        tool_call={
+            "id": "network-script",
+            "name": "execute",
+            "args": {"command": command},
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute"},
+        backend_mode="docker",
+    )
+
+    assert ShellPolicyAnalyzer.requires_network(command) is True
+    assert {"execute", "network_access"}.issubset(
+        set(pipeline._required_capabilities(request))
+    )
+
+
+def test_local_skill_hash_does_not_request_network_capability(tmp_path):
+    command = (
+        'python3 -c "import hashlib; '
+        "print(hashlib.sha256(open('/skills/aihot/SKILL.md', 'rb').read()).hexdigest())\""
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "id": "local-hash",
+            "name": "execute",
+            "args": {"command": command},
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute"},
+        backend_mode="docker",
+    )
+
+    assert ShellPolicyAnalyzer.requires_network(command) is False
+    assert pipeline._required_capabilities(request) == ["execute"]
+
+
+def test_safe_read_containing_url_does_not_silently_gain_network(tmp_path):
+    command = "echo https://example.com"
+    analyzer = ShellPolicyAnalyzer(
+        workspace_path=str(tmp_path),
+        backend_mode="docker",
+    )
+
+    assert analyzer.analyze(command).decision == PolicyDecision.ALLOW
+    assert analyzer.capabilities(command).network is False
+
+
+def test_read_only_package_inspection_does_not_gain_network():
+    assert ShellPolicyAnalyzer.capabilities("pip list").network is False
+    assert ShellPolicyAnalyzer.capabilities("pip show requests").package_install is False
+
+
+@pytest.mark.parametrize(
+    ("command", "required"),
+    [
+        ("timeout 10 curl https://example.com", {"network"}),
+        ("nice -n 5 curl https://example.com", {"network"}),
+        (
+            "PYTHONUNBUFFERED=1 python3 /skills/aihot/scripts/aihot_query.py --limit 10",
+            {"network", "workspace_write"},
+        ),
+        ("find . -delete", {"workspace_write"}),
+        ("find . -exec curl https://example.com {} +", {"network", "workspace_write"}),
+        ("sed -i s/a/b/ report.txt", {"workspace_write"}),
+        ("sort -o sorted.txt input.txt", {"workspace_write"}),
+        ("uniq input.txt output.txt", {"workspace_write"}),
+        ("git fetch origin", {"network", "workspace_write"}),
+        ("curl --output=update.zip https://example.com/update.zip", {"network", "workspace_write"}),
+        ("curl -OJ https://example.com/update.zip", {"network", "workspace_write"}),
+        (
+            "python3 -c \"import urllib.request; urllib.request.urlretrieve('https://example.com/a','a')\"",
+            {"network", "workspace_write"},
+        ),
+        ("python3 script.py", {"workspace_write"}),
+    ],
+)
+def test_shell_capabilities_never_understate_known_effects(command, required):
+    effects = ShellPolicyAnalyzer.capabilities(command)
+    enabled = {
+        name
+        for name in ("network", "workspace_write", "package_install")
+        if getattr(effects, name)
+    }
+
+    assert required.issubset(enabled)
+
+
+def test_input_redirection_is_not_mislabeled_as_workspace_write():
+    assert ShellPolicyAnalyzer.capabilities("wc -l < input.txt").workspace_write is False
+
+
+def test_allowed_project_test_with_remote_url_requires_network_approval(tmp_path):
+    command = "pytest --base-url https://example.com"
+    request = ToolCallRequest(
+        tool_call={"id": "remote-test", "name": "execute", "args": {"command": command}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+    pipeline = ToolExecutionPipeline(known_tools={"execute"}, backend_mode="docker")
+
+    result = pipeline._preflight(request)
+    assert result.decision == PolicyDecision.ASK
+    assert result.reason == "network_access:embedded_command"
+    assert pipeline._required_capabilities(request) == ["execute", "network_access"]
+
+
+def test_network_download_declares_write_and_network_capabilities(tmp_path):
+    command = "curl -o update.zip https://example.com/update.zip"
+    request = ToolCallRequest(
+        tool_call={"id": "download", "name": "execute", "args": {"command": command}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+    pipeline = ToolExecutionPipeline(known_tools={"execute"}, backend_mode="docker")
+
+    assert pipeline._required_capabilities(request) == [
+        "execute",
+        "network_access",
+        "managed_write",
+    ]
+
+
+def test_once_tool_grant_is_bound_to_originating_run(tmp_path):
+    sessions = SessionManager()
+    sessions.initialize(tmp_path)
+    sessions.create_session("session-run-bound")
+    sessions.add_permission_grant(
+        "session-run-bound",
+        grant_type="tool_action",
+        target_kind="fingerprint",
+        target="sha256:run-bound",
+        capabilities=["execute"],
+        scope="once",
+        metadata={"run_id": "run-a"},
+    )
+
+    assert not sessions.consume_tool_action_permission(
+        "session-run-bound",
+        "sha256:run-bound",
+        current_run_id="run-b",
+    )
+    assert sessions.consume_tool_action_permission(
+        "session-run-bound",
+        "sha256:run-bound",
+        current_run_id="run-a",
+    )
 
 
 def test_smart_package_scope_never_applies_to_raw_shell(tmp_path):

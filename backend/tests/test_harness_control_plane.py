@@ -245,6 +245,58 @@ def test_verification_can_be_disabled_without_false_grader_error(tmp_path):
     assert report.status == VerificationStatus.NOT_REQUIRED
 
 
+def test_deterministic_revision_state_is_not_reported_as_grader_error(tmp_path):
+    sessions = _sessions(tmp_path)
+    coordinator = HarnessRunCoordinator(sessions)
+    run, goal = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-deterministic-revision",
+        objective="生成销量报告并提供文件",
+        goal_mode=False,
+    )
+    coordinator.transition(run, RunStatus.RUNNING)
+
+    completed, _, report = coordinator.complete_from_final_state(
+        run,
+        goal,
+        {
+            "_completion_gate_status": "needs_revision",
+            "_harness_context": {
+                "todos": [{"id": "todo-1", "content": "完成任务", "status": "in_progress"}],
+                "final_content": "尚未完成",
+                "workspace_path": str(tmp_path),
+            },
+        },
+    )
+
+    assert completed.outcome == RunOutcome.FAILED
+    assert report.status == VerificationStatus.INCOMPLETE
+    assert any(item.passed is None for item in report.evaluations)
+
+
+def test_missing_terminal_verdict_is_reported_as_incomplete(tmp_path):
+    sessions = SessionManager()
+    sessions.initialize(tmp_path)
+    coordinator = HarnessRunCoordinator(sessions)
+    contract = coordinator.verification.compile_contract(
+        user_message="生成销量报告并提供文件",
+        analytics_model_id=None,
+        project_id="project-1",
+    )
+
+    assert contract is not None
+    report = coordinator.verification.report_from_final_state(
+        run_id="run-incomplete",
+        contract=contract,
+        final_state={"_completion_gate_iterations": 1},
+    )
+
+    assert report.status == VerificationStatus.INCOMPLETE
+    assert report.iteration_count == 1
+    assert all("验收器未返回" not in gap for gap in report.gaps)
+    assert all("验收器异常" not in gap for gap in report.gaps)
+
+
 def test_default_request_creates_one_run_without_goal(tmp_path):
     sessions = _sessions(tmp_path)
     coordinator = HarnessRunCoordinator(sessions)
@@ -375,6 +427,69 @@ def test_run_model_call_limit_does_not_exhaust_goal_budget_early(tmp_path):
     assert goal.status == GoalStatus.ACTIVE
     assert goal.model_call_count == 10
     assert goal.current_run_id is None
+
+
+def test_incomplete_verification_does_not_consume_goal_business_round(tmp_path):
+    sessions = _sessions(tmp_path)
+    coordinator = HarnessRunCoordinator(sessions)
+    run, goal = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-incomplete",
+        objective="持续生成销量报告",
+        goal_mode=True,
+        goal_max_rounds=1,
+    )
+    assert goal is not None and goal.round == 1
+    coordinator.transition(run, RunStatus.RUNNING)
+
+    completed, goal, report = coordinator.complete_from_final_state(
+        run,
+        goal,
+        {"_rubric_status": "needs_revision"},
+    )
+
+    assert completed.outcome == RunOutcome.FAILED
+    assert report.status == VerificationStatus.INCOMPLETE
+    assert goal is not None
+    assert goal.status == GoalStatus.ACTIVE
+    assert goal.round == 0
+    assert goal.gaps == []
+    retry, retried_goal = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-retry",
+        objective="重试",
+        goal_mode=True,
+        goal_id=goal.goal_id,
+    )
+    assert retry.goal_id == goal.goal_id
+    assert retried_goal is not None and retried_goal.round == 1
+
+
+def test_grader_error_does_not_consume_goal_business_round(tmp_path):
+    sessions = _sessions(tmp_path)
+    coordinator = HarnessRunCoordinator(sessions)
+    run, goal = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-grader-error",
+        objective="持续生成销量报告",
+        goal_mode=True,
+        goal_max_rounds=1,
+    )
+    assert goal is not None and goal.round == 1
+    coordinator.transition(run, RunStatus.RUNNING)
+
+    completed, goal, report = coordinator.complete_from_final_state(
+        run,
+        goal,
+        {"_rubric_status": "grader_error", "_rubric_error": "model unavailable"},
+    )
+
+    assert completed.outcome == RunOutcome.VERIFICATION_FAILED
+    assert report.status == VerificationStatus.GRADER_ERROR
+    assert goal is not None
+    assert goal.status == GoalStatus.ACTIVE
+    assert goal.round == 0
+    assert goal.gaps == []
 
 
 def test_explicit_goal_can_advance_across_runs(tmp_path):

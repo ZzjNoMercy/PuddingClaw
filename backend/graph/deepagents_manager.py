@@ -199,6 +199,7 @@ class PuddingClawAgentState(DeepAgentState):
     task_profile: NotRequired[dict[str, Any]]
     verification_contract: NotRequired[dict[str, Any]]
     verification_activations: NotRequired[Annotated[list[dict[str, Any]], PrivateStateAttr]]
+    _verification_attempts: NotRequired[Annotated[int, PrivateStateAttr]]
     _completion_gate_iterations: NotRequired[Annotated[int, PrivateStateAttr]]
     _completion_gate_status: NotRequired[Annotated[str | None, PrivateStateAttr]]
     _deterministic_evaluations: NotRequired[Annotated[list[dict[str, Any]], PrivateStateAttr]]
@@ -319,6 +320,8 @@ and gaps in Chinese. Missing criteria are treated as failed by Harness.
         self,
         state: dict[str, Any],
         runtime: Any,
+        *,
+        attempt: int | None = None,
     ) -> dict[str, Any] | None:
         payload = state.get("verification_contract")
         if not isinstance(payload, dict):
@@ -336,27 +339,39 @@ and gaps in Chinese. Missing criteria are treated as failed by Harness.
         evaluations = evaluate_deterministic_criteria(contract, check_state)
         required_by_id = {criterion.id: criterion.required for criterion in contract.criteria}
         failures = [item for item in evaluations if not item.passed and required_by_id.get(item.criterion_id, True)]
+        previous_attempts = max(
+            int(state.get("_verification_attempts") or 0),
+            int(state.get("_completion_gate_iterations") or 0),
+            int(state.get("_rubric_iterations") or 0),
+        )
+        current_attempt = attempt if attempt is not None else previous_attempts + 1
+        gate_status = "satisfied"
+        if failures:
+            gate_status = (
+                "max_iterations_reached"
+                if current_attempt >= self.max_iterations
+                else "needs_revision"
+            )
         writer = getattr(runtime, "stream_writer", None)
-        iteration = int(state.get("_completion_gate_iterations") or 0)
         if writer is not None:
             writer(
                 {
                     "type": "deterministic_checks_completed",
-                    "iteration": iteration,
-                    "status": "needs_revision" if failures else "satisfied",
+                    "iteration": current_attempt,
+                    "attempt": current_attempt,
+                    "status": gate_status,
                     "evaluations": [item.model_dump(mode="json") for item in evaluations],
                 }
             )
         update: dict[str, Any] = {
             "_deterministic_evaluations": [item.model_dump(mode="json") for item in evaluations],
-            "_completion_gate_status": ("needs_revision" if failures else "satisfied"),
+            "_verification_attempts": current_attempt,
+            "_completion_gate_iterations": current_attempt,
+            "_completion_gate_status": gate_status,
         }
         if not failures:
             return update
-        next_iteration = iteration + 1
-        update["_completion_gate_iterations"] = next_iteration
-        if next_iteration >= self.max_iterations:
-            update["_completion_gate_status"] = "max_iterations_reached"
+        if current_attempt >= self.max_iterations:
             update["_rubric_status"] = "max_iterations_reached"
             return update
         feedback = [
@@ -445,13 +460,37 @@ and gaps in Chinese. Missing criteria are treated as failed by Harness.
     def after_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:
         effective_update = self._effective_contract_update(dict(state), runtime)
         effective_state = {**dict(state), **effective_update}
-        gate_update = self._completion_gate_update(effective_state, runtime)
-        if gate_update and (
-            gate_update.get("jump_to") == "model"
-            or gate_update.get("_completion_gate_status") == "max_iterations_reached"
-        ):
+        if not isinstance(effective_state.get("verification_contract"), dict):
+            return super().after_agent(effective_state, runtime)
+        previous_attempts = max(
+            int(effective_state.get("_verification_attempts") or 0),
+            int(effective_state.get("_completion_gate_iterations") or 0),
+            int(effective_state.get("_rubric_iterations") or 0),
+        )
+        if previous_attempts >= self.max_iterations:
+            return {
+                **effective_update,
+                "_verification_attempts": previous_attempts,
+                "_completion_gate_status": "max_iterations_reached",
+                "_rubric_status": "max_iterations_reached",
+            }
+        attempt = previous_attempts + 1
+        effective_state["_rubric_iterations"] = previous_attempts
+        gate_update = self._completion_gate_update(
+            effective_state,
+            runtime,
+            attempt=attempt,
+        )
+        if gate_update and gate_update.get("jump_to") == "model":
             return {**effective_update, **gate_update}
-        rubric_update = super().after_agent(effective_state, runtime)
+        grading_state = {**effective_state, **(gate_update or {})}
+        rubric_update = super().after_agent(grading_state, runtime)
+        if gate_update and gate_update.get("_completion_gate_status") == "max_iterations_reached":
+            rubric_update = dict(rubric_update or {})
+            rubric_update.pop("jump_to", None)
+            rubric_update.pop("messages", None)
+            if rubric_update.get("_rubric_status") != "grader_error":
+                rubric_update["_rubric_status"] = "max_iterations_reached"
         return {
             **effective_update,
             **(gate_update or {}),
@@ -466,13 +505,37 @@ and gaps in Chinese. Missing criteria are treated as failed by Harness.
     ) -> dict[str, Any] | None:
         effective_update = self._effective_contract_update(dict(state), runtime)
         effective_state = {**dict(state), **effective_update}
-        gate_update = self._completion_gate_update(effective_state, runtime)
-        if gate_update and (
-            gate_update.get("jump_to") == "model"
-            or gate_update.get("_completion_gate_status") == "max_iterations_reached"
-        ):
+        if not isinstance(effective_state.get("verification_contract"), dict):
+            return await super().aafter_agent(effective_state, runtime)
+        previous_attempts = max(
+            int(effective_state.get("_verification_attempts") or 0),
+            int(effective_state.get("_completion_gate_iterations") or 0),
+            int(effective_state.get("_rubric_iterations") or 0),
+        )
+        if previous_attempts >= self.max_iterations:
+            return {
+                **effective_update,
+                "_verification_attempts": previous_attempts,
+                "_completion_gate_status": "max_iterations_reached",
+                "_rubric_status": "max_iterations_reached",
+            }
+        attempt = previous_attempts + 1
+        effective_state["_rubric_iterations"] = previous_attempts
+        gate_update = self._completion_gate_update(
+            effective_state,
+            runtime,
+            attempt=attempt,
+        )
+        if gate_update and gate_update.get("jump_to") == "model":
             return {**effective_update, **gate_update}
-        rubric_update = await super().aafter_agent(effective_state, runtime)
+        grading_state = {**effective_state, **(gate_update or {})}
+        rubric_update = await super().aafter_agent(grading_state, runtime)
+        if gate_update and gate_update.get("_completion_gate_status") == "max_iterations_reached":
+            rubric_update = dict(rubric_update or {})
+            rubric_update.pop("jump_to", None)
+            rubric_update.pop("messages", None)
+            if rubric_update.get("_rubric_status") != "grader_error":
+                rubric_update["_rubric_status"] = "max_iterations_reached"
         return {
             **effective_update,
             **(gate_update or {}),
@@ -869,14 +932,11 @@ class DeepAgentsAgentManager:
     def __init__(self) -> None:
         self._base_dir: Path | None = None
         self._checkpointer: Any | None = None
-        self._checkpointer_cm: Any | None = None
         self._checkpointer_info: dict[str, Any] | None = None
         self._run_coordinator = HarnessRunCoordinator(session_manager)
 
     def initialize(self, base_dir: Path) -> None:
         self._base_dir = base_dir
-        # LangGraph checkpoint SQLite recommends strict msgpack encoding.
-        os.environ.setdefault("LANGGRAPH_STRICT_MSGPACK", "true")
 
     def _resolve_workspace(
         self,
@@ -1000,6 +1060,7 @@ class DeepAgentsAgentManager:
                 analytics_models_dir,
                 skills_dir,
             ),
+            workspace_root=workspace_path,
         )
         backend.execution_mode = selection.mode
         backend.execution_backend_id = workspace_backend.id
@@ -1108,52 +1169,29 @@ class DeepAgentsAgentManager:
         return middlewares
 
     async def _build_checkpointer(self) -> Any:
-        """Return a process-wide checkpointer for HITL interrupt/resume.
+        """Return the process-local checkpointer used by live HITL runs.
 
-        Production/runtime uses SQLite so pending interrupts survive normal
-        request boundaries and backend restarts. Local test environments may not
-        have the optional plugin installed yet, so fall back to MemorySaver while
-        recording that fact in runtime inventory.
+        Conversation continuity is rebuilt from Session history, and PuddingClaw
+        does not resume an interrupted graph from a later HTTP request. Keeping
+        every Run in SQLite therefore only accumulated unused checkpoint rows.
+        A process-local saver is sufficient for pause/resume inside the active
+        SSE generator, and each thread is deleted when that Run terminates.
         """
 
         if self._checkpointer is not None:
             return self._checkpointer
 
-        assert self._base_dir is not None
-        checkpoint_dir = self._base_dir / "data" / "checkpoints"
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        db_path = checkpoint_dir / "deepagents.sqlite"
+        from langgraph.checkpoint.memory import InMemorySaver
 
-        try:
-            from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-
-            cm = AsyncSqliteSaver.from_conn_string(str(db_path))
-            checkpointer = await cm.__aenter__()
-            setup = getattr(checkpointer, "setup", None)
-            if callable(setup):
-                await setup()
-            self._checkpointer_cm = cm
-            self._checkpointer = checkpointer
-            self._checkpointer_info = {
-                "type": "async_sqlite",
-                "path": str(db_path),
-                "strict_msgpack": os.environ.get("LANGGRAPH_STRICT_MSGPACK") == "true",
-            }
-            return checkpointer
-        except Exception as exc:
-            logger.warning("SQLite LangGraph checkpointer unavailable, falling back to memory: %s", exc)
-            from langgraph.checkpoint.memory import InMemorySaver
-
-            self._checkpointer = InMemorySaver()
-            self._checkpointer_info = {
-                "type": "memory",
-                "fallback_reason": str(exc),
-                "strict_msgpack": os.environ.get("LANGGRAPH_STRICT_MSGPACK") == "true",
-            }
-            return self._checkpointer
+        self._checkpointer = InMemorySaver()
+        self._checkpointer_info = {
+            "type": "memory",
+            "scope": "active_sse_run",
+        }
+        return self._checkpointer
 
     async def _delete_checkpoint_thread(self, thread_id: str) -> None:
-        """Delete the LangGraph checkpoint thread for an explicitly cancelled stream."""
+        """Delete a terminal Run's temporary LangGraph checkpoint thread."""
 
         checkpointer = self._checkpointer
         if checkpointer is None:
@@ -1166,7 +1204,7 @@ class DeepAgentsAgentManager:
                 result = method(thread_id)
                 if hasattr(result, "__await__"):
                     await result
-                logger.info("Deleted DeepAgents checkpoint thread after cancellation: %s", thread_id)
+                logger.info("Deleted terminal DeepAgents checkpoint thread: %s", thread_id)
                 return
             except Exception:
                 logger.warning(
@@ -3963,17 +4001,21 @@ class DeepAgentsAgentManager:
                     rubric_evaluations,
                 )
             if deterministic_check_events:
+                last_gate_event = deterministic_check_events[-1]
                 verification_state.setdefault(
                     "_deterministic_evaluations",
-                    list(deterministic_check_events[-1].get("evaluations") or []),
+                    list(last_gate_event.get("evaluations") or []),
                 )
-                if deterministic_check_events[-1].get("status") == "needs_revision" and len(
-                    deterministic_check_events
-                ) >= int(rubric_config.get("max_iterations", 2)):
-                    verification_state.setdefault(
-                        "_rubric_status",
-                        "max_iterations_reached",
-                    )
+                gate_status = str(last_gate_event.get("status") or "")
+                if gate_status:
+                    verification_state.setdefault("_completion_gate_status", gate_status)
+                event_attempt = int(last_gate_event.get("attempt") or last_gate_event.get("iteration") or 0)
+                if event_attempt:
+                    verification_state.setdefault("_verification_attempts", event_attempt)
+                if gate_status == "max_iterations_reached":
+                    # A deterministic max is authoritative over any earlier
+                    # grader event observed in the same natural-stop attempt.
+                    verification_state["_rubric_status"] = "max_iterations_reached"
             model_limit_detail = verification_state.get("_model_call_limit_exceeded")
             if not isinstance(model_limit_detail, dict) and model_call_limit_events:
                 model_limit_detail = model_call_limit_events[-1]
@@ -4228,10 +4270,6 @@ class DeepAgentsAgentManager:
             except Exception:
                 logger.debug("Failed to reject pending permission requests for session=%s", session_id, exc_info=True)
             try:
-                await self._delete_checkpoint_thread(checkpoint_thread_id)
-            except Exception:
-                logger.debug("Failed to clean cancelled checkpoint for session=%s", session_id, exc_info=True)
-            try:
                 if trace_collector is not None:
                     trace = trace_collector.finish(status="cancelled", error="client_cancelled")
                     await asyncio.to_thread(
@@ -4361,6 +4399,20 @@ class DeepAgentsAgentManager:
             if trace_context_active and trace_collector is not None:
                 trace_collector.__exit__(type(exc), exc, exc.__traceback__)
             yield self._sse("error", {"error": error_msg, "message": error_notice})
+        finally:
+            # This checkpointer is only a live-Run HITL scratchpad. Session
+            # history is authoritative for future user turns, so success,
+            # failure, cancellation, and generator close all release the
+            # unique session_id:query_id checkpoint thread here.
+            try:
+                await self._delete_checkpoint_thread(checkpoint_thread_id)
+            except Exception:
+                logger.debug(
+                    "Failed to clean terminal checkpoint for session=%s query=%s",
+                    session_id,
+                    query_id,
+                    exc_info=True,
+                )
 
 
 deepagents_agent_manager = DeepAgentsAgentManager()

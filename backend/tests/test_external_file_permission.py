@@ -130,9 +130,9 @@ def test_permissioned_backend_never_mutates_managed_resources(tmp_path):
     session_manager.initialize(tmp_path)
     session_manager.create_session("managed-readonly-session")
     workspace = tmp_path / "workspace"
-    skills = tmp_path / "skills"
+    skills = workspace / "backend" / "skills"
     workspace.mkdir()
-    skills.mkdir()
+    skills.mkdir(parents=True)
     skill_file = skills / "SKILL.md"
     skill_file.write_text("original", encoding="utf-8")
     workspace_backend = FilesystemBackend(root_dir=workspace, virtual_mode=True)
@@ -142,10 +142,16 @@ def test_permissioned_backend_never_mutates_managed_resources(tmp_path):
         routes={"/workspace/": workspace_backend, "/skills/": skills_backend},
         session_id="managed-readonly-session",
         managed_readonly_roots=(skills,),
+        workspace_root=workspace,
     )
 
     virtual_write = backend.write("/skills/new.md", "forged")
     virtual_edit = backend.edit("/skills/SKILL.md", "original", "forged")
+    workspace_alias_edit = backend.edit(
+        "/workspace/backend/skills/SKILL.md",
+        "original",
+        "forged",
+    )
     session_manager.add_permission_grant(
         "managed-readonly-session",
         grant_type="external_file_write",
@@ -157,6 +163,9 @@ def test_permissioned_backend_never_mutates_managed_resources(tmp_path):
 
     assert virtual_write.error == "Managed resource is read-only: /skills/new.md"
     assert virtual_edit.error == "Managed resource is read-only: /skills/SKILL.md"
+    assert workspace_alias_edit.error == (
+        "Managed resource is read-only: /workspace/backend/skills/SKILL.md"
+    )
     assert absolute_edit.error
     assert not (skills / "new.md").exists()
     assert skill_file.read_text(encoding="utf-8") == "original"

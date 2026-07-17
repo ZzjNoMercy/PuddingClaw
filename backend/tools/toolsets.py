@@ -25,6 +25,7 @@ NATIVE_TOOLSETS: dict[str, frozenset[str]] = {
 UNCONDITIONAL_EXTENSION_TOOLSETS: dict[str, frozenset[str]] = {
     "web_research": frozenset({"tavily_search", "fetch_url"}),
     "package_management": frozenset({"install_packages"}),
+    "skill_inspection": frozenset({"inspect_skill"}),
 }
 
 # PuddingClaw tools are opt-in business capabilities.  A name must occur in

@@ -8,12 +8,12 @@ third-party source code.
 from __future__ import annotations
 
 import inspect
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
 
 from graph.trace_collector import TraceCollector, get_current_trace_collector
-
 
 STATE_HOOKS = (
     "before_agent",
@@ -304,10 +304,14 @@ def wrap_middleware_for_trace(middleware: Any) -> Any:
     methods: dict[str, Any] = {}
     for hook in STATE_HOOKS:
         if _implements_hook(middleware, hook):
-            methods[hook] = _make_state_hook(hook)
+            proxy_hook = _make_state_hook(hook)
+            _copy_hook_config(getattr(middleware.__class__, hook), proxy_hook)
+            methods[hook] = proxy_hook
     for async_hook, hook in ASYNC_STATE_HOOKS.items():
         if _implements_hook(middleware, async_hook):
-            methods[async_hook] = _make_async_state_hook(async_hook, hook)
+            proxy_hook = _make_async_state_hook(async_hook, hook)
+            _copy_hook_config(getattr(middleware.__class__, async_hook), proxy_hook)
+            methods[async_hook] = proxy_hook
     for hook in WRAP_HOOKS:
         if _implements_hook(middleware, hook):
             methods[hook] = _make_wrap_hook(hook)
@@ -324,6 +328,19 @@ def wrap_middleware_for_trace(middleware: Any) -> Any:
         methods,
     )
     return proxy_class(middleware)
+
+
+def _copy_hook_config(source: Any, target: Any) -> None:
+    """Preserve LangChain graph-edge metadata on generated proxy hooks.
+
+    Losing ``__can_jump_to__`` makes a traced middleware return a state field
+    named ``jump_to`` without the graph having the corresponding conditional
+    edge. The trace then looks correct while the completion loop silently ends.
+    """
+
+    can_jump_to = getattr(source, "__can_jump_to__", None)
+    if can_jump_to is not None:
+        target.__can_jump_to__ = list(can_jump_to)
 
 
 def _implements_hook(middleware: AgentMiddleware, hook: str) -> bool:

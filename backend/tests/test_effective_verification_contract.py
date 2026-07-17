@@ -8,7 +8,7 @@ from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
 from graph.session_manager import SessionManager
-from harness.coordinators import CompletionVerificationCoordinator
+from harness.coordinators import CompletionVerificationCoordinator, HarnessRunCoordinator
 from harness.models import (
     RunOutcome,
     RunStatus,
@@ -158,6 +158,34 @@ def test_aihot_skill_command_activates_web_research():
 
 
 @pytest.mark.parametrize(
+    "command",
+    [
+        "cd /skills/aihot && python3 scripts/aihot_query.py --limit 10",
+        "PYTHONUNBUFFERED=1 python3 /skills/aihot/scripts/aihot_query.py --limit 10",
+        "timeout 30 python3 /skills/aihot/scripts/aihot_query.py --limit 10",
+        "bash -lc 'cd /skills/aihot && python3 scripts/aihot_query.py --limit 10'",
+    ],
+)
+def test_wrapped_aihot_skill_commands_activate_web_research(command):
+    assert verification_packs_for_tool(
+        "execute",
+        {"command": command},
+    ) == ["web_research"]
+
+
+def test_mentioning_aihot_path_without_executing_entrypoint_does_not_activate_web():
+    assert verification_packs_for_tool(
+        "execute",
+        {
+            "command": (
+                "python3 -c \"import hashlib; "
+                "print(hashlib.sha256(open('/skills/aihot/SKILL.md','rb').read()).hexdigest())\""
+            )
+        },
+    ) == []
+
+
+@pytest.mark.parametrize(
     ("path", "expected"),
     [
         ("/workspace/app.py", {"code"}),
@@ -182,6 +210,138 @@ def test_sql_generation_activates_analytics_but_is_not_material_evidence():
 
     assert activation.pack == "analytics"
     assert activation.evidence_refs[0]["material"] is False
+
+
+def test_non_material_aihot_inspection_does_not_widen_persisted_contract(
+    tmp_path,
+):
+    from types import SimpleNamespace
+
+    from langchain.agents.middleware.types import ToolCallRequest
+
+    from graph.session_manager import session_manager
+    from harness.verification_activations import VerificationActivationMiddleware
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("session-material")
+    coordinator = HarnessRunCoordinator(session_manager)
+    run, _goal = coordinator.start_run(
+        session_id="session-material",
+        query_id="query-material",
+        objective="检查本地 Skill 哈希",
+        goal_mode=False,
+    )
+    coordinator.transition(run, RunStatus.RUNNING)
+    request = ToolCallRequest(
+        tool_call={
+            "id": "call-hash",
+            "name": "execute",
+            "args": {
+                "command": (
+                    "python3 -c \"import hashlib; "
+                    "print(hashlib.sha256(open('/skills/aihot/SKILL.md','rb').read()).hexdigest())\""
+                )
+            },
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(
+            context={
+                "session_id": "session-material",
+                "run_id": run.run_id,
+                "query_id": "query-material",
+            },
+            stream_writer=None,
+        ),
+    )
+    result = ToolMessage(
+        content="abc123\n\n[Command succeeded with exit code 0]",
+        tool_call_id="call-hash",
+        name="execute",
+    )
+
+    VerificationActivationMiddleware._record(request, result)
+
+    persisted = session_manager.get_run_state("session-material", run.run_id)
+    assert persisted is not None
+    assert persisted["verification_activations"] == []
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "args", "content", "expected_pack"),
+    [
+        (
+            "execute",
+            {"command": "curl -fsSL https://example.com/news"},
+            "news body\n\n[Command succeeded with exit code 0]",
+            "web_research",
+        ),
+        (
+            "database_sql_generate",
+            {"question": "查询销量"},
+            "SELECT SUM(amount) FROM sales",
+            "analytics",
+        ),
+    ],
+)
+def test_non_material_semantic_activation_is_persisted_fail_closed(
+    tmp_path,
+    tool_name,
+    args,
+    content,
+    expected_pack,
+):
+    from types import SimpleNamespace
+
+    from langchain.agents.middleware.types import ToolCallRequest
+
+    from graph.session_manager import session_manager
+    from harness.verification_activations import VerificationActivationMiddleware
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("session-non-material")
+    coordinator = HarnessRunCoordinator(session_manager)
+    run, _goal = coordinator.start_run(
+        session_id="session-non-material",
+        query_id="query-non-material",
+        objective="继续处理",
+        goal_mode=False,
+    )
+    coordinator.transition(run, RunStatus.RUNNING)
+    request = ToolCallRequest(
+        tool_call={"id": "call-non-material", "name": tool_name, "args": args},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(
+            context={
+                "session_id": "session-non-material",
+                "run_id": run.run_id,
+                "query_id": "query-non-material",
+            },
+            stream_writer=None,
+        ),
+    )
+    result = ToolMessage(
+        content=content,
+        tool_call_id="call-non-material",
+        name=tool_name,
+    )
+
+    VerificationActivationMiddleware._record(request, result)
+
+    persisted = session_manager.get_run_state("session-non-material", run.run_id)
+    assert persisted is not None
+    activation = persisted["verification_activations"][0]
+    assert activation["pack"] == expected_pack
+    assert all(item.get("material") is False for item in activation["evidence_refs"])
+    effective = RunRubricCompiler.expand_for_activations(
+        contract=None,
+        profile=TaskProfileClassifier.classify(message="继续处理"),
+        message="继续处理",
+        activations=[VerificationActivation.model_validate(activation)],
+    )
+    assert effective is not None
+    assert expected_pack in effective.verification_packs
 
 
 def test_effective_contract_is_order_independent_and_idempotent():
@@ -761,7 +921,7 @@ def test_required_grader_gap_forces_needs_revision():
     assert report.status == VerificationStatus.NEEDS_REVISION
 
 
-def test_passing_effective_criteria_override_stale_needs_revision_status():
+def test_nonterminal_needs_revision_cannot_be_terminalized_as_satisfied():
     contract = RunRubricCompiler.compile(
         RubricBuildContext(user_message="搜索最新 AI 新闻并附来源")
     )
@@ -815,8 +975,8 @@ def test_passing_effective_criteria_override_stale_needs_revision_status():
     )
 
     assert all(item.passed for item in report.evaluations)
-    assert report.status == VerificationStatus.SATISFIED
-    assert report.gaps == []
+    assert report.status == VerificationStatus.INCOMPLETE
+    assert any("未形成合法终态" in gap for gap in report.gaps)
 
 
 def _web_report(final_content: str, *, cited_source_id: str | None = None):

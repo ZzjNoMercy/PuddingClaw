@@ -2223,6 +2223,7 @@ class SessionManager:
         session_target: str | None = None,
         required_bindings: dict[str, Any] | None = None,
         required_capabilities: list[str] | None = None,
+        current_run_id: str | None = None,
     ) -> bool:
         """Consume a matching once/session grant for one managed Tool action."""
 
@@ -2245,6 +2246,11 @@ class SessionManager:
                 set(grant.get("capabilities") or [])
             ):
                 continue
+            if grant.get("scope") == "once" and current_run_id:
+                metadata = grant.get("metadata")
+                grant_run_id = str(metadata.get("run_id") or "") if isinstance(metadata, dict) else ""
+                if grant_run_id != current_run_id:
+                    continue
             exact_match = grant.get("target_kind") == "fingerprint" and grant.get("target") == fingerprint
             reusable_session_match = (
                 grant.get("scope") == "session"

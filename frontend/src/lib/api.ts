@@ -108,7 +108,7 @@ export interface VerificationActivation {
 export interface CriterionEvaluation {
   criterion_id: string;
   name: string;
-  passed: boolean;
+  passed: boolean | null;
   verifier: string;
   evidence: Array<Record<string, unknown>>;
   gap?: string | null;
