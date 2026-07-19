@@ -62,13 +62,13 @@ class TestContextEngineeringConfig:
         assert cm["keep_recent"] == 8
         assert cm["compact_budget_tokens"] == 120000
 
-    def test_deepagents_summarization_is_independent_at_200k(self):
+    def test_deepagents_summarization_is_independent_at_160k(self):
         from config import _DEFAULT_CONFIG
 
         agent_summary = _DEFAULT_CONFIG["compression"]["deepagents"]["summarization"]
         chat_middleware = _DEFAULT_CONFIG["compression"]["middleware"]
 
-        assert agent_summary["trigger_tokens"] == 200000
+        assert agent_summary["trigger_tokens"] == 160000
         assert "summary_input_tokens" not in agent_summary
         assert agent_summary["keep_messages"] == 20
         # Legacy Chat keeps its existing two-stage policy.
@@ -1047,5 +1047,5 @@ class TestTokensAPI:
                     result = await get_session_token_count(sid)
 
         assert result["total_tokens"] == 6800
-        assert result["compaction_trigger"] == 200000
-        assert result["percentage"] == 3.4
+        assert result["compaction_trigger"] == 160000
+        assert result["percentage"] == 4.2

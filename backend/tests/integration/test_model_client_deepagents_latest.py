@@ -124,7 +124,8 @@ def test_latest_deepagents_middleware_tool_loop_works_through_model_client():
     assert any(getattr(message, "content", None) == "TOOL_MARKER:middleware" for message in messages)
     assert fake._calls == 2
     assert any("pudding_probe" in names for names in fake._bound_tool_names)
-    assert any("write_todos" in names for names in fake._bound_tool_names)
+    assert any("update_todos" in names for names in fake._bound_tool_names)
+    assert all("write_todos" not in names for names in fake._bound_tool_names)
 
 
 def test_latest_deepagents_general_purpose_subagent_inherits_model_client():
@@ -160,7 +161,7 @@ def test_latest_deepagents_general_purpose_subagent_inherits_model_client():
     assert any(getattr(message, "content", None) == "SUBAGENT_RESULT" for message in messages)
     assert fake._calls == 3
     assert any("task" in names for names in fake._bound_tool_names)
-    assert any("task" not in names and "write_todos" in names for names in fake._bound_tool_names)
+    assert any("task" not in names and "update_todos" in names for names in fake._bound_tool_names)
 
 
 def test_latest_deepagents_hitl_interrupt_resume_preserves_tool_call_flow():

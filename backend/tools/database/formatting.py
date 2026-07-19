@@ -99,7 +99,7 @@ def format_result(result: DatabaseQueryResult) -> str:
         ]
         lines.append(f"- 语义资产：已注入 {len(matched_assets)} 个，{', '.join(asset_names)}")
     else:
-        lines.append("- 语义资产：本轮未命中，SQL 未获得度量值/维度正文约束")
+        lines.append("- 语义资产：本轮未命中，已依据模型上下文与允许字段进行泛化")
     if result.stage_timings:
         total_seconds = (result.stage_timings.get("total_ms") or 0) / 1000
         sql_seconds = (result.stage_timings.get("sql_execution_ms") or 0) / 1000

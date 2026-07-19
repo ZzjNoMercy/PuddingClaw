@@ -57,6 +57,39 @@ def test_analytics_model_id_round_trips_in_session_metadata(tmp_path):
     assert session_manager.get_metadata("analytics-model-session")["analytics_model_id"] is None
 
 
+def test_todo_ledgers_continue_same_goal_revision_without_cross_contamination(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("todo-scope")
+    todos = [
+        {
+            "id": "todo-1",
+            "content": "更新图表",
+            "status": "in_progress",
+            "goal_id": "goal-1",
+            "goal_revision": 1,
+            "created_run_id": "run-1",
+        }
+    ]
+    session_manager.update_todos(
+        "todo-scope",
+        todos,
+        goal_id="goal-1",
+        goal_revision=1,
+        run_id="run-1",
+    )
+
+    assert session_manager.get_todos(
+        "todo-scope", goal_id="goal-1", goal_revision=1, run_id="run-2"
+    ) == todos
+    assert session_manager.get_todos(
+        "todo-scope", goal_id="goal-1", goal_revision=2, run_id="run-3"
+    ) == []
+    assert session_manager.get_todos(
+        "todo-scope", goal_id="goal-2", goal_revision=1, run_id="run-4"
+    ) == []
+    assert session_manager.get_todos("todo-scope", run_id="standalone-run") == []
+
+
 def test_save_and_load_reasoning_content_for_tool_call_turn(tmp_path):
     session_manager.initialize(tmp_path)
     session_manager.create_session("reasoning-session")
@@ -320,3 +353,42 @@ def test_conversation_history_does_not_read_trace_sidecar(tmp_path, monkeypatch)
     assert session_manager.get_raw_messages("fast-history-session")["messages"] == [
         {"role": "user", "content": "只读取消息"}
     ]
+
+
+def test_assistant_output_attachments_survive_draft_upserts_and_history_reload(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("attachment-output-session")
+    output = {
+        "id": "att_generated123",
+        "name": "修改版.html",
+        "type": "file",
+        "mime_type": "text/html",
+        "size": 321,
+        "source": "generated",
+        "sha256": "sha256:abc",
+        "derived_from": "att_source123",
+        "created_by_run_id": "run-1",
+        "created_by_query_id": "query-1",
+        "download_url": "/api/attachments/att_generated123/download?session_id=attachment-output-session",
+    }
+
+    session_manager.upsert_assistant_message(
+        "attachment-output-session",
+        query_id="query-1",
+        content="已生成",
+        output_attachments=[output],
+        status="running",
+    )
+    session_manager.upsert_assistant_message(
+        "attachment-output-session",
+        query_id="query-1",
+        content="已生成并验证",
+        output_attachments=[output],
+        status="completed",
+    )
+
+    history = session_manager.load_session("attachment-output-session")
+    assert len(history) == 1
+    assert history[0]["status"] == "completed"
+    restored = history[0]["output_attachments"][0]
+    assert {key: restored[key] for key in output} == output

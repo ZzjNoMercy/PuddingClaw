@@ -121,6 +121,8 @@ def _persist_satisfied_evidence(
             tool_name=tool_name,
             args=args,
             result=result,
+            session_id=run.session_id,
+            workspace_path=str(workspace),
         ):
             sessions.append_run_verification_activation(
                 run.session_id,
@@ -245,6 +247,29 @@ def test_verification_can_be_disabled_without_false_grader_error(tmp_path):
     assert report.status == VerificationStatus.NOT_REQUIRED
 
 
+def test_goal_without_verification_keeps_decision_and_run_acceptance_consistent(tmp_path):
+    sessions = _sessions(tmp_path)
+    coordinator = HarnessRunCoordinator(sessions)
+    run, goal = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-goal-no-verification",
+        objective="完成一个无需 rubric 的目标",
+        goal_mode=True,
+        verification_enabled=False,
+    )
+    assert goal is not None
+    coordinator.transition(run, RunStatus.RUNNING)
+
+    run, goal, report = coordinator.complete_from_final_state(run, goal, {})
+
+    assert report.status == VerificationStatus.NOT_REQUIRED
+    assert report.accepted_for_goal_revision is True
+    assert goal is not None and goal.status == GoalStatus.ACHIEVED
+    assert goal.latest_goal_decision is not None
+    assert goal.latest_goal_decision.accepted is True
+    assert goal.latest_goal_decision.accepted_run_id == run.run_id
+
+
 def test_deterministic_revision_state_is_not_reported_as_grader_error(tmp_path):
     sessions = _sessions(tmp_path)
     coordinator = HarnessRunCoordinator(sessions)
@@ -324,7 +349,7 @@ def test_default_request_creates_one_run_without_goal(tmp_path):
     )
 
     assert completed_goal is None
-    assert report.status == VerificationStatus.SATISFIED
+    assert report.status == VerificationStatus.SATISFIED, report.model_dump(mode="json")
     assert completed.status == RunStatus.COMPLETED
     assert completed.outcome == RunOutcome.COMPLETED
     harness = sessions.get_harness_state("session-1")
@@ -350,6 +375,7 @@ def test_non_goal_verification_failure_does_not_create_followup_run(tmp_path):
     )
 
     assert completed.outcome == RunOutcome.VERIFICATION_FAILED
+    assert report.status == VerificationStatus.MAX_ITERATIONS_REACHED
     assert report.gaps
     harness = sessions.get_harness_state("session-1")
     assert len(harness["runs"]) == 1
@@ -373,6 +399,7 @@ def test_deterministic_todo_gate_overrides_satisfied_grader(tmp_path):
 
     assert completed.outcome == RunOutcome.VERIFICATION_FAILED
     assert report.status == VerificationStatus.NEEDS_REVISION
+    assert report.explanation.startswith("确定性检查失败：")
     todo_evaluation = next(item for item in report.evaluations if item.criterion_id == "todo_reconciliation")
     assert todo_evaluation.passed is False
     assert "补齐数据来源" in str(todo_evaluation.gap)
@@ -388,15 +415,222 @@ def test_missing_artifact_overrides_satisfied_grader(tmp_path):
         goal_mode=False,
     )
     coordinator.transition(run, RunStatus.RUNNING)
+    result = ToolMessage(
+        content="Updated file /workspace/missing.md",
+        tool_call_id="call-missing",
+        name="write_file",
+        status="success",
+    )
+    activation = next(
+        item
+        for item in build_verification_activations(
+            run_id=run.run_id,
+            query_id=run.query_id,
+            tool_call_id="call-missing",
+            tool_name="write_file",
+            args={"file_path": "/workspace/missing.md", "content": "missing"},
+            result=result,
+            workspace_path=str(tmp_path),
+        )
+        if item.pack == "artifact"
+    )
+    sessions.append_run_verification_activation(
+        run.session_id,
+        run.run_id,
+        activation.model_dump(mode="json"),
+    )
     state = _satisfied_final_state(tmp_path)
     state["_harness_context"]["final_content"] = "已生成：`/workspace/missing.md`"
 
     completed, _, report = coordinator.complete_from_final_state(run, goal, state)
 
     assert completed.outcome == RunOutcome.VERIFICATION_FAILED
+    assert report.status == VerificationStatus.NEEDS_REVISION
     artifact_evaluation = next(item for item in report.evaluations if item.criterion_id == "artifact_delivery")
     assert artifact_evaluation.passed is False
     assert "missing.md" in str(artifact_evaluation.gap)
+
+
+def test_workspace_copy_cannot_replace_declared_external_target(tmp_path):
+    sessions = _sessions(tmp_path)
+    coordinator = HarnessRunCoordinator(sessions)
+    external = tmp_path / "outside" / "报告 模板 v2.html"
+    run, goal = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-external-target",
+        objective=f"{external} 刷新这个报告到 2026 年",
+        goal_mode=False,
+    )
+    coordinator.transition(run, RunStatus.RUNNING)
+    workspace_copy = tmp_path / "报告 模板 v2.html"
+    workspace_copy.write_text("<html>2026</html>", encoding="utf-8")
+    result = ToolMessage(
+        content="Updated file /workspace/报告 模板 v2.html",
+        tool_call_id="call-workspace-copy",
+        name="write_file",
+        status="success",
+    )
+    activation = next(
+        item
+        for item in build_verification_activations(
+            run_id=run.run_id,
+            query_id=run.query_id,
+            tool_call_id="call-workspace-copy",
+            tool_name="write_file",
+            args={"file_path": "/workspace/报告 模板 v2.html", "content": "2026"},
+            result=result,
+            workspace_path=str(tmp_path),
+        )
+        if item.pack == "artifact"
+    )
+    sessions.append_run_verification_activation(
+        run.session_id,
+        run.run_id,
+        activation.model_dump(mode="json"),
+    )
+    state = _satisfied_final_state(tmp_path)
+    completed, _, report = coordinator.complete_from_final_state(run, goal, state)
+
+    artifact_evaluation = next(
+        item for item in report.evaluations if item.criterion_id == "artifact_delivery"
+    )
+    assert completed.outcome == RunOutcome.VERIFICATION_FAILED
+    assert artifact_evaluation.passed is False
+    assert "workspace 副本不能替代" in str(artifact_evaluation.gap)
+    assert str(external) in str(artifact_evaluation.gap)
+
+
+def test_goal_inherits_authorized_external_artifact_across_runs(tmp_path):
+    from graph.session_manager import session_manager
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("session-external-goal", metadata={"runtime_mode": "agent"})
+    coordinator = HarnessRunCoordinator(session_manager)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    external = tmp_path / "outside" / "报告 模板 v2.md"
+    external.parent.mkdir()
+    external.write_text("# 2026\n", encoding="utf-8")
+    session_manager.add_permission_grant(
+        "session-external-goal",
+        grant_type="external_file_write",
+        target_kind="exact_file",
+        target=str(external.resolve()),
+        capabilities=["write", "external_path"],
+    )
+
+    first, goal = coordinator.start_run(
+        session_id="session-external-goal",
+        query_id="query-1",
+        objective=f"更新外部报告 {external}",
+        goal_mode=True,
+    )
+    assert goal is not None
+    coordinator.transition(first, RunStatus.RUNNING)
+    result = ToolMessage(
+        content=f"Updated file {external}",
+        tool_call_id="call-write",
+        name="edit_file",
+        status="success",
+    )
+    activation = next(
+        item
+        for item in build_verification_activations(
+            run_id=first.run_id,
+            query_id=first.query_id,
+            tool_call_id="call-write",
+            tool_name="edit_file",
+            args={"file_path": str(external), "old_string": "2025", "new_string": "2026"},
+            result=result,
+            session_id=first.session_id,
+            workspace_path=str(workspace),
+        )
+        if item.pack == "artifact"
+    )
+    artifact_receipt = next(
+        item for item in activation.evidence_refs if item.get("kind") == "artifact_write"
+    )
+    assert artifact_receipt["role"] == "target"
+    assert artifact_receipt["goal_id"] == goal.goal_id
+    assert artifact_receipt["goal_revision"] == 1
+    assert artifact_receipt["content_sha256"].startswith("sha256:")
+    session_manager.append_run_verification_activation(
+        first.session_id,
+        first.run_id,
+        activation.model_dump(mode="json"),
+    )
+    failed_state = {
+        "_rubric_status": "max_iterations_reached",
+        "_rubric_evaluations": [{
+            "result": "max_iterations_reached",
+            "criteria": [
+                {"name": "task_fulfillment", "passed": False, "gap": "仍需补充总结。"},
+                {"name": "todo_reconciliation", "passed": True},
+                {"name": "artifact_delivery", "passed": True},
+                {"name": "code_validation", "passed": True},
+                {"name": "report_integrity", "passed": True},
+            ],
+        }],
+        "_harness_context": {"workspace_path": str(workspace), "todos": []},
+    }
+    first, goal, first_report = coordinator.complete_from_final_state(first, goal, failed_state)
+    assert first_report.status == VerificationStatus.MAX_ITERATIONS_REACHED
+    assert goal is not None and goal.evidence_refs
+
+    second, goal = coordinator.start_run(
+        session_id="session-external-goal",
+        query_id="query-2",
+        objective="继续完成",
+        goal_mode=True,
+        goal_id=goal.goal_id,
+    )
+    coordinator.transition(second, RunStatus.RUNNING)
+    validation_result = ToolMessage(
+        content="1 passed\n[Command succeeded with exit code 0]",
+        tool_call_id="call-test",
+        name="execute",
+        status="success",
+    )
+    validation = next(
+        item
+        for item in build_verification_activations(
+            run_id=second.run_id,
+            query_id=second.query_id,
+            tool_call_id="call-test",
+            tool_name="execute",
+            args={"command": "pytest -q"},
+            result=validation_result,
+        )
+        if item.pack == "code"
+    )
+    session_manager.append_run_verification_activation(
+        second.session_id,
+        second.run_id,
+        validation.model_dump(mode="json"),
+    )
+    satisfied_state = {
+        "_rubric_status": "satisfied",
+        "_rubric_evaluations": [{
+            "result": "satisfied",
+            "criteria": [
+                {"name": "task_fulfillment", "passed": True},
+                {"name": "todo_reconciliation", "passed": True},
+                {"name": "artifact_delivery", "passed": True},
+                {"name": "code_validation", "passed": True},
+                {"name": "report_integrity", "passed": True},
+            ],
+        }],
+        "_harness_context": {"workspace_path": str(workspace), "todos": []},
+    }
+    second, goal, report = coordinator.complete_from_final_state(second, goal, satisfied_state)
+
+    artifact = next(item for item in report.evaluations if item.criterion_id == "artifact_delivery")
+    assert artifact.passed is True
+    assert artifact.evidence[0]["current_run_count"] == 0
+    assert artifact.evidence[0]["inherited_count"] == 1
+    assert report.status == VerificationStatus.SATISFIED, report.model_dump(mode="json")
+    assert second.outcome == RunOutcome.COMPLETED
+    assert goal is not None and goal.status == GoalStatus.ACHIEVED
 
 
 def test_run_model_call_limit_does_not_exhaust_goal_budget_early(tmp_path):
@@ -454,6 +688,10 @@ def test_incomplete_verification_does_not_consume_goal_business_round(tmp_path):
     assert goal.status == GoalStatus.ACTIVE
     assert goal.round == 0
     assert goal.gaps == []
+    assert any(
+        "未完成评审" in notice or "未形成合法终态" in notice
+        for notice in goal.control_notices
+    )
     retry, retried_goal = coordinator.start_run(
         session_id="session-1",
         query_id="query-retry",
@@ -490,6 +728,48 @@ def test_grader_error_does_not_consume_goal_business_round(tmp_path):
     assert goal.status == GoalStatus.ACTIVE
     assert goal.round == 0
     assert goal.gaps == []
+    assert any("模型验收器执行异常" in notice for notice in goal.control_notices)
+
+
+def test_varying_control_failure_fingerprints_still_hit_total_retry_budget(tmp_path):
+    sessions = _sessions(tmp_path)
+    coordinator = HarnessRunCoordinator(sessions)
+    goal = None
+
+    statuses = [
+        "grader_error",
+        "infrastructure_error",
+        "grader_error",
+        "infrastructure_error",
+    ]
+    for attempt, status in enumerate(statuses):
+        run, goal = coordinator.start_run(
+            session_id="session-1",
+            query_id=f"query-{attempt}",
+            objective="持续生成销量报告",
+            goal_mode=True,
+            goal_id=goal.goal_id if goal is not None else None,
+            goal_max_rounds=1,
+        )
+        assert goal is not None
+        coordinator.transition(run, RunStatus.RUNNING)
+        _, goal, report = coordinator.complete_from_final_state(
+            run,
+            goal,
+            {
+                "_rubric_status": status,
+                "_rubric_error": f"request-{attempt}-unavailable",
+            },
+        )
+        assert report.status in {
+            VerificationStatus.GRADER_ERROR,
+            VerificationStatus.INFRASTRUCTURE_ERROR,
+        }
+
+    assert goal is not None
+    assert goal.total_control_retry_count == 4
+    assert goal.status == GoalStatus.BLOCKED
+    assert goal.round == 0
 
 
 def test_explicit_goal_can_advance_across_runs(tmp_path):
@@ -540,7 +820,77 @@ def test_explicit_goal_can_advance_across_runs(tmp_path):
     assert achieved_goal is not None
     assert achieved_goal.status == GoalStatus.ACHIEVED
     assert achieved_goal.run_ids == [first_run.run_id, second_run.run_id]
+    assert achieved_goal.latest_goal_decision is not None
+    assert achieved_goal.latest_goal_decision.accepted is True
+    assert achieved_goal.latest_goal_decision.criterion_provenance
+    assert second_run.run_id in achieved_goal.latest_goal_decision.supporting_run_ids
     assert sessions.get_active_goal_state("session-1") is None
+
+
+def test_editing_running_goal_supersedes_old_run_and_next_run_uses_revision(tmp_path):
+    sessions = _sessions(tmp_path)
+    coordinator = HarnessRunCoordinator(sessions)
+    first_run, goal = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-old-revision",
+        objective="生成 2025 年报告",
+        goal_mode=True,
+    )
+    assert goal is not None
+    assert first_run.goal_revision == 1
+    coordinator.transition(first_run, RunStatus.RUNNING)
+    goal.evidence_refs = [{
+        "kind": "artifact_write",
+        "artifact_id": "artifact-old-revision",
+        "goal_id": goal.goal_id,
+        "goal_revision": 1,
+        "path": "/workspace/old-report.md",
+    }]
+    sessions.upsert_goal_state("session-1", goal.model_dump(mode="json"))
+
+    revised = coordinator.goals.update_objective(
+        "session-1",
+        goal.goal_id,
+        objective="生成 2026 年报告，并更新趋势总结",
+        expected_revision=1,
+    )
+    assert revised.objective_revision == 2
+    assert revised.pending_revision is True
+    assert revised.current_run_id == first_run.run_id
+    assert revised.evidence_refs == []
+
+    _persist_satisfied_evidence(sessions, first_run, tmp_path)
+    first_run, still_active, report = coordinator.complete_from_final_state(
+        first_run,
+        goal,
+        _satisfied_final_state(tmp_path),
+    )
+
+    assert report.status == VerificationStatus.SATISFIED
+    assert report.accepted_for_goal_revision is False
+    persisted_old_run = sessions.get_run_state("session-1", first_run.run_id)
+    assert persisted_old_run["verification_report"]["accepted_for_goal_revision"] is False
+    assert first_run.outcome == RunOutcome.COMPLETED
+    assert still_active is not None
+    assert still_active.status == GoalStatus.ACTIVE
+    assert still_active.objective_revision == 2
+    assert still_active.pending_revision is True
+    assert still_active.latest_verification_report_id is None
+    assert still_active.current_run_id is None
+
+    next_run, next_goal = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-new-revision",
+        objective="继续",
+        goal_mode=True,
+        goal_id=goal.goal_id,
+    )
+    assert next_goal is not None
+    assert next_goal.pending_revision is False
+    assert next_run.goal_revision == 2
+    assert next_run.objective == "生成 2026 年报告，并更新趋势总结"
+    assert next_run.verification_contract is not None
+    assert next_run.verification_contract.contract_id == next_goal.goal_contract.contract_id
 
 
 def test_goal_followup_inherits_frozen_contract(tmp_path):
@@ -856,7 +1206,7 @@ def test_execution_snapshot_is_single_assignment_and_config_is_immutable(tmp_pat
     assert saved["config_snapshot"] == run.config_snapshot
 
 
-def test_goal_cannot_pause_or_cancel_while_run_is_attached(tmp_path):
+def test_goal_pause_or_cancel_request_stops_attached_run_then_wins(tmp_path):
     sessions = _sessions(tmp_path)
     coordinator = HarnessRunCoordinator(sessions)
     _, goal = coordinator.start_run(
@@ -867,10 +1217,81 @@ def test_goal_cannot_pause_or_cancel_while_run_is_attached(tmp_path):
     )
     assert goal is not None
 
-    with pytest.raises(HarnessStateError, match="stop the Run before pausing"):
-        coordinator.goals.pause("session-1", goal.goal_id)
-    with pytest.raises(HarnessStateError, match="stop the Run before cancelling"):
-        coordinator.goals.cancel("session-1", goal.goal_id)
+    paused = coordinator.goals.pause("session-1", goal.goal_id)
+    assert paused.status == GoalStatus.ACTIVE
+    assert paused.requested_status == GoalStatus.PAUSED
+    assert paused.current_run_id is not None
+    with pytest.raises(HarnessStateError, match="等待暂停生效"):
+        coordinator.goals.resume("session-1", goal.goal_id)
+
+    cancelled = coordinator.goals.cancel("session-1", goal.goal_id)
+    assert cancelled.status == GoalStatus.ACTIVE
+    assert cancelled.requested_status == GoalStatus.CANCELLED
+
+    released = coordinator.goals.release_run(cancelled, gap="当前 Run 已停止。")
+    assert released.status == GoalStatus.CANCELLED
+    assert released.requested_status is None
+    assert released.current_run_id is None
+
+
+def test_goal_finalize_atomically_consumes_concurrent_pause_request(tmp_path):
+    sessions = _sessions(tmp_path)
+    coordinator = HarnessRunCoordinator(sessions)
+    run, goal = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-race",
+        objective="并发控制目标",
+        goal_mode=True,
+    )
+    assert goal is not None
+    stale_completion = goal.model_copy(deep=True)
+    stale_completion.current_run_id = None
+    stale_completion.transition(GoalStatus.ACHIEVED)
+
+    sessions.request_goal_control("session-1", goal.goal_id, "paused")
+    saved = sessions.finalize_goal_run_state(
+        "session-1",
+        stale_completion.model_dump(mode="json"),
+        run_id=run.run_id,
+    )
+
+    assert saved["status"] == "paused"
+    assert saved["requested_status"] is None
+    assert saved["current_run_id"] is None
+
+
+def test_superseded_run_finalize_consumes_concurrent_cancel_request(tmp_path):
+    sessions = _sessions(tmp_path)
+    coordinator = HarnessRunCoordinator(sessions)
+    run, goal = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-old-revision",
+        objective="旧目标",
+        goal_mode=True,
+    )
+    assert goal is not None
+    stale_old_revision = goal.model_copy(deep=True)
+    stale_old_revision.current_run_id = None
+    sessions.update_goal_objective(
+        "session-1",
+        goal.goal_id,
+        objective="新目标",
+        expected_revision=1,
+        contract=None,
+    )
+    sessions.request_goal_control("session-1", goal.goal_id, "cancelled")
+
+    saved = sessions.finalize_goal_run_state(
+        "session-1",
+        stale_old_revision.model_dump(mode="json"),
+        run_id=run.run_id,
+    )
+
+    assert saved["objective"] == "新目标"
+    assert saved["objective_revision"] == 2
+    assert saved["status"] == "cancelled"
+    assert saved["requested_status"] is None
+    assert saved["current_run_id"] is None
 
 
 def test_goal_max_rounds_is_enforced_before_persistence(tmp_path):

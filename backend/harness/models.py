@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import time
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -59,7 +59,28 @@ class VerificationStatus(StrEnum):
     MAX_ITERATIONS_REACHED = "max_iterations_reached"
     INCOMPLETE = "verification_incomplete"
     GRADER_ERROR = "grader_error"
+    INFRASTRUCTURE_ERROR = "infrastructure_error"
     BUDGET_EXCEEDED = "budget_exceeded"
+
+
+class VerificationFailureKind(StrEnum):
+    TASK_GAP = "task_gap"
+    INFRASTRUCTURE_ERROR = "infrastructure_error"
+
+
+class ArtifactScope(StrEnum):
+    WORKSPACE = "workspace"
+    EXTERNAL = "external"
+    SCRATCH = "scratch"
+    ATTACHMENT = "attachment"
+
+
+class ArtifactRole(StrEnum):
+    """How one write relates to the current Run objective."""
+
+    TARGET = "target"
+    CANDIDATE = "candidate"
+    TEMPORARY = "temporary"
 
 
 class CriterionSource(StrEnum):
@@ -206,6 +227,39 @@ class VerificationActivation(BaseModel):
     created_at: float = Field(default_factory=time.time)
 
 
+class ArtifactReference(BaseModel):
+    """Canonical identity for one Tool-produced artifact.
+
+    ``path`` is the user-visible canonical path. Workspace artifacts also carry
+    their stable ``/workspace`` virtual path; explicitly approved external
+    artifacts keep their real host path and grant identity instead of being
+    rewritten into a fake workspace path.
+    """
+
+    receipt_version: int = 2
+    artifact_id: str
+    scope: ArtifactScope
+    role: ArtifactRole = ArtifactRole.CANDIDATE
+    path: str
+    host_path: str | None = None
+    virtual_path: str | None = None
+    workspace_relative_path: str | None = None
+    authorized: bool = True
+    permission_grant_id: str | None = None
+    run_id: str | None = None
+    query_id: str | None = None
+    goal_id: str | None = None
+    goal_revision: int | None = None
+    backend_id: str | None = None
+    workspace_id: str | None = None
+    tool_call_id: str
+    output_digest: str | None = None
+    content_sha256: str | None = None
+    size_bytes: int | None = None
+    mtime_ns: int | None = None
+    written_at: float = Field(default_factory=time.time)
+
+
 class CriterionEvaluation(BaseModel):
     criterion_id: str
     name: str
@@ -215,6 +269,7 @@ class CriterionEvaluation(BaseModel):
     verifier: VerifierKind = VerifierKind.LLM_GRADER
     evidence: list[dict[str, Any]] = Field(default_factory=list)
     gap: str | None = None
+    failure_kind: VerificationFailureKind | None = None
 
 
 class RunVerificationContract(BaseModel):
@@ -243,6 +298,10 @@ class RubricEvaluationReport(BaseModel):
     gaps: list[str] = Field(default_factory=list)
     explanation: str = ""
     iteration_count: int = 0
+    verification_scope: Literal["run", "goal_aggregate"] = "run"
+    supporting_run_ids: list[str] = Field(default_factory=list)
+    goal_revision: int | None = None
+    accepted_for_goal_revision: bool | None = None
     created_at: float = Field(default_factory=time.time)
 
 
@@ -251,7 +310,9 @@ class RunRecord(BaseModel):
     query_id: str
     session_id: str
     objective: str
+    declared_artifact_targets: list[str] = Field(default_factory=list)
     goal_id: str | None = None
+    goal_revision: int | None = None
     project_id: str | None = None
     analytics_model_id: str | None = None
     verification_enabled: bool = True
@@ -307,21 +368,56 @@ class RunRecord(BaseModel):
         self.error = error
 
 
+class GoalRevision(BaseModel):
+    revision: int
+    objective: str
+    contract_id: str | None = None
+    created_at: float = Field(default_factory=time.time)
+
+
+class GoalVerificationDecision(BaseModel):
+    """Cross-Run acceptance decision for one immutable Goal revision."""
+
+    decision_id: str
+    goal_id: str
+    objective_revision: int
+    status: VerificationStatus
+    accepted: bool = False
+    supporting_run_ids: list[str] = Field(default_factory=list)
+    criterion_provenance: list[dict[str, Any]] = Field(default_factory=list)
+    evidence_ref_count: int = 0
+    gaps: list[str] = Field(default_factory=list)
+    accepted_run_id: str | None = None
+    report_id: str | None = None
+    created_at: float = Field(default_factory=time.time)
+
+
 class GoalRecord(BaseModel):
     goal_id: str
     session_id: str
     objective: str
+    objective_revision: int = 1
+    revisions: list[GoalRevision] = Field(default_factory=list)
+    pending_revision: bool = False
     status: GoalStatus = GoalStatus.ACTIVE
+    requested_status: GoalStatus | None = None
     current_run_id: str | None = None
     run_ids: list[str] = Field(default_factory=list)
     goal_contract: RunVerificationContract | None = None
     gaps: list[str] = Field(default_factory=list)
+    control_notices: list[str] = Field(default_factory=list)
     evidence_refs: list[dict[str, Any]] = Field(default_factory=list)
     latest_verification_report_id: str | None = None
+    latest_goal_decision: GoalVerificationDecision | None = None
     max_rounds: int = 8
     round: int = 0
     model_call_count: int = 0
     budget_exhaustion_reason: str | None = None
+    consecutive_control_failure_count: int = 0
+    total_control_retry_count: int = 0
+    last_control_failure_fingerprint: str | None = None
+    max_control_retries: int = 2
+    max_total_control_retries: int = 4
     created_at: float = Field(default_factory=time.time)
     updated_at: float = Field(default_factory=time.time)
     completed_at: float | None = None

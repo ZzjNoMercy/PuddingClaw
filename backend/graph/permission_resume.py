@@ -97,6 +97,7 @@ class PermissionResumeRegistry:
         run_id: str = "",
         grant_bindings: dict[str, Any] | None = None,
         required_capabilities: list[str] | None = None,
+        change_preview: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         fingerprint = self.tool_action_fingerprint(
             tool_name=tool_name,
@@ -135,6 +136,8 @@ class PermissionResumeRegistry:
             request["session_scope_label"] = session_scope_label
         if grant_bindings:
             request["grant_bindings"] = dict(grant_bindings)
+        if change_preview:
+            request["change_preview"] = dict(change_preview)
         self._requests[request_id] = request
         self._pending[request_id] = asyncio.get_running_loop().create_future()
         return dict(request)

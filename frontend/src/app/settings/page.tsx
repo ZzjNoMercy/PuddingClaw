@@ -399,7 +399,7 @@ export default function SettingsPage() {
         // Compression
         setCompRatio(s.compression.ratio);
         setContextSummaryTriggerTokens(
-          String(s.compression.deepagents?.summarization?.trigger_tokens ?? 200000)
+          String(s.compression.deepagents?.summarization?.trigger_tokens ?? 160000)
         );
         setToolContextEnabled(s.compression.deepagents?.tool_context?.enabled ?? true);
         setImmediateToolCompactionEnabled(
@@ -2207,7 +2207,7 @@ export default function SettingsPage() {
                             compression: {
                               deepagents: {
                                 summarization: {
-                                  trigger_tokens: positiveIntOrNull(contextSummaryTriggerTokens) ?? 200000,
+                                  trigger_tokens: positiveIntOrNull(contextSummaryTriggerTokens) ?? 160000,
                                 },
                                 tool_context: {
                                   enabled: toolContextEnabled,

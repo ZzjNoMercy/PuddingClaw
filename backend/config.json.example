@@ -75,7 +75,7 @@
     "deepagents": {
       "summarization": {
         "enabled": true,
-        "trigger_tokens": 200000,
+        "trigger_tokens": 160000,
         "keep_messages": 20
       },
       "tool_context": {

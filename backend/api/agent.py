@@ -43,6 +43,7 @@ async def agent(request: AgentRequest):
                     request.message,
                     request.attachments,
                 ),
+                attachments=request.attachments,
             )
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="Session not found") from exc

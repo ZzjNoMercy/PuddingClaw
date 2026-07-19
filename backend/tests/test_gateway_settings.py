@@ -30,6 +30,13 @@ def _stored_image_attachment(tmp_path, session_id: str = "session-attachments"):
     )
 
 
+def test_attachment_lookup_is_strictly_session_scoped(tmp_path):
+    attachment = _stored_image_attachment(tmp_path, session_id="session-owner")
+
+    assert attachment_store.get("session-owner", attachment["id"]) is not None
+    assert attachment_store.get("session-other", attachment["id"]) is None
+
+
 def test_harness_settings_freeze_explicit_goal_and_validate_rules(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     config_path.write_text("{}", encoding="utf-8")
@@ -838,7 +845,7 @@ def test_agent_collects_image_inputs_for_native_task_subagent(tmp_path):
 
 
 def test_image_analyzer_materializes_only_tool_read_image_refs(tmp_path):
-    attachment = _stored_image_attachment(tmp_path, session_id="default")
+    attachment = _stored_image_attachment(tmp_path, session_id="session-real")
     middleware = AttachmentImageContentMiddleware()
 
     spoofed = SimpleNamespace(
@@ -924,7 +931,7 @@ def test_image_analyzer_ignores_task_description_refs_until_resource_is_read(tmp
 
 
 def test_image_analyzer_still_accepts_legacy_image_session_id(tmp_path):
-    attachment = _stored_image_attachment(tmp_path, session_id="default")
+    attachment = _stored_image_attachment(tmp_path, session_id="session-real")
     middleware = AttachmentImageContentMiddleware()
 
     request = SimpleNamespace(
@@ -979,6 +986,54 @@ def test_agent_user_content_routes_pasted_absolute_file_path_to_read_resource(tm
     assert "read_resource(resource=原始路径)" in content
     assert "不要调用 read_file" in content
     assert str(external_file) in content
+
+
+def test_agent_user_content_preserves_spaced_external_html_target(tmp_path):
+    from harness.artifact_paths import extract_declared_artifact_targets
+
+    workspace_path = tmp_path / "workspace"
+    workspace_path.mkdir()
+    external_file = tmp_path / "Design Reports" / "产品配置分析模型模板 v2.html"
+    external_file.parent.mkdir()
+    external_file.write_text("<html></html>", encoding="utf-8")
+
+    content = DeepAgentsAgentManager._build_user_content(
+        f"{external_file} 刷新这个报告到 2026 年",
+        session_id="session-spaced-html-path",
+        workspace_path=workspace_path,
+    )
+
+    assert isinstance(content, str)
+    assert str(external_file) in content
+    assert "原始绝对路径调用 edit_file/write_file" in content
+    assert "临时转换或验证只能写入 /scratch" in content
+    assert "禁止复制到 /workspace" in content
+    assert extract_declared_artifact_targets(
+        f"{external_file} 刷新这个报告到 2026 年"
+    ) == [str(external_file)]
+    source_file = tmp_path / "input data.csv"
+    assert extract_declared_artifact_targets(
+        f"读取 {source_file} 并更新分析报告"
+    ) == []
+
+
+def test_artifact_target_parser_handles_compact_chinese_and_negation():
+    from harness.artifact_paths import extract_declared_artifact_targets
+
+    target = "/Users/pet/报告目录/产品配置分析模型模板 v2.html"
+    assert extract_declared_artifact_targets(f"请修改{target}并刷新到2026年") == [target]
+    assert extract_declared_artifact_targets(f"不要修改 {target}，只读取并总结") == []
+    for target in (
+        "/data/jobs/report.py",
+        "/srv/queries/latest.sql",
+        "/opt/designs/chart.svg",
+        "/tmp/export.zip",
+    ):
+        assert extract_declared_artifact_targets(f"请修改{target}并交付") == [target]
+        assert extract_declared_artifact_targets(f"请勿修改 {target}，只做审查") == []
+    assert extract_declared_artifact_targets(
+        "请分析 https://example.com/reports/latest.html，不要写入本地"
+    ) == []
 
 
 def test_agent_user_content_keeps_virtual_workspace_path_as_managed_input(tmp_path):

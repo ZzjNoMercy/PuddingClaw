@@ -209,10 +209,13 @@ ResolvedModelSpec
 
 PuddingData 先使用：
 
-- 本地 JSON/YAML 保存 Provider、Endpoint、Model 和 Binding；
-- macOS Keychain/现有 Token Store 保存密钥；
+- 用户数据目录下的 `providers.json` 保存 Provider、Endpoint、Model 和 Binding；
+- 用户数据目录下独立的 `credentials.json` 保存 Key，不再把 Secret 写进仓库或 `backend/config.json`；
+- 从第一版开始通过 `CredentialStore` 接口访问 Key，第一版使用 `LocalCredentialStore`，第二版替换为系统 Keyring；
 - 进程内不可变 Registry Snapshot；
 - 配置 revision 用于 Run 和 Trace 复现。
+
+当前代码没有可直接复用的模型密钥 Token Store，模型 Key 主要仍在仓库内的 `backend/config.json` 中明文持久化。第一版的安全目标是把它移出仓库、限制文件访问和所有外泄路径；不在这一版引入跨平台 Keyring 的打包与兼容成本。
 
 当前不需要为了对齐 Yuxi 引入 Postgres + Redis。未来 PuddingAgent 只定义 Registry 接口，再提供 Local、Database 等适配器。
 
@@ -230,11 +233,166 @@ Yuxi 的 Provider CRUD、远程模型发现、Chat/Embedding Adapter 和缓存�
 
 结论是“参考服务分层，不继承其 Provider schema”。
 
+### 4.6 现有模型配置与 Key 的无缝迁移
+
+这是本次改造的发布硬约束：已有用户升级后不需要重新选择模型、重新填写 Base URL 或重新输入任何 API Key。首次启动自动迁移；迁移失败时继续使用旧配置，不能让模型调用失效。
+
+#### 迁移来源
+
+迁移器必须读取实际生效值及其来源，覆盖：
+
+| 旧来源 | 迁移内容 | 新目标 |
+| --- | --- | --- |
+| `fallback_llm` | Provider、Model、Base URL、Key、temperature、max tokens、thinking 配置 | LLM Provider/Endpoint/Model + `llm` Binding |
+| `gateway_llm` + Higress route/provider | 网关模型别名、上游 Provider、模型路由、Token | 对应直连 Provider/Endpoint/Model；保留当前主模型语义 |
+| `fallback_embedding` | Provider、Model、Base URL、Key、dimension、batch size | Text Embedding Endpoint/Model + `text_embedding` Binding |
+| `multimodal_embedding` | Provider、Model、原生 Base URL/route path、Key、dimension、并发 | Multimodal Embedding Endpoint/Model + `multimodal_embedding` Binding |
+| `rag.rerank` | Provider、Model、Base URL、Key | Rerank Provider/Endpoint/Model（若启用或已配置） |
+| `vanna.llm` / `vanna.embedding` | 非空的独立覆盖配置和 Key | 独立模型引用；`reuse` 配置继续指向默认 Binding |
+| 环境变量 | `DEEPSEEK_API_KEY`、`OPENAI_API_KEY`、`DASHSCOPE_API_KEY`、`EMBEDDING_API_KEY` 等有效覆盖 | `env://VARIABLE_NAME` Credential Reference，不复制环境变量明文 |
+| Higress `ai-proxy` 配置 | Provider、route、model alias、`apiTokens` | Provider Registry + LocalCredentialStore |
+
+迁移必须按旧代码相同的优先级解析 effective value，尤其保留多模态 Embedding 当前的 Key 顺序：显式配置 → `DASHSCOPE_API_KEY` → `EMBEDDING_API_KEY` → Higress DashScope Token。
+
+#### CredentialStore
+
+新增统一接口：
+
+```text
+CredentialStore
+  put(credential_id, secret, metadata)
+  get(credential_id)
+  exists(credential_id)
+  delete(credential_id)
+```
+
+第一版实现选择：**Python Backend 使用 `LocalCredentialStore`，把 Key 移出仓库并存入用户数据目录的独立文件。** Provider Registry 从第一版起只保存 `credential_ref`，第二版切换系统 Keyring 时不修改 Provider、前端或模型客户端结构。
+
+```text
+PuddingData userData/
+  providers.json
+  credentials.json
+  provider-migration.json
+
+providers.json:
+  credential_ref: local-file://provider/<credential_id>
+
+credentials.json:
+  credentials:
+    <credential_id>:
+      secret: <actual API key>
+      created_at: <timestamp>
+      updated_at: <timestamp>
+```
+
+第一版路径：
+
+| 平台 | 用户数据目录 |
+| --- | --- | --- |
+| macOS | `~/Library/Application Support/PuddingData/` |
+| Windows | `%APPDATA%\PuddingData\` |
+| Linux Desktop | `~/.config/PuddingData/` |
+| Docker/Headless | 显式挂载的用户数据目录，或使用环境变量/Secret Mount |
+
+Electron 将系统 `userData` 目录通过专用环境变量传给 Backend；非 Electron 开发模式使用 `platformdirs` 解析同一位置，不允许默认回退到仓库目录。
+
+第一版要求：
+
+- 环境变量不写入 CredentialStore，只保存 `env://...` 引用；
+- API、日志、Trace、异常和迁移报告永不包含完整 Secret；
+- Provider 配置只保存 `credential_ref`、`has_credential` 和可选末四位；
+- Credential ID 使用随机 ID 或稳定非敏感 ID，不包含 Key 片段；
+- macOS/Linux 用户数据目录权限为 `700`，`credentials.json` 权限为 `600`；
+- Windows 文件放在当前用户 `%APPDATA%`，继承并校验当前用户 ACL，不放入共享目录；
+- `credentials.json` 使用临时文件、flush/fsync、原子 rename 写入；
+- 普通备份、导出、诊断包和云同步清单排除 `credentials.json`；
+- 文件损坏或不可读时不能覆盖为空文件，必须保留现场并报告错误；
+- `providers.json` 和 `credentials.json` 均加入仓库级忽略与 Secret 扫描规则。
+
+第二版新增 `OSKeyringCredentialStore`：
+
+- macOS 映射到 Keychain；
+- Windows 映射到 Credential Locker/Credential Manager；
+- Linux Desktop 映射到 Secret Service/KWallet；
+- Docker/Headless 继续使用 `env://NAME` 或 `secret-file:///run/secrets/name`；
+- Backend 直接访问 OS Keyring，不经 Electron 传递明文；
+- 自动把 `local-file://` Secret 写入 Keyring、读回验证，再把引用切换为 `os-keyring://`；
+- 所有引用切换成功后才删除 `credentials.json` 中对应明文；
+- Keyring 不可用时继续使用第一版 LocalCredentialStore，不影响现有用户。
+
+不采用“密文文件旁边保存解密 Key”的自建加密方案；这不能有效改善本地同用户威胁模型。Electron `safeStorage` 也不作为当前方案，因为 Backend 消费 Secret 还需要额外建设鉴权 IPC/Credential Broker。
+
+#### Provider 合并规则
+
+不能仅凭 `provider=qwen` 把旧配置合并。迁移身份至少考虑：
+
+```text
+provider family + normalized endpoint origin + credential fingerprint
+```
+
+- 相同 Provider、相同 Key、不同用途 Endpoint 可以合并为一个 Provider；
+- LLM、文本 Embedding、多模态 Embedding 共用同一 DashScope Key 时，只写入一次 CredentialStore，多个 Endpoint 引用同一 Credential；
+- 同一厂商配置了不同 Key 时必须保留为不同 Provider 实例或不同 Credential Profile，不能擅自覆盖；
+- Secret fingerprint 只在内存中用于去重，不能持久化可用于猜测 Key 的原始 Hash；
+- 模型别名与真实模型映射不明确时保留原别名，并在迁移报告中标记 `needs_verification`，不能静默换成猜测模型。
+
+#### 事务与崩溃恢复
+
+迁移必须幂等，并使用版本化 Journal：
+
+```text
+legacy_detected → credentials_prepared → registry_committed
+                → legacy_secrets_scrubbed → completed
+```
+
+执行顺序：
+
+1. 对旧配置加迁移锁，读取原始配置并计算不含 Secret 的校验摘要；
+2. 在内存中生成 Provider Registry 草稿和迁移映射；
+3. 把旧明文 Key 写入 CredentialStore，并立即读回比对；
+4. 原子写入新 Registry（临时文件、flush/fsync、rename）；
+5. 用新 Registry 解析 LLM、文本 Embedding、多模态 Embedding，确认 resolved config 与旧 effective config 等价；
+6. 原子回写旧配置，移除已成功迁移的明文 Key 和 Higress Token；
+7. 写入 `migration_version`、完成状态和不含 Secret 的迁移摘要。
+
+任一步失败时：
+
+- 不修改旧配置中的 Key；
+- 不切换到新 Registry；
+- 继续由旧配置路径提供模型能力；
+- 下次启动从 Journal 安全重试；
+- 设置页显示“模型配置迁移待完成”，但不要求用户重新输入 Key。
+
+不得创建包含明文 Key 的普通 `.bak` 文件。需要回滚的信息保存为脱敏配置快照；Secret 已由 CredentialStore 管理。
+
+#### 迁移后的前端体验
+
+- 成功迁移不弹阻断向导，设置页直接展示原模型和“凭证已迁移”；
+- Provider、模型和三个默认 Binding 的结果必须与升级前有效配置一致；
+- Key 输入框显示“已配置”和末四位，只提供“替换”操作；
+- 环境变量来源显示“由环境变量提供”，保持只读覆盖语义；
+- `needs_verification` 项显示非阻断警告，并允许用户测试确认；
+- 只有无法解析到任何有效 Key 的旧配置才显示“凭证缺失”，不能把迁移器自身失败伪装成凭证缺失。
+
+#### 迁移测试矩阵
+
+- LLM、文本 Embedding、多模态 Embedding 分别使用三个不同 Key；
+- 三种能力共用一个 DashScope Key，验证只生成一个 Credential；
+- config.json 无 Key、完全依赖环境变量；
+- 多模态 Embedding 只依赖 Higress DashScope Token；
+- 同一 Provider 使用两个不同 Key，验证不会错误合并；
+- 自定义 Base URL/OpenAI-compatible Provider；
+- Thinking Model、Gateway Model Alias 和 Vanna reuse/override；
+- 在写 Credential、提交 Registry、清除旧 Key 三个阶段模拟崩溃并验证恢复；
+- 迁移后 API 响应、日志、Trace、Registry 和脱敏备份中均搜索不到原始 Key；
+- 迁移前后的 `ResolvedModelSpec`、模型参数、Embedding dimension/batch size 完全一致。
+
 ## 5. Higress 迁移步骤
 
 ### Phase A：冻结行为并建立 Provider Registry
 
-- 为现有 `gateway_llm`、`fallback_llm`、Embedding 和多模态 Embedding 配置建立一次性迁移器；
+- 先实现 `CredentialStore` 接口与第一版 `LocalCredentialStore`，再为现有 `gateway_llm`、`fallback_llm`、Embedding、多模态 Embedding、环境变量和 Higress Token 建立幂等迁移器；
+- 升级后模型、参数、Base URL、默认用途和 Key 必须无缝保留，不要求用户重新配置；
 - 增加 Provider/Endpoint/Model/Binding 校验与 capability 检查；
 - 保持现有 Client 接口，先只替换配置解析；
 - 在 Trace 中记录 resolved provider/model/endpoint/protocol/revision；

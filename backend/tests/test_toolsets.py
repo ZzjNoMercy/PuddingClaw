@@ -28,6 +28,12 @@ def test_project_skill_frontmatter_declares_known_toolsets() -> None:
 
 def test_every_registered_agent_custom_tool_has_an_explicit_policy() -> None:
     assert agent_custom_tool_names() == business_tool_names() | DEFAULT_CUSTOM_TOOL_NAMES
+    assert {
+        "prepare_skill_install",
+        "install_skill",
+        "prepare_skill_update",
+        "update_skill",
+    }.issubset(DEFAULT_CUSTOM_TOOL_NAMES)
 
     owners: dict[str, list[str]] = {}
     for toolset, tool_names in BUSINESS_TOOLSETS.items():
@@ -211,6 +217,10 @@ def test_native_and_explicit_base_tools_are_unconditionally_visible_and_executab
         {"name": "read_resource"},
         {"name": "tavily_search"},
         {"name": "fetch_url"},
+        {"name": "prepare_skill_install"},
+        {"name": "install_skill"},
+        {"name": "prepare_skill_update"},
+        {"name": "update_skill"},
         {"name": "unknown_custom_tool"},
     ]
     request = ModelRequest(model=None, messages=[], tools=tools, state={"messages": [], "active_skill_ids": []})
@@ -223,6 +233,10 @@ def test_native_and_explicit_base_tools_are_unconditionally_visible_and_executab
         "read_resource",
         "tavily_search",
         "fetch_url",
+        "prepare_skill_install",
+        "install_skill",
+        "prepare_skill_update",
+        "update_skill",
     ]
 
     calls: list[str] = []

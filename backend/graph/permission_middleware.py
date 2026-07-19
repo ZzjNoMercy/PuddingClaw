@@ -26,6 +26,7 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
         "/analytics-models/",
         "/skills/",
         "/large_tool_results/",
+        "/scratch/",
     )
 
     @classmethod
@@ -52,6 +53,16 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
             values = {
                 "old_string": str(args.get("old_string") or ""),
                 "new_string": str(args.get("new_string") or ""),
+            }
+        elif tool_name == "patch_file":
+            values = {
+                "expected_sha256": str(args.get("expected_sha256") or ""),
+                "replacements": str(args.get("replacements") or ""),
+            }
+        elif tool_name == "commit_external_artifact":
+            values = {
+                "lease_id": str(args.get("lease_id") or ""),
+                "expected_source_sha256": str(args.get("expected_source_sha256") or ""),
             }
         else:
             values = {"content": str(args.get("content") or "")}
@@ -88,6 +99,10 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                 "read_file",
                 "edit_file",
                 "write_file",
+                "inspect_file_version",
+                "patch_file",
+                "stage_external_artifact",
+                "commit_external_artifact",
             }:
                 continue
             args = tool_call.get("args") or {}
@@ -99,7 +114,7 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
             if raw_path.replace("\\", "/").startswith(self._VIRTUAL_PREFIXES):
                 continue
 
-            if tool_name in {"edit_file", "write_file"}:
+            if tool_name in {"edit_file", "write_file", "patch_file", "commit_external_artifact"}:
                 requested = self._external_write_path(raw_path, workspace_path)
                 if requested is None:
                     continue

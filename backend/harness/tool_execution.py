@@ -147,7 +147,6 @@ _WRAPPERS = frozenset({"command", "env", "timeout", "gtimeout", "nice", "nohup"}
 _SHELLS = frozenset({"sh", "bash", "zsh"})
 _SHELL_META_PATTERN = re.compile(r"(`|\$\(|\$\{|\n|<<)")
 _ENV_ASSIGNMENT_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", re.DOTALL)
-_ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![\w.-])(/[^\s;&|<>\"']+)")
 _NETWORK_URL_PATTERN = re.compile(r"\b(?:https?|wss?)://", re.IGNORECASE)
 _EMBEDDED_NETWORK_API_PATTERN = re.compile(
     r"(?:urllib(?:\.request)?|urlopen\s*\(|requests\.|httpx\.|aiohttp|"
@@ -183,9 +182,6 @@ class ShellPolicyAnalyzer:
                 "complex_shell_expansion",
                 "high",
             )
-        path_result = self._check_absolute_paths(command)
-        if path_result is not None:
-            return path_result
         try:
             segments, has_write_redirect = self._segments(command)
         except ValueError:
@@ -196,6 +192,9 @@ class ShellPolicyAnalyzer:
             )
         if not segments:
             return ToolPolicyResult(PolicyDecision.DENY, "empty_command", "invalid")
+        path_result = self._check_absolute_paths(segments)
+        if path_result is not None:
+            return path_result
         relative_path_result = self._check_relative_paths(segments)
         if relative_path_result is not None:
             return relative_path_result
@@ -411,35 +410,81 @@ class ShellPolicyAnalyzer:
             package_install=package_install,
         )
 
-    def _check_absolute_paths(self, command: str) -> ToolPolicyResult | None:
-        if self.backend_mode != "restricted_host":
-            return None
-        without_urls = re.sub(
-            r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s;&|<>\"']+",
-            "",
-            command,
-        )
-        for matched in _ABSOLUTE_PATH_PATTERN.findall(without_urls):
-            raw = matched.rstrip("),]")
-            if raw == "/workspace" or raw.startswith("/workspace/"):
-                continue
-            try:
-                resolved = Path(raw).expanduser().resolve()
-                resolved.relative_to(self.workspace_path)
-            except (OSError, ValueError):
-                return ToolPolicyResult(
-                    PolicyDecision.DENY,
-                    "host_filesystem_access",
-                    "critical",
-                )
+    def _check_absolute_paths(self, segments: list[list[str]]) -> ToolPolicyResult | None:
+        for tokens in segments:
+            for token in tokens:
+                for raw in self._absolute_path_fragments(token):
+                    if raw == "/harness-scratch" or raw.startswith("/harness-scratch/"):
+                        return ToolPolicyResult(
+                            PolicyDecision.DENY,
+                            "harness_internal_path_access",
+                            "critical",
+                        )
+                    if (raw == "/scratch" or raw.startswith("/scratch/")) and ".." in Path(raw).parts:
+                        return ToolPolicyResult(
+                            PolicyDecision.DENY,
+                            "scratch_path_traversal",
+                            "critical",
+                        )
+                    if self.backend_mode != "restricted_host":
+                        continue
+                    if raw == "/workspace" or raw.startswith("/workspace/"):
+                        continue
+                    if raw == "/scratch" or raw.startswith("/scratch/"):
+                        continue
+                    try:
+                        resolved = Path(raw).expanduser().resolve()
+                        resolved.relative_to(self.workspace_path)
+                    except (OSError, ValueError):
+                        return ToolPolicyResult(
+                            PolicyDecision.DENY,
+                            "host_filesystem_access",
+                            "critical",
+                        )
         return None
+
+    @staticmethod
+    def _absolute_path_fragments(token: str) -> list[str]:
+        """Find absolute host paths while preserving quoted whitespace."""
+
+        if "://" in token:
+            return []
+        fragments: list[str] = []
+        index = 0
+        anchors = "=:'\"([{,"
+        terminators = set("\t\r\n,;|&<>)]}\"")
+        while index < len(token):
+            start = token.find("/", index)
+            if start < 0:
+                break
+            previous = token[start - 1] if start > 0 else ""
+            if start > 0 and not previous.isspace() and previous not in anchors:
+                index = start + 1
+                continue
+            quote = previous if previous in {"'", '"'} else None
+            if quote is not None:
+                end = token.find(quote, start)
+                if end < 0:
+                    end = len(token)
+            elif start == 0 or previous == "=":
+                # shlex keeps a quoted path with spaces as one token.
+                end = start
+                while end < len(token) and token[end] not in terminators:
+                    end += 1
+            else:
+                end = start
+                while end < len(token) and token[end] not in terminators and not token[end].isspace():
+                    end += 1
+            raw = token[start:end].rstrip("),]}")
+            if raw:
+                fragments.append(raw)
+            index = max(end, start + 1)
+        return fragments
 
     def _check_relative_paths(
         self,
         segments: list[list[str]],
     ) -> ToolPolicyResult | None:
-        if self.backend_mode != "restricted_host":
-            return None
         for tokens in segments:
             for index, token in enumerate(tokens):
                 raw = token.strip().rstrip("),]")
@@ -453,10 +498,38 @@ class ShellPolicyAnalyzer:
                     raw = raw.split("=", 1)[1].strip()
                     if not raw:
                         continue
+                if self.backend_mode == "docker" and any(char in raw for char in "*?["):
+                    # The project container currently reuses one host scratch
+                    # mount. Shell pathname expansion can otherwise conceal
+                    # `/harness-scratch` (for example `harness-scrat[c]h`) and
+                    # bypass literal path checks. Fail closed until scratch is
+                    # physically mounted per exact Run.
+                    return ToolPolicyResult(
+                        PolicyDecision.DENY,
+                        "container_path_expansion",
+                        "critical",
+                    )
+                normalized_parts = Path(raw.replace("\\", "/")).parts
+                if "harness-scratch" in normalized_parts or "harness-scratch" in raw:
+                    return ToolPolicyResult(
+                        PolicyDecision.DENY,
+                        "harness_internal_path_access",
+                        "critical",
+                    )
+                if self.backend_mode == "docker" and ".." in normalized_parts:
+                    return ToolPolicyResult(
+                        PolicyDecision.DENY,
+                        "container_workspace_escape",
+                        "critical",
+                    )
+                if self.backend_mode != "restricted_host":
+                    continue
                 if raw == "/workspace":
                     candidate = self.workspace_path
                 elif raw.startswith("/workspace/"):
                     candidate = self.workspace_path / raw.removeprefix("/workspace/")
+                elif raw == "/scratch" or raw.startswith("/scratch/"):
+                    continue
                 elif raw.startswith("~/"):
                     candidate = Path(raw).expanduser()
                 elif Path(raw).is_absolute():
@@ -703,6 +776,7 @@ class ShellPolicyAnalyzer:
             "high": 2,
             "network": 3,
             "package_install": 3,
+            "managed_skill_write": 3,
             "critical": 4,
         }
         return max(
@@ -719,11 +793,17 @@ class ToolExecutionPipeline(AgentMiddleware):
 
     BUILTIN_TOOLS = frozenset(
         {
-            "write_todos",
+            "update_todos",
             "ls",
             "read_file",
             "write_file",
             "edit_file",
+            "inspect_file_version",
+            "patch_file",
+            "stage_external_artifact",
+            "commit_external_artifact",
+            "prepare_attachment_edit",
+            "publish_attachment",
             "glob",
             "grep",
             "execute",
@@ -732,11 +812,17 @@ class ToolExecutionPipeline(AgentMiddleware):
     )
     DECLARED_ALLOW_TOOLS = frozenset(
         {
-            "write_todos",
+            "update_todos",
             "ls",
             "read_file",
             "write_file",
             "edit_file",
+            "inspect_file_version",
+            "patch_file",
+            "stage_external_artifact",
+            "commit_external_artifact",
+            "prepare_attachment_edit",
+            "publish_attachment",
             "glob",
             "grep",
             "task",
@@ -762,7 +848,13 @@ class ToolExecutionPipeline(AgentMiddleware):
             "apply_logical_dataset_rule",
         }
     )
-    NETWORK_TOOLS = frozenset({"tavily_search", "fetch_url"})
+    NETWORK_TOOLS = frozenset({
+        "tavily_search",
+        "fetch_url",
+        "prepare_skill_install",
+        "prepare_skill_update",
+    })
+    SKILL_COMMIT_TOOLS = frozenset({"install_skill", "update_skill"})
 
     def __init__(
         self,
@@ -770,9 +862,11 @@ class ToolExecutionPipeline(AgentMiddleware):
         known_tools: set[str],
         backend_mode: str,
         permission_context: RunPermissionContext | None = None,
+        base_dir: Path | None = None,
     ) -> None:
         self.known_tools = set(known_tools) | set(self.BUILTIN_TOOLS)
         self.backend_mode = backend_mode
+        self.base_dir = base_dir.expanduser().resolve() if base_dir is not None else None
         self.permission_context = permission_context or RunPermissionContext.from_config_snapshot(
             {
                 "permissions": {"approval_mode": "strict"},
@@ -835,6 +929,7 @@ class ToolExecutionPipeline(AgentMiddleware):
             run_id=str(context.get("run_id") or ""),
             grant_bindings=self.permission_context.grant_bindings(),
             required_capabilities=required_capabilities,
+            change_preview=self._skill_change_preview(request),
         )
         if run_id:
             session_manager.transition_run_status(
@@ -888,6 +983,12 @@ class ToolExecutionPipeline(AgentMiddleware):
                 f"unknown_tool:{tool_name}",
                 "critical",
             )
+        if tool_name == "edit_file":
+            return ToolPolicyResult(
+                PolicyDecision.DENY,
+                "versioned_patch_required: use inspect_file_version then patch_file",
+                "managed_write",
+            )
         if tool_name in self.DECLARED_ALLOW_TOOLS:
             return ToolPolicyResult(
                 PolicyDecision.ALLOW,
@@ -900,6 +1001,12 @@ class ToolExecutionPipeline(AgentMiddleware):
                     return ToolPolicyResult(
                         PolicyDecision.ALLOW,
                         "smart_controlled_network:tavily_search",
+                        "network",
+                    )
+                if tool_name in {"prepare_skill_install", "prepare_skill_update"}:
+                    return ToolPolicyResult(
+                        PolicyDecision.ASK,
+                        f"skill_source_download:{tool_name}",
                         "network",
                     )
                 if self._smart_fetch_candidate(request):
@@ -917,6 +1024,12 @@ class ToolExecutionPipeline(AgentMiddleware):
                 PolicyDecision.ASK,
                 f"network_access:{tool_name}",
                 "network",
+            )
+        if tool_name in self.SKILL_COMMIT_TOOLS:
+            return ToolPolicyResult(
+                PolicyDecision.ASK,
+                f"managed_skill_write:{tool_name}",
+                "managed_skill_write",
             )
         if tool_name == "install_packages":
             if self.permission_context.backend_mode != "docker":
@@ -988,23 +1101,78 @@ class ToolExecutionPipeline(AgentMiddleware):
         args = request.tool_call.get("args") or {}
         return str(args.get("command") or "")
 
-    @classmethod
-    def _action_preview(cls, request: ToolCallRequest) -> str:
-        if str(request.tool_call.get("name") or "") == "execute":
-            return cls._command(request)
+    def _action_preview(self, request: ToolCallRequest) -> str:
+        tool_name = str(request.tool_call.get("name") or "")
+        if tool_name == "execute":
+            return self._command(request)
         args = request.tool_call.get("args") or {}
+        if tool_name in self.SKILL_COMMIT_TOOLS and self.base_dir is not None:
+            try:
+                from services.skill_management import get_skill_management_service
+
+                plan = get_skill_management_service(self.base_dir).preview(str(args.get("plan_id") or ""))
+            except Exception:
+                plan = None
+            if plan is not None:
+                args = {"request": args, "verified_plan": plan}
         try:
             rendered = json.dumps(args, ensure_ascii=False, sort_keys=True)
         except (TypeError, ValueError):
             rendered = str(args)
         return rendered[:4000]
 
+    def _skill_change_preview(self, request: ToolCallRequest) -> dict[str, str] | None:
+        tool_name = str(request.tool_call.get("name") or "")
+        args = request.tool_call.get("args") or {}
+        if tool_name in {"prepare_skill_install", "prepare_skill_update"}:
+            preview = {
+                "action": "prepare_update" if tool_name.endswith("update") else "prepare_install",
+                "skill_name": str(args.get("skill_name") or args.get("subpath") or ""),
+                "source": str(args.get("source") or ""),
+                "ref": str(args.get("ref") or ""),
+                "subpath": str(args.get("subpath") or ""),
+            }
+            return {key: value for key, value in preview.items() if value}
+        if tool_name not in self.SKILL_COMMIT_TOOLS or self.base_dir is None:
+            return None
+        try:
+            from services.skill_management import get_skill_management_service
+
+            plan = get_skill_management_service(self.base_dir).preview(str(args.get("plan_id") or ""))
+        except Exception:
+            plan = None
+        if plan is None:
+            return None
+        diff = plan.get("diff") if isinstance(plan.get("diff"), dict) else {}
+        metadata = plan.get("staged_metadata") if isinstance(plan.get("staged_metadata"), dict) else {}
+        preview = {
+            "action": str(plan.get("action") or ""),
+            "skill_name": str(plan.get("skill_name") or ""),
+            "source": str(plan.get("source") or ""),
+            "version": str(metadata.get("version") or ""),
+            "changes": str(diff.get("summary") or ""),
+            "plan_sha256": str(plan.get("plan_sha256") or ""),
+        }
+        for key in ("added", "changed", "removed"):
+            values = diff.get(key)
+            if isinstance(values, list) and values:
+                rendered = ", ".join(str(item) for item in values[:20])
+                if len(values) > 20:
+                    rendered += f" … (+{len(values) - 20})"
+                preview[key] = rendered
+        return {key: value for key, value in preview.items() if value}
+
     @classmethod
     def _required_capabilities(cls, request: ToolCallRequest) -> list[str]:
-        if str(request.tool_call.get("name") or "") == "install_packages":
+        tool_name = str(request.tool_call.get("name") or "")
+        if tool_name == "install_packages":
             return ["execute", "package_install", "temporary_network"]
+        if tool_name in {"prepare_skill_install", "prepare_skill_update"}:
+            return ["execute", "temporary_network"]
+        if tool_name in cls.SKILL_COMMIT_TOOLS:
+            return ["execute", "managed_skill_write"]
         capabilities = ["execute"]
-        if str(request.tool_call.get("name") or "") == "execute":
+        if tool_name == "execute":
             effects = ShellPolicyAnalyzer.capabilities(cls._command(request))
             if effects.network:
                 capabilities.append("network_access")
@@ -1021,6 +1189,10 @@ class ToolExecutionPipeline(AgentMiddleware):
         """Return the narrow reusable scope for a Session-level approval."""
 
         tool_name = str(request.tool_call.get("name") or "")
+        if tool_name in self.SKILL_COMMIT_TOOLS:
+            # Skill writes are always bound to the exact immutable plan and
+            # may never become reusable Session authority.
+            return None
         if tool_name == "tavily_search":
             return {
                 "target_kind": "tool_name",

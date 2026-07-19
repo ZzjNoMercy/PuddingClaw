@@ -6,7 +6,7 @@ from typing import Any
 
 from deepagents import create_deep_agent
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import tool
 from pydantic import PrivateAttr
@@ -102,6 +102,203 @@ def _start_run(tmp_path, *, objective: str, analytics_model_id: str | None = Non
     )
     coordinator.transition(run, RunStatus.RUNNING)
     return coordinator, run, goal
+
+
+def test_runtime_context_scopes_grader_to_current_run(tmp_path, monkeypatch):
+    from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
+
+    contract = RunRubricCompiler.compile(
+        RubricBuildContext(user_message="L6 年度改款多少钱？", force_required=True)
+    )
+    assert contract is not None
+    main_model = ScriptedModel([AIMessage(content="L6 售价 24.98 万元。")])
+    grader_model = _grader_model("task_fulfillment", "todo_reconciliation")
+    monkeypatch.setattr(
+        PuddingClawRubricMiddleware,
+        "_effective_contract_update",
+        staticmethod(lambda _state, _runtime: {}),
+    )
+    agent = create_deep_agent(
+        model=main_model,
+        tools=[],
+        middleware=[PuddingClawRubricMiddleware(model=grader_model, max_iterations=2)],
+        state_schema=PuddingClawAgentState,
+    )
+    messages = [
+        HumanMessage(content="aihot技能有更新吗？帮我重新安装一次"),
+        AIMessage(content="aihot 更新完成"),
+        HumanMessage(
+            content="L6 年度改款多少钱？",
+            additional_kwargs={"puddingclaw_query_id": "scope-query"},
+        ),
+    ]
+
+    asyncio.run(
+        agent.ainvoke(
+            {
+                "messages": messages,
+                "rubric": contract.rubric,
+                "verification_contract": contract.model_dump(mode="json"),
+            },
+            context={
+                "session_id": "scope-session",
+                "run_id": "scope-run",
+                "query_id": "scope-query",
+                "workspace_path": str(tmp_path),
+                "run_objective": "L6 年度改款多少钱？",
+            },
+        )
+    )
+
+    main_prompt = "\n".join(
+        str(getattr(message, "content", ""))
+        for message in main_model._received_messages[0]
+    )
+    grader_prompt = "\n".join(
+        str(getattr(message, "content", ""))
+        for message in grader_model._received_messages[0]
+    )
+    assert "aihot技能有更新吗" in main_prompt
+    assert "L6 年度改款多少钱" in grader_prompt
+    assert "L6 售价 24.98 万元" in grader_prompt
+    assert "aihot技能有更新吗" not in grader_prompt
+    assert "aihot 更新完成" not in grader_prompt
+
+
+def test_runtime_context_restores_objective_after_user_turn_is_summarized(
+    tmp_path,
+    monkeypatch,
+):
+    from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
+
+    contract = RunRubricCompiler.compile(
+        RubricBuildContext(user_message="L6 年度改款多少钱？", force_required=True)
+    )
+    assert contract is not None
+    main_model = ScriptedModel([AIMessage(content="L6 售价 24.98 万元。")])
+    grader_model = _grader_model("task_fulfillment", "todo_reconciliation")
+    monkeypatch.setattr(
+        PuddingClawRubricMiddleware,
+        "_effective_contract_update",
+        staticmethod(lambda _state, _runtime: {}),
+    )
+    agent = create_deep_agent(
+        model=main_model,
+        tools=[],
+        middleware=[PuddingClawRubricMiddleware(model=grader_model, max_iterations=2)],
+        state_schema=PuddingClawAgentState,
+    )
+
+    asyncio.run(
+        agent.ainvoke(
+            {
+                "messages": [
+                    HumanMessage(
+                        content="摘要中包含旧任务：重新安装 aihot",
+                        additional_kwargs={"lc_source": "summarization"},
+                    )
+                ],
+                "rubric": contract.rubric,
+                "verification_contract": contract.model_dump(mode="json"),
+            },
+            context={
+                "session_id": "summarized-scope-session",
+                "run_id": "summarized-scope-run",
+                "query_id": "summarized-scope-query",
+                "workspace_path": str(tmp_path),
+                "run_objective": "L6 年度改款多少钱？",
+            },
+        )
+    )
+
+    grader_prompt = "\n".join(
+        str(getattr(message, "content", ""))
+        for message in grader_model._received_messages[0]
+    )
+    assert "L6 年度改款多少钱" in grader_prompt
+    assert "L6 售价 24.98 万元" in grader_prompt
+    assert "重新安装 aihot" not in grader_prompt
+
+
+def test_run_scope_survives_rubric_revision_loop(tmp_path, monkeypatch):
+    from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
+
+    contract = RunRubricCompiler.compile(
+        RubricBuildContext(user_message="L6 年度改款多少钱？", force_required=True)
+    )
+    assert contract is not None
+    main_model = ScriptedModel(
+        [
+            AIMessage(content="L6 售价 24.98 万元。"),
+            AIMessage(content="L6 售价 24.98 万元，置换 23.48 万元起。"),
+        ]
+    )
+    grader_model = ScriptedModel(
+        [
+            AIMessage(
+                content=(
+                    '{"result":"needs_revision","explanation":"补充置换价",'
+                    '"criteria":[{"name":"task_fulfillment","passed":false,'
+                    '"gap":"缺少置换价格"},{"name":"todo_reconciliation",'
+                    '"passed":true}]}'
+                )
+            ),
+            AIMessage(
+                content=(
+                    '{"result":"satisfied","explanation":"已完成",'
+                    '"criteria":[{"name":"task_fulfillment","passed":true},'
+                    '{"name":"todo_reconciliation","passed":true}]}'
+                )
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        PuddingClawRubricMiddleware,
+        "_effective_contract_update",
+        staticmethod(lambda _state, _runtime: {}),
+    )
+    agent = create_deep_agent(
+        model=main_model,
+        tools=[],
+        middleware=[PuddingClawRubricMiddleware(model=grader_model, max_iterations=3)],
+        state_schema=PuddingClawAgentState,
+    )
+
+    asyncio.run(
+        agent.ainvoke(
+            {
+                "messages": [
+                    HumanMessage(content="aihot技能有更新吗？帮我重新安装一次"),
+                    AIMessage(content="aihot 更新完成"),
+                    HumanMessage(
+                        content="L6 年度改款多少钱？",
+                        additional_kwargs={"puddingclaw_query_id": "revision-query"},
+                    ),
+                ],
+                "rubric": contract.rubric,
+                "verification_contract": contract.model_dump(mode="json"),
+            },
+            context={
+                "session_id": "revision-session",
+                "run_id": "revision-run",
+                "query_id": "revision-query",
+                "workspace_path": str(tmp_path),
+                "run_objective": "L6 年度改款多少钱？",
+            },
+        )
+    )
+
+    assert len(grader_model._received_messages) == 2
+    for received in grader_model._received_messages:
+        prompt = "\n".join(str(getattr(message, "content", "")) for message in received)
+        assert "L6 年度改款多少钱" in prompt
+        assert "aihot技能有更新吗" not in prompt
+        assert "aihot 更新完成" not in prompt
+    second_prompt = "\n".join(
+        str(getattr(message, "content", ""))
+        for message in grader_model._received_messages[1]
+    )
+    assert "置换 23.48 万元起" in second_prompt
 
 
 def test_runtime_database_tool_upgrades_contract_before_grader(tmp_path):

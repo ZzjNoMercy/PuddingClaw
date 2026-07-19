@@ -8,6 +8,7 @@ import posixpath
 import re
 import shlex
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
@@ -16,8 +17,15 @@ from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
 from graph.session_manager import session_manager
+from graph.attachment_store import attachment_store
 from graph.tool_result_adapter import tool_result_adapter
-from harness.models import VerificationActivation
+from harness.artifact_paths import artifact_path_matches, extract_declared_artifact_targets
+from harness.models import (
+    ArtifactReference,
+    ArtifactRole,
+    ArtifactScope,
+    VerificationActivation,
+)
 from harness.tool_execution import ShellPolicyAnalyzer
 
 _WEB_TOOLS = frozenset(
@@ -63,7 +71,9 @@ _MATERIAL_ANALYTICS_TOOLS = frozenset(
         "apply_logical_dataset_rule",
     }
 )
-_WRITE_TOOLS = frozenset({"write_file", "edit_file"})
+_WRITE_TOOLS = frozenset(
+    {"write_file", "edit_file", "patch_file", "commit_external_artifact", "publish_attachment"}
+)
 _CODE_EXTENSIONS = frozenset(
     {
         ".c",
@@ -161,10 +171,24 @@ def verification_packs_for_tool(
         return ["web_research"]
     if tool_name in _ANALYTICS_TOOLS:
         return ["analytics"]
+    if tool_name == "prepare_attachment_edit":
+        # Taking an edit lease is a one-way capability transition: the Run may
+        # no longer finish with only a scratch copy or a verbal completion.
+        # Artifact delivery remains unsatisfied until publish_attachment emits
+        # a material Attachment ArtifactReference.
+        return ["artifact"]
+    if tool_name == "publish_attachment":
+        # Publishing is delivery, not proof that code was tested. Every file
+        # type (including binary/image/archive outputs) receives the same
+        # artifact gate; code validation must come from a real validation
+        # command rather than the filename extension.
+        return ["artifact"]
     if tool_name in _WRITE_TOOLS:
         raw_path = str(
-            (args or {}).get("file_path")
+            ((args or {}).get("output_name") if tool_name == "publish_attachment" else None)
+            or (args or {}).get("file_path")
             or (args or {}).get("path")
+            or (args or {}).get("output_path")
             or ""
         ).lower()
         suffix = "." + raw_path.rsplit(".", 1)[-1] if "." in raw_path else ""
@@ -355,12 +379,82 @@ def tool_result_succeeded(
     return all(_message_succeeded(message) for message in messages)
 
 
+def resolve_published_attachment(
+    artifact: dict[str, Any] | None,
+    *,
+    session_id: str,
+    run_id: str,
+    query_id: str,
+    tool_call_id: str,
+    goal_id: str | None = None,
+    goal_revision: int | None = None,
+) -> dict[str, Any] | None:
+    """Resolve a publish receipt through AttachmentStore authority.
+
+    Neither model text nor ToolMessage artifact URLs are trusted. The returned
+    object is rebuilt by the server only after receipt, scope, ownership and
+    actual-byte hash checks all agree.
+    """
+
+    if not isinstance(artifact, dict):
+        return None
+    published_item = artifact.get("published_attachment")
+    receipt_data = artifact.get("artifact_reference")
+    if not isinstance(published_item, dict):
+        return None
+    try:
+        receipt = ArtifactReference.model_validate(receipt_data)
+    except Exception:
+        return None
+    attachment_id = str(published_item.get("id") or "")
+    stored = attachment_store.get(session_id, attachment_id) if attachment_id else None
+    if not isinstance(stored, dict):
+        return None
+    try:
+        stored_path = Path(str(stored.get("path") or "")).resolve(strict=True)
+        hasher = hashlib.sha256()
+        with stored_path.open("rb") as source_file:
+            while chunk := source_file.read(1024 * 1024):
+                hasher.update(chunk)
+        actual_sha = f"sha256:{hasher.hexdigest()}"
+        receipt_host_path = Path(str(receipt.host_path or "")).resolve(strict=True)
+    except (OSError, ValueError):
+        return None
+    expected_goal_id = goal_id or None
+    checks = (
+        receipt.scope == ArtifactScope.ATTACHMENT,
+        receipt.authorized,
+        receipt.tool_call_id == tool_call_id,
+        receipt.run_id == run_id,
+        receipt.query_id == query_id,
+        receipt.goal_id == expected_goal_id,
+        receipt.goal_revision == goal_revision,
+        stored.get("source") == "generated",
+        stored.get("created_by_run_id") == run_id,
+        stored.get("created_by_query_id") == query_id,
+        (stored.get("created_by_goal_id") or None) == expected_goal_id,
+        stored.get("created_by_goal_revision") == goal_revision,
+        receipt.path == f"attachment://{attachment_id}",
+        receipt_host_path == stored_path,
+        receipt.content_sha256 == actual_sha,
+        stored.get("sha256") == actual_sha,
+        published_item.get("sha256") == actual_sha,
+    )
+    return attachment_store.public_item(stored) if all(checks) else None
+
+
 def _result_evidence_refs(
     *,
     tool_call_id: str,
     tool_name: str,
     args: dict[str, Any],
     result: ToolMessage | Command[Any] | None,
+    session_id: str = "",
+    run_id: str = "",
+    query_id: str = "",
+    workspace_path: str = "",
+    goal_id: str | None = None,
+    goal_revision: int | None = None,
 ) -> list[dict[str, Any]]:
     if result is None:
         return []
@@ -406,23 +500,200 @@ def _result_evidence_refs(
                     "ref": match.group("value"),
                 }
             )
-        if tool_name in _WRITE_TOOLS:
+        if tool_name == "publish_attachment":
+            message_artifact = getattr(message, "artifact", None)
+            resolved = resolve_published_attachment(
+                message_artifact if isinstance(message_artifact, dict) else None,
+                session_id=session_id,
+                run_id=run_id,
+                query_id=query_id,
+                tool_call_id=tool_call_id,
+                goal_id=goal_id,
+                goal_revision=goal_revision,
+            )
+            if resolved is not None:
+                receipt = ArtifactReference.model_validate(message_artifact["artifact_reference"])
+                refs.append({"kind": "artifact_write", **receipt.model_dump(mode="json")})
+        elif tool_name in _WRITE_TOOLS:
             raw_path = str(args.get("file_path") or args.get("path") or "").strip()
             if raw_path:
-                virtual_path = (
-                    raw_path
-                    if raw_path.startswith("/workspace/")
-                    else f"/workspace/{raw_path.lstrip('/')}"
+                artifact = _artifact_reference_for_write(
+                    raw_path=raw_path,
+                    tool_call_id=tool_call_id,
+                    output_digest=f"sha256:{digest}",
+                    session_id=session_id,
+                    run_id=run_id,
+                    query_id=query_id,
+                    workspace_path=workspace_path,
                 )
-                refs.append(
-                    {
-                        "kind": "artifact_write",
-                        "tool_call_id": tool_call_id,
-                        "path": virtual_path,
-                        "output_digest": f"sha256:{digest}",
-                    }
-                )
+                refs.append({"kind": "artifact_write", **artifact.model_dump(mode="json")})
     return refs
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _external_write_grant(session_id: str, host_path: str) -> dict[str, Any] | None:
+    if not session_id:
+        return None
+    for grant in session_manager.list_permission_grants(session_id):
+        if (
+            grant.get("type") == "external_file_write"
+            and grant.get("target_kind") == "exact_file"
+            and grant.get("target") == host_path
+            and "write" in (grant.get("capabilities") or [])
+        ):
+            return grant
+    return None
+
+
+def _artifact_reference_for_write(
+    *,
+    raw_path: str,
+    tool_call_id: str,
+    output_digest: str,
+    session_id: str,
+    run_id: str,
+    query_id: str,
+    workspace_path: str,
+) -> ArtifactReference:
+    """Resolve a write target without changing its authority boundary."""
+
+    workspace = Path(workspace_path).expanduser().resolve() if workspace_path else None
+    try:
+        persisted_run = (
+            session_manager.get_run_state(session_id, run_id)
+            if session_id and run_id
+            else None
+        )
+    except (AssertionError, FileNotFoundError):
+        # The pure builder is also used with isolated SessionManager instances
+        # in tests and migrations. Runtime middleware always has the initialized
+        # authoritative manager; receipt verification remains fail-closed.
+        persisted_run = None
+    run_payload = persisted_run if isinstance(persisted_run, dict) else {}
+    execution = (
+        run_payload.get("config_snapshot", {}).get("execution", {})
+        if isinstance(run_payload.get("config_snapshot"), dict)
+        else {}
+    )
+    objective = str(run_payload.get("objective") or "")
+    normalized = raw_path.replace("\\", "/")
+    if normalized == "/scratch" or normalized.startswith("/scratch/"):
+        scratch_root_value = str(execution.get("scratch_host_path") or "").strip()
+        scratch_root = Path(scratch_root_value).expanduser().resolve() if scratch_root_value else None
+        relative = normalized.removeprefix("/scratch").lstrip("/")
+        host = (scratch_root / relative).resolve() if scratch_root is not None else None
+        if host is not None and scratch_root is not None and _is_relative_to(host, scratch_root):
+            virtual_path = "/scratch" + (f"/{relative}" if relative else "")
+            canonical = virtual_path
+        else:
+            virtual_path = None
+            canonical = raw_path
+        scope = ArtifactScope.SCRATCH
+        grant = None
+    elif normalized == "/workspace" or normalized.startswith("/workspace/"):
+        relative = normalized.removeprefix("/workspace").lstrip("/")
+        host = (workspace / relative).resolve() if workspace is not None else None
+        if host is not None and workspace is not None and _is_relative_to(host, workspace):
+            virtual_path = "/workspace" + (f"/{relative}" if relative else "")
+            canonical = str(host)
+            scope = ArtifactScope.WORKSPACE
+            grant = None
+        else:
+            # ``/workspace/../...`` is not a workspace file. Preserve the
+            # resolved authority boundary instead of minting a trusted receipt.
+            virtual_path = None
+            canonical = str(host) if host is not None else raw_path
+            scope = ArtifactScope.EXTERNAL
+            grant = _external_write_grant(session_id, canonical)
+    else:
+        requested = Path(raw_path).expanduser()
+        if requested.is_absolute():
+            host = requested.resolve()
+        elif workspace is not None:
+            host = (workspace / requested).resolve()
+        else:
+            host = None
+        if host is not None and workspace is not None and _is_relative_to(host, workspace):
+            relative = host.relative_to(workspace).as_posix()
+            virtual_path = f"/workspace/{relative}" if relative else "/workspace"
+            canonical = str(host)
+            scope = ArtifactScope.WORKSPACE
+            grant = None
+        else:
+            relative = ""
+            virtual_path = None
+            canonical = str(host) if host is not None else raw_path
+            scope = ArtifactScope.EXTERNAL
+            grant = _external_write_grant(session_id, canonical)
+
+    identity_path = str(host) if host is not None else canonical
+    declared_targets = (
+        [str(item) for item in run_payload.get("declared_artifact_targets") or [] if str(item)]
+        if isinstance(run_payload.get("declared_artifact_targets"), list)
+        else extract_declared_artifact_targets(objective)
+    )
+    if scope == ArtifactScope.SCRATCH:
+        artifact_role = ArtifactRole.TEMPORARY
+    else:
+        artifact_role = ArtifactRole.TARGET if any(
+            artifact_path_matches(candidate, declared)
+            for candidate in {raw_path, canonical, virtual_path or ""}
+            if candidate
+            for declared in declared_targets
+        ) else ArtifactRole.CANDIDATE
+    content_sha256: str | None = None
+    size_bytes: int | None = None
+    mtime_ns: int | None = None
+    if host is not None and host.is_file():
+        hasher = hashlib.sha256()
+        with host.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                hasher.update(chunk)
+        stat = host.stat()
+        content_sha256 = f"sha256:{hasher.hexdigest()}"
+        size_bytes = stat.st_size
+        mtime_ns = stat.st_mtime_ns
+    artifact_id = "artifact-" + hashlib.sha256(
+        (
+            f"{scope.value}\0{execution.get('workspace_id', '')}\0"
+            f"{identity_path}"
+        ).encode("utf-8")
+    ).hexdigest()[:20]
+    return ArtifactReference(
+        artifact_id=artifact_id,
+        scope=scope,
+        role=artifact_role,
+        path=canonical,
+        host_path=str(host) if host is not None else None,
+        virtual_path=virtual_path,
+        workspace_relative_path=relative or None,
+        authorized=(scope in {ArtifactScope.WORKSPACE, ArtifactScope.SCRATCH} or grant is not None),
+        permission_grant_id=(str(grant.get("id")) if grant is not None else None),
+        run_id=run_id or None,
+        query_id=query_id or None,
+        goal_id=(str(run_payload.get("goal_id")) if run_payload.get("goal_id") else None),
+        goal_revision=(
+            int(run_payload.get("goal_revision"))
+            if run_payload.get("goal_revision") is not None
+            else None
+        ),
+        backend_id=(str(execution.get("backend_id")) if execution.get("backend_id") else None),
+        workspace_id=(
+            str(execution.get("workspace_id")) if execution.get("workspace_id") else None
+        ),
+        tool_call_id=tool_call_id,
+        output_digest=output_digest,
+        content_sha256=content_sha256,
+        size_bytes=size_bytes,
+        mtime_ns=mtime_ns,
+    )
 
 
 def build_verification_activations(
@@ -433,6 +704,10 @@ def build_verification_activations(
     tool_name: str,
     args: dict[str, Any] | None,
     result: ToolMessage | Command[Any] | None = None,
+    session_id: str = "",
+    workspace_path: str = "",
+    goal_id: str | None = None,
+    goal_revision: int | None = None,
 ) -> list[VerificationActivation]:
     normalized_args = args or {}
     preview = json.dumps(normalized_args, ensure_ascii=False, sort_keys=True)[:1000]
@@ -441,6 +716,12 @@ def build_verification_activations(
         tool_name=tool_name,
         args=normalized_args,
         result=result,
+        session_id=session_id,
+        run_id=run_id,
+        query_id=query_id,
+        workspace_path=workspace_path,
+        goal_id=goal_id,
+        goal_revision=goal_revision,
     )
     activations: list[VerificationActivation] = []
     for pack in verification_packs_for_tool(tool_name, args):
@@ -453,8 +734,8 @@ def build_verification_activations(
         elif pack == "web_research":
             material = any(item.get("kind") == "source" for item in result_refs)
         elif pack == "artifact":
-            material = tool_name in _WRITE_TOOLS and bool(
-                normalized_args.get("file_path") or normalized_args.get("path")
+            material = tool_name in _WRITE_TOOLS and any(
+                item.get("kind") == "artifact_write" for item in result_refs
             )
         digest = hashlib.sha256(
             f"{run_id}:{query_id}:{tool_call_id}:{tool_name}:{pack}".encode()
@@ -538,6 +819,14 @@ class VerificationActivationMiddleware(AgentMiddleware):
             tool_name=tool_name,
             args=normalized_args,
             result=result,
+            session_id=session_id,
+            workspace_path=str(context.get("workspace_path") or ""),
+            goal_id=(str(context.get("goal_id")) if context.get("goal_id") else None),
+            goal_revision=(
+                int(context.get("goal_revision"))
+                if context.get("goal_revision") is not None
+                else None
+            ),
         ):
             try:
                 saved, created = session_manager.append_run_verification_activation(

@@ -3,7 +3,7 @@
 import { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
-import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Database, FileSpreadsheet, FileText, Globe2, Key, KeyRound, Layers3, PauseCircle, Plus, Sparkles, SquareTerminal, Trash2 } from "lucide-react";
+import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Database, Download, FileSpreadsheet, FileText, Globe2, Key, KeyRound, Layers3, PauseCircle, Plus, Sparkles, SquareTerminal, Trash2 } from "lucide-react";
 import { denyPermissionRequest, grantExternalFilePermission, grantToolActionPermission, openLocalFile, resolveDatabaseSqlRevisionRequest, resolveDimensionBuildRuleRequest, resolveLogicalDatasetRuleRequest, type AgentAttachment, type DatabaseSqlRevisionRequest, type DimensionBuildRuleRequest, type LogicalDatasetRuleRequest, type PermissionRequest } from "@/lib/api";
 import { markdownRemarkPlugins, markdownUrlTransform } from "@/lib/markdown";
 import { useApp, type ChatMessage as ChatMessageType, type SourceRecord, type TimelineItem } from "@/lib/store";
@@ -14,12 +14,22 @@ interface Props {
   message: ChatMessageType;
   sessionSources?: SourceRecord[];
   isStreaming?: boolean;
+  verificationState?: "pending" | "progress" | "passed" | "failed" | "unverified";
   showInterruptionNotice?: boolean;
 }
 
 function formatTime(ts: number): string {
   const d = new Date(ts);
   return d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+}
+
+function stripModelCallLimitNotice(content: string): string {
+  return content
+    .replace(
+      /(?:\r?\n){0,2}Model call limits exceeded:\s*(?:run|thread) limit\s*\(\d+\s*\/\s*\d+\)\.?\s*$/i,
+      ""
+    )
+    .trimEnd();
 }
 
 /** Detect 401 / API key errors without matching arbitrary numbers like patent IDs. */
@@ -33,11 +43,12 @@ function isAuthError(content: string): boolean {
   return has401 || hasApiKeyError || hasAuthFail;
 }
 
-export default function ChatMessage({ message, sessionSources = [], isStreaming = false, showInterruptionNotice = false }: Props) {
+export default function ChatMessage({ message, sessionSources = [], isStreaming = false, verificationState, showInterruptionNotice = false }: Props) {
   const isUser = message.role === "user";
   const hasAuthError = !isUser && isAuthError(message.content);
   const renderedContent = renderCitationMarkers(message, sessionSources);
   const availableSources = mergeSources(message.sources, sessionSources);
+  const messageVerificationState = message.segments?.length ? undefined : verificationState;
   const { sessionId, setActiveSourceId, setInspectorOpen } = useApp();
   const pendingPermissionRequests = (message.permissionRequests || []).filter(
     (request) => request.status !== "resolved"
@@ -88,6 +99,23 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
           /* Assistant message — left-aligned */
           <div>
             <div className="min-w-0">
+              {messageVerificationState === "pending" && message.content ? (
+                <div className="inline-flex items-center gap-2 rounded-xl border border-blue-200 bg-blue-50/80 px-3 py-2.5 text-[12px] text-blue-800">
+                  <Sparkles className="h-3.5 w-3.5 animate-pulse" />
+                  <span><strong>正在验收</strong> · 回答已生成，Harness 核验通过后才会显示为最终结果。</span>
+                </div>
+              ) : (
+                <details
+                  open={messageVerificationState !== "failed"}
+                  className={messageVerificationState === "failed" ? "rounded-xl border border-amber-200 bg-amber-50/50" : undefined}
+                >
+                  <summary
+                    className={messageVerificationState === "failed"
+                      ? "cursor-pointer list-none px-3 py-2.5 text-[12px] font-semibold text-amber-800 [&::-webkit-details-marker]:hidden"
+                      : "hidden"}
+                  >
+                    候选回答未通过验收 · 点击查看
+                  </summary>
               {message.segments && message.segments.length > 0 ? (
                 /* Multi-segment agent turn: each model invocation is its own block */
                 <div className="space-y-4">
@@ -194,6 +222,12 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
                   })()}
                 </>
               )}
+                </details>
+              )}
+
+              {message.outputAttachments?.length ? (
+                <AssistantAttachmentList attachments={message.outputAttachments} />
+              ) : null}
 
               {showInterruptionNotice && message.interrupted && message.interruptionNotice ? (
                 <InterruptionNotice text={message.interruptionNotice} />
@@ -241,9 +275,60 @@ function UserAttachmentList({ attachments }: { attachments: AgentAttachment[] })
   );
 }
 
+function formatAttachmentSize(size?: number): string {
+  if (!size || size < 1) return "";
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function AssistantAttachmentList({ attachments }: { attachments: AgentAttachment[] }) {
+  return (
+    <div className="mt-3 flex max-w-[680px] flex-col gap-2">
+      {attachments.map((attachment, index) => {
+        const Icon = attachment.type === "spreadsheet" ? FileSpreadsheet : FileText;
+        const href = attachment.download_url || "";
+        const content = (
+          <>
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[#002fa7]/10 text-[#002fa7]">
+              <Icon className="h-4.5 w-4.5" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-[13px] font-semibold text-slate-900">
+                {attachment.name || attachment.id || "生成附件"}
+              </div>
+              <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-[10px] text-slate-500">
+                <span>已生成附件</span>
+                {formatAttachmentSize(attachment.size) ? <span>{formatAttachmentSize(attachment.size)}</span> : null}
+                {attachment.derived_from ? <span>源自上传文件</span> : null}
+              </div>
+            </div>
+            <Download className="h-4 w-4 shrink-0 text-[#002fa7]" />
+          </>
+        );
+        const className = "flex w-full items-center gap-3 rounded-2xl border border-[#002fa7]/15 bg-[#f7f9ff] px-3 py-2.5 text-left shadow-sm transition hover:border-[#002fa7]/30 hover:bg-[#f1f5ff]";
+        return href ? (
+          <a
+            key={`${attachment.id || attachment.name || "output"}-${index}`}
+            className={className}
+            href={href}
+            download={attachment.name || true}
+          >
+            {content}
+          </a>
+        ) : (
+          <div key={`${attachment.id || attachment.name || "output"}-${index}`} className={className}>
+            {content}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function InterruptionNotice({ text }: { text: string }) {
   return (
-    <div className="mt-3 inline-flex max-w-full items-start gap-2 rounded-xl border border-amber-200 bg-amber-50/80 px-3 py-1.5 text-[12px] font-medium leading-relaxed text-amber-800 shadow-sm shadow-amber-900/[0.03]">
+    <div className="mt-3 flex w-full max-w-[820px] items-start gap-2 rounded-xl border border-amber-200 bg-amber-50/80 px-3 py-2.5 text-[12px] font-medium leading-relaxed text-amber-800 shadow-sm shadow-amber-900/[0.03]">
       <PauseCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-600" />
       <span className="min-w-0 break-words">{text}</span>
     </div>
@@ -252,7 +337,7 @@ function InterruptionNotice({ text }: { text: string }) {
 
 function ErrorNotice({ text }: { text: string }) {
   return (
-    <div className="mt-3 inline-flex max-w-full items-start gap-2 rounded-xl border border-rose-200 bg-rose-50/85 px-3 py-1.5 text-[12px] font-medium leading-relaxed text-rose-800 shadow-sm shadow-rose-900/[0.03]">
+    <div className="mt-3 flex w-full max-w-[820px] items-start gap-2 rounded-xl border border-rose-200 bg-rose-50/85 px-3 py-2.5 text-[12px] font-medium leading-relaxed text-rose-800 shadow-sm shadow-rose-900/[0.03]">
       <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-rose-600" />
       <span className="min-w-0 break-words">{text}</span>
     </div>
@@ -411,11 +496,19 @@ function ToolActionPermissionCard({
   const needsNetwork = needsTemporaryNetwork || (request.capabilities || []).includes("network_access");
   const installsPackages = (request.capabilities || []).includes("package_install");
   const writesWorkspace = (request.capabilities || []).includes("managed_write");
+  const writesSkills = (request.capabilities || []).includes("managed_skill_write");
+  const managesSkills = writesSkills || [
+    "prepare_skill_install",
+    "prepare_skill_update",
+    "install_skill",
+    "update_skill",
+  ].includes(request.tool_name || "");
   const riskLabel = ({
     high: "脚本执行 · 需确认",
     network: "联网 · 需确认",
     package_install: "安装依赖 · 需确认",
     managed_write: "写入项目 · 需确认",
+    managed_skill_write: "安装或更新 Skill · 需确认",
     critical: "禁止级风险",
   } as Record<string, string>)[request.risk || ""] || request.risk || "受控操作";
   const reason = request.reason || "需要人工确认";
@@ -425,6 +518,10 @@ function ToolActionPermissionCard({
       ? "该命令需要访问互联网。"
       : reason.startsWith("package_management")
         ? "该操作会下载并安装运行时依赖。"
+        : reason.startsWith("skill_source_download")
+          ? "该操作会联网下载 Skill 到隔离暂存区，并校验文件和来源；不会修改已安装 Skill。"
+        : reason.startsWith("managed_skill_write")
+          ? "该操作会提交已校验的不可变计划到受管 Skill 目录。授权仅对本次计划有效。"
         : reason.startsWith("managed_workspace_write")
           ? "该命令会修改项目目录。"
           : `Harness 规则：${reason}`;
@@ -434,6 +531,12 @@ function ToolActionPermissionCard({
       ? "允许联网搜索"
       : installsPackages
         ? "允许在沙箱中安装依赖"
+        : managesSkills
+          ? request.tool_name === "prepare_skill_update"
+            ? "允许检查 Skill 更新"
+            : request.tool_name === "prepare_skill_install"
+              ? "允许准备安装 Skill"
+              : request.tool_name === "update_skill" ? "允许更新 Skill" : "允许安装 Skill"
         : needsNetwork
           ? "允许命令联网执行"
         : "允许执行受控命令";
@@ -497,11 +600,16 @@ function ToolActionPermissionCard({
               </span>
             </div>
           ) : null}
-          {writesWorkspace || installsPackages ? (
+          {writesWorkspace || writesSkills || installsPackages ? (
             <div className="mt-2 flex flex-wrap gap-1.5">
               {writesWorkspace ? (
                 <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-800">
                   写入项目
+                </span>
+              ) : null}
+              {writesSkills ? (
+                <span className="rounded-full bg-cyan-100 px-2 py-0.5 text-[10px] font-semibold text-cyan-800">
+                  写入受管 Skill
                 </span>
               ) : null}
               {installsPackages ? (
@@ -511,9 +619,49 @@ function ToolActionPermissionCard({
               ) : null}
             </div>
           ) : null}
-          <pre className="mt-3 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-xl bg-slate-950 px-3 py-2.5 font-mono text-[12px] leading-5 text-slate-100">
-            {request.command || ""}
-          </pre>
+          {managesSkills && request.change_preview ? (
+            <div className="mt-3 rounded-xl border border-cyan-200 bg-white/80 p-3 text-[12px] text-slate-700">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="font-bold text-slate-950">
+                  {request.change_preview.skill_name || "Skill"}
+                  {request.change_preview.version ? ` · ${request.change_preview.version}` : ""}
+                </span>
+                <span className="rounded-full bg-cyan-100 px-2 py-0.5 font-semibold text-cyan-800">
+                  {request.change_preview.changes || (writesSkills ? "已校验变更" : "下载并校验")}
+                </span>
+              </div>
+              {request.change_preview.source ? (
+                <p className="mt-2 break-all font-mono text-[10.5px] text-slate-500">{request.change_preview.source}</p>
+              ) : null}
+              {["added", "changed", "removed"].map((key) => request.change_preview?.[key] ? (
+                <p key={key} className="mt-1 break-all">
+                  <span className="mr-1 font-semibold text-slate-500">
+                    {key === "added" ? "新增" : key === "changed" ? "修改" : "删除"}：
+                  </span>
+                  {request.change_preview[key]}
+                </p>
+              ) : null)}
+            </div>
+          ) : null}
+          {managesSkills ? (
+            <details className="group mt-3 rounded-xl border border-black/[0.06] bg-white/60 px-3 py-2">
+              <summary className="cursor-pointer select-none text-[11px] font-semibold text-slate-500 marker:text-slate-300">
+                技术详情
+              </summary>
+              {request.change_preview?.plan_sha256 ? (
+                <p className="mt-2 break-all font-mono text-[10px] text-slate-400">
+                  Plan SHA-256: {request.change_preview.plan_sha256}
+                </p>
+              ) : null}
+              <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-slate-950 px-3 py-2.5 font-mono text-[11px] leading-5 text-slate-100">
+                {request.command || ""}
+              </pre>
+            </details>
+          ) : (
+            <pre className="mt-3 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-xl bg-slate-950 px-3 py-2.5 font-mono text-[12px] leading-5 text-slate-100">
+              {request.command || ""}
+            </pre>
+          )}
           {status === "idle" || status === "error" ? (
             <div className="mt-3 flex flex-wrap gap-2">
               <button
@@ -523,13 +671,15 @@ function ToolActionPermissionCard({
               >
                 仅允许本次
               </button>
-              <button
-                type="button"
-                onClick={() => void grant("session")}
-                className="rounded-full bg-white px-3.5 py-2 text-[12px] font-semibold text-slate-700 ring-1 ring-black/[0.08] hover:bg-slate-50"
-              >
-                {request.session_scope_label || "本 Session 允许相同命令"}
-              </button>
+              {!managesSkills ? (
+                <button
+                  type="button"
+                  onClick={() => void grant("session")}
+                  className="rounded-full bg-white px-3.5 py-2 text-[12px] font-semibold text-slate-700 ring-1 ring-black/[0.08] hover:bg-slate-50"
+                >
+                  {request.session_scope_label || "本 Session 允许相同命令"}
+                </button>
+              ) : null}
               <button
                 type="button"
                 onClick={() => void deny()}
@@ -841,7 +991,7 @@ function SegmentBlock({
   isStreaming,
   isLast,
 }: {
-  segment: { content: string; reasoning?: string; timeline?: TimelineItem[] };
+  segment: { content: string; reasoning?: string; timeline?: TimelineItem[]; runId?: string; verificationState?: "pending" | "progress" | "passed" | "failed" | "unverified" };
   message: ChatMessageType;
   sessionSources: SourceRecord[];
   isStreaming?: boolean;
@@ -891,17 +1041,65 @@ function SegmentBlock({
     </div>
   ) : null;
 
-  // Keep reasoning and tools together as one thought chain. If the chain only
-  // contains reasoning, show it before the statement so it doesn't jump after
-  // streaming ends. If it contains tools, show it after the statement so the
-  // user can see the intent -> action flow and why tools were called.
-  return (
+  const body = (
     <div className="space-y-2">
       {!hasTools && thoughtChain}
       {contentBlock}
       {hasTools && thoughtChain}
     </div>
   );
+
+  // Verification is owned by one Run segment. A later Run must never hide or
+  // relabel an earlier candidate response in the same continuous Goal turn.
+  if (segment.verificationState === "pending" && segment.content && hasTools) {
+    return (
+      <details open={Boolean(isStreaming && isLast)} className="rounded-xl border border-blue-100 bg-blue-50/35">
+        <summary className="cursor-pointer list-none px-3 py-2.5 text-[12px] font-semibold text-blue-800 [&::-webkit-details-marker]:hidden">
+          执行进度 · 本轮尚未验收
+        </summary>
+        <div className="px-3 pb-3">{body}</div>
+      </details>
+    );
+  }
+  if (segment.verificationState === "pending" && segment.content) {
+    return (
+      <div className="inline-flex items-center gap-2 rounded-xl border border-blue-200 bg-blue-50/80 px-3 py-2.5 text-[12px] text-blue-800">
+        <Sparkles className="h-3.5 w-3.5 animate-pulse" />
+        <span><strong>本轮正在验收</strong> · 通过后才会作为最终结果。</span>
+      </div>
+    );
+  }
+  if (segment.verificationState === "progress") {
+    return (
+      <details className="rounded-xl border border-slate-200 bg-slate-50/55">
+        <summary className="cursor-pointer list-none px-3 py-2.5 text-[12px] font-semibold text-slate-600 [&::-webkit-details-marker]:hidden">
+          本轮执行过程 · 点击查看
+        </summary>
+        <div className="px-3 pb-3">{body}</div>
+      </details>
+    );
+  }
+  if (segment.verificationState === "failed") {
+    return (
+      <details className="rounded-xl border border-amber-200 bg-amber-50/50">
+        <summary className="cursor-pointer list-none px-3 py-2.5 text-[12px] font-semibold text-amber-800 [&::-webkit-details-marker]:hidden">
+          本轮候选回答未通过验收 · 点击查看
+        </summary>
+        <div className="px-3 pb-3">{body}</div>
+      </details>
+    );
+  }
+  if (segment.verificationState === "unverified") {
+    return (
+      <details className="rounded-xl border border-amber-200 bg-amber-50/50">
+        <summary className="cursor-pointer list-none px-3 py-2.5 text-[12px] font-semibold text-amber-800 [&::-webkit-details-marker]:hidden">
+          本轮候选回答尚未形成有效验收 · 点击查看
+        </summary>
+        <div className="px-3 pb-3">{body}</div>
+      </details>
+    );
+  }
+  return body;
 }
 
 function renderCitationMarkersForSegment(
@@ -909,7 +1107,7 @@ function renderCitationMarkersForSegment(
   content: string,
   sessionSources: SourceRecord[] = []
 ): string {
-  const normalizedContent = stripCitationDefinitions(content);
+  const normalizedContent = stripCitationDefinitions(stripModelCallLimitNotice(content));
   const indexes = new Map<string, number>();
   message.citations?.forEach((citation) => {
     indexes.set(citation.source_id, citation.display_index);
@@ -987,7 +1185,7 @@ function ReasoningBlock({
 }
 
 function renderCitationMarkers(message: ChatMessageType, sessionSources: SourceRecord[] = []): string {
-  const normalizedContent = stripCitationDefinitions(message.content);
+  const normalizedContent = stripCitationDefinitions(stripModelCallLimitNotice(message.content));
   const indexes = new Map<string, number>();
 
   // Citations carry the authoritative display index.

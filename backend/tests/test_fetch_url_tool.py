@@ -91,6 +91,20 @@ def test_mixed_public_and_private_dns_fails_closed(monkeypatch) -> None:
         _resolve_public_addresses("rebind.example", 443)
 
 
+def test_https_hostname_accepts_standard_fake_ip_but_http_does_not(monkeypatch) -> None:
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.0.118", 443)),
+        ],
+    )
+
+    assert _resolve_public_addresses("public.example", 443, scheme="https") == ["198.18.0.118"]
+    with pytest.raises(UnsafePublicURL, match="non-public"):
+        _resolve_public_addresses("public.example", 80, scheme="http")
+
+
 def test_redirect_is_revalidated_before_following(monkeypatch) -> None:
     requested: list[str] = []
 
@@ -119,6 +133,7 @@ def test_redirect_is_revalidated_before_following(monkeypatch) -> None:
         "https://user:secret@example.com/",
         "http://example.com:8080/",
         "https://example.com:8443/",
+        "https://198.18.0.118/",
     ],
 )
 def test_unsafe_url_shapes_are_blocked_without_request(url) -> None:

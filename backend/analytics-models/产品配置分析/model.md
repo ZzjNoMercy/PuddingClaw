@@ -49,16 +49,6 @@ updated_at: "2026-07-14 00:00:00"
 - 使用 `vehicle_model_base` 时按 `vehicle_level` 排除；回退到 `vehicle_params` 时，必须在款型聚合中读取 `type_name = '级别'` 并排除 `type_value = '皮卡'`。
 - 用户明确指定车型范围时，以用户要求为准。
 
-## 报告生成规范
-
-生成或修改产品配置分析报告前，必须读取：
-
-`references/report-generation.md`
-
-该 reference 定义字段映射、必需章节、25 个图表契约和完整执行状态机。HTML 模板由 frontmatter 的 `default_template` 指定。
-
-不得从 HTML 示例值反推分析结果，也不得边查询边改 HTML。必须先完成查询计划和全部计算，生成统一 `report_payload`，通过完整性校验后再一次性刷新 HTML。未通过 reference 中的四个 Gate 时，不得把报告标记为完成。
-
 ## 输出要求
 
 - 先输出结论，再给数据证据、口径和异常说明。

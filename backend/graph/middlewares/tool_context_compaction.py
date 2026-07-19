@@ -119,9 +119,15 @@ def _with_candidate_metadata(candidate: dict[str, Any], summary: str) -> str:
     else:
         input_value = str(tool_input)[:1200]
     metadata = {
+        "tool_call_id": str(candidate.get("tool_call_id") or ""),
         "tool": str(candidate.get("tool") or "unknown_tool"),
         "input": input_value,
+        "source_hash": candidate.get("source_hash"),
         "raw_output_ref": candidate.get("raw_output_ref"),
+        "harness_evidence": {
+            "identity_preserved": True,
+            "raw_output_recoverable": bool(candidate.get("raw_output_ref")),
+        },
     }
     return (
         "[Tool Context 元数据]\n"
@@ -262,10 +268,35 @@ class ToolContextCompactionService:
         task.add_done_callback(remove_finished)
         return job_id
 
-    async def wait(self, session_id: str, timeout: float = 5) -> None:
+    async def wait(self, session_id: str, timeout: float = 5) -> dict[str, Any]:
         task = self._tasks.get(session_id)
         if task is not None:
-            await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+                status = await asyncio.to_thread(
+                    self.manager.get_tool_context_status,
+                    session_id,
+                )
+                job_id = str(status.get("id") or "")
+                if job_id:
+                    await asyncio.to_thread(
+                        self.manager.fail_unresolved_tool_context_candidates,
+                        session_id,
+                        job_id,
+                        reason="Background Tool Context task was cancelled; raw result retained.",
+                    )
+                    await asyncio.to_thread(
+                        self.manager.update_tool_context_job,
+                        session_id,
+                        job_id,
+                        status="failed",
+                        error="Background Tool Context task was cancelled.",
+                    )
+        return await asyncio.to_thread(self.manager.get_tool_context_status, session_id)
 
     def _model(self) -> Any:
         if self.model_factory is not None:
@@ -422,6 +453,13 @@ class ToolContextCompactionService:
                 "tool_call_id_integrity_failure_count": failed,
                 "compaction_job_duration_ms": round((time.monotonic() - started) * 1000),
             }
+            if failed:
+                await asyncio.to_thread(
+                    self.manager.fail_unresolved_tool_context_candidates,
+                    session_id,
+                    job_id,
+                    reason="Tool Context compaction failed; raw result retained.",
+                )
             await asyncio.to_thread(
                 self.manager.update_tool_context_job,
                 session_id,
@@ -446,8 +484,31 @@ class ToolContextCompactionService:
                 before_tokens,
                 after_tokens,
             )
+        except asyncio.CancelledError:
+            await asyncio.to_thread(
+                self.manager.fail_unresolved_tool_context_candidates,
+                session_id,
+                job_id,
+                reason="Tool Context compaction was cancelled; raw result retained.",
+            )
+            await asyncio.to_thread(
+                self.manager.update_tool_context_job,
+                session_id,
+                job_id,
+                status="failed",
+                completed_count=completed,
+                failed_count=max(1, failed),
+                error="CancelledError: background Tool Context task was cancelled.",
+            )
+            raise
         except Exception as exc:
             logger.exception("Tool Context job failed for session=%s", session_id)
+            await asyncio.to_thread(
+                self.manager.fail_unresolved_tool_context_candidates,
+                session_id,
+                job_id,
+                reason=f"{type(exc).__name__}: {exc}; raw result retained.",
+            )
             await asyncio.to_thread(
                 self.manager.update_tool_context_job,
                 session_id,
@@ -483,9 +544,19 @@ class ToolContextCompactionMiddleware(AgentMiddleware[Any, Any, Any]):
         result = await handler(request)
         if not isinstance(result, ToolMessage):
             return result
+        raw = str(result.content or "")
+        runtime_context = getattr(getattr(request, "runtime", None), "context", None)
+        context = runtime_context if isinstance(runtime_context, dict) else {}
+        tagged_kwargs = dict(result.additional_kwargs or {})
+        tagged_kwargs.update(
+            {
+                "puddingclaw_query_id": str(context.get("query_id") or ""),
+                "puddingclaw_tool_source_hash": self.manager._tool_context_source_hash(raw),
+            }
+        )
+        result = result.model_copy(update={"additional_kwargs": tagged_kwargs})
         if not self.cfg.immediate_compaction_enabled:
             return result
-        raw = str(result.content or "")
         if len(raw) > DEEPAGENTS_FILESYSTEM_EVICT_CHARS:
             return result
         if estimate_text_tokens(raw) <= self.cfg.single_tool_trigger_tokens:
@@ -520,13 +591,29 @@ class ToolContextCompactionMiddleware(AgentMiddleware[Any, Any, Any]):
         session_id = str(context.get("session_id") or "") if isinstance(context, dict) else ""
         if not session_id:
             return await handler(request)
-        ready = await asyncio.to_thread(self.manager.get_ready_tool_context_outputs, session_id)
+        ready = await asyncio.to_thread(self.manager.get_ready_tool_context_entries, session_id)
         if not ready:
             return await handler(request)
         messages: list[Any] = []
         for message in request.messages:
             if isinstance(message, ToolMessage) and message.tool_call_id in ready:
-                messages.append(message.model_copy(update={"content": ready[message.tool_call_id]}))
+                extra = dict(message.additional_kwargs or {})
+                source_hash = str(extra.get("puddingclaw_tool_source_hash") or "")
+                if not source_hash:
+                    artifact = message.artifact if isinstance(message.artifact, dict) else {}
+                    raw = str(artifact.get(RAW_OUTPUT_ARTIFACT_KEY) or message.content or "")
+                    source_hash = self.manager._tool_context_source_hash(raw)
+                query_id = str(extra.get("puddingclaw_query_id") or "")
+                matches = [
+                    entry
+                    for entry in ready[message.tool_call_id]
+                    if entry.get("source_hash") == source_hash
+                    and (not query_id or entry.get("query_id") == query_id)
+                ]
+                if len(matches) == 1:
+                    messages.append(message.model_copy(update={"content": matches[0]["context_output"]}))
+                    continue
+                messages.append(message)
             else:
                 messages.append(message)
         return await handler(request.override(messages=messages))

@@ -10,6 +10,7 @@ from starlette.concurrency import run_in_threadpool
 
 from config import get_rag_mode
 from graph.permission_resume import permission_resume_registry
+from graph.deepagents_manager import deepagents_agent_manager
 from graph.prompt_builder import build_system_prompt
 from graph.session_manager import session_manager
 from harness.coordinators import GoalActivationError, GoalCoordinator
@@ -35,6 +36,11 @@ class SessionAnalyticsModelRequest(BaseModel):
 class SessionCreateRequest(BaseModel):
     analytics_model_id: str | None = None
     approval_mode: Literal["strict", "smart"] = "strict"
+
+
+class GoalUpdateRequest(BaseModel):
+    objective: str
+    expected_revision: int
 
 
 # ── Endpoints ───────────────────────────────────────────────
@@ -140,10 +146,33 @@ async def get_session_goal(session_id: str, goal_id: str):
     return goal
 
 
+@router.patch("/sessions/{session_id}/goals/{goal_id}")
+async def update_session_goal(
+    session_id: str,
+    goal_id: str,
+    request: GoalUpdateRequest,
+):
+    try:
+        goal = await run_in_threadpool(
+            goal_coordinator.update_objective,
+            session_id,
+            goal_id,
+            objective=request.objective,
+            expected_revision=request.expected_revision,
+        )
+        return goal.model_dump(mode="json")
+    except GoalActivationError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except HarnessStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 async def _transition_goal(session_id: str, goal_id: str, action: str):
     try:
         method = getattr(goal_coordinator, action)
         goal = await run_in_threadpool(method, session_id, goal_id)
+        if action in {"pause", "cancel"} and goal.requested_status is not None:
+            deepagents_agent_manager.cancel_active_goal_run(session_id, goal_id)
         return goal.model_dump(mode="json")
     except GoalActivationError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

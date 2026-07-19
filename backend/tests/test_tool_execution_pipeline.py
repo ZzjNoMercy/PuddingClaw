@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import subprocess
+import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,6 +25,7 @@ from harness.workspace_backends import (
     DockerWorkspaceBackend,
     ProjectSandboxManager,
     RestrictedHostWorkspaceBackend,
+    _canonical_docker_mount_source,
     build_workspace_execution_backend,
 )
 
@@ -197,6 +200,130 @@ def test_restricted_host_shell_policy(command, decision, reason, tmp_path):
     assert result.reason == reason
 
 
+def test_restricted_host_policy_preserves_quoted_paths_with_spaces(tmp_path):
+    workspace = tmp_path / "project with spaces"
+    workspace.mkdir()
+    inside = workspace / "report v2.html"
+    inside.write_text("ok", encoding="utf-8")
+    outside = tmp_path / "outside report.html"
+    outside.write_text("no", encoding="utf-8")
+    analyzer = ShellPolicyAnalyzer(
+        workspace_path=str(workspace),
+        backend_mode="restricted_host",
+    )
+
+    assert analyzer.analyze(f'cat "{inside}"').decision == PolicyDecision.ALLOW
+    denied = analyzer.analyze(f'cat "{outside}"')
+    assert denied.decision == PolicyDecision.DENY
+    assert denied.reason == "host_filesystem_access"
+
+
+def test_shell_policy_allows_virtual_scratch_but_denies_internal_mount(tmp_path):
+    analyzer = ShellPolicyAnalyzer(
+        workspace_path=str(tmp_path),
+        backend_mode="restricted_host",
+    )
+
+    assert analyzer.analyze("cat /scratch/report.html").decision == PolicyDecision.ALLOW
+    denied = analyzer.analyze("cat /harness-scratch/other-session/report.html")
+    assert denied.decision == PolicyDecision.DENY
+    assert denied.reason == "harness_internal_path_access"
+
+    traversal = analyzer.analyze("cat /scratch/../../../../etc/passwd")
+    assert traversal.decision == PolicyDecision.DENY
+    assert traversal.reason == "scratch_path_traversal"
+
+
+def test_restricted_host_backend_rejects_scratch_traversal_before_rewrite(tmp_path):
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    workspace.mkdir()
+    scratch.mkdir()
+    backend = RestrictedHostWorkspaceBackend(
+        root_dir=workspace,
+        scratch_path=scratch,
+    )
+
+    result = backend.execute("cat /scratch/../../../../etc/passwd")
+
+    assert result.exit_code == 126
+    assert "parent traversal" in result.output
+
+
+def test_docker_runtime_validation_requires_exact_writable_scratch_mount(tmp_path, monkeypatch):
+    workspace = tmp_path / "project"
+    scratch = tmp_path / "scratch-project"
+    workspace.mkdir()
+    scratch.mkdir()
+    manager = ProjectSandboxManager(
+        {
+            "image": DEFAULT_SANDBOX_IMAGE,
+            "_managed_writable_mounts": [
+                {"source": str(scratch), "target": "/harness-scratch"}
+            ],
+            "_scratch_relative": "session/query",
+        }
+    )
+    spec = manager._spec(workspace)
+
+    monkeypatch.setattr(
+        manager,
+        "_run",
+        lambda args, **_kwargs: subprocess.CompletedProcess(
+            args,
+            0,
+            json.dumps(
+                [
+                    {
+                        "Mounts": [],
+                        "Config": {"User": f"{os.getuid()}:{os.getgid()}"},
+                    }
+                ]
+            ),
+            "",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="writable mount contract mismatch"):
+        manager._validate_runtime("sandbox", spec)
+
+
+def test_docker_desktop_mount_source_normalizes_host_mnt_projection():
+    assert _canonical_docker_mount_source(
+        "/host_mnt/Users/pet/project/.puddingclaw/scratch"
+    ) == "/Users/pet/project/.puddingclaw/scratch"
+
+
+def test_restricted_host_backend_maps_virtual_scratch_outside_workspace(tmp_path):
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "harness-scratch" / "session" / "query"
+    workspace.mkdir()
+    scratch.mkdir(parents=True)
+    backend = RestrictedHostWorkspaceBackend(root_dir=workspace, scratch_path=scratch)
+
+    result = backend.execute("printf scratch > /scratch/result.txt")
+
+    assert result.exit_code == 0
+    assert (scratch / "result.txt").read_text() == "scratch"
+    assert not (workspace / "result.txt").exists()
+
+
+def test_restricted_host_backend_maps_quoted_and_assigned_scratch_paths(tmp_path):
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "harness-scratch" / "session" / "query"
+    workspace.mkdir()
+    scratch.mkdir(parents=True)
+    backend = RestrictedHostWorkspaceBackend(root_dir=workspace, scratch_path=scratch)
+
+    quoted = backend.execute("printf quoted > \"/scratch/quoted.txt\"")
+    assigned = backend.execute("OUT=/scratch/assigned.txt; printf assigned > \"$OUT\"")
+
+    assert quoted.exit_code == 0
+    assert assigned.exit_code == 0
+    assert (scratch / "quoted.txt").read_text() == "quoted"
+    assert (scratch / "assigned.txt").read_text() == "assigned"
+
+
 def test_shell_chain_uses_strictest_segment(tmp_path):
     analyzer = ShellPolicyAnalyzer(
         workspace_path=str(tmp_path),
@@ -245,6 +372,25 @@ def test_docker_mode_does_not_treat_container_as_authorization(tmp_path):
     assert analyzer.analyze("cat /etc/os-release").decision == PolicyDecision.ALLOW
 
 
+def test_docker_mode_denies_relative_harness_scratch_and_workspace_escape(tmp_path):
+    analyzer = ShellPolicyAnalyzer(
+        workspace_path=str(tmp_path),
+        backend_mode="docker",
+    )
+
+    for command in (
+        "find ../harness-scratch -type f",
+        "cat ../harness-scratch/other-session/other-query/secret.txt",
+        "cd ..",
+        "cat ../../etc/passwd",
+        "cd / && find harness-scrat[c]h -type f",
+        "cd / && cat h*/other/query/x",
+    ):
+        result = analyzer.analyze(command)
+        assert result.decision == PolicyDecision.DENY, command
+        assert result.risk == "critical"
+
+
 def test_unknown_tool_fails_closed(tmp_path):
     request = ToolCallRequest(
         tool_call={"id": "call-1", "name": "forged_tool", "args": {}},
@@ -275,6 +421,31 @@ def test_registered_but_unclassified_tool_fails_closed(tmp_path):
 
     assert result.decision == PolicyDecision.DENY
     assert result.reason == "unclassified_tool:new_mutating_tool"
+
+
+def test_attachment_lease_tools_are_internal_capabilities_not_host_write_grants(tmp_path):
+    pipeline = ToolExecutionPipeline(
+        known_tools={"prepare_attachment_edit", "publish_attachment"},
+        backend_mode="docker",
+    )
+    for name, args in (
+        ("prepare_attachment_edit", {"attachment_id": "att_source"}),
+        (
+            "publish_attachment",
+            {
+                "lease_id": "attachment-lease-1",
+                "output_path": "/scratch/attachments/attachment-lease-1/result.html",
+            },
+        ),
+    ):
+        request = ToolCallRequest(
+            tool_call={"id": f"call-{name}", "name": name, "args": args},
+            tool=None,
+            state={},
+            runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+        )
+        result = pipeline._preflight(request)
+        assert result.decision == PolicyDecision.ALLOW
 
 
 def test_network_tool_requires_hitl_and_fingerprints_arguments(tmp_path):
@@ -455,6 +626,11 @@ def test_once_tool_grant_is_consumed_atomically(tmp_path):
 
     assert sessions.consume_tool_action_permission("session-1", fingerprint) is True
     assert sessions.consume_tool_action_permission("session-1", fingerprint) is False
+    assert sessions.list_permission_grants("session-1") == []
+    history = sessions.list_permission_grant_history("session-1")
+    assert len(history) == 1
+    assert history[0]["scope"] == "once"
+    assert history[0]["consumed_at"] == history[0]["revoked_at"]
 
 
 def test_session_tool_grant_remains_available(tmp_path):
@@ -658,6 +834,20 @@ def test_project_container_spec_has_no_docker_socket_or_host_home(tmp_path, monk
     def fake_run(args, *, timeout=30):
         calls.append(list(args))
         if args[0] == "inspect":
+            if len(args) == 2:
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    json.dumps(
+                        [
+                            {
+                                "Mounts": [],
+                                "Config": {"User": f"{os.getuid()}:{os.getgid()}"},
+                            }
+                        ]
+                    ),
+                    "",
+                )
             return subprocess.CompletedProcess(args, 1, "", "not found")
         return subprocess.CompletedProcess(args, 0, "ok", "")
 

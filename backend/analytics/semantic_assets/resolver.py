@@ -12,6 +12,7 @@ from .registry import get_semantic_asset_registry
 TOKEN_RE = re.compile(r"[0-9A-Za-z_\u4e00-\u9fff]+")
 MAX_MATCHED_ASSETS = 8
 MAX_BODY_CHARS = 2400
+MIN_ASSET_MATCH_SCORE = 6.0
 GENERIC_CJK_BIGRAMS = {
     "车型",
     "配置",
@@ -133,6 +134,14 @@ def _score_text_against_question(
         score += min(12.0, 4.0 * len(metadata_hits))
         reasons.append(f"metadata token hit: {', '.join(metadata_hits[:6])}")
 
+    metadata_cjk_hits = sorted(
+        _cjk_bigrams(question)
+        & _cjk_bigrams(" ".join([name, *aliases, *tags, description]))
+    )
+    if metadata_cjk_hits:
+        score += min(12.0, 6.0 * len(metadata_cjk_hits))
+        reasons.append(f"metadata phrase hit: {', '.join(metadata_cjk_hits[:6])}")
+
     body_hits = sorted(question_tokens & _tokens(body))
     if body_hits:
         score += min(10.0, 1.5 * len(body_hits))
@@ -221,6 +230,7 @@ def resolve_semantic_assets(
     *,
     base_dir: Path | None = None,
     requested_ids: list[str] | None = None,
+    allowed_ids: list[str] | None = None,
     max_assets: int = MAX_MATCHED_ASSETS,
 ) -> dict[str, Any]:
     """Resolve semantic assets relevant to a question.
@@ -233,10 +243,17 @@ def resolve_semantic_assets(
     resolved_base_dir = (base_dir or Path(__file__).resolve().parents[2]).resolve()
     snapshot = registry.list_assets()
     requested = {item.strip() for item in (requested_ids or []) if item and item.strip()}
+    allowed = (
+        {item.strip() for item in allowed_ids or [] if item and item.strip()}
+        if allowed_ids is not None
+        else None
+    )
     scored: list[tuple[float, str, dict[str, Any]]] = []
 
     for summary in snapshot.get("assets") or []:
         asset_id = str(summary.get("id") or "")
+        if allowed is not None and asset_id not in allowed:
+            continue
         # Asset relations are model-scoped graph edges. They are resolved only
         # through the selected analytics model, never by free-text retrieval.
         if str(summary.get("type") or "") == "relation":
@@ -276,7 +293,9 @@ def resolve_semantic_assets(
                 score = 0.0
                 reasons = []
 
-        if score > 0:
+        # One incidental CJK bigram is not enough to claim that a published
+        # business definition applies. Explicit ids already carry score 100.
+        if score >= MIN_ASSET_MATCH_SCORE:
             scored.append((score, "；".join(reasons[:4]), detail))
 
     scored.sort(key=lambda item: item[0], reverse=True)
@@ -319,6 +338,7 @@ def resolve_semantic_assets(
         "available_count": snapshot.get("count", 0),
         "type_counts": snapshot.get("type_counts") or {},
         "unmatched_requested_ids": unmatched_requested,
+        "resolution_mode": "model_scoped_fuzzy" if allowed is not None else "fuzzy",
     }
 
 
@@ -326,6 +346,7 @@ def resolve_semantic_assets_by_ids(
     question: str,
     *,
     requested_ids: list[str],
+    allowed_ids: list[str] | None = None,
     base_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Load only explicitly selected assets, preserving complete definitions."""
@@ -335,7 +356,15 @@ def resolve_semantic_assets_by_ids(
     snapshot = registry.list_assets()
     matched: list[ResolvedSemanticAsset] = []
     unmatched_requested: list[str] = []
+    allowed = (
+        {item.strip() for item in allowed_ids or [] if item and item.strip()}
+        if allowed_ids is not None
+        else None
+    )
     for asset_id in dict.fromkeys(item.strip() for item in requested_ids if item and item.strip()):
+        if allowed is not None and asset_id not in allowed:
+            unmatched_requested.append(asset_id)
+            continue
         try:
             detail = registry.get_asset(asset_id)
         except Exception:
@@ -387,6 +416,12 @@ def format_semantic_assets_for_prompt(resolution: dict[str, Any]) -> str:
     matched = resolution.get("matched") or []
     references = resolution.get("references") or []
     if not matched and not references:
+        if resolution.get("resolution_mode") == "generalized":
+            return (
+                "语义资产定义：本轮没有命中与问题相关的已发布度量值、颗粒度、维度或 Reference。\n"
+                "这不是失败条件：可以依据当前分析模型、允许的数据表字段和用户原始问题进行泛化 SQL 生成。\n"
+                "不得虚构一个已发布语义口径；存在业务歧义时应在结果中明确说明假设。"
+            )
         return (
             "语义资产定义：本轮未命中任何度量值、颗粒度、维度或度量值 references。\n"
             "如果问题涉及业务口径，请不要自行从字段名或款型名称猜测；必要时生成保守 SQL 或要求补充定义。"

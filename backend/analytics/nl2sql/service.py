@@ -43,6 +43,44 @@ logger = logging.getLogger(__name__)
 
 VANNA_REFERENCE_TOP_K = 5
 VANNA_ENTITY_TOP_K_PER_TYPE = 10
+
+
+def _resolve_request_semantic_assets(request: DatabaseQueryRequest) -> dict[str, Any]:
+    """Resolve explicit assets first, while preserving model-scoped fallback.
+
+    A selected analytics model is an authority boundary, not a signal that the
+    outer Agent necessarily supplied explicit semantic ids. When ids are
+    absent, fuzzy resolution remains available but is restricted to assets
+    declared by that model. A genuine no-match stays in generalized mode.
+    """
+
+    allowed_ids: list[str] | None = None
+    if request.model_id:
+        model = get_analytics_model_registry().get_model_context(request.model_id)
+        allowed_ids = [
+            str(item.get("id") or "").strip()
+            for item in model.get("semantic_assets") or []
+            if str(item.get("id") or "").strip()
+        ]
+    selected_ids = [str(item).strip() for item in request.measure_ids if str(item).strip()]
+    if selected_ids:
+        return resolve_semantic_assets_by_ids(
+            request.question,
+            requested_ids=selected_ids,
+            allowed_ids=allowed_ids,
+        )
+    if not request.model_id:
+        resolution = resolve_semantic_assets(request.question)
+    else:
+        resolution = resolve_semantic_assets(
+            request.question,
+            allowed_ids=allowed_ids,
+        )
+    if not resolution.get("matched") and not resolution.get("references"):
+        resolution["resolution_mode"] = "generalized"
+    return resolution
+
+
 _CONFIG_RATE_SQL_TEMPLATE = """
 当允许表包含 vehicle_model_base 时，配置率、配备率、搭载率等问题必须优先使用
 vehicle_model_base 计算分母和常用维度筛选，再 JOIN vehicle_params 判断配置明细。
@@ -513,11 +551,9 @@ async def query_database_knowledge(
         record_stage("router_ms", stage_started)
 
         stage_started = perf_counter()
-        resolver = resolve_semantic_assets_by_ids if request.model_id else resolve_semantic_assets
         semantic_resolution = await asyncio.to_thread(
-            resolver,
-            request.question,
-            requested_ids=request.measure_ids,
+            _resolve_request_semantic_assets,
+            request,
         )
         semantic_trace = semantic_resolution_to_trace(semantic_resolution)
         model_context, model_trace = await asyncio.to_thread(
@@ -721,11 +757,9 @@ async def generate_database_sql(
         record_stage("router_ms", stage_started)
 
         stage_started = perf_counter()
-        resolver = resolve_semantic_assets_by_ids if request.model_id else resolve_semantic_assets
         semantic_resolution = await asyncio.to_thread(
-            resolver,
-            request.question,
-            requested_ids=request.measure_ids,
+            _resolve_request_semantic_assets,
+            request,
         )
         semantic_trace = semantic_resolution_to_trace(semantic_resolution)
         model_context, model_trace = await asyncio.to_thread(

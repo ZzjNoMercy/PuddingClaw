@@ -345,6 +345,12 @@ class SessionManager:
             return {"id": session_id, "title": session_id, "runtime_mode": "chat"}
         return self._metadata_from_data(session_id, data)
 
+    def session_exists(self, session_id: str) -> bool:
+        """Return whether an authoritative Session JSON exists."""
+
+        safe_id = "".join(c for c in session_id if c.isalnum() or c in "-_")
+        return bool(safe_id == session_id and self._session_path(session_id).is_file())
+
     @staticmethod
     def _loaded_skill_ids_from_traces(data: dict[str, Any]) -> set[str]:
         """Recover successful authoritative Skill reads from legacy trace snapshots."""
@@ -468,6 +474,9 @@ class SessionManager:
         interrupted: bool = False,  # 本轮是否由用户主动停止
         interruption_notice: str | None = None,  # 用户可见的停止提示
         error_notice: str | None = None,  # 用户可见的错误提示
+        run_boundary_notice: dict[str, Any] | None = None,  # 跨 Run 续跑/停止说明
+        attachments: list[dict[str, Any]] | None = None,  # Session-scoped stable attachment refs
+        output_attachments: list[dict[str, Any]] | None = None,  # Assistant-published derived attachments
     ) -> None:
         """追加一条消息到会话历史"""
         data = self._read_file(session_id)  # 读取现有数据
@@ -485,6 +494,9 @@ class SessionManager:
             interrupted=interrupted,
             interruption_notice=interruption_notice,
             error_notice=error_notice,
+            run_boundary_notice=run_boundary_notice,
+            attachments=attachments,
+            output_attachments=output_attachments,
         )
         data["messages"].append(msg)  # 追加到消息列表末尾
         if isinstance(data.get("display_messages"), list):
@@ -505,6 +517,9 @@ class SessionManager:
         interrupted: bool = False,
         interruption_notice: str | None = None,
         error_notice: str | None = None,
+        run_boundary_notice: dict[str, Any] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+        output_attachments: list[dict[str, Any]] | None = None,
         query_id: str | None = None,
         status: str | None = None,
     ) -> dict[str, Any]:
@@ -529,6 +544,40 @@ class SessionManager:
             msg["interruption_notice"] = interruption_notice
         if error_notice:
             msg["error_notice"] = error_notice
+        if run_boundary_notice:
+            msg["run_boundary_notice"] = run_boundary_notice
+        if attachments:
+            msg["attachments"] = [
+                {
+                    "id": str(item.get("id") or ""),
+                    "name": str(item.get("name") or item.get("id") or "attachment"),
+                    "type": str(item.get("type") or "file"),
+                    "mime_type": str(item.get("mime_type") or ""),
+                    "source": str(item.get("source") or "upload"),
+                }
+                for item in attachments
+                if isinstance(item, dict) and item.get("id")
+            ]
+        if output_attachments:
+            msg["output_attachments"] = [
+                {
+                    "id": str(item.get("id") or ""),
+                    "name": str(item.get("name") or item.get("id") or "attachment"),
+                    "type": str(item.get("type") or "file"),
+                    "mime_type": str(item.get("mime_type") or ""),
+                    "size": int(item.get("size") or 0),
+                    "source": str(item.get("source") or "generated"),
+                    "sha256": str(item.get("sha256") or ""),
+                    "derived_from": str(item.get("derived_from") or ""),
+                    "created_by_run_id": str(item.get("created_by_run_id") or ""),
+                    "created_by_query_id": str(item.get("created_by_query_id") or ""),
+                    "created_by_goal_id": str(item.get("created_by_goal_id") or ""),
+                    "created_by_goal_revision": item.get("created_by_goal_revision"),
+                    "download_url": str(item.get("download_url") or ""),
+                }
+                for item in output_attachments
+                if isinstance(item, dict) and item.get("id")
+            ]
         if query_id:
             msg["query_id"] = query_id
         if status:
@@ -551,6 +600,8 @@ class SessionManager:
         interrupted: bool = False,
         interruption_notice: str | None = None,
         error_notice: str | None = None,
+        run_boundary_notice: dict[str, Any] | None = None,
+        output_attachments: list[dict[str, Any]] | None = None,
         status: str = "running",
     ) -> None:
         """Create or replace the assistant draft for a query.
@@ -576,6 +627,8 @@ class SessionManager:
             interrupted=interrupted,
             interruption_notice=interruption_notice,
             error_notice=error_notice,
+            run_boundary_notice=run_boundary_notice,
+            output_attachments=output_attachments,
             query_id=query_id,
             status=status,
         )
@@ -635,6 +688,36 @@ class SessionManager:
 
         self._write_file(session_id, data)
 
+    @_session_write_locked
+    def set_assistant_run_boundary_notice(
+        self,
+        session_id: str,
+        query_id: str,
+        notice: dict[str, Any],
+    ) -> None:
+        """Persist a user-facing Run boundary without rewriting message content."""
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        updated = False
+        for collection_name in ("messages", "display_messages"):
+            collection = data.get(collection_name)
+            if not isinstance(collection, list):
+                continue
+            for message in reversed(collection):
+                if (
+                    isinstance(message, dict)
+                    and message.get("role") == "assistant"
+                    and message.get("query_id") == query_id
+                ):
+                    message["run_boundary_notice"] = dict(notice)
+                    updated = True
+                    break
+        if not updated:
+            raise ValueError(f"Assistant message for query {query_id} does not exist")
+        self._write_file(session_id, data)
+
     @staticmethod
     def _tool_result_context(
         tool_calls: list[dict[str, Any]],
@@ -678,27 +761,75 @@ class SessionManager:
         data["title"] = title  # 更新标题
         self._write_file(session_id, data)  # 写回磁盘
 
-    def get_todos(self, session_id: str) -> list[dict[str, Any]]:
-        """Return the persisted todo list for a session."""
+    @staticmethod
+    def _todo_scope_key(
+        *,
+        goal_id: str | None = None,
+        goal_revision: int | None = None,
+        run_id: str | None = None,
+    ) -> str:
+        if goal_id:
+            return f"goal:{goal_id}:revision:{int(goal_revision or 1)}"
+        if run_id:
+            return f"run:{run_id}"
+        return "session:legacy"
+
+    def get_todos(
+        self,
+        session_id: str,
+        *,
+        goal_id: str | None = None,
+        goal_revision: int | None = None,
+        run_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return the Todo ledger for one Goal revision or standalone Run."""
         data = self._read_file(session_id)
         if not data:
             return []
+        if goal_id or run_id:
+            ledgers = data.get("todo_ledgers")
+            scoped = (
+                ledgers.get(
+                    self._todo_scope_key(
+                        goal_id=goal_id,
+                        goal_revision=goal_revision,
+                        run_id=run_id,
+                    )
+                )
+                if isinstance(ledgers, dict)
+                else None
+            )
+            return deepcopy(scoped) if isinstance(scoped, list) else []
         todos = data.get("todos")
-        return list(todos) if isinstance(todos, list) else []
+        return deepcopy(todos) if isinstance(todos, list) else []
 
     @_session_write_locked
     def update_todos(
         self,
         session_id: str,
         todos: list[dict[str, Any]],
+        *,
+        goal_id: str | None = None,
+        goal_revision: int | None = None,
+        run_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Persist the todo list and return the saved list."""
+        """Persist the current Todo ledger with explicit lifecycle ownership."""
         data = self._read_file(session_id)
         if not data:
             return []
-        data["todos"] = list(todos)
+        saved = deepcopy(todos)
+        data["todos"] = saved
+        if goal_id or run_id:
+            ledgers = data.setdefault("todo_ledgers", {})
+            ledgers[
+                self._todo_scope_key(
+                    goal_id=goal_id,
+                    goal_revision=goal_revision,
+                    run_id=run_id,
+                )
+            ] = saved
         self._write_file(session_id, data)
-        return list(todos)
+        return deepcopy(saved)
 
     def get_harness_state(self, session_id: str) -> dict[str, Any]:
         """Return the product-level Run/Goal state stored in Session JSON."""
@@ -981,6 +1112,35 @@ class SessionManager:
         return deepcopy(saved)
 
     @_session_write_locked
+    def update_terminal_run_verification_report(
+        self,
+        session_id: str,
+        run_id: str,
+        report: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Attach the post-Goal acceptance projection to an existing terminal Run."""
+
+        from harness.models import RubricEvaluationReport, RunRecord
+
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        raw_run = runs.get(run_id) if isinstance(runs, dict) else None
+        if not isinstance(raw_run, dict):
+            raise ValueError(f"Run {run_id} does not exist in session {session_id}")
+        current = RunRecord.model_validate(raw_run)
+        if not current.terminal:
+            raise ValueError(f"Run {run_id} is not terminal")
+        validated = RubricEvaluationReport.model_validate(report)
+        if validated.run_id != run_id:
+            raise ValueError("Verification report run_id does not match terminal Run")
+        current.verification_report = validated
+        saved = current.model_dump(mode="json")
+        runs[run_id] = saved
+        self._write_file(session_id, data)
+        return deepcopy(saved)
+
+    @_session_write_locked
     def update_run_verification_contract(
         self,
         session_id: str,
@@ -1078,7 +1238,39 @@ class SessionManager:
                 "budget_exceeded",
             }:
                 raise ValueError(f"Goal {goal_id} is already terminal")
-            saved_goal = deepcopy(goal)
+            if isinstance(existing_goal, dict):
+                if existing_goal.get("status") != "active":
+                    raise ValueError(
+                        f"Goal {goal_id} is not active ({existing_goal.get('status')})"
+                    )
+                if existing_goal.get("requested_status"):
+                    raise ValueError(
+                        f"Goal {goal_id} has pending control request "
+                        f"{existing_goal.get('requested_status')}"
+                    )
+                if existing_goal.get("current_run_id"):
+                    raise ValueError(
+                        f"Goal {goal_id} already has running Run "
+                        f"{existing_goal.get('current_run_id')}"
+                    )
+                if int(existing_goal.get("objective_revision") or 1) != int(
+                    goal.get("objective_revision") or 1
+                ):
+                    raise ValueError(f"Goal {goal_id} revision changed before Run start")
+                saved_goal = deepcopy(existing_goal)
+                run_ids = saved_goal.setdefault("run_ids", [])
+                if run_id not in run_ids:
+                    if int(saved_goal.get("round") or 0) >= int(
+                        saved_goal.get("max_rounds") or 0
+                    ):
+                        raise ValueError(f"Goal {goal_id} has no remaining Runs")
+                    run_ids.append(run_id)
+                    saved_goal["round"] = int(saved_goal.get("round") or 0) + 1
+                saved_goal["current_run_id"] = run_id
+                saved_goal["pending_revision"] = False
+                saved_goal["updated_at"] = time.time()
+            else:
+                saved_goal = deepcopy(goal)
             goals[goal_id] = saved_goal
             goal_order = harness.setdefault("goal_order", [])
             if goal_id not in goal_order:
@@ -1100,6 +1292,50 @@ class SessionManager:
         harness["latest_run_id"] = run_id
         self._write_file(session_id, data)
         return deepcopy(saved_run), deepcopy(saved_goal)
+
+    @_session_write_locked
+    def request_goal_control(
+        self,
+        session_id: str,
+        goal_id: str,
+        requested_status: str,
+    ) -> dict[str, Any]:
+        """Linearize pause/cancel intent against Run start and completion."""
+
+        if requested_status not in {"paused", "cancelled"}:
+            raise ValueError(f"Unsupported Goal control status: {requested_status}")
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        goals = harness.get("goals") if isinstance(harness, dict) else None
+        raw_goal = goals.get(goal_id) if isinstance(goals, dict) else None
+        if not isinstance(raw_goal, dict):
+            raise ValueError(f"Goal {goal_id} does not exist in session {session_id}")
+        status = str(raw_goal.get("status") or "")
+        if status in {"achieved", "cancelled", "budget_exceeded"}:
+            raise ValueError(f"Goal {goal_id} is already terminal ({status})")
+        now = time.time()
+        current_run_id = str(raw_goal.get("current_run_id") or "").strip()
+        if current_run_id:
+            raw_goal["requested_status"] = requested_status
+            notice = (
+                "已请求暂停 Goal，正在停止当前 Run。"
+                if requested_status == "paused"
+                else "已请求取消 Goal，正在停止当前 Run。"
+            )
+            notices = raw_goal.setdefault("control_notices", [])
+            if notice not in notices:
+                notices.append(notice)
+        else:
+            raw_goal["status"] = requested_status
+            raw_goal["requested_status"] = None
+            raw_goal["current_run_id"] = None
+            if requested_status == "cancelled":
+                raw_goal["completed_at"] = now
+            if harness.get("active_goal_id") == goal_id:
+                harness.pop("active_goal_id", None)
+        raw_goal["updated_at"] = now
+        self._write_file(session_id, data)
+        return deepcopy(raw_goal)
 
     @_session_write_locked
     def bind_run_execution_snapshot(
@@ -1157,6 +1393,79 @@ class SessionManager:
         return deepcopy(goal)
 
     @_session_write_locked
+    def update_goal_objective(
+        self,
+        session_id: str,
+        goal_id: str,
+        *,
+        objective: str,
+        expected_revision: int,
+        contract: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Atomically revise a Goal objective and its frozen acceptance contract."""
+
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        goals = harness.get("goals") if isinstance(harness, dict) else None
+        raw_goal = goals.get(goal_id) if isinstance(goals, dict) else None
+        if not isinstance(raw_goal, dict):
+            raise ValueError(f"Goal {goal_id} does not exist in session {session_id}")
+        status = str(raw_goal.get("status") or "")
+        if status in {"achieved", "cancelled", "budget_exceeded"}:
+            raise ValueError(f"Goal {goal_id} is already terminal ({status})")
+        current_revision = int(raw_goal.get("objective_revision") or 1)
+        if current_revision != expected_revision:
+            raise ValueError(
+                f"Goal revision conflict: expected {expected_revision}, current {current_revision}."
+            )
+        current_objective = str(raw_goal.get("objective") or "").strip()
+        if objective == current_objective:
+            return deepcopy(raw_goal)
+
+        revisions = raw_goal.get("revisions")
+        if not isinstance(revisions, list):
+            revisions = []
+        if not revisions:
+            existing_contract = raw_goal.get("goal_contract")
+            revisions.append(
+                {
+                    "revision": current_revision,
+                    "objective": current_objective,
+                    "contract_id": (
+                        existing_contract.get("contract_id")
+                        if isinstance(existing_contract, dict)
+                        else None
+                    ),
+                    "created_at": float(raw_goal.get("created_at") or time.time()),
+                }
+            )
+        next_revision = current_revision + 1
+        revisions.append(
+            {
+                "revision": next_revision,
+                "objective": objective,
+                "contract_id": contract.get("contract_id") if isinstance(contract, dict) else None,
+                "created_at": time.time(),
+            }
+        )
+        raw_goal["objective"] = objective
+        raw_goal["objective_revision"] = next_revision
+        raw_goal["revisions"] = revisions
+        raw_goal["goal_contract"] = deepcopy(contract)
+        raw_goal["pending_revision"] = True
+        raw_goal["gaps"] = []
+        # Artifact receipts are acceptance evidence for one immutable Goal
+        # revision. Runs remain in history for audit, but old receipts cannot
+        # satisfy a materially revised objective.
+        raw_goal["evidence_refs"] = []
+        raw_goal["latest_verification_report_id"] = None
+        raw_goal["latest_goal_decision"] = None
+        raw_goal["budget_exhaustion_reason"] = None
+        raw_goal["updated_at"] = time.time()
+        self._write_file(session_id, data)
+        return deepcopy(raw_goal)
+
+    @_session_write_locked
     def upsert_goal_state(
         self,
         session_id: str,
@@ -1196,6 +1505,25 @@ class SessionManager:
                 raise ValueError(f"Session {session_id} already has active Goal {active_goal_id}")
 
         saved = deepcopy(goal)
+        if isinstance(existing, dict):
+            existing_revision = int(existing.get("objective_revision") or 1)
+            incoming_revision = int(saved.get("objective_revision") or 1)
+            if existing_revision > incoming_revision:
+                # A Run that started under an older objective may finish after
+                # the user edits the Goal. It may detach itself and contribute
+                # usage, but it must never overwrite the revised objective,
+                # contract, status, or pending-revision marker.
+                authoritative = deepcopy(existing)
+                authoritative["current_run_id"] = saved.get("current_run_id")
+                authoritative["model_call_count"] = max(
+                    int(authoritative.get("model_call_count") or 0),
+                    int(saved.get("model_call_count") or 0),
+                )
+                authoritative["updated_at"] = max(
+                    float(authoritative.get("updated_at") or 0),
+                    float(saved.get("updated_at") or 0),
+                )
+                saved = authoritative
         goals[goal_id] = saved
         goal_order = harness.setdefault("goal_order", [])
         if goal_id not in goal_order:
@@ -1203,6 +1531,84 @@ class SessionManager:
         if status == "active":
             harness["active_goal_id"] = goal_id
         elif active_goal_id == goal_id:
+            harness.pop("active_goal_id", None)
+        self._write_file(session_id, data)
+        return deepcopy(saved)
+
+    @_session_write_locked
+    def finalize_goal_run_state(
+        self,
+        session_id: str,
+        goal: dict[str, Any],
+        *,
+        run_id: str,
+    ) -> dict[str, Any]:
+        """Atomically detach one Run without losing concurrent Goal control.
+
+        Run completion is a compare-and-set operation over the authoritative
+        Session JSON. A pause/cancel request or objective revision that lands
+        after the coordinator loaded its snapshot must win over the stale
+        completion proposal.
+        """
+
+        goal_id = str(goal.get("goal_id") or "").strip()
+        if not goal_id or not run_id:
+            raise ValueError("goal_id and run_id are required")
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        goals = harness.get("goals") if isinstance(harness, dict) else None
+        existing = goals.get(goal_id) if isinstance(goals, dict) else None
+        if not isinstance(existing, dict):
+            raise ValueError(f"Goal {goal_id} does not exist in session {session_id}")
+        current_run_id = str(existing.get("current_run_id") or "").strip()
+        if current_run_id != run_id:
+            raise ValueError(
+                f"Goal {goal_id} current Run changed: expected {run_id}, got {current_run_id or 'none'}"
+            )
+
+        incoming = deepcopy(goal)
+        existing_revision = int(existing.get("objective_revision") or 1)
+        incoming_revision = int(incoming.get("objective_revision") or 1)
+        if existing_revision > incoming_revision:
+            # Preserve the edited objective/contract and only close the old
+            # Run. Its evidence and acceptance result belong to the old
+            # revision and cannot satisfy the new one.
+            saved = deepcopy(existing)
+            saved["current_run_id"] = None
+            saved["model_call_count"] = max(
+                int(existing.get("model_call_count") or 0),
+                int(incoming.get("model_call_count") or 0),
+            )
+            saved["pending_revision"] = True
+            saved["gaps"] = []
+            revision_notice = "目标描述已更新，将按最新版本进入下一 Run。"
+            notices = saved.setdefault("control_notices", [])
+            if revision_notice not in notices:
+                notices.append(revision_notice)
+        else:
+            saved = incoming
+            saved["current_run_id"] = None
+
+        # Merge notices written by the control endpoint after the coordinator
+        # loaded its snapshot, then consume the latest requested transition.
+        notices = saved.setdefault("control_notices", [])
+        for notice in existing.get("control_notices") or []:
+            if notice and notice not in notices:
+                notices.append(notice)
+        requested = str(existing.get("requested_status") or "").strip()
+        if requested in {"paused", "cancelled"}:
+            saved["status"] = requested
+            saved["requested_status"] = None
+            if requested == "cancelled":
+                saved["completed_at"] = time.time()
+        else:
+            saved["requested_status"] = None
+        saved["updated_at"] = time.time()
+
+        goals[goal_id] = saved
+        if saved.get("status") == "active":
+            harness["active_goal_id"] = goal_id
+        elif harness.get("active_goal_id") == goal_id:
             harness.pop("active_goal_id", None)
         self._write_file(session_id, data)
         return deepcopy(saved)
@@ -1294,6 +1700,12 @@ class SessionManager:
         if path.exists():  # 存在则删除
             path.unlink()
         self._trace_path(session_id).unlink(missing_ok=True)
+        # Keep attachment lifetime aligned with the authoritative Session.
+        # Import lazily to avoid a module cycle at startup.
+        from graph.attachment_store import attachment_store
+
+        if attachment_store.root_dir is not None:
+            attachment_store.delete_session(session_id)
 
     def get_raw_messages(self, session_id: str) -> dict[str, Any]:
         """Return session data without loading heavyweight trace sidecars."""
@@ -1302,6 +1714,35 @@ class SessionManager:
             return {"title": "", "messages": []}
         data = dict(data)
         data["messages"] = self.load_session(session_id)
+        deliveries = data.get("attachment_deliveries")
+        if isinstance(deliveries, dict):
+            by_query = {
+                str(query_id): [dict(item) for item in items if isinstance(item, dict)]
+                for query_id, items in deliveries.items()
+                if isinstance(items, list)
+            }
+            seen_queries: set[str] = set()
+            for message in data["messages"]:
+                if not isinstance(message, dict) or message.get("role") != "assistant":
+                    continue
+                query_id = str(message.get("query_id") or "")
+                if query_id not in by_query:
+                    continue
+                message["output_attachments"] = deepcopy(by_query[query_id])
+                seen_queries.add(query_id)
+            # A crash can happen after durable publish but before the stream
+            # consumes its ToolMessage. Keep the generated file discoverable.
+            for query_id, items in by_query.items():
+                if query_id not in seen_queries and items:
+                    data["messages"].append(
+                        {
+                            "role": "assistant",
+                            "content": "",
+                            "query_id": query_id,
+                            "status": "interrupted",
+                            "output_attachments": deepcopy(items),
+                        }
+                    )
         # Lightweight runtime state remains available, but trace data has a
         # dedicated lazy endpoint and is never read by the conversation view.
         if isinstance(data.get("todos"), list):
@@ -1619,6 +2060,113 @@ class SessionManager:
             changed = True
         return changed
 
+    @staticmethod
+    def _merge_replayed_tool_call(target: dict[str, Any], replay: dict[str, Any]) -> None:
+        """Merge useful fields from one cumulative-stream replay into its first record."""
+
+        empty_values = (None, "", [], {})
+        for key, value in replay.items():
+            if key == "completed_at":
+                # The first completion is authoritative; a later timestamp is
+                # evidence of the replay, not a second execution.
+                continue
+            if target.get(key) in empty_values and value not in empty_values:
+                target[key] = value
+
+    @classmethod
+    def _coalesce_replayed_tool_calls(cls, data: dict[str, Any]) -> bool:
+        """Remove duplicate persisted representations of the same Tool Call ID.
+
+        A Tool Call ID denotes one execution. LangGraph may repeat its completed
+        ToolMessage in cumulative parallel-node updates, but the Session/model
+        transcript must remain idempotent. The first record keeps its ID and
+        position; sparse fields from later replays are merged into it.
+        """
+
+        changed = False
+
+        def coalesce_records(
+            records: list[Any],
+            seen: dict[tuple[str, str], dict[str, Any]],
+            scope: str,
+        ) -> list[Any]:
+            nonlocal changed
+            result: list[Any] = []
+            for record in records:
+                if not isinstance(record, dict):
+                    result.append(record)
+                    continue
+                tool_call_id = str(record.get("id") or "")
+                if not tool_call_id:
+                    result.append(record)
+                    continue
+                identity = (scope, tool_call_id)
+                first = seen.get(identity)
+                if first is None:
+                    seen[identity] = record
+                    result.append(record)
+                    continue
+                cls._merge_replayed_tool_call(first, record)
+                changed = True
+            return result
+
+        def coalesce_messages(messages: Any) -> None:
+            nonlocal changed
+            if not isinstance(messages, list):
+                return
+            seen_top_level: dict[tuple[str, str], dict[str, Any]] = {}
+            seen_segment: dict[tuple[str, str], dict[str, Any]] = {}
+            seen_timeline: dict[tuple[str, str], dict[str, Any]] = {}
+            for message_index, message in enumerate(messages):
+                if not isinstance(message, dict):
+                    continue
+                scope = str(message.get("query_id") or f"legacy-message-{message_index}")
+                tool_calls = message.get("tool_calls")
+                if isinstance(tool_calls, list):
+                    deduped = coalesce_records(tool_calls, seen_top_level, scope)
+                    if len(deduped) != len(tool_calls):
+                        message["tool_calls"] = deduped
+
+                segments = message.get("segments")
+                if isinstance(segments, list):
+                    for segment in segments:
+                        if not isinstance(segment, dict):
+                            continue
+                        segment_calls = segment.get("tool_calls")
+                        if isinstance(segment_calls, list):
+                            deduped = coalesce_records(segment_calls, seen_segment, scope)
+                            if len(deduped) != len(segment_calls):
+                                segment["tool_calls"] = deduped
+
+                timeline = message.get("timeline")
+                if isinstance(timeline, list):
+                    next_timeline: list[Any] = []
+                    for item in timeline:
+                        if not isinstance(item, dict) or item.get("type") != "tool":
+                            next_timeline.append(item)
+                            continue
+                        tool_call = item.get("tool_call")
+                        if not isinstance(tool_call, dict):
+                            next_timeline.append(item)
+                            continue
+                        tool_call_id = str(tool_call.get("id") or "")
+                        identity = (scope, tool_call_id)
+                        if not tool_call_id or identity not in seen_timeline:
+                            if tool_call_id:
+                                seen_timeline[identity] = tool_call
+                            next_timeline.append(item)
+                            continue
+                        cls._merge_replayed_tool_call(seen_timeline[identity], tool_call)
+                        changed = True
+                    if len(next_timeline) != len(timeline):
+                        message["timeline"] = next_timeline
+
+        coalesce_messages(data.get("messages"))
+        # display_messages is an independent UI projection, so dedupe it with
+        # fresh identity maps rather than comparing it to the model transcript.
+        coalesce_messages(data.get("display_messages"))
+        return changed
+
     def select_tool_context_candidates(
         self,
         session_id: str,
@@ -1724,11 +2272,15 @@ class SessionManager:
             return candidates
 
     def ensure_tool_call_ids(self, session_id: str) -> bool:
-        """Persist stable IDs for legacy tool calls before model reconstruction."""
+        """Persist stable, unique Tool Call IDs before model reconstruction."""
 
         with self._tool_context_lock(session_id):
             data = self._read_file(session_id)
-            if not data or not self._migrate_missing_tool_call_ids(session_id, data):
+            if not data:
+                return False
+            changed = self._migrate_missing_tool_call_ids(session_id, data)
+            changed = self._coalesce_replayed_tool_calls(data) or changed
+            if not changed:
                 return False
             self._write_file(session_id, data)
             return True
@@ -1823,6 +2375,34 @@ class SessionManager:
                 job["error"] = error
             self._write_file(session_id, data)
             return True
+
+    def fail_unresolved_tool_context_candidates(
+        self,
+        session_id: str,
+        job_id: str,
+        *,
+        reason: str,
+    ) -> int:
+        """Release pending compaction leases while retaining raw Tool output."""
+
+        with self._tool_context_lock(session_id):
+            data = self._read_file(session_id)
+            if not data:
+                return 0
+            failed = 0
+            for _, _, _, tool_call in self._iter_persisted_tool_calls(data):
+                metadata = tool_call.get("context_compaction")
+                if not isinstance(metadata, dict) or metadata.get("job_id") != job_id:
+                    continue
+                if metadata.get("status") not in {"pending", "running"}:
+                    continue
+                metadata["status"] = "failed"
+                metadata["error"] = reason
+                metadata["updated_at"] = time.time()
+                failed += 1
+            if failed:
+                self._write_file(session_id, data)
+            return failed
 
     def complete_tool_context_compaction(
         self,
@@ -1926,12 +2506,22 @@ class SessionManager:
     def get_ready_tool_context_outputs(self, session_id: str) -> dict[str, str]:
         """Return only valid ready outputs; pending/running entries stay raw."""
 
+        entries = self.get_ready_tool_context_entries(session_id)
+        return {
+            tool_call_id: str(candidates[0]["context_output"])
+            for tool_call_id, candidates in entries.items()
+            if len(candidates) == 1
+        }
+
+    def get_ready_tool_context_entries(self, session_id: str) -> dict[str, list[dict[str, str]]]:
+        """Return ready outputs with Run and source identity for safe matching."""
+
         with self._tool_context_lock(session_id):
             data = self._read_file(session_id)
             if not data:
                 return {}
-            ready: dict[str, str] = {}
-            for _, _, _, tool_call in self._iter_persisted_tool_calls(data):
+            ready: dict[str, list[dict[str, str]]] = {}
+            for _, _, message, tool_call in self._iter_persisted_tool_calls(data):
                 tool_call_id = str(tool_call.get("id") or "")
                 context_output = tool_call.get("context_output")
                 metadata = tool_call.get("context_compaction")
@@ -1942,7 +2532,13 @@ class SessionManager:
                 current_hash = self._tool_context_source_hash(self._tool_context_source(tool_call))
                 if metadata.get("source_hash") != current_hash:
                     continue
-                ready[tool_call_id] = str(context_output)
+                ready.setdefault(tool_call_id, []).append(
+                    {
+                        "context_output": str(context_output),
+                        "source_hash": current_hash,
+                        "query_id": str(message.get("query_id") or ""),
+                    }
+                )
             return ready
 
     def get_tool_context_status(self, session_id: str) -> dict[str, Any]:
@@ -2069,6 +2665,191 @@ class SessionManager:
         return [item for item in messages if isinstance(item, dict)]
 
     @_session_write_locked
+    def upsert_external_artifact_lease(
+        self,
+        session_id: str,
+        lease: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist one external-artifact staging lease in Session JSON."""
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        lease_id = str(lease.get("lease_id") or "")
+        if not lease_id:
+            raise ValueError("external artifact lease requires lease_id")
+        leases = data.setdefault("external_artifact_leases", {})
+        leases[lease_id] = deepcopy(lease)
+        self._write_file(session_id, data)
+        return deepcopy(leases[lease_id])
+
+    def get_external_artifact_lease(
+        self,
+        session_id: str,
+        lease_id: str,
+    ) -> dict[str, Any] | None:
+        data = self._read_file(session_id)
+        leases = data.get("external_artifact_leases") if data else None
+        lease = leases.get(lease_id) if isinstance(leases, dict) else None
+        return deepcopy(lease) if isinstance(lease, dict) else None
+
+    @_session_write_locked
+    def upsert_attachment_edit_lease(
+        self,
+        session_id: str,
+        lease: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist one immutable-source attachment edit lease in Session JSON."""
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        lease_id = str(lease.get("lease_id") or "")
+        if not lease_id:
+            raise ValueError("attachment edit lease requires lease_id")
+        leases = data.setdefault("attachment_edit_leases", {})
+        leases[lease_id] = deepcopy(lease)
+        self._write_file(session_id, data)
+        return deepcopy(leases[lease_id])
+
+    def get_attachment_edit_lease(
+        self,
+        session_id: str,
+        lease_id: str,
+    ) -> dict[str, Any] | None:
+        data = self._read_file(session_id)
+        leases = data.get("attachment_edit_leases") if data else None
+        lease = leases.get(lease_id) if isinstance(leases, dict) else None
+        return deepcopy(lease) if isinstance(lease, dict) else None
+
+    @_session_write_locked
+    def claim_attachment_publish(
+        self,
+        session_id: str,
+        *,
+        lease_id: str,
+        tool_call_id: str,
+        output_path: str,
+        output_name: str,
+    ) -> dict[str, Any]:
+        """Atomically claim the one allowed publish branch for a lease."""
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        leases = data.get("attachment_edit_leases")
+        lease = leases.get(lease_id) if isinstance(leases, dict) else None
+        if not isinstance(lease, dict):
+            raise FileNotFoundError(f"AttachmentEditLease {lease_id} not found")
+        status = str(lease.get("status") or "")
+        if status == "published":
+            return deepcopy(lease)
+        if status == "publishing":
+            same_claim = (
+                str(lease.get("publish_tool_call_id") or "") == tool_call_id
+                and str(lease.get("publish_output_path") or "") == output_path
+                and str(lease.get("publish_name") or "") == output_name
+            )
+            if not same_claim:
+                raise RuntimeError("AttachmentEditLease already has an in-flight publish branch")
+            return deepcopy(lease)
+        if status != "staged":
+            raise RuntimeError(f"AttachmentEditLease is not publishable ({status})")
+        lease.update(
+            {
+                "status": "publishing",
+                "publish_started_at": time.time(),
+                "publish_tool_call_id": tool_call_id,
+                "publish_output_path": output_path,
+                "publish_name": output_name,
+            }
+        )
+        self._write_file(session_id, data)
+        return deepcopy(lease)
+
+    @_session_write_locked
+    def commit_attachment_publish(
+        self,
+        session_id: str,
+        *,
+        lease_id: str,
+        tool_call_id: str,
+        published_fields: dict[str, Any],
+        delivery: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Atomically commit lease completion and its durable UI outbox."""
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        leases = data.get("attachment_edit_leases")
+        lease = leases.get(lease_id) if isinstance(leases, dict) else None
+        if not isinstance(lease, dict):
+            raise FileNotFoundError(f"AttachmentEditLease {lease_id} not found")
+        if lease.get("status") == "published":
+            return deepcopy(lease)
+        if (
+            lease.get("status") != "publishing"
+            or str(lease.get("publish_tool_call_id") or "") != tool_call_id
+        ):
+            raise RuntimeError("AttachmentEditLease publish claim no longer belongs to this Tool call")
+        lease.update(deepcopy(published_fields))
+        lease["status"] = "published"
+
+        query_id = str(delivery.get("created_by_query_id") or lease.get("query_id") or "")
+        attachment_id = str(delivery.get("id") or "")
+        if not query_id or not attachment_id:
+            raise ValueError("attachment delivery requires query and attachment ids")
+        outbox = data.setdefault("attachment_deliveries", {})
+        entries = outbox.setdefault(query_id, [])
+        if not any(
+            isinstance(item, dict) and str(item.get("id") or "") == attachment_id
+            for item in entries
+        ):
+            entries.append(deepcopy(delivery))
+        self._write_file(session_id, data)
+        return deepcopy(lease)
+
+    @_session_write_locked
+    def release_attachment_publish_claim(
+        self,
+        session_id: str,
+        *,
+        lease_id: str,
+        tool_call_id: str,
+    ) -> None:
+        """Release a claim after a handled pre-commit failure."""
+
+        data = self._read_file(session_id)
+        leases = data.get("attachment_edit_leases") if data else None
+        lease = leases.get(lease_id) if isinstance(leases, dict) else None
+        if not isinstance(lease, dict):
+            return
+        if (
+            lease.get("status") == "publishing"
+            and str(lease.get("publish_tool_call_id") or "") == tool_call_id
+        ):
+            lease["status"] = "staged"
+            for key in (
+                "publish_started_at",
+                "publish_tool_call_id",
+                "publish_output_path",
+                "publish_name",
+            ):
+                lease.pop(key, None)
+            self._write_file(session_id, data)
+
+    def list_attachment_deliveries(
+        self,
+        session_id: str,
+        query_id: str,
+    ) -> list[dict[str, Any]]:
+        data = self._read_file(session_id)
+        outbox = data.get("attachment_deliveries") if data else None
+        entries = outbox.get(query_id) if isinstance(outbox, dict) else None
+        return [deepcopy(item) for item in entries if isinstance(item, dict)] if isinstance(entries, list) else []
+
+    @_session_write_locked
     def update_agent_context_state(
         self,
         session_id: str,
@@ -2097,6 +2878,40 @@ class SessionManager:
         if not isinstance(grants, list):
             return []
         return [dict(grant) for grant in grants if isinstance(grant, dict) and not grant.get("revoked_at")]
+
+    def list_permission_grant_history(
+        self,
+        session_id: str,
+        *,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Return recently consumed or revoked grants, newest first.
+
+        One-shot grants remain useful audit evidence after consumption even
+        though they must no longer be treated as active permissions.
+        """
+        data = self._read_file(session_id)
+        if not data:
+            return []
+        permissions = data.get("permissions")
+        grants = permissions.get("grants") if isinstance(permissions, dict) else None
+        if not isinstance(grants, list):
+            return []
+        inactive = [
+            dict(grant)
+            for grant in grants
+            if isinstance(grant, dict) and grant.get("revoked_at")
+        ]
+        inactive.sort(
+            key=lambda grant: float(
+                grant.get("consumed_at")
+                or grant.get("revoked_at")
+                or grant.get("created_at")
+                or 0
+            ),
+            reverse=True,
+        )
+        return inactive[: max(0, int(limit))]
 
     @_session_write_locked
     def add_permission_grant(

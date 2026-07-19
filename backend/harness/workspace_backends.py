@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shlex
@@ -24,6 +25,31 @@ from harness.dependency_setup import (
 
 DEFAULT_SANDBOX_IMAGE = "puddingclaw/sandbox:python3.12-node22-v2"
 RUNTIME_CONTRACT = "python3.12+node22-v2"
+logger = logging.getLogger(__name__)
+
+
+def _canonical_docker_mount_source(value: str) -> str:
+    """Normalize Docker Desktop's `/host_mnt/...` inspect projection."""
+
+    normalized = str(value or "").replace("\\", "/")
+    if normalized.startswith("/host_mnt/"):
+        normalized = normalized.removeprefix("/host_mnt")
+    try:
+        return str(Path(normalized).resolve())
+    except OSError:
+        return normalized
+
+
+def _reject_scratch_traversal(command: str) -> ExecuteResponse | None:
+    """Fail closed when virtual scratch syntax contains a parent hop."""
+
+    for match in re.finditer(r"(?<![A-Za-z0-9_./-])/scratch(?:/[^\s\"'|;&<>]*)?", command):
+        if ".." in Path(match.group(0)).parts:
+            return ExecuteResponse(
+                output="Error: /scratch parent traversal is not allowed.",
+                exit_code=126,
+            )
+    return None
 
 
 def _bounded_output(
@@ -56,11 +82,13 @@ class RestrictedHostWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         self,
         *,
         root_dir: Path,
+        scratch_path: Path | None = None,
         timeout: int = 120,
         max_output_bytes: int = 100_000,
     ) -> None:
         super().__init__(root_dir=root_dir, virtual_mode=True)
         self.workspace_path = root_dir.expanduser().resolve()
+        self.scratch_path = scratch_path.expanduser().resolve() if scratch_path is not None else None
         self._default_timeout = timeout
         self._max_output_bytes = max_output_bytes
         workspace_digest = hashlib.sha256(str(self.workspace_path).encode("utf-8")).hexdigest()[:16]
@@ -95,11 +123,20 @@ class RestrictedHostWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
                 output="Error: Command must be a non-empty string.",
                 exit_code=1,
             )
+        traversal = _reject_scratch_traversal(command)
+        if traversal is not None:
+            return traversal
         command = re.sub(
             r"(^|\s)/workspace(?=(/|\s|$))",
             lambda match: f"{match.group(1)}{shlex.quote(str(self.workspace_path))}",
             command,
         )
+        if self.scratch_path is not None:
+            command = re.sub(
+                r"(?<![A-Za-z0-9_./-])/scratch(?=(?:/|\s|$|[\"']))",
+                shlex.quote(str(self.scratch_path)),
+                command,
+            )
         effective_timeout = timeout if timeout is not None else self._default_timeout
         if not isinstance(effective_timeout, int) or effective_timeout <= 0:
             raise ValueError("timeout must be a positive integer")
@@ -321,6 +358,14 @@ class ProjectSandboxManager:
                         "workspace_target": workspace_target,
                     }
                 )
+        writable_mounts = []
+        for item in self.config.get("_managed_writable_mounts") or []:
+            if not isinstance(item, dict):
+                continue
+            source = Path(str(item.get("source") or "")).expanduser().resolve()
+            target = str(item.get("target") or "")
+            if source.is_dir() and target == "/harness-scratch":
+                writable_mounts.append({"source": str(source), "target": target})
         return {
             "workspace": str(workspace),
             "image": str(self.config.get("image") or DEFAULT_SANDBOX_IMAGE),
@@ -332,6 +377,7 @@ class ProjectSandboxManager:
             "gid": os.getgid() if hasattr(os, "getgid") else None,
             "runtime_contract": RUNTIME_CONTRACT,
             "readonly_mounts": readonly_mounts,
+            "writable_mounts": writable_mounts,
             "runtime_mounts": ([item.to_dict() for item in plan.runtime_mounts] if plan is not None else []),
         }
 
@@ -357,16 +403,33 @@ class ProjectSandboxManager:
                     if removed.returncode != 0:
                         raise RuntimeError(removed.stderr.strip() or "failed to replace Docker sandbox")
                 elif running.strip().lower() == "true":
-                    self._validate_runtime(name)
-                    self.mark_activity(name)
-                    return name, spec_hash
+                    try:
+                        self._validate_runtime(name, spec)
+                    except RuntimeError:
+                        logger.warning(
+                            "Replacing Docker sandbox %s because runtime validation failed",
+                            name,
+                            exc_info=True,
+                        )
+                        removed = self._run(["rm", "-f", name])
+                        if removed.returncode != 0:
+                            raise RuntimeError(removed.stderr.strip() or "failed to replace invalid Docker sandbox")
+                    else:
+                        self.mark_activity(name)
+                        return name, spec_hash
                 else:
                     started = self._run(["start", name])
                     if started.returncode != 0:
                         raise RuntimeError(started.stderr.strip() or "failed to start Docker sandbox")
-                    self._validate_runtime(name)
-                    self.mark_activity(name)
-                    return name, spec_hash
+                    try:
+                        self._validate_runtime(name, spec)
+                    except RuntimeError:
+                        removed = self._run(["rm", "-f", name])
+                        if removed.returncode != 0:
+                            raise RuntimeError(removed.stderr.strip() or "failed to replace invalid Docker sandbox")
+                    else:
+                        self.mark_activity(name)
+                        return name, spec_hash
 
             runtime_mount_args: list[str] = []
             runtime_home_volume = self._runtime_home_volume_name(
@@ -449,6 +512,13 @@ class ProjectSandboxManager:
                             (f"type=bind,src={mount['source']},dst={target},readonly"),
                         ]
                     )
+            for mount in spec["writable_mounts"]:
+                runtime_mount_args.extend(
+                    [
+                        "--mount",
+                        f"type=bind,src={mount['source']},dst={mount['target']}",
+                    ]
+                )
             create_args = [
                 "create",
                 "--name",
@@ -516,7 +586,7 @@ class ProjectSandboxManager:
             if started.returncode != 0:
                 raise RuntimeError(started.stderr.strip() or "failed to start Docker sandbox")
             try:
-                self._validate_runtime(name)
+                self._validate_runtime(name, spec)
             except Exception:
                 self._run(["rm", "-f", name])
                 raise
@@ -567,6 +637,13 @@ class ProjectSandboxManager:
                         f"type=bind,src={mount['source']},dst={target},readonly",
                     ]
                 )
+        for mount in spec["writable_mounts"]:
+            mount_args.extend(
+                [
+                    "--mount",
+                    f"type=bind,src={mount['source']},dst={mount['target']}",
+                ]
+            )
         for mount in spec["runtime_mounts"]:
             volume_name = self._dependency_volume_name(
                 workspace,
@@ -643,14 +720,57 @@ class ProjectSandboxManager:
             truncated=truncated,
         )
 
-    def _validate_runtime(self, container_name: str) -> None:
+    def _validate_runtime(self, container_name: str, spec: dict[str, Any]) -> None:
+        inspect_result = self._run(["inspect", container_name])
+        if inspect_result.returncode != 0:
+            raise RuntimeError(inspect_result.stderr.strip() or "failed to inspect Docker sandbox")
+        try:
+            inspected = json.loads(inspect_result.stdout)[0]
+        except (json.JSONDecodeError, IndexError, TypeError) as exc:
+            raise RuntimeError("Docker sandbox inspect output is invalid") from exc
+        mounts = {
+            str(item.get("Destination") or ""): item
+            for item in inspected.get("Mounts") or []
+            if isinstance(item, dict)
+        }
+        for expected in spec.get("writable_mounts") or []:
+            target = str(expected.get("target") or "")
+            actual = mounts.get(target)
+            expected_source = _canonical_docker_mount_source(
+                str(expected.get("source") or "")
+            )
+            actual_source = _canonical_docker_mount_source(
+                str(actual.get("Source") or "")
+            ) if actual else ""
+            if actual is None or actual_source != expected_source or actual.get("RW") is not True:
+                raise RuntimeError(
+                    f"Docker sandbox writable mount contract mismatch for {target or '<empty>'}."
+                )
+        expected_user = ""
+        if spec.get("uid") is not None and spec.get("gid") is not None:
+            expected_user = f"{spec['uid']}:{spec['gid']}"
+        configured_user = str(inspected.get("Config", {}).get("User") or "")
+        if expected_user and configured_user != expected_user:
+            raise RuntimeError(
+                f"Docker sandbox user contract mismatch: expected {expected_user}, got {configured_user or '<root>'}."
+            )
+        scratch_relative = str(self.config.get("_scratch_relative") or "").strip("/")
+        scratch_path = f"/harness-scratch/{scratch_relative}" if scratch_relative else "/harness-scratch"
+        probe_name = f".puddingclaw-write-probe-{uuid.uuid4().hex[:12]}"
         result = self._run(
             [
                 "exec",
                 container_name,
                 "sh",
                 "-c",
-                ("python3 --version >/dev/null 2>&1 && node --version >/dev/null 2>&1"),
+                (
+                    "python3 --version >/dev/null 2>&1 && "
+                    "node --version >/dev/null 2>&1 && "
+                    f"test -d {shlex.quote(scratch_path)} && "
+                    f"test -w {shlex.quote(scratch_path)} && "
+                    f": > {shlex.quote(f'{scratch_path}/{probe_name}')} && "
+                    f"rm -f {shlex.quote(f'{scratch_path}/{probe_name}')}"
+                ),
             ]
         )
         if result.returncode != 0:
@@ -717,6 +837,10 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         self._default_timeout = timeout
         self._max_output_bytes = max_output_bytes
         self.dependency_plan = manager.dependency_plan(self.workspace_path)
+        scratch_relative = str(manager.config.get("_scratch_relative") or "").strip("/")
+        self.scratch_container_path = (
+            f"/harness-scratch/{scratch_relative}" if scratch_relative else "/harness-scratch"
+        )
         self.container_name, self.spec_hash = manager.ensure_container(self.workspace_path)
 
     @property
@@ -729,9 +853,17 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         *,
         timeout: int | None = None,
     ) -> ExecuteResponse:
+        traversal = _reject_scratch_traversal(command)
+        if traversal is not None:
+            return traversal
         effective_timeout = timeout if timeout is not None else self._default_timeout
         if not isinstance(effective_timeout, int) or effective_timeout <= 0:
             raise ValueError("timeout must be a positive integer")
+        command = re.sub(
+            r"(?<![A-Za-z0-9_./-])/scratch(?=(?:/|\s|$|[\"']))",
+            self.scratch_container_path,
+            command,
+        )
         try:
             with self.manager._lock(self.container_name):
                 # An idle timer may stop a project container between Runs.
@@ -842,6 +974,8 @@ def build_workspace_execution_backend(
     timeout = int(terminal_config.get("default_timeout_seconds") or 120)
     docker_enabled = bool(terminal_config.get("docker_enabled", False))
     docker_config = dict(terminal_config.get("docker") or {})
+    scratch_host_path_raw = str(terminal_config.get("_scratch_host_path") or "").strip()
+    scratch_host_path = Path(scratch_host_path_raw) if scratch_host_path_raw else None
     if docker_enabled:
         manager = ProjectSandboxManager(docker_config)
         available, reason = manager.probe()
@@ -864,6 +998,7 @@ def build_workspace_execution_backend(
         return WorkspaceBackendSelection(
             backend=RestrictedHostWorkspaceBackend(
                 root_dir=workspace_path,
+                scratch_path=scratch_host_path,
                 timeout=timeout,
             ),
             mode="restricted_host",
@@ -872,6 +1007,7 @@ def build_workspace_execution_backend(
     return WorkspaceBackendSelection(
         backend=RestrictedHostWorkspaceBackend(
             root_dir=workspace_path,
+            scratch_path=scratch_host_path,
             timeout=timeout,
         ),
         mode="restricted_host",

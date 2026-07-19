@@ -11,7 +11,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 import analytics.nl2sql.result_store as result_store_module
 import analytics.nl2sql.service as nl2sql_service
 import tools.database.sql_execute_tool as sql_execute_module
-from analytics.nl2sql.schemas import DatabaseSqlGenerationResult, SqlExecutionResult, TableRoute
+from analytics.nl2sql.schemas import (
+    DatabaseQueryRequest,
+    DatabaseSqlGenerationResult,
+    SqlExecutionResult,
+    TableRoute,
+)
 from analytics.nl2sql.service import DatabaseKnowledgeQueryError
 from analytics.nl2sql.sql_runner import (
     _compact_rows,
@@ -56,6 +61,61 @@ def test_product_configuration_model_declares_default_pickup_exclusion() -> None
     assert "默认分析中国狭义乘用车" in prompt
     assert "必须排除车型级别为 `皮卡`" in prompt
     assert "type_name = '级别'" in prompt
+
+
+def test_semantic_resolution_uses_strict_match_then_generalizes_on_real_miss() -> None:
+    matched = nl2sql_service._resolve_request_semantic_assets(
+        DatabaseQueryRequest(
+            question="按价格段统计空气悬架配置率",
+            model_id="产品配置分析",
+        )
+    )
+    assert matched["resolution_mode"] == "model_scoped_fuzzy"
+    assert any(item.id == "measure:config_rate" for item in matched["matched"])
+    assert any("air_suspension" in item.id for item in matched["references"])
+
+    generalized = nl2sql_service._resolve_request_semantic_assets(
+        DatabaseQueryRequest(
+            question="统计杯架氛围灯开关颜色组合",
+            model_id="产品配置分析",
+        )
+    )
+    assert generalized["resolution_mode"] == "generalized"
+    assert generalized["matched"] == []
+    prompt = nl2sql_service.format_semantic_assets_for_prompt(generalized)
+    assert "这不是失败条件" in prompt
+    assert "泛化 SQL" in prompt
+
+
+def test_explicit_semantic_asset_selection_remains_authoritative() -> None:
+    selected = nl2sql_service._resolve_request_semantic_assets(
+        DatabaseQueryRequest(
+            question="统计配置情况",
+            model_id="产品配置分析",
+            measure_ids=["measure:config_rate"],
+        )
+    )
+    assert selected["resolution_mode"] == "selected_ids"
+    assert [item.id for item in selected["matched"]] == ["measure:config_rate"]
+
+
+def test_explicit_semantic_asset_cannot_cross_selected_model(monkeypatch) -> None:
+    class _Registry:
+        @staticmethod
+        def get_model_context(_model_id: str) -> dict[str, Any]:
+            return {"semantic_assets": [{"id": "measure:other"}]}
+
+    monkeypatch.setattr(nl2sql_service, "get_analytics_model_registry", lambda: _Registry())
+    selected = nl2sql_service._resolve_request_semantic_assets(
+        DatabaseQueryRequest(
+            question="统计配置率",
+            model_id="model-without-config-rate",
+            measure_ids=["measure:config_rate"],
+        )
+    )
+
+    assert selected["matched"] == []
+    assert selected["unmatched_requested_ids"] == ["measure:config_rate"]
 
 
 class _FakeSessionMaker:

@@ -316,6 +316,51 @@ def test_permission_middleware_accepts_virtual_workspace_read_resource(
     assert ExternalFilePermissionMiddleware().after_model(state, runtime) is None
 
 
+def test_permission_middleware_accepts_versioned_patch_inside_virtual_scratch(
+    tmp_path,
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from langchain_core.messages import AIMessage
+
+    import graph.permission_middleware as permission_middleware_module
+    from graph.permission_middleware import ExternalFilePermissionMiddleware
+
+    def fail_interrupt(_payload):
+        raise AssertionError("virtual scratch path must not request host-file permission")
+
+    monkeypatch.setattr(permission_middleware_module, "interrupt", fail_interrupt)
+    state = {
+        "messages": [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "patch_file",
+                        "args": {
+                            "file_path": "/scratch/external/lease/report.html",
+                            "expected_sha256": "sha256:abc",
+                            "replacements": [{"old_string": "before", "new_string": "after"}],
+                        },
+                        "id": "call-patch-scratch",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
+    }
+    runtime = SimpleNamespace(
+        context={
+            "session_id": "virtual-scratch-session",
+            "query_id": "query-patch",
+            "workspace_path": str(tmp_path),
+        }
+    )
+
+    assert ExternalFilePermissionMiddleware().after_model(state, runtime) is None
+
+
 def test_read_resource_maps_virtual_workspace_path(tmp_path):
     from tools.read_resource_tool import ReadResourceTool
 

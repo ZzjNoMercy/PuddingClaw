@@ -37,25 +37,26 @@ class ApprovalModeUpdateRequest(BaseModel):
 
 @router.get("/sessions/{session_id}/permissions")
 async def list_permissions(session_id: str) -> dict[str, Any]:
-    """List active permission grants for a session."""
+    """List active grants and recent consumed/revoked grant history."""
 
     try:
         session_manager.get_permission_policy(session_id)
         grants = session_manager.list_permission_grants(session_id)
+        history = session_manager.list_permission_grant_history(session_id)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Session not found") from exc
-    for grant in grants:
-        if grant.get("type") != "tool_action" or grant.get("metadata"):
-            continue
-        request = permission_resume_registry.find_tool_action_request(str(grant.get("target") or ""))
-        if request is not None:
-            grant["metadata"] = {
-                "tool_name": request.get("tool_name"),
-                "command": request.get("command"),
-                "reason": request.get("reason"),
-                "risk": request.get("risk"),
-            }
-    return {"session_id": session_id, "grants": grants}
+    for grant in [*grants, *history]:
+        if grant.get("type") == "tool_action" and not grant.get("metadata"):
+            request = permission_resume_registry.find_tool_action_request(str(grant.get("target") or ""))
+            if request is not None:
+                grant["metadata"] = {
+                    "tool_name": request.get("tool_name"),
+                    "command": request.get("command"),
+                    "reason": request.get("reason"),
+                    "risk": request.get("risk"),
+                    "change_preview": request.get("change_preview"),
+                }
+    return {"session_id": session_id, "grants": grants, "history": history}
 
 
 @router.get("/sessions/{session_id}/permissions/mode")
@@ -205,6 +206,18 @@ async def grant_tool_action_permission(
             status_code=409,
             detail="permission request is no longer pending",
         )
+    capabilities = [str(item) for item in (pending.get("capabilities") or ["execute"])]
+    is_skill_management = str(pending.get("tool_name") or "") in {
+        "prepare_skill_install",
+        "prepare_skill_update",
+        "install_skill",
+        "update_skill",
+    }
+    if is_skill_management and req.scope != "once":
+        raise HTTPException(
+            status_code=400,
+            detail="Skill management actions only support one-time approval",
+        )
     fingerprint = str(pending.get("fingerprint") or "")
     if not fingerprint:
         raise HTTPException(status_code=400, detail="permission fingerprint missing")
@@ -219,6 +232,8 @@ async def grant_tool_action_permission(
         "reason": pending.get("reason"),
         "risk": pending.get("risk"),
     }
+    if isinstance(pending.get("change_preview"), dict):
+        metadata["change_preview"] = dict(pending["change_preview"])
     if pending.get("run_id"):
         metadata["run_id"] = pending.get("run_id")
     if use_reusable_scope:
@@ -230,7 +245,7 @@ async def grant_tool_action_permission(
             grant_type="tool_action",
             target_kind=target_kind,
             target=target,
-            capabilities=[str(item) for item in (pending.get("capabilities") or ["execute"])],
+            capabilities=capabilities,
             scope=req.scope,
             source="user",
             metadata=metadata,

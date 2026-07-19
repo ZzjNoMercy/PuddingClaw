@@ -9,7 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from langchain_core.messages import AIMessage, ToolMessage
+import pytest
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from graph.middlewares.tool_context_compaction import (
     POLICY_VERSION,
@@ -84,6 +85,82 @@ def test_legacy_missing_ids_are_stable_persisted_and_mirrored(tmp_path: Path) ->
     assert first["display_messages"][0]["tool_calls"][0]["id"] == first_id
     assert manager.ensure_tool_call_ids(session_id) is False
     assert _ids(manager, session_id) == [first_id]
+
+
+def test_ensure_tool_call_ids_coalesces_cumulative_stream_replays(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    session_id = "replayed-tool-result"
+    manager.create_session(session_id)
+    data = manager.get_raw_messages(session_id)
+    first = {
+        "id": "call-replayed",
+        "tool": "read_file",
+        "input": '{"path":"/README.md"}',
+        "output": "README content",
+        "completed_at": 10.0,
+    }
+    replay = {
+        "id": "call-replayed",
+        "tool": "read_file",
+        "input": "",
+        "output": "README content",
+        "completed_at": 17.0,
+    }
+    message = {
+        "role": "assistant",
+        "content": "done",
+        "tool_calls": [dict(first), dict(replay)],
+        "segments": [{"tool_calls": [dict(first), dict(replay)], "timeline": []}],
+        "timeline": [
+            {"type": "tool", "id": "call-replayed", "tool_call": dict(first)},
+            {"type": "tool", "id": "call-replayed", "tool_call": dict(replay)},
+        ],
+    }
+    data["messages"] = [json.loads(json.dumps(message))]
+    data["display_messages"] = [json.loads(json.dumps(message))]
+    manager._write_file(session_id, data)
+
+    assert manager.ensure_tool_call_ids(session_id) is True
+    repaired = manager.get_raw_messages(session_id)
+    for projection in ("messages", "display_messages"):
+        saved = repaired[projection][0]
+        assert len(saved["tool_calls"]) == 1
+        assert len(saved["segments"][0]["tool_calls"]) == 1
+        assert len(saved["timeline"]) == 1
+        assert saved["tool_calls"][0]["id"] == "call-replayed"
+        assert saved["tool_calls"][0]["input"] == '{"path":"/README.md"}'
+        assert saved["tool_calls"][0]["completed_at"] == 10.0
+    assert manager.ensure_tool_call_ids(session_id) is False
+
+
+def test_ensure_tool_call_ids_preserves_same_id_from_different_runs(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    session_id = "cross-run-tool-id"
+    manager.create_session(session_id)
+    data = manager.get_raw_messages(session_id)
+    data["messages"] = [
+        {
+            "role": "assistant",
+            "query_id": "query-aihot",
+            "content": "旧任务",
+            "tool_calls": [{"id": "call-shared", "tool": "inspect_skill", "output": "aihot"}],
+        },
+        {
+            "role": "assistant",
+            "query_id": "query-l6",
+            "content": "当前任务",
+            "tool_calls": [{"id": "call-shared", "tool": "tavily_search", "output": "L6"}],
+        },
+    ]
+    manager._write_file(session_id, data)
+
+    manager.ensure_tool_call_ids(session_id)
+
+    repaired = manager.get_raw_messages(session_id)
+    assert [message["tool_calls"][0]["output"] for message in repaired["messages"]] == [
+        "aihot",
+        "L6",
+    ]
 
 
 def test_candidate_scan_preserves_recent_n_and_short_results(tmp_path: Path) -> None:
@@ -543,6 +620,52 @@ def test_enqueue_returns_while_background_summary_is_still_running(tmp_path: Pat
     asyncio.run(run())
 
 
+def test_cancelled_background_job_releases_candidate_lease_and_keeps_raw_output(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    _save_tools(
+        manager,
+        "service-cancelled",
+        count=1,
+        output_chars=100000,
+        tool="custom_unstructured_blob",
+    )
+
+    async def run() -> None:
+        started = asyncio.Event()
+
+        class BlockingSummaryModel:
+            async def ainvoke(self, _messages: list[Any]) -> AIMessage:
+                started.set()
+                await asyncio.Event().wait()
+                return AIMessage(content="unreachable")
+
+        service = ToolContextCompactionService(
+            manager=manager,
+            model_factory=lambda: BlockingSummaryModel(),
+        )
+        cfg = ToolContextConfig(background_min_result_tokens=1000, keep_recent_tool_results=0)
+        assert await service.enqueue("service-cancelled", cfg)
+        await asyncio.wait_for(started.wait(), timeout=1)
+        task = service._tasks["service-cancelled"]
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+    status = manager.get_tool_context_status("service-cancelled")
+    assert status["status"] == "failed"
+    call = manager.get_raw_messages("service-cancelled")["messages"][0]["tool_calls"][0]
+    assert call["context_compaction"]["status"] == "failed"
+    assert str(call["output"]).startswith("result-0:")
+    assert len(str(call["output"])) > 90_000
+    assert manager.select_tool_context_candidates(
+        "service-cancelled",
+        min_result_tokens=1000,
+        keep_recent=0,
+        policy_version=POLICY_VERSION,
+    )
+
+
 def test_immediate_guard_only_compacts_single_oversized_result_and_keeps_id() -> None:
     cfg = ToolContextConfig(
         immediate_compaction_enabled=True,
@@ -634,6 +757,69 @@ def test_saved_agent_context_does_not_duplicate_raw_tool_artifact() -> None:
     assert artifact["keep"] == "metadata"
 
 
+def test_saved_agent_context_excludes_completion_control_messages() -> None:
+    from graph.deepagents_manager import _serialize_agent_context_messages
+
+    serialized = _serialize_agent_context_messages(
+        [
+            HumanMessage(content="真实用户问题"),
+            HumanMessage(
+                content="grader revision",
+                name="rubric_grader",
+                additional_kwargs={"lc_source": "rubric_grader"},
+            ),
+            HumanMessage(
+                content="历史摘要",
+                additional_kwargs={"lc_source": "summarization"},
+            ),
+        ]
+    )
+
+    assert [item["data"]["content"] for item in serialized] == [
+        "真实用户问题",
+        "历史摘要",
+    ]
+
+
+def test_summarizer_excludes_completion_controls_from_summary_input() -> None:
+    from graph.deepagents_manager import PuddingClawSummarizationMiddleware
+
+    messages = [
+        HumanMessage(content="真实用户问题"),
+        HumanMessage(
+            content="grader revision",
+            name="rubric_grader",
+            additional_kwargs={"lc_source": "rubric_grader"},
+        ),
+        AIMessage(content="正式回答"),
+    ]
+
+    filtered = PuddingClawSummarizationMiddleware._without_internal_controls(messages)
+    assert [message.content for message in filtered] == ["真实用户问题", "正式回答"]
+
+
+def test_summarizer_excludes_completion_controls_from_offloaded_history() -> None:
+    from graph.deepagents_manager import PuddingClawSummarizationMiddleware
+
+    middleware = object.__new__(PuddingClawSummarizationMiddleware)
+    messages = [
+        HumanMessage(content="真实用户问题"),
+        HumanMessage(
+            content="grader revision",
+            name="rubric_grader",
+            additional_kwargs={"lc_source": "rubric_grader"},
+        ),
+        HumanMessage(
+            content="历史摘要",
+            additional_kwargs={"lc_source": "summarization"},
+        ),
+        AIMessage(content="正式回答"),
+    ]
+
+    filtered = middleware._filter_summary_messages(messages)
+    assert [message.content for message in filtered] == ["真实用户问题", "正式回答"]
+
+
 def test_model_route_uses_only_ready_entries_without_waiting(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     _save_tools(manager, "model-route", count=2)
@@ -655,6 +841,8 @@ def test_model_route_uses_only_ready_entries_without_waiting(tmp_path: Path) -> 
     )
     middleware = ToolContextCompactionMiddleware(ToolContextConfig(), manager=manager)
     observed: list[ToolMessage] = []
+    raw_messages = manager.get_raw_messages("model-route")["messages"]
+    raw_first = raw_messages[0]["tool_calls"][0]["output"]
 
     class Request:
         def __init__(self, messages: list[ToolMessage]) -> None:
@@ -666,9 +854,9 @@ def test_model_route_uses_only_ready_entries_without_waiting(tmp_path: Path) -> 
 
     async def run() -> None:
         request = Request(
-            [
-                ToolMessage(content="raw first", tool_call_id="call-0"),
-                ToolMessage(content="raw pending", tool_call_id="call-1"),
+                [
+                    ToolMessage(content=raw_first, tool_call_id="call-0"),
+                    ToolMessage(content="raw pending", tool_call_id="call-1"),
             ]
         )
 
@@ -683,6 +871,81 @@ def test_model_route_uses_only_ready_entries_without_waiting(tmp_path: Path) -> 
         ("call-0", "compressed first"),
         ("call-1", "raw pending"),
     ]
+
+
+def test_model_route_rejects_ready_output_from_another_run_with_same_id(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    session_id = "cross-run-ready"
+    manager.create_session(session_id)
+    old_output = "aihot skill update result"
+    new_output = "L6 price is 24.98"
+    old_hash = manager._tool_context_source_hash(old_output)
+    data = manager.get_raw_messages(session_id)
+    data["messages"] = [
+        {
+            "role": "assistant",
+            "query_id": "query-aihot",
+            "content": "old",
+            "tool_calls": [
+                {
+                    "id": "call-shared",
+                    "tool": "inspect_skill",
+                    "output": old_output,
+                    "context_output": "compressed aihot update",
+                    "context_compaction": {
+                        "status": "ready",
+                        "source_hash": old_hash,
+                    },
+                }
+            ],
+        },
+        {
+            "role": "assistant",
+            "query_id": "query-l6",
+            "content": "new",
+            "tool_calls": [
+                {
+                    "id": "call-shared",
+                    "tool": "tavily_search",
+                    "output": new_output,
+                }
+            ],
+        },
+    ]
+    manager._write_file(session_id, data)
+    middleware = ToolContextCompactionMiddleware(ToolContextConfig(), manager=manager)
+    observed: list[ToolMessage] = []
+
+    class Request:
+        def __init__(self, messages: list[ToolMessage]) -> None:
+            self.messages = messages
+            self.runtime = SimpleNamespace(context={"session_id": session_id})
+
+        def override(self, *, messages: list[ToolMessage]):
+            return Request(messages)
+
+    async def run() -> None:
+        request = Request(
+            [
+                ToolMessage(
+                    content=new_output,
+                    tool_call_id="call-shared",
+                    additional_kwargs={
+                        "puddingclaw_query_id": "query-l6",
+                        "puddingclaw_tool_source_hash": manager._tool_context_source_hash(new_output),
+                    },
+                )
+            ]
+        )
+
+        async def handler(next_request: Request):
+            observed.extend(next_request.messages)
+            return SimpleNamespace(result=[])
+
+        await middleware.awrap_model_call(request, handler)
+
+    asyncio.run(run())
+    assert observed[0].content == new_output
 
 
 def test_effective_context_meter_applies_ready_delta_only_when_enabled(tmp_path: Path) -> None:

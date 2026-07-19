@@ -1717,6 +1717,25 @@ harness:
 - GoalCard 能区分 active、waiting_hitl、evaluating、paused、blocked、budget_exceeded、achieved；
 - 无 Goal 时不展示空 GoalCard；无 Rubric 时不展示空 VerificationCard。
 
+### 本轮冻结：输入资产、外部产物与临时目录的权威边界
+
+1. 用户上传、拖入或粘贴的文件/图片复制到当前 Session 的 <code>attachments</code>，生成稳定的 <code>attachment_id</code>；后续 Goal Run 通过 Session 内引用复用同一份输入快照，不做跨 Session 猜测或全局回退查找。
+2. 普通粘贴文本直接保存在消息正文；只有达到大文本阈值时才转存为 attachment。attachment 是输入快照，不是最终交付目录。
+3. 用户直接给出的本机路径默认不复制。Harness 保存指向原文件的外部 <code>FileRef</code>，读取、修改和写回均经过 Tool 权限管线；只有用户明确要求冻结/留档时才额外复制到 attachments。
+4. 用户指定的外部修改目标是唯一权威交付路径。<code>/workspace</code> 中的副本、attachment 副本及其他派生文件不得冒充原始交付目标。
+5. <code>/scratch</code> 是每次 Run 隔离的临时转换与验证目录，映射在 workspace 之外；Run 结束后清理。其产物固定标记为 <code>scope=scratch, role=temporary</code>，不能满足 artifact delivery Rubric。
+6. Docker 的隐藏 <code>/harness-scratch</code> 仅供 Backend 映射使用，模型和 Terminal 权限策略禁止直接访问；Host fallback 与 Docker 均只向命令暴露虚拟 <code>/scratch</code>。
+
+### 本轮冻结：Goal 连续性、Todo 所有权与三态语义资产
+
+- Goal 的 Todo ledger 按 <code>goal_id + goal_revision</code> 隔离；同一 revision 的下一 Run 继承进度，新 revision、新 Goal 与普通 Run 不继承旧 Todo。
+- 每个 Todo 保留创建/最近变更的 Run 与 query 归属，TodoGate 只验收当前 Goal revision 或当前普通 Run 的事项。
+- Goal 跨 Run 的对话仍呈现为同一个助手任务过程；每个持久化 segment 绑定 <code>run_id + goal_id + verification_state</code>，刷新后按 Goal 重建同一消息。Run 边界、预算原因、模型调用和终态进入右侧时间线，不再向聊天区插入伪消息；后一 Run 的验收不能重标或隐藏前一 Run 的候选内容。
+- 活跃 Run 中的暂停/取消先写入 <code>requested_status</code>，再中止执行任务；Run 收尾必须通过 Session 单锁下的 compare-and-set 原子读取 <code>current_run_id/objective_revision/requested_status</code>，控制请求与新 revision 优先于 grader 或旧 graph state，避免暂停后被写回 active。跨进程执行者还需在模型、工具与 HITL 流边界轮询持久化控制请求。
+- Todo 从中间件数组中消失不代表完成；未先标记 <code>completed/cancelled</code> 的删除转为 <code>removed_unresolved</code> tombstone，继续阻断 TodoGate。
+- 语义资产解析采用三态：显式资产 ID 为 strict；仅选择模型时只在该模型资产内匹配；确实未命中时进入 generalized，由模型结合 schema 与用户问题泛化并显式说明假设，而不是 fail-closed。
+- verifier/grader/基础设施异常属于控制面说明 <code>control_notices</code>，不得伪装成用户任务未满足的 acceptance gap；只有真实验收失败才进入下一 Run 的修正上下文。
+
 ### Persistence
 
 - tool_start 后崩溃 → interrupted terminal record；
@@ -1837,3 +1856,474 @@ PuddingClaw 当前最强的是 **Context Engineering 与白盒可观测性**，�
 3. **Lifecycle Control Loop**：HarnessRunCoordinator 统一 Run/Goal/HITL/取消/异常/预算的合法状态迁移。
 
 三个控制面补齐后，PuddingClaw 智能问数 Agent 才会从“可观察的 DeepAgents 产品封装”升级为“动作受控、完成可验、生命周期一致”的产品级 Agent。
+
+## 19. 2026-07-19 长 Goal Session 复盘与修订方案（待审核）
+
+> 本节来自真实 Session `session-8d0da6dfb9c5` 的 Session JSON、Trace sidecar、Docker 运行时和前端截图复盘。它修订的是已经实现后的产品行为，不推翻前三个控制面的总体架构。
+
+### 19.1 复盘事实
+
+该 Goal 用于刷新外部 HTML/JS 报告，最终形成以下运行事实：
+
+- Goal 已运行 6 个 Run，累计 189 次主 Agent 模型调用；前两个 Run 均达到 50 次单 Run 上限；随后三个 Run 分别以 `max_iterations_reached`、`needs_revision`、`max_iterations_reached` 结束，第六个 Run 被用户取消。
+- 一个 assistant message 内最多出现 26 个执行 segment；模型的过程性 content 与候选最终 content 被同时渲染，导致用户先看到“闭环完成”，随后又看到继续验收和修正。
+- `edit_file` 共调用 80 次，其中 14 次因 `old_string` 精确匹配失败，失败率 17.5%。主要诱因是旧快照、Unicode/中文引号和多次修改后的文本漂移。
+- workspace 为 `/Users/pet/puddingclaw`，交付目标位于 workspace 外部。Host 文件工具可以读取和编辑目标，但 Docker Terminal 无法直接访问；Agent 因此尝试将文件复制到 `/workspace` 做 Python/Node 验证。
+- Run 记录已经声明 `scratch_host_path`，当前源码也声明 `/harness-scratch` mount；但真实长生命周期容器没有 `/scratch` 或 `/harness-scratch`，属于运行时容器 generation 与当前 Backend contract 漂移。
+- Todo 在多个 Run 中被重命名、拆分和整表覆盖，最终出现 3 个 `removed_unresolved` tombstone；后一 Run 又重建早期计划，形成已完成进度回退。
+- Global Summarization 实际已经触发：压缩前 UI 曾显示约 201k/200k，压缩后持久化的有效 Agent context 为约 46k tokens；但生成摘要错误声称“全部完成、无下一步”，与权威 Goal/Todo 不一致。
+- Tool Context Compaction 实际完成：本次选中 4 个结果，从约 23,066 tokens 压到 2,808 tokens，失败为 0；但它目前是后台异步任务，Goal 下一 Run 不一定等待压缩完成。
+- Trace sidecar 约 196 MB，Session JSON 约 7.7 MB。Trace 不参与 Agent 恢复或下一轮模型输入；该体积本身不构成 Harness 正确性缺陷。
+
+### 19.2 修订决策一：Goal 仍然必须自主跨 Run，不增加普通确认点
+
+**审核结论：同 Run 修正次数耗尽后，active Goal 应自动进入下一 Run；只要 Goal Run 预算尚未耗尽，就不要求用户确认。**
+
+这一区分必须固定为两层：
+
+1. **Run 内修正循环**：`deterministic checks → rubric → correction` 在同一 Run 内有限回跳，避免一次小缺口立即切换 Run。
+2. **Goal 外层推进**：Run 内修正耗尽、单 Run model-call budget 耗尽或 context boundary 需要切段时，只要 Goal 仍 active 且 `round < max_rounds`，Harness 自动创建下一 Run，并注入权威 gaps、Todo、Artifact/Evidence Manifest 后继续。
+
+因此推荐状态机为：
+
+```text
+Run natural stop
+  → deterministic checks
+  → rubric
+  → satisfied ───────────────→ Goal aggregate verification
+  → needs_revision
+       ├─ Run correction budget remains → same Run correction
+       └─ Run correction budget exhausted
+            ├─ active Goal and Goal budget remains → next Run automatically
+            └─ no Goal / Goal budget exhausted → terminal needs_revision
+```
+
+只有以下情况允许打断 Goal 并要求用户处理：
+
+- Goal 的 `max_rounds`、总 token/model-call/wall-time 组合预算耗尽；
+- 需要新增权限、外部系统协调或扩大任务范围；
+- HITL 明确要求用户选择；
+- 不可恢复的基础设施错误重复发生；
+- 用户主动暂停、取消或修改 Goal。
+
+普通 Grader 未通过不是用户确认点。否则 Goal Mode 会退化成需要人工不断点击“继续”的普通多轮对话。
+
+来源标记：**[Grok Build Goal round / verifier 思想借鉴] + [PuddingClaw 自动 Run continuation 适配]**。
+
+### 19.3 修订决策二：区分 Run 验收与 Goal 聚合验收
+
+当前实现把 LLM grader 限定在当前 Run，同时部分 deterministic check 又读取 Goal 继承证据，导致验收范围不一致。例如前序 Run 已完成 16 组 SQL，后续 Run 只修 HTML，却被 grader 要求重新执行核心 SQL。
+
+必须拆成两个明确层级：
+
+#### Run Verification
+
+只判断本 Run 的局部执行是否合法、是否产生可信增量：
+
+- 本 Run 工具调用是否成功或被明确处理；
+- 当前 Run 新增/修改的 Todo 是否收口；
+- 本 Run 声称的修改是否存在对应 Artifact Receipt；
+- 当前 Run 使用的验证命令是否真实执行；
+- 是否出现 infrastructure error、permission interruption 或预算边界。
+
+#### Goal Aggregate Verification
+
+判断当前 Goal revision 的最终完成度：
+
+- 使用跨 Run 的 Effective Evidence Manifest；
+- 使用 Goal revision 下的 canonical Todo ledger；
+- 使用目标 Artifact 的当前版本与全部写入 receipt；
+- 允许前一 Run 的 SQL/result_id/generation_id 在后一 Run 被继承；
+- 只要证据仍有效，不要求每个 Run 重复查询、重复写入或重复安装依赖。
+
+Goal 完成判定的输入不再是“当前 Run 对话文本”，而是：
+
+```text
+Goal objective revision
++ Effective Verification Contract
++ Canonical Todo Ledger
++ Effective Artifact Manifest
++ Effective Evidence Manifest
++ Latest candidate answer
++ unresolved gaps / control notices
+```
+
+来源标记：**[本方案新增]**。这是为解决 PuddingClaw 已有 Run 级 Rubric 与 Goal 级连续性冲突而引入的双层验收。
+
+### 19.4 修订决策三：候选答案不能冒充已验收答案
+
+模型 content 需要按生命周期分流：
+
+| 内容类型 | 前端位置 | 是否代表完成 |
+|---|---|---|
+| 带 Tool Call 的过程性 content | Run 进度/时间线 | 否 |
+| 自然停止后的回答 | 候选结果，标记“验收中” | 否 |
+| deterministic/rubric 修正提示 | 验收面板与 Run 时间线 | 否 |
+| Goal/Run 验收通过后的候选结果 | 正式 assistant answer | 是 |
+
+前端在 `executing → deterministic_checking → grading → revising` 期间必须保持统一的“执行/验收中”状态。不能因为模型输出了“完成”“全部通过”就提前显示任务完成。
+
+来源标记：**[本方案新增]**，借鉴 Harness-owned completion 的原则，但交互和事件契约属于 PuddingClaw 自己的设计。
+
+### 19.5 修订决策四：Global Summary 必须携带权威 Harness Envelope
+
+Global Summarization 保持跨 Run 全局压缩能力，但最终上下文必须由两部分组成：
+
+```text
+LLM semantic conversation summary
++ deterministic Harness State Envelope
+```
+
+Harness State Envelope 由代码生成，不能交给摘要模型自由归纳，至少包含：
+
+- `session_id`、`goal_id`、`goal_revision`；
+- Goal objective、status、current/max round、组合预算余量；
+- canonical Todo 的稳定 ID、顺序、状态和未完成项；
+- Effective Verification Contract 的 criterion ID/version；
+- 当前 gaps 与 control notices；
+- Artifact Manifest：权威目标、当前 receipt/hash、临时副本身份；
+- Evidence Manifest：SQL generation/result/trace refs、数据源、验证命令与产物证据；
+- active permission/HITL 的最小恢复信息；
+- 下一 Run 的 continuation reason。
+
+压缩后必须对账：
+
+```text
+summary Harness Envelope
+  == Session JSON authoritative Harness projection
+```
+
+任一 Goal/Todo/Artifact/Evidence 关键字段缺失或冲突时，摘要不得成为下一 Run 输入，必须回退到确定性 Harness Envelope + 最近消息。
+
+#### 前端交互
+
+上下文压缩不能再是一闪而过的 toast。前端需要持续展示全局阶段：
+
+```text
+正在压缩全局上下文
+  1. 整理历史消息
+  2. 生成语义摘要
+  3. 注入 Goal / Todo / 证据状态
+  4. 重建上下文并继续
+```
+
+完成后显示一次明确结果，例如“201k → 46k，Goal/Todo/证据已保留”，随后自动继续，不要求用户操作。
+
+触发阈值是否从 200k 提前属于性能参数，不是本节正确性前提；当前实现允许单 Run 膨胀，只要在真正越过模型安全窗口前完成全局压缩即可。
+
+来源标记：**[Grok Build compaction/continuation 思想借鉴] + [PuddingClaw Harness Envelope 新增]**。
+
+### 19.6 修订决策五：Tool Context Compaction 保持 Run 后执行，但必须 Harness-aware
+
+Tool Context Compaction 不改为频繁的单 Run 内即时压缩。单 Run 内保留完整工具上下文有利于模型连续执行和调试。
+
+固定边界调整为：
+
+```text
+Run terminal
+  → persist raw Run result
+  → Tool Context Compaction
+  → verify Harness evidence preservation
+  → persist compact Agent context
+  → start next Goal Run
+```
+
+即：**每个 Run 结束后、下一 Run 开始前先完成工具压缩**，不能只 enqueue 后立刻启动下一 Run。
+
+工具压缩必须保留以下 Harness 信息：
+
+- `tool_call_id`、tool name、成功/失败/中断状态；
+- permission decision、grant ID 与风险能力摘要；
+- SQL `generation_id`、`result_id`、数据源与 trace ref；
+- Artifact Receipt、目标路径、scope/role、hash；
+- deterministic verifier 依赖的结构化字段；
+- 原始结果的 `raw_output_ref` 与 digest。
+
+可以压缩的是面向模型的冗长正文、重复 schema、表格行和日志；不能压缩掉验收所依赖的结构化事实。压缩完成后运行一次 Evidence Manifest 对账，缺失证据则保留原结果并记录 compaction failure。
+
+来源标记：**[PuddingClaw 现有 Tool Context 延续] + [本方案 Harness-aware 对账新增]**。
+
+### 19.7 修订决策六：Trace 大文件暂不视为正确性问题
+
+Trace 继续保持以下边界：
+
+- Trace 只记录事实，不参与 Session 恢复；
+- Trace 不作为 Agent 下一 Run 的输入；
+- Goal/Run 权威状态仍在 Session JSON；
+- LangGraph checkpoint 仍只负责同 Run HITL。
+
+因此本次约 196 MB Trace 不进入 P0/P1 正确性修复。Session 约 7.7 MB 当前也可接受。
+
+后续只做低优先级产品化治理：
+
+- Trace UI 分页/按 Run 懒加载；
+- sidecar 保持独立，禁止随 Session 列表接口整体返回；
+- 可选按 span 类型去重 hook snapshot；
+- 磁盘配额、归档和清理策略；
+- 不以压缩 Trace 为代价丢失审计证据。
+
+来源标记：**[PuddingClaw 既有权威边界延续]**。
+
+### 19.8 外部文件与 `/scratch` 修复
+
+现有冻结边界保持不变：用户直接给出的外部路径仍是权威目标，不默认复制到 attachments，也不能用 workspace 副本冒充最终产物。
+
+需要补齐的实现：
+
+1. Docker project container 固定挂载项目级 `/harness-scratch`；
+2. Backend 将当前 Run 的 `/scratch` 重写到独立子目录；
+3. `_validate_runtime` 检查 mount、读写权限和 generation contract，不满足就重建容器；
+4. 外部文件需要 Python/Node 验证时，由 Host 侧建立 `ExternalArtifactLease`，暂存到 `/scratch/external/<artifact_id>/`；
+5. 验证完成后通过带 `expected_source_sha256` 的受控 commit 写回原路径；
+6. Run 结束清理 scratch，Artifact Manifest 保留原目标 receipt，不登记临时副本为交付物。
+
+来源标记：**[本方案新增]**，延续此前冻结的 FileRef、外部路径授权与 scratch 设计。
+
+### 19.9 `edit_file` 版本化 Patch
+
+模型工具面不再继续放行简单 `old_string/new_string` 盲改入口；保留其底层兼容实现仅供旧记录恢复，新的 Agent 写路径使用稳健编辑协议：
+
+- `inspect_file_version` 返回完整 UTF-8 内容与版本/hash；
+- Patch 携带 `expected_sha256`；
+- 第一阶段支持原子 `replacements[]` hunk；后续可扩展 line range、before/after anchor 或 unified diff，但不作为当前已实现能力宣称；
+- source hash mismatch 返回当前 hash；hunk mismatch 要求重新 inspect/rebase，不允许模型连续猜测；
+- 同一路径第一次 mismatch 后强制重新读取，禁止连续猜测字符串；
+- 多处修改支持原子 batch，任一冲突不写入半成品。
+
+来源标记：**[Grok Build/成熟 Coding Agent patch 交互借鉴] + [PuddingClaw 外部文件权限适配]**。
+
+### 19.10 Todo 稳定身份与增量协议
+
+Todo 不再以“整张自然语言列表”作为身份来源，改为 Harness-owned stable ID：
+
+```text
+create_todo
+update_todo
+complete_todo
+cancel_todo
+reopen_todo
+reorder_todos
+```
+
+规则：
+
+- 改标题不改变 ID；
+- 拆分 Todo 必须显式声明 parent/children；
+- completed Todo 不能因后一 Run 重建列表而恢复 pending；
+- 省略 Todo 不等于删除，仍保留原状态；
+- 只有显式 complete/cancel 才满足 TodoGate；
+- Global Summary 只引用 canonical Todo，不反向覆盖 Todo ledger。
+
+来源标记：**[Grok Build TodoGate 思想借鉴] + [PuddingClaw stable ledger 新增]**。
+
+### 19.11 修订后的开发优先级
+
+#### P0：完成语义与跨 Run 连续性
+
+1. **候选答案/正式答案分离**：前端增加 executing/checking/grading/revising/accepted 生命周期，禁止提前显示完成。
+2. **Run Verification 与 Goal Aggregate Verification 分层**：Goal 验收读取跨 Run Effective Evidence/Artifact Manifest。
+3. **Goal 自动跨 Run 规则收口**：同 Run 修正耗尽后，只要 Goal 预算仍有余量就自动进入下一 Run，不询问用户。
+4. **Harness-aware Global Summary**：确定性 Harness Envelope、摘要对账、前端持续压缩状态。
+5. **Todo stable ID + patch protocol**：消除重命名、拆分和跨 Run 重建造成的进度回退。
+6. **Docker scratch contract 修复**：容器 mount 自检、generation recreate、外部产物 staging/commit。
+
+#### P1：工具可靠性与 Run 边界压缩
+
+1. **Tool Context 设为跨 Run barrier**：Run 后压缩完成并完成 Evidence Manifest 对账，再启动下一 Goal Run。
+2. **`edit_file` 版本化 Patch**：hash、anchor、候选匹配、原子 batch。
+3. **验收明细产品化**：区分本 Run 局部缺口、Goal 总体缺口、控制面错误和继承证据。
+4. **Todo/Goal/Grader 进度顺序修复**：所有卡片使用权威 position、run_id、attempt，不按自然语言或 SSE 到达顺序猜测。
+
+#### P2：可观测性与存储体验
+
+1. Trace 按 Run/span 懒加载与分页；
+2. 可选去重重复 hook snapshot，但不得影响审计；
+3. Session segments/tool output 是否进一步引用化，按真实加载性能决定；
+4. Trace 归档、磁盘配额和清理设置。
+
+Trace 体积和当前 7.7 MB Session 不作为 P0/P1 阻塞项。
+
+### 19.12 修订后的验收用例
+
+#### Goal Continuation
+
+- 同 Run rubric correction 达到上限、Goal 尚有 Run 预算时，自动启动下一 Run，不产生 HITL；
+- Goal `max_rounds` 耗尽时停止并展示最终 gaps；
+- 普通非 Goal Run 验收耗尽时不自动创建 Goal；
+- 前一 Run 完成 SQL、后一 Run 只编辑 HTML 时，Goal Aggregate Verification 能继承 SQL evidence，不要求重复查询；
+- Goal 自动下一 Run 前必须完成 Tool Context barrier。
+
+#### Summary / Tool Context
+
+- Global Summary 后 Goal ID/revision/status/round 不变；
+- Summary 前后 canonical Todo ID、状态、顺序完全一致；
+- Summary 前后 Artifact/Evidence Manifest 对账一致；
+- 摘要模型错误声称“已完成”时，Harness Envelope 仍保持 active + unresolved gaps；
+- 前端完整显示 global compression 的开始、阶段、前后 token 和完成状态；
+- Tool Context 压缩后 SQL generation/result ID、Artifact Receipt、permission decision 和 raw ref 仍存在；
+- Tool Context 失败时下一 Goal Run 使用未压缩原结果，不丢证据。
+
+#### External Artifact / Scratch
+
+- Docker container 启动后 `/scratch` 虚拟路径可写，`/harness-scratch` 不直接暴露给模型权限；
+- spec 已声明 scratch、真实 container 缺 mount 时自动 recreate；
+- 外部 HTML 可在 scratch 中通过 Python/Node 验证，不写入 `/workspace`；
+- scratch 副本不能满足 artifact delivery，只有原目标 commit receipt 可以；
+- source hash 冲突时禁止覆盖外部文件并返回明确冲突。
+
+#### Todo / Edit
+
+- Todo 改名不创建新 ID；
+- Todo 拆分后 parent/children 可追踪；
+- 后一 Run 省略已完成 Todo 不会让其回退；
+- `edit_file` hash 冲突返回候选与行号，不产生部分写入；
+- 中文引号、Unicode 转义和并发修改场景不会进入连续 blind retry。
+
+### 19.13 第一阶段实现检查点（2026-07-19）
+
+本检查点记录代码已落地与仍未闭环的边界，不能把“已写代码”等同于整轮 Harness 已验收。
+
+已落地：
+
+- Run 启动即把输出标为 candidate/pending；通过时仅最后一个 content segment 成为 accepted，前序模型/工具片段统一折叠为 progress；刷新恢复时读取持久化 running/pending 状态；budget、grader、infrastructure 等无合法终态的候选标为 unverified，不再投影成普通答案。
+- Goal 模式把当前修订版的跨 Run evidence refs、Todo、known gaps 和 prior Run 状态作为结构化 aggregate context 提供给 grader；analytics/web evidence 可在同一 Goal revision 下继承，报告显式标记 `verification_scope=goal_aggregate` 与 supporting Run IDs。
+- 同 Run 正常 rubric correction 仍由 RubricMiddleware 完成；耗尽后由 Goal 自动进入下一 Run。验收器/基础设施异常使用独立 failure fingerprint 和有限 retry budget，连续同指纹达到阈值后转 blocked，避免退款导致无限循环。
+- Global Summary 默认阈值调整到约 160k；摘要末尾由 Harness 确定性附加 `puddingclaw.harness-envelope/v1`，包含 Goal、Run、canonical Todo、artifact target、evidence 与 gaps；前端在压缩期间显示持续的“全局上下文压缩”状态。
+- 原 `write_todos` 整表替换从模型工具面移除，改为 `update_todos` 增量协议；create ID 由 tool-call identity 确定性生成，rename/reorder 不换 ID，cancel 保留 tombstone。
+- 新增 `inspect_file_version → patch_file(expected_sha256, replacements[])` 原子 compare-and-swap 流程；旧 `edit_file` 在 ToolExecutionPipeline 中拒绝并引导重读/rebase。
+- Tool Context 从“只 enqueue”改为 Run boundary barrier；完成或形成明确错误终态后才允许外层 Goal loop 继续，摘要保留 tool_call_id、source_hash、raw_output_ref 与 Harness evidence 标记。
+- Docker 启动复用前增加 inspect Mount、RW、UID/GID 与实际写探针；runtime contract 不匹配时销毁并重建。Host/Docker 执行入口和 shell policy 同时拒绝显式 `/scratch/..` parent traversal。
+- 外部目标增加 `stage_external_artifact → ExternalArtifactLease → commit_external_artifact`：staging 只进入当前 `/scratch/external/<lease_id>/`，lease 在 Session JSON 绑定原始绝对路径和 source SHA；commit 只允许写回该精确路径，源文件在 staging 后发生变化时 fail-closed，scratch 副本不登记为交付产物。
+- Goal 已持久化独立 `GoalVerificationDecision`，记录 objective revision、supporting Run IDs、聚合证据数、gaps、accepted Run 与 report ID；前端验收卡显式区分“本 Run 验收”和“Goal 聚合验收”。
+- 第二轮对抗审查后，`GoalVerificationDecision` 不再只是最后一个 Run report 的别名：新增 `accepted` 与 `criterion_provenance[]`，逐项记录 verifier、实际 supporting Run、evidence ref、gap 和 report ID；下一 Run 的 grader 同时读取前序 Run 的候选正文摘要和验收来源，因此“Run 1 完成纯文本子任务 A、Run 2 完成 B”不再因为 A 没有工具证据而天然丢失。
+- Goal objective revision 在运行中被修改或用户请求暂停/取消时，即使旧 Run 的 grader 返回 satisfied，也只保存为 superseded candidate，`accepted_for_goal_revision=false`；前端显示“旧版目标验收通过（未接纳）”，不能冒充当前 Goal 的正式结果。
+- Harness Envelope 不再用 `todos[-80:]` 截断权威进度：全部 pending/in_progress Todo 必须完整保留，仅 completed/cancelled 历史保留最近 40 条并附总数与 digest；evidence refs 保留全部结构化索引。模型摘要中伪造的 `<HARNESS_ENVELOPE>` 会先被剥离，最后只追加控制面生成的权威块。
+- Tool Context `completed_with_errors` 明确显示“部分压缩、失败项保留原始结果”，不再误称全部证据已对账；后台任务异常取消会持久化 failed，下一 Run 使用原始上下文。
+- 最终对抗复审补上跨 revision 污染反例：`prior_runs` 与 `prior_run_candidates` 必须逐条匹配当前 `goal_id + objective_revision`，Goal 修改后保留的旧 run_ids 只能用于审计，不能进入新 revision 的 aggregate grader。
+- 普通非 Goal Run 触发 Summary 时不会导入历史 terminal Goal；只有 latest Run 自身携带 goal_id 时，才允许加载对应 terminal Goal 形成收尾 Envelope。
+- `GoalVerificationDecision` 对 `NOT_REQUIRED` 的 accepted 语义与 Goal/Run 终态保持一致；criterion provenance 显式区分 `evaluated_in_run_id` 和 `evidence_origin_run_ids`，当前 evidence 已覆盖时不再合并旧 artifact receipt。
+- Tool Context 后台任务被 event-loop/client 生命周期取消时，会立即把 job 和仍 pending 的 candidate 标为 failed、保留 raw output 并释放重试租约，不再等待 lease timeout。
+- Todo 每次增量操作后写入显式 `position`；前端按 position 投影，不再用 SSE 到达顺序猜测列表位置。
+
+仍未闭环，继续按优先级处理：
+
+1. **Docker exact-Run scratch 强隔离**：当前 project container 挂载项目 scratch root，可写探针与路径策略已补，但一个长驻 project container 无法天然阻止解释器/符号链接访问其他 Run 子目录。要满足强隔离，需要 per-Run helper/ephemeral exec mount 或等价 FS jail；不能用字符串过滤冒充真隔离。本轮不把这个物理限制包装成已经实现的“Run 级真隔离”。
+2. **ExternalArtifactLease 清理策略**：staging/冲突保护/精确写回已经闭环；仍需按审计保留期清理已 committed/abandoned 的 scratch 文件。清理不得删除原目标或 Artifact Receipt，因此作为生命周期卫生项处理，不阻塞正确写回。
+3. **Evidence 有效期**：跨 Run analytics/web evidence 已绑定 Goal revision；仍需针对可失效 result/source 增加 TTL/version 校验，code validation 默认不跨修改继承。
+4. **进度位置与验收明细**：Todo position、Run ID、verification scope 已由控制面提供；candidate/accepted ID 和更细的 grader attempt 仍需继续从显示层彻底移除推断逻辑。
+5. Trace/Session 体积治理仍为 P2；Trace 不进入 Agent context，也不作为恢复权威，因此不阻塞上述正确性闭环。
+
+本阶段机制来源区分：
+
+- 借鉴 Grok Build/成熟 coding agent：candidate→verify→accept、TodoGate、版本化 patch、compaction 后 continuation 的交互原则。
+- PuddingClaw 自有设计：Run/Goal 双预算、Goal revision-bound Evidence Manifest、Session JSON 权威边界、LangGraph 同 Run checkpoint、Harness Envelope、Tool Context Run barrier、Docker/Host 同一权限管线。
+
+### 19.14 本轮实现验收记录（2026-07-19）
+
+- Backend 产品测试边界：`backend/.venv/bin/pytest -q tests`，**779 passed**；Backend 根级无范围 `pytest` 会额外收集第三方 Skill 自带测试并产生模块名冲突，不作为 Backend 产品回归入口。
+- Frontend：`tsc --noEmit` 通过；Next.js production build 通过，13 个路由完成静态/动态构建。
+- Docker 镜像 smoke：`puddingclaw/sandbox:python3.12-node22-v2` 在 `--network none`、宿主 UID/GID、真实 bind mount 下确认 Python 3.12、Node.js 22 与 `/harness-scratch/<session>/<query>` 写入成功。
+- 当前本机两个旧 project container 均缺 `/harness-scratch` mount；没有在审核过程中强制销毁。新 Backend 下次使用相应 project sandbox 时会因 spec hash/runtime validation 不匹配而自动重建。
+- `git diff --check` 通过。
+- 最终只读对抗复核确认四个高风险反例均已封住：旧 revision/cross-goal candidate 注入、普通 Run 导入 terminal Goal、未闭合伪造 Harness Envelope、Tool Context cancel 后租约悬挂；对应定向用例 4 passed。
+
+上述验收证明的是代码路径、状态契约和运行时基础能力已形成闭环；不把 Docker project container 内的 exact-Run 物理隔离、Evidence TTL、scratch retention 或 Trace 存储治理提前宣称为已完成。
+
+### 19.15 对抗式复审后的最终优先级（本轮审核版）
+
+复审顺序按“先保证控制语义，再保证状态穿越，再改善工具可靠性和体验”执行：
+
+#### P0-A：Goal 自主性与验收权威
+
+1. 同 Run rubric correction 或 `run_model_call_limit` 耗尽，只要 Goal 的 `max_rounds`、Goal model-call/token/time budget 仍有余量，必须自动进入下一 Run；不增加确认点。
+2. Goal 结束只能由 revision-bound `GoalVerificationDecision.accepted=true` 触发；Run candidate、grader satisfied、Todo 文案或模型口头声明都不能独立结束 Goal。
+3. GoalDecision 必须按 criterion 保存来源，`supporting_run_ids` 只能来自实际复核 Run、继承的 prior decision 或 evidence origin，禁止直接填满 `goal.run_ids`。
+4. 用户修改 Goal objective 时立刻提升 revision；旧 revision 的并发 Run 可留作审计，但永不接纳为新 revision 的完成结果。
+
+#### P0-B：跨上下文边界保持 Harness 不变量
+
+1. Global Summary 在约 160k 触发；前端持续显示“正在进行全局上下文压缩”，完成后自动继续。
+2. 摘要自然语言仅帮助模型理解；Goal、canonical Todo、Artifact/Evidence、permissions、gaps、budget 和 latest decision 必须来自确定性 Harness Envelope。
+3. 全部未收口 Todo 永不因摘要长度上限丢失；终态 Todo 允许以 recent items + count + digest 表示。
+4. 每个 Run 终态后、下一 Goal Run 前执行 Tool Context barrier；部分失败时保留原始工具结果，不能因压缩失败阻止 Goal 在证据仍可用时继续。
+
+#### P1：文件与容器执行可靠性
+
+1. 外部绝对路径保持交付权威，通过 revision/Goal/Run-bound `ExternalArtifactLease` 暂存、验证和 CAS commit；不复制到 workspace 冒充最终交付。
+2. 新写操作统一使用 inspect + expected hash + atomic patch；旧 `edit_file` 只做历史兼容，模型面禁止 blind retry。
+3. Docker project container 继续复用，基础镜像只保证 Python/Node；依赖按需、联网经权限管线。`/harness-scratch` mount、RW、UID/GID、Python/Node 和真实写探针必须在复用前通过。
+4. **待产品决策**：project-level 长驻容器与“解释器层物理 exact-Run scratch 隔离”存在结构冲突。若必须达到物理隔离，需要 per-Run helper/ephemeral exec mount、独立 UID/namespace 或 FS jail；当前路径重写和 traversal policy 只是逻辑隔离，不能宣称为强隔离。
+
+#### P2：存储与可观测性
+
+1. 7.7 MB Session 和大 Trace 本身不构成控制正确性问题；Trace 不参与 Agent 输入、恢复或 checkpoint authority。
+2. 后续按真实加载性能实现 Trace 分页、按 Run/span 懒加载、配额和归档；不能为减小文件牺牲审计事实。
+3. Session/Trace 大小不能反向驱动 P0 控制面设计，只有 Session 列表加载、单 Run 恢复或磁盘增长出现可测量问题时才升级优先级。
+
+来源区分：Goal 自主跨 Run、revision-bound Decision、Harness Envelope、ExternalArtifactLease、project container 权衡属于 **PuddingClaw 本方案新增/演进**；candidate→verify→accept、TodoGate、版本化 patch、compaction 后 continuation 的交互原则属于 **Grok Build 与成熟 coding agent 的机制借鉴**；Session JSON/Trace/checkpoint 权威边界属于 **PuddingClaw 既有产品决策的延续**。
+
+### 19.16 上传附件的只读/修改分流（审核补充）
+
+“通用附件自动暂存到 Docker `/scratch`”容易被理解为所有上传文件都会启动容器并产生副本，因此不采用这个表述，也不采用这种行为。正确边界是由任务能力决定是否升级：
+
+#### 只读路径
+
+- 用户上传或粘贴的文件先保存为当前 Session 的托管附件 `att_xxx`；
+- 原始附件在 `data/attachments/<session_id>/...` 中保持不可变；
+- 仅查看、摘录、问答或读取内容时，Agent 直接调用现有 `read_resource(att_xxx)`；
+- 只读路径不创建 scratch 副本、不启动 Docker 编辑链路，也不产生新的交付附件。
+
+#### 修改路径
+
+当用户要求修改、转换或生成该附件的新版本时，Agent 必须显式升级到附件编辑能力：
+
+```text
+att_xxx（不可变源附件）
+  -> prepare_attachment_edit
+  -> AttachmentEditLease（绑定 session/run/query/goal revision/source sha256）
+  -> /scratch/attachments/<lease_id>/<filename>
+  -> Docker Backend 内修改与验证
+  -> publish_attachment
+  -> 新的 derived attachment（可下载交付物）
+```
+
+核心规则：
+
+1. `prepare_attachment_edit` 只能读取当前 Session 已授权的附件，并把字节级副本放入当前 Run 的 scratch；不能接受任意宿主路径。
+2. staging 本身不需要再次 HITL，因为用户上传附件已经授权当前 Session 使用；Docker 内命令、联网和安装依赖仍分别经过 `ToolExecutionPipeline`。
+3. `publish_attachment` 只能发布该 lease 目录中的文件，不能借机读取其他 Run、其他 Session 或任意宿主路径；这条是发布工具的确定性边界，不等同于宣称 project container 已具备物理 exact-Run 文件系统隔离。
+4. 发布结果保存为新的 `source=generated` 附件，并记录 `derived_from`、Run/Query、内容 hash 和 Artifact Receipt；原始上传附件永不原地覆盖。
+5. 前端在助手消息中展示新附件的名称、大小、来源和下载入口；scratch 路径不是交付路径，也不暴露给用户。
+6. Docker 不可用时是否允许受控 Host fallback 继续遵循 Harness 设置；无论使用哪个 Backend，权限、lease、发布和验收语义必须一致，UI 不得把 Host fallback 宣称为 Docker 沙箱。
+
+因此，“用户上传一个文件，然后要求修改”是 `AttachmentEditLease` 的标准场景；“用户上传一个文件，然后询问内容”仍然只是 `read_resource` 场景。识别结果最终由工具契约约束，而不是仅靠提示词：未取得 edit lease 就没有可写路径，未执行 publish 就没有可接纳的附件交付物。
+
+该机制属于 **[PuddingClaw 本方案新增]**：复用现有托管附件、Run scratch、Backend 和 Artifact Verification，不照搬 Grok Build 的具体实现。
+
+#### 19.16.1 已实现的权威链路
+
+- `AttachmentStore` 使用临时目录写文件与 manifest，再原子 rename；确定性派生 ID 遇到无有效 manifest 的半提交目录时可安全回收重放。
+- 同一 lease 通过 Session 内原子 `staged → publishing → published` 状态转换选择唯一发布分支；并发发布不同 output path/name 时只有一个分支可以成功。
+- `published` lease 与 `attachment_deliveries[query_id]` 在同一次 Session JSON 提交中完成。该 outbox 是刷新/进程中断后的交付权威，SSE 和助手消息只是其投影。
+- Chat/SSE 不信任 ToolMessage 自带的 `download_url`。服务端重新核对 AttachmentStore、Session/Run/Query/Goal revision、Artifact Receipt、真实路径与实际字节 hash 后，才重建 public item 和下载 URL。
+- 上传与下载均要求 Session 真实存在；删除 Session 同时删除其附件树，旧 URL 随即失效。上传入口限制最多 8 个 multipart 文件，并在解析流阶段限制整个请求为 100 MB，避免先完整 spool 再进入业务限额。
+- 一旦成功调用 `prepare_attachment_edit`，Artifact Verification 被激活但仍为 non-material；只有权威 `publish_attachment` receipt 才能满足交付，不允许 scratch 文件或模型口头声明冒充产物。
+
+#### 19.16.2 对抗审查后的诚实限制
+
+当前 project container 仍复用项目级 `/harness-scratch` mount。本轮已经确定性拒绝：
+
+- 字面量 `/harness-scratch` 与相对 `../harness-scratch`；
+- Docker 命令中的 parent traversal；
+- 可把路径隐藏为 `harness-scrat[c]h`、`h*` 的 shell glob/path expansion。
+
+这能封住已复现的 shell 绕过，但不能把同 UID 解释器看到整棵 mount 的事实变成物理隔离。例如经用户批准执行的任意 Python 仍可能动态拼接不可见路径。若产品要求“即使任意容器代码也绝不读取相邻 Run scratch”，必须改为 per-Run helper/ephemeral mount、独立 UID/namespace 或 FS jail。结合当前产品决策——单文件修改走附件 lease，项目联调由用户明确选择项目目录——本轮保留 project container 复用，不伪称已完成 exact-Run 强隔离。
+
+#### 19.16.3 本轮附件链路验收
+
+- 定向附件、Session、权限管线及 DeepAgents 流测试：127 passed；
+- Backend 产品全量：779 passed，24 warnings；
+- Frontend `tsc --noEmit` 通过；Next.js production build 通过，13 个路由；
+- `git diff --check` 通过。
+
+对抗回归覆盖：跨 Session/Run/Query/Goal revision lease、source hash 篡改、路径穿越、shell glob 隐藏、超大源/输出、并发双发布、伪造 ToolMessage 下载卡、半提交重放、publish 后 stream 消费前崩溃、Session 删除后下载失效、任意文件类型统一 Artifact Verification。

@@ -218,7 +218,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         "deepagents": {
             "summarization": {
                 "enabled": True,
-                "trigger_tokens": 200000,
+                "trigger_tokens": 160000,
                 "keep_messages": 20,
             },
             "tool_context": {
@@ -1676,7 +1676,7 @@ def get_deepagents_summarization_config() -> dict[str, Any]:
             "summarization",
             {
                 "enabled": True,
-                "trigger_tokens": 200000,
+                "trigger_tokens": 160000,
                 "keep_messages": 20,
             },
         )

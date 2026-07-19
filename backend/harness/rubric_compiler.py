@@ -18,7 +18,7 @@ from harness.models import (
 from harness.task_profiles import INTENT_REGISTRY, TaskProfileClassifier
 
 _TIME_PATTERN = re.compile(
-    r"(?:20\d{2}[-/.年]\s*\d{1,2}(?:月)?|"
+    r"(?:20\d{2}(?:\s*年(?:\s*\d{1,2}月)?|[-/.]\s*\d{1,2}(?:月)?)|"
     r"\d{1,2}\s*月|"
     r"最近\s*[一二三四五六七八九十\d]+\s*(?:天|周|月|季|年)|"
     r"(?:本|上|下)(?:周|月|季度|年)|"

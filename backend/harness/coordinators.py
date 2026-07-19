@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import time
 import uuid
+import hashlib
 from typing import Any
 
 from graph.session_manager import SessionManager
+from harness.artifact_paths import extract_declared_artifact_targets
 from harness.deterministic_checks import evaluate_deterministic_criteria
 from harness.models import (
     CriterionEvaluation,
     GoalRecord,
+    GoalRevision,
+    GoalVerificationDecision,
     GoalStatus,
     HarnessStateError,
     RubricEvaluationReport,
@@ -20,6 +24,7 @@ from harness.models import (
     RunTaskProfile,
     RunVerificationContract,
     VerificationStatus,
+    VerificationFailureKind,
     VerifierKind,
 )
 from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
@@ -28,6 +33,22 @@ from harness.task_profiles import TaskProfileClassifier
 
 class GoalActivationError(HarnessStateError):
     """Raised when Goal identifiers and the explicit Goal Mode disagree."""
+
+
+def _evidence_origin_run_ids(value: Any) -> set[str]:
+    """Collect explicit Run identity from nested structured evidence."""
+
+    found: set[str] = set()
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in {"origin_run_id", "run_id"} and str(item or "").strip():
+                found.add(str(item).strip())
+            elif isinstance(item, (dict, list)):
+                found.update(_evidence_origin_run_ids(item))
+    elif isinstance(value, list):
+        for item in value:
+            found.update(_evidence_origin_run_ids(item))
+    return found
 
 
 class GoalCoordinator:
@@ -72,6 +93,13 @@ class GoalCoordinator:
             objective=objective.strip(),
             goal_contract=goal_contract,
             max_rounds=max_rounds,
+            revisions=[
+                GoalRevision(
+                    revision=1,
+                    objective=objective.strip(),
+                    contract_id=(goal_contract.contract_id if goal_contract else None),
+                )
+            ],
         )
         return goal
 
@@ -90,25 +118,149 @@ class GoalCoordinator:
         report: RubricEvaluationReport,
         outcome: RunOutcome,
     ) -> GoalRecord:
+        authoritative = self._load_goal(goal.session_id, goal.goal_id)
+        if run.goal_revision != authoritative.objective_revision:
+            return self._release_superseded_run(authoritative, run)
+        goal = authoritative
+        goal.goal_contract = RunRubricCompiler.merge_contracts(
+            base=goal.goal_contract,
+            expanded=run.verification_contract,
+            profile=run.task_profile,
+            message=goal.objective,
+        )
+        goal.evidence_refs = self._merge_artifact_evidence(
+            goal.evidence_refs,
+            run.verification_activations,
+            goal_id=goal.goal_id,
+            goal_revision=goal.objective_revision,
+        )
         goal.latest_verification_report_id = report.report_id
+        previous_decision = goal.latest_goal_decision
+        provenance_by_criterion: dict[str, dict[str, Any]] = {}
+        if (
+            previous_decision is not None
+            and previous_decision.objective_revision == goal.objective_revision
+        ):
+            for item in previous_decision.criterion_provenance:
+                criterion_id = str(item.get("criterion_id") or "").strip()
+                if criterion_id:
+                    provenance_by_criterion[criterion_id] = dict(item)
+        for evaluation in report.evaluations:
+            evidence_refs = [dict(item) for item in evaluation.evidence if isinstance(item, dict)]
+            evidence_origin_run_ids = _evidence_origin_run_ids(evidence_refs)
+            previous_provenance = provenance_by_criterion.get(evaluation.criterion_id)
+            if (
+                evaluation.passed is True
+                and isinstance(previous_provenance, dict)
+                and previous_provenance.get("passed") is True
+                and not evidence_refs
+            ):
+                evidence_origin_run_ids.update(
+                    str(item)
+                    for item in previous_provenance.get("evidence_origin_run_ids") or []
+                    if str(item)
+                )
+                prior_evidence = previous_provenance.get("evidence_refs")
+                if isinstance(prior_evidence, list):
+                    evidence_refs = [dict(item) for item in prior_evidence if isinstance(item, dict)]
+            supporting_run_ids = sorted({run.run_id, *evidence_origin_run_ids})
+            provenance_by_criterion[evaluation.criterion_id] = {
+                "criterion_id": evaluation.criterion_id,
+                "name": evaluation.name,
+                "passed": evaluation.passed,
+                "verifier": evaluation.verifier.value,
+                "evaluated_in_run_id": run.run_id,
+                "evidence_origin_run_ids": sorted(evidence_origin_run_ids),
+                "supporting_run_ids": supporting_run_ids,
+                "evidence_refs": evidence_refs,
+                "gap": evaluation.gap,
+                "report_id": report.report_id,
+            }
+        criterion_provenance = list(provenance_by_criterion.values())
+        supporting_run_ids = sorted(
+            {
+                str(run_id)
+                for item in criterion_provenance
+                for run_id in item.get("supporting_run_ids") or []
+                if str(run_id)
+            }
+        )
+        decision_accepted = bool(
+            report.status in {VerificationStatus.SATISFIED, VerificationStatus.NOT_REQUIRED}
+            and goal.requested_status not in {GoalStatus.PAUSED, GoalStatus.CANCELLED}
+        )
+        goal.latest_goal_decision = GoalVerificationDecision(
+            decision_id=f"goal-decision-{uuid.uuid4().hex[:16]}",
+            goal_id=goal.goal_id,
+            objective_revision=goal.objective_revision,
+            status=report.status,
+            accepted=decision_accepted,
+            supporting_run_ids=supporting_run_ids,
+            criterion_provenance=criterion_provenance,
+            evidence_ref_count=len(goal.evidence_refs),
+            gaps=list(report.gaps),
+            accepted_run_id=(run.run_id if decision_accepted else None),
+            report_id=report.report_id,
+        )
         goal.current_run_id = None
         goal.model_call_count += max(0, run.model_call_count)
+        requested_status = goal.requested_status
+        if requested_status in {GoalStatus.PAUSED, GoalStatus.CANCELLED}:
+            goal.requested_status = None
+            goal.transition(requested_status)
+            saved = self._sessions.finalize_goal_run_state(
+                goal.session_id,
+                goal.model_dump(mode="json"),
+                run_id=run.run_id,
+            )
+            return GoalRecord.model_validate(saved)
         if report.status in {
             VerificationStatus.INCOMPLETE,
             VerificationStatus.GRADER_ERROR,
+            VerificationStatus.INFRASTRUCTURE_ERROR,
         }:
             # An internal verification lifecycle failure is not a business
-            # correction attempt. Keep the Run for audit, but refund the Goal
-            # round so retrying cannot exhaust max_rounds.
+            # correction attempt. Refund the business round, but track a
+            # separate failure fingerprint so autonomous retries remain finite.
+            fingerprint_payload = "|".join(
+                [report.status.value, *sorted(str(item) for item in report.gaps)]
+            )
+            fingerprint = hashlib.sha256(
+                fingerprint_payload.encode("utf-8")
+            ).hexdigest()[:20]
+            if fingerprint == goal.last_control_failure_fingerprint:
+                goal.consecutive_control_failure_count += 1
+            else:
+                goal.last_control_failure_fingerprint = fingerprint
+                goal.consecutive_control_failure_count = 1
+            goal.total_control_retry_count += 1
             goal.round = max(0, goal.round - 1)
-            goal.updated_at = time.time()
-            self._sessions.upsert_goal_state(
+            for notice in report.gaps:
+                if notice and notice not in goal.control_notices:
+                    goal.control_notices.append(notice)
+            if (
+                goal.consecutive_control_failure_count >= goal.max_control_retries
+                or goal.total_control_retry_count >= goal.max_total_control_retries
+            ):
+                goal.transition(GoalStatus.BLOCKED)
+            else:
+                goal.updated_at = time.time()
+            saved = self._sessions.finalize_goal_run_state(
                 goal.session_id,
                 goal.model_dump(mode="json"),
+                run_id=run.run_id,
             )
-            return goal
-        goal.gaps = list(report.gaps)
-        if outcome == RunOutcome.COMPLETED and report.status == VerificationStatus.SATISFIED:
+            return GoalRecord.model_validate(saved)
+        goal.consecutive_control_failure_count = 0
+        goal.last_control_failure_fingerprint = None
+        if report.status == VerificationStatus.BUDGET_EXCEEDED:
+            for notice in report.gaps:
+                if notice and notice not in goal.control_notices:
+                    goal.control_notices.append(notice)
+        else:
+            goal.gaps = list(report.gaps)
+        aggregate_status = goal.latest_goal_decision.status
+        if outcome == RunOutcome.COMPLETED and aggregate_status == VerificationStatus.SATISFIED:
             goal.transition(GoalStatus.ACHIEVED)
         elif (
             outcome == RunOutcome.COMPLETED
@@ -128,11 +280,12 @@ class GoalCoordinator:
             goal.transition(GoalStatus.BUDGET_EXCEEDED)
         else:
             goal.updated_at = time.time()
-        self._sessions.upsert_goal_state(
+        saved = self._sessions.finalize_goal_run_state(
             goal.session_id,
             goal.model_dump(mode="json"),
+            run_id=run.run_id,
         )
-        return goal
+        return GoalRecord.model_validate(saved)
 
     def release_run(
         self,
@@ -143,41 +296,224 @@ class GoalCoordinator:
     ) -> GoalRecord:
         """Detach a cancelled/failed Run without cancelling the Goal."""
 
-        if run is not None:
+        authoritative = self._load_goal(goal.session_id, goal.goal_id)
+        superseded = (
+            run is not None
+            and run.goal_revision != authoritative.objective_revision
+        )
+        goal = authoritative
+        attached_run_id = run.run_id if run is not None else str(goal.current_run_id or "")
+        if run is not None and not superseded:
             goal.goal_contract = RunRubricCompiler.merge_contracts(
                 base=goal.goal_contract,
                 expanded=run.verification_contract,
                 profile=run.task_profile,
                 message=goal.objective,
             )
+            goal.evidence_refs = self._merge_artifact_evidence(
+                goal.evidence_refs,
+                run.verification_activations,
+                goal_id=goal.goal_id,
+                goal_revision=goal.objective_revision,
+            )
         goal.current_run_id = None
-        if gap:
-            goal.gaps = [gap]
+        if gap and gap not in goal.control_notices:
+            goal.control_notices.append(gap)
+        requested_status = goal.requested_status
+        goal.requested_status = None
+        if requested_status in {GoalStatus.PAUSED, GoalStatus.CANCELLED}:
+            goal.transition(requested_status)
         goal.updated_at = time.time()
-        self._sessions.upsert_goal_state(
+        if not attached_run_id:
+            raise HarnessStateError("Goal has no attached Run to release")
+        saved = self._sessions.finalize_goal_run_state(
             goal.session_id,
             goal.model_dump(mode="json"),
+            run_id=attached_run_id,
         )
-        return goal
+        return GoalRecord.model_validate(saved)
+
+    @staticmethod
+    def _merge_artifact_evidence(
+        existing: list[dict[str, Any]],
+        activations: list[Any],
+        *,
+        goal_id: str,
+        goal_revision: int,
+    ) -> list[dict[str, Any]]:
+        """Persist trusted, revision-bound Tool evidence across Goal Runs."""
+
+        merged: dict[str, dict[str, Any]] = {}
+        for ref in existing:
+            if not isinstance(ref, dict):
+                continue
+            if ref.get("goal_id") != goal_id or ref.get("goal_revision") != goal_revision:
+                continue
+            key = str(
+                ref.get("artifact_id")
+                or ref.get("source_id")
+                or ref.get("result_id")
+                or ref.get("tool_call_id")
+                or ref.get("output_digest")
+                or ref.get("host_path")
+                or ref.get("path")
+                or ""
+            )
+            if key:
+                merged[key] = dict(ref)
+        for activation in activations:
+            payload = (
+                activation.model_dump(mode="json")
+                if hasattr(activation, "model_dump")
+                else activation
+            )
+            if not isinstance(payload, dict) or payload.get("status") != "succeeded":
+                continue
+            pack = str(payload.get("pack") or "")
+            for ref in payload.get("evidence_refs") or []:
+                if not isinstance(ref, dict):
+                    continue
+                if ref.get("role") == "temporary" or ref.get("scope") == "scratch":
+                    continue
+                bound_ref = dict(ref)
+                bound_ref.setdefault("goal_id", goal_id)
+                bound_ref.setdefault("goal_revision", goal_revision)
+                bound_ref.setdefault("verification_pack", pack)
+                bound_ref.setdefault("origin_run_id", payload.get("run_id"))
+                if bound_ref.get("goal_id") != goal_id or bound_ref.get("goal_revision") != goal_revision:
+                    continue
+                key = str(
+                    bound_ref.get("artifact_id")
+                    or bound_ref.get("source_id")
+                    or bound_ref.get("result_id")
+                    or bound_ref.get("tool_call_id")
+                    or bound_ref.get("output_digest")
+                    or bound_ref.get("host_path")
+                    or bound_ref.get("path")
+                    or ""
+                )
+                if key:
+                    merged[key] = bound_ref
+        return list(merged.values())
+
+    def update_objective(
+        self,
+        session_id: str,
+        goal_id: str,
+        *,
+        objective: str,
+        expected_revision: int,
+    ) -> GoalRecord:
+        """Create an auditable Goal revision and rebuild its acceptance contract."""
+
+        normalized = objective.strip()
+        if not normalized:
+            raise HarnessStateError("Goal objective cannot be empty.")
+        if len(normalized) > 20_000:
+            raise HarnessStateError("Goal objective is too long (maximum 20000 characters).")
+        goal = self._load_goal(session_id, goal_id)
+        if goal.terminal:
+            raise HarnessStateError(
+                f"Goal {goal_id} is already terminal ({goal.status}); create a new Goal instead."
+            )
+        if goal.round >= goal.max_rounds:
+            raise HarnessStateError(f"Goal {goal_id} has no remaining Runs.")
+        if goal.objective_revision != expected_revision:
+            raise HarnessStateError(
+                f"Goal revision conflict: expected {expected_revision}, "
+                f"current {goal.objective_revision}."
+            )
+        if normalized == goal.objective:
+            return goal
+
+        latest_run = self._sessions.get_run_state(
+            session_id,
+            goal.current_run_id or (goal.run_ids[-1] if goal.run_ids else None),
+        )
+        project_id = latest_run.get("project_id") if isinstance(latest_run, dict) else None
+        analytics_model_id = (
+            latest_run.get("analytics_model_id") if isinstance(latest_run, dict) else None
+        )
+        snapshot = latest_run.get("config_snapshot") if isinstance(latest_run, dict) else {}
+        completion = snapshot.get("completion") if isinstance(snapshot, dict) else {}
+        rubric = completion.get("rubric") if isinstance(completion, dict) else {}
+        custom_rules = (
+            list(rubric.get("custom_rules") or [])
+            if isinstance(rubric, dict) and rubric.get("custom_rules_enabled", False)
+            else []
+        )
+        profile = TaskProfileClassifier.classify(
+            message=normalized,
+            analytics_model_id=(str(analytics_model_id) if analytics_model_id else None),
+        )
+        contract = CompletionVerificationCoordinator.compile_contract(
+            user_message=normalized,
+            analytics_model_id=(str(analytics_model_id) if analytics_model_id else None),
+            project_id=(str(project_id) if project_id else None),
+            custom_rules=custom_rules,
+            force_required=True,
+            task_profile=profile,
+        )
+        try:
+            saved = self._sessions.update_goal_objective(
+                session_id,
+                goal_id,
+                objective=normalized,
+                expected_revision=expected_revision,
+                contract=(contract.model_dump(mode="json") if contract is not None else None),
+            )
+        except ValueError as exc:
+            raise HarnessStateError(str(exc)) from exc
+        return GoalRecord.model_validate(saved)
+
+    def _release_superseded_run(self, goal: GoalRecord, run: RunRecord) -> GoalRecord:
+        """Close an old-revision Run without letting it satisfy the revised Goal."""
+
+        goal.current_run_id = None
+        goal.model_call_count += max(0, run.model_call_count)
+        goal.pending_revision = True
+        revision_notice = "目标描述已更新，将按最新版本进入下一 Run。"
+        if revision_notice not in goal.control_notices:
+            goal.control_notices.append(revision_notice)
+        # Old-revision acceptance gaps cannot be used to judge the new Goal.
+        goal.gaps = []
+        goal.updated_at = time.time()
+        saved = self._sessions.finalize_goal_run_state(
+            goal.session_id,
+            goal.model_dump(mode="json"),
+            run_id=run.run_id,
+        )
+        return GoalRecord.model_validate(saved)
 
     def pause(self, session_id: str, goal_id: str) -> GoalRecord:
-        goal = self._load_goal(session_id, goal_id)
-        if goal.current_run_id:
-            raise HarnessStateError(
-                f"Goal {goal_id} has running Run {goal.current_run_id}; stop the Run before pausing the Goal."
+        try:
+            saved = self._sessions.request_goal_control(
+                session_id,
+                goal_id,
+                GoalStatus.PAUSED.value,
             )
-        return self._transition(session_id, goal_id, GoalStatus.PAUSED)
+        except ValueError as exc:
+            raise HarnessStateError(str(exc)) from exc
+        return GoalRecord.model_validate(saved)
 
     def resume(self, session_id: str, goal_id: str) -> GoalRecord:
+        goal = self._load_goal(session_id, goal_id)
+        if goal.requested_status is not None or goal.current_run_id is not None:
+            raise HarnessStateError(
+                "当前 Run 正在收尾，需等待暂停生效后再恢复 Goal。"
+            )
         return self._transition(session_id, goal_id, GoalStatus.ACTIVE)
 
     def cancel(self, session_id: str, goal_id: str) -> GoalRecord:
-        goal = self._load_goal(session_id, goal_id)
-        if goal.current_run_id:
-            raise HarnessStateError(
-                f"Goal {goal_id} has running Run {goal.current_run_id}; stop the Run before cancelling the Goal."
+        try:
+            saved = self._sessions.request_goal_control(
+                session_id,
+                goal_id,
+                GoalStatus.CANCELLED.value,
             )
-        return self._transition(session_id, goal_id, GoalStatus.CANCELLED)
+        except ValueError as exc:
+            raise HarnessStateError(str(exc)) from exc
+        return GoalRecord.model_validate(saved)
 
     def _transition(
         self,
@@ -210,6 +546,7 @@ class CompletionVerificationCoordinator:
         "max_iterations_reached": VerificationStatus.MAX_ITERATIONS_REACHED,
         "verification_incomplete": VerificationStatus.INCOMPLETE,
         "grader_error": VerificationStatus.GRADER_ERROR,
+        "infrastructure_error": VerificationStatus.INFRASTRUCTURE_ERROR,
     }
 
     @staticmethod
@@ -270,12 +607,26 @@ class CompletionVerificationCoordinator:
         criteria_by_statement = {item.statement: item for item in contract.criteria}
         criteria_by_id = {item.id: item for item in contract.criteria}
         raw_by_id: dict[str, list[dict[str, Any]]] = {}
+        unknown_grader_criteria: list[str] = []
+        known_managed_criteria = {
+            "task_fulfillment",
+            "todo_reconciliation",
+            "web_evidence_traceability",
+            "metric_consistency",
+            "analytics_evidence_traceability",
+            "artifact_delivery",
+            "code_validation",
+            "time_scope",
+            "report_integrity",
+        }
         for raw in latest_criteria:
             if not isinstance(raw, dict):
                 continue
             name = str(raw.get("name") or "").strip()
             configured = criteria_by_id.get(name) or criteria_by_statement.get(name)
             if configured is None:
+                if name not in known_managed_criteria:
+                    unknown_grader_criteria.append(name or "未命名标准")
                 continue
             raw_by_id.setdefault(configured.id, []).append(raw)
 
@@ -387,6 +738,15 @@ class CompletionVerificationCoordinator:
             if configured.required and (not passed or gap):
                 gaps.append(gap or f"标准 {configured.id} 未通过。")
         explanation = str(latest.get("explanation") or "") if isinstance(latest, dict) else ""
+        if unknown_grader_criteria:
+            unknown_gap = (
+                "模型验收器返回了契约外标准："
+                + "、".join(dict.fromkeys(unknown_grader_criteria))
+                + "。Harness 未采纳该结果。"
+            )
+            gaps.append(unknown_gap)
+            status = VerificationStatus.GRADER_ERROR
+            explanation = unknown_gap
         required_by_id = {item.id: item.required for item in contract.criteria}
         if (
             any(
@@ -405,7 +765,35 @@ class CompletionVerificationCoordinator:
             # deterministic evaluation.  Derive the effective aggregate from
             # the merged per-criterion results so the report cannot show all
             # green criteria with a contradictory terminal status.
-            status = VerificationStatus.SATISFIED
+            status = VerificationStatus.INCOMPLETE
+            explanation = (
+                "模型总体判定与逐项结果存在冲突；Harness 没有猜测通过，"
+                "已将本次验收标记为流程异常。"
+            )
+        infrastructure_gaps = [
+            item.gap
+            for item in evaluations
+            if item.failure_kind == VerificationFailureKind.INFRASTRUCTURE_ERROR
+            and item.gap
+        ]
+        if infrastructure_gaps:
+            status = VerificationStatus.INFRASTRUCTURE_ERROR
+            explanation = "验收基础设施异常：" + "；".join(infrastructure_gaps)
+        elif status != VerificationStatus.SATISFIED and gaps:
+            # The merged deterministic result is authoritative. Do not retain a
+            # contradictory grader explanation such as “所有标准均满足”.
+            deterministic_gaps = [
+                item.gap
+                for item in evaluations
+                if item.verifier == VerifierKind.DETERMINISTIC
+                and item.passed is False
+                and item.gap
+            ]
+            explanation = (
+                "确定性检查失败：" + "；".join(dict.fromkeys(deterministic_gaps))
+                if deterministic_gaps
+                else "验收未通过：" + "；".join(dict.fromkeys(gaps))
+            )
         if status == VerificationStatus.INCOMPLETE:
             gaps.append("验收控制流程未形成合法终态，请重试本 Run 或查看运行日志。")
         elif status != VerificationStatus.SATISFIED and not gaps:
@@ -434,6 +822,8 @@ class CompletionVerificationCoordinator:
         }:
             return RunOutcome.COMPLETED
         if report.status == VerificationStatus.INCOMPLETE:
+            return RunOutcome.FAILED
+        if report.status == VerificationStatus.INFRASTRUCTURE_ERROR:
             return RunOutcome.FAILED
         return RunOutcome.VERIFICATION_FAILED
 
@@ -485,6 +875,12 @@ class HarnessRunCoordinator:
             goal_contract=contract,
             max_rounds=goal_max_rounds,
         )
+        effective_objective = goal.objective if goal is not None else objective
+        if effective_objective != objective:
+            task_profile = TaskProfileClassifier.classify(
+                message=effective_objective,
+                analytics_model_id=analytics_model_id,
+            )
         # An explicit Goal freezes its acceptance contract. Follow-up prompts
         # such as “继续” or “确认后完成” must not weaken or bypass the original
         # Rubric merely because the new message contains fewer task keywords.
@@ -494,8 +890,10 @@ class HarnessRunCoordinator:
             run_id=f"run-{uuid.uuid4().hex[:16]}",
             query_id=query_id,
             session_id=session_id,
-            objective=objective,
+            objective=effective_objective,
+            declared_artifact_targets=extract_declared_artifact_targets(effective_objective),
             goal_id=goal.goal_id if goal else None,
+            goal_revision=goal.objective_revision if goal else None,
             project_id=project_id,
             analytics_model_id=analytics_model_id,
             verification_enabled=verification_enabled,
@@ -505,6 +903,7 @@ class HarnessRunCoordinator:
             config_snapshot=dict(config_snapshot or {}),
         )
         if goal is not None:
+            goal.pending_revision = False
             goal.attach_run(run.run_id)
         saved_run, saved_goal = self._sessions.start_harness_run(
             session_id,
@@ -576,12 +975,63 @@ class HarnessRunCoordinator:
             for item in run.verification_activations
             if isinstance(item, dict) or hasattr(item, "model_dump")
         ]
+        authoritative_goal = (
+            self._sessions.get_goal_state(run.session_id, goal.goal_id)
+            if goal is not None
+            else None
+        )
+        authoritative_revision = (
+            authoritative_goal.get("objective_revision")
+            if isinstance(authoritative_goal, dict)
+            else None
+        )
+        raw_goal_evidence = (
+            authoritative_goal.get("evidence_refs")
+            if isinstance(authoritative_goal, dict)
+            and authoritative_revision == run.goal_revision
+            else []
+        )
+        harness_context["goal_evidence_refs"] = [
+            dict(item)
+            for item in (raw_goal_evidence if isinstance(raw_goal_evidence, list) else [])
+            if isinstance(item, dict)
+        ]
+        execution = (
+            run.config_snapshot.get("execution", {})
+            if isinstance(run.config_snapshot, dict)
+            else {}
+        )
+        harness_context.update(
+            {
+                "run_id": run.run_id,
+                "goal_id": run.goal_id or "",
+                "goal_revision": run.goal_revision,
+                "workspace_id": str(execution.get("workspace_id") or ""),
+                "backend_id": str(execution.get("backend_id") or ""),
+                "declared_artifact_targets": list(run.declared_artifact_targets),
+                "active_permission_grant_ids": [
+                    str(item.get("id"))
+                    for item in self._sessions.list_permission_grants(run.session_id)
+                    if item.get("id")
+                ],
+                "permission_grants_authoritative": True,
+            }
+        )
         state["_harness_context"] = harness_context
         report = self.verification.report_from_final_state(
             run_id=run.run_id,
             contract=run.verification_contract,
             final_state=state,
         )
+        if goal is not None:
+            report.verification_scope = "goal_aggregate"
+            report.supporting_run_ids = list(dict.fromkeys([*goal.run_ids, run.run_id]))
+            report.goal_revision = run.goal_revision
+            report.accepted_for_goal_revision = False
+        else:
+            report.accepted_for_goal_revision = (
+                report.status == VerificationStatus.SATISFIED
+            )
         outcome = self.verification.outcome_for_report(report)
         run.verification_report = report
         run.finish(outcome)
@@ -592,13 +1042,30 @@ class HarnessRunCoordinator:
         )
         self._replace_run(run, RunRecord.model_validate(saved))
         if goal is not None:
-            goal.goal_contract = RunRubricCompiler.merge_contracts(
-                base=goal.goal_contract,
-                expanded=run.verification_contract,
-                profile=run.task_profile,
-                message=goal.objective,
-            )
             goal = self.goals.apply_run_report(goal, run, report, outcome)
+            decision = goal.latest_goal_decision
+            if decision is not None and decision.objective_revision == run.goal_revision:
+                report.supporting_run_ids = list(decision.supporting_run_ids)
+            report.accepted_for_goal_revision = bool(
+                goal.status == GoalStatus.ACHIEVED
+                and goal.objective_revision == run.goal_revision
+                and (
+                    report.status == VerificationStatus.NOT_REQUIRED
+                    or (
+                        decision is not None
+                        and decision.objective_revision == run.goal_revision
+                        and decision.accepted
+                        and decision.accepted_run_id == run.run_id
+                    )
+                )
+            )
+            run.verification_report = report
+            saved = self._sessions.update_terminal_run_verification_report(
+                run.session_id,
+                run.run_id,
+                report.model_dump(mode="json"),
+            )
+            self._replace_run(run, RunRecord.model_validate(saved))
         return run, goal, report
 
     def _refresh_runtime_fields(self, run: RunRecord) -> None:
@@ -665,6 +1132,10 @@ class HarnessRunCoordinator:
             contract_version=(run.verification_contract.version if run.verification_contract is not None else None),
             gaps=[detail],
             explanation=detail,
+            verification_scope="goal_aggregate" if goal is not None else "run",
+            supporting_run_ids=list(goal.run_ids) if goal is not None else [],
+            goal_revision=run.goal_revision,
+            accepted_for_goal_revision=False,
         )
         run.model_call_count = max(0, model_call_count)
         run.budget_exhaustion_reason = reason
@@ -677,18 +1148,19 @@ class HarnessRunCoordinator:
         )
         self._replace_run(run, RunRecord.model_validate(saved))
         if goal is not None:
-            goal.goal_contract = RunRubricCompiler.merge_contracts(
-                base=goal.goal_contract,
-                expanded=run.verification_contract,
-                profile=run.task_profile,
-                message=goal.objective,
-            )
             goal = self.goals.apply_run_report(
                 goal,
                 run,
                 report,
                 RunOutcome.BUDGET_EXCEEDED,
             )
+            run.verification_report = report
+            saved = self._sessions.update_terminal_run_verification_report(
+                run.session_id,
+                run.run_id,
+                report.model_dump(mode="json"),
+            )
+            self._replace_run(run, RunRecord.model_validate(saved))
         return run, goal, report
 
     def fail(

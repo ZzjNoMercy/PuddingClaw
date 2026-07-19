@@ -18,6 +18,8 @@ from pydantic import BaseModel, Field
 from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
 from urllib3.util import Timeout
 
+from utils.network_safety import is_public_or_trusted_https_fake_ip, normalized_ip
+
 MAX_REDIRECTS = 5
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 READ_CHUNK_BYTES = 64 * 1024
@@ -38,11 +40,18 @@ class FetchURLInput(BaseModel):
     url: str = Field(description="The public HTTP(S) URL to fetch")
 
 
-def _public_ip(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
-    address = ipaddress.ip_address(value.split("%", 1)[0])
-    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
-        address = address.ipv4_mapped
-    if not address.is_global:
+def _public_ip(
+    value: str,
+    *,
+    scheme: str = "",
+    hostname: str = "",
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    address = normalized_ip(value)
+    if not is_public_or_trusted_https_fake_ip(
+        str(address),
+        scheme=scheme,
+        hostname=hostname,
+    ):
         raise UnsafePublicURL(f"target resolves to non-public address {address}")
     return address
 
@@ -76,7 +85,7 @@ def _validated_url(url: str) -> tuple[str, str, int, str]:
     return scheme, ascii_hostname, expected_port, path
 
 
-def _resolve_public_addresses(hostname: str, port: int) -> list[str]:
+def _resolve_public_addresses(hostname: str, port: int, *, scheme: str = "https") -> list[str]:
     try:
         records = socket.getaddrinfo(
             hostname,
@@ -89,7 +98,7 @@ def _resolve_public_addresses(hostname: str, port: int) -> list[str]:
     addresses: list[str] = []
     for record in records:
         raw = str(record[4][0])
-        address = str(_public_ip(raw))
+        address = str(_public_ip(raw, scheme=scheme, hostname=hostname))
         if address not in addresses:
             addresses.append(address)
     if not addresses:
@@ -135,7 +144,7 @@ class FetchURLTool(BaseTool):
     @classmethod
     def _request_once(cls, url: str) -> _FetchedResponse:
         scheme, hostname, port, path = _validated_url(url)
-        addresses = _resolve_public_addresses(hostname, port)
+        addresses = _resolve_public_addresses(hostname, port, scheme=scheme)
         last_error: Exception | None = None
         for address in addresses:
             pool = cls._pool(
@@ -162,7 +171,9 @@ class FetchURLTool(BaseTool):
                 )
                 connection = response.connection
                 peer = connection.sock.getpeername()[0] if connection and connection.sock else ""
-                if not peer or str(_public_ip(str(peer))) != str(_public_ip(address)):
+                if not peer or str(_public_ip(str(peer), scheme=scheme, hostname=hostname)) != str(
+                    _public_ip(address, scheme=scheme, hostname=hostname)
+                ):
                     raise UnsafePublicURL("connected peer does not match the validated address")
 
                 content_length = response.headers.get("content-length")

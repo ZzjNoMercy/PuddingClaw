@@ -37,6 +37,7 @@ import {
   pauseGoal as apiPauseGoal,
   resumeGoal as apiResumeGoal,
   cancelGoal as apiCancelGoal,
+  updateGoalObjective as apiUpdateGoalObjective,
   ProjectMeta,
   TodoItem,
   AgentTrace,
@@ -94,6 +95,13 @@ const TERMINAL_RUN_STATUSES = new Set([
   "verification_failed",
 ]);
 const CLOSED_GOAL_STATUSES = new Set(["achieved", "cancelled", "budget_exceeded"]);
+const CONTROL_ONLY_VERIFICATION_STATUSES = new Set([
+  "not_required",
+  "verification_incomplete",
+  "grader_error",
+  "infrastructure_error",
+  "budget_exceeded",
+]);
 
 function runIsActive(run: HarnessRun | null | undefined): boolean {
   return Boolean(run && !TERMINAL_RUN_STATUSES.has(run.status));
@@ -146,6 +154,20 @@ export interface MessageSegment {
   reasoning?: string;
   toolCalls?: ToolCall[];
   timeline?: TimelineItem[];
+  runId?: string;
+  goalId?: string;
+  verificationState?: "pending" | "progress" | "passed" | "failed" | "unverified";
+}
+
+export interface RunBoundaryNotice {
+  reason: "run_model_call_limit" | "thread_model_call_limit" | "verification_failed" | string;
+  message: string;
+  modelCallCount?: number;
+  limit?: number | null;
+  completedRound?: number;
+  nextRound?: number;
+  maxRounds?: number;
+  autoContinued?: boolean;
 }
 
 export interface ChatMessage {
@@ -153,6 +175,7 @@ export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   attachments?: AgentAttachment[];
+  outputAttachments?: AgentAttachment[];
   reasoning?: string;
   toolCalls?: ToolCall[];
   timeline?: TimelineItem[];
@@ -167,6 +190,9 @@ export interface ChatMessage {
   interrupted?: boolean;
   interruptionNotice?: string;
   errorNotice?: string;
+  runBoundaryNotice?: RunBoundaryNotice;
+  verificationState?: "pending" | "progress" | "passed" | "failed" | "unverified";
+  verificationRunId?: string;
   timestamp: number;
 }
 
@@ -230,10 +256,12 @@ interface AppState {
   setApprovalMode: (mode: ApprovalMode) => Promise<boolean>;
   activeGoal: HarnessGoal | null;
   currentRun: HarnessRun | null;
+  goalRuns: HarnessRun[];
   verificationReport: RubricEvaluationReport | null;
   pauseActiveGoal: () => Promise<void>;
   resumeActiveGoal: () => Promise<void>;
   cancelActiveGoal: () => Promise<void>;
+  updateActiveGoal: (objective: string) => Promise<HarnessGoal>;
 
   // Sessions
   sessionId: string;
@@ -349,10 +377,21 @@ function splitPersistedUserMessage(content: string): { content: string; attachme
   };
 }
 
+function stripPersistedModelCallLimitNotice(content: string): string {
+  return content
+    .replace(
+      /(?:\r?\n){0,2}Model call limits exceeded:\s*(?:run|thread) limit\s*\(\d+\s*\/\s*\d+\)\.?\s*$/i,
+      ""
+    )
+    .trimEnd();
+}
+
 function parseHistoryMessages(
   backendMessages: Array<{
     role: string;
     content: string;
+    attachments?: AgentAttachment[];
+    output_attachments?: AgentAttachment[];
     reasoning_content?: string;
     tool_calls?: Array<{
       id?: string;
@@ -364,12 +403,23 @@ function parseHistoryMessages(
       endedAt?: number;
     }>;
     timeline?: Array<{ type: string; content?: string; tool_call?: ToolCall; id?: string }>;
-    segments?: Array<{ content?: string; reasoning_content?: string; tool_calls?: ToolCall[]; timeline?: TimelineItem[] }>;
+    status?: string;
+    segments?: Array<{ content?: string; reasoning_content?: string; tool_calls?: ToolCall[]; timeline?: TimelineItem[]; run_id?: string; goal_id?: string; verification_state?: "pending" | "progress" | "passed" | "failed" | "unverified" }>;
     sources?: SourceRecord[];
     citations?: CitationRef[];
     interrupted?: boolean;
     interruption_notice?: string;
     error_notice?: string;
+    run_boundary_notice?: {
+      reason?: string;
+      message?: string;
+      model_call_count?: number;
+      limit?: number | null;
+      completed_round?: number;
+      next_round?: number;
+      max_rounds?: number;
+      auto_continued?: boolean;
+    };
   }>
 ): ChatMessage[] {
   const loaded: ChatMessage[] = [];
@@ -381,7 +431,7 @@ function parseHistoryMessages(
         id: `hist-user-${msgIndex++}`,
         role: "user",
         content: userMessage.content,
-        attachments: userMessage.attachments,
+        attachments: msg.attachments?.length ? msg.attachments : userMessage.attachments,
         timestamp: Date.now() - (backendMessages.length - msgIndex) * 1000,
       });
     } else if (msg.role === "assistant") {
@@ -416,28 +466,62 @@ function parseHistoryMessages(
               ? normalizeSavedTimeline(seg.timeline, segToolCalls)
               : undefined;
             return {
-              content: seg.content || "",
+              content: stripPersistedModelCallLimitNotice(seg.content || ""),
               reasoning: seg.reasoning_content,
               toolCalls: segToolCalls.length > 0 ? segToolCalls : undefined,
               timeline: segTimeline,
+              runId: seg.run_id,
+              goalId: seg.goal_id,
+              verificationState:
+                seg.verification_state
+                || (msg.status === "running" ? "pending" : undefined),
             };
           })
         : undefined;
-      loaded.push({
+      const restored: ChatMessage = {
         id: `hist-asst-${msgIndex++}`,
         role: "assistant",
-        content: msg.content,
+        content: stripPersistedModelCallLimitNotice(msg.content),
         reasoning: msg.reasoning_content,
         toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
         timeline: timeline.length > 0 ? timeline : undefined,
         segments,
+        outputAttachments: msg.output_attachments,
         sources: msg.sources,
         citations: msg.citations,
         interrupted: Boolean(msg.interrupted),
         interruptionNotice: msg.interruption_notice,
         errorNotice: msg.error_notice,
+        // Run boundaries are Harness control-plane state. They remain in the
+        // persisted audit record, but are intentionally not rendered as chat
+        // messages; the Goal drawer owns the cross-Run timeline.
+        runBoundaryNotice: undefined,
         timestamp: Date.now() - (backendMessages.length - msgIndex) * 1000,
-      });
+      };
+      const previous = loaded[loaded.length - 1];
+      const restoredGoalId = segments?.find((segment) => segment.goalId)?.goalId;
+      const previousGoalId = previous?.segments?.find((segment) => segment.goalId)?.goalId;
+      if (
+        restoredGoalId
+        && previous?.role === "assistant"
+        && previousGoalId === restoredGoalId
+      ) {
+        previous.content = [previous.content, restored.content].filter(Boolean).join("\n\n");
+        previous.segments = [...(previous.segments || []), ...(restored.segments || [])];
+        previous.toolCalls = [...(previous.toolCalls || []), ...(restored.toolCalls || [])];
+        previous.timeline = [...(previous.timeline || []), ...(restored.timeline || [])];
+        previous.sources = [...(previous.sources || []), ...(restored.sources || [])];
+        previous.citations = [...(previous.citations || []), ...(restored.citations || [])];
+        previous.outputAttachments = [
+          ...(previous.outputAttachments || []),
+          ...(restored.outputAttachments || []).filter(
+            (item) => !(previous.outputAttachments || []).some((current) => current.id === item.id)
+          ),
+        ];
+        previous.timestamp = restored.timestamp;
+      } else {
+        loaded.push(restored);
+      }
     }
   }
   return loaded;
@@ -664,6 +748,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const approvalModeErrorsMapRef = useRef<Record<string, string | null>>({});
   const activeGoalsMapRef = useRef<Record<string, HarnessGoal | null>>({});
   const currentRunsMapRef = useRef<Record<string, HarnessRun | null>>({});
+  const goalRunsMapRef = useRef<Record<string, HarnessRun[]>>({});
   const verificationReportsMapRef = useRef<Record<string, RubricEvaluationReport | null>>({});
   const abortControllersRef = useRef<Map<string, AbortController>>(new Map());
   const assistantIdsRef = useRef<Map<string, string>>(new Map());
@@ -718,6 +803,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [approvalModeError, setApprovalModeError] = useState<string | null>(null);
   const [activeGoal, setActiveGoal] = useState<HarnessGoal | null>(null);
   const [currentRun, setCurrentRun] = useState<HarnessRun | null>(null);
+  const [goalRuns, setGoalRuns] = useState<HarnessRun[]>([]);
   const [verificationReport, setVerificationReport] = useState<RubricEvaluationReport | null>(null);
   const [projects, setProjects] = useState<ProjectMeta[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -991,9 +1077,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   // ── Helper: update Agent white-box state for a session ──────────────
   const updateSessionTodos = useCallback((sid: string, nextTodos: TodoItem[]) => {
-    todosMapRef.current[sid] = nextTodos;
+    const orderedTodos = nextTodos
+      .map((todo, arrivalIndex) => ({ todo, arrivalIndex }))
+      .sort((left, right) =>
+        (left.todo.position ?? left.arrivalIndex) - (right.todo.position ?? right.arrivalIndex)
+      )
+      .map(({ todo }) => todo);
+    todosMapRef.current[sid] = orderedTodos;
     if (sessionIdRef.current === sid) {
-      setTodos(nextTodos);
+      setTodos(orderedTodos);
     }
   }, []);
 
@@ -1287,6 +1379,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setApprovalModeError(approvalModeErrorsMapRef.current.default ?? null);
         setActiveGoal(null);
         setCurrentRun(null);
+        setGoalRuns([]);
         setVerificationReport(null);
       } else {
         setAnalyticsModelIdRaw(analyticsModelIdsMapRef.current[id] ?? null);
@@ -1297,6 +1390,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setActiveGoal(cachedGoal);
         setGoalModeEnabledRaw(Boolean(nextRunGoalModeMapRef.current[id]));
         setCurrentRun(currentRunsMapRef.current[id] ?? null);
+        setGoalRuns(goalRunsMapRef.current[id] ?? []);
         setVerificationReport(verificationReportsMapRef.current[id] ?? null);
         apiGetSessionHarnessState(id)
           .then((data) => {
@@ -1315,17 +1409,24 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               data.latest_run_id && data.runs[data.latest_run_id]
                 ? data.runs[data.latest_run_id]
                 : null;
-            const loadedReport =
-              loadedRun?.verification_report?.status === "not_required"
-                ? null
-                : loadedRun?.verification_report || null;
+            const loadedReport = loadedRun?.verification_report
+              && !CONTROL_ONLY_VERIFICATION_STATUSES.has(loadedRun.verification_report.status)
+                ? loadedRun.verification_report
+                : null;
+            const loadedGoalRuns = loadedGoal
+              ? loadedGoal.run_ids
+                  .map((runId) => data.runs[runId])
+                  .filter((candidate): candidate is HarnessRun => Boolean(candidate))
+              : [];
             activeGoalsMapRef.current[id] = loadedGoal;
             currentRunsMapRef.current[id] = loadedRun;
+            goalRunsMapRef.current[id] = loadedGoalRuns;
             verificationReportsMapRef.current[id] = loadedReport;
             if (sessionIdRef.current === id) {
               setActiveGoal(loadedGoal);
               setGoalModeEnabledRaw(Boolean(nextRunGoalModeMapRef.current[id]));
               setCurrentRun(loadedRun);
+              setGoalRuns(loadedGoalRuns);
               setVerificationReport(loadedReport);
             }
           })
@@ -1658,7 +1759,20 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     const next = await apiPauseGoal(sessionId, activeGoal.goal_id);
     activeGoalsMapRef.current[sessionId] = next;
     setActiveGoal(next);
-  }, [activeGoal, sessionId]);
+    if (next.requested_status) {
+      stopStreaming();
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 120));
+        const harness = await apiGetSessionHarnessState(sessionId);
+        const settled = harness.goals[activeGoal.goal_id];
+        if (settled && !settled.requested_status && !settled.current_run_id) {
+          activeGoalsMapRef.current[sessionId] = settled;
+          if (sessionIdRef.current === sessionId) setActiveGoal(settled);
+          break;
+        }
+      }
+    }
+  }, [activeGoal, sessionId, stopStreaming]);
 
   const resumeActiveGoal = useCallback(async () => {
     if (!activeGoal) return;
@@ -1669,9 +1783,38 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const cancelActiveGoal = useCallback(async () => {
     if (!activeGoal) return;
-    await apiCancelGoal(sessionId, activeGoal.goal_id);
-    activeGoalsMapRef.current[sessionId] = null;
-    setActiveGoal(null);
+    const next = await apiCancelGoal(sessionId, activeGoal.goal_id);
+    if (!next.requested_status && next.status === "cancelled") {
+      activeGoalsMapRef.current[sessionId] = null;
+      if (sessionIdRef.current === sessionId) setActiveGoal(null);
+      return;
+    }
+    activeGoalsMapRef.current[sessionId] = next;
+    setActiveGoal(next);
+    stopStreaming();
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 120));
+      const harness = await apiGetSessionHarnessState(sessionId);
+      const settled = harness.goals[activeGoal.goal_id];
+      if (settled?.status === "cancelled") {
+        activeGoalsMapRef.current[sessionId] = null;
+        if (sessionIdRef.current === sessionId) setActiveGoal(null);
+        break;
+      }
+    }
+  }, [activeGoal, sessionId, stopStreaming]);
+
+  const updateActiveGoal = useCallback(async (objective: string) => {
+    if (!activeGoal) throw new Error("当前没有可编辑的目标");
+    const next = await apiUpdateGoalObjective(
+      sessionId,
+      activeGoal.goal_id,
+      objective,
+      activeGoal.objective_revision || 1,
+    );
+    activeGoalsMapRef.current[sessionId] = next;
+    setActiveGoal(next);
+    return next;
   }, [activeGoal, sessionId]);
 
   // ── Send message ───────────────────────────────────
@@ -1905,6 +2048,29 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             continue;
           }
 
+          if (event.event === "segment_content_replaced") {
+            flushPendingTokens();
+            const targetId = getAssistantId();
+            const replacement = String(event.data.content || "");
+            updateMsgs((prev) => {
+              const updated = [...prev];
+              const idx = updated.findIndex((m) => m.id === targetId);
+              if (idx === -1) return prev;
+              const segments = updated[idx].segments?.length
+                ? [...updated[idx].segments]
+                : [{ content: "" }];
+              const last = segments.length - 1;
+              segments[last] = { ...segments[last], content: replacement };
+              updated[idx] = {
+                ...updated[idx],
+                segments,
+                content: segments.map((segment) => segment.content).filter(Boolean).join("\n\n"),
+              };
+              return updated;
+            });
+            continue;
+          }
+
           if (event.event === "reasoning") {
             // Reasoning is rendered inline as a collapsible block on the
             // current assistant message, so we do not duplicate it with the
@@ -1924,8 +2090,21 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               const updated = [...prev];
               const idx = updated.findIndex((m) => m.id === targetId);
               if (idx !== -1) {
+                const current = currentRunsMapRef.current[sendSessionId];
                 const segments = updated[idx].segments
-                  ? [...updated[idx].segments, { content: "" }]
+                  ? [
+                      ...updated[idx].segments.map((segment) =>
+                        segment.verificationState === "pending"
+                          ? { ...segment, verificationState: "progress" as const }
+                          : segment
+                      ),
+                      {
+                        content: "",
+                        runId: current?.run_id,
+                        verificationState:
+                          current?.verification_enabled === false ? undefined : "pending" as const,
+                      },
+                    ]
                   : [{ content: "" }];
                 updated[idx] = { ...updated[idx], segments };
               }
@@ -2077,6 +2256,27 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             continue;
           }
 
+          if (event.event === "attachment_published") {
+            const targetId = getAssistantId();
+            const attachment = event.data.attachment as unknown as AgentAttachment;
+            if (attachment?.id) {
+              updateMsgs((prev) => {
+                const updated = [...prev];
+                const idx = updated.findIndex((m) => m.id === targetId);
+                if (idx === -1) return prev;
+                const existing = updated[idx].outputAttachments || [];
+                updated[idx] = {
+                  ...updated[idx],
+                  outputAttachments: existing.some((item) => item.id === attachment.id)
+                    ? existing.map((item) => item.id === attachment.id ? { ...item, ...attachment } : item)
+                    : [...existing, attachment],
+                };
+                return updated;
+              });
+            }
+            continue;
+          }
+
           if (event.event === "citations_finalized") {
             const targetId = getAssistantId();
             const citations = (event.data.citations || []) as unknown as CitationRef[];
@@ -2122,11 +2322,30 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             const run = event.data.run as unknown as HarnessRun;
             if (run?.run_id) {
               currentRunsMapRef.current[sendSessionId] = run;
+              const existingRuns = goalRunsMapRef.current[sendSessionId] || [];
+              goalRunsMapRef.current[sendSessionId] = [
+                ...existingRuns.filter((item) => item.run_id !== run.run_id),
+                run,
+              ];
               verificationReportsMapRef.current[sendSessionId] = null;
               if (sessionIdRef.current === sendSessionId) {
                 setCurrentRun(run);
+                setGoalRuns(goalRunsMapRef.current[sendSessionId]);
                 setVerificationReport(null);
               }
+              const targetId = getAssistantId();
+              updateMsgs((prev) => prev.map((message) => {
+                if (message.id !== targetId || !message.segments?.length) return message;
+                const segments = [...message.segments];
+                const last = segments.length - 1;
+                segments[last] = {
+                  ...segments[last],
+                  runId: run.run_id,
+                  verificationState:
+                    run.verification_enabled === false ? undefined : "pending" as const,
+                };
+                return { ...message, segments };
+              }));
             }
             continue;
           }
@@ -2162,7 +2381,47 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             if (current) {
               const next = { ...current, status: "evaluating" as const };
               currentRunsMapRef.current[sendSessionId] = next;
+              goalRunsMapRef.current[sendSessionId] = (goalRunsMapRef.current[sendSessionId] || []).map(
+                (item) => item.run_id === next.run_id ? next : item
+              );
               if (sessionIdRef.current === sendSessionId) setCurrentRun(next);
+              if (sessionIdRef.current === sendSessionId) setGoalRuns(goalRunsMapRef.current[sendSessionId]);
+              const targetId = getAssistantId();
+              updateMsgs((prev) => prev.map((message) => {
+                if (message.id !== targetId) return message;
+                if (message.segments?.length) {
+                  return {
+                    ...message,
+                    segments: message.segments.map((segment) =>
+                      segment.runId === current.run_id
+                        ? { ...segment, verificationState: "pending" as const }
+                        : segment
+                    ),
+                  };
+                }
+                return {
+                  ...message,
+                  verificationState: "pending" as const,
+                  verificationRunId: current.run_id,
+                };
+              }));
+            }
+            continue;
+          }
+
+          if (event.event === "run_status_changed") {
+            const current = currentRunsMapRef.current[sendSessionId];
+            if (current && event.data.status) {
+              const next = {
+                ...current,
+                status: event.data.status as HarnessRun["status"],
+              };
+              currentRunsMapRef.current[sendSessionId] = next;
+              goalRunsMapRef.current[sendSessionId] = (goalRunsMapRef.current[sendSessionId] || []).map(
+                (item) => item.run_id === next.run_id ? next : item
+              );
+              if (sessionIdRef.current === sendSessionId) setCurrentRun(next);
+              if (sessionIdRef.current === sendSessionId) setGoalRuns(goalRunsMapRef.current[sendSessionId]);
             }
             continue;
           }
@@ -2176,8 +2435,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 verification_contract: contract,
               };
               currentRunsMapRef.current[sendSessionId] = next;
+              goalRunsMapRef.current[sendSessionId] = (goalRunsMapRef.current[sendSessionId] || []).map(
+                (item) => item.run_id === next.run_id ? next : item
+              );
               if (sessionIdRef.current === sendSessionId) {
                 setCurrentRun(next);
+                setGoalRuns(goalRunsMapRef.current[sendSessionId]);
               }
             }
             continue;
@@ -2186,22 +2449,82 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           if (event.event === "verification_report") {
             const report = event.data.report as unknown as RubricEvaluationReport;
             if (report?.report_id) {
-              if (report.status === "not_required") {
+              const targetId = getAssistantId();
+              const controlOnly = CONTROL_ONLY_VERIFICATION_STATUSES.has(report.status);
+              const notRequired = report.status === "not_required";
+              const supersededGoalCandidate =
+                report.status === "satisfied" && report.accepted_for_goal_revision === false;
+              updateMsgs((prev) => prev.map((message) => {
+                if (message.id !== targetId) return message;
+                if (message.segments?.length) {
+                  const matchingIndexes = message.segments
+                    .map((segment, index) => segment.runId === report.run_id ? index : -1)
+                    .filter((index) => index >= 0);
+                  const finalCandidateIndex = [...matchingIndexes]
+                    .reverse()
+                    .find((index) => Boolean(message.segments?.[index]?.content.trim()))
+                    ?? matchingIndexes.at(-1);
+                  return {
+                    ...message,
+                    segments: message.segments.map((segment, index) =>
+                      segment.runId === report.run_id
+                        ? {
+                            ...segment,
+                            verificationState: index !== finalCandidateIndex
+                              ? "progress" as const
+                              : notRequired
+                                ? "passed" as const
+                                : controlOnly || supersededGoalCandidate
+                                  ? "unverified" as const
+                                  : report.status === "satisfied"
+                                    ? "passed" as const
+                                    : "failed" as const,
+                          }
+                        : segment
+                    ),
+                  };
+                }
+                if (controlOnly || supersededGoalCandidate) {
+                  return {
+                    ...message,
+                    verificationState: notRequired
+                      ? "passed" as const
+                      : "unverified" as const,
+                    verificationRunId: report.run_id,
+                  };
+                }
+                return {
+                  ...message,
+                  verificationState: report.status === "not_required" || report.status === "satisfied"
+                    ? "passed" as const
+                    : "failed" as const,
+                  verificationRunId: report.run_id,
+                };
+              }));
+              if (controlOnly || supersededGoalCandidate) {
                 verificationReportsMapRef.current[sendSessionId] = null;
                 if (sessionIdRef.current === sendSessionId) {
                   setVerificationReport(null);
                 }
-                continue;
+              } else {
+                verificationReportsMapRef.current[sendSessionId] = report;
               }
-              verificationReportsMapRef.current[sendSessionId] = report;
               const current = currentRunsMapRef.current[sendSessionId];
               if (current) {
-                currentRunsMapRef.current[sendSessionId] = {
+                const next = {
                   ...current,
                   verification_report: report,
                 };
+                currentRunsMapRef.current[sendSessionId] = next;
+                goalRunsMapRef.current[sendSessionId] = (goalRunsMapRef.current[sendSessionId] || []).map(
+                  (item) => item.run_id === next.run_id ? next : item
+                );
+                if (sessionIdRef.current === sendSessionId) {
+                  setCurrentRun(next);
+                  setGoalRuns(goalRunsMapRef.current[sendSessionId]);
+                }
               }
-              if (sessionIdRef.current === sendSessionId) {
+              if (!controlOnly && sessionIdRef.current === sendSessionId) {
                 setVerificationReport(report);
                 setInspectorOpen(true);
                 setInspectorActiveTab("verification");
@@ -2218,10 +2541,49 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 status: (event.data.status as HarnessRun["status"]) || current.status,
                 outcome: (event.data.outcome as string) || current.outcome,
                 error: (event.data.error as string) || current.error,
+                budget_exhaustion_reason:
+                  (event.data.budget_exhaustion_reason as string) ||
+                  current.budget_exhaustion_reason,
+                model_call_count:
+                  event.data.model_call_count == null
+                    ? current.model_call_count
+                    : Number(event.data.model_call_count),
               };
               currentRunsMapRef.current[sendSessionId] = next;
+              goalRunsMapRef.current[sendSessionId] = (goalRunsMapRef.current[sendSessionId] || []).map(
+                (item) => item.run_id === next.run_id ? next : item
+              );
               if (sessionIdRef.current === sendSessionId) setCurrentRun(next);
+              if (sessionIdRef.current === sendSessionId) setGoalRuns(goalRunsMapRef.current[sendSessionId]);
             }
+            continue;
+          }
+
+          if (event.event === "run_limit_reached") {
+            // This is a Run control boundary, not assistant content. The Run
+            // outcome/timeline in the Goal drawer carries the user-visible state.
+            continue;
+          }
+
+          if (event.event === "goal_run_continued") {
+            const targetId = getAssistantId();
+            updateMsgs((prev) => {
+              const updated = [...prev];
+              const idx = updated.findIndex((m) => m.id === targetId);
+              if (idx !== -1) {
+                const previous = finalizeRunningToolsInMessage(
+                  updated[idx],
+                  "本轮结束前，该工具未返回结果。"
+                );
+                updated[idx] = {
+                  ...previous,
+                  // Keep one continuous assistant response across internal Runs,
+                  // while separating segment-local tool/reasoning state.
+                  segments: [...(previous.segments || []), { content: "" }],
+                };
+              }
+              return updated;
+            });
             continue;
           }
 
@@ -2794,10 +3156,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setApprovalMode,
         activeGoal,
         currentRun,
+        goalRuns,
         verificationReport,
         pauseActiveGoal,
         resumeActiveGoal,
         cancelActiveGoal,
+        updateActiveGoal,
         sessionId,
         setSessionId,
         sessions,

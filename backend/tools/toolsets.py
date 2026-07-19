@@ -13,7 +13,7 @@ from collections.abc import Iterable
 # DeepAgents injects the native tools itself.  They are recorded here for a
 # complete, inspectable runtime inventory, but are not created by tools/.
 NATIVE_TOOLSETS: dict[str, frozenset[str]] = {
-    "core_workspace": frozenset({"ls", "read_file", "glob", "grep", "write_todos"}),
+    "core_workspace": frozenset({"ls", "read_file", "glob", "grep", "update_todos"}),
     "workspace_write": frozenset({"write_file", "edit_file"}),
     "local_execution": frozenset({"execute"}),
     "delegation": frozenset({"task"}),
@@ -26,6 +26,12 @@ UNCONDITIONAL_EXTENSION_TOOLSETS: dict[str, frozenset[str]] = {
     "web_research": frozenset({"tavily_search", "fetch_url"}),
     "package_management": frozenset({"install_packages"}),
     "skill_inspection": frozenset({"inspect_skill"}),
+    "skill_management": frozenset({
+        "prepare_skill_install",
+        "install_skill",
+        "prepare_skill_update",
+        "update_skill",
+    }),
 }
 
 # PuddingClaw tools are opt-in business capabilities.  A name must occur in

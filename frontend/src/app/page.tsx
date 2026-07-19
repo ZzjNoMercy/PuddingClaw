@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, Suspense, useMemo, useRef } from "react";
+import { useCallback, useEffect, Suspense, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useApp } from "@/lib/store";
 import Navbar from "@/components/layout/Navbar";
@@ -36,6 +36,17 @@ function ChatLayout() {
   const searchParams = useSearchParams();
   const router = useRouter();
   const hasPrefilledRef = useRef(false);
+  const [inspectorAvailability, setInspectorAvailability] = useState({
+    sessionId: "",
+    available: false,
+  });
+
+  const handleInspectorAvailabilityChange = useCallback((available: boolean) => {
+    setInspectorAvailability({ sessionId, available });
+  }, [sessionId]);
+  const inspectorAvailable =
+    inspectorAvailability.sessionId === sessionId && inspectorAvailability.available;
+  const visibleInspectorOpen = inspectorOpen && inspectorAvailable;
 
   const sessionTitle = useMemo(() => {
     if (sessionId === "default") return "新对话";
@@ -55,6 +66,12 @@ function ChatLayout() {
       router.replace("/", { scroll: false });
     }
   }, [searchParams, triggerSkillCreator, router]);
+
+  useEffect(() => {
+    if (!inspectorAvailable) {
+      setInspectorOpen(false);
+    }
+  }, [inspectorAvailable, setInspectorOpen]);
 
   const handleSidebarResize = (delta: number) => {
     setSidebarWidth((prev: number) => Math.max(MIN_SIDEBAR, prev + delta));
@@ -109,7 +126,8 @@ function ChatLayout() {
         <div className="workspace-content-frame flex min-w-0 flex-1 flex-col overflow-hidden" style={{ minWidth: MIN_CHAT }}>
           <Navbar
             title={sessionTitle}
-            inspectorOpen={inspectorOpen}
+            inspectorOpen={visibleInspectorOpen}
+            inspectorAvailable={inspectorAvailable}
             toggleInspector={toggleInspector}
             onToggleTrace={toggleTraceDashboard}
             traceSpanCount={trace?.spans?.length || 0}
@@ -123,16 +141,16 @@ function ChatLayout() {
               {workspaceView === "trace" ? <TraceDashboard /> : <ChatPanel />}
             </div>
 
-            {inspectorOpen && (
+            {visibleInspectorOpen && (
               <ResizeHandle onResize={handleInspectorResize} direction="right" />
             )}
 
             <div
               className="workspace-inspector-shell shrink-0 panel-transition overflow-hidden"
-              style={{ width: inspectorOpen ? inspectorWidth : 0 }}
+              style={{ width: visibleInspectorOpen ? inspectorWidth : 0 }}
             >
               <div style={{ width: inspectorWidth, minWidth: MIN_INSPECTOR }} className="h-full">
-                <SourcesPanel />
+                <SourcesPanel onAvailabilityChange={handleInspectorAvailabilityChange} />
               </div>
             </div>
           </div>

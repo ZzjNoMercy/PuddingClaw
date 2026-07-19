@@ -17,6 +17,7 @@ interface NavbarProps {
   sidebarOpen?: boolean;
   toggleSidebar?: () => void;
   inspectorOpen?: boolean;
+  inspectorAvailable?: boolean;
   toggleInspector?: () => void;
   onToggleTrace?: () => void;
   traceSpanCount?: number;
@@ -33,6 +34,7 @@ export default function Navbar({
   sidebarOpen,
   toggleSidebar,
   inspectorOpen,
+  inspectorAvailable = true,
   toggleInspector,
   onToggleTrace,
   traceSpanCount,
@@ -264,13 +266,16 @@ export default function Navbar({
         {showPanelToggles && toggleInspector ? (
           <button
             onClick={toggleInspector}
+            disabled={!inspectorAvailable}
             className={`w-8 h-8 flex items-center justify-center rounded-lg transition-all ${
-              inspectorOpen
+              !inspectorAvailable
+                ? "cursor-not-allowed text-gray-200"
+                : inspectorOpen
                 ? "bg-[#002fa7]/[0.08] text-[#002fa7] shadow-sm"
                 : "text-gray-400 hover:text-gray-700 hover:bg-black/[0.04]"
             }`}
-            title="切换右侧面板"
-            aria-label="切换右侧面板"
+            title={inspectorAvailable ? "切换右侧面板" : "暂无可展示内容"}
+            aria-label={inspectorAvailable ? "切换右侧面板" : "右侧面板暂无内容"}
           >
             <PanelRight className="w-[16px] h-[16px]" />
           </button>

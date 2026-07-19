@@ -7,7 +7,7 @@ import ChatInput from "./ChatInput";
 import { Loader2, Sparkles } from "lucide-react";
 
 export default function ChatPanel() {
-  const { messages, maintenanceStatus, isStreaming } = useApp();
+  const { messages, maintenanceStatus, isStreaming, currentRun, verificationReport } = useApp();
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -54,10 +54,37 @@ export default function ChatPanel() {
                 message={msg}
                 sessionSources={sessionSources}
                 isStreaming={isStreaming && msg.id === lastAssistantId}
+                verificationState={
+                  msg.verificationState
+                  || (msg.id !== lastAssistantId
+                    ? undefined
+                    : currentRun?.status === "evaluating"
+                      ? "pending"
+                      : verificationReport && verificationReport.run_id === currentRun?.run_id
+                        ? verificationReport.status === "not_required"
+                          || (
+                            verificationReport.status === "satisfied"
+                            && verificationReport.accepted_for_goal_revision !== false
+                          )
+                          ? "passed"
+                          : "failed"
+                        : undefined)
+                }
                 showInterruptionNotice={msg.id === lastMessageId}
               />
             ))}
-            {maintenanceStatus && (
+            {maintenanceStatus && maintenanceStatus.phase === "global_summarization" && (
+              <div className="sticky bottom-3 z-20 animate-fade-in px-4 py-2">
+                <div className="mx-auto flex w-full max-w-[900px] items-center gap-3 rounded-2xl border border-blue-200 bg-blue-50/95 px-4 py-3 text-[13px] font-medium text-blue-900 shadow-lg shadow-blue-950/10 backdrop-blur">
+                  <Loader2 className="h-4 w-4 shrink-0 animate-spin text-[#002fa7]" />
+                  <div>
+                    <p className="font-semibold">正在进行全局上下文压缩</p>
+                    <p className="mt-0.5 text-[12px] font-normal text-blue-700">{maintenanceStatus.message}</p>
+                  </div>
+                </div>
+              </div>
+            )}
+            {maintenanceStatus && maintenanceStatus.phase !== "global_summarization" && (
               <div className="animate-fade-in px-4 py-1.5">
                 <div className="mx-auto w-full max-w-[900px]">
                   <div className="inline-flex items-center gap-2 rounded-full border border-black/[0.05] bg-white/70 px-3 py-1.5 text-[12px] text-gray-500 shadow-sm">

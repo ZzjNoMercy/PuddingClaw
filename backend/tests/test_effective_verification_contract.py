@@ -199,6 +199,124 @@ def test_successful_workspace_writes_activate_matching_packs(path, expected):
     ) == expected
 
 
+def test_external_write_keeps_real_authorized_path_with_spaces(tmp_path):
+    from graph.session_manager import session_manager
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("session-external")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    external = tmp_path / "outside" / "产品配置分析模型模板 v2.html"
+    external.parent.mkdir()
+    external.write_text("<html></html>", encoding="utf-8")
+    grant = session_manager.add_permission_grant(
+        "session-external",
+        grant_type="external_file_write",
+        target_kind="exact_file",
+        target=str(external.resolve()),
+        capabilities=["write", "external_path"],
+    )
+    result = ToolMessage(
+        content=f"Updated file {external}",
+        tool_call_id="call-external",
+        name="edit_file",
+        status="success",
+    )
+
+    activation = next(
+        item
+        for item in build_verification_activations(
+            run_id="run-external",
+            query_id="query-external",
+            tool_call_id="call-external",
+            tool_name="edit_file",
+            args={
+                "file_path": str(external),
+                "old_string": "old",
+                "new_string": "new",
+            },
+            result=result,
+            session_id="session-external",
+            workspace_path=str(workspace),
+        )
+        if item.pack == "artifact"
+    )
+    ref = next(item for item in activation.evidence_refs if item.get("kind") == "artifact_write")
+
+    assert ref["scope"] == "external"
+    assert ref["path"] == str(external.resolve())
+    assert ref["host_path"] == str(external.resolve())
+    assert ref["virtual_path"] is None
+    assert ref["authorized"] is True
+    assert ref["permission_grant_id"] == grant["id"]
+    assert ref["content_sha256"].startswith("sha256:")
+    assert ref["size_bytes"] == external.stat().st_size
+    assert "/workspace/Users/" not in ref["path"]
+
+
+def test_scratch_write_is_temporary_and_cannot_satisfy_artifact_delivery(tmp_path):
+    from graph.session_manager import session_manager
+    from harness.deterministic_checks import _evaluate_artifact_delivery
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("session-scratch")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    scratch = tmp_path / "scratch" / "session-scratch" / "query-scratch"
+    scratch.mkdir(parents=True)
+    run, _goal = HarnessRunCoordinator(session_manager).start_run(
+        session_id="session-scratch",
+        query_id="query-scratch",
+        objective="生成一个 HTML 报告",
+        goal_mode=False,
+    )
+    session_manager.bind_run_execution_snapshot(
+        "session-scratch",
+        run.run_id,
+        {
+            "backend_mode": "restricted_host",
+            "backend_id": "host:test",
+            "workspace_id": "workspace:test",
+            "scratch_host_path": str(scratch),
+        },
+    )
+    scratch_file = scratch / "report.html"
+    scratch_file.write_text("<html></html>", encoding="utf-8")
+    activation = next(
+        item
+        for item in build_verification_activations(
+            run_id=run.run_id,
+            query_id="query-scratch",
+            tool_call_id="call-scratch",
+            tool_name="write_file",
+            args={"file_path": "/scratch/report.html", "content": "<html></html>"},
+            result=ToolMessage(
+                content="Updated /scratch/report.html",
+                tool_call_id="call-scratch",
+                name="write_file",
+                status="success",
+            ),
+            session_id="session-scratch",
+            workspace_path=str(workspace),
+        )
+        if item.pack == "artifact"
+    )
+    ref = next(item for item in activation.evidence_refs if item.get("kind") == "artifact_write")
+    assert ref["scope"] == "scratch"
+    assert ref["role"] == "temporary"
+
+    evaluation = _evaluate_artifact_delivery(
+        "artifact_delivery",
+        {
+            "workspace_path": str(workspace),
+            "run_id": run.run_id,
+            "verification_activations": [activation.model_dump(mode="json")],
+            "declared_artifact_targets": [],
+        },
+    )
+    assert evaluation.passed is False
+
+
 def test_sql_generation_activates_analytics_but_is_not_material_evidence():
     activation = build_verification_activations(
         run_id="run-1",

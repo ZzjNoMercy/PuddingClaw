@@ -88,7 +88,7 @@ def _format_generation(
         f"- 数据源：{result.source.get('name')} ({result.source.get('id')})",
         f"- 表：{', '.join(result.route.table_names)}",
         f"- 路由：{result.route.reason}，confidence={result.route.confidence:.2f}",
-        f"- 语义资产：{', '.join(asset_names) if asset_names else '未命中'}",
+        f"- 语义资产：{', '.join(asset_names) if asset_names else '未命中（已进入模型泛化模式）'}",
     ]
     if disposition == "rejected_revision":
         lines.extend(

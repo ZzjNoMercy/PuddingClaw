@@ -4,7 +4,6 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   BookOpen,
   AlertTriangle,
-  Ban,
   CheckCircle2,
   ChevronDown,
   Circle,
@@ -14,11 +13,13 @@ import {
   KeyRound,
   ListChecks,
   Pause,
+  Pencil,
   Play,
   ShieldCheck,
   SquareTerminal,
   Target,
   Timer,
+  Trash2,
   X,
 } from "lucide-react";
 import {
@@ -34,7 +35,11 @@ import { useApp, type SourceRecord, type ToolCall } from "@/lib/store";
 
 type TodoStatus = "completed" | "in_progress" | "pending";
 
-export default function SourcesPanel() {
+export default function SourcesPanel({
+  onAvailabilityChange,
+}: {
+  onAvailabilityChange?: (available: boolean) => void;
+}) {
   const {
     messages,
     isStreaming,
@@ -45,21 +50,40 @@ export default function SourcesPanel() {
     setInspectorActiveTab,
     activeGoal,
     currentRun,
+    goalRuns,
     verificationReport,
     pauseActiveGoal,
     resumeActiveGoal,
     cancelActiveGoal,
+    updateActiveGoal,
+    sendMessage,
   } = useApp();
   const [permissionGrants, setPermissionGrants] = useState<PermissionGrant[]>([]);
+  const [permissionHistory, setPermissionHistory] = useState<PermissionGrant[]>([]);
+  const [permissionSessionId, setPermissionSessionId] = useState<string | null>(null);
+  const permissionLoadVersionRef = useRef(0);
 
   const loadPermissions = React.useCallback(() => {
+    const loadVersion = ++permissionLoadVersionRef.current;
     if (!sessionId || sessionId === "default") {
       setPermissionGrants([]);
+      setPermissionHistory([]);
+      setPermissionSessionId(sessionId || null);
       return;
     }
     listSessionPermissions(sessionId)
-      .then(setPermissionGrants)
-      .catch(() => setPermissionGrants([]));
+      .then(({ grants, history }) => {
+        if (permissionLoadVersionRef.current !== loadVersion) return;
+        setPermissionGrants(grants);
+        setPermissionHistory(history);
+        setPermissionSessionId(sessionId);
+      })
+      .catch(() => {
+        if (permissionLoadVersionRef.current !== loadVersion) return;
+        setPermissionGrants([]);
+        setPermissionHistory([]);
+        setPermissionSessionId(sessionId);
+      });
   }, [sessionId]);
 
   useEffect(() => {
@@ -71,6 +95,10 @@ export default function SourcesPanel() {
     window.addEventListener("puddingclaw:permissions-changed", handler);
     return () => window.removeEventListener("puddingclaw:permissions-changed", handler);
   }, [loadPermissions]);
+
+  useEffect(() => {
+    if (!isStreaming) loadPermissions();
+  }, [isStreaming, loadPermissions]);
 
   // When a citation marker in the chat is clicked, activeSourceId is set and the
   // inspector opens. Make sure the drawer shows the Sources tab so the cited
@@ -190,53 +218,87 @@ export default function SourcesPanel() {
   const total = cited.length + retrieved.length;
   const hasSources = total > 0;
   const hasTodos = displayTodos.length > 0;
-  return (
-    <div className="h-full overflow-y-auto px-5 py-5">
-      <div className="workspace-side-card overflow-hidden rounded-[28px] px-5 py-3">
-        {activeGoal && (
-          <>
-            <GoalCard
-              active={inspectorActiveTab === "goal"}
-              onActivate={() => setInspectorActiveTab(inspectorActiveTab === "goal" ? null : "goal")}
-              goal={activeGoal}
-              run={currentRun}
-              onPause={pauseActiveGoal}
-              onResume={resumeActiveGoal}
-              onCancel={cancelActiveGoal}
-            />
-            <PanelDivider />
-          </>
-        )}
-        {verificationReport && (
-          <>
-            <VerificationCard
-              active={inspectorActiveTab === "verification"}
-              onActivate={() =>
-                setInspectorActiveTab(inspectorActiveTab === "verification" ? null : "verification")
-              }
-              report={verificationReport}
-              run={currentRun}
-            />
-            <PanelDivider />
-          </>
-        )}
+  const hasPermissions =
+    permissionSessionId === sessionId &&
+    (permissionGrants.some((grant) => grant.scope !== "once") ||
+      permissionHistory.length > 0);
+  const showSources = hasSources || selectedHistoricalSource !== null;
+  const hasContent = Boolean(activeGoal || verificationReport || hasTodos || hasPermissions || showSources);
+
+  useEffect(() => {
+    onAvailabilityChange?.(hasContent);
+  }, [hasContent, onAvailabilityChange]);
+
+  const cards: Array<{ key: string; content: React.ReactNode }> = [];
+  if (activeGoal) {
+    cards.push({
+      key: "goal",
+      content: (
+        <GoalCard
+          active={inspectorActiveTab === "goal"}
+          onActivate={() => setInspectorActiveTab(inspectorActiveTab === "goal" ? null : "goal")}
+          goal={activeGoal}
+          run={currentRun}
+          runs={goalRuns}
+          onPause={pauseActiveGoal}
+          onResume={resumeActiveGoal}
+          onCancel={cancelActiveGoal}
+          onUpdate={updateActiveGoal}
+          onContinue={() => sendMessage("继续完成修改后的目标")}
+          isStreaming={isStreaming}
+        />
+      ),
+    });
+  }
+  if (verificationReport) {
+    cards.push({
+      key: "verification",
+      content: (
+        <VerificationCard
+          active={inspectorActiveTab === "verification"}
+          onActivate={() =>
+            setInspectorActiveTab(inspectorActiveTab === "verification" ? null : "verification")
+          }
+          report={verificationReport}
+          run={currentRun}
+        />
+      ),
+    });
+  }
+  if (hasTodos) {
+    cards.push({
+      key: "progress",
+      content: (
         <ProgressCard
           active={inspectorActiveTab === "progress"}
           onActivate={() => setInspectorActiveTab(inspectorActiveTab === "progress" ? null : "progress")}
           todos={displayTodos as Array<{ content: string; status: TodoStatus }>}
         />
-        <PanelDivider />
+      ),
+    });
+  }
+  if (hasPermissions) {
+    cards.push({
+      key: "permissions",
+      content: (
         <PermissionsCard
           active={inspectorActiveTab === "permissions"}
           onActivate={() => setInspectorActiveTab(inspectorActiveTab === "permissions" ? null : "permissions")}
           grants={permissionGrants}
+          history={permissionHistory}
           onRevoke={async (grantId) => {
             await revokePermissionGrant(sessionId, grantId);
             loadPermissions();
             window.dispatchEvent(new CustomEvent("puddingclaw:permissions-changed"));
           }}
         />
-        <PanelDivider />
+      ),
+    });
+  }
+  if (showSources) {
+    cards.push({
+      key: "sources",
+      content: (
         <SourcesCard
           active={inspectorActiveTab === "sources"}
           onActivate={() => setInspectorActiveTab(inspectorActiveTab === "sources" ? null : "sources")}
@@ -245,7 +307,22 @@ export default function SourcesPanel() {
           selectedHistoricalSource={selectedHistoricalSource}
           isStreaming={isStreaming && hasSources}
         />
-      </div>
+      ),
+    });
+  }
+
+  return (
+    <div className="h-full overflow-y-auto px-5 py-5">
+      {cards.length > 0 && (
+        <div className="workspace-side-card overflow-hidden rounded-[28px] px-5 py-3">
+          {cards.map((card, index) => (
+            <React.Fragment key={card.key}>
+              {index > 0 && <PanelDivider />}
+              {card.content}
+            </React.Fragment>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -263,24 +340,74 @@ const goalStatusLabel: Record<HarnessGoal["status"], string> = {
   budget_exceeded: "预算已耗尽",
 };
 
+const runStatusLabel: Record<HarnessRun["status"], string> = {
+  preparing: "准备中",
+  running: "执行中",
+  waiting_hitl: "等待授权",
+  evaluating: "验收中",
+  completed: "已完成",
+  cancelled: "已停止",
+  failed: "执行失败",
+  blocked: "受阻",
+  budget_exceeded: "已达本轮上限",
+  verification_failed: "待修正",
+};
+
+function budgetReasonLabel(reason: string): string {
+  const labels: Record<string, string> = {
+    run_model_call_limit: "本轮模型调用已达上限",
+    thread_model_call_limit: "当前会话模型调用已达上限",
+    goal_max_runs: "已达到 Goal 最大轮数",
+  };
+  return labels[reason] || reason;
+}
+
+function goalGapLabel(gap: string): string {
+  const modelLimitMatch = gap.match(
+    /模型调用预算已耗尽[：:]\s*(run_model_call_limit|thread_model_call_limit)(?:\s*\((\d+)\/(\d+)\))?[。.]?/i
+  );
+  if (modelLimitMatch) {
+    const [, reason, used, limit] = modelLimitMatch;
+    const scope = reason === "run_model_call_limit" ? "本轮" : "当前会话";
+    const usage = used && limit ? `（${used}/${limit}）` : "";
+    return `${scope}主 Agent 模型调用已达上限${usage}。`;
+  }
+  return gap;
+}
+
 function GoalCard({
   active,
   onActivate,
   goal,
   run,
+  runs,
   onPause,
   onResume,
   onCancel,
+  onUpdate,
+  onContinue,
+  isStreaming,
 }: {
   active: boolean;
   onActivate: () => void;
   goal: HarnessGoal;
   run: HarnessRun | null;
+  runs: HarnessRun[];
   onPause: () => Promise<void>;
   onResume: () => Promise<void>;
   onCancel: () => Promise<void>;
+  onUpdate: (objective: string) => Promise<HarnessGoal>;
+  onContinue: () => Promise<boolean>;
+  isStreaming: boolean;
 }) {
   const [actionError, setActionError] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [draftObjective, setDraftObjective] = useState(goal.objective);
+  const [saving, setSaving] = useState(false);
+  const [editNotice, setEditNotice] = useState("");
+  useEffect(() => {
+    if (!editing) setDraftObjective(goal.objective);
+  }, [editing, goal.objective, goal.objective_revision]);
   const runIsActive = Boolean(
     run && ![
       "completed",
@@ -291,6 +418,14 @@ function GoalCard({
       "verification_failed",
     ].includes(run.status)
   );
+  const requestedStatus = goal.requested_status;
+  const displayedStatus = requestedStatus
+    ? requestedStatus === "paused" ? "正在暂停" : "正在取消"
+    : goalStatusLabel[goal.status];
+  const orderedRuns = useMemo(() => {
+    const byId = new Map(runs.map((item) => [item.run_id, item]));
+    return goal.run_ids.map((runId) => byId.get(runId)).filter((item): item is HarnessRun => Boolean(item));
+  }, [goal.run_ids, runs]);
   const performAction = async (action: () => Promise<void>) => {
     setActionError("");
     try {
@@ -299,42 +434,230 @@ function GoalCard({
       setActionError(error instanceof Error ? error.message : "目标状态更新失败");
     }
   };
+  const saveRevision = async (continueAfterSave: boolean) => {
+    const normalized = draftObjective.trim();
+    if (!normalized) {
+      setActionError("目标描述不能为空");
+      return;
+    }
+    setSaving(true);
+    setActionError("");
+    setEditNotice("");
+    try {
+      const next = await onUpdate(normalized);
+      setEditing(false);
+      if (!continueAfterSave) {
+        setEditNotice(`已保存为第 ${next.objective_revision || 1} 版`);
+        return;
+      }
+      if (runIsActive || isStreaming) {
+        setEditNotice("已保存；当前 Run 结束后将自动按新目标继续");
+        return;
+      }
+      if (next.status === "paused" || next.status === "blocked") {
+        await onResume();
+      }
+      const started = await onContinue();
+      setEditNotice(started ? "已保存并继续" : "已保存；请稍后继续目标");
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "目标更新失败");
+    } finally {
+      setSaving(false);
+    }
+  };
   return (
     <section>
       <SectionHeader
         icon={<Target className="h-4 w-4" />}
         title="目标"
-        metric={goalStatusLabel[goal.status]}
+        metric={displayedStatus}
         open={active}
         onToggle={onActivate}
+        actions={
+          !["achieved", "cancelled", "budget_exceeded"].includes(goal.status) ? (
+            <div className="flex items-center gap-0.5">
+              <button
+                type="button"
+                aria-label="编辑目标"
+                title="编辑目标"
+                onClick={() => {
+                  setDraftObjective(goal.objective);
+                  setEditing(true);
+                  setActionError("");
+                  setEditNotice("");
+                }}
+                className="rounded-lg p-1.5 text-slate-400 hover:bg-black/[0.045] hover:text-slate-700"
+              >
+                <Pencil className="h-3.5 w-3.5" />
+              </button>
+              {goal.status === "active" ? (
+                <button
+                  type="button"
+                  aria-label="暂停目标"
+                  title={requestedStatus === "paused" ? "正在暂停" : "暂停目标"}
+                  disabled={Boolean(requestedStatus)}
+                  onClick={() => void performAction(onPause)}
+                  className="rounded-lg p-1.5 text-slate-400 hover:bg-black/[0.045] hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-35"
+                >
+                  <Pause className="h-3.5 w-3.5" />
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  aria-label="继续目标"
+                  title="继续目标"
+                  onClick={() => void performAction(async () => {
+                    await onResume();
+                    if (!isStreaming && !runIsActive) await onContinue();
+                  })}
+                  className="rounded-lg p-1.5 text-slate-400 hover:bg-black/[0.045] hover:text-emerald-700"
+                >
+                  <Play className="h-3.5 w-3.5" />
+                </button>
+              )}
+              <button
+                type="button"
+                aria-label="删除目标"
+                title={requestedStatus === "cancelled" ? "正在删除" : "删除目标"}
+                disabled={Boolean(requestedStatus)}
+                onClick={() => {
+                  if (window.confirm("确定删除这个目标吗？执行记录仍会保留用于审计。")) {
+                    void performAction(onCancel);
+                  }
+                }}
+                className="rounded-lg p-1.5 text-slate-400 hover:bg-rose-50 hover:text-rose-600 disabled:cursor-not-allowed disabled:opacity-35"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          ) : undefined
+        }
       />
       {active && (
         <div className="pb-4">
-          <p className="text-[13px] leading-6 text-slate-700">{goal.objective}</p>
-          <div className="mt-3 grid grid-cols-3 gap-2 text-[11px] text-slate-500">
-            <div className="rounded-xl bg-black/[0.035] px-3 py-2">
+          {editing ? (
+            <div className="rounded-2xl border border-[#002fa7]/20 bg-[#002fa7]/[0.025] p-3">
+              <div className="mb-2 flex items-center justify-between gap-3">
+                <span className="text-[11px] font-semibold text-slate-600">修改目标描述</span>
+                <span className="text-[10px] text-slate-400">
+                  当前第 {goal.objective_revision || 1} 版
+                </span>
+              </div>
+              <textarea
+                value={draftObjective}
+                onChange={(event) => setDraftObjective(event.target.value)}
+                rows={6}
+                maxLength={20000}
+                autoFocus
+                className="w-full resize-y rounded-xl border border-black/[0.08] bg-white px-3 py-2 text-[13px] leading-6 text-slate-700 outline-none focus:border-[#002fa7]/40 focus:ring-2 focus:ring-[#002fa7]/10"
+              />
+              <div className="mt-2 flex flex-wrap justify-end gap-2">
+                <button
+                  type="button"
+                  disabled={saving}
+                  onClick={() => setEditing(false)}
+                  className="rounded-lg px-2.5 py-1.5 text-[11px] text-slate-500 hover:bg-black/[0.04]"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  disabled={saving || !draftObjective.trim() || draftObjective.trim() === goal.objective}
+                  onClick={() => void saveRevision(false)}
+                  className="rounded-lg border border-black/[0.08] px-2.5 py-1.5 text-[11px] text-slate-600 hover:bg-black/[0.04] disabled:opacity-40"
+                >
+                  仅保存
+                </button>
+                <button
+                  type="button"
+                  disabled={saving || !draftObjective.trim() || draftObjective.trim() === goal.objective}
+                  onClick={() => void saveRevision(true)}
+                  className="rounded-lg bg-[#002fa7] px-3 py-1.5 text-[11px] font-medium text-white hover:bg-[#002686] disabled:opacity-40"
+                >
+                  {saving ? "保存中…" : runIsActive || isStreaming ? "保存，下轮生效" : "保存并继续"}
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div>
+              <p className="text-[13px] leading-6 text-slate-700">{goal.objective}</p>
+              {(goal.objective_revision || 1) > 1 && (
+                <p className="mt-1 text-[10px] text-slate-400">
+                  第 {goal.objective_revision} 版
+                  {goal.pending_revision ? " · 等待按新版本执行" : ""}
+                </p>
+              )}
+            </div>
+          )}
+          <div className="mt-3 grid grid-cols-2 gap-2 text-[11px] text-slate-500">
+            <div className="min-w-0 rounded-xl bg-black/[0.035] px-3 py-2">
               Run
               <span className="mt-0.5 block font-semibold text-slate-700">
                 {goal.round}/{goal.max_rounds}
               </span>
             </div>
-            <div className="rounded-xl bg-black/[0.035] px-3 py-2">
-              当前状态
-              <span className="mt-0.5 block font-semibold text-slate-700">
-                {run?.status || goalStatusLabel[goal.status]}
+            <div className="min-w-0 rounded-xl bg-black/[0.035] px-3 py-2">
+              主 Agent 模型调用
+              <span className="mt-0.5 block break-words font-semibold text-slate-700">
+                {goal.model_call_count || 0}
               </span>
             </div>
-            <div className="rounded-xl bg-black/[0.035] px-3 py-2">
-              模型调用
-              <span className="mt-0.5 block font-semibold text-slate-700">
-                {goal.model_call_count || 0}
+            <div className="col-span-2 min-w-0 rounded-xl bg-black/[0.035] px-3 py-2">
+              本轮状态
+              <span className="mt-0.5 block break-words font-semibold text-slate-700">
+                {run ? runStatusLabel[run.status] : goalStatusLabel[goal.status]}
               </span>
             </div>
           </div>
           {goal.budget_exhaustion_reason && (
             <p className="mt-2 text-[11px] text-amber-700">
-              预算原因：{goal.budget_exhaustion_reason}
+              预算原因：{budgetReasonLabel(goal.budget_exhaustion_reason)}
             </p>
+          )}
+          {orderedRuns.length > 0 && (
+            <div className="mt-3 rounded-xl border border-black/[0.06] bg-white/70 px-3 py-2.5">
+              <div className="flex items-center gap-1.5 text-[11px] font-semibold text-slate-600">
+                <Timer className="h-3.5 w-3.5" />
+                Run 时间线
+              </div>
+              <div className="mt-2 space-y-2">
+                {orderedRuns.map((item, index) => (
+                  <div key={item.run_id} className="flex min-w-0 items-start gap-2 text-[11px]">
+                    <span className={`mt-1 h-2 w-2 shrink-0 rounded-full ${
+                      item.status === "completed"
+                        ? "bg-emerald-500"
+                        : ["failed", "blocked", "verification_failed"].includes(item.status)
+                          ? "bg-rose-500"
+                          : item.status === "budget_exceeded"
+                            ? "bg-amber-500"
+                            : "bg-[#002fa7]"
+                    }`} />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex min-w-0 items-center justify-between gap-2">
+                        <span className="truncate font-medium text-slate-700">第 {index + 1} 轮</span>
+                        <span className="shrink-0 text-slate-500">{runStatusLabel[item.status]}</span>
+                      </div>
+                      <div className="mt-0.5 flex flex-wrap gap-x-2 text-[10px] text-slate-400">
+                        <span>模型调用 {item.model_call_count || 0}</span>
+                        {item.budget_exhaustion_reason ? (
+                          <span>{budgetReasonLabel(item.budget_exhaustion_reason)}</span>
+                        ) : null}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          {(goal.control_notices || []).length > 0 && (
+            <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5">
+              <div className="text-[11px] font-semibold text-slate-600">运行说明</div>
+              <ul className="mt-1 space-y-1 text-[11px] leading-5 text-slate-500">
+                {(goal.control_notices || []).slice(-3).map((notice, index) => (
+                  <li key={`${notice}-${index}`}>• {goalGapLabel(notice)}</li>
+                ))}
+              </ul>
+            </div>
           )}
           {goal.gaps.length > 0 && (
             <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5">
@@ -343,48 +666,13 @@ function GoalCard({
                 尚待补齐
               </div>
               <ul className="mt-1.5 space-y-1 text-[11px] leading-5 text-amber-800/90">
-                {goal.gaps.map((gap, index) => <li key={`${gap}-${index}`}>• {gap}</li>)}
+                {goal.gaps.map((gap, index) => (
+                  <li key={`${gap}-${index}`}>• {goalGapLabel(gap)}</li>
+                ))}
               </ul>
             </div>
           )}
-          <div className="mt-3 flex flex-wrap gap-2">
-            {goal.status === "active" && (
-              <button
-                type="button"
-                disabled={runIsActive}
-                title={runIsActive ? "请先停止当前 Run" : "暂停目标"}
-                onClick={() => void performAction(onPause)}
-                className="flex items-center gap-1 rounded-lg border border-black/[0.08] px-2.5 py-1.5 text-[11px] text-slate-600 hover:bg-black/[0.035] disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                <Pause className="h-3 w-3" />暂停
-              </button>
-            )}
-            {(goal.status === "paused" || goal.status === "blocked") && (
-              <button
-                type="button"
-                onClick={() => void performAction(onResume)}
-                className="flex items-center gap-1 rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-[11px] text-emerald-700 hover:bg-emerald-100"
-              >
-                <Play className="h-3 w-3" />恢复
-              </button>
-            )}
-            {!["achieved", "cancelled", "budget_exceeded"].includes(goal.status) && (
-              <button
-                type="button"
-                disabled={runIsActive}
-                title={runIsActive ? "请先停止当前 Run" : "取消目标"}
-                onClick={() => void performAction(onCancel)}
-                className="flex items-center gap-1 rounded-lg border border-rose-200 px-2.5 py-1.5 text-[11px] text-rose-600 hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                <Ban className="h-3 w-3" />取消目标
-              </button>
-            )}
-          </div>
-          {runIsActive && (
-            <p className="mt-2 text-[11px] text-slate-400">
-              当前 Run 结束或停止后，才能暂停或取消 Goal。
-            </p>
-          )}
+          {editNotice && <p className="mt-2 text-[11px] text-emerald-700">{editNotice}</p>}
           {actionError && (
             <p className="mt-2 rounded-lg bg-rose-50 px-2.5 py-2 text-[11px] text-rose-700">
               {actionError}
@@ -407,9 +695,16 @@ function VerificationCard({
   report: RubricEvaluationReport;
   run: HarnessRun | null;
 }) {
-  const passed = report.status === "satisfied" || report.status === "not_required";
-  const controlError = report.status === "verification_incomplete" || report.status === "grader_error";
-  const statusLabel = verificationStatusLabel(report.status);
+  const supersededGoalCandidate = report.status === "satisfied"
+    && report.accepted_for_goal_revision === false;
+  const passed = report.status === "not_required"
+    || (report.status === "satisfied" && !supersededGoalCandidate);
+  const controlError = report.status === "verification_incomplete"
+    || report.status === "grader_error"
+    || report.status === "infrastructure_error";
+  const statusLabel = supersededGoalCandidate
+    ? "旧版目标验收通过（未接纳）"
+    : verificationStatusLabel(report.status);
   const criteriaById = new Map(
     (run?.verification_contract?.criteria || []).map((criterion) => [
       criterion.id,
@@ -421,7 +716,7 @@ function VerificationCard({
       <SectionHeader
         icon={passed ? <CheckCircle2 className="h-4 w-4" /> : <AlertTriangle className="h-4 w-4" />}
         title="验收"
-        metric={verificationMetricLabel(report.status)}
+        metric={supersededGoalCandidate ? "未接纳" : verificationMetricLabel(report.status)}
         open={active}
         onToggle={onActivate}
       />
@@ -440,9 +735,17 @@ function VerificationCard({
                   <span>第 {report.iteration_count} 轮验收</span>
                 </>
               )}
+              <span className="text-slate-300">·</span>
+              <span>
+                {report.verification_scope === "goal_aggregate"
+                  ? `Goal 聚合验收 · ${Math.max(1, report.supporting_run_ids?.length || 0)} 个 Run 证据`
+                  : "本 Run 验收"}
+              </span>
             </div>
             <p className="mt-1.5 text-[11px] leading-5 text-slate-600">
-              {passed
+              {supersededGoalCandidate
+                ? "该候选答案属于已被修改的 Goal 版本，不会作为当前目标的正式完成结果。"
+                : passed
                 ? "全部必需验收项均已通过。"
                 : controlError
                   ? "验收控制流程没有形成有效终态；这不代表用户任务本身未通过。"
@@ -486,8 +789,11 @@ function VerificationCard({
               evaluation.name,
               criterion?.statement,
             );
-            const evidenceLines = evaluation.evidence.flatMap(formatVerificationEvidence);
+            const evidenceLines = Array.from(
+              new Set(evaluation.evidence.flatMap(formatVerificationEvidence)),
+            );
             const notEvaluated = evaluation.passed === null;
+            const infrastructureFailure = evaluation.failure_kind === "infrastructure_error";
             return (
               <details
                 key={`${evaluation.criterion_id}-${evaluation.name}`}
@@ -517,7 +823,13 @@ function VerificationCard({
                               ? "text-slate-500"
                               : "text-amber-700"
                         }`}>
-                          {evaluation.passed ? "通过" : notEvaluated ? "未执行" : "未通过"}
+                          {evaluation.passed
+                            ? "通过"
+                            : notEvaluated
+                              ? "未执行"
+                              : infrastructureFailure
+                                ? "验收异常"
+                                : "未通过"}
                         </span>
                         <span className="text-[10px] text-slate-400">查看明细</span>
                       </div>
@@ -550,7 +862,11 @@ function VerificationCard({
                   {evaluation.gap && (
                     <div className="mt-2.5">
                       <p className={`text-[10px] font-semibold ${notEvaluated ? "text-slate-600" : "text-amber-700"}`}>
-                        {notEvaluated ? "未执行原因" : "未通过原因"}
+                        {notEvaluated
+                          ? "未执行原因"
+                          : infrastructureFailure
+                            ? "验收异常原因"
+                            : "未通过原因"}
                       </p>
                       <p className={`mt-1 text-[11px] leading-5 ${notEvaluated ? "text-slate-600" : "text-amber-800"}`}>
                         {evaluation.gap}
@@ -558,7 +874,9 @@ function VerificationCard({
                     </div>
                   )}
                   <div className="mt-2.5">
-                    <p className="text-[10px] font-semibold text-slate-500">判定依据</p>
+                    <p className="text-[10px] font-semibold text-slate-500">
+                      {notEvaluated ? "为什么未执行" : evaluation.passed ? "为什么通过" : "为什么未通过"}
+                    </p>
                     {evidenceLines.length > 0 ? (
                       <ul className="mt-1 space-y-1 text-[11px] leading-5 text-slate-600">
                         {evidenceLines.map((line, index) => (
@@ -574,6 +892,17 @@ function VerificationCard({
                           ? "该项尚未进入评审，因此没有判定依据。"
                           : `该项仅由${verificationMethodLabel(evaluation.verifier)}基于本轮上下文判断，当前未附结构化证据，不属于确定性验证。`}
                       </p>
+                    )}
+                    {evaluation.evidence.length > 0 && (
+                      <details className="group/technical mt-2 rounded-lg border border-black/[0.05] bg-white/55">
+                        <summary className="flex cursor-pointer list-none items-center justify-between gap-2 px-2.5 py-2 text-[10px] text-slate-400 [&::-webkit-details-marker]:hidden">
+                          <span>技术明细（高级）· {evaluation.evidence.length} 条</span>
+                          <ChevronDown className="h-3 w-3 transition-transform group-open/technical:rotate-180" />
+                        </summary>
+                        <pre className="max-h-52 overflow-auto whitespace-pre-wrap break-all border-t border-black/[0.05] px-2.5 py-2 text-[10px] leading-4 text-slate-500">
+                          {JSON.stringify(evaluation.evidence, null, 2)}
+                        </pre>
+                      </details>
                     )}
                   </div>
                 </div>
@@ -662,6 +991,7 @@ function verificationStatusLabel(status: string): string {
       max_iterations_reached: "已达最大验收轮次",
       verification_incomplete: "验收流程未完成",
       grader_error: "验收器异常",
+      infrastructure_error: "验收基础设施异常",
       budget_exceeded: "验收预算耗尽",
     } as Record<string, string>
   )[status] || status;
@@ -671,16 +1001,16 @@ function verificationMetricLabel(status: string): string {
   if (status === "satisfied") return "通过";
   if (status === "not_required") return "无需验收";
   if (status === "pending" || status === "evaluating") return "进行中";
-  if (status === "verification_incomplete" || status === "grader_error") return "异常";
+  if (status === "verification_incomplete" || status === "grader_error" || status === "infrastructure_error") return "异常";
   return "待修正";
 }
 
 function verificationMethodLabel(verifier: string): string {
   return (
     {
-      deterministic: "确定性检查",
-      analytics: "分析验收",
-      llm_grader: "模型评审",
+      deterministic: "系统核验",
+      analytics: "数据核验",
+      llm_grader: "模型复核",
     } as Record<string, string>
   )[verifier] || "验收检查";
 }
@@ -732,21 +1062,100 @@ function formatVerificationEvidence(evidence: Record<string, unknown>): string[]
       `最终回答引用 ${mentioned} 个产物，确认存在 ${existing} 个，缺失 ${missing} 个。`,
     ];
   }
-  if (evidence.kind === "tool_execution") {
-    const toolName = String(evidence.tool_name || "未知工具");
-    const toolCallId = String(evidence.tool_call_id || "");
-    const inputPreview = String(evidence.input_preview || "");
+  if (evidence.kind === "artifact_registry") {
+    const selected = Array.isArray(evidence.selected_artifact_ids)
+      ? evidence.selected_artifact_ids.length
+      : 0;
+    const existing = Array.isArray(evidence.existing) ? evidence.existing.length : 0;
+    const missing = Array.isArray(evidence.missing) ? evidence.missing.length : 0;
+    const changed = Array.isArray(evidence.changed) ? evidence.changed.length : 0;
+    const invalid = Array.isArray(evidence.invalid) ? evidence.invalid.length : 0;
     return [
-      `${toolName} 已成功执行${toolCallId ? `（${toolCallId}）` : ""}${inputPreview ? `：${inputPreview}` : ""}`,
+      `按工具写入收据核对 ${selected} 个目标产物：${existing} 个有效，${missing} 个缺失，${changed} 个写入后发生变化，${invalid} 个权限或映射异常。`,
     ];
   }
-  return Object.entries(evidence).map(([key, value]) => {
-    const rendered =
-      typeof value === "string"
-        ? value
-        : JSON.stringify(value, null, 0);
-    return `${key}：${rendered}`;
-  });
+  if (evidence.kind === "tool_result") {
+    const toolName = String(evidence.tool_name || "");
+    const toolLabel = verificationToolLabel(toolName);
+    const resultCount = verificationResultCount(evidence.output_preview);
+    if (resultCount !== null) {
+      return [`本轮${toolLabel}成功返回 ${resultCount} 条结果，已用于核对结论。`];
+    }
+    return [`本轮${toolLabel}成功返回结果，已用于核对结论。`];
+  }
+  if (evidence.kind === "source") {
+    const title = String(evidence.title || "").trim();
+    const uri = String(evidence.uri || "").trim();
+    const host = verificationSourceHost(uri);
+    const sourceName = title ? `《${title}》` : host || "网页来源";
+    return [
+      `已核对本轮获取的来源${sourceName}${title && host ? `（${host}）` : ""}。`,
+    ];
+  }
+  if (evidence.kind === "analytics_result") {
+    const reference = String(evidence.ref || "").trim();
+    return [
+      reference
+        ? `分析结论可追溯到本轮查询结果 ${reference}。`
+        : "分析结论可追溯到本轮查询结果。",
+    ];
+  }
+  if (evidence.kind === "artifact_write") {
+    const path = String(evidence.path || "").trim();
+    return [path ? `已确认本轮生成或更新产物：${path}` : "已确认本轮完成产物写入。"];
+  }
+  if (evidence.kind === "tool_execution") {
+    const toolName = String(evidence.tool_name || "未知工具");
+    return [`本轮已成功使用${verificationToolLabel(toolName)}完成相关操作。`];
+  }
+  return ["验收器已记录一条可复核的结构化依据。"];
+}
+
+function verificationToolLabel(toolName: string): string {
+  return (
+    {
+      fetch_url: "网页抓取",
+      tavily_search: "网页搜索",
+      llamaindex_knowledge_query: "知识检索",
+      pandas_knowledge_query: "表格分析",
+      database_schema_inspect: "数据库结构检查",
+      database_sql_generate: "查询生成",
+      database_sql_validate: "查询校验",
+      database_sql_execute: "数据查询",
+      database_query_trace_inspect: "查询轨迹检查",
+      database_query_result_page: "查询结果读取",
+      semantic_entity_lookup: "语义实体查询",
+      write_file: "文件写入",
+      edit_file: "文件修改",
+      execute: "命令执行",
+      terminal: "命令执行",
+    } as Record<string, string>
+  )[toolName] || "工具";
+}
+
+function verificationResultCount(rawPreview: unknown): number | null {
+  if (typeof rawPreview !== "string" || !rawPreview.trim()) return null;
+  try {
+    const parsed = JSON.parse(rawPreview) as Record<string, unknown>;
+    if (typeof parsed.count === "number" && Number.isFinite(parsed.count)) {
+      return parsed.count;
+    }
+    for (const key of ["items", "results", "sources", "data"]) {
+      if (Array.isArray(parsed[key])) return parsed[key].length;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function verificationSourceHost(uri: string): string {
+  if (!uri) return "";
+  try {
+    return new URL(uri).hostname.replace(/^www\./, "");
+  } catch {
+    return "";
+  }
 }
 
 function SectionHeader({
@@ -755,34 +1164,41 @@ function SectionHeader({
   metric,
   open,
   onToggle,
+  actions,
 }: {
   icon: React.ReactNode;
   title: string;
   metric?: React.ReactNode;
   open: boolean;
   onToggle: () => void;
+  actions?: React.ReactNode;
 }) {
   return (
-    <button
-      type="button"
-      onClick={onToggle}
-      className="flex w-full items-center justify-between gap-3 py-4 text-left"
-    >
-      <div className="flex min-w-0 items-center gap-3">
-        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-black/[0.045] text-slate-500">
-          {icon}
+    <div className="flex w-full items-center justify-between gap-3 py-4">
+      <button
+        type="button"
+        onClick={onToggle}
+        className="flex min-w-0 flex-1 items-center gap-3 text-left"
+      >
+        <div className="flex min-w-0 items-center gap-3">
+          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-black/[0.045] text-slate-500">
+            {icon}
+          </div>
+          <span className="truncate text-[15px] font-bold text-slate-700">{title}</span>
+          <ChevronDown
+            className={`h-4 w-4 shrink-0 text-slate-400 transition-transform duration-200 ${open ? "rotate-90" : ""}`}
+          />
         </div>
-        <span className="truncate text-[15px] font-bold text-slate-700">{title}</span>
-        <ChevronDown
-          className={`h-4 w-4 shrink-0 text-slate-400 transition-transform duration-200 ${open ? "rotate-90" : ""}`}
-        />
+      </button>
+      <div className="flex shrink-0 items-center gap-2">
+        {metric && (
+          <div className="text-[13px] font-semibold text-slate-500">
+            {metric}
+          </div>
+        )}
+        {actions}
       </div>
-      {metric && (
-        <div className="shrink-0 text-[13px] font-semibold text-slate-500">
-          {metric}
-        </div>
-      )}
-    </button>
+    </div>
   );
 }
 
@@ -790,19 +1206,17 @@ function PermissionsCard({
   active,
   onActivate,
   grants,
+  history,
   onRevoke,
 }: {
   active: boolean;
   onActivate: () => void;
   grants: PermissionGrant[];
+  history: PermissionGrant[];
   onRevoke: (grantId: string) => Promise<void>;
 }) {
   const [revoking, setRevoking] = useState<string | null>(null);
-  // One-shot grants are consumed immediately when the interrupted Run
-  // resumes. Showing the API race window here leaves a stale permission card;
-  // durable Session grants belong in this control panel, one-shot decisions
-  // remain visible in the message/trace audit trail.
-  const visibleGrants = grants.filter((grant) => grant.scope !== "once");
+  const activeGrants = grants.filter((grant) => grant.scope !== "once");
 
   return (
     <section>
@@ -812,15 +1226,18 @@ function PermissionsCard({
         open={active}
         onToggle={onActivate}
         metric={
-          visibleGrants.length > 0 ? (
-            <span className="text-[#002fa7]">{visibleGrants.length}</span>
+          activeGrants.length > 0 || history.length > 0 ? (
+            <span>
+              <span className="text-[#002fa7]">{activeGrants.length}</span>
+              <span className="text-slate-300"> 有效 · {history.length} 记录</span>
+            </span>
           ) : (
             <span className="text-slate-300">0</span>
           )
         }
       />
 
-      {active && visibleGrants.length === 0 ? (
+      {active && activeGrants.length === 0 && history.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-9 text-center">
           <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-slate-50 text-slate-300">
             <KeyRound className="h-5 w-5" />
@@ -828,141 +1245,235 @@ function PermissionsCard({
           <p className="text-[14px] font-medium text-slate-400">授权信息将显示在这里</p>
         </div>
       ) : active ? (
-        <div className="mt-4 space-y-3 pb-5">
-          {visibleGrants.map((grant) => {
-            const isToolAction =
-              grant.type === "tool_action"
-              || ["fingerprint", "network_origin", "tool_name"].includes(grant.target_kind);
-            const command = String(grant.metadata?.command || "").trim();
-            const sessionTarget = String(grant.metadata?.session_target || "").trim();
-            const target = isToolAction
-              ? sessionTarget
-                || command
-                || `命令指纹 ${grant.target.slice(0, 20)}…`
-              : grant.target_kind === "all_external_files"
-                ? "所有外部文件"
-                : grant.target;
-            const canWrite = grant.capabilities.includes("write") || grant.type === "external_file_write";
-            const commandExecutable = extractCommandExecutable(command);
-            const risk = String(grant.metadata?.risk || "");
-            const riskLabel = risk
-              ? (
-                  {
-                    high: "脚本执行",
-                    network: "联网",
-                    package_install: "依赖安装",
-                    managed_write: "受控写入",
-                    critical: "关键风险",
-                  } as Record<string, string>
-                )[risk] || risk
-              : "";
-            const name = isToolAction
-              ? grant.target_kind === "network_origin"
-                ? "网站访问授权"
-                : grant.target_kind === "tool_name"
-                  ? "联网搜索授权"
-                  : grant.target_kind === "capability" && grant.capabilities.includes("package_install")
-                    ? "沙箱依赖安装授权"
-                  : commandExecutable
-                ? `${commandExecutable} 命令授权`
-                : "受控命令授权"
-              : grant.target_kind === "all_external_files"
-                ? `本 session 外部文件${canWrite ? "写入" : "读取"}`
-                : grant.target.split("/").filter(Boolean).pop() || "外部文件";
-            return (
-              <div key={grant.id} className="rounded-2xl border border-black/[0.06] bg-white/70 p-3">
-                <div className="flex items-start gap-2.5">
-                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[#002fa7]/10 text-[#002fa7]">
-                    {isToolAction
-                      ? grant.target_kind === "network_origin" || grant.target_kind === "tool_name"
-                        ? <Globe2 className="h-4 w-4" />
-                        : <SquareTerminal className="h-4 w-4" />
-                      : <KeyRound className="h-4 w-4" />}
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center justify-between gap-2">
-                      <div className="min-w-0 truncate text-[13px] font-semibold text-slate-900">{name}</div>
-                      <button
-                        type="button"
-                        disabled={revoking === grant.id}
-                        onClick={async () => {
-                          setRevoking(grant.id);
-                          try {
-                            await onRevoke(grant.id);
-                          } finally {
-                            setRevoking(null);
-                          }
-                        }}
-                        className="rounded-full p-1 text-slate-400 transition hover:bg-slate-100 hover:text-slate-700 disabled:opacity-50"
-                        aria-label="撤销权限"
-                      >
-                        <X className="h-3.5 w-3.5" />
-                      </button>
-                    </div>
-                    <div
-                      className={`mt-1 text-[10.5px] text-slate-500 ${
-                        isToolAction
-                          ? "line-clamp-2 break-all font-mono leading-4"
-                          : "truncate font-mono"
-                      }`}
-                      title={target}
-                    >
-                      {target}
-                    </div>
-                    <div className="mt-2 flex flex-wrap gap-1.5">
-                      <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-500">
-                        {grant.scope === "once" ? "仅本次" : "本 Session"}
-                      </span>
-                      {isToolAction ? (
-                        <>
-                          <span className="rounded-full bg-blue-50 px-2 py-0.5 text-[10px] font-medium text-blue-700">
-                            {grant.target_kind === "network_origin"
-                              ? "网站访问"
-                              : grant.target_kind === "tool_name"
-                                ? "联网搜索"
-                                : "命令执行"}
-                          </span>
-                          {riskLabel && (
-                            <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700">
-                              {riskLabel}
-                            </span>
-                          )}
-                          {(grant.capabilities.includes("temporary_network") ||
-                            grant.capabilities.includes("network_access")) && (
-                            <span className="rounded-full bg-blue-50 px-2 py-0.5 text-[10px] font-medium text-blue-700">
-                              {grant.capabilities.includes("temporary_network") ? "临时联网" : "联网执行"}
-                            </span>
-                          )}
-                          {grant.capabilities.includes("managed_write") && (
-                            <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700">
-                              写入项目
-                            </span>
-                          )}
-                          {grant.capabilities.includes("package_install") && (
-                            <span className="rounded-full bg-violet-50 px-2 py-0.5 text-[10px] font-medium text-violet-700">
-                              安装依赖
-                            </span>
-                          )}
-                        </>
-                      ) : (
-                        <span
-                          className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${
-                            canWrite ? "bg-amber-50 text-amber-700" : "bg-slate-100 text-slate-500"
-                          }`}
-                        >
-                          {canWrite ? "Write" : "Read only"}
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                </div>
+        <div className="mt-4 space-y-5 pb-5">
+          {activeGrants.length > 0 ? (
+            <PermissionGrantGroup title="当前有效" count={activeGrants.length}>
+              {activeGrants.map((grant) => (
+                <PermissionGrantRow
+                  key={grant.id}
+                  grant={grant}
+                  revoking={revoking === grant.id}
+                  onRevoke={async () => {
+                    setRevoking(grant.id);
+                    try {
+                      await onRevoke(grant.id);
+                    } finally {
+                      setRevoking(null);
+                    }
+                  }}
+                />
+              ))}
+            </PermissionGrantGroup>
+          ) : null}
+          {history.length > 0 ? (
+            <details className="group/history">
+              <summary className="flex cursor-pointer list-none items-center gap-2 text-[11px] font-semibold text-slate-400">
+                <ChevronDown className="h-3.5 w-3.5 -rotate-90 transition-transform group-open/history:rotate-0" />
+                <span>已消费或撤销</span>
+                <span className="rounded-full bg-slate-100 px-1.5 py-0.5 text-[9px] text-slate-500">{history.length}</span>
+              </summary>
+              <div className="mt-2 space-y-3">
+                {history.map((grant) => (
+                  <PermissionGrantRow key={grant.id} grant={grant} historical />
+                ))}
               </div>
-            );
-          })}
+            </details>
+          ) : null}
         </div>
       ) : null}
     </section>
   );
+}
+
+function PermissionGrantGroup({
+  title,
+  count,
+  children,
+}: {
+  title: string;
+  count: number;
+  children: React.ReactNode;
+}) {
+  return (
+    <div>
+      <div className="mb-2 flex items-center gap-2 text-[11px] font-semibold text-slate-400">
+        <span>{title}</span>
+        <span className="rounded-full bg-slate-100 px-1.5 py-0.5 text-[9px] text-slate-500">{count}</span>
+      </div>
+      <div className="space-y-3">{children}</div>
+    </div>
+  );
+}
+
+function PermissionGrantRow({
+  grant,
+  historical = false,
+  revoking = false,
+  onRevoke,
+}: {
+  grant: PermissionGrant;
+  historical?: boolean;
+  revoking?: boolean;
+  onRevoke?: () => Promise<void>;
+}) {
+  const presentation = permissionGrantPresentation(grant);
+  const canWrite = grant.capabilities.includes("write") || grant.type === "external_file_write";
+  const timestamp = grant.consumed_at || grant.revoked_at || grant.created_at;
+  return (
+    <div className="rounded-2xl border border-black/[0.06] bg-white/70 p-3">
+      <div className="flex items-start gap-2.5">
+        <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-xl ${
+          presentation.isSkill
+            ? "bg-cyan-50 text-cyan-700"
+            : "bg-[#002fa7]/10 text-[#002fa7]"
+        }`}>
+          {presentation.isSkill
+            ? <ShieldCheck className="h-4 w-4" />
+            : presentation.isNetwork
+              ? <Globe2 className="h-4 w-4" />
+              : presentation.isToolAction
+                ? <SquareTerminal className="h-4 w-4" />
+                : <KeyRound className="h-4 w-4" />}
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center justify-between gap-2">
+            <div className="min-w-0 truncate text-[13px] font-semibold text-slate-900">
+              {presentation.name}
+            </div>
+            {!historical && onRevoke ? (
+              <button
+                type="button"
+                disabled={revoking}
+                onClick={() => void onRevoke()}
+                className="rounded-full p-1 text-slate-400 transition hover:bg-slate-100 hover:text-slate-700 disabled:opacity-50"
+                aria-label="撤销权限"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            ) : null}
+          </div>
+          <div className="mt-1 line-clamp-2 break-all text-[10.5px] leading-4 text-slate-500" title={presentation.target}>
+            {presentation.target}
+          </div>
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {historical ? (
+              <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-medium text-emerald-700">
+                {grant.consumed_at ? "已消费" : "已撤销"}
+              </span>
+            ) : null}
+            <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-500">
+              {grant.scope === "once" ? "单次" : "本 Session"}
+            </span>
+            {presentation.isSkill ? (
+              <span className="rounded-full bg-cyan-50 px-2 py-0.5 text-[10px] font-medium text-cyan-700">
+                Skill 管理
+              </span>
+            ) : presentation.isToolAction ? (
+              <span className="rounded-full bg-blue-50 px-2 py-0.5 text-[10px] font-medium text-blue-700">
+                {presentation.isNetwork ? "联网访问" : "命令执行"}
+              </span>
+            ) : (
+              <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${
+                canWrite ? "bg-amber-50 text-amber-700" : "bg-slate-100 text-slate-500"
+              }`}>
+                {canWrite ? "Write" : "Read only"}
+              </span>
+            )}
+            {presentation.changes ? (
+              <span className="rounded-full bg-cyan-50 px-2 py-0.5 text-[10px] font-medium text-cyan-700">
+                {presentation.changes}
+              </span>
+            ) : null}
+          </div>
+          {historical && timestamp ? (
+            <div className="mt-2 text-[10px] text-slate-400">
+              {new Date(timestamp * 1000).toLocaleString("zh-CN", { hour12: false })}
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function permissionGrantPresentation(grant: PermissionGrant): {
+  name: string;
+  target: string;
+  changes: string;
+  isSkill: boolean;
+  isNetwork: boolean;
+  isToolAction: boolean;
+} {
+  const isToolAction = grant.type === "tool_action"
+    || ["fingerprint", "network_origin", "tool_name"].includes(grant.target_kind);
+  const toolName = String(grant.metadata?.tool_name || "");
+  const command = String(grant.metadata?.command || "").trim();
+  const preview = grant.metadata?.change_preview || {};
+  let commandData: Record<string, unknown> = {};
+  try {
+    const parsed = JSON.parse(command);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      commandData = parsed as Record<string, unknown>;
+    }
+  } catch {
+    // Normal shell commands are intentionally not JSON.
+  }
+  const requestData = commandData.request && typeof commandData.request === "object"
+    ? commandData.request as Record<string, unknown>
+    : commandData;
+  const planData = commandData.verified_plan && typeof commandData.verified_plan === "object"
+    ? commandData.verified_plan as Record<string, unknown>
+    : {};
+  const isSkill = ["prepare_skill_install", "prepare_skill_update", "install_skill", "update_skill"].includes(toolName)
+    || grant.capabilities.includes("managed_skill_write");
+  if (isSkill) {
+    const skillName = String(preview.skill_name || planData.skill_name || requestData.skill_name || "Skill");
+    const source = String(preview.source || planData.source || requestData.source || "受管 Skill 目录");
+    const changes = String(preview.changes || "");
+    const action = toolName.includes("update") ? "更新" : "安装";
+    const prepare = toolName.startsWith("prepare_");
+    return {
+      name: `${prepare ? "检查" : action} ${skillName}${prepare ? ` ${action}` : ""}`,
+      target: source,
+      changes,
+      isSkill: true,
+      isNetwork: grant.capabilities.includes("temporary_network"),
+      isToolAction: true,
+    };
+  }
+  const isNetwork = grant.target_kind === "network_origin"
+    || grant.target_kind === "tool_name"
+    || grant.capabilities.includes("temporary_network")
+    || grant.capabilities.includes("network_access");
+  if (isToolAction) {
+    const executable = extractCommandExecutable(command);
+    const name = grant.target_kind === "network_origin"
+      ? "网站访问授权"
+      : grant.target_kind === "tool_name"
+        ? "联网搜索授权"
+        : grant.capabilities.includes("package_install")
+          ? "沙箱依赖安装授权"
+          : executable ? `${executable} 命令授权` : "受控命令授权";
+    return {
+      name,
+      target: String(grant.metadata?.session_target || command || `命令指纹 ${grant.target.slice(0, 20)}…`),
+      changes: "",
+      isSkill: false,
+      isNetwork,
+      isToolAction: true,
+    };
+  }
+  const canWrite = grant.capabilities.includes("write") || grant.type === "external_file_write";
+  return {
+    name: grant.target_kind === "all_external_files"
+      ? `本 session 外部文件${canWrite ? "写入" : "读取"}`
+      : grant.target.split("/").filter(Boolean).pop() || "外部文件",
+    target: grant.target_kind === "all_external_files" ? "所有外部文件" : grant.target,
+    changes: "",
+    isSkill: false,
+    isNetwork: false,
+    isToolAction: false,
+  };
 }
 
 function ProgressCard({
@@ -1354,7 +1865,7 @@ function sourceOpenUrl(source: SourceRecord): string {
 }
 
 function extractTodosFromToolCall(toolCall: ToolCall): Array<{ content: string; status: TodoStatus }> {
-  if (toolCall.tool !== "write_todos" || !toolCall.output) return [];
+  if (!{"write_todos": true, "update_todos": true}[toolCall.tool] || !toolCall.output) return [];
   try {
     const parsed = JSON.parse(toolCall.output);
     const raw = parsed.todos || parsed;

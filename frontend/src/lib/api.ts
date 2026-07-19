@@ -112,7 +112,21 @@ export interface CriterionEvaluation {
   verifier: string;
   evidence: Array<Record<string, unknown>>;
   gap?: string | null;
+  failure_kind?: "task_gap" | "infrastructure_error" | null;
 }
+
+export type VerificationStatus =
+  | "not_required"
+  | "pending"
+  | "evaluating"
+  | "satisfied"
+  | "needs_revision"
+  | "failed"
+  | "max_iterations_reached"
+  | "verification_incomplete"
+  | "grader_error"
+  | "infrastructure_error"
+  | "budget_exceeded";
 
 export interface RubricEvaluationReport {
   report_id: string;
@@ -124,6 +138,10 @@ export interface RubricEvaluationReport {
   gaps: string[];
   explanation: string;
   iteration_count: number;
+  verification_scope?: "run" | "goal_aggregate";
+  supporting_run_ids?: string[];
+  goal_revision?: number | null;
+  accepted_for_goal_revision?: boolean | null;
   created_at: number;
 }
 
@@ -133,6 +151,7 @@ export interface HarnessRun {
   session_id: string;
   objective: string;
   goal_id?: string | null;
+  goal_revision?: number | null;
   verification_enabled?: boolean;
   task_profile?: RunTaskProfile;
   status: RunStatus;
@@ -153,11 +172,35 @@ export interface HarnessGoal {
   goal_id: string;
   session_id: string;
   objective: string;
+  objective_revision?: number;
+  revisions?: Array<{
+    revision: number;
+    objective: string;
+    contract_id?: string | null;
+    created_at: number;
+  }>;
+  pending_revision?: boolean;
   status: GoalStatus;
+  requested_status?: GoalStatus | null;
   current_run_id?: string | null;
   run_ids: string[];
   gaps: string[];
+  control_notices?: string[];
   latest_verification_report_id?: string | null;
+  latest_goal_decision?: {
+    decision_id: string;
+    goal_id: string;
+    objective_revision: number;
+    status: VerificationStatus;
+    accepted?: boolean;
+    supporting_run_ids: string[];
+    criterion_provenance?: Array<Record<string, unknown>>;
+    evidence_ref_count: number;
+    gaps: string[];
+    accepted_run_id?: string | null;
+    report_id?: string | null;
+    created_at: number;
+  } | null;
   round: number;
   max_rounds: number;
   model_call_count: number;
@@ -209,7 +252,14 @@ export interface AgentAttachment {
   mime_type?: string;
   path?: string;
   size?: number;
-  source?: "upload" | "paste";
+  source?: "upload" | "paste" | "generated";
+  sha256?: string;
+  derived_from?: string;
+  created_by_run_id?: string;
+  created_by_query_id?: string;
+  created_by_goal_id?: string;
+  created_by_goal_revision?: number;
+  download_url?: string;
   created_at?: number;
 }
 
@@ -2110,7 +2160,9 @@ export async function uploadAgentAttachments(
 export interface TodoItem {
   id: string;
   content: string;
-  status: "pending" | "in_progress" | "completed" | "error";
+  status: "pending" | "in_progress" | "completed" | "cancelled" | "error";
+  position?: number;
+  parent_id?: string | null;
   created_at?: number;
   updated_at?: number;
   metadata?: Record<string, unknown>;
@@ -2280,6 +2332,7 @@ export interface PermissionGrant {
   source?: string;
   created_at?: number;
   revoked_at?: number;
+  consumed_at?: number;
   metadata?: {
     tool_name?: string;
     command?: string;
@@ -2287,7 +2340,14 @@ export interface PermissionGrant {
     risk?: string;
     session_scope_label?: string;
     session_target?: string;
+    run_id?: string;
+    change_preview?: Record<string, string>;
   };
+}
+
+export interface SessionPermissionState {
+  grants: PermissionGrant[];
+  history: PermissionGrant[];
 }
 
 export interface PermissionRequest {
@@ -2596,6 +2656,30 @@ export const resumeGoal = (sessionId: string, goalId: string) =>
 export const cancelGoal = (sessionId: string, goalId: string) =>
   transitionGoal(sessionId, goalId, "cancel");
 
+export async function updateGoalObjective(
+  sessionId: string,
+  goalId: string,
+  objective: string,
+  expectedRevision: number,
+): Promise<HarnessGoal> {
+  const response = await fetch(
+    `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/goals/${encodeURIComponent(goalId)}`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        objective,
+        expected_revision: expectedRevision,
+      }),
+    },
+  );
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(apiErrorMessage(text, `Failed to update Goal: ${response.status}`));
+  }
+  return response.json();
+}
+
 function parseSSEFrame(frame: string): SSEEvent | null {
   let event = "message";
   const dataLines: string[] = [];
@@ -2754,11 +2838,14 @@ export async function updateProjectContext(
   return resp.json();
 }
 
-export async function listSessionPermissions(sessionId: string): Promise<PermissionGrant[]> {
+export async function listSessionPermissions(sessionId: string): Promise<SessionPermissionState> {
   const resp = await fetch(`${API_BASE}/sessions/${encodeURIComponent(sessionId)}/permissions`);
   if (!resp.ok) throw new Error(`Failed to list permissions: ${resp.status}`);
   const data = await resp.json();
-  return data.grants || [];
+  return {
+    grants: Array.isArray(data.grants) ? data.grants : [],
+    history: Array.isArray(data.history) ? data.history : [],
+  };
 }
 
 export async function grantExternalFilePermission(

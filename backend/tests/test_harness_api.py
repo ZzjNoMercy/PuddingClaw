@@ -173,3 +173,39 @@ def test_goal_pause_resume_cancel_api(tmp_path):
 
     invalid_resume = client.post("/api/sessions/session-1/goals/goal-1/resume")
     assert invalid_resume.status_code == 409
+
+
+def test_goal_objective_update_api_versions_contract_and_rejects_stale_edit(tmp_path):
+    client = _client(tmp_path)
+    goal = GoalRecord(
+        goal_id="goal-edit",
+        session_id="session-1",
+        objective="生成 2025 年报告",
+    )
+    session_manager.upsert_goal_state("session-1", goal.model_dump(mode="json"))
+
+    updated = client.patch(
+        "/api/sessions/session-1/goals/goal-edit",
+        json={
+            "objective": "分析 2026 年销量，并生成报告与趋势总结",
+            "expected_revision": 1,
+        },
+    )
+
+    assert updated.status_code == 200
+    payload = updated.json()
+    assert payload["objective_revision"] == 2
+    assert payload["pending_revision"] is True
+    assert [item["revision"] for item in payload["revisions"]] == [1, 2]
+    assert payload["revisions"][0]["objective"] == "生成 2025 年报告"
+    assert payload["goal_contract"]["contract_id"] == payload["revisions"][1]["contract_id"]
+    assert "time_scope" in {
+        item["id"] for item in payload["goal_contract"]["criteria"]
+    }
+
+    stale = client.patch(
+        "/api/sessions/session-1/goals/goal-edit",
+        json={"objective": "覆盖新目标", "expected_revision": 1},
+    )
+    assert stale.status_code == 409
+    assert "revision conflict" in stale.json()["detail"]

@@ -86,6 +86,17 @@ class PermissionedCompositeBackend(CompositeBackend):
         backend = FilesystemBackend(root_dir=resolved.parent, virtual_mode=True)
         return backend, f"/{resolved.name}", str(resolved)
 
+    def _approved_external_read_target(self, file_path: str) -> tuple[FilesystemBackend, str] | None:
+        if not self.session_id or self._managed_readonly(file_path):
+            return None
+        requested = Path(file_path).expanduser()
+        if not requested.is_absolute():
+            return None
+        resolved = requested.resolve()
+        if not session_manager.has_external_file_read_permission(self.session_id, resolved):
+            return None
+        return FilesystemBackend(root_dir=resolved.parent, virtual_mode=True), f"/{resolved.name}"
+
     @staticmethod
     def _restore_external_path(result: Any, resolved: str):
         if result.path is not None:
@@ -101,6 +112,20 @@ class PermissionedCompositeBackend(CompositeBackend):
         backend, backend_path, resolved = target
         result = backend.write(backend_path, content)
         return self._restore_external_path(result, resolved)
+
+    def read(self, file_path: str, offset: int = 0, limit: int = 2000):
+        target = self._approved_external_read_target(file_path)
+        if target is None:
+            return super().read(file_path, offset=offset, limit=limit)
+        backend, backend_path = target
+        return backend.read(backend_path, offset=offset, limit=limit)
+
+    async def aread(self, file_path: str, offset: int = 0, limit: int = 2000):
+        target = self._approved_external_read_target(file_path)
+        if target is None:
+            return await super().aread(file_path, offset=offset, limit=limit)
+        backend, backend_path = target
+        return await backend.aread(backend_path, offset=offset, limit=limit)
 
     async def awrite(self, file_path: str, content: str):
         if self._managed_readonly(file_path):

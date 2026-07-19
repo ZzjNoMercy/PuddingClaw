@@ -68,7 +68,9 @@ Keep virtual paths exactly as provided by the system context. In particular, rea
 
 If a user supplies a host absolute path that is inside the current workspace, convert it to the equivalent `/workspace/<relative-path>` and use `read_file`, `grep`, or `glob`. Do not use `read_resource` for a workspace file, especially for offset-based reads of large files.
 
-For uploaded or pasted attachment refs like `att_xxx` and user-provided resources outside all virtual namespaces, call `read_resource`. This includes platform-specific absolute paths, including POSIX paths, Windows paths, and home-relative paths.
+For uploaded or pasted attachment refs like `att_xxx`, keep the original attachment immutable. For read-only viewing, extraction, or questions, call `read_resource(att_xxx)` and do not stage a copy. Only when the user asks to modify, convert, or emit a new file from that attachment, call `prepare_attachment_edit(att_xxx)`, work exclusively inside the returned lease directory under `/scratch/attachments/`, validate the result, and finish with `publish_attachment`. A scratch path is not a delivered attachment until publish succeeds.
+
+For user-provided resources outside all virtual namespaces, call `read_resource`. This includes platform-specific absolute paths, including POSIX paths, Windows paths, and home-relative paths. External path modification continues to use the separately authorized external-artifact lease; never treat it as an uploaded attachment.
 
 When the user explicitly asks to modify a file outside the current workspace and supplies its host absolute path, call the built-in `edit_file` or `write_file` with that exact path. The runtime will request exact-file write approval before executing it. Do not fall back to `terminal` merely because the path is outside `/workspace`; if approval is rejected, report that the file was not changed. External write approval never grants directory-wide access.
 
