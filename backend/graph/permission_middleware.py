@@ -66,9 +66,35 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
             }
         else:
             values = {"content": str(args.get("content") or "")}
+        return {key: value[:1000] + ("...[truncated]" if len(value) > 1000 else "") for key, value in values.items()}
+
+    @staticmethod
+    def _directory_change_preview(session_id: str, args: dict[str, Any]) -> dict[str, str]:
+        lease = session_manager.get_external_directory_lease(
+            session_id,
+            str(args.get("lease_id") or ""),
+        )
+        plan = lease.get("commit_plan") if isinstance(lease, dict) else None
+        if not isinstance(plan, dict):
+            return {"状态": "尚未生成目录变更计划，提交将被拒绝。"}
+
+        def lines(key: str) -> str:
+            values = plan.get(key)
+            if not isinstance(values, list) or not values:
+                return "无"
+            rendered = [str(item) for item in values[:100]]
+            if len(values) > 100:
+                rendered.append(f"…另有 {len(values) - 100} 项")
+            return "\n".join(rendered)
+
         return {
-            key: value[:1000] + ("...[truncated]" if len(value) > 1000 else "")
-            for key, value in values.items()
+            "新增文件": lines("added"),
+            "修改文件": lines("modified"),
+            "删除文件": lines("deleted"),
+            "变更统计": (
+                f"新增 {len(plan.get('added') or [])}，修改 {len(plan.get('modified') or [])}，"
+                f"删除 {len(plan.get('deleted') or [])}"
+            ),
         }
 
     def after_model(
@@ -87,6 +113,7 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
         context = runtime.context if isinstance(runtime.context, dict) else {}
         session_id = str(context.get("session_id") or "")
         query_id = str(context.get("query_id") or "")
+        run_id = str(context.get("run_id") or "")
         workspace_path = str(context.get("workspace_path") or "")
         if not session_id:
             return None
@@ -103,16 +130,79 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                 "patch_file",
                 "stage_external_artifact",
                 "commit_external_artifact",
+                "stage_external_directory",
+                "commit_external_directory",
             }:
                 continue
             args = tool_call.get("args") or {}
-            raw_path = str(args.get("path") or args.get("resource") or args.get("file_path") or "").strip()
+            raw_path = str(
+                args.get("path") or args.get("resource") or args.get("file_path") or args.get("directory_path") or ""
+            ).strip()
             if not raw_path:
                 continue
             if raw_path.startswith("att_"):
                 continue
             if raw_path.replace("\\", "/").startswith(self._VIRTUAL_PREFIXES):
                 continue
+
+            if tool_name in {"stage_external_directory", "commit_external_directory"}:
+                requested = Path(raw_path).expanduser().resolve()
+                access = "write" if tool_name == "commit_external_directory" else "read"
+                if session_manager.has_external_directory_permission(
+                    session_id,
+                    requested,
+                    access=access,
+                    run_id=run_id,
+                ):
+                    continue
+                change_preview = (
+                    self._directory_change_preview(session_id, args)
+                    if access == "write"
+                    else {
+                        "授权范围": "当前 Run 递归只读",
+                        "安全说明": "目录将复制为 Docker /scratch 快照；不会直接挂载或修改原目录。",
+                    }
+                )
+                request = permission_resume_registry.create_external_directory_request(
+                    session_id=session_id,
+                    query_id=query_id,
+                    run_id=run_id,
+                    tool_call_id=str(tool_call.get("id") or ""),
+                    path=requested,
+                    access=access,
+                    operation=tool_name,
+                    change_preview=change_preview,
+                )
+                collector = get_current_trace_collector()
+                if collector is not None:
+                    collector.add_custom_span(
+                        "permission.request",
+                        {"request": request},
+                        span_type="permission",
+                        metadata={
+                            "harness": {
+                                "mechanism": "permission",
+                                "pillars": [{"name": "architectural_constraints", "role": "primary"}],
+                            },
+                            "permission": {
+                                "request_id": request["id"],
+                                "type": request["type"],
+                                "target_kind": "exact_directory",
+                                "capabilities": request["capabilities"],
+                                "outcome": "needs_user",
+                            },
+                        },
+                    )
+                interrupt(
+                    {
+                        "type": "permission_request",
+                        "request": request,
+                        "decisions": [{"type": "approve"}, {"type": "reject"}],
+                    }
+                )
+                # LangGraph resumes by re-running this middleware after the
+                # API records the exact Run-scoped directory grant.
+                return None
 
             if tool_name in {"edit_file", "write_file", "patch_file", "commit_external_artifact"}:
                 requested = self._external_write_path(raw_path, workspace_path)

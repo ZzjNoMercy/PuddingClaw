@@ -16,7 +16,7 @@ class ApprovalMode(StrEnum):
 
 
 DEFAULT_APPROVAL_MODE = ApprovalMode.STRICT
-PERMISSION_POLICY_VERSION = "tool-execution-v2"
+PERMISSION_POLICY_VERSION = "tool-execution-v3"
 
 
 def normalize_approval_mode(value: Any) -> ApprovalMode:

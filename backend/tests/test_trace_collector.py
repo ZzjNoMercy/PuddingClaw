@@ -76,7 +76,9 @@ def test_trace_collector_adds_todo_span():
 
 def test_trace_collector_adds_rag_span_under_tool():
     collector = TraceCollector(session_id="session-rag")
-    tool_id = collector.start_tool_span("llamaindex_knowledge_query", tool_call_id="call-rag", input_data={"query": "AI"})
+    tool_id = collector.start_tool_span(
+        "llamaindex_knowledge_query", tool_call_id="call-rag", input_data={"query": "AI"}
+    )
     rag_id = collector.add_rag_span(
         "retrieve.text_vector",
         {
@@ -320,24 +322,14 @@ def test_trace_collector_orders_before_agent_invocations_by_middleware_stack():
         messages=[
             {
                 "role": "system",
-                "content": (
-                    "skills/aihot/SKILL.md\n"
-                    "<agent_memory>\n"
-                    "/MEMORY.md\n"
-                    "# Project Memory\n"
-                    "</agent_memory>"
-                ),
+                "content": ("skills/aihot/SKILL.md\n<agent_memory>\n/MEMORY.md\n# Project Memory\n</agent_memory>"),
             }
         ],
         capture_boundary="test.boundary",
     )
 
     trace = collector.finish(status="completed")
-    before_agent = [
-        item
-        for item in trace["middleware_invocations"]
-        if item["hook"] == "before_agent"
-    ]
+    before_agent = [item for item in trace["middleware_invocations"] if item["hook"] == "before_agent"]
     assert [item["category"] for item in before_agent] == ["skills", "memory"]
     assert before_agent[0]["middleware"] == ["SkillsMiddleware"]
     assert before_agent[1]["middleware"] == ["MemoryMiddleware"]
@@ -419,6 +411,51 @@ def test_trace_collector_model_input_records_tool_call_args():
     ]
 
 
+def test_trace_collector_exposes_hidden_provider_tool_calls_and_tool_response_id():
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    collector = TraceCollector(session_id="session-hidden-tool-call")
+    collector.add_model_input_span(
+        messages=[
+            AIMessage(
+                content="",
+                invalid_tool_calls=[
+                    {
+                        "id": "call-invalid",
+                        "name": "patch_file",
+                        "args": "{",
+                        "error": "bad json",
+                        "type": "invalid_tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(
+                content="could not execute",
+                tool_call_id="call-invalid",
+                name="patch_file",
+                status="error",
+            ),
+        ],
+        capture_boundary="test.boundary",
+    )
+
+    trace = collector.finish(status="completed")
+    model_input = next(s for s in trace["spans"] if s["type"] == "model_input")
+    messages = model_input["output"]["messages_preview"]
+
+    assert messages[0]["tool_call_count"] == 0
+    assert messages[0]["invalid_tool_call_count"] == 1
+    assert messages[0]["provider_tool_call_count"] == 1
+    assert messages[0]["provider_tool_call_ids"] == ["call-invalid"]
+    assert messages[1]["tool_call_id"] == "call-invalid"
+    message_section = next(
+        item
+        for item in model_input["output"]["model_call_contract"]["assembly"]["sections"]
+        if item["key"] == "messages"
+    )
+    assert message_section["provider_tool_call_count"] == 1
+
+
 def test_trace_collector_adds_custom_span():
     collector = TraceCollector(session_id="session-5")
     collector.add_custom_span("context_maintenance", {"phase": "summarize"})
@@ -498,9 +535,7 @@ def test_middleware_trace_proxy_records_direct_state_hook_attribution():
     assert result["messages"][-1]["role"] == "system"
     trace = collector.finish(status="completed")
     invocation = next(
-        item
-        for item in trace["middleware_invocations"]
-        if item["title"] == "DemoBeforeModelMiddleware.before_model"
+        item for item in trace["middleware_invocations"] if item["title"] == "DemoBeforeModelMiddleware.before_model"
     )
     assert invocation["metadata"]["attribution"] == "middleware_proxy"
     assert invocation["metadata"]["coverage"] == "direct"
@@ -554,9 +589,7 @@ def test_middleware_trace_proxy_records_model_call_index_per_before_model_call()
 
     trace = collector.finish(status="completed")
     invocations = [
-        item
-        for item in trace["middleware_invocations"]
-        if item["title"] == "DemoBeforeModelMiddleware.before_model"
+        item for item in trace["middleware_invocations"] if item["title"] == "DemoBeforeModelMiddleware.before_model"
     ]
     assert [item["metadata"]["model_call_index"] for item in invocations] == [0, 1]
 
@@ -602,9 +635,7 @@ def test_trace_collector_state_summary_tracks_field_level_changes():
     after = TraceCollector.summarize_hook_payload(
         {
             "messages": [{"role": "user", "content": "hello"}],
-            "skills_metadata": [
-                {"name": "aihot", "location": "skills/aihot/SKILL.md", "description": "AI HOT"}
-            ],
+            "skills_metadata": [{"name": "aihot", "location": "skills/aihot/SKILL.md", "description": "AI HOT"}],
             "todos": [
                 {"content": "plan", "status": "in_progress"},
                 {"content": "ship", "status": "pending"},
@@ -654,9 +685,7 @@ def test_middleware_trace_proxy_records_wrap_model_call_attribution():
     assert response.result[0].content == "hi"
     trace = collector.finish(status="completed")
     invocation = next(
-        item
-        for item in trace["middleware_invocations"]
-        if item["title"] == "DemoWrapModelMiddleware.wrap_model_call"
+        item for item in trace["middleware_invocations"] if item["title"] == "DemoWrapModelMiddleware.wrap_model_call"
     )
     assert invocation["hook"] == "wrap_model_call"
     assert invocation["metadata"]["coverage"] == "direct"
@@ -737,9 +766,7 @@ def test_trace_collector_emits_tool_span_events():
     collector.finish(status="completed")
 
     start_events = [e for e in events if e[0] == "trace_span_start"]
-    tool_start = next(
-        (e for e in start_events if e[1]["span"]["type"] == "tool"), None
-    )
+    tool_start = next((e for e in start_events if e[1]["span"]["type"] == "tool"), None)
     assert tool_start is not None
     assert tool_start[1]["span"]["status"] == "running"
 

@@ -306,7 +306,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "docker": {
                 "connection": "",
                 "context": "",
-                "image": "puddingclaw/sandbox:python3.12-node22-v2",
+                "image": "puddingclaw/sandbox:python3.12-node22-curl-v3",
                 "cpu_limit": "2",
                 "memory_limit_mb": 2048,
                 "pids_limit": 256,
@@ -413,8 +413,9 @@ def _migrate_legacy_config(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     if isinstance(docker, dict) and docker.get("image") in {
         "python:3.12-slim",
         "puddingclaw/sandbox:python3.12-node22-v1",
+        "puddingclaw/sandbox:python3.12-node22-v2",
     }:
-        docker["image"] = "puddingclaw/sandbox:python3.12-node22-v2"
+        docker["image"] = "puddingclaw/sandbox:python3.12-node22-curl-v3"
         docker.setdefault("dependency_setup_enabled", False)
         migrated = True
     if isinstance(docker, dict):

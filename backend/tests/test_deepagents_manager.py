@@ -36,22 +36,19 @@ def test_effective_agent_messages_uses_summary_and_preserved_tail():
     ]
 
 
-def test_terminal_candidate_projection_marks_only_last_segment_as_terminal():
+def test_legacy_segment_verification_projection_is_removed():
     from graph.deepagents_manager import DeepAgentsAgentManager
 
     segments = [
         {"content": "执行说明", "verification_state": "pending"},
         {"content": "", "tool_calls": [{"id": "call-1"}], "verification_state": "pending"},
-        {"content": "候选结果", "verification_state": "pending"},
+        {"content": "旧终态文本", "verification_state": "pending"},
     ]
 
-    DeepAgentsAgentManager._mark_terminal_candidate_segments(segments, "failed")
+    DeepAgentsAgentManager._strip_legacy_segment_verification_state(segments)
 
-    assert [item["verification_state"] for item in segments] == [
-        "progress",
-        "progress",
-        "failed",
-    ]
+    assert all("verification_state" not in item for item in segments)
+    assert [item.get("content") for item in segments] == ["执行说明", "", "旧终态文本"]
 
 
 def test_middleware_inventory_uses_actual_hook_overrides(tmp_path):
@@ -75,14 +72,13 @@ def test_middleware_inventory_uses_actual_hook_overrides(tmp_path):
         "MemoryMiddleware",
     ]
     assert [item["name"] for item in inventory["hooks"]["wrap_model_call"]] == [
-        "TodoListMiddleware",
+        "HarnessTodoMiddleware",
         "SubAgentMiddleware",
         "MemoryMiddleware",
         "AnthropicPromptCachingMiddleware",
     ]
     assert [item["name"] for item in inventory["hooks"]["after_model"]] == [
         "PatchToolCallsMiddleware",
-        "TodoListMiddleware",
     ]
 
 
@@ -164,7 +160,6 @@ def test_completion_gate_reads_current_run_artifact_receipt_from_session(tmp_pat
     from harness.coordinators import HarnessRunCoordinator
     from harness.models import RunStatus
     from harness.verification_activations import build_verification_activations
-    from langchain_core.messages import ToolMessage
 
     session_manager.initialize(tmp_path)
     session_manager.create_session("session-gate-artifact", metadata={"runtime_mode": "agent"})
@@ -229,7 +224,7 @@ def test_completion_gate_reads_current_run_artifact_receipt_from_session(tmp_pat
     assert "jump_to" not in update
 
 
-def test_completion_gate_grades_task_at_deterministic_iteration_limit(tmp_path, monkeypatch):
+def test_completion_gate_keeps_revising_past_legacy_iteration_limit(tmp_path, monkeypatch):
     from graph.deepagents_manager import PuddingClawRubricMiddleware
     from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
 
@@ -265,14 +260,47 @@ def test_completion_gate_grades_task_at_deterministic_iteration_limit(tmp_path, 
     )
 
     assert update is not None
-    assert update["_completion_gate_status"] == "max_iterations_reached"
-    assert update["_rubric_status"] == "max_iterations_reached"
-    assert "jump_to" not in update
-    assert "messages" not in update
-    assert update["_rubric_evaluations"][-1]["criteria"][0]["name"] == "task_fulfillment"
+    assert update["_completion_gate_status"] == "needs_revision"
+    assert update["jump_to"] == "model"
+    assert update["messages"][0].name == "puddingclaw_completion_gate"
+    assert "_rubric_evaluations" not in update
 
 
-def test_deterministic_and_grader_share_one_verification_attempt_budget(tmp_path, monkeypatch):
+def test_completion_gate_stops_after_repeated_identical_gap_without_new_evidence(tmp_path):
+    from graph.deepagents_manager import PuddingClawRubricMiddleware
+    from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
+
+    contract = RunRubricCompiler.compile(
+        RubricBuildContext(user_message="生成销量报告")
+    )
+    assert contract is not None
+    middleware = PuddingClawRubricMiddleware(model=SimpleNamespace(), max_iterations=2)
+    runtime = SimpleNamespace(
+        context={"workspace_path": str(tmp_path)},
+        stream_writer=None,
+    )
+    initial = {
+        "messages": [AIMessage(content="报告完成")],
+        "todos": [{"id": "todo-1", "content": "生成报告", "status": "in_progress"}],
+        "rubric": contract.rubric,
+        "verification_contract": contract.model_dump(mode="json"),
+    }
+
+    first = middleware._completion_gate_update(initial, runtime)
+    assert first is not None
+    assert first["_completion_gate_status"] == "needs_revision"
+    assert first["jump_to"] == "model"
+
+    second = middleware._completion_gate_update({**initial, **first}, runtime)
+
+    assert second is not None
+    assert second["_completion_gate_status"] == "failed"
+    assert second["_rubric_status"] == "failed"
+    assert "jump_to" not in second
+    assert second["_completion_gate_stagnation_count"] == 1
+
+
+def test_deterministic_and_grader_share_attempt_counter_without_ending_run(tmp_path, monkeypatch):
     from graph.deepagents_manager import PuddingClawRubricMiddleware
     from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
 
@@ -328,16 +356,17 @@ def test_deterministic_and_grader_share_one_verification_attempt_budget(tmp_path
     second = middleware.after_agent(second_state, runtime)
     assert second is not None
     assert second["_verification_attempts"] == 2
-    assert second["_rubric_status"] == "max_iterations_reached"
-    assert "jump_to" not in second
+    assert second["_completion_gate_status"] == "needs_revision"
+    assert second["jump_to"] == "model"
 
     third = middleware.after_agent(
         {**second_state, **second, "todos": []},
         runtime,
     )
     assert third is not None
-    assert third["_rubric_status"] == "max_iterations_reached"
-    assert grader_calls == [0, 1]
+    assert third["_rubric_status"] == "satisfied"
+    assert third["_verification_attempts"] == 3
+    assert grader_calls == [0, 2]
 
 
 def test_rubric_grader_parses_plain_json_without_tool_binding():
@@ -387,6 +416,74 @@ def test_rubric_grader_payload_is_scoped_to_current_run():
     assert "本轮 L03 回答" in payload
     assert "上一轮：总结 AI 新闻" not in payload
     assert "上一轮新闻回答" not in payload
+
+
+def test_deterministic_source_result_is_not_rejudged_by_llm_grader():
+    from graph.deepagents_manager import PuddingClawRubricMiddleware
+    from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
+
+    contract = RunRubricCompiler.compile(
+        RubricBuildContext(user_message="搜索最近 AI 新闻并附来源")
+    )
+    assert contract is not None
+    middleware = PuddingClawRubricMiddleware(model=SimpleNamespace(), max_iterations=2)
+    graded = middleware._parse_grader_response(
+        AIMessage(
+            content=(
+                '{"result":"needs_revision","explanation":"对话里看不到来源",'
+                '"criteria":['
+                '{"name":"task_fulfillment","passed":true},'
+                '{"name":"web_evidence_traceability","passed":false,'
+                '"gap":"没有来源"},'
+                '{"name":"time_scope","passed":true}'
+                "]}"
+            )
+        )
+    )
+    state = {
+        "verification_contract": contract.model_dump(mode="json"),
+        "_deterministic_evaluations": [
+            {
+                "criterion_id": "web_evidence_traceability",
+                "passed": True,
+                "verifier": "deterministic",
+                "evidence": [{"kind": "source", "uri": "https://example.com/news"}],
+            },
+            {
+                "criterion_id": "time_scope",
+                "passed": True,
+                "verifier": "deterministic",
+                "evidence": [],
+            },
+        ],
+    }
+
+    reconciled = middleware._reconcile_deterministic_grader_response(state, graded)
+
+    assert reconciled.result == "satisfied"
+    by_name = {item["name"]: item for item in reconciled.criteria}
+    assert by_name["web_evidence_traceability"]["passed"] is True
+    assert by_name["time_scope"]["passed"] is True
+    assert "对话里看不到来源" not in reconciled.explanation
+
+
+def test_published_verification_summary_keeps_only_user_relevant_outcomes():
+    from graph.deepagents_manager import _user_facing_verification_summary
+
+    summary = _user_facing_verification_summary(
+        "已读取 SKILL.md 并执行版本检查。"
+        "两次 execute 都返回 ToolMessage，Todo 和 reconciliation 无缺口。"
+        "已整理过去 24 小时的 8 条重点资讯，来源链接完整可用。"
+        "关键信息均能追溯到本次查询结果。"
+        "Harness 的 required criterion 均已满足。"
+    )
+
+    assert summary == (
+        "已整理过去 24 小时的 8 条重点资讯，来源链接完整可用。"
+        "关键信息均能追溯到本次查询结果。"
+    )
+    assert "execute" not in summary
+    assert "Harness" not in summary
 
 
 def test_harness_summary_envelope_is_deterministic_and_keeps_authoritative_pending_work(monkeypatch):
@@ -443,6 +540,37 @@ def test_harness_summary_envelope_is_deterministic_and_keeps_authoritative_pendi
             }
         ],
     )
+    monkeypatch.setattr(
+        manager_module.session_manager,
+        "list_external_artifact_leases",
+        lambda _session_id: [
+            {
+                "lease_id": "artifact-lease-1",
+                "status": "staged",
+                "target_path": "/outside/report.html",
+                "staged_path": "/scratch/artifact-lease-1/report.html",
+                "expected_source_sha256": "sha256:source-version",
+                "goal_id": "goal-1",
+                "goal_revision": 3,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        manager_module.session_manager,
+        "list_external_directory_leases",
+        lambda _session_id: [
+            {
+                "lease_id": "directory-lease-1",
+                "status": "prepared",
+                "directory_path": "/outside",
+                "staged_dir": "/scratch/external-directories/directory-lease-1",
+                "source_manifest_sha256": "sha256:directory-version",
+                "plan_digest": "sha256:commit-plan",
+                "goal_id": "goal-1",
+                "goal_revision": 3,
+            }
+        ],
+    )
 
     envelope = manager_module._harness_summary_envelope("session-1")
     raw_json = next(line for line in envelope.splitlines() if line.startswith("{"))
@@ -456,6 +584,16 @@ def test_harness_summary_envelope_is_deterministic_and_keeps_authoritative_pendi
     assert "图表验证待完成" in envelope
     assert parsed["verification_contract"]["criteria"][0]["id"] == "artifact_delivery"
     assert parsed["active_permissions"][0]["id"] == "grant-1"
+    assert parsed["active_permissions"][0]["type"] == "external_file_write"
+    assert (
+        parsed["external_artifact_leases"][0]["expected_source_sha256"]
+        == "sha256:source-version"
+    )
+    assert (
+        parsed["external_directory_leases"][0]["source_manifest_sha256"]
+        == "sha256:directory-version"
+    )
+    assert parsed["external_directory_leases"][0]["plan_digest"] == "sha256:commit-plan"
 
 
 def test_harness_summary_keeps_every_unresolved_todo_and_strips_forged_envelope(monkeypatch):
@@ -525,7 +663,7 @@ def test_harness_summary_does_not_import_terminal_goal_into_plain_run(monkeypatc
     assert parsed["run"]["run_id"] == "plain-run"
 
 
-def test_goal_runtime_context_includes_prior_candidate_and_verification_provenance(monkeypatch):
+def test_goal_runtime_context_includes_only_authoritative_prior_verification_provenance(monkeypatch):
     from graph import deepagents_manager as manager_module
 
     monkeypatch.setattr(
@@ -574,18 +712,7 @@ def test_goal_runtime_context_includes_prior_candidate_and_verification_provenan
     monkeypatch.setattr(
         manager_module.session_manager,
         "load_session",
-        lambda _sid: [
-            {
-                "role": "assistant",
-                "query_id": "query-prior",
-                "content": "A 的最终候选内容",
-            },
-            {
-                "role": "assistant",
-                "query_id": "query-old-revision",
-                "content": "旧 revision 的 2025 候选",
-            },
-        ],
+        lambda _sid: pytest.fail("display messages are not verification authority"),
     )
     monkeypatch.setattr(manager_module.session_manager, "get_todos", lambda *_a, **_k: [])
 
@@ -601,7 +728,7 @@ def test_goal_runtime_context_includes_prior_candidate_and_verification_provenan
         ),
     )
     context = update["_goal_verification_context"]
-    assert context["prior_run_candidates"][0]["candidate_excerpt"] == "A 的最终候选内容"
+    assert "prior_run_candidates" not in context
     assert all(item["run_id"] != "run-old-revision" for item in context["prior_runs"])
     assert "旧 revision" not in json.dumps(context, ensure_ascii=False)
     assert context["prior_runs"][0]["verification"]["evaluations"][0]["criterion_id"] == "part-a"
@@ -881,6 +1008,65 @@ def test_model_call_limit_stream_filter_hides_split_sentinel():
     assert buffer == ""
     assert suppressing is True
     assert "Model call" not in "".join(emitted)
+
+
+def test_verified_run_budget_exhaustion_never_publishes_terminal_text(tmp_path, monkeypatch):
+    """A legitimate budget boundary is still not permission to publish a draft."""
+
+    from graph import deepagents_manager as manager_module
+    from graph.session_manager import session_manager
+    from projects.registry import project_registry
+
+    session_manager.initialize(tmp_path)
+    project_registry.initialize(tmp_path)
+    session_manager.create_session("budget-publication-session")
+
+    class FakeDeepAgent:
+        async def astream(self, *_args, **_kwargs):
+            yield (
+                "messages",
+                (AIMessageChunk(content="尚未验收的终态文本。"), {"langgraph_node": "model"}),
+            )
+            raise manager_module.ModelCallLimitExceededError(
+                thread_count=1,
+                run_count=1,
+                thread_limit=None,
+                run_limit=1,
+            )
+
+    monkeypatch.setattr(manager_module, "create_deep_agent", lambda **_kwargs: FakeDeepAgent())
+
+    async def no_title(_session_id: str):
+        return None
+
+    monkeypatch.setattr(manager_module, "_generate_title", no_title)
+    runtime = manager_module.DeepAgentsAgentManager()
+    runtime.initialize(Path(tmp_path))
+
+    async def collect():
+        return [
+            event
+            async for event in runtime.astream(
+                message="完成一个需要验收的任务",
+                session_id="budget-publication-session",
+                user_id="test-user",
+            )
+        ]
+
+    events = asyncio.run(collect())
+    event_names = [event["event"] for event in events]
+    done = json.loads(next(event["data"] for event in events if event["event"] == "done"))
+    history = session_manager.load_session("budget-publication-session")
+
+    assert "token" not in event_names
+    assert "final_response" not in event_names
+    assert "run_limit_reached" in event_names
+    assert done["content"] == ""
+    assert all(
+        "尚未验收的终态文本" not in str(message.get("content") or "")
+        for message in history
+        if message.get("role") == "assistant"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1734,12 +1920,16 @@ def test_cancelled_agent_stream_rejects_pending_permissions_and_cleans_checkpoin
     class FakeDeepAgent:
         async def astream(self, *_args, **_kwargs):
             yield (
+                "messages",
+                (AIMessageChunk(content="我先读取 README，确认当前内容。"), {"langgraph_node": "model"}),
+            )
+            yield (
                 "updates",
                 {
                     "model": {
                         "messages": [
                             AIMessage(
-                                content="",
+                                content="我先读取 README，确认当前内容。",
                                 tool_calls=[
                                     {
                                         "name": "read_file",
@@ -1814,8 +2004,11 @@ def test_cancelled_agent_stream_rejects_pending_permissions_and_cleans_checkpoin
     history = session_manager.load_session("cancel-session")
     assert [message["role"] for message in history] == ["user", "assistant"]
     assert history[0]["content"] == "会被取消"
-    assert "已经读取了报告" in history[1]["content"]
-    assert "本轮已被用户停止" not in history[1]["content"]
+    assert history[1]["content"] == "我先读取 README，确认当前内容。"
+    assert [segment["content"] for segment in history[1]["segments"]] == [
+        "我先读取 README，确认当前内容。",
+        "",
+    ]
     assert history[1]["interrupted"] is True
     assert "本轮已被用户停止" in history[1]["interruption_notice"]
     assert history[1]["tool_calls"][0]["tool"] == "read_file"
@@ -2309,6 +2502,45 @@ def test_harness_scratch_is_isolated_by_run_and_not_in_workspace(tmp_path, monke
     assert Path(first.execution_scratch_host_path).joinpath("report.html").read_text() == "first"
 
 
+def test_harness_scratch_survives_runs_within_same_goal_revision(tmp_path, monkeypatch):
+    from graph import deepagents_manager as manager_module
+
+    manager = manager_module.DeepAgentsAgentManager()
+    manager.initialize(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    knowledge_dir = tmp_path / "knowledge"
+    knowledge_dir.mkdir()
+    monkeypatch.setattr(manager_module, "get_knowledge_root", lambda _base_dir: knowledge_dir)
+
+    first = manager._build_backend(
+        workspace,
+        session_id="session-1",
+        query_id="query-1",
+        goal_id="goal-1",
+        goal_revision=2,
+    )
+    second = manager._build_backend(
+        workspace,
+        session_id="session-1",
+        query_id="query-2",
+        goal_id="goal-1",
+        goal_revision=2,
+    )
+    revised = manager._build_backend(
+        workspace,
+        session_id="session-1",
+        query_id="query-3",
+        goal_id="goal-1",
+        goal_revision=3,
+    )
+
+    assert first.write("/scratch/report.html", "draft").error is None
+    assert second.read("/scratch/report.html").file_data["content"] == "draft"
+    assert revised.read("/scratch/report.html").error is not None
+    assert first.execution_scratch_host_path == second.execution_scratch_host_path
+
+
 def test_persisted_attachment_refs_are_rehydrated_for_later_goal_run(tmp_path):
     from graph.deepagents_manager import DeepAgentsAgentManager
 
@@ -2348,12 +2580,16 @@ def test_deepagents_manager_emits_and_persists_tool_events(tmp_path, monkeypatch
     class FakeDeepAgent:
         async def astream(self, *_args, **_kwargs):
             yield (
+                "messages",
+                (AIMessageChunk(content="我先读取 README，确认当前内容。"), {"langgraph_node": "model"}),
+            )
+            yield (
                 "updates",
                 {
                     "model": {
                         "messages": [
                             AIMessage(
-                                content="",
+                                content="我先读取 README，确认当前内容。",
                                 tool_calls=[
                                     {
                                         "name": "read_file",
@@ -2439,6 +2675,9 @@ def test_deepagents_manager_emits_and_persists_tool_events(tmp_path, monkeypatch
     event_names = [event["event"] for event in events]
     tool_start = next(event for event in events if event["event"] == "tool_start")
     tool_end = next(event for event in events if event["event"] == "tool_end")
+    process_content = next(
+        event for event in events if event["event"] == "segment_content_replaced"
+    )
     done = next(event for event in events if event["event"] == "done")
     history = session_manager.load_session("agent-tool-session")
     assistant_with_tool = next(
@@ -2449,7 +2688,10 @@ def test_deepagents_manager_emits_and_persists_tool_events(tmp_path, monkeypatch
     assert "tool_end" in event_names
     assert event_names.count("tool_end") == 1
     assert "segment_break" in event_names
-    assert "token" in event_names
+    assert "token" not in event_names
+    assert event_names.index("segment_content_replaced") < event_names.index("tool_start")
+    assert event_names.count("final_response") == 1
+    assert event_names.index("final_response") < event_names.index("done")
     assert "citations_finalized" in event_names
     assert "done" in event_names
     # Dynamic trace events should be emitted during the run.
@@ -2466,13 +2708,105 @@ def test_deepagents_manager_emits_and_persists_tool_events(tmp_path, monkeypatch
         "id": "call_read",
     }
     assert json.loads(tool_end["data"])["output"] == "README content"
+    assert json.loads(process_content["data"])["content"] == "我先读取 README，确认当前内容。"
     assert json.loads(done["data"])["content"] == "已读取。"
+    assert assistant_with_tool["content"] == "已读取。"
+    assert [segment["content"] for segment in assistant_with_tool["segments"]] == [
+        "我先读取 README，确认当前内容。",
+        "已读取。",
+    ]
     assert assistant_with_tool["tool_calls"][0]["tool"] == "read_file"
     assert assistant_with_tool["tool_calls"][0]["output"] == "README content"
     assert len(assistant_with_tool["tool_calls"]) == 1
     assert "raw_output" not in assistant_with_tool["tool_calls"][0]
     assert len(deleted) == 1
     assert deleted[0].startswith("agent-tool-session:query-")
+
+
+def test_verification_retry_persists_only_the_accepted_terminal_segment(tmp_path, monkeypatch):
+    """Rejected terminal text remains in Trace/checkpoint, not Session chat."""
+
+    from graph import deepagents_manager as manager_module
+    from graph.session_manager import session_manager
+    from projects.registry import project_registry
+
+    session_manager.initialize(tmp_path)
+    project_registry.initialize(tmp_path)
+    session_manager.create_session("verification-segment-session")
+
+    class FakeDeepAgent:
+        async def astream(self, initial_state, *_args, **_kwargs):
+            yield (
+                "messages",
+                (AIMessageChunk(content="任务已经完成。"), {"langgraph_node": "model"}),
+            )
+            yield (
+                "custom",
+                {
+                    "type": "deterministic_checks_completed",
+                    "iteration": 1,
+                    "attempt": 1,
+                    "status": "needs_revision",
+                    "evaluations": [],
+                },
+            )
+            yield (
+                "messages",
+                (AIMessageChunk(content="已修正并真正完成。"), {"langgraph_node": "model"}),
+            )
+            yield (
+                "values",
+                {
+                    **initial_state,
+                    "messages": [AIMessage(content="已修正并真正完成。")],
+                    "_verification_attempts": 2,
+                    "_completion_gate_status": "satisfied",
+                    "_rubric_status": "satisfied",
+                },
+            )
+
+    monkeypatch.setattr(
+        manager_module,
+        "create_deep_agent",
+        lambda **_kwargs: FakeDeepAgent(),
+    )
+
+    async def no_title(_session_id: str):
+        return None
+
+    monkeypatch.setattr(manager_module, "_generate_title", no_title)
+
+    runtime = manager_module.DeepAgentsAgentManager()
+    runtime.initialize(Path(tmp_path))
+
+    async def collect():
+        return [
+            event
+            async for event in runtime.astream(
+                message="继续处理",
+                session_id="verification-segment-session",
+                project_id=None,
+                user_id="test-user",
+            )
+        ]
+
+    events = asyncio.run(collect())
+    breaks = [event for event in events if event["event"] == "segment_break"]
+    history = session_manager.load_session("verification-segment-session")
+    assistant = next(message for message in history if message["role"] == "assistant")
+
+    assert any(json.loads(event["data"]).get("reason") == "verification_retry" for event in breaks)
+    assert [segment["content"] for segment in assistant["segments"]] == [
+        "",
+        "已修正并真正完成。",
+    ]
+    assert all("verification_state" not in segment for segment in assistant["segments"])
+    assert "任务已经完成" not in assistant["content"]
+    assert any(
+        item.get("type") == "activity"
+        and item.get("label") == "发现完成条件缺口，继续处理"
+        for item in assistant["timeline"]
+    )
 
 
 def test_deepagents_manager_streams_and_persists_published_attachment(tmp_path, monkeypatch):
@@ -2485,6 +2819,7 @@ def test_deepagents_manager_streams_and_persists_published_attachment(tmp_path, 
     from projects.registry import project_registry
 
     session_manager.initialize(tmp_path)
+    attachment_store.initialize(tmp_path)
     project_registry.initialize(tmp_path)
     session_manager.create_session("published-attachment-session")
     emitted: list[dict] = []
@@ -2690,7 +3025,7 @@ def test_deepagents_manager_emits_sources_citations_and_title(tmp_path, monkeypa
         return [
             event
             async for event in runtime.astream(
-                message="今天 AI 有什么热点",
+                    message="整理这段内容",
                 session_id="agent-citation-session",
                 project_id=None,
                 user_id="test-user",
@@ -2710,7 +3045,7 @@ def test_deepagents_manager_emits_sources_citations_and_title(tmp_path, monkeypa
     assert "citations_finalized" in event_names
     assert json.loads(source_found["data"])["source"]["source_id"] == "src_aihot_demo"
     assert json.loads(citations_finalized["data"])["citations"][0]["source_id"] == "src_aihot_demo"
-    assert json.loads(title_events[0]["data"])["title"] == "今天 AI 有什么热点"
+    assert json.loads(title_events[0]["data"])["title"] == "整理这段内容"
     assert json.loads(title_events[0]["data"])["provisional"] is True
     assert json.loads(title_events[-1]["data"])["title"] == "AI热点"
     assert tool_message["tool_calls"][0]["output"] == "AI HOT 返回 1 条动态 [src_aihot_demo]"
@@ -2832,14 +3167,14 @@ def test_deepagents_manager_separates_reasoning_from_final_answer(tmp_path, monk
 
     events = asyncio.run(collect())
     reasoning = next(event for event in events if event["event"] == "reasoning")
-    token = next(event for event in events if event["event"] == "token")
+    final_response = next(event for event in events if event["event"] == "final_response")
     history = session_manager.load_session("agent-reasoning-session")
     assistant = next(message for message in history if message["role"] == "assistant")
 
     assert json.loads(reasoning["data"])["chars"] > 0
     assert "模型内部推理" in json.loads(reasoning["data"])["content"]
-    assert "模型本轮只返回了 reasoning_content" in json.loads(token["data"])["content"]
-    assert "模型内部推理" not in json.loads(token["data"])["content"]
+    assert "模型本轮只返回了 reasoning_content" in json.loads(final_response["data"])["content"]
+    assert "模型内部推理" not in json.loads(final_response["data"])["content"]
     assert "模型内部推理" not in assistant["content"]
 
 
@@ -2898,7 +3233,7 @@ def test_deepagents_manager_ignores_internal_context_summary_chunks(tmp_path, mo
     visible_text = "".join(
         json.loads(event["data"])["content"]
         for event in events
-        if event["event"] == "token"
+        if event["event"] in {"token", "final_response"}
     )
     assistant = next(
         message
@@ -2997,7 +3332,7 @@ def test_deepagents_manager_extracts_reasoning_from_thinking_blocks(tmp_path, mo
         return [
             event
             async for event in runtime.astream(
-                message="今天 AI 有什么热点",
+                    message="分析这段模型输出",
                 session_id="agent-thinking-session",
                 project_id=None,
                 user_id="test-user",
@@ -3006,12 +3341,12 @@ def test_deepagents_manager_extracts_reasoning_from_thinking_blocks(tmp_path, mo
 
     events = asyncio.run(collect())
     reasoning_events = [e for e in events if e["event"] == "reasoning"]
-    token_events = [e for e in events if e["event"] == "token"]
+    final_events = [e for e in events if e["event"] == "final_response"]
 
     reasoning_text = "".join(json.loads(e["data"])["content"] for e in reasoning_events)
     assert "分析用户需求" in reasoning_text
     assert "调用 AI HOT 工具" in reasoning_text
-    assert any("以下是" in json.loads(e["data"])["content"] for e in token_events)
+    assert any("以下是" in json.loads(e["data"])["content"] for e in final_events)
 
 
 def test_deepagents_manager_emits_interleaved_reasoning_and_content(tmp_path, monkeypatch):
@@ -3064,10 +3399,10 @@ def test_deepagents_manager_emits_interleaved_reasoning_and_content(tmp_path, mo
 
     events = asyncio.run(collect())
     reasoning = next(e for e in events if e["event"] == "reasoning")
-    token = next(e for e in events if e["event"] == "token")
+    final_response = next(e for e in events if e["event"] == "final_response")
 
     assert json.loads(reasoning["data"])["content"] == "内部推理过程。"
-    assert json.loads(token["data"])["content"] == "正式回答。"
+    assert json.loads(final_response["data"])["content"] == "正式回答。"
 
 
 def test_deepagents_manager_persists_reasoning_for_tool_call_turns(tmp_path, monkeypatch):

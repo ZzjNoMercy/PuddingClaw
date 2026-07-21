@@ -137,6 +137,16 @@ export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
   const hasRunningTool = toolItems.some(
     (item) => item.type === "tool" && item.toolCall?.status === "running"
   );
+  const hasRunningVerification = timeline.some(
+    (item) => item.type === "activity"
+      && item.status === "running"
+      && item.label === "正在核对完成质量"
+  );
+  const hasCompletedVerification = timeline.some(
+    (item) => item.type === "activity"
+      && (item.status === "satisfied" || item.status === "passed")
+      && item.label === "完成质量检查通过"
+  );
 
   const runningDurations = toolItems
     .map((item) => {
@@ -148,10 +158,13 @@ export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
   const runningSuffix = hasRunningTool && isStreaming
     ? ` · 运行中${runningElapsed ? ` ${runningElapsed}` : "..."}`
     : "";
-  const summaryText =
-    toolCount > 0
+  const summaryText = hasRunningVerification
+    ? "验收中"
+    : hasCompletedVerification
+      ? "验收完成"
+    : toolCount > 0
       ? `使用了 ${toolCount} 个工具，运行 ${commandCount} 个命令${runningSuffix}`
-      : `思考过程${runningSuffix}`;
+      : `处理过程${runningSuffix}`;
 
   const toggleTool = (id: string) => {
     setExpandedTools((prev) => ({ ...prev, [id]: !prev[id] }));
@@ -206,6 +219,19 @@ export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
                         {item.content}
                       </pre>
                     </div>
+                  </div>
+                );
+              }
+
+              if (item.type === "activity") {
+                const passed = item.status === "satisfied" || item.status === "passed";
+                const ActivityIcon = passed ? CheckCircle2 : Loader2;
+                return (
+                  <div key={item.id} className="relative flex items-start gap-3">
+                    <div className={`relative z-10 flex h-5 w-5 shrink-0 items-center justify-center rounded-full ${passed ? "bg-emerald-50 text-emerald-600" : "bg-blue-50 text-[#002fa7]"}`}>
+                      <ActivityIcon className={`h-3 w-3 ${item.status === "running" ? "animate-spin" : ""}`} />
+                    </div>
+                    <div className="pt-0.5 text-[12px] text-gray-500">{item.label}</div>
                   </div>
                 );
               }

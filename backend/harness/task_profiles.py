@@ -126,6 +126,28 @@ INTENT_REGISTRY: dict[str, dict[str, Any]] = {
         "skill": "tavily-search",
         "packs": ["core", "web_research"],
     },
+    "skill_management": {
+        "keywords": [
+            "安装skill",
+            "安装 skill",
+            "更新skill",
+            "更新 skill",
+            "升级skill",
+            "升级 skill",
+            "检查skill",
+            "检查 skill",
+            "skill版本",
+            "skill 版本",
+            "skill完整性",
+            "skill 完整性",
+        ],
+        "patterns": [
+            r"(?:安装|更新|升级|检查|校验).{0,8}skills?",
+            r"skills?.{0,8}(?:安装|更新|升级|版本|完整性|哈希)",
+        ],
+        "skill": "skill-management",
+        "packs": ["core"],
+    },
     "code": {
         "keywords": [
             "修改代码",
@@ -181,6 +203,7 @@ _PRIMARY_PRIORITY = (
     "logical_dataset",
     "database_analysis",
     "table_analysis",
+    "skill_management",
     "code",
     "ai_insights",
     "web_research",

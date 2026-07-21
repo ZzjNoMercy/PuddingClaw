@@ -147,6 +147,7 @@ export default function ChatInput() {
   const controlsMenuRef = useRef<HTMLDivElement>(null);
   const submitInFlightRef = useRef(false);
   const currentSessionIdRef = useRef(sessionId);
+  const contextUsageRequestRef = useRef(0);
   const [openPopover, setOpenPopover] = useState<OpenPopover>(null);
   const openPopoverRef = useRef<OpenPopover>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -175,8 +176,21 @@ export default function ChatInput() {
   // system prompt + messages + tool outputs (or the recorded runtime peak).
   const refreshContextUsage = useCallback(() => {
     if (!sessionId) return;
-    getSessionTokenCount(sessionId)
+    const requestedSessionId = sessionId;
+    const requestId = contextUsageRequestRef.current + 1;
+    contextUsageRequestRef.current = requestId;
+    getSessionTokenCount(requestedSessionId)
       .then((data) => {
+        // Initial page restoration briefly mounts with the default session.
+        // Its slower response must never overwrite the token meter after the
+        // persisted real session has already been restored. The sequence check
+        // also prevents older same-session refreshes from winning a race.
+        if (
+          currentSessionIdRef.current !== requestedSessionId ||
+          contextUsageRequestRef.current !== requestId
+        ) {
+          return;
+        }
         const used = data.total_tokens;
         const total = data.compaction_trigger;
         const percentage = Math.min(100, data.percentage);

@@ -79,6 +79,7 @@ class DatabaseQueryResult:
     references: dict[str, Any] = field(default_factory=dict)
     semantic_assets: dict[str, Any] = field(default_factory=dict)
     stage_timings: dict[str, float] = field(default_factory=dict)
+    generation: dict[str, Any] = field(default_factory=dict)
     warning: str | None = None
 
 
@@ -94,6 +95,7 @@ class DatabaseSqlGenerationResult:
     semantic_assets: dict[str, Any] = field(default_factory=dict)
     stage_timings: dict[str, float] = field(default_factory=dict)
     guardrail_note: str = ""
+    generation: dict[str, Any] = field(default_factory=dict)
 
 
 def to_plain_dict(value: Any) -> Any:

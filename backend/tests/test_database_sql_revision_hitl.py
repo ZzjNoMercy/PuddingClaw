@@ -94,6 +94,56 @@ async def test_database_sql_generate_rejects_asset_outside_selected_model() -> N
 
 
 @pytest.mark.asyncio
+async def test_database_sql_generate_normalizes_unique_bare_asset_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.database.sql_generate_tool as module
+
+    requests: list[Any] = []
+
+    async def fake_generate(_session: object, request: Any) -> DatabaseSqlGenerationResult:
+        requests.append(request)
+        return _result(request.question)
+
+    monkeypatch.setattr(module, "get_sessionmaker", lambda: _FakeSessionMaker())
+    monkeypatch.setattr(module, "generate_database_sql", fake_generate)
+    runtime = SimpleNamespace(
+        state={
+            "analytics_model_id": "产品配置分析",
+            "allowed_semantic_asset_ids": ["measure:launch_cycle", "dimension:launch_time"],
+        }
+    )
+
+    await DatabaseSqlGenerateTool()._arun(
+        question="上市周期",
+        selected_semantic_asset_ids=["launch_cycle"],
+        runtime=runtime,
+    )
+
+    assert requests[0].measure_ids == ["measure:launch_cycle"]
+
+
+@pytest.mark.asyncio
+async def test_database_sql_generate_rejects_ambiguous_bare_asset_id() -> None:
+    runtime = SimpleNamespace(
+        state={
+            "analytics_model_id": "产品配置分析",
+            "allowed_semantic_asset_ids": ["measure:launch", "dimension:launch"],
+        }
+    )
+
+    result = await DatabaseSqlGenerateTool()._arun(
+        question="上市情况",
+        selected_semantic_asset_ids=["launch"],
+        runtime=runtime,
+    )
+
+    assert "存在多个候选" in result
+    assert "measure:launch" in result
+    assert "dimension:launch" in result
+
+
+@pytest.mark.asyncio
 async def test_revision_registry_has_exactly_three_natural_language_decisions() -> None:
     registry = DatabaseSqlRevisionResumeRegistry()
     generation = registry.register_generation(
@@ -217,6 +267,89 @@ async def test_rejected_revision_reuses_original_generation_without_regeneration
     assert "database_sql_validate" in rejected
     assert "database_sql_execute" in rejected
     assert "SELECT original" in rejected
+
+
+@pytest.mark.asyncio
+async def test_technical_sql_repair_regenerates_without_business_hitl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.database.sql_generate_tool as module
+
+    requests: list[str] = []
+
+    async def fake_generate(_session: object, request: Any) -> DatabaseSqlGenerationResult:
+        requests.append(request.question)
+        return _result(request.question, sql=f"SELECT {len(requests)}")
+
+    def unexpected_interrupt(_payload: object) -> object:
+        raise AssertionError("technical SQL repair must not open business HITL")
+
+    monkeypatch.setattr(module, "get_sessionmaker", lambda: _FakeSessionMaker())
+    monkeypatch.setattr(module, "generate_database_sql", fake_generate)
+    monkeypatch.setattr(module, "interrupt", unexpected_interrupt)
+    tool = DatabaseSqlGenerateTool(session_id="session-technical", query_id="query-technical")
+
+    original = await tool._arun(question="查询 2020 到 2026 年高速 NOA 配置率")
+    generation_id = next(
+        line.split("：", 1)[1]
+        for line in original.splitlines()
+        if line.startswith("- generation_id：")
+    )
+    repaired = await tool._arun(
+        question="ignored",
+        parent_generation_id=generation_id,
+        revision_instruction=(
+            "原始 SQL 的相关 EXISTS 子查询超时，请改用 LEFT JOIN、DISTINCT 标志表和 COUNT FILTER 聚合。"
+        ),
+    )
+
+    assert len(requests) == 2
+    assert "原始业务问题（业务语义不可改变）" in requests[1]
+    assert "SQL 技术修复反馈" in requests[1]
+    assert "技术修复已自动重生成" in repaired
+    assert "无需业务口径确认" in repaired
+    assert "SELECT 2" in repaired
+
+
+@pytest.mark.asyncio
+async def test_mixed_business_and_technical_revision_still_requires_hitl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.database.sql_generate_tool as module
+
+    requests: list[str] = []
+    interrupted: list[dict[str, Any]] = []
+
+    async def fake_generate(_session: object, request: Any) -> DatabaseSqlGenerationResult:
+        requests.append(request.question)
+        return _result(request.question, sql=f"SELECT {len(requests)}")
+
+    def approve(payload: dict[str, Any]) -> dict[str, str]:
+        interrupted.append(payload)
+        return {
+            "action": "agree",
+            "revision_instruction": "分母改为车系粒度，并使用 LEFT JOIN",
+        }
+
+    monkeypatch.setattr(module, "get_sessionmaker", lambda: _FakeSessionMaker())
+    monkeypatch.setattr(module, "generate_database_sql", fake_generate)
+    monkeypatch.setattr(module, "interrupt", approve)
+    tool = DatabaseSqlGenerateTool(session_id="session-mixed", query_id="query-mixed")
+
+    original = await tool._arun(question="高速 NOA 配置率")
+    generation_id = next(
+        line.split("：", 1)[1]
+        for line in original.splitlines()
+        if line.startswith("- generation_id：")
+    )
+    await tool._arun(
+        question="ignored",
+        parent_generation_id=generation_id,
+        revision_instruction="分母改为车系粒度，并使用 LEFT JOIN",
+    )
+
+    assert len(interrupted) == 1
+    assert interrupted[0]["type"] == "database_sql_revision_request"
 
 
 @pytest.mark.asyncio

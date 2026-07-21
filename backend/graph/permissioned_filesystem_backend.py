@@ -14,6 +14,10 @@ from graph.session_manager import session_manager
 class PermissionedCompositeBackend(CompositeBackend):
     """Delegate approved external writes while keeping normal virtual routing."""
 
+    _ROUTED_VIRTUAL_PREFIXES = (
+        "/workspace/",
+        "/scratch/",
+    )
     _READONLY_VIRTUAL_PREFIXES = (
         "/knowledge/",
         "/semantic-assets/",
@@ -72,10 +76,20 @@ class PermissionedCompositeBackend(CompositeBackend):
     def _managed_readonly(self, file_path: str) -> bool:
         return self._readonly_virtual_path(file_path) or self._readonly_host_path(file_path)
 
+    @classmethod
+    def _routed_virtual_path(cls, file_path: str) -> bool:
+        """Return whether CompositeBackend, not host grants, owns this path."""
+
+        normalized = file_path.replace("\\", "/")
+        return any(
+            normalized == prefix.rstrip("/") or normalized.startswith(prefix)
+            for prefix in cls._ROUTED_VIRTUAL_PREFIXES
+        )
+
     def _approved_external_target(self, file_path: str) -> tuple[FilesystemBackend, str, str] | None:
         if not self.session_id:
             return None
-        if self._managed_readonly(file_path):
+        if self._routed_virtual_path(file_path) or self._managed_readonly(file_path):
             return None
         requested = Path(file_path).expanduser()
         if not requested.is_absolute():
@@ -87,7 +101,11 @@ class PermissionedCompositeBackend(CompositeBackend):
         return backend, f"/{resolved.name}", str(resolved)
 
     def _approved_external_read_target(self, file_path: str) -> tuple[FilesystemBackend, str] | None:
-        if not self.session_id or self._managed_readonly(file_path):
+        if (
+            not self.session_id
+            or self._routed_virtual_path(file_path)
+            or self._managed_readonly(file_path)
+        ):
             return None
         requested = Path(file_path).expanduser()
         if not requested.is_absolute():

@@ -2232,7 +2232,7 @@ export default function SettingsPage() {
                             <div>
                               <p className="text-[13px] font-semibold text-gray-900">Run Rubric 验收</p>
                               <p className="mt-1 text-[11px] leading-relaxed text-gray-500">
-                                Rubric 属于 Run。即使未开启 Goal，有明确产物或分析结果的 Run 仍可自动验收。
+                                Rubric 属于 Run。完成缺口会在同一 Run 内继续修正，统一由模型调用预算控制，不再按验收轮次提前结束。
                               </p>
                             </div>
                             <SwitchButton
@@ -2240,19 +2240,6 @@ export default function SettingsPage() {
                               onChange={setRubricEnabled}
                               ariaLabel="启用 Run Rubric"
                             />
-                          </div>
-                          <div className="mt-4 max-w-xs">
-                            <FormField label="单 Run 最大修正轮数">
-                              <input
-                                type="number"
-                                min={1}
-                                max={20}
-                                value={rubricMaxIterations}
-                                onChange={(event) => setRubricMaxIterations(event.target.value)}
-                                className="form-input"
-                                disabled={!rubricEnabled}
-                              />
-                            </FormField>
                           </div>
                         </div>
 

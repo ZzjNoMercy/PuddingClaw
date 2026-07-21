@@ -3,6 +3,7 @@
 import hashlib
 import json
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -44,6 +45,7 @@ class SessionManager:
     _shared_session_locks_guard = threading.Lock()
 
     def __init__(self) -> None:
+        self._base_dir: Path | None = None
         self._sessions_dir: Path | None = None  # 会话文件存储目录，initialize() 时设置
         self._traces_dir: Path | None = None
 
@@ -59,6 +61,7 @@ class SessionManager:
 
     def initialize(self, base_dir: Path) -> None:
         """初始化：设置存储目录为 base_dir/sessions/，不存在则创建"""
+        self._base_dir = base_dir
         self._sessions_dir = base_dir / "sessions"  # 拼接会话目录路径
         self._sessions_dir.mkdir(exist_ok=True)  # 目录不存在时自动创建
         self._traces_dir = self._sessions_dir / "traces"
@@ -689,6 +692,115 @@ class SessionManager:
         self._write_file(session_id, data)
 
     @_session_write_locked
+    def commit_accepted_completion(
+        self,
+        session_id: str,
+        *,
+        run: dict[str, Any],
+        goal: dict[str, Any] | None,
+        query_id: str,
+        content: str,
+        tool_calls: list[dict[str, Any]] | None = None,
+        sources: list[dict[str, Any]] | None = None,
+        citations: list[dict[str, Any]] | None = None,
+        reasoning_content: str | None = None,
+        timeline: list[dict[str, Any]] | None = None,
+        segments: list[dict[str, Any]] | None = None,
+        output_attachments: list[dict[str, Any]] | None = None,
+        verification_summary: str | None = None,
+    ) -> None:
+        """Atomically publish an accepted answer with its Run/Goal authority.
+
+        A caller cannot use this path to publish a draft, a failed verification
+        result, or a Goal Run that has not achieved the current revision.
+        The final Session write contains the assistant message, accepted report,
+        RunOutcome and Goal decision together.
+        """
+
+        from harness.models import (
+            GoalRecord,
+            GoalStatus,
+            RunOutcome,
+            RunRecord,
+            VerificationStatus,
+        )
+
+        validated_run = RunRecord.model_validate(run)
+        if validated_run.session_id != session_id or validated_run.query_id != query_id:
+            raise ValueError("Accepted completion identity does not match the Session query")
+        report = validated_run.verification_report
+        if (
+            validated_run.outcome != RunOutcome.COMPLETED
+            or report is None
+            or report.status
+            not in {VerificationStatus.NOT_REQUIRED, VerificationStatus.SATISFIED}
+        ):
+            raise ValueError("Only an accepted completed Run may publish a final response")
+
+        validated_goal: GoalRecord | None = None
+        if goal is not None:
+            validated_goal = GoalRecord.model_validate(goal)
+            decision = validated_goal.latest_goal_decision
+            if (
+                validated_goal.session_id != session_id
+                or validated_goal.goal_id != validated_run.goal_id
+                or validated_goal.status != GoalStatus.ACHIEVED
+                or decision is None
+                or not decision.accepted
+                or decision.accepted_run_id != validated_run.run_id
+                or report.accepted_for_goal_revision is not True
+            ):
+                raise ValueError("Goal completion is not accepted for the current revision")
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        harness = data.setdefault("harness", {})
+        runs = harness.setdefault("runs", {})
+        if validated_run.run_id not in runs:
+            raise ValueError(f"Run {validated_run.run_id} does not exist in session {session_id}")
+        runs[validated_run.run_id] = validated_run.model_dump(mode="json")
+        harness["latest_run_id"] = validated_run.run_id
+        if validated_goal is not None:
+            goals = harness.setdefault("goals", {})
+            goals[validated_goal.goal_id] = validated_goal.model_dump(mode="json")
+            harness["active_goal_id"] = None
+
+        message = self._build_message_payload(
+            "assistant",
+            content,
+            tool_calls=tool_calls,
+            sources=sources,
+            citations=citations,
+            reasoning_content=reasoning_content,
+            timeline=timeline,
+            segments=segments,
+            output_attachments=output_attachments,
+            query_id=query_id,
+            status="completed",
+        )
+        if verification_summary:
+            message["verification_summary"] = verification_summary
+        for collection_name in ("messages", "display_messages"):
+            collection = data.get(collection_name)
+            if collection_name == "messages" and not isinstance(collection, list):
+                collection = data.setdefault("messages", [])
+            if not isinstance(collection, list):
+                continue
+            for index, existing in enumerate(collection):
+                if (
+                    isinstance(existing, dict)
+                    and existing.get("role") == "assistant"
+                    and existing.get("query_id") == query_id
+                ):
+                    collection[index] = dict(message)
+                    break
+            else:
+                collection.append(dict(message))
+
+        self._write_file(session_id, data)
+
+    @_session_write_locked
     def set_assistant_run_boundary_notice(
         self,
         session_id: str,
@@ -1052,7 +1164,7 @@ class SessionManager:
             raise ValueError(f"Terminal Run {run_id} cannot enter evaluation")
         if run.verification_enabled:
             run.verification_contract = RunRubricCompiler.expand_for_activations(
-                contract=run.verification_contract,
+                contract=run.declared_verification_contract,
                 profile=run.task_profile,
                 message=run.objective,
                 activations=list(run.verification_activations),
@@ -1096,7 +1208,7 @@ class SessionManager:
 
         if current.verification_enabled:
             current.verification_contract = RunRubricCompiler.expand_for_activations(
-                contract=current.verification_contract,
+                contract=current.declared_verification_contract,
                 profile=current.task_profile,
                 message=current.objective,
                 activations=list(current.verification_activations),
@@ -1706,6 +1818,12 @@ class SessionManager:
 
         if attachment_store.root_dir is not None:
             attachment_store.delete_session(session_id)
+        if self._base_dir is not None:
+            safe_session = re.sub(r"[^A-Za-z0-9_-]+", "_", session_id)
+            projects_root = self._base_dir / "data" / "harness-scratch" / "projects"
+            if projects_root.exists():
+                for project_root in projects_root.iterdir():
+                    shutil.rmtree(project_root / safe_session, ignore_errors=True)
 
     def get_raw_messages(self, session_id: str) -> dict[str, Any]:
         """Return session data without loading heavyweight trace sidecars."""
@@ -2693,6 +2811,158 @@ class SessionManager:
         lease = leases.get(lease_id) if isinstance(leases, dict) else None
         return deepcopy(lease) if isinstance(lease, dict) else None
 
+    def list_external_artifact_leases(self, session_id: str) -> list[dict[str, Any]]:
+        """Return exact-file lease control state without hydrating message history."""
+
+        data = self._read_file(session_id)
+        leases = data.get("external_artifact_leases") if data else None
+        if not isinstance(leases, dict):
+            return []
+        return [deepcopy(lease) for lease in leases.values() if isinstance(lease, dict)]
+
+    def find_staged_external_artifact_lease(
+        self,
+        session_id: str,
+        *,
+        run_id: str,
+        query_id: str,
+        target_path: str,
+        goal_id: str = "",
+        goal_revision: Any = None,
+    ) -> dict[str, Any] | None:
+        """Return the active exact-file lease already owned by this Run.
+
+        A model may repeat the staging call after compaction or a tool-routing
+        correction. Reusing the active lease preserves staged edits and avoids
+        creating multiple scratch paths for the same authoritative target.
+        """
+
+        data = self._read_file(session_id)
+        leases = data.get("external_artifact_leases") if data else None
+        if not isinstance(leases, dict):
+            return None
+
+        def same_owner(lease: dict[str, Any]) -> bool:
+            return (
+                bool(goal_id)
+                and str(lease.get("goal_id") or "") == goal_id
+                and lease.get("goal_revision") == goal_revision
+            ) or (
+                not goal_id
+                and not str(lease.get("goal_id") or "")
+                and str(lease.get("run_id") or "") == run_id
+                and str(lease.get("query_id") or "") == query_id
+            )
+
+        owned_target_leases = [
+            lease
+            for lease in leases.values()
+            if isinstance(lease, dict)
+            and str(lease.get("target_path") or "") == target_path
+            and same_owner(lease)
+        ]
+        # A successful commit supersedes every older draft for the same Goal
+        # revision and target.  Without this boundary, a stale pre-commit lease
+        # can block a later validation/restage with an obsolete source hash.
+        latest_commit_at = max(
+            (
+                float(lease.get("committed_at") or lease.get("created_at") or 0)
+                for lease in owned_target_leases
+                if lease.get("status") == "committed"
+            ),
+            default=0.0,
+        )
+        matches = [
+            lease
+            for lease in owned_target_leases
+            if lease.get("status") == "staged"
+            and float(lease.get("created_at") or 0) > latest_commit_at
+        ]
+        if not matches:
+            return None
+        matches.sort(key=lambda lease: float(lease.get("created_at") or 0), reverse=True)
+        return deepcopy(matches[0])
+
+    @_session_write_locked
+    def upsert_external_directory_lease(
+        self,
+        session_id: str,
+        lease: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist one Run-scoped external-directory snapshot lease."""
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        lease_id = str(lease.get("lease_id") or "")
+        if not lease_id:
+            raise ValueError("external directory lease requires lease_id")
+        leases = data.setdefault("external_directory_leases", {})
+        leases[lease_id] = deepcopy(lease)
+        self._write_file(session_id, data)
+        return deepcopy(leases[lease_id])
+
+    def get_external_directory_lease(
+        self,
+        session_id: str,
+        lease_id: str,
+    ) -> dict[str, Any] | None:
+        data = self._read_file(session_id)
+        leases = data.get("external_directory_leases") if data else None
+        lease = leases.get(lease_id) if isinstance(leases, dict) else None
+        return deepcopy(lease) if isinstance(lease, dict) else None
+
+    def list_external_directory_leases(self, session_id: str) -> list[dict[str, Any]]:
+        """Return directory lease control state without hydrating message history."""
+
+        data = self._read_file(session_id)
+        leases = data.get("external_directory_leases") if data else None
+        if not isinstance(leases, dict):
+            return []
+        return [deepcopy(lease) for lease in leases.values() if isinstance(lease, dict)]
+
+    def find_staged_external_directory_lease(
+        self,
+        session_id: str,
+        *,
+        run_id: str,
+        query_id: str,
+        directory_path: str,
+        goal_id: str = "",
+        goal_revision: Any = None,
+    ) -> dict[str, Any] | None:
+        """Return a reusable directory draft for the same execution scope."""
+
+        data = self._read_file(session_id)
+        leases = data.get("external_directory_leases") if data else None
+        if not isinstance(leases, dict):
+            return None
+
+        def same_owner(lease: dict[str, Any]) -> bool:
+            if goal_id:
+                return (
+                    str(lease.get("goal_id") or "") == goal_id
+                    and lease.get("goal_revision") == goal_revision
+                )
+            return (
+                not str(lease.get("goal_id") or "")
+                and str(lease.get("run_id") or "") == run_id
+                and str(lease.get("query_id") or "") == query_id
+            )
+
+        matches = [
+            lease
+            for lease in leases.values()
+            if isinstance(lease, dict)
+            and lease.get("status") in {"staged", "prepared"}
+            and str(lease.get("directory_path") or "") == directory_path
+            and same_owner(lease)
+        ]
+        if not matches:
+            return None
+        matches.sort(key=lambda lease: float(lease.get("created_at") or 0), reverse=True)
+        return deepcopy(matches[0])
+
     @_session_write_locked
     def upsert_attachment_edit_lease(
         self,
@@ -2939,19 +3209,7 @@ class SessionManager:
         if not isinstance(grants, list):
             grants = []
 
-        now = time.time()
-        grant = {
-            "id": f"grant-{uuid.uuid4().hex[:12]}",
-            "type": grant_type,
-            "scope": scope,
-            "target_kind": target_kind,
-            "target": target,
-            "capabilities": list(dict.fromkeys(capabilities)),
-            "source": source,
-            "created_at": now,
-        }
-        if metadata:
-            grant["metadata"] = dict(metadata)
+        normalized_bindings: dict[str, Any] | None = None
         if bindings:
             effective = permission_policy_snapshot(permissions)
             if (
@@ -2972,10 +3230,54 @@ class SessionManager:
                 "verification_failed",
             }:
                 raise ValueError("Permission request no longer belongs to an active Run")
-            expected_bindings = RunPermissionContext.from_config_snapshot(run.get("config_snapshot")).grant_bindings()
+            expected_bindings = RunPermissionContext.from_config_snapshot(
+                run.get("config_snapshot")
+            ).grant_bindings()
             if bindings != expected_bindings:
                 raise ValueError("Permission request does not match the active Run")
-            grant["bindings"] = deepcopy(bindings)
+            normalized_bindings = deepcopy(bindings)
+
+        now = time.time()
+        normalized_capabilities = list(dict.fromkeys(capabilities))
+        # Session approvals are semantic capabilities, not a log of button
+        # clicks. Re-approving the same bound scope must reuse one authoritative
+        # grant so subagents and later Goal Runs do not create duplicate cards.
+        if scope == "session":
+            for existing in grants:
+                if not isinstance(existing, dict) or existing.get("revoked_at"):
+                    continue
+                if (
+                    existing.get("type") == grant_type
+                    and existing.get("scope") == scope
+                    and existing.get("target_kind") == target_kind
+                    and existing.get("target") == target
+                    and set(existing.get("capabilities") or []) == set(normalized_capabilities)
+                    and existing.get("bindings") == normalized_bindings
+                ):
+                    existing["last_approved_at"] = now
+                    if metadata:
+                        prior_metadata = existing.get("metadata")
+                        prior_metadata = dict(prior_metadata) if isinstance(prior_metadata, dict) else {}
+                        prior_metadata.update(metadata)
+                        existing["metadata"] = prior_metadata
+                    permissions["grants"] = grants
+                    data["permissions"] = permissions
+                    self._write_file(session_id, data)
+                    return dict(existing)
+        grant = {
+            "id": f"grant-{uuid.uuid4().hex[:12]}",
+            "type": grant_type,
+            "scope": scope,
+            "target_kind": target_kind,
+            "target": target,
+            "capabilities": normalized_capabilities,
+            "source": source,
+            "created_at": now,
+        }
+        if metadata:
+            grant["metadata"] = dict(metadata)
+        if normalized_bindings is not None:
+            grant["bindings"] = normalized_bindings
         grants.append(grant)
         permissions["grants"] = grants
         data["permissions"] = permissions
@@ -3025,6 +3327,31 @@ class SessionManager:
             if "write" not in (grant.get("capabilities") or []):
                 continue
             if grant.get("target_kind") == "exact_file" and grant.get("target") == resolved:
+                return True
+        return False
+
+    def has_external_directory_permission(
+        self,
+        session_id: str,
+        path: Path,
+        *,
+        access: str,
+        run_id: str,
+    ) -> bool:
+        """Return whether this Run may recursively read or write one directory."""
+
+        if access not in {"read", "write"} or not run_id:
+            return False
+        resolved = str(path.expanduser().resolve())
+        for grant in self.list_permission_grants(session_id):
+            if grant.get("type") != f"external_directory_{access}":
+                continue
+            if access not in (grant.get("capabilities") or []):
+                continue
+            if grant.get("target_kind") != "exact_directory" or grant.get("target") != resolved:
+                continue
+            metadata = grant.get("metadata")
+            if grant.get("scope") == "run" and isinstance(metadata, dict) and metadata.get("run_id") == run_id:
                 return True
         return False
 

@@ -42,30 +42,34 @@ def test_harness_settings_freeze_explicit_goal_and_validate_rules(tmp_path, monk
     config_path.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(config, "CONFIG_FILE", config_path)
 
-    config.update_settings({
-        "harness": {
-            "goals": {
-                "enabled": True,
-                "activation": "automatic",
-                "default_enabled": True,
-                "auto_promote_from_run": True,
-                "max_rounds": 5,
-            },
-            "completion": {
-                "rubric": {
+    config.update_settings(
+        {
+            "harness": {
+                "goals": {
                     "enabled": True,
-                    "model": "  grader-model  ",
-                    "max_iterations": 3,
-                    "custom_rules": [{
-                        "id": "quantified",
-                        "statement": "原因必须给出影响量级",
-                        "required": True,
-                        "verifier": "analytics",
-                    }],
+                    "activation": "automatic",
+                    "default_enabled": True,
+                    "auto_promote_from_run": True,
+                    "max_rounds": 5,
+                },
+                "completion": {
+                    "rubric": {
+                        "enabled": True,
+                        "model": "  grader-model  ",
+                        "max_iterations": 3,
+                        "custom_rules": [
+                            {
+                                "id": "quantified",
+                                "statement": "原因必须给出影响量级",
+                                "required": True,
+                                "verifier": "analytics",
+                            }
+                        ],
+                    },
                 },
             },
-        },
-    })
+        }
+    )
 
     saved = json.loads(config_path.read_text(encoding="utf-8"))["harness"]
     assert saved["goals"]["activation"] == "explicit_user_only"
@@ -75,32 +79,40 @@ def test_harness_settings_freeze_explicit_goal_and_validate_rules(tmp_path, monk
     assert saved["completion"]["rubric"]["model"] == "grader-model"
 
     with pytest.raises(ValueError, match="verifier is not registered"):
-        config.update_settings({
-            "harness": {
-                "completion": {
-                    "rubric": {
-                        "custom_rules": [{
-                            "statement": "run shell",
-                            "verifier": "shell",
-                        }],
+        config.update_settings(
+            {
+                "harness": {
+                    "completion": {
+                        "rubric": {
+                            "custom_rules": [
+                                {
+                                    "statement": "run shell",
+                                    "verifier": "shell",
+                                }
+                            ],
+                        },
                     },
                 },
-            },
-        })
+            }
+        )
 
     with pytest.raises(ValueError, match="verifier is not registered"):
-        config.update_settings({
-            "harness": {
-                "completion": {
-                    "rubric": {
-                        "custom_rules": [{
-                            "statement": "自然语言不能冒充代码验证器",
-                            "verifier": "deterministic",
-                        }],
+        config.update_settings(
+            {
+                "harness": {
+                    "completion": {
+                        "rubric": {
+                            "custom_rules": [
+                                {
+                                    "statement": "自然语言不能冒充代码验证器",
+                                    "verifier": "deterministic",
+                                }
+                            ],
+                        },
                     },
                 },
-            },
-        })
+            }
+        )
 
 
 def test_legacy_python_only_sandbox_image_migrates_to_managed_runtime(
@@ -127,14 +139,11 @@ def test_legacy_python_only_sandbox_image_migrates_to_managed_runtime(
     loaded = config.load_config()
 
     docker = loaded["harness"]["terminal"]["docker"]
-    assert docker["image"] == "puddingclaw/sandbox:python3.12-node22-v2"
+    assert docker["image"] == "puddingclaw/sandbox:python3.12-node22-curl-v3"
     assert docker["dependency_setup_enabled"] is False
     assert docker["dependency_setup_opt_in_version"] == 1
     persisted = json.loads(config_path.read_text(encoding="utf-8"))
-    assert (
-        persisted["harness"]["terminal"]["docker"]["image"]
-        == "puddingclaw/sandbox:python3.12-node22-v2"
-    )
+    assert persisted["harness"]["terminal"]["docker"]["image"] == "puddingclaw/sandbox:python3.12-node22-curl-v3"
 
 
 def test_legacy_implicit_project_dependency_setup_is_reset_to_clean_default(
@@ -162,9 +171,35 @@ def test_legacy_implicit_project_dependency_setup_is_reset_to_clean_default(
     loaded = config.load_config()
 
     docker = loaded["harness"]["terminal"]["docker"]
-    assert docker["image"] == "puddingclaw/sandbox:python3.12-node22-v2"
+    assert docker["image"] == "puddingclaw/sandbox:python3.12-node22-curl-v3"
     assert docker["dependency_setup_enabled"] is False
     assert docker["dependency_setup_opt_in_version"] == 1
+
+
+def test_managed_v2_sandbox_migrates_to_curl_runtime(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "harness": {
+                    "terminal": {
+                        "docker": {
+                            "image": "puddingclaw/sandbox:python3.12-node22-v2",
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
+
+    loaded = config.load_config()
+
+    assert (
+        loaded["harness"]["terminal"]["docker"]["image"]
+        == "puddingclaw/sandbox:python3.12-node22-curl-v3"
+    )
 
 
 def test_docker_probe_endpoint_reports_daemon_status(monkeypatch):
@@ -187,14 +222,19 @@ def test_docker_probe_endpoint_reports_daemon_status(monkeypatch):
 
 def test_gateway_has_no_key_and_provider_key_is_masked(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
-    config_path.write_text(json.dumps({
-        "ai_gateway": {
-            "base_url": "http://gateway:8080/v1",
-            "health_path": "/ready",
-            "fallback_to_direct": True,
-        },
-        "fallback_llm": {"api_key": "provider-secret-1234"},
-    }), encoding="utf-8")
+    config_path.write_text(
+        json.dumps(
+            {
+                "ai_gateway": {
+                    "base_url": "http://gateway:8080/v1",
+                    "health_path": "/ready",
+                    "fallback_to_direct": True,
+                },
+                "fallback_llm": {"api_key": "provider-secret-1234"},
+            }
+        ),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(config, "CONFIG_FILE", config_path)
 
     displayed = config.get_settings_for_display()
@@ -210,22 +250,27 @@ def test_gateway_has_no_key_and_provider_key_is_masked(tmp_path, monkeypatch):
 
 def test_multimodal_embedding_settings_are_separate_from_openai_embedding(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
-    config_path.write_text(json.dumps({
-        "fallback_embedding": {
-            "model": "text-embedding-v4",
-            "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-            "api_key": "text-secret-1234",
-        },
-        "multimodal_embedding": {
-            "provider": "dashscope",
-            "model": "qwen2.5-vl-embedding",
-            "dimension": 1024,
-            "base_url": "http://localhost:8080",
-            "route_path": "/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding",
-            "api_key": "mm-secret-5678",
-            "prefer_gateway": True,
-        },
-    }), encoding="utf-8")
+    config_path.write_text(
+        json.dumps(
+            {
+                "fallback_embedding": {
+                    "model": "text-embedding-v4",
+                    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                    "api_key": "text-secret-1234",
+                },
+                "multimodal_embedding": {
+                    "provider": "dashscope",
+                    "model": "qwen2.5-vl-embedding",
+                    "dimension": 1024,
+                    "base_url": "http://localhost:8080",
+                    "route_path": "/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding",
+                    "api_key": "mm-secret-5678",
+                    "prefer_gateway": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(config, "CONFIG_FILE", config_path)
 
     mm = config.get_multimodal_embedding_config()
@@ -239,13 +284,15 @@ def test_multimodal_embedding_settings_are_separate_from_openai_embedding(tmp_pa
     assert displayed["multimodal_embedding"]["openai_compatible"] is False
     assert "api_key" not in displayed["multimodal_embedding"]
 
-    config.update_settings({
-        "multimodal_embedding": {
-            "base_url": "http://higress:8080",
-            "model": "qwen3-vl-embedding",
-            "dimension": 2560,
+    config.update_settings(
+        {
+            "multimodal_embedding": {
+                "base_url": "http://higress:8080",
+                "model": "qwen3-vl-embedding",
+                "dimension": 2560,
+            }
         }
-    })
+    )
     saved = json.loads(config_path.read_text(encoding="utf-8"))
     assert saved["multimodal_embedding"]["base_url"] == "http://higress:8080"
     assert saved["multimodal_embedding"]["model"] == "qwen3-vl-embedding"
@@ -254,18 +301,24 @@ def test_multimodal_embedding_settings_are_separate_from_openai_embedding(tmp_pa
 
 def test_multimodal_embedding_can_reuse_higress_qwen_token(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
-    config_path.write_text(json.dumps({
-        "multimodal_embedding": {
-            "provider": "dashscope",
-            "model": "qwen2.5-vl-embedding",
-            "dimension": 1024,
-            "api_key": "",
-        }
-    }), encoding="utf-8")
+    config_path.write_text(
+        json.dumps(
+            {
+                "multimodal_embedding": {
+                    "provider": "dashscope",
+                    "model": "qwen2.5-vl-embedding",
+                    "dimension": 1024,
+                    "api_key": "",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
     higress_dir = tmp_path / "higress"
     plugin_dir = higress_dir / "wasmplugins"
     plugin_dir.mkdir(parents=True)
-    (plugin_dir / "ai-proxy.internal.yaml").write_text("""
+    (plugin_dir / "ai-proxy.internal.yaml").write_text(
+        """
 apiVersion: extensions.higress.io/v1alpha1
 kind: WasmPlugin
 metadata:
@@ -282,7 +335,9 @@ spec:
         qwenEnableCompatible: true
         apiTokens:
           - dashscope-secret-9999
-""", encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
     monkeypatch.setattr(config, "CONFIG_FILE", config_path)
     monkeypatch.setattr(higress_config_reader, "DEFAULT_HIGRESS_DATA_DIR", higress_dir)
     monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
@@ -298,20 +353,25 @@ spec:
 
 def test_knowledge_multimodal_index_settings_live_in_config_json(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
-    config_path.write_text(json.dumps({
-        "knowledge": {
-            "multimodal_index": {
-                "enabled": True,
-                "vector_store": "milvus",
-                "milvus_uri": "http://milvus.local:19530",
-                "text_collection": "kb_text",
-                "image_collection": "kb_image",
-                # Legacy value should be ignored. Collection reset is now an
-                # explicit user action, not an ingestion-time flag.
-                "overwrite": True,
+    config_path.write_text(
+        json.dumps(
+            {
+                "knowledge": {
+                    "multimodal_index": {
+                        "enabled": True,
+                        "vector_store": "milvus",
+                        "milvus_uri": "http://milvus.local:19530",
+                        "text_collection": "kb_text",
+                        "image_collection": "kb_image",
+                        # Legacy value should be ignored. Collection reset is now an
+                        # explicit user action, not an ingestion-time flag.
+                        "overwrite": True,
+                    }
+                }
             }
-        }
-    }), encoding="utf-8")
+        ),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(config, "CONFIG_FILE", config_path)
 
     index = config.get_knowledge_multimodal_index_config()
@@ -325,15 +385,17 @@ def test_knowledge_multimodal_index_settings_live_in_config_json(tmp_path, monke
     displayed = config.get_settings_for_display()
     assert displayed["knowledge"]["multimodal_index"]["text_collection"] == "kb_text"
 
-    config.update_settings({
-        "knowledge": {
-            "multimodal_index": {
-                "enabled": False,
-                "text_collection": "pudding_text",
-                "image_collection": "pudding_image",
+    config.update_settings(
+        {
+            "knowledge": {
+                "multimodal_index": {
+                    "enabled": False,
+                    "text_collection": "pudding_text",
+                    "image_collection": "pudding_image",
+                }
             }
         }
-    })
+    )
     saved = json.loads(config_path.read_text(encoding="utf-8"))
     assert saved["knowledge"]["multimodal_index"]["enabled"] is False
     assert saved["knowledge"]["multimodal_index"]["text_collection"] == "pudding_text"
@@ -345,11 +407,16 @@ def test_knowledge_multimodal_index_settings_live_in_config_json(tmp_path, monke
 def test_knowledge_root_dir_settings_live_in_config_json(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     root_dir = tmp_path / "user-kb"
-    config_path.write_text(json.dumps({
-        "knowledge": {
-            "root_dir": str(root_dir),
-        }
-    }), encoding="utf-8")
+    config_path.write_text(
+        json.dumps(
+            {
+                "knowledge": {
+                    "root_dir": str(root_dir),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(config, "CONFIG_FILE", config_path)
     monkeypatch.delenv("PUDDINGCLAW_KNOWLEDGE_DIR", raising=False)
 
@@ -365,12 +432,17 @@ def test_knowledge_root_dir_settings_live_in_config_json(tmp_path, monkeypatch):
 
 def test_database_settings_live_in_config_json(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
-    config_path.write_text(json.dumps({
-        "database": {
-            "mode": "external",
-            "url": "postgresql+asyncpg://alice:secret@127.0.0.1:15432/pudding",
-        }
-    }), encoding="utf-8")
+    config_path.write_text(
+        json.dumps(
+            {
+                "database": {
+                    "mode": "external",
+                    "url": "postgresql+asyncpg://alice:secret@127.0.0.1:15432/pudding",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(config, "CONFIG_FILE", config_path)
     monkeypatch.delenv("PUDDINGCLAW_DATABASE_URL", raising=False)
     monkeypatch.delenv("DATABASE_URL", raising=False)
@@ -386,12 +458,14 @@ def test_database_settings_live_in_config_json(tmp_path, monkeypatch):
     assert displayed["database"]["mode"] == "external"
     assert displayed["database"]["url"].endswith(":15432/pudding")
 
-    config.update_settings({
-        "database": {
-            "mode": "bundled",
-            "url": "postgresql+asyncpg://puddingclaw:puddingclaw@127.0.0.1:5432/puddingclaw",
+    config.update_settings(
+        {
+            "database": {
+                "mode": "bundled",
+                "url": "postgresql+asyncpg://puddingclaw:puddingclaw@127.0.0.1:5432/puddingclaw",
+            }
         }
-    })
+    )
     saved = json.loads(config_path.read_text(encoding="utf-8"))
     assert saved["database"]["mode"] == "bundled"
     assert saved["database"]["url"].startswith("postgresql+asyncpg://puddingclaw:")
@@ -399,16 +473,21 @@ def test_database_settings_live_in_config_json(tmp_path, monkeypatch):
 
 def test_database_settings_can_build_url_from_local_fields(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
-    config_path.write_text(json.dumps({
-        "database": {
-            "mode": "bundled",
-            "host": "127.0.0.1",
-            "port": 5433,
-            "database": "puddingclaw",
-            "username": "puddingclaw",
-            "password": "puddingclaw",
-        }
-    }), encoding="utf-8")
+    config_path.write_text(
+        json.dumps(
+            {
+                "database": {
+                    "mode": "bundled",
+                    "host": "127.0.0.1",
+                    "port": 5433,
+                    "database": "puddingclaw",
+                    "username": "puddingclaw",
+                    "password": "puddingclaw",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(config, "CONFIG_FILE", config_path)
     monkeypatch.delenv("PUDDINGCLAW_DATABASE_URL", raising=False)
     monkeypatch.delenv("DATABASE_URL", raising=False)
@@ -419,15 +498,17 @@ def test_database_settings_can_build_url_from_local_fields(tmp_path, monkeypatch
     assert database["port"] == 5433
     assert database["url"] == "postgresql+asyncpg://puddingclaw:puddingclaw@127.0.0.1:5433/puddingclaw"
 
-    config.update_settings({
-        "database": {
-            "mode": "external",
-            "port": 15432,
-            "database": "mydb",
-            "username": "me",
-            "password": "secret",
+    config.update_settings(
+        {
+            "database": {
+                "mode": "external",
+                "port": 15432,
+                "database": "mydb",
+                "username": "me",
+                "password": "secret",
+            }
         }
-    })
+    )
     saved = json.loads(config_path.read_text(encoding="utf-8"))
     assert saved["database"]["mode"] == "external"
     assert saved["database"]["port"] == 15432
@@ -437,12 +518,17 @@ def test_database_settings_can_build_url_from_local_fields(tmp_path, monkeypatch
 
 def test_database_generic_env_does_not_override_config_json(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
-    config_path.write_text(json.dumps({
-        "database": {
-            "mode": "external",
-            "url": "postgresql+asyncpg://alice:secret@127.0.0.1:15432/pudding",
-        }
-    }), encoding="utf-8")
+    config_path.write_text(
+        json.dumps(
+            {
+                "database": {
+                    "mode": "external",
+                    "url": "postgresql+asyncpg://alice:secret@127.0.0.1:15432/pudding",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(config, "CONFIG_FILE", config_path)
     monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://env:secret@127.0.0.1:5432/envdb")
 
@@ -455,12 +541,17 @@ def test_database_generic_env_does_not_override_config_json(tmp_path, monkeypatc
 
 def test_database_puddingclaw_env_can_override_config_json(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
-    config_path.write_text(json.dumps({
-        "database": {
-            "mode": "external",
-            "url": "postgresql+asyncpg://alice:secret@127.0.0.1:15432/pudding",
-        }
-    }), encoding="utf-8")
+    config_path.write_text(
+        json.dumps(
+            {
+                "database": {
+                    "mode": "external",
+                    "url": "postgresql+asyncpg://alice:secret@127.0.0.1:15432/pudding",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(config, "CONFIG_FILE", config_path)
     monkeypatch.setenv("PUDDINGCLAW_DATABASE_URL", "postgresql+asyncpg://env:secret@127.0.0.1:5432/envdb")
 
@@ -473,26 +564,31 @@ def test_database_puddingclaw_env_can_override_config_json(tmp_path, monkeypatch
 
 def test_thinking_mode_switches_to_thinking_model(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
-    config_path.write_text(json.dumps({
-        "thinking_mode": False,
-        "gateway_llm": {
-            "model": "deepseek-v4-flash",
-            "thinking": {
-                "model": "deepseek-v4-pro",
-                "reasoning_effort": "high",
-                "extra_body": {"thinking": {"type": "enabled"}},
-            },
-        },
-        "fallback_llm": {
-            "provider": "deepseek",
-            "model": "deepseek-v4-flash",
-            "thinking": {
-                "model": "deepseek-v4-pro",
-                "reasoning_effort": "high",
-                "extra_body": {"thinking": {"type": "enabled"}},
-            },
-        },
-    }), encoding="utf-8")
+    config_path.write_text(
+        json.dumps(
+            {
+                "thinking_mode": False,
+                "gateway_llm": {
+                    "model": "deepseek-v4-flash",
+                    "thinking": {
+                        "model": "deepseek-v4-pro",
+                        "reasoning_effort": "high",
+                        "extra_body": {"thinking": {"type": "enabled"}},
+                    },
+                },
+                "fallback_llm": {
+                    "provider": "deepseek",
+                    "model": "deepseek-v4-flash",
+                    "thinking": {
+                        "model": "deepseek-v4-pro",
+                        "reasoning_effort": "high",
+                        "extra_body": {"thinking": {"type": "enabled"}},
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(config, "CONFIG_FILE", config_path)
 
     # Off by default
@@ -535,11 +631,16 @@ def test_thinking_mode_switches_to_thinking_model(tmp_path, monkeypatch):
 def test_settings_api_accepts_thinking_mode(tmp_path, monkeypatch):
     """PUT /api/settings must persist the thinking_mode toggle from the dialog."""
     config_path = tmp_path / "config.json"
-    config_path.write_text(json.dumps({
-        "thinking_mode": True,
-        "gateway_llm": {"model": "deepseek-v4-flash"},
-        "fallback_llm": {"model": "deepseek-v4-flash"},
-    }), encoding="utf-8")
+    config_path.write_text(
+        json.dumps(
+            {
+                "thinking_mode": True,
+                "gateway_llm": {"model": "deepseek-v4-flash"},
+                "fallback_llm": {"model": "deepseek-v4-flash"},
+            }
+        ),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(config, "CONFIG_FILE", config_path)
 
     client = TestClient(app)
@@ -640,9 +741,7 @@ def test_settings_api_persists_harness_model_call_limit(tmp_path, monkeypatch):
     assert displayed["harness"]["model_call_limit"]["thread_limit"] == 100
 
 
-def test_settings_api_persists_deepagents_context_engineering_without_touching_chat(
-    tmp_path, monkeypatch
-):
+def test_settings_api_persists_deepagents_context_engineering_without_touching_chat(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     config_path.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(config, "CONFIG_FILE", config_path)
@@ -680,9 +779,7 @@ def test_settings_api_persists_deepagents_context_engineering_without_touching_c
     assert displayed["compression"]["middleware"] == chat_before
 
 
-def test_settings_api_rejects_immediate_tool_threshold_above_offload_boundary(
-    tmp_path, monkeypatch
-):
+def test_settings_api_rejects_immediate_tool_threshold_above_offload_boundary(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     config_path.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(config, "CONFIG_FILE", config_path)
@@ -872,11 +969,7 @@ def test_image_analyzer_materializes_only_tool_read_image_refs(tmp_path):
                 )
             ),
             ToolMessage(
-                content=(
-                    "Attachment: diagram.png\n"
-                    "Type: image\n"
-                    f"PuddingClaw-Resource-Image: {attachment['id']}"
-                ),
+                content=(f"Attachment: diagram.png\nType: image\nPuddingClaw-Resource-Image: {attachment['id']}"),
                 tool_call_id="call_read_resource",
             ),
         ],
@@ -1005,16 +1098,14 @@ def test_agent_user_content_preserves_spaced_external_html_target(tmp_path):
 
     assert isinstance(content, str)
     assert str(external_file) in content
-    assert "原始绝对路径调用 edit_file/write_file" in content
-    assert "临时转换或验证只能写入 /scratch" in content
-    assert "禁止复制到 /workspace" in content
-    assert extract_declared_artifact_targets(
-        f"{external_file} 刷新这个报告到 2026 年"
-    ) == [str(external_file)]
+    assert "stage_external_artifact(file_path=原始绝对路径)" in content
+    assert "commit_external_artifact" in content
+    assert "不要直接对外部绝对路径调用 write_file、patch_file 或 edit_file" in content
+    assert "只在返回的 /scratch/external/<lease_id>/... 暂存文件上修改与验证" in content
+    assert "禁止把 /scratch 或 /workspace 副本冒充交付结果" in content
+    assert extract_declared_artifact_targets(f"{external_file} 刷新这个报告到 2026 年") == [str(external_file)]
     source_file = tmp_path / "input data.csv"
-    assert extract_declared_artifact_targets(
-        f"读取 {source_file} 并更新分析报告"
-    ) == []
+    assert extract_declared_artifact_targets(f"读取 {source_file} 并更新分析报告") == []
 
 
 def test_artifact_target_parser_handles_compact_chinese_and_negation():
@@ -1031,9 +1122,7 @@ def test_artifact_target_parser_handles_compact_chinese_and_negation():
     ):
         assert extract_declared_artifact_targets(f"请修改{target}并交付") == [target]
         assert extract_declared_artifact_targets(f"请勿修改 {target}，只做审查") == []
-    assert extract_declared_artifact_targets(
-        "请分析 https://example.com/reports/latest.html，不要写入本地"
-    ) == []
+    assert extract_declared_artifact_targets("请分析 https://example.com/reports/latest.html，不要写入本地") == []
 
 
 def test_agent_user_content_keeps_virtual_workspace_path_as_managed_input(tmp_path):

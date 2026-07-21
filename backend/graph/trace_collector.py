@@ -7,22 +7,21 @@ viewer. LangSmith remains optional and independent.
 
 from __future__ import annotations
 
-import time
-import uuid
 import ast
 import hashlib
 import json
+import time
+import uuid
 from contextvars import ContextVar
 from typing import Any
 
-
-_current_trace_collector: ContextVar["TraceCollector | None"] = ContextVar(
+_current_trace_collector: ContextVar[TraceCollector | None] = ContextVar(
     "current_trace_collector",
     default=None,
 )
 
 
-def get_current_trace_collector() -> "TraceCollector | None":
+def get_current_trace_collector() -> TraceCollector | None:
     return _current_trace_collector.get()
 
 
@@ -153,7 +152,7 @@ class TraceCollector:
             return self._model_input_count - 1
         return None
 
-    def __enter__(self) -> "TraceCollector":
+    def __enter__(self) -> TraceCollector:
         self._context_token = _current_trace_collector.set(self)
         return self
 
@@ -247,9 +246,7 @@ class TraceCollector:
         tool_schema_items = [self._tool_schema_contract(tool) for tool in (tool_schemas or [])]
         estimated_tokens = sum(item.get("estimated_tokens", 0) for item in preview)
         system_prompt_chars = sum(
-            item.get("chars", 0)
-            for item in preview
-            if item.get("role") in {"system", "SystemMessage"}
+            item.get("chars", 0) for item in preview if item.get("role") in {"system", "SystemMessage"}
         )
         system_prompt_text = "\n\n".join(
             str(item.get("content") or "")
@@ -342,15 +339,9 @@ class TraceCollector:
     ) -> dict[str, Any]:
         """Describe how the final LLM payload is assembled at the model boundary."""
 
-        system_messages = [
-            item
-            for item in preview
-            if str(item.get("role", "")).lower() in {"system", "systemmessage"}
-        ]
+        system_messages = [item for item in preview if str(item.get("role", "")).lower() in {"system", "systemmessage"}]
         conversation_messages = [
-            item
-            for item in preview
-            if str(item.get("role", "")).lower() not in {"system", "systemmessage"}
+            item for item in preview if str(item.get("role", "")).lower() not in {"system", "systemmessage"}
         ]
         role_counts: dict[str, int] = {}
         for item in preview:
@@ -360,6 +351,7 @@ class TraceCollector:
         system_chars = sum(int(item.get("chars") or 0) for item in system_messages)
         message_chars = sum(int(item.get("chars") or 0) for item in conversation_messages)
         tool_call_count = sum(int(item.get("tool_call_count") or 0) for item in preview)
+        provider_tool_call_count = sum(int(item.get("provider_tool_call_count") or 0) for item in preview)
         bind_kwargs = {
             key: value
             for key, value in {
@@ -395,8 +387,10 @@ class TraceCollector:
                     "included": len(conversation_messages) > 0,
                     "roles": role_counts,
                     "tool_call_count": tool_call_count,
+                    "provider_tool_call_count": provider_tool_call_count,
                     "notes": [
                         "User, assistant, tool, and AI messages are preserved as structured messages.",
+                        "Provider tool-call count includes parsed, invalid, and raw additional tool calls.",
                     ],
                 },
                 {
@@ -667,13 +661,13 @@ class TraceCollector:
             for item in subagents
             if str(item.get("name") or "") and str(item.get("name") or "") in system_text
         ]
-        native_marker_present = "Available subagent types:" in system_text or "## `task` (subagent spawner)" in system_text
+        native_marker_present = (
+            "Available subagent types:" in system_text or "## `task` (subagent spawner)" in system_text
+        )
         if not native_marker_present and not matched:
             return
         evidence = [
-            "DeepAgents task/subagent instructions found in final system prompt"
-            if native_marker_present
-            else "",
+            "DeepAgents task/subagent instructions found in final system prompt" if native_marker_present else "",
             f"{len(matched)} subagent names found in final system prompt",
         ]
         self.add_middleware_effect(
@@ -711,15 +705,15 @@ class TraceCollector:
         return f"{value:+g}"
 
     @staticmethod
-    def _model_input_summary(
-        preview: list[dict[str, Any]], metadata: dict[str, Any]
-    ) -> dict[str, Any]:
+    def _model_input_summary(preview: list[dict[str, Any]], metadata: dict[str, Any]) -> dict[str, Any]:
         role_counts: dict[str, int] = {}
         tool_call_count = 0
+        provider_tool_call_count = 0
         for item in preview:
             role = str(item.get("role") or "unknown").lower()
             role_counts[role] = role_counts.get(role, 0) + 1
             tool_call_count += int(item.get("tool_call_count") or 0)
+            provider_tool_call_count += int(item.get("provider_tool_call_count") or 0)
         non_system = [
             {
                 "role": item.get("role"),
@@ -727,6 +721,10 @@ class TraceCollector:
                 "chars": item.get("chars"),
                 "preview": item.get("preview"),
                 "tool_calls": item.get("tool_calls") or [],
+                "invalid_tool_calls": item.get("invalid_tool_calls") or [],
+                "raw_tool_calls": item.get("raw_tool_calls") or [],
+                "provider_tool_call_ids": item.get("provider_tool_call_ids") or [],
+                "tool_call_id": item.get("tool_call_id"),
             }
             for item in preview
             if str(item.get("role", "")).lower() not in {"system", "systemmessage"}
@@ -739,6 +737,7 @@ class TraceCollector:
             "tool_schema_count": metadata.get("tool_schema_count", 0),
             "fingerprints": metadata.get("fingerprints", {}),
             "tool_call_count": tool_call_count,
+            "provider_tool_call_count": provider_tool_call_count,
             "roles": role_counts,
             "recent_messages": non_system[-4:],
         }
@@ -772,7 +771,9 @@ class TraceCollector:
         if isinstance(serialized, dict):
             function = serialized.get("function") if isinstance(serialized.get("function"), dict) else {}
             name = serialized.get("name") or function.get("name") or getattr(tool, "name", None)
-            description = serialized.get("description") or function.get("description") or getattr(tool, "description", None)
+            description = (
+                serialized.get("description") or function.get("description") or getattr(tool, "description", None)
+            )
             schema = (
                 serialized.get("parameters")
                 or function.get("parameters")
@@ -791,9 +792,7 @@ class TraceCollector:
         }
 
     @staticmethod
-    def _summary_diff(
-        before: dict[str, Any] | None, after: dict[str, Any]
-    ) -> dict[str, Any]:
+    def _summary_diff(before: dict[str, Any] | None, after: dict[str, Any]) -> dict[str, Any]:
         if before is None:
             return {
                 "message_count_delta": after.get("message_count", 0),
@@ -859,9 +858,7 @@ class TraceCollector:
         return cls.summarize_hook_payload(update)
 
     @classmethod
-    def hook_summary_diff(
-        cls, before: dict[str, Any] | None, after: dict[str, Any] | None
-    ) -> dict[str, Any]:
+    def hook_summary_diff(cls, before: dict[str, Any] | None, after: dict[str, Any] | None) -> dict[str, Any]:
         if not before or not after:
             return {}
         diff: dict[str, Any] = {}
@@ -1111,11 +1108,7 @@ class TraceCollector:
                     }
                 )
             elif key == "skills_metadata":
-                summary["names"] = [
-                    str(item.get("name") or "")
-                    for item in value
-                    if isinstance(item, dict)
-                ][:20]
+                summary["names"] = [str(item.get("name") or "") for item in value if isinstance(item, dict)][:20]
             elif key == "todos":
                 status_counts: dict[str, int] = {}
                 for item in value:
@@ -1172,9 +1165,7 @@ class TraceCollector:
         }
 
     @classmethod
-    def _message_collection_summary(
-        cls, messages: list[Any], extra: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
+    def _message_collection_summary(cls, messages: list[Any], extra: dict[str, Any] | None = None) -> dict[str, Any]:
         preview = [cls._message_preview(message) for message in messages]
         estimated_tokens = sum(item.get("estimated_tokens", 0) for item in preview)
         system_prompt_text = "\n\n".join(
@@ -1183,9 +1174,7 @@ class TraceCollector:
             if str(item.get("role", "")).lower() in {"system", "systemmessage"}
         )
         system_prompt_chars = sum(
-            item.get("chars", 0)
-            for item in preview
-            if str(item.get("role", "")).lower() in {"system", "systemmessage"}
+            item.get("chars", 0) for item in preview if str(item.get("role", "")).lower() in {"system", "systemmessage"}
         )
         tool_call_count = sum(int(item.get("tool_call_count") or 0) for item in preview)
         role_counts: dict[str, int] = {}
@@ -1224,9 +1213,7 @@ class TraceCollector:
             lowered = name.lower()
             if category == "skills" and "skill" in lowered:
                 names.append(name)
-            elif category == "state" and (
-                "todo" in lowered or "memory" in lowered or "patchtoolcalls" in lowered
-            ):
+            elif category == "state" and ("todo" in lowered or "memory" in lowered or "patchtoolcalls" in lowered):
                 names.append(name)
             elif category == "memory" and "memory" in lowered:
                 names.append(name)
@@ -1293,9 +1280,9 @@ class TraceCollector:
         )
         effect["metadata"]["source_span_id"] = source_span_id
         normalized_hook = hook or self._hook_for_category(category)
-        if not self._is_hook_level_boundary_effect(category=category, title=title) and not self._has_direct_middleware_invocation(
-            normalized_hook, middleware or []
-        ):
+        if not self._is_hook_level_boundary_effect(
+            category=category, title=title
+        ) and not self._has_direct_middleware_invocation(normalized_hook, middleware or []):
             self.add_middleware_invocation(
                 hook=normalized_hook,
                 middleware=middleware or [],
@@ -1440,16 +1427,38 @@ class TraceCollector:
         tool_calls = getattr(message, "tool_calls", None)
         if isinstance(message, dict):
             tool_calls = message.get("tool_calls", tool_calls)
+        invalid_tool_calls = getattr(message, "invalid_tool_calls", None)
+        if isinstance(message, dict):
+            invalid_tool_calls = message.get("invalid_tool_calls", invalid_tool_calls)
+        additional_kwargs = getattr(message, "additional_kwargs", None)
+        if isinstance(message, dict):
+            additional_kwargs = message.get("additional_kwargs", additional_kwargs)
+        additional_kwargs = additional_kwargs if isinstance(additional_kwargs, dict) else {}
+        raw_tool_calls = additional_kwargs.get("tool_calls")
+        parsed_preview = TraceCollector._message_tool_calls(tool_calls)
+        invalid_preview = TraceCollector._message_tool_calls(invalid_tool_calls)
+        raw_preview = TraceCollector._message_tool_calls(raw_tool_calls)
+        provider_preview = [*parsed_preview, *invalid_preview] if parsed_preview or invalid_preview else raw_preview
         name = getattr(message, "name", None)
         if isinstance(message, dict):
             name = message.get("name", name)
+        tool_call_id = getattr(message, "tool_call_id", None)
+        if isinstance(message, dict):
+            tool_call_id = message.get("tool_call_id", tool_call_id)
         return {
             "role": str(role),
             "name": name,
             "chars": len(content_text),
             "estimated_tokens": max(1, len(content_text) // 4) if content_text else 0,
-            "tool_call_count": len(tool_calls) if isinstance(tool_calls, list) else 0,
-            "tool_calls": TraceCollector._message_tool_calls(tool_calls),
+            "tool_call_count": len(parsed_preview),
+            "tool_calls": parsed_preview,
+            "invalid_tool_call_count": len(invalid_preview),
+            "invalid_tool_calls": invalid_preview,
+            "raw_tool_call_count": len(raw_preview),
+            "raw_tool_calls": raw_preview,
+            "provider_tool_call_count": len(provider_preview),
+            "provider_tool_call_ids": [item.get("id") for item in provider_preview],
+            "tool_call_id": str(tool_call_id or "") or None,
             "content": content_text,
             "preview": content_text[:600],
         }

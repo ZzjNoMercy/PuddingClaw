@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import re
+from difflib import get_close_matches
 
 from langchain.tools import ToolRuntime
 from langchain_core.tools import BaseTool
@@ -23,6 +25,71 @@ from .models import DatabaseSqlGenerateInput
 from .spans import emit_database_span
 
 _SEMANTIC_CONTRACT_PREVIEW_CHARS = 700
+_TECHNICAL_SQL_REVISION_PATTERN = re.compile(
+    r"(?:\bSQL\b|\bEXISTS\b|\bJOIN\b|\bCTE\b|\bFILTER\b|\bILIKE\b|"
+    r"\bGROUP\s+BY\b|\bDISTINCT\b|\bquery\b|超时|慢查询|性能|执行计划|"
+    r"相关子查询|子查询|语法|括号|表别名|重写查询)",
+    re.IGNORECASE,
+)
+_BUSINESS_SEMANTIC_CHANGE_PATTERN = re.compile(
+    r"(?:业务口径|指标口径|分母|分子|统计口径|计算口径|"
+    r"(?:新增|取消|包含|排除|改成|改为|只统计|仅统计|范围改为|粒度改为|维度改为)"
+    r".{0,24}(?:指标|范围|筛选|时间|年份|能源|品牌|价格|车型|车系|款型|皮卡|分母|分子|粒度|维度))",
+    re.IGNORECASE,
+)
+
+
+def _is_technical_sql_revision(instruction: str) -> bool:
+    """Identify implementation repair that must not become business HITL."""
+
+    normalized = " ".join(str(instruction or "").split())
+    return bool(
+        normalized
+        and _TECHNICAL_SQL_REVISION_PATTERN.search(normalized)
+        and not _BUSINESS_SEMANTIC_CHANGE_PATTERN.search(normalized)
+    )
+
+
+def _normalize_selected_semantic_asset_ids(
+    selected_ids: list[str],
+    allowed_ids: set[str],
+) -> tuple[list[str], str | None]:
+    """Resolve model-friendly bare ids against the authoritative model scope.
+
+    The semantic index exposes namespaced ids such as ``measure:launch_cycle``.
+    Models occasionally retain only the stable suffix. A unique suffix is safe
+    to normalize server-side; ambiguous or unknown values remain fail-closed.
+    """
+
+    normalized: list[str] = []
+    for raw_id in selected_ids:
+        asset_id = str(raw_id or "").strip()
+        if not asset_id:
+            continue
+        if asset_id in allowed_ids:
+            resolved = asset_id
+        else:
+            suffix_matches = sorted(
+                candidate
+                for candidate in allowed_ids
+                if candidate.rsplit(":", 1)[-1] == asset_id
+            )
+            if len(suffix_matches) == 1:
+                resolved = suffix_matches[0]
+            elif len(suffix_matches) > 1:
+                return [], (
+                    f"语义资产 ID“{asset_id}”存在多个候选："
+                    + ", ".join(suffix_matches)
+                    + "。请使用完整 namespaced id。"
+                )
+            else:
+                close = get_close_matches(asset_id, sorted(allowed_ids), n=5, cutoff=0.25)
+                candidates = close or sorted(allowed_ids)[:8]
+                suffix = f" 当前模型可用候选：{', '.join(candidates)}。" if candidates else ""
+                return [], f"语义资产 ID“{asset_id}”不属于当前分析模型或已被删除。{suffix}"
+        if resolved not in normalized:
+            normalized.append(resolved)
+    return normalized, None
 
 
 def _format_semantic_contract(semantic_assets: dict[str, object]) -> list[str]:
@@ -82,6 +149,8 @@ def _format_generation(
         title = "🧮 用户拒绝修改，继续使用原 SQL 生成结果（未执行）"
     elif disposition == "approved_revision":
         title = "🧮 已按用户确认的自然语言约束重新生成 SQL（未执行）"
+    elif disposition == "technical_repair":
+        title = "🧮 SQL 技术修复已自动重生成（未执行）"
     lines = [
         title,
         f"- generation_id：{generation.id}",
@@ -107,6 +176,14 @@ def _format_generation(
                 "- 下一步：立即使用新的 generation_id 校验并执行当前 SQL。",
             ]
         )
+    elif disposition == "technical_repair":
+        lines.extend(
+            [
+                "- 修复类型：SQL 实现/性能修复；业务问题与语义资产保持不变",
+                "- HITL 状态：无需业务口径确认",
+                "- 下一步：立即使用新的 generation_id 校验并执行当前 SQL。",
+            ]
+        )
     if result.guardrail_note:
         lines.append(f"- Guardrail：{result.guardrail_note}")
     if result.stage_timings:
@@ -127,10 +204,13 @@ class DatabaseSqlGenerateTool(BaseTool):
     description: str = (
         "Generate PostgreSQL SQL from a natural-language database question without executing it. "
         "Use this as the first step for database analysis when the Agent needs to inspect, validate, "
-        "or execute SQL. It runs table routing, semantic asset injection, Vanna references, and SQL guardrails, "
-        "then returns SQL plus its authoritative semantic contract. Do not manually rewrite semantics from a "
-        "matched Measure/Reference. To propose a change, call this tool with parent_generation_id and a natural-language "
-        "revision_instruction; the user then chooses agree, reject, or modify before this tool regenerates SQL."
+        "or execute SQL. It uses the original question for Vanna evidence/candidate retrieval, then applies semantic "
+        "assets in a separate final refinement pass before SQL guardrails. Database entity evidence is authoritative "
+        "for physical table/column/EAV values. It returns SQL plus its authoritative semantic contract. Do not "
+        "manually rewrite semantics from a "
+        "matched Measure/Reference. To propose a business-semantic change, call this tool with parent_generation_id and "
+        "a natural-language revision_instruction; the user then chooses agree, reject, or modify. SQL timeout, syntax, "
+        "query-shape, JOIN/CTE, or performance repair is technical and is automatically regenerated without business HITL."
     )
     args_schema: type[BaseModel] = DatabaseSqlGenerateInput
     risk_level: str = "moderate"
@@ -167,12 +247,12 @@ class DatabaseSqlGenerateTool(BaseTool):
                 for item in runtime.state.get("allowed_semantic_asset_ids") or []
                 if str(item).strip()
             }
-            invalid_asset_ids = [item for item in selected_asset_ids if item not in allowed_asset_ids]
-            if invalid_asset_ids:
-                return (
-                    "🧮 SQL 生成失败：以下语义资产不属于当前分析模型或已被删除："
-                    + ", ".join(invalid_asset_ids)
-                )
+            selected_asset_ids, normalization_error = _normalize_selected_semantic_asset_ids(
+                selected_asset_ids,
+                allowed_asset_ids,
+            )
+            if normalization_error:
+                return "🧮 SQL 生成失败：" + normalization_error
         request_payload = {
             "question": question,
             "database_source_id": database_source_id,
@@ -182,6 +262,7 @@ class DatabaseSqlGenerateTool(BaseTool):
         }
         parent: RegisteredDatabaseSqlGeneration | None = None
         disposition = "generated"
+        applied_instruction = ""
         if parent_generation_id:
             parent = database_sql_revision_resume_registry.get_generation(
                 parent_generation_id,
@@ -192,35 +273,45 @@ class DatabaseSqlGenerateTool(BaseTool):
             proposed = str(revision_instruction or "").strip()
             if not proposed:
                 return "🧮 SQL 重新生成失败：必须提供自然语言 revision_instruction，不能提供 SQL。"
-            revision_request = database_sql_revision_resume_registry.create_revision_request(
-                generation=parent,
-                proposed_revision_instruction=proposed,
-                tool_call_id=tool_call_id,
-                query_id=self.query_id,
-            )
-            decision = interrupt(
-                {
-                    "type": "database_sql_revision_request",
-                    "request": revision_request,
-                    "decisions": [
-                        {"action": "agree"},
-                        {"action": "reject"},
-                        {"action": "modify"},
-                    ],
-                }
-            )
-            if not isinstance(decision, dict) or decision.get("action") == "reject":
-                return _format_generation(parent, disposition="rejected_revision")
-            approved_instruction = str(decision.get("revision_instruction") or "").strip()
-            if not approved_instruction:
-                return "🧮 SQL 重新生成失败：审批结果缺少自然语言修改说明。"
             request_payload = dict(parent.request)
             original_question = str(request_payload.get("question") or parent.result.question)
-            request_payload["question"] = (
-                f"原始问题：\n{original_question}\n\n"
-                f"用户确认的本次口径补充：\n{approved_instruction}"
-            )
-            disposition = "approved_revision"
+            if _is_technical_sql_revision(proposed):
+                applied_instruction = proposed
+                request_payload["question"] = (
+                    f"原始业务问题（业务语义不可改变）：\n{original_question}\n\n"
+                    f"上一版 SQL：\n{parent.result.sql}\n\n"
+                    f"SQL 技术修复反馈（只允许改变实现与性能，不得改变指标、分母、粒度、筛选或时间范围）：\n"
+                    f"{proposed}"
+                )
+                disposition = "technical_repair"
+            else:
+                revision_request = database_sql_revision_resume_registry.create_revision_request(
+                    generation=parent,
+                    proposed_revision_instruction=proposed,
+                    tool_call_id=tool_call_id,
+                    query_id=self.query_id,
+                )
+                decision = interrupt(
+                    {
+                        "type": "database_sql_revision_request",
+                        "request": revision_request,
+                        "decisions": [
+                            {"action": "agree"},
+                            {"action": "reject"},
+                            {"action": "modify"},
+                        ],
+                    }
+                )
+                if not isinstance(decision, dict) or decision.get("action") == "reject":
+                    return _format_generation(parent, disposition="rejected_revision")
+                applied_instruction = str(decision.get("revision_instruction") or "").strip()
+                if not applied_instruction:
+                    return "🧮 SQL 重新生成失败：审批结果缺少自然语言修改说明。"
+                request_payload["question"] = (
+                    f"原始问题：\n{original_question}\n\n"
+                    f"用户确认的本次口径补充：\n{applied_instruction}"
+                )
+                disposition = "approved_revision"
         elif revision_instruction:
             return "🧮 SQL 重新生成失败：revision_instruction 必须与 parent_generation_id 一起使用。"
 
@@ -249,6 +340,7 @@ class DatabaseSqlGenerateTool(BaseTool):
                 "route": summarize_table_route(result.route),
                 "semantic_assets": result.semantic_assets,
                 "references": result.references,
+                "generation": result.generation,
                 "guardrail_note": result.guardrail_note,
                 "stage_timings": result.stage_timings,
             },
@@ -259,16 +351,13 @@ class DatabaseSqlGenerateTool(BaseTool):
             },
         )
         generation_request = dict(parent.request) if parent is not None else dict(request_payload)
-        approved_instruction = ""
-        if parent is not None:
-            approved_instruction = str(decision.get("revision_instruction") or "").strip()
         generation = database_sql_revision_resume_registry.register_generation(
             session_id=self.session_id,
             query_id=self.query_id,
             result=result,
             request=generation_request,
             parent_generation_id=parent.id if parent is not None else "",
-            revision_instruction=approved_instruction,
+            revision_instruction=applied_instruction,
         )
         return _format_generation(generation, disposition=disposition)
 

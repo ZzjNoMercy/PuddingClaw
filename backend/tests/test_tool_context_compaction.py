@@ -18,6 +18,7 @@ from graph.middlewares.tool_context_compaction import (
     ToolContextCompactionMiddleware,
     ToolContextCompactionService,
     ToolContextConfig,
+    _deterministic_background_compaction,
 )
 from graph.session_manager import SessionManager
 
@@ -26,6 +27,56 @@ def _manager(tmp_path: Path) -> SessionManager:
     manager = SessionManager()
     manager.initialize(tmp_path)
     return manager
+
+
+def test_harness_control_results_are_not_semantically_rewritten() -> None:
+    output = (
+        '{"todos":[{"id":"todo-final","content":"运行最终验证",'
+        '"status":"completed"}],"ledger_sha256":"sha256:todo-ledger"}'
+    )
+    compacted = _deterministic_background_compaction(
+        {
+            "tool_call_id": "call-todos",
+            "tool": "update_todos",
+            "input": {"todos": []},
+            "output": output,
+            "source_hash": "sha256:source",
+            "raw_output_ref": "/raw/tool-output.json",
+        }
+    )
+
+    assert compacted is not None
+    context, method = compacted
+    assert method == "harness_control_passthrough"
+    assert output in context
+    assert "验证通过" not in context
+    assert '"source_hash":"sha256:source"' in context
+
+
+def test_versioned_file_compaction_preserves_hash_header_exactly() -> None:
+    output = (
+        "file_path: /scratch/report.html\n"
+        "version: sha256:0123456789abcdef\n"
+        "size_chars: 9000\n"
+        "content:\n"
+        + "A" * 9000
+    )
+    compacted = _deterministic_background_compaction(
+        {
+            "tool_call_id": "call-version",
+            "tool": "inspect_file_version",
+            "output": output,
+            "source_hash": "sha256:tool-result",
+            "raw_output_ref": "/raw/version.txt",
+        }
+    )
+
+    assert compacted is not None
+    context, method = compacted
+    assert method == "versioned_file_adapter"
+    assert "version: sha256:0123456789abcdef" in context
+    assert "size_chars: 9000" in context
+    assert len(context) < len(output)
 
 
 def _save_tools(
@@ -180,12 +231,15 @@ def test_candidate_scan_preserves_recent_n_and_short_results(tmp_path: Path) -> 
         "call-3",
     ]
 
-    assert manager.select_tool_context_candidates(
-        "candidates",
-        min_result_tokens=10000,
-        keep_recent=2,
-        policy_version=POLICY_VERSION,
-    ) == []
+    assert (
+        manager.select_tool_context_candidates(
+            "candidates",
+            min_result_tokens=10000,
+            keep_recent=2,
+            policy_version=POLICY_VERSION,
+        )
+        == []
+    )
     assert manager.get_tool_context_status("candidates")["status"] == "idle"
 
 
@@ -231,12 +285,15 @@ def test_duplicate_tool_ids_fail_closed_without_compaction(tmp_path: Path) -> No
     data["messages"][0]["tool_calls"][1]["id"] = "call-0"
     manager._write_file("duplicate", data)
 
-    assert manager.select_tool_context_candidates(
-        "duplicate",
-        min_result_tokens=100,
-        keep_recent=0,
-        policy_version=POLICY_VERSION,
-    ) == []
+    assert (
+        manager.select_tool_context_candidates(
+            "duplicate",
+            min_result_tokens=100,
+            keep_recent=0,
+            policy_version=POLICY_VERSION,
+        )
+        == []
+    )
     assert manager.get_tool_context_status("duplicate")["error"] == "duplicate_tool_call_id"
 
 
@@ -262,15 +319,18 @@ def test_commit_rejects_duplicate_ids_even_if_session_is_corrupted_after_job_sta
     manager._write_file("duplicate-after-start", data)
 
     candidate = candidates[0]
-    assert manager.complete_tool_context_compaction(
-        "duplicate-after-start",
-        job_id="duplicate-job",
-        tool_call_id=candidate["tool_call_id"],
-        source_hash=candidate["source_hash"],
-        policy_version=POLICY_VERSION,
-        context_output="must not commit",
-        method="test",
-    ) is False
+    assert (
+        manager.complete_tool_context_compaction(
+            "duplicate-after-start",
+            job_id="duplicate-job",
+            tool_call_id=candidate["tool_call_id"],
+            source_hash=candidate["source_hash"],
+            policy_version=POLICY_VERSION,
+            context_output="must not commit",
+            method="test",
+        )
+        is False
+    )
     calls = manager.get_raw_messages("duplicate-after-start")["messages"][0]["tool_calls"]
     assert all("context_output" not in call for call in calls)
 
@@ -286,23 +346,29 @@ def test_job_commit_keeps_id_count_order_and_ui_output(tmp_path: Path) -> None:
         keep_recent=0,
         policy_version=POLICY_VERSION,
     )
-    assert manager.begin_tool_context_job(
-        "commit",
-        job_id="job-1",
-        candidates=candidates,
-        policy_version=POLICY_VERSION,
-    ) is True
-
-    for candidate in candidates:
-        assert manager.complete_tool_context_compaction(
+    assert (
+        manager.begin_tool_context_job(
             "commit",
             job_id="job-1",
-            tool_call_id=candidate["tool_call_id"],
-            source_hash=candidate["source_hash"],
+            candidates=candidates,
             policy_version=POLICY_VERSION,
-            context_output=f"摘要：{candidate['tool_call_id']}",
-            method="test",
-        ) is True
+        )
+        is True
+    )
+
+    for candidate in candidates:
+        assert (
+            manager.complete_tool_context_compaction(
+                "commit",
+                job_id="job-1",
+                tool_call_id=candidate["tool_call_id"],
+                source_hash=candidate["source_hash"],
+                policy_version=POLICY_VERSION,
+                context_output=f"摘要：{candidate['tool_call_id']}",
+                method="test",
+            )
+            is True
+        )
 
     assert _ids(manager, "commit") == before_ids
     visible = manager.load_session("commit")[0]["tool_calls"][0]
@@ -337,15 +403,16 @@ def test_same_hash_policy_is_idempotent_and_source_change_becomes_stale(tmp_path
         context_output="ready summary",
         method="test",
     )
-    assert manager.update_tool_context_job(
-        "idempotent", "job-ready", status="completed", completed_count=1
+    assert manager.update_tool_context_job("idempotent", "job-ready", status="completed", completed_count=1)
+    assert (
+        manager.select_tool_context_candidates(
+            "idempotent",
+            min_result_tokens=100,
+            keep_recent=0,
+            policy_version=POLICY_VERSION,
+        )
+        == []
     )
-    assert manager.select_tool_context_candidates(
-        "idempotent",
-        min_result_tokens=100,
-        keep_recent=0,
-        policy_version=POLICY_VERSION,
-    ) == []
 
     data = manager.get_raw_messages("idempotent")
     call = data["messages"][0]["tool_calls"][0]
@@ -368,15 +435,18 @@ def test_same_hash_policy_is_idempotent_and_source_change_becomes_stale(tmp_path
     latest = manager.get_raw_messages("idempotent")
     latest["messages"][0]["tool_calls"][0]["output"] = "changed during job" * 2000
     manager._write_file("idempotent", latest)
-    assert manager.complete_tool_context_compaction(
-        "idempotent",
-        job_id="job-stale",
-        tool_call_id=stale_candidate["tool_call_id"],
-        source_hash=stale_candidate["source_hash"],
-        policy_version=POLICY_VERSION,
-        context_output="must not overwrite",
-        method="test",
-    ) is False
+    assert (
+        manager.complete_tool_context_compaction(
+            "idempotent",
+            job_id="job-stale",
+            tool_call_id=stale_candidate["tool_call_id"],
+            source_hash=stale_candidate["source_hash"],
+            policy_version=POLICY_VERSION,
+            context_output="must not overwrite",
+            method="test",
+        )
+        is False
+    )
     stale = manager.get_raw_messages("idempotent")["messages"][0]["tool_calls"][0]
     assert stale["context_compaction"]["status"] == "stale"
     assert stale["context_output"] == "ready summary"
@@ -697,9 +767,7 @@ def test_immediate_guard_only_compacts_single_oversized_result_and_keeps_id() ->
 
 
 def test_immediate_guard_is_disabled_by_default() -> None:
-    middleware = ToolContextCompactionMiddleware(
-        ToolContextConfig(single_tool_trigger_tokens=8000)
-    )
+    middleware = ToolContextCompactionMiddleware(ToolContextConfig(single_tool_trigger_tokens=8000))
     raw = "x" * 40_000
 
     async def invoke() -> ToolMessage:
@@ -745,16 +813,85 @@ def test_saved_agent_context_does_not_duplicate_raw_tool_artifact() -> None:
 
     serialized = _serialize_agent_context_messages(
         [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call-artifact",
+                        "name": "read_file",
+                        "args": {"file_path": "/large"},
+                    }
+                ],
+            ),
             ToolMessage(
                 content="model summary",
                 tool_call_id="call-artifact",
                 artifact={RAW_OUTPUT_ARTIFACT_KEY: "very large raw output", "keep": "metadata"},
-            )
+            ),
         ]
     )
-    artifact = serialized[0]["data"]["artifact"]
+    artifact = serialized[1]["data"]["artifact"]
     assert RAW_OUTPUT_ARTIFACT_KEY not in artifact
     assert artifact["keep"] == "metadata"
+
+
+def test_compact_context_waits_for_real_tool_result_before_persisting() -> None:
+    from graph.deepagents_manager import _serialize_protocol_closed_agent_context
+
+    call = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "id": "call-live",
+                "name": "read_file",
+                "args": {"file_path": "/workspace/report.html"},
+            }
+        ],
+    )
+
+    assert _serialize_protocol_closed_agent_context([call]) is None
+
+    serialized = _serialize_protocol_closed_agent_context(
+        [
+            call,
+            ToolMessage(
+                content="real file contents",
+                tool_call_id="call-live",
+                name="read_file",
+            ),
+        ]
+    )
+
+    assert serialized is not None
+    assert serialized[1]["data"]["content"] == "real file contents"
+    assert serialized[1]["data"]["additional_kwargs"].get("lc_source") is None
+
+
+def test_compact_context_closes_non_executable_invalid_call() -> None:
+    from graph.deepagents_manager import _serialize_protocol_closed_agent_context
+
+    serialized = _serialize_protocol_closed_agent_context(
+        [
+            AIMessage(
+                content="",
+                invalid_tool_calls=[
+                    {
+                        "id": "call-invalid",
+                        "name": "patch_file",
+                        "args": "{",
+                        "error": "bad json",
+                        "type": "invalid_tool_call",
+                    }
+                ],
+            ),
+            HumanMessage(content="rubric feedback", name="rubric_grader"),
+        ]
+    )
+
+    assert serialized is not None
+    assert [item["type"] for item in serialized] == ["ai", "tool"]
+    assert serialized[1]["data"]["tool_call_id"] == "call-invalid"
+    assert serialized[1]["data"]["status"] == "error"
 
 
 def test_saved_agent_context_excludes_completion_control_messages() -> None:
@@ -854,9 +991,9 @@ def test_model_route_uses_only_ready_entries_without_waiting(tmp_path: Path) -> 
 
     async def run() -> None:
         request = Request(
-                [
-                    ToolMessage(content=raw_first, tool_call_id="call-0"),
-                    ToolMessage(content="raw pending", tool_call_id="call-1"),
+            [
+                ToolMessage(content=raw_first, tool_call_id="call-0"),
+                ToolMessage(content="raw pending", tool_call_id="call-1"),
             ]
         )
 
@@ -1013,10 +1150,7 @@ def test_deepagents_tool_context_switch_isolated_from_chat_config(tmp_path: Path
     )
     saved = config.load_config()
     assert saved["compression"]["deepagents"]["tool_context"]["enabled"] is False
-    assert (
-        saved["compression"]["deepagents"]["tool_context"]["immediate_compaction_enabled"]
-        is True
-    )
+    assert saved["compression"]["deepagents"]["tool_context"]["immediate_compaction_enabled"] is True
     assert "summary_input_tokens" not in saved["compression"]["deepagents"]["summarization"]
     assert saved["compression"]["middleware"] == chat_before
     assert config._DEFAULT_CONFIG == defaults_before

@@ -1,7 +1,5 @@
 """Optimistic, versioned file patch tools for DeepAgents."""
 
-from __future__ import annotations
-
 import hashlib
 import re
 import time
@@ -12,6 +10,8 @@ from langchain.tools import ToolRuntime
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field, model_validator
+
+EXTERNAL_ARTIFACT_LEASE_TTL_SECONDS = 6 * 60 * 60
 
 
 class ReplacementHunk(BaseModel):
@@ -202,6 +202,69 @@ class VersionedPatchMiddleware(AgentMiddleware[Any, Any, Any]):
                     status="error",
                 )
             source_version = _digest(original)
+            active_lease = session_manager.find_staged_external_artifact_lease(
+                session_id,
+                run_id=run_id,
+                query_id=query_id,
+                target_path=file_path,
+                goal_id=goal_id,
+                goal_revision=goal_revision,
+            )
+            if isinstance(active_lease, dict):
+                if str(active_lease.get("expected_source_sha256") or "") != source_version:
+                    return ToolMessage(
+                        content=(
+                            "Stage conflict: the authoritative external target changed after the active "
+                            "lease was created. Commit or discard that lease before staging again."
+                        ),
+                        name="stage_external_artifact",
+                        tool_call_id=runtime.tool_call_id,
+                        status="error",
+                    )
+                staged_path = str(active_lease.get("staged_path") or "")
+                _, staged_error = _read_all(self.backend, staged_path)
+                rehydrated = staged_error is not None
+                if staged_error is not None:
+                    write_result = self.backend.write(staged_path, original)
+                    if write_result.error:
+                        return ToolMessage(
+                            content=f"Error rehydrating staged artifact: {write_result.error}",
+                            name="stage_external_artifact",
+                            tool_call_id=runtime.tool_call_id,
+                            status="error",
+                        )
+                now = time.time()
+                expired = float(active_lease.get("expires_at") or 0) < now
+                rebound = (
+                    str(active_lease.get("run_id") or "") != run_id
+                    or str(active_lease.get("query_id") or "") != query_id
+                )
+                if expired or rebound:
+                    active_lease.update(
+                        {
+                            "run_id": run_id,
+                            "query_id": query_id,
+                            "expires_at": now + EXTERNAL_ARTIFACT_LEASE_TTL_SECONDS,
+                            "renewed_at": now,
+                        }
+                    )
+                    session_manager.upsert_external_artifact_lease(
+                        session_id,
+                        active_lease,
+                    )
+                return ToolMessage(
+                    content=(
+                        "ExternalArtifactLease "
+                        f"{'rehydrated from the current source; the previous uncommitted draft was unavailable' if rehydrated else 'rebound to this Run' if rebound else 'renewed after expiry' if expired else 'reused'} "
+                        "for this Goal revision and exact target. "
+                        f"lease_id={active_lease.get('lease_id')}; staged_path={staged_path}; "
+                        f"expected_source_sha256={source_version}. Continue from the existing staged file; "
+                        "do not create or copy another workspace artifact."
+                    ),
+                    name="stage_external_artifact",
+                    tool_call_id=runtime.tool_call_id,
+                    status="success",
+                )
             lease_seed = f"{session_id}:{run_id}:{runtime.tool_call_id}:{file_path}"
             lease_id = "artifact-lease-" + hashlib.sha256(
                 lease_seed.encode("utf-8")
@@ -265,7 +328,7 @@ class VersionedPatchMiddleware(AgentMiddleware[Any, Any, Any]):
                 "expected_source_sha256": source_version,
                 "status": "staged",
                 "created_at": time.time(),
-                "expires_at": time.time() + 6 * 60 * 60,
+                "expires_at": time.time() + EXTERNAL_ARTIFACT_LEASE_TTL_SECONDS,
             }
             session_manager.upsert_external_artifact_lease(session_id, lease)
             return ToolMessage(
@@ -319,16 +382,17 @@ class VersionedPatchMiddleware(AgentMiddleware[Any, Any, Any]):
                     tool_call_id=runtime.tool_call_id,
                     status="error",
                 )
-            if str(lease.get("run_id") or "") != run_id or str(lease.get("query_id") or "") != query_id:
+            same_owner = (
+                str(lease.get("goal_id") or "") == goal_id
+                and lease.get("goal_revision") == goal_revision
+                if goal_id
+                else not str(lease.get("goal_id") or "")
+                and str(lease.get("run_id") or "") == run_id
+                and str(lease.get("query_id") or "") == query_id
+            )
+            if not same_owner:
                 return ToolMessage(
-                    content="Error: ExternalArtifactLease belongs to a different Run/query.",
-                    name="commit_external_artifact",
-                    tool_call_id=runtime.tool_call_id,
-                    status="error",
-                )
-            if str(lease.get("goal_id") or "") != goal_id or lease.get("goal_revision") != goal_revision:
-                return ToolMessage(
-                    content="Error: ExternalArtifactLease belongs to a different Goal revision.",
+                    content="Error: ExternalArtifactLease belongs to a different execution scope or Goal revision.",
                     name="commit_external_artifact",
                     tool_call_id=runtime.tool_call_id,
                     status="error",

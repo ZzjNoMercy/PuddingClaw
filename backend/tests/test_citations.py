@@ -1,6 +1,7 @@
 """Tests for structured Agent sources and final citation mappings."""
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -92,6 +93,24 @@ def test_finalize_citations_rejects_unknown_sources_and_reuses_index():
     assert len(citations) == 2
     assert {item["display_index"] for item in citations} == {1}
     assert {item["source_id"] for item in citations} == {source_id}
+
+
+def test_sanitize_citation_markdown_keeps_source_markers_but_removes_sql_footnotes():
+    from graph.citations import sanitize_citation_markdown
+
+    content = (
+        "查询句柄 `sql-gen-demo` [^sql-gen-demo]，真实来源[^src_valid]。\n\n"
+        "[^sql-gen-demo]: 这不是可引用来源\n"
+        "[^src_valid]: 模型也不应自行输出来源脚注定义\n"
+    )
+
+    sanitized = sanitize_citation_markdown(content)
+
+    assert "`sql-gen-demo`" in sanitized
+    assert "[^sql-gen-demo]" not in sanitized
+    assert "这不是可引用来源" not in sanitized
+    assert "[^src_valid]" in sanitized
+    assert "模型也不应自行输出来源脚注定义" not in sanitized
 
 
 def test_resolve_message_citations_reuses_only_cited_session_sources():
@@ -282,6 +301,7 @@ def test_tool_result_adapter_handles_aihot_items_json():
             "id": "news-1",
             "title": "OpenAI 发布新模型",
             "url": "https://example.com/openai-model",
+            "permalink": "https://aihot.virxact.com/items/news-1",
             "source": "OpenAI",
             "summary": "模型能力和上下文窗口得到提升。",
             "publishedAt": "2026-06-22T08:00:00Z",
@@ -292,16 +312,55 @@ def test_tool_result_adapter_handles_aihot_items_json():
 
     adapted = tool_result_adapter.adapt(
         output,
-        tool_name="terminal",
+        tool_name="execute",
         tool_input="curl https://aihot.virxact.com/api/public/items?mode=selected",
         tool_call_id="aihot-call",
     )
 
     assert adapted.adapter == "common_json"
     assert adapted.sources[0]["title"] == "OpenAI 发布新模型"
-    assert adapted.sources[0]["uri"] == "https://example.com/openai-model"
+    assert adapted.sources[0]["uri"] == "https://aihot.virxact.com/items/news-1"
     assert adapted.sources[0]["source_type"] == "web"
     assert adapted.sources[0]["metadata"]["published_at"] == "2026-06-22T08:00:00Z"
+
+
+def test_plain_network_response_uses_requested_endpoint_as_source():
+    from graph.tool_result_adapter import tool_result_adapter
+
+    adapted = tool_result_adapter.adapt(
+        "最新结果是模型能力更新。",
+        tool_name="execute",
+        tool_input=json.dumps(
+            {
+                "command": (
+                    'UA="custom-skill/1.0 (+https://skill.example/about)"\n'
+                    'curl -sS -H "User-Agent: $UA" '
+                    '"https://api.example.com/public/latest"'
+                )
+            }
+        ),
+        tool_call_id="call-plain-network",
+    )
+
+    assert adapted.adapter == "network_request"
+    assert [source["uri"] for source in adapted.sources] == [
+        "https://api.example.com/public/latest"
+    ]
+    assert adapted.sources[0]["quote"] == "最新结果是模型能力更新。"
+
+
+def test_execute_skill_stdout_links_are_generic_sources():
+    from graph.tool_result_adapter import tool_result_adapter
+
+    adapted = tool_result_adapter.adapt(
+        "技能：demo\n\n执行结果：\n[最新公告](https://example.com/latest)",
+        tool_name="execute_skill",
+        tool_input='{"skill_name":"demo"}',
+        tool_call_id="call-skill",
+    )
+
+    assert adapted.adapter == "markdown_links"
+    assert adapted.sources[0]["uri"] == "https://example.com/latest"
 
 
 def test_tool_result_adapter_handles_tavily_schema():

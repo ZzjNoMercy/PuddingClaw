@@ -16,8 +16,8 @@ from langchain.agents.middleware.types import ToolCallRequest
 from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
-from graph.session_manager import session_manager
 from graph.attachment_store import attachment_store
+from graph.session_manager import session_manager
 from graph.tool_result_adapter import tool_result_adapter
 from harness.artifact_paths import artifact_path_matches, extract_declared_artifact_targets
 from harness.models import (
@@ -474,24 +474,27 @@ def _result_evidence_refs(
                 "output_preview": content[:1000],
             }
         )
-        if tool_name in _WEB_TOOLS or tool_name in {"execute", "terminal"}:
-            tool_input = json.dumps(args, ensure_ascii=False, sort_keys=True)
-            adapted = tool_result_adapter.adapt(
-                content,
-                tool_name=tool_name,
-                tool_input=tool_input,
-                tool_call_id=tool_call_id,
+        # Normalize every ToolMessage at the authority boundary. The adapter
+        # itself rejects non-retrieval tools, while explicit envelopes and
+        # arbitrary Skill script outputs remain portable across tool names.
+        tool_input = json.dumps(args, ensure_ascii=False, sort_keys=True)
+        adapted = tool_result_adapter.adapt(
+            content,
+            tool_name=tool_name,
+            tool_input=tool_input,
+            tool_call_id=tool_call_id,
+        )
+        for source in adapted.sources:
+            refs.append(
+                {
+                    "kind": "source",
+                    "tool_call_id": tool_call_id,
+                    "source_id": source.get("source_id"),
+                    "source_type": source.get("source_type"),
+                    "uri": source.get("uri"),
+                    "title": source.get("title"),
+                }
             )
-            for source in adapted.sources:
-                refs.append(
-                    {
-                        "kind": "source",
-                        "tool_call_id": tool_call_id,
-                        "source_id": source.get("source_id"),
-                        "uri": source.get("uri"),
-                        "title": source.get("title"),
-                    }
-                )
         for match in _ANALYTICS_RESULT_REF_RE.finditer(content):
             refs.append(
                 {
@@ -664,7 +667,7 @@ def _artifact_reference_for_write(
         (
             f"{scope.value}\0{execution.get('workspace_id', '')}\0"
             f"{identity_path}"
-        ).encode("utf-8")
+        ).encode()
     ).hexdigest()[:20]
     return ArtifactReference(
         artifact_id=artifact_id,
@@ -724,7 +727,18 @@ def build_verification_activations(
         goal_revision=goal_revision,
     )
     activations: list[VerificationActivation] = []
-    for pack in verification_packs_for_tool(tool_name, args):
+    packs = verification_packs_for_tool(tool_name, args)
+    has_web_source = any(
+        item.get("kind") == "source"
+        and (
+            item.get("source_type") == "web"
+            or str(item.get("uri") or "").startswith(("http://", "https://"))
+        )
+        for item in result_refs
+    )
+    if has_web_source and "web_research" not in packs:
+        packs.append("web_research")
+    for pack in packs:
         material = bool(result_refs)
         if pack == "analytics":
             material = material and (

@@ -6,14 +6,18 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from graph.middlewares.skill_intent_router import SkillIntentRouterMiddleware
 from graph.middlewares.toolset import ToolsetMiddleware, discover_skill_toolsets
+from harness.tool_execution import ToolExecutionPipeline
 from tools.toolsets import (
     BUSINESS_TOOLSETS,
     DEFAULT_CUSTOM_TOOL_NAMES,
+    TOOL_CONTROL_DESCRIPTORS,
     TOOLSETS,
+    UNCONDITIONAL_EXTENSION_TOOLSETS,
     UNCONDITIONAL_TOOL_NAMES,
     agent_custom_tool_names,
     business_tool_names,
     tools_for_toolsets,
+    validate_tool_control_descriptors,
 )
 
 
@@ -23,6 +27,7 @@ def test_project_skill_frontmatter_declares_known_toolsets() -> None:
     assert skills["build-semantic-dimension"] == {"semantic_dimension_build", "semantic_lookup"}
     assert skills["build-logical-dataset"] == {"logical_dataset"}
     assert skills["database-analysis"] == {"database_analysis", "semantic_lookup"}
+    assert skills["skill-management"] == {"skill_management"}
     assert all(name in TOOLSETS for values in skills.values() for name in values)
 
 
@@ -33,13 +38,40 @@ def test_every_registered_agent_custom_tool_has_an_explicit_policy() -> None:
         "install_skill",
         "prepare_skill_update",
         "update_skill",
-    }.issubset(DEFAULT_CUSTOM_TOOL_NAMES)
+        "inspect_skill",
+    }.issubset(BUSINESS_TOOLSETS["skill_management"])
+    assert "edit_file" not in UNCONDITIONAL_TOOL_NAMES
+    assert {
+        "inspect_file_version",
+        "patch_file",
+        "stage_external_artifact",
+        "commit_external_artifact",
+        "prepare_attachment_edit",
+        "publish_attachment",
+        "stage_external_directory",
+        "prepare_external_directory_commit",
+        "commit_external_directory",
+    }.issubset(UNCONDITIONAL_TOOL_NAMES)
 
     owners: dict[str, list[str]] = {}
     for toolset, tool_names in BUSINESS_TOOLSETS.items():
         for tool_name in tool_names:
             owners.setdefault(tool_name, []).append(toolset)
     assert {name: values for name, values in owners.items() if len(values) != 1} == {}
+
+
+def test_default_harness_file_toolset_is_registered_with_execution_pipeline() -> None:
+    harness_file_tools = UNCONDITIONAL_EXTENSION_TOOLSETS["harness_files"]
+
+    assert harness_file_tools <= ToolExecutionPipeline.BUILTIN_TOOLS
+    assert harness_file_tools <= ToolExecutionPipeline.DECLARED_ALLOW_TOOLS
+
+
+def test_every_registered_tool_declares_a_control_descriptor() -> None:
+    assert validate_tool_control_descriptors() == []
+    assert TOOL_CONTROL_DESCRIPTORS["execute"].policy == "dynamic"
+    assert TOOL_CONTROL_DESCRIPTORS["task"].policy == "inherit_parent"
+    assert TOOL_CONTROL_DESCRIPTORS["commit_external_artifact"].side_effect == "external_mutation"
 
 
 def test_toolset_activates_only_after_successfully_reading_skill_file(tmp_path) -> None:
@@ -77,6 +109,42 @@ def test_unloaded_business_tools_are_hidden_from_model_request(tmp_path) -> None
     request = ModelRequest(model=None, messages=[], tools=tools, state={"messages": []})
 
     assert [tool["name"] for tool in middleware._visible_tools(request)] == ["read_file", "execute"]
+
+
+def test_skill_management_tools_are_visible_only_after_skill_activation(tmp_path) -> None:
+    middleware = ToolsetMiddleware(
+        skills_dir=tmp_path,
+        toolsets_by_skill={"skill-management": {"skill_management"}},
+    )
+    tools = [
+        {"name": "inspect_skill"},
+        {"name": "prepare_skill_install"},
+        {"name": "install_skill"},
+        {"name": "prepare_skill_update"},
+        {"name": "update_skill"},
+    ]
+
+    inactive = ModelRequest(
+        model=None,
+        messages=[],
+        tools=tools,
+        state={"messages": [], "active_skill_ids": []},
+    )
+    active = ModelRequest(
+        model=None,
+        messages=[],
+        tools=tools,
+        state={"messages": [], "active_skill_ids": ["skill-management"]},
+    )
+
+    assert middleware._visible_tools(inactive) == []
+    assert [tool["name"] for tool in middleware._visible_tools(active)] == [
+        "inspect_skill",
+        "prepare_skill_install",
+        "install_skill",
+        "prepare_skill_update",
+        "update_skill",
+    ]
 
 
 def test_prior_turn_skill_reads_remain_active_in_same_session(tmp_path) -> None:
@@ -217,6 +285,13 @@ def test_native_and_explicit_base_tools_are_unconditionally_visible_and_executab
         {"name": "read_resource"},
         {"name": "tavily_search"},
         {"name": "fetch_url"},
+        {"name": "edit_file"},
+        {"name": "inspect_file_version"},
+        {"name": "patch_file"},
+        {"name": "stage_external_artifact"},
+        {"name": "commit_external_artifact"},
+        {"name": "prepare_attachment_edit"},
+        {"name": "publish_attachment"},
         {"name": "prepare_skill_install"},
         {"name": "install_skill"},
         {"name": "prepare_skill_update"},
@@ -233,10 +308,12 @@ def test_native_and_explicit_base_tools_are_unconditionally_visible_and_executab
         "read_resource",
         "tavily_search",
         "fetch_url",
-        "prepare_skill_install",
-        "install_skill",
-        "prepare_skill_update",
-        "update_skill",
+        "inspect_file_version",
+        "patch_file",
+        "stage_external_artifact",
+        "commit_external_artifact",
+        "prepare_attachment_edit",
+        "publish_attachment",
     ]
 
     calls: list[str] = []
@@ -336,3 +413,14 @@ def test_skill_intent_router_keeps_web_search_when_explicitly_requested_for_ai()
     decision = SkillIntentRouterMiddleware()._classify_intent("联网搜索 AI 最新新闻并给我原始网页链接")
 
     assert decision["skill_ids"] == ["aihot", "tavily-search"]
+
+
+def test_skill_intent_router_routes_skill_management_workflow() -> None:
+    router = SkillIntentRouterMiddleware()
+
+    assert router._classify_intent("检查 aihot Skill 的版本和完整性")["skill_ids"] == [
+        "skill-management"
+    ]
+    assert router._classify_intent("从 GitHub 更新 skill")["skill_ids"] == [
+        "skill-management"
+    ]

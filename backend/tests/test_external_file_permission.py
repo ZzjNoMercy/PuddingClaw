@@ -121,6 +121,50 @@ def test_permissioned_backend_edits_only_approved_external_file(tmp_path):
     assert external.read_text(encoding="utf-8") == "after"
 
 
+def test_external_read_grant_never_steals_virtual_scratch_routing(tmp_path):
+    from deepagents.backends import FilesystemBackend
+
+    from graph.permissioned_filesystem_backend import PermissionedCompositeBackend
+    from graph.session_manager import session_manager
+
+    state = tmp_path / "state"
+    state.mkdir()
+    session_manager.initialize(state)
+    session_manager.create_session("virtual-scratch-routing-session")
+    session_manager.add_permission_grant(
+        "virtual-scratch-routing-session",
+        grant_type="external_file_read",
+        target_kind="all_external_files",
+        target="*",
+        capabilities=["read", "external_path"],
+    )
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    workspace.mkdir()
+    target = scratch / "external-directories" / "directory-lease-1" / "chart.js"
+    target.parent.mkdir(parents=True)
+    target.write_text("const years = [2026];", encoding="utf-8")
+    workspace_backend = FilesystemBackend(root_dir=workspace, virtual_mode=True)
+    backend = PermissionedCompositeBackend(
+        default=workspace_backend,
+        routes={
+            "/workspace/": workspace_backend,
+            "/scratch/": FilesystemBackend(root_dir=scratch, virtual_mode=True),
+        },
+        session_id="virtual-scratch-routing-session",
+        workspace_root=workspace,
+    )
+
+    result = backend.read(
+        "/scratch/external-directories/directory-lease-1/chart.js",
+        limit=20,
+    )
+
+    assert result.error is None
+    assert result.file_data is not None
+    assert result.file_data.get("content") == "const years = [2026];"
+
+
 def test_permissioned_backend_never_mutates_managed_resources(tmp_path):
     from deepagents.backends import FilesystemBackend
 
@@ -651,7 +695,7 @@ def test_tool_action_grant_cannot_be_replayed(tmp_path):
     loop.close()
 
 
-def test_fetch_url_session_grant_persists_network_origin(tmp_path):
+def test_session_network_grant_persists_shared_network_capability(tmp_path):
     from fastapi.testclient import TestClient
 
     from app import app
@@ -662,7 +706,7 @@ def test_fetch_url_session_grant_persists_network_origin(tmp_path):
     session_manager.create_session("fetch-url-session")
     loop = asyncio.new_event_loop()
     future = loop.create_future()
-    request_id = "perm-req-fetch-url"
+    request_id = "perm-req-session-network"
     permission_resume_registry._pending[request_id] = future
     permission_resume_registry._requests[request_id] = {
         "id": request_id,
@@ -674,9 +718,10 @@ def test_fetch_url_session_grant_persists_network_origin(tmp_path):
         "command": '{"url": "https://example.com/report?month=1"}',
         "reason": "network_access:fetch_url",
         "risk": "network",
-        "session_target_kind": "network_origin",
-        "session_target": "https://example.com",
-        "session_scope_label": "本 Session 允许访问 example.com",
+        "capabilities": ["execute", "network_access"],
+        "session_target_kind": "capability",
+        "session_target": "session_network_access",
+        "session_scope_label": "本 Session 允许访问所有网络来源",
     }
     client = TestClient(app)
 
@@ -687,22 +732,89 @@ def test_fetch_url_session_grant_persists_network_origin(tmp_path):
 
     assert response.status_code == 200
     grant = response.json()["grant"]
-    assert grant["target_kind"] == "network_origin"
-    assert grant["target"] == "https://example.com"
+    assert grant["target_kind"] == "capability"
+    assert grant["target"] == "session_network_access"
     assert grant["scope"] == "session"
-    assert grant["metadata"]["session_target"] == "https://example.com"
+    assert grant["capabilities"] == ["execute", "network_access"]
+    assert grant["metadata"]["session_target"] == "session_network_access"
     assert session_manager.consume_tool_action_permission(
         "fetch-url-session",
         "sha256:different-query",
-        session_target_kind="network_origin",
-        session_target="https://example.com",
+        session_target_kind="capability",
+        session_target="session_network_access",
+        required_capabilities=["execute", "network_access"],
+    )
+    assert session_manager.consume_tool_action_permission(
+        "fetch-url-session",
+        "sha256:different-domain",
+        session_target_kind="capability",
+        session_target="session_network_access",
+        required_capabilities=["execute", "network_access"],
     )
     assert not session_manager.consume_tool_action_permission(
         "fetch-url-session",
-        "sha256:different-domain",
-        session_target_kind="network_origin",
-        session_target="https://other.example.com",
+        "sha256:package-install",
+        session_target_kind="capability",
+        session_target="session_network_access",
+        required_capabilities=["execute", "network_access", "package_install"],
     )
+    loop.close()
+
+
+def test_session_network_grant_auto_resumes_compatible_pending_requests(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from app import app
+    from graph.permission_resume import permission_resume_registry
+    from graph.session_manager import session_manager
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("parallel-network-session")
+    loop = asyncio.new_event_loop()
+    request_ids = [
+        "perm-req-network-version",
+        "perm-req-network-items",
+        "perm-req-network-package",
+    ]
+    capabilities = [
+        ["execute", "network_access"],
+        ["execute", "network_access"],
+        ["execute", "network_access", "package_install"],
+    ]
+    futures = []
+    for index, request_id in enumerate(request_ids):
+        future = loop.create_future()
+        futures.append(future)
+        permission_resume_registry._pending[request_id] = future
+        permission_resume_registry._requests[request_id] = {
+            "id": request_id,
+            "type": "tool_action",
+            "session_id": "parallel-network-session",
+            "status": "pending",
+            "fingerprint": f"sha256:parallel-{index}",
+            "tool_name": "execute",
+            "command": f"curl https://example.com/{index}",
+            "reason": "network_access:execute",
+            "risk": "network",
+            "capabilities": capabilities[index],
+            "session_target_kind": "capability",
+            "session_target": "session_network_access",
+        }
+
+    response = TestClient(app).post(
+        "/api/sessions/parallel-network-session/permissions/tool-actions",
+        json={"permission_request_id": request_ids[0], "scope": "session"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["auto_resumed_permission_request_ids"] == [request_ids[1]]
+    assert futures[0].result()["type"] == "approve"
+    assert futures[1].result()["grant_id"] == payload["grant"]["id"]
+    assert not futures[2].done()
+    assert permission_resume_registry.get(request_ids[1])["status"] == "resolved"
+    assert permission_resume_registry.get(request_ids[2])["status"] == "pending"
+    permission_resume_registry.resolve(request_ids[2], {"type": "reject", "message": "test cleanup"})
     loop.close()
 
 

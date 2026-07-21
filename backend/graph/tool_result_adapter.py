@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
 from graph.citations import normalize_source, parse_tool_result
-
 
 _MARKDOWN_LINK_RE = re.compile(r"(?<!!)\[([^\]\n]{1,240})\]\((https?://[^\s)]+)\)")
 _BARE_URL_RE = re.compile(r"(?<![\w\"'=])(https?://[^\s<>\]\[)\"']+)")
@@ -51,6 +51,11 @@ class ToolResultAdapter:
         if tool_name == "fetch_url" and requested_url:
             if self._looks_like_fetch_failure(raw_output):
                 return AdaptedToolResult(raw_output, [], "fetch_url_rejected")
+            payload = self._parse_json(raw_output)
+            if payload is not None:
+                json_sources = self._sources_from_json(payload, tool_call_id)
+                if json_sources:
+                    return AdaptedToolResult(raw_output, json_sources, "fetch_url_json")
             if self._is_search_results_url(requested_url):
                 search_sources = self._sources_from_search_page(
                     raw_output, requested_url, tool_call_id
@@ -90,16 +95,32 @@ class ToolResultAdapter:
         if markdown_sources:
             return AdaptedToolResult(raw_output, markdown_sources, "markdown_links")
 
+        # A successful observable network command still has authoritative
+        # provenance even when its response is plain text or a custom schema:
+        # the exact requested endpoint. This keeps arbitrary Skills compatible
+        # without trusting them to implement a PuddingClaw-specific envelope.
+        request_sources = self._sources_from_network_request(
+            tool_input,
+            raw_output,
+            tool_call_id,
+        )
+        if request_sources:
+            return AdaptedToolResult(raw_output, request_sources, "network_request")
+
         return AdaptedToolResult(raw_output, [], "plain_text")
 
     @staticmethod
     def supports_implicit_sources(tool_name: str, tool_input: str = "") -> bool:
         """Whether unstructured output from this tool may represent retrieved sources."""
         name = (tool_name or "").lower().replace("-", "_")
-        if name in {"read_file", "write_file", "create_skill_version", "execute_skill"}:
+        if name in {"read_file", "write_file", "create_skill_version"}:
             return False
-        if name in {"terminal", "python_repl"}:
-            command = (tool_input or "").lower()
+        if name == "execute_skill":
+            # execute_skill returns script stdout, not SKILL.md instructions;
+            # URLs in that stdout are retrieved results and may be normalized.
+            return True
+        if name in {"execute", "terminal", "python_repl"}:
+            command = ToolResultAdapter._command_from_tool_input(tool_input).lower()
             return bool(
                 re.search(r"https?://", command)
                 and re.search(r"\b(curl|wget|httpie|requests\.|urllib|fetch)\b", command)
@@ -109,6 +130,66 @@ class ToolResultAdapter:
             "lookup", "tavily", "news", "knowledge", "url", "web",
         )
         return any(token in name for token in source_tokens)
+
+    def _sources_from_network_request(
+        self,
+        tool_input: str,
+        raw_output: str,
+        tool_call_id: str,
+    ) -> list[dict[str, Any]]:
+        command = self._command_from_tool_input(tool_input)
+        if not command:
+            return []
+        lowered = command.lower()
+        if not re.search(r"\b(curl|wget|httpie|requests\.|urllib|fetch)\b", lowered):
+            return []
+
+        urls: list[str] = []
+        try:
+            tokens = shlex.split(command, posix=True)
+        except ValueError:
+            tokens = []
+        for token in tokens:
+            clean = token.rstrip(".,;，。；)}]")
+            if self._is_web_url(clean) and clean not in urls:
+                urls.append(clean)
+
+        if not urls:
+            for match in re.finditer(r"https?://[^\s<>'\"}\])]+", command):
+                # Identifiable User-Agent project URLs are metadata, not
+                # endpoints contacted by the command.
+                if command[max(0, match.start() - 2):match.start()] == "(+":
+                    continue
+                clean = match.group(0).rstrip(".,;，。；)")
+                if clean not in urls:
+                    urls.append(clean)
+
+        preview = self._plain_preview(raw_output)
+        return self._dedupe([
+            normalize_source({
+                "title": self._host_title(url),
+                "uri": url,
+                "document_id": url,
+                "chunk_id": "network-response",
+                "source_type": "web",
+                "quote": preview,
+                "metadata": {"adapter": "network_request"},
+            }, tool_call_id)
+            for url in urls[:_MAX_SOURCES]
+        ])
+
+    @staticmethod
+    def _command_from_tool_input(tool_input: str) -> str:
+        text = str(tool_input or "").strip()
+        if not text:
+            return ""
+        try:
+            payload = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            return text
+        if isinstance(payload, dict):
+            return str(payload.get("command") or "")
+        return text
 
     @staticmethod
     def _parse_json(raw_output: str) -> Any | None:
@@ -146,7 +227,19 @@ class ToolResultAdapter:
             if not isinstance(value, dict):
                 return
 
-            url = self._first(value, "url", "sourceUrl", "source_url", "link", "href")
+            # Aggregators such as AI HOT return both their stable canonical
+            # permalink and a third-party article URL. Prefer the permalink:
+            # it is the exact item the tool retrieved and remains traceable to
+            # the API response used by this Run.
+            url = self._first(
+                value,
+                "permalink",
+                "url",
+                "sourceUrl",
+                "source_url",
+                "link",
+                "href",
+            )
             title = self._first(value, "title", "name", "leadTitle", "headline")
             if self._is_web_url(url) and title:
                 quote = self._first(
@@ -337,7 +430,10 @@ class ToolResultAdapter:
         index = (text or "").find(needle)
         if index < 0:
             return ""
-        return self._plain_text((text[max(0, index - 240):index] + text[index + len(needle):index + len(needle) + 240]))[:600]
+        return self._plain_text(
+            text[max(0, index - 240):index]
+            + text[index + len(needle):index + len(needle) + 240]
+        )[:600]
 
     @staticmethod
     def _dedupe(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:

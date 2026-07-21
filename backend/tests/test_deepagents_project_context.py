@@ -62,6 +62,20 @@ def test_default_tool_guides_route_product_config_metrics_to_database() -> None:
     assert "Business metric questions such as sales volume" not in prompt
 
 
+def test_default_tool_guides_require_execution_self_check_before_completion() -> None:
+    prompt = (Path(__file__).resolve().parent.parent / "prompts" / "deepagents" / "TOOL_GUIDES.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "finish or" in prompt
+    assert "explicitly cancel every Todo" in prompt
+    assert "read back each declared deliverable" in prompt
+    assert "lidar/HUD" in prompt
+    assert "continue the Model/Tools loop and repair it" in prompt
+    assert "treat it as part of" in prompt
+    assert "the same Run" in prompt
+
+
 def test_default_tool_guides_use_virtual_filesystem_for_semantic_assets() -> None:
     prompt = (Path(__file__).resolve().parent.parent / "prompts" / "deepagents" / "TOOL_GUIDES.md").read_text(
         encoding="utf-8"
@@ -71,8 +85,9 @@ def test_default_tool_guides_use_virtual_filesystem_for_semantic_assets() -> Non
     assert "never pass it to `read_resource`" in prompt
     assert "Do not use `read_resource` for `/skills/`, `/semantic-assets/`" in prompt
     assert "convert it to the equivalent `/workspace/<relative-path>`" in prompt
-    assert "call the built-in `edit_file` or `write_file` with that exact path" in prompt
-    assert "Do not fall back to `terminal`" in prompt
+    assert "Use the external-artifact staging and commit workflow" in prompt
+    assert "never call `edit_file`, `write_file`, or `patch_file` on the host path" in prompt
+    assert "whole-directory modification, execution, or debugging" in prompt
 
 
 def test_default_agent_prompt_requires_chinese_user_visible_output() -> None:

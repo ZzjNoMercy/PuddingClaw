@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import time
 import uuid
-import hashlib
 from typing import Any
 
 from graph.session_manager import SessionManager
@@ -14,8 +14,8 @@ from harness.models import (
     CriterionEvaluation,
     GoalRecord,
     GoalRevision,
-    GoalVerificationDecision,
     GoalStatus,
+    GoalVerificationDecision,
     HarnessStateError,
     RubricEvaluationReport,
     RunOutcome,
@@ -23,8 +23,8 @@ from harness.models import (
     RunStatus,
     RunTaskProfile,
     RunVerificationContract,
-    VerificationStatus,
     VerificationFailureKind,
+    VerificationStatus,
     VerifierKind,
 )
 from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
@@ -79,13 +79,13 @@ class GoalCoordinator:
             goal = self._load_goal(session_id, goal_id)
             if goal.status != GoalStatus.ACTIVE:
                 raise GoalActivationError(f"Goal {goal_id} is {goal.status}; resume it before starting a Run.")
-            return goal
+            return self._migrate_declared_contract(goal)
 
         active = self._sessions.get_active_goal_state(session_id)
         if active:
             goal = GoalRecord.model_validate(active)
             if goal.status == GoalStatus.ACTIVE:
-                return goal
+                return self._migrate_declared_contract(goal)
 
         goal = GoalRecord(
             goal_id=f"goal-{uuid.uuid4().hex[:16]}",
@@ -102,6 +102,24 @@ class GoalCoordinator:
             ],
         )
         return goal
+
+    def _migrate_declared_contract(self, goal: GoalRecord) -> GoalRecord:
+        contract = goal.goal_contract
+        if contract is None or contract.version == RunRubricCompiler.VERSION:
+            return goal
+        goal.goal_contract = RunRubricCompiler.rebuild_declared_contract(
+            message=goal.objective,
+            legacy_contract=contract,
+        )
+        for revision in goal.revisions:
+            if revision.revision == goal.objective_revision:
+                revision.contract_id = goal.goal_contract.contract_id
+        goal.updated_at = time.time()
+        saved = self._sessions.upsert_goal_state(
+            goal.session_id,
+            goal.model_dump(mode="json"),
+        )
+        return GoalRecord.model_validate(saved)
 
     def attach_run(self, goal: GoalRecord, run_id: str) -> GoalRecord:
         goal.attach_run(run_id)
@@ -122,12 +140,9 @@ class GoalCoordinator:
         if run.goal_revision != authoritative.objective_revision:
             return self._release_superseded_run(authoritative, run)
         goal = authoritative
-        goal.goal_contract = RunRubricCompiler.merge_contracts(
-            base=goal.goal_contract,
-            expanded=run.verification_contract,
-            profile=run.task_profile,
-            message=goal.objective,
-        )
+        # ``goal_contract`` is the immutable declared Goal contract.  A Run's
+        # material Tool work belongs only to its effective contract and must
+        # not monotonically pollute every later continuation.
         goal.evidence_refs = self._merge_artifact_evidence(
             goal.evidence_refs,
             run.verification_activations,
@@ -185,20 +200,42 @@ class GoalCoordinator:
                 if str(run_id)
             }
         )
+        unresolved_provenance = [
+            item
+            for item in criterion_provenance
+            if item.get("passed") is not True or bool(item.get("gap"))
+        ]
+        aggregate_gaps = list(
+            dict.fromkeys(
+                [
+                    *report.gaps,
+                    *[
+                        str(item.get("gap") or f"标准 {item.get('criterion_id')} 尚未通过。")
+                        for item in unresolved_provenance
+                    ],
+                ]
+            )
+        )
         decision_accepted = bool(
             report.status in {VerificationStatus.SATISFIED, VerificationStatus.NOT_REQUIRED}
+            and not unresolved_provenance
             and goal.requested_status not in {GoalStatus.PAUSED, GoalStatus.CANCELLED}
+        )
+        aggregate_status = (
+            report.status if decision_accepted else VerificationStatus.NEEDS_REVISION
+            if report.status in {VerificationStatus.SATISFIED, VerificationStatus.NOT_REQUIRED}
+            else report.status
         )
         goal.latest_goal_decision = GoalVerificationDecision(
             decision_id=f"goal-decision-{uuid.uuid4().hex[:16]}",
             goal_id=goal.goal_id,
             objective_revision=goal.objective_revision,
-            status=report.status,
+            status=aggregate_status,
             accepted=decision_accepted,
             supporting_run_ids=supporting_run_ids,
             criterion_provenance=criterion_provenance,
             evidence_ref_count=len(goal.evidence_refs),
-            gaps=list(report.gaps),
+            gaps=aggregate_gaps,
             accepted_run_id=(run.run_id if decision_accepted else None),
             report_id=report.report_id,
         )
@@ -258,7 +295,7 @@ class GoalCoordinator:
                 if notice and notice not in goal.control_notices:
                     goal.control_notices.append(notice)
         else:
-            goal.gaps = list(report.gaps)
+            goal.gaps = aggregate_gaps
         aggregate_status = goal.latest_goal_decision.status
         if outcome == RunOutcome.COMPLETED and aggregate_status == VerificationStatus.SATISFIED:
             goal.transition(GoalStatus.ACHIEVED)
@@ -304,12 +341,6 @@ class GoalCoordinator:
         goal = authoritative
         attached_run_id = run.run_id if run is not None else str(goal.current_run_id or "")
         if run is not None and not superseded:
-            goal.goal_contract = RunRubricCompiler.merge_contracts(
-                base=goal.goal_contract,
-                expanded=run.verification_contract,
-                profile=run.task_profile,
-                message=goal.objective,
-            )
             goal.evidence_refs = self._merge_artifact_evidence(
                 goal.evidence_refs,
                 run.verification_activations,
@@ -372,6 +403,8 @@ class GoalCoordinator:
             pack = str(payload.get("pack") or "")
             for ref in payload.get("evidence_refs") or []:
                 if not isinstance(ref, dict):
+                    continue
+                if ref.get("material") is not True:
                     continue
                 if ref.get("role") == "temporary" or ref.get("scope") == "scratch":
                     continue
@@ -611,6 +644,7 @@ class CompletionVerificationCoordinator:
         known_managed_criteria = {
             "task_fulfillment",
             "todo_reconciliation",
+            "tool_protocol_integrity",
             "web_evidence_traceability",
             "metric_consistency",
             "analytics_evidence_traceability",
@@ -886,6 +920,33 @@ class HarnessRunCoordinator:
         # Rubric merely because the new message contains fewer task keywords.
         if goal is not None and goal.goal_contract is not None:
             contract = goal.goal_contract.model_copy(deep=True)
+            latest_decision = goal.latest_goal_decision
+            if (
+                latest_decision is not None
+                and latest_decision.objective_revision == goal.objective_revision
+                and not latest_decision.accepted
+            ):
+                unresolved_ids = {
+                    str(item.get("criterion_id") or "")
+                    for item in latest_decision.criterion_provenance
+                    if item.get("passed") is not True or bool(item.get("gap"))
+                }
+                task_profile.initial_packs = RunRubricCompiler._normalize_packs(
+                    [
+                        *task_profile.initial_packs,
+                        *RunRubricCompiler.packs_for_criteria(unresolved_ids),
+                    ]
+                )
+        effective_contract = (
+            RunRubricCompiler.expand_for_activations(
+                contract=contract,
+                profile=task_profile,
+                message=effective_objective,
+                activations=[],
+            )
+            if verification_enabled
+            else None
+        )
         run = RunRecord(
             run_id=f"run-{uuid.uuid4().hex[:16]}",
             query_id=query_id,
@@ -899,7 +960,7 @@ class HarnessRunCoordinator:
             verification_enabled=verification_enabled,
             task_profile=task_profile,
             declared_verification_contract=(contract.model_copy(deep=True) if contract is not None else None),
-            verification_contract=contract,
+            verification_contract=effective_contract,
             config_snapshot=dict(config_snapshot or {}),
         )
         if goal is not None:
@@ -1119,7 +1180,7 @@ class HarnessRunCoordinator:
         if run.status == RunStatus.RUNNING:
             self.transition(run, RunStatus.EVALUATING)
         run.verification_contract = RunRubricCompiler.expand_for_activations(
-            contract=run.verification_contract,
+            contract=run.declared_verification_contract,
             profile=run.task_profile,
             message=run.objective,
             activations=list(run.verification_activations),

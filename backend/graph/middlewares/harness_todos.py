@@ -1,17 +1,25 @@
 """Stable-ID, incremental Todo control for Harness Runs and Goals."""
 
-from __future__ import annotations
-
 import hashlib
 import time
-from typing import Any, Literal
+from typing import Any, Literal, NotRequired
 
-from langchain.agents.middleware.types import AgentMiddleware
+from langchain.agents.middleware.types import AgentMiddleware, AgentState
 from langchain.tools import ToolRuntime
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.types import Command
 from pydantic import BaseModel, Field, model_validator
+
+
+class HarnessTodoState(AgentState):
+    """Graph state owned by the Harness Todo control plane."""
+
+    # Session JSON is the cross-Run authority for the Todo ledger. The manager
+    # restores that trusted value through the graph input on every Run, so this
+    # field must remain part of the compiled input schema. Public clients never
+    # invoke the graph directly and cannot supply this internal state field.
+    todos: NotRequired[list[dict[str, Any]]]
 
 
 class TodoPatchOperation(BaseModel):
@@ -59,6 +67,8 @@ Never replace the whole list and never reuse an ID for a different task.
 
 Do not mark a Todo complete until its result is actually produced and verified.
 Do not delete unfinished work; use `cancel` with an explicit lifecycle record.
+If an update is rejected because a todo_id is unknown, do not retry that stale
+ID. Recreate the missing work from the returned current ledger instead.
 """
 
 
@@ -155,15 +165,30 @@ def _apply_operations(
 def _update_todos(
     runtime: ToolRuntime[Any, Any],
     operations: list[TodoPatchOperation],
-) -> Command[Any]:
+) -> ToolMessage | Command[Any]:
     context = runtime.context if isinstance(runtime.context, dict) else {}
-    next_todos, applied = _apply_operations(
-        list(runtime.state.get("todos") or []),
-        operations,
-        tool_call_id=runtime.tool_call_id,
-        run_id=str(context.get("run_id") or ""),
-        query_id=str(context.get("query_id") or ""),
-    )
+    current_todos = list(runtime.state.get("todos") or [])
+    try:
+        next_todos, applied = _apply_operations(
+            current_todos,
+            operations,
+            tool_call_id=runtime.tool_call_id,
+            run_id=str(context.get("run_id") or ""),
+            query_id=str(context.get("query_id") or ""),
+        )
+    except ValueError as exc:
+        # A stale model-visible ID must not abort the entire Run. Returning a
+        # tool error lets the model reconcile against the authoritative ledger
+        # and recreate genuinely missing work with a fresh stable ID.
+        return ToolMessage(
+            content=(
+                f"Todo update rejected: {exc}. Current ledger: {current_todos}. "
+                "Do not retry unknown IDs; recreate missing work with create operations."
+            ),
+            tool_call_id=runtime.tool_call_id,
+            name="update_todos",
+            status="error",
+        )
     return Command(
         update={
             "todos": next_todos,
@@ -180,12 +205,14 @@ def _update_todos(
 async def _aupdate_todos(
     runtime: ToolRuntime[Any, Any],
     operations: list[TodoPatchOperation],
-) -> Command[Any]:
+) -> ToolMessage | Command[Any]:
     return _update_todos(runtime, operations)
 
 
-class HarnessTodoMiddleware(AgentMiddleware[Any, Any, Any]):
+class HarnessTodoMiddleware(AgentMiddleware[HarnessTodoState, Any, Any]):
     """Expose patch-style Todo updates instead of whole-list replacement."""
+
+    state_schema = HarnessTodoState
 
     @property
     def name(self) -> str:

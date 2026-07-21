@@ -620,7 +620,11 @@ def test_goal_inherits_authorized_external_artifact_across_runs(tmp_path):
                 {"name": "report_integrity", "passed": True},
             ],
         }],
-        "_harness_context": {"workspace_path": str(workspace), "todos": []},
+        "_harness_context": {
+            "workspace_path": str(workspace),
+            "todos": [],
+            "final_content": f"已更新外部报告：`{external}`",
+        },
     }
     second, goal, report = coordinator.complete_from_final_state(second, goal, satisfied_state)
 
@@ -926,7 +930,7 @@ def test_goal_followup_inherits_frozen_contract(tmp_path):
     assert followup.verification_contract.contract_id == goal.goal_contract.contract_id
 
 
-def test_goal_contract_monotonically_inherits_runtime_analytics_pack(tmp_path):
+def test_goal_contract_stays_declared_while_unresolved_pack_enters_next_run(tmp_path):
     sessions = _sessions(tmp_path)
     coordinator = HarnessRunCoordinator(sessions)
     first_run, goal = coordinator.start_run(
@@ -945,6 +949,12 @@ def test_goal_contract_monotonically_inherits_runtime_analytics_pack(tmp_path):
         tool_call_id="call-db",
         tool_name="database_sql_execute",
         args={"question": "查询销量"},
+        result=ToolMessage(
+            content="database_source_id: db-sales\nresult_id: result-1",
+            tool_call_id="call-db",
+            name="database_sql_execute",
+            status="success",
+        ),
     )[0]
     sessions.append_run_verification_activation(
         first_run.session_id,
@@ -970,7 +980,7 @@ def test_goal_contract_monotonically_inherits_runtime_analytics_pack(tmp_path):
     assert goal is not None
     assert goal.status == GoalStatus.ACTIVE
     assert goal.goal_contract is not None
-    assert "analytics" in goal.goal_contract.verification_packs
+    assert "analytics" not in goal.goal_contract.verification_packs
 
     followup, same_goal = coordinator.start_run(
         session_id="session-1",
@@ -984,6 +994,45 @@ def test_goal_contract_monotonically_inherits_runtime_analytics_pack(tmp_path):
     assert followup.verification_contract is not None
     assert "analytics" in followup.verification_contract.verification_packs
     assert "metric_consistency" in {item.id for item in followup.verification_contract.criteria}
+
+
+def test_legacy_polluted_goal_contract_is_rebuilt_from_goal_objective(tmp_path):
+    sessions = _sessions(tmp_path)
+    polluted = RunRubricCompiler.compile(
+        RubricBuildContext(
+            user_message="检索网页并生成报告到 /workspace/report.md",
+            force_required=True,
+        )
+    )
+    assert polluted is not None
+    assert "web_research" in polluted.verification_packs
+    polluted = polluted.model_copy(
+        update={"version": "run-task-profile-v2", "contract_id": "legacy-polluted"}
+    )
+    legacy_goal = GoalRecord(
+        goal_id="goal-legacy",
+        session_id="session-1",
+        objective="生成报告到 /workspace/report.md",
+        goal_contract=polluted,
+    )
+    sessions.upsert_goal_state(
+        "session-1",
+        legacy_goal.model_dump(mode="json"),
+    )
+
+    run, migrated = HarnessRunCoordinator(sessions).start_run(
+        session_id="session-1",
+        query_id="query-migrated",
+        objective="继续",
+        goal_mode=True,
+        goal_id=legacy_goal.goal_id,
+    )
+
+    assert migrated is not None and migrated.goal_contract is not None
+    assert migrated.goal_contract.version == RunRubricCompiler.VERSION
+    assert "artifact" in migrated.goal_contract.verification_packs
+    assert "web_research" not in migrated.goal_contract.verification_packs
+    assert run.declared_verification_contract == migrated.goal_contract
 
 
 def test_cancelled_goal_run_preserves_successful_runtime_pack(tmp_path):
@@ -1029,10 +1078,14 @@ def test_cancelled_goal_run_preserves_successful_runtime_pack(tmp_path):
     )
 
     assert goal.goal_contract is not None
-    assert "analytics" in goal.goal_contract.verification_packs
+    assert "analytics" not in goal.goal_contract.verification_packs
+    assert any(
+        item.get("verification_pack") == "analytics"
+        for item in goal.evidence_refs
+    )
     persisted = sessions.get_goal_state(goal.session_id, goal.goal_id)
     assert persisted is not None
-    assert "analytics" in persisted["goal_contract"]["verification_packs"]
+    assert "analytics" not in persisted["goal_contract"]["verification_packs"]
 
 
 def test_goal_id_is_rejected_when_goal_mode_is_off(tmp_path):
@@ -1258,6 +1311,58 @@ def test_goal_finalize_atomically_consumes_concurrent_pause_request(tmp_path):
     assert saved["status"] == "paused"
     assert saved["requested_status"] is None
     assert saved["current_run_id"] is None
+
+
+def test_accepted_completion_commits_authority_and_message_in_one_write(
+    tmp_path,
+    monkeypatch,
+):
+    sessions = _sessions(tmp_path)
+    coordinator = HarnessRunCoordinator(sessions)
+    run, goal = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-accepted-commit",
+        objective="完成无需 rubric 的目标",
+        goal_mode=True,
+        verification_enabled=False,
+    )
+    assert goal is not None
+    coordinator.transition(run, RunStatus.RUNNING)
+    completed, achieved, report = coordinator.complete_from_final_state(run, goal, {})
+    assert achieved is not None and achieved.status == GoalStatus.ACHIEVED
+    assert report.status == VerificationStatus.NOT_REQUIRED
+
+    writes: list[str] = []
+    original_write = sessions._write_file
+
+    def tracked_write(session_id: str, data: dict) -> None:
+        writes.append(session_id)
+        original_write(session_id, data)
+
+    monkeypatch.setattr(sessions, "_write_file", tracked_write)
+    sessions.commit_accepted_completion(
+        "session-1",
+        run=completed.model_dump(mode="json"),
+        goal=achieved.model_dump(mode="json"),
+        query_id=completed.query_id,
+        content="最终答案",
+        verification_summary="无需额外验证。",
+    )
+
+    assert writes == ["session-1"]
+    state = sessions._read_file("session-1")
+    saved_run = state["harness"]["runs"][completed.run_id]
+    saved_goal = state["harness"]["goals"][achieved.goal_id]
+    saved_message = next(
+        item
+        for item in state["messages"]
+        if item.get("query_id") == completed.query_id
+    )
+    assert saved_run["outcome"] == RunOutcome.COMPLETED.value
+    assert saved_goal["status"] == GoalStatus.ACHIEVED.value
+    assert saved_goal["latest_goal_decision"]["accepted"] is True
+    assert saved_message["content"] == "最终答案"
+    assert saved_message["verification_summary"] == "无需额外验证。"
 
 
 def test_superseded_run_finalize_consumes_concurrent_cancel_request(tmp_path):

@@ -81,6 +81,48 @@ class PermissionResumeRegistry:
         self._pending[request_id] = asyncio.get_running_loop().create_future()
         return dict(request)
 
+    def create_external_directory_request(
+        self,
+        *,
+        session_id: str,
+        query_id: str,
+        run_id: str,
+        tool_call_id: str,
+        path: Path,
+        access: str,
+        operation: str,
+        change_preview: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Create a Run-scoped recursive directory permission request."""
+
+        if access not in {"read", "write"}:
+            raise ValueError(f"Unsupported external directory access: {access}")
+        replay_key = "\0".join([session_id, query_id, run_id, tool_call_id, access, str(path)])
+        request_id = f"perm-req-{hashlib.sha256(replay_key.encode('utf-8')).hexdigest()[:16]}"
+        existing = self._requests.get(request_id)
+        if existing is not None:
+            return dict(existing)
+        request = {
+            "id": request_id,
+            "type": f"external_directory_{access}",
+            "session_id": session_id,
+            "query_id": query_id,
+            "run_id": run_id,
+            "tool_call_id": tool_call_id,
+            "path": str(path),
+            "target_kind": "exact_directory",
+            "capabilities": [access, "recursive", "external_path"],
+            "status": "pending",
+            "created_at": time.time(),
+            "operation": operation,
+            "options": ["exact_directory_run"],
+        }
+        if change_preview:
+            request["change_preview"] = dict(change_preview)
+        self._requests[request_id] = request
+        self._pending[request_id] = asyncio.get_running_loop().create_future()
+        return dict(request)
+
     def create_tool_action_request(
         self,
         *,
@@ -98,15 +140,16 @@ class PermissionResumeRegistry:
         grant_bindings: dict[str, Any] | None = None,
         required_capabilities: list[str] | None = None,
         change_preview: dict[str, str] | None = None,
+        policy_source: str = "deterministic",
+        policy_explanation: str = "",
+        control_descriptor: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         fingerprint = self.tool_action_fingerprint(
             tool_name=tool_name,
             command=command,
             reason=reason,
         )
-        replay_key = "\0".join(
-            [session_id, query_id, run_id, tool_call_id, fingerprint]
-        )
+        replay_key = "\0".join([session_id, query_id, run_id, tool_call_id, fingerprint])
         request_id = f"perm-req-{hashlib.sha256(replay_key.encode('utf-8')).hexdigest()[:16]}"
         existing = self._requests.get(request_id)
         if existing is not None:
@@ -128,6 +171,7 @@ class PermissionResumeRegistry:
             "status": "pending",
             "created_at": time.time(),
             "options": ["once", "session"],
+            "policy_source": policy_source,
         }
         if session_target_kind and session_target:
             request["session_target_kind"] = session_target_kind
@@ -138,6 +182,10 @@ class PermissionResumeRegistry:
             request["grant_bindings"] = dict(grant_bindings)
         if change_preview:
             request["change_preview"] = dict(change_preview)
+        if policy_explanation:
+            request["policy_explanation"] = policy_explanation
+        if control_descriptor:
+            request["control_descriptor"] = dict(control_descriptor)
         self._requests[request_id] = request
         self._pending[request_id] = asyncio.get_running_loop().create_future()
         return dict(request)
@@ -160,6 +208,49 @@ class PermissionResumeRegistry:
         if not future.done():
             future.set_result(decision)
         return True
+
+    def resolve_compatible_session_tool_actions(
+        self,
+        *,
+        session_id: str,
+        target_kind: str,
+        target: str,
+        capabilities: list[str],
+        decision: dict[str, Any],
+        grant_bindings: dict[str, Any] | None = None,
+        exclude_request_id: str = "",
+    ) -> list[str]:
+        """Apply a newly granted Session capability to already-pending peers.
+
+        Multiple tool calls can reach HITL before the user answers the first
+        card.  Once a reusable Session grant exists, keeping compatible cards
+        blocked would make approval order observable and force duplicate user
+        decisions.  Compatibility is deliberately capability-based and does
+        not broaden the grant to requests with additional powers or bindings.
+        """
+
+        granted = set(capabilities)
+        expected_bindings = grant_bindings or None
+        resolved: list[str] = []
+        for request_id, request in list(self._requests.items()):
+            if request_id == exclude_request_id:
+                continue
+            if (
+                request.get("type") != "tool_action"
+                or request.get("status") != "pending"
+                or request.get("session_id") != session_id
+                or request.get("session_target_kind") != target_kind
+                or request.get("session_target") != target
+            ):
+                continue
+            required = set(request.get("capabilities") or ["execute"])
+            request_bindings = request.get("grant_bindings")
+            normalized_bindings = request_bindings if isinstance(request_bindings, dict) else None
+            if not required.issubset(granted) or normalized_bindings != expected_bindings:
+                continue
+            if self.resolve(request_id, dict(decision)):
+                resolved.append(request_id)
+        return resolved
 
     def reject_session(self, session_id: str, message: str) -> int:
         """Reject all active permission requests for a cancelled session stream."""

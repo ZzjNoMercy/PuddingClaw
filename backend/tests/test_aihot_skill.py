@@ -1,7 +1,6 @@
 import json
 from pathlib import Path
 
-
 SKILL = Path(__file__).parents[1] / "skills" / "aihot" / "SKILL.md"
 
 
@@ -12,6 +11,8 @@ def test_aihot_skill_uses_public_readonly_api_without_legacy_script():
     assert "匿名 `GET`" in content
     assert "不需要、也不得索要用户的 API Key" in content
     assert "aihot-skill/0.3.6" in content
+    assert "版本自检必须作为一次独立的 `execute` 调用" in content
+    assert "不要在任务中临时安装系统包" in content
     assert "scripts/aihot_query.py" not in content
     assert not SKILL.parent.joinpath("scripts", "aihot_query.py").exists()
 

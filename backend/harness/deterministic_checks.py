@@ -39,6 +39,8 @@ def evaluate_deterministic_criteria(
             continue
         if criterion.id == "todo_reconciliation":
             evaluations.append(_evaluate_todos(criterion.id, harness_context, final_state))
+        elif criterion.id == "tool_protocol_integrity":
+            evaluations.append(_evaluate_tool_protocol(criterion.id, final_state))
         elif criterion.id == "artifact_delivery":
             evaluations.append(_evaluate_artifact_delivery(criterion.id, harness_context))
         elif criterion.id == "web_evidence_traceability":
@@ -155,6 +157,78 @@ def _evaluate_todos(
     )
 
 
+def _evaluate_tool_protocol(
+    criterion_id: str,
+    final_state: dict[str, Any],
+) -> CriterionEvaluation:
+    requested: list[str] = []
+    completed: list[str] = []
+    pending: set[str] = set()
+    missing: list[str] = []
+    duplicate_ids: list[str] = []
+    seen_ids: set[str] = set()
+    for message in final_state.get("messages") or []:
+        if isinstance(message, dict):
+            role = str(message.get("role") or message.get("type") or "").lower()
+            tool_calls = message.get("tool_calls") or []
+            tool_call_id = message.get("tool_call_id")
+        else:
+            role = str(getattr(message, "type", "") or "").lower()
+            tool_calls = getattr(message, "tool_calls", None) or []
+            tool_call_id = getattr(message, "tool_call_id", None)
+        if role in {"tool", "toolmessage"}:
+            call_id = str(tool_call_id or "")
+            if call_id and call_id in pending:
+                pending.remove(call_id)
+                completed.append(call_id)
+            continue
+        # A ToolMessage must immediately close every parsed call before the
+        # transcript advances to another Human/AI message. A later response
+        # with the same id cannot retroactively repair the protocol boundary.
+        if pending:
+            missing.extend(sorted(pending))
+            pending.clear()
+        # Only executable, parsed tool calls create a protocol obligation.
+        # Provider ``invalid_tool_calls`` never entered the tools node; the
+        # last model-boundary protocol middleware represents those as an
+        # explicit synthetic error in the next model request.
+        for call in tool_calls:
+            call_id = (
+                call.get("id") if isinstance(call, dict) else getattr(call, "id", None)
+            )
+            if call_id:
+                normalized_id = str(call_id)
+                requested.append(normalized_id)
+                if normalized_id in seen_ids:
+                    duplicate_ids.append(normalized_id)
+                seen_ids.add(normalized_id)
+                pending.add(normalized_id)
+    missing.extend(sorted(pending))
+    missing = sorted(dict.fromkeys(missing))
+    duplicate_ids = sorted(dict.fromkeys(duplicate_ids))
+    evidence = [{
+        "kind": "tool_protocol",
+        "requested_call_ids": requested,
+        "completed_call_ids": completed,
+        "missing_call_ids": missing,
+        "duplicate_call_ids": duplicate_ids,
+    }]
+    return CriterionEvaluation(
+        criterion_id=criterion_id,
+        name=criterion_id,
+        passed=not missing and not duplicate_ids,
+        verifier=VerifierKind.DETERMINISTIC,
+        evidence=evidence,
+        gap=(
+            "存在缺失 ToolMessage 的工具调用：" + "、".join(missing[:10])
+            if missing
+            else "存在重复使用 tool_call_id 的工具调用：" + "、".join(duplicate_ids[:10])
+            if duplicate_ids
+            else None
+        ),
+    )
+
+
 def _evaluate_artifact_delivery(
     criterion_id: str,
     harness_context: dict[str, Any],
@@ -243,6 +317,8 @@ def _evaluate_artifact_delivery(
     invalid: list[dict[str, Any]] = list(malformed)
     missing: list[dict[str, Any]] = []
     changed: list[dict[str, Any]] = []
+    final_content = str(harness_context.get("final_content") or "")
+    unreferenced: list[dict[str, Any]] = []
     for ref in selected_refs:
         parsed = ArtifactReference.model_validate(ref)
         if parsed.scope == ArtifactScope.EXTERNAL and (
@@ -311,18 +387,29 @@ def _evaluate_artifact_delivery(
                 "scope": parsed.scope.value,
             })
             continue
-        if parsed.receipt_version >= 2 and not parsed.content_sha256:
+        if parsed.receipt_version >= 2 and (
+            not parsed.content_sha256 or parsed.size_bytes is None
+        ):
             invalid.append({
                 "artifact_id": parsed.artifact_id,
                 "path": parsed.path,
-                "reason": "artifact_content_digest_missing",
+                "reason": "artifact_content_identity_missing",
             })
             continue
         hasher = hashlib.sha256()
         with artifact_path.open("rb") as stream:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                 hasher.update(chunk)
+        current_size = artifact_path.stat().st_size
         current_digest = f"sha256:{hasher.hexdigest()}"
+        if parsed.size_bytes is not None and current_size != parsed.size_bytes:
+            changed.append({
+                "artifact_id": parsed.artifact_id,
+                "path": parsed.path,
+                "expected_size_bytes": parsed.size_bytes,
+                "actual_size_bytes": current_size,
+            })
+            continue
         if parsed.content_sha256 and current_digest != parsed.content_sha256:
             changed.append({
                 "artifact_id": parsed.artifact_id,
@@ -335,8 +422,26 @@ def _evaluate_artifact_delivery(
             **ref,
             "verified_host_path": host_path,
             "verified_content_sha256": current_digest,
-            "verified_size_bytes": artifact_path.stat().st_size,
+            "verified_size_bytes": current_size,
         })
+        reference_candidates = {
+            str(value)
+            for value in (
+                parsed.path,
+                parsed.virtual_path,
+                parsed.host_path,
+                Path(parsed.path).name if parsed.path else "",
+            )
+            if value
+        }
+        if not final_content or not any(
+            value in final_content for value in reference_candidates
+        ):
+            unreferenced.append({
+                "artifact_id": parsed.artifact_id,
+                "path": parsed.path,
+                "reference_candidates": sorted(reference_candidates),
+            })
 
     evidence = [{
         "kind": "artifact_registry",
@@ -350,6 +455,7 @@ def _evaluate_artifact_delivery(
         "missing": missing,
         "changed": changed,
         "invalid": invalid,
+        "unreferenced": unreferenced,
     }]
     if (
         selected_refs
@@ -358,6 +464,7 @@ def _evaluate_artifact_delivery(
         and not missing
         and not changed
         and not invalid
+        and not unreferenced
     ):
         return CriterionEvaluation(
             criterion_id=criterion_id,
@@ -383,6 +490,10 @@ def _evaluate_artifact_delivery(
     elif changed:
         paths = [str(item.get("path") or "") for item in changed[:5]]
         gap = f"产物在写入后发生变化，需要重新完成并登记：{'；'.join(paths)}"
+        failure_kind = VerificationFailureKind.TASK_GAP
+    elif unreferenced:
+        paths = [str(item.get("path") or "") for item in unreferenced[:5]]
+        gap = f"最终回答尚未引用已交付产物：{'；'.join(paths)}"
         failure_kind = VerificationFailureKind.TASK_GAP
     else:
         gap = "本次 Goal 尚无成功写入的结构化产物证据。"
@@ -443,6 +554,11 @@ def _evaluate_evidence_traceability(
     evidence = [*inherited, *evidence]
     if required_pack == "web_research":
         sources = [item for item in evidence if item.get("kind") == "source"]
+        tool_result_call_ids = {
+            str(item.get("tool_call_id") or "")
+            for item in evidence
+            if item.get("kind") == "tool_result" and item.get("tool_call_id")
+        }
         final_content = str(
             harness_context.get(
                 "final_content",
@@ -464,10 +580,32 @@ def _evaluate_evidence_traceability(
             match.group(0)[2:-1]
             for match in _SOURCE_CITATION_PATTERN.finditer(final_content)
         }
-        cited = bool(evidence_source_ids & cited_source_ids) or any(
+        has_structured_citations = bool(cited_source_ids)
+        explicitly_cited = bool(evidence_source_ids & cited_source_ids) or any(
             url in final_content for url in evidence_urls
         )
-        if not sources or not cited:
+        unique_sources: dict[str, dict[str, Any]] = {}
+        for source in sources:
+            identity = str(source.get("uri") or source.get("source_id") or "")
+            if identity:
+                unique_sources.setdefault(identity, source)
+        source_call_ids = {
+            str(source.get("tool_call_id") or "")
+            for source in unique_sources.values()
+            if source.get("tool_call_id")
+        }
+        # One source joined to one successful Tool result is already
+        # unambiguous in the evidence graph. Inline citations add no lineage
+        # information in that topology.
+        # With multiple sources, an explicit citation remains necessary to map
+        # the published conclusion to the relevant source.
+        unambiguous_tool_lineage = (
+            len(unique_sources) == 1
+            and len(source_call_ids) == 1
+            and source_call_ids.issubset(tool_result_call_ids)
+            and not has_structured_citations
+        )
+        if not sources or not (explicitly_cited or unambiguous_tool_lineage):
             return CriterionEvaluation(
                 criterion_id=criterion_id,
                 name=criterion_id,
@@ -475,8 +613,8 @@ def _evaluate_evidence_traceability(
                 verifier=VerifierKind.DETERMINISTIC,
                 evidence=evidence,
                 gap=(
-                    "当前 Goal 修订版没有形成可验证的来源引用，或最终回答没有引用"
-                    "真实 source_id / 网页链接。"
+                    "当前 Goal 修订版没有形成可验证的来源链路，或多来源回答没有"
+                    "显式引用真实 source_id / 网页链接。"
                 ),
             )
     if required_pack == "analytics":
@@ -530,27 +668,126 @@ def _evaluate_code_validation(
         for item in _verification_activations(harness_context, final_state)
         if item.get("pack") == "code"
     ]
-    evidence = [
+    current_writes = [
         evidence_ref
         for activation in activations
         for evidence_ref in activation.get("evidence_refs") or []
         if isinstance(evidence_ref, dict)
-        and evidence_ref.get("kind") == "tool_result"
-        and evidence_ref.get("material", True) is not False
+        and evidence_ref.get("kind") == "artifact_write"
+        and evidence_ref.get("material") is True
     ]
-    if activations and evidence:
+    latest_write_at = max(
+        (
+            float(activation.get("created_at") or 0)
+            for activation in activations
+            if any(
+                isinstance(ref, dict)
+                and ref.get("kind") == "artifact_write"
+                and ref.get("material") is True
+                for ref in activation.get("evidence_refs") or []
+            )
+        ),
+        default=0.0,
+    )
+    current_validations = [
+        evidence_ref
+        for activation in activations
+        if activation.get("tool_name") in {"execute", "terminal"}
+        and float(activation.get("created_at") or 0) >= latest_write_at
+        for evidence_ref in activation.get("evidence_refs") or []
+        if isinstance(evidence_ref, dict)
+        and evidence_ref.get("kind") == "tool_result"
+        and evidence_ref.get("material") is True
+    ]
+    if current_validations:
         return CriterionEvaluation(
             criterion_id=criterion_id,
             name=criterion_id,
             passed=True,
             verifier=VerifierKind.DETERMINISTIC,
-            evidence=evidence,
+            evidence=[*current_writes, *current_validations],
         )
+
+    # Code validation is artifact-bound across Goal Runs.  Reuse is valid only
+    # when both the validation receipt and every bound code artifact receipt
+    # exist, and the current bytes still match the recorded digests.
+    inherited_raw = harness_context.get("goal_evidence_refs")
+    inherited = [
+        item
+        for item in (inherited_raw if isinstance(inherited_raw, list) else [])
+        if isinstance(item, dict)
+        and item.get("verification_pack") == "code"
+        and item.get("material") is True
+    ]
+    inherited_validations = [
+        item
+        for item in inherited
+        if item.get("kind") == "tool_result"
+        and item.get("tool_name") in {"execute", "terminal"}
+    ]
+    inherited_writes = [item for item in inherited if item.get("kind") == "artifact_write"]
+    valid_writes = [
+        item
+        for item in inherited_writes
+        if _artifact_evidence_matches_current_bytes(item, harness_context)
+    ]
+    if (
+        not current_writes
+        and inherited_validations
+        and inherited_writes
+        and len(valid_writes) == len(inherited_writes)
+    ):
+        return CriterionEvaluation(
+            criterion_id=criterion_id,
+            name=criterion_id,
+            passed=True,
+            verifier=VerifierKind.DETERMINISTIC,
+            evidence=[*valid_writes, *inherited_validations],
+        )
+    if current_writes:
+        gap = "当前 Run 修改了代码，但尚未成功完成测试、构建或静态检查。"
+    elif inherited_writes and len(valid_writes) != len(inherited_writes):
+        gap = "代码产物 hash 已变化，前序 Run 的验证证据失效，必须重新验证。"
+    else:
+        gap = "未发现与当前代码产物绑定的成功测试、构建或静态检查证据。"
     return CriterionEvaluation(
         criterion_id=criterion_id,
         name=criterion_id,
         passed=False,
         verifier=VerifierKind.DETERMINISTIC,
-        evidence=[],
-        gap="未发现当前 Run 成功完成的测试、构建或静态检查命令。",
+        evidence=[*current_writes, *inherited_writes, *inherited_validations],
+        gap=gap,
     )
+
+
+def _artifact_evidence_matches_current_bytes(
+    ref: dict[str, Any],
+    harness_context: dict[str, Any],
+) -> bool:
+    digest = str(ref.get("content_sha256") or "")
+    if not digest.startswith("sha256:"):
+        return False
+    raw_path = str(ref.get("host_path") or "").strip()
+    if not raw_path and ref.get("workspace_relative_path"):
+        workspace_raw = str(harness_context.get("workspace_path") or "").strip()
+        if workspace_raw:
+            raw_path = str(
+                Path(workspace_raw).expanduser().resolve()
+                / str(ref.get("workspace_relative_path"))
+            )
+    if not raw_path:
+        return False
+    path = Path(raw_path).expanduser()
+    if not path.is_file():
+        return False
+    expected_size = ref.get("size_bytes")
+    if not isinstance(expected_size, int) or path.stat().st_size != expected_size:
+        return False
+    hasher = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                hasher.update(chunk)
+    except OSError:
+        return False
+    return f"sha256:{hasher.hexdigest()}" == digest

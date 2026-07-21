@@ -22,7 +22,7 @@ class ReadResourceInput(BaseModel):
             "Resource to read. Pass either an attachment id like att_11d3cfb4dc67 for uploaded/pasted "
             "attachments, a /knowledge/... virtual path, or the exact non-workspace path the user provided. "
             "This includes POSIX absolute paths, Windows absolute paths, and home-relative paths. "
-            "Do not pass /workspace virtual paths here."
+            "Do not pass /workspace or /scratch virtual paths here."
         )
     )
     offset: int = Field(default=0, ge=0, description="Zero-based line offset for text files")
@@ -34,7 +34,8 @@ class ReadResourceTool(BaseTool):
     description: str = (
         "Read a PuddingClaw resource from a single entry point. Use this for uploaded/pasted attachment refs "
         "(`att_xxx`), `/knowledge/...` virtual paths, and user-provided paths outside the `/workspace/` virtual namespace. "
-        "Never use read_file for non-workspace paths; read_file is only for `/workspace/...` virtual paths."
+        "Never pass `/scratch/...` here: staged scratch artifacts belong to the Backend/Docker namespace and "
+        "must be read with read_file."
     )
     args_schema: type[BaseModel] = ReadResourceInput
     risk_level: str = "moderate"

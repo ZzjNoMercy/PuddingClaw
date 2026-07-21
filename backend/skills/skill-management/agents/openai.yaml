@@ -1,0 +1,4 @@
+interface:
+  display_name: "Skill 管理"
+  short_description: "安全检查、安装和更新本地 Agent Skills"
+  default_prompt: "Use $skill-management to inspect or safely install and update a managed Skill."

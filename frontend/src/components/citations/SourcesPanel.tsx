@@ -218,12 +218,13 @@ export default function SourcesPanel({
   const total = cited.length + retrieved.length;
   const hasSources = total > 0;
   const hasTodos = displayTodos.length > 0;
+  const hasProgress = hasTodos;
   const hasPermissions =
     permissionSessionId === sessionId &&
     (permissionGrants.some((grant) => grant.scope !== "once") ||
       permissionHistory.length > 0);
   const showSources = hasSources || selectedHistoricalSource !== null;
-  const hasContent = Boolean(activeGoal || verificationReport || hasTodos || hasPermissions || showSources);
+  const hasContent = Boolean(activeGoal || verificationReport || hasProgress || hasPermissions || showSources);
 
   useEffect(() => {
     onAvailabilityChange?.(hasContent);
@@ -265,7 +266,7 @@ export default function SourcesPanel({
       ),
     });
   }
-  if (hasTodos) {
+  if (hasProgress) {
     cards.push({
       key: "progress",
       content: (
@@ -695,14 +696,14 @@ function VerificationCard({
   report: RubricEvaluationReport;
   run: HarnessRun | null;
 }) {
-  const supersededGoalCandidate = report.status === "satisfied"
+  const supersededGoalRevision = report.status === "satisfied"
     && report.accepted_for_goal_revision === false;
   const passed = report.status === "not_required"
-    || (report.status === "satisfied" && !supersededGoalCandidate);
+    || (report.status === "satisfied" && !supersededGoalRevision);
   const controlError = report.status === "verification_incomplete"
     || report.status === "grader_error"
     || report.status === "infrastructure_error";
-  const statusLabel = supersededGoalCandidate
+  const statusLabel = supersededGoalRevision
     ? "旧版目标验收通过（未接纳）"
     : verificationStatusLabel(report.status);
   const criteriaById = new Map(
@@ -716,7 +717,7 @@ function VerificationCard({
       <SectionHeader
         icon={passed ? <CheckCircle2 className="h-4 w-4" /> : <AlertTriangle className="h-4 w-4" />}
         title="验收"
-        metric={supersededGoalCandidate ? "未接纳" : verificationMetricLabel(report.status)}
+        metric={supersededGoalRevision ? "未接纳" : verificationMetricLabel(report.status)}
         open={active}
         onToggle={onActivate}
       />
@@ -743,8 +744,8 @@ function VerificationCard({
               </span>
             </div>
             <p className="mt-1.5 text-[11px] leading-5 text-slate-600">
-              {supersededGoalCandidate
-                ? "该候选答案属于已被修改的 Goal 版本，不会作为当前目标的正式完成结果。"
+              {supersededGoalRevision
+                ? "该验收报告属于已被修改的 Goal 版本，不会作为当前目标的正式完成结果。"
                 : passed
                 ? "全部必需验收项均已通过。"
                 : controlError
@@ -988,7 +989,7 @@ function verificationStatusLabel(status: string): string {
       satisfied: "验收通过",
       needs_revision: "需要修正",
       failed: "验收失败",
-      max_iterations_reached: "已达最大验收轮次",
+      max_iterations_reached: "验收流程未完成（兼容状态）",
       verification_incomplete: "验收流程未完成",
       grader_error: "验收器异常",
       infrastructure_error: "验收基础设施异常",
@@ -1317,7 +1318,9 @@ function PermissionGrantRow({
   onRevoke?: () => Promise<void>;
 }) {
   const presentation = permissionGrantPresentation(grant);
-  const canWrite = grant.capabilities.includes("write") || grant.type === "external_file_write";
+  const canWrite = grant.capabilities.includes("write")
+    || grant.type === "external_file_write"
+    || grant.type === "external_directory_write";
   const timestamp = grant.consumed_at || grant.revoked_at || grant.created_at;
   return (
     <div className="rounded-2xl border border-black/[0.06] bg-white/70 p-3">
@@ -1364,6 +1367,11 @@ function PermissionGrantRow({
             <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-500">
               {grant.scope === "once" ? "单次" : "本 Session"}
             </span>
+            {grant.metadata?.policy_source === "codex_grok_smart_reviewer" ? (
+              <span className="rounded-full bg-blue-50 px-2 py-0.5 text-[10px] font-medium text-blue-700">
+                智能审查
+              </span>
+            ) : null}
             {presentation.isSkill ? (
               <span className="rounded-full bg-cyan-50 px-2 py-0.5 text-[10px] font-medium text-cyan-700">
                 Skill 管理
@@ -1447,7 +1455,11 @@ function permissionGrantPresentation(grant: PermissionGrant): {
     || grant.capabilities.includes("network_access");
   if (isToolAction) {
     const executable = extractCommandExecutable(command);
-    const name = grant.target_kind === "network_origin"
+    const isSessionNetwork = grant.target_kind === "capability"
+      && grant.target === "session_network_access";
+    const name = isSessionNetwork
+      ? "Session 联网授权"
+      : grant.target_kind === "network_origin"
       ? "网站访问授权"
       : grant.target_kind === "tool_name"
         ? "联网搜索授权"
@@ -1456,18 +1468,24 @@ function permissionGrantPresentation(grant: PermissionGrant): {
           : executable ? `${executable} 命令授权` : "受控命令授权";
     return {
       name,
-      target: String(grant.metadata?.session_target || command || `命令指纹 ${grant.target.slice(0, 20)}…`),
+      target: isSessionNetwork
+        ? "所有网络来源"
+        : String(grant.metadata?.session_target || command || `命令指纹 ${grant.target.slice(0, 20)}…`),
       changes: "",
       isSkill: false,
       isNetwork,
       isToolAction: true,
     };
   }
-  const canWrite = grant.capabilities.includes("write") || grant.type === "external_file_write";
+  const canWrite = grant.capabilities.includes("write")
+    || grant.type === "external_file_write"
+    || grant.type === "external_directory_write";
+  const isDirectory = grant.target_kind === "exact_directory"
+    || grant.type.startsWith("external_directory_");
   return {
     name: grant.target_kind === "all_external_files"
       ? `本 session 外部文件${canWrite ? "写入" : "读取"}`
-      : grant.target.split("/").filter(Boolean).pop() || "外部文件",
+      : `${grant.target.split("/").filter(Boolean).pop() || (isDirectory ? "外部目录" : "外部文件")}${isDirectory ? ` · 目录${canWrite ? "写入" : "读取"}` : ""}`,
     target: grant.target_kind === "all_external_files" ? "所有外部文件" : grant.target,
     changes: "",
     isSkill: false,

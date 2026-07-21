@@ -7,6 +7,7 @@ from harness.coordinators import (
 )
 from harness.deterministic_checks import evaluate_deterministic_criteria
 from harness.models import (
+    EvidenceScope,
     GoalRecord,
     GoalStatus,
     RubricEvaluationReport,
@@ -20,6 +21,7 @@ from harness.models import (
 __all__ = [
     "CompletionVerificationCoordinator",
     "evaluate_deterministic_criteria",
+    "EvidenceScope",
     "GoalCoordinator",
     "GoalRecord",
     "GoalStatus",

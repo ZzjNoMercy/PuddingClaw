@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 
 from deepagents import create_deep_agent
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import tool
 from pydantic import PrivateAttr
@@ -15,6 +16,7 @@ from graph.deepagents_manager import (
     PuddingClawAgentState,
     PuddingClawRubricMiddleware,
 )
+from graph.middlewares.tool_protocol import ToolProtocolIntegrityMiddleware
 from graph.session_manager import session_manager
 from harness.coordinators import HarnessRunCoordinator
 from harness.models import RunStatus
@@ -57,12 +59,7 @@ class ScriptedModel(BaseChatModel):
 def fake_database_sql_execute(question: str) -> str:
     """Return deterministic analytics evidence."""
 
-    return (
-        f"query completed: {question}\n"
-        "database_source_id: db-sales\n"
-        "result_id: result-sales-1\n"
-        "rows: 12"
-    )
+    return f"query completed: {question}\ndatabase_source_id: db-sales\nresult_id: result-sales-1\nrows: 12"
 
 
 @tool("fetch_url")
@@ -72,16 +69,16 @@ def fake_fetch_url(url: str) -> str:
     return f"page fetched: {url}"
 
 
-def _grader_model(*criterion_ids: str) -> ScriptedModel:
-    criteria = ",".join(
-        f'{{"name":"{criterion_id}","passed":true}}'
-        for criterion_id in criterion_ids
-    )
+def _grader_model(
+    *criterion_ids: str,
+    explanation: str = "已核对最终交付及其实际证据，本次启用的验收项均有结果支持。",
+) -> ScriptedModel:
+    criteria = ",".join(f'{{"name":"{criterion_id}","passed":true}}' for criterion_id in criterion_ids)
     return ScriptedModel(
         [
             AIMessage(
                 content=(
-                    '{"result":"satisfied","explanation":"全部必需项通过",'
+                    f'{{"result":"satisfied","explanation":"{explanation}",'
                     f'"criteria":[{criteria}]}}'
                 )
             )
@@ -107,9 +104,8 @@ def _start_run(tmp_path, *, objective: str, analytics_model_id: str | None = Non
 def test_runtime_context_scopes_grader_to_current_run(tmp_path, monkeypatch):
     from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
 
-    contract = RunRubricCompiler.compile(
-        RubricBuildContext(user_message="L6 年度改款多少钱？", force_required=True)
-    )
+    session_manager.initialize(tmp_path)
+    contract = RunRubricCompiler.compile(RubricBuildContext(user_message="L6 年度改款多少钱？", force_required=True))
     assert contract is not None
     main_model = ScriptedModel([AIMessage(content="L6 售价 24.98 万元。")])
     grader_model = _grader_model("task_fulfillment", "todo_reconciliation")
@@ -150,14 +146,8 @@ def test_runtime_context_scopes_grader_to_current_run(tmp_path, monkeypatch):
         )
     )
 
-    main_prompt = "\n".join(
-        str(getattr(message, "content", ""))
-        for message in main_model._received_messages[0]
-    )
-    grader_prompt = "\n".join(
-        str(getattr(message, "content", ""))
-        for message in grader_model._received_messages[0]
-    )
+    main_prompt = "\n".join(str(getattr(message, "content", "")) for message in main_model._received_messages[0])
+    grader_prompt = "\n".join(str(getattr(message, "content", "")) for message in grader_model._received_messages[0])
     assert "aihot技能有更新吗" in main_prompt
     assert "L6 年度改款多少钱" in grader_prompt
     assert "L6 售价 24.98 万元" in grader_prompt
@@ -171,9 +161,8 @@ def test_runtime_context_restores_objective_after_user_turn_is_summarized(
 ):
     from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
 
-    contract = RunRubricCompiler.compile(
-        RubricBuildContext(user_message="L6 年度改款多少钱？", force_required=True)
-    )
+    session_manager.initialize(tmp_path)
+    contract = RunRubricCompiler.compile(RubricBuildContext(user_message="L6 年度改款多少钱？", force_required=True))
     assert contract is not None
     main_model = ScriptedModel([AIMessage(content="L6 售价 24.98 万元。")])
     grader_model = _grader_model("task_fulfillment", "todo_reconciliation")
@@ -211,10 +200,7 @@ def test_runtime_context_restores_objective_after_user_turn_is_summarized(
         )
     )
 
-    grader_prompt = "\n".join(
-        str(getattr(message, "content", ""))
-        for message in grader_model._received_messages[0]
-    )
+    grader_prompt = "\n".join(str(getattr(message, "content", "")) for message in grader_model._received_messages[0])
     assert "L6 年度改款多少钱" in grader_prompt
     assert "L6 售价 24.98 万元" in grader_prompt
     assert "重新安装 aihot" not in grader_prompt
@@ -223,9 +209,8 @@ def test_runtime_context_restores_objective_after_user_turn_is_summarized(
 def test_run_scope_survives_rubric_revision_loop(tmp_path, monkeypatch):
     from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
 
-    contract = RunRubricCompiler.compile(
-        RubricBuildContext(user_message="L6 年度改款多少钱？", force_required=True)
-    )
+    session_manager.initialize(tmp_path)
+    contract = RunRubricCompiler.compile(RubricBuildContext(user_message="L6 年度改款多少钱？", force_required=True))
     assert contract is not None
     main_model = ScriptedModel(
         [
@@ -294,11 +279,176 @@ def test_run_scope_survives_rubric_revision_loop(tmp_path, monkeypatch):
         assert "L6 年度改款多少钱" in prompt
         assert "aihot技能有更新吗" not in prompt
         assert "aihot 更新完成" not in prompt
-    second_prompt = "\n".join(
-        str(getattr(message, "content", ""))
-        for message in grader_model._received_messages[1]
-    )
+    second_prompt = "\n".join(str(getattr(message, "content", "")) for message in grader_model._received_messages[1])
     assert "置换 23.48 万元起" in second_prompt
+
+
+def test_rubric_iteration_setting_never_terminates_business_run(tmp_path, monkeypatch):
+    """Only the model-call budget may stop repeated completion revisions."""
+
+    from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
+
+    session_manager.initialize(tmp_path)
+    contract = RunRubricCompiler.compile(
+        RubricBuildContext(user_message="完成这个回答", force_required=True)
+    )
+    assert contract is not None
+    main_model = ScriptedModel(
+        [
+            AIMessage(content="第一次申请完成。"),
+            AIMessage(content="第二次申请完成。"),
+            AIMessage(content="最终完成。"),
+        ]
+    )
+    grader_model = ScriptedModel(
+        [
+            AIMessage(content=(
+                '{"result":"needs_revision","explanation":"缺口一",'
+                '"criteria":[{"name":"task_fulfillment","passed":false,"gap":"缺口一"},'
+                '{"name":"todo_reconciliation","passed":true}]}'
+            )),
+            AIMessage(content=(
+                '{"result":"failed","explanation":"缺口二",'
+                '"criteria":[{"name":"task_fulfillment","passed":false,"gap":"缺口二"},'
+                '{"name":"todo_reconciliation","passed":true}]}'
+            )),
+            AIMessage(content=(
+                '{"result":"satisfied","explanation":"通过",'
+                '"criteria":[{"name":"task_fulfillment","passed":true},'
+                '{"name":"todo_reconciliation","passed":true}]}'
+            )),
+        ]
+    )
+    monkeypatch.setattr(
+        PuddingClawRubricMiddleware,
+        "_effective_contract_update",
+        staticmethod(lambda _state, _runtime: {}),
+    )
+    evaluations = []
+    agent = create_deep_agent(
+        model=main_model,
+        tools=[],
+        middleware=[PuddingClawRubricMiddleware(
+            model=grader_model,
+            max_iterations=1,
+            on_evaluation=evaluations.append,
+        )],
+        state_schema=PuddingClawAgentState,
+    )
+
+    final_state = asyncio.run(
+        agent.ainvoke(
+            {
+                "messages": [HumanMessage(content="完成这个回答")],
+                "rubric": contract.rubric,
+                "verification_contract": contract.model_dump(mode="json"),
+            },
+            context={
+                "session_id": "iteration-session",
+                "run_id": "iteration-run",
+                "query_id": "iteration-query",
+                "workspace_path": str(tmp_path),
+                "run_objective": "完成这个回答",
+            },
+        )
+    )
+
+    assert main_model._calls == 3
+    assert grader_model._calls == 3
+    assert [item["result"] for item in evaluations] == [
+        "needs_revision",
+        "failed",
+        "satisfied",
+    ]
+    assert final_state["messages"][-1].content == "最终完成。"
+
+
+def test_rubric_revision_jump_repairs_hidden_provider_tool_call(tmp_path, monkeypatch):
+    """The Rubric jump must not bypass the last model-boundary protocol guard."""
+
+    from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
+
+    session_manager.initialize(tmp_path)
+    contract = RunRubricCompiler.compile(RubricBuildContext(user_message="修改报告", force_required=True))
+    assert contract is not None
+    main_model = ScriptedModel(
+        [
+            AIMessage(
+                content="",
+                invalid_tool_calls=[
+                    {
+                        "id": "call-hidden",
+                        "name": "patch_file",
+                        "args": "{broken",
+                        "error": "invalid json",
+                        "type": "invalid_tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="报告已修正。"),
+        ]
+    )
+    grader_model = ScriptedModel(
+        [
+            AIMessage(
+                content=(
+                    '{"result":"needs_revision","explanation":"继续修正",'
+                    '"criteria":[{"name":"task_fulfillment","passed":false,'
+                    '"gap":"尚未完成"},{"name":"todo_reconciliation","passed":true}]}'
+                )
+            ),
+            AIMessage(
+                content=(
+                    '{"result":"satisfied","explanation":"已完成",'
+                    '"criteria":[{"name":"task_fulfillment","passed":true},'
+                    '{"name":"todo_reconciliation","passed":true}]}'
+                )
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        PuddingClawRubricMiddleware,
+        "_effective_contract_update",
+        staticmethod(lambda _state, _runtime: {}),
+    )
+    agent = create_deep_agent(
+        model=main_model,
+        tools=[],
+        middleware=[
+            PuddingClawRubricMiddleware(model=grader_model, max_iterations=3),
+            ToolProtocolIntegrityMiddleware(emit_context_usage=False),
+        ],
+        state_schema=PuddingClawAgentState,
+    )
+
+    asyncio.run(
+        agent.ainvoke(
+            {
+                "messages": [HumanMessage(content="修改报告")],
+                "rubric": contract.rubric,
+                "verification_contract": contract.model_dump(mode="json"),
+            },
+            context={
+                "session_id": "protocol-session",
+                "run_id": "protocol-run",
+                "query_id": "protocol-query",
+                "workspace_path": str(tmp_path),
+                "run_objective": "修改报告",
+            },
+        )
+    )
+
+    assert len(main_model._received_messages) == 2
+    second_request = main_model._received_messages[1]
+    hidden_index = next(
+        index
+        for index, message in enumerate(second_request)
+        if isinstance(message, AIMessage) and message.invalid_tool_calls
+    )
+    assert isinstance(second_request[hidden_index + 1], ToolMessage)
+    assert second_request[hidden_index + 1].tool_call_id == "call-hidden"
+    assert isinstance(second_request[hidden_index + 2], HumanMessage)
+    assert second_request[hidden_index + 2].name == "rubric_grader"
 
 
 def test_runtime_database_tool_upgrades_contract_before_grader(tmp_path):
@@ -325,6 +475,10 @@ def test_runtime_database_tool_upgrades_contract_before_grader(tmp_path):
         "todo_reconciliation",
         "metric_consistency",
         "analytics_evidence_traceability",
+        explanation=(
+            "已核对最终回答确实返回 12 行销量结果；数据库查询成功完成，"
+            "结果可追溯到已登记的数据源。"
+        ),
     )
     agent = create_deep_agent(
         model=main_model,
@@ -355,10 +509,7 @@ def test_runtime_database_tool_upgrades_contract_before_grader(tmp_path):
         )
     )
     assert evaluations
-    grader_prompt = "\n".join(
-        str(getattr(message, "content", ""))
-        for message in grader_model._received_messages[0]
-    )
+    grader_prompt = "\n".join(str(getattr(message, "content", "")) for message in grader_model._received_messages[0])
     assert "[metric_consistency]" in grader_prompt
     assert "[analytics_evidence_traceability]" in grader_prompt
     final_state["_rubric_status"] = evaluations[-1]["result"]
@@ -446,9 +597,7 @@ def test_runtime_fetch_url_activates_web_without_selected_model_pollution(tmp_pa
     assert completed.verification_contract is not None
     assert "web_research" in completed.verification_contract.verification_packs
     assert "analytics" not in completed.verification_contract.verification_packs
-    assert "metric_consistency" not in {
-        item.id for item in completed.verification_contract.criteria
-    }
+    assert "metric_consistency" not in {item.id for item in completed.verification_contract.criteria}
     assert report.status.value == "satisfied"
 
 
@@ -507,10 +656,7 @@ def test_manager_does_not_inject_full_selected_model_context_into_general_run(
     assert "ANALYTICS_FULL_CONTEXT" not in captured["system_prompt"]
     assert captured["subagents"]
     assert all(
-        any(
-            isinstance(item, VerificationActivationMiddleware)
-            for item in subagent.get("middleware", [])
-        )
+        any(isinstance(item, VerificationActivationMiddleware) for item in subagent.get("middleware", []))
         for subagent in captured["subagents"]
     )
     assert persisted is not None
@@ -549,9 +695,7 @@ def test_manager_runtime_database_action_persists_effective_contract(
                 tool_calls=[
                     {
                         "name": "read_file",
-                        "args": {
-                            "file_path": "/skills/database-analysis/SKILL.md"
-                        },
+                        "args": {"file_path": "/skills/database-analysis/SKILL.md"},
                         "id": "call-read-skill",
                     }
                 ],
@@ -574,6 +718,10 @@ def test_manager_runtime_database_action_persists_effective_contract(
         "todo_reconciliation",
         "metric_consistency",
         "analytics_evidence_traceability",
+        explanation=(
+            "已核对最终回答确实返回 12 行销量结果；数据库查询成功完成，"
+            "结果可追溯到已登记的数据源。"
+        ),
     )
 
     def fake_model_client(*_args, **kwargs):
@@ -622,20 +770,46 @@ def test_manager_runtime_database_action_persists_effective_contract(
     assert persisted["outcome"] == "completed"
     assert persisted["verification_report"]["status"] == "satisfied"
     assert "analytics" in persisted["verification_contract"]["verification_packs"]
-    assert persisted["verification_activations"][0]["tool_call_id"] == (
-        "call-db-manager"
-    )
+    assert persisted["verification_activations"][0]["tool_call_id"] == ("call-db-manager")
     evidence = persisted["verification_activations"][0]["evidence_refs"]
     assert any(item.get("kind") == "tool_result" for item in evidence)
-    event_payload = "\n".join(
-        f"{event.get('event')}:{event.get('data')}" for event in events
-    )
+    event_payload = "\n".join(f"{event.get('event')}:{event.get('data')}" for event in events)
     activation_index = event_payload.index("verification_activation_recorded")
     contract_index = event_payload.index("verification_contract_updated")
     report_index = event_payload.index("verification_report:")
     assert activation_index < contract_index < report_index
-    grader_prompt = "\n".join(
-        str(getattr(message, "content", ""))
-        for message in grader_model._received_messages[0]
+    event_names = [event.get("event") for event in events]
+    assert "token" not in event_names
+    assert event_names.count("final_response") == 1
+    assert event_names.index("verification_report") < event_names.index("final_response")
+    assert event_names.index("final_response") < event_names.index("done")
+    final_payload = json.loads(
+        next(event["data"] for event in events if event["event"] == "final_response")
     )
+    assert final_payload["verification_summary"] == (
+        "**验证结果：**\n\n已核对最终回答确实返回 12 行销量结果；"
+        "数据库查询成功完成，结果可追溯到已登记的数据源。"
+    )
+    session = session_manager.load_session("manager-dynamic-session")
+    assistant = next(
+        item
+        for item in reversed(session)
+        if item.get("role") == "assistant"
+    )
+    assert assistant["content"] == "销量查询完成，结果为 12 行。"
+    assert assistant["verification_summary"] == final_payload["verification_summary"]
+    assert "verification_state" not in assistant["segments"][-1]
+    assert any(
+        item.get("type") == "activity"
+        and item.get("label") == "完成质量检查通过"
+        for item in assistant["timeline"]
+    )
+    assert not any(
+        item.get("type") == "activity"
+        and item.get("label") == "正在核对完成质量"
+        and item.get("status") == "running"
+        for item in assistant["timeline"]
+    )
+    grader_prompt = "\n".join(str(getattr(message, "content", "")) for message in grader_model._received_messages[0])
     assert "[analytics_evidence_traceability]" in grader_prompt
+    assert "Do not merely say" in grader_prompt

@@ -77,7 +77,8 @@ export interface ToolCall {
 
 export type TimelineItem =
   | { type: "reasoning"; content: string; id: string }
-  | { type: "tool"; toolCall: ToolCall; id: string };
+  | { type: "tool"; toolCall: ToolCall; id: string }
+  | { type: "activity"; label: string; status?: string; id: string };
 
 type InspectorActiveTab = "progress" | "goal" | "verification" | "sources" | "permissions" | null;
 const INSPECTOR_ACTIVE_TAB_STORAGE_KEY = "puddingclaw_inspector_active_tab";
@@ -156,7 +157,6 @@ export interface MessageSegment {
   timeline?: TimelineItem[];
   runId?: string;
   goalId?: string;
-  verificationState?: "pending" | "progress" | "passed" | "failed" | "unverified";
 }
 
 export interface RunBoundaryNotice {
@@ -191,8 +191,7 @@ export interface ChatMessage {
   interruptionNotice?: string;
   errorNotice?: string;
   runBoundaryNotice?: RunBoundaryNotice;
-  verificationState?: "pending" | "progress" | "passed" | "failed" | "unverified";
-  verificationRunId?: string;
+  verificationSummary?: string;
   timestamp: number;
 }
 
@@ -225,6 +224,26 @@ export interface ContextUsage {
 export interface ContextMaintenanceStatus {
   phase: string;
   message: string;
+  usedTokensBefore?: number;
+  triggerTokens?: number;
+}
+
+export interface RunActivityStatus {
+  phase:
+    | "running"
+    | "reasoning"
+    | "subagent"
+    | "reading"
+    | "querying"
+    | "writing"
+    | "command"
+    | "tool"
+    | "verification"
+    | "revision"
+    | "permission"
+    | "continuing";
+  label: string;
+  detail?: string;
 }
 
 interface AppState {
@@ -351,6 +370,9 @@ interface AppState {
   // Context maintenance
   maintenanceStatus: ContextMaintenanceStatus | null;
 
+  // Current streaming phase, rendered next to the composer rather than in chat.
+  runActivityStatus: RunActivityStatus | null;
+
   // Active citation source (syncs chat click with right panel)
   activeSourceId: string | null;
   setActiveSourceId: (id: string | null) => void;
@@ -404,12 +426,13 @@ function parseHistoryMessages(
     }>;
     timeline?: Array<{ type: string; content?: string; tool_call?: ToolCall; id?: string }>;
     status?: string;
-    segments?: Array<{ content?: string; reasoning_content?: string; tool_calls?: ToolCall[]; timeline?: TimelineItem[]; run_id?: string; goal_id?: string; verification_state?: "pending" | "progress" | "passed" | "failed" | "unverified" }>;
+    segments?: Array<{ content?: string; reasoning_content?: string; tool_calls?: ToolCall[]; timeline?: TimelineItem[]; run_id?: string; goal_id?: string }>;
     sources?: SourceRecord[];
     citations?: CitationRef[];
     interrupted?: boolean;
     interruption_notice?: string;
     error_notice?: string;
+    verification_summary?: string;
     run_boundary_notice?: {
       reason?: string;
       message?: string;
@@ -472,9 +495,6 @@ function parseHistoryMessages(
               timeline: segTimeline,
               runId: seg.run_id,
               goalId: seg.goal_id,
-              verificationState:
-                seg.verification_state
-                || (msg.status === "running" ? "pending" : undefined),
             };
           })
         : undefined;
@@ -492,6 +512,7 @@ function parseHistoryMessages(
         interrupted: Boolean(msg.interrupted),
         interruptionNotice: msg.interruption_notice,
         errorNotice: msg.error_notice,
+        verificationSummary: msg.verification_summary,
         // Run boundaries are Harness control-plane state. They remain in the
         // persisted audit record, but are intentionally not rendered as chat
         // messages; the Goal drawer owns the cross-Run timeline.
@@ -510,6 +531,7 @@ function parseHistoryMessages(
         previous.segments = [...(previous.segments || []), ...(restored.segments || [])];
         previous.toolCalls = [...(previous.toolCalls || []), ...(restored.toolCalls || [])];
         previous.timeline = [...(previous.timeline || []), ...(restored.timeline || [])];
+        previous.verificationSummary = restored.verificationSummary || previous.verificationSummary;
         previous.sources = [...(previous.sources || []), ...(restored.sources || [])];
         previous.citations = [...(previous.citations || []), ...(restored.citations || [])];
         previous.outputAttachments = [
@@ -676,7 +698,7 @@ function buildHistoryTimeline(
 }
 
 function normalizeSavedTimeline(
-  saved: Array<{ type: string; content?: string; tool_call?: ToolCall; id?: string }>,
+  saved: Array<{ type: string; content?: string; tool_call?: ToolCall; label?: string; status?: string; id?: string }>,
   toolCalls: ToolCall[]
 ): TimelineItem[] {
   // Prefer the persisted tool_call from the timeline, but supplement with the
@@ -706,6 +728,14 @@ function normalizeSavedTimeline(
           id: tc.id || `saved-tool-${Date.now()}`,
         };
       }
+      if (item.type === "activity" && item.label) {
+        return {
+          type: "activity",
+          label: item.label,
+          status: item.status,
+          id: item.id || `saved-activity-${Date.now()}`,
+        };
+      }
       return null;
     })
     .filter((item): item is TimelineItem => item !== null);
@@ -729,6 +759,54 @@ function sortProjects(projects: ProjectMeta[]): ProjectMeta[] {
   });
 }
 
+function toolActivityStatus(toolName: string, rawInput?: string): RunActivityStatus {
+  const tool = toolName.trim().toLowerCase();
+  if (tool === "task" || tool.includes("subagent")) {
+    let detail = "";
+    try {
+      const parsed = JSON.parse(rawInput || "{}") as Record<string, unknown>;
+      detail = String(parsed.description || parsed.task || parsed.prompt || "").trim();
+    } catch {
+      // Tool input is optional UI detail; never expose an unparsed payload.
+    }
+    return {
+      phase: "subagent",
+      label: "子代理处理中",
+      detail: detail ? detail.slice(0, 72) : undefined,
+    };
+  }
+  if (
+    tool.startsWith("database_") ||
+    tool.includes("knowledge_search") ||
+    tool.includes("web_search") ||
+    tool.includes("tavily") ||
+    tool === "fetch_url"
+  ) {
+    return { phase: "querying", label: "正在查询与整理数据" };
+  }
+  if (
+    tool === "write_file" ||
+    tool === "patch_file" ||
+    tool === "edit_file" ||
+    tool.includes("commit_external") ||
+    tool.includes("publish_attachment")
+  ) {
+    return { phase: "writing", label: "正在更新文件" };
+  }
+  if (
+    tool === "read_file" ||
+    tool === "read_resource" ||
+    tool === "inspect_file_version" ||
+    tool.includes("stage_external")
+  ) {
+    return { phase: "reading", label: "正在读取与核对资料" };
+  }
+  if (tool === "execute" || tool === "terminal" || tool === "shell") {
+    return { phase: "command", label: "正在运行命令" };
+  }
+  return { phase: "tool", label: "正在调用工具" };
+}
+
 export function AppProvider({ children }: { children: React.ReactNode }) {
   // ── Per-session state (Map-based, supports parallel sessions) ──
   const messagesMapRef = useRef<Record<string, ChatMessage[]>>({});
@@ -750,6 +828,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const currentRunsMapRef = useRef<Record<string, HarnessRun | null>>({});
   const goalRunsMapRef = useRef<Record<string, HarnessRun[]>>({});
   const verificationReportsMapRef = useRef<Record<string, RubricEvaluationReport | null>>({});
+  const runActivityStatusesMapRef = useRef<Record<string, RunActivityStatus | null>>({});
   const abortControllersRef = useRef<Map<string, AbortController>>(new Map());
   const assistantIdsRef = useRef<Map<string, string>>(new Map());
   const sessionIdRef = useRef("default"); // tracks current sessionId for SSE callbacks
@@ -908,6 +987,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [pendingInput, setPendingInput] = useState<string | null>(null);
   const [maintenanceStatus, setMaintenanceStatus] =
     useState<ContextMaintenanceStatus | null>(null);
+  const [runActivityStatus, setRunActivityStatus] =
+    useState<RunActivityStatus | null>(null);
   const toolContextPollingJobsRef = useRef<Set<string>>(new Set());
 
   const [activeSourceId, setActiveSourceId] = useState<string | null>(null);
@@ -1088,6 +1169,24 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       setTodos(orderedTodos);
     }
   }, []);
+
+  const updateSessionRunActivity = useCallback(
+    (sid: string, status: RunActivityStatus | null) => {
+      const previous = runActivityStatusesMapRef.current[sid] ?? null;
+      if (
+        previous?.phase === status?.phase &&
+        previous?.label === status?.label &&
+        previous?.detail === status?.detail
+      ) {
+        return;
+      }
+      runActivityStatusesMapRef.current[sid] = status;
+      if (sessionIdRef.current === sid) {
+        setRunActivityStatus(status);
+      }
+    },
+    []
+  );
 
   const updateSessionTrace = useCallback((sid: string, nextTrace: AgentTrace | null) => {
     tracesMapRef.current[sid] = nextTrace;
@@ -1370,6 +1469,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }
       setSessionIdRaw(id);
       setRawMessages(null);
+      setRunActivityStatus(runActivityStatusesMapRef.current[id] ?? null);
 
       if (id === "default") {
         setAnalyticsModelIdRaw(analyticsModelIdsMapRef.current.default ?? null);
@@ -1471,6 +1571,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setMessages([]);
         apiGetSessionHistory(id)
           .then((data) => {
+            if (Array.isArray(data.todos)) {
+              updateSessionTodos(id, data.todos);
+            }
+            if (data.graph !== undefined) {
+              updateSessionGraph(id, data.graph || null);
+            }
             if (data.messages && data.messages.length > 0) {
               const loaded = parseHistoryMessages(data.messages);
               messagesMapRef.current[id] = loaded;
@@ -1486,7 +1592,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }
 
     },
-    []
+    [updateSessionGraph, updateSessionTodos]
   );
 
   // Trace history is intentionally lazy: switching conversations reads only
@@ -1894,6 +2000,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         timestamp: Date.now(),
       };
 
+      const goalForRun =
+        activeGoalsMapRef.current[sendSessionId] ||
+        (sessionIdRef.current === sendSessionId ? activeGoal : null);
+      const goalModeForRun =
+        runOptions.runtimeMode === "agent" &&
+        (runOptions.requestedGoalMode || goalForRun?.status === "active");
+
       const firstAssistantId = `assistant-${Date.now()}`;
       const assistantMsg: ChatMessage = {
         id: firstAssistantId,
@@ -1901,7 +2014,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         content: "",
         toolCalls: [],
         timeline: [],
-        segments: [{ content: "" }],
+        segments: [{
+          content: "",
+        }],
         timestamp: Date.now(),
       };
 
@@ -1911,6 +2026,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
       // Mark this session as streaming
       setStreamingSessions((prev) => new Set(prev).add(sendSessionId));
+      updateSessionRunActivity(sendSessionId, {
+        phase: "running",
+        label: runOptions.runtimeMode === "agent" ? "Agent 正在处理" : "正在生成回复",
+      });
 
       const controller = new AbortController();
       abortControllersRef.current.set(sendSessionId, controller);
@@ -1922,7 +2041,34 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
       // Helper: get current assistant ID for this session
       const getAssistantId = () => assistantIdsRef.current.get(sendSessionId) || "";
-
+      const appendLifecycleActivity = (label: string, status = "", activityId = "") => {
+        const targetId = getAssistantId();
+        updateMsgs((prev) => prev.map((message) => {
+          if (message.id !== targetId) return message;
+          const segments = message.segments?.length
+            ? [...message.segments]
+            : [{ content: "" } as MessageSegment];
+          const last = segments.length - 1;
+          const timeline = [...(segments[last].timeline || [])];
+          const id = activityId || `activity-${Date.now()}-${timeline.length}`;
+          const nextActivity = {
+            type: "activity" as const,
+            label,
+            status,
+            id,
+          };
+          const existingIndex = activityId
+            ? timeline.findIndex((item) => item.type === "activity" && item.id === activityId)
+            : -1;
+          if (existingIndex >= 0) timeline[existingIndex] = nextActivity;
+          else timeline.push(nextActivity);
+          segments[last] = {
+            ...segments[last],
+            timeline,
+          };
+          return { ...message, segments };
+        }));
+      };
       // Keep network consumption independent from React rendering. SSE frames
       // are drained immediately into this buffer, while the UI receives one
       // immutable state update roughly every 32ms. This prevents both React
@@ -1967,6 +2113,21 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       };
       let pendingReasoningContent = "";
       let reasoningFlushTimer: number | null = null;
+      const activeToolActivities = new Map<string, RunActivityStatus & { tool: string }>();
+      let anonymousToolSequence = 0;
+      let correctingVerificationGap = false;
+      const refreshActivityAfterTool = () => {
+        const active = Array.from(activeToolActivities.values()).at(-1);
+        updateSessionRunActivity(
+          sendSessionId,
+          active || (correctingVerificationGap
+            ? { phase: "revision", label: "Agent 正在处理" }
+            : {
+                phase: "running",
+                label: runOptions.runtimeMode === "agent" ? "Agent 正在处理" : "正在生成回复",
+              })
+        );
+      };
       const flushPendingReasoning = () => {
         if (reasoningFlushTimer !== null) {
           window.clearTimeout(reasoningFlushTimer);
@@ -2017,12 +2178,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       };
 
       try {
-        const goalForRun =
-          activeGoalsMapRef.current[sendSessionId] ||
-          (sessionIdRef.current === sendSessionId ? activeGoal : null);
-        const goalModeForRun =
-          runOptions.runtimeMode === "agent" &&
-          (runOptions.requestedGoalMode || goalForRun?.status === "active");
         const eventStream = runOptions.runtimeMode === "agent"
           ? streamAgent(
               processedText,
@@ -2045,6 +2200,25 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               current?.phase === "reasoning" ? null : current
             );
             queueToken((event.data.content as string) || "");
+            continue;
+          }
+
+          if (event.event === "final_response") {
+            setMaintenanceStatus(null);
+            queueToken((event.data.content as string) || "");
+            const targetId = getAssistantId();
+            const verificationSummary = String(event.data.verification_summary || "").trim();
+            if (verificationSummary) {
+              updateMsgs((prev) => prev.map((message) =>
+                message.id === targetId
+                  ? { ...message, verificationSummary }
+                  : message
+              ));
+            }
+            updateSessionRunActivity(sendSessionId, {
+              phase: "verification",
+              label: String(event.data.verification_summary || "正在整理最终结果"),
+            });
             continue;
           }
 
@@ -2076,6 +2250,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             // current assistant message, so we do not duplicate it with the
             // global maintenance badge.
             queueReasoning((event.data.content as string) || "");
+            if (activeToolActivities.size === 0) {
+              updateSessionRunActivity(sendSessionId, correctingVerificationGap
+                ? { phase: "revision", label: "Agent 正在处理" }
+                : { phase: "reasoning", label: "正在思考与规划" });
+            }
             continue;
           }
 
@@ -2093,16 +2272,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 const current = currentRunsMapRef.current[sendSessionId];
                 const segments = updated[idx].segments
                   ? [
-                      ...updated[idx].segments.map((segment) =>
-                        segment.verificationState === "pending"
-                          ? { ...segment, verificationState: "progress" as const }
-                          : segment
-                      ),
+                      ...updated[idx].segments,
                       {
                         content: "",
                         runId: current?.run_id,
-                        verificationState:
-                          current?.verification_enabled === false ? undefined : "pending" as const,
                       },
                     ]
                   : [{ content: "" }];
@@ -2139,11 +2312,36 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               status?: "start" | "done" | "error";
               phase?: string;
               message?: string;
+              used_tokens_before?: number;
+              trigger_tokens?: number;
             };
             if (payload.status === "start") {
+              if (
+                payload.phase === "global_summarization" &&
+                Number.isFinite(payload.used_tokens_before) &&
+                Number.isFinite(payload.trigger_tokens) &&
+                Number(payload.trigger_tokens) > 0
+              ) {
+                const used = Number(payload.used_tokens_before);
+                const total = Number(payload.trigger_tokens);
+                setContextUsage({
+                  used,
+                  total,
+                  percentage: Math.round((used / total) * 1000) / 10,
+                });
+              }
               setMaintenanceStatus({
                 phase: payload.phase || "context",
                 message: payload.message || "正在维护上下文...",
+                usedTokensBefore: payload.used_tokens_before,
+                triggerTokens: payload.trigger_tokens,
+              });
+              updateSessionRunActivity(sendSessionId, {
+                phase: "running",
+                label: payload.phase === "global_summarization"
+                  ? "正在进行全局上下文压缩"
+                  : "正在优化工具上下文",
+                detail: payload.message,
               });
               const jobId = String(event.data.job_id || "");
               const maintenanceSessionId = String(event.data.session_id || sendSessionId);
@@ -2209,6 +2407,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               }
             } else {
               setMaintenanceStatus(null);
+              refreshActivityAfterTool();
             }
             continue;
           }
@@ -2320,6 +2519,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
           if (event.event === "run_started") {
             const run = event.data.run as unknown as HarnessRun;
+            correctingVerificationGap = false;
+            updateSessionRunActivity(sendSessionId, {
+              phase: "running",
+              label: "Agent 正在处理",
+            });
             if (run?.run_id) {
               currentRunsMapRef.current[sendSessionId] = run;
               const existingRuns = goalRunsMapRef.current[sendSessionId] || [];
@@ -2341,8 +2545,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 segments[last] = {
                   ...segments[last],
                   runId: run.run_id,
-                  verificationState:
-                    run.verification_enabled === false ? undefined : "pending" as const,
                 };
                 return { ...message, segments };
               }));
@@ -2377,6 +2579,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           }
 
           if (event.event === "verification_started") {
+            correctingVerificationGap = false;
+            updateSessionRunActivity(sendSessionId, {
+              phase: "verification",
+              label: "Agent 正在处理",
+            });
+            const gradingRunId = String(event.data.grading_run_id || event.data.iteration || "current");
+            appendLifecycleActivity(
+              "正在核对完成质量",
+              "running",
+              `verification-quality-${gradingRunId}`,
+            );
             const current = currentRunsMapRef.current[sendSessionId];
             if (current) {
               const next = { ...current, status: "evaluating" as const };
@@ -2386,25 +2599,49 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               );
               if (sessionIdRef.current === sendSessionId) setCurrentRun(next);
               if (sessionIdRef.current === sendSessionId) setGoalRuns(goalRunsMapRef.current[sendSessionId]);
-              const targetId = getAssistantId();
-              updateMsgs((prev) => prev.map((message) => {
-                if (message.id !== targetId) return message;
-                if (message.segments?.length) {
-                  return {
-                    ...message,
-                    segments: message.segments.map((segment) =>
-                      segment.runId === current.run_id
-                        ? { ...segment, verificationState: "pending" as const }
-                        : segment
-                    ),
-                  };
-                }
-                return {
-                  ...message,
-                  verificationState: "pending" as const,
-                  verificationRunId: current.run_id,
-                };
-              }));
+            }
+            continue;
+          }
+
+          if (
+            event.event === "rubric_evaluation_end" ||
+            event.event === "deterministic_checks_completed"
+          ) {
+            const result = String(
+              event.event === "rubric_evaluation_end"
+                ? event.data.result || ""
+                : event.data.status || ""
+            );
+            if (result === "needs_revision" || result === "failed") {
+              correctingVerificationGap = true;
+              updateSessionRunActivity(sendSessionId, {
+                phase: "revision",
+                label: "Agent 正在处理",
+              });
+              appendLifecycleActivity(
+                event.event === "deterministic_checks_completed"
+                  ? "发现完成条件缺口，继续处理"
+                  : "发现质量缺口，继续处理",
+                result,
+                event.event === "rubric_evaluation_end"
+                  ? `verification-quality-${String(event.data.grading_run_id || event.data.iteration || "current")}`
+                  : "",
+              );
+            } else if (result === "satisfied" || result === "passed") {
+              correctingVerificationGap = false;
+              updateSessionRunActivity(sendSessionId, {
+                phase: "verification",
+                label: "Agent 正在处理",
+              });
+              appendLifecycleActivity(
+                event.event === "deterministic_checks_completed"
+                  ? "完成条件检查通过"
+                  : "完成质量检查通过",
+                result,
+                event.event === "rubric_evaluation_end"
+                  ? `verification-quality-${String(event.data.grading_run_id || event.data.iteration || "current")}`
+                  : "",
+              );
             }
             continue;
           }
@@ -2449,59 +2686,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           if (event.event === "verification_report") {
             const report = event.data.report as unknown as RubricEvaluationReport;
             if (report?.report_id) {
-              const targetId = getAssistantId();
               const controlOnly = CONTROL_ONLY_VERIFICATION_STATUSES.has(report.status);
-              const notRequired = report.status === "not_required";
-              const supersededGoalCandidate =
+              const supersededGoalRun =
                 report.status === "satisfied" && report.accepted_for_goal_revision === false;
-              updateMsgs((prev) => prev.map((message) => {
-                if (message.id !== targetId) return message;
-                if (message.segments?.length) {
-                  const matchingIndexes = message.segments
-                    .map((segment, index) => segment.runId === report.run_id ? index : -1)
-                    .filter((index) => index >= 0);
-                  const finalCandidateIndex = [...matchingIndexes]
-                    .reverse()
-                    .find((index) => Boolean(message.segments?.[index]?.content.trim()))
-                    ?? matchingIndexes.at(-1);
-                  return {
-                    ...message,
-                    segments: message.segments.map((segment, index) =>
-                      segment.runId === report.run_id
-                        ? {
-                            ...segment,
-                            verificationState: index !== finalCandidateIndex
-                              ? "progress" as const
-                              : notRequired
-                                ? "passed" as const
-                                : controlOnly || supersededGoalCandidate
-                                  ? "unverified" as const
-                                  : report.status === "satisfied"
-                                    ? "passed" as const
-                                    : "failed" as const,
-                          }
-                        : segment
-                    ),
-                  };
-                }
-                if (controlOnly || supersededGoalCandidate) {
-                  return {
-                    ...message,
-                    verificationState: notRequired
-                      ? "passed" as const
-                      : "unverified" as const,
-                    verificationRunId: report.run_id,
-                  };
-                }
-                return {
-                  ...message,
-                  verificationState: report.status === "not_required" || report.status === "satisfied"
-                    ? "passed" as const
-                    : "failed" as const,
-                  verificationRunId: report.run_id,
-                };
-              }));
-              if (controlOnly || supersededGoalCandidate) {
+              if (controlOnly || supersededGoalRun) {
                 verificationReportsMapRef.current[sendSessionId] = null;
                 if (sessionIdRef.current === sendSessionId) {
                   setVerificationReport(null);
@@ -2526,14 +2714,22 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               }
               if (!controlOnly && sessionIdRef.current === sendSessionId) {
                 setVerificationReport(report);
-                setInspectorOpen(true);
-                setInspectorActiveTab("verification");
               }
             }
             continue;
           }
 
           if (event.event === "run_outcome") {
+            const outcomeStatus = String(event.data.status || event.data.outcome || "");
+            updateSessionRunActivity(sendSessionId, outcomeStatus === "satisfied" || outcomeStatus === "completed"
+              ? {
+                  phase: "verification",
+                  label: "Agent 正在处理",
+                }
+              : {
+                  phase: "continuing",
+                  label: "正在准备后续处理",
+                });
             const current = currentRunsMapRef.current[sendSessionId];
             if (current) {
               const next: HarnessRun = {
@@ -2566,6 +2762,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           }
 
           if (event.event === "goal_run_continued") {
+            correctingVerificationGap = false;
+            updateSessionRunActivity(sendSessionId, {
+              phase: "continuing",
+              label: "正在进入下一轮",
+              detail: "已保留 Goal、Todo、产物与当前进度",
+            });
             const targetId = getAssistantId();
             updateMsgs((prev) => {
               const updated = [...prev];
@@ -2588,6 +2790,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           }
 
           if (event.event === "permission_required") {
+            updateSessionRunActivity(sendSessionId, {
+              phase: "permission",
+              label: "等待你的授权",
+            });
             const targetId = getAssistantId();
             const permissionRequest = event.data as unknown as PermissionRequest;
             const toolCallId = permissionRequest.tool_call_id || "";
@@ -2657,6 +2863,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           }
 
           if (event.event === "permission_resolved") {
+            refreshActivityAfterTool();
             const targetId = getAssistantId();
             const requestId = (event.data.request_id as string) || "";
             updateMsgs((prev) => {
@@ -2674,6 +2881,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           }
 
           if (event.event === "dimension_build_rule_required") {
+            updateSessionRunActivity(sendSessionId, {
+              phase: "permission",
+              label: "等待你确认数据口径",
+            });
             const targetId = getAssistantId();
             const request = event.data as unknown as DimensionBuildRuleRequest;
             updateMsgs((prev) => {
@@ -2692,6 +2903,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           }
 
           if (event.event === "logical_dataset_rule_required") {
+            updateSessionRunActivity(sendSessionId, {
+              phase: "permission",
+              label: "等待你确认数据规则",
+            });
             const targetId = getAssistantId();
             const request = event.data as unknown as LogicalDatasetRuleRequest;
             updateMsgs((prev) => {
@@ -2710,6 +2925,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           }
 
           if (event.event === "database_sql_revision_required") {
+            updateSessionRunActivity(sendSessionId, {
+              phase: "permission",
+              label: "等待你确认 SQL 口径",
+            });
             const targetId = getAssistantId();
             const request = event.data as unknown as DatabaseSqlRevisionRequest;
             updateMsgs((prev) => {
@@ -2877,11 +3096,36 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 content: "",
                 toolCalls: [],
                 timeline: [],
-                segments: [{ content: "" }],
+                segments: [{
+                  content: "",
+                }],
                 timestamp: Date.now(),
               },
             ]);
             continue;
+          }
+
+          if (event.event === "tool_start") {
+            const tool = String(event.data.tool || "");
+            const rawId = String(event.data.id || "");
+            const activityId = rawId || `anonymous-${tool}-${anonymousToolSequence++}`;
+            activeToolActivities.set(activityId, {
+              ...toolActivityStatus(tool, String(event.data.input || "")),
+              tool,
+            });
+            refreshActivityAfterTool();
+          } else if (event.event === "tool_end") {
+            const rawId = String(event.data.id || "");
+            if (rawId) {
+              activeToolActivities.delete(rawId);
+            } else {
+              const tool = String(event.data.tool || "");
+              const matchingId = Array.from(activeToolActivities.entries())
+                .reverse()
+                .find(([, activity]) => activity.tool === tool)?.[0];
+              if (matchingId) activeToolActivities.delete(matchingId);
+            }
+            refreshActivityAfterTool();
           }
 
           const targetId = getAssistantId();
@@ -3064,10 +3308,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           const updated = [...prev];
           const idx = updated.findIndex((m) => m.id === targetId);
           if (idx === -1) return prev;
-          updated[idx] = finalizeRunningToolsInMessage(
+          const finalized = finalizeRunningToolsInMessage(
             updated[idx],
             "Stream ended before this tool returned a result."
           );
+          updated[idx] = finalized;
           return updated;
         });
         abortControllersRef.current.delete(sendSessionId);
@@ -3075,6 +3320,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         if (sessionIdRef.current === sendSessionId) {
           setMaintenanceStatus(null);
         }
+        updateSessionRunActivity(sendSessionId, null);
         setStreamingSessions((prev) => {
           const next = new Set(prev);
           next.delete(sendSessionId);
@@ -3117,6 +3363,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       analyticsModelId,
       goalModeEnabled,
       activeGoal,
+      updateSessionRunActivity,
     ]
   );
 
@@ -3213,6 +3460,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         contextUsage,
         setContextUsage,
         maintenanceStatus,
+        runActivityStatus,
         activeSourceId,
         setActiveSourceId,
       }}

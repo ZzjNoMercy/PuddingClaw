@@ -1,4 +1,10 @@
-# 从 Grok Build 反推 PuddingClaw Harness：差距分析与演进架构
+# 外部 Agent Harness 对比与 PuddingClaw 演进记录
+
+> **历史文件名说明**：文件名保留 `grok-build-to-puddingclaw-*`，因为本文最初从 Grok Build 扫描开始；这不表示 PuddingClaw Harness 源自 Grok Build。
+>
+> **文档定位**：本文是外部 Agent 机制的附属调研与演进台账，不是 PuddingClaw Harness 的主架构文档。产品设计、当前边界与长期入口以 [PuddingClaw Harness Engineering 整合说明](./puddingclaw-harness-engineering.md) 为准。
+>
+> **归因边界**：Grok Build 只为权限确定性快路径、TodoGate 等少量机制提供过参考。PuddingClaw 的三控制面、Session/Checkpoint/Trace 权威边界、Goal/Run 状态机、Rubric/Effective Contract、Docker Backend、外部 Artifact/Directory/Attachment lease、上下文压缩、Toolset、协议修复与前端产品化，主要来自 PuddingClaw 自身需求、DeepAgents/LangGraph 能力和多轮真实 Session 复盘。
 
 状态：**方案已审核并持续实现于 `main` 工作区；项目后端测试集 670 项、前端生产构建、TaskProfile/Effective Contract、Manager 级动态问数、Goal/Rubric UI 与真实 Docker Backend E2E 已通过**
 日期：2026-07-17
@@ -65,7 +71,7 @@ PuddingClaw 基线提交：<code>7fb380f43be9c9b13fd3478bb28ef1a637fe6203</code>
 - **[本方案新增]**：`smart` 仅自动放行确定性低风险联网工具（Tavily、通过 SSRF 校验的公开网页抓取）；Docker 动态装包仍需用户审批，但可给当前 Session 的类型化安装能力；
 - **[本方案新增]**：动态依赖通过类型化 `install_packages` 工具进入一次性联网 installer 容器；长期项目容器保持 `network=none`，原始 Shell 安装命令不能继承这一可复用授权；
 - **[本方案新增]**：网页抓取执行公开地址校验、DNS 全地址校验、连接 IP 固定、HTTPS SNI/证书主机名校验、跳转重验、peer IP 校验、内容类型与解压后体积限制；
-- **[本方案新增]**：Docker runtime/dependency volume 绑定解析后的不可变 image ID，而不是可漂移 tag；默认镜像为 `puddingclaw/sandbox:python3.12-node22-v2`；
+- **[本方案新增]**：Docker runtime/dependency volume 绑定解析后的不可变 image ID，而不是可漂移 tag；默认镜像为 `puddingclaw/sandbox:python3.12-node22-curl-v3`；
 - **[本方案新增]**：`/skills`、`/knowledge`、`/semantic-assets`、`/sql-guardrails`、`/analytics-models` 同时在 Docker mount 与 DeepAgents 虚拟文件路由层强制只读，外部写权限不能覆盖这一系统约束；
 - **[产品交互借鉴] + [本方案适配]**：Composer 外层只保留项目目录与审批模式；模型、附件、Goal 收入 `+`；思考模式移到右侧。Popover 互斥，Goal 是“下一 Run 意图”，只有收到 `run_started` 才消费。
 
@@ -405,7 +411,7 @@ harness:
     docker:
       connection: auto                # auto | context
       context: desktop-linux
-      image: puddingclaw/sandbox:python3.12-node22-v2
+      image: puddingclaw/sandbox:python3.12-node22-curl-v3
       cpu_limit: 2
       memory_limit_mb: 2048
       pids_limit: 128
@@ -570,7 +576,7 @@ Node.js 22 + npm + corepack
 仅附带基础 POSIX shell 与 CA 证书
 ~~~
 
-普通用户不需要选择或上传镜像。PuddingClaw 默认使用 <code>puddingclaw/sandbox:python3.12-node22-v2</code>；高级用户可以填写本机已有 Docker tag 或 registry image reference，Docker 会按标准规则解析本地镜像或拉取 registry 镜像。Backend 在 Run 开始时把 tag 解析为不可变 image ID 并写入执行快照；项目容器和依赖 volume 都以该 image ID 为键，避免同名 tag 漂移后复用 ABI 不兼容的旧环境。自定义镜像仍必须提供 Python 与 Node.js 基础运行时。
+普通用户不需要选择或上传镜像。PuddingClaw 默认使用 <code>puddingclaw/sandbox:python3.12-node22-curl-v3</code>；高级用户可以填写本机已有 Docker tag 或 registry image reference，Docker 会按标准规则解析本地镜像或拉取 registry 镜像。Backend 在 Run 开始时把 tag 解析为不可变 image ID 并写入执行快照；项目容器和依赖 volume 都以该 image ID 为键，避免同名 tag 漂移后复用 ABI 不兼容的旧环境。自定义镜像仍必须提供 Python、Node.js 与 curl 基础运行时。
 
 PuddingClaw 默认不扫描或安装项目依赖，因为当前产品不是以执行任意项目脚本为主要目标。只有高级用户显式开启 <code>dependency_setup_enabled</code> 后，才扫描项目根及有限层级子目录中的实际配置：
 
@@ -2222,7 +2228,7 @@ Trace 体积和当前 7.7 MB Session 不作为 P0/P1 阻塞项。
 
 - Backend 产品测试边界：`backend/.venv/bin/pytest -q tests`，**779 passed**；Backend 根级无范围 `pytest` 会额外收集第三方 Skill 自带测试并产生模块名冲突，不作为 Backend 产品回归入口。
 - Frontend：`tsc --noEmit` 通过；Next.js production build 通过，13 个路由完成静态/动态构建。
-- Docker 镜像 smoke：`puddingclaw/sandbox:python3.12-node22-v2` 在 `--network none`、宿主 UID/GID、真实 bind mount 下确认 Python 3.12、Node.js 22 与 `/harness-scratch/<session>/<query>` 写入成功。
+- Docker 镜像 smoke：`puddingclaw/sandbox:python3.12-node22-curl-v3` 在 `--network none`、宿主 UID/GID、真实 bind mount 下确认 Python 3.12、Node.js 22、curl 与 `/harness-scratch/<session>/<query>` 写入成功。
 - 当前本机两个旧 project container 均缺 `/harness-scratch` mount；没有在审核过程中强制销毁。新 Backend 下次使用相应 project sandbox 时会因 spec hash/runtime validation 不匹配而自动重建。
 - `git diff --check` 通过。
 - 最终只读对抗复核确认四个高风险反例均已封住：旧 revision/cross-goal candidate 注入、普通 Run 导入 terminal Goal、未闭合伪造 Harness Envelope、Tool Context cancel 后租约悬挂；对应定向用例 4 passed。
@@ -2327,3 +2333,354 @@ att_xxx（不可变源附件）
 - `git diff --check` 通过。
 
 对抗回归覆盖：跨 Session/Run/Query/Goal revision lease、source hash 篡改、路径穿越、shell glob 隐藏、超大源/输出、并发双发布、伪造 ToolMessage 下载卡、半提交重放、publish 后 stream 消费前崩溃、Session 删除后下载失效、任意文件类型统一 Artifact Verification。
+
+## 20. 权限控制横向审计：Codex / Grok Build / StaffDeck / Yuxi / PuddingClaw（2026-07-20，P0/P1 首版已实现）
+
+本节记录 Codex、Grok Build、StaffDeck、Yuxi 的扫描结论，并据此修订 PuddingClaw 的智能审批方案。20.9 的 P0 与 P1 首版已于 2026-07-20 落地；P2 仍是产品演进候选。实现边界与未完成项以 20.11 为准。
+
+需要先区分三个经常被混在一起的控制问题：
+
+1. **Action Control**：某个具体动作是否允许执行，是否需要 HITL，例如 shell、联网、安装包、删除文件；
+2. **Resource Control**：当前 Agent 是否有资格看到或调用某项业务资源，例如租户工具、Skill、数据集、HTTP/MCP 工具；
+3. **Isolation Control**：动作即使被允许，实际进程还能接触哪些文件、网络、凭据和系统能力。
+
+Codex 与 Grok Build 主要解决第一类，StaffDeck 主要解决第二类，Yuxi 主要解决第三类。PuddingClaw 的目标不是抄其中任意一套，而是把三类控制统一放进 Harness 控制面。
+
+### 20.1 Codex：边界优先，Reviewer 只审查已经越界的动作
+
+来源：Codex 本地手册，以及 OpenAI 官方的 [Agent approvals & security](https://learn.chatgpt.com/docs/agent-approvals-security.md) 和 [Auto-review approvals](https://learn.chatgpt.com/docs/sandboxing/auto-review.md)。
+
+Codex 的智能模式不是“每条命令先判一次风险”，而是两层模型：
+
+```text
+Workspace sandbox / network boundary
+  ├─ 边界内：直接执行
+  └─ 需要越界：进入 approval reviewer
+                    ├─ 低/中风险：替用户批准
+                    ├─ 高风险：仍询问用户
+                    └─ 关键风险：拒绝
+```
+
+关键结论：
+
+- `workspace-write + on-request` 下，工作目录内读取、修改文件和运行普通命令默认不重复打断；工作区外写入、受限网络或其他越界动作才请求升级；
+- “替我审批/Auto review”只改变**升级请求由谁审核**，不扩大文件系统、网络或沙箱本身的边界；
+- 审查不是静态命令白名单，而是对动作、参数、目标和上下文做风险判断，并且审查失败时 fail closed；
+- 带有破坏性语义的 Apps/MCP 动作仍保持明确审批，不因智能模式变成无条件放行。
+
+对 PuddingClaw 的启示是：Docker 已经提供清晰边界后，容器内普通 Python/Node、构建、测试和项目写入不应继续逐条 HITL。Reviewer 应放在“确定性策略无法决定的灰区”，不能替代沙箱边界。
+
+### 20.2 Grok Build：确定性快路径 + 危险规则 + LLM 灰区分类
+
+扫描范围：
+
+- `crates/codegen/xai-grok-workspace/src/permission/auto_mode.rs`
+- `crates/codegen/xai-grok-workspace/src/permission/manager.rs`
+- `crates/codegen/xai-grok-workspace/src/permission/rules.rs`
+- `crates/codegen/xai-grok-sandbox/src/profiles.rs`
+
+Grok Build 采用混合模型：
+
+```text
+显式 deny
+  -> 确定性 allowlist / metadata fast-path
+  -> 明确危险模式
+  -> 上下文感知 LLM classifier
+  -> classifier 不可用或仍不确定时询问用户
+```
+
+源码事实：
+
+- `Read`、`Grep`、`WebSearch`、Todo/plan/task wait 等协调工具可进入自动快路径；
+- 常用构建、测试、Python/Node、Cargo、Make 和一批 Git 操作被视为普通本地开发行为；
+- npm/pnpm/yarn/uv/pip 的常用本地项目子命令有结构化识别；`npx`、`uvx` 这类下载后直接执行的 launcher 不进入安全快路径；
+- 复杂 shell 不简单按可执行文件名决定，而是交给会话感知 classifier 判断；发布、远程机器、秘密信息、不可逆 Git、下载并执行等继续询问；
+- `WebFetch` 没有像 PuddingClaw 的安全公共 `fetch_url` 一样自动放行；未知 MCP 也默认询问；
+- 权限层对 Edit 很宽松，但真实文件写入仍受 OS sandbox 限制。不能把“permission manager 允许 Edit”误读为“宿主任意路径可写”。
+
+Grok Build 值得借鉴的是“确定性快路径覆盖高频开发动作，灰区才调用 reviewer”；不应照搬的是过宽的 Edit 快路径、过大的包管理 allowlist，以及把网络默认开放的 workspace sandbox 直接移植到 PuddingClaw。
+
+### 20.3 StaffDeck：业务资源治理强，但不是执行沙箱或智能审批
+
+扫描范围：
+
+- `backend/app/security/permissions.py`
+- `backend/app/tools/tool_schema.py`
+- `backend/app/tools/tool_executor.py`
+- `backend/app/core/agent_loop.py`
+- `backend/app/general_skills/runner.py`
+- `backend/app/general_skills/runtime_env.py`
+
+StaffDeck 的权限主轴是“谁能调用哪个业务工具”：
+
+1. tenant admin/member 与 agent manager/viewer 控制管理、查看权限；
+2. 工具必须启用、对当前员工可见或已绑定；
+3. 当前 workflow step 的 `allowed_actions` 与 `allowed_skills` 再收窄本步可调用能力；
+4. POST/PUT/PATCH/DELETE 等副作用 HTTP 调用使用事件历史做幂等重放，避免恢复或重试时重复执行；
+5. `handoff_human` 是工作流动作，不是每次危险工具的通用审批中间件。
+
+它没有形成 PuddingClaw 所需的 Action Control：
+
+- HTTP/MCP 工具通过绑定校验后直接执行，没有统一的风险描述、域名/SSRF 策略和 HITL；
+- general Skill runner 让模型生成 Python/Bash，在宿主 `mkdtemp` 中通过 `subprocess.Popen` 执行；主要依赖提示词约束“不要执行用户输入命令”；
+- runner 继承运行环境，并可按配置自动建立 venv、联网安装依赖，没有 Docker/OS 沙箱和统一审批管线。
+
+因此 StaffDeck **不能作为 PuddingClaw 智能审批的模板**。可借鉴部分只有：
+
+- `tenant → agent → workflow step → skill/tool` 多轴资源绑定；
+- 对业务副作用工具建立 idempotency key 与 replay receipt；
+- 把人工接管作为显式 workflow capability。
+
+禁止照搬其模型生成代码后直接宿主执行的 runner。
+
+### 20.4 Yuxi：线程级真容器与文件命名空间明确，但没有动作风险审核
+
+扫描范围：
+
+- `docs/agents/sandbox-architecture.md`
+- `backend/package/yuxi/agents/backends/sandbox/backend.py`
+- `backend/package/yuxi/agents/backends/sandbox/provider.py`
+- `docker/sandbox_provisioner/app.py`
+- `backend/package/yuxi/agents/buildin/subagent/graph.py`
+
+Yuxi 将应用层与独立 `sandbox-provisioner` 分开，支持 Docker 和 Kubernetes Backend。其稳定 sandbox identity 由 `uid + file_thread_id + skills_thread_id` 派生：
+
+- 用户共享 workspace：`/home/gem/user-data/workspace`；
+- 当前 file thread 的 uploads：`/home/gem/user-data/uploads`；
+- 当前 file thread 的 outputs：`/home/gem/user-data/outputs`；
+- 当前 skills thread 的 skills：`/home/gem/skills`，只读；
+- 子代理继承父任务的 `file_thread_id`，因此共享附件和 outputs，但使用自己的 `skills_thread_id`，因此可以获得不同 Skill 视图；
+- idle reaper 默认 120 秒清理空闲 sandbox。
+
+文件 API 侧的边界较清晰：路径必须是绝对 Posix path，拒绝 `..`；读取仅允许 user-data 与 skills，写入只允许 workspace 与 outputs，uploads/skills 对 Agent 文件工具只读。
+
+但 `ProvisionerSandboxBackend.execute()` 将 command 直接交给 sandbox shell，没有命令分类、危险模式判断或 HITL。这意味着“文件工具不让写 uploads”并不自动等价于“任意 shell 也无法写 uploads”，真实保证取决于容器 mount 和进程权限。
+
+容器硬化也不能直接照搬：
+
+- Docker 使用 `seccomp=unconfined`，`/home/gem` 为 `rw,exec,mode=777` tmpfs；
+- 未看到 `cap_drop=ALL`、`no-new-privileges`、只读根文件系统、非 root 用户、CPU/内存/PID 限制；
+- Kubernetes 明确 `run_as_user=0`、`fs_group=0`，并通过 `chmod 777` 准备目录；
+- Docker 默认可加入配置网络，且把用户 Agent env 注入 sandbox。
+
+Yuxi 值得借鉴的是：
+
+- 应用服务与 provisioner 分离；
+- `file_thread_id` 与 `skills_thread_id` 分离，子代理共享文件但不必共享全部 Skill；
+- uploads/workspace/outputs/skills 的稳定虚拟命名空间；
+- Docker/Kubernetes Backend 抽象和 idle lifecycle。
+
+不应照搬的是：root、`seccomp=unconfined`、777、无资源上限、常态网络与凭据注入，以及可见 shell 无 Action Control。
+
+### 20.5 五方权限模型对比
+
+| 维度 | Codex | Grok Build | StaffDeck | Yuxi | PuddingClaw 当前 |
+|---|---|---|---|---|---|
+| 核心控制 | workspace 边界 + approval reviewer | 规则快路径 + LLM 灰区分类 | tenant/agent/step/skill 资源绑定 | thread/uid 容器与文件命名空间 | ToolExecutionPipeline + Docker/Host Backend |
+| 边界内普通命令 | 默认放行 | 大量常用开发命令放行 | general Skill 可直接宿主执行 | sandbox 内任意 shell 直接执行 | 智能模式已允许一部分 Docker 普通计算，但仍偏保守 |
+| 文件修改 | workspace 内默认放行 | Edit 权限层宽松，OS sandbox 收口 | 不提供统一本地文件 action policy | 文件 API 仅 workspace/outputs 可写 | 版本化 inspect/patch；外部文件走 lease/commit |
+| 网络 | 默认受限，越界审批 | workspace profile 较宽；WebFetch 仍询问 | HTTP/MCP 绑定后直连 | 容器可加入网络并注入 env | safe public fetch/search 自动；安装与 raw network 分级询问 |
+| 包安装 | 越界/联网时审批 | 识别常见包管理命令，remote launcher 更严格 | runner 可自动 pip install | shell 可直接执行，取决于容器网络 | Docker 内按需安装，package/network Session 授权 |
+| Git 本地写操作 | workspace 内常规操作低摩擦 | add/commit/checkout/switch/stash 等大量快路径 | 不适用 | shell 无分类 | 目前大多归 managed write 并询问，明显更保守 |
+| 业务副作用工具 | Apps/MCP 依注解审批 | 未知 MCP 询问 | 资源绑定 + 幂等重放，但无通用 HITL | 可见工具直接调用 | 尚需统一 side-effect descriptor、idempotency 与 approval |
+| 子代理授权 | 继承任务沙箱与规则 | 受统一 permission manager 约束 | 继承员工/step/tool binding | 共享 file thread、分离 skills thread | 应继承父 Run 的 immutable permission context，当前重复询问体验需继续收口 |
+| 真沙箱 | workspace OS sandbox | workspace/strict sandbox profile | general Skill runner 无真沙箱 | 真 Docker/K8s，但硬化偏弱 | Docker 非 root、cap drop、no-new-privileges、资源限制、默认断网；Host fallback 明示降级 |
+| 主要优势 | 低摩擦边界模型 | 高频动作覆盖与灰区 reviewer | 业务资源治理、幂等副作用 | provisioner、线程命名空间、生命周期 | 三类控制可以统一进 Harness，已有强 Docker 基线与 artifact lease |
+| 主要风险 | reviewer 不能替代 sandbox | allowlist 过宽会扩大攻击面 | 宿主执行生成代码 | arbitrary shell 绕过文件 API；容器 root/联网/env | 规则过细、过度询问；subagent grant 继承和业务工具副作用尚未完全产品化 |
+
+### 20.6 修订后的 PuddingClaw 智能审批原则
+
+智能模式应从“逐命令谨慎确认”调整为“边界内默认工作，越界才打断”：
+
+```text
+Tool/command
+  -> 硬拒绝：宿主越界、提权、Docker control、跨 lease、秘密外传
+  -> 明确询问：不可逆删除、危险 Git、package install、raw network、外部副作用
+  -> 明确放行：Docker 边界内普通读取/写入/计算/构建/测试/常规 Git
+  -> 灰区 reviewer：仅处理确定性规则无法分类的复杂 shell 或工具
+```
+
+#### 必须继续硬拒绝
+
+- 容器访问未挂载宿主路径、跨 Session/Run/lease 读取或写入；
+- `sudo`/提权、Docker daemon/socket/control、宿主系统目录；
+- 未声明目的地的秘密、凭据或私有数据外传；
+- Host fallback 中突破 project/lease 边界的写入；
+- 未登记、无 toolset、无 descriptor 的未知工具。
+
+#### 智能模式应默认放行
+
+- Docker 内 Python、Node 与其他可确定分类的普通本地计算；
+- `sh/bash/zsh script.sh` 必须先读取并分类实际脚本内容，不能仅凭解释器名称自动放行；
+- project/lease 边界内读取、生成、patch、格式化、构建和测试；
+- `git status/diff/log/show/branch/rev-parse`；
+- 建议追加结构化低风险本地 Git：`git add`、`git commit`、`git switch/checkout`（不覆盖未提交修改）、`git stash`；
+- project 内可回退的文件移动/重命名；
+- 已验证为公共、只读且通过 SSRF 防护的 `fetch_url` 与搜索工具；
+- 子代理在父 Run 已授权 workspace/project/lease 内的同类动作。
+
+#### 仍需询问，但授权应尽量聚合为 Session grant
+
+- Docker 内安装/更新依赖以及为此临时联网；
+- raw network、未知域名、下载后执行；
+- `rm -r/-rf/--recursive`、`rmdir/truncate/dd/find -delete`、权限/所有权修改；普通 project 内单文件 `rm file` 可自动放行；
+- `git reset/rebase/clean`、force 操作、覆盖本地修改；
+- 外部文件或目录写回；
+- POST/PUT/PATCH/DELETE、发送消息、创建事件、发布等外部业务副作用。
+
+#### 不再按单个可执行文件粗暴判断
+
+`python3`、`node`、`bash` 本身既不安全也不危险。分类输入必须至少包括：
+
+- Backend（Docker / restricted host）；
+- 工作目录、读写目标和 mount/lease；
+- 是否联网、安装包、产生外部副作用；
+- 是否删除、覆盖、提权或控制 Docker；
+- 父 Run 已有的 Session grants。
+
+因此，`python3` 在 Docker 内读取、计算和写项目文件应自动放行；同一个 `python3` 若尝试联网下载并执行、读取 secrets 或访问 lease 外路径，则继续询问或拒绝。
+
+### 20.7 子代理授权收敛
+
+截图中子代理反复请求 `workspace 命令授权`，不是安全收益，而是权限上下文没有被当成 Run 权威状态继承。目标模型：
+
+1. 父 Run 创建 immutable `EffectivePermissionContext`，包含 Backend、project root、有效 leases、network/package grants、approval mode 和 policy version；
+2. 子代理只能获得父上下文的相同或更小能力，不能自行扩大；
+3. 同一 Run/Session 已批准的能力按语义 grant 复用，不再按 command string 或 tool_call_id 重复询问；
+4. 子代理普通 Docker workspace 命令直接使用父 grant；触发 package/network/destructive/external side effect 时才产生新的聚合审批；
+5. UI 把相同 grant 合并展示为一张卡，显示“谁申请、作用域、有效期、允许的能力”，不堆叠多个“本 Session”标签。
+
+这里可借鉴 Yuxi 的 `file_thread_id / skills_thread_id` 分离，但不能继承它的任意 shell 直通：PuddingClaw 子代理共享父 Run 的 artifact/file scope，同时工具和 Skill visibility 可以进一步缩小。
+
+### 20.8 业务工具补充控制面
+
+StaffDeck 暴露出 PuddingClaw 下一阶段不能只治理 terminal。所有外部业务工具需要统一声明：
+
+```yaml
+side_effect: none | reversible | external_mutation | destructive
+data_classification: public | internal | private | secret
+network_scope: fixed_domain | declared_domains | arbitrary
+idempotency: unsupported | optional | required
+approval_scope: call | run | session
+```
+
+执行顺序建议为：
+
+```text
+tool visibility（tenant/agent/skill/step）
+  -> ToolExecutionPipeline 风险判定
+  -> HITL / grant
+  -> idempotency key
+  -> execute
+  -> receipt + trace
+```
+
+这部分借鉴 StaffDeck 的多轴 binding 与副作用重放，但 idempotency 不能替代 approval：重复执行安全和“用户是否允许第一次执行”是两个问题。
+
+### 20.9 开发优先级
+
+#### P0：先消除低价值重复审批
+
+1. 将 Docker/project/lease 内普通 Python、Node、构建、测试、写文件统一视为边界内操作；
+2. 拆分当前过宽的 `managed_git_write`：低风险本地 Git 自动放行，reset/rebase/clean/force 继续询问；
+3. 将 project 内 `mv/rename` 从 destructive 类中拆出，只有覆盖目标、移出边界或跨 lease 才询问；
+4. 建立 `EffectivePermissionContext`，确保 subagent 与下一 Goal Run 继承 Session grants，修复重复 workspace 授权；
+5. 审批 UI 按 grant 聚合，修复重复“本 Session”与无法看出具体能力的问题。
+
+#### P1：引入受控灰区 reviewer 与业务副作用契约
+
+1. 对确定性规则无法理解的复杂 shell 调用 reviewer；明确 allow/block/ask，reviewer 不可用时 ask，绝不静默扩大权限；
+2. 为 HTTP/MCP/业务工具增加 side-effect、data、domain、idempotency descriptor；
+3. 外部副作用必须产生 receipt，重试/恢复使用 idempotency key；
+4. 增加高级用户自定义 rule，但规则只允许在产品硬边界内收紧或配置 ask/allow，不能取消 hard deny。
+
+#### P2：Provisioner 化与远程沙箱
+
+仅当 PuddingClaw 需要多用户服务端部署、远程执行或 Kubernetes 时，再把当前 Docker Backend 拆成独立 provisioner。届时借鉴 Yuxi 的 provider/provisioner、idle reaper 与 thread namespace，但保留 PuddingClaw 当前更强的非 root、cap drop、no-new-privileges、资源限制、默认断网和最小 env 注入。
+
+### 20.10 验收场景
+
+| 场景 | 智能模式期望 |
+|---|---|
+| 主 Agent 或子代理在 Docker project 内运行 Python/Node 处理文件 | 自动放行，不重复 workspace 授权 |
+| 运行测试、格式化、构建、生成 HTML/JS | 自动放行 |
+| `git add/commit/stash/switch` 且不覆盖未提交修改 | 自动放行并记录 Trace |
+| `git reset --hard`、`git clean`、force 操作 | HITL |
+| project 内重命名文件 | 自动放行；覆盖或移出边界时 HITL |
+| 公共安全 URL 的只读 fetch/search | 自动放行 |
+| Docker 缺包，申请安装并临时联网 | 一次 Session 级 package/network HITL，后续同 scope 复用 |
+| Python 下载脚本后直接执行 | HITL，不能因命令名是 Python 自动放行 |
+| 子代理使用父 Run 已批准的 workspace | 自动继承，不再申请 |
+| 子代理扩大到新域名、外部目录或新副作用工具 | 新 HITL |
+| POST 创建业务记录，因恢复再次调用 | 首次按策略审批，后续凭 idempotency receipt 重放，不重复创建 |
+| 未注册 toolset 或缺少风险 descriptor 的新工具 | fail closed，并给开发者明确注册错误 |
+
+本节机制来源区分：
+
+- **借鉴 Codex**：boundary-first、Reviewer 不扩大 sandbox、低风险边界内动作低摩擦；
+- **借鉴 Grok Build**：确定性 fast-path + 危险模式 + 会话感知灰区 classifier；
+- **借鉴 StaffDeck**：tenant/agent/step/skill 多轴绑定和业务副作用幂等重放；
+- **借鉴 Yuxi**：provider/provisioner 分离、file thread 与 skills thread 分离、稳定虚拟命名空间、idle lifecycle；
+- **PuddingClaw 自有并继续保留**：ToolExecutionPipeline、Docker/Host 统一策略、Goal/Run/Session grants、ExternalArtifactLease、AttachmentEditLease、Artifact Receipt、默认断网与强容器硬化。
+
+### 20.11 P0/P1 首版实现记录与溯源
+
+#### 实际采用的参考机制
+
+| 最终机制 | 参考来源 | PuddingClaw 落点 | 实现状态 |
+|---|---|---|---|
+| sandbox boundary 内低摩擦执行，reviewer 不扩大边界 | **Codex boundary-first / auto-review** | `harness/tool_execution.py::ToolExecutionPipeline` 在确定性 host path、Docker control、network、package、destructive 检查之后才进入智能快路径或 reviewer | 已实现 |
+| deterministic fast-path → dangerous rules → LLM gray zone | **Grok Build `permission/auto_mode.rs`、`manager.rs`、`rules.rs`** | `ShellPolicyAnalyzer` + `ModelPermissionReviewer`；reviewer 仅接收 eligible ASK，失败时回退人工确认 | 已实现 |
+| 常规本地 Git 低摩擦，危险 Git 单独拦截 | **Codex 工作区边界 + Grok 本地 Git fast-path** | `git add/commit/switch/stash` 与安全 branch checkout 自动放行；reset/clean/rebase/restore、force、checkout path、stash drop/clear 继续 HITL | 已实现 |
+| 工具注册时声明副作用契约 | **StaffDeck 业务工具 binding/idempotency 启发 + PuddingClaw 自有控制面** | `tools/toolsets.py::ToolControlDescriptor` 覆盖全部已注册 Tool；缺 descriptor 的 Tool fail closed；runtime inventory 投影 control 信息 | 已实现首版 |
+| 子代理共享任务文件域但不能扩大能力 | **Yuxi file-thread 继承思想 + Codex/Grok 统一策略边界** | 主 Agent 与 subagent 共享同一个冻结 `RunPermissionContext`、Backend 与 Session grant 权威源；subagent 单独建立 Pipeline，但不能修改父 Run policy | 已实现 |
+
+#### 本轮具体行为边界
+
+- 智能 Docker 模式自动放行：普通 Python/Node 本地计算与 project 写入、测试/构建/格式化、`git add/commit/switch/stash`、project 内静态 `mv`、非递归 `rm file`。
+- `sh/bash/zsh script.sh` 不是白名单。Harness 将脚本解析为实际命令后再判定；无法读取、路径越界或脚本语义不透明时继续询问。Reviewer 收到脚本时同时看到已读取的脚本正文，避免只审查无害的 wrapper。
+- 确定性规则不能理解的普通终端命令不会静默放行，而由 `ModelPermissionReviewer` 判断 allow/ask/deny；它无权放开联网、安装包、递归删除、提权、Docker control、host path 或外部副作用。
+- `rm -r/-rf/--recursive`、`find -delete/-exec`、危险 Git、下载执行、package install、raw network、外部 artifact commit 仍为 HITL 或 hard deny。
+- 等价 Session grant 在 `SessionManager.add_permission_grant` 中去重；主 Agent 与 subagent 都从 Session JSON 消费同一绑定 grant，避免重复授权卡。Run policy 继续绑定 `policy_epoch + policy_version + backend + workspace`，切换策略后旧 grant 失效。
+- 权限请求与 Trace 记录 `policy_source`、中文 `policy_explanation` 和 `control_descriptor`；前端区分“确定性规则”与“智能审查后需确认”。
+
+#### 关键代码文件
+
+- `backend/harness/tool_execution.py`：确定性分类、脚本正文检查、智能 Docker fast-path、Git/mv/rm 边界、reviewer 接入；
+- `backend/harness/permission_reviewer.py`：灰区审查 prompt、结构化结果与 fail-closed；
+- `backend/tools/toolsets.py`：Tool control descriptor 单一注册表；
+- `backend/graph/permission_policy.py`、`backend/graph/session_manager.py`：冻结 Run policy、绑定校验、Session grant 复用与去重；
+- `backend/graph/deepagents_manager.py`：main/subagent 共享 effective permission context 与 reviewer，inventory 暴露 control contract；
+- `frontend/src/components/chat/ChatMessage.tsx`、`frontend/src/components/citations/SourcesPanel.tsx`：中文风险说明、智能审查来源与 grant 展示。
+
+#### 尚未伪称完成的部分
+
+- HTTP/MCP 外部副作用的通用 receipt/idempotency executor 尚未统一；当前 descriptor 已能 fail closed 和声明契约，既有附件、外部 artifact、SQL 等流程继续使用各自 receipt/plan 协议。
+- 高级用户自定义 permission rules 尚未开放到 Harness 设置；后续规则只能在 hard boundary 内调整 allow/ask，不能取消 hard deny。
+- P2 独立 provisioner、Kubernetes 与 exact-Run 物理隔离仍是后续产品取舍，不属于本轮权限降噪。
+
+#### 本轮验证
+
+- `pytest -q backend/tests`：862 passed，24 warnings；
+- 智能审批定向回归覆盖 Python/Node、Git、mv、单文件 rm、递归删除、shell script inspection、gray-zone reviewer、fail-closed、descriptor 完整性和 Session grant 去重；
+- Frontend `tsc --noEmit` 与 Next.js production build（13 个静态路由）通过；
+- Ruff 定向检查与 `git diff --check` 通过。
+
+### 20.12 单文件外部产物的 Backend 写入收口
+
+最新真实 Session 暴露的故障并非数据查询失败，而是外部文件进入 Docker 后的路径语义不一致：
+
+1. `stage_external_artifact` 已把精确文件放入 `/scratch/external/<lease_id>/...`，但模型把 `/scratch` 误当成宿主机非 workspace 路径，重复调用 `read_resource`，产生虚假的 `File not found`；
+2. Python heredoc 中的 JSON/数组 `[` 被 ShellPolicyAnalyzer 误判成容器路径通配展开，返回 `container_path_expansion (critical)`；
+3. 同一 Run 对同一精确目标重复 staging 会生成多个 lease，模型在多个 scratch 路径之间漂移；
+4. 精确文件授权不应隐式扩大到父目录，但读取文件后发现真实兄弟依赖时，应允许 Agent 调用 `stage_external_directory(parent)` 主动发起目录级 HITL。
+
+收口后的权威规则：
+
+- `/scratch/...` 与 `/workspace/...` 同属 Backend 虚拟命名空间；前者用 `read_file`、Harness 文件工具或受控 Terminal，不得交给 `read_resource`。执行边界对误用的 `read_resource(/scratch/...)` 自动适配到 Backend read，避免模型循环；
+- `read_resource` 只负责附件、托管知识以及宿主机精确外部文件；
+- Python/Node heredoc 的数据数组不再触发 critical path expansion；真实 `/harness-scratch`、路径遍历、通配探测仍确定性拒绝。智能 Docker 模式下，边界内无联网、无安装、无破坏性的 heredoc 文件处理自动放行；
+- 同一 Session/Run/Query/Goal revision/target 的活动 `ExternalArtifactLease` 必须复用，保留已经完成的 staged edits；外部权威源发生变化仍 fail closed；
+- 精确文件默认不推断父目录。只有 Agent 读后确认确需发现 sibling dependency，才调用 `stage_external_directory` 请求显式目录授权；整个目录联调仍优先提示用户将目录作为项目打开。
+
+该修复属于 **PuddingClaw 自有 Backend/Harness 边界一致性修复**；低摩擦的 sandbox 内解释器执行继续沿用前文借鉴的 Codex boundary-first 与 Grok deterministic fast-path 思路。

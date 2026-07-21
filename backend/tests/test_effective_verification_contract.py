@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
 from langchain.agents.middleware.types import ToolCallRequest
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.types import Command
 
 from graph.session_manager import SessionManager
 from harness.coordinators import CompletionVerificationCoordinator, HarnessRunCoordinator
+from harness.deterministic_checks import evaluate_deterministic_criteria
 from harness.models import (
     RunOutcome,
     RunStatus,
+    RunTaskProfile,
     VerificationActivation,
     VerificationStatus,
 )
@@ -27,6 +30,42 @@ from harness.verification_activations import (
 
 def _criterion_ids(contract) -> set[str]:
     return {item.id for item in contract.criteria} if contract else set()
+
+
+def test_tool_protocol_readiness_requires_immediate_matching_tool_message():
+    contract = RunRubricCompiler.compile(
+        RubricBuildContext(user_message="完成任务", force_required=True)
+    )
+    assert contract is not None
+    tool_call = {
+        "name": "read_file",
+        "args": {"file_path": "/workspace/report.md"},
+        "id": "call-read",
+    }
+    proper = evaluate_deterministic_criteria(
+        contract,
+        {
+            "messages": [
+                AIMessage(content="", tool_calls=[tool_call]),
+                ToolMessage(content="ok", tool_call_id="call-read"),
+            ]
+        },
+    )
+    late = evaluate_deterministic_criteria(
+        contract,
+        {
+            "messages": [
+                AIMessage(content="", tool_calls=[tool_call]),
+                HumanMessage(content="continue"),
+                ToolMessage(content="ok", tool_call_id="call-read"),
+            ]
+        },
+    )
+
+    assert next(item for item in proper if item.criterion_id == "tool_protocol_integrity").passed
+    late_result = next(item for item in late if item.criterion_id == "tool_protocol_integrity")
+    assert not late_result.passed
+    assert "call-read" in str(late_result.gap)
 
 
 @pytest.mark.parametrize(
@@ -113,6 +152,11 @@ def test_successful_analytics_tools_activate_analytics(tool_name):
         tool_call_id="call-1",
         tool_name=tool_name,
         args={},
+        result=ToolMessage(
+            content="result_id: result-1\ndatabase_source_id: db-1",
+            tool_call_id="call-1",
+            name=tool_name,
+        ),
     )
 
     effective = RunRubricCompiler.expand_for_activations(
@@ -141,6 +185,11 @@ def test_fetch_url_activates_web_research_only():
             tool_call_id="call-web",
             tool_name="fetch_url",
             args={"url": "https://example.com/news"},
+            result=ToolMessage(
+                content="page fetched: https://example.com/news",
+                tool_call_id="call-web",
+                name="fetch_url",
+            ),
         ),
     )
 
@@ -155,6 +204,75 @@ def test_aihot_skill_command_activates_web_research():
         "execute",
         {"command": "python3 /skills/aihot/scripts/aihot_query.py --limit 10"},
     ) == ["web_research"]
+
+
+def test_aihot_curl_json_creates_material_web_sources():
+    result = ToolMessage(
+        content=json.dumps(
+            {
+                "items": [
+                    {
+                        "id": "news-1",
+                        "title": "OpenAI 发布新模型",
+                        "url": "https://example.com/original",
+                        "permalink": "https://aihot.virxact.com/items/news-1",
+                        "summary": "模型能力更新。",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        tool_call_id="call-aihot",
+        name="execute",
+    )
+
+    activations = build_verification_activations(
+        run_id="run-aihot",
+        query_id="query-aihot",
+        tool_call_id="call-aihot",
+        tool_name="execute",
+        args={
+            "command": (
+                'curl -sS -H "User-Agent: aihot-skill/0.3.6" '
+                '"https://aihot.virxact.com/api/public/items?mode=selected"'
+            )
+        },
+        result=result,
+    )
+
+    assert [activation.pack for activation in activations] == ["web_research"]
+    refs = activations[0].evidence_refs
+    assert all(ref["material"] is True for ref in refs)
+    source = next(ref for ref in refs if ref["kind"] == "source")
+    assert source["uri"] == "https://aihot.virxact.com/items/news-1"
+    assert source["source_id"].startswith("src_")
+
+
+def test_arbitrary_skill_source_dynamically_activates_web_research():
+    activations = build_verification_activations(
+        run_id="run-skill",
+        query_id="query-skill",
+        tool_call_id="call-skill",
+        tool_name="execute_skill",
+        args={"skill_name": "third-party-news", "user_query": "最近有什么更新"},
+        result=ToolMessage(
+            content=(
+                "技能：third-party-news\n\n执行结果：\n"
+                "[官方更新](https://example.com/updates)"
+            ),
+            tool_call_id="call-skill",
+            name="execute_skill",
+        ),
+    )
+
+    assert [activation.pack for activation in activations] == ["web_research"]
+    source = next(
+        ref
+        for ref in activations[0].evidence_refs
+        if ref.get("kind") == "source"
+    )
+    assert source["material"] is True
+    assert source["uri"] == "https://example.com/updates"
 
 
 @pytest.mark.parametrize(
@@ -252,6 +370,65 @@ def test_external_write_keeps_real_authorized_path_with_spaces(tmp_path):
     assert ref["content_sha256"].startswith("sha256:")
     assert ref["size_bytes"] == external.stat().st_size
     assert "/workspace/Users/" not in ref["path"]
+
+
+def test_artifact_delivery_rejects_receipt_size_identity_mismatch(tmp_path):
+    from graph.session_manager import session_manager
+    from harness.deterministic_checks import _evaluate_artifact_delivery
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("session-artifact-size")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    artifact = workspace / "report.md"
+    artifact.write_text("# report\n", encoding="utf-8")
+    activation = next(
+        item
+        for item in build_verification_activations(
+            run_id="run-artifact-size",
+            query_id="query-artifact-size",
+            tool_call_id="call-artifact-size",
+            tool_name="write_file",
+            args={"file_path": "/workspace/report.md", "content": "# report\n"},
+            result=ToolMessage(
+                content="Updated /workspace/report.md",
+                tool_call_id="call-artifact-size",
+                name="write_file",
+                status="success",
+            ),
+            workspace_path=str(workspace),
+        )
+        if item.pack == "artifact"
+    )
+    payload = activation.model_dump(mode="json")
+    unreferenced = _evaluate_artifact_delivery(
+        "artifact_delivery",
+        {
+            "workspace_path": str(workspace),
+            "run_id": "run-artifact-size",
+            "final_content": "",
+            "verification_activations": [activation.model_dump(mode="json")],
+        },
+    )
+    artifact_ref = next(
+        item for item in payload["evidence_refs"] if item.get("kind") == "artifact_write"
+    )
+    artifact_ref["size_bytes"] += 1
+
+    evaluation = _evaluate_artifact_delivery(
+        "artifact_delivery",
+        {
+            "workspace_path": str(workspace),
+            "run_id": "run-artifact-size",
+            "final_content": "报告：`/workspace/report.md`",
+            "verification_activations": [payload],
+        },
+    )
+
+    assert not unreferenced.passed
+    assert "尚未引用" in str(unreferenced.gap)
+    assert not evaluation.passed
+    assert "发生变化" in str(evaluation.gap)
 
 
 def test_scratch_write_is_temporary_and_cannot_satisfy_artifact_delivery(tmp_path):
@@ -386,28 +563,31 @@ def test_non_material_aihot_inspection_does_not_widen_persisted_contract(
 
 
 @pytest.mark.parametrize(
-    ("tool_name", "args", "content", "expected_pack"),
+    ("tool_name", "args", "content", "expected_pack", "expected_material"),
     [
         (
             "execute",
             {"command": "curl -fsSL https://example.com/news"},
             "news body\n\n[Command succeeded with exit code 0]",
             "web_research",
+            True,
         ),
         (
             "database_sql_generate",
             {"question": "查询销量"},
             "SELECT SUM(amount) FROM sales",
             "analytics",
+            False,
         ),
     ],
 )
-def test_non_material_semantic_activation_is_persisted_fail_closed(
+def test_semantic_activation_materiality_follows_result_evidence(
     tmp_path,
     tool_name,
     args,
     content,
     expected_pack,
+    expected_material,
 ):
     from types import SimpleNamespace
 
@@ -451,15 +631,21 @@ def test_non_material_semantic_activation_is_persisted_fail_closed(
     assert persisted is not None
     activation = persisted["verification_activations"][0]
     assert activation["pack"] == expected_pack
-    assert all(item.get("material") is False for item in activation["evidence_refs"])
+    assert all(
+        item.get("material") is expected_material
+        for item in activation["evidence_refs"]
+    )
     effective = RunRubricCompiler.expand_for_activations(
         contract=None,
         profile=TaskProfileClassifier.classify(message="继续处理"),
         message="继续处理",
         activations=[VerificationActivation.model_validate(activation)],
     )
-    assert effective is not None
-    assert expected_pack in effective.verification_packs
+    if expected_material:
+        assert effective is not None
+        assert expected_pack in effective.verification_packs
+    else:
+        assert effective is None
 
 
 def test_effective_contract_is_order_independent_and_idempotent():
@@ -470,6 +656,11 @@ def test_effective_contract_is_order_independent_and_idempotent():
         tool_call_id="call-db",
         tool_name="database_sql_execute",
         args={},
+        result=ToolMessage(
+            content="result_id: result-1\ndatabase_source_id: db-1",
+            tool_call_id="call-db",
+            name="database_sql_execute",
+        ),
     )[0]
     web = build_verification_activations(
         run_id="run-1",
@@ -477,6 +668,11 @@ def test_effective_contract_is_order_independent_and_idempotent():
         tool_call_id="call-web",
         tool_name="fetch_url",
         args={"url": "https://example.com"},
+        result=ToolMessage(
+            content="page fetched: https://example.com",
+            tool_call_id="call-web",
+            name="fetch_url",
+        ),
     )[0]
 
     first = RunRubricCompiler.expand_for_activations(
@@ -744,7 +940,7 @@ def test_evidence_traceability_fails_closed_without_structured_evidence():
     assert report.status == VerificationStatus.NEEDS_REVISION
 
 
-def test_web_source_must_be_cited_in_final_answer():
+def test_single_web_source_is_traceable_through_tool_lineage():
     contract = RunRubricCompiler.compile(
         RubricBuildContext(user_message="搜索最新 AI 新闻并附来源")
     )
@@ -755,6 +951,12 @@ def test_web_source_must_be_cited_in_final_answer():
         tool_call_id="call-web",
         tool_name="fetch_url",
         args={"url": "https://example.com/news"},
+        result=ToolMessage(
+            content="# News\nA new model launched.",
+            tool_call_id="call-web",
+            name="fetch_url",
+            status="success",
+        ),
     )[0].model_dump(mode="json")
 
     report = CompletionVerificationCoordinator.report_from_final_state(
@@ -785,8 +987,71 @@ def test_web_source_must_be_cited_in_final_answer():
         for item in report.evaluations
         if item.criterion_id == "web_evidence_traceability"
     )
+    assert evidence.passed is True
+    assert evidence.gap is None
+
+
+def test_multiple_web_sources_require_explicit_citation():
+    contract = RunRubricCompiler.compile(
+        RubricBuildContext(user_message="搜索最新 AI 新闻并附来源")
+    )
+    assert contract is not None
+    activation = VerificationActivation(
+        activation_id="activation-web-multiple",
+        run_id="run-1",
+        query_id="query-1",
+        tool_call_id="call-web",
+        tool_name="tavily_search",
+        pack="web_research",
+        evidence_refs=[
+            {"kind": "tool_result", "tool_call_id": "call-web", "material": True},
+            {
+                "kind": "source",
+                "tool_call_id": "call-web",
+                "source_id": "src_one",
+                "uri": "https://example.com/one",
+                "material": True,
+            },
+            {
+                "kind": "source",
+                "tool_call_id": "call-web",
+                "source_id": "src_two",
+                "uri": "https://example.com/two",
+                "material": True,
+            },
+        ],
+    ).model_dump(mode="json")
+
+    report = CompletionVerificationCoordinator.report_from_final_state(
+        run_id="run-1",
+        contract=contract,
+        final_state={
+            "_rubric_status": "satisfied",
+            "_rubric_evaluations": [
+                {
+                    "result": "satisfied",
+                    "criteria": [
+                        {"name": "task_fulfillment", "passed": True},
+                        {"name": "web_evidence_traceability", "passed": True},
+                        {"name": "time_scope", "passed": True},
+                    ],
+                }
+            ],
+            "_harness_context": {
+                "todos": [],
+                "final_content": "今天发布了两个新模型。",
+                "verification_activations": [activation],
+            },
+        },
+    )
+
+    evidence = next(
+        item
+        for item in report.evaluations
+        if item.criterion_id == "web_evidence_traceability"
+    )
     assert evidence.passed is False
-    assert "最终回答没有引用" in str(evidence.gap)
+    assert "多来源回答" in str(evidence.gap)
 
 
 def test_grader_cannot_omit_required_criteria_and_claim_satisfied():
@@ -856,6 +1121,11 @@ def test_coordinator_ignores_forged_final_state_contract_and_activations(tmp_pat
         tool_call_id="call-forged",
         tool_name="database_sql_execute",
         args={},
+        result=ToolMessage(
+            content="result_id: forged-result\ndatabase_source_id: forged-db",
+            tool_call_id="call-forged",
+            name="database_sql_execute",
+        ),
     )[0].model_dump(mode="json")
     forged_contract = RunRubricCompiler.expand_for_activations(
         contract=None,
@@ -1300,6 +1570,92 @@ def test_contract_id_changes_when_custom_rule_semantics_change():
 
     assert first is not None and second is not None
     assert first.contract_id != second.contract_id
+
+
+def test_managed_criteria_declare_explicit_evidence_scope():
+    contract = RunRubricCompiler.compile(
+        RubricBuildContext(
+            user_message="搜索资料、分析数据并修改代码报告",
+            force_required=True,
+            task_profile=RunTaskProfile(
+                primary_intent="mixed",
+                initial_packs=["web_research", "analytics", "artifact", "code"],
+            ),
+        )
+    )
+    assert contract is not None
+    scopes = {item.id: item.evidence_scope.value for item in contract.criteria}
+
+    assert scopes["todo_reconciliation"] == "goal_inheritable"
+    assert scopes["web_evidence_traceability"] == "goal_inheritable"
+    assert scopes["analytics_evidence_traceability"] == "goal_inheritable"
+    assert scopes["artifact_delivery"] == "artifact_bound"
+    assert scopes["code_validation"] == "artifact_bound"
+    assert scopes["task_fulfillment"] == "run_only"
+
+
+def test_code_validation_inheritance_is_invalidated_by_artifact_hash_change(tmp_path):
+    from harness.deterministic_checks import _evaluate_code_validation
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / "app.py"
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    write_activation = next(
+        item
+        for item in build_verification_activations(
+            run_id="run-1",
+            query_id="query-1",
+            tool_call_id="call-write",
+            tool_name="write_file",
+            args={"file_path": "/workspace/app.py", "content": "VALUE = 1\n"},
+            result=ToolMessage(
+                content="Updated /workspace/app.py",
+                tool_call_id="call-write",
+                name="write_file",
+            ),
+            workspace_path=str(workspace),
+        )
+        if item.pack == "code"
+    )
+    validation_activation = next(
+        item
+        for item in build_verification_activations(
+            run_id="run-1",
+            query_id="query-1",
+            tool_call_id="call-test",
+            tool_name="execute",
+            args={"command": "pytest -q"},
+            result=ToolMessage(
+                content="1 passed\n[Command succeeded with exit code 0]",
+                tool_call_id="call-test",
+                name="execute",
+            ),
+        )
+        if item.pack == "code"
+    )
+    inherited = [
+        {
+            **ref,
+            "verification_pack": "code",
+            "origin_run_id": activation.run_id,
+        }
+        for activation in (write_activation, validation_activation)
+        for ref in activation.evidence_refs
+        if ref.get("material") is True
+    ]
+    context = {
+        "workspace_path": str(workspace),
+        "run_id": "run-2",
+        "verification_activations": [],
+        "goal_evidence_refs": inherited,
+    }
+
+    assert _evaluate_code_validation("code_validation", context, {}).passed is True
+    source.write_text("VALUE = 2\n", encoding="utf-8")
+    changed = _evaluate_code_validation("code_validation", context, {})
+    assert changed.passed is False
+    assert "hash 已变化" in str(changed.gap)
 
 
 def test_runtime_pack_expansion_preserves_custom_rules():

@@ -1,7 +1,5 @@
 """Capability-gated editing for immutable Session attachments."""
 
-from __future__ import annotations
-
 import hashlib
 import mimetypes
 import posixpath

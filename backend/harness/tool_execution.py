@@ -26,6 +26,8 @@ from langgraph.types import Command, interrupt
 from graph.permission_policy import RunPermissionContext
 from graph.permission_resume import permission_resume_registry
 from graph.session_manager import session_manager
+from harness.permission_reviewer import PermissionReviewer
+from tools.toolsets import tool_control_descriptor
 
 
 class PolicyDecision(StrEnum):
@@ -39,6 +41,8 @@ class ToolPolicyResult:
     decision: PolicyDecision
     reason: str
     risk: str
+    source: str = "deterministic"
+    explanation: str = ""
 
 
 @dataclass(frozen=True)
@@ -48,6 +52,7 @@ class ShellCapabilities:
     network: bool = False
     workspace_write: bool = False
     package_install: bool = False
+    destructive: bool = False
 
 
 _HARD_DENY_COMMANDS = frozenset(
@@ -101,6 +106,7 @@ _PACKAGE_COMMANDS = frozenset(
         "uvx",
     }
 )
+_RECURSIVE_RM_FLAGS = frozenset({"-r", "-R", "-rf", "-fr", "-rF", "-Rf", "--recursive"})
 _DESTRUCTIVE_OR_WRITE_COMMANDS = frozenset(
     {
         "rm",
@@ -164,6 +170,36 @@ _KNOWN_NETWORK_SKILL_ENTRYPOINT_PATTERN = re.compile(
     r"(?:python3?|node)\s+/skills/(?:aihot|tavily-search)/[^\s\"']+",
     re.IGNORECASE,
 )
+_EMBEDDED_DESTRUCTIVE_API_PATTERN = re.compile(
+    r"(?:\bos\.(?:remove|unlink|rmdir|removedirs)\s*\(|"
+    r"\bshutil\.rmtree\s*\(|"
+    r"\bPath\s*\([^)]*\)\.(?:unlink|rmdir)\s*\(|"
+    r"(?:\bfs|require\s*\(\s*['\"](?:node:)?fs['\"]\s*\))"
+    r"\.(?:rm|rmSync|rmdir|rmdirSync|unlink|unlinkSync)\s*\(|"
+    r"\bDeno\.remove\s*\(|"
+    r"\bsubprocess\.(?:run|call|Popen)\s*\([^\n]*(?:\brm\b|git\s+(?:reset|clean|checkout|restore))|"
+    r"\bos\.system\s*\([^\n]*(?:\brm\b|git\s+(?:reset|clean|checkout|restore)))",
+    re.IGNORECASE,
+)
+_OPAQUE_CRITICAL_ACTION_PATTERN = re.compile(
+    r"(?:^|[;&|`(){}\s])(?:sudo|su|doas|pkexec|docker|podman|nerdctl|mount|umount|chroot)\b|"
+    r"(?:^|[;&|`(){}\s])(?:rm|rmdir|truncate|dd)\b|"
+    r"\bgit\s+(?:reset|clean|rebase)\b|"
+    r"\b(?:chmod|chown)\b",
+    re.IGNORECASE,
+)
+_SMART_GIT_WRITE_SUBCOMMANDS = frozenset({"add", "commit", "switch", "stash"})
+_SMART_DOCKER_DESTRUCTIVE_REASONS = frozenset(
+    {
+        "destructive_workspace_delete:rm_recursive",
+        "managed_workspace_write:rmdir",
+        "managed_workspace_write:chmod",
+        "managed_workspace_write:chown",
+        "managed_workspace_write:truncate",
+        "managed_workspace_write:dd",
+        "managed_workspace_write:find:-delete",
+    }
+)
 
 
 class ShellPolicyAnalyzer:
@@ -176,12 +212,6 @@ class ShellPolicyAnalyzer:
     def analyze(self, command: str) -> ToolPolicyResult:
         if not isinstance(command, str) or not command.strip():
             return ToolPolicyResult(PolicyDecision.DENY, "empty_command", "invalid")
-        if _SHELL_META_PATTERN.search(command):
-            return ToolPolicyResult(
-                PolicyDecision.ASK,
-                "complex_shell_expansion",
-                "high",
-            )
         try:
             segments, has_write_redirect = self._segments(command)
         except ValueError:
@@ -195,9 +225,29 @@ class ShellPolicyAnalyzer:
         path_result = self._check_absolute_paths(segments)
         if path_result is not None:
             return path_result
-        relative_path_result = self._check_relative_paths(segments)
+        relative_path_result = self._check_relative_paths(
+            segments,
+            inline_program=bool(
+                re.search(r"<<-?\s*['\"]?[A-Za-z_][A-Za-z0-9_]*", command)
+                or re.search(
+                    r"(?:^|[;&|]\s*)(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
+                    r"(?:python(?:\d+(?:\.\d+)*)?|node|ruby|perl)\s+"
+                    r"(?:-[ce]\b|--eval(?:\s|=))",
+                    command,
+                )
+            ),
+        )
         if relative_path_result is not None:
             return relative_path_result
+        # Inspect paths before handing opaque expansion to the smart reviewer.
+        # Reviewer approval never gets a chance to bypass a deterministic path
+        # escape or Harness-internal scratch boundary.
+        if _SHELL_META_PATTERN.search(command):
+            return ToolPolicyResult(
+                PolicyDecision.ASK,
+                "complex_shell_expansion",
+                "high",
+            )
         decisions = [self._analyze_segment(segment) for segment in segments]
         if has_write_redirect:
             decisions.append(
@@ -233,8 +283,50 @@ class ShellPolicyAnalyzer:
 
         return cls._unwrap(tokens)
 
+    @staticmethod
+    def _curl_writes_material_output(tokens: list[str]) -> bool:
+        """Return whether curl stores response bytes in a material file.
+
+        ``curl -o /dev/null`` is a common status/probe command. Treating that
+        sink as a workspace write adds a capability the command cannot use and
+        defeats an otherwise valid Session network grant.
+        """
+
+        safe_sinks = {
+            "-",
+            "/dev/null",
+            "/dev/stdout",
+            "/dev/stderr",
+            "/proc/self/fd/1",
+            "/proc/self/fd/2",
+        }
+        index = 1
+        while index < len(tokens):
+            argument = tokens[index]
+            if argument in {"-O", "--remote-name", "--remote-header-name", "-OJ"}:
+                return True
+            if argument in {"-o", "--output"}:
+                if index + 1 >= len(tokens) or tokens[index + 1] not in safe_sinks:
+                    return True
+                index += 2
+                continue
+            if argument.startswith("--output="):
+                if argument.partition("=")[2] not in safe_sinks:
+                    return True
+            elif argument.startswith("-o") and len(argument) > 2:
+                if argument[2:] not in safe_sinks:
+                    return True
+            index += 1
+        return False
+
     @classmethod
-    def capabilities(cls, command: str) -> ShellCapabilities:
+    def capabilities(
+        cls,
+        command: str,
+        *,
+        workspace_path: str | Path | None = None,
+        _seen_scripts: frozenset[Path] = frozenset(),
+    ) -> ShellCapabilities:
         """Classify effects without treating authorization as an execution hint.
 
         This method is shared by preflight and the backend router.  Therefore
@@ -249,6 +341,7 @@ class ShellPolicyAnalyzer:
         network = False
         workspace_write = has_write_redirect
         package_install = False
+        destructive = False
         for raw_tokens in segments:
             tokens = cls._unwrap(raw_tokens)
             if not tokens:
@@ -257,24 +350,52 @@ class ShellPolicyAnalyzer:
             args = [item.lower() for item in tokens[1:]]
             joined_args = " ".join(tokens[1:])
             if executable in _SHELLS and len(tokens) >= 3 and args[0] in {"-c", "-lc"}:
-                nested = cls.capabilities(tokens[2])
+                nested = cls.capabilities(
+                    tokens[2],
+                    workspace_path=workspace_path,
+                    _seen_scripts=_seen_scripts,
+                )
                 network = network or nested.network
                 workspace_write = workspace_write or nested.workspace_write
                 package_install = package_install or nested.package_install
+                destructive = destructive or nested.destructive
                 continue
+            if executable in _SHELLS:
+                script = cls._shell_script_path(tokens[1:], workspace_path)
+                if script is not None and script not in _seen_scripts:
+                    try:
+                        script_text = script.read_text(encoding="utf-8")
+                    except (OSError, UnicodeError):
+                        script_text = ""
+                    if script_text:
+                        nested = cls.capabilities(
+                            cls._normalize_shell_script(script_text),
+                            workspace_path=workspace_path,
+                            _seen_scripts=_seen_scripts | {script},
+                        )
+                        network = network or nested.network
+                        workspace_write = workspace_write or nested.workspace_write
+                        package_install = package_install or nested.package_install
+                        destructive = destructive or nested.destructive
+                        continue
             if executable in _NETWORK_COMMANDS:
                 network = True
                 if executable == "wget" or (
                     executable == "curl"
-                    and any(
-                        arg in {"-o", "-O", "--output", "--remote-name", "--remote-header-name", "-OJ"}
-                        or arg.startswith(("--output=", "-o", "-O"))
-                        for arg in tokens[1:]
-                    )
+                    and cls._curl_writes_material_output(tokens)
                 ):
                     workspace_write = True
             if executable in _DESTRUCTIVE_OR_WRITE_COMMANDS:
                 workspace_write = True
+            if executable == "rm" and any(
+                arg in _RECURSIVE_RM_FLAGS
+                or arg.startswith("--recursive=")
+                or (arg.startswith("-") and "r" in arg[1:])
+                for arg in tokens[1:]
+            ):
+                destructive = True
+            if executable == "rmdir":
+                destructive = True
             if executable == "sed" and any(arg == "-i" or arg.startswith("-i") for arg in args):
                 workspace_write = True
             if executable == "sort" and any(arg == "-o" or arg.startswith("--output") for arg in args):
@@ -295,6 +416,8 @@ class ShellPolicyAnalyzer:
                 matched = next((arg for arg in args if arg in write_flags), None)
                 if matched:
                     workspace_write = True
+                if matched in {"-delete", "-exec", "-execdir", "-ok", "-okdir"}:
+                    destructive = True
                 if matched in {"-exec", "-execdir", "-ok", "-okdir"}:
                     nested_tokens = tokens[tokens.index(matched) + 1 :]
                     nested_tokens = [item for item in nested_tokens if item not in {"{}", ";", "+"}]
@@ -303,6 +426,7 @@ class ShellPolicyAnalyzer:
                         network = network or nested.network
                         workspace_write = workspace_write or nested.workspace_write
                         package_install = package_install or nested.package_install
+                        destructive = destructive or nested.destructive
             package_subcommands = {
                 "install",
                 "uninstall",
@@ -330,7 +454,7 @@ class ShellPolicyAnalyzer:
                     if skip_git_value:
                         skip_git_value = False
                         continue
-                    if item in {"-c", "-C", "--git-dir", "--work-tree"}:
+                    if item in {"-c", "--git-dir", "--work-tree"}:
                         skip_git_value = True
                         continue
                     if item.startswith("-"):
@@ -339,8 +463,25 @@ class ShellPolicyAnalyzer:
                     break
                 if subcommand in {"clone", "fetch", "pull", "push", "submodule"}:
                     network = True
-                if subcommand in {"clone", "fetch", "pull", "submodule"}:
+                if subcommand in {
+                    "add",
+                    "commit",
+                    "switch",
+                    "checkout",
+                    "stash",
+                    "merge",
+                    "rebase",
+                    "reset",
+                    "clean",
+                    "restore",
+                    "clone",
+                    "fetch",
+                    "pull",
+                    "submodule",
+                }:
                     workspace_write = True
+                if subcommand in {"reset", "clean", "rebase", "restore"}:
+                    destructive = True
             option_value_flags = {"--prefix", "--dir", "--cwd", "-c", "-C"}
             normalized_subcommand = ""
             skip_next = False
@@ -408,6 +549,41 @@ class ShellPolicyAnalyzer:
             network=network,
             workspace_write=workspace_write,
             package_install=package_install,
+            destructive=destructive,
+        )
+
+    @staticmethod
+    def _shell_script_path(
+        args: list[str],
+        workspace_path: str | Path | None,
+    ) -> Path | None:
+        if workspace_path is None:
+            return None
+        candidate = next((item for item in args if not item.startswith("-")), "")
+        if not candidate or ".." in Path(candidate).parts:
+            return None
+        workspace = Path(workspace_path).expanduser().resolve()
+        if candidate == "/workspace":
+            path = workspace
+        elif candidate.startswith("/workspace/"):
+            path = workspace / candidate.removeprefix("/workspace/")
+        elif Path(candidate).is_absolute():
+            return None
+        else:
+            path = workspace / candidate
+        try:
+            resolved = path.resolve()
+            resolved.relative_to(workspace)
+        except (OSError, ValueError):
+            return None
+        return resolved if resolved.is_file() else None
+
+    @staticmethod
+    def _normalize_shell_script(content: str) -> str:
+        return "; ".join(
+            line.strip()
+            for line in content.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
         )
 
     def _check_absolute_paths(self, segments: list[list[str]]) -> ToolPolicyResult | None:
@@ -484,6 +660,8 @@ class ShellPolicyAnalyzer:
     def _check_relative_paths(
         self,
         segments: list[list[str]],
+        *,
+        inline_program: bool = False,
     ) -> ToolPolicyResult | None:
         for tokens in segments:
             for index, token in enumerate(tokens):
@@ -498,12 +676,32 @@ class ShellPolicyAnalyzer:
                     raw = raw.split("=", 1)[1].strip()
                     if not raw:
                         continue
-                if self.backend_mode == "docker" and any(char in raw for char in "*?["):
+                # shlex places a heredoc program body in the command token
+                # stream. JSON/Python/JS list literals therefore contain `[`;
+                # that is source code, not shell pathname expansion. Keep the
+                # critical check for real wildcard/path-like tokens and for
+                # attempts to obfuscate the private Harness scratch mount.
+                expansion_syntax = (
+                    "*" in raw
+                    or "?" in raw
+                    or "harness-scrat" in raw
+                    or ("[" in raw and not inline_program)
+                )
+                if (
+                    self.backend_mode == "docker"
+                    and expansion_syntax
+                    and (
+                        "/" in raw
+                        or "harness-scrat" in raw
+                        or raw.startswith(("*", "?", ".", "~"))
+                    )
+                ):
                     # The project container currently reuses one host scratch
                     # mount. Shell pathname expansion can otherwise conceal
                     # `/harness-scratch` (for example `harness-scrat[c]h`) and
-                    # bypass literal path checks. Fail closed until scratch is
-                    # physically mounted per exact Run.
+                    # bypass literal path checks. Inline interpreter source can
+                    # also contain list brackets; do not misclassify code that
+                    # is not path-like as shell pathname expansion.
                     return ToolPolicyResult(
                         PolicyDecision.DENY,
                         "container_path_expansion",
@@ -597,6 +795,26 @@ class ShellPolicyAnalyzer:
             )
         if command in _SHELLS and len(args) >= 2 and args[0] in {"-c", "-lc"}:
             return self.analyze(args[1])
+        if command in _SHELLS:
+            script = self._shell_script_path(args, self.workspace_path)
+            if script is None:
+                return ToolPolicyResult(PolicyDecision.ASK, f"arbitrary_shell:{command}", "high")
+            try:
+                script_text = script.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                return ToolPolicyResult(PolicyDecision.ASK, f"unreadable_shell_script:{command}", "high")
+            nested = self.analyze(self._normalize_shell_script(script_text))
+            if nested.decision != PolicyDecision.ALLOW:
+                return nested
+            # A shell file is never approved merely because its entry point is
+            # ``bash``/``sh``.  Strict mode still asks; smart Docker mode can
+            # take the deterministic fast path only after the script body was
+            # successfully inspected and classified as boundary-safe.
+            return ToolPolicyResult(
+                PolicyDecision.ASK,
+                f"inspected_shell_script:{command}",
+                "managed_write",
+            )
         if command in _NETWORK_COMMANDS:
             return ToolPolicyResult(
                 PolicyDecision.ASK,
@@ -627,6 +845,18 @@ class ShellPolicyAnalyzer:
                 PolicyDecision.ASK,
                 f"arbitrary_interpreter:{command}",
                 "high",
+            )
+        if command == "rm":
+            recursive = any(
+                arg in _RECURSIVE_RM_FLAGS
+                or arg.startswith("--recursive=")
+                or (arg.startswith("-") and "r" in arg[1:])
+                for arg in args
+            )
+            return ToolPolicyResult(
+                PolicyDecision.ASK,
+                "destructive_workspace_delete:rm_recursive" if recursive else "managed_workspace_write:rm",
+                "high" if recursive else "managed_write",
             )
         if command in _DESTRUCTIVE_OR_WRITE_COMMANDS:
             return ToolPolicyResult(
@@ -692,12 +922,16 @@ class ShellPolicyAnalyzer:
                 "managed_write",
             )
         if command == "git":
-            subcommand = next((arg for arg in args if not arg.startswith("-")), "")
+            subcommand = self._git_subcommand(args)
             if subcommand in {"status", "diff", "log", "show", "branch", "rev-parse"}:
                 return ToolPolicyResult(PolicyDecision.ALLOW, "safe_git_read", "low")
             if subcommand in {"push", "pull", "fetch", "clone"}:
                 return ToolPolicyResult(PolicyDecision.ASK, "git_network", "network")
-            return ToolPolicyResult(PolicyDecision.ASK, "managed_git_write", "high")
+            return ToolPolicyResult(
+                PolicyDecision.ASK,
+                f"managed_git_write:{subcommand or 'unknown'}",
+                "managed_write",
+            )
         if command in {"pytest", "ruff", "mypy", "pyright"}:
             return ToolPolicyResult(PolicyDecision.ALLOW, "project_test", "low")
         if command in {"npm", "pnpm", "yarn"}:
@@ -740,6 +974,21 @@ class ShellPolicyAnalyzer:
             f"unknown_command:{command}",
             "high",
         )
+
+    @staticmethod
+    def _git_subcommand(args: list[str]) -> str:
+        skip_value = False
+        for item in args:
+            if skip_value:
+                skip_value = False
+                continue
+            if item in {"-c", "-C", "--git-dir", "--work-tree"}:
+                skip_value = True
+                continue
+            if item.startswith("-"):
+                continue
+            return item.lower()
+        return ""
 
     @staticmethod
     def _unwrap(tokens: list[str]) -> list[str]:
@@ -804,6 +1053,9 @@ class ToolExecutionPipeline(AgentMiddleware):
             "commit_external_artifact",
             "prepare_attachment_edit",
             "publish_attachment",
+            "stage_external_directory",
+            "prepare_external_directory_commit",
+            "commit_external_directory",
             "glob",
             "grep",
             "execute",
@@ -823,6 +1075,9 @@ class ToolExecutionPipeline(AgentMiddleware):
             "commit_external_artifact",
             "prepare_attachment_edit",
             "publish_attachment",
+            "stage_external_directory",
+            "prepare_external_directory_commit",
+            "commit_external_directory",
             "glob",
             "grep",
             "task",
@@ -863,10 +1118,12 @@ class ToolExecutionPipeline(AgentMiddleware):
         backend_mode: str,
         permission_context: RunPermissionContext | None = None,
         base_dir: Path | None = None,
+        reviewer: PermissionReviewer | None = None,
     ) -> None:
         self.known_tools = set(known_tools) | set(self.BUILTIN_TOOLS)
         self.backend_mode = backend_mode
         self.base_dir = base_dir.expanduser().resolve() if base_dir is not None else None
+        self.reviewer = reviewer
         self.permission_context = permission_context or RunPermissionContext.from_config_snapshot(
             {
                 "permissions": {"approval_mode": "strict"},
@@ -879,10 +1136,12 @@ class ToolExecutionPipeline(AgentMiddleware):
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
     ) -> ToolMessage | Command[Any]:
-        result = self._preflight(request)
+        result = await self._apreflight(request)
         if result.decision == PolicyDecision.ALLOW:
+            self._record_reviewer_decision(request, result)
             return await handler(request)
         if result.decision == PolicyDecision.DENY:
+            self._record_reviewer_decision(request, result)
             return self._denied_message(request, result)
 
         context = self._context(request)
@@ -930,6 +1189,9 @@ class ToolExecutionPipeline(AgentMiddleware):
             grant_bindings=self.permission_context.grant_bindings(),
             required_capabilities=required_capabilities,
             change_preview=self._skill_change_preview(request),
+            policy_source=result.source,
+            policy_explanation=result.explanation,
+            control_descriptor=self._control_descriptor(tool_name),
         )
         if run_id:
             session_manager.transition_run_status(
@@ -981,6 +1243,12 @@ class ToolExecutionPipeline(AgentMiddleware):
             return ToolPolicyResult(
                 PolicyDecision.DENY,
                 f"unknown_tool:{tool_name}",
+                "critical",
+            )
+        if tool_control_descriptor(tool_name) is None:
+            return ToolPolicyResult(
+                PolicyDecision.DENY,
+                f"missing_tool_control_descriptor:{tool_name}",
                 "critical",
             )
         if tool_name == "edit_file":
@@ -1056,14 +1324,316 @@ class ToolExecutionPipeline(AgentMiddleware):
         )
         command = self._command(request)
         result = analyzer.analyze(command)
-        effects = analyzer.capabilities(command)
+        effects = analyzer.capabilities(
+            command,
+            workspace_path=str(context.get("workspace_path") or "."),
+        )
         if effects.network and result.decision == PolicyDecision.ALLOW:
             return ToolPolicyResult(
                 PolicyDecision.ASK,
                 "network_access:embedded_command",
                 "network",
             )
+        smart_result = self._smart_docker_workspace_result(
+            command=command,
+            result=result,
+            effects=effects,
+        )
+        if smart_result is not None:
+            return smart_result
         return result
+
+    async def _apreflight(self, request: ToolCallRequest) -> ToolPolicyResult:
+        """Run deterministic policy, then review only an eligible smart gray zone."""
+
+        result = self._preflight(request)
+        if not self._reviewer_eligible(request, result):
+            return result
+        assert self.reviewer is not None
+        command = self._command(request)
+        context = {
+            **self._context(request),
+            "backend_mode": self.backend_mode,
+        }
+        effects = ShellPolicyAnalyzer.capabilities(
+            command,
+            workspace_path=str(context.get("workspace_path") or "."),
+        )
+        verdict = await self.reviewer.review(
+            tool_name=str(request.tool_call.get("name") or ""),
+            action=self._review_action(command, context),
+            deterministic_reason=result.reason,
+            deterministic_risk=result.risk,
+            context=context,
+            capabilities={
+                "network": effects.network,
+                "workspace_write": effects.workspace_write,
+                "package_install": effects.package_install,
+                "destructive": effects.destructive,
+            },
+        )
+        if verdict.decision == "allow":
+            return ToolPolicyResult(
+                PolicyDecision.ALLOW,
+                f"smart_reviewer_allow:{result.reason}",
+                "managed_write" if effects.workspace_write else "low",
+                source="codex_grok_smart_reviewer",
+                explanation=verdict.explanation,
+            )
+        if verdict.decision == "deny" and verdict.risk == "critical":
+            return ToolPolicyResult(
+                PolicyDecision.DENY,
+                f"smart_reviewer_deny:{result.reason}",
+                "critical",
+                source="codex_grok_smart_reviewer",
+                explanation=verdict.explanation,
+            )
+        return ToolPolicyResult(
+            PolicyDecision.ASK,
+            f"smart_reviewer_ask:{result.reason}",
+            verdict.risk,
+            source="codex_grok_smart_reviewer",
+            explanation=verdict.explanation,
+        )
+
+    def _reviewer_eligible(
+        self,
+        request: ToolCallRequest,
+        result: ToolPolicyResult,
+    ) -> bool:
+        if (
+            self.reviewer is None
+            or not self.permission_context.smart
+            or self.permission_context.backend_mode != "docker"
+            or self.backend_mode != "docker"
+            or result.decision != PolicyDecision.ASK
+            or str(request.tool_call.get("name") or "") != "execute"
+        ):
+            return False
+        command = self._command(request)
+        context = self._context(request)
+        effects = ShellPolicyAnalyzer.capabilities(
+            command,
+            workspace_path=str(context.get("workspace_path") or "."),
+        )
+        if effects.network or effects.package_install or effects.destructive:
+            return False
+        if result.reason in _SMART_DOCKER_DESTRUCTIVE_REASONS:
+            return False
+        if result.reason.startswith(
+            (
+                "managed_workspace_write:find:",
+                "managed_git_write:",
+                "network_access:",
+                "package_management",
+                "git_network",
+                "external_command_hook:",
+            )
+        ):
+            return False
+        if _EMBEDDED_DESTRUCTIVE_API_PATTERN.search(command) or _OPAQUE_CRITICAL_ACTION_PATTERN.search(command):
+            return False
+        return result.reason.startswith(
+            (
+                "unknown_command:",
+                "complex_shell_expansion",
+                "shell_parse_failed",
+                "wrapper_without_command",
+                "node_command",
+                "python_tool:",
+            )
+        )
+
+    @staticmethod
+    def _review_action(command: str, context: dict[str, Any]) -> str:
+        """Expose inspected shell content to the reviewer, never only its wrapper."""
+
+        try:
+            segments = ShellPolicyAnalyzer.parse_segments(command)
+        except ValueError:
+            return command
+        if len(segments) != 1:
+            return command
+        tokens = ShellPolicyAnalyzer.unwrap_command(segments[0])
+        if not tokens or Path(tokens[0]).name.lower() not in _SHELLS:
+            return command
+        script = ShellPolicyAnalyzer._shell_script_path(
+            tokens[1:],
+            str(context.get("workspace_path") or "."),
+        )
+        if script is None:
+            return command
+        try:
+            content = script.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return command
+        return f"{command}\n\n# Inspected local shell script: {script.name}\n{content[:12000]}"
+
+    def _smart_docker_workspace_result(
+        self,
+        *,
+        command: str,
+        result: ToolPolicyResult,
+        effects: ShellCapabilities,
+    ) -> ToolPolicyResult | None:
+        """Auto-approve ordinary project work inside the real Docker sandbox.
+
+        Smart mode is intended to remove approval noise for computation,
+        validation, and normal project writes.  The deterministic analyzer has
+        already denied host-path escapes, privilege escalation, and Docker
+        control before this hook runs.  Network/package capabilities and
+        explicitly destructive workspace operations remain user-controlled.
+        """
+
+        if (
+            not self.permission_context.smart
+            or self.permission_context.backend_mode != "docker"
+            or self.backend_mode != "docker"
+            or result.decision != PolicyDecision.ASK
+        ):
+            return None
+        if effects.network or effects.package_install or effects.destructive:
+            return None
+        if result.reason in _SMART_DOCKER_DESTRUCTIVE_REASONS or result.reason.startswith(
+            "managed_workspace_write:find:"
+        ):
+            return None
+        # Unknown/opaque entry points are the Grok-style gray zone.  They go
+        # through the reviewer instead of being silently treated as ordinary
+        # Docker work.  Unreadable shell files are not reviewable because the
+        # reviewer would see only the innocent-looking ``bash file`` wrapper.
+        if result.reason.startswith(("arbitrary_shell:", "unreadable_shell_script:")):
+            return None
+        if result.reason.startswith(
+            (
+                "unknown_command:",
+                "shell_parse_failed",
+                "wrapper_without_command",
+                "node_command",
+                "python_tool:",
+            )
+        ):
+            return None
+        if result.reason.startswith("managed_git_write:"):
+            if not self._smart_git_write_allowed(command, result.reason):
+                return None
+        if result.reason == "managed_workspace_write:mv" and not self._smart_move_allowed(command):
+            return None
+        if result.reason.startswith(("external_command_hook:", "git_network")):
+            return None
+
+        # Command substitution remains an opaque execution boundary.  A
+        # multiline Python/Node program, on the other hand, is common in Agent
+        # workflows and is contained by the Docker workspace policy.
+        if re.search(r"`|\$\(|\$\{", command):
+            return None
+        if _EMBEDDED_DESTRUCTIVE_API_PATTERN.search(command):
+            return None
+
+        return ToolPolicyResult(
+            PolicyDecision.ALLOW,
+            "smart_docker_workspace_write" if effects.workspace_write else "smart_docker_workspace_execute",
+            "managed_write" if effects.workspace_write else "low",
+        )
+
+    @staticmethod
+    def _smart_git_write_allowed(command: str, reason: str) -> bool:
+        subcommand = reason.partition(":")[2]
+        if subcommand not in _SMART_GIT_WRITE_SUBCOMMANDS and subcommand != "checkout":
+            return False
+        try:
+            segments = ShellPolicyAnalyzer.parse_segments(command)
+        except ValueError:
+            return False
+        if len(segments) != 1:
+            return False
+        tokens = ShellPolicyAnalyzer.unwrap_command(segments[0])
+        if not tokens or Path(tokens[0]).name.lower() != "git":
+            return False
+        lowered = [item.lower() for item in tokens[1:]]
+        if any(item in {"-f", "--force", "--hard", "--discard-changes"} for item in lowered):
+            return False
+        if subcommand == "checkout":
+            # Branch checkout is low-friction; checkout/restore of a path can
+            # discard user edits and remains an explicit decision.
+            try:
+                index = lowered.index("checkout")
+            except ValueError:
+                return False
+            tail = lowered[index + 1 :]
+            positional = [item for item in tail if not item.startswith("-")]
+            if "--" in tail or len(positional) != 1 or any(item in {"-b", "-B", "--orphan"} for item in tail):
+                return False
+        if subcommand == "stash" and any(item in {"clear", "drop"} for item in lowered):
+            return False
+        return True
+
+    def _smart_move_allowed(self, command: str) -> bool:
+        """Allow a static rename only when both sides stay in managed roots."""
+
+        try:
+            segments = ShellPolicyAnalyzer.parse_segments(command)
+        except ValueError:
+            return False
+        for segment in segments:
+            tokens = ShellPolicyAnalyzer.unwrap_command(segment)
+            if not tokens or Path(tokens[0]).name.lower() != "mv":
+                continue
+            args = [item for item in tokens[1:] if not item.startswith("-")]
+            if len(args) != 2:
+                return False
+            source, target = args
+            if not all(self._managed_container_path(path) for path in (source, target)):
+                return False
+            return True
+        return False
+
+    @staticmethod
+    def _managed_container_path(raw: str) -> bool:
+        normalized = raw.replace("\\", "/")
+        if any(char in normalized for char in "*?[") or ".." in Path(normalized).parts:
+            return False
+        if normalized.startswith("/"):
+            return normalized == "/workspace" or normalized.startswith("/workspace/") or normalized == "/scratch" or normalized.startswith("/scratch/")
+        return True
+
+    @staticmethod
+    def _control_descriptor(tool_name: str) -> dict[str, str] | None:
+        descriptor = tool_control_descriptor(tool_name)
+        return descriptor.as_dict() if descriptor is not None else None
+
+    @staticmethod
+    def _record_reviewer_decision(
+        request: ToolCallRequest,
+        result: ToolPolicyResult,
+    ) -> None:
+        if result.source != "codex_grok_smart_reviewer":
+            return
+        try:
+            from graph.trace_collector import get_current_trace_collector
+
+            collector = get_current_trace_collector()
+            if collector is None:
+                return
+            collector.add_custom_span(
+                "permission.smart_review",
+                {
+                    "tool_name": str(request.tool_call.get("name") or ""),
+                    "decision": result.decision.value,
+                    "reason": result.reason,
+                    "risk": result.risk,
+                    "explanation": result.explanation,
+                },
+                span_type="permission",
+                metadata={
+                    "permission": {
+                        "outcome": result.decision.value,
+                        "source": result.source,
+                    }
+                },
+            )
+        except Exception:
+            return
 
     @staticmethod
     def _smart_fetch_candidate(request: ToolCallRequest) -> bool:
@@ -1171,33 +1741,41 @@ class ToolExecutionPipeline(AgentMiddleware):
             return ["execute", "temporary_network"]
         if tool_name in cls.SKILL_COMMIT_TOOLS:
             return ["execute", "managed_skill_write"]
+        if tool_name in {"fetch_url", "tavily_search"}:
+            return ["execute", "network_access"]
         capabilities = ["execute"]
         if tool_name == "execute":
-            effects = ShellPolicyAnalyzer.capabilities(cls._command(request))
+            context = cls._context(request)
+            effects = ShellPolicyAnalyzer.capabilities(
+                cls._command(request),
+                workspace_path=str(context.get("workspace_path") or "."),
+            )
             if effects.network:
                 capabilities.append("network_access")
             if effects.workspace_write:
                 capabilities.append("managed_write")
             if effects.package_install:
                 capabilities.append("package_install")
+            if effects.destructive:
+                capabilities.append("destructive_write")
         return capabilities
 
     def _session_grant_scope(
         self,
         request: ToolCallRequest,
     ) -> dict[str, str] | None:
-        """Return the narrow reusable scope for a Session-level approval."""
+        """Return the capability scope for a reusable Session approval."""
 
         tool_name = str(request.tool_call.get("name") or "")
         if tool_name in self.SKILL_COMMIT_TOOLS:
             # Skill writes are always bound to the exact immutable plan and
             # may never become reusable Session authority.
             return None
-        if tool_name == "tavily_search":
+        if tool_name in {"tavily_search", "fetch_url"}:
             return {
-                "target_kind": "tool_name",
-                "target": tool_name,
-                "label": "本 Session 允许联网搜索",
+                "target_kind": "capability",
+                "target": "session_network_access",
+                "label": "本 Session 允许访问所有网络来源",
             }
         if tool_name == "install_packages":
             if not self.permission_context.smart or self.permission_context.backend_mode != "docker":
@@ -1207,30 +1785,23 @@ class ToolExecutionPipeline(AgentMiddleware):
                 "target": "docker_package_install",
                 "label": "本 Session 允许在隔离安装器中安装 Skill 依赖",
             }
-        if tool_name != "fetch_url":
+        if tool_name != "execute":
             return None
 
-        args = request.tool_call.get("args") or {}
-        raw_url = str(args.get("url") or "").strip()
-        try:
-            parsed = urlsplit(raw_url)
-            scheme = parsed.scheme.lower()
-            hostname = (parsed.hostname or "").lower()
-            port = parsed.port
-        except ValueError:
+        context = self._context(request)
+        effects = ShellPolicyAnalyzer.capabilities(
+            self._command(request),
+            workspace_path=str(context.get("workspace_path") or "."),
+        )
+        # A Session network grant authorizes connectivity only. Package
+        # installation, project writes and destructive actions keep their own
+        # capability checks and can never hitchhike on this broad grant.
+        if not effects.network or effects.workspace_write or effects.package_install or effects.destructive:
             return None
-        if scheme not in {"http", "https"} or not hostname:
-            return None
-
-        default_port = 80 if scheme == "http" else 443
-        host = f"[{hostname}]" if ":" in hostname else hostname
-        origin = f"{scheme}://{host}"
-        if port is not None and port != default_port:
-            origin += f":{port}"
         return {
-            "target_kind": "network_origin",
-            "target": origin,
-            "label": f"本 Session 允许访问 {origin}",
+            "target_kind": "capability",
+            "target": "session_network_access",
+            "label": "本 Session 允许访问所有网络来源",
         }
 
     @staticmethod

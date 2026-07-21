@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import subprocess
 import json
 import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,6 +15,7 @@ from graph.permission_policy import RunPermissionContext
 from graph.permission_resume import PermissionResumeRegistry
 from graph.session_manager import SessionManager, session_manager
 from harness.dependency_setup import detect_workspace_dependency_plan
+from harness.permission_reviewer import ModelPermissionReviewer, PermissionReviewVerdict
 from harness.tool_execution import (
     PolicyDecision,
     ShellPolicyAnalyzer,
@@ -22,6 +23,7 @@ from harness.tool_execution import (
 )
 from harness.workspace_backends import (
     DEFAULT_SANDBOX_IMAGE,
+    RUNTIME_CONTRACT,
     DockerWorkspaceBackend,
     ProjectSandboxManager,
     RestrictedHostWorkspaceBackend,
@@ -176,7 +178,7 @@ def test_docker_backend_rejects_spec_drift_within_run(tmp_path, monkeypatch):
             "package_management:python3",
         ),
         ("npm ci", PolicyDecision.ASK, "package_management"),
-        ("rm -rf build", PolicyDecision.ASK, "managed_workspace_write:rm"),
+        ("rm -rf build", PolicyDecision.ASK, "destructive_workspace_delete:rm_recursive"),
         ("python script.py", PolicyDecision.ASK, "arbitrary_interpreter:python"),
         ("sudo ls", PolicyDecision.DENY, "hard_denied_command:sudo"),
         ("docker ps", PolicyDecision.DENY, "hard_denied_command:docker"),
@@ -232,6 +234,53 @@ def test_shell_policy_allows_virtual_scratch_but_denies_internal_mount(tmp_path)
     traversal = analyzer.analyze("cat /scratch/../../../../etc/passwd")
     assert traversal.decision == PolicyDecision.DENY
     assert traversal.reason == "scratch_path_traversal"
+
+
+def test_docker_python_heredoc_with_data_arrays_is_not_path_expansion(tmp_path):
+    analyzer = ShellPolicyAnalyzer(
+        workspace_path=str(tmp_path),
+        backend_mode="docker",
+    )
+    command = """python3 << 'PYEOF'
+import json
+data = {"categories": ["2020", "2021", "2026"]}
+with open("/scratch/external/artifact-lease-1/report.js", "r") as handle:
+    original = handle.read()
+PYEOF"""
+
+    result = analyzer.analyze(command)
+
+    assert result.decision == PolicyDecision.ASK
+    assert result.reason == "complex_shell_expansion"
+
+
+def test_docker_inline_program_arrays_are_not_shell_path_expansion(tmp_path):
+    analyzer = ShellPolicyAnalyzer(
+        workspace_path=str(tmp_path),
+        backend_mode="docker",
+    )
+
+    result = analyzer.analyze(
+        'node -e "const years = [2024, 2025, 2026]; console.log(years.length)"'
+    )
+
+    assert result.reason != "container_path_expansion"
+
+
+def test_docker_python_heredoc_cannot_glob_harness_private_scratch(tmp_path):
+    analyzer = ShellPolicyAnalyzer(
+        workspace_path=str(tmp_path),
+        backend_mode="docker",
+    )
+    command = """python3 << 'PYEOF'
+import glob
+print(glob.glob('/harness-scrat[c]h/*'))
+PYEOF"""
+
+    result = analyzer.analyze(command)
+
+    assert result.decision == PolicyDecision.DENY
+    assert result.reason == "container_path_expansion"
 
 
 def test_restricted_host_backend_rejects_scratch_traversal_before_rewrite(tmp_path):
@@ -420,7 +469,7 @@ def test_registered_but_unclassified_tool_fails_closed(tmp_path):
     )._preflight(request)
 
     assert result.decision == PolicyDecision.DENY
-    assert result.reason == "unclassified_tool:new_mutating_tool"
+    assert result.reason == "missing_tool_control_descriptor:new_mutating_tool"
 
 
 def test_attachment_lease_tools_are_internal_capabilities_not_host_write_grants(tmp_path):
@@ -435,6 +484,36 @@ def test_attachment_lease_tools_are_internal_capabilities_not_host_write_grants(
             {
                 "lease_id": "attachment-lease-1",
                 "output_path": "/scratch/attachments/attachment-lease-1/result.html",
+            },
+        ),
+    ):
+        request = ToolCallRequest(
+            tool_call={"id": f"call-{name}", "name": name, "args": args},
+            tool=None,
+            state={},
+            runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+        )
+        result = pipeline._preflight(request)
+        assert result.decision == PolicyDecision.ALLOW
+
+
+def test_external_directory_lease_tools_are_known_harness_capabilities(tmp_path):
+    pipeline = ToolExecutionPipeline(
+        known_tools=set(),
+        backend_mode="docker",
+    )
+    for name, args in (
+        ("stage_external_directory", {"directory_path": str(tmp_path)}),
+        (
+            "prepare_external_directory_commit",
+            {"directory_path": str(tmp_path), "lease_id": "directory-lease-1"},
+        ),
+        (
+            "commit_external_directory",
+            {
+                "directory_path": str(tmp_path),
+                "lease_id": "directory-lease-1",
+                "plan_digest": "sha256:plan",
             },
         ),
     ):
@@ -534,22 +613,13 @@ def test_smart_mode_allows_only_controlled_network_tools(tmp_path):
     assert pipeline._preflight(shell_network).decision == PolicyDecision.ASK
 
 
-@pytest.mark.parametrize(
-    ("url", "target"),
-    [
-        ("https://Example.com/private?token=1", "https://example.com"),
-        ("https://example.com:443/other", "https://example.com"),
-        ("http://example.com:80/report", "http://example.com"),
-        ("https://example.com:8443/report", "https://example.com:8443"),
-        ("https://[2001:db8::1]/report", "https://[2001:db8::1]"),
-    ],
-)
-def test_fetch_url_session_scope_uses_normalized_origin(tmp_path, url, target):
+@pytest.mark.parametrize("tool_name", ["fetch_url", "tavily_search"])
+def test_network_tool_session_scope_opens_network_for_session(tmp_path, tool_name):
     request = ToolCallRequest(
         tool_call={
             "id": "call-1",
-            "name": "fetch_url",
-            "args": {"url": url},
+            "name": tool_name,
+            "args": {"url": "https://example.com/report", "query": "AI news"},
         },
         tool=None,
         state={},
@@ -557,38 +627,79 @@ def test_fetch_url_session_scope_uses_normalized_origin(tmp_path, url, target):
     )
 
     pipeline = ToolExecutionPipeline(
-        known_tools={"fetch_url"},
-        backend_mode="restricted_host",
-    )
-    scope = pipeline._session_grant_scope(request)
-
-    assert scope is not None
-    assert scope["target_kind"] == "network_origin"
-    assert scope["target"] == target
-    assert scope["label"] == f"本 Session 允许访问 {target}"
-
-
-def test_search_session_scope_reuses_network_search_tool(tmp_path):
-    request = ToolCallRequest(
-        tool_call={
-            "id": "call-1",
-            "name": "tavily_search",
-            "args": {"query": "first query"},
-        },
-        tool=None,
-        state={},
-        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
-    )
-
-    pipeline = ToolExecutionPipeline(
-        known_tools={"tavily_search"},
+        known_tools={tool_name},
         backend_mode="restricted_host",
     )
     assert pipeline._session_grant_scope(request) == {
-        "target_kind": "tool_name",
-        "target": "tavily_search",
-        "label": "本 Session 允许联网搜索",
+        "target_kind": "capability",
+        "target": "session_network_access",
+        "label": "本 Session 允许访问所有网络来源",
     }
+    assert pipeline._required_capabilities(request) == ["execute", "network_access"]
+
+
+def test_execute_curl_session_scope_opens_network_for_session(tmp_path):
+    request = ToolCallRequest(
+        tool_call={
+            "id": "call-1",
+            "name": "execute",
+            "args": {"command": "curl -sS https://aihot.virxact.com/api/public/version"},
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute"},
+        backend_mode="restricted_host",
+    )
+    assert pipeline._session_grant_scope(request) == {
+        "target_kind": "capability",
+        "target": "session_network_access",
+        "label": "本 Session 允许访问所有网络来源",
+    }
+
+
+def test_curl_dev_null_probe_reuses_session_network_scope(tmp_path):
+    command = 'curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "https://example.com"'
+    request = ToolCallRequest(
+        tool_call={"id": "call-probe", "name": "execute", "args": {"command": command}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+    pipeline = ToolExecutionPipeline(known_tools={"execute"}, backend_mode="docker")
+
+    effects = ShellPolicyAnalyzer.capabilities(command)
+    assert effects.network is True
+    assert effects.workspace_write is False
+    assert pipeline._required_capabilities(request) == ["execute", "network_access"]
+    assert pipeline._session_grant_scope(request) == {
+        "target_kind": "capability",
+        "target": "session_network_access",
+        "label": "本 Session 允许访问所有网络来源",
+    }
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "curl -sS -o report.json https://example.com/report",
+        "pip install requests",
+        "git clone https://example.com/repo.git",
+    ],
+)
+def test_session_network_scope_does_not_absorb_other_capabilities(tmp_path, command):
+    request = ToolCallRequest(
+        tool_call={"id": "call-1", "name": "execute", "args": {"command": command}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+    pipeline = ToolExecutionPipeline(known_tools={"execute"}, backend_mode="restricted_host")
+
+    assert pipeline._session_grant_scope(request) is None
 
 
 def test_tool_action_fingerprint_preserves_semantic_whitespace():
@@ -655,6 +766,30 @@ def test_session_tool_grant_remains_available(tmp_path):
     assert sessions.consume_tool_action_permission("session-1", fingerprint) is True
 
 
+def test_equivalent_session_tool_grants_are_deduplicated(tmp_path):
+    sessions = SessionManager()
+    sessions.initialize(tmp_path)
+    sessions.create_session("session-dedup")
+    kwargs = {
+        "grant_type": "tool_action",
+        "target_kind": "capability",
+        "target": "workspace_commands",
+        "capabilities": ["execute", "managed_write"],
+        "scope": "session",
+    }
+
+    first = sessions.add_permission_grant("session-dedup", **kwargs)
+    second = sessions.add_permission_grant(
+        "session-dedup",
+        **kwargs,
+        metadata={"policy_source": "codex_grok_smart_reviewer"},
+    )
+
+    assert second["id"] == first["id"]
+    assert len(sessions.list_permission_grants("session-dedup")) == 1
+    assert second["metadata"]["policy_source"] == "codex_grok_smart_reviewer"
+
+
 def test_network_origin_session_grant_reuses_paths_but_not_other_origins(tmp_path):
     sessions = SessionManager()
     sessions.initialize(tmp_path)
@@ -685,6 +820,36 @@ def test_network_origin_session_grant_reuses_paths_but_not_other_origins(tmp_pat
         "sha256:other-origin",
         session_target_kind="network_origin",
         session_target="https://api.example.com",
+    )
+
+
+def test_session_network_grant_reuses_different_tools_and_sources(tmp_path):
+    sessions = SessionManager()
+    sessions.initialize(tmp_path)
+    sessions.create_session("session-network")
+    sessions.add_permission_grant(
+        "session-network",
+        grant_type="tool_action",
+        target_kind="capability",
+        target="session_network_access",
+        capabilities=["execute", "network_access"],
+        scope="session",
+    )
+
+    for fingerprint in ("sha256:curl-aihot", "sha256:fetch-other", "sha256:search"):
+        assert sessions.consume_tool_action_permission(
+            "session-network",
+            fingerprint,
+            session_target_kind="capability",
+            session_target="session_network_access",
+            required_capabilities=["execute", "network_access"],
+        )
+    assert not sessions.consume_tool_action_permission(
+        "session-network",
+        "sha256:package-install",
+        session_target_kind="capability",
+        session_target="session_network_access",
+        required_capabilities=["execute", "network_access", "package_install"],
     )
 
 
@@ -808,6 +973,15 @@ def test_managed_sandbox_image_is_built_when_missing(monkeypatch):
     build = next(args for args in calls if args[0] == "build")
     assert build[:4] == ["build", "--pull", "--tag", DEFAULT_SANDBOX_IMAGE]
     assert build[-1].endswith("/harness/docker")
+
+
+def test_managed_sandbox_runtime_declares_curl_as_base_capability():
+    dockerfile = Path(__file__).parents[1] / "harness" / "docker" / "Dockerfile"
+    content = dockerfile.read_text(encoding="utf-8")
+
+    assert 'com.puddingclaw.runtime="python3.12-node22-curl-v3"' in content
+    assert "curl" in content
+    assert "curl" in RUNTIME_CONTRACT
 
 
 def test_project_container_spec_has_no_docker_socket_or_host_home(tmp_path, monkeypatch):
@@ -1099,6 +1273,290 @@ def test_allowed_project_test_with_remote_url_requires_network_approval(tmp_path
     assert result.decision == PolicyDecision.ASK
     assert result.reason == "network_access:embedded_command"
     assert pipeline._required_capabilities(request) == ["execute", "network_access"]
+
+
+class _FakePermissionReviewer:
+    def __init__(self, verdict: PermissionReviewVerdict) -> None:
+        self.verdict = verdict
+        self.calls: list[dict[str, object]] = []
+
+    async def review(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.verdict
+
+
+def _smart_docker_pipeline(
+    tmp_path: Path,
+    *,
+    reviewer=None,
+) -> ToolExecutionPipeline:
+    context = RunPermissionContext.from_config_snapshot(
+        {
+            "permissions": {"approval_mode": "smart", "policy_epoch": 1},
+            "execution": {
+                "backend_mode": "docker",
+                "backend_id": "docker:project:spec",
+                "workspace_id": "sha256:workspace",
+            },
+        }
+    )
+    return ToolExecutionPipeline(
+        known_tools={"execute"},
+        backend_mode="docker",
+        permission_context=context,
+        reviewer=reviewer,
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python3 compute_data.py",
+        "node --check product-config-charts.js",
+        "sed -i s/2024/2026/g report.html",
+        "cp source.js generated.js",
+        "cd /workspace && python3 -c \"\\nwith open('report.html', 'w') as f:\\n    f.write('ok')\\n\"",
+        "cd /workspace && python3 -c \"import subprocess; subprocess.run(['node', '--check', 'report.js'])\"",
+        "python3 << 'PYEOF'\nimport json\ndata = {\"categories\": [\"2020\", \"2026\"]}\nwith open('/scratch/external/lease/report.js', 'w') as f:\n    f.write(json.dumps(data))\nPYEOF",
+    ],
+)
+def test_smart_docker_auto_approves_ordinary_workspace_execution(tmp_path, command):
+    pipeline = _smart_docker_pipeline(tmp_path)
+    request = ToolCallRequest(
+        tool_call={"id": "smart", "name": "execute", "args": {"command": command}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+
+    result = pipeline._preflight(request)
+
+    assert result.decision == PolicyDecision.ALLOW
+    assert result.reason.startswith("smart_docker_workspace_")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rm -rf build",
+        "find . -delete",
+        "git reset --hard HEAD~1",
+        "python3 -c \"import shutil; shutil.rmtree('build')\"",
+        "node -e \"require('fs').rmSync('build', {recursive: true})\"",
+        "echo $(cat secret)",
+    ],
+)
+def test_smart_docker_still_asks_for_destructive_or_opaque_execution(tmp_path, command):
+    pipeline = _smart_docker_pipeline(tmp_path)
+    request = ToolCallRequest(
+        tool_call={"id": "smart-risk", "name": "execute", "args": {"command": command}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+
+    assert pipeline._preflight(request).decision == PolicyDecision.ASK
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "pip install pandas",
+        "python3 -c \"import urllib.request; urllib.request.urlopen('https://example.com')\"",
+    ],
+)
+def test_smart_docker_still_asks_for_package_or_network_execution(tmp_path, command):
+    pipeline = _smart_docker_pipeline(tmp_path)
+    request = ToolCallRequest(
+        tool_call={"id": "smart-network", "name": "execute", "args": {"command": command}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+
+    assert pipeline._preflight(request).decision == PolicyDecision.ASK
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git add report.html",
+        "git commit -m refresh-report",
+        "git switch main",
+        "git stash push -m before-refresh",
+        "mv report.tmp report.html",
+        "rm report.tmp",
+    ],
+)
+def test_smart_docker_allows_reversible_project_mutations(tmp_path, command):
+    pipeline = _smart_docker_pipeline(tmp_path)
+    request = ToolCallRequest(
+        tool_call={"id": "smart-mutation", "name": "execute", "args": {"command": command}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+
+    result = pipeline._preflight(request)
+
+    assert result.decision == PolicyDecision.ALLOW
+    assert result.risk == "managed_write"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rm --recursive build",
+        "git checkout -- report.html",
+        "git stash drop",
+        "mv /workspace/report.html /etc/report.html",
+        "bash missing-script.sh",
+    ],
+)
+def test_smart_docker_keeps_irreversible_or_uninspectable_actions_gated(tmp_path, command):
+    pipeline = _smart_docker_pipeline(tmp_path)
+    request = ToolCallRequest(
+        tool_call={"id": "smart-gated", "name": "execute", "args": {"command": command}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+
+    assert pipeline._preflight(request).decision in {PolicyDecision.ASK, PolicyDecision.DENY}
+
+
+def test_shell_script_is_inspected_before_smart_mode_allows_it(tmp_path):
+    script = tmp_path / "refresh.sh"
+    script.write_text("#!/bin/sh\nprintf 'ok'\n", encoding="utf-8")
+    strict = ShellPolicyAnalyzer(workspace_path=str(tmp_path), backend_mode="docker")
+    smart = _smart_docker_pipeline(tmp_path)
+    request = ToolCallRequest(
+        tool_call={"id": "script", "name": "execute", "args": {"command": "bash refresh.sh"}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+
+    assert strict.analyze("bash refresh.sh").reason == "inspected_shell_script:bash"
+    assert strict.analyze("bash refresh.sh").decision == PolicyDecision.ASK
+    assert smart._preflight(request).decision == PolicyDecision.ALLOW
+
+
+def test_shell_script_with_recursive_delete_is_not_auto_approved(tmp_path):
+    script = tmp_path / "cleanup.sh"
+    script.write_text("#!/bin/sh\nrm -rf build\n", encoding="utf-8")
+    pipeline = _smart_docker_pipeline(tmp_path)
+    request = ToolCallRequest(
+        tool_call={"id": "script-delete", "name": "execute", "args": {"command": "bash cleanup.sh"}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+
+    result = pipeline._preflight(request)
+
+    assert result.decision == PolicyDecision.ASK
+    assert result.reason == "destructive_workspace_delete:rm_recursive"
+
+
+@pytest.mark.asyncio
+async def test_smart_gray_zone_uses_reviewer_instead_of_silent_allow(tmp_path):
+    reviewer = _FakePermissionReviewer(
+        PermissionReviewVerdict(
+            decision="allow",
+            risk="low",
+            explanation="命令仅在项目边界内生成可逆产物。",
+        )
+    )
+    pipeline = _smart_docker_pipeline(tmp_path, reviewer=reviewer)
+    request = ToolCallRequest(
+        tool_call={"id": "review", "name": "execute", "args": {"command": "custom-formatter report.html"}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+
+    result = await pipeline._apreflight(request)
+
+    assert result.decision == PolicyDecision.ALLOW
+    assert result.source == "codex_grok_smart_reviewer"
+    assert len(reviewer.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_smart_reviewer_never_sees_known_destructive_action(tmp_path):
+    reviewer = _FakePermissionReviewer(
+        PermissionReviewVerdict(decision="allow", risk="low", explanation="allow")
+    )
+    pipeline = _smart_docker_pipeline(tmp_path, reviewer=reviewer)
+    request = ToolCallRequest(
+        tool_call={"id": "review-delete", "name": "execute", "args": {"command": "rm -rf build"}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+
+    result = await pipeline._apreflight(request)
+
+    assert result.decision == PolicyDecision.ASK
+    assert reviewer.calls == []
+
+
+@pytest.mark.asyncio
+async def test_smart_reviewer_receives_inspected_shell_body(tmp_path):
+    script = tmp_path / "wrapped.sh"
+    script.write_text("#!/bin/sh\nset -e\nprintf ok\n", encoding="utf-8")
+    reviewer = _FakePermissionReviewer(
+        PermissionReviewVerdict(decision="ask", risk="high", explanation="需要确认脚本语义。")
+    )
+    pipeline = _smart_docker_pipeline(tmp_path, reviewer=reviewer)
+    request = ToolCallRequest(
+        tool_call={"id": "script-review", "name": "execute", "args": {"command": "bash wrapped.sh"}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+
+    await pipeline._apreflight(request)
+
+    assert len(reviewer.calls) == 1
+    assert "set -e" in str(reviewer.calls[0]["action"])
+
+
+@pytest.mark.asyncio
+async def test_model_permission_reviewer_is_structured_and_fail_closed():
+    class _Model:
+        async def ainvoke(self, _messages):
+            return SimpleNamespace(
+                content='```json\n{"decision":"allow","risk":"low","explanation":"仅格式化项目文件"}\n```'
+            )
+
+    verdict = await ModelPermissionReviewer(_Model()).review(
+        tool_name="execute",
+        action="formatter report.html",
+        deterministic_reason="unknown_command:formatter",
+        deterministic_risk="high",
+        context={"backend_mode": "docker", "workspace_path": "/workspace"},
+        capabilities={"network": False, "workspace_write": True, "package_install": False, "destructive": False},
+    )
+
+    assert verdict.decision == "allow"
+    assert verdict.explanation == "仅格式化项目文件"
+
+    class _BrokenModel:
+        async def ainvoke(self, _messages):
+            raise RuntimeError("offline")
+
+    fallback = await ModelPermissionReviewer(_BrokenModel()).review(
+        tool_name="execute",
+        action="formatter report.html",
+        deterministic_reason="unknown_command:formatter",
+        deterministic_risk="high",
+        context={"backend_mode": "docker"},
+        capabilities={"network": False, "workspace_write": True, "package_install": False, "destructive": False},
+    )
+
+    assert fallback.decision == "ask"
 
 
 def test_network_download_declares_write_and_network_capabilities(tmp_path):

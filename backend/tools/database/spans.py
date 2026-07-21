@@ -21,9 +21,9 @@ def emit_database_span(stage: str, payload: dict[str, Any], *, metadata: dict[st
         "harness": {
             "mechanism": "database_knowledge_query",
             "pillars": [
-                {"name": "semantic_assets", "role": "business_semantics"},
+                {"name": "semantic_assets", "role": "final_business_semantic_refinement"},
                 {"name": "table_router", "role": "scope"},
-                {"name": "vanna", "role": "sql_generation"},
+                {"name": "vanna", "role": "raw_question_evidence_and_candidate_sql"},
                 {"name": "readonly_sql_runner", "role": "execution"},
             ],
         },
@@ -100,6 +100,7 @@ def emit_trace_spans(result: DatabaseQueryResult) -> None:
         {
             "question": result.question,
             "sql": result.sql,
+            "generation": result.generation,
             "source": result.source,
             "tables": result.route.table_names,
             "duration_ms": timings.get("sql_generation_ms"),

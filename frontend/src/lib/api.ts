@@ -70,6 +70,7 @@ export interface VerificationCriterion {
   source: string;
   verifier: string;
   required: boolean;
+  evidence_scope: "run_only" | "goal_inheritable" | "artifact_bound" | "freshness_bound";
 }
 
 export interface RunVerificationContract {
@@ -2338,6 +2339,9 @@ export interface PermissionGrant {
     command?: string;
     reason?: string;
     risk?: string;
+    policy_source?: string;
+    policy_explanation?: string;
+    control_descriptor?: Record<string, string>;
     session_scope_label?: string;
     session_target?: string;
     run_id?: string;
@@ -2364,6 +2368,9 @@ export interface PermissionRequest {
   command?: string;
   reason?: string;
   risk?: string;
+  policy_source?: string;
+  policy_explanation?: string;
+  control_descriptor?: Record<string, string>;
   fingerprint?: string;
   session_target_kind?: string;
   session_target?: string;
@@ -2850,7 +2857,7 @@ export async function listSessionPermissions(sessionId: string): Promise<Session
 
 export async function grantExternalFilePermission(
   sessionId: string,
-  targetKind: "exact_file" | "all_external_files",
+  targetKind: "exact_file" | "exact_directory" | "all_external_files",
   path?: string,
   permissionRequestId?: string
 ): Promise<PermissionGrant> {
@@ -3071,6 +3078,8 @@ export async function getSessionHistory(
   sessionId: string
 ): Promise<{
   session_id: string;
+  todos?: TodoItem[];
+  graph?: GraphStructure | null;
   messages: Array<{
     role: string;
     content: string;

@@ -9,8 +9,8 @@ from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
 from config import get_rag_mode
-from graph.permission_resume import permission_resume_registry
 from graph.deepagents_manager import deepagents_agent_manager
+from graph.permission_resume import permission_resume_registry
 from graph.prompt_builder import build_system_prompt
 from graph.session_manager import session_manager
 from harness.coordinators import GoalActivationError, GoalCoordinator
@@ -211,9 +211,23 @@ async def get_session_traces(session_id: str):
 
 @router.get("/sessions/{session_id}/history")
 async def get_session_history(session_id: str):
-    """Get conversation history for display (no system prompt, includes tool_calls)."""
-    messages = await run_in_threadpool(session_manager.load_session, session_id)
-    return {"session_id": session_id, "messages": messages}
+    """Get chat history plus lightweight durable Agent UI state.
+
+    Todo/graph recovery must not depend on opening the heavyweight Trace view.
+    Both fields live in Session JSON and are therefore returned with the normal
+    conversation reload path.
+    """
+
+    data = await run_in_threadpool(session_manager.get_raw_messages, session_id)
+    result: dict[str, Any] = {
+        "session_id": session_id,
+        "messages": data.get("messages", []),
+    }
+    if "todos" in data:
+        result["todos"] = data["todos"]
+    if "graph" in data:
+        result["graph"] = data["graph"]
+    return result
 
 
 @router.post("/sessions/{session_id}/generate-title")

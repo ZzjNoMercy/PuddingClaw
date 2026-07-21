@@ -20,7 +20,7 @@ from langgraph.types import Command
 from graph.session_manager import SessionManager, session_manager
 
 logger = logging.getLogger(__name__)
-POLICY_VERSION = "tool-context-v1"
+POLICY_VERSION = "tool-context-v2-harness-control"
 LLM_RESULT_INPUT_MAX_CHARS = 24000
 LLM_RESULT_OUTPUT_MAX_CHARS = 4000
 LLM_BATCH_TIMEOUT_MAX_SECONDS = 30
@@ -28,6 +28,21 @@ RAW_OUTPUT_ARTIFACT_KEY = "puddingclaw_raw_tool_output"
 CONTEXT_OUTPUT_ARTIFACT_KEY = "puddingclaw_context_output"
 CONTEXT_METHOD_ARTIFACT_KEY = "puddingclaw_context_method"
 CONTEXT_POLICY_ARTIFACT_KEY = "puddingclaw_context_policy"
+HARNESS_CONTROL_TOOLS = frozenset(
+    {
+        "create_goal",
+        "get_goal",
+        "update_goal",
+        "update_todos",
+        "stage_external_artifact",
+        "commit_external_artifact",
+        "stage_external_directory",
+        "prepare_external_directory_commit",
+        "commit_external_directory",
+        "inspect_file_version",
+        "patch_file",
+    }
+)
 # Keep this boundary aligned with DeepAgents FilesystemMiddleware defaults:
 # 20,000 tokens at its fixed approximation of four characters per token.
 # Results above this character boundary must pass through unchanged so the
@@ -143,6 +158,25 @@ def _deterministic_background_compaction(candidate: dict[str, Any]) -> tuple[str
         return _with_candidate_metadata(
             candidate, _head_tail(output, max_chars=3200, label="错误结果高保真摘要")
         ), "error_adapter"
+    # Harness control-plane results are evidence, not prose.  In particular,
+    # an LLM must never turn "Todo status=completed" into the stronger claim
+    # "verification passed", or rewrite lease IDs / CAS hashes.  Keep these
+    # outputs byte-for-byte inside the model context; raw_output_ref remains the
+    # recovery source and the authoritative Session state is injected separately.
+    if tool_name in HARNESS_CONTROL_TOOLS:
+        if tool_name == "inspect_file_version":
+            header, separator, content = output.partition("\ncontent:\n")
+            if separator:
+                compact_content = _head_tail(
+                    content,
+                    max_chars=2200,
+                    label="文件正文摘要；版本头保持原值",
+                )
+                return _with_candidate_metadata(
+                    candidate,
+                    f"{header}{separator}{compact_content}",
+                ), "versioned_file_adapter"
+        return _with_candidate_metadata(candidate, output), "harness_control_passthrough"
     if tool_name in {"read_file", "read_resource", "read_external_file"}:
         return _with_candidate_metadata(
             candidate, _head_tail(output, max_chars=2200, label="文件读取摘要")

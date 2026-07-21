@@ -1,4 +1,30 @@
-from graph.middlewares.harness_todos import TodoPatchOperation, _apply_operations
+import pytest
+from langchain_core.messages import AIMessage, ToolMessage
+from langgraph.graph import END, START, StateGraph
+from langgraph.prebuilt import ToolNode
+from langgraph.prebuilt.tool_node import ToolRuntime
+from langgraph.types import Command
+
+from graph.middlewares.harness_todos import (
+    HarnessTodoMiddleware,
+    HarnessTodoState,
+    TodoPatchOperation,
+    _apply_operations,
+)
+
+
+def test_harness_todo_ledger_remains_in_compiled_agent_input_schema():
+    """Persisted Session todos must survive the agent factory schema merge."""
+
+    from langchain.agents.factory import _resolve_schemas
+
+    from graph.deepagents_manager import PuddingClawAgentState
+
+    _state_schema, input_schema, _output_schema = _resolve_schemas(
+        [PuddingClawAgentState, HarnessTodoState]
+    )
+
+    assert "todos" in input_schema.__annotations__
 
 
 def test_todo_patch_rename_and_reorder_preserve_stable_identity():
@@ -68,3 +94,165 @@ def test_todo_cancel_is_tombstone_not_deletion():
             "position": 0,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_update_todos_receives_runtime_through_real_async_tool_node():
+    tool = HarnessTodoMiddleware().tools[0]
+    node = ToolNode([tool])
+    runtime = ToolRuntime(
+        state={"messages": [], "todos": []},
+        context={"run_id": "run-async", "query_id": "query-async"},
+        config={},
+        stream_writer=lambda _: None,
+        tool_call_id="call-async",
+        store=None,
+        tools=[tool],
+    )
+
+    result = await node._arun_one(
+        {
+            "name": "update_todos",
+            "args": {
+                "operations": [
+                    {
+                        "action": "create",
+                        "content": "查询最新上市时间",
+                        "status": "in_progress",
+                    }
+                ]
+            },
+            "id": "call-async",
+            "type": "tool_call",
+        },
+        "dict",
+        runtime,
+    )
+
+    assert isinstance(result, Command)
+    created = result.update["todos"][0]
+    assert created["content"] == "查询最新上市时间"
+    assert created["created_run_id"] == "run-async"
+    assert created["last_changed_query_id"] == "query-async"
+
+
+@pytest.mark.asyncio
+async def test_harness_todo_state_channel_persists_command_update_in_graph():
+    middleware = HarnessTodoMiddleware()
+    tool = middleware.tools[0]
+    builder = StateGraph(HarnessTodoState)
+    builder.add_node("tools", ToolNode([tool]))
+    builder.add_edge(START, "tools")
+    builder.add_edge("tools", END)
+    graph = builder.compile()
+
+    result = await graph.ainvoke(
+        {
+            "messages": [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "update_todos",
+                            "args": {
+                                "operations": [
+                                    {
+                                        "action": "create",
+                                        "content": "刷新 2026 图表",
+                                    }
+                                ]
+                            },
+                            "id": "call-state-channel",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            ],
+            "todos": [],
+        },
+        context={"run_id": "run-state", "query_id": "query-state"},
+    )
+
+    assert result["todos"][0]["content"] == "刷新 2026 图表"
+    assert result["todos"][0]["id"].startswith("todo_")
+
+
+@pytest.mark.asyncio
+async def test_persisted_todo_can_be_completed_after_cross_run_restore():
+    middleware = HarnessTodoMiddleware()
+    tool = middleware.tools[0]
+    builder = StateGraph(HarnessTodoState)
+    builder.add_node("tools", ToolNode([tool]))
+    builder.add_edge(START, "tools")
+    builder.add_edge("tools", END)
+    graph = builder.compile()
+    persisted = {
+        "id": "todo-persisted",
+        "content": "更新目标 HTML",
+        "status": "in_progress",
+    }
+
+    result = await graph.ainvoke(
+        {
+            "messages": [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "update_todos",
+                            "args": {
+                                "operations": [
+                                    {
+                                        "action": "complete",
+                                        "todo_id": "todo-persisted",
+                                    }
+                                ]
+                            },
+                            "id": "call-cross-run",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            ],
+            "todos": [persisted],
+        },
+        context={"run_id": "run-next", "query_id": "query-next"},
+    )
+
+    assert result["todos"][0]["id"] == "todo-persisted"
+    assert result["todos"][0]["status"] == "completed"
+    assert result["todos"][0]["last_changed_run_id"] == "run-next"
+
+
+@pytest.mark.asyncio
+async def test_unknown_todo_id_returns_recoverable_tool_error():
+    tool = HarnessTodoMiddleware().tools[0]
+    node = ToolNode([tool])
+    runtime = ToolRuntime(
+        state={"messages": [], "todos": []},
+        context={"run_id": "run-stale", "query_id": "query-stale"},
+        config={},
+        stream_writer=lambda _: None,
+        tool_call_id="call-stale",
+        store=None,
+        tools=[tool],
+    )
+
+    result = await node._arun_one(
+        {
+            "name": "update_todos",
+            "args": {
+                "operations": [
+                    {"action": "complete", "todo_id": "todo_missing"}
+                ]
+            },
+            "id": "call-stale",
+            "type": "tool_call",
+        },
+        "dict",
+        runtime,
+    )
+
+    assert isinstance(result, ToolMessage)
+    assert result.status == "error"
+    assert "Unknown todo_id: todo_missing" in str(result.content)

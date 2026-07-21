@@ -19,6 +19,7 @@ from analytics.nl2sql.schemas import (
 )
 from analytics.nl2sql.service import DatabaseKnowledgeQueryError
 from analytics.nl2sql.sql_runner import (
+    SqlRunnerError,
     _compact_rows,
     _estimate_tokens,
     _profile_from_rows,
@@ -116,6 +117,107 @@ def test_explicit_semantic_asset_cannot_cross_selected_model(monkeypatch) -> Non
 
     assert selected["matched"] == []
     assert selected["unmatched_requested_ids"] == ["measure:config_rate"]
+
+
+@pytest.mark.asyncio
+async def test_grounded_sql_keeps_long_l2_question_raw_for_vanna_retrieval() -> None:
+    question = (
+        "查询2020年到2026年每年L2级及以上智能驾驶辅助系统的车系维度和款型维度配备率。"
+        "同时查询每年各价格段（10万以下、10-15万、15-20万、20-30万、30万以上）的"
+        "款型维度L2+配备率。排除皮卡车型。"
+    )
+    calls: list[tuple[str, str]] = []
+
+    class _FakeVanna:
+        config = {"model": "fake-model"}
+
+        @staticmethod
+        def get_all_entities() -> list[dict[str, str]]:
+            return [
+                {
+                    "entity_type": "配置名称",
+                    "table_column": "public.vehicle_params.type_name",
+                }
+            ]
+
+        @staticmethod
+        def get_related_entities(query: str, **_kwargs: Any) -> list[dict[str, Any]]:
+            calls.append(("entities", query))
+            if query != question:
+                return []
+            return [
+                {
+                    "entity_type": "配置名称",
+                    "canonical_name": "驾驶辅助级别",
+                    "aliases": ["自动驾驶级别", "智驾级别", "L2+"],
+                    "table_column": "public.vehicle_params.type_name",
+                    "score": 0.99,
+                }
+            ]
+
+        @staticmethod
+        def get_related_ddl(query: str, **_kwargs: Any) -> list[str]:
+            calls.append(("ddl", query))
+            return ["CREATE TABLE vehicle_params (type_name text, type_value text);"]
+
+        @staticmethod
+        def get_related_documentation(query: str, **_kwargs: Any) -> list[str]:
+            calls.append(("documentation", query))
+            return []
+
+        @staticmethod
+        def get_similar_question_sql(query: str, **_kwargs: Any) -> list[dict[str, str]]:
+            calls.append(("sql_examples", query))
+            return []
+
+        @staticmethod
+        def generate_sql(*, question: str, entity_list: list[dict[str, Any]], **_kwargs: Any) -> str:
+            calls.append(("generate_sql", question))
+            assert entity_list[0]["canonical_name"] == "驾驶辅助级别"
+            return "SELECT COUNT(*) FROM vehicle_params WHERE type_name = '自动驾驶级别'"
+
+        @staticmethod
+        def submit_prompt(prompt: list[dict[str, str]], **_kwargs: Any) -> str:
+            calls.append(("refine", prompt[1]["content"]))
+            assert "canonical_name\": \"驾驶辅助级别" in prompt[1]["content"]
+            assert "语义资产中的自然语言概念“自动驾驶级别”" in prompt[1]["content"]
+            assert "数据库实体证据在物理名称或存储值上冲突时" in prompt[0]["content"]
+            return "SELECT COUNT(*) FROM vehicle_params WHERE type_name = '驾驶辅助级别'"
+
+    route = TableRoute(
+        database_source_id="source-1",
+        source_name="测试库",
+        database="test",
+        dialect="PostgreSQL",
+        table_names=["vehicle_params"],
+        available_tables=["vehicle_params"],
+        candidates=[],
+        confidence=1.0,
+        reason="test",
+        prompt_context="只允许使用 vehicle_params。",
+    )
+    timings: dict[str, float] = {}
+
+    sql, references, _guardrail_note, generation = await nl2sql_service._generate_grounded_sql(
+        request=DatabaseQueryRequest(question=question),
+        route=route,
+        semantic_context="语义资产中的自然语言概念“自动驾驶级别”表示 L2 及以上。",
+        semantic_trace={},
+        vanna=_FakeVanna(),
+        stage_timings=timings,
+    )
+
+    retrieval_calls = [value for name, value in calls if name != "refine"]
+    assert retrieval_calls
+    assert all(value == question for value in retrieval_calls)
+    assert references["entities"]["groups"][0]["items"][0]["name"] == "驾驶辅助级别"
+    assert "type_name = '驾驶辅助级别'" in sql
+    assert "type_name = '自动驾驶级别'" not in sql
+    assert generation["candidate_sql"].endswith("type_name = '自动驾驶级别'")
+    assert generation["final_sql"] == sql
+    assert generation["entity_authority"] == "database_entity_evidence_for_physical_facts"
+    assert timings["sql_candidate_generation_ms"] >= 0
+    assert timings["sql_semantic_refinement_ms"] >= 0
 
 
 class _FakeSessionMaker:
@@ -243,6 +345,18 @@ def test_validate_readonly_sql_ignores_table_like_text_inside_comments() -> None
     clean_sql = validate_readonly_sql(sql, allowed_tables=["vehicle_params"])
 
     assert clean_sql == sql
+
+
+def test_validate_readonly_sql_reports_incomplete_cte_shape_before_table_scope() -> None:
+    sql = """SELECT brand FROM vehicle_params
+    ),
+    car_launch AS (
+      SELECT brand FROM model_base
+    )
+    SELECT brand FROM car_launch"""
+
+    with pytest.raises(SqlRunnerError, match="SQL 结构不完整：括号不平衡"):
+        validate_readonly_sql(sql, allowed_tables=["vehicle_params"])
 
 
 def test_database_query_error_format_includes_generated_sql() -> None:

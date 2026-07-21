@@ -3,7 +3,7 @@
 import { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
-import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Database, Download, FileSpreadsheet, FileText, Globe2, Key, KeyRound, Layers3, PauseCircle, Plus, Sparkles, SquareTerminal, Trash2 } from "lucide-react";
+import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Database, Download, FileSpreadsheet, FileText, FolderOpen, Globe2, Key, KeyRound, Layers3, PauseCircle, Plus, Sparkles, SquareTerminal, Trash2 } from "lucide-react";
 import { denyPermissionRequest, grantExternalFilePermission, grantToolActionPermission, openLocalFile, resolveDatabaseSqlRevisionRequest, resolveDimensionBuildRuleRequest, resolveLogicalDatasetRuleRequest, type AgentAttachment, type DatabaseSqlRevisionRequest, type DimensionBuildRuleRequest, type LogicalDatasetRuleRequest, type PermissionRequest } from "@/lib/api";
 import { markdownRemarkPlugins, markdownUrlTransform } from "@/lib/markdown";
 import { useApp, type ChatMessage as ChatMessageType, type SourceRecord, type TimelineItem } from "@/lib/store";
@@ -14,7 +14,6 @@ interface Props {
   message: ChatMessageType;
   sessionSources?: SourceRecord[];
   isStreaming?: boolean;
-  verificationState?: "pending" | "progress" | "passed" | "failed" | "unverified";
   showInterruptionNotice?: boolean;
 }
 
@@ -43,12 +42,11 @@ function isAuthError(content: string): boolean {
   return has401 || hasApiKeyError || hasAuthFail;
 }
 
-export default function ChatMessage({ message, sessionSources = [], isStreaming = false, verificationState, showInterruptionNotice = false }: Props) {
+export default function ChatMessage({ message, sessionSources = [], isStreaming = false, showInterruptionNotice = false }: Props) {
   const isUser = message.role === "user";
   const hasAuthError = !isUser && isAuthError(message.content);
   const renderedContent = renderCitationMarkers(message, sessionSources);
   const availableSources = mergeSources(message.sources, sessionSources);
-  const messageVerificationState = message.segments?.length ? undefined : verificationState;
   const { sessionId, setActiveSourceId, setInspectorOpen } = useApp();
   const pendingPermissionRequests = (message.permissionRequests || []).filter(
     (request) => request.status !== "resolved"
@@ -99,23 +97,8 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
           /* Assistant message — left-aligned */
           <div>
             <div className="min-w-0">
-              {messageVerificationState === "pending" && message.content ? (
-                <div className="inline-flex items-center gap-2 rounded-xl border border-blue-200 bg-blue-50/80 px-3 py-2.5 text-[12px] text-blue-800">
-                  <Sparkles className="h-3.5 w-3.5 animate-pulse" />
-                  <span><strong>正在验收</strong> · 回答已生成，Harness 核验通过后才会显示为最终结果。</span>
-                </div>
-              ) : (
-                <details
-                  open={messageVerificationState !== "failed"}
-                  className={messageVerificationState === "failed" ? "rounded-xl border border-amber-200 bg-amber-50/50" : undefined}
-                >
-                  <summary
-                    className={messageVerificationState === "failed"
-                      ? "cursor-pointer list-none px-3 py-2.5 text-[12px] font-semibold text-amber-800 [&::-webkit-details-marker]:hidden"
-                      : "hidden"}
-                  >
-                    候选回答未通过验收 · 点击查看
-                  </summary>
+              <details open>
+                  <summary className="hidden" />
               {message.segments && message.segments.length > 0 ? (
                 /* Multi-segment agent turn: each model invocation is its own block */
                 <div className="space-y-4">
@@ -127,6 +110,7 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
                       sessionSources={sessionSources}
                       isStreaming={isStreaming}
                       isLast={index === message.segments!.length - 1}
+                      verificationSummary={index === message.segments!.length - 1 ? message.verificationSummary : undefined}
                     />
                   ))}
                   {message.retrievals && message.retrievals.length > 0 && (
@@ -148,20 +132,21 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
                   {pendingDatabaseSqlRevisionRequests.map((request) => (
                     <DatabaseSqlRevisionCard key={request.id} request={request} />
                   ))}
-                  <div className="text-[10px] text-gray-400 mt-1 pl-1">
-                    {formatTime(message.timestamp)}
-                  </div>
+                  {(message.segments.length > 0 || pendingPermissionRequests.length > 0 || pendingDimensionBuildRuleRequests.length > 0 || pendingLogicalDatasetRuleRequests.length > 0 || pendingDatabaseSqlRevisionRequests.length > 0) && (
+                    <div className="text-[10px] text-gray-400 mt-1 pl-1">
+                      {formatTime(message.timestamp)}
+                    </div>
+                  )}
                 </div>
               ) : (
                 <>
                   {(() => {
                     const hasTools = message.timeline?.some((item) => item.type === "tool") ?? false;
 
-                    const thoughtChain =
-                      message.timeline && message.timeline.length > 0 ? (
-                        <ThoughtChain timeline={message.timeline} isStreaming={isStreaming} />
+                    const thoughtChain = message.timeline && message.timeline.length > 0 ? (
+                      <ThoughtChain timeline={message.timeline} isStreaming={isStreaming} />
                       ) : message.reasoning ? (
-                        <ReasoningBlock
+                      <ReasoningBlock
                           content={message.reasoning}
                           defaultOpen={isStreaming && !message.content}
                           isStreaming={isStreaming && !message.content}
@@ -170,17 +155,20 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
 
                     const contentBlock = hasAuthError ? (
                       <AuthErrorAlert content={message.content} />
-                    ) : message.content ? (
+                    ) : message.content || message.verificationSummary ? (
                       <div>
                         <div className="px-1 py-1 text-[15px] leading-relaxed">
                           <div className="markdown-content">
-                            <ReactMarkdown
-                              remarkPlugins={markdownRemarkPlugins}
-                              components={citationComponents}
-                              urlTransform={markdownUrlTransform}
-                            >
-                              {renderedContent}
-                            </ReactMarkdown>
+                            {message.content ? (
+                              <ReactMarkdown
+                                remarkPlugins={markdownRemarkPlugins}
+                                components={citationComponents}
+                                urlTransform={markdownUrlTransform}
+                              >
+                                {renderedContent}
+                              </ReactMarkdown>
+                            ) : null}
+                            <VerificationSummaryText text={message.verificationSummary} />
                           </div>
                         </div>
                         {message.retrievals && message.retrievals.length > 0 && (
@@ -212,7 +200,7 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
                         {pendingDatabaseSqlRevisionRequests.map((request) => (
                           <DatabaseSqlRevisionCard key={request.id} request={request} />
                         ))}
-                        {(message.content || thoughtChain || pendingPermissionRequests.length > 0 || pendingDimensionBuildRuleRequests.length > 0 || pendingLogicalDatasetRuleRequests.length > 0 || pendingDatabaseSqlRevisionRequests.length > 0) && (
+                        {((message.content || thoughtChain) || pendingPermissionRequests.length > 0 || pendingDimensionBuildRuleRequests.length > 0 || pendingLogicalDatasetRuleRequests.length > 0 || pendingDatabaseSqlRevisionRequests.length > 0) && (
                           <div className="text-[10px] text-gray-400 mt-1 pl-1">
                             {formatTime(message.timestamp)}
                           </div>
@@ -223,7 +211,6 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
                 </>
               )}
                 </details>
-              )}
 
               {message.outputAttachments?.length ? (
                 <AssistantAttachmentList attachments={message.outputAttachments} />
@@ -355,16 +342,17 @@ function ExternalFilePermissionCard({
   const [error, setError] = useState("");
   const path = request.path || "";
   const name = path.split("/").filter(Boolean).pop() || "外部文件";
-  const isWrite = request.type === "external_file_write";
+  const isDirectory = request.type.startsWith("external_directory_");
+  const isWrite = request.type === "external_file_write" || request.type === "external_directory_write";
 
-  const grant = async (targetKind: "exact_file" | "all_external_files") => {
+  const grant = async (targetKind: "exact_file" | "exact_directory" | "all_external_files") => {
     setStatus("loading");
     setError("");
     try {
       await grantExternalFilePermission(
         sessionId,
         targetKind,
-        targetKind === "exact_file" ? path : undefined,
+        targetKind === "all_external_files" ? undefined : path,
         request.id
       );
       setStatus("granted");
@@ -382,7 +370,7 @@ function ExternalFilePermissionCard({
       await denyPermissionRequest(
         sessionId,
         request.id,
-        isWrite ? "User denied external file write permission." : "User denied external file read permission."
+        `User denied external ${isDirectory ? "directory" : "file"} ${isWrite ? "write" : "read"} permission.`
       );
       setStatus("denied");
       window.dispatchEvent(new CustomEvent("puddingclaw:permissions-changed"));
@@ -396,12 +384,14 @@ function ExternalFilePermissionCard({
     <div className="mb-3 max-w-[680px] rounded-2xl border border-black/[0.06] bg-white/75 p-4 shadow-sm shadow-slate-950/[0.04] backdrop-blur">
       <div className="flex gap-3">
         <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-[#002fa7]/10 text-[#002fa7]">
-          {status === "granted" ? <CheckCircle2 className="h-5 w-5" /> : <KeyRound className="h-5 w-5" />}
+          {status === "granted"
+            ? <CheckCircle2 className="h-5 w-5" />
+            : isDirectory ? <FolderOpen className="h-5 w-5" /> : <KeyRound className="h-5 w-5" />}
         </div>
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <h3 className="text-[15px] font-bold text-slate-950">
-              {isWrite ? "允许修改外部文件" : "允许读取外部文件"}
+              {isWrite ? `允许修改外部${isDirectory ? "目录" : "文件"}` : `允许读取外部${isDirectory ? "目录" : "文件"}`}
             </h3>
             {status === "granted" ? (
               <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700">
@@ -410,7 +400,9 @@ function ExternalFilePermissionCard({
             ) : null}
           </div>
           <div className="mt-2 flex items-start gap-2 rounded-xl bg-slate-50 px-3 py-2">
-            <FileText className="mt-0.5 h-4 w-4 shrink-0 text-slate-400" />
+            {isDirectory
+              ? <FolderOpen className="mt-0.5 h-4 w-4 shrink-0 text-slate-400" />
+              : <FileText className="mt-0.5 h-4 w-4 shrink-0 text-slate-400" />}
             <div className="min-w-0">
               <div className="truncate text-[13px] font-medium text-slate-800">{name}</div>
               <div className="mt-0.5 truncate font-mono text-[11px] text-slate-500">{path}</div>
@@ -428,17 +420,25 @@ function ExternalFilePermissionCard({
               ))}
             </div>
           ) : null}
+          {isDirectory ? (
+            <div className="mt-2 rounded-xl border border-sky-100 bg-sky-50/70 px-3 py-2 text-[11px] leading-relaxed text-sky-800">
+              修改、运行或联调整个目录时，建议将该目录作为项目打开。若仍在当前会话继续，目录只会暂存到隔离环境；
+              {isWrite ? " 本次 Run 将按上方已审核的新增、修改和删除清单递归写回。" : " 读取授权不会直接修改原目录。"}
+            </div>
+          ) : null}
           {status !== "granted" && status !== "denied" ? (
             <div className="mt-3 flex flex-wrap items-center gap-2">
               <button
                 type="button"
                 disabled={status === "loading"}
-                onClick={() => grant("exact_file")}
+                onClick={() => grant(isDirectory ? "exact_directory" : "exact_file")}
                 className="rounded-full bg-[#002fa7] px-3.5 py-2 text-[12px] font-semibold text-white shadow-sm transition hover:bg-[#00298f] disabled:cursor-default disabled:opacity-60"
               >
-                {isWrite ? "允许修改此文件" : "允许此文件"}
+                {isDirectory
+                  ? isWrite ? "仍然允许本次 Run 修改目录" : "允许本次 Run 读取目录"
+                  : isWrite ? "允许修改此文件" : "允许此文件"}
               </button>
-              {!isWrite ? (
+              {!isWrite && !isDirectory ? (
                 <button
                   type="button"
                   disabled={status === "loading"}
@@ -497,6 +497,8 @@ function ToolActionPermissionCard({
   const installsPackages = (request.capabilities || []).includes("package_install");
   const writesWorkspace = (request.capabilities || []).includes("managed_write");
   const writesSkills = (request.capabilities || []).includes("managed_skill_write");
+  const opensSessionNetwork = request.session_target_kind === "capability"
+    && request.session_target === "session_network_access";
   const managesSkills = writesSkills || [
     "prepare_skill_install",
     "prepare_skill_update",
@@ -508,11 +510,12 @@ function ToolActionPermissionCard({
     network: "联网 · 需确认",
     package_install: "安装依赖 · 需确认",
     managed_write: "写入项目 · 需确认",
+    destructive_write: "破坏性写入 · 需确认",
     managed_skill_write: "安装或更新 Skill · 需确认",
     critical: "禁止级风险",
   } as Record<string, string>)[request.risk || ""] || request.risk || "受控操作";
   const reason = request.reason || "需要人工确认";
-  const reasonLabel = reason.startsWith("arbitrary_interpreter:")
+  const reasonLabel = request.policy_explanation || (reason.startsWith("arbitrary_interpreter:")
     ? "解释器可执行任意代码；Harness 会另外标明本次是否联网、写入或安装依赖。"
     : reason.startsWith("network_access:")
       ? "该命令需要访问互联网。"
@@ -522,9 +525,10 @@ function ToolActionPermissionCard({
           ? "该操作会联网下载 Skill 到隔离暂存区，并校验文件和来源；不会修改已安装 Skill。"
         : reason.startsWith("managed_skill_write")
           ? "该操作会提交已校验的不可变计划到受管 Skill 目录。授权仅对本次计划有效。"
-        : reason.startsWith("managed_workspace_write")
-          ? "该命令会修改项目目录。"
-          : `Harness 规则：${reason}`;
+          : reason.startsWith("managed_workspace_write")
+            ? "该命令会修改项目目录。"
+          : `Harness 规则：${reason}`);
+  const reviewedBySmartPolicy = request.policy_source === "codex_grok_smart_reviewer";
   const title = isFetchUrl
     ? "允许访问网站"
     : isSearch
@@ -586,6 +590,11 @@ function ToolActionPermissionCard({
             <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-800">
               {riskLabel}
             </span>
+            {reviewedBySmartPolicy ? (
+              <span className="rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-semibold text-blue-800">
+                智能审查后需确认
+              </span>
+            ) : null}
           </div>
           <p className="mt-1 text-[12px] text-slate-500">
             {reasonLabel}
@@ -664,20 +673,32 @@ function ToolActionPermissionCard({
           )}
           {status === "idle" || status === "error" ? (
             <div className="mt-3 flex flex-wrap gap-2">
-              <button
-                type="button"
-                onClick={() => void grant("once")}
-                className="rounded-full bg-[#002fa7] px-3.5 py-2 text-[12px] font-semibold text-white hover:bg-[#00298f]"
-              >
-                仅允许本次
-              </button>
-              {!managesSkills ? (
+              {opensSessionNetwork ? (
                 <button
                   type="button"
                   onClick={() => void grant("session")}
+                  className="rounded-full bg-[#002fa7] px-3.5 py-2 text-[12px] font-semibold text-white hover:bg-[#00298f]"
+                >
+                  {request.session_scope_label || "本 Session 允许联网"}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => void grant("once")}
+                  className="rounded-full bg-[#002fa7] px-3.5 py-2 text-[12px] font-semibold text-white hover:bg-[#00298f]"
+                >
+                  仅允许本次
+                </button>
+              )}
+              {!managesSkills ? (
+                <button
+                  type="button"
+                  onClick={() => void grant(opensSessionNetwork ? "once" : "session")}
                   className="rounded-full bg-white px-3.5 py-2 text-[12px] font-semibold text-slate-700 ring-1 ring-black/[0.08] hover:bg-slate-50"
                 >
-                  {request.session_scope_label || "本 Session 允许相同命令"}
+                  {opensSessionNetwork
+                    ? "仅允许本次"
+                    : request.session_scope_label || "本 Session 允许相同命令"}
                 </button>
               ) : null}
               <button
@@ -990,14 +1011,23 @@ function SegmentBlock({
   sessionSources,
   isStreaming,
   isLast,
+  verificationSummary,
 }: {
-  segment: { content: string; reasoning?: string; timeline?: TimelineItem[]; runId?: string; verificationState?: "pending" | "progress" | "passed" | "failed" | "unverified" };
+  segment: {
+    content: string;
+    reasoning?: string;
+    timeline?: TimelineItem[];
+  };
   message: ChatMessageType;
   sessionSources: SourceRecord[];
   isStreaming?: boolean;
   isLast?: boolean;
+  verificationSummary?: string;
 }) {
   const { sessionId, setActiveSourceId, setInspectorOpen } = useApp();
+  // Terminal text is withheld by the backend until accepted.  Segments shown
+  // here are therefore process activity or the single published response;
+  // verification control state must never hide history or tool progress.
   const rendered = renderCitationMarkersForSegment(message, segment.content, sessionSources);
   const availableSources = mergeSources(message.sources, sessionSources);
   const citationComponents: Components = {
@@ -1027,79 +1057,45 @@ function SegmentBlock({
       />
     ) : null;
 
-  const contentBlock = segment.content ? (
+  const contentBlock = segment.content || verificationSummary ? (
     <div className="px-1 py-1 text-[15px] leading-relaxed">
       <div className="markdown-content">
-        <ReactMarkdown
-          remarkPlugins={markdownRemarkPlugins}
-          components={citationComponents}
-          urlTransform={markdownUrlTransform}
-        >
-          {rendered}
-        </ReactMarkdown>
+        {segment.content ? (
+          <ReactMarkdown
+            remarkPlugins={markdownRemarkPlugins}
+            components={citationComponents}
+            urlTransform={markdownUrlTransform}
+          >
+            {rendered}
+          </ReactMarkdown>
+        ) : null}
+        <VerificationSummaryText text={verificationSummary} />
       </div>
     </div>
   ) : null;
 
-  const body = (
+  return (
     <div className="space-y-2">
       {!hasTools && thoughtChain}
       {contentBlock}
       {hasTools && thoughtChain}
     </div>
   );
+}
 
-  // Verification is owned by one Run segment. A later Run must never hide or
-  // relabel an earlier candidate response in the same continuous Goal turn.
-  if (segment.verificationState === "pending" && segment.content && hasTools) {
-    return (
-      <details open={Boolean(isStreaming && isLast)} className="rounded-xl border border-blue-100 bg-blue-50/35">
-        <summary className="cursor-pointer list-none px-3 py-2.5 text-[12px] font-semibold text-blue-800 [&::-webkit-details-marker]:hidden">
-          执行进度 · 本轮尚未验收
-        </summary>
-        <div className="px-3 pb-3">{body}</div>
-      </details>
-    );
-  }
-  if (segment.verificationState === "pending" && segment.content) {
-    return (
-      <div className="inline-flex items-center gap-2 rounded-xl border border-blue-200 bg-blue-50/80 px-3 py-2.5 text-[12px] text-blue-800">
-        <Sparkles className="h-3.5 w-3.5 animate-pulse" />
-        <span><strong>本轮正在验收</strong> · 通过后才会作为最终结果。</span>
-      </div>
-    );
-  }
-  if (segment.verificationState === "progress") {
-    return (
-      <details className="rounded-xl border border-slate-200 bg-slate-50/55">
-        <summary className="cursor-pointer list-none px-3 py-2.5 text-[12px] font-semibold text-slate-600 [&::-webkit-details-marker]:hidden">
-          本轮执行过程 · 点击查看
-        </summary>
-        <div className="px-3 pb-3">{body}</div>
-      </details>
-    );
-  }
-  if (segment.verificationState === "failed") {
-    return (
-      <details className="rounded-xl border border-amber-200 bg-amber-50/50">
-        <summary className="cursor-pointer list-none px-3 py-2.5 text-[12px] font-semibold text-amber-800 [&::-webkit-details-marker]:hidden">
-          本轮候选回答未通过验收 · 点击查看
-        </summary>
-        <div className="px-3 pb-3">{body}</div>
-      </details>
-    );
-  }
-  if (segment.verificationState === "unverified") {
-    return (
-      <details className="rounded-xl border border-amber-200 bg-amber-50/50">
-        <summary className="cursor-pointer list-none px-3 py-2.5 text-[12px] font-semibold text-amber-800 [&::-webkit-details-marker]:hidden">
-          本轮候选回答尚未形成有效验收 · 点击查看
-        </summary>
-        <div className="px-3 pb-3">{body}</div>
-      </details>
-    );
-  }
-  return body;
+function VerificationSummaryText({ text }: { text?: string }) {
+  const summary = String(text || "").trim();
+  if (!summary || /^验证通过[。.!！]?$/.test(summary)) return null;
+  return (
+    <div className="mt-5 text-slate-700">
+      <ReactMarkdown
+        remarkPlugins={markdownRemarkPlugins}
+        urlTransform={markdownUrlTransform}
+      >
+        {summary}
+      </ReactMarkdown>
+    </div>
+  );
 }
 
 function renderCitationMarkersForSegment(
@@ -1107,7 +1103,7 @@ function renderCitationMarkersForSegment(
   content: string,
   sessionSources: SourceRecord[] = []
 ): string {
-  const normalizedContent = stripCitationDefinitions(stripModelCallLimitNotice(content));
+  const normalizedContent = sanitizeCitationMarkdown(stripModelCallLimitNotice(content));
   const indexes = new Map<string, number>();
   message.citations?.forEach((citation) => {
     indexes.set(citation.source_id, citation.display_index);
@@ -1162,7 +1158,7 @@ function ReasoningBlock({
         <div className="flex h-5 w-5 items-center justify-center rounded bg-[#eef2ff] text-[#002fa7]">
           <Sparkles className="h-3 w-3" />
         </div>
-        <span className="font-medium">思考过程</span>
+        <span className="font-medium">处理过程</span>
         <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">
           {content.length} 字{lineCount > 1 ? ` · ${lineCount} 行` : ""}
         </span>
@@ -1185,7 +1181,7 @@ function ReasoningBlock({
 }
 
 function renderCitationMarkers(message: ChatMessageType, sessionSources: SourceRecord[] = []): string {
-  const normalizedContent = stripCitationDefinitions(stripModelCallLimitNotice(message.content));
+  const normalizedContent = sanitizeCitationMarkdown(stripModelCallLimitNotice(message.content));
   const indexes = new Map<string, number>();
 
   // Citations carry the authoritative display index.
@@ -1220,8 +1216,16 @@ function renderCitationMarkers(message: ChatMessageType, sessionSources: SourceR
   });
 }
 
-function stripCitationDefinitions(content: string): string {
-  return content.replace(/^[ \t]*\[\^src_[A-Za-z0-9_-]+\]:[^\n]*(?:\n|$)/gm, "");
+function sanitizeCitationMarkdown(content: string): string {
+  return content
+    // Citation metadata belongs to the structured source cards, never a GFM
+    // Footnotes appendix rendered inside the assistant answer.
+    .replace(/^[ \t]*\[\^[^\]\n]+\]:[^\n]*(?:\n(?:(?: {2,}|\t)[^\n]*))*(?:\n|$)/gm, "")
+    // Only structured source ids are eligible for citation rendering. SQL
+    // generation ids and arbitrary model-created footnotes remain plain ids.
+    .replace(/\[\^(?!src_[A-Za-z0-9_-]+\])[^\]\n]+\]/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 function mergeSources(

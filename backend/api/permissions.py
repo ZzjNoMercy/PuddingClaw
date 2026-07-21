@@ -15,7 +15,7 @@ router = APIRouter()
 
 
 class ExternalFileGrantRequest(BaseModel):
-    target_kind: str = Field(pattern="^(exact_file|all_external_files)$")
+    target_kind: str = Field(pattern="^(exact_file|all_external_files|exact_directory)$")
     path: str | None = None
     permission_request_id: str | None = None
 
@@ -54,6 +54,9 @@ async def list_permissions(session_id: str) -> dict[str, Any]:
                     "command": request.get("command"),
                     "reason": request.get("reason"),
                     "risk": request.get("risk"),
+                    "policy_source": request.get("policy_source"),
+                    "policy_explanation": request.get("policy_explanation"),
+                    "control_descriptor": request.get("control_descriptor"),
                     "change_preview": request.get("change_preview"),
                 }
     return {"session_id": session_id, "grants": grants, "history": history}
@@ -103,16 +106,31 @@ async def grant_external_file_permission(
     if pending is not None and pending.get("type") not in {
         "external_file_read",
         "external_file_write",
+        "external_directory_read",
+        "external_directory_write",
     }:
+        # Keep the legacy response text for API compatibility. The endpoint
+        # now accepts both external files and exact external directories.
         raise HTTPException(status_code=400, detail="permission request is not an external file action")
-    access = "write" if pending and pending.get("type") == "external_file_write" else "read"
-    if access == "write" and req.target_kind != "exact_file":
-        raise HTTPException(status_code=400, detail="external write permission only supports exact_file")
+    pending_type = str((pending or {}).get("type") or "external_file_read")
+    is_directory = pending_type.startswith("external_directory_")
+    access = "write" if pending_type.endswith("_write") else "read"
+    expected_target_kind = "exact_directory" if is_directory else "exact_file"
+    if pending is None and req.target_kind == "exact_directory":
+        raise HTTPException(status_code=400, detail="external directory permission requires a pending request")
+    effective_target_kind = "exact_directory" if is_directory else req.target_kind
+    if access == "write" and effective_target_kind != expected_target_kind:
+        raise HTTPException(status_code=400, detail=f"external write permission requires {expected_target_kind}")
 
-    if req.target_kind == "exact_file":
-        if not req.path:
-            raise HTTPException(status_code=400, detail="path is required for exact_file grants")
-        target = str(Path(req.path).expanduser().resolve())
+    if effective_target_kind in {"exact_file", "exact_directory"}:
+        # Older frontends render directory requests as external-file cards.
+        # For a trusted pending directory request, collapse exact_file or the
+        # old broad button back to the pending exact directory. This preserves
+        # compatibility without widening the authorization boundary.
+        requested_path = req.path or (str((pending or {}).get("path") or "") if is_directory else "")
+        if not requested_path:
+            raise HTTPException(status_code=400, detail="path is required for exact path grants")
+        target = str(Path(requested_path).expanduser().resolve())
         if pending is not None and target != str(Path(str(pending.get("path") or "")).expanduser().resolve()):
             raise HTTPException(status_code=400, detail="path does not match the pending permission request")
     else:
@@ -121,12 +139,20 @@ async def grant_external_file_permission(
     try:
         grant = session_manager.add_permission_grant(
             session_id,
-            grant_type=f"external_file_{access}",
-            target_kind=req.target_kind,
+            grant_type=f"external_{'directory' if is_directory else 'file'}_{access}",
+            target_kind=effective_target_kind,
             target=target,
-            capabilities=[access, "external_path"],
-            scope="session",
+            capabilities=[access, *(["recursive"] if is_directory else []), "external_path"],
+            scope="run" if is_directory else "session",
             source="user",
+            metadata=(
+                {
+                    "run_id": str((pending or {}).get("run_id") or ""),
+                    "requested_target_kind": req.target_kind,
+                }
+                if is_directory
+                else None
+            ),
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Session not found") from exc
@@ -226,12 +252,15 @@ async def grant_tool_action_permission(
     use_reusable_scope = req.scope == "session" and session_target_kind and session_target
     target_kind = session_target_kind if use_reusable_scope else "fingerprint"
     target = session_target if use_reusable_scope else fingerprint
-    metadata = {
+    metadata = {key: value for key, value in {
         "tool_name": pending.get("tool_name"),
         "command": pending.get("command"),
         "reason": pending.get("reason"),
         "risk": pending.get("risk"),
-    }
+        "policy_source": pending.get("policy_source"),
+        "policy_explanation": pending.get("policy_explanation"),
+        "control_descriptor": pending.get("control_descriptor"),
+    }.items() if value is not None}
     if isinstance(pending.get("change_preview"), dict):
         metadata["change_preview"] = dict(pending["change_preview"])
     if pending.get("run_id"):
@@ -265,10 +294,26 @@ async def grant_tool_action_permission(
             status_code=409,
             detail="permission request was resolved concurrently",
         )
+    auto_resumed: list[str] = []
+    if use_reusable_scope:
+        auto_resumed = permission_resume_registry.resolve_compatible_session_tool_actions(
+            session_id=session_id,
+            target_kind=target_kind,
+            target=target,
+            capabilities=capabilities,
+            decision={"type": "approve", "grant_id": grant["id"]},
+            grant_bindings=(
+                dict(pending["grant_bindings"])
+                if isinstance(pending.get("grant_bindings"), dict)
+                else None
+            ),
+            exclude_request_id=req.permission_request_id,
+        )
     return {
         "session_id": session_id,
         "grant": grant,
         "resumed": resumed,
+        "auto_resumed_permission_request_ids": auto_resumed,
     }
 
 

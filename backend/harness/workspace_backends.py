@@ -23,8 +23,8 @@ from harness.dependency_setup import (
     detect_workspace_dependency_plan,
 )
 
-DEFAULT_SANDBOX_IMAGE = "puddingclaw/sandbox:python3.12-node22-v2"
-RUNTIME_CONTRACT = "python3.12+node22-v2"
+DEFAULT_SANDBOX_IMAGE = "puddingclaw/sandbox:python3.12-node22-curl-v3"
+RUNTIME_CONTRACT = "python3.12+node22+curl-v3"
 logger = logging.getLogger(__name__)
 
 
@@ -364,7 +364,7 @@ class ProjectSandboxManager:
                 continue
             source = Path(str(item.get("source") or "")).expanduser().resolve()
             target = str(item.get("target") or "")
-            if source.is_dir() and target == "/harness-scratch":
+            if source.is_dir() and target in {"/harness-scratch", "/scratch"}:
                 writable_mounts.append({"source": str(source), "target": target})
         return {
             "workspace": str(workspace),
@@ -755,7 +755,13 @@ class ProjectSandboxManager:
                 f"Docker sandbox user contract mismatch: expected {expected_user}, got {configured_user or '<root>'}."
             )
         scratch_relative = str(self.config.get("_scratch_relative") or "").strip("/")
-        scratch_path = f"/harness-scratch/{scratch_relative}" if scratch_relative else "/harness-scratch"
+        scratch_path = (
+            "/scratch"
+            if any(item.get("target") == "/scratch" for item in spec.get("writable_mounts") or [])
+            else f"/harness-scratch/{scratch_relative}"
+            if scratch_relative
+            else "/harness-scratch"
+        )
         probe_name = f".puddingclaw-write-probe-{uuid.uuid4().hex[:12]}"
         result = self._run(
             [
@@ -766,6 +772,7 @@ class ProjectSandboxManager:
                 (
                     "python3 --version >/dev/null 2>&1 && "
                     "node --version >/dev/null 2>&1 && "
+                    "curl --version >/dev/null 2>&1 && "
                     f"test -d {shlex.quote(scratch_path)} && "
                     f"test -w {shlex.quote(scratch_path)} && "
                     f": > {shlex.quote(f'{scratch_path}/{probe_name}')} && "
@@ -775,7 +782,7 @@ class ProjectSandboxManager:
         )
         if result.returncode != 0:
             raise RuntimeError(
-                "Docker sandbox image must provide both python3 and node. "
+                "Docker sandbox image must provide python3, node, and curl. "
                 + (result.stderr.strip() or result.stdout.strip())
             )
 
@@ -838,8 +845,13 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         self._max_output_bytes = max_output_bytes
         self.dependency_plan = manager.dependency_plan(self.workspace_path)
         scratch_relative = str(manager.config.get("_scratch_relative") or "").strip("/")
+        spec = manager._spec(self.workspace_path)
         self.scratch_container_path = (
-            f"/harness-scratch/{scratch_relative}" if scratch_relative else "/harness-scratch"
+            "/scratch"
+            if any(item.get("target") == "/scratch" for item in spec.get("writable_mounts") or [])
+            else f"/harness-scratch/{scratch_relative}"
+            if scratch_relative
+            else "/harness-scratch"
         )
         self.container_name, self.spec_hash = manager.ensure_container(self.workspace_path)
 
@@ -876,7 +888,10 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
                     )
                 from harness.tool_execution import ShellPolicyAnalyzer
 
-                effects = ShellPolicyAnalyzer.capabilities(command)
+                effects = ShellPolicyAnalyzer.capabilities(
+                    command,
+                    workspace_path=self.workspace_path,
+                )
                 if not bool(self.manager.config.get("network_enabled", False)) and effects.network:
                     result = self.manager.run_ephemeral_network_command(
                         self.workspace_path,

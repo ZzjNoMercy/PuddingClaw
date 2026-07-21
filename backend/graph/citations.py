@@ -11,6 +11,27 @@ from typing import Any
 STRUCTURED_TOOL_RESULT_KEY = "puddingclaw_tool_result"
 STRUCTURED_TOOL_RESULT_VERSION = 1
 _CITATION_MARKER_RE = re.compile(r"\[\^(src_[A-Za-z0-9_-]+)\]")
+_FOOTNOTE_DEFINITION_RE = re.compile(
+    r"^[ \t]*\[\^[^\]\n]+\]:[^\n]*(?:\n(?:(?: {2,}|\t)[^\n]*))*\n?",
+    re.MULTILINE,
+)
+_UNSUPPORTED_FOOTNOTE_REFERENCE_RE = re.compile(
+    r"\[\^(?!src_[A-Za-z0-9_-]+\])[^\]\n]+\]"
+)
+
+
+def sanitize_citation_markdown(content: str) -> str:
+    """Allow only structured ``src_*`` citation markers in assistant Markdown.
+
+    SQL ``generation_id`` values and other runtime identifiers are execution
+    handles, not citation sources.  Models may still show those ids as normal
+    code or table cells, but GFM footnote syntax must not turn them into a
+    synthetic Footnotes section with localhost back-links.
+    """
+
+    sanitized = _FOOTNOTE_DEFINITION_RE.sub("", str(content or ""))
+    sanitized = _UNSUPPORTED_FOOTNOTE_REFERENCE_RE.sub("", sanitized)
+    return re.sub(r"\n{3,}", "\n\n", sanitized).strip()
 
 
 def _clean_text(value: Any, limit: int | None = None) -> str:
@@ -150,6 +171,7 @@ def format_sources_for_model(answer_context: str, sources: list[dict[str, Any]])
 
 def finalize_citations(content: str, sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Validate citation markers and assign stable display indexes by first use."""
+    content = sanitize_citation_markdown(content)
     source_ids = {source.get("source_id") for source in sources}
     display_indexes: dict[str, int] = {}
     citations: list[dict[str, Any]] = []

@@ -34,6 +34,10 @@ curl -sS --max-time 10 -H "User-Agent: $UA" \
   "https://aihot.virxact.com/api/public/version"
 ```
 
+在 PuddingClaw 中，版本自检必须作为一次独立的 `execute` 调用；实际资讯查询再使用另一次独立的 `execute` 调用。不要把版本响应、分隔符和资讯 JSON 拼进同一个命令输出，否则来源无法被可靠识别。`curl` 是 PuddingClaw Agent 沙箱的基础能力；如果缺失，应报告运行环境异常，不要在任务中临时安装系统包，也不要改用 Python 绕过。
+
+若用户为第一次请求选择“本 Session”，该授权表示当前 Session 的联网能力已开启；后续资讯请求即使访问不同网络来源也不得重复索要联网权限。包安装、文件写入和破坏性操作仍是独立能力，不能借联网授权放行。
+
 从 `$UA` 读取本地版本，按 semver 数字比较：
 
 - 线上 `skillVersion` 严格大于本地版本：在正常答案最后追加一行更新提示。

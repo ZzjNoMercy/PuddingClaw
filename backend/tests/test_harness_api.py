@@ -33,15 +33,33 @@ def test_create_session_atomically_persists_model_and_approval_mode(tmp_path):
     assert created["analytics_model_id"] == "sales-model"
     assert created["approval_mode"] == "smart"
     assert created["policy_epoch"] == 1
-    assert created["policy_version"] == "tool-execution-v2"
+    assert created["policy_version"] == "tool-execution-v3"
     mode = client.get(f"/api/sessions/{created['id']}/permissions/mode")
     assert mode.status_code == 200
     assert mode.json() == {
         "session_id": created["id"],
         "approval_mode": "smart",
         "policy_epoch": 1,
-        "policy_version": "tool-execution-v2",
+        "policy_version": "tool-execution-v3",
     }
+
+
+def test_session_history_restores_persisted_todos_without_opening_trace(tmp_path):
+    client = _client(tmp_path)
+    todos = [
+        {
+            "id": "todo-1",
+            "content": "更新外部报告",
+            "status": "in_progress",
+            "position": 0,
+        }
+    ]
+    session_manager.update_todos("session-1", todos)
+
+    response = client.get("/api/sessions/session-1/history")
+
+    assert response.status_code == 200
+    assert response.json()["todos"] == todos
 
 
 def test_permission_mode_api_rejects_stale_epoch_and_active_run(tmp_path):

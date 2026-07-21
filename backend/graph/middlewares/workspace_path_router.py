@@ -19,8 +19,10 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
 
     _PATH_ARGS = {
         "read_file": "file_path",
+        "ls": "path",
         "glob": "path",
         "grep": "path",
+        "read_resource": "resource",
     }
     _VIRTUAL_PREFIXES = (
         "/workspace/",
@@ -30,7 +32,11 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
         "/analytics-models/",
         "/skills/",
         "/large_tool_results/",
+        "/scratch/",
     )
+
+    def __init__(self, backend: Any | None = None) -> None:
+        self.backend = backend
 
     @staticmethod
     def _runtime_context(request: ToolCallRequest) -> dict[str, Any]:
@@ -101,6 +107,30 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
         workspace_path = str(context.get("workspace_path") or "")
         kind, routed_path = self._classify_path(raw_path, workspace_path)
 
+        # `/scratch` is a Backend/Docker virtual namespace, not a host path.
+        # Models occasionally choose read_resource merely because it is not
+        # under `/workspace`; adapt that mistake at the execution boundary so
+        # a valid staged artifact does not appear to be missing.
+        if (
+            tool_name == "read_resource"
+            and kind == "virtual"
+            and routed_path.startswith("/scratch/")
+        ):
+            if self.backend is None:
+                return "result", self._tool_message(
+                    request,
+                    "❌ `/scratch/...` is a Docker/Backend virtual path. Use read_file, not read_resource.",
+                    name="read_resource",
+                )
+            return "backend_read", (request, routed_path, args)  # type: ignore[return-value]
+
+        # Exact host-side resources remain the responsibility of
+        # ReadResourceTool and ExternalFilePermissionMiddleware. Only scratch
+        # needs adaptation above; treating every external read_resource call as
+        # a directory search would incorrectly force directory staging.
+        if tool_name == "read_resource":
+            return "execute", request
+
         if kind == "workspace":
             args[path_arg] = routed_path
             tool_call = {**request.tool_call, "args": args}
@@ -114,7 +144,11 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
                 request,
                 (
                     f"❌ `{tool_name}` cannot search outside the current workspace. "
-                    f"Use read_resource(resource={routed_path!r}) for the exact external file."
+                    "External authorization is exact-file scoped and does not grant access to its parent directory. "
+                    f"Use read_resource(resource={routed_path!r}) only when this is the exact file path, "
+                    "or call stage_external_directory(directory_path=<parent directory>) to request explicit "
+                    "directory access when sibling discovery is genuinely required. For whole-project debugging, "
+                    "prefer selecting that directory as the project workspace."
                 ),
                 name=tool_name,
             )
@@ -140,6 +174,22 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
             return handler(routed)  # type: ignore[arg-type]
         if action == "result":
             return routed  # type: ignore[return-value]
+        if action == "backend_read":
+            original, routed_path, args = routed  # type: ignore[misc]
+            result = self.backend.read(
+                routed_path,
+                offset=int(args.get("offset") or 0),
+                limit=int(args.get("limit") or 2000),
+            )
+            if result.error:
+                content = f"❌ Error reading staged artifact: {result.error}"
+            else:
+                data = result.file_data or {}
+                if data.get("encoding") != "utf-8":
+                    content = f"❌ Staged artifact is not UTF-8 text: {routed_path}"
+                else:
+                    content = str(data.get("content") or "")
+            return self._tool_message(original, content, name="read_file")
         original, resource_tool, resource_args = routed  # type: ignore[misc]
         content = str(resource_tool.invoke(resource_args))
         return self._tool_message(original, content, name="read_resource")
@@ -154,6 +204,22 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
             return await handler(routed)  # type: ignore[arg-type]
         if action == "result":
             return routed  # type: ignore[return-value]
+        if action == "backend_read":
+            original, routed_path, args = routed  # type: ignore[misc]
+            result = await self.backend.aread(
+                routed_path,
+                offset=int(args.get("offset") or 0),
+                limit=int(args.get("limit") or 2000),
+            )
+            if result.error:
+                content = f"❌ Error reading staged artifact: {result.error}"
+            else:
+                data = result.file_data or {}
+                if data.get("encoding") != "utf-8":
+                    content = f"❌ Staged artifact is not UTF-8 text: {routed_path}"
+                else:
+                    content = str(data.get("content") or "")
+            return self._tool_message(original, content, name="read_file")
         original, resource_tool, resource_args = routed  # type: ignore[misc]
         content = str(await resource_tool.ainvoke(resource_args))
         return self._tool_message(original, content, name="read_resource")

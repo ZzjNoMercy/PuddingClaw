@@ -38,6 +38,7 @@
 详细设计：
 
 - [后端架构总览](docs/ARCHITECTURE.md)
+- [PuddingClaw Harness Engineering 整合说明](docs/puddingclaw-harness-engineering.md)
 - [`vehicle_model_base` 字段新增与维护手册](docs/runbooks/vehicle-model-base-maintenance.md)
 - [ADR-001：AI Gateway + ModelClient 统一模型接入层](docs/adr/ADR-001-ai-gateway-and-model-client.md)
 - [ADR-002：直连 / Higress 双模式与 Provider 配置同步](docs/adr/ADR-002-dual-mode-provider-sync.md)

@@ -249,6 +249,13 @@ def validate_readonly_sql(sql: str, *, allowed_tables: list[str]) -> str:
     lowered = clean_sql.lower().strip()
     if not (lowered.startswith("select") or lowered.startswith("with")):
         raise SqlRunnerError("只允许执行 SELECT / WITH 查询。")
+    balance = _paren_balance(clean_sql)
+    if balance != 0:
+        direction = "缺少右括号" if balance > 0 else "缺少左括号或 WITH/SELECT 起始结构"
+        raise SqlRunnerError(
+            f"SQL 结构不完整：括号不平衡（balance={balance}，{direction}）。",
+            sql=clean_sql,
+        )
     if ";" in clean_sql:
         raise SqlRunnerError("不允许执行多条 SQL。")
     if _DANGEROUS_RE.search(clean_sql):

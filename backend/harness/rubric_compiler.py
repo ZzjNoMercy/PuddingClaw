@@ -9,6 +9,7 @@ from typing import Any
 
 from harness.models import (
     CriterionSource,
+    EvidenceScope,
     RunTaskProfile,
     RunVerificationContract,
     VerificationActivation,
@@ -42,12 +43,14 @@ def _criterion(
     *,
     source: CriterionSource,
     verifier: VerifierKind,
+    evidence_scope: EvidenceScope = EvidenceScope.RUN_ONLY,
 ) -> VerificationCriterion:
     return VerificationCriterion(
         id=criterion_id,
         statement=statement,
         source=source,
         verifier=verifier,
+        evidence_scope=evidence_scope,
     )
 
 
@@ -58,12 +61,21 @@ _PACK_CRITERIA: dict[str, tuple[VerificationCriterion, ...]] = {
             "最终结果必须完成用户本次 Run 明确提出的任务，不能只给计划或声称已完成。",
             source=CriterionSource.TASK,
             verifier=VerifierKind.LLM_GRADER,
+            evidence_scope=EvidenceScope.RUN_ONLY,
         ),
         _criterion(
             "todo_reconciliation",
             "若本 Run 使用了 Todo，结束时所有 Todo 必须已完成或明确取消。",
             source=CriterionSource.MANAGED,
             verifier=VerifierKind.DETERMINISTIC,
+            evidence_scope=EvidenceScope.GOAL_INHERITABLE,
+        ),
+        _criterion(
+            "tool_protocol_integrity",
+            "所有工具调用必须拥有对应 ToolMessage，不能以缺失工具结果的协议状态结束。",
+            source=CriterionSource.SYSTEM,
+            verifier=VerifierKind.DETERMINISTIC,
+            evidence_scope=EvidenceScope.RUN_ONLY,
         ),
     ),
     "web_research": (
@@ -72,6 +84,7 @@ _PACK_CRITERIA: dict[str, tuple[VerificationCriterion, ...]] = {
             "关键事实与结论必须能追溯到本 Run 成功完成的检索工具或知识来源。",
             source=CriterionSource.SYSTEM,
             verifier=VerifierKind.DETERMINISTIC,
+            evidence_scope=EvidenceScope.GOAL_INHERITABLE,
         ),
     ),
     "analytics": (
@@ -80,12 +93,14 @@ _PACK_CRITERIA: dict[str, tuple[VerificationCriterion, ...]] = {
             "指标名称、计算口径、维度和结论必须前后一致；未知口径必须明确说明。",
             source=CriterionSource.SYSTEM,
             verifier=VerifierKind.LLM_GRADER,
+            evidence_scope=EvidenceScope.RUN_ONLY,
         ),
         _criterion(
             "analytics_evidence_traceability",
             "关键数据与结论必须能追溯到本 Run 成功完成的查询、数据源或产物证据。",
             source=CriterionSource.SYSTEM,
             verifier=VerifierKind.DETERMINISTIC,
+            evidence_scope=EvidenceScope.GOAL_INHERITABLE,
         ),
     ),
     "artifact": (
@@ -94,6 +109,7 @@ _PACK_CRITERIA: dict[str, tuple[VerificationCriterion, ...]] = {
             "要求生成或更新的产物必须真实存在，并在最终回答中给出可定位的路径或引用。",
             source=CriterionSource.TASK,
             verifier=VerifierKind.DETERMINISTIC,
+            evidence_scope=EvidenceScope.ARTIFACT_BOUND,
         ),
     ),
     "code": (
@@ -102,6 +118,7 @@ _PACK_CRITERIA: dict[str, tuple[VerificationCriterion, ...]] = {
             "代码修改任务必须给出并通过与改动相称的测试、构建或静态检查。",
             source=CriterionSource.SYSTEM,
             verifier=VerifierKind.DETERMINISTIC,
+            evidence_scope=EvidenceScope.ARTIFACT_BOUND,
         ),
     ),
 }
@@ -109,9 +126,45 @@ _PACK_ORDER = ("core", "web_research", "analytics", "artifact", "code")
 
 
 class RunRubricCompiler:
-    """Build immutable declared contracts and monotonic effective contracts."""
+    """Build immutable declared contracts and material effective contracts."""
 
-    VERSION = "run-task-profile-v2"
+    VERSION = "run-task-profile-v3"
+
+    @classmethod
+    def rebuild_declared_contract(
+        cls,
+        *,
+        message: str,
+        legacy_contract: RunVerificationContract,
+    ) -> RunVerificationContract:
+        """Migrate an older Goal contract from objective truth, not prior packs.
+
+        Older Goal records may contain an effective Run contract that was
+        monotonically widened by incidental Tool work.  Reclassification of
+        the immutable Goal objective removes those historical packs while
+        preserving genuine custom criteria.
+        """
+
+        managed_ids = {
+            criterion.id
+            for pack in _PACK_CRITERIA.values()
+            for criterion in pack
+        } | {"time_scope", "report_integrity"}
+        custom_rules = tuple(
+            criterion.model_dump(mode="json")
+            for criterion in legacy_contract.criteria
+            if criterion.id not in managed_ids
+        )
+        rebuilt = cls.compile(
+            RubricBuildContext(
+                user_message=message,
+                custom_rules=custom_rules,
+                force_required=True,
+            )
+        )
+        if rebuilt is None:  # force_required makes this unreachable; fail closed.
+            raise ValueError("Could not rebuild declared Goal contract")
+        return rebuilt
 
     @classmethod
     def classify(cls, context: RubricBuildContext) -> RunTaskProfile:
@@ -182,8 +235,20 @@ class RunRubricCompiler:
             else VerificationActivation.model_validate(item)
             for item in activations
         ]
-        successful = [item for item in normalized if item.status == "succeeded"]
-        packs = list(contract.verification_packs if contract is not None else profile.initial_packs)
+        # A successful call is only an activation candidate.  Widen the
+        # effective contract only when the result became completion evidence,
+        # a cited source, or a delivered artifact.  Objective-derived packs are
+        # already present in ``profile.initial_packs`` and do not need a Tool
+        # call to become mandatory.
+        successful = [
+            item
+            for item in normalized
+            if item.status == "succeeded" and cls._is_material_activation(item)
+        ]
+        packs = list(contract.verification_packs if contract is not None else ())
+        for pack in profile.initial_packs:
+            if pack not in packs:
+                packs.append(pack)
         for activation in successful:
             if activation.pack not in packs:
                 packs.append(activation.pack)
@@ -248,39 +313,6 @@ class RunRubricCompiler:
         return effective
 
     @classmethod
-    def merge_contracts(
-        cls,
-        *,
-        base: RunVerificationContract | None,
-        expanded: RunVerificationContract | None,
-        profile: RunTaskProfile,
-        message: str,
-    ) -> RunVerificationContract | None:
-        if expanded is None:
-            return base
-        if base is None:
-            return expanded
-        synthetic = [
-            VerificationActivation(
-                activation_id=f"contract-pack-{pack}",
-                run_id="contract-merge",
-                query_id="contract-merge",
-                tool_call_id=f"contract-pack-{pack}",
-                tool_name="goal_contract",
-                pack=pack,
-                source="goal",
-            )
-            for pack in expanded.verification_packs
-            if pack not in base.verification_packs
-        ]
-        return cls.expand_for_activations(
-            contract=base,
-            profile=profile,
-            message=message,
-            activations=synthetic,
-        )
-
-    @classmethod
     def _criteria_for(
         cls,
         *,
@@ -330,6 +362,9 @@ class RunRubricCompiler:
             try:
                 verifier = VerifierKind(str(rule.get("verifier") or "llm_grader"))
                 source = CriterionSource(str(rule.get("source") or "settings"))
+                evidence_scope = EvidenceScope(
+                    str(rule.get("evidence_scope") or EvidenceScope.RUN_ONLY.value)
+                )
             except ValueError:
                 continue
             criteria.append(
@@ -339,6 +374,7 @@ class RunRubricCompiler:
                     source=source,
                     verifier=verifier,
                     required=bool(rule.get("required", True)),
+                    evidence_scope=evidence_scope,
                 )
             )
             seen.add(rule_id)
@@ -369,6 +405,7 @@ class RunRubricCompiler:
                     criterion.source.value,
                     criterion.verifier.value,
                     str(criterion.required),
+                    criterion.evidence_scope.value,
                 )
             )
             for criterion in criteria
@@ -414,6 +451,23 @@ class RunRubricCompiler:
         ordered = [pack for pack in _PACK_ORDER if pack in unique]
         ordered.extend(sorted(unique - set(_PACK_ORDER)))
         return ordered
+
+    @staticmethod
+    def packs_for_criteria(criterion_ids: set[str]) -> list[str]:
+        return [
+            pack
+            for pack in _PACK_ORDER
+            if any(criterion.id in criterion_ids for criterion in _PACK_CRITERIA.get(pack, ()))
+        ]
+
+    @staticmethod
+    def _is_material_activation(activation: VerificationActivation) -> bool:
+        return any(
+            isinstance(ref, dict)
+            and ref.get("material") is True
+            and ref.get("kind") != "tool_execution"
+            for ref in activation.evidence_refs
+        )
 
 
 __all__ = ["RubricBuildContext", "RunRubricCompiler"]

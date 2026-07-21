@@ -97,6 +97,20 @@ class VerifierKind(StrEnum):
     LLM_GRADER = "llm_grader"
 
 
+class EvidenceScope(StrEnum):
+    """When evidence for one criterion remains valid.
+
+    The scope is part of the contract rather than an implicit property of a
+    verifier implementation.  This makes cross-Run reuse auditable and keeps a
+    Goal continuation from applying a different inheritance rule per pack.
+    """
+
+    RUN_ONLY = "run_only"
+    GOAL_INHERITABLE = "goal_inheritable"
+    ARTIFACT_BOUND = "artifact_bound"
+    FRESHNESS_BOUND = "freshness_bound"
+
+
 TERMINAL_RUN_STATUSES = frozenset(
     {
         RunStatus.COMPLETED,
@@ -200,6 +214,7 @@ class VerificationCriterion(BaseModel):
     source: CriterionSource
     verifier: VerifierKind
     required: bool = True
+    evidence_scope: EvidenceScope = EvidenceScope.RUN_ONLY
 
 
 class RunTaskProfile(BaseModel):
