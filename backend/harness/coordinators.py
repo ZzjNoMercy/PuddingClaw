@@ -884,10 +884,15 @@ class HarnessRunCoordinator:
         verification_enabled: bool = True,
         goal_max_rounds: int = 8,
         custom_rubric_rules: list[dict[str, Any]] | None = None,
+        task_profile: RunTaskProfile | None = None,
     ) -> tuple[RunRecord, GoalRecord | None]:
-        task_profile = TaskProfileClassifier.classify(
-            message=objective,
-            analytics_model_id=analytics_model_id,
+        task_profile = (
+            task_profile.model_copy(deep=True)
+            if task_profile is not None
+            else TaskProfileClassifier.classify(
+                message=objective,
+                analytics_model_id=analytics_model_id,
+            )
         )
         contract = (
             self.verification.compile_contract(
@@ -1134,6 +1139,8 @@ class HarnessRunCoordinator:
         if not isinstance(persisted, dict):
             return
         current = RunRecord.model_validate(persisted)
+        run.task_profile = current.task_profile
+        run.declared_verification_contract = current.declared_verification_contract
         run.verification_activations = list(current.verification_activations)
         if current.verification_contract is not None:
             run.verification_contract = current.verification_contract

@@ -1058,6 +1058,9 @@ def test_verified_run_budget_exhaustion_never_publishes_terminal_text(tmp_path, 
     done = json.loads(next(event["data"] for event in events if event["event"] == "done"))
     history = session_manager.load_session("budget-publication-session")
 
+    assert event_names.index("task_preflight_started") < event_names.index(
+        "task_preflight_completed"
+    ) < event_names.index("task_routing_started") < event_names.index("run_started")
     assert "token" not in event_names
     assert "final_response" not in event_names
     assert "run_limit_reached" in event_names
@@ -1067,6 +1070,131 @@ def test_verified_run_budget_exhaustion_never_publishes_terminal_text(tmp_path, 
         for message in history
         if message.get("role") == "assistant"
     )
+
+
+def test_slow_task_router_never_blocks_run_or_main_agent_start(tmp_path, monkeypatch):
+    from graph import deepagents_manager as manager_module
+    from graph.session_manager import session_manager
+    from projects.registry import project_registry
+
+    session_manager.initialize(tmp_path)
+    project_registry.initialize(tmp_path)
+    session_manager.create_session("nonblocking-router-session")
+    router_started = asyncio.Event()
+
+    async def blocked_router(_self, **_kwargs):
+        router_started.set()
+        await asyncio.Event().wait()
+
+    class FakeDeepAgent:
+        async def astream(self, *_args, **_kwargs):
+            await asyncio.sleep(0)
+            yield ("values", {"messages": [AIMessage(content="你好。")]})
+
+    async def no_title(_session_id: str):
+        return None
+
+    monkeypatch.setattr(
+        manager_module.DeepAgentsAgentManager,
+        "_classify_task_profile",
+        blocked_router,
+    )
+    monkeypatch.setattr(
+        manager_module,
+        "create_deep_agent",
+        lambda **_kwargs: FakeDeepAgent(),
+    )
+    monkeypatch.setattr(manager_module, "_generate_title", no_title)
+    runtime = manager_module.DeepAgentsAgentManager()
+    runtime.initialize(Path(tmp_path))
+
+    async def collect():
+        return [
+            event
+            async for event in runtime.astream(
+                message="你好",
+                session_id="nonblocking-router-session",
+                user_id="test-user",
+            )
+        ]
+
+    events = asyncio.run(collect())
+    event_names = [event["event"] for event in events]
+    trace = session_manager.get_trace("nonblocking-router-session")
+
+    assert router_started.is_set()
+    assert event_names.index("task_routing_started") < event_names.index(
+        "run_started"
+    )
+    assert "task_routing_completed" not in event_names
+    assert "done" in event_names
+    assert trace is not None
+    router_span = next(span for span in trace["spans"] if span["name"] == "task_router")
+    assert router_span["output"]["status"] == "cancelled"
+    assert router_span["output"]["error"] == "run_finished_before_router"
+
+
+def test_task_router_timeout_is_persisted_in_trace(tmp_path, monkeypatch):
+    from graph import deepagents_manager as manager_module
+    from graph.session_manager import session_manager
+    from projects.registry import project_registry
+
+    session_manager.initialize(tmp_path)
+    project_registry.initialize(tmp_path)
+    session_manager.create_session("router-timeout-trace-session")
+
+    async def timed_out_router(_self, **_kwargs):
+        raise TimeoutError
+
+    class FakeDeepAgent:
+        async def astream(self, *_args, **_kwargs):
+            await asyncio.sleep(0)
+            yield ("values", {"messages": [AIMessage(content="你好。")]})
+
+    async def no_title(_session_id: str):
+        return None
+
+    monkeypatch.setattr(
+        manager_module.DeepAgentsAgentManager,
+        "_classify_task_profile",
+        timed_out_router,
+    )
+    monkeypatch.setattr(
+        manager_module,
+        "create_deep_agent",
+        lambda **_kwargs: FakeDeepAgent(),
+    )
+    monkeypatch.setattr(manager_module, "_generate_title", no_title)
+    runtime = manager_module.DeepAgentsAgentManager()
+    runtime.initialize(Path(tmp_path))
+
+    async def collect():
+        return [
+            event
+            async for event in runtime.astream(
+                message="你好",
+                session_id="router-timeout-trace-session",
+                user_id="test-user",
+            )
+        ]
+
+    events = asyncio.run(collect())
+    completion = next(
+        json.loads(event["data"])
+        for event in events
+        if event["event"] == "task_routing_completed"
+    )
+    trace = session_manager.get_trace("router-timeout-trace-session")
+
+    assert completion["status"] == "timed_out"
+    assert completion["blocking"] is False
+    assert trace is not None
+    router_span = next(span for span in trace["spans"] if span["name"] == "task_router")
+    assert router_span["type"] == "custom"
+    assert router_span["output"]["status"] == "timed_out"
+    assert router_span["output"]["applied"] is False
+    assert router_span["metadata"]["role"] == "task_classifier"
+    assert router_span["metadata"]["blocking"] is False
 
 
 @pytest.mark.parametrize(
@@ -1448,8 +1576,8 @@ def test_semantic_asset_middleware_owns_model_frontmatter_index(tmp_path):
         },
         runtime=None,
     )
-    assert unrelated["semantic_assets_model_id"] == ""
-    assert unrelated["semantic_assets_metadata"] == []
+    assert unrelated["semantic_assets_model_id"] == model["id"]
+    assert unrelated["allowed_semantic_asset_ids"] == [measure["id"]]
 
     inherited_goal = middleware.before_agent(
         {

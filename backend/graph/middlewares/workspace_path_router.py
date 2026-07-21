@@ -62,7 +62,15 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
         normalized = raw_path.strip().replace("\\", "/")
         if not normalized:
             return "relative", normalized
-        if normalized.startswith(cls._VIRTUAL_PREFIXES):
+        # The namespace root itself (for example ``/analytics-models``) is a
+        # valid Backend directory.  ``str.startswith('/analytics-models/')``
+        # only covered descendants and accidentally classified the root as an
+        # external host path, causing ``ls`` to be rejected before the Backend
+        # could serve it.
+        if any(
+            normalized == prefix.rstrip("/") or normalized.startswith(prefix)
+            for prefix in cls._VIRTUAL_PREFIXES
+        ):
             return "virtual", normalized
 
         requested = Path(raw_path).expanduser()

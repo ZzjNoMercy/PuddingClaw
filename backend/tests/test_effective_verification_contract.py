@@ -13,13 +13,14 @@ from harness.coordinators import CompletionVerificationCoordinator, HarnessRunCo
 from harness.deterministic_checks import evaluate_deterministic_criteria
 from harness.models import (
     RunOutcome,
+    RunRecord,
     RunStatus,
     RunTaskProfile,
     VerificationActivation,
     VerificationStatus,
 )
 from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
-from harness.task_profiles import TaskProfileClassifier
+from harness.task_profiles import SemanticTaskProfileClassifier, TaskProfileClassifier
 from harness.verification_activations import (
     VerificationActivationMiddleware,
     build_verification_activations,
@@ -91,6 +92,325 @@ def test_selected_analytics_model_is_context_not_task_intent(
     assert profile.available_context_refs == ["analytics_model:汽车行业分析模型"]
     if expected_pack:
         assert expected_pack in profile.initial_packs
+
+
+class _TaskClassifierModel:
+    def __init__(self, content: str | None = None, error: Exception | None = None):
+        self.content = content
+        self.error = error
+        self.received_messages = []
+
+    async def ainvoke(self, messages):
+        self.received_messages.append(messages)
+        if self.error is not None:
+            raise self.error
+        return AIMessage(content=self.content or "")
+
+
+@pytest.mark.asyncio
+async def test_semantic_classifier_separates_work_nature_from_delivery_form():
+    profile = await SemanticTaskProfileClassifier.classify(
+        message=(
+            "刷新产品配置分析报告到 2026 年，重算所有年份数据，并同步更新图表趋势。"
+        ),
+        analytics_model_id="产品配置分析",
+        model=_TaskClassifierModel(
+            json.dumps(
+                {
+                    "work_natures": ["重算业务指标并刷新分析报告"],
+                    "delivery_forms": ["artifact"],
+                    "verification_intents": ["database_analysis", "artifact"],
+                    "evidence": {
+                        "database_analysis": ["重算所有年份数据"],
+                        "artifact": ["刷新产品配置分析报告到 2026 年"],
+                    },
+                    "skill_candidates": [
+                        {
+                            "skill_id": "database-analysis",
+                            "confidence": 0.93,
+                            "evidence": "重算所有年份数据",
+                        }
+                    ],
+                    "explicit_skill_requests": [],
+                },
+                ensure_ascii=False,
+            )
+        ),
+        skill_catalog=[
+            {
+                "skill_id": "database-analysis",
+                "name": "database-analysis",
+                "description": "Analyze relational data.",
+            }
+        ],
+    )
+
+    assert profile.primary_intent == "database_analysis"
+    assert profile.work_natures == ["重算业务指标并刷新分析报告"]
+    assert profile.verification_intents == ["database_analysis", "artifact"]
+    assert profile.delivery_forms == ["artifact"]
+    assert profile.intents == ["database_analysis", "artifact"]
+    assert {"core", "analytics", "artifact"} <= set(profile.initial_packs)
+    assert profile.available_context_refs == ["analytics_model:产品配置分析"]
+    assert profile.classifier == "llm_semantic"
+    assert [item.skill_id for item in profile.skill_candidates] == [
+        "database-analysis"
+    ]
+    assert profile.execution_route == "skill_first"
+
+
+@pytest.mark.asyncio
+async def test_semantic_classifier_does_not_treat_selected_model_as_analytics_intent():
+    profile = await SemanticTaskProfileClassifier.classify(
+        message="解释一下 RubricMiddleware 是什么",
+        analytics_model_id="产品配置分析",
+        model=_TaskClassifierModel(
+            '{"work_natures":["解释概念"],"delivery_forms":["answer"],'
+            '"verification_intents":[],"evidence":{},"skill_candidates":[],'
+            '"explicit_skill_requests":[]}'
+        ),
+        skill_catalog=[],
+    )
+
+    assert profile.primary_intent == "general"
+    assert profile.delivery_forms == ["answer"]
+    assert "analytics" not in profile.initial_packs
+    assert profile.available_context_refs == ["analytics_model:产品配置分析"]
+
+
+@pytest.mark.asyncio
+async def test_semantic_classifier_falls_back_when_model_output_is_invalid():
+    profile = await SemanticTaskProfileClassifier.classify(
+        message="查询数据库中的月销量",
+        analytics_model_id=None,
+        model=_TaskClassifierModel("not-json"),
+        skill_catalog=[],
+    )
+
+    assert profile.primary_intent == "database_analysis"
+    assert profile.classifier == "deterministic_fallback"
+
+
+@pytest.mark.asyncio
+async def test_semantic_classifier_fallback_preserves_explicit_skill_request():
+    profile = await SemanticTaskProfileClassifier.classify(
+        message="使用 aihot Skill 和 missing-news Skill",
+        analytics_model_id=None,
+        model=_TaskClassifierModel(error=RuntimeError("provider unavailable")),
+        skill_catalog=[
+            {
+                "skill_id": "aihot",
+                "name": "aihot",
+                "description": "Query current AI news.",
+            }
+        ],
+    )
+
+    assert [item.skill_id for item in profile.skill_candidates] == ["aihot"]
+    assert profile.missing_explicit_skill_ids == ["missing-news"]
+
+
+@pytest.mark.asyncio
+async def test_semantic_classifier_routes_new_installed_skill_without_registry_entry():
+    model = _TaskClassifierModel(
+        json.dumps(
+            {
+                "work_natures": ["整理会议决策"],
+                "delivery_forms": ["artifact"],
+                "verification_intents": ["artifact"],
+                "evidence": {"artifact": ["整理成决策日志"]},
+                "skill_candidates": [
+                    {
+                        "skill_id": "decision-log",
+                        "confidence": 0.91,
+                        "evidence": "整理成决策日志",
+                    },
+                    {
+                        "skill_id": "weak-match",
+                        "confidence": 0.31,
+                        "evidence": "会议记录",
+                    },
+                ],
+                "explicit_skill_requests": [],
+            },
+            ensure_ascii=False,
+        )
+    )
+    profile = await SemanticTaskProfileClassifier.classify(
+        message="把这段会议记录整理成决策日志",
+        analytics_model_id=None,
+        model=model,
+        skill_catalog=[
+            {
+                "skill_id": "decision-log",
+                "name": "decision-log",
+                "description": "Turn meeting notes into decision logs.",
+            },
+            {
+                "skill_id": "weak-match",
+                "name": "weak-match",
+                "description": "A weakly related workflow.",
+            },
+        ],
+    )
+
+    assert [item.skill_id for item in profile.skill_candidates] == ["decision-log"]
+    assert profile.execution_route == "skill_first"
+    assert "decision-log" in str(model.received_messages[0][0].content)
+    assert "Turn meeting notes into decision logs" in str(
+        model.received_messages[0][0].content
+    )
+
+
+@pytest.mark.asyncio
+async def test_semantic_classifier_prioritizes_explicit_skill_and_reports_missing():
+    profile = await SemanticTaskProfileClassifier.classify(
+        message="使用 aihot Skill，并同时使用 missing-news Skill",
+        analytics_model_id=None,
+        model=_TaskClassifierModel(
+            json.dumps(
+                {
+                    "work_natures": ["查询 AI 新闻"],
+                    "delivery_forms": ["answer"],
+                    "verification_intents": ["ai_insights"],
+                    "evidence": {"ai_insights": ["AI 新闻"]},
+                    "skill_candidates": [],
+                    "explicit_skill_requests": ["aihot", "missing-news"],
+                },
+                ensure_ascii=False,
+            )
+        ),
+        skill_catalog=[
+            {
+                "skill_id": "aihot",
+                "name": "aihot",
+                "description": "Query current AI news.",
+            }
+        ],
+    )
+
+    assert profile.skill_candidates[0].skill_id == "aihot"
+    assert profile.skill_candidates[0].explicit is True
+    assert profile.missing_explicit_skill_ids == ["missing-news"]
+    assert profile.native_fallback is False
+
+
+def test_semantic_router_enhancement_only_adds_to_deterministic_baseline():
+    baseline = TaskProfileClassifier.classify(
+        message="更新报告",
+        analytics_model_id="model-1",
+        skill_catalog=[],
+    )
+    semantic = TaskProfileClassifier.profile_from_dimensions(
+        work_natures=["重算产品配置指标"],
+        delivery_forms=["answer"],
+        verification_intents=["database_analysis"],
+        skill_candidates=[
+            {
+                "skill_id": "database-analysis",
+                "confidence": 0.92,
+                "evidence": "重算产品配置指标",
+            }
+        ],
+        analytics_model_id="model-1",
+        classifier="llm_semantic",
+    )
+
+    merged = TaskProfileClassifier.merge_semantic_enhancement(
+        baseline,
+        semantic,
+        analytics_model_id="model-1",
+    )
+
+    assert {"artifact", "database_analysis"} <= set(merged.intents)
+    assert {"artifact", "analytics"} <= set(merged.initial_packs)
+    assert [item.skill_id for item in merged.skill_candidates] == [
+        "database-analysis"
+    ]
+    assert merged.available_context_refs == ["analytics_model:model-1"]
+    assert merged.classifier == "llm_semantic"
+
+
+def test_async_router_can_enhance_preparing_run_but_not_running_contract(tmp_path):
+    sessions = SessionManager()
+    sessions.initialize(tmp_path)
+    sessions.create_session("router-enhancement-session")
+    coordinator = HarnessRunCoordinator(sessions)
+    baseline = TaskProfileClassifier.classify(message="更新报告")
+    run, _ = coordinator.start_run(
+        session_id="router-enhancement-session",
+        query_id="query-router-enhancement",
+        objective="更新报告并重算配置指标",
+        goal_mode=False,
+        task_profile=baseline,
+    )
+    semantic = TaskProfileClassifier.profile_from_dimensions(
+        work_natures=["重算配置指标"],
+        delivery_forms=["artifact"],
+        verification_intents=["database_analysis"],
+        classifier="llm_semantic",
+    )
+
+    saved, applied = sessions.enhance_run_task_profile(
+        run.session_id,
+        run.run_id,
+        semantic.model_dump(mode="json"),
+    )
+
+    assert applied is True
+    assert {"artifact", "analytics"} <= set(
+        saved["verification_contract"]["verification_packs"]
+    )
+
+    persisted_run = sessions.get_run_state(run.session_id, run.run_id)
+    assert persisted_run is not None
+    live_run = RunRecord.model_validate(persisted_run)
+    coordinator.transition(live_run, RunStatus.RUNNING)
+    later = TaskProfileClassifier.profile_from_dimensions(
+        work_natures=["联网研究"],
+        delivery_forms=["answer"],
+        verification_intents=["web_research"],
+        classifier="llm_semantic",
+    )
+    unchanged, applied_late = sessions.enhance_run_task_profile(
+        live_run.session_id,
+        live_run.run_id,
+        later.model_dump(mode="json"),
+    )
+
+    assert applied_late is False
+    assert "web_research" not in unchanged["verification_contract"][
+        "verification_packs"
+    ]
+
+
+def test_run_coordinator_accepts_semantic_task_profile(tmp_path):
+    from graph.session_manager import SessionManager
+
+    sessions = SessionManager()
+    sessions.initialize(tmp_path)
+    sessions.create_session("semantic-profile-session")
+    profile = TaskProfileClassifier.profile_from_dimensions(
+        work_natures=["database_analysis"],
+        delivery_forms=["artifact"],
+        analytics_model_id="产品配置分析",
+        classifier="llm_semantic",
+    )
+
+    run, _goal = HarnessRunCoordinator(sessions).start_run(
+        session_id="semantic-profile-session",
+        query_id="query-semantic-profile",
+        objective="刷新报告并重算历史数据",
+        goal_mode=False,
+        analytics_model_id="产品配置分析",
+        task_profile=profile,
+    )
+
+    assert run.task_profile.classifier == "llm_semantic"
+    assert run.verification_contract is not None
+    assert {"analytics", "artifact"} <= set(
+        run.verification_contract.verification_packs
+    )
 
 
 def test_selected_model_does_not_change_contract_semantics():

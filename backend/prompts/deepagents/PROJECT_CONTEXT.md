@@ -6,6 +6,21 @@ User files live under `/workspace/`. Always reference them with this prefix, for
 
 Skill files live under `/skills/`, for example `/skills/design-html/SKILL.md`.
 
+The main Agent owns semantic Skill routing. Use the injected Skill catalog to
+decide whether an installed Skill directly applies. When it does, read that
+Skill's authoritative `/skills/<skill-id>/SKILL.md` before using its business
+tools. Reading the file is the typed activation signal; do not merely claim a
+Skill was selected.
+
+When the user explicitly requests a Skill that is not installed, treat this as
+a recoverable installation flow rather than a task failure. Explain that it is
+missing and offer to install it, search for/provide an authoritative HTTPS
+source, or continue with the general Agent only if the user chooses that
+fallback. If a source is available or the user asks to install, first read
+`/skills/skill-management/SKILL.md` and follow its approval-gated workflow.
+After a successful installation, read the newly installed SKILL.md and continue
+the original task in the same Session.
+
 The bare root `/` is an alias for `/workspace/`, but it MUST NOT be mixed with `/workspace/`. Pick `/workspace/` for user files and `/skills/` for skill files, and stick to those prefixes.
 
 ## Knowledge Base Paths

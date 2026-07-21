@@ -9,7 +9,8 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ModelRequest, ModelResponse
 from langchain_core.messages import HumanMessage
 
-from harness.task_profiles import TaskProfileClassifier
+from graph.session_manager import session_manager
+from harness.models import RunTaskProfile
 
 _MARKER = "[系统 Skill 提示]"
 
@@ -21,16 +22,50 @@ class SkillIntentRouterMiddleware(AgentMiddleware):
     ``read_file(/skills/<id>/SKILL.md)`` is the only activation signal.
     """
 
-    def _classify_intent(self, text: str) -> dict[str, Any]:
-        profile = TaskProfileClassifier.classify(message=text)
-        skills = TaskProfileClassifier.skill_ids(profile)
-        if not skills:
-            return {"matched": False, "skill_ids": [], "routing_prompt": ""}
-        paths = ", ".join(f"/skills/{skill_id}/SKILL.md" for skill_id in skills)
+    def _routing_decision(
+        self,
+        profile_payload: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        try:
+            profile = RunTaskProfile.model_validate(profile_payload)
+        except Exception:
+            return {
+                "matched": False,
+                "skill_ids": [],
+                "missing_explicit_skill_ids": [],
+                "routing_prompt": "",
+            }
+        candidates = sorted(
+            profile.skill_candidates,
+            key=lambda item: (not item.explicit, -item.confidence),
+        )
+        skill_ids = [item.skill_id for item in candidates]
+        missing = list(profile.missing_explicit_skill_ids)
+        if not skill_ids and not missing:
+            return {
+                "matched": False,
+                "skill_ids": [],
+                "missing_explicit_skill_ids": [],
+                "routing_prompt": "",
+            }
+        paths = ", ".join(f"/skills/{skill_id}/SKILL.md" for skill_id in skill_ids)
+        missing_notice = (
+            "用户明确指定但当前未安装以下 Skill："
+            f"{', '.join(missing)}。这是可恢复的安装流程，不是任务失败。"
+            if missing
+            else ""
+        )
+        load_notice = (
+            "先读取以下语义匹配的 SKILL.md，再按其中流程执行："
+            f"{paths}。不要猜测尚未加载 Skill 的业务工具。"
+            if skill_ids
+            else ""
+        )
         return {
             "matched": True,
-            "skill_ids": skills,
-            "routing_prompt": f"本轮问题匹配到项目 Skill。先读取以下最相关的 SKILL.md，再按其中流程执行：{paths}。不要猜测尚未加载 Skill 的业务工具。",
+            "skill_ids": skill_ids,
+            "missing_explicit_skill_ids": missing,
+            "routing_prompt": " ".join(item for item in (missing_notice, load_notice) if item),
         }
 
     def _request_with_routing_prompt(self, request: ModelRequest) -> ModelRequest:
@@ -41,17 +76,43 @@ class SkillIntentRouterMiddleware(AgentMiddleware):
             return request
         original = messages[index]
         content = original.content.split(f"\n\n{_MARKER}")[0]
-        decision = self._classify_intent(content)
+        profile_payload = (
+            request.state.get("task_profile")
+            if isinstance(request.state.get("task_profile"), dict)
+            else None
+        )
+        runtime = request.runtime
+        context = runtime.context if runtime is not None and isinstance(runtime.context, dict) else {}
+        session_id = str(context.get("session_id") or "")
+        run_id = str(context.get("run_id") or "")
+        persisted = session_manager.get_run_state(session_id, run_id) if session_id and run_id else None
+        if isinstance(persisted, dict) and isinstance(persisted.get("task_profile"), dict):
+            profile_payload = persisted["task_profile"]
+        decision = self._routing_decision(profile_payload)
         if not decision["matched"]:
             return request
         active_skill_ids = {str(item) for item in request.state.get("active_skill_ids") or []}
         missing_skill_ids = [skill_id for skill_id in decision["skill_ids"] if skill_id not in active_skill_ids]
-        if not missing_skill_ids:
+        if not missing_skill_ids and not decision["missing_explicit_skill_ids"]:
             return request
         paths = ", ".join(f"/skills/{skill_id}/SKILL.md" for skill_id in missing_skill_ids)
-        routing_prompt = (
-            "本轮问题匹配到尚未加载的项目 Skill。先读取以下最相关的 SKILL.md，再按其中流程执行："
-            f"{paths}。不要猜测尚未加载 Skill 的业务工具。"
+        missing_notice = (
+            "用户明确指定但当前未安装以下 Skill："
+            f"{', '.join(decision['missing_explicit_skill_ids'])}。"
+            "不要假装已经加载，也不要直接判定任务失败。向用户提供安装并继续、提供或搜索权威 HTTPS 来源、"
+            "以及由用户明确选择通用 Agent 执行三种恢复方式。若已有来源或用户要求安装，先读取 "
+            "/skills/skill-management/SKILL.md，按其中审批流程安装；安装成功后读取新 Skill 并继续原任务。"
+            if decision["missing_explicit_skill_ids"]
+            else ""
+        )
+        load_notice = (
+            "本轮任务已由统一路由器匹配到尚未加载的项目 Skill。先读取："
+            f"{paths}。再按其中流程执行；不要猜测尚未加载 Skill 的业务工具。"
+            if missing_skill_ids
+            else ""
+        )
+        routing_prompt = " ".join(
+            item for item in (missing_notice, load_notice) if item
         )
         messages[index] = original.model_copy(
             update={"content": f"{content}\n\n{_MARKER} {routing_prompt}"}

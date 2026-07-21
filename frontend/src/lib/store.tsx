@@ -2517,6 +2517,54 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             continue;
           }
 
+          if (event.event === "task_preflight_started") {
+            continue;
+          }
+
+          if (event.event === "task_preflight_completed") {
+            continue;
+          }
+
+          if (event.event === "skill_install_required") {
+            const skillIds = Array.isArray(event.data.skill_ids)
+              ? event.data.skill_ids.map(String).filter(Boolean)
+              : [];
+            updateSessionRunActivity(sendSessionId, {
+              phase: "running",
+              label: "Agent 正在准备 Skill 安装恢复方案",
+              detail: skillIds.length > 0 ? `尚未安装：${skillIds.join("、")}` : undefined,
+            });
+            continue;
+          }
+
+          if (event.event === "task_routing_started") {
+            continue;
+          }
+
+          if (event.event === "task_routing_completed") {
+            // The semantic Router is a non-blocking soft enhancement. Its
+            // timeout/fallback is diagnostic Trace data, not a user-actionable
+            // chat state, so never flash it over the main Agent activity.
+            if (event.data.blocking === false) {
+              continue;
+            }
+            const route = String(event.data.execution_route || "").trim();
+            const skills = Array.isArray(event.data.skill_candidates)
+              ? event.data.skill_candidates.map(String).filter(Boolean)
+              : [];
+            const detail = skills.length > 0
+              ? `Skill 优先：${skills.join("、")}`
+              : route === "native"
+                ? "使用通用 Agent 执行"
+                : "执行路线已确定";
+            updateSessionRunActivity(sendSessionId, {
+              phase: "running",
+              label: "Agent 正在处理",
+              detail: `${String(event.data.label || "任务识别与执行路线已确定")} · ${detail}`,
+            });
+            continue;
+          }
+
           if (event.event === "run_started") {
             const run = event.data.run as unknown as HarnessRun;
             correctingVerificationGap = false;

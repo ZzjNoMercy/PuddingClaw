@@ -628,6 +628,18 @@ def test_thinking_mode_switches_to_thinking_model(tmp_path, monkeypatch):
     assert rubric_gateway["extra_body"] is None
 
 
+def test_default_agent_routing_and_rubric_models_use_pro(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
+
+    loaded = config.load_config()
+
+    assert loaded["gateway_llm"]["model"] == "deepseek-v4-pro"
+    assert loaded["fallback_llm"]["model"] == "deepseek-v4-pro"
+    assert loaded["harness"]["completion"]["rubric"]["model"] == "deepseek-v4-pro"
+
+
 def test_settings_api_accepts_thinking_mode(tmp_path, monkeypatch):
     """PUT /api/settings must persist the thinking_mode toggle from the dialog."""
     config_path = tmp_path / "config.json"

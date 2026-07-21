@@ -26,7 +26,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     },
     "gateway_llm": {
         # Higress 可用时实际使用的模型；与 fallback_llm 分离，避免和 fallback 直连配置混淆
-        "model": "deepseek-v4-flash",
+        "model": "deepseek-v4-pro",
         # 思考模式开关开启时使用的模型与参数（DeepSeek 通过 extra_body 启用 thinking）
         "thinking": {
             "model": "deepseek-v4-pro",
@@ -36,7 +36,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     },
     "fallback_llm": {
         "provider": "deepseek",
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-pro",
         "base_url": "https://api.deepseek.com",
         "api_key": "",
         "temperature": 0.7,
@@ -284,9 +284,9 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         "completion": {
             "rubric": {
                 "enabled": True,
-                # Empty means: use fallback_llm.model with thinking disabled.
-                # Structured grading must not inherit a thinking-only gateway model.
-                "model": "",
+                # Task classification, permission review and completion grading
+                # share this non-thinking model unless a deployment overrides it.
+                "model": "deepseek-v4-pro",
                 "max_iterations": 2,
                 "custom_rules_enabled": False,
                 "custom_rules": [],

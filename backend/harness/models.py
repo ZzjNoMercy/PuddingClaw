@@ -217,13 +217,31 @@ class VerificationCriterion(BaseModel):
     evidence_scope: EvidenceScope = EvidenceScope.RUN_ONLY
 
 
+class SkillCandidate(BaseModel):
+    """One installed Skill selected by the task-understanding router."""
+
+    skill_id: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    evidence: str = ""
+    explicit: bool = False
+
+
 class RunTaskProfile(BaseModel):
     """Run-local task classification independent from selected model context."""
 
     primary_intent: str = "general"
     intents: list[str] = Field(default_factory=list)
+    work_natures: list[str] = Field(default_factory=list)
+    delivery_forms: list[str] = Field(default_factory=list)
+    verification_intents: list[str] = Field(default_factory=list)
+    skill_candidates: list[SkillCandidate] = Field(default_factory=list)
+    missing_explicit_skill_ids: list[str] = Field(default_factory=list)
+    execution_route: Literal["skill_first", "native", "missing_skill"] = "native"
+    native_fallback: bool = True
     initial_packs: list[str] = Field(default_factory=list)
     available_context_refs: list[str] = Field(default_factory=list)
+    classification_evidence: dict[str, list[str]] = Field(default_factory=dict)
+    classifier: str = "deterministic_fallback"
     reasons: list[str] = Field(default_factory=list)
 
 

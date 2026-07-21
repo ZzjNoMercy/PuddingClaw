@@ -154,6 +154,16 @@ _SHELLS = frozenset({"sh", "bash", "zsh"})
 _SHELL_META_PATTERN = re.compile(r"(`|\$\(|\$\{|\n|<<)")
 _ENV_ASSIGNMENT_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", re.DOTALL)
 _NETWORK_URL_PATTERN = re.compile(r"\b(?:https?|wss?)://", re.IGNORECASE)
+_NON_MATERIAL_REDIRECT_SINKS = frozenset(
+    {
+        "-",
+        "/dev/null",
+        "/dev/stdout",
+        "/dev/stderr",
+        "/proc/self/fd/1",
+        "/proc/self/fd/2",
+    }
+)
 _EMBEDDED_NETWORK_API_PATTERN = re.compile(
     r"(?:urllib(?:\.request)?|urlopen\s*\(|requests\.|httpx\.|aiohttp|"
     r"socket\.|http\.client|fetch\s*\(|axios\.|https?\.request\s*\(|node:https?)",
@@ -292,29 +302,24 @@ class ShellPolicyAnalyzer:
         defeats an otherwise valid Session network grant.
         """
 
-        safe_sinks = {
-            "-",
-            "/dev/null",
-            "/dev/stdout",
-            "/dev/stderr",
-            "/proc/self/fd/1",
-            "/proc/self/fd/2",
-        }
         index = 1
         while index < len(tokens):
             argument = tokens[index]
             if argument in {"-O", "--remote-name", "--remote-header-name", "-OJ"}:
                 return True
             if argument in {"-o", "--output"}:
-                if index + 1 >= len(tokens) or tokens[index + 1] not in safe_sinks:
+                if (
+                    index + 1 >= len(tokens)
+                    or tokens[index + 1] not in _NON_MATERIAL_REDIRECT_SINKS
+                ):
                     return True
                 index += 2
                 continue
             if argument.startswith("--output="):
-                if argument.partition("=")[2] not in safe_sinks:
+                if argument.partition("=")[2] not in _NON_MATERIAL_REDIRECT_SINKS:
                     return True
             elif argument.startswith("-o") and len(argument) > 2:
-                if argument[2:] not in safe_sinks:
+                if argument[2:] not in _NON_MATERIAL_REDIRECT_SINKS:
                     return True
             index += 1
         return False
@@ -762,18 +767,34 @@ class ShellPolicyAnalyzer:
         segments: list[list[str]] = []
         current: list[str] = []
         has_write_redirect = False
-        for token in tokens:
+        for index, token in enumerate(tokens):
             if token in {"&&", "||", ";", "|", "&"}:
                 if current:
                     segments.append(current)
                     current = []
                 continue
-            if token in {">", ">>", "<", "2>", "2>>", "&>"} or set(token) <= {
+            is_redirect = token in {
+                ">",
+                ">>",
+                "<",
+                "2>",
+                "2>>",
+                "&>",
+                "&>>",
+                ">&",
+            } or set(token) <= {
                 ">",
                 "<",
-            }:
+            }
+            if is_redirect:
                 if ">" in token:
-                    has_write_redirect = True
+                    target = tokens[index + 1] if index + 1 < len(tokens) else ""
+                    duplicates_fd = token == ">&" and target.isdigit()
+                    if (
+                        not duplicates_fd
+                        and target not in _NON_MATERIAL_REDIRECT_SINKS
+                    ):
+                        has_write_redirect = True
                 continue
             current.append(token)
         if current:

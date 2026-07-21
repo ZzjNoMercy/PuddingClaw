@@ -78,6 +78,43 @@ def test_absolute_workspace_path_is_rewritten_before_ls(tmp_path):
     assert captured["args"]["path"] == "/workspace/reports"
 
 
+def test_virtual_namespace_roots_are_not_misclassified_as_external(tmp_path):
+    from graph.middlewares.workspace_path_router import WorkspacePathRouterMiddleware
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    observed: list[str] = []
+
+    def handler(request):
+        observed.append(request.tool_call["args"]["path"])
+        return ToolMessage(
+            content="[]",
+            name="ls",
+            tool_call_id=str(request.tool_call["id"]),
+            status="success",
+        )
+
+    roots = [
+        "/workspace",
+        "/knowledge",
+        "/semantic-assets",
+        "/sql-guardrails",
+        "/analytics-models",
+        "/skills",
+        "/large_tool_results",
+        "/scratch",
+    ]
+    middleware = WorkspacePathRouterMiddleware()
+    for index, root in enumerate(roots):
+        result = middleware.wrap_tool_call(
+            _request("ls", {"path": root}, workspace, call_id=f"call-{index}"),
+            handler,
+        )
+        assert result.status == "success"
+
+    assert observed == roots
+
+
 def test_external_read_file_routes_to_read_resource_with_pagination(tmp_path, monkeypatch):
     import graph.middlewares.workspace_path_router as module
     from graph.middlewares.workspace_path_router import WorkspacePathRouterMiddleware

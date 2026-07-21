@@ -95,7 +95,11 @@ from graph.middlewares.tool_protocol import (
     pending_executable_tool_call_ids,
     repair_tool_message_protocol,
 )
-from graph.middlewares.toolset import ToolsetMiddleware, discover_skill_toolsets
+from graph.middlewares.toolset import (
+    ToolsetMiddleware,
+    discover_skill_catalog,
+    discover_skill_toolsets,
+)
 from graph.middlewares.versioned_patch import VersionedPatchMiddleware
 from graph.middlewares.workspace_path_router import WorkspacePathRouterMiddleware
 from graph.permission_middleware import ExternalFilePermissionMiddleware
@@ -128,6 +132,7 @@ from harness.models import (
 )
 from harness.permission_reviewer import ModelPermissionReviewer, PermissionReviewer
 from harness.rubric_compiler import RunRubricCompiler
+from harness.task_profiles import SemanticTaskProfileClassifier, TaskProfileClassifier
 from harness.tool_execution import ToolExecutionPipeline
 from harness.verification_activations import (
     VerificationActivationMiddleware,
@@ -142,6 +147,12 @@ from tools.package_install import create_install_packages_tool
 from tools.toolsets import agent_custom_tool_names, tool_control_descriptor
 
 logger = logging.getLogger(__name__)
+
+_TASK_ROUTER_TIMEOUT_SECONDS = 15.0
+_TASK_PROFILE_CONTINUATION_RE = re.compile(
+    r"^(?:继续|继续处理|继续执行|继续完成|接着做|接着处理|再试一次|重试|重试一次|继续吧)[。.!！?？\s]*$",
+    flags=re.IGNORECASE,
+)
 
 _INTERNAL_CONTROL_SOURCES = frozenset(
     {
@@ -1830,7 +1841,7 @@ async def _generate_title(session_id: str) -> str | None:
 
         from llm.model_client import ModelClient
 
-        llm = ModelClient(role="title", temperature=0.3)
+        llm = ModelClient(role="title", temperature=0.3, thinking_enabled=False)
         prompt = (
             "根据以下对话内容，生成一个不超过10个字的中文标题，只输出标题文本，不要加引号或标点。\n\n"
             f"用户: {first_user}\n"
@@ -2513,54 +2524,19 @@ class DeepAgentsAgentManager:
             )
         return mounted
 
-    @staticmethod
-    def _extract_skill_frontmatter(text: str, fallback_name: str) -> dict[str, str]:
-        name = fallback_name
-        description = ""
-        if text.startswith("---"):
-            match = re.match(r"^---\n(.*?)\n---", text, flags=re.S)
-            if match:
-                for line in match.group(1).splitlines():
-                    if line.startswith("name:"):
-                        name = line.split(":", 1)[1].strip().strip("'\"") or name
-                    elif line.startswith("description:"):
-                        description = line.split(":", 1)[1].strip().strip("'\"")
-        if not description:
-            for line in text.splitlines():
-                stripped = line.strip()
-                if stripped and not stripped.startswith("#") and not stripped.startswith("---"):
-                    description = stripped[:240]
-                    break
-        return {"name": name, "description": description}
-
     def _skills_inventory(self) -> list[dict[str, Any]]:
         assert self._base_dir is not None
-        skills_dir = self._base_dir / "skills"
-        if not skills_dir.exists():
-            return []
-        skills: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for skill_md in sorted(skills_dir.rglob("SKILL.md")):
-            try:
-                text = skill_md.read_text(encoding="utf-8")
-            except Exception:
-                continue
-            info = self._extract_skill_frontmatter(text, skill_md.parent.name)
-            if info["name"] in seen:
-                continue
-            seen.add(info["name"])
-            location = str(skill_md.relative_to(self._base_dir))
-            skills.append(
-                {
-                    "name": info["name"],
-                    "description": info["description"],
-                    "location": location,
-                    "system_prompt_source": "/skills/",
-                    "in_system_prompt": True,
-                    "href": f"/skills?skill={info['name']}",
-                }
-            )
-        return skills
+        return [
+            {
+                "name": item["name"],
+                "description": item["description"],
+                "location": item["path"].lstrip("/"),
+                "system_prompt_source": "/skills/",
+                "in_system_prompt": True,
+                "href": f"/skills?skill={item['skill_id']}",
+            }
+            for item in discover_skill_catalog(self._base_dir / "skills")
+        ]
 
     def _runtime_inventory(
         self,
@@ -3027,6 +3003,83 @@ class DeepAgentsAgentManager:
         if not links:
             return ""
         return "\n\n产物：\n" + "\n".join(links)
+
+    def _build_preflight_task_profile(
+        self,
+        *,
+        objective: str,
+        analytics_model_id: str | None,
+        skill_catalog: list[dict[str, Any]],
+    ) -> RunTaskProfile:
+        """Build non-semantic Run safety state before the main Agent starts.
+
+        Installed Skill selection deliberately does not happen here.  The main
+        Agent receives the dynamic catalog and selects a Skill by reading its
+        authoritative SKILL.md, which ToolsetMiddleware records on the Run.
+        """
+
+        return TaskProfileClassifier.classify(
+            message=objective,
+            analytics_model_id=analytics_model_id,
+            skill_catalog=skill_catalog,
+        )
+
+    async def _classify_task_profile(
+        self,
+        *,
+        objective: str,
+        analytics_model_id: str | None,
+        model_override: str | None,
+        skill_catalog: list[dict[str, Any]],
+    ) -> RunTaskProfile:
+        """Run the semantic Router as a bounded soft enhancement."""
+
+        router_model = ModelClientChatModel(
+            role="task_classifier",
+            temperature=0,
+            streaming=False,
+            thinking_enabled=False,
+            model_override=model_override or None,
+        )
+        return await asyncio.wait_for(
+            SemanticTaskProfileClassifier.classify(
+                message=objective,
+                analytics_model_id=analytics_model_id,
+                model=router_model,
+                skill_catalog=skill_catalog,
+            ),
+            timeout=_TASK_ROUTER_TIMEOUT_SECONDS,
+        )
+
+    @staticmethod
+    def _reusable_task_profile(
+        *,
+        session_id: str,
+        message: str,
+        analytics_model_id: str | None,
+        internal_continuation: bool,
+    ) -> RunTaskProfile | None:
+        """Reuse the latest task understanding for explicit continuations."""
+
+        if not internal_continuation and not _TASK_PROFILE_CONTINUATION_RE.fullmatch(
+            message.strip()
+        ):
+            return None
+        previous = session_manager.get_run_state(session_id)
+        profile_payload = previous.get("task_profile") if isinstance(previous, dict) else None
+        if not isinstance(profile_payload, dict):
+            return None
+        try:
+            profile = RunTaskProfile.model_validate(profile_payload)
+        except Exception:
+            return None
+        profile.available_context_refs = (
+            [f"analytics_model:{analytics_model_id}"] if analytics_model_id else []
+        )
+        if "reused_for_continuation" not in profile.reasons:
+            profile.reasons.append("reused_for_continuation")
+        profile.classifier = "session_continuation"
+        return profile
 
     def _analytics_model_context(self, analytics_model_id: str | None) -> tuple[str, dict[str, Any] | None]:
         if not analytics_model_id:
@@ -4454,6 +4507,9 @@ class DeepAgentsAgentManager:
         user_message_persisted = user_message_already_persisted
         title_task: asyncio.Task[str | None] | None = None
         title_event_emitted = False
+        task_router_task: asyncio.Task[dict[str, Any]] | None = None
+        task_router_event_emitted = False
+        task_router_trace_recorded = False
         checkpoint_thread_id = f"{session_id}:{query_id}"
         try:
             thinking_enabled = bool(config.load_config().get("thinking_mode", False))
@@ -4507,11 +4563,65 @@ class DeepAgentsAgentManager:
             harness_config = config.load_config().get("harness", {})
             goals_config = harness_config.get("goals", {})
             rubric_config = harness_config.get("completion", {}).get("rubric", {})
+            rubric_model_name = str(rubric_config.get("model") or "").strip()
+            if not rubric_model_name:
+                rubric_model_name = str(
+                    config.get_fallback_llm_config(
+                        thinking_enabled_override=False,
+                    ).get("model")
+                    or ""
+                ).strip()
             goal_max_rounds = goals_config.get("max_rounds", 8)
             if not isinstance(goal_max_rounds, int) or isinstance(goal_max_rounds, bool) or goal_max_rounds <= 0:
                 goal_max_rounds = 8
             if goal_mode and not goals_config.get("enabled", True):
                 raise ValueError("Goal Mode is disabled by Harness Settings.")
+            yield self._sse(
+                "task_preflight_started",
+                {
+                    "session_id": session_id,
+                    "query_id": query_id,
+                    "label": "正在准备权限、附件与任务上下文",
+                },
+            )
+            skill_catalog = discover_skill_catalog(self._base_dir / "skills")
+            reused_task_profile = self._reusable_task_profile(
+                session_id=session_id,
+                message=message,
+                analytics_model_id=analytics_model_id,
+                internal_continuation=internal_continuation,
+            )
+            task_profile = reused_task_profile or self._build_preflight_task_profile(
+                objective=run_objective or message,
+                analytics_model_id=analytics_model_id,
+                skill_catalog=skill_catalog,
+            )
+            explicit_skills = [
+                candidate.skill_id
+                for candidate in task_profile.skill_candidates
+                if candidate.skill_id and candidate.explicit
+            ]
+            yield self._sse(
+                "task_preflight_completed",
+                {
+                    "session_id": session_id,
+                    "query_id": query_id,
+                    "label": "任务上下文已准备",
+                    "execution_route": task_profile.execution_route,
+                    "explicit_skill_ids": explicit_skills,
+                    "missing_skill_ids": list(task_profile.missing_explicit_skill_ids),
+                },
+            )
+            if task_profile.missing_explicit_skill_ids:
+                yield self._sse(
+                    "skill_install_required",
+                    {
+                        "session_id": session_id,
+                        "query_id": query_id,
+                        "skill_ids": list(task_profile.missing_explicit_skill_ids),
+                        "label": "指定的 Skill 尚未安装，Agent 将引导安装或选择通用执行",
+                    },
+                )
             run_record, goal_record = self._run_coordinator.start_run(
                 session_id=session_id,
                 query_id=query_id,
@@ -4532,7 +4642,212 @@ class DeepAgentsAgentManager:
                     if rubric_config.get("custom_rules_enabled", False)
                     else []
                 ),
+                task_profile=task_profile,
             )
+
+            async def route_task_in_background() -> dict[str, Any]:
+                started_at = time.monotonic()
+                try:
+                    semantic_profile = await self._classify_task_profile(
+                        objective=run_record.objective,
+                        analytics_model_id=analytics_model_id,
+                        model_override=rubric_model_name or None,
+                        skill_catalog=skill_catalog,
+                    )
+                    saved_run, applied = await asyncio.to_thread(
+                        session_manager.enhance_run_task_profile,
+                        session_id,
+                        run_record.run_id,
+                        semantic_profile.model_dump(mode="json"),
+                    )
+                    saved_profile = saved_run.get("task_profile")
+                    return {
+                        "status": "completed",
+                        "applied": applied,
+                        "duration_ms": round((time.monotonic() - started_at) * 1000, 2),
+                        "task_profile": (
+                            saved_profile if isinstance(saved_profile, dict) else {}
+                        ),
+                    }
+                except TimeoutError:
+                    logger.warning(
+                        "Task Router timed out after %.1fs for session=%s run=%s; "
+                        "continuing with deterministic baseline",
+                        _TASK_ROUTER_TIMEOUT_SECONDS,
+                        session_id,
+                        run_record.run_id,
+                    )
+                    return {
+                        "status": "timed_out",
+                        "applied": False,
+                        "duration_ms": round((time.monotonic() - started_at) * 1000, 2),
+                        "task_profile": run_record.task_profile.model_dump(mode="json"),
+                    }
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "Task Router failed for session=%s run=%s: %s; "
+                        "continuing with deterministic baseline",
+                        session_id,
+                        run_record.run_id,
+                        exc,
+                        exc_info=True,
+                    )
+                    return {
+                        "status": "failed",
+                        "applied": False,
+                        "duration_ms": round((time.monotonic() - started_at) * 1000, 2),
+                        "error": str(exc),
+                        "task_profile": run_record.task_profile.model_dump(mode="json"),
+                    }
+
+            if reused_task_profile is None:
+                task_router_task = asyncio.create_task(route_task_in_background())
+
+            def task_router_completion_event() -> dict[str, str] | None:
+                if task_router_task is None or not task_router_task.done():
+                    return None
+                if task_router_task.cancelled():
+                    result: dict[str, Any] = {
+                        "status": "cancelled",
+                        "applied": False,
+                        "task_profile": run_record.task_profile.model_dump(mode="json"),
+                    }
+                else:
+                    try:
+                        result = task_router_task.result()
+                    except Exception as exc:
+                        result = {
+                            "status": "failed",
+                            "applied": False,
+                            "error": str(exc),
+                            "task_profile": run_record.task_profile.model_dump(mode="json"),
+                        }
+                profile_payload = result.get("task_profile")
+                profile = (
+                    profile_payload if isinstance(profile_payload, dict) else {}
+                )
+                candidates = [
+                    str(item.get("skill_id") or "")
+                    for item in profile.get("skill_candidates") or []
+                    if isinstance(item, dict) and str(item.get("skill_id") or "")
+                ]
+                status = str(result.get("status") or "failed")
+                label = (
+                    "任务理解与 Skill 候选已补充"
+                    if status == "completed" and result.get("applied")
+                    else "任务路由无需补充，继续使用当前任务画像"
+                    if status == "completed"
+                    else "任务路由超时，已使用确定性任务画像继续执行"
+                    if status == "timed_out"
+                    else "任务路由不可用，已使用确定性任务画像继续执行"
+                )
+                return self._sse(
+                    "task_routing_completed",
+                    {
+                        "session_id": session_id,
+                        "query_id": query_id,
+                        "run_id": run_record.run_id,
+                        "label": label,
+                        "status": status,
+                        "applied": bool(result.get("applied")),
+                        "blocking": False,
+                        "duration_ms": result.get("duration_ms"),
+                        "execution_route": profile.get("execution_route", "native"),
+                        "skill_candidates": candidates,
+                    },
+                )
+
+            def record_task_router_trace(
+                collector: TraceCollector,
+                *,
+                settle_pending: bool = False,
+            ) -> None:
+                nonlocal task_router_trace_recorded
+                if task_router_trace_recorded or task_router_task is None:
+                    return
+                if not task_router_task.done():
+                    if not settle_pending:
+                        return
+                    task_router_task.cancel()
+                    result: dict[str, Any] = {
+                        "status": "cancelled",
+                        "applied": False,
+                        "error": "run_finished_before_router",
+                    }
+                elif task_router_task.cancelled():
+                    result: dict[str, Any] = {
+                        "status": "cancelled",
+                        "applied": False,
+                    }
+                else:
+                    try:
+                        result = task_router_task.result()
+                    except Exception as exc:
+                        result = {
+                            "status": "failed",
+                            "applied": False,
+                            "error": str(exc),
+                        }
+                collector.add_custom_span(
+                    "task_router",
+                    {
+                        "status": result.get("status"),
+                        "applied": bool(result.get("applied")),
+                        "duration_ms": result.get("duration_ms"),
+                        "timeout_seconds": _TASK_ROUTER_TIMEOUT_SECONDS,
+                        "error": result.get("error"),
+                    },
+                    metadata={
+                        "role": "task_classifier",
+                        "blocking": False,
+                        "fallback": "deterministic_task_profile",
+                        "harness": {
+                            "mechanism": "task_routing",
+                            "pillars": [
+                                {"name": "context_engineering", "role": "primary"},
+                                {"name": "architectural_constraints", "role": "supporting"},
+                            ],
+                        },
+                    },
+                )
+                task_router_trace_recorded = True
+
+            yield self._sse(
+                "task_routing_started",
+                {
+                    "session_id": session_id,
+                    "query_id": query_id,
+                    "run_id": run_record.run_id,
+                    "label": (
+                        "已复用上一轮任务理解"
+                        if reused_task_profile is not None
+                        else "Agent 正在后台理解任务并匹配 Skill"
+                    ),
+                    "blocking": False,
+                    "timeout_seconds": _TASK_ROUTER_TIMEOUT_SECONDS,
+                },
+            )
+            if reused_task_profile is not None:
+                task_router_event_emitted = True
+                yield self._sse(
+                    "task_routing_completed",
+                    {
+                        "session_id": session_id,
+                        "query_id": query_id,
+                        "run_id": run_record.run_id,
+                        "label": "已复用上一轮任务理解，无需重新路由",
+                        "status": "reused",
+                        "applied": True,
+                        "blocking": False,
+                        "duration_ms": 0,
+                        "execution_route": reused_task_profile.execution_route,
+                        "skill_candidates": TaskProfileClassifier.skill_ids(
+                            reused_task_profile
+                        ),
+                    },
+                )
             if goal_record is not None:
                 current_task = asyncio.current_task()
                 if current_task is not None:
@@ -4670,15 +4985,6 @@ class DeepAgentsAgentManager:
             )
 
             model = ModelClientChatModel(role="agent", streaming=True)
-            rubric_cfg = config.load_config().get("harness", {}).get("completion", {}).get("rubric", {})
-            rubric_model_name = str(rubric_cfg.get("model") or "").strip()
-            if not rubric_model_name:
-                rubric_model_name = str(
-                    config.get_fallback_llm_config(
-                        thinking_enabled_override=False,
-                    ).get("model")
-                    or ""
-                ).strip()
             rubric_model = ModelClientChatModel(
                 role="rubric",
                 streaming=False,
@@ -4760,23 +5066,9 @@ class DeepAgentsAgentManager:
                 checkpointer=self._checkpointer_info,
                 execution_backend=agent_backend,
             )
-            analytics_contract_active = (
-                run_record.verification_contract is not None
-                and "analytics" in run_record.verification_contract.verification_packs
+            analytics_model_prompt, analytics_model_payload = self._analytics_model_context(
+                analytics_model_id
             )
-            if analytics_contract_active:
-                analytics_model_prompt, analytics_model_payload = self._analytics_model_context(analytics_model_id)
-            else:
-                analytics_model_prompt = ""
-                analytics_model_payload = (
-                    {
-                        "id": analytics_model_id,
-                        "loaded": False,
-                        "deferred": True,
-                    }
-                    if analytics_model_id
-                    else None
-                )
             if analytics_model_payload:
                 runtime_inventory["analytics_model"] = analytics_model_payload
             traced_middlewares = wrap_middlewares_for_trace(agent_middlewares)
@@ -4821,7 +5113,7 @@ class DeepAgentsAgentManager:
             dependency_prompt = dependency_plan_prompt(getattr(agent_backend, "execution_dependency_plan", None))
             if dependency_prompt:
                 system_prompt += f"\n\n{dependency_prompt}"
-            if analytics_model_prompt and analytics_contract_active:
+            if analytics_model_prompt:
                 system_prompt += analytics_model_prompt
             agent = create_deep_agent(
                 model=model,
@@ -4882,6 +5174,7 @@ class DeepAgentsAgentManager:
             )
             trace_collector.__enter__()
             trace_context_active = True
+            record_task_router_trace(trace_collector)
             active_llm_span: str | None = None
             model_call_index = 0
             active_graph_node: str | None = None
@@ -5002,6 +5295,13 @@ class DeepAgentsAgentManager:
             if langsmith_callbacks:
                 agent_config["callbacks"] = langsmith_callbacks
 
+            if task_router_task is not None and task_router_task.done():
+                self._run_coordinator._refresh_runtime_fields(run_record)
+                router_event = task_router_completion_event()
+                if router_event is not None:
+                    task_router_event_emitted = True
+                    yield router_event
+
             initial_state: dict[str, Any] = {
                 "messages": messages,
                 "todos": persisted_todos,
@@ -5044,6 +5344,17 @@ class DeepAgentsAgentManager:
                 },
                 trace_collector=trace_collector,
             ):
+                if (
+                    task_router_task is not None
+                    and task_router_task.done()
+                    and not task_router_event_emitted
+                ):
+                    self._run_coordinator._refresh_runtime_fields(run_record)
+                    record_task_router_trace(trace_collector)
+                    router_event = task_router_completion_event()
+                    if router_event is not None:
+                        task_router_event_emitted = True
+                        yield router_event
                 if title_task is not None and title_task.done() and not title_event_emitted:
                     refined_title = title_task.result()
                     title_event_emitted = True
@@ -5658,6 +5969,18 @@ class DeepAgentsAgentManager:
                             {"todos": normalized, "session_id": session_id, "query_id": query_id},
                         )
 
+            if (
+                task_router_task is not None
+                and task_router_task.done()
+                and not task_router_event_emitted
+            ):
+                self._run_coordinator._refresh_runtime_fields(run_record)
+                record_task_router_trace(trace_collector)
+                router_event = task_router_completion_event()
+                if router_event is not None:
+                    task_router_event_emitted = True
+                    yield router_event
+
             # Close any still-running LLM span at the end of the stream.
             if active_llm_span is not None:
                 trace_collector.finish_llm_span(output=emitted_text)
@@ -5746,6 +6069,7 @@ class DeepAgentsAgentManager:
             if pending_tool_starts:
                 persist_assistant_snapshot(force=True)
 
+            self._run_coordinator._refresh_runtime_fields(run_record)
             if run_record.status == RunStatus.RUNNING:
                 self._run_coordinator.transition(run_record, RunStatus.EVALUATING)
                 yield self._sse(
@@ -5934,6 +6258,7 @@ class DeepAgentsAgentManager:
             # Streaming already emitted model/tool/reasoning spans. Avoid
             # rebuilding segment spans here because that duplicates simple
             # turns such as "你好" as two model calls.
+            record_task_router_trace(trace_collector, settle_pending=True)
             trace = trace_collector.finish(status=run_record.outcome.value if run_record.outcome else "completed")
             await asyncio.to_thread(
                 session_manager.update_trace,
@@ -6233,6 +6558,7 @@ class DeepAgentsAgentManager:
                 logger.debug("Failed to reject pending permission requests for session=%s", session_id, exc_info=True)
             try:
                 if trace_collector is not None:
+                    record_task_router_trace(trace_collector, settle_pending=True)
                     trace = trace_collector.finish(status="cancelled", error="client_cancelled")
                     await asyncio.to_thread(
                         session_manager.update_trace,
@@ -6349,6 +6675,7 @@ class DeepAgentsAgentManager:
                     )
                     run_messages_persisted = True
                     if trace_collector is not None:
+                        record_task_router_trace(trace_collector, settle_pending=True)
                         trace = trace_collector.finish(
                             status=RunOutcome.BUDGET_EXCEEDED.value,
                             error=detail,
@@ -6481,6 +6808,7 @@ class DeepAgentsAgentManager:
                 )
             try:
                 if trace_collector is not None:
+                    record_task_router_trace(trace_collector, settle_pending=True)
                     trace = trace_collector.finish(status="error", error=error_msg)
                     await asyncio.to_thread(
                         session_manager.update_trace,
@@ -6494,6 +6822,12 @@ class DeepAgentsAgentManager:
                 trace_collector.__exit__(type(exc), exc, exc.__traceback__)
             yield self._sse("error", {"error": error_msg, "message": error_notice})
         finally:
+            if task_router_task is not None and not task_router_task.done():
+                task_router_task.cancel()
+                try:
+                    await task_router_task
+                except asyncio.CancelledError:
+                    pass
             if goal_record is not None:
                 key = (session_id, goal_record.goal_id)
                 if self._active_goal_tasks.get(key) is asyncio.current_task():

@@ -80,10 +80,9 @@ class SemanticAssetsMiddleware(AgentMiddleware[SemanticAssetsState, Any, Any]):
         # Rebuild on every run so model switches and registry edits cannot leave
         # a stale session-scoped id range behind.
         model_id = str(state.get("analytics_model_id") or "").strip()
-        analytics_active = self._analytics_active(state)
-        metadata = self._load(model_id) if analytics_active else []
+        metadata = self._load(model_id) if model_id else []
         return SemanticAssetsStateUpdate(
-            semantic_assets_model_id=model_id if analytics_active else "",
+            semantic_assets_model_id=model_id,
             semantic_assets_metadata=metadata,
             allowed_semantic_asset_ids=[item["id"] for item in metadata],
         )
@@ -93,10 +92,10 @@ class SemanticAssetsMiddleware(AgentMiddleware[SemanticAssetsState, Any, Any]):
         state: SemanticAssetsState,
         runtime: Any,
     ) -> SemanticAssetsStateUpdate | None:
-        """Load selected-model assets only when the current path turns analytic."""
+        """Refresh the selected model's metadata index after a model switch."""
 
         model_id = str(state.get("analytics_model_id") or "").strip()
-        if not model_id or not self._analytics_active(state):
+        if not model_id:
             return None
         if (
             str(state.get("semantic_assets_model_id") or "") == model_id
@@ -108,36 +107,6 @@ class SemanticAssetsMiddleware(AgentMiddleware[SemanticAssetsState, Any, Any]):
             semantic_assets_model_id=model_id,
             semantic_assets_metadata=metadata,
             allowed_semantic_asset_ids=[item["id"] for item in metadata],
-        )
-
-    @staticmethod
-    def _analytics_active(state: SemanticAssetsState) -> bool:
-        profile = state.get("task_profile")
-        packs = profile.get("initial_packs") if isinstance(profile, dict) else []
-        contract = state.get("verification_contract")
-        contract_packs = (
-            contract.get("verification_packs")
-            if isinstance(contract, dict)
-            else []
-        )
-        active_skills = {
-            str(item) for item in state.get("active_skill_ids") or []
-        }
-        activations = state.get("verification_activations")
-        runtime_analytics = any(
-            isinstance(item, dict)
-            and item.get("status") == "succeeded"
-            and item.get("pack") == "analytics"
-            for item in (activations if isinstance(activations, list) else [])
-        )
-        return (
-            isinstance(packs, list)
-            and "analytics" in packs
-        ) or (
-            isinstance(contract_packs, list)
-            and "analytics" in contract_packs
-        ) or runtime_analytics or bool(
-            active_skills & {"database-analysis", "table-analysis"}
         )
 
     @staticmethod

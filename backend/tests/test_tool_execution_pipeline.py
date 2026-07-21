@@ -682,6 +682,49 @@ def test_curl_dev_null_probe_reuses_session_network_scope(tmp_path):
     }
 
 
+def test_aihot_date_fallback_is_classified_as_reusable_network_only(tmp_path):
+    command = (
+        'UA="aihot-skill/0.3.6"; '
+        "since=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ "
+        "2>/dev/null || date -u -v-7d +%Y-%m-%dT%H:%M:%SZ); "
+        'curl -sS --max-time 20 -H "User-Agent: $UA" '
+        '"https://aihot.virxact.com/api/public/items?since=$since"'
+    )
+    request = ToolCallRequest(
+        tool_call={"id": "call-aihot", "name": "execute", "args": {"command": command}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+    pipeline = ToolExecutionPipeline(known_tools={"execute"}, backend_mode="docker")
+
+    effects = ShellPolicyAnalyzer.capabilities(command)
+    assert effects.network is True
+    assert effects.workspace_write is False
+    assert pipeline._required_capabilities(request) == ["execute", "network_access"]
+    assert pipeline._session_grant_scope(request) == {
+        "target_kind": "capability",
+        "target": "session_network_access",
+        "label": "本 Session 允许访问所有网络来源",
+    }
+
+
+def test_material_shell_redirection_still_requires_write_capability(tmp_path):
+    command = 'curl -sS "https://example.com/report" > report.json'
+    request = ToolCallRequest(
+        tool_call={"id": "call-report", "name": "execute", "args": {"command": command}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+    pipeline = ToolExecutionPipeline(known_tools={"execute"}, backend_mode="docker")
+
+    effects = ShellPolicyAnalyzer.capabilities(command)
+    assert effects.network is True
+    assert effects.workspace_write is True
+    assert pipeline._session_grant_scope(request) is None
+
+
 @pytest.mark.parametrize(
     "command",
     [

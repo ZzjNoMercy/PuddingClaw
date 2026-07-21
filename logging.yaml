@@ -39,6 +39,11 @@ loggers:
     handlers: [console]
     propagate: false
 
+  api.agent:
+    level: INFO
+    handlers: [console]
+    propagate: false
+
   llm.model_client:
     level: INFO
     handlers: [console]

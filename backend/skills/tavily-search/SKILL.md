@@ -7,44 +7,29 @@ description: "Web search via Tavily API (alternative to Brave). Use when the use
 
 # Tavily Search
 
-Use the bundled script to search the web with Tavily.
+Use the platform-native `tavily_search` tool for every search. It is the
+controlled, read-only network entry point and receives credentials from the
+runtime.
 
-## Requirements
+## Workflow
 
-- Provide API key via either:
-  - environment variable: `TAVILY_API_KEY`, or
-  - `~/.openclaw/.env` line: `TAVILY_API_KEY=...`
+1. Call `tavily_search` with a focused `query`.
+2. Keep `max_results` at 3–5 by default; use up to 10 only when broader
+   coverage materially helps.
+3. Refine the query and call `tavily_search` again when the first result set is
+   ambiguous or incomplete.
+4. Return the useful findings with their source URLs. Use `fetch_url` only
+   when a returned page needs closer inspection.
 
-## Commands
+## Runtime boundary
 
-Run from the OpenClaw workspace:
-
-```bash
-# raw JSON (default)
-python3 {baseDir}/scripts/tavily_search.py --query "..." --max-results 5
-
-# include short answer (if available)
-python3 {baseDir}/scripts/tavily_search.py --query "..." --max-results 5 --include-answer
-
-# stable schema (closer to web_search): {query, results:[{title,url,snippet}], answer?}
-python3 {baseDir}/scripts/tavily_search.py --query "..." --max-results 5 --format brave
-
-# human-readable Markdown list
-python3 {baseDir}/scripts/tavily_search.py --query "..." --max-results 5 --format md
-```
-
-## Output
-
-### raw (default)
-- JSON: `query`, optional `answer`, `results: [{title,url,content}]`
-
-### brave
-- JSON: `query`, optional `answer`, `results: [{title,url,snippet}]`
-
-### md
-- A compact Markdown list with title/url/snippet.
+- Do not run `scripts/tavily_search.py` through `execute` for normal searches.
+- Do not ask the user for `TAVILY_API_KEY`; the native tool owns credential
+  handling.
+- If `tavily_search` returns an error, report that error or use another visible
+  controlled research tool. Do not bypass the platform boundary with Python,
+  curl, or a hand-written HTTP client.
 
 ## Notes
 
-- Keep `max-results` small by default (3–5) to reduce token/reading load.
 - Prefer returning URLs + snippets; fetch full pages only when needed.

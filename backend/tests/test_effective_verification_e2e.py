@@ -601,7 +601,7 @@ def test_runtime_fetch_url_activates_web_without_selected_model_pollution(tmp_pa
     assert report.status.value == "satisfied"
 
 
-def test_manager_does_not_inject_full_selected_model_context_into_general_run(
+def test_manager_loads_selected_model_context_without_enabling_analytics_verification(
     tmp_path,
     monkeypatch,
 ):
@@ -622,6 +622,12 @@ def test_manager_does_not_inject_full_selected_model_context_into_general_run(
         return FakeDeepAgent()
 
     monkeypatch.setattr(manager_module, "create_deep_agent", fake_create_deep_agent)
+    passive_model = ScriptedModel([AIMessage(content="unused")])
+
+    def fake_model_client(*_args, **kwargs):
+        return passive_model
+
+    monkeypatch.setattr(manager_module, "ModelClientChatModel", fake_model_client)
     monkeypatch.setattr(
         manager_module.DeepAgentsAgentManager,
         "_analytics_model_context",
@@ -653,7 +659,7 @@ def test_manager_does_not_inject_full_selected_model_context_into_general_run(
     asyncio.run(collect())
     persisted = session_manager.get_run_state("manager-context-session")
 
-    assert "ANALYTICS_FULL_CONTEXT" not in captured["system_prompt"]
+    assert "ANALYTICS_FULL_CONTEXT" in captured["system_prompt"]
     assert captured["subagents"]
     assert all(
         any(isinstance(item, VerificationActivationMiddleware) for item in subagent.get("middleware", []))
@@ -661,6 +667,7 @@ def test_manager_does_not_inject_full_selected_model_context_into_general_run(
     )
     assert persisted is not None
     assert persisted["task_profile"]["primary_intent"] == "general"
+    assert persisted["task_profile"]["classifier"] == "deterministic_fallback"
     assert persisted["verification_contract"] is None
 
 

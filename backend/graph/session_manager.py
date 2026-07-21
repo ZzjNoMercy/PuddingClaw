@@ -1283,6 +1283,148 @@ class SessionManager:
         return deepcopy(saved)
 
     @_session_write_locked
+    def enhance_run_task_profile(
+        self,
+        session_id: str,
+        run_id: str,
+        enhancement: dict[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        """Monotonically merge a late semantic Router result into a live Run.
+
+        The Run already owns a deterministic baseline before this method can
+        be called.  A slow or failed Router therefore cannot prevent Agent
+        startup, remove acceptance requirements, or detach selected model
+        context.
+        """
+
+        from harness.models import RunRecord, RunStatus, RunTaskProfile
+        from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
+        from harness.task_profiles import TaskProfileClassifier
+
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        raw_run = runs.get(run_id) if isinstance(runs, dict) else None
+        if not isinstance(raw_run, dict):
+            raise ValueError(f"Run {run_id} does not exist in session {session_id}")
+        run = RunRecord.model_validate(raw_run)
+        # The verification rubric and graph state freeze when the main Agent
+        # enters RUNNING. A later semantic result remains advisory and must not
+        # widen the persisted contract behind an already-running grader.
+        if run.status != RunStatus.PREPARING:
+            return deepcopy(raw_run), False
+
+        semantic = RunTaskProfile.model_validate(enhancement)
+        merged = TaskProfileClassifier.merge_semantic_enhancement(
+            run.task_profile,
+            semantic,
+            analytics_model_id=run.analytics_model_id,
+        )
+        if merged == run.task_profile:
+            return deepcopy(raw_run), False
+        run.task_profile = merged
+
+        if run.verification_enabled:
+            completion = run.config_snapshot.get("completion")
+            rubric = completion.get("rubric") if isinstance(completion, dict) else {}
+            custom_rules = (
+                list(rubric.get("custom_rules") or [])
+                if isinstance(rubric, dict)
+                and rubric.get("custom_rules_enabled", False)
+                else []
+            )
+            declared = RunRubricCompiler.compile(
+                RubricBuildContext(
+                    user_message=run.objective,
+                    analytics_model_id=run.analytics_model_id,
+                    project_id=run.project_id,
+                    custom_rules=tuple(custom_rules),
+                    force_required=bool(run.goal_id),
+                    task_profile=merged,
+                )
+            )
+            run.declared_verification_contract = declared
+            run.verification_contract = RunRubricCompiler.expand_for_activations(
+                contract=declared,
+                profile=merged,
+                message=run.objective,
+                activations=list(run.verification_activations),
+            )
+
+        run.updated_at = time.time()
+        saved = run.model_dump(mode="json")
+        runs[run_id] = saved
+        harness["latest_run_id"] = run_id
+        self._write_file(session_id, data)
+        return deepcopy(saved), True
+
+    @_session_write_locked
+    def record_run_skill_selection(
+        self,
+        session_id: str,
+        run_id: str,
+        skill_id: str,
+    ) -> dict[str, Any]:
+        """Persist one main-Agent Skill choice after SKILL.md was read.
+
+        This is the semantic routing authority for a live Run.  Preflight may
+        record explicit user requests, but only a successful authoritative
+        Skill read turns a candidate into an Agent-selected execution route.
+        """
+
+        from harness.models import RunRecord, RunStatus, SkillCandidate
+
+        normalized = str(skill_id or "").strip()
+        if not normalized:
+            raise ValueError("skill_id is required")
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        raw_run = runs.get(run_id) if isinstance(runs, dict) else None
+        if not isinstance(raw_run, dict):
+            raise ValueError(f"Run {run_id} does not exist in session {session_id}")
+        run = RunRecord.model_validate(raw_run)
+        if run.status in {
+            RunStatus.COMPLETED,
+            RunStatus.CANCELLED,
+            RunStatus.FAILED,
+            RunStatus.BLOCKED,
+            RunStatus.BUDGET_EXCEEDED,
+            RunStatus.VERIFICATION_FAILED,
+        }:
+            raise ValueError(f"Terminal Run {run_id} cannot change Skill routing")
+
+        candidates = {item.skill_id: item for item in run.task_profile.skill_candidates}
+        existing = candidates.get(normalized)
+        candidates[normalized] = SkillCandidate(
+            skill_id=normalized,
+            confidence=1.0,
+            evidence=(
+                existing.evidence
+                if existing is not None and existing.explicit
+                else "主 Agent 已读取该 Skill 的权威 SKILL.md"
+            ),
+            explicit=bool(existing.explicit) if existing is not None else False,
+        )
+        run.task_profile.skill_candidates = list(candidates.values())
+        run.task_profile.missing_explicit_skill_ids = [
+            item
+            for item in run.task_profile.missing_explicit_skill_ids
+            if item.lower() != normalized.lower()
+        ]
+        run.task_profile.execution_route = "skill_first"
+        run.task_profile.native_fallback = True
+        run.task_profile.classifier = "agent_runtime"
+        reason = f"agent_loaded_skill:{normalized}"
+        if reason not in run.task_profile.reasons:
+            run.task_profile.reasons.append(reason)
+        run.updated_at = time.time()
+        saved = run.model_dump(mode="json")
+        runs[run_id] = saved
+        self._write_file(session_id, data)
+        return deepcopy(saved["task_profile"])
+
+    @_session_write_locked
     def start_harness_run(
         self,
         session_id: str,

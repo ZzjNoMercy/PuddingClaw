@@ -152,7 +152,7 @@
     "completion": {
       "rubric": {
         "enabled": true,
-        "model": "",
+        "model": "deepseek-v4-pro",
         "max_iterations": 2,
         "custom_rules_enabled": false,
         "custom_rules": []
