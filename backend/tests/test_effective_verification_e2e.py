@@ -94,7 +94,7 @@ def _start_run(tmp_path, *, objective: str, analytics_model_id: str | None = Non
         session_id="e2e-session",
         query_id="query-current",
         objective=objective,
-        goal_mode=False,
+        goal_mode=True,
         analytics_model_id=analytics_model_id,
     )
     coordinator.transition(run, RunStatus.RUNNING)
@@ -453,7 +453,8 @@ def test_rubric_revision_jump_repairs_hidden_provider_tool_call(tmp_path, monkey
 
 def test_runtime_database_tool_upgrades_contract_before_grader(tmp_path):
     coordinator, run, goal = _start_run(tmp_path, objective="继续处理")
-    assert run.verification_contract is None
+    assert run.verification_contract is not None
+    assert run.verification_contract.verification_packs == ["core"]
     main_model = ScriptedModel(
         [
             AIMessage(
@@ -536,7 +537,8 @@ def test_runtime_fetch_url_activates_web_without_selected_model_pollution(tmp_pa
         objective="继续整理",
         analytics_model_id="selected-analytics-model",
     )
-    assert run.verification_contract is None
+    assert run.verification_contract is not None
+    assert run.verification_contract.verification_packs == ["core"]
     main_model = ScriptedModel(
         [
             AIMessage(
@@ -775,28 +777,22 @@ def test_manager_runtime_database_action_persists_effective_contract(
     assert persisted is not None
     assert persisted["verification_activations"], persisted
     assert persisted["outcome"] == "completed"
-    assert persisted["verification_report"]["status"] == "satisfied"
+    assert persisted["verification_report"]["status"] == "not_required"
     assert "analytics" in persisted["verification_contract"]["verification_packs"]
     assert persisted["verification_activations"][0]["tool_call_id"] == ("call-db-manager")
     evidence = persisted["verification_activations"][0]["evidence_refs"]
     assert any(item.get("kind") == "tool_result" for item in evidence)
     event_payload = "\n".join(f"{event.get('event')}:{event.get('data')}" for event in events)
-    activation_index = event_payload.index("verification_activation_recorded")
-    contract_index = event_payload.index("verification_contract_updated")
-    report_index = event_payload.index("verification_report:")
-    assert activation_index < contract_index < report_index
+    assert "verification_activation_recorded" in event_payload
+    assert "rubric_evaluation_start" not in event_payload
     event_names = [event.get("event") for event in events]
-    assert "token" not in event_names
+    assert "token" in event_names
     assert event_names.count("final_response") == 1
-    assert event_names.index("verification_report") < event_names.index("final_response")
     assert event_names.index("final_response") < event_names.index("done")
     final_payload = json.loads(
         next(event["data"] for event in events if event["event"] == "final_response")
     )
-    assert final_payload["verification_summary"] == (
-        "**验证结果：**\n\n已核对最终回答确实返回 12 行销量结果；"
-        "数据库查询成功完成，结果可追溯到已登记的数据源。"
-    )
+    assert not final_payload.get("verification_summary")
     session = session_manager.load_session("manager-dynamic-session")
     assistant = next(
         item
@@ -804,19 +800,11 @@ def test_manager_runtime_database_action_persists_effective_contract(
         if item.get("role") == "assistant"
     )
     assert assistant["content"] == "销量查询完成，结果为 12 行。"
-    assert assistant["verification_summary"] == final_payload["verification_summary"]
+    assert not assistant.get("verification_summary")
     assert "verification_state" not in assistant["segments"][-1]
-    assert any(
-        item.get("type") == "activity"
-        and item.get("label") == "完成质量检查通过"
-        for item in assistant["timeline"]
-    )
     assert not any(
         item.get("type") == "activity"
-        and item.get("label") == "正在核对完成质量"
-        and item.get("status") == "running"
+        and item.get("label") in {"正在核对完成质量", "完成质量检查通过"}
         for item in assistant["timeline"]
     )
-    grader_prompt = "\n".join(str(getattr(message, "content", "")) for message in grader_model._received_messages[0])
-    assert "[analytics_evidence_traceability]" in grader_prompt
-    assert "Do not merely say" in grader_prompt
+    assert grader_model._received_messages == []

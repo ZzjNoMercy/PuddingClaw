@@ -1072,7 +1072,7 @@ def test_agent_user_content_does_not_inline_external_image_without_permission(tm
     assert str(image_path) in content
 
 
-def test_agent_user_content_routes_pasted_absolute_file_path_to_read_resource(tmp_path):
+def test_agent_user_content_routes_pasted_absolute_file_path_to_host_file_broker(tmp_path):
     workspace_path = tmp_path / "workspace"
     workspace_path.mkdir()
     external_file = tmp_path / "Documents" / "notes.md"
@@ -1088,8 +1088,9 @@ def test_agent_user_content_routes_pasted_absolute_file_path_to_read_resource(tm
     assert isinstance(content, str)
     assert "[本地文件路径]" in content
     assert "非 workspace 本地路径" in content
-    assert "read_resource(resource=原始路径)" in content
-    assert "不要调用 read_file" in content
+    assert "直接对原始绝对路径使用 read_file" in content
+    assert "HostFileBroker 原子落到正式路径" in content
+    assert "文件授权不授予 execute" in content
     assert str(external_file) in content
 
 
@@ -1110,11 +1111,9 @@ def test_agent_user_content_preserves_spaced_external_html_target(tmp_path):
 
     assert isinstance(content, str)
     assert str(external_file) in content
-    assert "stage_external_artifact(file_path=原始绝对路径)" in content
-    assert "commit_external_artifact" in content
-    assert "不要直接对外部绝对路径调用 write_file、patch_file 或 edit_file" in content
-    assert "只在返回的 /scratch/external/<lease_id>/... 暂存文件上修改与验证" in content
-    assert "禁止把 /scratch 或 /workspace 副本冒充交付结果" in content
+    assert "直接对原始绝对路径使用 read_file/inspect_file_version/patch_file" in content
+    assert "HostFileBroker 原子落到正式路径" in content
+    assert "不要创建 /workspace 或 /scratch 影子副本" in content
     assert extract_declared_artifact_targets(f"{external_file} 刷新这个报告到 2026 年") == [str(external_file)]
     source_file = tmp_path / "input data.csv"
     assert extract_declared_artifact_targets(f"读取 {source_file} 并更新分析报告") == []

@@ -1095,6 +1095,7 @@ def test_verified_run_budget_exhaustion_never_publishes_terminal_text(tmp_path, 
                 message="完成一个需要验收的任务",
                 session_id="budget-publication-session",
                 user_id="test-user",
+                goal_mode=True,
             )
         ]
 
@@ -2229,10 +2230,10 @@ def test_cancelled_agent_stream_rejects_pending_permissions_and_cleans_checkpoin
     history = session_manager.load_session("cancel-session")
     assert [message["role"] for message in history] == ["user", "assistant"]
     assert history[0]["content"] == "会被取消"
-    assert history[1]["content"] == "我先读取 README，确认当前内容。"
+    assert history[1]["content"] == "我先读取 README，确认当前内容。\n\n已经读取了报告。"
     assert [segment["content"] for segment in history[1]["segments"]] == [
         "我先读取 README，确认当前内容。",
-        "",
+        "已经读取了报告。",
     ]
     assert history[1]["interrupted"] is True
     assert "本轮已被用户停止" in history[1]["interruption_notice"]
@@ -2866,9 +2867,6 @@ def test_deepagents_manager_emits_and_persists_tool_events(tmp_path, monkeypatch
     event_names = [event["event"] for event in events]
     tool_start = next(event for event in events if event["event"] == "tool_start")
     tool_end = next(event for event in events if event["event"] == "tool_end")
-    process_content = next(
-        event for event in events if event["event"] == "segment_content_replaced"
-    )
     done = next(event for event in events if event["event"] == "done")
     history = session_manager.load_session("agent-tool-session")
     assistant_with_tool = next(
@@ -2879,8 +2877,7 @@ def test_deepagents_manager_emits_and_persists_tool_events(tmp_path, monkeypatch
     assert "tool_end" in event_names
     assert event_names.count("tool_end") == 1
     assert "segment_break" in event_names
-    assert "token" not in event_names
-    assert event_names.index("segment_content_replaced") < event_names.index("tool_start")
+    assert "token" in event_names
     assert event_names.count("final_response") == 1
     assert event_names.index("final_response") < event_names.index("done")
     assert "citations_finalized" in event_names
@@ -2899,9 +2896,8 @@ def test_deepagents_manager_emits_and_persists_tool_events(tmp_path, monkeypatch
         "id": "call_read",
     }
     assert json.loads(tool_end["data"])["output"] == "README content"
-    assert json.loads(process_content["data"])["content"] == "我先读取 README，确认当前内容。"
-    assert json.loads(done["data"])["content"] == "已读取。"
-    assert assistant_with_tool["content"] == "已读取。"
+    assert json.loads(done["data"])["content"] == "我先读取 README，确认当前内容。\n\n已读取。"
+    assert assistant_with_tool["content"] == "我先读取 README，确认当前内容。\n\n已读取。"
     assert [segment["content"] for segment in assistant_with_tool["segments"]] == [
         "我先读取 README，确认当前内容。",
         "已读取。",
@@ -2914,8 +2910,8 @@ def test_deepagents_manager_emits_and_persists_tool_events(tmp_path, monkeypatch
     assert deleted[0].startswith("agent-tool-session:query-")
 
 
-def test_verification_retry_persists_only_the_accepted_terminal_segment(tmp_path, monkeypatch):
-    """Rejected terminal text remains in Trace/checkpoint, not Session chat."""
+def test_unverified_goal_retry_never_publishes_terminal_segments(tmp_path, monkeypatch):
+    """A fake retry event cannot bypass the persisted Goal verifier."""
 
     from graph import deepagents_manager as manager_module
     from graph.session_manager import session_manager
@@ -2978,6 +2974,7 @@ def test_verification_retry_persists_only_the_accepted_terminal_segment(tmp_path
                 session_id="verification-segment-session",
                 project_id=None,
                 user_id="test-user",
+                goal_mode=True,
             )
         ]
 
@@ -2987,10 +2984,8 @@ def test_verification_retry_persists_only_the_accepted_terminal_segment(tmp_path
     assistant = next(message for message in history if message["role"] == "assistant")
 
     assert any(json.loads(event["data"]).get("reason") == "verification_retry" for event in breaks)
-    assert [segment["content"] for segment in assistant["segments"]] == [
-        "",
-        "已修正并真正完成。",
-    ]
+    assert [segment["content"] for segment in assistant["segments"]] == [""]
+    assert assistant["status"] == "running"
     assert all("verification_state" not in segment for segment in assistant["segments"])
     assert "任务已经完成" not in assistant["content"]
     assert any(
@@ -3421,10 +3416,15 @@ def test_deepagents_manager_ignores_internal_context_summary_chunks(tmp_path, mo
         ]
 
     events = asyncio.run(collect())
-    visible_text = "".join(
+    streamed_text = "".join(
         json.loads(event["data"])["content"]
         for event in events
-        if event["event"] in {"token", "final_response"}
+        if event["event"] == "token"
+    )
+    final_text = "".join(
+        json.loads(event["data"])["content"]
+        for event in events
+        if event["event"] == "final_response"
     )
     assistant = next(
         message
@@ -3432,7 +3432,8 @@ def test_deepagents_manager_ignores_internal_context_summary_chunks(tmp_path, mo
         if message["role"] == "assistant"
     )
 
-    assert visible_text == "正式回答。"
+    assert streamed_text == "正式回答。"
+    assert final_text == "正式回答。"
     assert assistant["content"] == "正式回答。"
     assert "SESSION INTENT" not in assistant["content"]
 

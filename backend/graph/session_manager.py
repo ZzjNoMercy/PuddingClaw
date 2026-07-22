@@ -1981,6 +1981,57 @@ class SessionManager:
         return deepcopy(saved)
 
     @_session_write_locked
+    def upgrade_run_verification_mode(
+        self,
+        session_id: str,
+        run_id: str,
+        mode: str,
+    ) -> dict[str, Any]:
+        """Monotonically upgrade ordinary Runs without enabling Goal repair.
+
+        ``agent -> proportional`` is the only runtime upgrade performed by
+        successful mutation tools. Goal mode is established only by the Run
+        coordinator from explicit product state and can never be inferred from
+        a tool call or task classifier.
+        """
+
+        from harness.models import RunRecord, RunStatus, VerificationMode
+
+        requested = VerificationMode(mode)
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        raw_run = runs.get(run_id) if isinstance(runs, dict) else None
+        if not isinstance(raw_run, dict):
+            raise ValueError(f"Run {run_id} does not exist in session {session_id}")
+        run = RunRecord.model_validate(raw_run)
+        if run.status in {
+            RunStatus.COMPLETED,
+            RunStatus.CANCELLED,
+            RunStatus.FAILED,
+            RunStatus.BLOCKED,
+            RunStatus.BUDGET_EXCEEDED,
+            RunStatus.VERIFICATION_FAILED,
+        }:
+            raise ValueError(f"Terminal Run {run_id} cannot change verification mode")
+        if run.verification_mode == VerificationMode.GOAL:
+            return deepcopy(raw_run)
+        if requested == VerificationMode.GOAL:
+            raise ValueError("Goal verification mode requires an explicit Goal")
+        if (
+            run.verification_mode == VerificationMode.AGENT
+            and requested == VerificationMode.PROPORTIONAL
+        ):
+            run.verification_mode = requested
+            run.updated_at = time.time()
+            saved = run.model_dump(mode="json")
+            runs[run_id] = saved
+            harness["latest_run_id"] = run_id
+            self._write_file(session_id, data)
+            return deepcopy(saved)
+        return deepcopy(raw_run)
+
+    @_session_write_locked
     def enhance_run_task_profile(
         self,
         session_id: str,
@@ -4759,6 +4810,73 @@ class SessionManager:
             data["agent_context_messages"] = messages
             data["agent_context_run_id"] = run_id
         self._write_file(session_id, data)
+
+    # ── Host-file mutation receipts ──────────────────────────────────────────
+
+    @_session_write_locked
+    def append_external_mutation_receipt(
+        self,
+        session_id: str,
+        receipt: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist one immutable HostFileBroker mutation receipt."""
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        receipt_id = str(receipt.get("receipt_id") or "")
+        if not receipt_id:
+            raise ValueError("external mutation receipt requires receipt_id")
+        receipts = data.setdefault("external_mutation_receipts", {})
+        existing = receipts.get(receipt_id)
+        if isinstance(existing, dict):
+            if existing != receipt:
+                raise ValueError(f"external mutation receipt {receipt_id} is immutable")
+            return deepcopy(existing)
+        receipts[receipt_id] = deepcopy(receipt)
+        self._write_file(session_id, data)
+        return deepcopy(receipts[receipt_id])
+
+    def list_external_mutation_receipts(
+        self,
+        session_id: str,
+        *,
+        run_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        data = self._read_file(session_id)
+        receipts = data.get("external_mutation_receipts") if data else None
+        if not isinstance(receipts, dict):
+            return []
+        values = [
+            deepcopy(item)
+            for item in receipts.values()
+            if isinstance(item, dict)
+            and (run_id is None or str(item.get("run_id") or "") == run_id)
+        ]
+        return sorted(values, key=lambda item: float(item.get("created_at") or 0))
+
+    def find_external_mutation_receipt(
+        self,
+        session_id: str,
+        *,
+        run_id: str,
+        canonical_path: str,
+        after_sha256: str | None = None,
+    ) -> dict[str, Any] | None:
+        matches = [
+            item
+            for item in self.list_external_mutation_receipts(
+                session_id,
+                run_id=run_id,
+            )
+            if str(item.get("canonical_path") or "") == canonical_path
+            and str(item.get("status") or "") == "completed"
+            and (
+                not after_sha256
+                or str(item.get("after_sha256") or "") == after_sha256
+            )
+        ]
+        return deepcopy(matches[-1]) if matches else None
 
     # ── Permission grants ─────────────────────────────────────────────────────
 

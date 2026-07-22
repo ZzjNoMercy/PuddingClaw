@@ -25,6 +25,7 @@ from harness.models import (
     RunTaskProfile,
     RunVerificationContract,
     VerificationFailureKind,
+    VerificationMode,
     VerificationStatus,
     VerifierKind,
 )
@@ -1031,6 +1032,11 @@ class HarnessRunCoordinator:
             project_id=project_id,
             analytics_model_id=analytics_model_id,
             verification_enabled=verification_enabled,
+            verification_mode=(
+                VerificationMode.GOAL
+                if verification_enabled and goal is not None
+                else VerificationMode.AGENT
+            ),
             task_profile=task_profile,
             declared_verification_contract=(contract.model_copy(deep=True) if contract is not None else None),
             verification_contract=effective_contract,
@@ -1093,7 +1099,7 @@ class HarnessRunCoordinator:
         final_state: dict[str, Any] | None,
     ) -> tuple[RunRecord, GoalRecord | None, RubricEvaluationReport]:
         self._refresh_runtime_fields(run)
-        if run.status == RunStatus.RUNNING:
+        if run.status == RunStatus.RUNNING and run.requires_goal_verification:
             self.transition(
                 run,
                 RunStatus.EVALUATING,
@@ -1154,7 +1160,11 @@ class HarnessRunCoordinator:
         state["_harness_context"] = harness_context
         report = self.verification.report_from_final_state(
             run_id=run.run_id,
-            contract=run.verification_contract,
+            contract=(
+                run.verification_contract
+                if run.requires_goal_verification
+                else None
+            ),
             final_state=state,
         )
         if goal is not None:

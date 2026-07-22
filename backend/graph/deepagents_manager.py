@@ -1568,7 +1568,14 @@ details. Never invent evidence that is absent from the supplied context.
         persisted = session_manager.get_run_state(session_id, run_id)
         if not isinstance(persisted, dict):
             return {}
-        if persisted.get("verification_enabled") is False:
+        verification_mode = str(
+            persisted.get("verification_mode")
+            or ("goal" if persisted.get("goal_id") else "agent")
+        )
+        if (
+            persisted.get("verification_enabled") is False
+            or verification_mode != "goal"
+        ):
             return {}
         profile_payload = persisted.get("task_profile")
         profile = RunTaskProfile.model_validate(profile_payload or {})
@@ -1633,6 +1640,26 @@ details. Never invent evidence that is absent from the supplied context.
 
     @hook_config(can_jump_to=["model"])
     def after_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:
+        runtime_context = getattr(runtime, "context", None)
+        context = runtime_context if isinstance(runtime_context, dict) else {}
+        session_id = str(context.get("session_id") or "")
+        run_id = str(context.get("run_id") or "")
+        persisted = None
+        if session_id and run_id:
+            try:
+                persisted = session_manager.get_run_state(session_id, run_id)
+            except (AssertionError, FileNotFoundError, ValueError):
+                persisted = None
+        verification_mode = (
+            str(
+                persisted.get("verification_mode")
+                or ("goal" if persisted.get("goal_id") else "agent")
+            )
+            if isinstance(persisted, dict)
+            else ("goal" if isinstance(dict(state).get("verification_contract"), dict) else "agent")
+        )
+        if verification_mode != "goal":
+            return None
         effective_update = self._effective_contract_update(dict(state), runtime)
         effective_state = {**dict(state), **effective_update}
         if not isinstance(effective_state.get("verification_contract"), dict):
@@ -1670,6 +1697,30 @@ details. Never invent evidence that is absent from the supplied context.
         state: Any,
         runtime: Any,
     ) -> dict[str, Any] | None:
+        runtime_context = getattr(runtime, "context", None)
+        context = runtime_context if isinstance(runtime_context, dict) else {}
+        session_id = str(context.get("session_id") or "")
+        run_id = str(context.get("run_id") or "")
+        persisted = None
+        if session_id and run_id:
+            try:
+                persisted = await asyncio.to_thread(
+                    session_manager.get_run_state,
+                    session_id,
+                    run_id,
+                )
+            except (AssertionError, FileNotFoundError, ValueError):
+                persisted = None
+        verification_mode = (
+            str(
+                persisted.get("verification_mode")
+                or ("goal" if persisted.get("goal_id") else "agent")
+            )
+            if isinstance(persisted, dict)
+            else ("goal" if isinstance(dict(state).get("verification_contract"), dict) else "agent")
+        )
+        if verification_mode != "goal":
+            return None
         effective_update = self._effective_contract_update(dict(state), runtime)
         effective_state = {**dict(state), **effective_update}
         if not isinstance(effective_state.get("verification_contract"), dict):
@@ -2195,6 +2246,7 @@ class DeepAgentsAgentManager:
         self,
         workspace_path: Path,
         session_id: str = "",
+        run_id: str = "",
         query_id: str = "",
         goal_id: str = "",
         goal_revision: int | None = None,
@@ -2292,6 +2344,8 @@ class DeepAgentsAgentManager:
                 skills_dir,
             ),
             workspace_root=workspace_path,
+            run_id=run_id,
+            query_id=query_id,
         )
         backend.execution_mode = selection.mode
         backend.execution_backend_id = workspace_backend.id
@@ -3125,21 +3179,18 @@ class DeepAgentsAgentManager:
                 notes.append(
                     "[本地文件路径]\n"
                     + "\n".join(f"- {path}" for path in non_image_resource_paths)
-                    + "\n以上非 workspace 本地路径请调用 read_resource(resource=原始路径) 读取；不要调用 read_file、glob 或 grep。"
+                    + "\n以上非 workspace 本地路径请直接调用 read_file(file_path=原始绝对路径)；"
+                    "未授权时系统会请求精确权限并自动重放。"
                 )
             if external_resource_paths and not external_paths_needing_permission:
                 paths = "\n".join(f"- {path}" for path in external_resource_paths)
                 notes.append(
-                    "[外部文件授权] 检测到 workspace 外的本地文件路径。主 Agent 必须通过 "
-                    f"read_resource 触发授权并读取：\n{paths}\n"
-                    "若用户只要求读取，到此即可；不要对其父目录调用 ls/glob/grep，因为外部授权严格限定到单个文件。"
-                    "如果读取后确认必须发现同目录依赖文件，不要猜测兄弟文件路径；调用 "
-                    "stage_external_directory(directory_path=该文件的父目录) 主动请求一次目录级授权，"
-                    "获批后只在返回的 /scratch/external-directories/<lease_id>/ 中检索。"
-                    "若用户要求修改该文件，必须调用 stage_external_artifact(file_path=原始绝对路径)，"
-                    "只在返回的 /scratch/external/<lease_id>/... 暂存文件上修改与验证，最后调用 "
-                    "commit_external_artifact 将结果原子提交回同一个原始路径。禁止把 /scratch 或 /workspace "
-                    "副本冒充交付结果，也不要直接对外部绝对路径调用 write_file、patch_file 或 edit_file。"
+                    "[外部文件授权] 检测到 workspace 外的本地文件路径。直接对原始绝对路径使用 "
+                    f"read_file/inspect_file_version/patch_file：\n{paths}\n"
+                    "未授权时系统会请求精确文件权限并重放原调用。若确认必须发现同目录依赖，"
+                    "对直接父目录调用 ls/glob/grep；系统只请求该 exact directory，不得猜测兄弟路径或提升到更高祖先目录。"
+                    "获批后的读写由 HostFileBroker 原子落到正式路径；不要创建 /workspace 或 /scratch 影子副本。"
+                    "文件授权不授予 execute 对宿主绝对路径的访问。"
                 )
             if external_paths_needing_permission:
                 paths = "\n".join(f"- {path}" for path in external_paths_needing_permission)
@@ -3150,13 +3201,11 @@ class DeepAgentsAgentManager:
             if external_directory_paths:
                 paths = "\n".join(f"- {path}" for path in external_directory_paths)
                 notes.append(
-                    "[外部目录授权] 检测到 workspace 外的本地目录。不要对宿主机绝对目录直接调用 "
-                    "ls/glob/grep/read_file，也不要逐文件猜测路径。请调用 "
-                    f"stage_external_directory(directory_path=原始绝对目录) 创建当前 Run 的只读快照：\n{paths}\n"
-                    "随后只在返回的 /scratch/external-directories/<lease_id>/ 中检索、运行和测试。"
-                    "如果任务需要修改、运行或联调整个目录，应先建议将该目录作为项目打开；用户仍要在当前会话继续时，"
-                    "允许在暂存目录中操作。需要写回时，调用 prepare_external_directory_commit 生成变更明细，最后调用 "
-                    "commit_external_directory 触发递归写入审批并提交。"
+                    "[外部目录授权] 检测到 workspace 外的本地目录。直接对原始绝对路径调用 "
+                    f"ls/glob/grep/read_file/write_file/inspect_file_version/patch_file：\n{paths}\n"
+                    "未授权时系统会请求 exact-directory 权限并自动重放；授权后 HostFileBroker 直接访问正式文件，"
+                    "不会暴露 lease、staged path 或 hash 编排。execute 仍受项目 Docker 与 container_path_expansion "
+                    "约束；需要完整目录命令语义时优先建议把该目录作为项目打开。"
                 )
             return f"{message}\n\n" + "\n\n".join(notes)
 
@@ -5314,6 +5363,7 @@ class DeepAgentsAgentManager:
             agent_backend = self._build_backend(
                 workspace_path,
                 session_id=session_id,
+                run_id=run_record.run_id,
                 query_id=query_id,
                 goal_id=str(run_record.goal_id or ""),
                 goal_revision=run_record.goal_revision,
@@ -5547,7 +5597,7 @@ class DeepAgentsAgentManager:
             last_snapshot_signature = ""
             last_context_usage = -1
             persisted_agent_context_fingerprint = _agent_context_fingerprint(saved_agent_context)
-            defer_final_publication = bool(run_record.verification_enabled)
+            defer_final_publication = bool(run_record.requires_goal_verification)
 
             def persist_assistant_snapshot(
                 *,
@@ -6873,7 +6923,7 @@ class DeepAgentsAgentManager:
                         status="cancelled",
                         interruption_notice="本轮已被用户停止，以上为中断前已完成的部分结果。",
                         pending_tool_output="Tool execution was interrupted because the user stopped the run.",
-                        suppress_terminal_content=bool(run_record.verification_enabled),
+                        suppress_terminal_content=bool(run_record.requires_goal_verification),
                     )
             except Exception:
                 logger.warning("Failed to persist partial cancelled run for session=%s", session_id, exc_info=True)
@@ -7144,7 +7194,7 @@ class DeepAgentsAgentManager:
                         interruption_notice=None,
                         error_notice=error_notice,
                         pending_tool_output="Tool execution was interrupted because the agent run failed.",
-                        suppress_terminal_content=bool(run_record.verification_enabled),
+                        suppress_terminal_content=bool(run_record.requires_goal_verification),
                     )
             except Exception:
                 logger.warning("Failed to persist partial failed run for session=%s", session_id, exc_info=True)

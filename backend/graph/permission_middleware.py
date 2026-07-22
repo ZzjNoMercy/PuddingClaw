@@ -257,7 +257,7 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                         "安全说明": (
                             "目录将复制为 Docker /scratch 快照；不会直接挂载或修改原目录。"
                             if tool_name == "stage_external_directory"
-                            else "授权后将自动创建只读 snapshot，并重放原搜索调用。"
+                            else "授权后由 HostFileBroker 直接重放原文件搜索；不会授予 shell 访问。"
                         ),
                     }
                 )
@@ -316,7 +316,15 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                 if requested is None:
                     continue
                 access = "write"
-                if session_manager.has_external_file_write_permission(session_id, requested):
+                if (
+                    session_manager.has_external_file_write_permission(session_id, requested)
+                    or self._has_directory_permission_for_path(
+                        session_id,
+                        requested,
+                        access="write",
+                        run_id=run_id,
+                    )
+                ):
                     continue
                 change_preview = self._change_preview(tool_name, args)
             else:
@@ -332,7 +340,15 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                         except ValueError:
                             pass
                 access = "read"
-                if session_manager.has_external_file_read_permission(session_id, requested):
+                if (
+                    session_manager.has_external_file_read_permission(session_id, requested)
+                    or self._has_directory_permission_for_path(
+                        session_id,
+                        requested,
+                        access="read",
+                        run_id=run_id,
+                    )
+                ):
                     continue
                 change_preview = None
 

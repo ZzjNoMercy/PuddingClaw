@@ -476,6 +476,25 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
         if kind != "external":
             return "execute", request
 
+        # Session Workspace Roots are direct host-file capabilities. Once the
+        # exact file or containing exact-directory grant is active, keep the
+        # original canonical path and let PermissionedCompositeBackend's
+        # HostFileBroker serve the native file tool. No snapshot/lease path is
+        # exposed to the model.
+        can_access = getattr(self.backend, "can_access_external_path", None)
+        if callable(can_access) and can_access(routed_path, access="read"):
+            emit_harness_metric(
+                logger,
+                "external_search_route",
+                session_id=str(context.get("session_id") or ""),
+                route="host_file_broker",
+                tool=tool_name,
+            )
+            args[path_arg] = routed_path
+            return "execute", request.override(
+                tool_call={**request.tool_call, "args": args}
+            )
+
         if tool_name != "read_file":
             return self._route_external_search(
                 request=request,

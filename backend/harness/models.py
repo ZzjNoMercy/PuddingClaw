@@ -11,7 +11,7 @@ import time
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class HarnessStateError(ValueError):
@@ -62,6 +62,20 @@ class VerificationStatus(StrEnum):
     GRADER_ERROR = "grader_error"
     INFRASTRUCTURE_ERROR = "infrastructure_error"
     BUDGET_EXCEEDED = "budget_exceeded"
+
+
+class VerificationMode(StrEnum):
+    """Run verification ownership.
+
+    ``agent`` is the default for ordinary read-only work. A successful
+    mutation upgrades it monotonically to ``proportional``. Only an explicit
+    Goal (or a future explicit strict-verification control) may use ``goal``
+    and enter the independent reviewer/repair loop.
+    """
+
+    AGENT = "agent"
+    PROPORTIONAL = "proportional"
+    GOAL = "goal"
 
 
 class VerificationFailureKind(StrEnum):
@@ -535,6 +549,7 @@ class RunRecord(BaseModel):
     project_id: str | None = None
     analytics_model_id: str | None = None
     verification_enabled: bool = True
+    verification_mode: VerificationMode = VerificationMode.AGENT
     task_profile: RunTaskProfile = Field(default_factory=RunTaskProfile)
     skill_activations: list[SkillActivation] = Field(default_factory=list)
     capability_manifest: CapabilityManifest | None = None
@@ -556,9 +571,30 @@ class RunRecord(BaseModel):
     updated_at: float = Field(default_factory=time.time)
     completed_at: float | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_verification_mode(cls, value: Any) -> Any:
+        """Preserve strict semantics for Goal Runs persisted before v3."""
+
+        if not isinstance(value, dict) or value.get("verification_mode"):
+            return value
+        migrated = dict(value)
+        migrated["verification_mode"] = (
+            VerificationMode.GOAL.value
+            if migrated.get("verification_enabled", True) and migrated.get("goal_id")
+            else VerificationMode.AGENT.value
+        )
+        return migrated
+
     @property
     def terminal(self) -> bool:
         return self.status in TERMINAL_RUN_STATUSES
+
+    @property
+    def requires_goal_verification(self) -> bool:
+        """Whether this Run may invoke the reviewer and repair loop."""
+
+        return self.verification_enabled and self.verification_mode == VerificationMode.GOAL
 
     def transition(self, next_status: RunStatus, *, now: float | None = None) -> None:
         timestamp = now if now is not None else time.time()

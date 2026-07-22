@@ -37,6 +37,15 @@ from observability import emit_harness_metric
 from tools.toolsets import UNCONDITIONAL_TOOL_NAMES, tools_for_toolsets, validate_toolset_names
 
 _SKILL_PATH_RE = re.compile(r"^/skills/([^/]+)/SKILL\.md$")
+_LEGACY_EXTERNAL_LEASE_TOOLS = frozenset(
+    {
+        "stage_external_artifact",
+        "commit_external_artifact",
+        "stage_external_directory",
+        "prepare_external_directory_commit",
+        "commit_external_directory",
+    }
+)
 logger = logging.getLogger(__name__)
 
 
@@ -394,11 +403,50 @@ class ToolsetMiddleware(AgentMiddleware):
 
     def _visible_tools(self, request: ModelRequest) -> list[Any]:
         allowed = self._allowed_tool_names(request.state)
+        legacy_enabled = self._legacy_external_lease_tools_enabled(request)
         return [
             tool
             for tool in request.tools
             if self._tool_name(tool) in allowed
+            and (
+                legacy_enabled
+                or self._tool_name(tool) not in _LEGACY_EXTERNAL_LEASE_TOOLS
+            )
         ]
+
+    @staticmethod
+    def _legacy_external_lease_tools_enabled(request: ModelRequest) -> bool:
+        """Expose deprecated lease tools only while resuming their owner."""
+
+        context = (
+            request.runtime.context
+            if request.runtime is not None and isinstance(request.runtime.context, dict)
+            else {}
+        )
+        session_id = str(context.get("session_id") or "")
+        run_id = str(context.get("run_id") or "")
+        goal_id = str(context.get("goal_id") or "")
+        goal_revision = context.get("goal_revision")
+        if not session_id:
+            return False
+        active_statuses = {"staged", "prepared", "committing", "publishing"}
+        leases = [
+            *session_manager.list_external_artifact_leases(session_id),
+            *session_manager.list_external_directory_leases(session_id),
+        ]
+        return any(
+            str(lease.get("status") or "") in active_statuses
+            and (
+                (run_id and str(lease.get("run_id") or "") == run_id)
+                or (
+                    goal_id
+                    and str(lease.get("goal_id") or "") == goal_id
+                    and lease.get("goal_revision") == goal_revision
+                )
+            )
+            for lease in leases
+            if isinstance(lease, dict)
+        )
 
     def _capability_manifest(
         self,

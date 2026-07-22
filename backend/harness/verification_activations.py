@@ -82,6 +82,15 @@ _WRITE_TOOLS = frozenset(
         "publish_attachment",
     }
 )
+_PROPORTIONAL_MUTATION_TOOLS = frozenset(
+    {
+        *_WRITE_TOOLS,
+        "install_skill",
+        "update_skill",
+        "apply_logical_dataset_rule",
+        "publish_semantic_dimension_build",
+    }
+)
 _CODE_EXTENSIONS = frozenset(
     {
         ".c",
@@ -609,6 +618,15 @@ def _result_evidence_refs(
                     workspace_path=workspace_path,
                 )
                 refs.append({"kind": "artifact_write", **artifact.model_dump(mode="json")})
+                if artifact.scope == ArtifactScope.EXTERNAL and artifact.content_sha256:
+                    mutation = session_manager.find_external_mutation_receipt(
+                        session_id,
+                        run_id=run_id,
+                        canonical_path=str(artifact.host_path or artifact.path),
+                        after_sha256=artifact.content_sha256,
+                    )
+                    if mutation is not None:
+                        refs.append(dict(mutation))
     return refs
 
 
@@ -620,7 +638,12 @@ def _is_relative_to(path: Path, parent: Path) -> bool:
         return False
 
 
-def _external_write_grant(session_id: str, host_path: str) -> dict[str, Any] | None:
+def _external_write_grant(
+    session_id: str,
+    host_path: str,
+    *,
+    run_id: str,
+) -> dict[str, Any] | None:
     if not session_id:
         return None
     for grant in session_manager.list_permission_grants(session_id):
@@ -631,6 +654,23 @@ def _external_write_grant(session_id: str, host_path: str) -> dict[str, Any] | N
             and "write" in (grant.get("capabilities") or [])
         ):
             return grant
+        if (
+            grant.get("type") == "external_directory_write"
+            and grant.get("target_kind") == "exact_directory"
+            and "write" in (grant.get("capabilities") or [])
+        ):
+            root = Path(str(grant.get("target") or "")).expanduser().resolve()
+            requested = Path(host_path).expanduser().resolve()
+            if (
+                _is_relative_to(requested, root)
+                and session_manager.has_external_directory_permission(
+                    session_id,
+                    root,
+                    access="write",
+                    run_id=run_id,
+                )
+            ):
+                return grant
     return None
 
 
@@ -693,7 +733,7 @@ def _artifact_reference_for_write(
             virtual_path = None
             canonical = str(host) if host is not None else raw_path
             scope = ArtifactScope.EXTERNAL
-            grant = _external_write_grant(session_id, canonical)
+            grant = _external_write_grant(session_id, canonical, run_id=run_id)
     else:
         requested = Path(raw_path).expanduser()
         if requested.is_absolute():
@@ -713,7 +753,7 @@ def _artifact_reference_for_write(
             virtual_path = None
             canonical = str(host) if host is not None else raw_path
             scope = ArtifactScope.EXTERNAL
-            grant = _external_write_grant(session_id, canonical)
+            grant = _external_write_grant(session_id, canonical, run_id=run_id)
 
     identity_path = str(host) if host is not None else canonical
     declared_targets = (
@@ -1483,6 +1523,27 @@ class VerificationActivationMiddleware(AgentMiddleware):
         args = request.tool_call.get("args")
         normalized_args = args if isinstance(args, dict) else {}
         succeeded = tool_result_succeeded(result, expected_call_id=tool_call_id)
+        mutation = tool_name in _PROPORTIONAL_MUTATION_TOOLS
+        if tool_name in {"execute", "terminal"}:
+            command = str(normalized_args.get("command") or normalized_args.get("cmd") or "")
+            capabilities = ShellPolicyAnalyzer.capabilities(
+                command,
+                workspace_path=str(context.get("workspace_path") or "."),
+            )
+            mutation = bool(
+                capabilities.workspace_write
+                or capabilities.package_install
+                or capabilities.destructive
+            )
+        if succeeded and mutation:
+            try:
+                session_manager.upgrade_run_verification_mode(
+                    session_id,
+                    run_id,
+                    "proportional",
+                )
+            except (FileNotFoundError, ValueError):
+                pass
         if not succeeded and not (
             tool_name in {"execute", "terminal"}
             and "code" in verification_packs_for_tool(tool_name, normalized_args)

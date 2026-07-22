@@ -881,7 +881,9 @@ def test_directory_pending_deduplicates_only_while_request_is_active(tmp_path: P
     asyncio.run(exercise())
 
 
-def test_user_supplied_external_directory_gets_lease_instructions(tmp_path: Path) -> None:
+def test_user_supplied_external_directory_gets_host_file_broker_instructions(
+    tmp_path: Path,
+) -> None:
     from graph.deepagents_manager import DeepAgentsAgentManager
 
     workspace = tmp_path / "workspace"
@@ -896,10 +898,11 @@ def test_user_supplied_external_directory_gets_lease_instructions(tmp_path: Path
     )
 
     assert isinstance(content, str)
-    assert "stage_external_directory(directory_path=原始绝对目录)" in content
-    assert "/scratch/external-directories/<lease_id>/" in content
-    assert "prepare_external_directory_commit" in content
-    assert "commit_external_directory" in content
+    assert "直接对原始绝对路径调用" in content
+    assert "ls/glob/grep/read_file/write_file/inspect_file_version/patch_file" in content
+    assert "HostFileBroker 直接访问正式文件" in content
+    assert "不会暴露 lease、staged path 或 hash 编排" in content
+    assert "execute 仍受项目 Docker" in content
 
 
 def test_precise_external_file_does_not_infer_parent_directory(tmp_path: Path) -> None:
@@ -919,9 +922,11 @@ def test_precise_external_file_does_not_infer_parent_directory(tmp_path: Path) -
     )
 
     assert isinstance(content, str)
-    assert "stage_external_artifact(file_path=原始绝对路径)" in content
-    assert "stage_external_directory(directory_path=该文件的父目录)" in content
-    assert "如果读取后确认必须发现同目录依赖文件" in content
+    assert "直接对原始绝对路径使用 read_file/inspect_file_version/patch_file" in content
+    assert "若确认必须发现同目录依赖" in content
+    assert "对直接父目录调用 ls/glob/grep" in content
+    assert "HostFileBroker 原子落到正式路径" in content
+    assert "不得猜测兄弟路径或提升到更高祖先目录" in content
 
 
 def test_stage_external_directory_receives_runtime_through_tool_node(tmp_path: Path) -> None:
@@ -1131,7 +1136,8 @@ def test_permission_middleware_turns_external_grep_into_directory_hitl(tmp_path:
     assert request["operation"] == "grep"
     assert request["path"] == str(external.resolve())
     assert request["options"][0] == "exact_directory_session"
-    assert "重放原搜索调用" in request["change_preview"]["安全说明"]
+    assert "HostFileBroker" in request["change_preview"]["安全说明"]
+    assert "不会授予 shell 访问" in request["change_preview"]["安全说明"]
     permission_resume_registry._requests.pop(request["id"], None)
     permission_resume_registry._pending.pop(request["id"], None)
 

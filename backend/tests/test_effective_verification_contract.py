@@ -935,6 +935,59 @@ def test_non_material_aihot_inspection_does_not_widen_persisted_contract(
     assert persisted["verification_activations"] == []
 
 
+def test_successful_workspace_mutation_upgrades_to_proportional_without_goal_loop(
+    tmp_path,
+):
+    from types import SimpleNamespace
+
+    from langchain.agents.middleware.types import ToolCallRequest
+
+    from graph.session_manager import session_manager
+    from harness.models import VerificationMode
+    from harness.verification_activations import VerificationActivationMiddleware
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("session-proportional")
+    coordinator = HarnessRunCoordinator(session_manager)
+    run, _goal = coordinator.start_run(
+        session_id="session-proportional",
+        query_id="query-proportional",
+        objective="把标题改为 2026",
+        goal_mode=False,
+    )
+    coordinator.transition(run, RunStatus.RUNNING)
+    request = ToolCallRequest(
+        tool_call={
+            "id": "call-write",
+            "name": "write_file",
+            "args": {"file_path": "/workspace/report.html", "content": "<h1>2026</h1>"},
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(
+            context={
+                "session_id": "session-proportional",
+                "run_id": run.run_id,
+                "query_id": "query-proportional",
+                "workspace_path": str(tmp_path),
+            },
+            stream_writer=None,
+        ),
+    )
+    result = ToolMessage(
+        content="Wrote file successfully",
+        tool_call_id="call-write",
+        name="write_file",
+    )
+
+    VerificationActivationMiddleware._record(request, result)
+
+    persisted = session_manager.get_run_state("session-proportional", run.run_id)
+    assert persisted is not None
+    assert persisted["verification_mode"] == VerificationMode.PROPORTIONAL.value
+    assert persisted["goal_id"] is None
+
+
 @pytest.mark.parametrize(
     ("tool_name", "args", "content", "expected_pack", "expected_material"),
     [

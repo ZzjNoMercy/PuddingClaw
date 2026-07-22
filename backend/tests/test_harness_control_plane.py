@@ -20,6 +20,7 @@ from harness.models import (
     RunTaskProfile,
     SkillActivation,
     SkillCandidate,
+    VerificationMode,
     VerificationStatus,
 )
 from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
@@ -41,6 +42,32 @@ def _verification_context(workspace: Path) -> dict:
         "final_content": "报告已生成：`/workspace/report.md`",
         "workspace_path": str(workspace),
     }
+
+
+def test_run_verification_mode_is_owned_by_explicit_goal_state(tmp_path: Path) -> None:
+    sessions = _sessions(tmp_path)
+    coordinator = HarnessRunCoordinator(sessions)
+
+    ordinary, ordinary_goal = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-ordinary",
+        objective="HTML 中 HUD 数据是多少？",
+        goal_mode=False,
+    )
+    assert ordinary_goal is None
+    assert ordinary.verification_mode == VerificationMode.AGENT
+    assert ordinary.requires_goal_verification is False
+    coordinator.fail(ordinary, outcome=RunOutcome.CANCELLED, error="test boundary")
+
+    strict, goal = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-goal",
+        objective="刷新完整分析报告并严格验收",
+        goal_mode=True,
+    )
+    assert goal is not None
+    assert strict.verification_mode == VerificationMode.GOAL
+    assert strict.requires_goal_verification is True
 
 
 def test_standalone_artifact_follow_up_uses_delta_repair_without_reopening_goal(
@@ -340,7 +367,7 @@ def test_deterministic_revision_state_is_not_reported_as_grader_error(tmp_path):
         session_id="session-1",
         query_id="query-deterministic-revision",
         objective="生成销量报告并提供文件",
-        goal_mode=False,
+        goal_mode=True,
     )
     coordinator.transition(run, RunStatus.RUNNING)
 
@@ -404,7 +431,6 @@ def test_default_request_creates_one_run_without_goal(tmp_path):
     assert sessions.get_harness_state("session-1")["run_order"] == [run.run_id]
 
     coordinator.transition(run, RunStatus.RUNNING)
-    _persist_satisfied_evidence(sessions, run, tmp_path)
     completed, completed_goal, report = coordinator.complete_from_final_state(
         run,
         goal,
@@ -412,7 +438,8 @@ def test_default_request_creates_one_run_without_goal(tmp_path):
     )
 
     assert completed_goal is None
-    assert report.status == VerificationStatus.SATISFIED, report.model_dump(mode="json")
+    assert completed.verification_mode == VerificationMode.AGENT
+    assert report.status == VerificationStatus.NOT_REQUIRED, report.model_dump(mode="json")
     assert completed.status == RunStatus.COMPLETED
     assert completed.outcome == RunOutcome.COMPLETED
     harness = sessions.get_harness_state("session-1")
@@ -420,7 +447,7 @@ def test_default_request_creates_one_run_without_goal(tmp_path):
     assert harness["goals"] == {}
 
 
-def test_non_goal_verification_failure_does_not_create_followup_run(tmp_path):
+def test_non_goal_run_does_not_enter_completion_repair_loop(tmp_path):
     sessions = _sessions(tmp_path)
     coordinator = HarnessRunCoordinator(sessions)
     run, goal = coordinator.start_run(
@@ -437,9 +464,9 @@ def test_non_goal_verification_failure_does_not_create_followup_run(tmp_path):
         _exhausted_final_state(tmp_path),
     )
 
-    assert completed.outcome == RunOutcome.VERIFICATION_FAILED
-    assert report.status == VerificationStatus.MAX_ITERATIONS_REACHED
-    assert report.gaps
+    assert completed.outcome == RunOutcome.COMPLETED
+    assert completed.verification_mode == VerificationMode.AGENT
+    assert report.status == VerificationStatus.NOT_REQUIRED
     harness = sessions.get_harness_state("session-1")
     assert len(harness["runs"]) == 1
     assert harness["goals"] == {}
@@ -452,11 +479,25 @@ def test_deterministic_todo_gate_overrides_satisfied_grader(tmp_path):
         session_id="session-1",
         query_id="query-1",
         objective="分析 6 月销量并给出结论",
-        goal_mode=False,
+        goal_mode=True,
     )
     coordinator.transition(run, RunStatus.RUNNING)
     state = _satisfied_final_state(tmp_path)
-    state["_harness_context"]["todos"] = [{"id": "todo-1", "content": "补齐数据来源", "status": "in_progress"}]
+    pending_todos = [{
+        "id": "todo-1",
+        "content": "补齐数据来源",
+        "status": "in_progress",
+        "goal_id": run.goal_id,
+        "goal_revision": run.goal_revision,
+        "created_run_id": run.run_id,
+    }]
+    sessions.update_todos(
+        run.session_id,
+        pending_todos,
+        goal_id=run.goal_id,
+        goal_revision=run.goal_revision,
+    )
+    state["_harness_context"]["todos"] = pending_todos
 
     completed, _, report = coordinator.complete_from_final_state(run, goal, state)
 
@@ -475,7 +516,7 @@ def test_missing_artifact_overrides_satisfied_grader(tmp_path):
         session_id="session-1",
         query_id="query-1",
         objective="生成 6 月销量报告",
-        goal_mode=False,
+        goal_mode=True,
     )
     coordinator.transition(run, RunStatus.RUNNING)
     result = ToolMessage(
@@ -522,7 +563,7 @@ def test_workspace_copy_cannot_replace_declared_external_target(tmp_path):
         session_id="session-1",
         query_id="query-external-target",
         objective=f"{external} 刷新这个报告到 2026 年",
-        goal_mode=False,
+        goal_mode=True,
     )
     coordinator.transition(run, RunStatus.RUNNING)
     workspace_copy = tmp_path / "报告 模板 v2.html"

@@ -636,8 +636,6 @@ def test_native_and_explicit_base_tools_are_unconditionally_visible_and_executab
         "fetch_url",
         "inspect_file_version",
         "patch_file",
-        "stage_external_artifact",
-        "commit_external_artifact",
         "prepare_attachment_edit",
         "publish_attachment",
     ]
