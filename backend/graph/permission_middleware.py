@@ -55,7 +55,7 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                 "old_string": str(args.get("old_string") or ""),
                 "new_string": str(args.get("new_string") or ""),
             }
-        elif tool_name == "patch_file":
+        elif tool_name in {"patch_file", "patch_files"}:
             values = {
                 "expected_sha256": str(args.get("expected_sha256") or ""),
                 "replacements": str(args.get("replacements") or ""),
@@ -186,6 +186,7 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                 "write_file",
                 "inspect_file_version",
                 "patch_file",
+                "patch_files",
                 "stage_external_artifact",
                 "commit_external_artifact",
                 "stage_external_directory",
@@ -196,6 +197,48 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
             }:
                 continue
             args = tool_call.get("args") or {}
+            if tool_name == "patch_files":
+                for item in args.get("files") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    requested = self._external_write_path(
+                        str(item.get("file_path") or ""),
+                        workspace_path,
+                    )
+                    if requested is None or (
+                        session_manager.has_external_file_write_permission(
+                            session_id,
+                            requested,
+                        )
+                        or self._has_directory_permission_for_path(
+                            session_id,
+                            requested,
+                            access="write",
+                            run_id=run_id,
+                        )
+                    ):
+                        continue
+                    request = permission_resume_registry.create_external_file_request(
+                        session_id=session_id,
+                        query_id=query_id,
+                        tool_call_id=str(tool_call.get("id") or ""),
+                        path=requested,
+                        access="write",
+                        operation=tool_name,
+                        change_preview=self._change_preview(tool_name, item),
+                    )
+                    interrupt(
+                        {
+                            "type": "permission_request",
+                            "request": request,
+                            "decisions": [
+                                {"type": "approve"},
+                                {"type": "reject"},
+                            ],
+                        }
+                    )
+                    return None
+                continue
             raw_path = str(
                 args.get("path") or args.get("resource") or args.get("file_path") or args.get("directory_path") or ""
             ).strip()

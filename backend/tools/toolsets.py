@@ -27,6 +27,8 @@ UNCONDITIONAL_EXTENSION_TOOLSETS: dict[str, frozenset[str]] = {
     "harness_files": frozenset({
         "inspect_file_version",
         "patch_file",
+        "patch_files",
+        "rewind_external_file_changes",
         "stage_external_artifact",
         "commit_external_artifact",
         "prepare_attachment_edit",
@@ -189,6 +191,8 @@ TOOL_CONTROL_DESCRIPTORS: dict[str, ToolControlDescriptor] = {
     # Harness file protocol.
     "inspect_file_version": _READ_ONLY,
     "patch_file": _WORKSPACE_WRITE,
+    "patch_files": _WORKSPACE_WRITE,
+    "rewind_external_file_changes": _EXTERNAL_COMMIT,
     "upsert_scratch_file": _WORKSPACE_WRITE,
     "stage_external_artifact": _READ_ONLY,
     "commit_external_artifact": _EXTERNAL_COMMIT,

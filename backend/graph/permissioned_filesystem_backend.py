@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import shlex
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +52,7 @@ class PermissionedCompositeBackend(CompositeBackend):
                 session_id=session_id,
                 run_id=run_id,
                 query_id=query_id,
+                validation_runner=self._validate_external_candidate,
             )
             if session_id and run_id
             else None
@@ -64,6 +69,115 @@ class PermissionedCompositeBackend(CompositeBackend):
                 if relative:
                     workspace_prefixes.append(f"/workspace/{relative}/")
         self._readonly_workspace_prefixes = tuple(workspace_prefixes)
+
+    def _validate_external_candidate(
+        self,
+        target: Any,
+        content: bytes,
+    ) -> dict[str, Any] | None:
+        """Validate code-like host bytes inside the existing execution backend."""
+
+        suffix = target.canonical_path.suffix.lower()
+        validator: tuple[str, str, str] | None = None
+        if suffix in {".js", ".mjs", ".cjs"}:
+            validator = ("javascript_syntax", "node-check/v1", "node --check")
+        elif suffix == ".py":
+            validator = ("static_check", "python-py-compile/v1", "python3 -m py_compile")
+        elif suffix == ".json":
+            validator = ("json_structure", "python-json-tool/v1", "python3 -m json.tool")
+        if validator is None:
+            return None
+        execution_backend = getattr(self, "execution_backend", None)
+        scratch_root = str(getattr(self, "execution_scratch_host_path", "") or "")
+        if execution_backend is None or not scratch_root:
+            return None
+
+        content_sha256 = f"sha256:{hashlib.sha256(content).hexdigest()}"
+        digest = content_sha256.removeprefix("sha256:")
+        safe_name = "".join(
+            character
+            for character in target.canonical_path.name
+            if character.isalnum() or character in "._-"
+        ) or f"candidate{suffix}"
+        relative = Path("validation") / digest / safe_name
+        host_path = Path(scratch_root) / relative
+        host_path.parent.mkdir(parents=True, exist_ok=True)
+        host_path.write_bytes(content)
+        virtual_path = f"/scratch/{relative.as_posix()}"
+        validator_kind, validator_version, command_prefix = validator
+        command = f"{command_prefix} {shlex.quote(virtual_path)}"
+        try:
+            result = execution_backend.execute(command, timeout=60)
+        finally:
+            shutil.rmtree(host_path.parent, ignore_errors=True)
+            try:
+                host_path.parent.parent.rmdir()
+            except OSError:
+                pass
+        output = str(getattr(result, "output", "") or "")
+        raw_exit_code = getattr(result, "exit_code", None)
+        exit_code = int(raw_exit_code) if isinstance(raw_exit_code, int) else 1
+        receipt_seed = json.dumps(
+            {
+                "run_id": self.run_id,
+                "path": str(target.canonical_path),
+                "content_sha256": content_sha256,
+                "validator": validator_version,
+            },
+            sort_keys=True,
+        )
+        receipt_id = "validation-" + hashlib.sha256(
+            receipt_seed.encode("utf-8")
+        ).hexdigest()[:20]
+        artifact_id = "artifact-" + hashlib.sha256(
+            f"external\0{target.canonical_path}".encode()
+        ).hexdigest()[:20]
+        return {
+            "kind": "validation_receipt",
+            "validation_receipt_id": receipt_id,
+            "run_id": self.run_id,
+            "validator_kind": validator_kind,
+            "validator_version": validator_version,
+            "artifact_refs": [
+                {
+                    "artifact_id": artifact_id,
+                    "path": str(target.canonical_path),
+                    "content_sha256": content_sha256,
+                }
+            ],
+            "command_evidence_ref": "sha256:"
+            + hashlib.sha256(output.encode("utf-8")).hexdigest(),
+            "exit_code": exit_code,
+            "checks_passed": 1 if exit_code == 0 else 0,
+            "checks_failed": 0 if exit_code == 0 else 1,
+            "status": "passed" if exit_code == 0 else "failed",
+            "blocking": True,
+            "commit_authority": True,
+            "obligation_key": f"{validator_kind}:{validator_version}",
+            "summary": output[:2000],
+            "materialized_path": virtual_path,
+            "temporary_materialization": True,
+        }
+
+    def rewind_external_file_changes(self) -> dict[str, Any]:
+        if self.host_file_broker is None:
+            return {
+                "status": "permission_required",
+                "error": "permission_required: no active HostFileBroker Run",
+                "rewound_receipt_ids": [],
+            }
+        return self.host_file_broker.rewind_run()
+
+    def apply_external_file_transaction(
+        self,
+        changes: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if self.host_file_broker is None:
+            return {
+                "status": "permission_required",
+                "error": "permission_required: no active HostFileBroker Run",
+            }
+        return self.host_file_broker.apply_transaction(changes)
 
     def _readonly_virtual_path(self, file_path: str) -> bool:
         normalized = file_path.replace("\\", "/")

@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+import hashlib
+import shlex
 from pathlib import Path
 
 from deepagents.backends import FilesystemBackend
+from deepagents.backends.protocol import ExecuteResponse
+from langchain_core.messages import ToolMessage
 
 from graph.permissioned_filesystem_backend import PermissionedCompositeBackend
 from graph.session_manager import session_manager
 from harness.coordinators import HarnessRunCoordinator
 from harness.models import RunStatus
+from harness.verification_activations import build_verification_activations
+
+
+def _digest(value: str) -> str:
+    return "sha256:" + hashlib.sha256(value.encode()).hexdigest()
 
 
 def _setup(tmp_path: Path):
@@ -95,3 +104,197 @@ def test_authorized_directory_rejects_symlink_escape(tmp_path: Path) -> None:
     assert backend.can_access_external_path(str(link), access="read") is False
     assert backend.can_access_external_path(str(link), access="write") is False
 
+
+class _ValidationBackend:
+    def __init__(self, scratch: Path) -> None:
+        self.scratch = scratch
+
+    def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
+        del timeout
+        candidate = shlex.split(command)[-1]
+        assert candidate.startswith("/scratch/")
+        content = (self.scratch / candidate.removeprefix("/scratch/")).read_text(
+            encoding="utf-8"
+        )
+        if "INVALID" in content:
+            return ExecuteResponse(output="SyntaxError: invalid candidate", exit_code=1)
+        return ExecuteResponse(output="syntax ok", exit_code=0)
+
+
+def test_broker_validation_bridge_binds_formal_hash_and_blocks_bad_bytes(
+    tmp_path: Path,
+) -> None:
+    backend, external, _outside, run = _setup(tmp_path)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    backend.execution_backend = _ValidationBackend(scratch)
+    backend.execution_scratch_host_path = str(scratch)
+    target = external / "app.js"
+    target.write_text("const value = 1;\n", encoding="utf-8")
+
+    valid = backend.edit(str(target), "1", "2")
+    assert valid.error is None
+    assert target.read_text(encoding="utf-8") == "const value = 2;\n"
+    receipt = session_manager.list_external_mutation_receipts(
+        "broker-session",
+        run_id=run.run_id,
+    )[-1]
+    validation = receipt["validation_receipt"]
+    assert validation["status"] == "passed"
+    assert validation["commit_authority"] is True
+    assert validation["artifact_refs"] == [
+        {
+            "artifact_id": validation["artifact_refs"][0]["artifact_id"],
+            "path": str(target),
+            "content_sha256": receipt["after_sha256"],
+        }
+    ]
+    assert not (scratch / "validation").exists()
+    activations = build_verification_activations(
+        run_id=run.run_id,
+        query_id=run.query_id,
+        tool_call_id="call-edit",
+        tool_name="edit_file",
+        args={"file_path": str(target), "old_string": "1", "new_string": "2"},
+        result=ToolMessage(
+            content=f"Updated {target}",
+            tool_call_id="call-edit",
+            name="edit_file",
+            status="success",
+        ),
+        session_id="broker-session",
+        workspace_path=str(tmp_path / "workspace"),
+    )
+    assert any(
+        ref.get("validation_receipt_id") == validation["validation_receipt_id"]
+        for activation in activations
+        for ref in activation.evidence_refs
+    )
+
+    invalid = backend.edit(str(target), "2", "INVALID")
+    assert invalid.error is not None
+    assert invalid.error.startswith("validation_failed:")
+    assert target.read_text(encoding="utf-8") == "const value = 2;\n"
+    assert len(
+        session_manager.list_external_mutation_receipts(
+            "broker-session",
+            run_id=run.run_id,
+        )
+    ) == 1
+
+
+def test_rewind_restores_only_current_run_when_hashes_still_match(tmp_path: Path) -> None:
+    backend, external, _outside, _run = _setup(tmp_path)
+    target = external / "report.txt"
+    created = external / "notes.txt"
+    target.write_text("before\n", encoding="utf-8")
+
+    assert backend.edit(str(target), "before", "after").error is None
+    assert backend.write(str(created), "created\n").error is None
+    result = backend.rewind_external_file_changes()
+
+    assert result["status"] == "completed"
+    assert len(result["rewound_receipt_ids"]) == 2
+    assert target.read_text(encoding="utf-8") == "before\n"
+    assert not created.exists()
+    assert backend.rewind_external_file_changes()["status"] == "noop"
+
+
+def test_rewind_refuses_to_overwrite_concurrent_host_change(tmp_path: Path) -> None:
+    backend, external, _outside, _run = _setup(tmp_path)
+    target = external / "report.txt"
+    target.write_text("before\n", encoding="utf-8")
+    assert backend.edit(str(target), "before", "after").error is None
+    target.write_text("concurrent\n", encoding="utf-8")
+
+    result = backend.rewind_external_file_changes()
+
+    assert result["status"] == "conflict"
+    assert result["error"].startswith("conflict:")
+    assert target.read_text(encoding="utf-8") == "concurrent\n"
+
+
+def test_multi_file_transaction_is_all_or_nothing_and_journaled(tmp_path: Path) -> None:
+    backend, external, _outside, run = _setup(tmp_path)
+    first = external / "first.txt"
+    second = external / "second.txt"
+    first.write_text("one\n", encoding="utf-8")
+    second.write_text("two\n", encoding="utf-8")
+
+    completed = backend.apply_external_file_transaction(
+        [
+            {
+                "file_path": str(first),
+                "expected_sha256": _digest("one\n"),
+                "content": "ONE\n",
+            },
+            {
+                "file_path": str(second),
+                "expected_sha256": _digest("two\n"),
+                "content": "TWO\n",
+            },
+        ]
+    )
+    assert completed["status"] == "completed"
+    assert first.read_text(encoding="utf-8") == "ONE\n"
+    assert second.read_text(encoding="utf-8") == "TWO\n"
+    receipts = [
+        item
+        for item in session_manager.list_external_mutation_receipts(
+            "broker-session",
+            run_id=run.run_id,
+        )
+        if item.get("transaction_id") == completed["transaction_id"]
+    ]
+    assert len(receipts) == 2
+    assert all(item["diff"] for item in receipts)
+
+    conflict = backend.apply_external_file_transaction(
+        [
+            {
+                "file_path": str(first),
+                "expected_sha256": _digest("ONE\n"),
+                "content": "changed-one\n",
+            },
+            {
+                "file_path": str(second),
+                "expected_sha256": _digest("stale\n"),
+                "content": "changed-two\n",
+            },
+        ]
+    )
+    assert conflict["status"] == "conflict"
+    assert first.read_text(encoding="utf-8") == "ONE\n"
+    assert second.read_text(encoding="utf-8") == "TWO\n"
+
+
+def test_multi_file_transaction_validates_every_candidate_before_commit(
+    tmp_path: Path,
+) -> None:
+    backend, external, _outside, _run = _setup(tmp_path)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    backend.execution_backend = _ValidationBackend(scratch)
+    backend.execution_scratch_host_path = str(scratch)
+    first = external / "first.js"
+    second = external / "second.js"
+    first.write_text("const first = 1;\n", encoding="utf-8")
+    second.write_text("const second = 2;\n", encoding="utf-8")
+    result = backend.apply_external_file_transaction(
+        [
+            {
+                "file_path": str(first),
+                "expected_sha256": _digest("const first = 1;\n"),
+                "content": "const first = 10;\n",
+            },
+            {
+                "file_path": str(second),
+                "expected_sha256": _digest("const second = 2;\n"),
+                "content": "INVALID\n",
+            },
+        ]
+    )
+
+    assert result["status"] == "validation_failed"
+    assert first.read_text(encoding="utf-8") == "const first = 1;\n"
+    assert second.read_text(encoding="utf-8") == "const second = 2;\n"

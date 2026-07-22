@@ -4898,11 +4898,33 @@ class SessionManager:
 
     # ── Host-file mutation receipts ──────────────────────────────────────────
 
+    def _external_rewind_backup_path(
+        self,
+        session_id: str,
+        receipt_id: str,
+    ) -> Path:
+        assert self._base_dir is not None
+        safe_session = "".join(
+            character for character in session_id if character.isalnum() or character in "-_"
+        )
+        safe_receipt = "".join(
+            character for character in receipt_id if character.isalnum() or character in "-_"
+        )
+        return (
+            self._base_dir
+            / "data"
+            / "harness-rewind"
+            / safe_session
+            / f"{safe_receipt}.bin"
+        )
+
     @_session_write_locked
     def append_external_mutation_receipt(
         self,
         session_id: str,
         receipt: dict[str, Any],
+        *,
+        before_bytes: bytes | None = None,
     ) -> dict[str, Any]:
         """Persist one immutable HostFileBroker mutation receipt."""
 
@@ -4912,15 +4934,123 @@ class SessionManager:
         receipt_id = str(receipt.get("receipt_id") or "")
         if not receipt_id:
             raise ValueError("external mutation receipt requires receipt_id")
+        persisted = deepcopy(receipt)
+        if before_bytes is not None:
+            backup_path = self._external_rewind_backup_path(session_id, receipt_id)
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            if backup_path.exists():
+                existing_digest = f"sha256:{hashlib.sha256(backup_path.read_bytes()).hexdigest()}"
+                incoming_digest = f"sha256:{hashlib.sha256(before_bytes).hexdigest()}"
+                if existing_digest != incoming_digest:
+                    raise ValueError(
+                        f"external mutation rewind backup {receipt_id} is immutable"
+                    )
+            else:
+                temporary = backup_path.with_name(
+                    f".{backup_path.name}.{uuid.uuid4().hex}.tmp"
+                )
+                try:
+                    temporary.write_bytes(before_bytes)
+                    temporary.replace(backup_path)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            persisted["rewind_backup_ref"] = f"rewind-backup:{receipt_id}"
+            persisted["rewindable"] = True
+        elif str(receipt.get("operation") or "") == "create":
+            # Rewinding a create deletes the exact file after a hash check; no
+            # before-bytes backup is needed.
+            persisted["rewindable"] = True
         receipts = data.setdefault("external_mutation_receipts", {})
         existing = receipts.get(receipt_id)
         if isinstance(existing, dict):
-            if existing != receipt:
+            if existing != persisted:
                 raise ValueError(f"external mutation receipt {receipt_id} is immutable")
             return deepcopy(existing)
-        receipts[receipt_id] = deepcopy(receipt)
+        receipts[receipt_id] = persisted
         self._write_file(session_id, data)
         return deepcopy(receipts[receipt_id])
+
+    def load_external_mutation_backup(
+        self,
+        session_id: str,
+        receipt_id: str,
+    ) -> bytes | None:
+        """Return server-side rewind bytes without exposing their path."""
+
+        if self._base_dir is None:
+            return None
+        path = self._external_rewind_backup_path(session_id, receipt_id)
+        try:
+            return path.read_bytes()
+        except FileNotFoundError:
+            return None
+
+    @_session_write_locked
+    def append_external_mutation_receipts_atomic(
+        self,
+        session_id: str,
+        entries: list[tuple[dict[str, Any], bytes | None]],
+    ) -> list[dict[str, Any]]:
+        """Persist one Broker transaction's receipts in a single Session write."""
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        receipts = data.setdefault("external_mutation_receipts", {})
+        persisted_entries: list[dict[str, Any]] = []
+        pending_backups: list[tuple[Path, bytes]] = []
+        for receipt, before_bytes in entries:
+            persisted = deepcopy(receipt)
+            receipt_id = str(persisted.get("receipt_id") or "")
+            if not receipt_id:
+                raise ValueError("external mutation receipt requires receipt_id")
+            existing = receipts.get(receipt_id)
+            if isinstance(existing, dict):
+                if existing != persisted:
+                    raise ValueError(
+                        f"external mutation receipt {receipt_id} is immutable"
+                    )
+                persisted_entries.append(deepcopy(existing))
+                continue
+            if before_bytes is not None:
+                backup_path = self._external_rewind_backup_path(
+                    session_id,
+                    receipt_id,
+                )
+                if backup_path.exists() and backup_path.read_bytes() != before_bytes:
+                    raise ValueError(
+                        f"external mutation rewind backup {receipt_id} is immutable"
+                    )
+                persisted["rewind_backup_ref"] = f"rewind-backup:{receipt_id}"
+                persisted["rewindable"] = True
+                pending_backups.append((backup_path, before_bytes))
+            elif str(persisted.get("operation") or "") == "create":
+                persisted["rewindable"] = True
+            persisted_entries.append(persisted)
+
+        created_backups: list[Path] = []
+        try:
+            for backup_path, before_bytes in pending_backups:
+                if backup_path.exists():
+                    continue
+                backup_path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = backup_path.with_name(
+                    f".{backup_path.name}.{uuid.uuid4().hex}.tmp"
+                )
+                try:
+                    temporary.write_bytes(before_bytes)
+                    temporary.replace(backup_path)
+                    created_backups.append(backup_path)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            for persisted in persisted_entries:
+                receipts[str(persisted["receipt_id"])] = deepcopy(persisted)
+            self._write_file(session_id, data)
+        except Exception:
+            for backup_path in created_backups:
+                backup_path.unlink(missing_ok=True)
+            raise
+        return [deepcopy(item) for item in persisted_entries]
 
     def list_external_mutation_receipts(
         self,

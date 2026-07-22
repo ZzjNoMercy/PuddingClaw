@@ -47,6 +47,16 @@ class PatchFileInput(BaseModel):
     replacements: list[ReplacementHunk] = Field(min_length=1, max_length=100)
 
 
+class FilePatchSpec(BaseModel):
+    file_path: str
+    expected_sha256: str
+    replacements: list[ReplacementHunk] = Field(min_length=1, max_length=100)
+
+
+class PatchFilesInput(BaseModel):
+    files: list[FilePatchSpec] = Field(min_length=2, max_length=50)
+
+
 class StageExternalArtifactInput(BaseModel):
     file_path: str = Field(description="Approved absolute external source path")
 
@@ -87,6 +97,10 @@ class ValidateArtifactContractInput(BaseModel):
     contract_id: str = Field(description="Registered deterministic artifact contract id")
     html_file_path: str
     javascript_file_path: str
+
+
+class RewindExternalFileChangesInput(BaseModel):
+    """The active Run scope is supplied by the Backend, not the model."""
 
 
 def _read_all(backend: Any, file_path: str) -> tuple[str | None, str | None]:
@@ -363,6 +377,99 @@ class VersionedPatchMiddleware(AgentMiddleware[Any, Any, Any]):
                 name="patch_file",
                 tool_call_id=runtime.tool_call_id,
                 status="success",
+            )
+
+        def rewind_external_file_changes(
+            runtime: ToolRuntime[Any, Any],
+        ) -> ToolMessage:
+            rewind = getattr(self.backend, "rewind_external_file_changes", None)
+            if not callable(rewind):
+                return ToolMessage(
+                    content="io_error: this Backend does not support external-file rewind",
+                    name="rewind_external_file_changes",
+                    tool_call_id=runtime.tool_call_id,
+                    status="error",
+                )
+            result = rewind()
+            status = str(result.get("status") or "io_error")
+            return ToolMessage(
+                content=json.dumps(result, ensure_ascii=False, sort_keys=True),
+                name="rewind_external_file_changes",
+                tool_call_id=runtime.tool_call_id,
+                status=("success" if status in {"completed", "noop"} else "error"),
+            )
+
+        def patch_files(
+            files: list[FilePatchSpec],
+            runtime: ToolRuntime[Any, Any],
+        ) -> ToolMessage:
+            apply_transaction = getattr(
+                self.backend,
+                "apply_external_file_transaction",
+                None,
+            )
+            if not callable(apply_transaction):
+                return ToolMessage(
+                    content="io_error: this Backend does not support multi-file transactions",
+                    name="patch_files",
+                    tool_call_id=runtime.tool_call_id,
+                    status="error",
+                )
+            changes: list[dict[str, Any]] = []
+            for spec in files:
+                original, error = _read_all(self.backend, spec.file_path)
+                if error is not None or original is None:
+                    return ToolMessage(
+                        content=f"io_error: {error or 'unable to read file'}",
+                        name="patch_files",
+                        tool_call_id=runtime.tool_call_id,
+                        status="error",
+                    )
+                current = _digest(original)
+                if current != spec.expected_sha256:
+                    return ToolMessage(
+                        content=(
+                            f"conflict: {spec.file_path} expected "
+                            f"{spec.expected_sha256}, current {current}"
+                        ),
+                        name="patch_files",
+                        tool_call_id=runtime.tool_call_id,
+                        status="error",
+                    )
+                updated = original
+                for hunk in spec.replacements:
+                    occurrences = updated.count(hunk.old_string)
+                    if occurrences == 0 or (
+                        not hunk.replace_all and occurrences != 1
+                    ):
+                        return ToolMessage(
+                            content=(
+                                f"conflict: replacement is not uniquely applicable "
+                                f"to {spec.file_path}; re-inspect and rebase"
+                            ),
+                            name="patch_files",
+                            tool_call_id=runtime.tool_call_id,
+                            status="error",
+                        )
+                    updated = updated.replace(
+                        hunk.old_string,
+                        hunk.new_string,
+                        -1 if hunk.replace_all else 1,
+                    )
+                changes.append(
+                    {
+                        "file_path": spec.file_path,
+                        "expected_sha256": spec.expected_sha256,
+                        "content": updated,
+                    }
+                )
+            result = apply_transaction(changes)
+            status = str(result.get("status") or "io_error")
+            return ToolMessage(
+                content=json.dumps(result, ensure_ascii=False, sort_keys=True),
+                name="patch_files",
+                tool_call_id=runtime.tool_call_id,
+                status="success" if status == "completed" else "error",
             )
 
         def stage_external_artifact(
@@ -1124,6 +1231,28 @@ class VersionedPatchMiddleware(AgentMiddleware[Any, Any, Any]):
                 ),
                 func=patch_file,
                 args_schema=PatchFileInput,
+                infer_schema=False,
+            ),
+            StructuredTool.from_function(
+                name="patch_files",
+                description=(
+                    "Apply one atomic optimistic transaction across 2-50 authorized external files. "
+                    "Every file must carry the version returned by inspect_file_version; any permission, "
+                    "version, validation, or I/O failure leaves all targets unchanged."
+                ),
+                func=patch_files,
+                args_schema=PatchFilesInput,
+                infer_schema=False,
+            ),
+            StructuredTool.from_function(
+                name="rewind_external_file_changes",
+                description=(
+                    "Undo only HostFileBroker changes made by the current Run. "
+                    "Every target must still match the Run's recorded after-hash; "
+                    "otherwise rewind refuses instead of overwriting concurrent edits."
+                ),
+                func=rewind_external_file_changes,
+                args_schema=RewindExternalFileChangesInput,
                 infer_schema=False,
             ),
             StructuredTool.from_function(

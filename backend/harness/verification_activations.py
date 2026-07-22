@@ -77,6 +77,7 @@ _WRITE_TOOLS = frozenset(
         "write_file",
         "edit_file",
         "patch_file",
+        "patch_files",
         "commit_external_artifact",
         "commit_external_directory",
         "publish_attachment",
@@ -207,6 +208,18 @@ def verification_packs_for_tool(
         # command rather than the filename extension.
         return ["artifact"]
     if tool_name in _WRITE_TOOLS:
+        if tool_name == "patch_files":
+            paths = [
+                str(item.get("file_path") or "").lower()
+                for item in (args or {}).get("files") or []
+                if isinstance(item, dict)
+            ]
+            packs: list[str] = []
+            if any(Path(path).suffix in _CODE_EXTENSIONS for path in paths):
+                packs.append("code")
+            if any(Path(path).suffix in _ARTIFACT_EXTENSIONS for path in paths):
+                packs.append("artifact")
+            return packs
         raw_path = str(
             ((args or {}).get("output_name") if tool_name == "publish_attachment" else None)
             or (args or {}).get("file_path")
@@ -622,6 +635,64 @@ def _result_evidence_refs(
                         },
                     )
                 )
+        elif tool_name == "patch_files":
+            try:
+                transaction = json.loads(content)
+            except json.JSONDecodeError:
+                transaction = {}
+            receipt_ids = {
+                str(item)
+                for item in transaction.get("receipt_ids") or []
+                if str(item)
+            }
+            mutations = [
+                item
+                for item in session_manager.list_external_mutation_receipts(
+                    session_id,
+                    run_id=run_id,
+                )
+                if str(item.get("receipt_id") or "") in receipt_ids
+            ]
+            for mutation in mutations:
+                target_path = str(mutation.get("canonical_path") or "")
+                content_sha256 = str(mutation.get("after_sha256") or "")
+                if not target_path or not content_sha256:
+                    continue
+                artifact_id = "artifact-" + hashlib.sha256(
+                    f"external\0{target_path}".encode()
+                ).hexdigest()[:20]
+                artifact = ArtifactReference(
+                    artifact_id=artifact_id,
+                    scope=ArtifactScope.EXTERNAL,
+                    role=ArtifactRole.CANDIDATE,
+                    path=target_path,
+                    host_path=target_path,
+                    authorized=True,
+                    permission_grant_id=str(
+                        mutation.get("permission_grant_id") or ""
+                    )
+                    or None,
+                    run_id=run_id or None,
+                    query_id=query_id or None,
+                    goal_id=goal_id,
+                    goal_revision=goal_revision,
+                    tool_call_id=tool_call_id,
+                    output_digest=f"sha256:{digest}",
+                    content_sha256=content_sha256,
+                )
+                refs.append(
+                    {"kind": "artifact_write", **artifact.model_dump(mode="json")}
+                )
+                refs.append(dict(mutation))
+                validation_receipt = mutation.get("validation_receipt")
+                if isinstance(validation_receipt, dict):
+                    refs.append(
+                        {
+                            **validation_receipt,
+                            "kind": "validation_receipt",
+                            "material": True,
+                        }
+                    )
         elif tool_name in _WRITE_TOOLS:
             raw_path = str(args.get("file_path") or args.get("path") or "").strip()
             if raw_path:
@@ -644,6 +715,15 @@ def _result_evidence_refs(
                     )
                     if mutation is not None:
                         refs.append(dict(mutation))
+                        validation_receipt = mutation.get("validation_receipt")
+                        if isinstance(validation_receipt, dict):
+                            refs.append(
+                                {
+                                    **validation_receipt,
+                                    "kind": "validation_receipt",
+                                    "material": True,
+                                }
+                            )
     return refs
 
 
