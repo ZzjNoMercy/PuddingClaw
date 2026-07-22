@@ -717,7 +717,21 @@ register_harness_profile(
             "edit_file": (
                 "Deprecated by PuddingClaw Harness: direct exact-string editing is disabled. "
                 "Call inspect_file_version and then patch_file with expected_sha256."
-            )
+            ),
+            "ls": (
+                "List entries in a directory only when the task genuinely requires "
+                "discovering unknown children. Never call ls as a prerequisite for "
+                "read_file, grep, inspect_file_version, patch_file, or write_file when "
+                "an exact path is already known from the user, system context, a Tool "
+                "result, or a persisted artifact reference; operate on that path directly."
+            ),
+            "glob": (
+                "Discover files by pattern only when the exact path or file name is "
+                "unknown. Do not use glob to confirm a known path, inspect a known "
+                "file's parent, infer project identity, or repeat discovery after a "
+                "matching path has already been returned. Keep the pattern and search "
+                "root as narrow as the task permits."
+            ),
         },
     ),
 )

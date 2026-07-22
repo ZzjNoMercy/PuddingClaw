@@ -9,6 +9,7 @@ import {
   Circle,
   ExternalLink,
   FileText,
+  FolderOpen,
   Globe2,
   KeyRound,
   ListChecks,
@@ -1347,6 +1348,11 @@ function PermissionGrantRow({
   const canWrite = grant.capabilities.includes("write")
     || grant.type === "external_file_write"
     || grant.type === "external_directory_write";
+  const isDirectoryResource = grant.target_kind === "exact_directory"
+    || grant.type.startsWith("external_directory_");
+  const isFileResource = grant.target_kind === "exact_file"
+    || grant.target_kind === "all_external_files"
+    || grant.type.startsWith("external_file_");
   const timestamp = grant.consumed_at || grant.revoked_at || grant.created_at;
   return (
     <div className="rounded-2xl border border-black/[0.06] bg-white/70 p-3">
@@ -1354,6 +1360,10 @@ function PermissionGrantRow({
         <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-xl ${
           presentation.isSkill
             ? "bg-cyan-50 text-cyan-700"
+            : isDirectoryResource
+              ? "bg-amber-50 text-amber-700"
+              : isFileResource
+                ? "bg-blue-50 text-blue-700"
             : "bg-[#002fa7]/10 text-[#002fa7]"
         }`}>
           {presentation.isSkill
@@ -1362,7 +1372,11 @@ function PermissionGrantRow({
               ? <Globe2 className="h-4 w-4" />
               : presentation.isToolAction
                 ? <SquareTerminal className="h-4 w-4" />
-                : <KeyRound className="h-4 w-4" />}
+                : isDirectoryResource
+                  ? <FolderOpen className="h-4 w-4" />
+                  : isFileResource
+                    ? <FileText className="h-4 w-4" />
+                    : <KeyRound className="h-4 w-4" />}
         </div>
         <div className="min-w-0 flex-1">
           <div className="flex items-center justify-between gap-2">
@@ -1400,6 +1414,15 @@ function PermissionGrantRow({
             {grant.metadata?.policy_source === "codex_grok_smart_reviewer" ? (
               <span className="rounded-full bg-blue-50 px-2 py-0.5 text-[10px] font-medium text-blue-700">
                 智能审查
+              </span>
+            ) : null}
+            {!presentation.isSkill && !presentation.isToolAction && isDirectoryResource ? (
+              <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700">
+                目录
+              </span>
+            ) : !presentation.isSkill && !presentation.isToolAction && isFileResource ? (
+              <span className="rounded-full bg-blue-50 px-2 py-0.5 text-[10px] font-medium text-blue-700">
+                文件
               </span>
             ) : null}
             {presentation.isSkill ? (
@@ -1516,7 +1539,7 @@ function permissionGrantPresentation(grant: PermissionGrant): {
     || grant.type.startsWith("external_directory_");
   return {
     name: grant.target_kind === "all_external_files"
-      ? `本 session 外部文件${canWrite ? "写入" : canDelete ? "删除" : "读取"}`
+      ? `本 Session 外部文件${canWrite ? "写入" : canDelete ? "删除" : "读取"}`
       : `${grant.target.split("/").filter(Boolean).pop() || (isDirectory ? "外部目录" : "外部文件")}${isDirectory ? ` · 目录${canWrite ? "修改" : "读取"}` : canDelete ? " · 文件删除" : ""}`,
     target: grant.target_kind === "all_external_files" ? "所有外部文件" : grant.target,
     changes: "",

@@ -256,7 +256,7 @@ export default function Navbar({
           <button
             onClick={toggleInspector}
             disabled={!inspectorAvailable}
-            className={`w-8 h-8 flex items-center justify-center rounded-lg transition-all ${
+            className={`h-8 w-8 shrink-0 flex items-center justify-center rounded-lg transition-all ${
               !inspectorAvailable
                 ? "cursor-not-allowed text-gray-200"
                 : inspectorOpen

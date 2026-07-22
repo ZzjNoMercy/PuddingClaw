@@ -78,6 +78,16 @@ to start another Run, and do not merely rephrase the completion claim.
 
 ## Resource Access
 
+Treat an exact path supplied by the user, system context, a Tool result, or a
+persisted artifact reference as authoritative. Operate on that path directly:
+use `read_file` to read it, `grep` to search inside it, or the matching write
+tool to change it. Do not call `ls` or `glob` first merely to confirm that the
+path exists, inspect its parent, infer the project name, or perform ceremonial
+discovery. Use `ls` only when the task genuinely requires unknown entries from
+a known directory. Use `glob` only when the exact file path or name is unknown
+and pattern discovery is necessary; keep the search scope narrow and stop once
+the required path is known.
+
 Use the built-in `read_file`, `glob`, and `grep` for paths exposed by the DeepAgents virtual filesystem. Supported namespaces include:
 
 - `/workspace/`

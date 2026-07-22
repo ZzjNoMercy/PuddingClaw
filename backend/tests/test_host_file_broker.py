@@ -161,6 +161,56 @@ def test_read_only_directory_grant_allows_search_but_not_mutation(tmp_path: Path
     assert target.read_text(encoding="utf-8") == "read only\n"
 
 
+def test_all_external_files_grant_allows_exact_file_grep_but_not_directory_search(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    external = tmp_path / "external"
+    for directory in (state, workspace, external):
+        directory.mkdir()
+    target = external / "report.txt"
+    target.write_text("needle\n", encoding="utf-8")
+    session_manager.initialize(state)
+    session_manager.create_session("broad-file-read-session")
+    coordinator = HarnessRunCoordinator(session_manager)
+    run, _goal = coordinator.start_run(
+        session_id="broad-file-read-session",
+        query_id="broad-file-read-query",
+        objective="search one known external file",
+        goal_mode=False,
+        verification_enabled=False,
+    )
+    coordinator.transition(run, RunStatus.RUNNING)
+    session_manager.add_permission_grant(
+        "broad-file-read-session",
+        grant_type="external_file_read",
+        target_kind="all_external_files",
+        target="*",
+        capabilities=["read", "external_path"],
+        scope="session",
+    )
+    workspace_backend = FilesystemBackend(root_dir=workspace, virtual_mode=True)
+    backend = PermissionedCompositeBackend(
+        default=workspace_backend,
+        routes={"/workspace/": workspace_backend},
+        session_id="broad-file-read-session",
+        run_id=run.run_id,
+        query_id=run.query_id,
+        workspace_root=workspace,
+    )
+
+    exact_file_result = backend.grep("needle", path=str(target))
+
+    assert exact_file_result.error is None
+    assert [item["path"] for item in exact_file_result.matches or []] == [str(target)]
+    assert backend.can_access_external_path(str(target), access="read") is True
+    assert backend.can_access_external_path(str(external), access="read") is False
+    directory_result = backend.grep("needle", path=str(external))
+    assert directory_result.error is not None
+    assert "permission_required" in directory_result.error
+
+
 def test_ungranted_external_absolute_path_never_falls_through_default_backend(
     tmp_path: Path,
 ) -> None:

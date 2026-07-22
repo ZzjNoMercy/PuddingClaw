@@ -327,10 +327,12 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                 access = "write" if tool_name == "commit_external_directory" else "read"
                 if (
                     tool_name == "grep"
+                    and requested.is_file()
                     and session_manager.has_external_file_read_permission(session_id, requested)
                 ):
-                    # Exact-file grep remains exact-file scoped. The path
-                    # router copies only this file into an isolated snapshot.
+                    # A file Grant may authorize grep only when its path is an
+                    # existing exact file. Directory grep is discovery and
+                    # must continue through the exact-directory HITL path.
                     self._trace_permission_reuse(
                         tool_name=tool_name,
                         target=requested,

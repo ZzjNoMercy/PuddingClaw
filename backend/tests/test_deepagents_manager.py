@@ -12,6 +12,23 @@ from deepagents.middleware.memory import MemoryMiddleware
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 
 
+def test_filesystem_discovery_tool_descriptions_prefer_known_exact_paths():
+    # Importing the manager registers PuddingClaw's runtime Harness profile.
+    from deepagents.profiles.harness.harness_profiles import _get_harness_profile
+
+    import graph.deepagents_manager  # noqa: F401
+
+    profile = _get_harness_profile("modelclientchatmodel")
+
+    assert profile is not None
+    ls_description = profile.tool_description_overrides["ls"]
+    glob_description = profile.tool_description_overrides["glob"]
+    assert "exact path is already known" in ls_description
+    assert "Never call ls as a prerequisite" in ls_description
+    assert "exact path or file name is unknown" in glob_description
+    assert "Do not use glob to confirm a known path" in glob_description
+
+
 def test_effective_agent_messages_uses_summary_and_preserved_tail():
     from graph.deepagents_manager import _effective_agent_messages
 

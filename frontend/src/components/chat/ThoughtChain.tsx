@@ -26,9 +26,18 @@ interface Props {
   isStreaming?: boolean;
 }
 
-const COMMAND_TOOLS = new Set(["bash", "python_repl", "python", "shell", "exec"]);
+const COMMAND_TOOLS = new Set([
+  "execute",
+  "terminal",
+  "bash",
+  "python_repl",
+  "python",
+  "shell",
+  "exec",
+]);
 
 const TOOL_META: Record<string, { icon: React.ElementType; color: string; bg: string }> = {
+  execute: { icon: Terminal, color: "#6b7280", bg: "#f3f4f6" },
   terminal: { icon: Terminal, color: "#6b7280", bg: "#f3f4f6" },
   bash: { icon: Terminal, color: "#374151", bg: "#f3f4f6" },
   python_repl: { icon: Code, color: "#2563eb", bg: "#eff6ff" },
@@ -67,9 +76,8 @@ function getToolLabel(toolCall: ToolCall): string {
     if (tool === "glob" && parsed.pattern) {
       return `查找 ${parsed.pattern}`;
     }
-    if ((tool === "bash" || tool === "python_repl" || tool === "python") && parsed.command) {
-      const cmd = parsed.command as string;
-      return `运行 ${cmd.length > 60 ? cmd.slice(0, 60) + "..." : cmd}`;
+    if (COMMAND_TOOLS.has(tool) && parsed.command) {
+      return "运行命令";
     }
     if (tool === "execute_skill" && parsed.skill_name) {
       return `执行技能 ${parsed.skill_name}`;

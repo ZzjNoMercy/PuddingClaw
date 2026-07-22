@@ -1153,7 +1153,10 @@ def test_permission_middleware_requests_run_scoped_directory_write(tmp_path: Pat
     permission_resume_registry._pending.pop(request["id"], None)
 
 
-def test_permission_middleware_turns_external_grep_into_directory_hitl(tmp_path: Path, monkeypatch) -> None:
+def test_permission_middleware_turns_external_grep_into_directory_hitl_even_with_broad_file_read(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
     from langchain_core.messages import AIMessage
 
     import graph.permission_middleware as permission_middleware_module
@@ -1167,6 +1170,14 @@ def test_permission_middleware_turns_external_grep_into_directory_hitl(tmp_path:
     session_manager.create_session("directory-search-session")
     external = tmp_path / "external"
     external.mkdir()
+    session_manager.add_permission_grant(
+        "directory-search-session",
+        grant_type="external_file_read",
+        target_kind="all_external_files",
+        target="*",
+        capabilities=["read", "external_path"],
+        scope="session",
+    )
     captured: dict = {}
 
     def fake_interrupt(payload):

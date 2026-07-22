@@ -2296,16 +2296,34 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
           if (event.event === "final_response") {
             setMaintenanceStatus(null);
-            queueToken((event.data.content as string) || "");
+            // `token` events own normal visible output. `final_response` is a
+            // terminal marker and a fallback only for verification-gated Runs
+            // that intentionally published no text tokens. Material stream
+            // corrections use the dedicated `segment_content_replaced` event.
+            flushPendingTokens();
             const targetId = getAssistantId();
+            const finalContent = String(event.data.content || "");
             const verificationSummary = String(event.data.verification_summary || "").trim();
-            if (verificationSummary) {
-              updateMsgs((prev) => prev.map((message) =>
-                message.id === targetId
-                  ? { ...message, verificationSummary }
-                  : message
-              ));
-            }
+            updateMsgs((prev) => prev.map((message) => {
+              if (message.id !== targetId) return message;
+              const segments = message.segments?.length
+                ? [...message.segments]
+                : [{ content: "" } as MessageSegment];
+              const currentContent = segments
+                .map((segment) => segment.content)
+                .filter(Boolean)
+                .join("\n\n");
+              if (finalContent && !currentContent) {
+                const last = segments.length - 1;
+                segments[last] = { ...segments[last], content: finalContent };
+              }
+              return {
+                ...message,
+                content: currentContent ? message.content : finalContent || message.content,
+                segments,
+                verificationSummary: verificationSummary || message.verificationSummary,
+              };
+            }));
             updateSessionRunActivity(sendSessionId, {
               phase: "verification",
               label: String(event.data.verification_summary || "正在整理最终结果"),

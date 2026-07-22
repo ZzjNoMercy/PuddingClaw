@@ -114,6 +114,25 @@ class HostFileBroker:
                 continue
             target_kind = str(grant.get("target_kind") or "")
             grant_type = str(grant.get("type") or "")
+            if target_kind == "all_external_files":
+                # A broad file-read Grant covers any *known exact file*, but
+                # never authorizes directory discovery.  In particular,
+                # grep(path=<file>) may reuse it while grep/glob/ls on a
+                # directory must still obtain an exact-directory Grant.
+                if (
+                    access == "read"
+                    and grant_type == "external_file_read"
+                    and canonical.is_file()
+                ):
+                    candidates.append(
+                        AuthorizedHostPath(
+                            canonical_path=canonical,
+                            authority_root=canonical.parent,
+                            grant_id=grant_id,
+                            access=access,
+                        )
+                    )
+                continue
             try:
                 authority_root = Path(target).expanduser().resolve(strict=True)
             except OSError:
