@@ -1212,7 +1212,7 @@ function PermissionsCard({
   onRevoke: (grantId: string) => Promise<void>;
 }) {
   const [revoking, setRevoking] = useState<string | null>(null);
-  const activeGrants = Array.from(
+  const semanticGrants = Array.from(
     grants
       .filter((grant) => grant.scope !== "once" && !grant.superseded_at)
       .reduce((byIdentity, grant) => {
@@ -1225,6 +1225,25 @@ function PermissionsCard({
       }, new Map<string, PermissionGrant>())
       .values(),
   );
+  const normalizePath = (value: string) => value.replace(/\\/g, "/").replace(/\/+$/, "");
+  const directoryGrants = semanticGrants.filter(
+    (grant) => grant.target_kind === "exact_directory",
+  );
+  // An exact-file card remains an audit record, but it is redundant in the
+  // active list once an effective directory capability covers the same file.
+  const activeGrants = semanticGrants.filter((grant) => {
+    if (grant.target_kind !== "exact_file") return true;
+    const target = normalizePath(grant.target);
+    return !directoryGrants.some((directoryGrant) => {
+      const root = normalizePath(directoryGrant.target);
+      const coversPath = target.startsWith(`${root}/`);
+      const directoryCapabilities = new Set(directoryGrant.capabilities || []);
+      const coversCapabilities = (grant.capabilities || []).every(
+        (capability) => capability === "external_path" || directoryCapabilities.has(capability),
+      );
+      return coversPath && coversCapabilities;
+    });
+  });
 
   return (
     <section>

@@ -321,66 +321,23 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
         routed_path: str,
         context: dict[str, Any],
     ) -> tuple[str, ToolCallRequest | ToolMessage]:
-        requested = Path(routed_path).expanduser().resolve()
         session_id = str(context.get("session_id") or "")
-        run_id = str(context.get("run_id") or "")
-        if (
-            tool_name == "grep"
-            and session_id
-            and session_manager.has_external_file_read_permission(session_id, requested)
-        ):
-            route_label = "exact_file"
-            staged_path, error = self._stage_exact_search_file(
-                context=context,
-                requested=requested,
-            )
-        else:
-            root = self._authorized_directory_root(
-                session_id=session_id,
-                run_id=run_id,
-                requested=requested,
-            )
-            if root is None:
-                emit_harness_metric(
-                    logger,
-                    "external_search_route",
-                    session_id=session_id,
-                    route="denied",
-                    tool=tool_name,
-                )
-                return "result", self._tool_message(
-                    request,
-                    (
-                        f"🔒 `{tool_name}` requires explicit read authorization for the exact external "
-                        f"directory {routed_path!r}. Approve that directory once, then the original search "
-                        "will be replayed against an isolated /scratch snapshot. Exact-file grants never "
-                        "expand to a parent directory."
-                    ),
-                    name=tool_name,
-                )
-            route_label = "staged_directory"
-            staged_path, error = self._stage_directory_search(
-                context=context,
-                root=root,
-                requested=requested,
-            )
-        if error is not None or staged_path is None:
-            return "result", self._tool_message(
-                request,
-                f"❌ Unable to create external search snapshot: {error or 'unknown error'}",
-                name=tool_name,
-            )
-        routed_args = dict(args)
-        routed_args[path_arg] = staged_path
         emit_harness_metric(
             logger,
             "external_search_route",
             session_id=session_id,
-            route=route_label,
+            route="permission_required",
             tool=tool_name,
         )
-        return "execute", request.override(
-            tool_call={**request.tool_call, "args": routed_args}
+        return "result", self._tool_message(
+            request,
+            (
+                f"🔒 `{tool_name}` requires explicit read authorization for the exact external "
+                f"file or directory {routed_path!r}. Keep the original search call: Harness requests "
+                "the narrow permission and replays it through HostFileBroker after approval. "
+                "Exact-file grants never expand to a parent directory."
+            ),
+            name=tool_name,
         )
 
     def _route_request(

@@ -255,10 +255,11 @@ def test_exact_external_read_resource_is_not_misclassified_as_directory_search(t
     }
 
 
-def test_authorized_external_directory_glob_is_snapshotted_and_rewritten(tmp_path):
-    from deepagents.backends import CompositeBackend, FilesystemBackend
+def test_authorized_external_directory_glob_keeps_canonical_host_path(tmp_path):
+    from deepagents.backends import FilesystemBackend
 
     from graph.middlewares.workspace_path_router import WorkspacePathRouterMiddleware
+    from graph.permissioned_filesystem_backend import PermissionedCompositeBackend
     from graph.session_manager import session_manager
 
     workspace = tmp_path / "workspace"
@@ -266,8 +267,6 @@ def test_authorized_external_directory_glob_is_snapshotted_and_rewritten(tmp_pat
     external = tmp_path / "external"
     external.mkdir()
     (external / "report.html").write_text("<h1>ok</h1>", encoding="utf-8")
-    scratch = tmp_path / "scratch"
-    scratch.mkdir()
     session_manager.initialize(tmp_path)
     session_manager.create_session("routing-session")
     session_manager.add_permission_grant(
@@ -280,9 +279,14 @@ def test_authorized_external_directory_glob_is_snapshotted_and_rewritten(tmp_pat
         source="user",
         metadata={"run_id": "run-routing"},
     )
-    backend = CompositeBackend(
+    workspace_backend = FilesystemBackend(root_dir=workspace, virtual_mode=True)
+    backend = PermissionedCompositeBackend(
         default=FilesystemBackend(root_dir=workspace, virtual_mode=True),
-        routes={"/scratch/": FilesystemBackend(root_dir=scratch, virtual_mode=True)},
+        routes={"/workspace/": workspace_backend},
+        session_id="routing-session",
+        run_id="run-routing",
+        query_id="query-routing",
+        workspace_root=workspace,
     )
     captured = {}
 
@@ -296,15 +300,15 @@ def test_authorized_external_directory_glob_is_snapshotted_and_rewritten(tmp_pat
     )
 
     assert isinstance(result, ToolMessage)
-    assert captured["args"]["path"].startswith("/scratch/external-directories/directory-search-")
-    staged = scratch / captured["args"]["path"].removeprefix("/scratch/") / "report.html"
-    assert staged.read_text(encoding="utf-8") == "<h1>ok</h1>"
+    assert captured["args"]["path"] == str(external.resolve())
+    assert session_manager.list_external_directory_leases("routing-session") == []
 
 
-def test_authorized_exact_external_file_grep_does_not_expand_parent(tmp_path):
-    from deepagents.backends import CompositeBackend, FilesystemBackend
+def test_authorized_exact_external_file_grep_keeps_exact_path_without_parent_access(tmp_path):
+    from deepagents.backends import FilesystemBackend
 
     from graph.middlewares.workspace_path_router import WorkspacePathRouterMiddleware
+    from graph.permissioned_filesystem_backend import PermissionedCompositeBackend
     from graph.session_manager import session_manager
 
     workspace = tmp_path / "workspace"
@@ -314,8 +318,6 @@ def test_authorized_exact_external_file_grep_does_not_expand_parent(tmp_path):
     target = external / "report.html"
     target.write_text("needle", encoding="utf-8")
     (external / "secret.txt").write_text("must-not-stage", encoding="utf-8")
-    scratch = tmp_path / "scratch"
-    scratch.mkdir()
     session_manager.initialize(tmp_path)
     session_manager.create_session("routing-session")
     session_manager.add_permission_grant(
@@ -327,9 +329,14 @@ def test_authorized_exact_external_file_grep_does_not_expand_parent(tmp_path):
         scope="session",
         source="user",
     )
-    backend = CompositeBackend(
-        default=FilesystemBackend(root_dir=workspace, virtual_mode=True),
-        routes={"/scratch/": FilesystemBackend(root_dir=scratch, virtual_mode=True)},
+    workspace_backend = FilesystemBackend(root_dir=workspace, virtual_mode=True)
+    backend = PermissionedCompositeBackend(
+        default=workspace_backend,
+        routes={"/workspace/": workspace_backend},
+        session_id="routing-session",
+        run_id="run-routing",
+        query_id="query-routing",
+        workspace_root=workspace,
     )
     captured = {}
 
@@ -344,33 +351,10 @@ def test_authorized_exact_external_file_grep_does_not_expand_parent(tmp_path):
 
     assert result.status == "success"
     routed = captured["args"]["path"]
-    assert routed.startswith("/scratch/external-search-files/")
-    staged = scratch / routed.removeprefix("/scratch/")
-    assert staged.read_text(encoding="utf-8") == "needle"
-    assert not any(path.name == "secret.txt" for path in scratch.rglob("*"))
-    leases = session_manager.list_external_artifact_leases("routing-session")
-    assert len(leases) == 1
-    assert leases[0]["status"] == "search_snapshot"
-    assert leases[0]["search_only"] is True
-    assert leases[0]["run_id"] == "run-routing"
-    assert leases[0]["query_id"] == "query-routing"
-    assert leases[0]["staged_path"] == routed
-
-    target.write_text("changed after immutable Run snapshot", encoding="utf-8")
-    captured.clear()
-    second = WorkspacePathRouterMiddleware(backend).wrap_tool_call(
-        _request(
-            "grep",
-            {"path": str(target), "pattern": "needle"},
-            workspace,
-            call_id="call-2",
-        ),
-        handler,
-    )
-    assert second.status == "success"
-    assert captured["args"]["path"] == routed
-    assert staged.read_text(encoding="utf-8") == "needle"
-    assert len(session_manager.list_external_artifact_leases("routing-session")) == 1
+    assert routed == str(target.resolve())
+    assert backend.can_access_external_path(str(target), access="read") is True
+    assert backend.can_access_external_path(str(external / "secret.txt"), access="read") is False
+    assert session_manager.list_external_artifact_leases("routing-session") == []
 
 
 def test_external_ls_without_directory_grant_returns_replayable_authorization_gap(tmp_path):
@@ -389,7 +373,7 @@ def test_external_ls_without_directory_grant_returns_replayable_authorization_ga
     assert isinstance(result, ToolMessage)
     assert result.status == "error"
     assert "explicit read authorization" in str(result.content)
-    assert "original search will be replayed" in str(result.content)
+    assert "replays it through HostFileBroker" in str(result.content)
     assert "Exact-file grants never expand" in str(result.content)
 
 

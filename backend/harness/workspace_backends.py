@@ -274,7 +274,10 @@ class ProjectSandboxManager:
     @staticmethod
     def _container_name(workspace: Path) -> str:
         digest = hashlib.sha256(str(workspace).encode("utf-8")).hexdigest()[:16]
-        return f"puddingclaw-{digest}"
+        # One long-lived execution container belongs to one project path, not
+        # to a Session or Run. The explicit prefix makes that lifecycle visible
+        # in Docker Desktop while the stable path hash prevents duplicates.
+        return f"puddingclaw-project-{digest}"
 
     @staticmethod
     def _dependency_volume_name(

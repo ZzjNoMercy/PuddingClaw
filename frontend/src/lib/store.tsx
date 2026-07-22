@@ -3032,8 +3032,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               }
               msg.toolCalls = calls;
               const existingRequests = msg.permissionRequests || [];
-              msg.permissionRequests = existingRequests.some((request) => request.id === permissionRequest.id)
-                ? existingRequests.map((request) => request.id === permissionRequest.id ? permissionRequest : request)
+              const samePermissionRequest = (request: PermissionRequest) =>
+                request.id === permissionRequest.id || Boolean(
+                  permissionRequest.semantic_key
+                    && request.semantic_key === permissionRequest.semantic_key
+                );
+              msg.permissionRequests = existingRequests.some(samePermissionRequest)
+                ? existingRequests.map((request) => samePermissionRequest(request) ? permissionRequest : request)
                 : [...existingRequests, permissionRequest];
               const timeline = msg.timeline ? [...msg.timeline] : [];
               const permissionTool =

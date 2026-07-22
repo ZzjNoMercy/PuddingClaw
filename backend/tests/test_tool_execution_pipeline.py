@@ -1285,6 +1285,18 @@ def test_managed_sandbox_image_is_built_when_missing(monkeypatch):
     assert build[-1].endswith("/harness/docker")
 
 
+def test_project_container_name_is_path_stable_and_not_session_scoped(tmp_path):
+    workspace = (tmp_path / "project").resolve()
+
+    first = ProjectSandboxManager._container_name(workspace)
+    second = ProjectSandboxManager._container_name(workspace)
+
+    assert first == second
+    assert first.startswith("puddingclaw-project-")
+    assert "session" not in first
+    assert len(first.removeprefix("puddingclaw-project-")) == 16
+
+
 def test_managed_sandbox_runtime_declares_curl_as_base_capability():
     dockerfile = Path(__file__).parents[1] / "harness" / "docker" / "Dockerfile"
     content = dockerfile.read_text(encoding="utf-8")
@@ -1404,6 +1416,62 @@ def test_docker_backend_uses_ephemeral_container_for_approved_network_command(
     )
     assert f"type=volume,src={runtime_home},dst=/home/puddingclaw" in command
     assert all("network connect" not in " ".join(call) for call in calls)
+
+
+def test_external_directory_command_mounts_only_exact_root_read_only(
+    tmp_path,
+    monkeypatch,
+):
+    workspace = tmp_path / "project"
+    external = tmp_path / "external"
+    sibling = tmp_path / "sibling"
+    for directory in (workspace, external, sibling):
+        directory.mkdir()
+    manager = ProjectSandboxManager(
+        {
+            "network_enabled": False,
+            "dependency_setup_enabled": False,
+        }
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        manager,
+        "ensure_image",
+        lambda _image: "sha256:immutable-image",
+    )
+
+    def fake_run(args, *, timeout=30):
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args, 0, "checked", "")
+
+    monkeypatch.setattr(manager, "_run", fake_run)
+
+    result = manager.run_ephemeral_external_directory_command(
+        workspace,
+        external_directory=external,
+        command="rg --files .",
+        timeout=30,
+        max_output_bytes=10_000,
+    )
+
+    assert result.exit_code == 0
+    assert len(calls) == 1
+    command = calls[0]
+    assert command[:5] == ["run", "--rm", "--network", "none", "--read-only"]
+    assert f"type=bind,src={workspace.resolve()},dst=/workspace,readonly" in command
+    assert (
+        f"type=bind,src={external.resolve()},dst=/external-workspace,readonly"
+        in command
+    )
+    assert str(sibling.resolve()) not in " ".join(command)
+    assert ["--workdir", "/external-workspace"] == command[
+        command.index("--workdir") : command.index("--workdir") + 2
+    ]
+    assert command[command.index("--entrypoint") : command.index("--entrypoint") + 2] == [
+        "--entrypoint",
+        "sh",
+    ]
+    assert command[-3:] == ["sha256:immutable-image", "-c", "rg --files ."]
 
 
 def test_docker_backend_gives_approved_python_network_command_real_network(

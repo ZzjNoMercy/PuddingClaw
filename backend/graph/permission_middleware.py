@@ -139,6 +139,60 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
         }
 
     @staticmethod
+    def _automatic_directory_request_allowed(
+        session_id: str,
+        requested: Path,
+    ) -> bool:
+        """Keep Agent-initiated directory escalation narrow and non-sensitive.
+
+        A user can still select an exact directory in the UI. This guard only
+        prevents a file-tool call from silently turning an exact-file grant
+        into a broad Home/credential/temp-cache prompt.
+        """
+
+        try:
+            canonical = requested.expanduser().resolve(strict=True)
+        except OSError:
+            return False
+        home = Path.home().resolve()
+        broad_roots = {
+            Path("/").resolve(),
+            home,
+            home.parent,
+        }
+        if canonical in broad_roots:
+            return False
+        parts = canonical.parts
+        sensitive_names = {".ssh", ".gnupg", ".aws", ".azure", ".kube"}
+        if any(part in sensitive_names for part in parts):
+            return False
+        normalized = canonical.as_posix()
+        if "/.codex/attachments/" in f"{normalized.rstrip('/')}/":
+            return False
+        if (
+            normalized.startswith(("/private/var/folders/", "/var/folders/"))
+            and canonical.name == "T"
+        ):
+            return False
+
+        # If this request broadens an existing exact-file grant, only the
+        # direct parent is an admissible sibling-discovery root.
+        for grant in session_manager.list_permission_grants(session_id):
+            if grant.get("target_kind") != "exact_file":
+                continue
+            target = grant.get("target")
+            if not isinstance(target, str) or not target:
+                continue
+            try:
+                exact_file = Path(target).expanduser().resolve(strict=True)
+                exact_file.relative_to(canonical)
+            except (OSError, ValueError):
+                continue
+            if exact_file.parent != canonical:
+                return False
+        return True
+
+    @staticmethod
     def _trace_permission_reuse(
         *,
         tool_name: str,
@@ -304,6 +358,14 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                         target=requested,
                         access=access,
                     )
+                    continue
+                if not self._automatic_directory_request_allowed(
+                    session_id,
+                    requested,
+                ):
+                    # Let WorkspacePathRouter return a deterministic
+                    # permission_required result. Do not create an unsafe HITL
+                    # card merely because the model guessed a broad ancestor.
                     continue
                 change_preview = (
                     self._directory_change_preview(session_id, args)

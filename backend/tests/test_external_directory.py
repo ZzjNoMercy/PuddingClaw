@@ -6,6 +6,7 @@ import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from deepagents.backends import FilesystemBackend
 from langchain_core.messages import ToolMessage
 
@@ -881,6 +882,55 @@ def test_directory_pending_deduplicates_only_while_request_is_active(tmp_path: P
     asyncio.run(exercise())
 
 
+def test_concurrent_directory_requests_share_ui_semantic_key_across_runs(
+    tmp_path: Path,
+) -> None:
+    from graph.permission_resume import PermissionResumeRegistry
+
+    async def exercise() -> None:
+        registry = PermissionResumeRegistry()
+        common = {
+            "session_id": "directory-session",
+            "path": tmp_path.resolve(),
+            "access": "read",
+            "operation": "grep",
+            "grant_bindings": {
+                "backend_mode": "docker",
+                "workspace_id": "workspace:stable",
+                "policy_epoch": 1,
+            },
+        }
+        first = registry.create_external_directory_request(
+            query_id="query-1",
+            run_id="run-1",
+            tool_call_id="call-1",
+            **common,
+        )
+        second = registry.create_external_directory_request(
+            query_id="query-2",
+            run_id="run-2",
+            tool_call_id="call-2",
+            **common,
+        )
+
+        assert first["id"] != second["id"]
+        assert first["semantic_key"] == second["semantic_key"]
+        assert registry.resolve(first["id"], {"type": "approve", "grant_id": "grant-1"})
+        peers = registry.resolve_compatible_session_external_directories(
+            session_id="directory-session",
+            path=str(tmp_path.resolve()),
+            access="read",
+            capabilities=["read", "recursive", "external_path"],
+            decision={"type": "approve", "grant_id": "grant-1"},
+            grant_bindings=common["grant_bindings"],
+            exclude_request_id=first["id"],
+        )
+        assert peers == [second["id"]]
+        assert registry.get(second["id"])["status"] == "resolved"
+
+    asyncio.run(exercise())
+
+
 def test_user_supplied_external_directory_gets_host_file_broker_instructions(
     tmp_path: Path,
 ) -> None:
@@ -1140,6 +1190,134 @@ def test_permission_middleware_turns_external_grep_into_directory_hitl(tmp_path:
     assert "不会授予 shell 访问" in request["change_preview"]["安全说明"]
     permission_resume_registry._requests.pop(request["id"], None)
     permission_resume_registry._pending.pop(request["id"], None)
+
+
+@pytest.mark.asyncio
+async def test_exact_file_sibling_discovery_requests_only_direct_parent(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from langchain_core.messages import AIMessage
+
+    import graph.permission_middleware as permission_middleware_module
+    from graph.permission_middleware import ExternalFilePermissionMiddleware
+    from graph.permission_resume import permission_resume_registry
+    from graph.session_manager import session_manager
+
+    state_dir = tmp_path / "state"
+    external = tmp_path / "external"
+    state_dir.mkdir()
+    external.mkdir()
+    target = external / "report.html"
+    target.write_text("<script src='charts.js'></script>", encoding="utf-8")
+    session_manager.initialize(state_dir)
+    session_manager.create_session("sibling-session")
+    session_manager.add_permission_grant(
+        "sibling-session",
+        grant_type="external_file_read",
+        target_kind="exact_file",
+        target=str(target.resolve()),
+        capabilities=["read", "external_path"],
+        scope="session",
+    )
+    captured: dict = {}
+
+    def fake_interrupt(payload):
+        captured.update(payload)
+        return {"decisions": [{"type": "reject"}]}
+
+    monkeypatch.setattr(permission_middleware_module, "interrupt", fake_interrupt)
+    state = {
+        "messages": [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "grep",
+                        "args": {"path": str(external), "pattern": "charts.js"},
+                        "id": "call-sibling-grep",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
+    }
+    runtime = SimpleNamespace(
+        context={
+            "session_id": "sibling-session",
+            "query_id": "query-sibling",
+            "run_id": "run-sibling",
+            "workspace_path": str(tmp_path / "workspace"),
+        }
+    )
+
+    assert ExternalFilePermissionMiddleware().after_model(state, runtime) is None
+    request = captured["request"]
+    assert request["path"] == str(target.parent.resolve())
+    assert request["target_kind"] == "exact_directory"
+    assert request["options"][0] == "exact_directory_session"
+    permission_resume_registry._requests.pop(request["id"], None)
+    permission_resume_registry._pending.pop(request["id"], None)
+
+
+def test_exact_file_sibling_discovery_never_prompts_for_broad_ancestor(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from langchain_core.messages import AIMessage
+
+    import graph.permission_middleware as permission_middleware_module
+    from graph.permission_middleware import ExternalFilePermissionMiddleware
+    from graph.session_manager import session_manager
+
+    state_dir = tmp_path / "state"
+    external = tmp_path / "external"
+    state_dir.mkdir()
+    external.mkdir()
+    target = external / "report.html"
+    target.write_text("report", encoding="utf-8")
+    session_manager.initialize(state_dir)
+    session_manager.create_session("broad-sibling-session")
+    session_manager.add_permission_grant(
+        "broad-sibling-session",
+        grant_type="external_file_read",
+        target_kind="exact_file",
+        target=str(target.resolve()),
+        capabilities=["read", "external_path"],
+        scope="session",
+    )
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        permission_middleware_module,
+        "interrupt",
+        lambda payload: calls.append(payload),
+    )
+    state = {
+        "messages": [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "grep",
+                        "args": {"path": str(tmp_path), "pattern": "report"},
+                        "id": "call-broad-grep",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
+    }
+    runtime = SimpleNamespace(
+        context={
+            "session_id": "broad-sibling-session",
+            "query_id": "query-broad",
+            "run_id": "run-broad",
+            "workspace_path": str(tmp_path / "workspace"),
+        }
+    )
+
+    assert ExternalFilePermissionMiddleware().after_model(state, runtime) is None
+    assert calls == []
 
 
 def test_permission_api_grants_exact_directory_for_current_run(tmp_path: Path) -> None:

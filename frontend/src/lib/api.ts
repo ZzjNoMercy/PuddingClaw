@@ -2389,6 +2389,7 @@ export interface PermissionRequest {
   policy_explanation?: string;
   control_descriptor?: Record<string, string>;
   fingerprint?: string;
+  semantic_key?: string;
   session_target_kind?: string;
   session_target?: string;
   session_scope_label?: string;

@@ -4670,6 +4670,7 @@ class SessionManager:
         control = data.setdefault("legacy_external_lease_compatibility", {})
         total_calls = int(control.get("total_call_count") or 0)
         observations = control.setdefault("release_observations", [])
+        release_observation_added = False
         if release_id and not any(
             isinstance(item, dict) and item.get("release_id") == release_id
             for item in observations
@@ -4688,6 +4689,7 @@ class SessionManager:
                     "active_lease_count": len(active),
                 }
             )
+            release_observation_added = True
             if len(observations) > 20:
                 del observations[:-20]
         zero_call_cycles = 0
@@ -4710,8 +4712,13 @@ class SessionManager:
             "retirement_eligible": retirement_eligible,
             "source_code_retained": True,
         }
-        control["latest_audit"] = audit
-        self._write_file(session_id, data)
+        # Model-schema filtering calls this audit on every model turn. Persist
+        # only an actual migration or one release observation; otherwise a
+        # read-only visibility check would rewrite the Session JSON and update
+        # timestamps on every turn without changing authoritative state.
+        if migrated or release_observation_added:
+            control["latest_audit"] = audit
+            self._write_file(session_id, data)
         return deepcopy(audit)
 
     def resolve_terminal_scratch_reference(

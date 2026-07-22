@@ -87,9 +87,12 @@ def test_default_tool_guides_use_virtual_filesystem_for_semantic_assets() -> Non
     assert "never pass it to `read_resource`" in prompt
     assert "Do not use `read_resource` for `/skills/`, `/semantic-assets/`" in prompt
     assert "convert it to the equivalent `/workspace/<relative-path>`" in prompt
-    assert "Use the external-artifact staging and commit workflow" in prompt
-    assert "never call `edit_file`, `write_file`, or `patch_file` on the host path" in prompt
-    assert "whole-directory modification, execution, or debugging" in prompt
+    assert "transparently routed through the HostFileBroker" in prompt
+    assert "do not call deprecated Stage/lease tools for a new Run" in prompt
+    assert "use `inspect_file_version` followed by `patch_file`" in prompt
+    assert "offline, read-only `docker run --rm`" in prompt
+    assert "stage_external_artifact" not in prompt
+    assert "stage_external_directory" not in prompt
 
 
 def test_default_agent_prompt_requires_chinese_user_visible_output() -> None:

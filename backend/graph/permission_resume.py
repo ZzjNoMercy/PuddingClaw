@@ -116,6 +116,20 @@ class PermissionResumeRegistry:
             raise ValueError(f"Unsupported external directory access: {access}")
         replay_key = "\0".join([session_id, query_id, run_id, access, str(path)])
         request_id = f"perm-req-{hashlib.sha256(replay_key.encode('utf-8')).hexdigest()[:16]}"
+        semantic_payload = {
+            "session_id": session_id,
+            "access": access,
+            "path": str(path),
+            "grant_bindings": dict(grant_bindings or {}),
+        }
+        semantic_key = "sha256:" + hashlib.sha256(
+            json.dumps(
+                semantic_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
         existing = self._requests.get(request_id)
         if existing is not None and existing.get("status") == "pending":
             emit_harness_metric(
@@ -147,6 +161,7 @@ class PermissionResumeRegistry:
             "status": "pending",
             "created_at": time.time(),
             "operation": operation,
+            "semantic_key": semantic_key,
             "options": (
                 ["exact_directory_session", "exact_directory_run"]
                 if access == "read"
