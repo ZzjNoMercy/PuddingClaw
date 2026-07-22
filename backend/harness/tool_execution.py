@@ -1088,6 +1088,10 @@ class ToolExecutionPipeline(AgentMiddleware):
             "edit_file",
             "inspect_file_version",
             "patch_file",
+            "patch_files",
+            "delete_file",
+            "execute_external_directory",
+            "rewind_external_file_changes",
             "upsert_scratch_file",
             "stage_external_artifact",
             "commit_external_artifact",
@@ -1112,6 +1116,9 @@ class ToolExecutionPipeline(AgentMiddleware):
             "edit_file",
             "inspect_file_version",
             "patch_file",
+            "patch_files",
+            "delete_file",
+            "rewind_external_file_changes",
             "upsert_scratch_file",
             "stage_external_artifact",
             "commit_external_artifact",
@@ -1424,6 +1431,29 @@ class ToolExecutionPipeline(AgentMiddleware):
                 PolicyDecision.ASK,
                 "package_management:install_packages",
                 "package_install",
+            )
+        if tool_name == "execute_external_directory":
+            if self.permission_context.backend_mode != "docker" or self.backend_mode != "docker":
+                return ToolPolicyResult(
+                    PolicyDecision.DENY,
+                    "external_directory_command_requires_docker",
+                    "critical",
+                )
+            command = self._command(request)
+            effects = ShellPolicyAnalyzer.capabilities(
+                command,
+                workspace_path="/external-workspace",
+            )
+            if effects.network or effects.package_install:
+                return ToolPolicyResult(
+                    PolicyDecision.DENY,
+                    "external_directory_command_is_offline_and_read_only",
+                    "critical",
+                )
+            return ToolPolicyResult(
+                PolicyDecision.ASK,
+                "external_directory_command:exact_read_only_mount",
+                "high" if effects.destructive or effects.workspace_write else "managed_write",
             )
         if tool_name != "execute":
             return ToolPolicyResult(
@@ -1858,12 +1888,18 @@ class ToolExecutionPipeline(AgentMiddleware):
         if tool_name in {"fetch_url", "tavily_search"}:
             return ["execute", "network_access"]
         capabilities = ["execute"]
-        if tool_name == "execute":
+        if tool_name in {"execute", "execute_external_directory"}:
             context = cls._context(request)
             effects = ShellPolicyAnalyzer.capabilities(
                 cls._command(request),
-                workspace_path=str(context.get("workspace_path") or "."),
+                workspace_path=(
+                    "/external-workspace"
+                    if tool_name == "execute_external_directory"
+                    else str(context.get("workspace_path") or ".")
+                ),
             )
+            if tool_name == "execute_external_directory":
+                capabilities.append("external_directory_mount")
             if effects.network:
                 capabilities.append("network_access")
             if effects.workspace_write:

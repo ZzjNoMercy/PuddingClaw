@@ -43,7 +43,12 @@ def _setup(tmp_path: Path):
             grant_type=f"external_directory_{access}",
             target_kind="exact_directory",
             target=str(external.resolve()),
-            capabilities=[access, "recursive", "external_path"],
+            capabilities=[
+                access,
+                *(["delete"] if access == "write" else []),
+                "recursive",
+                "external_path",
+            ],
             scope="run",
             metadata={"run_id": run.run_id},
         )
@@ -121,6 +126,21 @@ class _ValidationBackend:
         return ExecuteResponse(output="syntax ok", exit_code=0)
 
 
+class _ExternalDirectoryExecutionBackend:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, int]] = []
+
+    def execute_external_directory(
+        self,
+        directory_path: str,
+        command: str,
+        *,
+        timeout: int,
+    ) -> ExecuteResponse:
+        self.calls.append((directory_path, command, timeout))
+        return ExecuteResponse(output="validated read-only tree", exit_code=0)
+
+
 def test_broker_validation_bridge_binds_formal_hash_and_blocks_bad_bytes(
     tmp_path: Path,
 ) -> None:
@@ -183,6 +203,37 @@ def test_broker_validation_bridge_binds_formal_hash_and_blocks_bad_bytes(
     ) == 1
 
 
+def test_external_directory_command_requires_root_grant_and_uses_ephemeral_backend(
+    tmp_path: Path,
+) -> None:
+    backend, external, outside, _run = _setup(tmp_path)
+    execution = _ExternalDirectoryExecutionBackend()
+    backend.execution_backend = execution
+
+    completed = backend.execute_external_directory_command(
+        str(external),
+        "node --check app.js",
+        timeout=45,
+    )
+    denied = backend.execute_external_directory_command(
+        str(outside),
+        "ls",
+        timeout=45,
+    )
+
+    assert completed == {
+        "status": "completed",
+        "directory_path": str(external),
+        "read_only": True,
+        "ephemeral": True,
+        "exit_code": 0,
+        "output": "validated read-only tree",
+        "truncated": False,
+    }
+    assert execution.calls == [(str(external), "node --check app.js", 45)]
+    assert denied["status"] == "permission_required"
+
+
 def test_rewind_restores_only_current_run_when_hashes_still_match(tmp_path: Path) -> None:
     backend, external, _outside, _run = _setup(tmp_path)
     target = external / "report.txt"
@@ -212,6 +263,95 @@ def test_rewind_refuses_to_overwrite_concurrent_host_change(tmp_path: Path) -> N
     assert result["status"] == "conflict"
     assert result["error"].startswith("conflict:")
     assert target.read_text(encoding="utf-8") == "concurrent\n"
+
+
+def test_delete_is_single_file_versioned_and_rewindable(tmp_path: Path) -> None:
+    backend, external, _outside, run = _setup(tmp_path)
+    target = external / "obsolete.txt"
+    target.write_text("remove me\n", encoding="utf-8")
+
+    conflict = backend.delete_external_file(
+        str(target),
+        expected_sha256=_digest("stale\n"),
+    )
+    assert conflict["status"] == "conflict"
+    assert target.exists()
+
+    deleted = backend.delete_external_file(
+        str(target),
+        expected_sha256=_digest("remove me\n"),
+    )
+    assert deleted["status"] == "completed"
+    assert not target.exists()
+    receipt = session_manager.list_external_mutation_receipts(
+        "broker-session",
+        run_id=run.run_id,
+    )[-1]
+    assert receipt["operation"] == "delete"
+    assert receipt["after_sha256"] == "deleted"
+    assert receipt["rewindable"] is True
+
+    rewound = backend.rewind_external_file_changes()
+    assert rewound["status"] == "completed"
+    assert target.read_text(encoding="utf-8") == "remove me\n"
+
+
+def test_exact_file_write_does_not_imply_delete(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    external = tmp_path / "external"
+    for directory in (state, workspace, external):
+        directory.mkdir()
+    target = external / "keep.txt"
+    target.write_text("keep\n", encoding="utf-8")
+    session_manager.initialize(state)
+    session_manager.create_session("exact-delete-session")
+    coordinator = HarnessRunCoordinator(session_manager)
+    run, _goal = coordinator.start_run(
+        session_id="exact-delete-session",
+        query_id="exact-delete-query",
+        objective="try exact file delete",
+        goal_mode=False,
+        verification_enabled=False,
+    )
+    coordinator.transition(run, RunStatus.RUNNING)
+    session_manager.add_permission_grant(
+        "exact-delete-session",
+        grant_type="external_file_write",
+        target_kind="exact_file",
+        target=str(target),
+        capabilities=["write", "external_path"],
+    )
+    workspace_backend = FilesystemBackend(root_dir=workspace, virtual_mode=True)
+    backend = PermissionedCompositeBackend(
+        default=workspace_backend,
+        routes={"/workspace/": workspace_backend},
+        session_id="exact-delete-session",
+        run_id=run.run_id,
+        query_id=run.query_id,
+        workspace_root=workspace,
+    )
+
+    denied = backend.delete_external_file(
+        str(target),
+        expected_sha256=_digest("keep\n"),
+    )
+    assert denied["status"] == "permission_required"
+    assert target.exists()
+
+    session_manager.add_permission_grant(
+        "exact-delete-session",
+        grant_type="external_file_delete",
+        target_kind="exact_file",
+        target=str(target),
+        capabilities=["delete", "external_path"],
+    )
+    allowed = backend.delete_external_file(
+        str(target),
+        expected_sha256=_digest("keep\n"),
+    )
+    assert allowed["status"] == "completed"
+    assert not target.exists()
 
 
 def test_multi_file_transaction_is_all_or_nothing_and_journaled(tmp_path: Path) -> None:

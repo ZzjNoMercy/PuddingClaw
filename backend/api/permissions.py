@@ -109,6 +109,7 @@ async def grant_external_file_permission(
     if pending is not None and pending.get("type") not in {
         "external_file_read",
         "external_file_write",
+        "external_file_delete",
         "external_directory_read",
         "external_directory_write",
     }:
@@ -117,7 +118,9 @@ async def grant_external_file_permission(
         raise HTTPException(status_code=400, detail="permission request is not an external file action")
     pending_type = str((pending or {}).get("type") or "external_file_read")
     is_directory = pending_type.startswith("external_directory_")
-    access = "write" if pending_type.endswith("_write") else "read"
+    access = pending_type.rsplit("_", 1)[-1]
+    if access not in {"read", "write", "delete"}:
+        raise HTTPException(status_code=400, detail="unsupported external path capability")
     effective_scope = str(req.scope or ("run" if is_directory else "session"))
     if is_directory and effective_scope not in {"run", "session"}:
         raise HTTPException(status_code=400, detail="external directory scope must be run or session")
@@ -127,8 +130,11 @@ async def grant_external_file_permission(
     if pending is None and req.target_kind == "exact_directory":
         raise HTTPException(status_code=400, detail="external directory permission requires a pending request")
     effective_target_kind = "exact_directory" if is_directory else req.target_kind
-    if access == "write" and effective_target_kind != expected_target_kind:
-        raise HTTPException(status_code=400, detail=f"external write permission requires {expected_target_kind}")
+    if access in {"write", "delete"} and effective_target_kind != expected_target_kind:
+        raise HTTPException(
+            status_code=400,
+            detail=f"external {access} permission requires {expected_target_kind}",
+        )
 
     if effective_target_kind in {"exact_file", "exact_directory"}:
         # Older frontends render directory requests as external-file cards.
@@ -168,7 +174,12 @@ async def grant_external_file_permission(
             grant_type=f"external_{'directory' if is_directory else 'file'}_{access}",
             target_kind=effective_target_kind,
             target=target,
-            capabilities=[access, *(["recursive"] if is_directory else []), "external_path"],
+            capabilities=[
+                access,
+                *(["delete"] if is_directory and access == "write" else []),
+                *(["recursive"] if is_directory else []),
+                "external_path",
+            ],
             scope=effective_scope if is_directory else "session",
             source="user",
             metadata=(

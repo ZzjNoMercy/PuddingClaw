@@ -505,6 +505,9 @@ class ExternalDirectoryMiddleware(AgentMiddleware[Any, Any, Any]):
         super().__init__()
         self.backend = backend
 
+        # DEPRECATED COMPATIBILITY SURFACE: ordinary directory file operations
+        # now route directly through HostFileBroker. Keep this implementation
+        # frozen only for active historical checkpoint recovery.
         def stage_external_directory(
             directory_path: str,
             runtime: ToolRuntime[Any, Any],
@@ -749,6 +752,8 @@ class ExternalDirectoryMiddleware(AgentMiddleware[Any, Any, Any]):
                 artifact={"external_directory_lease": lease},
             )
 
+        # DEPRECATED COMPATIBILITY SURFACE. Do not add new product behavior to
+        # the lease protocol; multi-file atomicity belongs inside the Broker.
         def prepare_external_directory_commit(
             lease_id: str,
             directory_path: str,
@@ -834,6 +839,8 @@ class ExternalDirectoryMiddleware(AgentMiddleware[Any, Any, Any]):
                 artifact={"external_directory_commit_plan": plan_payload},
             )
 
+        # DEPRECATED COMPATIBILITY SURFACE. Retirement is gated by durable
+        # usage telemetry and active-lease migration audit.
         def commit_external_directory(
             lease_id: str,
             directory_path: str,

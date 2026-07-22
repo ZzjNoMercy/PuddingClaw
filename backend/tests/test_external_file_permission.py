@@ -253,6 +253,27 @@ def test_external_write_request_contains_change_preview(tmp_path):
     )
 
 
+def test_external_delete_request_is_a_separate_capability(tmp_path):
+    from graph.permission_resume import permission_resume_registry
+
+    async def create_request():
+        return permission_resume_registry.create_external_file_request(
+            session_id="delete-preview-session",
+            query_id="query-delete",
+            tool_call_id="call-delete",
+            path=tmp_path / "obsolete.txt",
+            access="delete",
+            operation="delete_file",
+            change_preview={"expected_sha256": "sha256:current"},
+        )
+
+    request = asyncio.run(create_request())
+
+    assert request["type"] == "external_file_delete"
+    assert request["capabilities"] == ["delete", "external_path"]
+    assert request["options"] == ["exact_file_session"]
+
+
 def test_permission_middleware_interrupts_external_edit_file(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
@@ -921,3 +942,50 @@ def test_permission_api_grants_exact_external_write_from_pending_request(tmp_pat
     )
     loop.close()
     assert broad_response.status_code == 400
+
+
+def test_permission_api_grants_exact_external_delete_separately(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from app import app
+    from graph.permission_resume import permission_resume_registry
+    from graph.session_manager import session_manager
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("delete-api-session")
+    target = (tmp_path / "outside" / "obsolete.txt").resolve()
+    target.parent.mkdir()
+    target.write_text("obsolete", encoding="utf-8")
+    request_id = "perm-req-delete-test"
+    loop = asyncio.new_event_loop()
+    permission_resume_registry._pending[request_id] = loop.create_future()
+    permission_resume_registry._requests[request_id] = {
+        "id": request_id,
+        "type": "external_file_delete",
+        "session_id": "delete-api-session",
+        "path": str(target),
+        "status": "pending",
+    }
+
+    response = TestClient(app).post(
+        "/api/sessions/delete-api-session/permissions/external-files",
+        json={
+            "target_kind": "exact_file",
+            "path": str(target),
+            "permission_request_id": request_id,
+        },
+    )
+
+    assert response.status_code == 200
+    grant = response.json()["grant"]
+    assert grant["type"] == "external_file_delete"
+    assert grant["capabilities"] == ["delete", "external_path"]
+    assert session_manager.has_external_file_delete_permission(
+        "delete-api-session",
+        target,
+    )
+    assert not session_manager.has_external_file_write_permission(
+        "delete-api-session",
+        target,
+    )
+    loop.close()

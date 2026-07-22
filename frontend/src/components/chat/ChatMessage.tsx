@@ -344,6 +344,7 @@ function ExternalFilePermissionCard({
   const name = path.split("/").filter(Boolean).pop() || "外部文件";
   const isDirectory = request.type.startsWith("external_directory_");
   const isWrite = request.type === "external_file_write" || request.type === "external_directory_write";
+  const isDelete = request.type === "external_file_delete";
 
   const grant = async (
     targetKind: "exact_file" | "exact_directory" | "all_external_files",
@@ -374,7 +375,7 @@ function ExternalFilePermissionCard({
       await denyPermissionRequest(
         sessionId,
         request.id,
-        `User denied external ${isDirectory ? "directory" : "file"} ${isWrite ? "write" : "read"} permission.`
+        `User denied external ${isDirectory ? "directory" : "file"} ${isDelete ? "delete" : isWrite ? "write" : "read"} permission.`
       );
       setStatus("denied");
       window.dispatchEvent(new CustomEvent("puddingclaw:permissions-changed"));
@@ -395,7 +396,11 @@ function ExternalFilePermissionCard({
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <h3 className="text-[15px] font-bold text-slate-950">
-              {isWrite ? `允许修改外部${isDirectory ? "目录" : "文件"}` : `允许读取外部${isDirectory ? "目录" : "文件"}`}
+              {isDelete
+                ? "允许删除此外部文件"
+                : isWrite
+                  ? `允许修改外部${isDirectory ? "目录" : "文件"}`
+                  : `允许读取外部${isDirectory ? "目录" : "文件"}`}
             </h3>
             {status === "granted" ? (
               <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700">
@@ -412,7 +417,7 @@ function ExternalFilePermissionCard({
               <div className="mt-0.5 truncate font-mono text-[11px] text-slate-500">{path}</div>
             </div>
           </div>
-          {isWrite && request.change_preview ? (
+          {(isWrite || isDelete) && request.change_preview ? (
             <div className="mt-2 space-y-2 rounded-xl border border-amber-100 bg-amber-50/70 px-3 py-2">
               {Object.entries(request.change_preview).map(([key, value]) => (
                 <div key={key}>
@@ -426,10 +431,10 @@ function ExternalFilePermissionCard({
           ) : null}
           {isDirectory ? (
             <div className="mt-2 rounded-xl border border-sky-100 bg-sky-50/70 px-3 py-2 text-[11px] leading-relaxed text-sky-800">
-              修改、运行或联调整个目录时，建议将该目录作为项目打开。若仍在当前会话继续，目录只会暂存到隔离环境；
+              此授权只开放 HostFileBroker 文件能力，不会把宿主目录挂载进命令容器，也不会授予 shell 访问；
               {isWrite
-                ? " 写回仍只会应用上方已审核的新增、修改和删除清单。"
-                : " 读取授权不会直接修改原目录，且不会扩展到父目录或相邻目录。"}
+                ? " 可在此目录内创建、修改和删除普通文件；递归或批量删除仍需单独确认。"
+                : " 只允许读取和搜索，不会修改原目录，也不会扩展到父目录或相邻目录。"}
             </div>
           ) : null}
           {status !== "granted" && status !== "denied" ? (
@@ -439,18 +444,18 @@ function ExternalFilePermissionCard({
                   <button
                     type="button"
                     disabled={status === "loading"}
-                    onClick={() => grant("exact_directory", isWrite ? "run" : "session")}
+                    onClick={() => grant("exact_directory", "session")}
                     className="rounded-full bg-[#002fa7] px-3.5 py-2 text-[12px] font-semibold text-white shadow-sm transition hover:bg-[#00298f] disabled:cursor-default disabled:opacity-60"
                   >
-                    {isWrite ? "仅本次 Run 写回" : "本 Session 允许读取此目录"}
+                    {isWrite ? "本 Session 允许修改此目录" : "本 Session 允许读取此目录"}
                   </button>
                   <button
                     type="button"
                     disabled={status === "loading"}
-                    onClick={() => grant("exact_directory", isWrite ? "session" : "run")}
+                    onClick={() => grant("exact_directory", "run")}
                     className="rounded-full bg-white px-3.5 py-2 text-[12px] font-semibold text-slate-700 shadow-sm ring-1 ring-black/[0.08] transition hover:bg-slate-50 disabled:cursor-default disabled:opacity-60"
                   >
-                    {isWrite ? "本 Session 允许写回此目录" : "仅本次 Run"}
+                    仅本次 Run
                   </button>
                 </>
               ) : (
@@ -460,10 +465,10 @@ function ExternalFilePermissionCard({
                   onClick={() => grant("exact_file")}
                   className="rounded-full bg-[#002fa7] px-3.5 py-2 text-[12px] font-semibold text-white shadow-sm transition hover:bg-[#00298f] disabled:cursor-default disabled:opacity-60"
                 >
-                  {isWrite ? "允许修改此文件" : "允许此文件"}
+                  {isDelete ? "确认删除此文件" : isWrite ? "允许修改此文件" : "允许此文件"}
                 </button>
               )}
-              {!isWrite && !isDirectory ? (
+              {!isWrite && !isDelete && !isDirectory ? (
                 <button
                   type="button"
                   disabled={status === "loading"}

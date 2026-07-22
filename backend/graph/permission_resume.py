@@ -61,7 +61,7 @@ class PermissionResumeRegistry:
         operation: str = "",
         change_preview: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        if access not in {"read", "write"}:
+        if access not in {"read", "write", "delete"}:
             raise ValueError(f"Unsupported external file access: {access}")
         request_id = f"perm-req-{uuid.uuid4().hex[:12]}"
         request_type = f"external_file_{access}"
@@ -77,7 +77,9 @@ class PermissionResumeRegistry:
             "status": "pending",
             "created_at": time.time(),
             "options": (
-                ["exact_file_session", "all_external_files_session"] if access == "read" else ["exact_file_session"]
+                ["exact_file_session", "all_external_files_session"]
+                if access == "read"
+                else ["exact_file_session"]
             ),
         }
         if operation:
@@ -136,7 +138,12 @@ class PermissionResumeRegistry:
             "tool_call_id": tool_call_id,
             "path": str(path),
             "target_kind": "exact_directory",
-            "capabilities": [access, "recursive", "external_path"],
+            "capabilities": [
+                access,
+                *(["delete"] if access == "write" else []),
+                "recursive",
+                "external_path",
+            ],
             "status": "pending",
             "created_at": time.time(),
             "operation": operation,

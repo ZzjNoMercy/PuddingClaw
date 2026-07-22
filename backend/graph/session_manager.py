@@ -4558,6 +4558,162 @@ class SessionManager:
             return []
         return [deepcopy(lease) for lease in leases.values() if isinstance(lease, dict)]
 
+    @_session_write_locked
+    def record_legacy_external_lease_tool_use(
+        self,
+        session_id: str,
+        record: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist a bounded compatibility-use journal for lease retirement.
+
+        Metrics and Trace spans are useful operationally but are not a durable
+        migration authority. This counter lets release audits prove that no
+        new Agent-facing lease calls occurred before schemas are removed.
+        """
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        control = data.setdefault("legacy_external_lease_compatibility", {})
+        usage = control.setdefault("usage", [])
+        saved = {
+            **deepcopy(record),
+            "used_at": float(record.get("used_at") or time.time()),
+        }
+        usage.append(saved)
+        if len(usage) > 500:
+            del usage[:-500]
+        control["total_call_count"] = int(control.get("total_call_count") or 0) + 1
+        control["last_used_at"] = saved["used_at"]
+        control["source_code_retained"] = True
+        control["minimum_zero_call_release_cycles"] = 2
+        self._write_file(session_id, data)
+        return deepcopy(saved)
+
+    @_session_write_locked
+    def audit_legacy_external_leases(
+        self,
+        session_id: str,
+        *,
+        migrate: bool = True,
+        release_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Audit and safely close orphaned pre-Broker draft leases.
+
+        Known terminal owners and expired drafts cannot be resumed, so they
+        are marked ``abandoned``. Unknown owners are preserved: an old Session
+        may still need checkpoint migration and must never lose recoverable
+        state merely because its historical schema lacked Run metadata.
+        """
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        now = time.time()
+        harness = data.get("harness") if isinstance(data.get("harness"), dict) else {}
+        runs = harness.get("runs") if isinstance(harness.get("runs"), dict) else {}
+        goals = harness.get("goals") if isinstance(harness.get("goals"), dict) else {}
+        terminal = {
+            "completed",
+            "cancelled",
+            "failed",
+            "blocked",
+            "budget_exceeded",
+            "verification_failed",
+        }
+        active_statuses = {"claiming", "staged", "prepared", "committing", "publishing"}
+        migrated: list[str] = []
+        active: list[dict[str, Any]] = []
+        for collection_name, kind in (
+            ("external_artifact_leases", "exact_file"),
+            ("external_directory_leases", "exact_directory"),
+        ):
+            collection = data.get(collection_name)
+            if not isinstance(collection, dict):
+                continue
+            for lease in collection.values():
+                if not isinstance(lease, dict) or str(lease.get("status") or "") not in active_statuses:
+                    continue
+                owner_terminal = False
+                owner_known = False
+                goal_id = str(lease.get("goal_id") or "")
+                run_id = str(lease.get("run_id") or "")
+                if goal_id and isinstance(goals.get(goal_id), dict):
+                    owner_known = True
+                    owner_terminal = str(goals[goal_id].get("status") or "") in terminal
+                elif run_id and isinstance(runs.get(run_id), dict):
+                    owner_known = True
+                    owner_terminal = str(runs[run_id].get("status") or "") in terminal
+                expired = bool(lease.get("expires_at")) and float(lease.get("expires_at") or 0) <= now
+                if migrate and (expired or (owner_known and owner_terminal)):
+                    lease["status"] = "abandoned"
+                    lease.setdefault("abandoned_at", now)
+                    lease.setdefault(
+                        "abandoned_reason",
+                        "legacy_migration_expired" if expired else "legacy_migration_owner_terminal",
+                    )
+                    lease["legacy_migration_version"] = 1
+                    migrated.append(str(lease.get("lease_id") or ""))
+                    continue
+                active.append(
+                    {
+                        "lease_id": str(lease.get("lease_id") or ""),
+                        "kind": kind,
+                        "status": str(lease.get("status") or ""),
+                        "run_id": run_id or None,
+                        "goal_id": goal_id or None,
+                        "goal_revision": lease.get("goal_revision"),
+                        "owner_known": owner_known,
+                    }
+                )
+
+        control = data.setdefault("legacy_external_lease_compatibility", {})
+        total_calls = int(control.get("total_call_count") or 0)
+        observations = control.setdefault("release_observations", [])
+        if release_id and not any(
+            isinstance(item, dict) and item.get("release_id") == release_id
+            for item in observations
+        ):
+            previous_calls = int(
+                observations[-1].get("total_call_count") or 0
+                if observations and isinstance(observations[-1], dict)
+                else 0
+            )
+            observations.append(
+                {
+                    "release_id": release_id,
+                    "observed_at": now,
+                    "total_call_count": total_calls,
+                    "calls_since_previous": max(0, total_calls - previous_calls),
+                    "active_lease_count": len(active),
+                }
+            )
+            if len(observations) > 20:
+                del observations[:-20]
+        zero_call_cycles = 0
+        for observation in reversed(observations):
+            if not isinstance(observation, dict) or int(
+                observation.get("calls_since_previous") or 0
+            ) != 0:
+                break
+            zero_call_cycles += 1
+        retirement_eligible = not active and zero_call_cycles >= 2
+        audit = {
+            "migration_version": 1,
+            "audited_at": now,
+            "active_lease_count": len(active),
+            "active_leases": active,
+            "migrated_lease_ids": [item for item in migrated if item],
+            "legacy_tool_call_count": total_calls,
+            "zero_call_release_cycles": zero_call_cycles,
+            "minimum_zero_call_release_cycles": 2,
+            "retirement_eligible": retirement_eligible,
+            "source_code_retained": True,
+        }
+        control["latest_audit"] = audit
+        self._write_file(session_id, data)
+        return deepcopy(audit)
+
     def resolve_terminal_scratch_reference(
         self,
         session_id: str,
@@ -5445,6 +5601,25 @@ class SessionManager:
             if grant.get("type") != "external_file_write":
                 continue
             if "write" not in (grant.get("capabilities") or []):
+                continue
+            if grant.get("target_kind") == "exact_file" and grant.get("target") == resolved:
+                return True
+        return False
+
+    def has_external_file_delete_permission(self, session_id: str, path: Path) -> bool:
+        """Return whether the session may delete the given exact external file.
+
+        Delete is deliberately not implied by an exact-file write grant. An
+        exact-directory write grant may include the separate ``delete``
+        capability, which is checked by HostFileBroker at the descendant
+        boundary.
+        """
+
+        resolved = str(path.expanduser().resolve())
+        for grant in self.list_permission_grants(session_id):
+            if grant.get("type") != "external_file_delete":
+                continue
+            if "delete" not in (grant.get("capabilities") or []):
                 continue
             if grant.get("target_kind") == "exact_file" and grant.get("target") == resolved:
                 return True

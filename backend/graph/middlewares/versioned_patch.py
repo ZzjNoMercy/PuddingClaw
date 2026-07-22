@@ -103,6 +103,24 @@ class RewindExternalFileChangesInput(BaseModel):
     """The active Run scope is supplied by the Backend, not the model."""
 
 
+class DeleteFileInput(BaseModel):
+    file_path: str = Field(description="Exact external file to delete; directories are rejected")
+    expected_sha256: str = Field(
+        description="sha256:<hex> returned by inspect_file_version for the exact file version"
+    )
+
+
+class ExecuteExternalDirectoryInput(BaseModel):
+    directory_path: str = Field(
+        description="Exact authorized external directory mounted read-only for this command only"
+    )
+    command: str = Field(
+        min_length=1,
+        description="Exact shell command; receives a separate command-level approval",
+    )
+    timeout: int = Field(default=120, ge=1, le=600)
+
+
 def _read_all(backend: Any, file_path: str) -> tuple[str | None, str | None]:
     chunks: list[str] = []
     offset = 0
@@ -399,6 +417,59 @@ class VersionedPatchMiddleware(AgentMiddleware[Any, Any, Any]):
                 status=("success" if status in {"completed", "noop"} else "error"),
             )
 
+        def delete_file(
+            file_path: str,
+            expected_sha256: str,
+            runtime: ToolRuntime[Any, Any],
+        ) -> ToolMessage:
+            delete = getattr(self.backend, "delete_external_file", None)
+            if not callable(delete):
+                return ToolMessage(
+                    content="io_error: this Backend does not support external-file deletion",
+                    name="delete_file",
+                    tool_call_id=runtime.tool_call_id,
+                    status="error",
+                )
+            result = delete(file_path, expected_sha256=expected_sha256)
+            status = str(result.get("status") or "io_error")
+            return ToolMessage(
+                content=json.dumps(result, ensure_ascii=False, sort_keys=True),
+                name="delete_file",
+                tool_call_id=runtime.tool_call_id,
+                status="success" if status == "completed" else "error",
+            )
+
+        def execute_external_directory(
+            directory_path: str,
+            command: str,
+            timeout: int,
+            runtime: ToolRuntime[Any, Any],
+        ) -> ToolMessage:
+            execute = getattr(
+                self.backend,
+                "execute_external_directory_command",
+                None,
+            )
+            if not callable(execute):
+                return ToolMessage(
+                    content="io_error: this Backend does not support ephemeral external commands",
+                    name="execute_external_directory",
+                    tool_call_id=runtime.tool_call_id,
+                    status="error",
+                )
+            result = execute(
+                directory_path,
+                command,
+                timeout=timeout,
+            )
+            status = str(result.get("status") or "io_error")
+            return ToolMessage(
+                content=json.dumps(result, ensure_ascii=False, sort_keys=True),
+                name="execute_external_directory",
+                tool_call_id=runtime.tool_call_id,
+                status="success" if status == "completed" else "error",
+            )
+
         def patch_files(
             files: list[FilePatchSpec],
             runtime: ToolRuntime[Any, Any],
@@ -472,6 +543,9 @@ class VersionedPatchMiddleware(AgentMiddleware[Any, Any, Any]):
                 status="success" if status == "completed" else "error",
             )
 
+        # DEPRECATED COMPATIBILITY SURFACE: hidden from every new Run. Keep
+        # behavior frozen for active historical checkpoints until the P2
+        # retirement audit proves two release cycles with zero calls.
         def stage_external_artifact(
             file_path: str,
             runtime: ToolRuntime[Any, Any],
@@ -678,6 +752,8 @@ class VersionedPatchMiddleware(AgentMiddleware[Any, Any, Any]):
                 status="success",
             )
 
+        # DEPRECATED COMPATIBILITY SURFACE. New external mutations are owned by
+        # HostFileBroker and external_mutation_completed receipts.
         def commit_external_artifact(
             lease_id: str,
             file_path: str,
@@ -1253,6 +1329,29 @@ class VersionedPatchMiddleware(AgentMiddleware[Any, Any, Any]):
                 ),
                 func=rewind_external_file_changes,
                 args_schema=RewindExternalFileChangesInput,
+                infer_schema=False,
+            ),
+            StructuredTool.from_function(
+                name="delete_file",
+                description=(
+                    "Delete one exact authorized external file after verifying the version from "
+                    "inspect_file_version. This never deletes directories and never performs bulk "
+                    "or recursive deletion. Exact-file write permission does not imply delete permission."
+                ),
+                func=delete_file,
+                args_schema=DeleteFileInput,
+                infer_schema=False,
+            ),
+            StructuredTool.from_function(
+                name="execute_external_directory",
+                description=(
+                    "Run one separately approved command in a disposable docker run --rm with exactly "
+                    "one authorized external directory mounted read-only at /external-workspace. Use only "
+                    "when a validator truly needs directory semantics; otherwise use Broker file tools. "
+                    "For editable/build work, ask the user to open the directory as the project workspace."
+                ),
+                func=execute_external_directory,
+                args_schema=ExecuteExternalDirectoryInput,
                 infer_schema=False,
             ),
             StructuredTool.from_function(

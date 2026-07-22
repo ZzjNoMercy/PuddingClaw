@@ -639,7 +639,7 @@ class HostFileBroker:
             item
             for item in receipts
             if str(item.get("status") or "") == "completed"
-            and str(item.get("operation") or "") in {"create", "edit"}
+            and str(item.get("operation") or "") in {"create", "edit", "delete"}
             and str(item.get("receipt_id") or "") not in already_rewound
             and item.get("rewindable") is True
         ]

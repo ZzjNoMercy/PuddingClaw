@@ -179,6 +179,75 @@ class PermissionedCompositeBackend(CompositeBackend):
             }
         return self.host_file_broker.apply_transaction(changes)
 
+    def delete_external_file(
+        self,
+        file_path: str,
+        *,
+        expected_sha256: str,
+    ) -> dict[str, Any]:
+        if self._managed_readonly(file_path):
+            return {
+                "status": "permission_required",
+                "error": f"permission_required: managed resource is read-only: {file_path}",
+            }
+        if self.host_file_broker is None:
+            return {
+                "status": "permission_required",
+                "error": "permission_required: no active HostFileBroker Run",
+            }
+        return self.host_file_broker.delete(
+            file_path,
+            expected_sha256=expected_sha256,
+        )
+
+    def execute_external_directory_command(
+        self,
+        directory_path: str,
+        command: str,
+        *,
+        timeout: int,
+    ) -> dict[str, Any]:
+        """Run one separately approved read-only directory command in Docker."""
+
+        if self.host_file_broker is None:
+            return {
+                "status": "permission_required",
+                "error": "permission_required: no active HostFileBroker Run",
+            }
+        try:
+            directory = Path(directory_path).expanduser().resolve(strict=True)
+        except OSError as exc:
+            return {"status": "io_error", "error": f"io_error: {exc}"}
+        if not directory.is_dir() or not self.host_file_broker.authorize(
+            directory,
+            access="read",
+        ):
+            return {
+                "status": "permission_required",
+                "error": (
+                    "permission_required: exact-directory read permission is required; "
+                    "file permission never grants a shell mount"
+                ),
+            }
+        execution_backend = getattr(self, "execution_backend", None)
+        execute = getattr(execution_backend, "execute_external_directory", None)
+        if not callable(execute):
+            return {
+                "status": "io_error",
+                "error": "io_error: external directory commands require the Docker backend",
+            }
+        response = execute(str(directory), command, timeout=timeout)
+        exit_code = getattr(response, "exit_code", None)
+        return {
+            "status": "completed" if exit_code == 0 else "io_error",
+            "directory_path": str(directory),
+            "read_only": True,
+            "ephemeral": True,
+            "exit_code": exit_code,
+            "output": str(getattr(response, "output", "") or ""),
+            "truncated": bool(getattr(response, "truncated", False)),
+        }
+
     def _readonly_virtual_path(self, file_path: str) -> bool:
         normalized = file_path.replace("\\", "/")
         return any(

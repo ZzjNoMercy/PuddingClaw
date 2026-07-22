@@ -720,6 +720,122 @@ class ProjectSandboxManager:
             truncated=truncated,
         )
 
+    def run_ephemeral_external_directory_command(
+        self,
+        workspace: Path,
+        *,
+        external_directory: Path,
+        command: str,
+        timeout: int,
+        max_output_bytes: int,
+    ) -> ExecuteResponse:
+        """Run one approved command with one exact external directory read-only.
+
+        This is the narrow P2 escape hatch for validators that need directory
+        semantics. It never modifies the persistent project container, never
+        enables networking, never mounts another Session root, and always uses
+        ``docker run --rm``. External mutations must use HostFileBroker.
+        """
+
+        workspace = workspace.expanduser().resolve(strict=True)
+        external_directory = external_directory.expanduser().resolve(strict=True)
+        if not external_directory.is_dir():
+            return ExecuteResponse(
+                output="Error: external command target must be one exact directory.",
+                exit_code=1,
+            )
+        if external_directory == workspace:
+            return ExecuteResponse(
+                output="Error: this directory is already the project workspace; use execute instead.",
+                exit_code=1,
+            )
+        spec = self._spec(workspace)
+        image_id = self.ensure_image(spec["image"])
+        runtime_home_volume = self._runtime_home_volume_name(
+            workspace,
+            image=image_id,
+        )
+        mount_args = [
+            "--mount",
+            f"type=bind,src={workspace},dst=/workspace,readonly",
+            "--mount",
+            f"type=bind,src={external_directory},dst=/external-workspace,readonly",
+            "--mount",
+            f"type=volume,src={runtime_home_volume},dst=/home/puddingclaw",
+        ]
+        for mount in spec["readonly_mounts"]:
+            mount_args.extend(
+                [
+                    "--mount",
+                    f"type=bind,src={mount['source']},dst={mount['target']},readonly",
+                ]
+            )
+        for mount in spec["runtime_mounts"]:
+            volume_name = self._dependency_volume_name(
+                workspace,
+                ecosystem=str(mount["ecosystem"]),
+                working_directory=str(mount["working_directory"]),
+                image=image_id,
+            )
+            relative = str(mount["working_directory"])
+            project_dir = "/workspace" if relative == "." else f"/workspace/{relative}"
+            mount_args.extend(
+                [
+                    "--mount",
+                    f"type=volume,src={volume_name},dst={project_dir}/{mount['target_name']}",
+                ]
+            )
+        args = [
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--read-only",
+            "--tmpfs",
+            "/tmp:rw,nosuid,nodev,size=256m",
+            "--workdir",
+            "/external-workspace",
+            *mount_args,
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--pids-limit",
+            str(spec["pids_limit"]),
+            "--memory",
+            f"{spec['memory_limit_mb']}m",
+            "--cpus",
+            spec["cpu_limit"],
+            "--env",
+            "HOME=/home/puddingclaw",
+            "--env",
+            "PATH=/home/puddingclaw/.local/bin:/home/puddingclaw/.npm-global/bin:/usr/local/bin:/usr/bin:/bin",
+            "--entrypoint",
+            "sh",
+        ]
+        if spec["uid"] is not None and spec["gid"] is not None:
+            args.extend(["--user", f"{spec['uid']}:{spec['gid']}"])
+        args.extend([image_id, "-c", command])
+        try:
+            result = self._run(args, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return ExecuteResponse(
+                output=f"Error: External directory command timed out after {timeout} seconds.",
+                exit_code=124,
+            )
+        output, truncated = _bounded_output(
+            result.stdout,
+            result.stderr,
+            max_output_bytes=max_output_bytes,
+        )
+        if result.returncode != 0:
+            output = f"{output.rstrip()}\n\nExit code: {result.returncode}"
+        return ExecuteResponse(
+            output=output,
+            exit_code=result.returncode,
+            truncated=truncated,
+        )
+
     def _validate_runtime(self, container_name: str, spec: dict[str, Any]) -> None:
         inspect_result = self._run(["inspect", container_name])
         if inspect_result.returncode != 0:
@@ -935,6 +1051,32 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         except Exception as exc:  # noqa: BLE001
             return ExecuteResponse(
                 output=f"Error executing command ({type(exc).__name__}): {exc}",
+                exit_code=1,
+            )
+
+    def execute_external_directory(
+        self,
+        directory_path: str,
+        command: str,
+        *,
+        timeout: int | None = None,
+    ) -> ExecuteResponse:
+        """Execute one approved read-only exact-directory command ephemerally."""
+
+        effective_timeout = timeout if timeout is not None else self._default_timeout
+        if not isinstance(effective_timeout, int) or effective_timeout <= 0:
+            raise ValueError("timeout must be a positive integer")
+        try:
+            return self.manager.run_ephemeral_external_directory_command(
+                self.workspace_path,
+                external_directory=Path(directory_path),
+                command=command,
+                timeout=effective_timeout,
+                max_output_bytes=self._max_output_bytes,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ExecuteResponse(
+                output=f"Error executing external directory command ({type(exc).__name__}): {exc}",
                 exit_code=1,
             )
 

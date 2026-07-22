@@ -1491,12 +1491,14 @@ function permissionGrantPresentation(grant: PermissionGrant): {
   const canWrite = grant.capabilities.includes("write")
     || grant.type === "external_file_write"
     || grant.type === "external_directory_write";
+  const canDelete = grant.capabilities.includes("delete")
+    || grant.type === "external_file_delete";
   const isDirectory = grant.target_kind === "exact_directory"
     || grant.type.startsWith("external_directory_");
   return {
     name: grant.target_kind === "all_external_files"
-      ? `本 session 外部文件${canWrite ? "写入" : "读取"}`
-      : `${grant.target.split("/").filter(Boolean).pop() || (isDirectory ? "外部目录" : "外部文件")}${isDirectory ? ` · 目录${canWrite ? "写入" : "读取"}` : ""}`,
+      ? `本 session 外部文件${canWrite ? "写入" : canDelete ? "删除" : "读取"}`
+      : `${grant.target.split("/").filter(Boolean).pop() || (isDirectory ? "外部目录" : "外部文件")}${isDirectory ? ` · 目录${canWrite ? "修改" : "读取"}` : canDelete ? " · 文件删除" : ""}`,
     target: grant.target_kind === "all_external_files" ? "所有外部文件" : grant.target,
     changes: "",
     isSkill: false,

@@ -130,9 +130,16 @@ async def get_raw_messages(session_id: str):
 async def get_session_harness_state(session_id: str):
     """Return lightweight Run/Goal product state without reading Trace."""
 
+    harness = await run_in_threadpool(session_manager.get_harness_state, session_id)
+    legacy_audit = await run_in_threadpool(
+        session_manager.audit_legacy_external_leases,
+        session_id,
+        migrate=True,
+    )
     return {
         "session_id": session_id,
-        **await run_in_threadpool(session_manager.get_harness_state, session_id),
+        **harness,
+        "legacy_external_lease_audit": legacy_audit,
     }
 
 

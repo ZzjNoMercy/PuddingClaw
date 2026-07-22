@@ -124,7 +124,10 @@ def test_default_harness_file_toolset_is_registered_with_execution_pipeline() ->
     harness_file_tools = UNCONDITIONAL_EXTENSION_TOOLSETS["harness_files"]
 
     assert harness_file_tools <= ToolExecutionPipeline.BUILTIN_TOOLS
-    assert harness_file_tools <= ToolExecutionPipeline.DECLARED_ALLOW_TOOLS
+    assert (
+        harness_file_tools - {"execute_external_directory"}
+    ) <= ToolExecutionPipeline.DECLARED_ALLOW_TOOLS
+    assert "execute_external_directory" not in ToolExecutionPipeline.DECLARED_ALLOW_TOOLS
 
 
 def test_every_registered_tool_declares_a_control_descriptor() -> None:
@@ -659,6 +662,112 @@ def test_native_and_explicit_base_tools_are_unconditionally_visible_and_executab
             ),
         )
     assert calls == ["execute", "tavily_search", "fetch_url"]
+
+
+def test_legacy_lease_tools_are_visible_only_to_active_owner_and_audited(
+    tmp_path,
+) -> None:
+    from graph.session_manager import session_manager
+    from harness.models import RunRecord, RunStatus
+
+    state = tmp_path / "state"
+    state.mkdir()
+    session_manager.initialize(state)
+    session_manager.create_session("legacy-tool-session")
+    run = RunRecord(
+        run_id="run-legacy",
+        query_id="query-legacy",
+        session_id="legacy-tool-session",
+        objective="resume old external draft",
+        status=RunStatus.PREPARING,
+    )
+    session_manager.start_harness_run(
+        "legacy-tool-session",
+        run.model_dump(mode="json"),
+    )
+    session_manager.transition_run_status(
+        "legacy-tool-session",
+        run.run_id,
+        RunStatus.RUNNING.value,
+    )
+    session_manager.upsert_external_artifact_lease(
+        "legacy-tool-session",
+        {
+            "lease_id": "artifact-lease-legacy",
+            "run_id": run.run_id,
+            "query_id": run.query_id,
+            "target_path": str(tmp_path / "external.txt"),
+            "status": "staged",
+            "expires_at": 4_102_444_800.0,
+        },
+    )
+    middleware = ToolsetMiddleware(skills_dir=tmp_path, toolsets_by_skill={})
+    runtime = SimpleNamespace(
+        context={
+            "session_id": "legacy-tool-session",
+            "run_id": run.run_id,
+            "goal_id": "",
+            "goal_revision": None,
+        }
+    )
+    request = ModelRequest(
+        model=None,
+        messages=[],
+        tools=[{"name": "stage_external_artifact"}],
+        state={"messages": [], "active_skill_ids": []},
+        runtime=runtime,
+    )
+    assert [item["name"] for item in middleware._visible_tools(request)] == [
+        "stage_external_artifact"
+    ]
+
+    tool_request = ToolCallRequest(
+        tool_call={
+            "name": "stage_external_artifact",
+            "args": {"file_path": str(tmp_path / "external.txt")},
+            "id": "legacy-call",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={"messages": [], "active_skill_ids": []},
+        runtime=runtime,
+    )
+    result = middleware.wrap_tool_call(
+        tool_request,
+        lambda request: ToolMessage(
+            content="compatibility call completed",
+            name=str(request.tool_call["name"]),
+            tool_call_id=str(request.tool_call["id"]),
+            status="success",
+        ),
+    )
+    assert result.status == "success"
+    first = session_manager.audit_legacy_external_leases(
+        "legacy-tool-session",
+        release_id="release-1",
+    )
+    assert first["legacy_tool_call_count"] == 1
+    assert first["active_lease_count"] == 1
+    assert first["retirement_eligible"] is False
+
+    for status in (RunStatus.EVALUATING, RunStatus.COMPLETED):
+        session_manager.transition_run_status(
+            "legacy-tool-session",
+            run.run_id,
+            status.value,
+        )
+    second = session_manager.audit_legacy_external_leases(
+        "legacy-tool-session",
+        release_id="release-2",
+    )
+    third = session_manager.audit_legacy_external_leases(
+        "legacy-tool-session",
+        release_id="release-3",
+    )
+    assert second["active_lease_count"] == 0
+    assert third["zero_call_release_cycles"] == 2
+    assert third["retirement_eligible"] is True
+    assert middleware._visible_tools(request) == []
 
 
 def test_active_skill_state_survives_message_compaction(tmp_path) -> None:

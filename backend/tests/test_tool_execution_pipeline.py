@@ -1886,6 +1886,83 @@ def test_network_download_declares_write_and_network_capabilities(tmp_path):
     ]
 
 
+def test_external_directory_command_is_exact_one_time_docker_approval(tmp_path):
+    request = ToolCallRequest(
+        tool_call={
+            "id": "external-directory",
+            "name": "execute_external_directory",
+            "args": {
+                "directory_path": str(tmp_path),
+                "command": "rg --files .",
+            },
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute_external_directory"},
+        backend_mode="docker",
+    )
+
+    decision = pipeline._preflight(request)
+
+    assert decision.decision == PolicyDecision.ASK
+    assert decision.reason == "external_directory_command:exact_read_only_mount"
+    assert pipeline._session_grant_scope(request) is None
+    assert pipeline._required_capabilities(request) == [
+        "execute",
+        "external_directory_mount",
+    ]
+
+
+def test_external_directory_command_is_denied_outside_docker(tmp_path):
+    request = ToolCallRequest(
+        tool_call={
+            "id": "external-directory",
+            "name": "execute_external_directory",
+            "args": {"directory_path": str(tmp_path), "command": "rg --files ."},
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute_external_directory"},
+        backend_mode="restricted_host",
+    )
+
+    decision = pipeline._preflight(request)
+
+    assert decision.decision == PolicyDecision.DENY
+    assert decision.reason == "external_directory_command_requires_docker"
+
+
+def test_external_directory_command_cannot_enable_network(tmp_path):
+    request = ToolCallRequest(
+        tool_call={
+            "id": "external-directory-network",
+            "name": "execute_external_directory",
+            "args": {
+                "directory_path": str(tmp_path),
+                "command": "curl https://example.com",
+            },
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute_external_directory"},
+        backend_mode="docker",
+    )
+
+    decision = pipeline._preflight(request)
+
+    assert decision.decision == PolicyDecision.DENY
+    assert decision.reason == "external_directory_command_is_offline_and_read_only"
+
+
 def test_once_tool_grant_is_bound_to_originating_run(tmp_path):
     sessions = SessionManager()
     sessions.initialize(tmp_path)

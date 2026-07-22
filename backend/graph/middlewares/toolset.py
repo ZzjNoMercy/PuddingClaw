@@ -27,6 +27,7 @@ from langgraph.types import Command
 from typing_extensions import TypedDict
 
 from graph.session_manager import session_manager
+from graph.trace_collector import get_current_trace_collector
 from harness.models import (
     CapabilityManifest,
     RunTaskProfile,
@@ -282,6 +283,7 @@ class ToolsetMiddleware(AgentMiddleware):
         denied = self._denied_tool_message(request)
         if denied is not None:
             return denied
+        self._record_legacy_external_lease_use(request)
         result = handler(request)
         self._remember_successful_skill_read(request, result)
         return result
@@ -294,6 +296,7 @@ class ToolsetMiddleware(AgentMiddleware):
         denied = self._denied_tool_message(request)
         if denied is not None:
             return denied
+        self._record_legacy_external_lease_use(request)
         result = await handler(request)
         self._remember_successful_skill_read(request, result)
         return result
@@ -418,6 +421,14 @@ class ToolsetMiddleware(AgentMiddleware):
     def _legacy_external_lease_tools_enabled(request: ModelRequest) -> bool:
         """Expose deprecated lease tools only while resuming their owner."""
 
+        return ToolsetMiddleware._legacy_external_lease_context(request) is not None
+
+    @staticmethod
+    def _legacy_external_lease_context(
+        request: ModelRequest | ToolCallRequest,
+    ) -> dict[str, Any] | None:
+        """Resolve the active owner that authorizes a compatibility call."""
+
         context = (
             request.runtime.context
             if request.runtime is not None and isinstance(request.runtime.context, dict)
@@ -428,25 +439,98 @@ class ToolsetMiddleware(AgentMiddleware):
         goal_id = str(context.get("goal_id") or "")
         goal_revision = context.get("goal_revision")
         if not session_id:
-            return False
+            return None
+        try:
+            session_manager.audit_legacy_external_leases(
+                session_id,
+                migrate=True,
+            )
+        except FileNotFoundError:
+            return None
         active_statuses = {"staged", "prepared", "committing", "publishing"}
         leases = [
             *session_manager.list_external_artifact_leases(session_id),
             *session_manager.list_external_directory_leases(session_id),
         ]
-        return any(
-            str(lease.get("status") or "") in active_statuses
-            and (
-                (run_id and str(lease.get("run_id") or "") == run_id)
-                or (
-                    goal_id
-                    and str(lease.get("goal_id") or "") == goal_id
-                    and lease.get("goal_revision") == goal_revision
+        lease = next(
+            (
+                item
+                for item in leases
+                if isinstance(item, dict)
+                and str(item.get("status") or "") in active_statuses
+                and (
+                    (run_id and str(item.get("run_id") or "") == run_id)
+                    or (
+                        goal_id
+                        and str(item.get("goal_id") or "") == goal_id
+                        and item.get("goal_revision") == goal_revision
+                    )
                 )
-            )
-            for lease in leases
-            if isinstance(lease, dict)
+            ),
+            None,
         )
+        if not isinstance(lease, dict):
+            return None
+        return {
+            "lease_id": str(lease.get("lease_id") or ""),
+            "source_run_id": str(lease.get("run_id") or "") or None,
+            "source_goal_id": str(lease.get("goal_id") or "") or None,
+            "source_goal_revision": lease.get("goal_revision"),
+            # New Runs never receive these schemas. Reaching this branch means
+            # the Tool call came from a compatibility checkpoint/active owner.
+            "from_old_checkpoint": True,
+        }
+
+    @staticmethod
+    def _record_legacy_external_lease_use(request: ToolCallRequest) -> None:
+        tool_name = str(request.tool_call.get("name") or "")
+        if tool_name not in _LEGACY_EXTERNAL_LEASE_TOOLS:
+            return
+        context = ToolsetMiddleware._legacy_external_lease_context(request)
+        if context is None:
+            return
+        runtime_context = (
+            request.runtime.context
+            if request.runtime is not None and isinstance(request.runtime.context, dict)
+            else {}
+        )
+        session_id = str(runtime_context.get("session_id") or "")
+        run_id = str(runtime_context.get("run_id") or "")
+        record = {
+            "tool": tool_name,
+            "run_id": run_id or None,
+            **context,
+        }
+        try:
+            session_manager.record_legacy_external_lease_tool_use(
+                session_id,
+                record,
+            )
+        except FileNotFoundError:
+            return
+        emit_harness_metric(
+            logger,
+            "legacy_external_lease_tool_used",
+            session_id=session_id,
+            run_id=run_id,
+            tool=tool_name,
+            source_run_id=context.get("source_run_id"),
+            from_old_checkpoint=context.get("from_old_checkpoint"),
+        )
+        collector = get_current_trace_collector()
+        if collector is not None:
+            collector.add_custom_span(
+                "legacy_external_lease_tool_used",
+                record,
+                span_type="compatibility",
+                metadata={
+                    "compatibility": {
+                        "protocol": "external_lease",
+                        "deprecated": True,
+                        **record,
+                    }
+                },
+            )
 
     def _capability_manifest(
         self,

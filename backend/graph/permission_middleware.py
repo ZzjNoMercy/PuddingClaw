@@ -60,6 +60,11 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                 "expected_sha256": str(args.get("expected_sha256") or ""),
                 "replacements": str(args.get("replacements") or ""),
             }
+        elif tool_name == "delete_file":
+            values = {
+                "expected_sha256": str(args.get("expected_sha256") or ""),
+                "risk": "Delete one exact file; directory and bulk deletion are not permitted.",
+            }
         elif tool_name == "commit_external_artifact":
             values = {
                 "lease_id": str(args.get("lease_id") or ""),
@@ -76,11 +81,16 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
         *,
         access: str,
         run_id: str,
+        required_capability: str | None = None,
     ) -> bool:
         """Honor one exact-directory Grant for its normalized descendants."""
 
         for grant in session_manager.list_permission_grants(session_id):
             if grant.get("type") != f"external_directory_{access}":
+                continue
+            if required_capability and required_capability not in (
+                grant.get("capabilities") or []
+            ):
                 continue
             target = grant.get("target")
             if not isinstance(target, str) or not target:
@@ -187,10 +197,13 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                 "inspect_file_version",
                 "patch_file",
                 "patch_files",
+                "delete_file",
+                "execute_external_directory",
                 "stage_external_artifact",
                 "commit_external_artifact",
                 "stage_external_directory",
                 "commit_external_directory",
+                "execute_external_directory",
                 "grep",
                 "glob",
                 "ls",
@@ -300,7 +313,11 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                         "安全说明": (
                             "目录将复制为 Docker /scratch 快照；不会直接挂载或修改原目录。"
                             if tool_name == "stage_external_directory"
-                            else "授权后由 HostFileBroker 直接重放原文件搜索；不会授予 shell 访问。"
+                            else (
+                                "授权后仍需单独批准精确命令；目录只读挂载到一次性 docker run --rm，命令结束即销毁。"
+                                if tool_name == "execute_external_directory"
+                                else "授权后由 HostFileBroker 直接重放原文件搜索；不会授予 shell 访问。"
+                            )
                         ),
                     }
                 )
@@ -354,20 +371,36 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                 # API records the exact Run-scoped directory grant.
                 return None
 
-            if tool_name in {"edit_file", "write_file", "patch_file", "commit_external_artifact"}:
+            if tool_name in {
+                "edit_file",
+                "write_file",
+                "patch_file",
+                "delete_file",
+                "commit_external_artifact",
+            }:
                 requested = self._external_write_path(raw_path, workspace_path)
                 if requested is None:
                     continue
-                access = "write"
-                if (
-                    session_manager.has_external_file_write_permission(session_id, requested)
-                    or self._has_directory_permission_for_path(
+                access = "delete" if tool_name == "delete_file" else "write"
+                exact_granted = (
+                    session_manager.has_external_file_delete_permission(
                         session_id,
                         requested,
-                        access="write",
-                        run_id=run_id,
                     )
-                ):
+                    if access == "delete"
+                    else session_manager.has_external_file_write_permission(
+                        session_id,
+                        requested,
+                    )
+                )
+                directory_granted = self._has_directory_permission_for_path(
+                    session_id,
+                    requested,
+                    access="write",
+                    run_id=run_id,
+                    required_capability="delete" if access == "delete" else None,
+                )
+                if exact_granted or directory_granted:
                     continue
                 change_preview = self._change_preview(tool_name, args)
             else:
