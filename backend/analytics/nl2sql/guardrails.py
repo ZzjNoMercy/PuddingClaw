@@ -11,7 +11,6 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, Field
 
-
 BASE_DIR = Path(__file__).resolve().parents[2]
 GUARDRAILS_ROOT = BASE_DIR / "sql-guardrails"
 GUARDRAILS_RULES_DIR = GUARDRAILS_ROOT / "rules"
@@ -137,6 +136,48 @@ DEFAULT_GUARDRAILS = GuardrailRuleSet(
             action=GuardrailAction(
                 type="rewrite",
                 message="空气悬架必须使用 type_name = '可调悬架种类' 且 type_value 包含 '空气悬架'。",
+            ),
+        ),
+        GuardrailRule(
+            id="voltage_platform_400v_physical_value",
+            name="400V 平台使用真实枚举值",
+            type="forbid_sql_pattern",
+            scope=GuardrailScope(
+                semantic_assets=["measure:config_rate"],
+                intent_any=["高压平台", "电压平台", "400V"],
+            ),
+            params={"pattern": r"['\"]400V['\"]"},
+            action=GuardrailAction(
+                type="rewrite",
+                message="高压平台物理枚举必须使用 '400V平台'，不能精确匹配不存在的 '400V'。",
+            ),
+        ),
+        GuardrailRule(
+            id="voltage_platform_800v_physical_value",
+            name="800V 平台使用真实枚举值",
+            type="forbid_sql_pattern",
+            scope=GuardrailScope(
+                semantic_assets=["measure:config_rate"],
+                intent_any=["高压平台", "电压平台", "800V"],
+            ),
+            params={"pattern": r"['\"]800V['\"]"},
+            action=GuardrailAction(
+                type="rewrite",
+                message="高压平台物理枚举必须使用 '800V平台'，不能精确匹配不存在的 '800V'。",
+            ),
+        ),
+        GuardrailRule(
+            id="rear_screen_physical_type_name",
+            name="后排屏使用真实物理字段",
+            type="require_sql_contains",
+            scope=GuardrailScope(
+                semantic_assets=["measure:config_rate"],
+                intent_any=["后排多媒体屏", "后排屏"],
+            ),
+            params={"contains": "type_name = '后排多媒体屏幕数量'"},
+            action=GuardrailAction(
+                type="rewrite",
+                message="后排多媒体屏必须使用真实字段 type_name = '后排多媒体屏幕数量'。",
             ),
         ),
         GuardrailRule(

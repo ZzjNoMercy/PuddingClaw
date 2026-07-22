@@ -11,6 +11,8 @@ from langchain_core.tools import StructuredTool
 from langgraph.types import Command
 from pydantic import BaseModel, Field, model_validator
 
+from graph.session_manager import session_manager
+
 
 class HarnessTodoState(AgentState):
     """Graph state owned by the Harness Todo control plane."""
@@ -36,6 +38,12 @@ class TodoPatchOperation(BaseModel):
     content: str | None = None
     status: Literal["pending", "in_progress", "completed", "cancelled"] | None = None
     ordered_ids: list[str] = Field(default_factory=list)
+    completion_contract: Literal[
+        "validation_receipt",
+        "artifact_receipt",
+        "query_result",
+    ] | None = None
+    evidence_refs: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_action_fields(self) -> "TodoPatchOperation":
@@ -65,6 +73,11 @@ Never replace the whole list and never reuse an ID for a different task.
 - `start`, `complete`, `cancel`, `reopen`: change lifecycle explicitly.
 - `reorder`: change display order only; it never changes identity or status.
 
+For validation, artifact delivery, or query-result work, set a
+`completion_contract` when creating the Todo. Completing such a Todo requires
+the corresponding structured IDs in `evidence_refs`; prose claims are not
+evidence. Use validation_receipt, artifact_receipt, or query_result.
+
 Do not mark a Todo complete until its result is actually produced and verified.
 Do not delete unfinished work; use `cancel` with an explicit lifecycle record.
 If an update is rejected because a todo_id is unknown, do not retry that stale
@@ -79,9 +92,7 @@ erase an unfinished Todo."""
 
 
 def _stable_created_id(tool_call_id: str, operation_index: int) -> str:
-    digest = hashlib.sha256(
-        f"{tool_call_id}:create:{operation_index}".encode("utf-8")
-    ).hexdigest()[:16]
+    digest = hashlib.sha256(f"{tool_call_id}:create:{operation_index}".encode()).hexdigest()[:16]
     return f"todo_{digest}"
 
 
@@ -92,6 +103,7 @@ def _apply_operations(
     tool_call_id: str,
     run_id: str,
     query_id: str,
+    available_evidence: dict[str, set[str]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     now = time.time()
     result = [dict(item) for item in todos if isinstance(item, dict)]
@@ -103,6 +115,15 @@ def _apply_operations(
             todo_id = _stable_created_id(tool_call_id, index)
             existing = by_id.get(todo_id)
             if existing is None:
+                if operation.status == "completed" and operation.completion_contract:
+                    accepted = (available_evidence or {}).get(operation.completion_contract, set())
+                    if not operation.evidence_refs or any(
+                        ref not in accepted for ref in operation.evidence_refs
+                    ):
+                        raise ValueError(
+                            f"Todo {todo_id} requires known {operation.completion_contract} "
+                            "evidence before completion"
+                        )
                 item = {
                     "id": todo_id,
                     "content": str(operation.content or "").strip(),
@@ -112,6 +133,8 @@ def _apply_operations(
                     "created_run_id": run_id or None,
                     "last_changed_run_id": run_id or None,
                     "last_changed_query_id": query_id or None,
+                    "completion_contract": operation.completion_contract,
+                    "evidence_refs": list(dict.fromkeys(operation.evidence_refs)),
                 }
                 result.append(item)
                 by_id[todo_id] = item
@@ -142,7 +165,37 @@ def _apply_operations(
                 item["content"] = operation.content.strip()
             if operation.status is not None:
                 item["status"] = operation.status
+            if operation.completion_contract is not None:
+                item["completion_contract"] = operation.completion_contract
+            if operation.evidence_refs:
+                item["evidence_refs"] = list(
+                    dict.fromkeys([*(item.get("evidence_refs") or []), *operation.evidence_refs])
+                )
+            if operation.status == "completed" and item.get("completion_contract"):
+                contract = str(item["completion_contract"])
+                refs = list(item.get("evidence_refs") or [])
+                accepted = (available_evidence or {}).get(contract, set())
+                if not refs or any(ref not in accepted for ref in refs):
+                    raise ValueError(
+                        f"Todo {todo_id} requires known {contract} evidence before completion"
+                    )
         else:
+            if operation.action == "complete":
+                contract = str(item.get("completion_contract") or "")
+                refs = list(dict.fromkeys([*(item.get("evidence_refs") or []), *operation.evidence_refs]))
+                if contract:
+                    accepted = (available_evidence or {}).get(contract, set())
+                    if not refs:
+                        raise ValueError(
+                            f"Todo {todo_id} requires {contract} evidence before completion"
+                        )
+                    unknown = [ref for ref in refs if ref not in accepted]
+                    if unknown:
+                        raise ValueError(
+                            f"Todo {todo_id} references unknown {contract} evidence: "
+                            + ", ".join(unknown)
+                        )
+                    item["evidence_refs"] = refs
             item["status"] = {
                 "start": "in_progress",
                 "complete": "completed",
@@ -168,6 +221,10 @@ def _update_todos(
 ) -> ToolMessage | Command[Any]:
     context = runtime.context if isinstance(runtime.context, dict) else {}
     current_todos = list(runtime.state.get("todos") or [])
+    available_evidence = _available_todo_evidence(
+        session_id=str(context.get("session_id") or ""),
+        run_id=str(context.get("run_id") or ""),
+    )
     try:
         next_todos, applied = _apply_operations(
             current_todos,
@@ -175,6 +232,7 @@ def _update_todos(
             tool_call_id=runtime.tool_call_id,
             run_id=str(context.get("run_id") or ""),
             query_id=str(context.get("query_id") or ""),
+            available_evidence=available_evidence,
         )
     except ValueError as exc:
         # A stale model-visible ID must not abort the entire Run. Returning a
@@ -200,6 +258,31 @@ def _update_todos(
             ],
         }
     )
+
+
+def _available_todo_evidence(*, session_id: str, run_id: str) -> dict[str, set[str]]:
+    available = {
+        "validation_receipt": set(),
+        "artifact_receipt": set(),
+        "query_result": set(),
+    }
+    run = session_manager.get_run_state(session_id, run_id) if session_id and run_id else None
+    activations = run.get("verification_activations") if isinstance(run, dict) else None
+    for activation in activations if isinstance(activations, list) else []:
+        if not isinstance(activation, dict):
+            continue
+        for ref in activation.get("evidence_refs") or []:
+            if not isinstance(ref, dict) or ref.get("material") is not True:
+                continue
+            if ref.get("kind") == "validation_receipt" and ref.get("validation_receipt_id"):
+                available["validation_receipt"].add(str(ref["validation_receipt_id"]))
+            if ref.get("kind") == "artifact_write" and ref.get("artifact_id"):
+                available["artifact_receipt"].add(str(ref["artifact_id"]))
+            if ref.get("kind") in {"analytics_result", "tool_result"}:
+                result_id = ref.get("result_id") or ref.get("ref") or ref.get("output_digest")
+                if result_id:
+                    available["query_result"].add(str(result_id))
+    return available
 
 
 async def _aupdate_todos(

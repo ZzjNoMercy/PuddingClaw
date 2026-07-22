@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import time
 import uuid
 from typing import Any
@@ -49,6 +50,25 @@ def _evidence_origin_run_ids(value: Any) -> set[str]:
         for item in value:
             found.update(_evidence_origin_run_ids(item))
     return found
+
+
+def _delta_repair_policy(objective: str) -> tuple[str, int]:
+    """Choose a bounded repair policy without granting additional capability."""
+
+    text = str(objective or "").lower()
+    data_signal = re.search(
+        r"(?:数据|矩阵|重算|补算|查询|统计|sql|database|dataset|recompute|refresh\s+data)",
+        text,
+    )
+    presentation_signal = re.search(
+        r"(?:下拉|选项|控件|按钮|默认年份|显示|html|selector|dropdown|option|ui)",
+        text,
+    )
+    if presentation_signal and not data_signal:
+        return "presentation_only", 6
+    if data_signal:
+        return "data_refresh", 12
+    return "bounded_unknown", 12
 
 
 class GoalCoordinator:
@@ -697,21 +717,25 @@ class CompletionVerificationCoordinator:
                 continue
             matches = raw_by_id.get(configured.id, [])
             if not matches:
+                not_evaluated = False
                 if (
                     configured.verifier == VerifierKind.LLM_GRADER
                     and raw_status in {"needs_revision", "max_iterations_reached"}
                     and not evaluations_payload
                 ):
+                    not_evaluated = True
                     gap = (
                         f"确定性检查尚未通过，标准 {configured.id} "
                         "尚未进入模型评审。"
                     )
                 elif status == VerificationStatus.INCOMPLETE:
+                    not_evaluated = True
                     gap = (
                         f"验收流程在形成终态判定前结束，标准 {configured.id} "
                         "尚未完成评审。"
                     )
                 elif status == VerificationStatus.GRADER_ERROR:
+                    not_evaluated = True
                     gap = f"模型验收器执行异常，标准 {configured.id} 未完成评审。"
                 else:
                     gap = f"验收器未返回必需标准 {configured.id} 的判定。"
@@ -719,16 +743,17 @@ class CompletionVerificationCoordinator:
                     CriterionEvaluation(
                         criterion_id=configured.id,
                         name=configured.id,
-                        passed=(
-                            None
-                            if status in {VerificationStatus.INCOMPLETE, VerificationStatus.GRADER_ERROR}
-                            else False
-                        ),
+                        passed=None if not_evaluated else False,
                         verifier=configured.verifier,
+                        evidence=(
+                            [{"kind": "criterion_state", "status": "not_evaluated"}]
+                            if not_evaluated
+                            else []
+                        ),
                         gap=gap,
                     )
                 )
-                if configured.required:
+                if configured.required and not not_evaluated:
                     gaps.append(gap)
                 continue
             if len(matches) > 1:
@@ -772,6 +797,10 @@ class CompletionVerificationCoordinator:
             if configured.required and (not passed or gap):
                 gaps.append(gap or f"标准 {configured.id} 未通过。")
         explanation = str(latest.get("explanation") or "") if isinstance(latest, dict) else ""
+        if status == VerificationStatus.GRADER_ERROR and not gaps:
+            control_gap = "模型验收器执行异常，业务标准尚未评审。"
+            gaps.append(control_gap)
+            explanation = explanation or control_gap
         if unknown_grader_criteria:
             unknown_gap = (
                 "模型验收器返回了契约外标准："
@@ -784,7 +813,8 @@ class CompletionVerificationCoordinator:
         required_by_id = {item.id: item.required for item in contract.criteria}
         if (
             any(
-                (not item.passed or bool(item.gap)) and required_by_id.get(item.criterion_id, True)
+                (item.passed is False or (item.passed is not None and bool(item.gap)))
+                and required_by_id.get(item.criterion_id, True)
                 for item in evaluations
             )
             and status == VerificationStatus.SATISFIED
@@ -813,6 +843,10 @@ class CompletionVerificationCoordinator:
         if infrastructure_gaps:
             status = VerificationStatus.INFRASTRUCTURE_ERROR
             explanation = "验收基础设施异常：" + "；".join(infrastructure_gaps)
+        elif status == VerificationStatus.GRADER_ERROR:
+            control_gap = "模型验收器执行异常，业务标准尚未评审。"
+            gaps = [control_gap]
+            explanation = control_gap
         elif status != VerificationStatus.SATISFIED and gaps:
             # The merged deterministic result is authoritative. Do not retain a
             # contradictory grader explanation such as “所有标准均满足”.
@@ -886,6 +920,7 @@ class HarnessRunCoordinator:
         custom_rubric_rules: list[dict[str, Any]] | None = None,
         task_profile: RunTaskProfile | None = None,
     ) -> tuple[RunRecord, GoalRecord | None]:
+        supplied_task_profile = task_profile is not None
         task_profile = (
             task_profile.model_copy(deep=True)
             if task_profile is not None
@@ -915,7 +950,7 @@ class HarnessRunCoordinator:
             max_rounds=goal_max_rounds,
         )
         effective_objective = goal.objective if goal is not None else objective
-        if effective_objective != objective:
+        if effective_objective != objective and not supplied_task_profile:
             task_profile = TaskProfileClassifier.classify(
                 message=effective_objective,
                 analytics_model_id=analytics_model_id,
@@ -952,6 +987,30 @@ class HarnessRunCoordinator:
             if verification_enabled
             else None
         )
+        follow_up_artifacts = (
+            self._sessions.resolve_follow_up_artifacts(session_id, objective)
+            if goal is None
+            else []
+        )
+        follow_up_artifact_ids = [
+            str(item.get("artifact_id") or "")
+            for item in follow_up_artifacts
+            if str(item.get("artifact_id") or "")
+        ]
+        follow_up_goal_ids = {
+            str(item.get("source_goal_id") or "")
+            for item in follow_up_artifacts
+            if str(item.get("source_goal_id") or "")
+        }
+        delta_repair = bool(follow_up_artifact_ids) and bool(
+            re.search(
+                r"(?:还没|没有更新|没更新|补上|修复|不对|有误|改一下|调整|纠正|刷新)",
+                objective,
+            )
+        )
+        delta_repair_kind, delta_repair_tool_budget = (
+            _delta_repair_policy(objective) if delta_repair else (None, None)
+        )
         run = RunRecord(
             run_id=f"run-{uuid.uuid4().hex[:16]}",
             query_id=query_id,
@@ -960,6 +1019,15 @@ class HarnessRunCoordinator:
             declared_artifact_targets=extract_declared_artifact_targets(effective_objective),
             goal_id=goal.goal_id if goal else None,
             goal_revision=goal.objective_revision if goal else None,
+            follow_up_of_goal_id=(
+                next(iter(follow_up_goal_ids))
+                if len(follow_up_goal_ids) == 1
+                else None
+            ),
+            follow_up_of_artifact_ids=follow_up_artifact_ids,
+            execution_mode="delta_repair" if delta_repair else "native",
+            delta_repair_kind=delta_repair_kind,
+            delta_repair_tool_budget=delta_repair_tool_budget,
             project_id=project_id,
             analytics_model_id=analytics_model_id,
             verification_enabled=verification_enabled,

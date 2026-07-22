@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
+from langchain.tools import ToolRuntime
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel
 
@@ -23,7 +24,8 @@ class DatabaseSqlExecuteTool(BaseTool):
     description: str = (
         "Execute explicit read-only PostgreSQL SQL against a configured database source. "
         "Use only after database_sql_generate. In Agent mode, generation_id is mandatory and its registered SQL is "
-        "loaded server-side; omit the SQL argument. Semantic changes must go through the natural-language revision HITL flow. "
+        "loaded server-side; omit the SQL argument. A validation_receipt_id from database_sql_validate is also mandatory "
+        "and must match the generation SQL hash. Semantic changes must go through the natural-language revision HITL flow. "
         "When the result is preview-only, the full materialized rows are persisted and returned with a result_id; "
         "use database_query_result_page to fetch subsequent pages."
     )
@@ -38,25 +40,65 @@ class DatabaseSqlExecuteTool(BaseTool):
         self,
         sql: str = "",
         generation_id: str = "",
+        validation_receipt_id: str = "",
         database_source_id: str | None = None,
         table_names: list[str] | None = None,
         limit: int = 100,
         timeout_ms: int | None = None,
+        runtime: ToolRuntime | None = None,
     ) -> str:
         question = "显式 SQL 执行"
         if self.session_id:
+            raw_context = getattr(runtime, "context", None)
+            context = raw_context if isinstance(raw_context, dict) else {}
             generation = database_sql_revision_resume_registry.get_generation(
                 generation_id,
                 session_id=self.session_id,
+                run_id=str(context.get("run_id") or ""),
+                goal_id=str(context.get("goal_id") or ""),
+                goal_revision=context.get("goal_revision"),
             )
             if generation is None:
                 return "🧮 SQL 执行失败：Agent 模式必须提供当前会话有效的 generation_id。请先调用 database_sql_generate。"
+            receipt = database_sql_revision_resume_registry.get_validation_receipt(
+                validation_receipt_id,
+                session_id=self.session_id,
+                run_id=str(context.get("run_id") or ""),
+                goal_id=str(context.get("goal_id") or ""),
+                goal_revision=context.get("goal_revision"),
+            )
+            if receipt is None:
+                return (
+                    "🧮 SQL 执行失败：缺少当前会话有效的 validation_receipt_id。"
+                    "请先用该 generation_id 调用 database_sql_validate。"
+                )
+            if (
+                receipt.generation_id != generation.id
+                or receipt.sql_sha256 != generation.sql_sha256
+            ):
+                return (
+                    "🧮 SQL 执行失败：ValidationReceipt 与 generation_id 或 SQL hash 不匹配。"
+                    "请重新校验当前 generation，不要执行或手工改写 SQL。"
+                )
+            if receipt.semantic_validation_status != "passed":
+                return (
+                    "🧮 SQL 执行失败：ValidationReceipt 未通过语义校验。"
+                    "请让 Generator 根据结构化修复协议生成 child generation，再重新校验。"
+                )
             sql = generation.result.sql
             question = generation.result.question
             database_source_id = generation.request.get("database_source_id")
             table_names = list(generation.request.get("table_names") or generation.result.route.table_names)
         try:
             source, public_source, allowed_tables = await resolve_database_source_scope(database_source_id, table_names)
+            if self.session_id and (
+                str(public_source.get("id") or "") != receipt.database_source_id
+                or set(allowed_tables) != set(receipt.allowed_tables)
+            ):
+                return (
+                    "🧮 SQL 执行失败：当前数据源/授权表范围与 ValidationReceipt 不一致。"
+                    "请重新调用 database_sql_validate 生成新 Receipt。"
+                )
             execution = await run_readonly_sql(
                 source,
                 sql,
@@ -121,7 +163,14 @@ class DatabaseSqlExecuteTool(BaseTool):
             f"- 授权表：{', '.join(allowed_tables)}",
         ]
         if self.session_id:
-            lines.append("- SQL 来源：generation_id 登记结果")
+            lines.extend(
+                [
+                    "- SQL 来源：generation_id 登记结果",
+                    f"- generation_id：{generation.id}",
+                    f"- validation_receipt_id：{receipt.id}",
+                    f"- sql_sha256：{generation.sql_sha256}",
+                ]
+            )
         lines.append(f"- 结果：{result_size}")
         if execution.result_id:
             lines.extend(
@@ -143,6 +192,7 @@ class DatabaseSqlExecuteTool(BaseTool):
         self,
         sql: str = "",
         generation_id: str = "",
+        validation_receipt_id: str = "",
         database_source_id: str | None = None,
         table_names: list[str] | None = None,
         limit: int = 100,
@@ -155,6 +205,7 @@ class DatabaseSqlExecuteTool(BaseTool):
                 self._arun(
                     sql=sql,
                     generation_id=generation_id,
+                    validation_receipt_id=validation_receipt_id,
                     database_source_id=database_source_id,
                     table_names=table_names,
                     limit=limit,

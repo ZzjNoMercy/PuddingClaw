@@ -109,18 +109,15 @@ export default function SourcesPanel({
     }
   }, [activeSourceId, setInspectorActiveTab]);
 
-  const { cited, retrieved, inferredTodos } = useMemo(() => {
+  const { cited, retrieved } = useMemo(() => {
     const lastUserIndex = messages.findLastIndex((message) => message.role === "user");
     const turnMessages = lastUserIndex >= 0 ? messages.slice(lastUserIndex) : [];
     const sourceMap = new Map<string, SourceRecord>();
     const citationIndex = new Map<string, number>();
     const toolByCallId = new Map<string, string>();
-    let latestTodos: Array<{ content: string; status: TodoStatus }> = [];
     for (const message of turnMessages) {
       for (const toolCall of message.toolCalls || []) {
         if (toolCall.id) toolByCallId.set(toolCall.id, toolCall.tool);
-        const parsedTodos = extractTodosFromToolCall(toolCall);
-        if (parsedTodos.length > 0) latestTodos = parsedTodos;
       }
     }
     for (const message of turnMessages) {
@@ -169,7 +166,7 @@ export default function SourcesPanel({
     const retrievedSources = Array.from(sourceMap.values())
       .filter((source) => !citationIndex.has(source.source_id))
       .map((source) => ({ source, index: undefined }));
-    return { cited: citedSources, retrieved: retrievedSources, inferredTodos: latestTodos };
+    return { cited: citedSources, retrieved: retrievedSources };
   }, [messages]);
 
   // The default Sources list intentionally stays scoped to the latest turn.
@@ -208,12 +205,10 @@ export default function SourcesPanel({
     return source ? { source, index: citationIndex } : null;
   }, [activeSourceId, cited, messages, retrieved]);
 
-  // Prefer persisted todos; fall back to todos inferred from the current turn
-  // when persistence has not been populated yet.
-  const displayTodos = useMemo(
-    () => (todos && todos.length > 0 ? todos : inferredTodos),
-    [todos, inferredTodos]
-  );
+  // Persisted Todo state is lifecycle-scoped by the backend. An empty list is
+  // authoritative after a Run starts or terminal work ends; inferring Todos
+  // from historical tool calls would resurrect a completed Goal.
+  const displayTodos = todos || [];
 
   const total = cited.length + retrieved.length;
   const hasSources = total > 0;
@@ -1217,7 +1212,19 @@ function PermissionsCard({
   onRevoke: (grantId: string) => Promise<void>;
 }) {
   const [revoking, setRevoking] = useState<string | null>(null);
-  const activeGrants = grants.filter((grant) => grant.scope !== "once");
+  const activeGrants = Array.from(
+    grants
+      .filter((grant) => grant.scope !== "once" && !grant.superseded_at)
+      .reduce((byIdentity, grant) => {
+        const identity = grant.semantic_key || grant.id;
+        const previous = byIdentity.get(identity);
+        if (!previous || Number(grant.created_at || 0) >= Number(previous.created_at || 0)) {
+          byIdentity.set(identity, grant);
+        }
+        return byIdentity;
+      }, new Map<string, PermissionGrant>())
+      .values(),
+  );
 
   return (
     <section>
@@ -1365,7 +1372,11 @@ function PermissionGrantRow({
               </span>
             ) : null}
             <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-500">
-              {grant.scope === "once" ? "单次" : "本 Session"}
+              {grant.scope === "once"
+                ? "单次"
+                : grant.scope === "run"
+                  ? "本 Run"
+                  : "本 Session"}
             </span>
             {grant.metadata?.policy_source === "codex_grok_smart_reviewer" ? (
               <span className="rounded-full bg-blue-50 px-2 py-0.5 text-[10px] font-medium text-blue-700">
@@ -1880,23 +1891,6 @@ function sourceOpenUrl(source: SourceRecord): string {
   if (virtualPath.startsWith("/knowledge/")) return rawKnowledgeFileUrl(virtualPath);
 
   return "";
-}
-
-function extractTodosFromToolCall(toolCall: ToolCall): Array<{ content: string; status: TodoStatus }> {
-  if (!{"write_todos": true, "update_todos": true}[toolCall.tool] || !toolCall.output) return [];
-  try {
-    const parsed = JSON.parse(toolCall.output);
-    const raw = parsed.todos || parsed;
-    if (!Array.isArray(raw)) return [];
-    return raw
-      .filter((item: unknown) => item && typeof item === "object")
-      .map((item: any) => ({
-        content: item.content || item.text || String(item),
-        status: normalizeTodoStatus(item.status),
-      }));
-  } catch {
-    return [];
-  }
 }
 
 function normalizeTodoStatus(status: unknown): TodoStatus {

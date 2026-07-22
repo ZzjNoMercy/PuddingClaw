@@ -86,6 +86,8 @@ class DatabaseSqlGenerateInput(BaseModel):
 
 
 class DatabaseSqlValidateInput(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     sql: str = Field(
         default="",
         description=(
@@ -99,9 +101,12 @@ class DatabaseSqlValidateInput(BaseModel):
     )
     database_source_id: str | None = Field(default=None, description="Optional configured database source id.")
     table_names: list[str] = Field(default_factory=list, description="Optional authorized table names.")
+    runtime: ToolRuntime
 
 
 class DatabaseSqlExecuteInput(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     sql: str = Field(
         default="",
         description=(
@@ -113,10 +118,18 @@ class DatabaseSqlExecuteInput(BaseModel):
         default="",
         description="Generation id returned by database_sql_generate. Required in Agent mode.",
     )
+    validation_receipt_id: str = Field(
+        default="",
+        description=(
+            "Receipt id returned by database_sql_validate. Required in Agent mode and bound to the exact "
+            "generation SQL hash."
+        ),
+    )
     database_source_id: str | None = Field(default=None, description="Optional configured database source id.")
     table_names: list[str] = Field(default_factory=list, description="Optional authorized table names.")
     limit: int = Field(default=100, ge=1, le=5000, description="Maximum preview rows returned to the model.")
     timeout_ms: int | None = Field(default=None, ge=1000, le=300000, description="Optional statement timeout in ms.")
+    runtime: ToolRuntime
 
 
 class DatabaseSchemaInspectInput(BaseModel):

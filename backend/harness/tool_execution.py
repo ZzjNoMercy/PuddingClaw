@@ -232,6 +232,24 @@ class ShellPolicyAnalyzer:
             )
         if not segments:
             return ToolPolicyResult(PolicyDecision.DENY, "empty_command", "invalid")
+        for segment in segments:
+            tokens = self.unwrap_command(segment)
+            if not tokens or Path(tokens[0]).name != "cp":
+                continue
+            operands = [token for token in tokens[1:] if not token.startswith("-")]
+            if (
+                len(operands) >= 2
+                and operands[-1].startswith("/scratch/external-directories/")
+                and any(
+                    source == "/workspace" or source.startswith("/workspace/")
+                    for source in operands[:-1]
+                )
+            ):
+                return ToolPolicyResult(
+                    PolicyDecision.DENY,
+                    "external_draft_shadow_import",
+                    "critical",
+                )
         path_result = self._check_absolute_paths(segments)
         if path_result is not None:
             return path_result
@@ -1070,6 +1088,7 @@ class ToolExecutionPipeline(AgentMiddleware):
             "edit_file",
             "inspect_file_version",
             "patch_file",
+            "upsert_scratch_file",
             "stage_external_artifact",
             "commit_external_artifact",
             "prepare_attachment_edit",
@@ -1077,6 +1096,7 @@ class ToolExecutionPipeline(AgentMiddleware):
             "stage_external_directory",
             "prepare_external_directory_commit",
             "commit_external_directory",
+            "validate_artifact_contract",
             "glob",
             "grep",
             "execute",
@@ -1092,6 +1112,7 @@ class ToolExecutionPipeline(AgentMiddleware):
             "edit_file",
             "inspect_file_version",
             "patch_file",
+            "upsert_scratch_file",
             "stage_external_artifact",
             "commit_external_artifact",
             "prepare_attachment_edit",
@@ -1099,6 +1120,7 @@ class ToolExecutionPipeline(AgentMiddleware):
             "stage_external_directory",
             "prepare_external_directory_commit",
             "commit_external_directory",
+            "validate_artifact_contract",
             "glob",
             "grep",
             "task",
@@ -1160,6 +1182,9 @@ class ToolExecutionPipeline(AgentMiddleware):
         result = await self._apreflight(request)
         if result.decision == PolicyDecision.ALLOW:
             self._record_reviewer_decision(request, result)
+            delta_denial = self._delta_repair_denial(request)
+            if delta_denial is not None:
+                return delta_denial
             return await handler(request)
         if result.decision == PolicyDecision.DENY:
             self._record_reviewer_decision(request, result)
@@ -1194,6 +1219,9 @@ class ToolExecutionPipeline(AgentMiddleware):
                     "running",
                     expected_statuses={"running", "waiting_hitl"},
                 )
+            delta_denial = self._delta_repair_denial(request)
+            if delta_denial is not None:
+                return delta_denial
             return await handler(request)
         preview = permission_resume_registry.create_tool_action_request(
             session_id=session_id,
@@ -1245,6 +1273,9 @@ class ToolExecutionPipeline(AgentMiddleware):
                 required_capabilities=required_capabilities,
                 current_run_id=run_id,
             ):
+                delta_denial = self._delta_repair_denial(request)
+                if delta_denial is not None:
+                    return delta_denial
                 return await handler(request)
         return self._denied_message(request, result)
 
@@ -1255,8 +1286,70 @@ class ToolExecutionPipeline(AgentMiddleware):
     ) -> ToolMessage | Command[Any]:
         result = self._preflight(request)
         if result.decision == PolicyDecision.ALLOW:
+            delta_denial = self._delta_repair_denial(request)
+            if delta_denial is not None:
+                return delta_denial
             return handler(request)
         return self._denied_message(request, result)
+
+    def _delta_repair_denial(self, request: ToolCallRequest) -> ToolMessage | None:
+        """Enforce the server-authored bounded repair policy before execution."""
+
+        context = self._context(request)
+        session_id = str(context.get("session_id") or "")
+        run_id = str(context.get("run_id") or "")
+        if not session_id or not run_id:
+            return None
+        run = session_manager.get_run_state(session_id, run_id)
+        if not isinstance(run, dict) or run.get("execution_mode") != "delta_repair":
+            return None
+        tool_name = str(request.tool_call.get("name") or "")
+        repair_kind = str(run.get("delta_repair_kind") or "bounded_unknown")
+        forbidden = {"task"}
+        if repair_kind == "presentation_only":
+            forbidden.update(
+                {
+                    "stage_external_directory",
+                    "prepare_external_directory_commit",
+                    "commit_external_directory",
+                }
+            )
+            forbidden.update(
+                name
+                for name in self.known_tools
+                if name.startswith("database_")
+            )
+        reservation = session_manager.reserve_delta_repair_tool_call(
+            session_id,
+            run_id,
+            str(request.tool_call.get("id") or ""),
+        )
+        if not reservation.get("allowed"):
+            reason = str(reservation.get("reason") or "delta_repair_policy")
+            return ToolMessage(
+                content=(
+                    "Tool call blocked by bounded delta-repair policy: "
+                    f"{reason}; count={reservation.get('count', 0)}; "
+                    f"limit={reservation.get('limit', run.get('delta_repair_tool_budget'))}. "
+                    "Use the already-related exact artifacts, finish the minimum patch, or explain why "
+                    "a new full Run is required."
+                ),
+                name=tool_name,
+                tool_call_id=str(request.tool_call.get("id") or ""),
+                status="error",
+            )
+        if tool_name in forbidden:
+            return ToolMessage(
+                content=(
+                    "Tool call blocked by bounded delta-repair policy: "
+                    f"{tool_name} is outside {repair_kind}. Work from the related exact artifacts; "
+                    "do not delegate or expand to database/directory-wide work for this repair."
+                ),
+                name=tool_name,
+                tool_call_id=str(request.tool_call.get("id") or ""),
+                status="error",
+            )
+        return None
 
     def _preflight(self, request: ToolCallRequest) -> ToolPolicyResult:
         tool_name = str(request.tool_call.get("name") or "")

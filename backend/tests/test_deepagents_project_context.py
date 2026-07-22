@@ -51,12 +51,14 @@ def test_default_tool_guides_route_product_config_metrics_to_database() -> None:
         encoding="utf-8"
     )
 
-    assert "Use `database_sql_generate` first" in prompt
+    assert "Current Capability Manifest lists `database_sql_generate`" in prompt
+    assert "`/skills/database-analysis/SKILL.md`" in prompt
     assert "配置率, 搭载率, 配备率" in prompt
     assert "Do not add physical table names" in prompt
     assert "Do not request a revision merely" in prompt
     assert "injected automatically from trusted runtime state" in prompt
-    assert "with `generation_id` only; omit `sql`" in prompt
+    assert "validation_receipt_id" in prompt
+    assert "Execute rejects a missing or hash-mismatched receipt" in prompt
     assert "never launch multiple revision requests in parallel" in prompt
     assert "Do not first search the knowledge base, inspect schema" in prompt
     assert "Business metric questions such as sales volume" not in prompt

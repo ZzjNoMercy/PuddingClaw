@@ -10,11 +10,13 @@ from types import SimpleNamespace
 
 import pytest
 from langchain.agents.middleware.types import ToolCallRequest
+from langchain_core.messages import ToolMessage
 
 from graph.permission_policy import RunPermissionContext
 from graph.permission_resume import PermissionResumeRegistry
 from graph.session_manager import SessionManager, session_manager
 from harness.dependency_setup import detect_workspace_dependency_plan
+from harness.models import RunRecord
 from harness.permission_reviewer import ModelPermissionReviewer, PermissionReviewVerdict
 from harness.tool_execution import (
     PolicyDecision,
@@ -46,6 +48,70 @@ def test_run_permission_context_preserves_frozen_policy_version():
     assert context.policy_version == "tool-execution-v1"
 
 
+def _delta_request(run_id: str, call_id: str, tool_name: str) -> ToolCallRequest:
+    return ToolCallRequest(
+        tool_call={"id": call_id, "name": tool_name, "args": {}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(
+            context={
+                "session_id": "delta-policy-session",
+                "query_id": "query-delta",
+                "run_id": run_id,
+            }
+        ),
+    )
+
+
+def test_presentation_delta_repair_denies_database_and_enforces_tool_budget(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("delta-policy-session")
+    run = RunRecord(
+        run_id="run-delta",
+        query_id="query-delta",
+        session_id="delta-policy-session",
+        objective="下拉只到 2024",
+        execution_mode="delta_repair",
+        delta_repair_kind="presentation_only",
+        delta_repair_tool_budget=3,
+    )
+    session_manager.start_harness_run(
+        "delta-policy-session", run.model_dump(mode="json")
+    )
+    pipeline = ToolExecutionPipeline(
+        known_tools={"read_file", "database_sql_generate", "task"},
+        backend_mode="docker",
+    )
+
+    def handler(request):
+        return ToolMessage(
+            content="ok",
+            name=str(request.tool_call["name"]),
+            tool_call_id=str(request.tool_call["id"]),
+            status="success",
+        )
+
+    database = pipeline.wrap_tool_call(
+        _delta_request(run.run_id, "call-db", "database_sql_generate"), handler
+    )
+    first = pipeline.wrap_tool_call(
+        _delta_request(run.run_id, "call-read-1", "read_file"), handler
+    )
+    second = pipeline.wrap_tool_call(
+        _delta_request(run.run_id, "call-read-2", "read_file"), handler
+    )
+    exhausted = pipeline.wrap_tool_call(
+        _delta_request(run.run_id, "call-read-3", "read_file"), handler
+    )
+
+    assert database.status == "error"
+    assert "outside presentation_only" in str(database.content)
+    assert first.status == "success"
+    assert second.status == "success"
+    assert exhausted.status == "error"
+    assert "budget_exhausted" in str(exhausted.content)
+
+
 def test_restricted_host_backend_id_is_stable_for_workspace(tmp_path):
     first = RestrictedHostWorkspaceBackend(root_dir=tmp_path)
     second = RestrictedHostWorkspaceBackend(root_dir=tmp_path)
@@ -73,6 +139,53 @@ async def test_tool_action_request_is_idempotent_across_graph_replay():
     assert second["id"] == first["id"]
     assert len(registry._pending) == 1
     assert registry.resolve(first["id"], {"type": "reject"})
+
+
+@pytest.mark.asyncio
+async def test_concurrent_network_requests_share_semantic_pending_decision():
+    registry = PermissionResumeRegistry()
+    common = {
+        "session_id": "session-1",
+        "query_id": "query-1",
+        "tool_name": "execute",
+        "reason": "network_access",
+        "risk": "execute",
+        "session_target_kind": "capability",
+        "session_target": "session_network_access",
+        "required_capabilities": ["execute", "network_access"],
+    }
+    first = registry.create_tool_action_request(
+        **common,
+        run_id="run-1",
+        tool_call_id="call-curl",
+        command="curl https://example.com",
+        grant_bindings={
+            "approval_mode": "smart",
+            "policy_epoch": 1,
+            "policy_version": "tool-execution-v3",
+            "backend_mode": "docker",
+            "backend_id": "container:first",
+            "workspace_id": "workspace:stable",
+        },
+    )
+    second = registry.create_tool_action_request(
+        **common,
+        run_id="run-2",
+        tool_call_id="call-search",
+        command="python tavily_search.py",
+        grant_bindings={
+            "approval_mode": "smart",
+            "policy_epoch": 1,
+            "policy_version": "tool-execution-v3",
+            "backend_mode": "docker",
+            "backend_id": "container:replacement",
+            "workspace_id": "workspace:stable",
+        },
+    )
+
+    assert second["id"] == first["id"]
+    assert second["semantic_key"] == first["semantic_key"]
+    assert len(registry._pending) == 1
 
 
 @pytest.mark.asyncio
@@ -281,6 +394,18 @@ PYEOF"""
 
     assert result.decision == PolicyDecision.DENY
     assert result.reason == "container_path_expansion"
+
+
+def test_shell_policy_rejects_workspace_shadow_copy_into_external_draft(tmp_path):
+    analyzer = ShellPolicyAnalyzer(workspace_path=str(tmp_path), backend_mode="docker")
+
+    result = analyzer.analyze(
+        "cp /workspace/product-config-charts.js "
+        "/scratch/external-directories/directory-lease-1/product-config-charts.js"
+    )
+
+    assert result.decision == PolicyDecision.DENY
+    assert result.reason == "external_draft_shadow_import"
 
 
 def test_restricted_host_backend_rejects_scratch_traversal_before_rewrite(tmp_path):
@@ -831,6 +956,148 @@ def test_equivalent_session_tool_grants_are_deduplicated(tmp_path):
     assert second["id"] == first["id"]
     assert len(sessions.list_permission_grants("session-dedup")) == 1
     assert second["metadata"]["policy_source"] == "codex_grok_smart_reviewer"
+
+
+def test_session_network_grant_survives_docker_instance_replacement(tmp_path):
+    from harness.coordinators import HarnessRunCoordinator
+    from harness.models import RunStatus
+
+    sessions = SessionManager()
+    sessions.initialize(tmp_path)
+    sessions.create_session("session-network-rebuild")
+    coordinator = HarnessRunCoordinator(sessions)
+
+    first_run, _ = coordinator.start_run(
+        session_id="session-network-rebuild",
+        query_id="query-network-1",
+        objective="访问网络",
+        goal_mode=False,
+    )
+    coordinator.bind_execution_snapshot(
+        first_run,
+        {
+            "backend_mode": "docker",
+            "backend_id": "container:first",
+            "workspace_id": "workspace:stable",
+        },
+    )
+    coordinator.transition(first_run, RunStatus.RUNNING)
+    first_state = sessions.get_run_state("session-network-rebuild", first_run.run_id)
+    assert first_state is not None
+    first_bindings = RunPermissionContext.from_config_snapshot(
+        first_state["config_snapshot"]
+    ).grant_bindings()
+    first = sessions.add_permission_grant(
+        "session-network-rebuild",
+        grant_type="tool_action",
+        target_kind="capability",
+        target="session_network_access",
+        capabilities=["execute", "network_access"],
+        scope="session",
+        metadata={"run_id": first_run.run_id},
+        bindings=first_bindings,
+    )
+    coordinator.transition(first_run, RunStatus.COMPLETED)
+
+    second_run, _ = coordinator.start_run(
+        session_id="session-network-rebuild",
+        query_id="query-network-2",
+        objective="继续访问网络",
+        goal_mode=False,
+    )
+    coordinator.bind_execution_snapshot(
+        second_run,
+        {
+            "backend_mode": "docker",
+            "backend_id": "container:replacement",
+            "workspace_id": "workspace:stable",
+        },
+    )
+    coordinator.transition(second_run, RunStatus.RUNNING)
+    second_state = sessions.get_run_state("session-network-rebuild", second_run.run_id)
+    assert second_state is not None
+    second_bindings = RunPermissionContext.from_config_snapshot(
+        second_state["config_snapshot"]
+    ).grant_bindings()
+    second = sessions.add_permission_grant(
+        "session-network-rebuild",
+        grant_type="tool_action",
+        target_kind="capability",
+        target="session_network_access",
+        capabilities=["execute", "network_access"],
+        scope="session",
+        metadata={"run_id": second_run.run_id},
+        bindings=second_bindings,
+    )
+
+    assert second["id"] == first["id"]
+    assert second["binding_schema_version"] == 2
+    assert second["semantic_key"].startswith("sha256:")
+    assert "backend_id" not in second["stable_bindings"]
+    assert len(sessions.list_permission_grants("session-network-rebuild")) == 1
+    assert sessions.consume_tool_action_permission(
+        "session-network-rebuild",
+        "sha256:replacement-container-call",
+        session_target_kind="capability",
+        session_target="session_network_access",
+        required_bindings=second_bindings,
+        required_capabilities=["execute", "network_access"],
+        current_run_id=second_run.run_id,
+    )
+
+
+def test_legacy_duplicate_grants_are_superseded_without_deleting_audit(tmp_path):
+    sessions = SessionManager()
+    sessions.initialize(tmp_path)
+    sessions.create_session("session-legacy-grants")
+    data = sessions._read_file("session-legacy-grants")
+    data["permissions"]["grants"] = [
+        {
+            "id": "grant-old",
+            "type": "tool_action",
+            "scope": "session",
+            "target_kind": "capability",
+            "target": "session_network_access",
+            "capabilities": ["execute", "network_access"],
+            "source": "user",
+            "created_at": 1.0,
+            "bindings": {
+                "approval_mode": "smart",
+                "policy_epoch": 1,
+                "policy_version": "tool-execution-v3",
+                "backend_mode": "docker",
+                "backend_id": "container:old",
+                "workspace_id": "workspace:stable",
+            },
+        },
+        {
+            "id": "grant-new",
+            "type": "tool_action",
+            "scope": "session",
+            "target_kind": "capability",
+            "target": "session_network_access",
+            "capabilities": ["network_access", "execute"],
+            "source": "user",
+            "created_at": 2.0,
+            "bindings": {
+                "approval_mode": "smart",
+                "policy_epoch": 1,
+                "policy_version": "tool-execution-v3",
+                "backend_mode": "docker",
+                "backend_id": "container:new",
+                "workspace_id": "workspace:stable",
+            },
+        },
+    ]
+    sessions._write_file("session-legacy-grants", data)
+
+    assert sessions.migrate_permission_grants("session-legacy-grants") == 1
+    active = sessions.list_permission_grants("session-legacy-grants")
+    history = sessions.list_permission_grant_history("session-legacy-grants")
+
+    assert [item["id"] for item in active] == ["grant-new"]
+    assert [item["id"] for item in history] == ["grant-old"]
+    assert history[0]["superseded_by"] == "grant-new"
 
 
 def test_network_origin_session_grant_reuses_paths_but_not_other_origins(tmp_path):

@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import logging
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -11,7 +15,19 @@ from langchain.agents.middleware.types import ToolCallRequest
 from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
+from graph.middlewares.external_directory import (
+    LEASE_TTL_SECONDS,
+    MAX_DIRECTORY_BYTES,
+    _manifest_digest,
+    _scan_source_directory,
+    _upload_snapshot,
+)
+from graph.session_manager import session_manager
+from graph.trace_collector import get_current_trace_collector
+from observability import emit_harness_metric
 from tools.read_resource_tool import ReadResourceTool
+
+logger = logging.getLogger(__name__)
 
 
 class WorkspacePathRouterMiddleware(AgentMiddleware):
@@ -100,6 +116,273 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
             status="error" if is_error else "success",
         )
 
+    def _authorized_directory_root(
+        self,
+        *,
+        session_id: str,
+        run_id: str,
+        requested: Path,
+    ) -> Path | None:
+        """Return the narrowest authorized exact directory containing path."""
+
+        candidates: list[Path] = []
+        for grant in session_manager.list_permission_grants(session_id):
+            if grant.get("type") != "external_directory_read":
+                continue
+            target = grant.get("target")
+            if not isinstance(target, str) or not target:
+                continue
+            root = Path(target).expanduser().resolve()
+            if not self._is_relative_to(requested, root):
+                continue
+            if session_manager.has_external_directory_permission(
+                session_id,
+                root,
+                access="read",
+                run_id=run_id,
+            ):
+                candidates.append(root)
+        return max(candidates, key=lambda item: len(item.parts)) if candidates else None
+
+    def _stage_exact_search_file(
+        self,
+        *,
+        context: dict[str, Any],
+        requested: Path,
+    ) -> tuple[str | None, str | None]:
+        if self.backend is None:
+            return None, "external search requires a Backend scratch namespace"
+        session_id = str(context.get("session_id") or "")
+        run_id = str(context.get("run_id") or "")
+        query_id = str(context.get("query_id") or "")
+        now = time.time()
+        for lease in session_manager.list_external_artifact_leases(session_id):
+            if (
+                lease.get("search_only")
+                and lease.get("status") == "search_snapshot"
+                and str(lease.get("run_id") or "") == run_id
+                and str(lease.get("query_id") or "") == query_id
+                and str(lease.get("target_path") or "") == str(requested)
+                and float(lease.get("expires_at") or 0) >= now
+            ):
+                staged_path = str(lease.get("staged_path") or "")
+                probe = self.backend.read(staged_path)
+                if not probe.error:
+                    return staged_path, None
+        try:
+            content = requested.read_bytes()
+        except OSError as exc:
+            return None, str(exc)
+        if len(content) > MAX_DIRECTORY_BYTES:
+            return None, f"external file exceeds {MAX_DIRECTORY_BYTES} byte search limit"
+        digest = hashlib.sha256(content).hexdigest()
+        seed = f"{session_id}:{run_id}:{query_id}:{requested}:{digest}"
+        snapshot_id = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+        staged_dir = f"/scratch/external-search-files/{snapshot_id}"
+        upload_error = _upload_snapshot(self.backend, staged_dir, {requested.name: content})
+        if upload_error is not None:
+            return None, upload_error
+        staged_path = f"{staged_dir}/{requested.name}"
+        now = time.time()
+        session_manager.upsert_external_artifact_lease(
+            session_id,
+            {
+                "lease_id": f"file-search-{snapshot_id}",
+                "session_id": session_id,
+                "run_id": run_id,
+                "query_id": query_id,
+                "goal_id": str(context.get("goal_id") or ""),
+                "goal_revision": context.get("goal_revision"),
+                "target_path": str(requested),
+                "staged_path": staged_path,
+                "source_sha256": f"sha256:{digest}",
+                "status": "search_snapshot",
+                "search_only": True,
+                "created_at": now,
+                "expires_at": now + LEASE_TTL_SECONDS,
+            },
+        )
+        return staged_path, None
+
+    def _stage_directory_search(
+        self,
+        *,
+        context: dict[str, Any],
+        root: Path,
+        requested: Path,
+    ) -> tuple[str | None, str | None]:
+        if self.backend is None:
+            return None, "external search requires a Backend scratch namespace"
+        started_at = time.monotonic()
+        collector = get_current_trace_collector()
+        session_id = str(context.get("session_id") or "")
+        run_id = str(context.get("run_id") or "")
+        query_id = str(context.get("query_id") or "")
+        now = time.time()
+        relative = requested.relative_to(root).as_posix()
+        for lease in session_manager.list_external_directory_leases(session_id):
+            if (
+                lease.get("search_only")
+                and lease.get("status") == "search_snapshot"
+                and str(lease.get("run_id") or "") == run_id
+                and str(lease.get("query_id") or "") == query_id
+                and str(lease.get("directory_path") or "") == str(root)
+                and float(lease.get("expires_at") or 0) >= now
+            ):
+                staged_dir = str(lease.get("staged_dir") or "")
+                probe = self.backend.ls(staged_dir)
+                if not probe.error:
+                    return (
+                        staged_dir
+                        if relative == "."
+                        else f"{staged_dir}/{relative}",
+                        None,
+                    )
+        if collector is not None:
+            collector.add_custom_span(
+                "external_directory_snapshot_started",
+                {"directory_path": str(root), "route": "automatic_search_snapshot"},
+                span_type="tool",
+            )
+        manifest, contents, skipped, error = _scan_source_directory(root, include_content=True)
+        if error is not None:
+            if collector is not None:
+                collector.add_custom_span(
+                    "external_directory_snapshot_failed",
+                    {
+                        "directory_path": str(root),
+                        "error": error,
+                        "duration_ms": round((time.monotonic() - started_at) * 1000, 2),
+                    },
+                    span_type="tool",
+                )
+            return None, error
+        source_digest = _manifest_digest(manifest)
+        seed = f"{session_id}:{run_id}:{query_id}:{root}:{source_digest}"
+        lease_id = "directory-search-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+        staged_dir = f"/scratch/external-directories/{lease_id}"
+        upload_error = _upload_snapshot(self.backend, staged_dir, contents)
+        if upload_error is not None:
+            if collector is not None:
+                collector.add_custom_span(
+                    "external_directory_snapshot_failed",
+                    {
+                        "directory_path": str(root),
+                        "error": upload_error,
+                        "duration_ms": round((time.monotonic() - started_at) * 1000, 2),
+                    },
+                    span_type="tool",
+                )
+            return None, upload_error
+        now = time.time()
+        lease = {
+            "lease_id": lease_id,
+            "session_id": session_id,
+            "run_id": run_id,
+            "query_id": query_id,
+            "goal_id": str(context.get("goal_id") or ""),
+            "goal_revision": context.get("goal_revision"),
+            "directory_path": str(root),
+            "staged_dir": staged_dir,
+            "source_manifest": manifest,
+            "source_manifest_sha256": source_digest,
+            "file_count": len(manifest),
+            "total_bytes": sum(int(item["size"]) for item in manifest.values()),
+            "skipped": skipped,
+            "status": "search_snapshot",
+            "search_only": True,
+            "created_at": now,
+            "expires_at": now + LEASE_TTL_SECONDS,
+        }
+        session_manager.upsert_external_directory_lease(session_id, lease)
+        if collector is not None:
+            collector.add_custom_span(
+                "external_directory_snapshot_completed",
+                {
+                    "directory_path": str(root),
+                    "staged_dir": staged_dir,
+                    "source_manifest_sha256": source_digest,
+                    "file_count": len(manifest),
+                    "total_bytes": lease["total_bytes"],
+                    "skipped_count": len(skipped),
+                    "duration_ms": round((time.monotonic() - started_at) * 1000, 2),
+                },
+                span_type="tool",
+            )
+        return staged_dir if relative == "." else f"{staged_dir}/{relative}", None
+
+    def _route_external_search(
+        self,
+        *,
+        request: ToolCallRequest,
+        tool_name: str,
+        args: dict[str, Any],
+        path_arg: str,
+        routed_path: str,
+        context: dict[str, Any],
+    ) -> tuple[str, ToolCallRequest | ToolMessage]:
+        requested = Path(routed_path).expanduser().resolve()
+        session_id = str(context.get("session_id") or "")
+        run_id = str(context.get("run_id") or "")
+        if (
+            tool_name == "grep"
+            and session_id
+            and session_manager.has_external_file_read_permission(session_id, requested)
+        ):
+            route_label = "exact_file"
+            staged_path, error = self._stage_exact_search_file(
+                context=context,
+                requested=requested,
+            )
+        else:
+            root = self._authorized_directory_root(
+                session_id=session_id,
+                run_id=run_id,
+                requested=requested,
+            )
+            if root is None:
+                emit_harness_metric(
+                    logger,
+                    "external_search_route",
+                    session_id=session_id,
+                    route="denied",
+                    tool=tool_name,
+                )
+                return "result", self._tool_message(
+                    request,
+                    (
+                        f"🔒 `{tool_name}` requires explicit read authorization for the exact external "
+                        f"directory {routed_path!r}. Approve that directory once, then the original search "
+                        "will be replayed against an isolated /scratch snapshot. Exact-file grants never "
+                        "expand to a parent directory."
+                    ),
+                    name=tool_name,
+                )
+            route_label = "staged_directory"
+            staged_path, error = self._stage_directory_search(
+                context=context,
+                root=root,
+                requested=requested,
+            )
+        if error is not None or staged_path is None:
+            return "result", self._tool_message(
+                request,
+                f"❌ Unable to create external search snapshot: {error or 'unknown error'}",
+                name=tool_name,
+            )
+        routed_args = dict(args)
+        routed_args[path_arg] = staged_path
+        emit_harness_metric(
+            logger,
+            "external_search_route",
+            session_id=session_id,
+            route=route_label,
+            tool=tool_name,
+        )
+        return "execute", request.override(
+            tool_call={**request.tool_call, "args": routed_args}
+        )
+
     def _route_request(
         self,
         request: ToolCallRequest,
@@ -114,6 +397,45 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
         context = self._runtime_context(request)
         workspace_path = str(context.get("workspace_path") or "")
         kind, routed_path = self._classify_path(raw_path, workspace_path)
+
+        if kind == "virtual" and routed_path.startswith("/scratch/"):
+            recovery = session_manager.resolve_terminal_scratch_reference(
+                str(context.get("session_id") or ""),
+                routed_path,
+            )
+            if isinstance(recovery, dict):
+                if recovery.get("status") == "durable":
+                    return "result", self._tool_message(
+                        request,
+                        (
+                            "terminal_scratch_ref: this execution path is no longer authoritative. "
+                            f"Retry with the formal target {recovery.get('formal_target_path')!r}; "
+                            f"content_sha256={recovery.get('content_sha256')}; "
+                            f"delivered_artifact_id={recovery.get('delivered_artifact_id')}. "
+                            "Normal external-file permission still applies."
+                        ),
+                        name=tool_name,
+                    )
+                if recovery.get("status") == "artifact_stale":
+                    return "result", self._tool_message(
+                        request,
+                        (
+                            "artifact_stale: the formal delivery registry no longer matches the target. "
+                            f"formal_target_path={recovery.get('formal_target_path')!r}; "
+                            f"reason={recovery.get('stale_reason')}. Re-inspect or re-stage that exact "
+                            "formal target; do not reuse the old scratch hash."
+                        ),
+                        name=tool_name,
+                    )
+                return "result", self._tool_message(
+                    request,
+                    (
+                        "artifact_not_durable: the referenced scratch lease ended without a formal commit. "
+                        "Re-stage the known formal source; do not glob the machine or guess sibling paths. "
+                        f"lease_id={recovery.get('lease_id')}; lease_status={recovery.get('lease_status')}"
+                    ),
+                    name=tool_name,
+                )
 
         # `/scratch` is a Backend/Docker virtual namespace, not a host path.
         # Models occasionally choose read_resource merely because it is not
@@ -140,6 +462,13 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
             return "execute", request
 
         if kind == "workspace":
+            emit_harness_metric(
+                logger,
+                "external_search_route",
+                session_id=str(context.get("session_id") or ""),
+                route="workspace",
+                tool=tool_name,
+            )
             args[path_arg] = routed_path
             tool_call = {**request.tool_call, "args": args}
             return "execute", request.override(tool_call=tool_call)
@@ -148,17 +477,13 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
             return "execute", request
 
         if tool_name != "read_file":
-            return "result", self._tool_message(
-                request,
-                (
-                    f"❌ `{tool_name}` cannot search outside the current workspace. "
-                    "External authorization is exact-file scoped and does not grant access to its parent directory. "
-                    f"Use read_resource(resource={routed_path!r}) only when this is the exact file path, "
-                    "or call stage_external_directory(directory_path=<parent directory>) to request explicit "
-                    "directory access when sibling discovery is genuinely required. For whole-project debugging, "
-                    "prefer selecting that directory as the project workspace."
-                ),
-                name=tool_name,
+            return self._route_external_search(
+                request=request,
+                tool_name=tool_name,
+                args=args,
+                path_arg=path_arg,
+                routed_path=routed_path,
+                context=context,
             )
 
         resource_args: dict[str, Any] = {"resource": routed_path}
@@ -207,7 +532,9 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
     ) -> ToolMessage | Command[Any]:
-        action, routed = self._route_request(request)
+        # Directory scanning and upload touch the host filesystem and may be
+        # sizeable; keep deterministic routing off the async model event loop.
+        action, routed = await asyncio.to_thread(self._route_request, request)
         if action == "execute":
             return await handler(routed)  # type: ignore[arg-type]
         if action == "result":

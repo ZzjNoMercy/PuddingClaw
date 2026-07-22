@@ -10,6 +10,7 @@ from langchain_core.messages import AIMessage
 from langgraph.runtime import Runtime
 from langgraph.types import interrupt
 
+from graph.permission_policy import RunPermissionContext
 from graph.permission_resume import permission_resume_registry
 from graph.session_manager import session_manager
 from graph.trace_collector import get_current_trace_collector
@@ -69,6 +70,36 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
         return {key: value[:1000] + ("...[truncated]" if len(value) > 1000 else "") for key, value in values.items()}
 
     @staticmethod
+    def _has_directory_permission_for_path(
+        session_id: str,
+        requested: Path,
+        *,
+        access: str,
+        run_id: str,
+    ) -> bool:
+        """Honor one exact-directory Grant for its normalized descendants."""
+
+        for grant in session_manager.list_permission_grants(session_id):
+            if grant.get("type") != f"external_directory_{access}":
+                continue
+            target = grant.get("target")
+            if not isinstance(target, str) or not target:
+                continue
+            root = Path(target).expanduser().resolve()
+            try:
+                requested.relative_to(root)
+            except ValueError:
+                continue
+            if session_manager.has_external_directory_permission(
+                session_id,
+                root,
+                access=access,
+                run_id=run_id,
+            ):
+                return True
+        return False
+
+    @staticmethod
     def _directory_change_preview(session_id: str, args: dict[str, Any]) -> dict[str, str]:
         lease = session_manager.get_external_directory_lease(
             session_id,
@@ -96,6 +127,33 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                 f"删除 {len(plan.get('deleted') or [])}"
             ),
         }
+
+    @staticmethod
+    def _trace_permission_reuse(
+        *,
+        tool_name: str,
+        target: Path,
+        access: str,
+    ) -> None:
+        collector = get_current_trace_collector()
+        if collector is None:
+            return
+        collector.add_custom_span(
+            "permission.reused",
+            {
+                "operation": tool_name,
+                "target": str(target),
+                "access": access,
+            },
+            span_type="permission",
+            metadata={
+                "permission": {
+                    "target_kind": "exact_directory",
+                    "capabilities": [access, "recursive", "external_path"],
+                    "outcome": "reused",
+                }
+            },
+        )
 
     def after_model(
         self,
@@ -132,6 +190,9 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                 "commit_external_artifact",
                 "stage_external_directory",
                 "commit_external_directory",
+                "grep",
+                "glob",
+                "ls",
             }:
                 continue
             args = tool_call.get("args") or {}
@@ -145,23 +206,68 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
             if raw_path.replace("\\", "/").startswith(self._VIRTUAL_PREFIXES):
                 continue
 
-            if tool_name in {"stage_external_directory", "commit_external_directory"}:
+            if tool_name in {
+                "stage_external_directory",
+                "commit_external_directory",
+                "grep",
+                "glob",
+                "ls",
+            }:
                 requested = Path(raw_path).expanduser().resolve()
                 access = "write" if tool_name == "commit_external_directory" else "read"
-                if session_manager.has_external_directory_permission(
-                    session_id,
-                    requested,
-                    access=access,
-                    run_id=run_id,
+                if (
+                    tool_name == "grep"
+                    and session_manager.has_external_file_read_permission(session_id, requested)
                 ):
+                    # Exact-file grep remains exact-file scoped. The path
+                    # router copies only this file into an isolated snapshot.
+                    self._trace_permission_reuse(
+                        tool_name=tool_name,
+                        target=requested,
+                        access="read",
+                    )
+                    continue
+                permission_exists = (
+                    self._has_directory_permission_for_path(
+                        session_id,
+                        requested,
+                        access=access,
+                        run_id=run_id,
+                    )
+                    if tool_name in {"grep", "glob", "ls"}
+                    else session_manager.has_external_directory_permission(
+                        session_id,
+                        requested,
+                        access=access,
+                        run_id=run_id,
+                    )
+                )
+                if permission_exists:
+                    self._trace_permission_reuse(
+                        tool_name=tool_name,
+                        target=requested,
+                        access=access,
+                    )
                     continue
                 change_preview = (
                     self._directory_change_preview(session_id, args)
                     if access == "write"
                     else {
-                        "授权范围": "当前 Run 递归只读",
-                        "安全说明": "目录将复制为 Docker /scratch 快照；不会直接挂载或修改原目录。",
+                        "授权范围": "可选择本 Session 或当前 Run 的 exact-directory 递归只读",
+                        "安全说明": (
+                            "目录将复制为 Docker /scratch 快照；不会直接挂载或修改原目录。"
+                            if tool_name == "stage_external_directory"
+                            else "授权后将自动创建只读 snapshot，并重放原搜索调用。"
+                        ),
                     }
+                )
+                run_state = session_manager.get_run_state(session_id, run_id)
+                grant_bindings = (
+                    RunPermissionContext.from_config_snapshot(
+                        run_state.get("config_snapshot")
+                    ).grant_bindings()
+                    if isinstance(run_state, dict)
+                    else None
                 )
                 request = permission_resume_registry.create_external_directory_request(
                     session_id=session_id,
@@ -171,6 +277,7 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                     path=requested,
                     access=access,
                     operation=tool_name,
+                    grant_bindings=grant_bindings,
                     change_preview=change_preview,
                 )
                 collector = get_current_trace_collector()

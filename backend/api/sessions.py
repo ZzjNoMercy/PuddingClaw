@@ -117,6 +117,8 @@ async def get_raw_messages(session_id: str):
     }
     if "todos" in data:
         result["todos"] = data["todos"]
+    if "todos_authority" in data:
+        result["todos_authority"] = data["todos_authority"]
     if "graph" in data:
         result["graph"] = data["graph"]
     if "harness" in data:
@@ -225,6 +227,8 @@ async def get_session_history(session_id: str):
     }
     if "todos" in data:
         result["todos"] = data["todos"]
+    if "todos_authority" in data:
+        result["todos_authority"] = data["todos_authority"]
     if "graph" in data:
         result["graph"] = data["graph"]
     return result

@@ -233,6 +233,8 @@ def _evaluate_artifact_delivery(
     criterion_id: str,
     harness_context: dict[str, Any],
 ) -> CriterionEvaluation:
+    evaluation_phase = str(harness_context.get("evaluation_phase") or "terminal")
+    enforce_publication_reference = evaluation_phase == "terminal"
     workspace_raw = str(harness_context.get("workspace_path") or "").strip()
     workspace = Path(workspace_raw).expanduser().resolve() if workspace_raw else None
     activations = [
@@ -434,8 +436,9 @@ def _evaluate_artifact_delivery(
             )
             if value
         }
-        if not final_content or not any(
-            value in final_content for value in reference_candidates
+        if enforce_publication_reference and (
+            not final_content
+            or not any(value in final_content for value in reference_candidates)
         ):
             unreferenced.append({
                 "artifact_id": parsed.artifact_id,
@@ -456,6 +459,8 @@ def _evaluate_artifact_delivery(
         "changed": changed,
         "invalid": invalid,
         "unreferenced": unreferenced,
+        "publication_reference_checked": enforce_publication_reference,
+        "evaluation_phase": evaluation_phase,
     }]
     if (
         selected_refs
@@ -663,10 +668,18 @@ def _evaluate_code_validation(
     harness_context: dict[str, Any],
     final_state: dict[str, Any],
 ) -> CriterionEvaluation:
+    def artifact_identity(item: dict[str, Any]) -> tuple[str, str]:
+        raw_path = str(item.get("path") or "").strip()
+        identity = str(Path(raw_path)) if raw_path else str(item.get("artifact_id") or "")
+        return identity, str(item.get("content_sha256") or "")
+
+    raw_activations = harness_context.get("verification_activations", [])
     activations = [
         item
-        for item in _verification_activations(harness_context, final_state)
-        if item.get("pack") == "code"
+        for item in (raw_activations if isinstance(raw_activations, list) else [])
+        if isinstance(item, dict)
+        and item.get("pack") == "code"
+        and item.get("status") in {"succeeded", "failed"}
     ]
     current_writes = [
         evidence_ref
@@ -692,20 +705,81 @@ def _evaluate_code_validation(
     current_validations = [
         evidence_ref
         for activation in activations
+        if float(activation.get("created_at") or 0) >= latest_write_at
+        for evidence_ref in activation.get("evidence_refs") or []
+        if isinstance(evidence_ref, dict)
+        and evidence_ref.get("kind") == "validation_receipt"
+        and evidence_ref.get("material") is True
+    ]
+    current_validation_attempts = [
+        evidence_ref
+        for activation in activations
         if activation.get("tool_name") in {"execute", "terminal"}
         and float(activation.get("created_at") or 0) >= latest_write_at
         for evidence_ref in activation.get("evidence_refs") or []
         if isinstance(evidence_ref, dict)
-        and evidence_ref.get("kind") == "tool_result"
+        and evidence_ref.get("kind") == "tool_execution"
         and evidence_ref.get("material") is True
     ]
-    if current_validations:
+    current_artifact_identity = {
+        artifact_identity(item)
+        for item in current_writes
+        if (item.get("path") or item.get("artifact_id")) and item.get("content_sha256")
+    }
+    valid_current_receipts = [
+        receipt
+        for receipt in current_validations
+        if str(receipt.get("status") or "passed") == "passed"
+        and int(receipt.get("exit_code", -1)) == 0
+        and int(receipt.get("checks_failed") or 0) == 0
+        and current_artifact_identity.issubset(
+            {
+                artifact_identity(item)
+                for item in receipt.get("artifact_refs") or []
+                if isinstance(item, dict)
+            }
+        )
+    ]
+    blocking_current_receipts = [
+        receipt
+        for receipt in current_validations
+        if bool(receipt.get("blocking", True))
+        and (
+            str(receipt.get("status") or "passed") == "failed"
+            or int(receipt.get("exit_code", -1)) != 0
+            or int(receipt.get("checks_failed") or 0) > 0
+        )
+    ]
+    if current_writes and blocking_current_receipts and not valid_current_receipts:
+        return CriterionEvaluation(
+            criterion_id=criterion_id,
+            name=criterion_id,
+            passed=False,
+            verifier=VerifierKind.DETERMINISTIC,
+            evidence=[*current_writes, *blocking_current_receipts],
+            gap="目标产物存在与当前 hash 绑定的失败验证，必须修复产物并验证新 hash。",
+            failure_kind=VerificationFailureKind.TASK_GAP,
+        )
+    if current_writes and valid_current_receipts:
         return CriterionEvaluation(
             criterion_id=criterion_id,
             name=criterion_id,
             passed=True,
             verifier=VerifierKind.DETERMINISTIC,
-            evidence=[*current_writes, *current_validations],
+            evidence=[*current_writes, *valid_current_receipts],
+        )
+    if current_writes and current_validation_attempts and not current_validations:
+        return CriterionEvaluation(
+            criterion_id=criterion_id,
+            name=criterion_id,
+            passed=False,
+            verifier=VerifierKind.DETERMINISTIC,
+            evidence=[*current_writes, *current_validation_attempts],
+            gap=(
+                "校验命令已经成功执行，但 Harness 未能为目标产物生成 ValidationReceipt。"
+                "这是验证协议错误，不应继续修改业务产物。"
+            ),
+            failure_kind=VerificationFailureKind.VALIDATOR_PROTOCOL_ERROR,
         )
 
     # Code validation is artifact-bound across Goal Runs.  Reuse is valid only
@@ -716,14 +790,16 @@ def _evaluate_code_validation(
         item
         for item in (inherited_raw if isinstance(inherited_raw, list) else [])
         if isinstance(item, dict)
-        and item.get("verification_pack") == "code"
         and item.get("material") is True
     ]
     inherited_validations = [
         item
         for item in inherited
-        if item.get("kind") == "tool_result"
-        and item.get("tool_name") in {"execute", "terminal"}
+        if item.get("kind") == "validation_receipt"
+        and item.get("verification_pack") == "code"
+        and str(item.get("status") or "passed") == "passed"
+        and int(item.get("exit_code", -1)) == 0
+        and int(item.get("checks_failed") or 0) == 0
     ]
     inherited_writes = [item for item in inherited if item.get("kind") == "artifact_write"]
     valid_writes = [
@@ -731,11 +807,53 @@ def _evaluate_code_validation(
         for item in inherited_writes
         if _artifact_evidence_matches_current_bytes(item, harness_context)
     ]
+    inherited_artifact_identity = {
+        artifact_identity(item)
+        for item in valid_writes
+        if (item.get("path") or item.get("artifact_id")) and item.get("content_sha256")
+    }
+    current_receipts_cover_inherited = any(
+        str(receipt.get("status") or "passed") == "passed"
+        and int(receipt.get("exit_code", -1)) == 0
+        and int(receipt.get("checks_failed") or 0) == 0
+        and inherited_artifact_identity.issubset(
+            {
+                artifact_identity(item)
+                for item in receipt.get("artifact_refs") or []
+                if isinstance(item, dict)
+            }
+        )
+        for receipt in current_validations
+    )
+    if (
+        not current_writes
+        and inherited_writes
+        and len(valid_writes) == len(inherited_writes)
+        and current_receipts_cover_inherited
+    ):
+        return CriterionEvaluation(
+            criterion_id=criterion_id,
+            name=criterion_id,
+            passed=True,
+            verifier=VerifierKind.DETERMINISTIC,
+            evidence=[*valid_writes, *current_validations],
+        )
     if (
         not current_writes
         and inherited_validations
         and inherited_writes
         and len(valid_writes) == len(inherited_writes)
+        and {
+            artifact_identity(item)
+            for item in inherited_writes
+        }.issubset(
+            {
+                artifact_identity(item)
+                for receipt in inherited_validations
+                for item in receipt.get("artifact_refs") or []
+                if isinstance(item, dict)
+            }
+        )
     ):
         return CriterionEvaluation(
             criterion_id=criterion_id,
@@ -745,11 +863,19 @@ def _evaluate_code_validation(
             evidence=[*valid_writes, *inherited_validations],
         )
     if current_writes:
-        gap = "当前 Run 修改了代码，但尚未成功完成测试、构建或静态检查。"
+        gap = (
+            "当前 Run 修改了代码，但尚未成功完成测试、构建或静态检查。"
+            "请运行与产物匹配的可执行验证，例如 pytest/ruff、npm run build、"
+            "node --check <file>，或命名含 validate/check/test 的 Python 校验脚本。"
+        )
     elif inherited_writes and len(valid_writes) != len(inherited_writes):
         gap = "代码产物 hash 已变化，前序 Run 的验证证据失效，必须重新验证。"
     else:
-        gap = "未发现与当前代码产物绑定的成功测试、构建或静态检查证据。"
+        gap = (
+            "未发现与当前代码产物绑定的成功测试、构建或静态检查证据。"
+            "可使用 pytest/ruff、npm run build、node --check <file>，"
+            "或命名含 validate/check/test 的 Python 校验脚本闭合。"
+        )
     return CriterionEvaluation(
         criterion_id=criterion_id,
         name=criterion_id,

@@ -55,6 +55,7 @@ import {
   RubricEvaluationReport,
   ApprovalMode,
 } from "./api";
+import { getSubagentActivityIdentity } from "./subagentActivity";
 import {
   getSettings as apiGetSettings,
   updateSettings as apiUpdateSettings,
@@ -1522,6 +1523,48 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             currentRunsMapRef.current[id] = loadedRun;
             goalRunsMapRef.current[id] = loadedGoalRuns;
             verificationReportsMapRef.current[id] = loadedReport;
+            if (!runIsActive(loadedRun)) {
+              updateSessionRunActivity(id, null);
+            } else if (!runActivityStatusesMapRef.current[id]) {
+              const latestDelegationEvent = [...(loadedRun?.delegation_events || [])]
+                .sort((left, right) => Number(left.timestamp || 0) - Number(right.timestamp || 0))
+                .at(-1);
+              if (latestDelegationEvent) {
+                const restoredLabels: Record<string, string> = {
+                  subagent_started: "子代理已启动",
+                  context_mounted: "子代理上下文已挂载",
+                  subagent_stage_changed: "子代理正在分析与规划",
+                  subagent_tool_started: latestDelegationEvent.tool
+                    ? `子代理正在执行：${latestDelegationEvent.tool}`
+                    : "子代理正在执行工具",
+                  subagent_tool_completed: latestDelegationEvent.tool
+                    ? `子代理已完成：${latestDelegationEvent.tool}`
+                    : "子代理工具执行完成",
+                  subagent_completed: "子代理已完成，主 Agent 正在接收结果",
+                  subagent_blocked: "子代理需要主 Agent 决策",
+                  subagent_timed_out: "子代理已超时，主 Agent 正在接管剩余任务",
+                  subagent_failed: "子代理未完成，主 Agent 正在接管剩余任务",
+                  subagent_fallback_to_parent: "主 Agent 正在接管剩余任务",
+                };
+                const restoredLabel = restoredLabels[String(latestDelegationEvent.type || "")];
+                if (restoredLabel) {
+                  const restoredTerminalTypes = new Set([
+                    "subagent_completed",
+                    "subagent_blocked",
+                    "subagent_timed_out",
+                    "subagent_failed",
+                    "subagent_fallback_to_parent",
+                  ]);
+                  updateSessionRunActivity(id, {
+                    phase: restoredTerminalTypes.has(String(latestDelegationEvent.type || ""))
+                      ? "continuing"
+                      : "subagent",
+                    label: restoredLabel,
+                    detail: latestDelegationEvent.objective?.slice(0, 96),
+                  });
+                }
+              }
+            }
             if (sessionIdRef.current === id) {
               setActiveGoal(loadedGoal);
               setGoalModeEnabledRaw(Boolean(nextRunGoalModeMapRef.current[id]));
@@ -1592,7 +1635,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }
 
     },
-    [updateSessionGraph, updateSessionTodos]
+    [updateSessionGraph, updateSessionRunActivity, updateSessionTodos]
   );
 
   // Trace history is intentionally lazy: switching conversations reads only
@@ -2069,6 +2112,26 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           return { ...message, segments };
         }));
       };
+      const settleLifecycleActivities = (activityPrefix: string, status: string) => {
+        const targetId = getAssistantId();
+        updateMsgs((prev) => prev.map((message) => {
+          if (message.id !== targetId) return message;
+          const segments = message.segments?.length
+            ? [...message.segments]
+            : [{ content: "" } as MessageSegment];
+          const last = segments.length - 1;
+          const timeline = (segments[last].timeline || []).map((item) => {
+            if (item.type !== "activity"
+              || !item.id.startsWith(activityPrefix)
+              || item.status !== "running") {
+              return item;
+            }
+            return { ...item, status };
+          });
+          segments[last] = { ...segments[last], timeline };
+          return { ...message, segments };
+        }));
+      };
       // Keep network consumption independent from React rendering. SSE frames
       // are drained immediately into this buffer, while the UI receives one
       // immutable state update roughly every 32ms. This prevents both React
@@ -2194,6 +2257,34 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
         for await (const event of eventStream) {
           if (controller.signal.aborted) break;
+
+          if (event.event === "model_stream_preview") {
+            // The provider chunk itself now streams through the ordinary
+            // token/reasoning events. Keep previews in Trace only; rendering
+            // them here would duplicate the authoritative token stream.
+            continue;
+          }
+
+          if (event.event === "model_transport_interrupted") {
+            const retrying = event.data.next_action === "retry_same_model_node";
+            appendLifecycleActivity(
+              retrying ? "模型连接中断，正在重试" : "模型连接中断",
+              retrying ? "running" : "error",
+              "model-transport-recovery",
+            );
+            updateSessionRunActivity(sendSessionId, {
+              phase: "running",
+              label: retrying ? "模型连接中断，正在重试" : "模型连接中断",
+            });
+            continue;
+          }
+
+          if (event.event === "model_stream_attempt") {
+            if (event.data.status === "completed") {
+              refreshActivityAfterTool();
+            }
+            continue;
+          }
 
           if (event.event === "token") {
             setMaintenanceStatus((current) =>
@@ -2565,9 +2656,71 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             continue;
           }
 
+          if (event.event.startsWith("subagent_") || event.event === "context_mounted") {
+            const objective = String(event.data.objective || "").trim();
+            const tool = String(event.data.tool || "").trim();
+            const labels: Record<string, { label: string; status: string }> = {
+              subagent_started: { label: "子代理已启动", status: "running" },
+              context_mounted: { label: "子代理上下文已挂载", status: "completed" },
+              subagent_stage_changed: { label: "子代理正在分析与规划", status: "running" },
+              subagent_tool_started: {
+                label: tool ? `子代理正在执行：${tool}` : "子代理正在执行工具",
+                status: "running",
+              },
+              subagent_tool_completed: {
+                label: tool ? `子代理已完成：${tool}` : "子代理工具执行完成",
+                status: "completed",
+              },
+              subagent_tool_failed: {
+                label: tool ? `子代理工具失败：${tool}` : "子代理工具执行失败",
+                status: "failed",
+              },
+              subagent_completed: { label: "子代理已完成，主 Agent 正在接收结果", status: "completed" },
+              subagent_blocked: { label: "子代理需要主 Agent 决策", status: "blocked" },
+              subagent_timed_out: { label: "子代理已超时，主 Agent 正在接管剩余任务", status: "timed_out" },
+              subagent_failed: { label: "子代理未完成，主 Agent 正在接管剩余任务", status: "failed" },
+              subagent_cancelled: { label: "子代理已随本轮任务取消", status: "cancelled" },
+              subagent_fallback_to_parent: { label: "主 Agent 正在接管剩余任务", status: "running" },
+            };
+            const presentation = labels[event.event];
+            if (presentation) {
+              const identity = getSubagentActivityIdentity(event.event, event.data);
+              const activityStatus = identity.statusOverride || presentation.status;
+              if (identity.terminal) {
+                // Close every outstanding stage/tool spinner for this
+                // sub-run before recording its terminal lifecycle state.
+                settleLifecycleActivities(identity.settlePrefix, activityStatus);
+              }
+              appendLifecycleActivity(
+                presentation.label,
+                activityStatus,
+                identity.activityId,
+              );
+              const terminal = identity.terminal;
+              if (!terminal) {
+                updateSessionRunActivity(sendSessionId, {
+                  phase: "subagent",
+                  label: presentation.label,
+                  detail: objective ? objective.slice(0, 96) : undefined,
+                });
+              } else {
+                updateSessionRunActivity(sendSessionId, {
+                  phase: "continuing",
+                  label: presentation.label,
+                  detail: objective ? objective.slice(0, 96) : undefined,
+                });
+              }
+            }
+          }
+
           if (event.event === "run_started") {
             const run = event.data.run as unknown as HarnessRun;
             correctingVerificationGap = false;
+            // Todo ledgers are owned by the active Goal revision or standalone
+            // Run. Never display the previous terminal ledger while waiting
+            // for this Run's first todos_updated event.
+            todosMapRef.current[sendSessionId] = [];
+            if (sessionIdRef.current === sendSessionId) setTodos([]);
             updateSessionRunActivity(sendSessionId, {
               phase: "running",
               label: "Agent 正在处理",
@@ -2660,6 +2813,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 ? event.data.result || ""
                 : event.data.status || ""
             );
+            const verificationActivityId = event.event === "rubric_evaluation_end"
+              ? `verification-quality-${String(event.data.grading_run_id || event.data.iteration || "current")}`
+              : `verification-completion-${String(event.data.run_id || currentRunsMapRef.current[sendSessionId]?.run_id || "current")}`;
             if (result === "needs_revision" || result === "failed") {
               correctingVerificationGap = true;
               updateSessionRunActivity(sendSessionId, {
@@ -2668,12 +2824,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               });
               appendLifecycleActivity(
                 event.event === "deterministic_checks_completed"
-                  ? "发现完成条件缺口，继续处理"
+                  ? result === "failed"
+                    ? "完成条件仍未满足"
+                    : "发现完成条件缺口，继续处理"
                   : "发现质量缺口，继续处理",
                 result,
-                event.event === "rubric_evaluation_end"
-                  ? `verification-quality-${String(event.data.grading_run_id || event.data.iteration || "current")}`
-                  : "",
+                verificationActivityId,
               );
             } else if (result === "satisfied" || result === "passed") {
               correctingVerificationGap = false;
@@ -2686,9 +2842,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                   ? "完成条件检查通过"
                   : "完成质量检查通过",
                 result,
-                event.event === "rubric_evaluation_end"
-                  ? `verification-quality-${String(event.data.grading_run_id || event.data.iteration || "current")}`
-                  : "",
+                verificationActivityId,
               );
             }
             continue;

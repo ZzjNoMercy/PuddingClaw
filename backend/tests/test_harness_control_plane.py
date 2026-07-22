@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,9 @@ from harness.models import (
     RunOutcome,
     RunRecord,
     RunStatus,
+    RunTaskProfile,
+    SkillActivation,
+    SkillCandidate,
     VerificationStatus,
 )
 from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
@@ -37,6 +41,65 @@ def _verification_context(workspace: Path) -> dict:
         "final_content": "报告已生成：`/workspace/report.md`",
         "workspace_path": str(workspace),
     }
+
+
+def test_standalone_artifact_follow_up_uses_delta_repair_without_reopening_goal(
+    tmp_path: Path,
+) -> None:
+    sessions = _sessions(tmp_path)
+    target = tmp_path / "report.html"
+    target.write_text("report", encoding="utf-8")
+    delivered = sessions.register_delivered_artifact(
+        "session-1",
+        target_path=str(target),
+        content_sha256="sha256:"
+        + hashlib.sha256(target.read_bytes()).hexdigest(),
+        source_run_id="run-old",
+        source_query_id="query-old",
+        source_goal_id="goal-achieved",
+        source_goal_revision=1,
+    )
+
+    run, goal = HarnessRunCoordinator(sessions).start_run(
+        session_id="session-1",
+        query_id="query-followup",
+        objective="report.html 里的年份还没有更新，请修复",
+        goal_mode=False,
+        verification_enabled=False,
+    )
+
+    assert goal is None
+    assert run.goal_id is None
+    assert run.follow_up_of_goal_id == "goal-achieved"
+    assert run.follow_up_of_artifact_ids == [delivered["artifact_id"]]
+    assert run.execution_mode == "delta_repair"
+    assert run.delta_repair_kind == "presentation_only"
+    assert run.delta_repair_tool_budget == 6
+
+
+def test_ui_only_follow_up_gets_six_call_presentation_policy(tmp_path: Path) -> None:
+    sessions = _sessions(tmp_path)
+    target = tmp_path / "report.html"
+    target.write_text("<select><option>2024</option></select>", encoding="utf-8")
+    delivered = sessions.register_delivered_artifact(
+        "session-1",
+        target_path=str(target),
+        content_sha256="sha256:" + hashlib.sha256(target.read_bytes()).hexdigest(),
+        source_run_id="run-old",
+        source_query_id="query-old",
+    )
+
+    run, _goal = HarnessRunCoordinator(sessions).start_run(
+        session_id="session-1",
+        query_id="query-ui-followup",
+        objective=f"{target.name} 的下拉选项只到 2024，请修复显示",
+        goal_mode=False,
+        verification_enabled=False,
+    )
+
+    assert run.follow_up_of_artifact_ids == [delivered["artifact_id"]]
+    assert run.delta_repair_kind == "presentation_only"
+    assert run.delta_repair_tool_budget == 6
 
 
 def _satisfied_final_state(workspace: Path) -> dict:
@@ -598,11 +661,19 @@ def test_goal_inherits_authorized_external_artifact_across_runs(tmp_path):
             query_id=second.query_id,
             tool_call_id="call-test",
             tool_name="execute",
-            args={"command": "pytest -q"},
+            args={"command": f'python3 validate_report.py "{external}"'},
             result=validation_result,
+            session_id=second.session_id,
+            workspace_path=str(workspace),
+            goal_id=second.goal_id,
+            goal_revision=second.goal_revision,
         )
         if item.pack == "code"
     )
+    assert any(
+        item.get("kind") == "validation_receipt"
+        for item in validation.evidence_refs
+    ), validation.model_dump(mode="json")
     session_manager.append_run_verification_activation(
         second.session_id,
         second.run_id,
@@ -665,6 +736,137 @@ def test_run_model_call_limit_does_not_exhaust_goal_budget_early(tmp_path):
     assert goal.status == GoalStatus.ACTIVE
     assert goal.model_call_count == 10
     assert goal.current_run_id is None
+
+
+def test_goal_skill_activation_inherits_across_same_revision_without_router_candidate(tmp_path):
+    sessions = _sessions(tmp_path)
+    coordinator = HarnessRunCoordinator(sessions)
+    profile = RunTaskProfile(
+        skill_candidates=[
+            SkillCandidate(
+                skill_id="database-analysis",
+                confidence=0.95,
+                evidence="数据库分析任务",
+            )
+        ]
+    )
+    first, goal = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-skill-1",
+        objective="分析数据库",
+        goal_mode=True,
+        task_profile=profile,
+    )
+    assert goal is not None
+    coordinator.transition(first, RunStatus.RUNNING)
+    sessions.record_run_skill_activation(
+        first.session_id,
+        first.run_id,
+        {
+            "activation_id": "skill-activation-db",
+            "skill_id": "database-analysis",
+            "run_id": first.run_id,
+            "skill_content_sha256": "sha256:abc",
+            "toolsets": ["database_analysis"],
+            "unlocked_tools": ["database_sql_generate"],
+            "source_tool_call_id": "read-skill",
+        },
+    )
+    first, goal, _ = coordinator.complete_budget_exceeded(
+        first,
+        goal,
+        reason="run_model_call_limit",
+        model_call_count=10,
+        detail="run limit",
+    )
+    assert goal is not None
+
+    followup, same_goal = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-skill-2",
+        objective="继续",
+        goal_mode=True,
+        goal_id=goal.goal_id,
+        task_profile=profile,
+    )
+    inherited = sessions.get_effective_run_skill_activations(
+        followup.session_id,
+        followup.run_id,
+    )
+    assert [item["skill_id"] for item in inherited] == ["database-analysis"]
+
+    assert same_goal is not None
+    coordinator.transition(followup, RunStatus.RUNNING)
+    _, same_goal, _ = coordinator.complete_budget_exceeded(
+        followup,
+        same_goal,
+        reason="run_model_call_limit",
+        model_call_count=20,
+        detail="run limit",
+    )
+    assert same_goal is not None
+    unrelated, _ = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-skill-3",
+        objective="继续",
+        goal_mode=True,
+        goal_id=same_goal.goal_id,
+        task_profile=RunTaskProfile(),
+    )
+    # The verified Goal-revision activation is capability authority. A soft
+    # router miss on a short continuation must not silently revoke it.
+    inherited_without_candidate = sessions.get_effective_run_skill_activations(
+        unrelated.session_id,
+        unrelated.run_id,
+    )
+    assert [item["skill_id"] for item in inherited_without_candidate] == [
+        "database-analysis"
+    ]
+
+
+def test_achieved_goal_skill_activation_does_not_leak_to_standalone_run(tmp_path):
+    sessions = _sessions(tmp_path)
+    achieved = GoalRecord(
+        goal_id="goal-achieved",
+        session_id="session-1",
+        objective="完成数据库报告",
+        status=GoalStatus.ACHIEVED,
+        skill_activations=[
+            SkillActivation(
+                activation_id="skill-activation-old-goal",
+                skill_id="database-analysis",
+                scope="goal",
+                run_id="run-old",
+                goal_id="goal-achieved",
+                goal_revision=1,
+                skill_content_sha256="sha256:abc",
+                toolsets=["database_analysis"],
+                unlocked_tools=["database_sql_generate"],
+                source_tool_call_id="read-skill",
+            )
+        ],
+    )
+    sessions.upsert_goal_state("session-1", achieved.model_dump(mode="json"))
+    standalone = RunRecord(
+        run_id="run-standalone",
+        query_id="query-standalone",
+        session_id="session-1",
+        objective="问一个新问题",
+        task_profile=RunTaskProfile(
+            skill_candidates=[
+                SkillCandidate(
+                    skill_id="database-analysis",
+                    confidence=0.9,
+                    evidence="仅作为推荐",
+                )
+            ]
+        ),
+    )
+    sessions.upsert_run_state("session-1", standalone.model_dump(mode="json"))
+
+    assert sessions.get_effective_run_skill_activations(
+        "session-1", standalone.run_id
+    ) == []
 
 
 def test_incomplete_verification_does_not_consume_goal_business_round(tmp_path):
@@ -1397,6 +1599,174 @@ def test_superseded_run_finalize_consumes_concurrent_cancel_request(tmp_path):
     assert saved["status"] == "cancelled"
     assert saved["requested_status"] is None
     assert saved["current_run_id"] is None
+
+
+def test_goal_revision_supersedes_old_exact_and_directory_drafts(tmp_path):
+    sessions = _sessions(tmp_path)
+    _run, goal = HarnessRunCoordinator(sessions).start_run(
+        session_id="session-1",
+        query_id="query-old-revision",
+        objective="旧目标",
+        goal_mode=True,
+        verification_enabled=False,
+    )
+    assert goal is not None
+    owner = {
+        "session_id": "session-1",
+        "run_id": _run.run_id,
+        "query_id": _run.query_id,
+        "goal_id": goal.goal_id,
+        "goal_revision": goal.objective_revision,
+    }
+    sessions.claim_external_draft(
+        "session-1",
+        lease_kind="exact_file",
+        lease={
+            **owner,
+            "lease_id": "old-file",
+            "target_path": str(tmp_path / "report.html"),
+            "staged_path": "/scratch/external/old-file/report.html",
+            "expires_at": 9_999_999_999,
+        },
+    )
+    sessions.claim_external_draft(
+        "session-1",
+        lease_kind="exact_directory",
+        lease={
+            **owner,
+            "lease_id": "old-directory",
+            "directory_path": str(tmp_path / "project"),
+            "staged_dir": "/scratch/external-directories/old-directory",
+            "expires_at": 9_999_999_999,
+        },
+    )
+
+    revised = sessions.update_goal_objective(
+        "session-1",
+        goal.goal_id,
+        objective="新目标",
+        expected_revision=goal.objective_revision,
+        contract=None,
+    )
+
+    old_file = sessions.get_external_artifact_lease("session-1", "old-file")
+    old_directory = sessions.get_external_directory_lease(
+        "session-1", "old-directory"
+    )
+    assert old_file is not None and old_file["status"] == "abandoned"
+    assert old_directory is not None and old_directory["status"] == "abandoned"
+    assert old_file["abandoned_reason"] == "goal_revision_superseded"
+    assert old_directory["abandoned_reason"] == "goal_revision_superseded"
+
+    new_owner = {
+        **owner,
+        "goal_revision": revised["objective_revision"],
+    }
+    new_file = sessions.claim_external_draft(
+        "session-1",
+        lease_kind="exact_file",
+        lease={
+            **new_owner,
+            "lease_id": "new-file",
+            "target_path": str(tmp_path / "report.html"),
+            "staged_path": "/scratch/external/new-file/report.html",
+            "expires_at": 9_999_999_999,
+        },
+    )
+    new_directory = sessions.claim_external_draft(
+        "session-1",
+        lease_kind="exact_directory",
+        lease={
+            **new_owner,
+            "lease_id": "new-directory",
+            "directory_path": str(tmp_path / "project"),
+            "staged_dir": "/scratch/external-directories/new-directory",
+            "expires_at": 9_999_999_999,
+        },
+    )
+    assert new_file["status"] == "claiming"
+    assert new_directory["status"] == "claiming"
+
+
+def test_terminal_goal_run_expires_search_snapshots_but_keeps_goal_draft(tmp_path):
+    sessions = _sessions(tmp_path)
+    run, goal = HarnessRunCoordinator(sessions).start_run(
+        session_id="session-1",
+        query_id="query-search",
+        objective="搜索并继续编辑",
+        goal_mode=True,
+        verification_enabled=False,
+    )
+    assert goal is not None
+    HarnessRunCoordinator(sessions).transition(run, RunStatus.RUNNING)
+    owner = {
+        "session_id": "session-1",
+        "run_id": run.run_id,
+        "query_id": run.query_id,
+        "goal_id": goal.goal_id,
+        "goal_revision": goal.objective_revision,
+    }
+    sessions.claim_external_draft(
+        "session-1",
+        lease_kind="exact_file",
+        lease={
+            **owner,
+            "lease_id": "goal-draft",
+            "target_path": str(tmp_path / "report.html"),
+            "staged_path": "/scratch/external/goal-draft/report.html",
+            "expires_at": 9_999_999_999,
+        },
+    )
+    sessions.upsert_external_artifact_lease(
+        "session-1",
+        {
+            **owner,
+            "lease_id": "file-search",
+            "target_path": str(tmp_path / "source.txt"),
+            "staged_path": "/scratch/external-search-files/file-search/source.txt",
+            "status": "search_snapshot",
+            "search_only": True,
+        },
+    )
+    sessions.upsert_external_directory_lease(
+        "session-1",
+        {
+            **owner,
+            "lease_id": "directory-search",
+            "directory_path": str(tmp_path / "source"),
+            "staged_dir": "/scratch/external-directories/directory-search",
+            "status": "search_snapshot",
+            "search_only": True,
+        },
+    )
+
+    incoming = run.model_copy(deep=True)
+    incoming.finish(RunOutcome.COMPLETED)
+    sessions.terminalize_run_state(
+        "session-1",
+        run.run_id,
+        incoming.model_dump(mode="json"),
+    )
+
+    draft = sessions.get_external_artifact_lease("session-1", "goal-draft")
+    file_search = sessions.get_external_artifact_lease("session-1", "file-search")
+    directory_search = sessions.get_external_directory_lease(
+        "session-1", "directory-search"
+    )
+    assert draft is not None and draft["status"] == "claiming"
+    assert file_search is not None and file_search["status"] == "abandoned"
+    assert directory_search is not None and directory_search["status"] == "abandoned"
+    assert file_search["abandoned_reason"] == "run_search_snapshot_terminal"
+    assert directory_search["abandoned_reason"] == "run_search_snapshot_terminal"
+    assert sessions.resolve_terminal_scratch_reference(
+        "session-1", file_search["staged_path"]
+    )["status"] == "artifact_not_durable"
+    assert sessions.resolve_terminal_scratch_reference(
+        "session-1", f"{directory_search['staged_dir']}/nested.txt"
+    )["status"] == "artifact_not_durable"
+    assert sessions.resolve_terminal_scratch_reference(
+        "session-1", directory_search["staged_dir"]
+    )["status"] == "artifact_not_durable"
 
 
 def test_goal_max_rounds_is_enforced_before_persistence(tmp_path):

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any
@@ -16,16 +17,73 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessageChunk, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.runnables.config import var_child_runnable_config
+from langgraph.config import get_stream_writer
 
 import capabilities
 from config import get_fallback_llm_config, get_gateway_config, get_gateway_llm_config
 from graph.token_usage_store import record_token_usage
-from langgraph.config import get_stream_writer
 
 logger = logging.getLogger(__name__)
 
 INTERNAL_CALL_MARKER = "_puddingclaw_internal_call"
 CONTEXT_SUMMARY_CALL = "context_summary"
+
+
+class ModelTransportInterruptedError(RuntimeError):
+    """A retryable model stream ended before a complete AIMessage existed."""
+
+    def __init__(
+        self,
+        *,
+        cause: Exception,
+        attempt: int,
+        route: str,
+        chunks_received: int,
+    ) -> None:
+        super().__init__(
+            "model_transport_interrupted: "
+            f"{cause.__class__.__name__}: {cause}"
+        )
+        self.cause = cause
+        self.attempt = attempt
+        self.route = route
+        self.chunks_received = chunks_received
+
+
+def _retryable_stream_error(exc: Exception) -> bool:
+    """Classify transport failures without coupling to one HTTP client."""
+
+    if isinstance(exc, (ConnectionResetError, ConnectionAbortedError, TimeoutError)):
+        return True
+    class_names = {cls.__name__ for cls in type(exc).__mro__}
+    if class_names.intersection(
+        {
+            "ConnectError",
+            "ConnectionError",
+            "NetworkError",
+            "ReadError",
+            "ReadTimeout",
+            "RemoteProtocolError",
+        }
+    ):
+        return True
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "connection reset",
+            "incomplete chunked read",
+            "peer closed connection",
+            "server disconnected",
+        )
+    )
+
+
+def _emit_model_stream_event(payload: dict[str, Any]) -> None:
+    try:
+        get_stream_writer()(payload)
+    except (KeyError, RuntimeError):
+        return
 
 
 def _message_text(message: BaseMessage) -> str:
@@ -416,34 +474,115 @@ class ModelClient:
         using_gateway = self._should_use_gateway()
         llm = self.get_chat_model()
         start = time.time()
-        aggregated_usage: dict[str, int] = {}
-        emitted = False
-        try:
-            async for chunk in llm.astream(messages, config=config, stop=stop, **kwargs):
-                emitted = True
-                chunk_usage = getattr(chunk, "usage_metadata", None) or {}
-                for key in ("input_tokens", "output_tokens", "total_tokens"):
-                    if chunk_usage.get(key):
-                        aggregated_usage[key] = aggregated_usage.get(key, 0) + chunk_usage[key]
-                yield chunk
-        except Exception:
-            # 流式输出一旦已向客户端发送 token，再回退会造成重复内容；只允许首 token 前重试。
-            if emitted or not using_gateway or not self.gateway_cfg.get("fallback_to_direct", True):
+        fallback_to_direct = bool(self.gateway_cfg.get("fallback_to_direct", True))
+        route = "gateway" if using_gateway else "direct"
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            emitted_chunks = 0
+            attempt_usage: dict[str, int] = {}
+            _emit_model_stream_event(
+                {
+                    "type": "model_stream_attempt",
+                    "status": "started",
+                    "attempt": attempt,
+                    "route": route,
+                    "role": self.role,
+                    "model": self.cfg.get("model"),
+                }
+            )
+            try:
+                async for chunk in llm.astream(messages, config=config, stop=stop, **kwargs):
+                    emitted_chunks += 1
+                    preview = _message_text(chunk)
+                    if preview:
+                        _emit_model_stream_event(
+                            {
+                                "type": "model_stream_preview",
+                                "attempt": attempt,
+                                "route": route,
+                                "content": preview,
+                            }
+                        )
+                    chunk_usage = getattr(chunk, "usage_metadata", None) or {}
+                    for key in ("input_tokens", "output_tokens", "total_tokens"):
+                        if chunk_usage.get(key):
+                            attempt_usage[key] = attempt_usage.get(key, 0) + chunk_usage[key]
+                    # Preserve genuine provider streaming. Once a chunk has
+                    # crossed this boundary the model node must never retry,
+                    # because a second attempt would replay or contradict
+                    # content already visible to the graph and UI.
+                    yield chunk
+            except Exception as exc:
+                retryable = _retryable_stream_error(exc)
+                legacy_gateway_fallback = (
+                    emitted_chunks == 0 and route == "gateway" and fallback_to_direct
+                )
+                can_retry = (
+                    emitted_chunks == 0
+                    and attempt < max_attempts
+                    and (retryable or legacy_gateway_fallback)
+                )
+                _emit_model_stream_event(
+                    {
+                        "type": "model_transport_interrupted",
+                        "status": "interrupted",
+                        "attempt": attempt,
+                        "route": route,
+                        "role": self.role,
+                        "model": self.cfg.get("model"),
+                        "chunks_received": emitted_chunks,
+                        "chunks_emitted": emitted_chunks,
+                        "error_class": exc.__class__.__name__,
+                        "retryable": retryable,
+                        "next_action": (
+                            "retry_same_model_node"
+                            if can_retry
+                            else "stop_without_replay"
+                            if emitted_chunks
+                            else "stop"
+                        ),
+                    }
+                )
+                if can_retry:
+                    logger.warning(
+                        "[ModelClient] model stream interrupted; retrying attempt=%d route=%s chunks=%d",
+                        attempt,
+                        route,
+                        emitted_chunks,
+                        exc_info=True,
+                    )
+                    if route == "gateway" and fallback_to_direct:
+                        llm = self._direct_model_with_tools()
+                        route = "direct"
+                    await asyncio.sleep(0.25 * (2 ** (attempt - 1)))
+                    continue
+                if retryable:
+                    raise ModelTransportInterruptedError(
+                        cause=exc,
+                        attempt=attempt,
+                        route=route,
+                        chunks_received=emitted_chunks,
+                    ) from exc
                 raise
-            logger.warning("[ModelClient] gateway stream failed before first token; retrying direct", exc_info=True)
-            async for chunk in self._direct_model_with_tools().astream(messages, config=config, stop=stop, **kwargs):
-                chunk_usage = getattr(chunk, "usage_metadata", None) or {}
-                for key in ("input_tokens", "output_tokens", "total_tokens"):
-                    if chunk_usage.get(key):
-                        aggregated_usage[key] = aggregated_usage.get(key, 0) + chunk_usage[key]
-                yield chunk
-        self._record_usage(
-            aggregated_usage,
-            start,
-            user_id=user_id,
-            session_id=session_id,
-            round_num=round_num,
-        )
+            _emit_model_stream_event(
+                {
+                    "type": "model_stream_attempt",
+                    "status": "completed",
+                    "attempt": attempt,
+                    "route": route,
+                    "role": self.role,
+                    "model": self.cfg.get("model"),
+                    "chunks_received": emitted_chunks,
+                }
+            )
+            self._record_usage(
+                attempt_usage,
+                start,
+                user_id=user_id,
+                session_id=session_id,
+                round_num=round_num,
+            )
+            return
 
     def invoke(
         self,
@@ -492,33 +631,111 @@ class ModelClient:
         using_gateway = self._should_use_gateway()
         llm = self.get_chat_model()
         start = time.time()
-        aggregated_usage: dict[str, int] = {}
-        emitted = False
-        try:
-            for chunk in llm.stream(messages, config=config, stop=stop, **kwargs):
-                emitted = True
-                chunk_usage = getattr(chunk, "usage_metadata", None) or {}
-                for key in ("input_tokens", "output_tokens", "total_tokens"):
-                    if chunk_usage.get(key):
-                        aggregated_usage[key] = aggregated_usage.get(key, 0) + chunk_usage[key]
-                yield chunk
-        except Exception:
-            if emitted or not using_gateway or not self.gateway_cfg.get("fallback_to_direct", True):
+        fallback_to_direct = bool(self.gateway_cfg.get("fallback_to_direct", True))
+        route = "gateway" if using_gateway else "direct"
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            emitted_chunks = 0
+            attempt_usage: dict[str, int] = {}
+            _emit_model_stream_event(
+                {
+                    "type": "model_stream_attempt",
+                    "status": "started",
+                    "attempt": attempt,
+                    "route": route,
+                    "role": self.role,
+                    "model": self.cfg.get("model"),
+                }
+            )
+            try:
+                for chunk in llm.stream(messages, config=config, stop=stop, **kwargs):
+                    emitted_chunks += 1
+                    preview = _message_text(chunk)
+                    if preview:
+                        _emit_model_stream_event(
+                            {
+                                "type": "model_stream_preview",
+                                "attempt": attempt,
+                                "route": route,
+                                "content": preview,
+                            }
+                        )
+                    chunk_usage = getattr(chunk, "usage_metadata", None) or {}
+                    for key in ("input_tokens", "output_tokens", "total_tokens"):
+                        if chunk_usage.get(key):
+                            attempt_usage[key] = attempt_usage.get(key, 0) + chunk_usage[key]
+                    yield chunk
+            except Exception as exc:
+                retryable = _retryable_stream_error(exc)
+                legacy_gateway_fallback = (
+                    emitted_chunks == 0 and route == "gateway" and fallback_to_direct
+                )
+                can_retry = (
+                    emitted_chunks == 0
+                    and attempt < max_attempts
+                    and (retryable or legacy_gateway_fallback)
+                )
+                _emit_model_stream_event(
+                    {
+                        "type": "model_transport_interrupted",
+                        "status": "interrupted",
+                        "attempt": attempt,
+                        "route": route,
+                        "role": self.role,
+                        "model": self.cfg.get("model"),
+                        "chunks_received": emitted_chunks,
+                        "chunks_emitted": emitted_chunks,
+                        "error_class": exc.__class__.__name__,
+                        "retryable": retryable,
+                        "next_action": (
+                            "retry_same_model_node"
+                            if can_retry
+                            else "stop_without_replay"
+                            if emitted_chunks
+                            else "stop"
+                        ),
+                    }
+                )
+                if can_retry:
+                    logger.warning(
+                        "[ModelClient] model stream interrupted; retrying attempt=%d route=%s chunks=%d",
+                        attempt,
+                        route,
+                        emitted_chunks,
+                        exc_info=True,
+                    )
+                    if route == "gateway" and fallback_to_direct:
+                        llm = self._direct_model_with_tools()
+                        route = "direct"
+                    time.sleep(0.25 * (2 ** (attempt - 1)))
+                    continue
+                if retryable:
+                    raise ModelTransportInterruptedError(
+                        cause=exc,
+                        attempt=attempt,
+                        route=route,
+                        chunks_received=emitted_chunks,
+                    ) from exc
                 raise
-            logger.warning("[ModelClient] gateway stream failed before first token; retrying direct", exc_info=True)
-            for chunk in self._direct_model_with_tools().stream(messages, config=config, stop=stop, **kwargs):
-                chunk_usage = getattr(chunk, "usage_metadata", None) or {}
-                for key in ("input_tokens", "output_tokens", "total_tokens"):
-                    if chunk_usage.get(key):
-                        aggregated_usage[key] = aggregated_usage.get(key, 0) + chunk_usage[key]
-                yield chunk
-        self._record_usage(
-            aggregated_usage,
-            start,
-            user_id=user_id,
-            session_id=session_id,
-            round_num=round_num,
-        )
+            _emit_model_stream_event(
+                {
+                    "type": "model_stream_attempt",
+                    "status": "completed",
+                    "attempt": attempt,
+                    "route": route,
+                    "role": self.role,
+                    "model": self.cfg.get("model"),
+                    "chunks_received": emitted_chunks,
+                }
+            )
+            self._record_usage(
+                attempt_usage,
+                start,
+                user_id=user_id,
+                session_id=session_id,
+                round_num=round_num,
+            )
+            return
 
 
 
@@ -679,7 +896,7 @@ class ModelClientChatModel(BaseChatModel):
         self,
         tools: list[Any],
         **kwargs: Any,
-    ) -> "ModelClientChatModel":
+    ) -> ModelClientChatModel:
         """绑定工具后返回新的 ModelClientChatModel 实例。"""
         return ModelClientChatModel(
             role=self._client.role,

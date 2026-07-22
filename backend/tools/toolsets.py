@@ -15,7 +15,7 @@ from dataclasses import dataclass
 # complete, inspectable runtime inventory, but are not created by tools/.
 NATIVE_TOOLSETS: dict[str, frozenset[str]] = {
     "core_workspace": frozenset({"ls", "read_file", "glob", "grep", "update_todos"}),
-    "workspace_write": frozenset({"write_file"}),
+    "workspace_write": frozenset({"write_file", "upsert_scratch_file"}),
     "local_execution": frozenset({"execute"}),
     "delegation": frozenset({"task"}),
 }
@@ -34,6 +34,7 @@ UNCONDITIONAL_EXTENSION_TOOLSETS: dict[str, frozenset[str]] = {
         "stage_external_directory",
         "prepare_external_directory_commit",
         "commit_external_directory",
+        "validate_artifact_contract",
     }),
     "web_research": frozenset({"tavily_search", "fetch_url"}),
     "package_management": frozenset({"install_packages"}),
@@ -188,6 +189,7 @@ TOOL_CONTROL_DESCRIPTORS: dict[str, ToolControlDescriptor] = {
     # Harness file protocol.
     "inspect_file_version": _READ_ONLY,
     "patch_file": _WORKSPACE_WRITE,
+    "upsert_scratch_file": _WORKSPACE_WRITE,
     "stage_external_artifact": _READ_ONLY,
     "commit_external_artifact": _EXTERNAL_COMMIT,
     "prepare_attachment_edit": _WORKSPACE_WRITE,
@@ -195,6 +197,7 @@ TOOL_CONTROL_DESCRIPTORS: dict[str, ToolControlDescriptor] = {
     "stage_external_directory": _READ_ONLY,
     "prepare_external_directory_commit": _READ_ONLY,
     "commit_external_directory": _EXTERNAL_COMMIT,
+    "validate_artifact_contract": _INTERNAL_MUTATION,
     "read_resource": _READ_ONLY,
     # Controlled network and runtime setup.
     "tavily_search": _CONTROLLED_NETWORK,

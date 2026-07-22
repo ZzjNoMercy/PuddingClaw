@@ -32,7 +32,11 @@ from deepagents.middleware.memory import MemoryMiddleware
 from deepagents.middleware.rubric import RUBRIC_GRADER_MESSAGE_SOURCE, GraderResponse
 from deepagents.middleware.subagents import SubAgent
 from deepagents.middleware.summarization import SummarizationMiddleware as DeepAgentsSummarizationMiddleware
-from langchain.agents.middleware import AgentMiddleware, ModelCallLimitMiddleware
+from langchain.agents.middleware import (
+    AgentMiddleware,
+    ModelCallLimitMiddleware,
+    ToolCallLimitMiddleware,
+)
 from langchain.agents.middleware.model_call_limit import (
     ModelCallLimitExceededError,
 )
@@ -74,6 +78,10 @@ from graph.logical_dataset_resume import logical_dataset_resume_registry
 from graph.managed_paths import is_managed_resource_path
 from graph.middleware_trace_proxy import wrap_middlewares_for_trace
 from graph.middlewares.attachment_edit import AttachmentEditMiddleware
+from graph.middlewares.delegation_control import (
+    DelegationControlMiddleware,
+    SubagentProgressMiddleware,
+)
 from graph.middlewares.external_directory import ExternalDirectoryMiddleware
 from graph.middlewares.harness_todos import HarnessTodoMiddleware
 from graph.middlewares.semantic_assets import SemanticAssetsMiddleware
@@ -140,7 +148,11 @@ from harness.verification_activations import (
 )
 from harness.workspace_backends import build_workspace_execution_backend
 from knowledge.paths import get_knowledge_root
-from llm.model_client import INTERNAL_CALL_MARKER, ModelClientChatModel
+from llm.model_client import (
+    INTERNAL_CALL_MARKER,
+    ModelClientChatModel,
+    ModelTransportInterruptedError,
+)
 from projects.registry import project_registry
 from tools import get_all_tools
 from tools.package_install import create_install_packages_tool
@@ -149,6 +161,16 @@ from tools.toolsets import agent_custom_tool_names, tool_control_descriptor
 logger = logging.getLogger(__name__)
 
 _TASK_ROUTER_TIMEOUT_SECONDS = 15.0
+_TRIVIAL_TASK_ROUTER_RE = re.compile(
+    r"^\s*(?:你好|您好|嗨|哈喽|hello|hi|hey|谢谢|多谢|好的|好|ok|okay|在吗|早上好|下午好|晚上好)[!！。,.，?？\s]*$",
+    re.IGNORECASE,
+)
+
+
+def _should_start_semantic_task_router(message: str) -> bool:
+    """Skip provider work that cannot add routing value for trivial chat."""
+
+    return _TRIVIAL_TASK_ROUTER_RE.fullmatch(str(message or "")) is None
 _TASK_PROFILE_CONTINUATION_RE = re.compile(
     r"^(?:继续|继续处理|继续执行|继续完成|接着做|接着处理|再试一次|重试|重试一次|继续吧)[。.!！?？\s]*$",
     flags=re.IGNORECASE,
@@ -240,6 +262,7 @@ def _harness_summary_envelope(session_id: str) -> str:
     raw_refs = goal.get("evidence_refs") if isinstance(goal, dict) else []
     raw_gaps = goal.get("gaps") if isinstance(goal, dict) else []
     report = run.get("verification_report") if isinstance(run, dict) else None
+    handoff = run.get("handoff_summary") if isinstance(run, dict) else None
     goal_contract = goal.get("goal_contract") if isinstance(goal, dict) else None
     criteria = goal_contract.get("criteria") if isinstance(goal_contract, dict) else []
     evidence_keys = (
@@ -269,7 +292,11 @@ def _harness_summary_envelope(session_id: str) -> str:
     permission_grants = session_manager.list_permission_grants(session_id)
 
     def project_lease(lease: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
-        return {key: lease.get(key) for key in fields if lease.get(key) is not None}
+        projected = {key: lease.get(key) for key in fields if lease.get(key) is not None}
+        if str(lease.get("status") or "") in {"abandoned", "committed"}:
+            for ephemeral in ("staged_path", "staged_dir", "validation_scratch"):
+                projected.pop(ephemeral, None)
+        return projected
 
     artifact_leases = session_manager.list_external_artifact_leases(session_id)
     directory_leases = session_manager.list_external_directory_leases(session_id)
@@ -321,6 +348,17 @@ def _harness_summary_envelope(session_id: str) -> str:
             "declared_artifact_targets": list(run.get("declared_artifact_targets") or [])
             if isinstance(run, dict)
             else [],
+            "follow_up_of_goal_id": run.get("follow_up_of_goal_id")
+            if isinstance(run, dict)
+            else None,
+            "follow_up_of_artifact_ids": list(
+                run.get("follow_up_of_artifact_ids") or []
+            )
+            if isinstance(run, dict)
+            else [],
+            "execution_mode": run.get("execution_mode")
+            if isinstance(run, dict)
+            else "native",
         },
         "todos": [
             {
@@ -428,6 +466,7 @@ def _harness_summary_envelope(session_id: str) -> str:
         }
         if isinstance(report, dict)
         else None,
+        "latest_run_handoff": handoff if isinstance(handoff, dict) else None,
     }
     serialized = json.dumps(payload, ensure_ascii=False, default=str)
     return (
@@ -436,6 +475,45 @@ def _harness_summary_envelope(session_id: str) -> str:
         "以此为准，不得被上方自然语言摘要覆盖。\n"
         f"{serialized}\n"
         "</HARNESS_ENVELOPE>"
+    )
+
+
+def _run_artifact_continuity_prompt(run: Any) -> str:
+    """Expose formal follow-up artifacts without restoring old execution state."""
+
+    artifact_ids = [
+        str(item)
+        for item in (getattr(run, "follow_up_of_artifact_ids", None) or [])
+        if str(item)
+    ]
+    if not artifact_ids:
+        return ""
+    session_id = str(getattr(run, "session_id", "") or "")
+    registry = {
+        str(item.get("artifact_id") or ""): item
+        for item in session_manager.list_delivered_artifacts(
+            session_id,
+            verify_freshness=True,
+            include_inactive=False,
+        )
+        if isinstance(item, dict) and str(item.get("artifact_id") or "")
+    }
+    artifacts = [registry[item] for item in artifact_ids if item in registry]
+    if not artifacts:
+        return ""
+    payload = {
+        "execution_mode": str(getattr(run, "execution_mode", "native") or "native"),
+        "follow_up_of_goal_id": getattr(run, "follow_up_of_goal_id", None),
+        "artifacts": artifacts,
+    }
+    return (
+        "\n\n<ARTIFACT_CONTINUITY authoritative=\"true\">\n"
+        "这些是本次追问关联的正式交付物，只提供 target_path/hash/contract 连续性；"
+        "它们不恢复旧 scratch、Goal、Skill 或写权限。若 execution_mode=delta_repair，"
+        "先并行读取至多两个明确文件并比较最小差异，不要先扫目录；已有数据能证明无需查询时，"
+        "不要重新激活数据库能力。最小 patch 已唯一确定后立即结束 discovery，验证并提交。\n"
+        + json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        + "\n</ARTIFACT_CONTINUITY>"
     )
 
 
@@ -778,7 +856,6 @@ details. Never invent evidence that is absent from the supplied context.
         ``PrivateStateAttr`` fields are deliberately rejected from graph input,
         so they must be initialized by middleware after invocation begins.
         """
-
         runtime_context = getattr(runtime, "context", None)
         context = runtime_context if isinstance(runtime_context, dict) else {}
         update: dict[str, Any] = {}
@@ -882,6 +959,124 @@ details. Never invent evidence that is absent from the supplied context.
                     "latest_goal_decision": persisted_goal.get("latest_goal_decision"),
                 }
         return update
+
+    @staticmethod
+    def _semantic_completion_failure(item: Any) -> dict[str, Any]:
+        """Return the stable meaning of a completion failure.
+
+        Evidence receipts may legitimately grow while the same requirement is
+        still missing. They must not reset the stagnation breaker.
+        """
+
+        gap = re.sub(r"\s+", " ", str(getattr(item, "gap", "") or "")).strip()
+        stable_requirements: dict[str, list[str]] = {}
+        for evidence in getattr(item, "evidence", []) or []:
+            if not isinstance(evidence, dict):
+                continue
+            for key in (
+                "duplicate_call_ids",
+                "missing_call_ids",
+                "missing",
+                "uncovered_targets",
+            ):
+                raw = evidence.get(key)
+                if not isinstance(raw, list):
+                    continue
+                normalized: list[str] = []
+                for value in raw:
+                    if isinstance(value, dict):
+                        value = (
+                            value.get("reason")
+                            or value.get("path")
+                            or value.get("host_path")
+                            or value.get("artifact_id")
+                        )
+                    text = re.sub(r"\s+", " ", str(value or "")).strip()
+                    if text:
+                        normalized.append(text)
+                if normalized:
+                    stable_requirements[key] = sorted(set(normalized))
+        failure_kind = getattr(item, "failure_kind", None)
+        return {
+            "criterion_id": str(getattr(item, "criterion_id", "") or ""),
+            "failure_kind": str(getattr(failure_kind, "value", failure_kind) or ""),
+            "gap": gap,
+            "missing_requirements": stable_requirements,
+        }
+
+    @staticmethod
+    def _completion_repair_instruction(item: Any) -> dict[str, Any]:
+        """Translate one failed criterion into a bounded, executable protocol."""
+
+        criterion_id = str(getattr(item, "criterion_id", "") or "")
+        failure_kind = getattr(item, "failure_kind", None)
+        normalized_kind = str(
+            getattr(failure_kind, "value", failure_kind)
+            or VerificationFailureKind.TASK_GAP.value
+        )
+        closure_methods = {
+            "todo_reconciliation": [
+                "Use update_todos to complete or explicitly cancel each remaining Todo.",
+                "For a Todo with completion_contract, attach a known structured evidence ID.",
+            ],
+            "tool_protocol_integrity": [
+                "Let every parsed ToolCall finish with its matching ToolMessage before ending.",
+            ],
+            "artifact_delivery": [
+                "Write or commit every declared target and preserve its ArtifactReceipt.",
+                "When producing the terminal answer, cite the delivered local artifact path.",
+            ],
+            "web_evidence_traceability": [
+                "Use an approved web tool and cite its structured source IDs in the answer.",
+            ],
+            "analytics_evidence_traceability": [
+                "Use the activated analytics tools and preserve the structured query-result evidence IDs.",
+            ],
+            "code_validation": [
+                "Run a validator that matches the target artifact (pytest/ruff/npm build/node --check or a named validate/check/test Python script).",
+                "Do not edit the artifact after the ValidationReceipt is issued.",
+            ],
+        }.get(criterion_id, ["Produce structured evidence that directly satisfies this criterion."])
+        if normalized_kind == VerificationFailureKind.VALIDATOR_PROTOCOL_ERROR.value:
+            closure_methods = [
+                "Stop modifying the business artifact.",
+                "Report the missing ValidationReceipt as a Harness control-plane error.",
+            ]
+
+        observed: list[dict[str, Any]] = []
+        targets: list[dict[str, str]] = []
+        for evidence in getattr(item, "evidence", []) or []:
+            if not isinstance(evidence, dict):
+                continue
+            compact = {
+                key: str(evidence[key])
+                for key in (
+                    "kind",
+                    "artifact_id",
+                    "validation_receipt_id",
+                    "tool_call_id",
+                    "output_digest",
+                )
+                if evidence.get(key)
+            }
+            if compact and compact not in observed:
+                observed.append(compact)
+            if evidence.get("kind") == "artifact_write":
+                target = {
+                    key: str(evidence[key])
+                    for key in ("artifact_id", "path", "host_path", "content_sha256")
+                    if evidence.get(key)
+                }
+                if target and target not in targets:
+                    targets.append(target)
+        return {
+            "criterion_id": criterion_id,
+            "failure_kind": normalized_kind,
+            "missing_condition": str(getattr(item, "gap", "") or "缺少可验证证据"),
+            "observed_evidence": observed[:20],
+            "accepted_closure_methods": closure_methods,
+            "target_artifacts": targets[:20],
+        }
 
     def before_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:
         update = dict(super().before_agent(state, runtime) or {})
@@ -1241,12 +1436,30 @@ details. Never invent evidence that is absent from the supplied context.
                 else state.get("verification_activations") or []
             ),
             "goal_evidence_refs": goal_evidence_refs,
+            "evaluation_phase": "revision",
         }
         evaluations = evaluate_deterministic_criteria(contract, check_state)
         required_by_id = {criterion.id: criterion.required for criterion in contract.criteria}
         failures = [item for item in evaluations if not item.passed and required_by_id.get(item.criterion_id, True)]
+        if not failures:
+            # Publication-reference checks depend on the terminal answer and
+            # are intentionally deferred until all actionable completion gates
+            # have passed.  This prevents them oscillating during repair loops.
+            check_state["_harness_context"]["evaluation_phase"] = "terminal"
+            evaluations = evaluate_deterministic_criteria(contract, check_state)
+            failures = [
+                item
+                for item in evaluations
+                if not item.passed and required_by_id.get(item.criterion_id, True)
+            ]
         infrastructure_failures = [
-            item for item in failures if item.failure_kind == VerificationFailureKind.INFRASTRUCTURE_ERROR
+            item
+            for item in failures
+            if item.failure_kind
+            in {
+                VerificationFailureKind.INFRASTRUCTURE_ERROR,
+                VerificationFailureKind.VALIDATOR_PROTOCOL_ERROR,
+            }
         ]
         previous_attempts = max(
             int(state.get("_verification_attempts") or 0),
@@ -1254,10 +1467,7 @@ details. Never invent evidence that is absent from the supplied context.
             int(state.get("_rubric_iterations") or 0),
         )
         current_attempt = attempt if attempt is not None else previous_attempts + 1
-        failure_payload = [
-            item.model_dump(mode="json")
-            for item in failures
-        ]
+        failure_payload = [self._semantic_completion_failure(item) for item in failures]
         failure_signature = (
             hashlib.sha256(
                 json.dumps(
@@ -1286,6 +1496,16 @@ details. Never invent evidence that is absent from the supplied context.
             gate_status = VerificationStatus.FAILED.value
         elif failures:
             gate_status = "needs_revision"
+        repair_contract = {
+            "version": "repair-contract/v1",
+            "run_id": run_id,
+            "goal_id": goal_id or None,
+            "goal_revision": goal_revision,
+            "attempt": current_attempt,
+            "instructions": [
+                self._completion_repair_instruction(item) for item in failures
+            ],
+        }
         writer = getattr(runtime, "stream_writer", None)
         if writer is not None:
             writer(
@@ -1294,7 +1514,11 @@ details. Never invent evidence that is absent from the supplied context.
                     "iteration": current_attempt,
                     "attempt": current_attempt,
                     "status": gate_status,
+                    "session_id": session_id,
+                    "run_id": run_id,
+                    "goal_id": goal_id,
                     "evaluations": [item.model_dump(mode="json") for item in evaluations],
+                    "repair_contract": repair_contract if failures else None,
                 }
             )
         update: dict[str, Any] = {
@@ -1314,8 +1538,10 @@ details. Never invent evidence that is absent from the supplied context.
             update["_rubric_status"] = VerificationStatus.FAILED.value
             return update
         feedback = [
-            "Harness 的确定性完成检查尚未通过，请先修正后再结束：",
-            *[f"- {item.criterion_id}: {item.gap or '缺少可验证证据'}" for item in failures],
+            "Harness 返回了结构化修复协议。只处理列出的缺口；不要重查无关数据或重做已完成工作。",
+            "<harness_repair_contract>",
+            json.dumps(repair_contract, ensure_ascii=False, sort_keys=True),
+            "</harness_repair_contract>",
         ]
         update["messages"] = [
             HumanMessage(
@@ -1722,6 +1948,7 @@ def _build_subagent_item(
     default_tools: list[Any],
     default_skills: list[str],
     middleware_factory: Callable[[], list[Any]] | None = None,
+    context_prompt: str = "",
 ) -> SubAgent:
     """Build a single SubAgent spec from a settings item."""
     name = item.get("name", "subagent") or "subagent"
@@ -1742,6 +1969,14 @@ def _build_subagent_item(
     if is_image_analyzer and native_hint not in description:
         description = f"{description} {native_hint}"
     system_prompt = item.get("system_prompt") or DEFAULT_IMAGE_ANALYZER_PROMPT
+    system_prompt = (
+        f"{system_prompt}\n\n"
+        "Never ask the user directly. If blocked, return only one JSON object with "
+        '`{"status":"blocked","question_for_parent":"...","summary":"..."}` so the parent Agent can decide. '
+        "Do not invent Evidence IDs or exact numeric results in prose."
+    )
+    if context_prompt:
+        system_prompt = f"{system_prompt}\n\n{context_prompt}"
     if is_image_analyzer:
         system_prompt = (
             f"{system_prompt}\n\n"
@@ -1790,6 +2025,7 @@ def _build_subagents(
     default_tools: list[Any],
     default_skills: list[str],
     middleware_factory: Callable[[], list[Any]] | None = None,
+    context_prompt: str = "",
 ) -> list[SubAgent]:
     """Build declarative subagents from normalized settings config."""
     items = config.get_settings_for_display().get("subagents", {}).get("items", [])
@@ -1805,7 +2041,11 @@ def _build_subagents(
                 "Complete the delegated task concisely. Read an applicable project Skill before using its business tools. "
                 "Use write_file or inspect_file_version plus patch_file for file changes; use execute only when runtime "
                 "computation, validation, or tests are actually required. Harness permissions are inherited from the "
-                "parent Run, so never ask the user for a separate subagent permission."
+                "parent Run, so never ask the user for a separate subagent permission. Return registered Evidence IDs, "
+                "SQL generation/validation receipt IDs and Artifact hashes instead of copying exact data through prose. "
+                "Never ask the user directly; return a concise blocker and question to the parent Agent instead."
+                " If blocked, return only one JSON object with status=blocked, question_for_parent and summary."
+                f"{context_prompt}"
             ),
             "tools": default_tools,
             "skills": list(default_skills),
@@ -1815,7 +2055,15 @@ def _build_subagents(
     for item in items:
         if not item.get("enabled", False):
             continue
-        subagents.append(_build_subagent_item(item, default_tools, default_skills, middleware_factory))
+        subagents.append(
+            _build_subagent_item(
+                item,
+                default_tools,
+                default_skills,
+                middleware_factory,
+                context_prompt,
+            )
+        )
     return subagents
 
 
@@ -2120,6 +2368,7 @@ class DeepAgentsAgentManager:
                 base_dir=self._base_dir,
                 reviewer=permission_reviewer,
             ),
+            DelegationControlMiddleware(),
             SkillIntentRouterMiddleware(),
             ToolsetMiddleware(
                 skills_dir=self._base_dir / "skills",
@@ -4274,12 +4523,18 @@ class DeepAgentsAgentManager:
             total_retry_limit = int(goal.get("max_total_control_retries") or 4)
             if retry_count < max(1, retry_limit) and total_retry_count < max(1, total_retry_limit):
                 return "verification_control_retry"
+        # Business acceptance gaps never justify a fresh Run without new
+        # information. The current Run already received one bounded repair
+        # attempt and a semantic stagnation check; starting another Run would
+        # merely reset those breakers and recreate the same loop. A new Run is
+        # allowed only after an explicit user continuation/revision, or for a
+        # bounded control-plane retry handled above.
         if outcome.get("outcome") == RunOutcome.VERIFICATION_FAILED.value and report_status in {
             VerificationStatus.NEEDS_REVISION.value,
             VerificationStatus.FAILED.value,
             VerificationStatus.MAX_ITERATIONS_REACHED.value,
         }:
-            return "verification_failed"
+            return None
         return None
 
     @staticmethod
@@ -4305,11 +4560,31 @@ class DeepAgentsAgentManager:
             "verification_control_retry": "上一 Run 的验收控制流程发生可恢复异常，Harness 正在有限自动重试",
         }.get(reason, "上一 Run 的验收仍有待修正项")
         objective = str(goal.get("objective") or "").strip()
+        latest_handoff: dict[str, Any] | None = None
+        session_id = str(goal.get("session_id") or "")
+        run_ids = goal.get("run_ids") if isinstance(goal.get("run_ids"), list) else []
+        for prior_run_id in reversed(run_ids):
+            prior = session_manager.get_run_state(session_id, str(prior_run_id)) if session_id else None
+            candidate = prior.get("handoff_summary") if isinstance(prior, dict) else None
+            if (
+                isinstance(candidate, dict)
+                and candidate.get("goal_id") == goal.get("goal_id")
+                and candidate.get("goal_revision") == goal.get("objective_revision")
+            ):
+                latest_handoff = candidate
+                break
+        handoff_text = (
+            "\n上一 Run 的结构化交接（不是原始工具日志）：\n"
+            + json.dumps(latest_handoff, ensure_ascii=False, sort_keys=True, default=str)
+            if latest_handoff
+            else ""
+        )
         return (
             "继续完成当前 Goal，不要把这条内部续跑指令当作新的用户需求。\n"
             + (f"当前 Goal（最新修订）：\n{objective}\n" if objective else "")
             + f"{reason_text}。读取当前 workspace、Todo、Goal 验收缺口和已有产物，"
             "从未完成处继续，避免重复已经完成的工作。" + (f"\n当前待补齐项：\n{gap_text}" if gap_text else "")
+            + handoff_text
         )
 
     async def astream(
@@ -4510,6 +4785,8 @@ class DeepAgentsAgentManager:
         task_router_task: asyncio.Task[dict[str, Any]] | None = None
         task_router_event_emitted = False
         task_router_trace_recorded = False
+        task_router_cancel_reason: str | None = None
+        router_skipped_trivial = False
         checkpoint_thread_id = f"{session_id}:{query_id}"
         try:
             thinking_enabled = bool(config.load_config().get("thinking_mode", False))
@@ -4702,8 +4979,15 @@ class DeepAgentsAgentManager:
                         "task_profile": run_record.task_profile.model_dump(mode="json"),
                     }
 
-            if reused_task_profile is None:
+            router_skipped_trivial = (
+                reused_task_profile is None
+                and not _should_start_semantic_task_router(run_record.objective)
+            )
+            if reused_task_profile is None and not router_skipped_trivial:
                 task_router_task = asyncio.create_task(route_task_in_background())
+                # Give a cache-fast Router one scheduling turn. Slow provider
+                # work remains cancellable before the user-visible model call.
+                await asyncio.sleep(0)
 
             def task_router_completion_event() -> dict[str, str] | None:
                 if task_router_task is None or not task_router_task.done():
@@ -4780,6 +5064,7 @@ class DeepAgentsAgentManager:
                     result: dict[str, Any] = {
                         "status": "cancelled",
                         "applied": False,
+                        "error": task_router_cancel_reason,
                     }
                 else:
                     try:
@@ -4823,6 +5108,8 @@ class DeepAgentsAgentManager:
                     "label": (
                         "已复用上一轮任务理解"
                         if reused_task_profile is not None
+                        else "普通对话无需语义路由"
+                        if router_skipped_trivial
                         else "Agent 正在后台理解任务并匹配 Skill"
                     ),
                     "blocking": False,
@@ -4846,6 +5133,23 @@ class DeepAgentsAgentManager:
                         "skill_candidates": TaskProfileClassifier.skill_ids(
                             reused_task_profile
                         ),
+                    },
+                )
+            elif router_skipped_trivial:
+                task_router_event_emitted = True
+                yield self._sse(
+                    "task_routing_completed",
+                    {
+                        "session_id": session_id,
+                        "query_id": query_id,
+                        "run_id": run_record.run_id,
+                        "label": "普通对话已直接交给 Agent",
+                        "status": "not_required",
+                        "applied": False,
+                        "blocking": False,
+                        "duration_ms": 0,
+                        "execution_route": "native",
+                        "skill_candidates": [],
                     },
                 )
             if goal_record is not None:
@@ -4882,7 +5186,9 @@ class DeepAgentsAgentManager:
                 ]
             )
             history = session_manager.load_session_for_agent(session_id)
-            history_for_build = raw_history
+            # Cross-Run model context is the sanitized user-visible transcript,
+            # never the raw UI record containing Tool calls or reasoning.
+            history_for_build = history
             if user_message_persisted and raw_history:
                 persisted_display = self._display_message_with_attachments(message, attachments)
                 last_message = raw_history[-1]
@@ -4891,8 +5197,11 @@ class DeepAgentsAgentManager:
                     # immediate disconnect cannot lose it. _build_messages adds
                     # the current turn itself, therefore exclude that persisted
                     # copy here or the model receives the prompt twice.
-                    history_for_build = raw_history[:-1]
-            saved_agent_context = session_manager.get_agent_context_messages(session_id)
+                    history_for_build = history[:-1]
+            saved_agent_context = session_manager.get_agent_context_messages(
+                session_id,
+                run_id=run_record.run_id,
+            )
             using_saved_agent_context = False
             if saved_agent_context:
                 try:
@@ -5076,8 +5385,13 @@ class DeepAgentsAgentManager:
 
             def build_subagent_middlewares() -> list[Any]:
                 middlewares: list[Any] = [
+                    SubagentProgressMiddleware(),
+                    SemanticAssetsMiddleware(base_dir=self._base_dir),
                     ExternalFilePermissionMiddleware(),
+                    WorkspacePathRouterMiddleware(agent_backend),
                     VerificationActivationMiddleware(),
+                    VersionedPatchMiddleware(agent_backend),
+                    ExternalDirectoryMiddleware(agent_backend),
                     ToolExecutionPipeline(
                         known_tools={
                             str(getattr(tool, "name", "")) for tool in agent_tools if getattr(tool, "name", "")
@@ -5091,6 +5405,16 @@ class DeepAgentsAgentManager:
                     ToolsetMiddleware(
                         skills_dir=self._base_dir / "skills",
                         toolsets_by_skill=skill_toolsets,
+                    ),
+                    ObservableModelCallLimitMiddleware(
+                        run_limit=12,
+                        thread_limit=None,
+                        exit_behavior="end",
+                    ),
+                    ToolCallLimitMiddleware(
+                        run_limit=30,
+                        thread_limit=None,
+                        exit_behavior="continue",
                     ),
                 ]
                 summarization = _build_deepagents_summarization(model, agent_backend)
@@ -5108,6 +5432,7 @@ class DeepAgentsAgentManager:
                 agent_tools,
                 agent_skills,
                 middleware_factory=build_subagent_middlewares,
+                context_prompt=analytics_model_prompt,
             )
             system_prompt = build_deepagents_system_prompt(self._base_dir, workspace_path)
             dependency_prompt = dependency_plan_prompt(getattr(agent_backend, "execution_dependency_plan", None))
@@ -5115,6 +5440,7 @@ class DeepAgentsAgentManager:
                 system_prompt += f"\n\n{dependency_prompt}"
             if analytics_model_prompt:
                 system_prompt += analytics_model_prompt
+            system_prompt += _run_artifact_continuity_prompt(run_record)
             agent = create_deep_agent(
                 model=model,
                 tools=agent_tools,
@@ -5127,6 +5453,18 @@ class DeepAgentsAgentManager:
                 state_schema=PuddingClawAgentState,
             )
             logger.info("DeepAgents agent built successfully for session=%s", session_id)
+            if task_router_task is not None and not task_router_task.done():
+                # Once the main Agent is about to start, the immutable
+                # verification profile is already frozen.  A late Router result
+                # cannot be applied, so keeping the provider request alive only
+                # competes with the user-visible model call.
+                task_router_cancel_reason = "main_agent_started_before_router"
+                task_router_task.cancel()
+                try:
+                    await task_router_task
+                except asyncio.CancelledError:
+                    pass
+                task_router_event_emitted = True
             self._run_coordinator.transition(run_record, RunStatus.RUNNING)
             yield self._sse(
                 "run_status_changed",
@@ -5295,7 +5633,11 @@ class DeepAgentsAgentManager:
             if langsmith_callbacks:
                 agent_config["callbacks"] = langsmith_callbacks
 
-            if task_router_task is not None and task_router_task.done():
+            if (
+                task_router_task is not None
+                and task_router_task.done()
+                and not task_router_event_emitted
+            ):
                 self._run_coordinator._refresh_runtime_fields(run_record)
                 router_event = task_router_completion_event()
                 if router_event is not None:
@@ -5766,6 +6108,8 @@ class DeepAgentsAgentManager:
                                 if lifecycle_status == "satisfied"
                                 else "发现完成条件缺口，继续处理"
                                 if lifecycle_status == "needs_revision"
+                                else "完成条件仍未满足"
+                                if lifecycle_status == "failed"
                                 else "完成条件检查异常"
                             )
                         elif event_type == "rubric_evaluation_end":
@@ -5787,6 +6131,13 @@ class DeepAgentsAgentManager:
                                     or "current"
                                 )
                                 activity_id = f"verification-quality-{grading_key}"
+                            elif event_type == "deterministic_checks_completed":
+                                run_key = str(
+                                    payload.get("run_id")
+                                    or (run_record.run_id if run_record is not None else "")
+                                    or "current"
+                                )
+                                activity_id = f"verification-completion-{run_key}"
                             activity = {
                                 "type": "activity",
                                 "label": lifecycle_label,
@@ -5882,6 +6233,7 @@ class DeepAgentsAgentManager:
                                 session_manager.update_agent_context_state(
                                     session_id,
                                     used_tokens=current_context_usage,
+                                    run_id=run_record.run_id,
                                 )
                             else:
                                 context_fingerprint = _agent_context_fingerprint(serialized_context)
@@ -5890,6 +6242,7 @@ class DeepAgentsAgentManager:
                                         session_id,
                                         used_tokens=current_context_usage,
                                         messages=serialized_context,
+                                        run_id=run_record.run_id,
                                     )
                                     persisted_agent_context_fingerprint = context_fingerprint
                         except Exception:
@@ -6306,12 +6659,14 @@ class DeepAgentsAgentManager:
                     session_manager.update_agent_context_state(
                         session_id,
                         used_tokens=final_context_usage,
+                        run_id=run_record.run_id,
                     )
                 else:
                     session_manager.update_agent_context_state(
                         session_id,
                         used_tokens=final_context_usage,
                         messages=serialized_context,
+                        run_id=run_record.run_id,
                     )
             verification_detail = _user_facing_verification_summary(
                 str(verification_report.explanation or "")
@@ -6572,6 +6927,7 @@ class DeepAgentsAgentManager:
                 trace_collector.__exit__(asyncio.CancelledError, None, None)
             raise
         except Exception as exc:
+            transport_interrupted = isinstance(exc, ModelTransportInterruptedError)
             if isinstance(exc, ModelCallLimitExceededError):
                 logger.info(
                     "Agent Run reached its model-call boundary for session=%s: %s",
@@ -6582,7 +6938,12 @@ class DeepAgentsAgentManager:
                 logger.exception("Agent stream failed for session=%s: %s", session_id, exc)
                 traceback.print_exc()
             error_msg = str(exc) or exc.__class__.__name__
-            error_notice = f"本轮执行中断：{error_msg}。已保留中断前完成的内容，可修复连接后输入“继续”。"
+            error_notice = (
+                "模型连接在有限重试后仍未恢复。本轮已按基础设施故障停止，"
+                "中断内容未作为最终回答或工具调用；已保留此前完成的 Todo、证据和产物，可输入“继续”恢复。"
+                if transport_interrupted
+                else f"本轮执行中断：{error_msg}。已保留中断前完成的内容，可修复连接后输入“继续”。"
+            )
             if isinstance(exc, ModelCallLimitExceededError) and run_record is not None:
                 reason = (
                     "run_model_call_limit"
@@ -6723,7 +7084,11 @@ class DeepAgentsAgentManager:
                 if run_record is not None and not run_record.terminal:
                     self._run_coordinator.fail(
                         run_record,
-                        outcome=RunOutcome.FAILED,
+                        outcome=(
+                            RunOutcome.INFRASTRUCTURE_ERROR
+                            if transport_interrupted
+                            else RunOutcome.FAILED
+                        ),
                         error=error_msg,
                     )
                     yield self._sse(
@@ -6842,6 +7207,54 @@ class DeepAgentsAgentManager:
                 "execution_scratch_goal_revision",
                 None,
             )
+            # Goal revisions deliberately share writable draft scratch across
+            # continuation Runs. Read-only external search snapshots are
+            # different: their authority belongs to the concrete Run that
+            # held the grant. Remove only terminalized search subtrees here so
+            # a later Run cannot read stale host contents through /scratch.
+            if scratch_path:
+                scratch_root = Path(str(scratch_path)).resolve()
+                terminal_run_id = str(
+                    getattr(locals().get("run_record"), "run_id", "") or ""
+                )
+                search_leases = [
+                    *session_manager.list_external_artifact_leases(session_id),
+                    *session_manager.list_external_directory_leases(session_id),
+                ]
+                for lease in search_leases:
+                    if (
+                        not isinstance(lease, dict)
+                        or lease.get("search_only") is not True
+                        or str(lease.get("status") or "") != "abandoned"
+                        or str(lease.get("abandoned_reason") or "")
+                        != "run_search_snapshot_terminal"
+                        or str(lease.get("run_id") or "") != terminal_run_id
+                        or str(lease.get("query_id") or "") != str(query_id or "")
+                    ):
+                        continue
+                    virtual_path = str(
+                        lease.get("staged_dir") or lease.get("staged_path") or ""
+                    ).replace("\\", "/")
+                    if not virtual_path.startswith("/scratch/"):
+                        continue
+                    relative = virtual_path.removeprefix("/scratch/")
+                    candidate = (scratch_root / relative).resolve()
+                    try:
+                        candidate.relative_to(scratch_root)
+                    except ValueError:
+                        continue
+                    if lease.get("staged_path") and not lease.get("staged_dir"):
+                        candidate = candidate.parent
+                    try:
+                        shutil.rmtree(candidate, ignore_errors=True)
+                    except Exception:
+                        logger.debug(
+                            "Failed to clean Run search snapshot %s for session=%s run=%s",
+                            virtual_path,
+                            session_id,
+                            terminal_run_id,
+                            exc_info=True,
+                        )
             cleanup_scratch = True
             if scratch_goal_id:
                 persisted_goal = session_manager.get_goal_state(

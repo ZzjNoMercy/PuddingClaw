@@ -296,7 +296,12 @@ def test_guardrail_rules_are_loaded_from_markdown_assets(tmp_path, monkeypatch) 
 
     payload = reset_guardrail_rules()
 
-    assert len(payload["guardrails"]) == 6
+    assert len(payload["guardrails"]) == 9
+    assert {
+        "voltage_platform_400v_physical_value",
+        "voltage_platform_800v_physical_value",
+        "rear_screen_physical_type_name",
+    }.issubset({item["id"] for item in payload["guardrails"]})
     doc_path = tmp_path / "sql-guardrails" / "rules" / "config_rate_model_key_group" / "guardrail.md"
     assert doc_path.exists()
     text = doc_path.read_text(encoding="utf-8")

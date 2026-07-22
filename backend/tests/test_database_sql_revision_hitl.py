@@ -36,10 +36,89 @@ def _result(question: str, sql: str = "SELECT 1") -> DatabaseSqlGenerationResult
 
 
 def test_database_sql_generate_runtime_is_hidden_from_llm_schema() -> None:
-    tool = DatabaseSqlGenerateTool()
+    for tool in (
+        DatabaseSqlGenerateTool(),
+        DatabaseSqlValidateTool(),
+        DatabaseSqlExecuteTool(),
+    ):
+        assert "runtime" in tool.get_input_schema().model_fields
+        assert "runtime" not in tool.tool_call_schema.model_fields
 
-    assert "runtime" in tool.get_input_schema().model_fields
-    assert "runtime" not in tool.tool_call_schema.model_fields
+
+def test_sql_authority_is_scoped_to_run_or_same_goal_revision() -> None:
+    registry = DatabaseSqlRevisionResumeRegistry()
+    run_generation = registry.register_generation(
+        session_id="session-scope",
+        query_id="query-a",
+        run_id="run-a",
+        result=_result("Run scoped"),
+        request={"question": "Run scoped"},
+    )
+    run_receipt = registry.register_validation_receipt(
+        generation=run_generation,
+        database_source_id="source-1",
+        allowed_tables=["vehicle_params"],
+    )
+
+    assert registry.get_generation(
+        run_generation.id,
+        session_id="session-scope",
+        run_id="run-a",
+    ) is run_generation
+    assert registry.get_generation(
+        run_generation.id,
+        session_id="session-scope",
+        run_id="run-b",
+    ) is None
+    assert registry.get_validation_receipt(
+        run_receipt.id,
+        session_id="session-scope",
+        run_id="run-b",
+    ) is None
+
+    goal_generation = registry.register_generation(
+        session_id="session-scope",
+        query_id="query-goal-a",
+        run_id="run-goal-a",
+        goal_id="goal-1",
+        goal_revision=3,
+        result=_result("Goal scoped"),
+        request={"question": "Goal scoped"},
+    )
+    goal_receipt = registry.register_validation_receipt(
+        generation=goal_generation,
+        database_source_id="source-1",
+        allowed_tables=["vehicle_params"],
+    )
+
+    assert registry.get_generation(
+        goal_generation.id,
+        session_id="session-scope",
+        run_id="run-goal-b",
+        goal_id="goal-1",
+        goal_revision=3,
+    ) is goal_generation
+    assert registry.get_validation_receipt(
+        goal_receipt.id,
+        session_id="session-scope",
+        run_id="run-goal-b",
+        goal_id="goal-1",
+        goal_revision=3,
+    ) is goal_receipt
+    assert registry.get_generation(
+        goal_generation.id,
+        session_id="session-scope",
+        run_id="run-goal-c",
+        goal_id="goal-1",
+        goal_revision=4,
+    ) is None
+    assert registry.get_generation(
+        goal_generation.id,
+        session_id="session-scope",
+        run_id="run-goal-b",
+        goal_id="goal-2",
+        goal_revision=3,
+    ) is None
 
 
 @pytest.mark.asyncio
@@ -383,8 +462,14 @@ async def test_agent_mode_validate_and_execute_use_registered_sql(
         sql="SELECT 2",
         generation_id=generation.id,
     )
+    receipt_id = next(
+        line.split("：", 1)[1]
+        for line in validate_output.splitlines()
+        if line.startswith("- validation_receipt_id：")
+    )
     execute_output = await DatabaseSqlExecuteTool(session_id="session-block")._arun(
         generation_id=generation.id,
+        validation_receipt_id=receipt_id,
     )
 
     assert "SQL 校验通过" in validate_output
@@ -392,3 +477,173 @@ async def test_agent_mode_validate_and_execute_use_registered_sql(
     assert "SELECT 2" not in validate_output
     assert "SQL 执行结果" in execute_output
     assert executed_sql == ["SELECT 1"]
+
+
+@pytest.mark.asyncio
+async def test_validator_replays_semantic_guardrails_and_withholds_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.database.sql_validate_tool as validate_module
+    from graph.database_sql_revision_resume import database_sql_revision_resume_registry
+
+    semantic_result = _result(
+        "高压平台配置率",
+        sql=(
+            "SELECT type_value, COUNT(*) FROM vehicle_params "
+            "WHERE type_name = '高压快充平台' AND type_value = '400V' GROUP BY type_value"
+        ),
+    )
+    semantic_result.semantic_assets = {
+        "matched": [{"id": "measure:config_rate", "name": "配置率", "type": "measure"}],
+        "references": [],
+    }
+    generation = database_sql_revision_resume_registry.register_generation(
+        session_id="session-semantic-validator",
+        query_id="query-semantic-validator",
+        result=semantic_result,
+        request={"question": "高压平台配置率", "table_names": ["vehicle_params"]},
+    )
+
+    async def fake_resolve(_source_id: str | None, _tables: list[str] | None) -> tuple[dict, dict, list[str]]:
+        return {}, {"id": "source-1", "name": "测试库", "database": "test"}, ["vehicle_params"]
+
+    monkeypatch.setattr(validate_module, "resolve_database_source_scope", fake_resolve)
+
+    output = await DatabaseSqlValidateTool(session_id="session-semantic-validator")._arun(
+        generation_id=generation.id,
+    )
+
+    assert "SQL 语义校验失败" in output
+    assert "voltage_platform_400v_physical_value" in output
+    assert "未签发 Receipt" in output
+    assert "parent_generation_id" in output
+
+
+@pytest.mark.asyncio
+async def test_agent_mode_execute_refuses_missing_cross_session_and_mismatched_receipts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.database.sql_execute_tool as execute_module
+    from graph.database_sql_revision_resume import database_sql_revision_resume_registry
+
+    generation = database_sql_revision_resume_registry.register_generation(
+        session_id="session-receipt-a",
+        query_id="query-receipt-a",
+        result=_result("原问题", sql="SELECT 1"),
+        request={"question": "原问题", "table_names": ["vehicle_params"]},
+    )
+    other_generation = database_sql_revision_resume_registry.register_generation(
+        session_id="session-receipt-a",
+        query_id="query-receipt-b",
+        result=_result("另一个问题", sql="SELECT 2"),
+        request={"question": "另一个问题", "table_names": ["vehicle_params"]},
+    )
+    mismatched_receipt = database_sql_revision_resume_registry.register_validation_receipt(
+        generation=other_generation,
+        database_source_id="source-1",
+        allowed_tables=["vehicle_params"],
+    )
+    cross_session_generation = database_sql_revision_resume_registry.register_generation(
+        session_id="session-receipt-b",
+        query_id="query-receipt-c",
+        result=_result("跨会话问题", sql="SELECT 3"),
+        request={"question": "跨会话问题", "table_names": ["vehicle_params"]},
+    )
+    cross_session_receipt = database_sql_revision_resume_registry.register_validation_receipt(
+        generation=cross_session_generation,
+        database_source_id="source-1",
+        allowed_tables=["vehicle_params"],
+    )
+
+    async def unexpected_resolve(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("invalid receipts must be refused before database access")
+
+    monkeypatch.setattr(execute_module, "resolve_database_source_scope", unexpected_resolve)
+    tool = DatabaseSqlExecuteTool(session_id="session-receipt-a")
+
+    missing = await tool._arun(generation_id=generation.id)
+    mismatched = await tool._arun(
+        generation_id=generation.id,
+        validation_receipt_id=mismatched_receipt.id,
+    )
+    cross_session = await tool._arun(
+        generation_id=generation.id,
+        validation_receipt_id=cross_session_receipt.id,
+    )
+
+    assert "缺少当前会话有效" in missing
+    assert "不匹配" in mismatched
+    assert "缺少当前会话有效" in cross_session
+
+
+def test_sql_generation_and_validation_receipt_survive_registry_memory_reset(
+    tmp_path,
+) -> None:
+    from graph.database_sql_revision_resume import database_sql_revision_resume_registry
+    from graph.session_manager import session_manager
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("session-sql-ledger")
+    generation = database_sql_revision_resume_registry.register_generation(
+        session_id="session-sql-ledger",
+        query_id="query-ledger",
+        result=_result("原问题", sql="SELECT 1"),
+        request={"question": "原问题", "table_names": ["vehicle_params"]},
+    )
+    receipt = database_sql_revision_resume_registry.register_validation_receipt(
+        generation=generation,
+        database_source_id="source-1",
+        allowed_tables=["vehicle_params"],
+    )
+    database_sql_revision_resume_registry._generations.pop(generation.id)
+    database_sql_revision_resume_registry._validation_receipts.pop(receipt.id)
+
+    restored_generation = database_sql_revision_resume_registry.get_generation(
+        generation.id,
+        session_id="session-sql-ledger",
+    )
+    restored_receipt = database_sql_revision_resume_registry.get_validation_receipt(
+        receipt.id,
+        session_id="session-sql-ledger",
+    )
+
+    assert restored_generation is not None
+    assert restored_generation.result.sql == "SELECT 1"
+    assert restored_generation.sql_sha256 == generation.sql_sha256
+    assert restored_receipt is not None
+    assert restored_receipt.generation_id == generation.id
+    assert restored_receipt.sql_sha256 == generation.sql_sha256
+    assert restored_receipt.semantic_validation_status == "passed"
+    assert restored_receipt.validator_version == "readonly+semantic-guardrails/v2"
+
+
+def test_legacy_validation_receipt_is_not_silently_upgraded(tmp_path) -> None:
+    from graph.session_manager import session_manager
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("session-legacy-receipt")
+    session_manager.record_sql_validation_receipt(
+        "session-legacy-receipt",
+        "sql-validation-legacy",
+        {
+            "id": "sql-validation-legacy",
+            "session_id": "session-legacy-receipt",
+            "query_id": "query-legacy",
+            "generation_id": "sql-gen-legacy",
+            "sql_sha256": "sha256:legacy",
+            "database_source_id": "source-1",
+            "allowed_tables": ["vehicle_params"],
+            "validator_version": "readonly-sql/v1",
+            "created_at": 1.0,
+        },
+    )
+    registry = DatabaseSqlRevisionResumeRegistry()
+
+    restored = registry.get_validation_receipt(
+        "sql-validation-legacy",
+        session_id="session-legacy-receipt",
+    )
+
+    assert restored is not None
+    assert restored.semantic_validation_status == "legacy_unverified"
+    assert restored.validator_version == "readonly-sql/v1"

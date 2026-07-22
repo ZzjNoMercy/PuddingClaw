@@ -5,10 +5,17 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+
+from graph.permission_policy import PermissionBindingPolicy
+from observability import emit_harness_metric
+
+logger = logging.getLogger(__name__)
 
 
 class PermissionResumeRegistry:
@@ -79,6 +86,13 @@ class PermissionResumeRegistry:
             request["change_preview"] = change_preview
         self._requests[request_id] = request
         self._pending[request_id] = asyncio.get_running_loop().create_future()
+        emit_harness_metric(
+            logger,
+            "permission_prompt_count",
+            session_id=session_id,
+            type=request_type,
+            target=str(path),
+        )
         return dict(request)
 
     def create_external_directory_request(
@@ -91,17 +105,28 @@ class PermissionResumeRegistry:
         path: Path,
         access: str,
         operation: str,
+        grant_bindings: dict[str, Any] | None = None,
         change_preview: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        """Create a Run-scoped recursive directory permission request."""
+        """Create one exact-directory request, deduplicated within a Run."""
 
         if access not in {"read", "write"}:
             raise ValueError(f"Unsupported external directory access: {access}")
-        replay_key = "\0".join([session_id, query_id, run_id, tool_call_id, access, str(path)])
+        replay_key = "\0".join([session_id, query_id, run_id, access, str(path)])
         request_id = f"perm-req-{hashlib.sha256(replay_key.encode('utf-8')).hexdigest()[:16]}"
         existing = self._requests.get(request_id)
-        if existing is not None:
+        if existing is not None and existing.get("status") == "pending":
+            emit_harness_metric(
+                logger,
+                "permission_reuse_count",
+                session_id=session_id,
+                scope="pending_request",
+            )
             return dict(existing)
+        if existing is not None:
+            # A revoked/expired capability can legitimately require a new
+            # decision inside the same Run. Never resurrect a resolved request.
+            request_id = f"{request_id}-{uuid.uuid4().hex[:6]}"
         request = {
             "id": request_id,
             "type": f"external_directory_{access}",
@@ -115,13 +140,75 @@ class PermissionResumeRegistry:
             "status": "pending",
             "created_at": time.time(),
             "operation": operation,
-            "options": ["exact_directory_run"],
+            "options": (
+                ["exact_directory_session", "exact_directory_run"]
+                if access == "read"
+                else ["exact_directory_run", "exact_directory_session"]
+            ),
         }
+        if grant_bindings:
+            request["grant_bindings"] = dict(grant_bindings)
         if change_preview:
             request["change_preview"] = dict(change_preview)
         self._requests[request_id] = request
         self._pending[request_id] = asyncio.get_running_loop().create_future()
+        emit_harness_metric(
+            logger,
+            "permission_prompt_count",
+            session_id=session_id,
+            type=request["type"],
+            target=str(path),
+        )
         return dict(request)
+
+    def resolve_compatible_session_external_directories(
+        self,
+        *,
+        session_id: str,
+        path: str,
+        access: str,
+        capabilities: list[str],
+        decision: dict[str, Any],
+        grant_bindings: dict[str, Any],
+        exclude_request_id: str = "",
+        binding_resolver: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
+    ) -> list[str]:
+        """Resolve pending peers covered by one exact Session directory Grant."""
+
+        granted = set(capabilities)
+        resolved: list[str] = []
+        for request_id, request in list(self._requests.items()):
+            if request_id == exclude_request_id:
+                continue
+            if (
+                request.get("type") != f"external_directory_{access}"
+                or request.get("status") != "pending"
+                or request.get("session_id") != session_id
+                or str(request.get("path") or "") != path
+            ):
+                continue
+            required = set(request.get("capabilities") or [])
+            request_bindings = request.get("grant_bindings")
+            if not isinstance(request_bindings, dict) and binding_resolver is not None:
+                request_bindings = binding_resolver(request)
+            if not required.issubset(granted) or not PermissionBindingPolicy.equivalent(
+                grant_type=f"external_directory_{access}",
+                scope="session",
+                target_kind="exact_directory",
+                target=path,
+                left=request_bindings if isinstance(request_bindings, dict) else None,
+                right=grant_bindings,
+            ):
+                continue
+            if self.resolve(request_id, dict(decision)):
+                resolved.append(request_id)
+                emit_harness_metric(
+                    logger,
+                    "permission_reuse_count",
+                    session_id=session_id,
+                    scope="session",
+                )
+        return resolved
 
     def create_tool_action_request(
         self,
@@ -149,6 +236,29 @@ class PermissionResumeRegistry:
             command=command,
             reason=reason,
         )
+        semantic_key = ""
+        if session_target_kind and session_target:
+            semantic_key, _stable = PermissionBindingPolicy.semantic_key(
+                session_id=session_id,
+                grant_type="tool_action",
+                scope="session",
+                target_kind=session_target_kind,
+                target=session_target,
+                capabilities=list(required_capabilities or ["execute"]),
+                runtime_bindings=grant_bindings,
+            )
+            for existing in self._requests.values():
+                if (
+                    existing.get("status") == "pending"
+                    and existing.get("semantic_key") == semantic_key
+                ):
+                    emit_harness_metric(
+                        logger,
+                        "permission_reuse_count",
+                        session_id=session_id,
+                        scope="pending_request",
+                    )
+                    return dict(existing)
         replay_key = "\0".join([session_id, query_id, run_id, tool_call_id, fingerprint])
         request_id = f"perm-req-{hashlib.sha256(replay_key.encode('utf-8')).hexdigest()[:16]}"
         existing = self._requests.get(request_id)
@@ -173,6 +283,8 @@ class PermissionResumeRegistry:
             "options": ["once", "session"],
             "policy_source": policy_source,
         }
+        if semantic_key:
+            request["semantic_key"] = semantic_key
         if session_target_kind and session_target:
             request["session_target_kind"] = session_target_kind
             request["session_target"] = session_target
@@ -188,6 +300,13 @@ class PermissionResumeRegistry:
             request["control_descriptor"] = dict(control_descriptor)
         self._requests[request_id] = request
         self._pending[request_id] = asyncio.get_running_loop().create_future()
+        emit_harness_metric(
+            logger,
+            "permission_prompt_count",
+            session_id=session_id,
+            type="tool_action",
+            target=session_target or fingerprint,
+        )
         return dict(request)
 
     async def wait(self, request_id: str) -> dict[str, Any]:
@@ -246,10 +365,23 @@ class PermissionResumeRegistry:
             required = set(request.get("capabilities") or ["execute"])
             request_bindings = request.get("grant_bindings")
             normalized_bindings = request_bindings if isinstance(request_bindings, dict) else None
-            if not required.issubset(granted) or normalized_bindings != expected_bindings:
+            if not required.issubset(granted) or not PermissionBindingPolicy.equivalent(
+                grant_type="tool_action",
+                scope="session",
+                target_kind=target_kind,
+                target=target,
+                left=normalized_bindings,
+                right=expected_bindings,
+            ):
                 continue
             if self.resolve(request_id, dict(decision)):
                 resolved.append(request_id)
+                emit_harness_metric(
+                    logger,
+                    "permission_reuse_count",
+                    session_id=session_id,
+                    scope="session",
+                )
         return resolved
 
     def reject_session(self, session_id: str, message: str) -> int:

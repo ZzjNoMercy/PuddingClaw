@@ -8,6 +8,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from graph.permission_policy import RunPermissionContext
 from graph.permission_resume import permission_resume_registry
 from graph.session_manager import session_manager
 
@@ -18,6 +19,7 @@ class ExternalFileGrantRequest(BaseModel):
     target_kind: str = Field(pattern="^(exact_file|all_external_files|exact_directory)$")
     path: str | None = None
     permission_request_id: str | None = None
+    scope: Literal["run", "session"] | None = None
 
 
 class PermissionDenyRequest(BaseModel):
@@ -41,6 +43,7 @@ async def list_permissions(session_id: str) -> dict[str, Any]:
 
     try:
         session_manager.get_permission_policy(session_id)
+        session_manager.migrate_permission_grants(session_id)
         grants = session_manager.list_permission_grants(session_id)
         history = session_manager.list_permission_grant_history(session_id)
     except FileNotFoundError as exc:
@@ -115,6 +118,11 @@ async def grant_external_file_permission(
     pending_type = str((pending or {}).get("type") or "external_file_read")
     is_directory = pending_type.startswith("external_directory_")
     access = "write" if pending_type.endswith("_write") else "read"
+    effective_scope = str(req.scope or ("run" if is_directory else "session"))
+    if is_directory and effective_scope not in {"run", "session"}:
+        raise HTTPException(status_code=400, detail="external directory scope must be run or session")
+    if not is_directory and req.scope not in {None, "session"}:
+        raise HTTPException(status_code=400, detail="external file grants are Session-scoped")
     expected_target_kind = "exact_directory" if is_directory else "exact_file"
     if pending is None and req.target_kind == "exact_directory":
         raise HTTPException(status_code=400, detail="external directory permission requires a pending request")
@@ -136,6 +144,24 @@ async def grant_external_file_permission(
     else:
         target = "*"
 
+    grant_bindings = (
+        dict(pending.get("grant_bindings"))
+        if isinstance((pending or {}).get("grant_bindings"), dict)
+        else None
+    )
+    if is_directory and grant_bindings is None:
+        run_id = str((pending or {}).get("run_id") or "")
+        run = session_manager.get_run_state(session_id, run_id) if run_id else None
+        if isinstance(run, dict):
+            grant_bindings = RunPermissionContext.from_config_snapshot(
+                run.get("config_snapshot")
+            ).grant_bindings()
+    if is_directory and effective_scope == "session" and grant_bindings is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Session directory permission requires an active bound Run",
+        )
+
     try:
         grant = session_manager.add_permission_grant(
             session_id,
@@ -143,20 +169,25 @@ async def grant_external_file_permission(
             target_kind=effective_target_kind,
             target=target,
             capabilities=[access, *(["recursive"] if is_directory else []), "external_path"],
-            scope="run" if is_directory else "session",
+            scope=effective_scope if is_directory else "session",
             source="user",
             metadata=(
                 {
                     "run_id": str((pending or {}).get("run_id") or ""),
                     "requested_target_kind": req.target_kind,
+                    "requested_scope": effective_scope,
                 }
                 if is_directory
                 else None
             ),
+            bindings=grant_bindings if is_directory else None,
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Session not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     resumed = False
+    auto_resumed: list[str] = []
     if req.permission_request_id:
         resumed = permission_resume_registry.resolve(
             req.permission_request_id,
@@ -168,7 +199,36 @@ async def grant_external_file_permission(
                 status_code=409,
                 detail="permission request was resolved concurrently",
             )
-    return {"session_id": session_id, "grant": grant, "resumed": resumed}
+        if is_directory and effective_scope == "session" and grant_bindings is not None:
+            def resolve_pending_bindings(request: dict[str, Any]) -> dict[str, Any] | None:
+                request_run_id = str(request.get("run_id") or "")
+                request_run = (
+                    session_manager.get_run_state(session_id, request_run_id)
+                    if request_run_id
+                    else None
+                )
+                if not isinstance(request_run, dict):
+                    return None
+                return RunPermissionContext.from_config_snapshot(
+                    request_run.get("config_snapshot")
+                ).grant_bindings()
+
+            auto_resumed = permission_resume_registry.resolve_compatible_session_external_directories(
+                session_id=session_id,
+                path=target,
+                access=access,
+                capabilities=list(grant.get("capabilities") or []),
+                decision={"type": "approve", "grant_id": grant["id"]},
+                grant_bindings=grant_bindings,
+                exclude_request_id=req.permission_request_id,
+                binding_resolver=resolve_pending_bindings,
+            )
+    return {
+        "session_id": session_id,
+        "grant": grant,
+        "resumed": resumed,
+        "auto_resumed_permission_request_ids": auto_resumed,
+    }
 
 
 @router.post("/sessions/{session_id}/permissions/deny")

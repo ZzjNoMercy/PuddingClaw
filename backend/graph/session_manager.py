@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+import logging
+import posixpath
 import re
 import shutil
 import threading
@@ -9,15 +11,20 @@ import time
 import uuid
 from copy import deepcopy
 from functools import wraps
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from graph.permission_policy import (
     DEFAULT_APPROVAL_MODE,
+    PERMISSION_BINDING_SCHEMA_VERSION,
+    PermissionBindingPolicy,
     RunPermissionContext,
     normalize_approval_mode,
     permission_policy_snapshot,
 )
+from observability import emit_harness_metric
+
+logger = logging.getLogger(__name__)
 
 # 压缩摘要的固定前缀标识，agent.py 和本模块共用，用于识别摘要消息
 COMPRESSED_CONTEXT_PREFIX = "[历史对话摘要]"
@@ -66,6 +73,17 @@ class SessionManager:
         self._sessions_dir.mkdir(exist_ok=True)  # 目录不存在时自动创建
         self._traces_dir = self._sessions_dir / "traces"
         self._traces_dir.mkdir(exist_ok=True)
+
+    @property
+    def is_initialized(self) -> bool:
+        """Whether durable Session storage is ready for use.
+
+        Registries are imported before application bootstrap in a few unit and
+        CLI contexts.  They may still provide their in-memory semantics there,
+        but must not infer that a missing persistence directory is corruption.
+        """
+
+        return self._sessions_dir is not None
 
     def _session_path(self, session_id: str) -> Path:
         """根据 session_id 生成对应的 JSON 文件路径"""
@@ -313,7 +331,15 @@ class SessionManager:
         grants = permissions.get("grants")
         if isinstance(grants, list):
             for grant in grants:
-                if isinstance(grant, dict) and grant.get("type") == "tool_action" and not grant.get("revoked_at"):
+                grant_type = str(grant.get("type") or "") if isinstance(grant, dict) else ""
+                invalidated_session_capability = (
+                    grant_type == "tool_action"
+                    or (
+                        grant.get("scope") == "session"
+                        and grant_type.startswith("external_directory_")
+                    )
+                ) if isinstance(grant, dict) else False
+                if invalidated_session_capability and not grant.get("revoked_at"):
                     grant["revoked_at"] = now
                     grant["revocation_reason"] = "permission_policy_changed"
         self._write_file(session_id, data)
@@ -761,10 +787,12 @@ class SessionManager:
             raise ValueError(f"Run {validated_run.run_id} does not exist in session {session_id}")
         runs[validated_run.run_id] = validated_run.model_dump(mode="json")
         harness["latest_run_id"] = validated_run.run_id
+        self._abandon_terminal_run_search_snapshots(data, validated_run)
         if validated_goal is not None:
             goals = harness.setdefault("goals", {})
             goals[validated_goal.goal_id] = validated_goal.model_dump(mode="json")
             harness["active_goal_id"] = None
+            self._abandon_uncommitted_execution_leases(data, validated_run)
 
         message = self._build_message_payload(
             "assistant",
@@ -915,6 +943,92 @@ class SessionManager:
         todos = data.get("todos")
         return deepcopy(todos) if isinstance(todos, list) else []
 
+    @classmethod
+    def _current_todo_projection(
+        cls,
+        data: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Project the authoritative current Todo ledger for the chat UI.
+
+        The top-level ``todos`` field is retained as a legacy write-through
+        cache, but it is not a lifecycle owner.  A completed Goal/Run must not
+        remain visible as current work merely because it wrote that cache last.
+        """
+
+        harness = data.get("harness")
+        if not isinstance(harness, dict):
+            legacy = data.get("todos")
+            return (
+                deepcopy(legacy) if isinstance(legacy, list) else [],
+                {"kind": "legacy"},
+            )
+        ledgers = data.get("todo_ledgers")
+        ledgers = ledgers if isinstance(ledgers, dict) else {}
+        goals = harness.get("goals")
+        goals = goals if isinstance(goals, dict) else {}
+        runs = harness.get("runs")
+        runs = runs if isinstance(runs, dict) else {}
+        latest_run_id = harness.get("latest_run_id")
+        if not isinstance(latest_run_id, str):
+            run_order = harness.get("run_order")
+            if isinstance(run_order, list):
+                latest_run_id = next(
+                    (item for item in reversed(run_order) if isinstance(item, str)),
+                    None,
+                )
+        latest_run = (
+            runs.get(latest_run_id) if isinstance(latest_run_id, str) else None
+        )
+        terminal_statuses = {
+            "completed",
+            "cancelled",
+            "failed",
+            "blocked",
+            "budget_exceeded",
+            "verification_failed",
+        }
+        if (
+            isinstance(latest_run, dict)
+            and str(latest_run.get("status") or "") not in terminal_statuses
+            and not str(latest_run.get("goal_id") or "")
+        ):
+            scoped = ledgers.get(cls._todo_scope_key(run_id=latest_run_id))
+            return (
+                deepcopy(scoped) if isinstance(scoped, list) else [],
+                {"kind": "run", "run_id": latest_run_id},
+            )
+
+        active_goal_id = harness.get("active_goal_id")
+        if isinstance(active_goal_id, str):
+            goal = goals.get(active_goal_id)
+            if isinstance(goal, dict) and goal.get("status") == "active":
+                revision = int(goal.get("objective_revision") or 1)
+                scoped = ledgers.get(
+                    cls._todo_scope_key(
+                        goal_id=active_goal_id,
+                        goal_revision=revision,
+                    )
+                )
+                return (
+                    deepcopy(scoped) if isinstance(scoped, list) else [],
+                    {
+                        "kind": "goal",
+                        "goal_id": active_goal_id,
+                        "goal_revision": revision,
+                    },
+                )
+
+        if (
+            isinstance(latest_run, dict)
+            and str(latest_run.get("status") or "") not in terminal_statuses
+        ):
+            scoped = ledgers.get(cls._todo_scope_key(run_id=latest_run_id))
+            return (
+                deepcopy(scoped) if isinstance(scoped, list) else [],
+                {"kind": "run", "run_id": latest_run_id},
+            )
+        return [], {"kind": "none"}
+
     @_session_write_locked
     def update_todos(
         self,
@@ -971,6 +1085,131 @@ class SessionManager:
             return None
         run = runs.get(effective_id)
         return deepcopy(run) if isinstance(run, dict) else None
+
+    @_session_write_locked
+    def reserve_delta_repair_tool_call(
+        self,
+        session_id: str,
+        run_id: str,
+        tool_call_id: str,
+    ) -> dict[str, Any]:
+        """Atomically reserve one Tool call against a bounded delta-repair Run."""
+
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        run = runs.get(run_id) if isinstance(runs, dict) else None
+        if not isinstance(run, dict):
+            return {"applies": False, "allowed": False, "reason": "run_not_found"}
+        if str(run.get("execution_mode") or "native") != "delta_repair":
+            return {"applies": False, "allowed": True}
+        call_id = str(tool_call_id or "").strip()
+        if not call_id:
+            return {"applies": True, "allowed": False, "reason": "missing_tool_call_id"}
+        reserved = [str(item) for item in run.get("delta_repair_tool_call_ids") or []]
+        limit = int(run.get("delta_repair_tool_budget") or 12)
+        if call_id in reserved:
+            return {
+                "applies": True,
+                "allowed": True,
+                "count": len(reserved),
+                "limit": limit,
+            }
+        if len(reserved) >= limit:
+            emit_harness_metric(
+                logger,
+                "delta_repair_tool_calls",
+                session_id=session_id,
+                value=len(reserved),
+                status="budget_exhausted",
+            )
+            return {
+                "applies": True,
+                "allowed": False,
+                "reason": "delta_repair_tool_budget_exhausted",
+                "count": len(reserved),
+                "limit": limit,
+            }
+        reserved.append(call_id)
+        run["delta_repair_tool_call_ids"] = reserved
+        self._write_file(session_id, data)
+        emit_harness_metric(
+            logger,
+            "delta_repair_tool_calls",
+            session_id=session_id,
+            value=len(reserved),
+            status="reserved",
+        )
+        return {
+            "applies": True,
+            "allowed": True,
+            "count": len(reserved),
+            "limit": limit,
+        }
+
+    @_session_write_locked
+    def record_sql_generation(
+        self,
+        session_id: str,
+        generation_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist a server-authored SQL generation for Run/Goal recovery."""
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        harness = data.setdefault("harness", {})
+        ledger = harness.setdefault("sql_generation_ledger", {})
+        existing = ledger.get(generation_id)
+        if isinstance(existing, dict) and existing != payload:
+            raise ValueError(f"SQL generation {generation_id} is immutable")
+        ledger[generation_id] = deepcopy(payload)
+        self._write_file(session_id, data)
+        return deepcopy(ledger[generation_id])
+
+    def get_sql_generation(
+        self,
+        session_id: str,
+        generation_id: str,
+    ) -> dict[str, Any] | None:
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        ledger = harness.get("sql_generation_ledger") if isinstance(harness, dict) else None
+        item = ledger.get(generation_id) if isinstance(ledger, dict) else None
+        return deepcopy(item) if isinstance(item, dict) else None
+
+    @_session_write_locked
+    def record_sql_validation_receipt(
+        self,
+        session_id: str,
+        receipt_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist an immutable SQL validator receipt bound to one SQL hash."""
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        harness = data.setdefault("harness", {})
+        receipts = harness.setdefault("sql_validation_receipts", {})
+        existing = receipts.get(receipt_id)
+        if isinstance(existing, dict) and existing != payload:
+            raise ValueError(f"SQL validation receipt {receipt_id} is immutable")
+        receipts[receipt_id] = deepcopy(payload)
+        self._write_file(session_id, data)
+        return deepcopy(receipts[receipt_id])
+
+    def get_sql_validation_receipt(
+        self,
+        session_id: str,
+        receipt_id: str,
+    ) -> dict[str, Any] | None:
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        receipts = harness.get("sql_validation_receipts") if isinstance(harness, dict) else None
+        item = receipts.get(receipt_id) if isinstance(receipts, dict) else None
+        return deepcopy(item) if isinstance(item, dict) else None
 
     @_session_write_locked
     def upsert_run_state(
@@ -1050,6 +1289,22 @@ class SessionManager:
                     seen_activation_ids.add(activation_id)
                 merged_activations.append(deepcopy(raw))
             saved["verification_activations"] = merged_activations
+
+            for list_field, identity_field in (
+                ("delegation_contracts", "subagent_run_id"),
+                ("delegation_results", "subagent_run_id"),
+                ("delegation_events", "event_id"),
+            ):
+                merged: dict[str, dict[str, Any]] = {}
+                existing_items = existing.get(list_field)
+                incoming_items = saved.get(list_field)
+                for raw in [
+                    *(existing_items if isinstance(existing_items, list) else []),
+                    *(incoming_items if isinstance(incoming_items, list) else []),
+                ]:
+                    if isinstance(raw, dict) and raw.get(identity_field):
+                        merged[str(raw[identity_field])] = deepcopy(raw)
+                saved[list_field] = list(merged.values())
 
             existing_contract = existing.get("verification_contract")
             if isinstance(existing_contract, dict):
@@ -1204,7 +1459,40 @@ class SessionManager:
         if current.terminal:
             if current.outcome != incoming.outcome:
                 raise ValueError(f"Run {run_id} already has terminal outcome {current.outcome}")
-            return deepcopy(raw_current)
+            goal_is_terminal = False
+            if current.goal_id:
+                goals = harness.get("goals") if isinstance(harness, dict) else None
+                raw_goal = goals.get(current.goal_id) if isinstance(goals, dict) else None
+                goal_is_terminal = isinstance(raw_goal, dict) and str(
+                    raw_goal.get("status") or ""
+                ) in {"achieved", "cancelled", "budget_exceeded"}
+            leases_changed = False
+            search_leases_changed = self._abandon_terminal_run_search_snapshots(
+                data,
+                current,
+            )
+            if not current.goal_id or goal_is_terminal:
+                leases_changed = self._abandon_uncommitted_execution_leases(data, current)
+            existing_handoff = current.handoff_summary
+            existing_refs = (
+                [
+                    *existing_handoff.evidence_refs,
+                    *existing_handoff.artifact_refs,
+                ]
+                if existing_handoff is not None
+                else []
+            )
+            handoff_is_safe = existing_handoff is not None and all(
+                self._is_safe_handoff_evidence(data, item)
+                for item in existing_refs
+                if isinstance(item, dict)
+            )
+            if leases_changed or search_leases_changed or not handoff_is_safe:
+                current.handoff_summary = self._build_run_handoff(data, current)
+            saved_terminal = current.model_dump(mode="json")
+            runs[run_id] = saved_terminal
+            self._write_file(session_id, data)
+            return deepcopy(saved_terminal)
 
         if current.verification_enabled:
             current.verification_contract = RunRubricCompiler.expand_for_activations(
@@ -1217,11 +1505,421 @@ class SessionManager:
         current.model_call_count = incoming.model_call_count
         current.budget_exhaustion_reason = incoming.budget_exhaustion_reason
         current.finish(incoming.outcome, error=incoming.error)
+        if current.execution_mode == "delta_repair" and current.completed_at is not None:
+            emit_harness_metric(
+                logger,
+                "delta_repair_elapsed_ms",
+                session_id=session_id,
+                value=round(
+                    max(0.0, current.completed_at - current.created_at) * 1000,
+                    2,
+                ),
+                outcome=current.outcome.value if current.outcome is not None else "",
+            )
+        self._abandon_terminal_run_search_snapshots(data, current)
+        # A standalone Run has no later execution scope that may legally reuse
+        # its draft. Goal-revision drafts remain live until the Goal itself is
+        # accepted or otherwise terminal, so bounded continuation is preserved.
+        if not current.goal_id:
+            self._abandon_uncommitted_execution_leases(data, current)
+        current.handoff_summary = self._build_run_handoff(data, current)
         saved = current.model_dump(mode="json")
         runs[run_id] = saved
         harness["latest_run_id"] = run_id
         self._write_file(session_id, data)
         return deepcopy(saved)
+
+    @classmethod
+    def _build_run_handoff(cls, data: dict[str, Any], run: Any) -> Any:
+        from harness.models import RunHandoffSummary
+
+        scope_key = cls._todo_scope_key(
+            goal_id=run.goal_id,
+            goal_revision=run.goal_revision,
+            run_id=None if run.goal_id else run.run_id,
+        )
+        ledgers = data.get("todo_ledgers")
+        todos = ledgers.get(scope_key) if isinstance(ledgers, dict) else []
+        completed_todos = [
+            {
+                key: item.get(key)
+                for key in ("id", "content", "status", "parent_id")
+                if key in item
+            }
+            for item in (todos if isinstance(todos, list) else [])
+            if isinstance(item, dict) and item.get("status") in {"completed", "cancelled"}
+        ][-40:]
+        refs: list[dict[str, Any]] = []
+        for activation in run.verification_activations:
+            for raw in activation.evidence_refs:
+                if not isinstance(raw, dict):
+                    continue
+                projected = {
+                    key: raw.get(key)
+                    for key in (
+                        "kind",
+                        "scope",
+                        "role",
+                        "activation_id",
+                        "tool_call_id",
+                        "tool_name",
+                        "source_id",
+                        "result_id",
+                        "generation_id",
+                        "trace_id",
+                        "artifact_id",
+                        "path",
+                        "host_path",
+                        "virtual_path",
+                        "content_sha256",
+                        "size_bytes",
+                        "uri",
+                        "output_digest",
+                        "source_hash",
+                        "raw_output_ref",
+                        "run_id",
+                        "goal_id",
+                        "goal_revision",
+                    )
+                    if raw.get(key) is not None
+                }
+                if projected:
+                    refs.append(projected)
+        refs = [item for item in refs if cls._is_safe_handoff_evidence(data, item)]
+        workspace_artifact_refs = [
+            item
+            for item in refs
+            if item.get("kind") == "artifact_write"
+            and item.get("scope") in {"workspace", "attachment"}
+        ]
+        registry = data.get("delivered_artifacts")
+        delivery_refs = [
+            deepcopy(item)
+            for item in registry.values()
+            if isinstance(registry, dict)
+            and isinstance(item, dict)
+            and str(item.get("source_run_id") or "") == run.run_id
+        ] if isinstance(registry, dict) else []
+        artifact_refs = [*workspace_artifact_refs, *delivery_refs]
+        sql_refs = [
+            item
+            for item in refs
+            if str(item.get("tool_name") or "").startswith("database_sql_")
+            or item.get("generation_id")
+        ]
+        report = run.verification_report
+        durable_facts = []
+        if report is not None and report.status.value in {"satisfied", "not_required"}:
+            explanation = str(report.explanation or "").strip()
+            if explanation:
+                durable_facts.append(explanation[:500])
+        return RunHandoffSummary(
+            source_run_id=run.run_id,
+            goal_id=run.goal_id,
+            goal_revision=run.goal_revision,
+            terminal_status=run.outcome.value if run.outcome is not None else run.status.value,
+            objective=run.objective,
+            completed_todos=completed_todos,
+            durable_facts=durable_facts,
+            evidence_refs=refs[-100:],
+            artifact_refs=artifact_refs[-40:],
+            sql_generation_refs=sql_refs[-40:],
+            unresolved_gaps=(list(report.gaps) if report is not None else []),
+        )
+
+    @staticmethod
+    def _lease_matches_execution_scope(lease: dict[str, Any], run: Any) -> bool:
+        def field(name: str) -> Any:
+            return run.get(name) if isinstance(run, dict) else getattr(run, name, None)
+
+        goal_id = str(field("goal_id") or "")
+        if goal_id:
+            return (
+                str(lease.get("goal_id") or "") == goal_id
+                and int(lease.get("goal_revision") or 1)
+                == int(field("goal_revision") or field("objective_revision") or 1)
+            )
+        return (
+            not str(lease.get("goal_id") or "")
+            and str(lease.get("run_id") or "") == str(field("run_id") or "")
+            and str(lease.get("query_id") or "")
+            == str(field("query_id") or "")
+        )
+
+    @classmethod
+    def _abandon_uncommitted_execution_leases(
+        cls,
+        data: dict[str, Any],
+        run: Any,
+        *,
+        reason: str = "execution_scope_terminal",
+    ) -> bool:
+        """Close draft leases owned by a terminal Run or Goal revision.
+
+        The mutation is deliberately idempotent: committed and already
+        abandoned receipts are immutable audit records.
+        """
+
+        now = time.time()
+        changed = False
+        for collection_name, draft_statuses in (
+            ("external_artifact_leases", {"claiming", "staged"}),
+            ("external_directory_leases", {"claiming", "staged", "prepared"}),
+        ):
+            leases = data.get(collection_name)
+            if not isinstance(leases, dict):
+                continue
+            for lease in leases.values():
+                if (
+                    not isinstance(lease, dict)
+                    or str(lease.get("status") or "") not in draft_statuses
+                    or not cls._lease_matches_execution_scope(lease, run)
+                ):
+                    continue
+                lease["status"] = "abandoned"
+                lease.setdefault("abandoned_at", now)
+                lease.setdefault("abandoned_reason", reason)
+                changed = True
+        return changed
+
+    @staticmethod
+    def _abandon_terminal_run_search_snapshots(
+        data: dict[str, Any],
+        run: Any,
+    ) -> bool:
+        """Expire read-only search snapshots at every Run boundary.
+
+        Writable Goal-revision drafts intentionally survive a non-terminal Goal
+        Run. Search snapshots do not: they are derived from the permission state
+        of one concrete Run and must never turn a Run grant into Goal-scoped
+        access merely because the Goal reuses its scratch directory.
+        """
+
+        def field(name: str) -> Any:
+            return run.get(name) if isinstance(run, dict) else getattr(run, name, None)
+
+        run_id = str(field("run_id") or "")
+        query_id = str(field("query_id") or "")
+        if not run_id:
+            return False
+        now = time.time()
+        changed = False
+        for collection_name in (
+            "external_artifact_leases",
+            "external_directory_leases",
+        ):
+            leases = data.get(collection_name)
+            if not isinstance(leases, dict):
+                continue
+            for lease in leases.values():
+                if (
+                    not isinstance(lease, dict)
+                    or str(lease.get("status") or "") != "search_snapshot"
+                    or str(lease.get("run_id") or "") != run_id
+                    or (
+                        query_id
+                        and str(lease.get("query_id") or "") != query_id
+                    )
+                ):
+                    continue
+                lease["status"] = "abandoned"
+                lease.setdefault("abandoned_at", now)
+                lease.setdefault("abandoned_reason", "run_search_snapshot_terminal")
+                changed = True
+        return changed
+
+    @staticmethod
+    def _external_draft_paths_overlap(
+        *,
+        first_kind: str,
+        first_path: str,
+        second_kind: str,
+        second_path: str,
+    ) -> bool:
+        """Return whether two writable draft claims cover any same formal file."""
+
+        first = Path(first_path).expanduser().resolve()
+        second = Path(second_path).expanduser().resolve()
+        if first_kind == "exact_file" and second_kind == "exact_file":
+            return first == second
+        if first_kind == "exact_directory" and second_kind == "exact_directory":
+            try:
+                first.relative_to(second)
+                return True
+            except ValueError:
+                try:
+                    second.relative_to(first)
+                    return True
+                except ValueError:
+                    return False
+        file_path, directory_path = (
+            (first, second)
+            if first_kind == "exact_file"
+            else (second, first)
+        )
+        try:
+            file_path.relative_to(directory_path)
+            return True
+        except ValueError:
+            return False
+
+    @_session_write_locked
+    def claim_external_draft(
+        self,
+        session_id: str,
+        *,
+        lease_kind: str,
+        lease: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Atomically reserve one authoritative writable draft surface.
+
+        Exact-file and directory leases share this conflict check, so the same
+        formal file cannot silently acquire two writable scratch authorities.
+        Read-only search snapshots never enter the active status set.
+        """
+
+        if lease_kind not in {"exact_file", "exact_directory"}:
+            raise ValueError(f"unsupported external draft kind: {lease_kind}")
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        lease_id = str(lease.get("lease_id") or "")
+        target_path = str(
+            lease.get("target_path")
+            if lease_kind == "exact_file"
+            else lease.get("directory_path")
+            or ""
+        )
+        if not lease_id or not target_path:
+            raise ValueError("external draft claim requires lease_id and target path")
+
+        now = time.time()
+        collections = (
+            ("external_artifact_leases", "exact_file", {"claiming", "staged"}),
+            (
+                "external_directory_leases",
+                "exact_directory",
+                {"claiming", "staged", "prepared"},
+            ),
+        )
+        for collection_name, existing_kind, active_statuses in collections:
+            leases = data.get(collection_name)
+            if not isinstance(leases, dict):
+                continue
+            for existing in leases.values():
+                if not isinstance(existing, dict):
+                    continue
+                status = str(existing.get("status") or "")
+                if status not in active_statuses:
+                    continue
+                if float(existing.get("expires_at") or 0) < now:
+                    existing["status"] = "abandoned"
+                    existing.setdefault("abandoned_at", now)
+                    existing.setdefault("abandoned_reason", "draft_claim_expired")
+                    continue
+                if str(existing.get("lease_id") or "") == lease_id:
+                    continue
+                existing_path = str(
+                    existing.get("target_path")
+                    if existing_kind == "exact_file"
+                    else existing.get("directory_path")
+                    or ""
+                )
+                if existing_path and self._external_draft_paths_overlap(
+                    first_kind=lease_kind,
+                    first_path=target_path,
+                    second_kind=existing_kind,
+                    second_path=existing_path,
+                ):
+                    raise RuntimeError(
+                        "authoritative writable draft conflict: "
+                        f"requested {lease_kind} {target_path}, but active "
+                        f"{existing_kind} lease {existing.get('lease_id')} covers "
+                        f"{existing_path}. Continue from that lease or abandon it first."
+                    )
+
+        collection_name = (
+            "external_artifact_leases"
+            if lease_kind == "exact_file"
+            else "external_directory_leases"
+        )
+        leases = data.setdefault(collection_name, {})
+        saved = deepcopy(lease)
+        saved["status"] = "claiming"
+        leases[lease_id] = saved
+        self._write_file(session_id, data)
+        return deepcopy(saved)
+
+    @staticmethod
+    def _is_durable_handoff_artifact(data: dict[str, Any], artifact: dict[str, Any]) -> bool:
+        """Return whether an artifact is a formal, durable delivery reference."""
+
+        paths = [
+            str(artifact.get(key) or "").replace("\\", "/")
+            for key in ("path", "host_path", "virtual_path")
+        ]
+        if (
+            str(artifact.get("scope") or "") == "scratch"
+            or str(artifact.get("role") or "") == "temporary"
+            or any(path.startswith("/scratch/") or "/scratch/validation/" in path for path in paths)
+        ):
+            return False
+
+        scope = str(artifact.get("scope") or "")
+        role = str(artifact.get("role") or "")
+        if scope in {"workspace", "attachment"}:
+            return role == "target"
+        if scope not in {"", "external"}:
+            return False
+
+        target = str(artifact.get("host_path") or artifact.get("path") or "")
+        content_sha256 = str(artifact.get("content_sha256") or "")
+        leases = data.get("external_artifact_leases")
+        if isinstance(leases, dict):
+            for lease in leases.values():
+                if not isinstance(lease, dict) or lease.get("status") != "committed":
+                    continue
+                if str(lease.get("target_path") or "") != target:
+                    continue
+                committed_sha256 = str(lease.get("committed_sha256") or "")
+                if not content_sha256 or not committed_sha256 or content_sha256 == committed_sha256:
+                    return True
+
+        directory_leases = data.get("external_directory_leases")
+        if isinstance(directory_leases, dict):
+            try:
+                target_path = Path(target).expanduser().resolve()
+            except (OSError, RuntimeError, ValueError):
+                return False
+            for lease in directory_leases.values():
+                if not isinstance(lease, dict) or lease.get("status") != "committed":
+                    continue
+                try:
+                    target_path.relative_to(Path(str(lease.get("directory_path") or "")).expanduser().resolve())
+                except (OSError, RuntimeError, ValueError):
+                    continue
+                return True
+        return False
+
+    @classmethod
+    def _is_safe_handoff_evidence(
+        cls,
+        data: dict[str, Any],
+        evidence: dict[str, Any],
+    ) -> bool:
+        paths = [
+            str(evidence.get(key) or "").replace("\\", "/")
+            for key in ("path", "host_path", "virtual_path")
+        ]
+        if (
+            str(evidence.get("scope") or "") == "scratch"
+            or str(evidence.get("role") or "") == "temporary"
+            or any(path.startswith("/scratch/") or "/scratch/validation/" in path for path in paths)
+        ):
+            return False
+        if evidence.get("kind") == "artifact_write":
+            return cls._is_durable_handoff_artifact(data, evidence)
+        return True
 
     @_session_write_locked
     def update_terminal_run_verification_report(
@@ -1425,6 +2123,233 @@ class SessionManager:
         return deepcopy(saved["task_profile"])
 
     @_session_write_locked
+    def record_run_skill_activation(
+        self,
+        session_id: str,
+        run_id: str,
+        activation: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist a verified Skill activation without granting Session scope."""
+
+        from harness.models import RunRecord, RunStatus, SkillActivation
+
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        raw_run = runs.get(run_id) if isinstance(runs, dict) else None
+        if not isinstance(raw_run, dict):
+            raise ValueError(f"Run {run_id} does not exist in session {session_id}")
+        run = RunRecord.model_validate(raw_run)
+        if run.status in {
+            RunStatus.COMPLETED,
+            RunStatus.CANCELLED,
+            RunStatus.FAILED,
+            RunStatus.BLOCKED,
+            RunStatus.BUDGET_EXCEEDED,
+            RunStatus.VERIFICATION_FAILED,
+        }:
+            raise ValueError(f"Terminal Run {run_id} cannot activate a Skill")
+        candidate = SkillActivation.model_validate(
+            {
+                **activation,
+                "run_id": run_id,
+                "goal_id": run.goal_id,
+                "goal_revision": run.goal_revision,
+                "scope": "run",
+            }
+        )
+        by_id = {item.activation_id: item for item in run.skill_activations}
+        by_id[candidate.activation_id] = candidate
+        run.skill_activations = list(by_id.values())
+        run.updated_at = time.time()
+        runs[run_id] = run.model_dump(mode="json")
+
+        if run.goal_id:
+            goals = harness.get("goals") if isinstance(harness, dict) else None
+            raw_goal = goals.get(run.goal_id) if isinstance(goals, dict) else None
+            if isinstance(raw_goal, dict) and int(
+                raw_goal.get("objective_revision") or 1
+            ) == int(run.goal_revision or 1):
+                inherited = SkillActivation.model_validate(
+                    candidate.model_copy(update={"scope": "goal"})
+                )
+                existing = [
+                    item
+                    for item in raw_goal.get("skill_activations") or []
+                    if isinstance(item, dict)
+                    and str(item.get("activation_id") or "")
+                    != inherited.activation_id
+                ]
+                raw_goal["skill_activations"] = [
+                    *existing,
+                    inherited.model_dump(mode="json"),
+                ]
+                raw_goal["updated_at"] = time.time()
+        self._write_file(session_id, data)
+        return candidate.model_dump(mode="json")
+
+    def get_effective_run_skill_activations(
+        self,
+        session_id: str,
+        run_id: str,
+    ) -> list[dict[str, Any]]:
+        """Return current-Run activations plus relevant same-Goal inheritance."""
+
+        from harness.models import RunRecord, SkillActivation
+
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        raw_run = runs.get(run_id) if isinstance(runs, dict) else None
+        if not isinstance(raw_run, dict):
+            return []
+        run = RunRecord.model_validate(raw_run)
+        activations = list(run.skill_activations)
+        if run.goal_id:
+            goals = harness.get("goals") if isinstance(harness, dict) else None
+            raw_goal = goals.get(run.goal_id) if isinstance(goals, dict) else None
+            if isinstance(raw_goal, dict) and int(
+                raw_goal.get("objective_revision") or 1
+            ) == int(run.goal_revision or 1):
+                for raw in raw_goal.get("skill_activations") or []:
+                    if not isinstance(raw, dict):
+                        continue
+                    try:
+                        activation = SkillActivation.model_validate(raw)
+                    except ValueError:
+                        continue
+                    if int(activation.goal_revision or 1) == int(run.goal_revision or 1):
+                        activations.append(activation)
+        unique = {item.activation_id: item for item in activations}
+        return [item.model_dump(mode="json") for item in unique.values()]
+
+    @_session_write_locked
+    def record_run_capability_manifest(
+        self,
+        session_id: str,
+        run_id: str,
+        manifest: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist the exact prompt/schema authority used by one model call."""
+
+        from harness.models import CapabilityManifest, RunRecord, RunStatus
+
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        raw_run = runs.get(run_id) if isinstance(runs, dict) else None
+        if not isinstance(raw_run, dict):
+            raise ValueError(f"Run {run_id} does not exist in session {session_id}")
+        run = RunRecord.model_validate(raw_run)
+        if run.status in {
+            RunStatus.COMPLETED,
+            RunStatus.CANCELLED,
+            RunStatus.FAILED,
+            RunStatus.BLOCKED,
+            RunStatus.BUDGET_EXCEEDED,
+            RunStatus.VERIFICATION_FAILED,
+        }:
+            raise ValueError(f"Terminal Run {run_id} cannot change capabilities")
+        parsed = CapabilityManifest.model_validate({**manifest, "run_id": run_id})
+        run.capability_manifest = parsed
+        run.updated_at = time.time()
+        runs[run_id] = run.model_dump(mode="json")
+        self._write_file(session_id, data)
+        return parsed.model_dump(mode="json")
+
+    @_session_write_locked
+    def record_delegation_contract(
+        self,
+        session_id: str,
+        run_id: str,
+        contract: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist one immutable server-authored subagent contract."""
+
+        from harness.models import DelegationContract, RunRecord
+
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        raw_run = runs.get(run_id) if isinstance(runs, dict) else None
+        if not isinstance(raw_run, dict):
+            raise ValueError(f"Run {run_id} does not exist in session {session_id}")
+        parsed = DelegationContract.model_validate(
+            {**contract, "session_id": session_id, "parent_run_id": run_id}
+        )
+        run = RunRecord.model_validate(raw_run)
+        existing = {item.subagent_run_id: item for item in run.delegation_contracts}
+        if parsed.subagent_run_id in existing and existing[parsed.subagent_run_id] != parsed:
+            raise ValueError(f"Delegation {parsed.subagent_run_id} is immutable")
+        existing[parsed.subagent_run_id] = parsed
+        run.delegation_contracts = list(existing.values())
+        run.updated_at = time.time()
+        runs[run_id] = run.model_dump(mode="json")
+        self._write_file(session_id, data)
+        return parsed.model_dump(mode="json")
+
+    @_session_write_locked
+    def record_delegation_event(
+        self,
+        session_id: str,
+        run_id: str,
+        event: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Append an idempotent nested subagent lifecycle event."""
+
+        from harness.models import RunRecord
+
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        raw_run = runs.get(run_id) if isinstance(runs, dict) else None
+        if not isinstance(raw_run, dict):
+            raise ValueError(f"Run {run_id} does not exist in session {session_id}")
+        run = RunRecord.model_validate(raw_run)
+        payload = deepcopy(event)
+        event_id = str(payload.get("event_id") or "")
+        if not event_id:
+            raise ValueError("delegation event_id is required")
+        by_id = {
+            str(item.get("event_id") or ""): item
+            for item in run.delegation_events
+            if isinstance(item, dict) and item.get("event_id")
+        }
+        by_id[event_id] = payload
+        run.delegation_events = list(by_id.values())
+        run.updated_at = time.time()
+        runs[run_id] = run.model_dump(mode="json")
+        self._write_file(session_id, data)
+        return deepcopy(payload)
+
+    @_session_write_locked
+    def record_delegation_result(
+        self,
+        session_id: str,
+        run_id: str,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist one terminal structured handoff from a subagent."""
+
+        from harness.models import DelegationResultEnvelope, RunRecord
+
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        raw_run = runs.get(run_id) if isinstance(runs, dict) else None
+        if not isinstance(raw_run, dict):
+            raise ValueError(f"Run {run_id} does not exist in session {session_id}")
+        parsed = DelegationResultEnvelope.model_validate(result)
+        run = RunRecord.model_validate(raw_run)
+        by_id = {item.subagent_run_id: item for item in run.delegation_results}
+        by_id[parsed.subagent_run_id] = parsed
+        run.delegation_results = list(by_id.values())
+        run.updated_at = time.time()
+        runs[run_id] = run.model_dump(mode="json")
+        self._write_file(session_id, data)
+        return parsed.model_dump(mode="json")
+
+    @_session_write_locked
     def start_harness_run(
         self,
         session_id: str,
@@ -1588,6 +2513,8 @@ class SessionManager:
             if harness.get("active_goal_id") == goal_id:
                 harness.pop("active_goal_id", None)
         raw_goal["updated_at"] = now
+        if raw_goal.get("status") in {"cancelled", "budget_exceeded", "achieved"}:
+            self._abandon_uncommitted_execution_leases(data, raw_goal)
         self._write_file(session_id, data)
         return deepcopy(raw_goal)
 
@@ -1712,10 +2639,23 @@ class SessionManager:
         # revision. Runs remain in history for audit, but old receipts cannot
         # satisfy a materially revised objective.
         raw_goal["evidence_refs"] = []
+        raw_goal["skill_activations"] = []
         raw_goal["latest_verification_report_id"] = None
         raw_goal["latest_goal_decision"] = None
         raw_goal["budget_exhaustion_reason"] = None
         raw_goal["updated_at"] = time.time()
+        # A revised objective establishes a new immutable execution authority.
+        # Old-revision drafts cannot remain writable or they will both block the
+        # replacement revision and risk being committed under the wrong
+        # acceptance contract. This mutation shares the Goal revision CAS/write.
+        self._abandon_uncommitted_execution_leases(
+            data,
+            {
+                "goal_id": goal_id,
+                "goal_revision": current_revision,
+            },
+            reason="goal_revision_superseded",
+        )
         self._write_file(session_id, data)
         return deepcopy(raw_goal)
 
@@ -1778,6 +2718,16 @@ class SessionManager:
                     float(saved.get("updated_at") or 0),
                 )
                 saved = authoritative
+            elif existing_revision == incoming_revision:
+                activations = {
+                    str(item.get("activation_id")): deepcopy(item)
+                    for item in [
+                        *(existing.get("skill_activations") or []),
+                        *(saved.get("skill_activations") or []),
+                    ]
+                    if isinstance(item, dict) and item.get("activation_id")
+                }
+                saved["skill_activations"] = list(activations.values())
         goals[goal_id] = saved
         goal_order = harness.setdefault("goal_order", [])
         if goal_id not in goal_order:
@@ -1842,6 +2792,15 @@ class SessionManager:
         else:
             saved = incoming
             saved["current_run_id"] = None
+            activations = {
+                str(item.get("activation_id")): deepcopy(item)
+                for item in [
+                    *(existing.get("skill_activations") or []),
+                    *(saved.get("skill_activations") or []),
+                ]
+                if isinstance(item, dict) and item.get("activation_id")
+            }
+            saved["skill_activations"] = list(activations.values())
 
         # Merge notices written by the control endpoint after the coordinator
         # loaded its snapshot, then consume the latest requested transition.
@@ -1860,6 +2819,8 @@ class SessionManager:
         saved["updated_at"] = time.time()
 
         goals[goal_id] = saved
+        if saved.get("status") in {"achieved", "cancelled", "budget_exceeded"}:
+            self._abandon_uncommitted_execution_leases(data, saved)
         if saved.get("status") == "active":
             harness["active_goal_id"] = goal_id
         elif harness.get("active_goal_id") == goal_id:
@@ -1924,8 +2885,9 @@ class SessionManager:
             "latest_query_id": data.get("latest_query_id"),
             "latest_trace_id": data.get("latest_trace_id"),
         }
-        if isinstance(session.get("todos"), list):
-            result["todos"] = list(session["todos"])
+        todos, authority = self._current_todo_projection(session)
+        result["todos"] = todos
+        result["todos_authority"] = authority
         if isinstance(session.get("graph"), dict):
             result["graph"] = dict(session["graph"])
         return result
@@ -2005,10 +2967,17 @@ class SessionManager:
                     )
         # Lightweight runtime state remains available, but trace data has a
         # dedicated lazy endpoint and is never read by the conversation view.
-        if isinstance(data.get("todos"), list):
-            data["todos"] = list(data["todos"])
-        else:
-            data.pop("todos", None)
+        todos, authority = self._current_todo_projection(data)
+        legacy_todos = data.get("todos")
+        if isinstance(legacy_todos, list) and legacy_todos != todos:
+            emit_harness_metric(
+                logger,
+                "goal_todo_projection_mismatch_count",
+                session_id=session_id,
+                authority=authority.get("kind"),
+            )
+        data["todos"] = todos
+        data["todos_authority"] = authority
         if isinstance(data.get("graph"), dict):
             data["graph"] = dict(data["graph"])
         else:
@@ -2906,23 +3875,413 @@ class SessionManager:
         self,
         session_id: str,
         messages: list[dict[str, Any]],
+        *,
+        run_id: str | None = None,
     ) -> None:
         """Persist DeepAgents' compact model context separately from UI history."""
         data = self._read_file(session_id)
         if not data:
             return
         data["agent_context_messages"] = messages
+        data["agent_context_run_id"] = run_id
         self._write_file(session_id, data)
 
-    def get_agent_context_messages(self, session_id: str) -> list[dict[str, Any]]:
+    def get_agent_context_messages(
+        self,
+        session_id: str,
+        *,
+        run_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Load the compact model context saved by a previous Agent turn."""
         data = self._read_file(session_id)
         if not data:
+            return []
+        if run_id is not None and data.get("agent_context_run_id") != run_id:
             return []
         messages = data.get("agent_context_messages")
         if not isinstance(messages, list):
             return []
         return [item for item in messages if isinstance(item, dict)]
+
+    @_session_write_locked
+    def register_delivered_artifact(
+        self,
+        session_id: str,
+        *,
+        target_path: str,
+        content_sha256: str,
+        source_run_id: str,
+        source_query_id: str,
+        source_goal_id: str | None = None,
+        source_goal_revision: int | None = None,
+        related_artifact_ids: list[str] | None = None,
+        contract_ids: list[str] | None = None,
+        validation_receipt_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Persist the formal target/hash produced by a successful commit.
+
+        The artifact id is stable for the formal target while each content
+        version gets an immutable delivery receipt in the history ledger.
+        Scratch paths are execution state and are deliberately rejected.
+        """
+
+        from harness.models import DeliveredArtifact
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        normalized_target = str(Path(target_path).expanduser().resolve())
+        if normalized_target.startswith("/scratch/"):
+            raise ValueError("delivered artifacts require a formal non-scratch target")
+        if not str(content_sha256).startswith("sha256:"):
+            raise ValueError("delivered artifacts require content_sha256")
+        artifact_id = "artifact-" + hashlib.sha256(
+            f"external\0{normalized_target}".encode()
+        ).hexdigest()[:20]
+        delivery_receipt_id = "delivery-" + hashlib.sha256(
+            f"{artifact_id}\0{content_sha256}".encode()
+        ).hexdigest()[:20]
+        now = time.time()
+        registry = data.setdefault("delivered_artifacts", {})
+        previous = registry.get(artifact_id)
+        created_at = (
+            float(previous.get("created_at") or now)
+            if isinstance(previous, dict)
+            else now
+        )
+        harness = data.get("harness")
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        source_run = runs.get(source_run_id) if isinstance(runs, dict) else None
+        source_skill_ids = sorted(
+            {
+                str(item.get("skill_id") or "")
+                for item in (
+                    source_run.get("skill_activations")
+                    if isinstance(source_run, dict)
+                    else []
+                )
+                if isinstance(item, dict) and str(item.get("skill_id") or "")
+            }
+        )
+        requested_validation_ids = {
+            str(item) for item in (validation_receipt_ids or []) if str(item)
+        }
+        receipt_refs: list[dict[str, Any]] = []
+        for activation in (
+            source_run.get("verification_activations")
+            if isinstance(source_run, dict)
+            else []
+        ) or []:
+            if isinstance(activation, dict):
+                receipt_refs.extend(
+                    ref
+                    for ref in activation.get("evidence_refs") or []
+                    if isinstance(ref, dict) and ref.get("kind") == "validation_receipt"
+                )
+        goals = harness.get("goals") if isinstance(harness, dict) else None
+        source_goal = (
+            goals.get(source_goal_id)
+            if isinstance(goals, dict) and source_goal_id
+            else None
+        )
+        if (
+            isinstance(source_goal, dict)
+            and source_goal.get("objective_revision") == source_goal_revision
+        ):
+            receipt_refs.extend(
+                ref
+                for ref in source_goal.get("evidence_refs") or []
+                if isinstance(ref, dict) and ref.get("kind") == "validation_receipt"
+            )
+
+        def receipt_matches_delivery(ref: dict[str, Any]) -> bool:
+            if (
+                str(ref.get("validation_receipt_id") or "")
+                not in requested_validation_ids
+                or not bool(ref.get("commit_authority"))
+                or str(ref.get("status") or "passed") != "passed"
+                or int(ref.get("exit_code", -1)) != 0
+                or int(ref.get("checks_failed") or 0) != 0
+            ):
+                return False
+            return any(
+                isinstance(item, dict)
+                and str(Path(str(item.get("path") or "")).expanduser().resolve())
+                == normalized_target
+                and str(item.get("content_sha256") or "") == content_sha256
+                for item in ref.get("artifact_refs") or []
+            )
+
+        accepted_receipts = [
+            ref for ref in receipt_refs if receipt_matches_delivery(ref)
+        ]
+        selected_validation_ids = {
+            str(ref.get("validation_receipt_id") or "")
+            for ref in accepted_receipts
+            if str(ref.get("validation_receipt_id") or "")
+        }
+        inferred_contract_ids = {
+            str(ref.get("validator_version") or "")
+            for ref in accepted_receipts
+            if str(ref.get("validator_kind") or "") == "artifact_ui_contract"
+            and str(ref.get("validator_version") or "")
+        }
+        inferred_related_ids = {
+            "artifact-"
+            + hashlib.sha256(
+                f"external\0{str(Path(str(item.get('path') or '')).expanduser().resolve())}".encode()
+            ).hexdigest()[:20]
+            for ref in accepted_receipts
+            if str(ref.get("validator_kind") or "") == "artifact_ui_contract"
+            for item in ref.get("artifact_refs") or []
+            if isinstance(item, dict)
+            and str(item.get("path") or "")
+            and str(Path(str(item.get("path") or "")).expanduser().resolve())
+            != normalized_target
+        }
+        selected_related_ids = inferred_related_ids | {
+            str(item)
+            for item in (related_artifact_ids or [])
+            if str(item) and str(item) != artifact_id
+        }
+        payload = DeliveredArtifact(
+            artifact_id=artifact_id,
+            target_path=normalized_target,
+            content_sha256=content_sha256,
+            delivery_receipt_id=delivery_receipt_id,
+            status="active",
+            related_artifact_ids=sorted(selected_related_ids),
+            contract_ids=sorted(
+                {
+                    *inferred_contract_ids,
+                    *(str(item) for item in (contract_ids or []) if str(item)),
+                }
+            ),
+            validation_receipt_ids=sorted(selected_validation_ids),
+            source_skill_ids=source_skill_ids,
+            source_run_id=source_run_id,
+            source_query_id=source_query_id,
+            source_goal_id=source_goal_id,
+            source_goal_revision=source_goal_revision,
+            created_at=created_at,
+            updated_at=now,
+        ).model_dump(mode="json")
+        registry[artifact_id] = payload
+        history = data.setdefault("artifact_delivery_history", [])
+        if not any(
+            isinstance(item, dict)
+            and item.get("delivery_receipt_id") == delivery_receipt_id
+            for item in history
+        ):
+            history.append(deepcopy(payload))
+            if len(history) > 500:
+                del history[:-500]
+        self._write_file(session_id, data)
+        return deepcopy(payload)
+
+    @_session_write_locked
+    def mark_delivered_artifact_deleted(
+        self,
+        session_id: str,
+        *,
+        target_path: str,
+        source_run_id: str,
+        source_query_id: str,
+    ) -> dict[str, Any] | None:
+        """Tombstone a formally delivered target removed by a committed plan."""
+
+        data = self._read_file(session_id)
+        registry = data.get("delivered_artifacts") if data else None
+        if not isinstance(registry, dict):
+            return None
+        normalized_target = str(Path(target_path).expanduser().resolve())
+        artifact_id = "artifact-" + hashlib.sha256(
+            f"external\0{normalized_target}".encode()
+        ).hexdigest()[:20]
+        current = registry.get(artifact_id)
+        if not isinstance(current, dict):
+            return None
+        tombstone = dict(current)
+        now = time.time()
+        tombstone.update(
+            {
+                "status": "deleted",
+                "deleted_at": now,
+                "stale_reason": "deleted_by_committed_directory_plan",
+                "source_run_id": source_run_id,
+                "source_query_id": source_query_id,
+                "updated_at": now,
+            }
+        )
+        registry[artifact_id] = tombstone
+        self._write_file(session_id, data)
+        return deepcopy(tombstone)
+
+    @_session_write_locked
+    def restore_delivered_artifact_registry_entries(
+        self,
+        session_id: str,
+        entries: dict[str, dict[str, Any] | None],
+    ) -> None:
+        """Restore registry heads after a failed cross-store directory commit."""
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        registry = data.setdefault("delivered_artifacts", {})
+        for artifact_id, previous in entries.items():
+            if isinstance(previous, dict):
+                registry[artifact_id] = deepcopy(previous)
+            else:
+                registry.pop(artifact_id, None)
+        self._write_file(session_id, data)
+
+    @staticmethod
+    def _fresh_artifact_view(item: dict[str, Any]) -> dict[str, Any]:
+        """Return current target freshness without mutating registry history."""
+
+        view = deepcopy(item)
+        if str(view.get("status") or "active") != "active":
+            return view
+        target = Path(str(view.get("target_path") or "")).expanduser()
+        try:
+            if not target.is_file():
+                view.update(status="stale", stale_reason="target_missing")
+                return view
+            digest = "sha256:" + hashlib.sha256(target.read_bytes()).hexdigest()
+        except OSError as exc:
+            view.update(status="stale", stale_reason=f"target_unreadable:{type(exc).__name__}")
+            return view
+        if digest != str(view.get("content_sha256") or ""):
+            view.update(
+                status="stale",
+                stale_reason="target_hash_mismatch",
+                observed_content_sha256=digest,
+            )
+        return view
+
+    def list_delivered_artifacts(
+        self,
+        session_id: str,
+        *,
+        verify_freshness: bool = False,
+        include_inactive: bool = True,
+    ) -> list[dict[str, Any]]:
+        data = self._read_file(session_id)
+        registry = data.get("delivered_artifacts") if data else None
+        if not isinstance(registry, dict):
+            return []
+        artifacts = [deepcopy(item) for item in registry.values() if isinstance(item, dict)]
+        if verify_freshness:
+            artifacts = [self._fresh_artifact_view(item) for item in artifacts]
+        if not include_inactive:
+            artifacts = [
+                item for item in artifacts if str(item.get("status") or "active") == "active"
+            ]
+        artifacts.sort(key=lambda item: float(item.get("updated_at") or 0), reverse=True)
+        return artifacts
+
+    def resolve_follow_up_artifacts(
+        self,
+        session_id: str,
+        objective: str,
+        *,
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        """Conservatively relate a standalone prompt to recent formal artifacts.
+
+        This is continuity resolution, not task/Skill classification. An
+        explicit path/name match wins; otherwise only clear follow-up language
+        may select the latest delivered group.
+        """
+
+        registered_artifacts = self.list_delivered_artifacts(session_id)
+        artifacts = self.list_delivered_artifacts(
+            session_id,
+            verify_freshness=True,
+            include_inactive=False,
+        )
+        if not artifacts:
+            if registered_artifacts:
+                emit_harness_metric(
+                    logger,
+                    "artifact_handoff_stale_ref_count",
+                    session_id=session_id,
+                    value=len(registered_artifacts),
+                )
+            return []
+        text = str(objective or "").strip().lower()
+        explicit: list[dict[str, Any]] = []
+        for item in artifacts:
+            target = str(item.get("target_path") or "").strip().lower()
+            name = Path(target).name if target else ""
+            if target and (target in text or (name and name in text)):
+                explicit.append(item)
+        if explicit:
+            selected_ids = {
+                str(item.get("artifact_id") or "") for item in explicit
+            }
+            for item in explicit:
+                selected_ids.update(
+                    str(value) for value in item.get("related_artifact_ids") or []
+                )
+            resolved = [
+                item
+                for item in artifacts
+                if str(item.get("artifact_id") or "") in selected_ids
+            ][: max(1, limit)]
+            emit_harness_metric(
+                logger,
+                "artifact_handoff_hit_count",
+                session_id=session_id,
+                value=len(resolved),
+                route="explicit",
+            )
+            return resolved
+        if not re.search(
+            r"(?:继续(?:修改|修复|更新|补充)|再试|再来|还是(?:没有|没|不对)|仍然(?:没有|没|不对)|还没|没有更新|没更新|补上|修复(?:这个|该)|(?:这个|刚才|上一轮).*(?:产物|文件|报告|图表|页面|代码).*(?:不对|有误|没更新|修复))",
+            text,
+        ):
+            return []
+        latest = artifacts[0]
+        data = self._read_file(session_id)
+        latest_assistant_query_id = next(
+            (
+                str(message.get("query_id") or "")
+                for message in reversed(data.get("messages") or [])
+                if isinstance(message, dict)
+                and message.get("role") == "assistant"
+                and str(message.get("query_id") or "")
+            ),
+            "",
+        )
+        if latest_assistant_query_id != str(latest.get("source_query_id") or ""):
+            return []
+        source_run_id = str(latest.get("source_run_id") or "")
+        source_goal_id = str(latest.get("source_goal_id") or "")
+        resolved = [
+            item
+            for item in artifacts
+            if (
+                source_run_id
+                and str(item.get("source_run_id") or "") == source_run_id
+            )
+            or (
+                source_goal_id
+                and str(item.get("source_goal_id") or "") == source_goal_id
+                and item.get("source_goal_revision")
+                == latest.get("source_goal_revision")
+            )
+        ][: max(1, limit)]
+        if resolved:
+            emit_harness_metric(
+                logger,
+                "artifact_handoff_hit_count",
+                session_id=session_id,
+                value=len(resolved),
+                route="deictic",
+            )
+        return resolved
 
     @_session_write_locked
     def upsert_external_artifact_lease(
@@ -3062,6 +4421,127 @@ class SessionManager:
         if not isinstance(leases, dict):
             return []
         return [deepcopy(lease) for lease in leases.values() if isinstance(lease, dict)]
+
+    def resolve_terminal_scratch_reference(
+        self,
+        session_id: str,
+        scratch_path: str,
+    ) -> dict[str, Any] | None:
+        """Resolve an old lease path to formal delivery state, never to sibling guesses."""
+
+        def observed(payload: dict[str, Any]) -> dict[str, Any]:
+            emit_harness_metric(
+                logger,
+                "terminal_scratch_ref_recovery_count",
+                session_id=session_id,
+                status=payload.get("status"),
+            )
+            return payload
+
+        normalized = str(PurePosixPath(scratch_path.replace("\\", "/")))
+        for lease in self.list_external_artifact_leases(session_id):
+            staged_path = str(lease.get("staged_path") or "").replace("\\", "/")
+            if not staged_path or normalized != staged_path:
+                continue
+            if lease.get("status") == "committed":
+                formal_target = str(lease.get("target_path") or "")
+                artifact_id = str(lease.get("delivered_artifact_id") or "")
+                latest = next(
+                    (
+                        item
+                        for item in self.list_delivered_artifacts(
+                            session_id,
+                            verify_freshness=True,
+                            include_inactive=True,
+                        )
+                        if (
+                            artifact_id
+                            and str(item.get("artifact_id") or "") == artifact_id
+                        )
+                        or (
+                            formal_target
+                            and str(item.get("target_path") or "") == formal_target
+                        )
+                    ),
+                    None,
+                )
+                if not isinstance(latest, dict) or str(latest.get("status") or "active") != "active":
+                    return observed({
+                        "status": "artifact_stale",
+                        "formal_target_path": formal_target or None,
+                        "stale_reason": (
+                            latest.get("stale_reason")
+                            if isinstance(latest, dict)
+                            else "delivery_registry_missing"
+                        ),
+                    })
+                return observed({
+                    "status": "durable",
+                    "formal_target_path": latest.get("target_path"),
+                    "content_sha256": latest.get("content_sha256"),
+                    "delivered_artifact_id": latest.get("artifact_id"),
+                })
+            if lease.get("status") in {"abandoned", "superseded", "expired"}:
+                return observed({
+                    "status": "artifact_not_durable",
+                    "lease_id": lease.get("lease_id"),
+                    "lease_status": lease.get("status"),
+                })
+            return None
+        for lease in self.list_external_directory_leases(session_id):
+            staged_dir = str(lease.get("staged_dir") or "").replace("\\", "/").rstrip("/")
+            if not staged_dir or not (
+                normalized == staged_dir or normalized.startswith(f"{staged_dir}/")
+            ):
+                continue
+            if lease.get("status") == "committed":
+                relative = posixpath.relpath(normalized, staged_dir)
+                target = str(
+                    (
+                        Path(str(lease.get("directory_path") or "")).expanduser().resolve()
+                        / relative
+                    ).resolve()
+                )
+                artifact = next(
+                    (
+                        item
+                        for item in self.list_delivered_artifacts(
+                            session_id,
+                            verify_freshness=True,
+                            include_inactive=True,
+                        )
+                        if str(item.get("target_path") or "") == target
+                    ),
+                    None,
+                )
+                if not isinstance(artifact, dict) or str(artifact.get("status") or "active") != "active":
+                    return observed({
+                        "status": "artifact_stale",
+                        "formal_target_path": target,
+                        "stale_reason": (
+                            artifact.get("stale_reason")
+                            if isinstance(artifact, dict)
+                            else "delivery_registry_missing"
+                        ),
+                    })
+                return observed({
+                    "status": "durable",
+                    "formal_target_path": target,
+                    "content_sha256": (
+                        artifact.get("content_sha256") if isinstance(artifact, dict) else None
+                    ),
+                    "delivered_artifact_id": (
+                        artifact.get("artifact_id") if isinstance(artifact, dict) else None
+                    ),
+                })
+            if lease.get("status") in {"abandoned", "superseded", "expired"}:
+                return observed({
+                    "status": "artifact_not_durable",
+                    "lease_id": lease.get("lease_id"),
+                    "lease_status": lease.get("status"),
+                })
+            return None
+        return None
 
     def find_staged_external_directory_lease(
         self,
@@ -3268,6 +4748,7 @@ class SessionManager:
         *,
         used_tokens: int,
         messages: list[dict[str, Any]] | None = None,
+        run_id: str | None = None,
     ) -> None:
         """Atomically persist Agent usage and, when compacted, its model context."""
         data = self._read_file(session_id)
@@ -3276,6 +4757,7 @@ class SessionManager:
         data["agent_context_usage"] = max(0, int(used_tokens))
         if messages is not None:
             data["agent_context_messages"] = messages
+            data["agent_context_run_id"] = run_id
         self._write_file(session_id, data)
 
     # ── Permission grants ─────────────────────────────────────────────────────
@@ -3289,7 +4771,13 @@ class SessionManager:
         grants = permissions.get("grants") if isinstance(permissions, dict) else None
         if not isinstance(grants, list):
             return []
-        return [dict(grant) for grant in grants if isinstance(grant, dict) and not grant.get("revoked_at")]
+        return [
+            dict(grant)
+            for grant in grants
+            if isinstance(grant, dict)
+            and not grant.get("revoked_at")
+            and not grant.get("superseded_at")
+        ]
 
     def list_permission_grant_history(
         self,
@@ -3312,7 +4800,8 @@ class SessionManager:
         inactive = [
             dict(grant)
             for grant in grants
-            if isinstance(grant, dict) and grant.get("revoked_at")
+            if isinstance(grant, dict)
+            and (grant.get("revoked_at") or grant.get("superseded_at"))
         ]
         inactive.sort(
             key=lambda grant: float(
@@ -3324,6 +4813,26 @@ class SessionManager:
             reverse=True,
         )
         return inactive[: max(0, int(limit))]
+
+    @_session_write_locked
+    def migrate_permission_grants(self, session_id: str) -> int:
+        """Persist v2 semantic bindings and supersede active duplicates."""
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        permissions = data.get("permissions")
+        grants = permissions.get("grants") if isinstance(permissions, dict) else None
+        if not isinstance(grants, list):
+            return 0
+        changed = self._migrate_permission_grants(session_id, grants)
+        if changed:
+            self._write_file(session_id, data)
+        return sum(
+            1
+            for item in grants
+            if isinstance(item, dict) and item.get("supersede_reason") == "semantic_duplicate_v2_migration"
+        )
 
     @_session_write_locked
     def add_permission_grant(
@@ -3381,12 +4890,31 @@ class SessionManager:
 
         now = time.time()
         normalized_capabilities = list(dict.fromkeys(capabilities))
+        self._migrate_permission_grants(session_id, grants)
+        semantic_runtime_bindings = self._permission_semantic_runtime_bindings(
+            scope=scope,
+            metadata=metadata,
+            bindings=normalized_bindings,
+        )
+        semantic_key, stable_bindings = PermissionBindingPolicy.semantic_key(
+            session_id=session_id,
+            grant_type=grant_type,
+            scope=scope,
+            target_kind=target_kind,
+            target=target,
+            capabilities=normalized_capabilities,
+            runtime_bindings=semantic_runtime_bindings,
+        )
         # Session approvals are semantic capabilities, not a log of button
         # clicks. Re-approving the same bound scope must reuse one authoritative
         # grant so subagents and later Goal Runs do not create duplicate cards.
         if scope == "session":
             for existing in grants:
-                if not isinstance(existing, dict) or existing.get("revoked_at"):
+                if (
+                    not isinstance(existing, dict)
+                    or existing.get("revoked_at")
+                    or existing.get("superseded_at")
+                ):
                     continue
                 if (
                     existing.get("type") == grant_type
@@ -3394,7 +4922,7 @@ class SessionManager:
                     and existing.get("target_kind") == target_kind
                     and existing.get("target") == target
                     and set(existing.get("capabilities") or []) == set(normalized_capabilities)
-                    and existing.get("bindings") == normalized_bindings
+                    and existing.get("semantic_key") == semantic_key
                 ):
                     existing["last_approved_at"] = now
                     if metadata:
@@ -3415,6 +4943,14 @@ class SessionManager:
             "capabilities": normalized_capabilities,
             "source": source,
             "created_at": now,
+            "binding_schema_version": PERMISSION_BINDING_SCHEMA_VERSION,
+            "semantic_key": semantic_key,
+            "stable_bindings": stable_bindings,
+            "runtime_observations": {
+                "backend_id_at_approval": str(
+                    (normalized_bindings or {}).get("backend_id") or ""
+                ),
+            },
         }
         if metadata:
             grant["metadata"] = dict(metadata)
@@ -3425,6 +4961,115 @@ class SessionManager:
         data["permissions"] = permissions
         self._write_file(session_id, data)
         return dict(grant)
+
+    @staticmethod
+    def _permission_semantic_runtime_bindings(
+        *,
+        scope: str,
+        metadata: dict[str, Any] | None,
+        bindings: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Project authority identity without conflating concurrent Run grants.
+
+        Runtime bindings describe the stable execution boundary. Run scope has
+        one additional authority dimension: the exact Run that the user
+        approved. It lives in metadata for matching, but must also participate
+        in the semantic key so concurrent Runs never supersede each other.
+        """
+
+        projected = dict(bindings or {})
+        if scope == "run":
+            projected["run_id"] = str((metadata or {}).get("run_id") or "")
+        return projected or None
+
+    @staticmethod
+    def _migrate_permission_grants(
+        session_id: str,
+        grants: list[Any],
+    ) -> bool:
+        """Upgrade legacy grants and preserve duplicate records as history."""
+
+        changed = False
+        active_by_key: dict[str, list[dict[str, Any]]] = {}
+        for raw in grants:
+            if not isinstance(raw, dict):
+                continue
+            bindings = raw.get("bindings") if isinstance(raw.get("bindings"), dict) else None
+            metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else None
+            semantic_bindings = SessionManager._permission_semantic_runtime_bindings(
+                scope=str(raw.get("scope") or "session"),
+                metadata=metadata,
+                bindings=bindings,
+            )
+            key, stable = PermissionBindingPolicy.semantic_key(
+                session_id=session_id,
+                grant_type=str(raw.get("type") or ""),
+                scope=str(raw.get("scope") or "session"),
+                target_kind=str(raw.get("target_kind") or ""),
+                target=str(raw.get("target") or ""),
+                capabilities=[str(item) for item in raw.get("capabilities") or []],
+                runtime_bindings=semantic_bindings,
+            )
+            desired = {
+                "binding_schema_version": PERMISSION_BINDING_SCHEMA_VERSION,
+                "semantic_key": key,
+                "stable_bindings": stable,
+            }
+            for field, value in desired.items():
+                if raw.get(field) != value:
+                    raw[field] = value
+                    changed = True
+            if "runtime_observations" not in raw:
+                raw["runtime_observations"] = {
+                    "backend_id_at_approval": str((bindings or {}).get("backend_id") or "")
+                }
+                changed = True
+            if not raw.get("revoked_at") and not raw.get("superseded_at"):
+                active_by_key.setdefault(key, []).append(raw)
+
+        now = time.time()
+        for group in active_by_key.values():
+            if len(group) < 2:
+                continue
+            authoritative = max(
+                group,
+                key=lambda item: float(
+                    item.get("last_approved_at") or item.get("created_at") or 0
+                ),
+            )
+            for duplicate in group:
+                if duplicate is authoritative:
+                    continue
+                duplicate["superseded_at"] = now
+                duplicate["superseded_by"] = authoritative.get("id")
+                duplicate["supersede_reason"] = "semantic_duplicate_v2_migration"
+                changed = True
+        return changed
+
+    @staticmethod
+    def _permission_bindings_match(
+        existing: Any,
+        required: Any,
+        *,
+        target: str,
+    ) -> bool:
+        """Compare authority bindings without coupling them to an instance.
+
+        Session-wide network authority belongs to the stable workspace and
+        policy boundary. A Docker container id is an execution observation,
+        not part of that authority; rebuilding the container must not create a
+        second grant. Other capabilities remain exact-bound until they define
+        their own stable projection.
+        """
+
+        return PermissionBindingPolicy.equivalent(
+            grant_type="tool_action",
+            scope="session" if target == "session_network_access" else "once",
+            target_kind="capability" if target == "session_network_access" else "fingerprint",
+            target=target,
+            left=existing if isinstance(existing, dict) else None,
+            right=required if isinstance(required, dict) else None,
+        )
 
     @_session_write_locked
     def revoke_permission_grant(self, session_id: str, grant_id: str) -> bool:
@@ -3495,6 +5140,28 @@ class SessionManager:
             metadata = grant.get("metadata")
             if grant.get("scope") == "run" and isinstance(metadata, dict) and metadata.get("run_id") == run_id:
                 return True
+            if grant.get("scope") != "session":
+                continue
+            bindings = grant.get("bindings")
+            if not isinstance(bindings, dict):
+                # Legacy unbound Session directory grants cannot be safely
+                # reused across a policy/workspace boundary.
+                continue
+            run = self.get_run_state(session_id, run_id)
+            if not isinstance(run, dict):
+                continue
+            required = RunPermissionContext.from_config_snapshot(
+                run.get("config_snapshot")
+            ).grant_bindings()
+            if PermissionBindingPolicy.equivalent(
+                grant_type=str(grant.get("type") or ""),
+                scope="session",
+                target_kind="exact_directory",
+                target=resolved,
+                left=bindings,
+                right=required,
+            ):
+                return True
         return False
 
     @_session_write_locked
@@ -3524,7 +5191,12 @@ class SessionManager:
                 or "execute" not in (grant.get("capabilities") or [])
             ):
                 continue
-            if required_bindings is not None and grant.get("bindings") != required_bindings:
+            binding_target = str(session_target or grant.get("target") or "")
+            if required_bindings is not None and not self._permission_bindings_match(
+                grant.get("bindings"),
+                required_bindings,
+                target=binding_target,
+            ):
                 continue
             if required_capabilities is not None and not set(required_capabilities).issubset(
                 set(grant.get("capabilities") or [])
@@ -3592,17 +5264,9 @@ class SessionManager:
 
         for msg in messages:  # 遍历所有消息
             entry: dict[str, Any] = {"role": msg["role"], "content": msg["content"]}
-            # 历史 tool_calls 不再回传给模型：
-            # 1. 我们的存储把 tool 结果合并到 assistant message，缺少独立 tool role 消息，
-            #    直接回传会导致 OpenAI API 报 duplicate tool_call_id。
-            # 2. 历史工具调用会在 LangGraph 流中重新被 emit，污染当前轮次时间轴。
-            # 结构化 tool_calls 不回传，但已完成工具输出必须以普通文本摘要回传，
-            # 否则用户说“继续”时模型看不到中断前已经查到的事实。
-            if msg.get("tool_calls"):
-                entry["content"] += self._tool_result_context(msg.get("tool_calls") or [])
-            # 思考模式下，assistant 消息的 reasoning_content 需要回传给 API（含工具调用时尤其关键）
-            if msg.get("reasoning_content"):
-                entry["reasoning_content"] = msg["reasoning_content"]
+            # New Runs receive user-visible conversation only. Raw Tool
+            # inputs/outputs and reasoning belong to their source Run; legal
+            # continuity is carried by RunHandoffSummary and evidence refs.
             # 合并判断仍依赖原始消息是否携带 tool_calls，但不要把 tool_calls 放进 entry。
             msg_has_tool_calls = bool(msg.get("tool_calls"))
             prev_has_tool_calls = bool(merged[-1].get("_had_tool_calls")) if merged else False

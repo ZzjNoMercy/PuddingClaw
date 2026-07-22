@@ -427,10 +427,16 @@ async def test_explicit_sql_execute_persists_complete_rows_for_pagination(monkey
     monkeypatch.setattr(sql_execute_module, "run_readonly_sql", fake_run)
     monkeypatch.setattr(sql_execute_module, "get_sessionmaker", lambda: _FakeSessionMaker())
     monkeypatch.setattr(result_store_module, "persist_query_result", fake_persist)
+    receipt = database_sql_revision_resume_registry.register_validation_receipt(
+        generation=generation,
+        database_source_id="source-1",
+        allowed_tables=["vehicle_params"],
+    )
 
     output = await DatabaseSqlExecuteTool(session_id="session-pagination")._arun(
         sql=generation.result.sql,
         generation_id=generation.id,
+        validation_receipt_id=receipt.id,
         limit=5000,
     )
 

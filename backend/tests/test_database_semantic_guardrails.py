@@ -102,6 +102,63 @@ def test_launch_time_dimension_allows_real_launch_time_filter() -> None:
     assert _detect_semantic_sql_conflicts(sql, semantic_trace) == []
 
 
+def test_voltage_platform_exact_short_values_are_rejected_before_execution() -> None:
+    semantic_trace = {
+        "matched": [{"id": "measure:config_rate", "name": "配置率", "type": "measure"}],
+        "references": [],
+    }
+    route = SimpleNamespace(table_names=["vehicle_params"])
+    wrong_sql = """
+    SELECT type_value, COUNT(*)
+    FROM vehicle_params
+    WHERE type_name = '高压快充平台' AND type_value IN ('400V', '800V')
+    GROUP BY type_value
+    """
+    correct_sql = wrong_sql.replace("'400V'", "'400V平台'").replace("'800V'", "'800V平台'")
+
+    conflicts = _detect_semantic_sql_conflicts(
+        wrong_sql,
+        semantic_trace,
+        route,
+        question="高压平台配置率",
+    )
+
+    assert {item.split("：", 1)[0] for item in conflicts} >= {
+        "voltage_platform_400v_physical_value",
+        "voltage_platform_800v_physical_value",
+    }
+    assert _detect_semantic_sql_conflicts(
+        correct_sql,
+        semantic_trace,
+        route,
+        question="高压平台配置率",
+    ) == []
+
+
+def test_rear_screen_requires_profile_backed_physical_type_name() -> None:
+    semantic_trace = {
+        "matched": [{"id": "measure:config_rate", "name": "配置率", "type": "measure"}],
+        "references": [],
+    }
+    route = SimpleNamespace(table_names=["vehicle_params"])
+
+    conflicts = _detect_semantic_sql_conflicts(
+        "SELECT COUNT(*) FROM vehicle_params WHERE type_name = '后排多媒体屏'",
+        semantic_trace,
+        route,
+        question="后排多媒体屏配备率",
+    )
+
+    assert conflicts
+    assert conflicts[0].startswith("rear_screen_physical_type_name：")
+    assert _detect_semantic_sql_conflicts(
+        "SELECT COUNT(*) FROM vehicle_params WHERE type_name = '后排多媒体屏幕数量'",
+        semantic_trace,
+        route,
+        question="后排多媒体屏配备率",
+    ) == []
+
+
 def test_config_rate_blocks_eav_exists_distinct_slow_pattern() -> None:
     sql = """
     WITH eligible AS (

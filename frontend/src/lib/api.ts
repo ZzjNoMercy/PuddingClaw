@@ -161,6 +161,16 @@ export interface HarnessRun {
   verification_contract?: RunVerificationContract | null;
   verification_activations?: VerificationActivation[];
   verification_report?: RubricEvaluationReport | null;
+  delegation_contracts?: Array<Record<string, unknown>>;
+  delegation_results?: Array<Record<string, unknown>>;
+  delegation_events?: Array<{
+    type?: string;
+    status?: string;
+    objective?: string;
+    tool?: string;
+    subagent_run_id?: string;
+    timestamp?: number;
+  }>;
   model_call_count: number;
   budget_exhaustion_reason?: string | null;
   error?: string | null;
@@ -2334,6 +2344,13 @@ export interface PermissionGrant {
   created_at?: number;
   revoked_at?: number;
   consumed_at?: number;
+  binding_schema_version?: number;
+  semantic_key?: string;
+  stable_bindings?: Record<string, unknown>;
+  runtime_observations?: Record<string, unknown>;
+  superseded_at?: number;
+  superseded_by?: string;
+  supersede_reason?: string;
   metadata?: {
     tool_name?: string;
     command?: string;
@@ -2859,12 +2876,18 @@ export async function grantExternalFilePermission(
   sessionId: string,
   targetKind: "exact_file" | "exact_directory" | "all_external_files",
   path?: string,
-  permissionRequestId?: string
+  permissionRequestId?: string,
+  scope?: "run" | "session",
 ): Promise<PermissionGrant> {
   const resp = await fetch(`${API_BASE}/sessions/${encodeURIComponent(sessionId)}/permissions/external-files`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ target_kind: targetKind, path, permission_request_id: permissionRequestId }),
+    body: JSON.stringify({
+      target_kind: targetKind,
+      path,
+      permission_request_id: permissionRequestId,
+      scope,
+    }),
   });
   if (!resp.ok) throw new Error(`Failed to grant external file permission: ${resp.status}`);
   const data = await resp.json();
@@ -3043,6 +3066,7 @@ export async function getRawMessages(
   title: string;
   messages: Array<{ role: string; content: string }>;
   todos?: TodoItem[];
+  todos_authority?: { kind: "legacy" | "none" | "goal" | "run"; goal_id?: string; goal_revision?: number; run_id?: string };
   graph?: GraphStructure | null;
 }> {
   const resp = await fetch(
@@ -3062,6 +3086,7 @@ export async function getSessionTraces(
   latest_query_id?: string | null;
   latest_trace_id?: string | null;
   todos?: TodoItem[];
+  todos_authority?: { kind: "legacy" | "none" | "goal" | "run"; goal_id?: string; goal_revision?: number; run_id?: string };
   graph?: GraphStructure | null;
 }> {
   const resp = await fetch(
@@ -3079,6 +3104,7 @@ export async function getSessionHistory(
 ): Promise<{
   session_id: string;
   todos?: TodoItem[];
+  todos_authority?: { kind: "legacy" | "none" | "goal" | "run"; goal_id?: string; goal_revision?: number; run_id?: string };
   graph?: GraphStructure | null;
   messages: Array<{
     role: string;

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
 from deepagents.backends import FilesystemBackend
+from langchain_core.messages import ToolMessage
 
 
 def _runtime(
@@ -13,16 +15,18 @@ def _runtime(
     *,
     run_id: str = "run-1",
     query_id: str = "query-1",
+    goal_id: str | None = "goal-1",
 ):
+    context = {
+        "session_id": "directory-session",
+        "run_id": run_id,
+        "query_id": query_id,
+    }
+    if goal_id:
+        context.update({"goal_id": goal_id, "goal_revision": 1})
     return SimpleNamespace(
         tool_call_id=call_id,
-        context={
-            "session_id": "directory-session",
-            "run_id": run_id,
-            "query_id": query_id,
-            "goal_id": "goal-1",
-            "goal_revision": 1,
-        },
+        context=context,
     )
 
 
@@ -52,17 +56,56 @@ def _setup(tmp_path: Path):
     return external, scratch, tools, session_manager
 
 
-def _grant(session_manager, path: Path, *, access: str, run_id: str = "run-1") -> None:
-    session_manager.add_permission_grant(
+def _grant(
+    session_manager,
+    path: Path,
+    *,
+    access: str,
+    run_id: str = "run-1",
+    scope: str = "run",
+    bindings: dict | None = None,
+) -> dict:
+    return session_manager.add_permission_grant(
         "directory-session",
         grant_type=f"external_directory_{access}",
         target_kind="exact_directory",
         target=str(path.resolve()),
         capabilities=[access, "recursive", "external_path"],
-        scope="run",
+        scope=scope,
         source="user",
         metadata={"run_id": run_id},
+        bindings=bindings,
     )
+
+
+def _start_bound_run(
+    session_manager,
+    *,
+    query_id: str,
+    backend_id: str,
+    workspace_id: str = "workspace:stable",
+):
+    from harness.coordinators import HarnessRunCoordinator
+    from harness.models import RunStatus
+
+    coordinator = HarnessRunCoordinator(session_manager)
+    run, _goal = coordinator.start_run(
+        session_id="directory-session",
+        query_id=query_id,
+        objective="inspect external directory",
+        goal_mode=False,
+        verification_enabled=False,
+    )
+    coordinator.bind_execution_snapshot(
+        run,
+        {
+            "backend_mode": "docker",
+            "backend_id": backend_id,
+            "workspace_id": workspace_id,
+        },
+    )
+    coordinator.transition(run, RunStatus.RUNNING)
+    return coordinator, run
 
 
 def test_external_directory_snapshot_prepare_and_commit(tmp_path: Path) -> None:
@@ -77,6 +120,13 @@ def test_external_directory_snapshot_prepare_and_commit(tmp_path: Path) -> None:
     outside.write_text("outside", encoding="utf-8")
     (external / "escape-link").symlink_to(outside)
     _grant(session_manager, external, access="read")
+    deleted_delivery = session_manager.register_delivered_artifact(
+        "directory-session",
+        target_path=str((external / "delete.txt").resolve()),
+        content_sha256="sha256:" + hashlib.sha256(b"delete").hexdigest(),
+        source_run_id="run-before-delete",
+        source_query_id="query-before-delete",
+    )
 
     staged = tools["stage_external_directory"].func(
         directory_path=str(external),
@@ -94,9 +144,18 @@ def test_external_directory_snapshot_prepare_and_commit(tmp_path: Path) -> None:
     (staged_host / "src" / "keep.txt").write_text("after", encoding="utf-8")
     (staged_host / "delete.txt").unlink()
     (staged_host / "new.txt").write_text("new", encoding="utf-8")
+    refused = tools["prepare_external_directory_commit"].func(
+        lease_id=lease["lease_id"],
+        directory_path=str(external),
+        runtime=_runtime("call-prepare-undeclared"),
+    )
+    assert refused.status == "error"
+    assert "undeclared new files" in refused.content
+    assert "/scratch/validation/" in refused.content
     prepared = tools["prepare_external_directory_commit"].func(
         lease_id=lease["lease_id"],
         directory_path=str(external),
+        declared_delivery_files=["new.txt"],
         runtime=_runtime("call-prepare"),
     )
 
@@ -120,6 +179,44 @@ def test_external_directory_snapshot_prepare_and_commit(tmp_path: Path) -> None:
     assert not (external / "delete.txt").exists()
     assert (external / ".env").read_text(encoding="utf-8") == "SECRET=1"
     assert outside.read_text(encoding="utf-8") == "outside"
+    delivered = session_manager.list_delivered_artifacts(
+        "directory-session", include_inactive=False
+    )
+    assert {Path(item["target_path"]).name for item in delivered} == {
+        "keep.txt",
+        "new.txt",
+    }
+    assert all(item["role"] == "delivered" for item in delivered)
+    tombstone = next(
+        item
+        for item in session_manager.list_delivered_artifacts("directory-session")
+        if item["artifact_id"] == deleted_delivery["artifact_id"]
+    )
+    assert tombstone["status"] == "deleted"
+    assert tombstone["stale_reason"] == "deleted_by_committed_directory_plan"
+    from harness.verification_activations import build_verification_activations
+
+    activations = build_verification_activations(
+        run_id="run-directory",
+        query_id="query-directory",
+        tool_call_id="call-commit",
+        tool_name="commit_external_directory",
+        args={
+            "lease_id": lease["lease_id"],
+            "directory_path": str(external),
+            "plan_digest": plan["plan_digest"],
+        },
+        result=committed,
+        session_id="directory-session",
+    )
+    artifact_activation = next(item for item in activations if item.pack == "artifact")
+    assert len(
+        [
+            ref
+            for ref in artifact_activation.evidence_refs
+            if ref.get("kind") == "artifact_write"
+        ]
+    ) == 2
 
 
 def test_external_directory_commit_detects_source_and_staged_conflicts(tmp_path: Path) -> None:
@@ -159,6 +256,293 @@ def test_external_directory_commit_detects_source_and_staged_conflicts(tmp_path:
     assert staged_conflict.status == "error"
     assert "staged directory changed after review" in staged_conflict.content
     assert (external / "report.txt").read_text(encoding="utf-8") == "v1"
+
+
+def test_external_directory_code_commit_requires_receipt_for_each_exact_draft(
+    tmp_path: Path,
+) -> None:
+    from harness.models import RunRecord, RunStatus, ValidationReceipt, VerificationActivation
+
+    external, scratch, tools, session_manager = _setup(tmp_path)
+    (external / "app.js").write_text("const value = 1;\n", encoding="utf-8")
+    run = RunRecord(
+        run_id="run-1",
+        query_id="query-1",
+        session_id="directory-session",
+        objective="update app.js",
+        status=RunStatus.PREPARING,
+    )
+    session_manager.start_harness_run("directory-session", run.model_dump(mode="json"))
+    session_manager.transition_run_status(
+        "directory-session", run.run_id, RunStatus.RUNNING.value
+    )
+    _grant(session_manager, external, access="read")
+    _grant(session_manager, external, access="write")
+
+    runtime = _runtime("call-stage", goal_id=None)
+    staged = tools["stage_external_directory"].func(
+        directory_path=str(external), runtime=runtime
+    )
+    lease = staged.artifact["external_directory_lease"]
+    staged_host = scratch / str(lease["staged_dir"]).removeprefix("/scratch/")
+    draft = "const value = 2;\n"
+    (staged_host / "app.js").write_text(draft, encoding="utf-8")
+    draft_sha = "sha256:" + hashlib.sha256(draft.encode()).hexdigest()
+    prepared = tools["prepare_external_directory_commit"].func(
+        lease_id=lease["lease_id"],
+        directory_path=str(external),
+        runtime=_runtime("call-prepare", goal_id=None),
+    )
+    plan = prepared.artifact["external_directory_commit_plan"]
+
+    missing = tools["commit_external_directory"].func(
+        lease_id=lease["lease_id"],
+        directory_path=str(external),
+        plan_digest=plan["plan_digest"],
+        validation_receipt_ids=[],
+        runtime=_runtime("call-missing", goal_id=None),
+    )
+    assert missing.status == "error"
+    assert "validation gate" in missing.content
+    assert (external / "app.js").read_text(encoding="utf-8") == "const value = 1;\n"
+
+    def persist(receipt: ValidationReceipt, call_id: str) -> None:
+        activation = VerificationActivation(
+            activation_id=f"activation-{call_id}",
+            run_id="run-1",
+            query_id="query-1",
+            tool_call_id=call_id,
+            tool_name="execute",
+            pack="code",
+            evidence_refs=[
+                {
+                    "kind": "validation_receipt",
+                    **receipt.model_dump(mode="json"),
+                    "material": True,
+                }
+            ],
+        )
+        session_manager.append_run_verification_activation(
+            "directory-session", "run-1", activation.model_dump(mode="json")
+        )
+
+    failed = ValidationReceipt(
+        validation_receipt_id="directory-validation-failed",
+        run_id="run-1",
+        validator_kind="javascript_syntax",
+        artifact_refs=[
+            {
+                "artifact_id": "artifact-app-js",
+                "content_sha256": draft_sha,
+                "path": str((external / "app.js").resolve()),
+            }
+        ],
+        command_evidence_ref="sha256:failed",
+        exit_code=1,
+        checks_failed=1,
+        status="failed",
+        commit_authority=True,
+        obligation_key="javascript_syntax:node-check/v1",
+        created_at=1.0,
+    )
+    persist(failed, "call-failed")
+    blocked = tools["commit_external_directory"].func(
+        lease_id=lease["lease_id"],
+        directory_path=str(external),
+        plan_digest=plan["plan_digest"],
+        validation_receipt_ids=[failed.validation_receipt_id],
+        runtime=_runtime("call-blocked", goal_id=None),
+    )
+    assert blocked.status == "error"
+    assert "blocking_failed_receipts" in blocked.content
+
+    passed = ValidationReceipt(
+        validation_receipt_id="directory-validation-passed",
+        run_id="run-1",
+        validator_kind="javascript_syntax",
+        artifact_refs=failed.artifact_refs,
+        command_evidence_ref="sha256:passed",
+        exit_code=0,
+        status="passed",
+        commit_authority=True,
+        obligation_key="javascript_syntax:node-check/v1",
+        created_at=2.0,
+    )
+    persist(passed, "call-passed")
+    committed = tools["commit_external_directory"].func(
+        lease_id=lease["lease_id"],
+        directory_path=str(external),
+        plan_digest=plan["plan_digest"],
+        validation_receipt_ids=[passed.validation_receipt_id],
+        runtime=_runtime("call-commit", goal_id=None),
+    )
+    assert committed.status == "success"
+    assert (external / "app.js").read_text(encoding="utf-8") == draft
+
+
+def test_directory_draft_validation_receipt_uses_formal_target_identity(
+    tmp_path: Path,
+) -> None:
+    from harness.models import RunRecord, RunStatus
+    from harness.verification_activations import build_verification_activations
+
+    external, scratch, tools, session_manager = _setup(tmp_path)
+    (external / "app.js").write_text("const value = 1;\n", encoding="utf-8")
+    run = RunRecord(
+        run_id="run-1",
+        query_id="query-1",
+        session_id="directory-session",
+        objective="validate directory draft",
+        status=RunStatus.PREPARING,
+        config_snapshot={
+            "execution": {
+                "scratch_host_path": str(scratch.resolve()),
+                "workspace_id": "workspace:test",
+            }
+        },
+    )
+    session_manager.start_harness_run("directory-session", run.model_dump(mode="json"))
+    session_manager.transition_run_status(
+        "directory-session", run.run_id, RunStatus.RUNNING.value
+    )
+    _grant(session_manager, external, access="read")
+    staged = tools["stage_external_directory"].func(
+        directory_path=str(external),
+        runtime=_runtime("call-stage", goal_id=None),
+    )
+    lease = staged.artifact["external_directory_lease"]
+    staged_path = f"{lease['staged_dir']}/app.js"
+    activations = build_verification_activations(
+        run_id="run-1",
+        query_id="query-1",
+        tool_call_id="call-node-check",
+        tool_name="execute",
+        args={"command": f"node --check {staged_path}"},
+        result=ToolMessage(
+            content="Exit code: 0",
+            name="execute",
+            tool_call_id="call-node-check",
+            status="success",
+        ),
+        session_id="directory-session",
+        workspace_path=str((tmp_path / "workspace").resolve()),
+    )
+    receipt = next(
+        ref
+        for activation in activations
+        for ref in activation.evidence_refs
+        if ref.get("kind") == "validation_receipt"
+    )
+    assert receipt["artifact_refs"] == [
+        {
+            "artifact_id": receipt["artifact_refs"][0]["artifact_id"],
+            "content_sha256": "sha256:"
+            + hashlib.sha256(b"const value = 1;\n").hexdigest(),
+            "path": str((external / "app.js").resolve()),
+            "observed_path": staged_path,
+        }
+    ]
+
+
+def test_exact_file_and_directory_staging_share_one_authoritative_draft_claim(
+    tmp_path: Path,
+) -> None:
+    from graph.middlewares.external_directory import ExternalDirectoryMiddleware
+    from graph.middlewares.versioned_patch import VersionedPatchMiddleware
+    from graph.permissioned_filesystem_backend import PermissionedCompositeBackend
+    from graph.session_manager import session_manager
+
+    state = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    external = tmp_path / "external"
+    for path in (state, workspace, scratch, external):
+        path.mkdir()
+    target = external / "app.js"
+    target.write_text("const value = 1;\n", encoding="utf-8")
+    session_manager.initialize(state)
+    session_manager.create_session("directory-session")
+    session_manager.add_permission_grant(
+        "directory-session",
+        grant_type="external_file_read",
+        target_kind="exact_file",
+        target=str(target.resolve()),
+        capabilities=["read", "external_path"],
+    )
+    _grant(session_manager, external, access="read")
+
+    workspace_backend = FilesystemBackend(root_dir=workspace, virtual_mode=True)
+    backend = PermissionedCompositeBackend(
+        default=workspace_backend,
+        routes={
+            "/workspace/": workspace_backend,
+            "/scratch/": FilesystemBackend(root_dir=scratch, virtual_mode=True),
+        },
+        session_id="directory-session",
+        workspace_root=workspace,
+    )
+    file_tools = {
+        item.name: item for item in VersionedPatchMiddleware(backend).tools
+    }
+    directory_tools = {
+        item.name: item for item in ExternalDirectoryMiddleware(backend).tools
+    }
+
+    exact = file_tools["stage_external_artifact"].func(
+        file_path=str(target.resolve()),
+        runtime=_runtime("call-file", goal_id=None),
+    )
+    assert exact.status == "success"
+    directory_conflict = directory_tools["stage_external_directory"].func(
+        directory_path=str(external.resolve()),
+        runtime=_runtime("call-directory-conflict", goal_id=None),
+    )
+    assert directory_conflict.status == "error"
+    assert "authoritative writable draft conflict" in directory_conflict.content
+
+    exact_lease = next(
+        item
+        for item in session_manager.list_external_artifact_leases("directory-session")
+        if item["status"] == "staged"
+    )
+    exact_lease["status"] = "abandoned"
+    session_manager.upsert_external_artifact_lease("directory-session", exact_lease)
+    directory = directory_tools["stage_external_directory"].func(
+        directory_path=str(external.resolve()),
+        runtime=_runtime("call-directory", goal_id=None),
+    )
+    assert directory.status == "success"
+
+    exact_conflict = file_tools["stage_external_artifact"].func(
+        file_path=str(target.resolve()),
+        runtime=_runtime("call-file-conflict", goal_id=None),
+    )
+    assert exact_conflict.status == "error"
+    assert "authoritative writable draft conflict" in exact_conflict.content
+
+
+def test_directory_commit_rejects_symlink_parent_without_writing_outside(
+    tmp_path: Path,
+) -> None:
+    from graph.middlewares.external_directory import _apply_directory_plan
+
+    root = tmp_path / "authorized"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    (root / "link").symlink_to(outside, target_is_directory=True)
+
+    error, rollback = _apply_directory_plan(
+        root,
+        "lease-test",
+        {"added": ["link/pwn.txt"], "modified": [], "deleted": []},
+        {"link/pwn.txt": b"escaped"},
+        {},
+    )
+
+    assert error is not None
+    assert rollback is None
+    assert not (outside / "pwn.txt").exists()
 
 
 def test_external_directory_goal_draft_rebinds_across_runs(tmp_path: Path) -> None:
@@ -293,6 +677,210 @@ def test_external_directory_permission_is_exact_and_run_scoped(tmp_path: Path) -
     )
 
 
+def test_session_directory_grant_survives_container_rebuild_but_stays_workspace_bound(
+    tmp_path: Path,
+) -> None:
+    from graph.permission_policy import RunPermissionContext
+    from harness.models import RunStatus
+
+    external, _scratch, _tools, session_manager = _setup(tmp_path)
+    sibling = tmp_path / "sibling"
+    sibling.mkdir()
+    coordinator, first = _start_bound_run(
+        session_manager,
+        query_id="query-session-grant-1",
+        backend_id="container:first",
+    )
+    first_state = session_manager.get_run_state("directory-session", first.run_id)
+    first_bindings = RunPermissionContext.from_config_snapshot(
+        first_state["config_snapshot"]
+    ).grant_bindings()
+    grant = _grant(
+        session_manager,
+        external,
+        access="write",
+        run_id=first.run_id,
+        scope="session",
+        bindings=first_bindings,
+    )
+
+    assert grant["scope"] == "session"
+    assert grant["stable_bindings"] == {
+        "approval_mode": "strict",
+        "backend_mode": "docker",
+        "policy_epoch": 1,
+        "policy_version": "tool-execution-v3",
+        "workspace_id": "workspace:stable",
+    }
+    assert "backend_id" not in grant["stable_bindings"]
+    coordinator.transition(first, RunStatus.COMPLETED)
+
+    second_coordinator, second = _start_bound_run(
+        session_manager,
+        query_id="query-session-grant-2",
+        backend_id="container:replacement",
+    )
+    assert session_manager.has_external_directory_permission(
+        "directory-session", external, access="write", run_id=second.run_id
+    )
+    assert not session_manager.has_external_directory_permission(
+        "directory-session", sibling, access="write", run_id=second.run_id
+    )
+    second_coordinator.transition(second, RunStatus.COMPLETED)
+
+    _third_coordinator, third = _start_bound_run(
+        session_manager,
+        query_id="query-session-grant-3",
+        backend_id="container:replacement",
+        workspace_id="workspace:different",
+    )
+    assert not session_manager.has_external_directory_permission(
+        "directory-session", external, access="write", run_id=third.run_id
+    )
+
+
+def test_session_directory_grant_is_invalid_after_permission_policy_epoch_changes(
+    tmp_path: Path,
+) -> None:
+    from graph.permission_policy import RunPermissionContext
+    from harness.models import RunStatus
+
+    external, _scratch, _tools, session_manager = _setup(tmp_path)
+    coordinator, first = _start_bound_run(
+        session_manager,
+        query_id="query-policy-1",
+        backend_id="container:first",
+    )
+    first_state = session_manager.get_run_state("directory-session", first.run_id)
+    bindings = RunPermissionContext.from_config_snapshot(first_state["config_snapshot"]).grant_bindings()
+    _grant(
+        session_manager,
+        external,
+        access="read",
+        run_id=first.run_id,
+        scope="session",
+        bindings=bindings,
+    )
+    coordinator.transition(first, RunStatus.COMPLETED)
+
+    policy = session_manager.set_approval_mode_if_idle(
+        "directory-session",
+        "smart",
+        expected_epoch=1,
+    )
+    assert policy["policy_epoch"] == 2
+    assert not any(
+        item["type"] == "external_directory_read"
+        for item in session_manager.list_permission_grants("directory-session")
+    )
+    _second_coordinator, second = _start_bound_run(
+        session_manager,
+        query_id="query-policy-2",
+        backend_id="container:first",
+    )
+    assert not session_manager.has_external_directory_permission(
+        "directory-session", external, access="read", run_id=second.run_id
+    )
+
+
+def test_run_directory_grants_from_concurrent_runs_do_not_supersede_each_other(
+    tmp_path: Path,
+) -> None:
+    external, _scratch, _tools, session_manager = _setup(tmp_path)
+    first = _grant(session_manager, external, access="read", run_id="run-a")
+    second = _grant(session_manager, external, access="read", run_id="run-b")
+
+    session_manager.migrate_permission_grants("directory-session")
+    active = {
+        item["id"]: item
+        for item in session_manager.list_permission_grants("directory-session")
+    }
+    assert set(active) == {first["id"], second["id"]}
+    assert active[first["id"]]["semantic_key"] != active[second["id"]]["semantic_key"]
+    assert session_manager.has_external_directory_permission(
+        "directory-session", external, access="read", run_id="run-a"
+    )
+    assert session_manager.has_external_directory_permission(
+        "directory-session", external, access="read", run_id="run-b"
+    )
+
+
+def test_session_grant_reapproval_never_reuses_a_superseded_duplicate(tmp_path: Path) -> None:
+    external, _scratch, _tools, session_manager = _setup(tmp_path)
+    data = session_manager._read_file("directory-session")
+    data["permissions"]["grants"] = [
+        {
+            "id": "grant-old",
+            "type": "external_directory_read",
+            "scope": "session",
+            "target_kind": "exact_directory",
+            "target": str(external.resolve()),
+            "capabilities": ["read", "recursive", "external_path"],
+            "source": "user",
+            "created_at": 1.0,
+        },
+        {
+            "id": "grant-new",
+            "type": "external_directory_read",
+            "scope": "session",
+            "target_kind": "exact_directory",
+            "target": str(external.resolve()),
+            "capabilities": ["external_path", "recursive", "read"],
+            "source": "user",
+            "created_at": 2.0,
+        },
+    ]
+    session_manager._write_file("directory-session", data)
+    assert session_manager.migrate_permission_grants("directory-session") == 1
+
+    approved = _grant(
+        session_manager,
+        external,
+        access="read",
+        scope="session",
+    )
+
+    assert approved["id"] == "grant-new"
+    assert not approved.get("superseded_at")
+    assert [item["id"] for item in session_manager.list_permission_grants("directory-session")] == [
+        "grant-new"
+    ]
+
+
+def test_directory_pending_deduplicates_only_while_request_is_active(tmp_path: Path) -> None:
+    from graph.permission_resume import PermissionResumeRegistry
+
+    async def exercise() -> None:
+        registry = PermissionResumeRegistry()
+        kwargs = {
+            "session_id": "directory-session",
+            "query_id": "query-1",
+            "run_id": "run-1",
+            "path": tmp_path.resolve(),
+            "access": "read",
+            "operation": "stage_external_directory",
+        }
+        first = registry.create_external_directory_request(
+            tool_call_id="call-1",
+            **kwargs,
+        )
+        duplicate = registry.create_external_directory_request(
+            tool_call_id="call-2",
+            **kwargs,
+        )
+        assert duplicate["id"] == first["id"]
+        assert registry.resolve(first["id"], {"type": "reject"})
+
+        replacement = registry.create_external_directory_request(
+            tool_call_id="call-3",
+            **kwargs,
+        )
+        assert replacement["id"] != first["id"]
+        assert replacement["status"] == "pending"
+
+    asyncio.run(exercise())
+
+
 def test_user_supplied_external_directory_gets_lease_instructions(tmp_path: Path) -> None:
     from graph.deepagents_manager import DeepAgentsAgentManager
 
@@ -410,6 +998,24 @@ def test_permission_middleware_requests_run_scoped_directory_write(tmp_path: Pat
         return {"decisions": [{"type": "reject"}]}
 
     monkeypatch.setattr(permission_middleware_module, "interrupt", fake_interrupt)
+    monkeypatch.setattr(
+        session_manager,
+        "get_run_state",
+        lambda _session_id, _run_id: {
+            "config_snapshot": {
+                "permissions": {
+                    "approval_mode": "strict",
+                    "policy_epoch": 1,
+                    "policy_version": "tool-execution-v3",
+                },
+                "execution": {
+                    "backend_mode": "docker",
+                    "backend_id": "container:ephemeral",
+                    "workspace_id": "workspace:stable",
+                },
+            }
+        },
+    )
     state = {
         "messages": [
             AIMessage(
@@ -447,6 +1053,85 @@ def test_permission_middleware_requests_run_scoped_directory_write(tmp_path: Pat
     assert request["target_kind"] == "exact_directory"
     assert request["run_id"] == "run-1"
     assert request["change_preview"]["新增文件"] == "new.txt"
+    assert request["options"] == ["exact_directory_run", "exact_directory_session"]
+    assert request["grant_bindings"]["workspace_id"] == "workspace:stable"
+    permission_resume_registry._requests.pop(request["id"], None)
+    permission_resume_registry._pending.pop(request["id"], None)
+
+
+def test_permission_middleware_turns_external_grep_into_directory_hitl(tmp_path: Path, monkeypatch) -> None:
+    from langchain_core.messages import AIMessage
+
+    import graph.permission_middleware as permission_middleware_module
+    from graph.permission_middleware import ExternalFilePermissionMiddleware
+    from graph.permission_resume import permission_resume_registry
+    from graph.session_manager import session_manager
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    session_manager.initialize(state_dir)
+    session_manager.create_session("directory-search-session")
+    external = tmp_path / "external"
+    external.mkdir()
+    captured: dict = {}
+
+    def fake_interrupt(payload):
+        captured.update(payload)
+        return {"decisions": [{"type": "reject"}]}
+
+    monkeypatch.setattr(permission_middleware_module, "interrupt", fake_interrupt)
+    monkeypatch.setattr(
+        session_manager,
+        "get_run_state",
+        lambda _session_id, _run_id: {
+            "config_snapshot": {
+                "permissions": {
+                    "approval_mode": "strict",
+                    "policy_epoch": 1,
+                    "policy_version": "tool-execution-v3",
+                },
+                "execution": {
+                    "backend_mode": "docker",
+                    "backend_id": "container:ephemeral",
+                    "workspace_id": "workspace:stable",
+                },
+            }
+        },
+    )
+    state = {
+        "messages": [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "grep",
+                        "args": {"path": str(external), "pattern": "heatmapByYear"},
+                        "id": "call-directory-grep",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
+    }
+    runtime = SimpleNamespace(
+        context={
+            "session_id": "directory-search-session",
+            "query_id": "query-search",
+            "run_id": "run-search",
+            "workspace_path": str(tmp_path / "workspace"),
+        }
+    )
+
+    async def invoke():
+        return ExternalFilePermissionMiddleware().after_model(state, runtime)
+
+    assert asyncio.run(invoke()) is None
+    request = captured["request"]
+    assert request["type"] == "external_directory_read"
+    assert request["operation"] == "grep"
+    assert request["path"] == str(external.resolve())
+    assert request["options"][0] == "exact_directory_session"
+    assert "重放原搜索调用" in request["change_preview"]["安全说明"]
     permission_resume_registry._requests.pop(request["id"], None)
     permission_resume_registry._pending.pop(request["id"], None)
 
@@ -485,6 +1170,7 @@ def test_permission_api_grants_exact_directory_for_current_run(tmp_path: Path) -
             "target_kind": "exact_file",
             "path": str(external),
             "permission_request_id": request_id,
+            "scope": "run",
         },
     )
 
@@ -517,6 +1203,7 @@ def test_permission_api_grants_exact_directory_for_current_run(tmp_path: Path) -
         json={
             "target_kind": "all_external_files",
             "permission_request_id": broad_request_id,
+            "scope": "run",
         },
     )
     assert broad_response.status_code == 200
@@ -525,4 +1212,81 @@ def test_permission_api_grants_exact_directory_for_current_run(tmp_path: Path) -
     assert broad_grant["target"] == str(external.resolve())
     assert broad_grant["scope"] == "run"
     assert broad_grant["metadata"]["requested_target_kind"] == "all_external_files"
+    loop.close()
+
+
+def test_permission_api_persists_session_directory_scope_and_resolves_compatible_pending(
+    tmp_path: Path,
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from app import app
+    from graph.permission_policy import RunPermissionContext
+    from graph.permission_resume import permission_resume_registry
+    from graph.session_manager import session_manager
+    from harness.models import RunStatus
+
+    state = tmp_path / "state"
+    external = tmp_path / "external"
+    state.mkdir()
+    external.mkdir()
+    session_manager.initialize(state)
+    session_manager.create_session("directory-session")
+    first_coordinator, first = _start_bound_run(
+        session_manager,
+        query_id="query-parallel-directory-1",
+        backend_id="container:first",
+    )
+    first_state = session_manager.get_run_state("directory-session", first.run_id)
+    first_bindings = RunPermissionContext.from_config_snapshot(
+        first_state["config_snapshot"]
+    ).grant_bindings()
+
+    loop = asyncio.new_event_loop()
+    request_ids = ["perm-req-directory-first", "perm-req-directory-second"]
+    futures = [loop.create_future(), loop.create_future()]
+    for request_id, future in zip(
+        request_ids,
+        futures,
+        strict=True,
+    ):
+        permission_resume_registry._pending[request_id] = future
+        permission_resume_registry._requests[request_id] = {
+            "id": request_id,
+            "type": "external_directory_read",
+            "session_id": "directory-session",
+            "query_id": first.query_id,
+            "run_id": first.run_id,
+            "tool_call_id": f"call-{request_id}",
+            "path": str(external.resolve()),
+            "target_kind": "exact_directory",
+            "capabilities": ["read", "recursive", "external_path"],
+            "grant_bindings": first_bindings,
+            "status": "pending",
+        }
+
+    response = TestClient(app).post(
+        "/api/sessions/directory-session/permissions/external-files",
+        json={
+            "target_kind": "exact_directory",
+            "path": str(external),
+            "permission_request_id": request_ids[0],
+            "scope": "session",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    grant = payload["grant"]
+    assert grant["scope"] == "session"
+    assert grant["target"] == str(external.resolve())
+    assert "backend_id" not in grant["stable_bindings"]
+    assert payload["auto_resumed_permission_request_ids"] == [request_ids[1]]
+    assert futures[0].result()["grant_id"] == grant["id"]
+    assert futures[1].result()["grant_id"] == grant["id"]
+    assert session_manager.has_external_directory_permission(
+        "directory-session", external, access="read", run_id=first.run_id
+    )
+
+    first_coordinator.transition(first, RunStatus.COMPLETED)
     loop.close()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from unittest import mock
 
@@ -11,7 +12,12 @@ from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 from langchain_core.runnables.config import var_child_runnable_config
 from pydantic import BaseModel, Field
 
-from llm.model_client import INTERNAL_CALL_MARKER, ModelClient, ModelClientChatModel
+from llm.model_client import (
+    INTERNAL_CALL_MARKER,
+    ModelClient,
+    ModelClientChatModel,
+    ModelTransportInterruptedError,
+)
 
 
 class FakeBoundModel:
@@ -33,7 +39,7 @@ class FakeBoundModel:
             AIMessageChunk(content="lo"),
         ]
 
-    def bind_tools(self, tools: list[Any], **kwargs: Any) -> "FakeBoundModel":
+    def bind_tools(self, tools: list[Any], **kwargs: Any) -> FakeBoundModel:
         self.bound_tools = list(tools)
         self.bound_kwargs = dict(kwargs)
         return self
@@ -427,6 +433,59 @@ def test_model_client_stream_does_not_fallback_after_first_chunk():
             with mock.patch.object(client, "_direct_model", return_value=FakeBoundModel(content="fallback")):
                 with pytest.raises(RuntimeError, match="stream broke"):
                     list(client.stream([HumanMessage(content="hello")]))
+
+
+@pytest.mark.asyncio
+async def test_model_client_astream_emits_first_chunk_before_provider_finishes():
+    class PausesAfterFirstChunk(FakeBoundModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.release = asyncio.Event()
+
+        async def astream(self, *args: Any, **kwargs: Any):
+            yield AIMessageChunk(content="first")
+            await self.release.wait()
+            yield AIMessageChunk(content="second")
+
+    provider = PausesAfterFirstChunk()
+    client = ModelClient()
+
+    with mock.patch.object(client, "_should_use_gateway", return_value=False):
+        with mock.patch.object(client, "get_chat_model", return_value=provider):
+            stream = client.astream([HumanMessage(content="hello")])
+            first = await asyncio.wait_for(anext(stream), timeout=0.1)
+            assert first.content == "first"
+            provider.release.set()
+            remaining = [chunk async for chunk in stream]
+
+    assert [chunk.content for chunk in remaining] == ["second"]
+
+
+@pytest.mark.asyncio
+async def test_model_client_astream_stops_without_retry_after_emitting_partial_chunk():
+    class RemoteProtocolError(Exception):
+        pass
+
+    class FailsAfterFirstChunk(FakeBoundModel):
+        async def astream(self, *args: Any, **kwargs: Any):
+            yield AIMessageChunk(content="discarded-partial")
+            raise RemoteProtocolError("peer closed connection: incomplete chunked read")
+
+    direct = FakeBoundModel(content="fallback")
+    client = ModelClient()
+    client.gateway_cfg = {"fallback_to_direct": True}
+
+    with mock.patch.object(client, "_should_use_gateway", return_value=True):
+        with mock.patch.object(client, "get_chat_model", return_value=FailsAfterFirstChunk()):
+            with mock.patch.object(client, "_direct_model", return_value=direct):
+                chunks = []
+                with pytest.raises(ModelTransportInterruptedError) as exc_info:
+                    async for chunk in client.astream([HumanMessage(content="hello")]):
+                        chunks.append(chunk)
+
+    assert [chunk.content for chunk in chunks] == ["discarded-partial"]
+    assert exc_info.value.chunks_received == 1
+    assert not direct.astream_calls
 
 
 def test_model_client_chat_model_callbacks_receive_success_lifecycle():

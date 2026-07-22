@@ -62,6 +62,26 @@ def test_session_history_restores_persisted_todos_without_opening_trace(tmp_path
     assert response.json()["todos"] == todos
 
 
+def test_session_history_does_not_project_terminal_run_todos_as_current(tmp_path):
+    client = _client(tmp_path)
+    todos = [{"id": "todo-old", "content": "旧任务", "status": "completed"}]
+    session_manager.update_todos("session-1", todos, run_id="run-old")
+    data = session_manager._read_file("session-1")
+    data["harness"] = {
+        "runs": {"run-old": {"run_id": "run-old", "status": "completed"}},
+        "run_order": ["run-old"],
+        "latest_run_id": "run-old",
+        "goals": {},
+    }
+    session_manager._write_file("session-1", data)
+
+    response = client.get("/api/sessions/session-1/history")
+
+    assert response.status_code == 200
+    assert response.json()["todos"] == []
+    assert response.json()["todos_authority"] == {"kind": "none"}
+
+
 def test_permission_mode_api_rejects_stale_epoch_and_active_run(tmp_path):
     client = _client(tmp_path)
 

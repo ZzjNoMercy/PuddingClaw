@@ -35,6 +35,7 @@ class RunOutcome(StrEnum):
     COMPLETED = "completed"
     CANCELLED = "cancelled"
     FAILED = "failed"
+    INFRASTRUCTURE_ERROR = "infrastructure_error"
     BLOCKED = "blocked"
     BUDGET_EXCEEDED = "budget_exceeded"
     VERIFICATION_FAILED = "verification_failed"
@@ -66,6 +67,7 @@ class VerificationStatus(StrEnum):
 class VerificationFailureKind(StrEnum):
     TASK_GAP = "task_gap"
     INFRASTRUCTURE_ERROR = "infrastructure_error"
+    VALIDATOR_PROTOCOL_ERROR = "validator_protocol_error"
 
 
 class ArtifactScope(StrEnum):
@@ -134,6 +136,7 @@ RUN_STATUS_FOR_OUTCOME = {
     RunOutcome.COMPLETED: RunStatus.COMPLETED,
     RunOutcome.CANCELLED: RunStatus.CANCELLED,
     RunOutcome.FAILED: RunStatus.FAILED,
+    RunOutcome.INFRASTRUCTURE_ERROR: RunStatus.FAILED,
     RunOutcome.BLOCKED: RunStatus.BLOCKED,
     RunOutcome.BUDGET_EXCEEDED: RunStatus.BUDGET_EXCEEDED,
     RunOutcome.VERIFICATION_FAILED: RunStatus.VERIFICATION_FAILED,
@@ -226,6 +229,100 @@ class SkillCandidate(BaseModel):
     explicit: bool = False
 
 
+class SkillActivation(BaseModel):
+    """A verified SKILL.md read scoped to one Run or Goal revision."""
+
+    activation_id: str
+    skill_id: str
+    scope: Literal["run", "goal"] = "run"
+    run_id: str
+    goal_id: str | None = None
+    goal_revision: int | None = None
+    skill_content_sha256: str
+    toolsets: list[str] = Field(default_factory=list)
+    unlocked_tools: list[str] = Field(default_factory=list)
+    source_tool_call_id: str
+    created_at: float = Field(default_factory=time.time)
+
+
+class SkillRecommendation(BaseModel):
+    """A relevant installed Skill that remains inactive until SKILL.md is read."""
+
+    skill_id: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    evidence: str = ""
+    source: str = "task_profile"
+
+
+class CapabilityManifest(BaseModel):
+    """Single authority used for model prompt, Tool Schema and Trace."""
+
+    manifest_id: str
+    run_id: str
+    active_skill_ids: list[str] = Field(default_factory=list)
+    recommended_inactive_skills: list[SkillRecommendation] = Field(default_factory=list)
+    enabled_toolsets: list[str] = Field(default_factory=list)
+    allowed_tool_names: list[str] = Field(default_factory=list)
+    tool_schema_hash: str
+    created_at: float = Field(default_factory=time.time)
+
+
+class DelegationLimits(BaseModel):
+    """Bounded resources for one subagent invocation."""
+
+    wall_clock_seconds: int = Field(default=600, ge=1)
+    model_calls: int = Field(default=12, ge=1)
+    tool_calls: int = Field(default=30, ge=1)
+    idle_seconds: int = Field(default=90, ge=1)
+
+
+class DelegationContract(BaseModel):
+    """Server-authored authority for one native task delegation."""
+
+    subagent_run_id: str
+    parent_run_id: str
+    parent_tool_call_id: str
+    session_id: str
+    goal_id: str | None = None
+    goal_revision: int | None = None
+    subagent_type: str
+    objective: str
+    todo_slice: list[str] = Field(default_factory=list)
+    selected_analytics_model: str | None = None
+    semantic_context_refs: list[str] = Field(default_factory=list)
+    allowed_skill_activations: list[str] = Field(default_factory=list)
+    allowed_toolsets: list[str] = Field(default_factory=list)
+    expected_output_schema: str = "DelegationResultEnvelope/v1"
+    completion_conditions: list[str] = Field(default_factory=list)
+    limits: DelegationLimits = Field(default_factory=DelegationLimits)
+    created_at: float = Field(default_factory=time.time)
+
+
+class DelegationResultEnvelope(BaseModel):
+    """Machine-readable subagent handoff consumed by the parent Agent."""
+
+    status: Literal["completed", "blocked", "timed_out", "failed", "cancelled"]
+    subagent_run_id: str
+    summary: str = ""
+    completed_todo_ids: list[str] = Field(default_factory=list)
+    remaining_todo_ids: list[str] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+    sql_generation_ids: list[str] = Field(default_factory=list)
+    validation_receipt_ids: list[str] = Field(default_factory=list)
+    artifact_refs: list[dict[str, Any]] = Field(default_factory=list)
+    question_for_parent: str | None = None
+    last_successful_action: str | None = None
+    blocking_or_timeout_reason: str | None = None
+    recommended_parent_action: Literal[
+        "continue_directly",
+        "ask_user",
+        "accept_result",
+        "revise_delegation",
+    ] = "accept_result"
+    retry_same_delegation_allowed: bool = False
+    created_at: float = Field(default_factory=time.time)
+
+
 class RunTaskProfile(BaseModel):
     """Run-local task classification independent from selected model context."""
 
@@ -258,6 +355,70 @@ class VerificationActivation(BaseModel):
     status: str = "succeeded"
     evidence_refs: list[dict[str, Any]] = Field(default_factory=list)
     created_at: float = Field(default_factory=time.time)
+
+
+class ValidationArtifactRef(BaseModel):
+    artifact_id: str
+    content_sha256: str
+    path: str | None = None
+    observed_path: str | None = None
+
+
+class ValidationReceipt(BaseModel):
+    """Artifact-bound immutable result produced by one validator attempt."""
+
+    validation_receipt_id: str
+    run_id: str
+    goal_id: str | None = None
+    goal_revision: int | None = None
+    validator_kind: Literal[
+        "html_structure",
+        "javascript_syntax",
+        "artifact_ui_contract",
+        "project_test",
+        "static_check",
+    ]
+    validator_version: str = "v1"
+    artifact_refs: list[ValidationArtifactRef]
+    command_evidence_ref: str
+    exit_code: int
+    checks_passed: int | None = None
+    checks_failed: int = 0
+    status: Literal["passed", "failed"] = "passed"
+    blocking: bool = True
+    # Completion evidence and commit authority are deliberately separate.
+    # A free-form command may still be useful evidence for the rubric, but it
+    # must not authorize publishing bytes merely because an artifact path was
+    # present in argv.  Only Harness-controlled validator adapters set this.
+    commit_authority: bool = False
+    # Stable semantic identity of the validation obligation.  Success can
+    # supersede failure only within the same obligation; a UI contract must
+    # never wash away a syntax failure (or vice versa).
+    obligation_key: str | None = None
+    created_at: float = Field(default_factory=time.time)
+
+
+class DeliveredArtifact(BaseModel):
+    """Latest durable identity for one formally committed artifact target."""
+
+    artifact_id: str
+    target_path: str
+    content_sha256: str
+    role: Literal["delivered"] = "delivered"
+    status: Literal["active", "deleted", "stale"] = "active"
+    deleted_at: float | None = None
+    stale_reason: str | None = None
+    delivery_receipt_id: str
+    related_artifact_ids: list[str] = Field(default_factory=list)
+    contract_ids: list[str] = Field(default_factory=list)
+    validation_receipt_ids: list[str] = Field(default_factory=list)
+    source_skill_ids: list[str] = Field(default_factory=list)
+    source_run_id: str
+    source_query_id: str
+    source_goal_id: str | None = None
+    source_goal_revision: int | None = None
+    created_at: float = Field(default_factory=time.time)
+    updated_at: float = Field(default_factory=time.time)
 
 
 class ArtifactReference(BaseModel):
@@ -338,6 +499,23 @@ class RubricEvaluationReport(BaseModel):
     created_at: float = Field(default_factory=time.time)
 
 
+class RunHandoffSummary(BaseModel):
+    """Bounded cross-Run continuity without replaying private execution logs."""
+
+    source_run_id: str
+    goal_id: str | None = None
+    goal_revision: int | None = None
+    terminal_status: str
+    objective: str
+    completed_todos: list[dict[str, Any]] = Field(default_factory=list)
+    durable_facts: list[str] = Field(default_factory=list)
+    evidence_refs: list[dict[str, Any]] = Field(default_factory=list)
+    artifact_refs: list[dict[str, Any]] = Field(default_factory=list)
+    sql_generation_refs: list[dict[str, Any]] = Field(default_factory=list)
+    unresolved_gaps: list[str] = Field(default_factory=list)
+    created_at: float = Field(default_factory=time.time)
+
+
 class RunRecord(BaseModel):
     run_id: str
     query_id: str
@@ -346,16 +524,30 @@ class RunRecord(BaseModel):
     declared_artifact_targets: list[str] = Field(default_factory=list)
     goal_id: str | None = None
     goal_revision: int | None = None
+    follow_up_of_goal_id: str | None = None
+    follow_up_of_artifact_ids: list[str] = Field(default_factory=list)
+    execution_mode: Literal["native", "delta_repair"] = "native"
+    delta_repair_kind: Literal[
+        "presentation_only", "data_refresh", "bounded_unknown"
+    ] | None = None
+    delta_repair_tool_budget: int | None = Field(default=None, ge=1)
+    delta_repair_tool_call_ids: list[str] = Field(default_factory=list)
     project_id: str | None = None
     analytics_model_id: str | None = None
     verification_enabled: bool = True
     task_profile: RunTaskProfile = Field(default_factory=RunTaskProfile)
+    skill_activations: list[SkillActivation] = Field(default_factory=list)
+    capability_manifest: CapabilityManifest | None = None
+    delegation_contracts: list[DelegationContract] = Field(default_factory=list)
+    delegation_results: list[DelegationResultEnvelope] = Field(default_factory=list)
+    delegation_events: list[dict[str, Any]] = Field(default_factory=list)
     status: RunStatus = RunStatus.PREPARING
     outcome: RunOutcome | None = None
     declared_verification_contract: RunVerificationContract | None = None
     verification_contract: RunVerificationContract | None = None
     verification_activations: list[VerificationActivation] = Field(default_factory=list)
     verification_report: RubricEvaluationReport | None = None
+    handoff_summary: RunHandoffSummary | None = None
     model_call_count: int = 0
     budget_exhaustion_reason: str | None = None
     error: str | None = None
@@ -440,6 +632,7 @@ class GoalRecord(BaseModel):
     gaps: list[str] = Field(default_factory=list)
     control_notices: list[str] = Field(default_factory=list)
     evidence_refs: list[dict[str, Any]] = Field(default_factory=list)
+    skill_activations: list[SkillActivation] = Field(default_factory=list)
     latest_verification_report_id: str | None = None
     latest_goal_decision: GoalVerificationDecision | None = None
     max_rounds: int = 8

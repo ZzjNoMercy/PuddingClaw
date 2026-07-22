@@ -224,11 +224,12 @@ export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
               }
 
               if (item.type === "activity") {
-                const passed = item.status === "satisfied" || item.status === "passed";
-                const ActivityIcon = passed ? CheckCircle2 : Loader2;
+                const passed = ["satisfied", "passed", "completed", "done"].includes(item.status || "");
+                const failed = ["failed", "timed_out", "cancelled", "error"].includes(item.status || "");
+                const ActivityIcon = passed ? CheckCircle2 : failed ? XCircle : Loader2;
                 return (
                   <div key={item.id} className="relative flex items-start gap-3">
-                    <div className={`relative z-10 flex h-5 w-5 shrink-0 items-center justify-center rounded-full ${passed ? "bg-emerald-50 text-emerald-600" : "bg-blue-50 text-[#002fa7]"}`}>
+                    <div className={`relative z-10 flex h-5 w-5 shrink-0 items-center justify-center rounded-full ${passed ? "bg-emerald-50 text-emerald-600" : failed ? "bg-rose-50 text-rose-600" : "bg-blue-50 text-[#002fa7]"}`}>
                       <ActivityIcon className={`h-3 w-3 ${item.status === "running" ? "animate-spin" : ""}`} />
                     </div>
                     <div className="pt-0.5 text-[12px] text-gray-500">{item.label}</div>

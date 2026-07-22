@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -17,6 +19,96 @@ class ApprovalMode(StrEnum):
 
 DEFAULT_APPROVAL_MODE = ApprovalMode.STRICT
 PERMISSION_POLICY_VERSION = "tool-execution-v3"
+PERMISSION_BINDING_SCHEMA_VERSION = 2
+
+
+class PermissionBindingPolicy:
+    """Define the stable authority boundary for reusable grants."""
+
+    _COMMON_KEYS = (
+        "approval_mode",
+        "backend_mode",
+        "policy_epoch",
+        "policy_version",
+        "workspace_id",
+    )
+
+    @classmethod
+    def project(
+        cls,
+        *,
+        grant_type: str,
+        scope: str,
+        target_kind: str,
+        target: str,
+        runtime_bindings: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        bindings = runtime_bindings if isinstance(runtime_bindings, Mapping) else {}
+        if scope == "session" and (
+            target == "session_network_access"
+            or grant_type.startswith("external_directory_")
+        ):
+            return {key: bindings.get(key) for key in cls._COMMON_KEYS}
+        return {str(key): value for key, value in bindings.items()}
+
+    @classmethod
+    def semantic_key(
+        cls,
+        *,
+        session_id: str,
+        grant_type: str,
+        scope: str,
+        target_kind: str,
+        target: str,
+        capabilities: list[str],
+        runtime_bindings: Mapping[str, Any] | None,
+    ) -> tuple[str, dict[str, Any]]:
+        stable = cls.project(
+            grant_type=grant_type,
+            scope=scope,
+            target_kind=target_kind,
+            target=target,
+            runtime_bindings=runtime_bindings,
+        )
+        payload = {
+            "binding_schema_version": PERMISSION_BINDING_SCHEMA_VERSION,
+            "session_id": session_id,
+            "grant_type": grant_type,
+            "scope": scope,
+            "target_kind": target_kind,
+            "target": target,
+            "capabilities": sorted(set(capabilities)),
+            "stable_bindings": stable,
+        }
+        digest = hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+        return f"sha256:{digest}", stable
+
+    @classmethod
+    def equivalent(
+        cls,
+        *,
+        grant_type: str,
+        scope: str,
+        target_kind: str,
+        target: str,
+        left: Mapping[str, Any] | None,
+        right: Mapping[str, Any] | None,
+    ) -> bool:
+        return cls.project(
+            grant_type=grant_type,
+            scope=scope,
+            target_kind=target_kind,
+            target=target,
+            runtime_bindings=left,
+        ) == cls.project(
+            grant_type=grant_type,
+            scope=scope,
+            target_kind=target_kind,
+            target=target,
+            runtime_bindings=right,
+        )
 
 
 def normalize_approval_mode(value: Any) -> ApprovalMode:

@@ -96,6 +96,51 @@ def test_todo_cancel_is_tombstone_not_deletion():
     ]
 
 
+def test_validation_todo_cannot_complete_without_registered_receipt():
+    created, _ = _apply_operations(
+        [],
+        [
+            TodoPatchOperation(
+                action="create",
+                content="验证目标产物",
+                completion_contract="validation_receipt",
+            )
+        ],
+        tool_call_id="call-validation",
+        run_id="run-validation",
+        query_id="query-validation",
+    )
+    todo_id = created[0]["id"]
+
+    with pytest.raises(ValueError, match="requires validation_receipt evidence"):
+        _apply_operations(
+            created,
+            [TodoPatchOperation(action="complete", todo_id=todo_id)],
+            tool_call_id="call-complete-missing",
+            run_id="run-validation",
+            query_id="query-validation",
+            available_evidence={"validation_receipt": set()},
+        )
+
+    completed, _ = _apply_operations(
+        created,
+        [
+            TodoPatchOperation(
+                action="complete",
+                todo_id=todo_id,
+                evidence_refs=["validation-receipt-1"],
+            )
+        ],
+        tool_call_id="call-complete-valid",
+        run_id="run-validation",
+        query_id="query-validation",
+        available_evidence={"validation_receipt": {"validation-receipt-1"}},
+    )
+
+    assert completed[0]["status"] == "completed"
+    assert completed[0]["evidence_refs"] == ["validation-receipt-1"]
+
+
 @pytest.mark.asyncio
 async def test_update_todos_receives_runtime_through_real_async_tool_node():
     tool = HarnessTodoMiddleware().tools[0]

@@ -154,6 +154,7 @@ def _format_generation(
     lines = [
         title,
         f"- generation_id：{generation.id}",
+        f"- sql_sha256：{generation.sql_sha256}",
         f"- 数据源：{result.source.get('name')} ({result.source.get('id')})",
         f"- 表：{', '.join(result.route.table_names)}",
         f"- 路由：{result.route.reason}，confidence={result.route.confidence:.2f}",
@@ -192,8 +193,8 @@ def _format_generation(
         lines.append(f"- 耗时：总计 {total_seconds:.2f}s，SQL生成 {generation_seconds:.2f}s")
     lines.extend(_format_semantic_contract(result.semantic_assets))
     lines.append(
-        "- 执行约束：database_sql_validate/database_sql_execute 必须携带此 generation_id；"
-        "Agent 模式无需回传 SQL，工具会从 generation_id 加载登记结果。"
+        "- 执行约束：先用 generation_id 调用 database_sql_validate 获得 validation_receipt_id；"
+        "再将两者一起传给 database_sql_execute。Agent 模式无需回传 SQL，工具会从服务器账本加载登记结果。"
     )
     lines.extend(["", "```sql", result.sql, "```"])
     return "\n".join(lines)
@@ -264,9 +265,14 @@ class DatabaseSqlGenerateTool(BaseTool):
         disposition = "generated"
         applied_instruction = ""
         if parent_generation_id:
+            runtime_context = getattr(runtime, "context", None)
+            context = runtime_context if isinstance(runtime_context, dict) else {}
             parent = database_sql_revision_resume_registry.get_generation(
                 parent_generation_id,
                 session_id=self.session_id,
+                run_id=str(context.get("run_id") or ""),
+                goal_id=str(context.get("goal_id") or ""),
+                goal_revision=context.get("goal_revision"),
             )
             if parent is None:
                 return "🧮 SQL 重新生成失败：parent_generation_id 不存在或不属于当前会话。"
@@ -351,9 +357,14 @@ class DatabaseSqlGenerateTool(BaseTool):
             },
         )
         generation_request = dict(parent.request) if parent is not None else dict(request_payload)
+        raw_runtime_context = getattr(runtime, "context", None)
+        runtime_context = raw_runtime_context if isinstance(raw_runtime_context, dict) else {}
         generation = database_sql_revision_resume_registry.register_generation(
             session_id=self.session_id,
             query_id=self.query_id,
+            run_id=str(runtime_context.get("run_id") or ""),
+            goal_id=str(runtime_context.get("goal_id") or ""),
+            goal_revision=runtime_context.get("goal_revision"),
             result=result,
             request=generation_request,
             parent_generation_id=parent.id if parent is not None else "",

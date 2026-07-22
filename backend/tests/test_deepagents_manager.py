@@ -151,6 +151,9 @@ def test_completion_gate_loops_before_rubric_grader(tmp_path):
     assert update["jump_to"] == "model"
     assert update["_completion_gate_status"] == "needs_revision"
     assert "todo_reconciliation" in update["messages"][0].content
+    assert "<harness_repair_contract>" in update["messages"][0].content
+    assert "accepted_closure_methods" in update["messages"][0].content
+    assert events[-1]["repair_contract"]["version"] == "repair-contract/v1"
     assert events[-1]["type"] == "deterministic_checks_completed"
 
 
@@ -297,6 +300,48 @@ def test_completion_gate_stops_after_repeated_identical_gap_without_new_evidence
     assert second["_completion_gate_status"] == "failed"
     assert second["_rubric_status"] == "failed"
     assert "jump_to" not in second
+    assert second["_completion_gate_stagnation_count"] == 1
+
+
+def test_completion_gate_ignores_growing_receipt_evidence_for_stagnation(tmp_path, monkeypatch):
+    from graph.deepagents_manager import PuddingClawRubricMiddleware
+    from harness.models import CriterionEvaluation, VerifierKind
+    from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
+
+    contract = RunRubricCompiler.compile(
+        RubricBuildContext(user_message="完成任务", force_required=True)
+    )
+    assert contract is not None
+    middleware = PuddingClawRubricMiddleware(model=SimpleNamespace(), max_iterations=2)
+    evidence_counts = iter((1, 2))
+
+    def evaluate(_contract, _state):
+        count = next(evidence_counts)
+        return [
+            CriterionEvaluation(
+                criterion_id="task_fulfillment",
+                name="task_fulfillment",
+                passed=False,
+                verifier=VerifierKind.DETERMINISTIC,
+                evidence=[{"kind": "receipt", "items": list(range(count))}],
+                gap="仍缺少同一项完成证据",
+            )
+        ]
+
+    monkeypatch.setattr("graph.deepagents_manager.evaluate_deterministic_criteria", evaluate)
+    runtime = SimpleNamespace(context={"workspace_path": str(tmp_path)}, stream_writer=None)
+    initial = {
+        "messages": [AIMessage(content="处理中")],
+        "rubric": contract.rubric,
+        "verification_contract": contract.model_dump(mode="json"),
+    }
+
+    first = middleware._completion_gate_update(initial, runtime)
+    assert first is not None and first["_completion_gate_status"] == "needs_revision"
+    second = middleware._completion_gate_update({**initial, **first}, runtime)
+
+    assert second is not None
+    assert second["_completion_gate_status"] == "failed"
     assert second["_completion_gate_stagnation_count"] == 1
 
 
@@ -1112,7 +1157,7 @@ def test_slow_task_router_never_blocks_run_or_main_agent_start(tmp_path, monkeyp
         return [
             event
             async for event in runtime.astream(
-                message="你好",
+                message="分析并刷新产品报告",
                 session_id="nonblocking-router-session",
                 user_id="test-user",
             )
@@ -1131,7 +1176,59 @@ def test_slow_task_router_never_blocks_run_or_main_agent_start(tmp_path, monkeyp
     assert trace is not None
     router_span = next(span for span in trace["spans"] if span["name"] == "task_router")
     assert router_span["output"]["status"] == "cancelled"
-    assert router_span["output"]["error"] == "run_finished_before_router"
+    assert router_span["output"]["error"] == "main_agent_started_before_router"
+
+
+def test_trivial_chat_skips_semantic_router_provider_call(tmp_path, monkeypatch):
+    from graph import deepagents_manager as manager_module
+    from graph.session_manager import session_manager
+    from projects.registry import project_registry
+
+    session_manager.initialize(tmp_path)
+    project_registry.initialize(tmp_path)
+    session_manager.create_session("trivial-router-session")
+
+    async def forbidden_router(_self, **_kwargs):
+        raise AssertionError("trivial chat must not call the semantic router")
+
+    class FakeDeepAgent:
+        async def astream(self, *_args, **_kwargs):
+            yield ("values", {"messages": [AIMessage(content="你好。")]})
+
+    async def no_title(_session_id: str):
+        return None
+
+    monkeypatch.setattr(
+        manager_module.DeepAgentsAgentManager,
+        "_classify_task_profile",
+        forbidden_router,
+    )
+    monkeypatch.setattr(manager_module, "create_deep_agent", lambda **_kwargs: FakeDeepAgent())
+    monkeypatch.setattr(manager_module, "_generate_title", no_title)
+    runtime = manager_module.DeepAgentsAgentManager()
+    runtime.initialize(Path(tmp_path))
+
+    async def collect():
+        return [
+            event
+            async for event in runtime.astream(
+                message="你好",
+                session_id="trivial-router-session",
+                user_id="test-user",
+            )
+        ]
+
+    events = asyncio.run(collect())
+    completion = next(
+        json.loads(event["data"])
+        for event in events
+        if event["event"] == "task_routing_completed"
+    )
+    trace = session_manager.get_trace("trivial-router-session")
+
+    assert completion["status"] == "not_required"
+    assert trace is not None
+    assert all(span["name"] != "task_router" for span in trace["spans"])
 
 
 def test_task_router_timeout_is_persisted_in_trace(tmp_path, monkeypatch):
@@ -1172,7 +1269,7 @@ def test_task_router_timeout_is_persisted_in_trace(tmp_path, monkeypatch):
         return [
             event
             async for event in runtime.astream(
-                message="你好",
+                message="分析并刷新产品报告",
                 session_id="router-timeout-trace-session",
                 user_id="test-user",
             )
@@ -1216,7 +1313,7 @@ def test_task_router_timeout_is_persisted_in_trace(tmp_path, monkeypatch):
             {"outcome": "verification_failed"},
             {"report": {"status": "needs_revision"}},
             {"status": "active", "round": 1, "max_rounds": 8},
-            "verification_failed",
+            None,
         ),
         (
             {"outcome": "verification_failed"},
@@ -2424,41 +2521,7 @@ def test_historical_tool_messages_are_not_reemitted_on_followup(tmp_path, monkey
                 msg for msg in graph_input["messages"]
                 if getattr(msg, "type", "") == "tool" and getattr(msg, "tool_call_id", "") == "call_old_db"
             ]
-            assert historical_tools
-            assert "旧工具结果" in historical_tools[0].content
-            yield (
-                "updates",
-                {
-                    "model": {
-                        "messages": [
-                            AIMessage(
-                                content="",
-                                tool_calls=[
-                                    {
-                                        "name": "database_sql_execute",
-                                        "args": {"question": "旧问题"},
-                                        "id": "call_old_db",
-                                    }
-                                ],
-                            )
-                        ]
-                    }
-                },
-            )
-            yield (
-                "updates",
-                {
-                    "tools": {
-                        "messages": [
-                            ToolMessage(
-                                content="旧工具结果",
-                                tool_call_id="call_old_db",
-                                name="database_sql_execute",
-                            )
-                        ]
-                    }
-                },
-            )
+            assert not historical_tools
             yield (
                 "messages",
                 (AIMessageChunk(content="继续回答。"), {"langgraph_node": "model"}),

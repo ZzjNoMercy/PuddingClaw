@@ -345,7 +345,10 @@ function ExternalFilePermissionCard({
   const isDirectory = request.type.startsWith("external_directory_");
   const isWrite = request.type === "external_file_write" || request.type === "external_directory_write";
 
-  const grant = async (targetKind: "exact_file" | "exact_directory" | "all_external_files") => {
+  const grant = async (
+    targetKind: "exact_file" | "exact_directory" | "all_external_files",
+    scope?: "run" | "session",
+  ) => {
     setStatus("loading");
     setError("");
     try {
@@ -353,7 +356,8 @@ function ExternalFilePermissionCard({
         sessionId,
         targetKind,
         targetKind === "all_external_files" ? undefined : path,
-        request.id
+        request.id,
+        scope,
       );
       setStatus("granted");
       window.dispatchEvent(new CustomEvent("puddingclaw:permissions-changed"));
@@ -423,21 +427,42 @@ function ExternalFilePermissionCard({
           {isDirectory ? (
             <div className="mt-2 rounded-xl border border-sky-100 bg-sky-50/70 px-3 py-2 text-[11px] leading-relaxed text-sky-800">
               修改、运行或联调整个目录时，建议将该目录作为项目打开。若仍在当前会话继续，目录只会暂存到隔离环境；
-              {isWrite ? " 本次 Run 将按上方已审核的新增、修改和删除清单递归写回。" : " 读取授权不会直接修改原目录。"}
+              {isWrite
+                ? " 写回仍只会应用上方已审核的新增、修改和删除清单。"
+                : " 读取授权不会直接修改原目录，且不会扩展到父目录或相邻目录。"}
             </div>
           ) : null}
           {status !== "granted" && status !== "denied" ? (
             <div className="mt-3 flex flex-wrap items-center gap-2">
-              <button
-                type="button"
-                disabled={status === "loading"}
-                onClick={() => grant(isDirectory ? "exact_directory" : "exact_file")}
-                className="rounded-full bg-[#002fa7] px-3.5 py-2 text-[12px] font-semibold text-white shadow-sm transition hover:bg-[#00298f] disabled:cursor-default disabled:opacity-60"
-              >
-                {isDirectory
-                  ? isWrite ? "仍然允许本次 Run 修改目录" : "允许本次 Run 读取目录"
-                  : isWrite ? "允许修改此文件" : "允许此文件"}
-              </button>
+              {isDirectory ? (
+                <>
+                  <button
+                    type="button"
+                    disabled={status === "loading"}
+                    onClick={() => grant("exact_directory", isWrite ? "run" : "session")}
+                    className="rounded-full bg-[#002fa7] px-3.5 py-2 text-[12px] font-semibold text-white shadow-sm transition hover:bg-[#00298f] disabled:cursor-default disabled:opacity-60"
+                  >
+                    {isWrite ? "仅本次 Run 写回" : "本 Session 允许读取此目录"}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={status === "loading"}
+                    onClick={() => grant("exact_directory", isWrite ? "session" : "run")}
+                    className="rounded-full bg-white px-3.5 py-2 text-[12px] font-semibold text-slate-700 shadow-sm ring-1 ring-black/[0.08] transition hover:bg-slate-50 disabled:cursor-default disabled:opacity-60"
+                  >
+                    {isWrite ? "本 Session 允许写回此目录" : "仅本次 Run"}
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  disabled={status === "loading"}
+                  onClick={() => grant("exact_file")}
+                  className="rounded-full bg-[#002fa7] px-3.5 py-2 text-[12px] font-semibold text-white shadow-sm transition hover:bg-[#00298f] disabled:cursor-default disabled:opacity-60"
+                >
+                  {isWrite ? "允许修改此文件" : "允许此文件"}
+                </button>
+              )}
               {!isWrite && !isDirectory ? (
                 <button
                   type="button"

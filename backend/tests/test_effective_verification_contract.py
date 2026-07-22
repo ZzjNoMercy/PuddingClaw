@@ -751,6 +751,59 @@ def test_artifact_delivery_rejects_receipt_size_identity_mismatch(tmp_path):
     assert "发生变化" in str(evaluation.gap)
 
 
+def test_artifact_publication_reference_is_deferred_during_revision(tmp_path):
+    from harness.deterministic_checks import _evaluate_artifact_delivery
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    artifact = workspace / "report.md"
+    artifact.write_text("# report\n", encoding="utf-8")
+    activation = next(
+        item
+        for item in build_verification_activations(
+            run_id="run-artifact-revision",
+            query_id="query-artifact-revision",
+            tool_call_id="call-artifact-revision",
+            tool_name="write_file",
+            args={"file_path": "/workspace/report.md", "content": "# report\n"},
+            result=ToolMessage(
+                content="Updated /workspace/report.md",
+                tool_call_id="call-artifact-revision",
+                name="write_file",
+                status="success",
+            ),
+            workspace_path=str(workspace),
+        )
+        if item.pack == "artifact"
+    )
+
+    revision = _evaluate_artifact_delivery(
+        "artifact_delivery",
+        {
+            "workspace_path": str(workspace),
+            "run_id": "run-artifact-revision",
+            "final_content": "",
+            "evaluation_phase": "revision",
+            "verification_activations": [activation.model_dump(mode="json")],
+        },
+    )
+    terminal = _evaluate_artifact_delivery(
+        "artifact_delivery",
+        {
+            "workspace_path": str(workspace),
+            "run_id": "run-artifact-revision",
+            "final_content": "",
+            "evaluation_phase": "terminal",
+            "verification_activations": [activation.model_dump(mode="json")],
+        },
+    )
+
+    assert revision.passed is True
+    assert revision.evidence[0]["publication_reference_checked"] is False
+    assert terminal.passed is False
+    assert "尚未引用" in str(terminal.gap)
+
+
 def test_scratch_write_is_temporary_and_cannot_satisfy_artifact_delivery(tmp_path):
     from graph.session_manager import session_manager
     from harness.deterministic_checks import _evaluate_artifact_delivery
@@ -1203,6 +1256,281 @@ def test_middleware_does_not_record_failed_tool(tmp_path, monkeypatch):
     assert calls == []
 
 
+def test_failed_validation_is_persisted_as_blocking_receipt(tmp_path):
+    from graph.session_manager import session_manager
+
+    state = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    state.mkdir()
+    workspace.mkdir()
+    source = workspace / "broken.js"
+    source.write_text("const = ;\n", encoding="utf-8")
+    session_manager.initialize(state)
+    session_manager.create_session("failed-validation-session")
+    run = RunRecord(
+        run_id="run-failed-validation",
+        query_id="query-failed-validation",
+        session_id="failed-validation-session",
+        objective="validate broken.js",
+        status=RunStatus.PREPARING,
+    )
+    session_manager.start_harness_run(
+        "failed-validation-session", run.model_dump(mode="json")
+    )
+    session_manager.transition_run_status(
+        "failed-validation-session", run.run_id, RunStatus.RUNNING.value
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "id": "call-node-check",
+            "name": "execute",
+            "args": {"command": "node --check /workspace/broken.js"},
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(
+            context={
+                "session_id": "failed-validation-session",
+                "run_id": run.run_id,
+                "query_id": run.query_id,
+                "workspace_path": str(workspace),
+            },
+            stream_writer=None,
+        ),
+    )
+
+    VerificationActivationMiddleware().wrap_tool_call(
+        request,
+        lambda _request: ToolMessage(
+            content="SyntaxError\n[Command failed with exit code 1]",
+            tool_call_id="call-node-check",
+            name="execute",
+            status="error",
+        ),
+    )
+
+    saved = session_manager.get_run_state(
+        "failed-validation-session", run.run_id
+    )
+    assert saved is not None
+    assert len(saved["verification_activations"]) == 1
+    activation = saved["verification_activations"][0]
+    assert activation["status"] == "succeeded"
+    receipt = next(
+        item
+        for item in activation["evidence_refs"]
+        if item.get("kind") == "validation_receipt"
+    )
+    assert receipt["status"] == "failed"
+    assert receipt["blocking"] is True
+    assert receipt["exit_code"] == 1
+    assert receipt["artifact_refs"] == [
+        {
+            "artifact_id": receipt["artifact_refs"][0]["artifact_id"],
+            "content_sha256": receipt["artifact_refs"][0]["content_sha256"],
+            "path": str(source.resolve()),
+            "observed_path": "/workspace/broken.js",
+        }
+    ]
+
+
+def test_validation_receipt_binds_only_explicit_command_input(tmp_path):
+    from graph.session_manager import session_manager
+
+    state = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    state.mkdir()
+    workspace.mkdir()
+    html = workspace / "report.html"
+    script = workspace / "chart.js"
+    html.write_text("<html></html>\n", encoding="utf-8")
+    script.write_text("const value = 1;\n", encoding="utf-8")
+    session_manager.initialize(state)
+    session_manager.create_session("receipt-input-session")
+    run = RunRecord(
+        run_id="run-receipt-input",
+        query_id="query-receipt-input",
+        session_id="receipt-input-session",
+        objective="update report and chart",
+        status=RunStatus.PREPARING,
+    )
+    session_manager.start_harness_run(
+        "receipt-input-session", run.model_dump(mode="json")
+    )
+    session_manager.transition_run_status(
+        "receipt-input-session", run.run_id, RunStatus.RUNNING.value
+    )
+    for index, path in enumerate((html, script), start=1):
+        activation = next(
+            item
+            for item in build_verification_activations(
+                run_id=run.run_id,
+                query_id=run.query_id,
+                tool_call_id=f"call-write-{index}",
+                tool_name="write_file",
+                args={
+                    "file_path": f"/workspace/{path.name}",
+                    "content": path.read_text(encoding="utf-8"),
+                },
+                result=ToolMessage(
+                    content=f"Updated /workspace/{path.name}",
+                    tool_call_id=f"call-write-{index}",
+                    name="write_file",
+                    status="success",
+                ),
+                session_id="receipt-input-session",
+                workspace_path=str(workspace),
+            )
+            if item.pack == "code"
+        )
+        session_manager.append_run_verification_activation(
+            "receipt-input-session",
+            run.run_id,
+            activation.model_dump(mode="json"),
+        )
+
+    validation = next(
+        item
+        for item in build_verification_activations(
+            run_id=run.run_id,
+            query_id=run.query_id,
+            tool_call_id="call-check-js",
+            tool_name="execute",
+            args={"command": "node --check /workspace/chart.js"},
+            result=ToolMessage(
+                content="[Command succeeded with exit code 0]",
+                tool_call_id="call-check-js",
+                name="execute",
+                status="success",
+            ),
+            session_id="receipt-input-session",
+            workspace_path=str(workspace),
+        )
+        if item.pack == "code"
+    )
+    receipt = next(
+        item
+        for item in validation.evidence_refs
+        if item.get("kind") == "validation_receipt"
+    )
+
+    assert [item["path"] for item in receipt["artifact_refs"]] == [
+        str(script.resolve())
+    ]
+
+
+def test_staged_validation_receipt_maps_observed_draft_to_external_target(tmp_path):
+    from graph.middlewares.versioned_patch import _digest
+    from graph.session_manager import session_manager
+
+    state = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    external = tmp_path / "external" / "app.js"
+    for path in (state, workspace, scratch, external.parent):
+        path.mkdir()
+    external.write_text("const value = 1;\n", encoding="utf-8")
+    staged_path = "/scratch/external/artifact-lease-test/app.js"
+    staged_host = scratch / staged_path.removeprefix("/scratch/")
+    staged_host.parent.mkdir(parents=True)
+    staged_host.write_text("const value = 2;\n", encoding="utf-8")
+    session_manager.initialize(state)
+    session_manager.create_session("staged-receipt-session")
+    run = RunRecord(
+        run_id="run-staged-receipt",
+        query_id="query-staged-receipt",
+        session_id="staged-receipt-session",
+        objective="update app.js",
+        status=RunStatus.PREPARING,
+        config_snapshot={
+            "execution": {
+                "scratch_host_path": str(scratch),
+                "workspace_id": "workspace-test",
+            }
+        },
+    )
+    session_manager.start_harness_run(
+        "staged-receipt-session", run.model_dump(mode="json")
+    )
+    session_manager.transition_run_status(
+        "staged-receipt-session", run.run_id, RunStatus.RUNNING.value
+    )
+    session_manager.upsert_external_artifact_lease(
+        "staged-receipt-session",
+        {
+            "lease_id": "artifact-lease-test",
+            "session_id": "staged-receipt-session",
+            "run_id": run.run_id,
+            "query_id": run.query_id,
+            "goal_id": "",
+            "goal_revision": None,
+            "target_path": str(external.resolve()),
+            "staged_path": staged_path,
+            "expected_source_sha256": "sha256:source",
+            "status": "staged",
+        },
+    )
+    write_activation = next(
+        item
+        for item in build_verification_activations(
+            run_id=run.run_id,
+            query_id=run.query_id,
+            tool_call_id="call-patch-draft",
+            tool_name="patch_file",
+            args={"file_path": staged_path},
+            result=ToolMessage(
+                content="Applied patch",
+                tool_call_id="call-patch-draft",
+                name="patch_file",
+                status="success",
+            ),
+            session_id="staged-receipt-session",
+            workspace_path=str(workspace),
+        )
+        if item.pack == "code"
+    )
+    session_manager.append_run_verification_activation(
+        "staged-receipt-session",
+        run.run_id,
+        write_activation.model_dump(mode="json"),
+    )
+
+    validation = next(
+        item
+        for item in build_verification_activations(
+            run_id=run.run_id,
+            query_id=run.query_id,
+            tool_call_id="call-check-draft",
+            tool_name="execute",
+            args={"command": f"node --check {staged_path}"},
+            result=ToolMessage(
+                content="[Command succeeded with exit code 0]",
+                tool_call_id="call-check-draft",
+                name="execute",
+                status="success",
+            ),
+            session_id="staged-receipt-session",
+            workspace_path=str(workspace),
+        )
+        if item.pack == "code"
+    )
+    receipt = next(
+        item
+        for item in validation.evidence_refs
+        if item.get("kind") == "validation_receipt"
+    )
+
+    assert receipt["status"] == "passed"
+    assert receipt["artifact_refs"] == [
+        {
+            "artifact_id": receipt["artifact_refs"][0]["artifact_id"],
+            "content_sha256": _digest("const value = 2;\n"),
+            "path": str(external.resolve()),
+            "observed_path": staged_path,
+        }
+    ]
+
+
 def test_general_subagent_inherits_verification_activation_middleware():
     from graph.deepagents_manager import _build_subagents
 
@@ -1567,6 +1895,34 @@ def test_non_analytics_or_fake_validation_commands_do_not_overactivate(command):
 
 
 @pytest.mark.parametrize(
+    "command",
+    [
+        "node --check product-config-charts-2026.js",
+        "npx eslint src/index.ts",
+        "npx tsc --noEmit",
+        "python3 validate_report.py report.html",
+        "python checks/check_report.py report.html",
+        "python3 -m pytest tests/test_report.py",
+    ],
+)
+def test_controlled_validation_commands_activate_code_pack(command):
+    assert "code" in verification_packs_for_tool("execute", {"command": command})
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python3 generate_report.py",
+        "python3 -c 'print(1)'",
+        "node render.js",
+        "npx prettier --write report.html",
+    ],
+)
+def test_arbitrary_script_execution_does_not_count_as_validation(command):
+    assert "code" not in verification_packs_for_tool("execute", {"command": command})
+
+
+@pytest.mark.parametrize(
     "message",
     [
         "分析 Python 的数据结构实现",
@@ -1627,6 +1983,29 @@ def test_required_grader_gap_forces_needs_revision():
     )
     assert task.passed is False
     assert report.status == VerificationStatus.NEEDS_REVISION
+
+
+def test_unreached_llm_criteria_are_reported_as_not_evaluated():
+    contract = RunRubricCompiler.compile(
+        RubricBuildContext(user_message="完成任务", force_required=True)
+    )
+    assert contract is not None
+
+    report = CompletionVerificationCoordinator.report_from_final_state(
+        run_id="run-not-evaluated",
+        contract=contract,
+        final_state={
+            "_rubric_status": "needs_revision",
+            "_harness_context": {"todos": []},
+        },
+    )
+
+    task = next(
+        item for item in report.evaluations if item.criterion_id == "task_fulfillment"
+    )
+    assert task.passed is None
+    assert task.evidence == [{"kind": "criterion_state", "status": "not_evaluated"}]
+    assert task.gap not in report.gaps
 
 
 def test_nonterminal_needs_revision_cannot_be_terminalized_as_satisfied():
@@ -1954,6 +2333,30 @@ def test_code_validation_inheritance_is_invalidated_by_artifact_hash_change(tmp_
         )
         if item.pack == "code"
     )
+    written_ref = next(
+        item for item in write_activation.evidence_refs if item.get("kind") == "artifact_write"
+    )
+    validation_activation.evidence_refs.append(
+        {
+            "kind": "validation_receipt",
+            "validation_receipt_id": "validation-test",
+            "run_id": "run-1",
+            "validator_kind": "project_test",
+            "validator_version": "test/v1",
+            "artifact_refs": [
+                {
+                    "artifact_id": written_ref["artifact_id"],
+                    "content_sha256": written_ref["content_sha256"],
+                    "path": written_ref["path"],
+                }
+            ],
+            "command_evidence_ref": "sha256:test",
+            "exit_code": 0,
+            "checks_passed": 1,
+            "checks_failed": 0,
+            "material": True,
+        }
+    )
     inherited = [
         {
             **ref,
@@ -1976,6 +2379,50 @@ def test_code_validation_inheritance_is_invalidated_by_artifact_hash_change(tmp_
     changed = _evaluate_code_validation("code_validation", context, {})
     assert changed.passed is False
     assert "hash 已变化" in str(changed.gap)
+
+
+def test_successful_validation_without_receipt_is_protocol_error():
+    from harness.deterministic_checks import _evaluate_code_validation
+    from harness.models import VerificationFailureKind
+
+    context = {
+        "run_id": "run-protocol-error",
+        "verification_activations": [
+            {
+                "pack": "code",
+                "tool_name": "write_file",
+                "created_at": 1.0,
+                "status": "succeeded",
+                "evidence_refs": [
+                    {
+                        "kind": "artifact_write",
+                        "artifact_id": "artifact-1",
+                        "content_sha256": "sha256:abc",
+                        "material": True,
+                    }
+                ],
+            },
+            {
+                "pack": "code",
+                "tool_name": "execute",
+                "created_at": 2.0,
+                "status": "succeeded",
+                "evidence_refs": [
+                    {
+                        "kind": "tool_execution",
+                        "tool_call_id": "call-validate",
+                        "material": True,
+                    }
+                ],
+            },
+        ],
+    }
+
+    evaluation = _evaluate_code_validation("code_validation", context, {})
+
+    assert evaluation.passed is False
+    assert evaluation.failure_kind == VerificationFailureKind.VALIDATOR_PROTOCOL_ERROR
+    assert "不应继续修改业务产物" in str(evaluation.gap)
 
 
 def test_runtime_pack_expansion_preserves_custom_rules():
