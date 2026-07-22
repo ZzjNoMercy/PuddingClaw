@@ -1,6 +1,6 @@
 # Goal 完成后追问：权限、Skill 连续性与外部搜索修复方案
 
-> 状态：第一阶段已实施；外部工作根与非 Goal 验收边界进入二次架构审核
+> 状态：§10.5–§10.11 已实施并完成 24 项代码级验收；Stage/lease 源码按双发布周期退出门禁保留兼容
 > 日期：2026-07-22
 > 范围：Goal/Run 生命周期、外部目录授权、Skill Capability Manifest、外部路径 `grep/glob/ls`、临时产物与验收契约
 > 原则：事故证据与设计决策保留为审计基线；实施结果以本节的代码、测试和最终 hash 约束为准。
@@ -1212,3 +1212,48 @@ P0-A 与 P0-B 必须作为同一批优化上线：前者停止简单任务被重
 2. 不因目录文件 Grant 自动允许 `execute` 读取宿主绝对路径；文件权限不等于 shell mount 权限；
 3. 不把全部 Session roots 挂入共享项目容器，也不建立长期 Session worker；
 4. 不用全局 fail-open 掩盖 Goal/高风险验收基础设施故障。
+
+### 10.12 落地状态与验收证据
+
+截至本轮实现，§10.5–§10.8 的目标架构已落地。P2 的“删除旧 Schema/源码”仍严格受“连续两个发布周期零新调用、无 active lease、旧 checkpoint 迁移完成”的退出条件约束；当前完成的是新 Run 退出旧路由、兼容调用遥测、active lease 审计/迁移和删除门禁，而不是提前破坏旧 Session 恢复。
+
+阶段证据：
+
+| 阶段 | 当前实现 | 权威入口 |
+|---|---|---|
+| P0-A 三级验收 | 普通 Run 为 `agent`；实际 mutation 升级 `proportional`；只有显式 Goal 为 `goal` 并允许 completion loop | `harness/models.py`、`harness/coordinators.py`、`graph/deepagents_manager.py`、`harness/verification_activations.py` |
+| P0-B Session Root/Broker | exact-file/exact-directory Grant 经 HostFileBroker 直读写；未授权原调用触发最窄 HITL；普通路径不再 stage | `graph/host_file_broker.py`、`graph/permissioned_filesystem_backend.py`、`graph/middlewares/workspace_path_router.py`、`graph/permission_middleware.py` |
+| P0-C 稳定证据引用 | Goal/Handoff/compact 只携带 `{type,id}`；Resolver 校验来源 Run、Tool Call、digest、revision 与状态 | `harness/evidence_ledger.py`、`graph/session_manager.py`、`graph/deepagents_manager.py` |
+| P1 Broker 一致性 | 单一 canonical/no-follow 权限边界、原子写、version token、统一错误、内部多文件事务、验证桥、per-Run rewind | `graph/host_file_broker.py`、`graph/permissioned_filesystem_backend.py`、`graph/middlewares/versioned_patch.py` |
+| P2 兼容/外部命令 | 新 Run 隐藏 Stage/lease；旧 owner 有界恢复并记指标；一次性 offline read-only `docker run --rm` 精确挂载；项目容器按项目路径稳定命名 | `graph/middlewares/toolset.py`、`scripts/audit_legacy_external_leases.py`、`harness/workspace_backends.py`、`harness/tool_execution.py` |
+
+24 条验收矩阵的代码级证据如下。测试名是长期回归入口，不能用“相邻测试通过”替代：
+
+| # | 验收结论 | 直接证据 |
+|---:|---|---|
+| 1 | 已完成 Goal 后的 HUD 追问保持 Level 0；无 completion activity；最近交付组可解析到当前 HTML/JS | `test_run_verification_mode_is_owned_by_explicit_goal_state`、`test_non_goal_rubric_middleware_emits_no_completion_activity`、`test_delivered_artifact_registry_resolves_standalone_follow_up_without_scratch` |
+| 2 | 历史 `2024.js` 不覆盖当前 `2026.js`；当前文件 hash/存在性是权威 | `test_delivered_artifact_registry_resolves_standalone_follow_up_without_scratch`、`test_follow_up_registry_rejects_deleted_or_externally_modified_targets`、`test_load_session_for_agent_excludes_cross_run_tool_output` |
+| 3 | 普通 HTML mutation 动态升 Level 1，仍无 Goal/reviewer 修订循环 | `test_successful_workspace_mutation_upgrades_to_proportional_without_goal_loop`、`test_non_goal_run_does_not_enter_completion_repair_loop` |
+| 4 | 显式 Goal 使用 Level 2 并冻结严格 contract | `test_run_verification_mode_is_owned_by_explicit_goal_state`、`test_explicit_goal_always_freezes_a_verification_contract` |
+| 5 | Session Root 跨 Run 支持 read/ls/glob/grep/edit/create/delete，不重复申请 | `test_session_directory_grant_survives_container_rebuild_but_stays_workspace_bound` |
+| 6 | 容器实例变化不使 Grant 失效；一个项目路径只有稳定项目容器，不创建 Session worker | `test_session_directory_grant_survives_container_rebuild_but_stays_workspace_bound`、`test_project_container_name_is_path_stable_and_not_session_scoped` |
+| 7 | 同义并发目录请求共享 UI semantic key，批准一张恢复同义 pending | `test_concurrent_directory_requests_share_ui_semantic_key_across_runs` |
+| 8 | 宿主并发变化产生 conflict，多文件事务不部分写入 | `test_multi_file_transaction_is_all_or_nothing_and_journaled`、`test_rewind_refuses_to_overwrite_concurrent_host_change` |
+| 9 | 普通文件结果无 lease/staged/source-vs-draft 参数；内部 receipt 仍保留版本与事务事实 | `test_authorized_directory_uses_direct_host_file_tools_and_receipts`、`test_authorized_external_directory_glob_keeps_canonical_host_path` |
+| 10 | Goal 外 Run 不执行 completion gate，也不发“发现完成条件缺口”事件 | `test_non_goal_rubric_middleware_emits_no_completion_activity`、`test_non_goal_run_does_not_enter_completion_repair_loop` |
+| 11 | exact-file sibling discovery 只请求直接父目录，敏感/过宽根不自动弹卡 | `test_exact_file_sibling_discovery_requests_only_direct_parent`、`test_exact_file_sibling_discovery_never_prompts_for_broad_ancestor` |
+| 12 | Read only Root 只允许 read/ls/glob/grep，write/edit/delete fail-closed；无 Grant 的绝对路径不能回落默认 Backend | `test_read_only_directory_grant_allows_search_but_not_mutation`、`test_ungranted_external_absolute_path_never_falls_through_default_backend` |
+| 13 | 文件 Grant 不改变项目容器 mount 或 shell 权限；完整目录命令另走一次性 exact-root 授权 | `test_project_container_spec_has_no_docker_socket_or_host_home`、`test_external_directory_command_mounts_only_exact_root_read_only`、`test_external_directory_command_is_exact_one_time_docker_approval` |
+| 14 | 验证副本位于 `/scratch/validation/<hash>`，Receipt 绑定正式 path/hash，结束即清理 | `test_broker_validation_bridge_binds_formal_hash_and_blocks_bad_bytes` |
+| 15 | 新 Run 不见 Stage/lease；只有 active legacy owner 可见并被审计 | `test_legacy_lease_tools_are_visible_only_to_active_owner_and_audited` |
+| 16 | `external_mutation_completed` 可直接形成 Artifact activation 并闭合交付，不依赖 `commit_external_*` 名称 | `test_broker_validation_bridge_binds_formal_hash_and_blocks_bad_bytes` |
+| 17 | Run B 的稳定 analytics ref 可解析回 Run A Tool Call/query trace | `test_analytics_ref_resolves_to_authoritative_cross_run_lineage` |
+| 18 | compact envelope 重复生成字节相同，`evidence_ref` 保持 `{type,id}` | `test_harness_summary_envelope_is_deterministic_and_keeps_authoritative_pending_work` |
+| 19 | 伪造或 revision 错误的 result/evidence id 被拒绝 | `test_forged_or_wrong_revision_ref_is_rejected` |
+| 20 | 完整旧 lineage 可迁移；缺来源记录审计为 non-inheritable | `test_legacy_complete_evidence_migrates_and_incomplete_is_audited` |
+| 21 | 同一 Goal revision 的同一权威结果引用去重，不复制 payload | `test_duplicate_identity_is_deduplicated_without_copying_payload` |
+| 22 | 历史 Goal analytics ref 不激活后续 standalone Level 0/1 contract | `test_historical_goal_evidence_does_not_activate_standalone_run` |
+| 23 | 同一语义 gap 不受 evidence 数量增长影响，下一轮即停滞早退 | `test_completion_gate_ignores_growing_receipt_evidence_for_stagnation` |
+| 24 | rewind 只处理当前 Run receipt；目标 hash 已变化时拒绝覆盖 | `test_rewind_restores_only_current_run_when_hashes_still_match`、`test_rewind_refuses_to_overwrite_concurrent_host_change` |
+
+补充安全审计结论：HostFileBroker 现在是外部 host path 的最终 fail-closed 边界。即使上游 Router 或权限 Middleware 漏拦，未授权的绝对路径也不能再回落到默认 `FilesystemBackend`；这是 `test_read_only_directory_grant_allows_search_but_not_mutation` 在本轮验收中发现并修复的真实越权缺口。Docker 内的普通绝对路径仍表示容器路径；宿主隔离由 mount spec 保证，不能错误地把“拒绝所有容器绝对路径”当作文件权限不扩 shell 权限的证明。

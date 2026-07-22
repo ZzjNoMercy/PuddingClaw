@@ -345,6 +345,51 @@ def test_completion_gate_ignores_growing_receipt_evidence_for_stagnation(tmp_pat
     assert second["_completion_gate_stagnation_count"] == 1
 
 
+def test_non_goal_rubric_middleware_emits_no_completion_activity(tmp_path):
+    from graph.deepagents_manager import PuddingClawRubricMiddleware
+    from graph.session_manager import session_manager
+    from harness.coordinators import HarnessRunCoordinator
+    from harness.models import RunStatus
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("plain-run-session")
+    coordinator = HarnessRunCoordinator(session_manager)
+    run, _goal = coordinator.start_run(
+        session_id="plain-run-session",
+        query_id="plain-query",
+        objective="HTML 中 HUD 数据是多少？",
+        goal_mode=False,
+    )
+    coordinator.transition(run, RunStatus.RUNNING)
+    events: list[dict] = []
+    runtime = SimpleNamespace(
+        context={
+            "session_id": "plain-run-session",
+            "run_id": run.run_id,
+            "query_id": run.query_id,
+            "workspace_path": str(tmp_path),
+        },
+        stream_writer=events.append,
+    )
+    middleware = PuddingClawRubricMiddleware(model=SimpleNamespace())
+
+    update = middleware.after_agent(
+        {
+            "messages": [AIMessage(content="HUD 数据来自当前 JS。")],
+            "verification_contract": {
+                "contract_id": "should-not-run",
+                "version": "test",
+                "criteria": [],
+                "rubric": "must not run",
+            },
+        },
+        runtime,
+    )
+
+    assert update is None
+    assert events == []
+
+
 def test_deterministic_and_grader_share_attempt_counter_without_ending_run(tmp_path, monkeypatch):
     from graph.deepagents_manager import PuddingClawRubricMiddleware
     from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
@@ -618,9 +663,11 @@ def test_harness_summary_envelope_is_deterministic_and_keeps_authoritative_pendi
     )
 
     envelope = manager_module._harness_summary_envelope("session-1")
+    repeated_envelope = manager_module._harness_summary_envelope("session-1")
     raw_json = next(line for line in envelope.splitlines() if line.startswith("{"))
     parsed = json.loads(raw_json)
 
+    assert repeated_envelope.encode("utf-8") == envelope.encode("utf-8")
     assert "puddingclaw.harness-envelope/v2" in envelope
     assert "goal-1" in envelope
     assert "todo-verify" in envelope

@@ -83,6 +83,13 @@ def test_authorized_directory_uses_direct_host_file_tools_and_receipts(tmp_path:
 
     edited = backend.edit(str(target), "2024", "2026")
     assert edited.error is None
+    assert not {
+        "lease_id",
+        "staged_path",
+        "source_sha256",
+        "draft_sha256",
+        "expected_source_sha256",
+    }.intersection(vars(edited))
     assert edited.path == str(target)
     assert target.read_text(encoding="utf-8") == "<option>2026</option>\n"
 
@@ -97,6 +104,106 @@ def test_authorized_directory_uses_direct_host_file_tools_and_receipts(tmp_path:
     assert [item["operation"] for item in receipts] == ["edit", "create"]
     assert all(item["atomic"] is True for item in receipts)
     assert all(item["permission_grant_id"] for item in receipts)
+    assert all(item["kind"] == "external_mutation_completed" for item in receipts)
+    assert all(item["before_version_token"] for item in receipts)
+    assert all(item["after_version_token"] for item in receipts)
+
+
+def test_read_only_directory_grant_allows_search_but_not_mutation(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    external = tmp_path / "external"
+    for directory in (state, workspace, external):
+        directory.mkdir()
+    target = external / "report.txt"
+    target.write_text("read only\n", encoding="utf-8")
+    session_manager.initialize(state)
+    session_manager.create_session("readonly-session")
+    coordinator = HarnessRunCoordinator(session_manager)
+    run, _goal = coordinator.start_run(
+        session_id="readonly-session",
+        query_id="readonly-query",
+        objective="inspect without modifying",
+        goal_mode=False,
+        verification_enabled=False,
+    )
+    coordinator.transition(run, RunStatus.RUNNING)
+    session_manager.add_permission_grant(
+        "readonly-session",
+        grant_type="external_directory_read",
+        target_kind="exact_directory",
+        target=str(external.resolve()),
+        capabilities=["read", "recursive", "external_path"],
+        scope="run",
+        metadata={"run_id": run.run_id},
+    )
+    workspace_backend = FilesystemBackend(root_dir=workspace, virtual_mode=True)
+    backend = PermissionedCompositeBackend(
+        default=workspace_backend,
+        routes={"/workspace/": workspace_backend},
+        session_id="readonly-session",
+        run_id=run.run_id,
+        query_id=run.query_id,
+        workspace_root=workspace,
+    )
+
+    assert backend.read(str(target)).error is None
+    assert backend.ls(str(external)).error is None
+    assert backend.glob("*.txt", path=str(external)).error is None
+    assert backend.grep("read", path=str(external)).error is None
+    assert backend.write(str(external / "new.txt"), "blocked\n").error is not None
+    assert backend.edit(str(target), "read", "write").error is not None
+    denied = backend.delete_external_file(
+        str(target),
+        expected_sha256=_digest("read only\n"),
+    )
+    assert denied["status"] == "permission_required"
+    assert target.read_text(encoding="utf-8") == "read only\n"
+
+
+def test_ungranted_external_absolute_path_never_falls_through_default_backend(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    external = tmp_path / "external"
+    for directory in (state, workspace, external):
+        directory.mkdir()
+    target = external / "secret.txt"
+    target.write_text("secret\n", encoding="utf-8")
+    session_manager.initialize(state)
+    session_manager.create_session("ungranted-session")
+    coordinator = HarnessRunCoordinator(session_manager)
+    run, _goal = coordinator.start_run(
+        session_id="ungranted-session",
+        query_id="ungranted-query",
+        objective="attempt ungranted access",
+        goal_mode=False,
+        verification_enabled=False,
+    )
+    coordinator.transition(run, RunStatus.RUNNING)
+    workspace_backend = FilesystemBackend(root_dir=workspace, virtual_mode=True)
+    backend = PermissionedCompositeBackend(
+        default=workspace_backend,
+        routes={"/workspace/": workspace_backend},
+        session_id="ungranted-session",
+        run_id=run.run_id,
+        query_id=run.query_id,
+        workspace_root=workspace,
+    )
+
+    results = [
+        backend.read(str(target)),
+        backend.write(str(external / "new.txt"), "blocked\n"),
+        backend.edit(str(target), "secret", "leaked"),
+        backend.ls(str(external)),
+        backend.glob("*.txt", path=str(external)),
+        backend.grep("secret", path=str(external)),
+    ]
+
+    assert all(str(result.error or "").startswith("permission_required:") for result in results)
+    assert target.read_text(encoding="utf-8") == "secret\n"
+    assert not (external / "new.txt").exists()
 
 
 def test_authorized_directory_rejects_symlink_escape(tmp_path: Path) -> None:
@@ -190,6 +297,23 @@ def test_broker_validation_bridge_binds_formal_hash_and_blocks_bad_bytes(
         for activation in activations
         for ref in activation.evidence_refs
     )
+    from harness.deterministic_checks import _evaluate_artifact_delivery
+
+    artifact_evaluation = _evaluate_artifact_delivery(
+        "artifact_delivery",
+        {
+            "run_id": run.run_id,
+            "workspace_path": str(tmp_path / "workspace"),
+            "verification_activations": [
+                activation.model_dump(mode="json") for activation in activations
+            ],
+            "active_permission_grant_ids": [receipt["permission_grant_id"]],
+            "permission_grants_authoritative": True,
+            "final_content": f"Updated {target}",
+            "evaluation_phase": "terminal",
+        },
+    )
+    assert artifact_evaluation.passed is True
 
     invalid = backend.edit(str(target), "2", "INVALID")
     assert invalid.error is not None

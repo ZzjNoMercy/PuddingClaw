@@ -1380,6 +1380,12 @@ def build_verification_activations(
         goal_id=goal_id,
         goal_revision=goal_revision,
     )
+    has_external_mutation_receipt = any(
+        item.get("kind") == "external_mutation_completed"
+        and item.get("status") == "completed"
+        for item in result_refs
+        if isinstance(item, dict)
+    )
     commit_receipts = (
         _commit_validation_receipts(
             session_id=session_id,
@@ -1393,6 +1399,12 @@ def build_verification_activations(
     )
     activations: list[VerificationActivation] = []
     packs = verification_packs_for_tool(tool_name, args)
+    # A Broker mutation is itself a formal delivered-file receipt regardless
+    # of extension. This replaces the old dependency on commit_external_* tool
+    # names and lets a proportional Run close delivery from the actual target
+    # bytes written by HostFileBroker.
+    if has_external_mutation_receipt and "artifact" not in packs:
+        packs.append("artifact")
     if tool_name == "commit_external_directory" and succeeded:
         written = [
             ref

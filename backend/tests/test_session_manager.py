@@ -1,6 +1,7 @@
 """SessionManager 持久化与 reasoning_content 处理测试。"""
 
 import hashlib
+from pathlib import Path
 
 import pytest
 
@@ -792,6 +793,12 @@ def test_delivered_artifact_registry_resolves_standalone_follow_up_without_scrat
     )
     session_manager.upsert_assistant_message(
         "artifact-followup-session",
+        query_id="query-historical",
+        content="旧回答曾提到 product-config-charts-2024.js。",
+        status="completed",
+    )
+    session_manager.upsert_assistant_message(
+        "artifact-followup-session",
         query_id="query-delivery",
         content=f"已交付 {html_path.name} 和 {js_path.name}",
         status="completed",
@@ -807,6 +814,14 @@ def test_delivered_artifact_registry_resolves_standalone_follow_up_without_scrat
         js["artifact_id"],
     }
     assert all(not item["target_path"].startswith("/scratch/") for item in resolved)
+    read_only = session_manager.resolve_follow_up_artifacts(
+        "artifact-followup-session",
+        "HTML 中 HUD 配置率数据是多少，用的是哪个 JS？",
+    )
+    assert {Path(item["target_path"]).name for item in read_only} == {
+        "产品配置分析_2026.html",
+        "product-config-charts-2026.js",
+    }
     assert session_manager.resolve_follow_up_artifacts(
         "artifact-followup-session", "你好"
     ) == []

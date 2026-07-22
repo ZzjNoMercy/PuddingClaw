@@ -11,7 +11,14 @@ from pathlib import Path
 from typing import Any
 
 from deepagents.backends import CompositeBackend, FilesystemBackend
-from deepagents.backends.protocol import EditResult, WriteResult
+from deepagents.backends.protocol import (
+    EditResult,
+    GlobResult,
+    GrepResult,
+    LsResult,
+    ReadResult,
+    WriteResult,
+)
 
 from graph.host_file_broker import HostFileBroker
 from graph.session_manager import session_manager
@@ -23,6 +30,7 @@ class PermissionedCompositeBackend(CompositeBackend):
     _ROUTED_VIRTUAL_PREFIXES = (
         "/workspace/",
         "/scratch/",
+        "/large_tool_results/",
     )
     _READONLY_VIRTUAL_PREFIXES = (
         "/knowledge/",
@@ -59,6 +67,7 @@ class PermissionedCompositeBackend(CompositeBackend):
         )
         self.managed_readonly_roots = tuple(root.expanduser().resolve() for root in managed_readonly_roots)
         resolved_workspace = workspace_root.expanduser().resolve() if workspace_root is not None else None
+        self.workspace_root = resolved_workspace
         workspace_prefixes: list[str] = []
         if resolved_workspace is not None:
             for root in self.managed_readonly_roots:
@@ -274,6 +283,48 @@ class PermissionedCompositeBackend(CompositeBackend):
     def _managed_readonly(self, file_path: str) -> bool:
         return self._readonly_virtual_path(file_path) or self._readonly_host_path(file_path)
 
+    def _unrouted_external_path(self, file_path: str | None) -> bool:
+        """Identify a host absolute path that no normal Backend may touch.
+
+        WorkspacePathRouter normally resolves this boundary before dispatch,
+        but the Backend remains the final authority. An ungranted absolute
+        path must never fall through to FilesystemBackend, whose root handling
+        is not a permission decision.
+        """
+
+        if not file_path or self._routed_virtual_path(file_path) or self._managed_readonly(file_path):
+            return False
+        requested = Path(file_path).expanduser()
+        if not requested.is_absolute():
+            return False
+        # DeepAgents' default virtual backend also uses root-absolute paths
+        # (for example ``/dashboard.html``). Preserve that namespace when the
+        # corresponding project target or its parent exists. Real host paths
+        # outside the workspace have no such project projection and remain
+        # fail-closed below.
+        if self.workspace_root is not None:
+            virtual_candidate = self.workspace_root / file_path.lstrip("/")
+            if virtual_candidate.exists() or virtual_candidate.parent.exists():
+                return False
+        try:
+            resolved = requested.resolve(strict=False)
+        except OSError:
+            return True
+        if self.workspace_root is not None:
+            try:
+                resolved.relative_to(self.workspace_root)
+                return False
+            except ValueError:
+                pass
+        return True
+
+    @staticmethod
+    def _permission_error(file_path: str) -> str:
+        return (
+            "permission_required: external host path is not covered by an "
+            f"effective file Grant: {file_path}"
+        )
+
     @classmethod
     def _routed_virtual_path(cls, file_path: str) -> bool:
         """Return whether CompositeBackend, not host grants, owns this path."""
@@ -328,6 +379,8 @@ class PermissionedCompositeBackend(CompositeBackend):
                 return broker_result
         target = self._approved_external_target(file_path)
         if target is None:
+            if self._unrouted_external_path(file_path):
+                return WriteResult(error=self._permission_error(file_path))
             return super().write(file_path, content)
         backend, backend_path, resolved = target
         result = backend.write(backend_path, content)
@@ -341,6 +394,8 @@ class PermissionedCompositeBackend(CompositeBackend):
                 return backend.read(backend_path, offset=offset, limit=limit)
         target = self._approved_external_read_target(file_path)
         if target is None:
+            if self._unrouted_external_path(file_path):
+                return ReadResult(error=self._permission_error(file_path))
             return super().read(file_path, offset=offset, limit=limit)
         backend, backend_path = target
         return backend.read(backend_path, offset=offset, limit=limit)
@@ -353,6 +408,8 @@ class PermissionedCompositeBackend(CompositeBackend):
                 return await backend.aread(backend_path, offset=offset, limit=limit)
         target = self._approved_external_read_target(file_path)
         if target is None:
+            if self._unrouted_external_path(file_path):
+                return ReadResult(error=self._permission_error(file_path))
             return await super().aread(file_path, offset=offset, limit=limit)
         backend, backend_path = target
         return await backend.aread(backend_path, offset=offset, limit=limit)
@@ -370,6 +427,8 @@ class PermissionedCompositeBackend(CompositeBackend):
                 return broker_result
         target = self._approved_external_target(file_path)
         if target is None:
+            if self._unrouted_external_path(file_path):
+                return WriteResult(error=self._permission_error(file_path))
             return await super().awrite(file_path, content)
         backend, backend_path, resolved = target
         result = await backend.awrite(backend_path, content)
@@ -395,6 +454,8 @@ class PermissionedCompositeBackend(CompositeBackend):
                 return broker_result
         target = self._approved_external_target(file_path)
         if target is None:
+            if self._unrouted_external_path(file_path):
+                return EditResult(error=self._permission_error(file_path))
             return super().edit(file_path, old_string, new_string, replace_all=replace_all)
         backend, backend_path, resolved = target
         result = backend.edit(backend_path, old_string, new_string, replace_all=replace_all)
@@ -421,6 +482,8 @@ class PermissionedCompositeBackend(CompositeBackend):
                 return broker_result
         target = self._approved_external_target(file_path)
         if target is None:
+            if self._unrouted_external_path(file_path):
+                return EditResult(error=self._permission_error(file_path))
             return await super().aedit(file_path, old_string, new_string, replace_all=replace_all)
         backend, backend_path, resolved = target
         result = await backend.aedit(backend_path, old_string, new_string, replace_all=replace_all)
@@ -431,6 +494,8 @@ class PermissionedCompositeBackend(CompositeBackend):
             result = self.host_file_broker.ls(path)
             if result is not None:
                 return result
+        if self._unrouted_external_path(path):
+            return LsResult(error=self._permission_error(path))
         return super().ls(path)
 
     async def als(self, path: str):
@@ -438,6 +503,8 @@ class PermissionedCompositeBackend(CompositeBackend):
             result = await asyncio.to_thread(self.host_file_broker.ls, path)
             if result is not None:
                 return result
+        if self._unrouted_external_path(path):
+            return LsResult(error=self._permission_error(path))
         return await super().als(path)
 
     def glob(self, pattern: str, path: str | None = None):
@@ -445,6 +512,8 @@ class PermissionedCompositeBackend(CompositeBackend):
             result = self.host_file_broker.glob(pattern, path=path)
             if result is not None:
                 return result
+        if self._unrouted_external_path(path):
+            return GlobResult(error=self._permission_error(str(path)))
         return super().glob(pattern, path=path)
 
     async def aglob(self, pattern: str, path: str | None = None):
@@ -456,6 +525,8 @@ class PermissionedCompositeBackend(CompositeBackend):
             )
             if result is not None:
                 return result
+        if self._unrouted_external_path(path):
+            return GlobResult(error=self._permission_error(str(path)))
         return await super().aglob(pattern, path=path)
 
     def grep(self, pattern: str, path: str | None = None, glob: str | None = None):
@@ -463,6 +534,8 @@ class PermissionedCompositeBackend(CompositeBackend):
             result = self.host_file_broker.grep(pattern, path=path, glob=glob)
             if result is not None:
                 return result
+        if self._unrouted_external_path(path):
+            return GrepResult(error=self._permission_error(str(path)))
         return super().grep(pattern, path=path, glob=glob)
 
     async def agrep(self, pattern: str, path: str | None = None, glob: str | None = None):
@@ -475,6 +548,8 @@ class PermissionedCompositeBackend(CompositeBackend):
             )
             if result is not None:
                 return result
+        if self._unrouted_external_path(path):
+            return GrepResult(error=self._permission_error(str(path)))
         return await super().agrep(pattern, path=path, glob=glob)
 
     def can_access_external_path(

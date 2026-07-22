@@ -4374,10 +4374,15 @@ class SessionManager:
                 route="explicit",
             )
             return resolved
-        if not re.search(
+        repair_follow_up = re.search(
             r"(?:继续(?:修改|修复|更新|补充)|再试|再来|还是(?:没有|没|不对)|仍然(?:没有|没|不对)|还没|没有更新|没更新|补上|修复(?:这个|该)|(?:这个|刚才|上一轮).*(?:产物|文件|报告|图表|页面|代码).*(?:不对|有误|没更新|修复))",
             text,
-        ):
+        )
+        read_only_follow_up = re.search(
+            r"(?:(?:html|页面|报告|图表|javascript|js).*(?:哪个|哪一个|用的|引用|来自|数据|配置率|是多少)|(?:哪个|哪一个|用的|引用|来自|数据|配置率|是多少).*(?:html|页面|报告|图表|javascript|js))",
+            text,
+        )
+        if not repair_follow_up and not read_only_follow_up:
             return []
         latest = artifacts[0]
         data = self._read_file(session_id)

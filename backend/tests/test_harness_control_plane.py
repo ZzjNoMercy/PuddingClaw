@@ -70,6 +70,69 @@ def test_run_verification_mode_is_owned_by_explicit_goal_state(tmp_path: Path) -
     assert strict.requires_goal_verification is True
 
 
+def test_historical_goal_evidence_does_not_activate_standalone_run(tmp_path: Path) -> None:
+    sessions = _sessions(tmp_path)
+    coordinator = HarnessRunCoordinator(sessions)
+    goal_run, goal = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-goal-evidence",
+        objective="严格查询并刷新报告",
+        goal_mode=True,
+    )
+    assert goal is not None
+    coordinator.transition(goal_run, RunStatus.RUNNING)
+    activation = build_verification_activations(
+        run_id=goal_run.run_id,
+        query_id=goal_run.query_id,
+        tool_call_id="call-db-history",
+        tool_name="database_sql_execute",
+        args={"question": "查询 HUD 配置率"},
+        result=ToolMessage(
+            content=(
+                "database_source_id: db-products\n"
+                "result_id: result-history\n"
+                "query_trace_id: trace-history\n"
+                "rows: 7"
+            ),
+            tool_call_id="call-db-history",
+            name="database_sql_execute",
+            status="success",
+        ),
+    )[0]
+    sessions.append_run_verification_activation(
+        goal_run.session_id,
+        goal_run.run_id,
+        activation.model_dump(mode="json"),
+    )
+    coordinator.fail(
+        goal_run,
+        outcome=RunOutcome.CANCELLED,
+        error="test goal handoff",
+    )
+    goal = coordinator.goals.release_run(
+        goal,
+        run=goal_run,
+        gap="test handoff",
+    )
+    assert any(ref.get("type") == "analytics_result" for ref in goal.evidence_refs)
+    goal.transition(GoalStatus.ACHIEVED)
+    sessions.upsert_goal_state("session-1", goal.model_dump(mode="json"))
+
+    ordinary, ordinary_goal = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-plain-after-goal",
+        objective="HTML 中 HUD 数据是多少，用哪个 JS？",
+        goal_mode=False,
+    )
+
+    assert ordinary_goal is None
+    assert ordinary.goal_id is None
+    assert ordinary.verification_mode == VerificationMode.AGENT
+    assert ordinary.verification_activations == []
+    assert ordinary.verification_contract is None
+    assert ordinary.declared_verification_contract is None
+
+
 def test_standalone_artifact_follow_up_uses_delta_repair_without_reopening_goal(
     tmp_path: Path,
 ) -> None:

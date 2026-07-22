@@ -71,7 +71,12 @@ def _grant(
         grant_type=f"external_directory_{access}",
         target_kind="exact_directory",
         target=str(path.resolve()),
-        capabilities=[access, "recursive", "external_path"],
+        capabilities=[
+            access,
+            *(["delete"] if access == "write" else []),
+            "recursive",
+            "external_path",
+        ],
         scope=scope,
         source="user",
         metadata={"run_id": run_id},
@@ -682,11 +687,14 @@ def test_session_directory_grant_survives_container_rebuild_but_stays_workspace_
     tmp_path: Path,
 ) -> None:
     from graph.permission_policy import RunPermissionContext
+    from graph.permissioned_filesystem_backend import PermissionedCompositeBackend
     from harness.models import RunStatus
 
     external, _scratch, _tools, session_manager = _setup(tmp_path)
     sibling = tmp_path / "sibling"
     sibling.mkdir()
+    target = external / "report.txt"
+    target.write_text("before\n", encoding="utf-8")
     coordinator, first = _start_bound_run(
         session_manager,
         query_id="query-session-grant-1",
@@ -696,6 +704,14 @@ def test_session_directory_grant_survives_container_rebuild_but_stays_workspace_
     first_bindings = RunPermissionContext.from_config_snapshot(
         first_state["config_snapshot"]
     ).grant_bindings()
+    _grant(
+        session_manager,
+        external,
+        access="read",
+        run_id=first.run_id,
+        scope="session",
+        bindings=first_bindings,
+    )
     grant = _grant(
         session_manager,
         external,
@@ -727,6 +743,29 @@ def test_session_directory_grant_survives_container_rebuild_but_stays_workspace_
     assert not session_manager.has_external_directory_permission(
         "directory-session", sibling, access="write", run_id=second.run_id
     )
+    workspace = tmp_path / "workspace"
+    workspace_backend = FilesystemBackend(root_dir=workspace, virtual_mode=True)
+    broker_backend = PermissionedCompositeBackend(
+        default=workspace_backend,
+        routes={"/workspace/": workspace_backend},
+        session_id="directory-session",
+        run_id=second.run_id,
+        query_id=second.query_id,
+        workspace_root=workspace,
+    )
+    assert broker_backend.read(str(target)).error is None
+    assert broker_backend.ls(str(external)).error is None
+    assert broker_backend.glob("*.txt", path=str(external)).error is None
+    assert broker_backend.grep("before", path=str(external)).error is None
+    assert broker_backend.edit(str(target), "before", "after").error is None
+    created = external / "created.txt"
+    assert broker_backend.write(str(created), "created\n").error is None
+    deleted = broker_backend.delete_external_file(
+        str(created),
+        expected_sha256="sha256:" + hashlib.sha256(b"created\n").hexdigest(),
+    )
+    assert deleted["status"] == "completed"
+    assert not created.exists()
     second_coordinator.transition(second, RunStatus.COMPLETED)
 
     _third_coordinator, third = _start_bound_run(
