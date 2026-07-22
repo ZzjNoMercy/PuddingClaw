@@ -22,6 +22,14 @@ from graph.permission_policy import (
     normalize_approval_mode,
     permission_policy_snapshot,
 )
+from harness.evidence_ledger import (
+    EvidenceRef,
+    is_evidence_ref,
+    migrate_legacy_refs,
+    ref_key,
+    register_activation_evidence,
+    resolve_evidence_ref,
+)
 from observability import emit_harness_metric
 
 logger = logging.getLogger(__name__)
@@ -1288,6 +1296,14 @@ class SessionManager:
                 if activation_id:
                     seen_activation_ids.add(activation_id)
                 merged_activations.append(deepcopy(raw))
+            for activation in merged_activations:
+                if activation.get("status") != "succeeded":
+                    continue
+                activation["stable_evidence_refs"] = register_activation_evidence(
+                    data,
+                    run=saved,
+                    activation=activation,
+                )
             saved["verification_activations"] = merged_activations
 
             for list_field, identity_field in (
@@ -1389,11 +1405,106 @@ class SessionManager:
             if isinstance(existing, dict) and existing.get("activation_id") == activation_id:
                 return deepcopy(existing), False
         saved = deepcopy(activation)
+        saved["stable_evidence_refs"] = register_activation_evidence(
+            data,
+            run=run,
+            activation=saved,
+        )
         activations.append(saved)
         run["verification_activations"] = activations
         run["updated_at"] = time.time()
         self._write_file(session_id, data)
         return deepcopy(saved), True
+
+    def get_evidence_record(
+        self,
+        session_id: str,
+        evidence_type: str,
+        evidence_id: str,
+    ) -> dict[str, Any] | None:
+        data = self._read_file(session_id)
+        ledger = data.get("evidence_ledger") if data else None
+        item = (
+            ledger.get(ref_key(EvidenceRef(type=evidence_type, id=evidence_id)))
+            if isinstance(ledger, dict)
+            else None
+        )
+        return deepcopy(item) if isinstance(item, dict) else None
+
+    def list_evidence_records(self, session_id: str) -> list[dict[str, Any]]:
+        data = self._read_file(session_id)
+        ledger = data.get("evidence_ledger") if data else None
+        return [
+            deepcopy(item)
+            for item in (ledger.values() if isinstance(ledger, dict) else [])
+            if isinstance(item, dict)
+        ]
+
+    def resolve_evidence_ref(
+        self,
+        session_id: str,
+        evidence_ref: dict[str, Any],
+        *,
+        goal_id: str | None = None,
+        goal_revision: int | None = None,
+        require_inheritable: bool = True,
+    ) -> dict[str, Any] | None:
+        data = self._read_file(session_id)
+        resolved = resolve_evidence_ref(
+            data,
+            evidence_ref,
+            goal_id=goal_id,
+            goal_revision=goal_revision,
+            require_inheritable=require_inheritable,
+        )
+        return resolved.model_dump(mode="json") if resolved is not None else None
+
+    def resolve_goal_evidence_records(
+        self,
+        session_id: str,
+        goal_id: str,
+        goal_revision: int,
+    ) -> list[dict[str, Any]]:
+        goal = self.get_goal_state(session_id, goal_id)
+        refs = goal.get("evidence_refs") if isinstance(goal, dict) else []
+        resolved: list[dict[str, Any]] = []
+        for evidence_ref in refs if isinstance(refs, list) else []:
+            if not is_evidence_ref(evidence_ref):
+                continue
+            record = self.resolve_evidence_ref(
+                session_id,
+                evidence_ref,
+                goal_id=goal_id,
+                goal_revision=goal_revision,
+            )
+            if record is not None:
+                resolved.append(record)
+        return resolved
+
+    @_session_write_locked
+    def migrate_goal_evidence_refs(
+        self,
+        session_id: str,
+        goal_id: str,
+    ) -> list[dict[str, str]]:
+        """One-way migrate legacy Goal evidence payloads into stable refs."""
+
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        goals = harness.get("goals") if isinstance(harness, dict) else None
+        goal = goals.get(goal_id) if isinstance(goals, dict) else None
+        if not isinstance(goal, dict):
+            raise ValueError(f"Goal {goal_id} does not exist in session {session_id}")
+        refs = migrate_legacy_refs(
+            data,
+            list(goal.get("evidence_refs") or []),
+            goal_id=goal_id,
+            goal_revision=int(goal.get("objective_revision") or 1),
+        )
+        goal["evidence_refs"] = refs
+        goal["updated_at"] = time.time()
+        self._write_file(session_id, data)
+        return deepcopy(refs)
 
     @_session_write_locked
     def prepare_run_evaluation(
@@ -1551,61 +1662,29 @@ class SessionManager:
         ][-40:]
         refs: list[dict[str, Any]] = []
         for activation in run.verification_activations:
-            for raw in activation.evidence_refs:
-                if not isinstance(raw, dict):
-                    continue
-                projected = {
-                    key: raw.get(key)
-                    for key in (
-                        "kind",
-                        "scope",
-                        "role",
-                        "activation_id",
-                        "tool_call_id",
-                        "tool_name",
-                        "source_id",
-                        "result_id",
-                        "generation_id",
-                        "trace_id",
-                        "artifact_id",
-                        "path",
-                        "host_path",
-                        "virtual_path",
-                        "content_sha256",
-                        "size_bytes",
-                        "uri",
-                        "output_digest",
-                        "source_hash",
-                        "raw_output_ref",
-                        "run_id",
-                        "goal_id",
-                        "goal_revision",
-                    )
-                    if raw.get(key) is not None
-                }
-                if projected:
-                    refs.append(projected)
+            for raw in activation.stable_evidence_refs:
+                stable = raw.model_dump(mode="json")
+                resolved = resolve_evidence_ref(
+                    data,
+                    stable,
+                    goal_id=run.goal_id,
+                    goal_revision=run.goal_revision,
+                    require_inheritable=True,
+                )
+                if resolved is not None:
+                    refs.append(stable)
         refs = [item for item in refs if cls._is_safe_handoff_evidence(data, item)]
-        workspace_artifact_refs = [
+        refs = list({ref_key(item): item for item in refs}.values())
+        artifact_refs = [
             item
             for item in refs
-            if item.get("kind") == "artifact_write"
-            and item.get("scope") in {"workspace", "attachment"}
+            if item.get("type") in {"artifact", "external_mutation"}
         ]
-        registry = data.get("delivered_artifacts")
-        delivery_refs = [
-            deepcopy(item)
-            for item in registry.values()
-            if isinstance(registry, dict)
-            and isinstance(item, dict)
-            and str(item.get("source_run_id") or "") == run.run_id
-        ] if isinstance(registry, dict) else []
-        artifact_refs = [*workspace_artifact_refs, *delivery_refs]
         sql_refs = [
             item
             for item in refs
-            if str(item.get("tool_name") or "").startswith("database_sql_")
-            or item.get("generation_id")
+            if item.get("type")
+            in {"analytics_result", "sql_generation", "sql_validation"}
         ]
         report = run.verification_report
         durable_facts = []
@@ -1907,6 +1986,12 @@ class SessionManager:
         data: dict[str, Any],
         evidence: dict[str, Any],
     ) -> bool:
+        if is_evidence_ref(evidence):
+            return resolve_evidence_ref(
+                data,
+                evidence,
+                require_inheritable=False,
+            ) is not None
         paths = [
             str(evidence.get(key) or "").replace("\\", "/")
             for key in ("path", "host_path", "virtual_path")

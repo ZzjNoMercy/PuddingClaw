@@ -2424,7 +2424,7 @@ def test_code_validation_inheritance_is_invalidated_by_artifact_hash_change(tmp_
         "workspace_path": str(workspace),
         "run_id": "run-2",
         "verification_activations": [],
-        "goal_evidence_refs": inherited,
+        "goal_evidence_records": inherited,
     }
 
     assert _evaluate_code_validation("code_validation", context, {}).passed is True

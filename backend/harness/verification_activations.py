@@ -164,7 +164,8 @@ _COMMAND_EXIT_RE = re.compile(
 )
 _PLAIN_EXIT_RE = re.compile(r"(?:^|\n)Exit code:\s*(?P<code>-?\d+)\s*$", re.IGNORECASE)
 _ANALYTICS_RESULT_REF_RE = re.compile(
-    r"(?:result_id|query_trace_id|trace_id|database_source_id|数据源)[：:\s]+"
+    r"(?P<ref_kind>result_id|query_trace_id|trace_id|database_source_id|"
+    r"generation_id|validation_receipt_id|数据源)[：:\s]+"
     r"(?P<value>[A-Za-z0-9_.:/-]+)",
     re.IGNORECASE,
 )
@@ -536,12 +537,28 @@ def _result_evidence_refs(
                     "title": source.get("title"),
                 }
             )
+        analytics_lineage: dict[str, str] = {}
         for match in _ANALYTICS_RESULT_REF_RE.finditer(content):
+            ref_kind = str(match.group("ref_kind") or "").lower()
+            if ref_kind == "数据源":
+                ref_kind = "database_source_id"
+            if ref_kind == "validation_receipt_id" and tool_name.startswith("database_"):
+                ref_kind = "sql_validation_receipt_id"
+            analytics_lineage[ref_kind] = match.group("value")
+        if analytics_lineage.get("result_id"):
             refs.append(
                 {
                     "kind": "analytics_result",
                     "tool_call_id": tool_call_id,
-                    "ref": match.group("value"),
+                    **analytics_lineage,
+                }
+            )
+        elif analytics_lineage:
+            refs.append(
+                {
+                    "kind": "analytics_lineage",
+                    "tool_call_id": tool_call_id,
+                    **analytics_lineage,
                 }
             )
         if tool_name == "publish_attachment":

@@ -1322,10 +1322,21 @@ def test_cancelled_goal_run_preserves_successful_runtime_pack(tmp_path):
 
     assert goal.goal_contract is not None
     assert "analytics" not in goal.goal_contract.verification_packs
-    assert any(
-        item.get("verification_pack") == "analytics"
-        for item in goal.evidence_refs
+    analytics_ref = next(
+        item for item in goal.evidence_refs if item.get("type") == "analytics_result"
     )
+    assert set(analytics_ref) == {"type", "id"}
+    resolved = sessions.resolve_evidence_ref(
+        goal.session_id,
+        analytics_ref,
+        goal_id=goal.goal_id,
+        goal_revision=goal.objective_revision,
+    )
+    assert resolved is not None
+    assert resolved["verification_pack"] == "analytics"
+    assert resolved["result_id"] == "result-1"
+    assert resolved["source_run_id"] == run.run_id
+    assert resolved["query_trace_id"]
     persisted = sessions.get_goal_state(goal.session_id, goal.goal_id)
     assert persisted is not None
     assert "analytics" not in persisted["goal_contract"]["verification_packs"]

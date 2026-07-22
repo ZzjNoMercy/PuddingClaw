@@ -434,18 +434,17 @@ def test_terminal_run_abandons_uncommitted_leases_and_filters_temporary_handoff(
     assert artifact_leases["lease-committed"]["status"] == "committed"
     assert directory_leases["directory-draft"]["status"] == "abandoned"
     assert first == second
-    assert [item["artifact_id"] for item in first["handoff_summary"]["artifact_refs"]] == [
-        delivered["artifact_id"]
-    ]
-    assert first["handoff_summary"]["artifact_refs"][0]["role"] == "delivered"
-    assert first["handoff_summary"]["artifact_refs"][0]["delivery_receipt_id"]
-    assert [item["artifact_id"] for item in first["handoff_summary"]["evidence_refs"]] == [
-        "artifact-delivered"
-    ]
-    assert all(
-        "/scratch/" not in str(item.get("path") or "")
-        for item in first["handoff_summary"]["artifact_refs"]
+    expected_ref = {"type": "artifact", "id": "artifact-delivered"}
+    assert first["handoff_summary"]["artifact_refs"] == [expected_ref]
+    assert first["handoff_summary"]["evidence_refs"] == [expected_ref]
+    resolved = session_manager.resolve_evidence_ref(
+        "terminal-artifacts",
+        expected_ref,
     )
+    assert resolved is not None
+    assert resolved["payload"]["role"] == "candidate"
+    assert resolved["content_sha256"] == delivered["content_sha256"]
+    assert resolved["payload"]["path"] == delivered["target_path"]
 
 
 def test_terminal_goal_abandons_goal_revision_drafts_but_keeps_committed_lease(tmp_path):

@@ -125,6 +125,7 @@ from harness.artifact_paths import (
 from harness.coordinators import HarnessRunCoordinator
 from harness.dependency_setup import dependency_plan_prompt
 from harness.deterministic_checks import evaluate_deterministic_criteria
+from harness.evidence_ledger import EvidenceRef, is_evidence_ref
 from harness.models import (
     GoalRecord,
     GoalStatus,
@@ -260,35 +261,15 @@ def _harness_summary_envelope(session_id: str) -> str:
         run_id=None if goal_id else str(run.get("run_id") or "") if isinstance(run, dict) else None,
     )
     raw_refs = goal.get("evidence_refs") if isinstance(goal, dict) else []
+    if goal_id and any(not is_evidence_ref(item) for item in (raw_refs or [])):
+        session_manager.migrate_goal_evidence_refs(session_id, goal_id)
+        goal = session_manager.get_goal_state(session_id, goal_id)
+        raw_refs = goal.get("evidence_refs") if isinstance(goal, dict) else []
     raw_gaps = goal.get("gaps") if isinstance(goal, dict) else []
     report = run.get("verification_report") if isinstance(run, dict) else None
     handoff = run.get("handoff_summary") if isinstance(run, dict) else None
     goal_contract = goal.get("goal_contract") if isinstance(goal, dict) else None
     criteria = goal_contract.get("criteria") if isinstance(goal_contract, dict) else []
-    evidence_keys = (
-        "kind",
-        "ref",
-        "activation_id",
-        "tool_call_id",
-        "tool_name",
-        "pack",
-        "status",
-        "source_id",
-        "result_id",
-        "generation_id",
-        "trace_id",
-        "artifact_id",
-        "target_path",
-        "path",
-        "uri",
-        "output_digest",
-        "source_hash",
-        "raw_output_ref",
-        "run_id",
-        "origin_run_id",
-        "goal_id",
-        "goal_revision",
-    )
     permission_grants = session_manager.list_permission_grants(session_id)
 
     def project_lease(lease: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
@@ -311,6 +292,69 @@ def _harness_summary_envelope(session_id: str) -> str:
         if permission_type is not None:
             projected["type"] = permission_type
         return projected
+
+    def project_handoff(item: dict[str, Any]) -> dict[str, Any]:
+        projected = {
+            key: item.get(key)
+            for key in (
+                "source_run_id",
+                "goal_id",
+                "goal_revision",
+                "terminal_status",
+                "objective",
+                "completed_todos",
+                "durable_facts",
+                "unresolved_gaps",
+                "created_at",
+            )
+            if item.get(key) is not None
+        }
+        for field in ("evidence_refs", "artifact_refs", "sql_generation_refs"):
+            projected[field] = [
+                EvidenceRef.model_validate(ref).model_dump(mode="json")
+                for ref in item.get(field) or []
+                if is_evidence_ref(ref)
+            ]
+        return projected
+
+    def project_goal_decision(item: Any) -> dict[str, Any] | None:
+        if not isinstance(item, dict):
+            return None
+        projected = {
+            key: item.get(key)
+            for key in (
+                "decision_id",
+                "goal_id",
+                "objective_revision",
+                "status",
+                "accepted",
+                "supporting_run_ids",
+                "evidence_ref_count",
+                "gaps",
+                "accepted_run_id",
+                "report_id",
+                "created_at",
+            )
+            if item.get(key) is not None
+        }
+        projected["criterion_provenance"] = [
+            {
+                **{
+                    key: value
+                    for key, value in provenance.items()
+                    if key != "evidence_refs"
+                },
+                "evidence_refs": [
+                    EvidenceRef.model_validate(ref).model_dump(mode="json")
+                    for ref in provenance.get("evidence_refs") or []
+                    if is_evidence_ref(ref)
+                ],
+            }
+            for provenance in item.get("criterion_provenance") or []
+            if isinstance(provenance, dict)
+        ]
+        return projected
+
     unresolved_todos = [
         item
         for item in todos
@@ -328,7 +372,7 @@ def _harness_summary_envelope(session_id: str) -> str:
         else None
     )
     payload = {
-        "schema": "puddingclaw.harness-envelope/v1",
+        "schema": "puddingclaw.harness-envelope/v2",
         "goal": {
             "goal_id": goal_id or None,
             "objective_revision": revision,
@@ -339,7 +383,9 @@ def _harness_summary_envelope(session_id: str) -> str:
             "model_call_count": goal.get("model_call_count") if isinstance(goal, dict) else None,
             "budget_exhaustion_reason": goal.get("budget_exhaustion_reason") if isinstance(goal, dict) else None,
             "pending_revision": bool(goal.get("pending_revision")) if isinstance(goal, dict) else False,
-            "latest_goal_decision": goal.get("latest_goal_decision") if isinstance(goal, dict) else None,
+            "latest_goal_decision": project_goal_decision(
+                goal.get("latest_goal_decision") if isinstance(goal, dict) else None
+            ),
         },
         "run": {
             "run_id": run.get("run_id") if isinstance(run, dict) else None,
@@ -426,9 +472,9 @@ def _harness_summary_envelope(session_id: str) -> str:
             if isinstance(lease, dict)
         ],
         "evidence_refs": [
-            {key: item.get(key) for key in evidence_keys if item.get(key) is not None}
+            EvidenceRef.model_validate(item).model_dump(mode="json")
             for item in (raw_refs if isinstance(raw_refs, list) else [])
-            if isinstance(item, dict)
+            if is_evidence_ref(item)
         ],
         "verification_contract": {
             "contract_id": goal_contract.get("contract_id"),
@@ -466,7 +512,7 @@ def _harness_summary_envelope(session_id: str) -> str:
         }
         if isinstance(report, dict)
         else None,
-        "latest_run_handoff": handoff if isinstance(handoff, dict) else None,
+        "latest_run_handoff": project_handoff(handoff) if isinstance(handoff, dict) else None,
     }
     serialized = json.dumps(payload, ensure_ascii=False, default=str)
     return (
@@ -874,6 +920,10 @@ details. Never invent evidence that is absent from the supplied context.
             persisted_goal = session_manager.get_goal_state(session_id, goal_id) if goal_id else None
             if isinstance(persisted_goal, dict) and int(persisted_goal.get("objective_revision") or 1) == goal_revision:
                 raw_refs = persisted_goal.get("evidence_refs")
+                if any(not is_evidence_ref(item) for item in (raw_refs or [])):
+                    session_manager.migrate_goal_evidence_refs(session_id, goal_id)
+                    persisted_goal = session_manager.get_goal_state(session_id, goal_id) or persisted_goal
+                    raw_refs = persisted_goal.get("evidence_refs")
                 raw_gaps = persisted_goal.get("gaps")
                 run_ids = persisted_goal.get("run_ids")
                 prior_runs: list[dict[str, Any]] = []
@@ -920,32 +970,9 @@ details. Never invent evidence that is absent from the supplied context.
                     "objective_revision": goal_revision,
                     "objective": persisted_goal.get("objective"),
                     "evidence_refs": [
-                        {
-                            key: item.get(key)
-                            for key in (
-                                "kind",
-                                "ref",
-                                "activation_id",
-                                "tool_call_id",
-                                "tool_name",
-                                "source_id",
-                                "result_id",
-                                "artifact_id",
-                                "target_path",
-                                "path",
-                                "uri",
-                                "output_digest",
-                                "source_hash",
-                                "raw_output_ref",
-                                "origin_run_id",
-                                "run_id",
-                                "goal_id",
-                                "goal_revision",
-                            )
-                            if item.get(key) is not None
-                        }
+                        EvidenceRef.model_validate(item).model_dump(mode="json")
                         for item in (raw_refs if isinstance(raw_refs, list) else [])
-                        if isinstance(item, dict)
+                        if is_evidence_ref(item)
                     ],
                     "todos": session_manager.get_todos(
                         session_id,
@@ -1393,6 +1420,7 @@ details. Never invent evidence that is absent from the supplied context.
         session_id = str(context.get("session_id") or "")
         run_id = str(context.get("run_id") or "")
         goal_evidence_refs: list[dict[str, Any]] = []
+        goal_evidence_records: list[dict[str, Any]] = []
         persisted_run = session_manager.get_run_state(session_id, run_id) if session_id and run_id else None
         persisted_activations = (
             persisted_run.get("verification_activations") if isinstance(persisted_run, dict) else None
@@ -1408,8 +1436,43 @@ details. Never invent evidence that is absent from the supplied context.
         if goal_id:
             persisted_goal = session_manager.get_goal_state(session_id, goal_id)
             raw_goal_refs = persisted_goal.get("evidence_refs") if isinstance(persisted_goal, dict) else None
+            if any(not is_evidence_ref(item) for item in (raw_goal_refs or [])):
+                session_manager.migrate_goal_evidence_refs(session_id, goal_id)
+                persisted_goal = session_manager.get_goal_state(session_id, goal_id)
+                raw_goal_refs = (
+                    persisted_goal.get("evidence_refs")
+                    if isinstance(persisted_goal, dict)
+                    else None
+                )
             if isinstance(raw_goal_refs, list):
-                goal_evidence_refs = [dict(item) for item in raw_goal_refs if isinstance(item, dict)]
+                goal_evidence_refs = [
+                    EvidenceRef.model_validate(item).model_dump(mode="json")
+                    for item in raw_goal_refs
+                    if is_evidence_ref(item)
+                ]
+            for record in session_manager.resolve_goal_evidence_records(
+                session_id,
+                goal_id,
+                int(goal_revision or 1),
+            ):
+                raw_payload = record.get("payload")
+                projected = dict(raw_payload) if isinstance(raw_payload, dict) else {}
+                projected.update(
+                    {
+                        "evidence_ref": {
+                            "type": record.get("kind"),
+                            "id": record.get("id"),
+                        },
+                        "verification_pack": record.get("verification_pack"),
+                        "origin_run_id": record.get("source_run_id"),
+                        "run_id": record.get("source_run_id"),
+                        "tool_call_id": record.get("origin_tool_call_id"),
+                        "output_digest": record.get("output_digest"),
+                        "result_id": record.get("result_id"),
+                        "query_trace_id": record.get("query_trace_id"),
+                    }
+                )
+                goal_evidence_records.append(projected)
         check_state["_harness_context"] = {
             "todos": list(state.get("todos") or []),
             "final_content": self._last_ai_text(state),
@@ -1436,6 +1499,7 @@ details. Never invent evidence that is absent from the supplied context.
                 else state.get("verification_activations") or []
             ),
             "goal_evidence_refs": goal_evidence_refs,
+            "goal_evidence_records": goal_evidence_records,
             "evaluation_phase": "revision",
         }
         evaluations = evaluate_deterministic_criteria(contract, check_state)

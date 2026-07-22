@@ -13,6 +13,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from harness.evidence_ledger import EvidenceRef
+
 
 class HarnessStateError(ValueError):
     """Raised when a caller attempts an illegal Harness state transition."""
@@ -368,6 +370,7 @@ class VerificationActivation(BaseModel):
     source: str = "tool"
     status: str = "succeeded"
     evidence_refs: list[dict[str, Any]] = Field(default_factory=list)
+    stable_evidence_refs: list[EvidenceRef] = Field(default_factory=list)
     created_at: float = Field(default_factory=time.time)
 
 

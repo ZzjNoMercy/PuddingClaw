@@ -551,7 +551,7 @@ def test_harness_summary_envelope_is_deterministic_and_keeps_authoritative_pendi
                     {"id": "artifact_delivery", "required": True, "verifier": "deterministic"}
                 ],
             },
-            "evidence_refs": [{"kind": "tool_result", "tool_call_id": "call-sql"}],
+            "evidence_refs": [{"type": "analytics_result", "id": "result-1"}],
             "gaps": ["图表验证待完成"],
             "control_notices": ["继续使用原始证据"],
         },
@@ -621,13 +621,16 @@ def test_harness_summary_envelope_is_deterministic_and_keeps_authoritative_pendi
     raw_json = next(line for line in envelope.splitlines() if line.startswith("{"))
     parsed = json.loads(raw_json)
 
-    assert "puddingclaw.harness-envelope/v1" in envelope
+    assert "puddingclaw.harness-envelope/v2" in envelope
     assert "goal-1" in envelope
     assert "todo-verify" in envelope
     assert '"status": "pending"' in envelope
     assert "/workspace/report.html" in envelope
     assert "图表验证待完成" in envelope
     assert parsed["verification_contract"]["criteria"][0]["id"] == "artifact_delivery"
+    assert parsed["evidence_refs"] == [
+        {"type": "analytics_result", "id": "result-1"}
+    ]
     assert parsed["active_permissions"][0]["id"] == "grant-1"
     assert parsed["active_permissions"][0]["type"] == "external_file_write"
     assert (

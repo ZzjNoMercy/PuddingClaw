@@ -11,6 +11,7 @@ from typing import Any
 from graph.session_manager import SessionManager
 from harness.artifact_paths import extract_declared_artifact_targets
 from harness.deterministic_checks import evaluate_deterministic_criteria
+from harness.evidence_ledger import EvidenceRef, is_evidence_ref, ref_key
 from harness.models import (
     CriterionEvaluation,
     GoalRecord,
@@ -157,6 +158,8 @@ class GoalCoordinator:
         report: RubricEvaluationReport,
         outcome: RunOutcome,
     ) -> GoalRecord:
+        if any(not is_evidence_ref(item) for item in goal.evidence_refs):
+            self._sessions.migrate_goal_evidence_refs(goal.session_id, goal.goal_id)
         authoritative = self._load_goal(goal.session_id, goal.goal_id)
         if run.goal_revision != authoritative.objective_revision:
             return self._release_superseded_run(authoritative, run)
@@ -167,6 +170,7 @@ class GoalCoordinator:
         goal.evidence_refs = self._merge_artifact_evidence(
             goal.evidence_refs,
             run.verification_activations,
+            session_id=goal.session_id,
             goal_id=goal.goal_id,
             goal_revision=goal.objective_revision,
         )
@@ -182,8 +186,42 @@ class GoalCoordinator:
                 if criterion_id:
                     provenance_by_criterion[criterion_id] = dict(item)
         for evaluation in report.evaluations:
-            evidence_refs = [dict(item) for item in evaluation.evidence if isinstance(item, dict)]
-            evidence_origin_run_ids = _evidence_origin_run_ids(evidence_refs)
+            evidence_refs = [
+                EvidenceRef.model_validate(item).model_dump(mode="json")
+                for item in evaluation.evidence
+                if is_evidence_ref(item)
+            ]
+            if evaluation.passed is True and not evidence_refs:
+                allowed_types = {
+                    "analytics_evidence_traceability": {
+                        "analytics_result",
+                        "sql_generation",
+                        "sql_validation",
+                    },
+                    "metric_consistency": {
+                        "analytics_result",
+                        "sql_generation",
+                        "sql_validation",
+                    },
+                    "artifact_delivery": {"artifact", "external_mutation"},
+                    "code_validation": {"validation_receipt", "artifact"},
+                    "web_evidence_traceability": {"web_source"},
+                }.get(evaluation.criterion_id, set())
+                evidence_refs = [
+                    dict(item)
+                    for item in goal.evidence_refs
+                    if is_evidence_ref(item) and item.get("type") in allowed_types
+                ]
+            evidence_origin_run_ids: set[str] = set()
+            for evidence_ref in evidence_refs:
+                resolved = self._sessions.resolve_evidence_ref(
+                    goal.session_id,
+                    evidence_ref,
+                    goal_id=goal.goal_id,
+                    goal_revision=goal.objective_revision,
+                )
+                if resolved is not None and resolved.get("source_run_id"):
+                    evidence_origin_run_ids.add(str(resolved["source_run_id"]))
             previous_provenance = provenance_by_criterion.get(evaluation.criterion_id)
             if (
                 evaluation.passed is True
@@ -354,6 +392,8 @@ class GoalCoordinator:
     ) -> GoalRecord:
         """Detach a cancelled/failed Run without cancelling the Goal."""
 
+        if any(not is_evidence_ref(item) for item in goal.evidence_refs):
+            self._sessions.migrate_goal_evidence_refs(goal.session_id, goal.goal_id)
         authoritative = self._load_goal(goal.session_id, goal.goal_id)
         superseded = (
             run is not None
@@ -365,6 +405,7 @@ class GoalCoordinator:
             goal.evidence_refs = self._merge_artifact_evidence(
                 goal.evidence_refs,
                 run.verification_activations,
+                session_id=goal.session_id,
                 goal_id=goal.goal_id,
                 goal_revision=goal.objective_revision,
             )
@@ -385,34 +426,31 @@ class GoalCoordinator:
         )
         return GoalRecord.model_validate(saved)
 
-    @staticmethod
     def _merge_artifact_evidence(
+        self,
         existing: list[dict[str, Any]],
         activations: list[Any],
         *,
+        session_id: str,
         goal_id: str,
         goal_revision: int,
     ) -> list[dict[str, Any]]:
-        """Persist trusted, revision-bound Tool evidence across Goal Runs."""
+        """Persist only resolved, revision-bound stable refs across Goal Runs."""
 
         merged: dict[str, dict[str, Any]] = {}
         for ref in existing:
-            if not isinstance(ref, dict):
+            if not is_evidence_ref(ref):
                 continue
-            if ref.get("goal_id") != goal_id or ref.get("goal_revision") != goal_revision:
-                continue
-            key = str(
-                ref.get("artifact_id")
-                or ref.get("source_id")
-                or ref.get("result_id")
-                or ref.get("tool_call_id")
-                or ref.get("output_digest")
-                or ref.get("host_path")
-                or ref.get("path")
-                or ""
+            resolved = self._sessions.resolve_evidence_ref(
+                session_id,
+                ref,
+                goal_id=goal_id,
+                goal_revision=goal_revision,
             )
-            if key:
-                merged[key] = dict(ref)
+            if resolved is None:
+                continue
+            parsed = EvidenceRef.model_validate(ref)
+            merged[ref_key(parsed)] = parsed.model_dump(mode="json")
         for activation in activations:
             payload = (
                 activation.model_dump(mode="json")
@@ -421,33 +459,19 @@ class GoalCoordinator:
             )
             if not isinstance(payload, dict) or payload.get("status") != "succeeded":
                 continue
-            pack = str(payload.get("pack") or "")
-            for ref in payload.get("evidence_refs") or []:
-                if not isinstance(ref, dict):
+            for ref in payload.get("stable_evidence_refs") or []:
+                if not is_evidence_ref(ref):
                     continue
-                if ref.get("material") is not True:
-                    continue
-                if ref.get("role") == "temporary" or ref.get("scope") == "scratch":
-                    continue
-                bound_ref = dict(ref)
-                bound_ref.setdefault("goal_id", goal_id)
-                bound_ref.setdefault("goal_revision", goal_revision)
-                bound_ref.setdefault("verification_pack", pack)
-                bound_ref.setdefault("origin_run_id", payload.get("run_id"))
-                if bound_ref.get("goal_id") != goal_id or bound_ref.get("goal_revision") != goal_revision:
-                    continue
-                key = str(
-                    bound_ref.get("artifact_id")
-                    or bound_ref.get("source_id")
-                    or bound_ref.get("result_id")
-                    or bound_ref.get("tool_call_id")
-                    or bound_ref.get("output_digest")
-                    or bound_ref.get("host_path")
-                    or bound_ref.get("path")
-                    or ""
+                resolved = self._sessions.resolve_evidence_ref(
+                    session_id,
+                    ref,
+                    goal_id=goal_id,
+                    goal_revision=goal_revision,
                 )
-                if key:
-                    merged[key] = bound_ref
+                if resolved is None:
+                    continue
+                parsed = EvidenceRef.model_validate(ref)
+                merged[ref_key(parsed)] = parsed.model_dump(mode="json")
         return list(merged.values())
 
     def update_objective(
@@ -1120,6 +1144,19 @@ class HarnessRunCoordinator:
             if goal is not None
             else None
         )
+        if (
+            goal is not None
+            and isinstance(authoritative_goal, dict)
+            and any(
+                not is_evidence_ref(item)
+                for item in authoritative_goal.get("evidence_refs") or []
+            )
+        ):
+            self._sessions.migrate_goal_evidence_refs(run.session_id, goal.goal_id)
+            authoritative_goal = self._sessions.get_goal_state(
+                run.session_id,
+                goal.goal_id,
+            )
         authoritative_revision = (
             authoritative_goal.get("objective_revision")
             if isinstance(authoritative_goal, dict)
@@ -1132,10 +1169,41 @@ class HarnessRunCoordinator:
             else []
         )
         harness_context["goal_evidence_refs"] = [
-            dict(item)
+            EvidenceRef.model_validate(item).model_dump(mode="json")
             for item in (raw_goal_evidence if isinstance(raw_goal_evidence, list) else [])
-            if isinstance(item, dict)
+            if is_evidence_ref(item)
         ]
+        harness_context["goal_evidence_records"] = []
+        for evidence_ref in harness_context["goal_evidence_refs"]:
+            resolved = self._sessions.resolve_evidence_ref(
+                run.session_id,
+                evidence_ref,
+                goal_id=run.goal_id,
+                goal_revision=run.goal_revision,
+            )
+            if resolved is None:
+                continue
+            payload = resolved.get("payload")
+            record = dict(payload) if isinstance(payload, dict) else {}
+            record.update(
+                {
+                    "evidence_ref": dict(evidence_ref),
+                    "evidence_type": resolved.get("kind"),
+                    "evidence_id": resolved.get("id"),
+                    "verification_pack": resolved.get("verification_pack"),
+                    "origin_run_id": resolved.get("source_run_id"),
+                    "run_id": resolved.get("source_run_id"),
+                    "tool_call_id": resolved.get("origin_tool_call_id"),
+                    "output_digest": resolved.get("output_digest"),
+                    "result_id": resolved.get("result_id"),
+                    "query_trace_id": resolved.get("query_trace_id"),
+                    "generation_id": resolved.get("generation_id"),
+                    "sql_validation_receipt_id": resolved.get(
+                        "sql_validation_receipt_id"
+                    ),
+                }
+            )
+            harness_context["goal_evidence_records"].append(record)
         execution = (
             run.config_snapshot.get("execution", {})
             if isinstance(run.config_snapshot, dict)

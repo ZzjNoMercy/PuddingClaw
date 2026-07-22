@@ -248,7 +248,7 @@ def _evaluate_artifact_delivery(
         for ref in activation.get("evidence_refs") or []
         if isinstance(ref, dict) and ref.get("kind") == "artifact_write"
     ]
-    inherited_raw = harness_context.get("goal_evidence_refs")
+    inherited_raw = harness_context.get("goal_evidence_records")
     inherited_refs = [
         ref
         for ref in (inherited_raw if isinstance(inherited_raw, list) else [])
@@ -547,7 +547,7 @@ def _evaluate_evidence_traceability(
         and evidence_ref.get("material", True) is not False
         and evidence_ref.get("kind") != "tool_execution"
     ]
-    inherited_raw = harness_context.get("goal_evidence_refs")
+    inherited_raw = harness_context.get("goal_evidence_records")
     inherited = [
         item
         for item in (inherited_raw if isinstance(inherited_raw, list) else [])
@@ -785,7 +785,7 @@ def _evaluate_code_validation(
     # Code validation is artifact-bound across Goal Runs.  Reuse is valid only
     # when both the validation receipt and every bound code artifact receipt
     # exist, and the current bytes still match the recorded digests.
-    inherited_raw = harness_context.get("goal_evidence_refs")
+    inherited_raw = harness_context.get("goal_evidence_records")
     inherited = [
         item
         for item in (inherited_raw if isinstance(inherited_raw, list) else [])
