@@ -597,6 +597,28 @@ def test_registered_but_unclassified_tool_fails_closed(tmp_path):
     assert result.reason == "missing_tool_control_descriptor:new_mutating_tool"
 
 
+def test_internal_database_result_source_uses_its_control_descriptor(tmp_path):
+    request = ToolCallRequest(
+        tool_call={
+            "id": "call-result-source",
+            "name": "database_query_result_source",
+            "args": {"result_id": "result-1"},
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+
+    result = ToolExecutionPipeline(
+        known_tools={"database_query_result_source"},
+        backend_mode="docker",
+    )._preflight(request)
+
+    assert result.decision == PolicyDecision.ALLOW
+    assert result.reason == "control_descriptor:tool_contract"
+    assert result.risk == "declared"
+
+
 def test_attachment_lease_tools_are_internal_capabilities_not_host_write_grants(tmp_path):
     pipeline = ToolExecutionPipeline(
         known_tools={"prepare_attachment_edit", "publish_attachment"},

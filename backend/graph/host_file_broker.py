@@ -191,22 +191,35 @@ class HostFileBroker:
                     if candidate is not None:
                         candidates.append(candidate)
                 continue
-            try:
-                authority_root = Path(target).expanduser().resolve(strict=True)
-            except OSError:
-                continue
             if target_kind == "exact_file":
                 expected_type = f"external_file_{access}"
-                if grant_type != expected_type or canonical != authority_root:
+                if grant_type != expected_type:
+                    continue
+                try:
+                    # A write approval commonly targets a file that does not
+                    # exist yet. Bind that exact missing leaf to its existing
+                    # parent instead of requiring the approved file itself to
+                    # pre-exist.
+                    authority_file = self._canonical(
+                        target,
+                        allow_missing_leaf=access == "write",
+                    )
+                except (OSError, ValueError):
+                    continue
+                if canonical != authority_file:
                     continue
                 candidate = self._authorized_path(
                     canonical_path=canonical,
-                    authority_root=authority_root.parent,
+                    authority_root=authority_file.parent,
                     grant_id=grant_id,
                     access=access,
                 )
                 if candidate is not None:
                     candidates.append(candidate)
+                continue
+            try:
+                authority_root = Path(target).expanduser().resolve(strict=True)
+            except OSError:
                 continue
             directory_grant_type = (
                 "external_directory_write"

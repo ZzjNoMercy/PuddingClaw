@@ -1869,9 +1869,11 @@ class VersionedPatchMiddleware(AgentMiddleware[Any, Any, Any]):
             StructuredTool.from_function(
                 name="copy_file",
                 description=(
-                    "Atomically create one exact file from an authorized source without "
-                    "streaming its body through model context. Records source/target hashes, "
-                    "validates code-like targets, and never overwrites an existing target."
+                    "Atomically create one exact Host file from an authorized absolute Host "
+                    "source directly at its final authorized absolute Host target, without "
+                    "streaming its body through model context. Do not use /workspace as the "
+                    "target; virtual-workspace files use write_file. Records source/target "
+                    "hashes, validates code-like targets, and never overwrites an existing target."
                 ),
                 func=copy_file,
                 args_schema=CopyFileInput,

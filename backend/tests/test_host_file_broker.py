@@ -150,6 +150,64 @@ def test_copy_and_hash_guarded_replace_are_atomic(tmp_path: Path) -> None:
     ] == ["copy", "replace"]
 
 
+def test_exact_file_write_grant_can_create_an_approved_missing_target(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    external = tmp_path / "external"
+    for directory in (state, workspace, external):
+        directory.mkdir()
+    source = external / "template.html"
+    source.write_text("<html>template</html>\n", encoding="utf-8")
+    target = external / "report-v3.html"
+
+    session_manager.initialize(state)
+    session_manager.create_session("missing-target-session")
+    coordinator = HarnessRunCoordinator(session_manager)
+    run, _goal = coordinator.start_run(
+        session_id="missing-target-session",
+        query_id="missing-target-query",
+        objective="复制模板创建 V3",
+        goal_mode=False,
+        verification_enabled=False,
+    )
+    coordinator.transition(run, RunStatus.RUNNING)
+    session_manager.add_permission_grant(
+        "missing-target-session",
+        grant_type="external_file_read",
+        target_kind="exact_file",
+        target=str(source.resolve()),
+        capabilities=["read", "external_path"],
+    )
+    write_grant = session_manager.add_permission_grant(
+        "missing-target-session",
+        grant_type="external_file_write",
+        target_kind="exact_file",
+        target=str(target.resolve()),
+        capabilities=["write", "external_path"],
+    )
+    workspace_backend = FilesystemBackend(root_dir=workspace, virtual_mode=True)
+    backend = PermissionedCompositeBackend(
+        default=workspace_backend,
+        routes={"/workspace/": workspace_backend},
+        session_id="missing-target-session",
+        run_id=run.run_id,
+        query_id=run.query_id,
+        workspace_root=workspace,
+    )
+
+    copied = backend.copy_external_file(str(source), str(target))
+
+    assert copied["status"] == "completed"
+    assert target.read_bytes() == source.read_bytes()
+    receipt = session_manager.list_external_mutation_receipts(
+        "missing-target-session",
+        run_id=run.run_id,
+    )[-1]
+    assert receipt["permission_grant_id"] == write_grant["id"]
+
+
 def test_delete_then_create_emits_deprecation_warning(tmp_path: Path) -> None:
     backend, external, _outside, run = _setup(tmp_path)
     target = external / "legacy-overwrite.txt"

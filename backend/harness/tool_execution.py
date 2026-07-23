@@ -1376,7 +1376,8 @@ class ToolExecutionPipeline(AgentMiddleware):
                 f"unknown_tool:{tool_name}",
                 "critical",
             )
-        if tool_control_descriptor(tool_name) is None:
+        control_descriptor = tool_control_descriptor(tool_name)
+        if control_descriptor is None:
             return ToolPolicyResult(
                 PolicyDecision.DENY,
                 f"missing_tool_control_descriptor:{tool_name}",
@@ -1387,6 +1388,21 @@ class ToolExecutionPipeline(AgentMiddleware):
                 PolicyDecision.DENY,
                 "versioned_patch_required: use inspect_file_version then patch_file",
                 "managed_write",
+            )
+        # The registration-boundary control descriptor is the authority for
+        # tools whose effects are entirely read-only or internal.  Do not
+        # require a second hand-maintained allowlist entry for every new query
+        # result reader/materializer: that list can drift and incorrectly turn
+        # safe registered tools into ``unclassified_tool`` denials.
+        if (
+            control_descriptor.side_effect in {"none", "internal_mutation"}
+            and control_descriptor.network_scope == "none"
+            and control_descriptor.approval_scope == "none"
+        ):
+            return ToolPolicyResult(
+                PolicyDecision.ALLOW,
+                f"control_descriptor:{control_descriptor.policy}",
+                "declared",
             )
         if tool_name in self.DECLARED_ALLOW_TOOLS:
             return ToolPolicyResult(
