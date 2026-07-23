@@ -21,21 +21,28 @@ import yaml
 from deepagents.middleware._utils import append_to_system_message
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ModelRequest, ModelResponse, ToolCallRequest
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import HumanMessage, ToolMessage
 from langgraph.config import get_stream_writer
 from langgraph.types import Command
 from typing_extensions import TypedDict
 
+from graph.permission_policy import PermissionBindingPolicy, RunPermissionContext
 from graph.session_manager import session_manager
 from graph.trace_collector import get_current_trace_collector
 from harness.models import (
     CapabilityManifest,
+    PermissionManifest,
     RunTaskProfile,
     SkillActivation,
     SkillRecommendation,
 )
 from observability import emit_harness_metric
-from tools.toolsets import UNCONDITIONAL_TOOL_NAMES, tools_for_toolsets, validate_toolset_names
+from tools.toolsets import (
+    UNCONDITIONAL_TOOL_NAMES,
+    tool_control_descriptor,
+    tools_for_toolsets,
+    validate_toolset_names,
+)
 
 _SKILL_PATH_RE = re.compile(r"^/skills/([^/]+)/SKILL\.md$")
 _LEGACY_EXTERNAL_LEASE_TOOLS = frozenset(
@@ -47,7 +54,49 @@ _LEGACY_EXTERNAL_LEASE_TOOLS = frozenset(
         "commit_external_directory",
     }
 )
+_INSPECTION_BLOCKED_READISH_TOOLS = frozenset(
+    {
+        "stage_external_artifact",
+        "stage_external_directory",
+        "prepare_external_directory_commit",
+    }
+)
+_GOAL_INSPECTION_ALLOWED_TOOLS = frozenset(
+    {
+        # Existing Session/Goal evidence and explicitly supplied resources.
+        "ls",
+        "read_file",
+        "glob",
+        "grep",
+        "inspect_file_version",
+        "read_resource",
+        "read_evidence",
+        # Existing database Evidence only; no generation, validation,
+        # execution, or SourceReference registration.
+        "database_query_trace_inspect",
+        "database_query_result_page",
+    }
+)
+_CAPABILITY_RECOMMENDATION_MARKER = "[系统 Capability 建议]"
 logger = logging.getLogger(__name__)
+
+_ARGUMENT_DEPENDENT_PERMISSION_TOOLS = frozenset(
+    {
+        "ls",
+        "read_file",
+        "glob",
+        "grep",
+        "write_file",
+        "edit_file",
+        "inspect_file_version",
+        "copy_file",
+        "materialize_source_ref",
+        "replace_file",
+        "patch_file",
+        "patch_files",
+        "delete_file",
+    }
+)
 
 
 def _merge_skill_ids(current: list[str], update: list[str]) -> list[str]:
@@ -195,6 +244,9 @@ class ToolsetMiddleware(AgentMiddleware):
         calls: dict[str, str] = {}
         succeeded: set[str] = set()
         for message in messages:
+            extra = getattr(message, "additional_kwargs", None)
+            if isinstance(extra, dict) and extra.get("puddingclaw_historical") is True:
+                continue
             tool_calls = getattr(message, "tool_calls", None) or []
             for call in tool_calls:
                 if call.get("name") != "read_file":
@@ -382,8 +434,48 @@ class ToolsetMiddleware(AgentMiddleware):
 
     def _denied_tool_message(self, request: ToolCallRequest) -> ToolMessage | None:
         tool_name = str(request.tool_call.get("name") or "")
-        if tool_name in self._allowed_tool_names(request.state):
+        runtime_context = (
+            request.runtime.context
+            if request.runtime is not None and isinstance(request.runtime.context, dict)
+            else {}
+        )
+        if (
+            str(runtime_context.get("run_kind") or "") == "goal_inspection"
+            and not self._inspection_tool_allowed(tool_name)
+        ):
+            emit_harness_metric(
+                logger,
+                "goal_inspection_mutation_denied_total",
+                session_id=str(runtime_context.get("session_id") or ""),
+                run_id=str(runtime_context.get("run_id") or ""),
+                tool=tool_name,
+            )
+            return ToolMessage(
+                content=(
+                    f"Tool `{tool_name}` is disabled because this is a read-only Goal "
+                    "inspection Run. Ask the user to explicitly continue the Goal before "
+                    "performing mutations or delegated execution."
+                ),
+                tool_call_id=str(request.tool_call.get("id") or ""),
+                name=tool_name,
+                status="error",
+            )
+        legacy_lease_denied = (
+            tool_name in _LEGACY_EXTERNAL_LEASE_TOOLS
+            and self._legacy_external_lease_context(request) is None
+        )
+        if tool_name in self._allowed_tool_names(request.state) and not legacy_lease_denied:
             return None
+        if legacy_lease_denied:
+            return ToolMessage(
+                content=(
+                    f"Tool `{tool_name}` is not enabled. This compatibility-only tool requires "
+                    "the still-active legacy lease owner; start a fresh external workflow instead."
+                ),
+                tool_call_id=str(request.tool_call.get("id") or ""),
+                name=tool_name,
+                status="error",
+            )
         providers = sorted(
             skill_id
             for skill_id, toolsets in self.toolsets_by_skill.items()
@@ -407,15 +499,33 @@ class ToolsetMiddleware(AgentMiddleware):
     def _visible_tools(self, request: ModelRequest) -> list[Any]:
         allowed = self._allowed_tool_names(request.state)
         legacy_enabled = self._legacy_external_lease_tools_enabled(request)
+        context = (
+            request.runtime.context
+            if request.runtime is not None and isinstance(request.runtime.context, dict)
+            else {}
+        )
+        inspection = str(context.get("run_kind") or "") == "goal_inspection"
         return [
             tool
             for tool in request.tools
             if self._tool_name(tool) in allowed
+            and (not inspection or self._inspection_tool_allowed(self._tool_name(tool)))
             and (
                 legacy_enabled
                 or self._tool_name(tool) not in _LEGACY_EXTERNAL_LEASE_TOOLS
             )
         ]
+
+    @staticmethod
+    def _inspection_tool_allowed(tool_name: str) -> bool:
+        if tool_name in _INSPECTION_BLOCKED_READISH_TOOLS:
+            return False
+        descriptor = tool_control_descriptor(tool_name)
+        return (
+            tool_name in _GOAL_INSPECTION_ALLOWED_TOOLS
+            and descriptor is not None
+            and descriptor.side_effect == "none"
+        )
 
     @staticmethod
     def _legacy_external_lease_tools_enabled(request: ModelRequest) -> bool:
@@ -570,17 +680,50 @@ class ToolsetMiddleware(AgentMiddleware):
             }
         )
         allowed = sorted(self._tool_name(tool) for tool in visible_tools if self._tool_name(tool))
-        schema_hash = f"sha256:{hashlib.sha256(json.dumps(allowed).encode()).hexdigest()}"
+        mounted = sorted(
+            {self._tool_name(tool) for tool in request.tools if self._tool_name(tool)}
+        )
+        unavailable = [
+            {
+                "tool": name,
+                "reason": (
+                    "inspection_run_read_only"
+                    if str(context.get("run_kind") or "") == "goal_inspection"
+                    and not self._inspection_tool_allowed(name)
+                    else
+                    "skill_not_activated"
+                    if any(
+                        name in tools_for_toolsets(set(toolsets))
+                        for toolsets in self.toolsets_by_skill.values()
+                    )
+                    else "policy_unavailable"
+                ),
+            }
+            for name in mounted
+            if name not in set(allowed)
+        ]
+        tool_schema_contracts = sorted(
+            (self._tool_schema_contract(tool) for tool in visible_tools),
+            key=lambda item: item["name"],
+        )
+        schema_hash = (
+            "sha256:"
+            + hashlib.sha256(
+                json.dumps(
+                    tool_schema_contracts,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                ).encode()
+            ).hexdigest()
+        )
         manifest_digest = hashlib.sha256(
             json.dumps(
                 {
-                    "run_id": run_id,
                     "skills": active,
-                    "recommendations": [
-                        item.model_dump(mode="json") for item in recommendations
-                    ],
                     "toolsets": enabled_toolsets,
                     "allowed": allowed,
+                    "unavailable": unavailable,
                     "schema_hash": schema_hash,
                 },
                 sort_keys=True,
@@ -593,6 +736,7 @@ class ToolsetMiddleware(AgentMiddleware):
             recommended_inactive_skills=recommendations,
             enabled_toolsets=enabled_toolsets,
             allowed_tool_names=allowed,
+            unavailable_tools=unavailable,
             tool_schema_hash=schema_hash,
             created_at=time.time(),
         )
@@ -649,6 +793,7 @@ class ToolsetMiddleware(AgentMiddleware):
                     confidence=candidate.confidence,
                     evidence=candidate.evidence,
                     source=source,
+                    activation_instruction=f"read /skills/{candidate.skill_id}/SKILL.md",
                 )
             )
         recommended_ids = {item.skill_id for item in result}
@@ -688,6 +833,7 @@ class ToolsetMiddleware(AgentMiddleware):
                                 "仅建议重新读取，不继承旧能力。"
                             ),
                             source="durable_artifact",
+                            activation_instruction=f"read /skills/{skill_id}/SKILL.md",
                         )
                     )
                     recommended_ids.add(skill_id)
@@ -696,7 +842,21 @@ class ToolsetMiddleware(AgentMiddleware):
     def _request_with_capability_manifest(self, request: ModelRequest) -> ModelRequest:
         visible_tools = self._visible_tools(request)
         manifest = self._capability_manifest(request, visible_tools)
-        payload = manifest.model_dump(mode="json")
+        permission_manifest = self._permission_manifest(request, visible_tools)
+        # Keep audit identity and soft routing metadata out of the authoritative
+        # model-visible boundary. ``run_id`` and ``created_at`` do not change
+        # capability or permission semantics, while SkillIntentRouter already
+        # projects recommendations next to the current user turn. Persistence
+        # and stream events retain the complete manifests for observability.
+        audit_payload = manifest.model_dump(mode="json")
+        model_payload = manifest.model_dump(
+            mode="json",
+            exclude={"created_at", "run_id", "recommended_inactive_skills"},
+        )
+        permission_audit_payload = permission_manifest.model_dump(mode="json")
+        permission_model_payload = permission_manifest.model_dump(
+            mode="json", exclude={"created_at", "run_id"}
+        )
         context = (
             request.runtime.context
             if request.runtime is not None and isinstance(request.runtime.context, dict)
@@ -706,35 +866,228 @@ class ToolsetMiddleware(AgentMiddleware):
         run_id = str(context.get("run_id") or "")
         if session_id and run_id:
             try:
-                session_manager.record_run_capability_manifest(session_id, run_id, payload)
+                session_manager.record_run_capability_manifest(
+                    session_id,
+                    run_id,
+                    audit_payload,
+                )
+                session_manager.record_run_permission_manifest(
+                    session_id,
+                    run_id,
+                    permission_audit_payload,
+                )
             except ValueError:
                 pass
         try:
-            get_stream_writer()({"type": "capability_manifest", **payload})
+            get_stream_writer()({"type": "capability_manifest", **audit_payload})
+            get_stream_writer()({"type": "permission_manifest", **permission_audit_payload})
         except (KeyError, RuntimeError):
             pass
         section = (
             "## Current Capability Manifest (authoritative)\n\n"
-            "Only tools listed below are callable in this model turn. Recommendations do not grant tools.\n\n"
-            f"```json\n{json.dumps(payload, ensure_ascii=False, sort_keys=True)}\n```"
+            "Only tools listed below are callable in this model turn. Soft routing hints do not grant tools.\n\n"
+            f"```json\n{json.dumps(model_payload, ensure_ascii=False, sort_keys=True)}\n```"
         )
-        if manifest.recommended_inactive_skills:
-            paths = ", ".join(
-                f"/skills/{item.skill_id}/SKILL.md"
-                for item in manifest.recommended_inactive_skills
-            )
-            section += (
-                "\n\nTo activate a recommended Skill, read its exact authoritative file first: "
-                f"{paths}. The corresponding tools can appear only on the following model turn."
-            )
-        return request.override(
+        section += (
+            "\n\n## Current Permission Manifest (authoritative)\n\n"
+            "This describes authorization for the current Run only. Historical grants and Evidence "
+            "do not grant permission; the Tool Gate makes the final per-call decision.\n\n"
+            f"```json\n{json.dumps(permission_model_payload, ensure_ascii=False, sort_keys=True)}\n```"
+        )
+        updated = request.override(
             tools=visible_tools,
             system_message=append_to_system_message(request.system_message, section),
+        )
+        return self._request_with_recommendation_hints(
+            updated,
+            manifest.recommended_inactive_skills,
+        )
+
+    @staticmethod
+    def _request_with_recommendation_hints(
+        request: ModelRequest,
+        recommendations: list[SkillRecommendation],
+    ) -> ModelRequest:
+        """Put missing soft recommendations beside the current user turn."""
+
+        if not recommendations:
+            return request
+        messages = list(request.messages or [])
+        index = next(
+            (
+                index
+                for index in range(len(messages) - 1, -1, -1)
+                if isinstance(messages[index], HumanMessage)
+            ),
+            None,
+        )
+        if index is None or not isinstance(messages[index].content, str):
+            return request
+        original = messages[index]
+        missing = [
+            item
+            for item in recommendations
+            if f"/skills/{item.skill_id}/SKILL.md" not in original.content
+        ]
+        if not missing:
+            return request
+        instructions = " ".join(
+            (
+                f"建议先读取 /skills/{item.skill_id}/SKILL.md"
+                f"（来源：{item.source}）。建议本身不授予工具权限；"
+                "只有成功读取权威 SKILL.md 后，下一模型轮次才会出现对应工具。"
+            )
+            for item in missing
+        )
+        messages[index] = original.model_copy(
+            update={
+                "content": (
+                    f"{original.content}\n\n{_CAPABILITY_RECOMMENDATION_MARKER} "
+                    f"{instructions}"
+                )
+            }
+        )
+        return request.override(messages=messages)
+
+    def _permission_manifest(
+        self,
+        request: ModelRequest,
+        visible_tools: list[Any],
+    ) -> PermissionManifest:
+        context = (
+            request.runtime.context
+            if request.runtime is not None and isinstance(request.runtime.context, dict)
+            else {}
+        )
+        session_id = str(context.get("session_id") or "")
+        run_id = str(context.get("run_id") or "unscoped")
+        run = session_manager.get_run_state(session_id, run_id) if session_id and run_id else None
+        config_snapshot = run.get("config_snapshot") if isinstance(run, dict) else {}
+        permissions = (
+            config_snapshot.get("permissions")
+            if isinstance(config_snapshot, dict) and isinstance(config_snapshot.get("permissions"), dict)
+            else {}
+        )
+        approval_mode = str(permissions.get("approval_mode") or "strict")
+        if approval_mode not in {"strict", "smart"}:
+            approval_mode = "strict"
+        allowed: list[dict[str, Any]] = []
+        hitl_required: list[dict[str, Any]] = []
+        for tool in visible_tools:
+            name = self._tool_name(tool)
+            descriptor = tool_control_descriptor(name)
+            if name in _ARGUMENT_DEPENDENT_PERMISSION_TOOLS:
+                hitl_required.append(
+                    {
+                        "tool": name,
+                        "approval_scope": "argument_dependent",
+                        "reason": "workspace_paths_are_allowed_but_external_paths_require_realtime_gate",
+                    }
+                )
+            elif descriptor is None or descriptor.approval_scope == "none":
+                allowed.append({"tool": name, "reason": "policy_allows_without_hitl"})
+            else:
+                hitl_required.append(
+                    {
+                        "tool": name,
+                        "approval_scope": descriptor.approval_scope,
+                        "reason": "arguments_require_realtime_tool_gate_evaluation",
+                    }
+                )
+        grants = session_manager.list_permission_grants(session_id) if session_id else []
+        current_bindings = RunPermissionContext.from_config_snapshot(
+            config_snapshot if isinstance(config_snapshot, dict) else {}
+        ).grant_bindings()
+        for grant in grants:
+            scope = str(grant.get("scope") or "session")
+            metadata = grant.get("metadata")
+            grant_run_id = str(metadata.get("run_id") or "") if isinstance(metadata, dict) else ""
+            if scope in {"once", "run"} and grant_run_id != run_id:
+                continue
+            bindings = grant.get("bindings")
+            if not isinstance(bindings, dict):
+                # Legacy grants without a policy/workspace binding are audit
+                # history, not current authority. The runtime Gate likewise
+                # refuses to reuse them across a Run boundary.
+                continue
+            if not PermissionBindingPolicy.equivalent(
+                grant_type=str(grant.get("type") or ""),
+                scope=scope,
+                target_kind=str(grant.get("target_kind") or ""),
+                target=str(grant.get("target") or ""),
+                left=bindings,
+                right=current_bindings,
+            ):
+                continue
+            allowed.append(
+                {
+                    "grant_type": str(grant.get("type") or ""),
+                    "scope": str(grant.get("scope") or ""),
+                    "target_kind": str(grant.get("target_kind") or ""),
+                    "target": str(grant.get("target") or ""),
+                    "capabilities": sorted(str(item) for item in grant.get("capabilities") or []),
+                }
+            )
+        allowed = sorted(
+            allowed,
+            key=lambda item: json.dumps(
+                item,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ),
+        )
+        hitl_required = sorted(
+            hitl_required,
+            key=lambda item: json.dumps(
+                item,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ),
+        )
+        boundary = {
+            "approval_mode": approval_mode,
+            "allowed": allowed,
+            "hitl_required": hitl_required,
+            "blocked": [],
+            "policy_epoch": int(permissions.get("policy_epoch") or 1),
+            "policy_version": str(permissions.get("policy_version") or ""),
+        }
+        digest = hashlib.sha256(
+            json.dumps(boundary, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:20]
+        return PermissionManifest(
+            manifest_id=f"permission-manifest-{digest}",
+            run_id=run_id,
+            created_at=time.time(),
+            **boundary,
         )
 
     @staticmethod
     def _tool_name(tool: Any) -> str:
         return str(tool.get("name") if isinstance(tool, dict) else getattr(tool, "name", ""))
+
+    @classmethod
+    def _tool_schema_contract(cls, tool: Any) -> dict[str, Any]:
+        if isinstance(tool, dict):
+            schema = tool.get("parameters") or tool.get("args_schema") or {}
+            description = str(tool.get("description") or "")
+        else:
+            args_schema = getattr(tool, "args_schema", None)
+            if args_schema is not None and hasattr(args_schema, "model_json_schema"):
+                try:
+                    schema = args_schema.model_json_schema()
+                except Exception:
+                    schema = {}
+            else:
+                schema = getattr(tool, "args", {}) or {}
+            description = str(getattr(tool, "description", "") or "")
+        return {
+            "name": cls._tool_name(tool),
+            "description": description,
+            "parameters": schema,
+        }
 
 
 def _skill_toolsets(path: Path) -> set[str]:

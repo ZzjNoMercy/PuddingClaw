@@ -81,6 +81,10 @@ _POSIX_ROOT_PREFIXES = (
     "/opt/",
 )
 _VIRTUAL_RESOURCE_PREFIXES = ("/workspace", "/scratch", "/skills", "/memories")
+_SCRIPT_SRC_RE = re.compile(
+    r"<script\b[^>]*\bsrc\s*=\s*[\"'](?P<src>[^\"']+\.js(?:\?[^\"']*)?)[\"']",
+    re.IGNORECASE,
+)
 
 
 def extract_local_resource_paths(message: str) -> list[str]:
@@ -143,6 +147,92 @@ def extract_declared_artifact_targets(message: str) -> list[str]:
         if direct_before or direct_after or referential_after:
             targets.append(path)
     return targets
+
+
+def resolve_declared_artifact_targets(message: str) -> list[str]:
+    """Resolve explicit targets plus deterministic versioned-copy targets.
+
+    A request such as "参考 /path/report.html，开一个新的 V2 版本（包含
+    HTML 和 JS）" names an input rather than spelling out the two output
+    filenames. Treating that as an open-ended artifact task weakens delivery
+    verification. This resolver derives the sibling V2 HTML and its local
+    script companion without asking the model to invent acceptance scope.
+    """
+
+    targets = extract_declared_artifact_targets(message)
+    version_match = re.search(r"(?i)(v\d+)", message)
+    if (
+        version_match is None
+        or not re.search(r"(?:新|另存|副本|版本)", message, re.IGNORECASE)
+    ):
+        return targets
+
+    version = version_match.group(1).lower()
+    lowered = message.lower()
+    wants_html = "html" in lowered
+    wants_js = bool(re.search(r"(?<![a-z])js(?![a-z])", lowered))
+    for raw_path in extract_local_resource_paths(message):
+        source = Path(raw_path).expanduser()
+        suffix = source.suffix.lower()
+        if suffix in {".html", ".htm"} and wants_html:
+            _append_unique(targets, str(_versioned_sibling(source, version)))
+        if suffix in {".js", ".cjs", ".mjs"} and wants_js:
+            _append_unique(targets, str(_versioned_sibling(source, version)))
+        if suffix not in {".html", ".htm"} or not wants_js:
+            continue
+        for script in _local_script_sources(source):
+            if _versioned_application_script(script):
+                _append_unique(targets, str(_versioned_sibling(script, version)))
+    return targets
+
+
+def _append_unique(items: list[str], value: str) -> None:
+    if value and value not in items:
+        items.append(value)
+
+
+def _versioned_sibling(path: Path, version: str) -> Path:
+    normalized = version.lower()
+    if re.search(rf"(?i)(?:[-_.\s]){re.escape(normalized)}$", path.stem):
+        return path
+    separator = "-" if path.stem.isascii() and " " not in path.stem else "_"
+    return path.with_name(f"{path.stem}{separator}{normalized}{path.suffix}")
+
+
+def _versioned_application_script(path: Path) -> bool:
+    """Keep report-owned scripts while reusing generated/vendor dependencies."""
+
+    normalized = path.as_posix().lower()
+    name = path.name.lower()
+    if "/node_modules/" in normalized:
+        return False
+    if any(marker in name for marker in (".min.js", ".min.cjs", ".min.mjs")):
+        return False
+    if re.match(r"^(?:vendor|runtime|polyfills?|chunk)(?:[.\-_]|$)", name):
+        return False
+    return True
+
+
+def _local_script_sources(html_path: Path) -> list[Path]:
+    try:
+        if not html_path.is_file() or html_path.stat().st_size > 2 * 1024 * 1024:
+            return []
+        content = html_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return []
+    scripts: list[Path] = []
+    for match in _SCRIPT_SRC_RE.finditer(content):
+        raw_src = match.group("src").split("?", 1)[0].strip()
+        if not raw_src or "://" in raw_src or raw_src.startswith(("//", "data:")):
+            continue
+        candidate = (
+            Path(raw_src).expanduser()
+            if Path(raw_src).is_absolute()
+            else html_path.parent / raw_src
+        )
+        if candidate not in scripts:
+            scripts.append(candidate)
+    return scripts
 
 
 def artifact_path_matches(candidate: str, declared: str) -> bool:
@@ -224,4 +314,5 @@ __all__ = [
     "extract_declared_artifact_targets",
     "extract_local_directory_paths",
     "extract_local_resource_paths",
+    "resolve_declared_artifact_targets",
 ]

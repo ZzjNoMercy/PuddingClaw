@@ -27,7 +27,8 @@ class DatabaseSqlExecuteTool(BaseTool):
         "loaded server-side; omit the SQL argument. A validation_receipt_id from database_sql_validate is also mandatory "
         "and must match the generation SQL hash. Semantic changes must go through the natural-language revision HITL flow. "
         "When the result is preview-only, the full materialized rows are persisted and returned with a result_id; "
-        "use database_query_result_page to fetch subsequent pages."
+        "use database_query_result_page only to inspect rows, or database_query_result_source followed by "
+        "materialize_source_ref to place the complete result in a file/typed slot without model-context transfer."
     )
     args_schema: type[BaseModel] = DatabaseSqlExecuteInput
     risk_level: str = "moderate"
@@ -48,6 +49,7 @@ class DatabaseSqlExecuteTool(BaseTool):
         runtime: ToolRuntime | None = None,
     ) -> str:
         question = "显式 SQL 执行"
+        context: dict[str, object] = {}
         if self.session_id:
             raw_context = getattr(runtime, "context", None)
             context = raw_context if isinstance(raw_context, dict) else {}
@@ -122,6 +124,12 @@ class DatabaseSqlExecuteTool(BaseTool):
                         question=question,
                         sql=sql,
                         session_id=self.session_id,
+                        tool_call_id=str(getattr(runtime, "tool_call_id", "") or ""),
+                        source_query_id=str(context.get("query_id") or ""),
+                        source_run_id=str(context.get("run_id") or ""),
+                        producer_receipt_ids=(
+                            [receipt.id] if self.session_id else []
+                        ),
                     )
             except Exception as exc:
                 persistence_error = type(exc).__name__
@@ -178,6 +186,9 @@ class DatabaseSqlExecuteTool(BaseTool):
                     f"- result_id：{execution.result_id}",
                     f"- 持久化：{execution.result_store.get('artifact_path')}"
                     f"（过期时间：{execution.result_store.get('expires_at')}）",
+                    f"- artifact_sha256：{execution.result_store.get('artifact_sha256')}",
+                    "- 完整结果落文件：先调用 database_query_result_source，"
+                    "再调用 materialize_source_ref（无需逐页穿过模型上下文）",
                 ]
             )
         elif persistence_error:

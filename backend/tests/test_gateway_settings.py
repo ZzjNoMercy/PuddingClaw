@@ -139,11 +139,11 @@ def test_legacy_python_only_sandbox_image_migrates_to_managed_runtime(
     loaded = config.load_config()
 
     docker = loaded["harness"]["terminal"]["docker"]
-    assert docker["image"] == "puddingclaw/sandbox:python3.12-node22-curl-v3"
+    assert docker["image"] == "puddingclaw/sandbox:python3.12-node22-chromium-v4"
     assert docker["dependency_setup_enabled"] is False
     assert docker["dependency_setup_opt_in_version"] == 1
     persisted = json.loads(config_path.read_text(encoding="utf-8"))
-    assert persisted["harness"]["terminal"]["docker"]["image"] == "puddingclaw/sandbox:python3.12-node22-curl-v3"
+    assert persisted["harness"]["terminal"]["docker"]["image"] == "puddingclaw/sandbox:python3.12-node22-chromium-v4"
 
 
 def test_legacy_implicit_project_dependency_setup_is_reset_to_clean_default(
@@ -171,12 +171,23 @@ def test_legacy_implicit_project_dependency_setup_is_reset_to_clean_default(
     loaded = config.load_config()
 
     docker = loaded["harness"]["terminal"]["docker"]
-    assert docker["image"] == "puddingclaw/sandbox:python3.12-node22-curl-v3"
+    assert docker["image"] == "puddingclaw/sandbox:python3.12-node22-chromium-v4"
     assert docker["dependency_setup_enabled"] is False
     assert docker["dependency_setup_opt_in_version"] == 1
 
 
-def test_managed_v2_sandbox_migrates_to_curl_runtime(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "legacy_image",
+    [
+        "puddingclaw/sandbox:python3.12-node22-v2",
+        "puddingclaw/sandbox:python3.12-node22-curl-v3",
+    ],
+)
+def test_managed_sandbox_migrates_to_browser_runtime(
+    tmp_path,
+    monkeypatch,
+    legacy_image,
+):
     config_path = tmp_path / "config.json"
     config_path.write_text(
         json.dumps(
@@ -184,7 +195,7 @@ def test_managed_v2_sandbox_migrates_to_curl_runtime(tmp_path, monkeypatch):
                 "harness": {
                     "terminal": {
                         "docker": {
-                            "image": "puddingclaw/sandbox:python3.12-node22-v2",
+                            "image": legacy_image,
                         }
                     }
                 }
@@ -198,7 +209,7 @@ def test_managed_v2_sandbox_migrates_to_curl_runtime(tmp_path, monkeypatch):
 
     assert (
         loaded["harness"]["terminal"]["docker"]["image"]
-        == "puddingclaw/sandbox:python3.12-node22-curl-v3"
+        == "puddingclaw/sandbox:python3.12-node22-chromium-v4"
     )
 
 
@@ -1111,7 +1122,11 @@ def test_agent_user_content_preserves_spaced_external_html_target(tmp_path):
 
     assert isinstance(content, str)
     assert str(external_file) in content
-    assert "直接对原始绝对路径使用 read_file/inspect_file_version/patch_file" in content
+    assert (
+        "直接对原始绝对路径使用 "
+        "read_file/inspect_file_version/copy_file/replace_file/"
+        "materialize_source_ref/patch_file"
+    ) in content
     assert "HostFileBroker 原子落到正式路径" in content
     assert "不要创建 /workspace 或 /scratch 影子副本" in content
     assert extract_declared_artifact_targets(f"{external_file} 刷新这个报告到 2026 年") == [str(external_file)]
@@ -1134,6 +1149,44 @@ def test_artifact_target_parser_handles_compact_chinese_and_negation():
         assert extract_declared_artifact_targets(f"请修改{target}并交付") == [target]
         assert extract_declared_artifact_targets(f"请勿修改 {target}，只做审查") == []
     assert extract_declared_artifact_targets("请分析 https://example.com/reports/latest.html，不要写入本地") == []
+
+
+def test_artifact_target_resolver_derives_v2_html_and_script_companion(tmp_path):
+    from harness.artifact_paths import resolve_declared_artifact_targets
+
+    source = tmp_path / "产品配置分析_2026.html"
+    source.write_text(
+        (
+            '<html><script src="echarts-6.1.0.min.js"></script>'
+            '<script src="product-config-charts-2026.js?v=1"></script></html>'
+        ),
+        encoding="utf-8",
+    )
+
+    targets = resolve_declared_artifact_targets(
+        f"参考{source}，开一个新的V2版本（包含html和js）"
+    )
+
+    assert targets == [
+        str(tmp_path / "产品配置分析_2026_v2.html"),
+        str(tmp_path / "product-config-charts-2026-v2.js"),
+    ]
+
+
+def test_artifact_target_resolver_preserves_already_versioned_script(tmp_path):
+    from harness.artifact_paths import resolve_declared_artifact_targets
+
+    source = tmp_path / "产品配置分析_2026.html"
+    source.write_text(
+        '<script src="product-config-charts-2026-v2.js"></script>',
+        encoding="utf-8",
+    )
+
+    targets = resolve_declared_artifact_targets(
+        f"参考{source}，开一个新的V2版本（包含html和js）"
+    )
+
+    assert targets[-1] == str(tmp_path / "product-config-charts-2026-v2.js")
 
 
 def test_agent_user_content_keeps_virtual_workspace_path_as_managed_input(tmp_path):

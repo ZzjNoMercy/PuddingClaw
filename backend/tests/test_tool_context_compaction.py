@@ -268,13 +268,14 @@ def test_result_id_raw_reference_keeps_session_fallback(tmp_path: Path) -> None:
     source_hash = manager._tool_context_source_hash(output)
     ref = manager._tool_context_raw_ref("raw-ref", "call-ref", output, source_hash)
 
-    assert ref["kind"] == "result_id"
-    assert ref["value"] == "qr-2026"
+    assert ref["kind"] == "sql_query_result"
+    assert ref["result_id"] == "qr-2026"
     assert ref["fallback"] == {
         "kind": "session_tool_call",
         "session_id": "raw-ref",
         "tool_call_id": "call-ref",
         "source_hash": source_hash,
+        "output_complete": False,
     }
 
 

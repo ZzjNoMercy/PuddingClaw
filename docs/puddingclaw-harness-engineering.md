@@ -312,7 +312,7 @@ Subagent 继承父 Run 冻结的 `EffectivePermissionContext`：
 当前采用“一项目一个可复用容器”，不是“一 Run 一个容器”：
 
 - 项目目录挂载为 `/workspace`；
-- 默认镜像 `puddingclaw/sandbox:python3.12-node22-curl-v3`；
+- 默认镜像 `puddingclaw/sandbox:python3.12-node22-chromium-v4`；
 - 提供 Python 3.12 + pip、Node.js 22 + npm/corepack、curl；
 - 默认不安装项目依赖；
 - 默认网络关闭；批准的依赖安装或联网命令使用临时联网能力，结束后断开；

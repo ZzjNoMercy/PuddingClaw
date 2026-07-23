@@ -914,9 +914,8 @@ class TestSessionManagerPersistence:
 
         assert [m["role"] for m in agent_history] == ["user", "assistant", "assistant"]
         assert agent_history[1]["content"] == "I will search now."
-        # load_session_for_agent 不再把历史 tool_calls 回传给模型，避免重复 tool_call_id
-        # 以及污染当前轮次时间轴；但仍保留 assistant 文本内容作为上下文。
-        assert "tool_calls" not in agent_history[1]
+        assert agent_history[1]["tool_calls"][0]["id"] == "tc1"
+        assert agent_history[1]["tool_calls"][0]["historical"] is True
         assert agent_history[2]["content"] == "Final answer from the searched topic."
         assert "tool_calls" not in agent_history[2]
 
@@ -935,7 +934,7 @@ class TestSessionManagerPersistence:
         assert agent_history == [{"role": "assistant", "content": "first\nsecond"}]
 
     def test_middle_trim_archives_but_display_history_stays_complete(self, tmp_path):
-        from graph.session_manager import MIDDLE_TRIM_CONTEXT_PREFIX, SessionManager
+        from graph.session_manager import SessionManager
 
         mgr = SessionManager()
         mgr.initialize(tmp_path)
@@ -975,9 +974,9 @@ class TestSessionManagerPersistence:
         ]
 
         agent_history = mgr.load_session_for_agent(sid)
-        assert agent_history[0]["content"].startswith(MIDDLE_TRIM_CONTEXT_PREFIX)
-        assert "trimmed task was completed" in agent_history[0]["content"]
-        assert all(m["content"] != "trim-user" for m in agent_history[1:])
+        assert any(m["content"] == "trim-user" for m in agent_history)
+        assert any(m["content"] == "trim-assistant" for m in agent_history)
+        assert not any("trimmed task was completed" in m["content"] for m in agent_history)
 
     def test_middle_trim_span_aligns_tail_to_user(self):
         from api.chat import _select_middle_trim_span

@@ -10,8 +10,8 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
-from sqlalchemy.pool import NullPool
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from config import get_database_config
 
@@ -70,6 +70,17 @@ async def init_database() -> bool:
         engine = get_engine()
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+        from analytics.nl2sql.result_store import (
+            backfill_query_result_catalogs,
+            cleanup_expired_query_results,
+            scavenge_orphaned_query_result_files,
+        )
+
+        sessionmaker = get_sessionmaker()
+        async with sessionmaker() as session:
+            await backfill_query_result_catalogs(session)
+            await cleanup_expired_query_results(session)
+            await scavenge_orphaned_query_result_files(session)
         _last_error = None
         return True
     except Exception as exc:

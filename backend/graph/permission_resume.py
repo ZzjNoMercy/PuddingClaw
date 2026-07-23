@@ -107,6 +107,7 @@ class PermissionResumeRegistry:
         path: Path,
         access: str,
         operation: str,
+        require_delete: bool = False,
         grant_bindings: dict[str, Any] | None = None,
         change_preview: dict[str, str] | None = None,
     ) -> dict[str, Any]:
@@ -114,7 +115,16 @@ class PermissionResumeRegistry:
 
         if access not in {"read", "write"}:
             raise ValueError(f"Unsupported external directory access: {access}")
-        replay_key = "\0".join([session_id, query_id, run_id, access, str(path)])
+        replay_key = "\0".join(
+            [
+                session_id,
+                query_id,
+                run_id,
+                access,
+                "delete" if require_delete else "no-delete",
+                str(path),
+            ]
+        )
         request_id = f"perm-req-{hashlib.sha256(replay_key.encode('utf-8')).hexdigest()[:16]}"
         semantic_payload = {
             "session_id": session_id,
@@ -154,7 +164,7 @@ class PermissionResumeRegistry:
             "target_kind": "exact_directory",
             "capabilities": [
                 access,
-                *(["delete"] if access == "write" else []),
+                *(["delete"] if access == "write" and require_delete else []),
                 "recursive",
                 "external_path",
             ],

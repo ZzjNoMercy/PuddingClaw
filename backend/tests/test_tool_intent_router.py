@@ -27,7 +27,9 @@ def test_database_business_question_routes_directly_without_schema_probe() -> No
     assert decision["matched"] is True
     assert decision["intents"] == ["database_analysis"]
     assert decision["preferred_tools"] == ["database_sql_generate", "database_sql_validate", "database_sql_execute"]
-    assert "先把用户原问题交给 database_sql_generate" in decision["routing_prompt"]
+    assert "直接问数时把用户原问题交给 database_sql_generate" in decision["routing_prompt"]
+    assert "Goal 任务可以拆成" in decision["routing_prompt"]
+    assert "不得添加用户未指定的表、字段" in decision["routing_prompt"]
     assert "需要元数据时使用 database_schema_inspect" in decision["routing_prompt"]
 
 

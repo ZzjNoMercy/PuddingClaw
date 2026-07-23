@@ -1082,15 +1082,20 @@ class ToolExecutionPipeline(AgentMiddleware):
     BUILTIN_TOOLS = frozenset(
         {
             "update_todos",
+            "read_evidence",
             "ls",
             "read_file",
             "write_file",
             "edit_file",
             "inspect_file_version",
+            "copy_file",
+            "materialize_source_ref",
+            "replace_file",
             "patch_file",
             "patch_files",
             "delete_file",
             "execute_external_directory",
+            "validate_html_report",
             "rewind_external_file_changes",
             "upsert_scratch_file",
             "stage_external_artifact",
@@ -1110,14 +1115,19 @@ class ToolExecutionPipeline(AgentMiddleware):
     DECLARED_ALLOW_TOOLS = frozenset(
         {
             "update_todos",
+            "read_evidence",
             "ls",
             "read_file",
             "write_file",
             "edit_file",
             "inspect_file_version",
+            "copy_file",
+            "materialize_source_ref",
+            "replace_file",
             "patch_file",
             "patch_files",
             "delete_file",
+            "validate_html_report",
             "rewind_external_file_changes",
             "upsert_scratch_file",
             "stage_external_artifact",
@@ -1440,6 +1450,8 @@ class ToolExecutionPipeline(AgentMiddleware):
                     "critical",
                 )
             command = self._command(request)
+            args = request.tool_call.get("args") or {}
+            mode = str(args.get("mode") or "read_only")
             effects = ShellPolicyAnalyzer.capabilities(
                 command,
                 workspace_path="/external-workspace",
@@ -1449,6 +1461,40 @@ class ToolExecutionPipeline(AgentMiddleware):
                     PolicyDecision.DENY,
                     "external_directory_command_is_offline_and_read_only",
                     "critical",
+                )
+            if mode == "writable_draft":
+                if self._safe_external_draft_command(command):
+                    return ToolPolicyResult(
+                        PolicyDecision.ALLOW,
+                        "external_directory_draft:narrow_engineering_command",
+                        "managed_write",
+                    )
+                return ToolPolicyResult(
+                    PolicyDecision.ASK,
+                    "external_directory_draft:unknown_or_compound_command",
+                    "high" if effects.destructive else "managed_write",
+                )
+            if mode != "read_only":
+                return ToolPolicyResult(
+                    PolicyDecision.DENY,
+                    "unsupported_external_directory_mode",
+                    "critical",
+                )
+            if self._registered_external_validator(command):
+                if (
+                    "/opt/puddingclaw/bin/validate-html-report-e2e.mjs"
+                    in command
+                    and not self._browser_e2e_required(request)
+                ):
+                    return ToolPolicyResult(
+                        PolicyDecision.DENY,
+                        "browser_e2e_not_required_by_contract",
+                        "critical",
+                    )
+                return ToolPolicyResult(
+                    PolicyDecision.ALLOW,
+                    "external_directory_validator:registered_read_only",
+                    "declared",
                 )
             return ToolPolicyResult(
                 PolicyDecision.ASK,
@@ -1732,6 +1778,22 @@ class ToolExecutionPipeline(AgentMiddleware):
             return True
         return False
 
+    @classmethod
+    def _browser_e2e_required(cls, request: ToolCallRequest) -> bool:
+        context = cls._context(request)
+        session_id = str(context.get("session_id") or "")
+        run_id = str(context.get("run_id") or "")
+        if not session_id or not run_id:
+            return False
+        run = session_manager.get_run_state(session_id, run_id)
+        contract = (
+            run.get("verification_contract")
+            if isinstance(run, dict)
+            and isinstance(run.get("verification_contract"), dict)
+            else {}
+        )
+        return bool(contract.get("browser_e2e_required"))
+
     @staticmethod
     def _managed_container_path(raw: str) -> bool:
         normalized = raw.replace("\\", "/")
@@ -1909,6 +1971,122 @@ class ToolExecutionPipeline(AgentMiddleware):
             if effects.destructive:
                 capabilities.append("destructive_write")
         return capabilities
+
+    @staticmethod
+    def _safe_external_argv_paths(tokens: list[str]) -> bool:
+        for token in tokens[1:]:
+            path_value = token.partition("=")[2] if "=" in token else token
+            if ".." in Path(path_value).parts:
+                return False
+            if path_value.startswith("/") and not (
+                path_value == "/external-workspace"
+                or path_value.startswith("/external-workspace/")
+                or path_value
+                == "/opt/puddingclaw/bin/validate-html-report-e2e.mjs"
+            ):
+                return False
+        return True
+
+    @staticmethod
+    def _single_external_argv(command: str) -> list[str] | None:
+        """Return one expansion-free argv for narrow external-dir automation."""
+
+        if any(character in command for character in ("$", "`", "\n", "\r", ">", "<")):
+            return None
+        try:
+            segments = ShellPolicyAnalyzer.parse_segments(command)
+        except ValueError:
+            return None
+        if len(segments) != 1:
+            return None
+        tokens = ShellPolicyAnalyzer.unwrap_command(segments[0])
+        if not tokens:
+            return None
+        if not ToolExecutionPipeline._safe_external_argv_paths(tokens):
+            return None
+        return tokens
+
+    @classmethod
+    def _safe_external_draft_command(cls, command: str) -> bool:
+        tokens = cls._single_external_argv(command)
+        if not tokens:
+            return False
+        return Path(tokens[0]).name.lower() in {"cp", "mv", "mkdir"}
+
+    @classmethod
+    def _registered_validator_argv(cls, tokens: list[str]) -> bool:
+        executable = Path(tokens[0]).name.lower()
+        args = tokens[1:]
+        if executable == "node":
+            return (
+                len(args) >= 2
+                and args[0] == "--check"
+            ) or (
+                len(args) == 2
+                and args[0]
+                == "/opt/puddingclaw/bin/validate-html-report-e2e.mjs"
+                and args[1].lower().endswith((".html", ".htm"))
+            )
+        if executable in {"python", "python3"}:
+            return len(args) >= 3 and args[:2] in (
+                ["-m", "py_compile"],
+                ["-m", "json.tool"],
+            )
+        return False
+
+    @classmethod
+    def _registered_external_validator(cls, command: str) -> bool:
+        tokens = cls._single_external_argv(command)
+        if tokens:
+            return cls._registered_validator_argv(tokens)
+
+        # Backward-compatible low-friction path for the common diagnostic
+        # wrapper emitted by older prompts:
+        #   pwd && ls ... && node <fixed-html-validator> report.html
+        # It remains expansion-free and read-only, permits exactly one final
+        # registered validator, and rejects pipes, fallback branches, writes,
+        # substitutions, absolute escapes, and arbitrary helper commands.
+        if any(
+            marker in command
+            for marker in ("$", "`", "\n", "\r", ">", "<", "|", ";")
+        ):
+            return False
+        try:
+            segments = ShellPolicyAnalyzer.parse_segments(command)
+        except ValueError:
+            return False
+        if len(segments) < 2 or "&&" not in command:
+            return False
+        argv_segments = [
+            ShellPolicyAnalyzer.unwrap_command(segment)
+            for segment in segments
+        ]
+        if any(not argv for argv in argv_segments):
+            return False
+        if any(
+            not cls._safe_external_argv_paths(argv)
+            for argv in argv_segments
+        ):
+            return False
+        if not cls._registered_validator_argv(argv_segments[-1]):
+            return False
+        for argv in argv_segments[:-1]:
+            executable = Path(argv[0]).name.lower()
+            if executable == "pwd" and len(argv) == 1:
+                continue
+            if executable != "ls":
+                return False
+            for token in argv[1:]:
+                if token.startswith("-"):
+                    continue
+                if ".." in Path(token).parts:
+                    return False
+                if token.startswith("/") and not (
+                    token == "/external-workspace"
+                    or token.startswith("/external-workspace/")
+                ):
+                    return False
+        return True
 
     def _session_grant_scope(
         self,

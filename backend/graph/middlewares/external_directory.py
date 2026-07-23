@@ -921,6 +921,19 @@ class ExternalDirectoryMiddleware(AgentMiddleware[Any, Any, Any]):
                 "modified": list(plan.get("modified") or []),
                 "deleted": list(plan.get("deleted") or []),
             }
+            if normalized_plan["deleted"] and not (
+                session_manager.has_external_directory_delete_permission(
+                    binding["session_id"],
+                    root,
+                    run_id=binding["run_id"],
+                )
+            ):
+                return _tool_error(
+                    "commit_external_directory",
+                    runtime,
+                    "directory plan contains deletions and requires a separate "
+                    "delete-capable exact-directory approval",
+                )
             from graph.middlewares.versioned_patch import (
                 _accepted_receipts_for_target,
                 _code_like_target,

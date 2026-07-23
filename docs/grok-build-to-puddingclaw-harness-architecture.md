@@ -71,7 +71,7 @@ PuddingClaw 基线提交：<code>7fb380f43be9c9b13fd3478bb28ef1a637fe6203</code>
 - **[本方案新增]**：`smart` 仅自动放行确定性低风险联网工具（Tavily、通过 SSRF 校验的公开网页抓取）；Docker 动态装包仍需用户审批，但可给当前 Session 的类型化安装能力；
 - **[本方案新增]**：动态依赖通过类型化 `install_packages` 工具进入一次性联网 installer 容器；长期项目容器保持 `network=none`，原始 Shell 安装命令不能继承这一可复用授权；
 - **[本方案新增]**：网页抓取执行公开地址校验、DNS 全地址校验、连接 IP 固定、HTTPS SNI/证书主机名校验、跳转重验、peer IP 校验、内容类型与解压后体积限制；
-- **[本方案新增]**：Docker runtime/dependency volume 绑定解析后的不可变 image ID，而不是可漂移 tag；默认镜像为 `puddingclaw/sandbox:python3.12-node22-curl-v3`；
+- **[本方案新增]**：Docker runtime/dependency volume 绑定解析后的不可变 image ID，而不是可漂移 tag；默认镜像为 `puddingclaw/sandbox:python3.12-node22-chromium-v4`；
 - **[本方案新增]**：`/skills`、`/knowledge`、`/semantic-assets`、`/sql-guardrails`、`/analytics-models` 同时在 Docker mount 与 DeepAgents 虚拟文件路由层强制只读，外部写权限不能覆盖这一系统约束；
 - **[产品交互借鉴] + [本方案适配]**：Composer 外层只保留项目目录与审批模式；模型、附件、Goal 收入 `+`；思考模式移到右侧。Popover 互斥，Goal 是“下一 Run 意图”，只有收到 `run_started` 才消费。
 
@@ -411,7 +411,7 @@ harness:
     docker:
       connection: auto                # auto | context
       context: desktop-linux
-      image: puddingclaw/sandbox:python3.12-node22-curl-v3
+      image: puddingclaw/sandbox:python3.12-node22-chromium-v4
       cpu_limit: 2
       memory_limit_mb: 2048
       pids_limit: 128
@@ -576,7 +576,7 @@ Node.js 22 + npm + corepack
 仅附带基础 POSIX shell 与 CA 证书
 ~~~
 
-普通用户不需要选择或上传镜像。PuddingClaw 默认使用 <code>puddingclaw/sandbox:python3.12-node22-curl-v3</code>；高级用户可以填写本机已有 Docker tag 或 registry image reference，Docker 会按标准规则解析本地镜像或拉取 registry 镜像。Backend 在 Run 开始时把 tag 解析为不可变 image ID 并写入执行快照；项目容器和依赖 volume 都以该 image ID 为键，避免同名 tag 漂移后复用 ABI 不兼容的旧环境。自定义镜像仍必须提供 Python、Node.js 与 curl 基础运行时。
+普通用户不需要选择或上传镜像。PuddingClaw 默认使用 <code>puddingclaw/sandbox:python3.12-node22-chromium-v4</code>；高级用户可以填写本机已有 Docker tag 或 registry image reference，Docker 会按标准规则解析本地镜像或拉取 registry 镜像。Backend 在 Run 开始时把 tag 解析为不可变 image ID 并写入执行快照；项目容器和依赖 volume 都以该 image ID 为键，避免同名 tag 漂移后复用 ABI 不兼容的旧环境。自定义镜像仍必须提供 Python、Node.js、Chromium 与 curl 基础运行时。
 
 PuddingClaw 默认不扫描或安装项目依赖，因为当前产品不是以执行任意项目脚本为主要目标。只有高级用户显式开启 <code>dependency_setup_enabled</code> 后，才扫描项目根及有限层级子目录中的实际配置：
 
@@ -2228,7 +2228,7 @@ Trace 体积和当前 7.7 MB Session 不作为 P0/P1 阻塞项。
 
 - Backend 产品测试边界：`backend/.venv/bin/pytest -q tests`，**779 passed**；Backend 根级无范围 `pytest` 会额外收集第三方 Skill 自带测试并产生模块名冲突，不作为 Backend 产品回归入口。
 - Frontend：`tsc --noEmit` 通过；Next.js production build 通过，13 个路由完成静态/动态构建。
-- Docker 镜像 smoke：`puddingclaw/sandbox:python3.12-node22-curl-v3` 在 `--network none`、宿主 UID/GID、真实 bind mount 下确认 Python 3.12、Node.js 22、curl 与 `/harness-scratch/<session>/<query>` 写入成功。
+- Docker 镜像 smoke：`puddingclaw/sandbox:python3.12-node22-chromium-v4` 在 `--network none`、宿主 UID/GID、真实 bind mount 下确认 Python 3.12、Node.js 22、Chromium、curl 与 `/harness-scratch/<session>/<query>` 写入成功。
 - 当前本机两个旧 project container 均缺 `/harness-scratch` mount；没有在审核过程中强制销毁。新 Backend 下次使用相应 project sandbox 时会因 spec hash/runtime validation 不匹配而自动重建。
 - `git diff --check` 通过。
 - 最终只读对抗复核确认四个高风险反例均已封住：旧 revision/cross-goal candidate 注入、普通 Run 导入 terminal Goal、未闭合伪造 Harness Envelope、Tool Context cancel 后租约悬挂；对应定向用例 4 passed。

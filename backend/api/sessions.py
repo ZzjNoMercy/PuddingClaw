@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from config import get_rag_mode
@@ -41,6 +41,10 @@ class SessionCreateRequest(BaseModel):
 class GoalUpdateRequest(BaseModel):
     objective: str
     expected_revision: int
+
+
+class GoalBudgetExtensionRequest(BaseModel):
+    additional_rounds: int = Field(ge=1, le=100)
 
 
 # ── Endpoints ───────────────────────────────────────────────
@@ -119,6 +123,8 @@ async def get_raw_messages(session_id: str):
         result["todos"] = data["todos"]
     if "todos_authority" in data:
         result["todos_authority"] = data["todos_authority"]
+    if "todo_ledger_revision" in data:
+        result["todo_ledger_revision"] = data["todo_ledger_revision"]
     if "graph" in data:
         result["graph"] = data["graph"]
     if "harness" in data:
@@ -141,6 +147,14 @@ async def get_session_harness_state(session_id: str):
         **harness,
         "legacy_external_lease_audit": legacy_audit,
     }
+
+
+@router.get("/sessions/{session_id}/todos/current")
+async def get_current_session_todos(session_id: str):
+    """Return the authoritative lightweight Todo projection for reconciliation."""
+
+    snapshot = await run_in_threadpool(session_manager.get_todo_snapshot, session_id)
+    return {"session_id": session_id, **snapshot}
 
 
 @router.get("/sessions/{session_id}/goals/{goal_id}")
@@ -204,6 +218,26 @@ async def cancel_session_goal(session_id: str, goal_id: str):
     return await _transition_goal(session_id, goal_id, "cancel")
 
 
+@router.post("/sessions/{session_id}/goals/{goal_id}/extend-budget")
+async def extend_session_goal_budget(
+    session_id: str,
+    goal_id: str,
+    request: GoalBudgetExtensionRequest,
+):
+    try:
+        goal = await run_in_threadpool(
+            goal_coordinator.extend_budget,
+            session_id,
+            goal_id,
+            additional_rounds=request.additional_rounds,
+        )
+        return goal.model_dump(mode="json")
+    except GoalActivationError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except HarnessStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @router.get("/sessions/{session_id}/traces")
 async def get_session_traces(session_id: str):
     """Load heavyweight Agent traces only when the trace workspace requests them."""
@@ -236,6 +270,8 @@ async def get_session_history(session_id: str):
         result["todos"] = data["todos"]
     if "todos_authority" in data:
         result["todos_authority"] = data["todos_authority"]
+    if "todo_ledger_revision" in data:
+        result["todo_ledger_revision"] = data["todo_ledger_revision"]
     if "graph" in data:
         result["graph"] = data["graph"]
     return result

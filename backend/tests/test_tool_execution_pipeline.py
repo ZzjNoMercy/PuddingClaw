@@ -1297,13 +1297,14 @@ def test_project_container_name_is_path_stable_and_not_session_scoped(tmp_path):
     assert len(first.removeprefix("puddingclaw-project-")) == 16
 
 
-def test_managed_sandbox_runtime_declares_curl_as_base_capability():
+def test_managed_sandbox_runtime_declares_browser_as_base_capability():
     dockerfile = Path(__file__).parents[1] / "harness" / "docker" / "Dockerfile"
     content = dockerfile.read_text(encoding="utf-8")
 
-    assert 'com.puddingclaw.runtime="python3.12-node22-curl-v3"' in content
+    assert 'com.puddingclaw.runtime="python3.12-node22-chromium-v4"' in content
     assert "curl" in content
-    assert "curl" in RUNTIME_CONTRACT
+    assert "chromium" in content
+    assert "chromium" in RUNTIME_CONTRACT
 
 
 def test_project_container_spec_has_no_docker_socket_or_host_home(tmp_path, monkeypatch):
@@ -1472,6 +1473,63 @@ def test_external_directory_command_mounts_only_exact_root_read_only(
         "sh",
     ]
     assert command[-3:] == ["sha256:immutable-image", "-c", "rg --files ."]
+
+
+def test_external_directory_writable_mount_is_limited_to_isolated_draft(
+    tmp_path,
+    monkeypatch,
+):
+    workspace = tmp_path / "project"
+    draft = tmp_path / "draft"
+    for directory in (workspace, draft):
+        directory.mkdir()
+    manager = ProjectSandboxManager(
+        {
+            "network_enabled": False,
+            "dependency_setup_enabled": False,
+        }
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        manager,
+        "ensure_image",
+        lambda _image: "sha256:immutable-image",
+    )
+    monkeypatch.setattr(
+        manager,
+        "_run",
+        lambda args, *, timeout=30: (
+            calls.append(list(args))
+            or subprocess.CompletedProcess(args, 0, "copied", "")
+        ),
+    )
+
+    result = manager.run_ephemeral_external_directory_command(
+        workspace,
+        external_directory=draft,
+        command="cp report.js report-v2.js",
+        timeout=30,
+        max_output_bytes=10_000,
+        writable=True,
+    )
+
+    assert result.exit_code == 0
+    command = calls[0]
+    assert command[:5] == ["run", "--rm", "--network", "none", "--read-only"]
+    assert f"type=bind,src={workspace.resolve()},dst=/workspace,readonly" in command
+    assert f"type=bind,src={draft.resolve()},dst=/external-workspace" in command
+    assert (
+        f"type=bind,src={draft.resolve()},dst=/external-workspace,readonly"
+        not in command
+    )
+    writable_bind_mounts = [
+        item
+        for item in command
+        if item.startswith("type=bind") and not item.endswith(",readonly")
+    ]
+    assert writable_bind_mounts == [
+        f"type=bind,src={draft.resolve()},dst=/external-workspace"
+    ]
 
 
 def test_docker_backend_gives_approved_python_network_command_real_network(
@@ -1982,6 +2040,139 @@ def test_external_directory_command_is_exact_one_time_docker_approval(tmp_path):
         "execute",
         "external_directory_mount",
     ]
+
+
+@pytest.mark.parametrize(
+    ("command", "mode", "expected"),
+    [
+        ("node --check app.js", "read_only", PolicyDecision.ALLOW),
+        (
+            "node /opt/puddingclaw/bin/validate-html-report-e2e.mjs report.html",
+            "read_only",
+            PolicyDecision.DENY,
+        ),
+        (
+            "pwd && ls -la && node "
+            "/opt/puddingclaw/bin/validate-html-report-e2e.mjs report.html",
+            "read_only",
+            PolicyDecision.DENY,
+        ),
+        (
+            "pwd && find . -maxdepth 2 && node "
+            "/opt/puddingclaw/bin/validate-html-report-e2e.mjs report.html",
+            "read_only",
+            PolicyDecision.ASK,
+        ),
+        (
+            "pwd && ls ../../ && node "
+            "/opt/puddingclaw/bin/validate-html-report-e2e.mjs report.html",
+            "read_only",
+            PolicyDecision.ASK,
+        ),
+        ("python3 -m json.tool report.json", "read_only", PolicyDecision.ALLOW),
+        ("cp app.js app-v2.js", "writable_draft", PolicyDecision.ALLOW),
+        ("mkdir -p assets", "writable_draft", PolicyDecision.ALLOW),
+        ("mv app.js app-v2.js", "writable_draft", PolicyDecision.ALLOW),
+        (
+            "cp app.js app-v2.js && node --check app-v2.js",
+            "writable_draft",
+            PolicyDecision.ASK,
+        ),
+        ("python3 custom.py", "writable_draft", PolicyDecision.ASK),
+    ],
+)
+def test_external_directory_narrow_commands_have_deterministic_hitl_policy(
+    tmp_path,
+    command,
+    mode,
+    expected,
+):
+    request = ToolCallRequest(
+        tool_call={
+            "id": "external-directory-narrow",
+            "name": "execute_external_directory",
+            "args": {
+                "directory_path": str(tmp_path),
+                "command": command,
+                "mode": mode,
+                "lease_id": (
+                    "directory-lease-test"
+                    if mode == "writable_draft"
+                    else None
+                ),
+            },
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute_external_directory"},
+        backend_mode="docker",
+    )
+
+    assert pipeline._preflight(request).decision == expected
+
+
+def test_registered_html_e2e_command_requires_explicit_contract_parameter(
+    tmp_path,
+):
+    from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    session_manager.initialize(state_dir)
+    session_manager.create_session("explicit-browser-e2e-session")
+    contract = RunRubricCompiler.compile(
+        RubricBuildContext(
+            user_message="生成 HTML，并在交付前执行 E2E 测试",
+            force_required=True,
+        )
+    )
+    assert contract is not None and contract.browser_e2e_required is True
+    run = RunRecord(
+        run_id="run-explicit-browser-e2e",
+        query_id="query-explicit-browser-e2e",
+        session_id="explicit-browser-e2e-session",
+        objective="生成 HTML，并在交付前执行 E2E 测试",
+        verification_contract=contract,
+        declared_verification_contract=contract,
+    )
+    session_manager.start_harness_run(
+        "explicit-browser-e2e-session",
+        run.model_dump(mode="json"),
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "id": "explicit-browser-e2e",
+            "name": "execute_external_directory",
+            "args": {
+                "directory_path": str(tmp_path),
+                "command": (
+                    "pwd && ls -la && node "
+                    "/opt/puddingclaw/bin/validate-html-report-e2e.mjs "
+                    "report.html"
+                ),
+                "mode": "read_only",
+            },
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(
+            context={
+                "session_id": run.session_id,
+                "run_id": run.run_id,
+                "query_id": run.query_id,
+                "workspace_path": str(tmp_path),
+            }
+        ),
+    )
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute_external_directory"},
+        backend_mode="docker",
+    )
+
+    assert pipeline._preflight(request).decision == PolicyDecision.ALLOW
 
 
 def test_external_directory_command_is_denied_outside_docker(tmp_path):

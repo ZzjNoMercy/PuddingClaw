@@ -21,6 +21,8 @@ from graph.session_manager import SessionManager, session_manager
 
 logger = logging.getLogger(__name__)
 POLICY_VERSION = "tool-context-v2-harness-control"
+PROJECTION_VERSION = "evidence-projection-v1"
+DEFAULT_CONTEXT_PROFILE = "detailed"
 LLM_RESULT_INPUT_MAX_CHARS = 24000
 LLM_RESULT_OUTPUT_MAX_CHARS = 4000
 LLM_BATCH_TIMEOUT_MAX_SECONDS = 30
@@ -40,6 +42,9 @@ HARNESS_CONTROL_TOOLS = frozenset(
         "prepare_external_directory_commit",
         "commit_external_directory",
         "inspect_file_version",
+        "copy_file",
+        "materialize_source_ref",
+        "replace_file",
         "patch_file",
     }
 )
@@ -271,6 +276,7 @@ class ToolContextCompactionService:
             min_result_tokens=cfg.background_min_result_tokens,
             keep_recent=cfg.keep_recent_tool_results,
             policy_version=POLICY_VERSION,
+            context_profile=DEFAULT_CONTEXT_PROFILE,
         )
         if not candidates:
             return None
@@ -381,6 +387,7 @@ class ToolContextCompactionService:
                     policy_version=POLICY_VERSION,
                     context_output=summary,
                     method=method,
+                    context_profile=str(candidate.get("context_profile") or DEFAULT_CONTEXT_PROFILE),
                 )
                 if ok:
                     completed += 1
@@ -439,6 +446,9 @@ class ToolContextCompactionService:
                             policy_version=POLICY_VERSION,
                             context_output=summary,
                             method=method,
+                            context_profile=str(
+                                candidate.get("context_profile") or DEFAULT_CONTEXT_PROFILE
+                            ),
                         )
                         if ok:
                             completed += 1

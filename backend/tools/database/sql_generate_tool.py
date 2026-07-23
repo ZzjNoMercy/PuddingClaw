@@ -7,6 +7,7 @@ import re
 from difflib import get_close_matches
 
 from langchain.tools import ToolRuntime
+from langchain_core.messages import HumanMessage
 from langchain_core.tools import BaseTool
 from langgraph.types import interrupt
 from pydantic import BaseModel
@@ -37,6 +38,144 @@ _BUSINESS_SEMANTIC_CHANGE_PATTERN = re.compile(
     r".{0,24}(?:指标|范围|筛选|时间|年份|能源|品牌|价格|车型|车系|款型|皮卡|分母|分子|粒度|维度))",
     re.IGNORECASE,
 )
+_PHYSICAL_IDENTIFIER_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9_]*\.[A-Za-z][A-Za-z0-9_]*(?![A-Za-z0-9_])"
+    r"|(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+(?![A-Za-z0-9_])"
+)
+_SQL_IMPLEMENTATION_PATTERN = re.compile(
+    r"\b(?:SELECT|FROM|JOIN|WHERE|CTE|EXISTS|DISTINCT|GROUP\s+BY|"
+    r"ORDER\s+BY|COUNT|FILTER|LIKE|ILIKE)\b",
+    re.IGNORECASE,
+)
+_PHYSICAL_DIRECTIVE_MARKERS = (
+    "判断依据",
+    "物理字段",
+    "物理表",
+    "字段名",
+    "列名",
+    "表名",
+)
+_PHYSICAL_CHOICE_DIRECTIVE_PATTERN = re.compile(
+    r"(?:使用|采用|改用|指定|选择|匹配|读取|关联|映射到|取自)"
+    r".{0,40}(?:字段|列|表|配置项|实体)"
+    r"|(?:字段|列|表|配置项|实体).{0,40}(?:使用|采用|指定|选择|匹配|映射)",
+    re.IGNORECASE,
+)
+_PRESCRIPTIVE_REVISION_PATTERN = re.compile(
+    r"(?:改用|请用|使用|应使用|优先使用|替换为|改写为|不要用|避免使用|"
+    r"改成|改为).{0,80}(?:\bSELECT\b|\bFROM\b|\bJOIN\b|\bWHERE\b|"
+    r"\bCTE\b|\bEXISTS\b|\bDISTINCT\b|\bGROUP\s+BY\b|\bCOUNT\b|"
+    r"\bFILTER\b|\bLIKE\b|\bILIKE\b|字段|列名|表名|物理表|实体|"
+    r"type_name|type_value|EAV)",
+    re.IGNORECASE,
+)
+
+
+def _message_text(message: object) -> str:
+    content = getattr(message, "content", "")
+    if isinstance(message, dict):
+        content = message.get("content", "")
+        if not content and isinstance(message.get("data"), dict):
+            content = message["data"].get("content", "")
+    if isinstance(content, list):
+        return "".join(
+            str(block.get("text") or block.get("content") or "")
+            if isinstance(block, dict)
+            else str(block)
+            for block in content
+        )
+    return str(content or "")
+
+
+def _trusted_user_scope_text(runtime: ToolRuntime | None) -> str:
+    """Return only user-owned business scope available to the current Run.
+
+    Goal continuations and grader/summarizer prompts are model-owned control
+    messages. They must not authorize physical database choices invented by
+    the Agent. The durable Run objective is trusted because it originates from
+    the user's Goal request.
+    """
+
+    if runtime is None or not isinstance(runtime.state, dict):
+        return ""
+    state = runtime.state
+    parts: list[str] = []
+    objective = state.get("_run_objective")
+    if isinstance(objective, str) and objective.strip():
+        parts.append(objective.strip())
+    messages = list(state.get("messages") or [])
+    run_query_id = str(state.get("_run_query_id") or "").strip()
+    for message in reversed(messages):
+        role = ""
+        name = getattr(message, "name", "")
+        extra = getattr(message, "additional_kwargs", {}) or {}
+        if isinstance(message, HumanMessage):
+            role = "user"
+        elif isinstance(message, dict):
+            role = str(message.get("role") or message.get("type") or "")
+            name = str(message.get("name") or "")
+            extra = message.get("additional_kwargs") or {}
+            if isinstance(message.get("data"), dict):
+                data = message["data"]
+                role = str(data.get("role") or role)
+                name = str(data.get("name") or name)
+                extra = data.get("additional_kwargs") or extra
+        if role not in {"user", "human"}:
+            continue
+        source = str(extra.get("lc_source") or "") if isinstance(extra, dict) else ""
+        if source or name in {"rubric_grader", "puddingclaw_completion_gate"}:
+            continue
+        message_query_id = str(extra.get("puddingclaw_query_id") or "") if isinstance(extra, dict) else ""
+        if run_query_id and message_query_id and message_query_id != run_query_id:
+            continue
+        text = _message_text(message)
+        if "\n\n[系统路由提示]" in text:
+            text = text.split("\n\n[系统路由提示]", 1)[0]
+        if text.strip():
+            parts.append(text.strip())
+            break
+    return "\n".join(dict.fromkeys(parts))
+
+
+def _agent_added_physical_guidance(
+    *,
+    question: str,
+    table_names: list[str],
+    runtime: ToolRuntime | None,
+) -> list[str]:
+    """Find physical implementation choices absent from trusted user scope."""
+
+    trusted_text = _trusted_user_scope_text(runtime)
+    if not trusted_text:
+        # Non-Agent callers and older tests do not expose message provenance.
+        return []
+    trusted_lower = trusted_text.lower()
+    findings: list[str] = []
+    for token in _PHYSICAL_IDENTIFIER_PATTERN.findall(question):
+        if token.lower() not in trusted_lower and token not in findings:
+            findings.append(token)
+    for match in _SQL_IMPLEMENTATION_PATTERN.finditer(question):
+        token = " ".join(match.group(0).upper().split())
+        if token.lower() not in trusted_lower and token not in findings:
+            findings.append(token)
+    for marker in _PHYSICAL_DIRECTIVE_MARKERS:
+        if marker in question and marker not in trusted_text and marker not in findings:
+            findings.append(marker)
+    for match in _PHYSICAL_CHOICE_DIRECTIVE_PATTERN.finditer(question):
+        directive = " ".join(match.group(0).split())
+        if directive not in trusted_text and directive not in findings:
+            findings.append(directive)
+    for table_name in table_names:
+        normalized = str(table_name or "").strip()
+        if normalized and normalized.lower() not in trusted_lower and normalized not in findings:
+            findings.append(normalized)
+    return findings
+
+
+def _is_prescriptive_sql_revision(instruction: str) -> bool:
+    """Whether feedback tells the generator how to implement the repair."""
+
+    return bool(_PRESCRIPTIVE_REVISION_PATTERN.search(" ".join(str(instruction or "").split())))
 
 
 def _is_technical_sql_revision(instruction: str) -> bool:
@@ -106,7 +245,8 @@ def _format_semantic_contract(semantic_assets: dict[str, object]) -> list[str]:
 
     lines = [
         "- 权威语义口径：以下摘要来自生成器已加载的 Measure/Reference，当前 SQL 已按这些规则生成。",
-        "  外层 Agent 不得凭字段名或常识直接覆盖；如用户明确改变口径，须携带新约束重新调用 database_sql_generate。",
+        "  外层 Agent 不得凭字段名或常识直接覆盖；如用户明确改变业务口径，只能携带原 "
+        "parent_generation_id 和用户确认的自然语言 revision_instruction 请求重新生成。",
     ]
     if isinstance(analytics_model, dict):
         lines.append(
@@ -203,15 +343,18 @@ def _format_generation(
 class DatabaseSqlGenerateTool(BaseTool):
     name: str = "database_sql_generate"
     description: str = (
-        "Generate PostgreSQL SQL from a natural-language database question without executing it. "
+        "Generate PostgreSQL SQL from a business-level database question without executing it. "
         "Use this as the first step for database analysis when the Agent needs to inspect, validate, "
-        "or execute SQL. It uses the original question for Vanna evidence/candidate retrieval, then applies semantic "
+        "or execute SQL. For a Goal, the Agent may decompose the Goal into a focused business sub-question, but it "
+        "must not add physical tables, columns, EAV names/values, entities, or SQL implementation choices that the "
+        "user did not specify. It uses that business question for Vanna evidence/candidate retrieval, then applies semantic "
         "assets in a separate final refinement pass before SQL guardrails. Database entity evidence is authoritative "
         "for physical table/column/EAV values. It returns SQL plus its authoritative semantic contract. Do not "
         "manually rewrite semantics from a "
         "matched Measure/Reference. To propose a business-semantic change, call this tool with parent_generation_id and "
-        "a natural-language revision_instruction; the user then chooses agree, reject, or modify. SQL timeout, syntax, "
-        "query-shape, JOIN/CTE, or performance repair is technical and is automatically regenerated without business HITL."
+        "a natural-language revision_instruction; the user then chooses agree, reject, or modify. For SQL timeout, "
+        "syntax, validation, or performance failures, report the observed problem through revision_instruction without "
+        "prescribing fields, tables, entities, JOIN/CTE shape, or replacement SQL."
     )
     args_schema: type[BaseModel] = DatabaseSqlGenerateInput
     risk_level: str = "moderate"
@@ -239,6 +382,27 @@ class DatabaseSqlGenerateTool(BaseTool):
         if runtime is not None and isinstance(runtime.state, dict):
             state_model_id = str(runtime.state.get("analytics_model_id") or "").strip()
         effective_model_id = state_model_id or model_id
+        requested_table_names = list(table_names or [])
+        if not parent_generation_id:
+            physical_guidance = _agent_added_physical_guidance(
+                question=question,
+                table_names=requested_table_names,
+                runtime=runtime,
+            )
+            if physical_guidance:
+                return (
+                    "🧮 SQL 生成失败：检测到 Agent 在业务子任务中新增了用户未指定的物理实现："
+                    + ", ".join(physical_guidance[:12])
+                    + "。Goal 模式允许拆解指标、维度、粒度、筛选和时间范围，但表、字段、"
+                    "EAV 配置项/枚举、实体映射及 SQL 写法必须由 SQL 生成器根据数据库证据决定。"
+                    "请删除这些实现提示，仅保留业务问题后重新调用。"
+                )
+        elif revision_instruction and _is_prescriptive_sql_revision(revision_instruction):
+            return (
+                "🧮 SQL 重新生成失败：revision_instruction 只能反馈已观察到的问题，"
+                "不能指导使用哪个字段、表、实体或 SQL 实现。请保留 parent_generation_id，"
+                "仅描述错误、超时、空结果、校验冲突或结果异常后重试。"
+            )
         selected_asset_ids = list(
             dict.fromkeys(selected_semantic_asset_ids or semantic_asset_ids or measure_ids or [])
         )
@@ -257,7 +421,7 @@ class DatabaseSqlGenerateTool(BaseTool):
         request_payload = {
             "question": question,
             "database_source_id": database_source_id,
-            "table_names": table_names or [],
+            "table_names": requested_table_names,
             "model_id": effective_model_id,
             "measure_ids": selected_asset_ids,
         }

@@ -54,8 +54,10 @@ def test_default_tool_guides_route_product_config_metrics_to_database() -> None:
     assert "Current Capability Manifest lists `database_sql_generate`" in prompt
     assert "`/skills/database-analysis/SKILL.md`" in prompt
     assert "配置率, 搭载率, 配备率" in prompt
-    assert "Do not add physical table names" in prompt
-    assert "Do not request a revision merely" in prompt
+    assert "business sub-question" in prompt
+    assert "Never add a physical choice the user did not state" in prompt
+    assert "describe only the observed error" in prompt
+    assert "Never start a fresh generation with an Agent-invented physical workaround" in prompt
     assert "injected automatically from trusted runtime state" in prompt
     assert "validation_receipt_id" in prompt
     assert "Execute rejects a missing or hash-mismatched receipt" in prompt

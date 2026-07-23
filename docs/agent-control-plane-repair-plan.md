@@ -1273,3 +1273,414 @@ P0-0 只负责立即止血，不替代后续 Validation Receipt、Grant schema m
 3. 临时验证脚本无法进入未显式声明的交付计划；
 4. scratch 脚本可安全原子重写，不产生递增垃圾文件；
 5. patch/commit 冲突后 Agent 能按一个结构化 next action 恢复，不连续猜测。
+
+## 17. 授权边界内常规文件工程能力与子代理恢复协议（已实施）
+
+### 17.1 问题定义与第一性原则
+
+最新 `产品配置图表重算` Session 证明，当前 Harness 不是“限制写入过严”这么简单，而是缺少与
+用户意图同粒度的合法写入原语。用户明确要求“以现有 HTML/JS 创建 V2”，系统却只能提供：
+
+- 读取完整正文后 `write_file`；
+- `inspect_file_version → patch_file`；
+- 只读挂载的 `execute_external_directory`；
+- 对已存在文件执行需要额外授权的 `delete_file`。
+
+这会把正常的 `copy → patch → validate` 强制展开为大正文穿越模型、删除重建、临时文件和子代理
+绕行。修复必须遵守以下原则：
+
+1. **用户授权的是作用域，不是某一种低级工具。** 已授权 exact-directory write 后，该目录内可恢复、
+   可审计的常规工程操作不应逐条 HITL。
+2. **操作权限与完成证据分离。** “允许复制/覆盖”不等于“产物已正确”；Artifact hash、Validation
+   Receipt 和 E2E 仍独立验收。
+3. **窄原语优先，通用 shell 后置。** 能用 `copy_file`、原子 replace、Result Export 表达的操作，
+   不应迫使 Agent 获得更宽的可写 shell。
+4. **安全边界由执行环境保证，不由模型字符串保证。** 禁止 `..` 或绝对路径只能改善错误提示，
+   不能作为目录逃逸的主要控制。
+5. **失败必须可恢复且有界。** 冲突、HITL、调用上限和验证异常都应返回唯一 `next_action`，不能诱发
+   原样重派、删除重写或无限续跑。
+
+### 17.2 最新 Session 的 HITL 审计
+
+本 Session 共观察到 10 条已授予记录和 1 条子代理内未决请求：
+
+| 类别 | 数量 | 判断 | 后续策略 |
+|---|---:|---|---|
+| 外部文件/目录只读 | 2 | 首次边界确认合理 | Session 内复用 |
+| V2 JS 精确写入 | 1 | 目标明确，但可由声明产物合同覆盖 | 对 declared target 自动放行 |
+| 原始 HTML 精确写入 | 1 | 错误目标；用户要求创建 V2，不是修改 V1 | 不自动放行，并由目标解析阻止 |
+| JS/HTML 只读校验命令 | 4 | 无网络、只读挂载、已注册 Validator | 自动放行并直接生成 Receipt |
+| 为覆盖而删除 V2 JS | 1 | 工具缺口诱发的危险绕行 | A2 上线后保留 HITL并增加告警 |
+| `cp + validate` 复合命令 | 1 | 在只读挂载中必然无法完成，却仍请求授权 | A3/A1 分流，旧路径确定性拒绝 |
+| 创建 V2 HTML 的子代理写请求 | 1（未决） | 用户已声明精确交付目标，不应再次 HITL | C1 继承/上抛；声明目标自动放行 |
+
+自动放行只覆盖下列可证明安全的集合：
+
+- 当前 Goal revision 的 `declared_artifact_targets` 中精确匹配的 create/replace；
+- 已存在 exact-directory write Grant 内、由受控原语产生的新增或修改；
+- 已授权只读目录中，单一 argv、无管道/重定向/逻辑运算符的注册 Validator；
+- 同一 Session 中已授权的 exact-file/exact-directory read。
+
+以下操作继续 HITL 或拒绝：
+
+- delete、递归删除、覆盖未声明目标；
+- 扩大到父目录或兄弟目录；
+- 网络、包安装、设备/Socket、Git 发布等额外副作用；
+- 复合 shell、自定义 Validator、无法形成确定性变更清单的命令；
+- 修改 V1 等与“创建 V2”合同不一致的源文件。
+
+### 17.3 A 组：外部文件写路径
+
+#### A3（P0）：`copy_file` 一等原语
+
+先提供最窄、直接命中本次问题的原语：
+
+```text
+copy_file(
+  source_path,
+  target_path,
+  expected_source_sha256? = null,
+  if_exists = "fail"
+) -> {
+  source_sha256,
+  target_sha256,
+  mutation_receipt_id,
+  validation_receipt_ids[]
+}
+```
+
+约束：
+
+- source 必须在 read Grant 内，target 必须是 declared target 或 write Grant 内精确路径；
+- 默认 create-only，目标存在即 `conflict`，不得隐式覆盖；
+- 文件正文不进入模型上下文；
+- 服务端按 bytes 复制、原子落盘、记录 source/target hash；
+- JS/JSON/Python 等 code-like 目标在提交前自动运行注册 Validator；
+- `.min.js`、vendor bundle 等依赖默认复用，不因“HTML+JS V2”自动派生副本；
+- `copy_file` 的 Mutation Receipt 必须被 Artifact Delivery 与后续验证直接识别。
+
+#### A2（P0）：版本保护的原子覆盖
+
+不采用 `delete + write`。建议为写工具增加明确模式，而不是让“创建”和“替换”语义混在一起：
+
+```text
+write_file(
+  file_path,
+  content_or_source_ref,
+  mode = "create" | "replace",
+  expected_sha256? = null
+)
+```
+
+- `create`：目标必须不存在；
+- `replace`：必须携带 `expected_sha256`，服务端 compare-and-swap；
+- 候选内容先验证，验证通过后原子 replace；
+- 任一失败保持原文件不变；
+- `delete_file` 后紧跟同路径 `write_file` 时发出
+  `overwrite_via_delete_deprecated` 控制面告警，但不自动代替用户批准删除。
+
+#### A4（P1）：有界自动 rebase
+
+“自动 rebase”不能偷偷重新解释业务修改。服务端只允许一次机械重放：
+
+- 当前文件变化后，所有 replacement hunk 在新版本中仍唯一匹配；
+- hunks 互不重叠；
+- 新候选通过相同 Validator；
+- 返回 `rebased_from_sha256`、`rebased_to_sha256` 和完整 Mutation Receipt。
+
+任一条件不满足即返回结构化冲突：
+
+```json
+{
+  "error_code": "patch_rebase_conflict",
+  "current_sha256": "sha256:...",
+  "failed_hunks": [2],
+  "nearby_context_ref": "evidence-...",
+  "next_action": "inspect_conflicting_region"
+}
+```
+
+不得在工具内部调用 LLM，不得自动重写 old/new string，不得重试超过一次。
+
+#### A1（P1，独立开关）：授权目录内可写执行
+
+只有 A3/A2 仍无法覆盖的批量工程操作才进入此通道。exact-directory write Grant 可启用
+`execute_external_directory(mode="writable")`，但必须同时满足：
+
+- Docker root filesystem 只读、无网络、无其他宿主挂载，工作目录固定为唯一 bind mount；
+- mount namespace 从机制上阻止写出授权根；字符串检查仅作早期拒绝；
+- 禁止设备、Socket、setuid、后台进程、二次 mount 和符号链接型交付目标；
+- 命令执行前解析能力，执行后扫描目录差异；
+- 服务端生成 `added/modified/deleted` 计划，删除项始终二次批准；
+- 只提交 declared targets 或 Grant 范围内已确认的变更；
+- 失败或超时丢弃容器层草稿，不留下半提交；
+- `cp/mv/mkdir` 等低风险命令可在边界内自动执行，未知/复合高风险命令仍 ASK。
+
+因此，A1 不能只实现“禁止 `..`、禁止绝对路径”；真正的安全边界是唯一可写挂载与服务端事务提交。
+
+### 17.4 B 组：通用 `source_ref → file/slot` 物化通道
+
+数据库结果只是结构化数据源的一种，不得把直通能力实现为数据库专用捷径。平台先定义统一的
+`SourceReference`，再由数据库、附件、搜索、HTTP/API、知识库和已有 Artifact 分别提供适配器：
+
+```json
+{
+  "source_ref": "source-...",
+  "kind": "database_result | attachment_table | search_result | api_response | artifact | evidence",
+  "content_sha256": "sha256:...",
+  "media_type": "application/json",
+  "schema_ref": "schema-...",
+  "size_bytes": 123456,
+  "row_count": 337,
+  "producer_receipt_ids": ["validation-..."],
+  "expires_at": null
+}
+```
+
+`SourceReference` 必须是服务端持久化、不可变且可寻址的能力引用。模型只接收摘要、schema、抽样和
+ref id，不接收完整 payload。每个 producer 负责证明来源真实性；物化层只负责格式转换、权限和目标
+提交，不能重新解释业务语义。
+
+#### B1（P0）：统一 Source Materialization
+
+```text
+materialize_source_ref(
+  source_ref,
+  destination = {
+    kind: "file",
+    target_path,
+    mode: "create" | "replace",
+    expected_sha256?
+  },
+  renderer = "identity | json | csv | js_array | text",
+  projection?,
+  expected_schema_ref?,
+  expected_item_count?
+)
+```
+
+- payload 从 Source Store 流向目标或 scratch，不经过 Agent 消息；
+- source hash、renderer version、目标 hash、schema 和数量写入 Materialization Receipt；
+- target 仍服从 declared target/write Grant 和 A2 原子提交协议；
+- 大结果分页只用于人工/Agent 抽样，不再作为完整写入手段；
+- renderer 是平台注册的确定性适配器，不允许模型提交任意转换脚本；
+- `identity` 保持原始 bytes；JSON/CSV/JS Array 等转换必须有稳定序列化规则；
+- Source 到目标的 Receipt 可被报告一致性、Artifact Delivery 和 E2E 验收直接消费；
+- source 过期、hash 不符、schema 不符或数量不符时 fail-closed，且目标保持不变。
+
+各业务工具只负责签发 SourceReference。例如数据库层提供：
+
+```text
+database_query_result_source(result_id) -> SourceReference
+```
+
+附件表格、搜索结果和 API 响应采用相同模式，不再分别实现
+`database_*_export`、`attachment_*_export` 或 `search_*_export`。
+
+#### B2（P1）：统一类型化 Slot Materialization
+
+模板只接受显式类型化 Slot，例如：
+
+```js
+bevHeatmapRaw: /*{{SLOT:bev_heatmap|js_array}}*/ [],
+```
+
+```text
+materialize_source_ref(
+  source_ref,
+  destination = {
+    kind: "slot",
+    template_path,
+    template_sha256,
+    slot_id,
+    output_path,
+    output_mode: "create" | "replace",
+    expected_output_sha256?
+  },
+  renderer = "js_array"
+)
+```
+
+Slot 物化必须：
+
+- 精确匹配一个 Slot；
+- 校验 source schema 与 slot type；
+- 使用服务端 renderer 转义/序列化；
+- 填充完成后再执行整文件语法校验；
+- Receipt 记录 template hash、source hash、renderer version 和 output hash。
+
+普通裸占位符继续 fail-closed；不得允许任意文本替换冒充类型化 Slot。
+
+#### B3：职责边界
+
+```text
+Producer                         Platform                         Consumer
+Database / Attachment / API  →  immutable SourceReference  →  file / typed slot
+                                      │
+                                      ├─ deterministic renderer
+                                      ├─ permission check
+                                      ├─ atomic commit
+                                      └─ Materialization Receipt
+```
+
+- Producer 不知道最终文件路径和模板结构；
+- Consumer 不知道 SQL、HTTP 或附件解析细节；
+- Renderer 不做业务推断，只执行声明式格式转换；
+- Harness 只按 Receipt 验证来源、转换和交付闭环；
+- Skill/分析模型只定义业务口径和 projection，不获得宿主文件写权限。
+
+#### B4：产品配置查询的完整例子
+
+以“查询 2021–2026 年空气悬架配置率并生成 V2 图表”为例，数据与文件链路为：
+
+```text
+database_sql_execute
+  → result_id = qr-config（337 行完整结果落 Result Store）
+  → database_query_result_source("qr-config")
+  → source_ref = source-db-qr-config
+       {row_count: 337, schema_ref, content_sha256, producer_receipt_ids}
+  → materialize_source_ref(
+       source_ref="source-db-qr-config",
+       destination={
+         kind: "slot",
+         template_path: "product-config-charts-v2.js",
+         template_sha256: "sha256:...",
+         slot_id: "config_rows",
+         output_path: "product-config-charts-v2.js",
+         output_mode: "replace",
+         expected_output_sha256: "sha256:..."
+       },
+       renderer="js_array",
+       projection=["year", "brand", "config_name", "config_rate"],
+       expected_item_count=337
+     )
+  → JS 整文件语法验证
+  → Mutation Receipt + Materialization Receipt + Validation Receipt
+```
+
+模板中的消费点是唯一且类型化的：
+
+```js
+const configRows = /*{{SLOT:config_rows|js_array}}*/ [];
+```
+
+模型消息只包含 `source_ref`、列、schema、337 行计数、hash 和 Receipt id，不包含 337 行正文。
+物化服务读取 Result Store 的不可变 payload，执行确定性 projection/转义并原子替换 V2 JS。若结果被
+篡改、行数不是 337、模板 hash 已变化、Slot 重复或最终 JS 语法不合法，提交前即 fail-closed，旧
+V2 文件字节保持不变。同一通道对附件表格、API 响应和已有 Artifact 只需更换 Producer adapter。
+
+### 17.5 C 组：子代理挂起、授权与接管
+
+#### C1（P0）：HITL 上抛而非子代理失败
+
+DelegationContract 必须携带父 Run 的授权上下文快照与 declared targets。子代理调用工具时：
+
+1. 已有父级 Grant 或声明目标可覆盖：直接执行，不再创建卡片；
+2. 真正需要新权限：子代理进入 `waiting_for_permission`，请求路由到父 Run 的用户队列；
+3. 用户批准后恢复同一个 subagent checkpoint；
+4. 用户拒绝后返回 `blocked(permission_denied)`，而不是 `failed(GraphInterrupt)`；
+5. 只有主 Agent 确实开始执行剩余 Todo 时才发
+   `subagent_fallback_to_parent`。
+
+UI 对应状态为：
+
+- 工具主行：`子代理执行中`；
+- 辅助状态：`上下文已挂载` / `等待授权`；
+- 失败：`子代理执行未完成`；
+- 收到真实 fallback 事件后：`主 Agent 正在接管剩余任务`。
+
+#### C2（P1）：按任务复杂度分配预算并禁止原样重派
+
+- 调用预算由任务类型、Todo 数、预计工具调用和数据规模共同计算；
+- 数据导出/模板填充应优先走 B1/B2，不应靠提高模型调用上限解决；
+- timeout/limit/permission blocker 产生稳定 delegation fingerprint；
+- 同一 fingerprint 不得原样重派；
+- parent 接管时只接收 remaining Todo、已完成 Evidence 和唯一 next action；
+- 若没有任何子任务完成，UI/Trace 不得使用“已完成后接管”等暗示性文案。
+
+### 17.6 D 组：与既有控制面修复的衔接
+
+- manifest 移除模型可见 `run_id`，保持跨 Run prompt prefix 稳定；
+- semantic assets 只注入选择所需白名单投影，完整正文仍由生成器解析；
+- informational 追问保持 read-only，不参与验收、不修改 Todo；
+- Goal continuation 只在“继续/恢复/完成剩余”等执行意图下创建新 Goal Run；
+- session 目录 Grant 可复用，但必须继续绑定 permission policy epoch 与 workspace identity；
+- 外部命令验证成功必须形成绑定最终 Artifact hash 的 Receipt，避免重复校验 HITL。
+
+### 17.7 建议实施批次与评审闸门
+
+| 批次 | 内容 | 进入下一批的条件 |
+|---|---|---|
+| P0-1 | A3、A2、目标解析排除 vendor、声明目标精确授权 | V2 用例不读大正文、不删除、不重复 HITL |
+| P0-2 | 通用 SourceReference + B1、C1 | 任意大 payload 不穿模型；子代理权限请求可挂起恢复 |
+| P1-1 | B2、A4、C2 | 大数据填充、冲突恢复和预算终止均有结构化 Receipt |
+| P1-2 | A1 可写目录执行（Feature Flag） | 威胁模型、事务回滚、逃逸与删除测试全部通过 |
+| 配套 | D 组缓存/追问/验证继承 | 跨 Run 命中率与轻量追问 E2E 达标 |
+
+A1 必须单独评审和灰度，不能与 A3 一起默认开启。A3 解决 `V2=copy+patch` 的直接痛点，
+A2 消灭 delete+write，二者已经覆盖大多数常规单文件工程操作。
+
+### 17.8 E2E 与对抗式验收矩阵
+
+1. **V2 正常路径**：从 V1 创建 V2 HTML+JS，只产生两个 declared targets；vendor ECharts 继续复用；
+   `copy_file → patch → HTML 基础验证` 完成，全程不读取完整源正文；仅当冻结合同明确要求
+   E2E 时继续执行 browser E2E。
+2. **权限最小化**：首次目录 read 后复用；declared target create/replace 无重复 HITL；delete 和修改 V1
+   仍触发 ASK。
+3. **覆盖安全**：目标 hash 不匹配时原文件字节不变；禁止 delete+write 绕过。
+4. **复制安全**：目标已存在时 create-only copy 失败；source 并发变化时 hash 条件失败。
+5. **目录逃逸**：`../`、绝对路径、symlink、hardlink、子进程、重定向、管道、命令替换均不能写出授权根。
+6. **事务回滚**：批量操作中任一验证失败，宿主目录零部分提交。
+7. **Source 直通**：数据库、附件和 API 的 337 行及 10 万行 payload 均不进入模型输入；
+   数量/hash 与各自 Producer Evidence 一致。
+8. **Slot 注入**：错误类型、重复 Slot、缺失 Slot、恶意字符串和非法 JS 均 fail-closed。
+9. **子代理 HITL**：请求在父 Run 展示，批准后恢复原 checkpoint；拒绝后状态为 blocked，不是假失败。
+10. **真实接管**：未发 fallback 事件不显示“主 Agent 接管”；发出后只显示一次且 remaining Todo 正确。
+11. **预算终止**：达到调用上限后不原样重派，parent 只执行剩余范围。
+12. **最终 E2E**：打开 V2 HTML，2021–2026 selector、图表渲染、数据截止日期、脚本引用和控制台错误
+    全部验证，Receipt 绑定最终 HTML/JS hash。
+
+### 17.9 已确认的实施决策
+
+1. **A3/A2 先于 A1**；A1 由
+   `harness.terminal.external_directory_writable_enabled=false` 独立灰度，默认关闭。
+2. declared target 自动权限只覆盖 create/replace，明确排除 delete；目录计划含删除时必须二次授权。
+3. 采用显式 `replace_file(expected_sha256)`，避免给旧 `write_file` 增加含混的双重语义。
+4. B1 首批注册 `identity/json/csv/js_array/text` 五种确定性 renderer。
+5. 子代理授权挂起复用同一个 parent tool call/subrun checkpoint；父 Run 取消时级联
+   `cancelled(parent_cancelled)`，不保留可脱离父 Run 复活的独立后台任务。
+6. HTML 使用一等 `validate_html_report`，并由冻结合同参数
+   `browser_e2e_required` 选择验证等级：所有 HTML 默认执行结构、重复 ID 和本地资源引用检查；
+   只有用户或 Goal 明确要求 E2E/真实浏览器验证时才启动平台固定 adapter 与离线只读 Chromium。
+   模型省略 `browser_e2e` 参数，不能自行升降级；兼容旧 Run 的精确命令仅允许单个注册 Validator，或
+   `pwd && ls ... && <注册 Validator>` 这一种只读诊断包装。重定向、管道、fallback、
+   路径逃逸及用户自定义脚本继续 ASK/拒绝；无 E2E 合同的旧命令直接 DENY，防止绕过参数启动
+   Chromium。
+
+### 17.10 实施状态与验证证据
+
+| 能力 | 实施状态 | 主要证据 |
+|---|---|---|
+| A3 copy、A2 CAS replace、A4 单次机械 rebase | 完成 | `test_host_file_broker.py`、`test_versioned_patch.py` |
+| A1 隔离 writable draft + Feature Flag | 完成，默认关闭 | `test_external_directory.py`、`test_tool_execution_pipeline.py` |
+| 通用 SourceReference、file/typed-slot materialization | 完成 | `test_source_materialization.py` |
+| 数据库 Producer adapter | 完成 | `test_database_query_result_contract.py` |
+| 子代理 HITL 上抛、动态预算、禁止原样重派 | 完成 | `create_deep_agent + CompiledSubAgent + InMemorySaver + Command(resume)` 原生恢复 E2E；`test_delegation_control.py` |
+| UI 子代理执行/Goal 控制/验收终态引导 | 完成 | Goal 区分生命周期与 Run 执行态：空闲 active 显示“待启动”，运行中可真正暂停，paused/blocked 可恢复并启动；运行中编辑执行 `pause → resume → start` 立即应用新 revision；播放按钮通过结构化 `goal_control_action=start` 直接创建 Goal Run，不伪造用户消息、不经过语义 Router；验收终态提示“继续完成剩余工作”或“重试验收”并持久化；`goalControls.test.ts`、`test_agent_api.py`、`subagentActivity.test.ts`、`verificationActivity.test.ts`、前端 production build |
+| D 组缓存、上下文感知 Goal 路由、Todo 即时持久化 | 完成 | informational 保持只读；执行中纠偏读取最近 Run/工具投影，Router 失败时 append-only 修订而非僵硬 `clarify`；`test_context_optimizations.py`、`test_goal_turn_router.py`、Goal/跨 Run E2E |
+| 合成 V1→V2 + 337 行配置结果 typed slot + JS/浏览器校验 | 完成 | `test_v2_artifact_pipeline_e2e.py`、Docker Chromium validator |
+| HTML 分级一等验证、失败分类与免循环终止 | 完成 | `validate_html_report` 默认生成 `html_structure` Receipt；冻结合同显式要求时生成 `browser_runtime` Receipt；`artifact_failure` 保持 hash-sticky，`invocation_failure`/`infrastructure_failure` 可由同 hash 后续成功覆盖；控制面错误直接终止为基础设施异常 |
+| copy authority 与旧写入跨 Run 继承 | 完成 | Broker Mutation Receipt authority 进入 ArtifactReference；旧 `write_file` 仅对同 Goal/修订、精确声明目标和字节相等 hash 做确定性回填 |
+| 确定性短路后的模型标准状态 | 完成 | 未运行的 LLM criteria 输出 `passed=null` / `not_evaluated`，不计入失败项或修复循环 |
+| 外部目录授权 TOCTOU 防护 | 完成 | Broker 以授权目录 inode + `dirfd/O_NOFOLLOW` 提交；`test_authorized_directory_inode_is_bound_across_validation_and_commit` |
+| Goal inspection 的现有证据只读边界 | 完成 | 显式 allowlist；SQL generate/validate/execute/source 均按内部变更处理；`test_goal_inspection_exposes_only_read_only_tools` |
+
+最终综合回归为后端正式测试域 **1168 项通过、1 项按环境开关 skip**；另以
+`PUDDINGCLAW_RUN_BROWSER_E2E=1` 单独启用 Docker Chromium 闸门，E2E **1 项通过**。
+前端 16 项状态投影测试、TypeScript
+检查和 Next.js production build 通过。开启 `PUDDINGCLAW_RUN_BROWSER_E2E=1` 后，Docker
+Chromium 在合成临时报告上验证完整 2021–2026 selector、数据截止日期、图表 surface、脚本
+引用、控制台/网络错误及最终 HTML/JS/vendor hash；Browser ValidationReceipt 已写入当前
+Run 的 VerificationActivation 和 Session Evidence Ledger。未开启环境开关时该用例明确标记
+为 skip，不会 false-green。该测试不读取、不修改
+`designs/product-configuration-analysis` 中的业务报告。A1 仍保持默认关闭，待灰度环境观察后再单独开启。

@@ -19,6 +19,7 @@ def test_stream_agent_persists_user_message_before_stream(monkeypatch, tmp_path)
         assert kwargs["user_message_already_persisted"] is True
         assert kwargs["goal_mode"] is False
         assert kwargs["goal_id"] is None
+        assert kwargs["context_goal_id"] is None
         yield {"event": "done", "data": "{}"}
 
     monkeypatch.setattr(agent_api.deepagents_agent_manager, "astream", fake_astream)
@@ -70,6 +71,118 @@ def test_agent_api_forwards_explicit_goal_mode(monkeypatch, tmp_path):
     )
 
     assert response.status_code == 200
+
+
+def test_goal_start_control_is_not_persisted_as_a_user_message(monkeypatch, tmp_path):
+    from api import agent as agent_api
+    from graph.session_manager import session_manager
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("goal-start-control-session")
+
+    async def fake_astream(**kwargs):
+        assert kwargs["goal_mode"] is True
+        assert kwargs["goal_id"] == "goal-existing"
+        assert kwargs["goal_control_action"] == "start"
+        assert kwargs["user_message_already_persisted"] is True
+        assert session_manager.load_session(kwargs["session_id"]) == []
+        yield {"event": "done", "data": "{}"}
+
+    monkeypatch.setattr(agent_api.deepagents_agent_manager, "astream", fake_astream)
+
+    app = FastAPI()
+    app.include_router(agent_api.router, prefix="/api")
+    response = TestClient(app).post(
+        "/api/agent",
+        json={
+            "message": "继续执行当前目标",
+            "session_id": "goal-start-control-session",
+            "goal_mode": True,
+            "goal_id": "goal-existing",
+            "goal_control_action": "start",
+            "stream": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert session_manager.load_session("goal-start-control-session") == []
+
+
+def test_goal_start_control_requires_an_explicit_goal(tmp_path):
+    from api import agent as agent_api
+    from graph.session_manager import session_manager
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("invalid-goal-start-control")
+    app = FastAPI()
+    app.include_router(agent_api.router, prefix="/api")
+
+    response = TestClient(app).post(
+        "/api/agent",
+        json={
+            "message": "继续执行当前目标",
+            "session_id": "invalid-goal-start-control",
+            "goal_control_action": "start",
+            "stream": True,
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_agent_api_forwards_goal_as_context_without_execution_ownership(monkeypatch, tmp_path):
+    from api import agent as agent_api
+    from graph.session_manager import session_manager
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("goal-context-api-session")
+
+    async def fake_astream(**kwargs):
+        assert kwargs["goal_mode"] is False
+        assert kwargs["goal_id"] is None
+        assert kwargs["context_goal_id"] == "goal-existing"
+        yield {"event": "done", "data": "{}"}
+
+    monkeypatch.setattr(agent_api.deepagents_agent_manager, "astream", fake_astream)
+
+    app = FastAPI()
+    app.include_router(agent_api.router, prefix="/api")
+    response = TestClient(app).post(
+        "/api/agent",
+        json={
+            "message": "总结一下当前进度",
+            "session_id": "goal-context-api-session",
+            "goal_mode": False,
+            "context_goal_id": "goal-existing",
+            "stream": True,
+        },
+    )
+
+    assert response.status_code == 200
+
+
+def test_agent_api_rejects_conflicting_goal_owner_and_context(tmp_path):
+    from api import agent as agent_api
+    from graph.session_manager import session_manager
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("goal-conflict-api-session")
+    app = FastAPI()
+    app.include_router(agent_api.router, prefix="/api")
+
+    response = TestClient(app).post(
+        "/api/agent",
+        json={
+            "message": "继续",
+            "session_id": "goal-conflict-api-session",
+            "goal_mode": True,
+            "goal_id": "goal-a",
+            "context_goal_id": "goal-b",
+            "stream": True,
+        },
+    )
+
+    assert response.status_code == 422
 
 
 def test_agent_api_logs_request_to_first_agent_text_and_tool(monkeypatch, tmp_path, caplog):

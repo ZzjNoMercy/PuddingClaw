@@ -11,6 +11,7 @@ from .legacy_query_tool import DatabaseKnowledgeQueryTool
 from .models import (
     DatabaseKnowledgeInput,
     DatabaseQueryResultPageInput,
+    DatabaseQueryResultSourceInput,
     DatabaseQueryTraceInspectInput,
     DatabaseSchemaInspectInput,
     DatabaseSqlExecuteInput,
@@ -19,6 +20,7 @@ from .models import (
     SemanticEntityLookupInput,
 )
 from .result_page_tool import DatabaseQueryResultPageTool
+from .result_source_tool import DatabaseQueryResultSourceTool
 from .schema_inspect_tool import DatabaseSchemaInspectTool
 from .semantic_entity_lookup_tool import SemanticEntityLookupTool
 from .sql_execute_tool import DatabaseSqlExecuteTool
@@ -38,6 +40,7 @@ def create_database_knowledge_tool(base_dir: Path) -> list[BaseTool]:
         SemanticEntityLookupTool(),
         DatabaseQueryTraceInspectTool(base_dir=str(base_dir)),
         DatabaseQueryResultPageTool(),
+        DatabaseQueryResultSourceTool(),
     ]
 
 
@@ -46,6 +49,8 @@ __all__ = [
     "DatabaseKnowledgeQueryTool",
     "DatabaseQueryResultPageInput",
     "DatabaseQueryResultPageTool",
+    "DatabaseQueryResultSourceInput",
+    "DatabaseQueryResultSourceTool",
     "DatabaseQueryTraceInspectInput",
     "DatabaseQueryTraceInspectTool",
     "DatabaseSchemaInspectInput",

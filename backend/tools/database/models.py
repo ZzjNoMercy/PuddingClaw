@@ -40,7 +40,14 @@ class DatabaseKnowledgeInput(BaseModel):
 class DatabaseSqlGenerateInput(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    question: str = Field(description="Natural-language question used only to generate SQL. The SQL is not executed.")
+    question: str = Field(
+        description=(
+            "Business-level question used only to generate SQL. For a Goal, decompose the Goal into a focused "
+            "sub-question containing only the metric/subject, dimensions, grain, filters, time range, and desired "
+            "output. Do not add physical tables, columns, EAV names/values, entity mappings, JOIN/CTE choices, or "
+            "other SQL implementation details unless the user explicitly supplied them."
+        )
+    )
     database_source_id: str | None = Field(default=None, description="Optional configured database source id.")
     table_names: list[str] = Field(
         default_factory=list,
@@ -78,8 +85,10 @@ class DatabaseSqlGenerateInput(BaseModel):
     revision_instruction: str | None = Field(
         default=None,
         description=(
-            "Natural-language description of the proposed semantic change. Never put SQL here. "
-            "Requires parent_generation_id and triggers the agree/reject/modify HITL flow."
+            "Natural-language feedback about an observed SQL problem or a user-requested semantic change. "
+            "Report the symptom/error; do not prescribe fields, tables, entities, SQL fragments, JOIN/CTE shape, "
+            "or replacement implementation. Requires parent_generation_id. Semantic changes trigger the "
+            "agree/reject/modify HITL flow."
         ),
     )
     runtime: ToolRuntime
@@ -150,11 +159,26 @@ class DatabaseQueryTraceInspectInput(BaseModel):
 
 
 class DatabaseQueryResultPageInput(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     result_id: str = Field(
         description="Persisted database query result id returned by database_knowledge_query or database_sql_execute."
     )
     page: int = Field(default=1, ge=1, description="1-based page number.")
     page_size: int | None = Field(default=None, ge=1, le=5000, description="Optional page size.")
+    runtime: ToolRuntime
+
+
+class DatabaseQueryResultSourceInput(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    result_id: str = Field(
+        description=(
+            "Persisted database query result id returned by database_knowledge_query "
+            "or database_sql_execute."
+        )
+    )
+    runtime: ToolRuntime
 
 
 class SemanticEntityLookupInput(BaseModel):

@@ -7,7 +7,7 @@ import logging
 import time
 import uuid
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, model_validator
@@ -130,12 +130,21 @@ class AgentRequest(BaseModel):
     attachments: list[dict] = Field(default_factory=list)
     goal_mode: bool = False
     goal_id: str | None = None
+    context_goal_id: str | None = None
+    goal_control_action: Literal["start"] | None = None
     stream: bool = True
 
     @model_validator(mode="after")
     def validate_goal_activation(self):
         if self.goal_id and not self.goal_mode:
             raise ValueError("goal_id requires goal_mode=true")
+        if self.goal_id and self.context_goal_id and self.goal_id != self.context_goal_id:
+            raise ValueError("goal_id and context_goal_id must reference the same Goal")
+        if self.goal_control_action == "start":
+            if not self.goal_mode or not self.goal_id:
+                raise ValueError("goal_control_action=start requires goal_mode=true and goal_id")
+            if self.attachments:
+                raise ValueError("Goal control actions do not accept attachments")
         return self
 
 
@@ -153,7 +162,7 @@ async def agent(request: AgentRequest):
         len(request.attachments),
     )
     persisted_user_message = False
-    if request.stream:
+    if request.stream and request.goal_control_action is None:
         try:
             session_manager.update_metadata(request.session_id, {"runtime_mode": "agent"})
             session_manager.save_message(
@@ -165,6 +174,14 @@ async def agent(request: AgentRequest):
                 ),
                 attachments=request.attachments,
             )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Session not found") from exc
+        persisted_user_message = True
+    elif request.goal_control_action is not None:
+        # Product controls are audited by the Run/Goal ledger. They are not
+        # synthetic user chat messages and must not pollute the transcript.
+        try:
+            session_manager.update_metadata(request.session_id, {"runtime_mode": "agent"})
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="Session not found") from exc
         persisted_user_message = True
@@ -180,6 +197,8 @@ async def agent(request: AgentRequest):
             user_message_already_persisted=persisted_user_message,
             goal_mode=request.goal_mode,
             goal_id=request.goal_id,
+            context_goal_id=request.context_goal_id,
+            goal_control_action=request.goal_control_action,
         )
         return EventSourceResponse(
             _instrument_agent_stream(
@@ -200,8 +219,11 @@ async def agent(request: AgentRequest):
         analytics_model_id=request.analytics_model_id,
         user_id=request.user_id,
         attachments=request.attachments,
+        user_message_already_persisted=request.goal_control_action is not None,
         goal_mode=request.goal_mode,
         goal_id=request.goal_id,
+        context_goal_id=request.context_goal_id,
+        goal_control_action=request.goal_control_action,
     )
     async for event in _instrument_agent_stream(
         stream,

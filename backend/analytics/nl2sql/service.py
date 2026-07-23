@@ -850,6 +850,11 @@ async def _generate_grounded_sql(
 async def query_database_knowledge(
     session: AsyncSession,
     request: DatabaseQueryRequest,
+    *,
+    session_id: str = "",
+    tool_call_id: str = "",
+    source_query_id: str = "",
+    source_run_id: str = "",
 ) -> DatabaseQueryResult:
     """Run the shared grounded SQL pipeline and execute its final SQL."""
 
@@ -933,6 +938,10 @@ async def query_database_knowledge(
             execution,
             question=request.question,
             sql=sql,
+            session_id=session_id,
+            tool_call_id=tool_call_id,
+            source_query_id=source_query_id,
+            source_run_id=source_run_id,
         ):
             record_stage("result_store_ms", stage_started)
         logger.info(

@@ -24,12 +24,17 @@ NATIVE_TOOLSETS: dict[str, frozenset[str]] = {
 # inventory and Skill documentation. Declaring one of these toolsets in a Skill
 # does not gate or expand access.
 UNCONDITIONAL_EXTENSION_TOOLSETS: dict[str, frozenset[str]] = {
+    "evidence_read": frozenset({"read_evidence"}),
     "harness_files": frozenset({
         "inspect_file_version",
+        "copy_file",
+        "materialize_source_ref",
+        "replace_file",
         "patch_file",
         "patch_files",
         "delete_file",
         "execute_external_directory",
+        "validate_html_report",
         "rewind_external_file_changes",
         "stage_external_artifact",
         "commit_external_artifact",
@@ -63,6 +68,7 @@ BUSINESS_TOOLSETS: dict[str, frozenset[str]] = {
         "database_sql_execute",
         "database_query_trace_inspect",
         "database_query_result_page",
+        "database_query_result_source",
     }),
     "semantic_lookup": frozenset({"semantic_entity_lookup"}),
     "semantic_dimension_build": frozenset({
@@ -192,6 +198,9 @@ TOOL_CONTROL_DESCRIPTORS: dict[str, ToolControlDescriptor] = {
     "task": _DELEGATION,
     # Harness file protocol.
     "inspect_file_version": _READ_ONLY,
+    "copy_file": _WORKSPACE_WRITE,
+    "materialize_source_ref": _WORKSPACE_WRITE,
+    "replace_file": _WORKSPACE_WRITE,
     "patch_file": _WORKSPACE_WRITE,
     "patch_files": _WORKSPACE_WRITE,
     "delete_file": ToolControlDescriptor(
@@ -206,6 +215,7 @@ TOOL_CONTROL_DESCRIPTORS: dict[str, ToolControlDescriptor] = {
         approval_scope="call",
         policy="dynamic",
     ),
+    "validate_html_report": _INTERNAL_MUTATION,
     "rewind_external_file_changes": _EXTERNAL_COMMIT,
     "upsert_scratch_file": _WORKSPACE_WRITE,
     "stage_external_artifact": _READ_ONLY,
@@ -217,6 +227,7 @@ TOOL_CONTROL_DESCRIPTORS: dict[str, ToolControlDescriptor] = {
     "commit_external_directory": _EXTERNAL_COMMIT,
     "validate_artifact_contract": _INTERNAL_MUTATION,
     "read_resource": _READ_ONLY,
+    "read_evidence": _READ_ONLY,
     # Controlled network and runtime setup.
     "tavily_search": _CONTROLLED_NETWORK,
     "fetch_url": _CONTROLLED_NETWORK,
@@ -231,11 +242,16 @@ TOOL_CONTROL_DESCRIPTORS: dict[str, ToolControlDescriptor] = {
     "llamaindex_knowledge_query": _READ_ONLY,
     "pandas_knowledge_query": _READ_ONLY,
     "database_schema_inspect": _READ_ONLY,
-    "database_sql_generate": _READ_ONLY,
-    "database_sql_validate": _READ_ONLY,
-    "database_sql_execute": _READ_ONLY,
+    # These tools may be business-read-only, but they create durable
+    # generations, validation receipts, and query-result artifacts.  Model
+    # control contracts describe observable control-plane mutation, not SQL
+    # verb semantics.
+    "database_sql_generate": _INTERNAL_MUTATION,
+    "database_sql_validate": _INTERNAL_MUTATION,
+    "database_sql_execute": _INTERNAL_MUTATION,
     "database_query_trace_inspect": _READ_ONLY,
     "database_query_result_page": _READ_ONLY,
+    "database_query_result_source": _INTERNAL_MUTATION,
     "semantic_entity_lookup": _READ_ONLY,
     "inspect_dimension_build_input": _READ_ONLY,
     "get_semantic_dimension_build_job": _READ_ONLY,

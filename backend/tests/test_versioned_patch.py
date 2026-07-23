@@ -1,7 +1,9 @@
 import json
 from types import SimpleNamespace
 
+import pytest
 from deepagents.backends import FilesystemBackend
+from deepagents.backends.protocol import ExecuteResponse
 from langchain_core.messages import ToolMessage
 
 from graph.middlewares.versioned_patch import (
@@ -13,7 +15,10 @@ from graph.middlewares.versioned_patch import (
 from graph.session_manager import SessionManager
 from harness.deterministic_checks import _evaluate_code_validation
 from harness.models import RunRecord, RunStatus, ValidationReceipt, VerificationActivation
-from harness.verification_activations import build_verification_activations
+from harness.verification_activations import (
+    build_verification_activations,
+    verification_packs_for_tool,
+)
 
 
 def _runtime(call_id: str = "call-1", **context):
@@ -68,7 +73,7 @@ def test_committed_external_artifact_supersedes_older_staged_lease(tmp_path) -> 
     assert found is None
 
 
-def test_versioned_patch_rejects_stale_source_and_applies_atomic_replacements(tmp_path):
+def test_versioned_patch_rebases_once_and_reports_structured_conflicts(tmp_path):
     path = tmp_path / "report.html"
     path.write_text("A\nB\n", encoding="utf-8")
     middleware = VersionedPatchMiddleware(
@@ -76,28 +81,45 @@ def test_versioned_patch_rejects_stale_source_and_applies_atomic_replacements(tm
     )
     patch_tool = next(tool for tool in middleware.tools if tool.name == "patch_file")
 
-    conflict = patch_tool.func(
+    rebased = patch_tool.func(
         file_path="/report.html",
         expected_sha256="sha256:stale",
         replacements=[ReplacementHunk(old_string="A", new_string="C")],
         runtime=_runtime(),
     )
+    assert rebased.status == "success"
+    rebased_payload = json.loads(rebased.content)
+    assert rebased_payload["rebased"] is True
+    assert rebased_payload["rebased_from_sha256"] == "sha256:stale"
+    assert rebased_payload["rebased_to_sha256"] == _digest("A\nB\n")
+    assert rebased_payload["mutation_receipt_id"] == ""
+    assert rebased_payload["validation_receipt_ids"] == []
+    assert path.read_text(encoding="utf-8") == "C\nB\n"
+
+    conflict = patch_tool.func(
+        file_path="/report.html",
+        expected_sha256="sha256:older",
+        replacements=[ReplacementHunk(old_string="missing", new_string="D")],
+        runtime=_runtime("call-conflict"),
+    )
     assert conflict.status == "error"
-    assert "source version changed" in conflict.content
-    assert path.read_text(encoding="utf-8") == "A\nB\n"
+    conflict_payload = json.loads(conflict.content)
+    assert conflict_payload["error_code"] == "patch_rebase_conflict"
+    assert conflict_payload["next_action"] == "inspect_conflicting_region"
+    assert path.read_text(encoding="utf-8") == "C\nB\n"
 
     current = path.read_text(encoding="utf-8")
     applied = patch_tool.func(
         file_path="/report.html",
         expected_sha256=_digest(current),
         replacements=[
-            ReplacementHunk(old_string="A", new_string="C"),
+            ReplacementHunk(old_string="C", new_string="E"),
             ReplacementHunk(old_string="B", new_string="D"),
         ],
         runtime=_runtime("call-2"),
     )
     assert applied.status == "success"
-    assert path.read_text(encoding="utf-8") == "C\nD\n"
+    assert path.read_text(encoding="utf-8") == "E\nD\n"
 
 
 def test_staged_filename_preserves_cjk_and_scratch_upsert_requires_compare_and_swap(tmp_path):
@@ -156,6 +178,9 @@ def test_validation_obligations_do_not_supersede_other_validator_families() -> N
             "exit_code": 0 if status == "passed" else 1,
             "checks_failed": 0 if status == "passed" else 1,
             "blocking": True,
+            "failure_class": (
+                "invocation_failure" if status == "failed" else None
+            ),
             "created_at": created_at,
         }
 
@@ -229,12 +254,569 @@ def test_only_controlled_single_command_validators_receive_commit_authority() ->
         "ruff check --exit-zero /scratch/external/lease/app.py",
         "forced-success",
     )
+    html_diagnostic_wrapper = build(
+        "pwd && ls -la && node "
+        "/opt/puddingclaw/bin/validate-html-report-e2e.mjs report.html",
+        "html-diagnostic-wrapper",
+    )
+    unregistered_wrapper = build(
+        "pwd && find . -maxdepth 2 && node "
+        "/opt/puddingclaw/bin/validate-html-report-e2e.mjs report.html",
+        "unregistered-wrapper",
+    )
 
     assert direct is not None and direct.commit_authority is True
     assert direct.validator_version == "node-check/v1"
     assert masked is not None and masked.commit_authority is False
     assert noop is not None and noop.commit_authority is False
     assert forced_success is not None and forced_success.commit_authority is False
+    assert html_diagnostic_wrapper is not None
+    assert html_diagnostic_wrapper.commit_authority is True
+    assert html_diagnostic_wrapper.validator_kind == "browser_runtime"
+    assert verification_packs_for_tool(
+        "execute_external_directory",
+        {
+            "command": (
+                "pwd && ls -la && node "
+                "/opt/puddingclaw/bin/validate-html-report-e2e.mjs report.html"
+            )
+        },
+    ) == ["code"]
+    assert unregistered_wrapper is not None
+    assert unregistered_wrapper.commit_authority is False
+
+
+class _HtmlValidatorExecutionBackend:
+    def __init__(self, *, exit_code: int = 0, output: str | None = None):
+        self.exit_code = exit_code
+        self.output = output or json.dumps(
+            {
+                "passed": exit_code == 0,
+                "page": {
+                    "echartsAvailable": True,
+                    "chartContainerCount": 1,
+                    "initializedChartCount": 1,
+                },
+                "failures": [],
+            }
+        )
+        self.commands: list[tuple[str, int]] = []
+
+    def execute(self, command: str, *, timeout: int):
+        self.commands.append((command, timeout))
+        return ExecuteResponse(output=self.output, exit_code=self.exit_code)
+
+
+def test_validate_html_report_emits_hash_bound_browser_receipt(tmp_path) -> None:
+    from graph.permissioned_filesystem_backend import PermissionedCompositeBackend
+    from graph.session_manager import session_manager
+    from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
+
+    state = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    state.mkdir()
+    workspace.mkdir()
+    report = workspace / "report.html"
+    report.write_text("<!doctype html><title>Report</title>", encoding="utf-8")
+    session_manager.initialize(state)
+    session_manager.create_session("html-validator-session")
+    contract = RunRubricCompiler.compile(
+        RubricBuildContext(
+            user_message=f"生成 {report} 并执行 E2E 测试",
+            force_required=True,
+        )
+    )
+    assert contract is not None and contract.browser_e2e_required is True
+    run = RunRecord(
+        run_id="run-html-validator",
+        query_id="query-html-validator",
+        session_id="html-validator-session",
+        objective=f"生成 {report}",
+        status=RunStatus.PREPARING,
+        declared_artifact_targets=[str(report)],
+        declared_verification_contract=contract,
+        verification_contract=contract,
+    )
+    session_manager.start_harness_run(
+        "html-validator-session",
+        run.model_dump(mode="json"),
+    )
+    session_manager.transition_run_status(
+        "html-validator-session",
+        run.run_id,
+        RunStatus.RUNNING.value,
+    )
+    workspace_backend = FilesystemBackend(root_dir=workspace, virtual_mode=True)
+    backend = PermissionedCompositeBackend(
+        default=workspace_backend,
+        routes={"/workspace/": workspace_backend},
+        session_id="html-validator-session",
+        run_id=run.run_id,
+        query_id=run.query_id,
+        workspace_root=workspace,
+    )
+    execution = _HtmlValidatorExecutionBackend()
+    backend.execution_backend = execution
+    tool = next(
+        item
+        for item in VersionedPatchMiddleware(backend).tools
+        if item.name == "validate_html_report"
+    )
+
+    result = tool.func(
+        html_file_path=str(report),
+        timeout=120,
+        runtime=_runtime(
+            "validate-html",
+            session_id="html-validator-session",
+            run_id=run.run_id,
+            query_id=run.query_id,
+        ),
+    )
+
+    assert result.status == "success"
+    assert execution.commands == [
+        (
+            "node /opt/puddingclaw/bin/validate-html-report-e2e.mjs "
+            "/workspace/report.html",
+            120,
+        )
+    ]
+    activations = build_verification_activations(
+        run_id=run.run_id,
+        query_id=run.query_id,
+        tool_call_id="validate-html",
+        tool_name="validate_html_report",
+        args={"html_file_path": str(report), "timeout": 120},
+        result=result,
+        session_id="html-validator-session",
+        workspace_path=str(workspace),
+    )
+    receipt = next(
+        ref
+        for activation in activations
+        for ref in activation.evidence_refs
+        if ref.get("kind") == "validation_receipt"
+    )
+    assert receipt["status"] == "passed"
+    assert receipt["validator_kind"] == "browser_runtime"
+    assert receipt["validator_version"] == "puddingclaw-html-e2e/v1"
+    assert receipt["commit_authority"] is True
+    assert receipt["failure_class"] is None
+    assert receipt["artifact_refs"] == [
+        {
+            "artifact_id": receipt["artifact_refs"][0]["artifact_id"],
+            "content_sha256": _digest(report.read_text(encoding="utf-8")),
+            "path": str(report.resolve()),
+            "observed_path": str(report.resolve()),
+        }
+    ]
+
+
+def test_validate_html_report_defaults_to_lightweight_structure_mode(
+    tmp_path,
+) -> None:
+    from graph.permissioned_filesystem_backend import PermissionedCompositeBackend
+    from graph.session_manager import session_manager
+    from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
+
+    state = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    state.mkdir()
+    workspace.mkdir()
+    report = workspace / "report.html"
+    script = workspace / "charts.js"
+    script.write_text("const ready = true;", encoding="utf-8")
+    report.write_text(
+        "<!doctype html><html><body><div id='chart'></div>"
+        "<script src='charts.js'></script></body></html>",
+        encoding="utf-8",
+    )
+    session_manager.initialize(state)
+    session_manager.create_session("html-structure-session")
+    contract = RunRubricCompiler.compile(
+        RubricBuildContext(
+            user_message=f"生成普通 HTML 报告 {report}",
+            force_required=True,
+        )
+    )
+    assert contract is not None and contract.browser_e2e_required is False
+    run = RunRecord(
+        run_id="run-html-structure",
+        query_id="query-html-structure",
+        session_id="html-structure-session",
+        objective=f"生成普通 HTML 报告 {report}",
+        status=RunStatus.PREPARING,
+        declared_artifact_targets=[str(report)],
+        declared_verification_contract=contract,
+        verification_contract=contract,
+    )
+    session_manager.start_harness_run(
+        "html-structure-session",
+        run.model_dump(mode="json"),
+    )
+    session_manager.transition_run_status(
+        "html-structure-session",
+        run.run_id,
+        RunStatus.RUNNING.value,
+    )
+    workspace_backend = FilesystemBackend(root_dir=workspace, virtual_mode=True)
+    backend = PermissionedCompositeBackend(
+        default=workspace_backend,
+        routes={"/workspace/": workspace_backend},
+        session_id="html-structure-session",
+        run_id=run.run_id,
+        query_id=run.query_id,
+        workspace_root=workspace,
+    )
+    tool = next(
+        item
+        for item in VersionedPatchMiddleware(backend).tools
+        if item.name == "validate_html_report"
+    )
+
+    result = tool.func(
+        html_file_path=str(report),
+        timeout=120,
+        runtime=_runtime(
+            "validate-html-structure",
+            session_id="html-structure-session",
+            run_id=run.run_id,
+            query_id=run.query_id,
+        ),
+    )
+
+    assert result.status == "success"
+    payload = json.loads(result.content)
+    assert payload["validator_kind"] == "html_structure"
+    assert payload["browser_e2e_required"] is False
+    assert json.loads(payload["output"])["passed"] is True
+    activations = build_verification_activations(
+        run_id=run.run_id,
+        query_id=run.query_id,
+        tool_call_id="validate-html-structure",
+        tool_name="validate_html_report",
+        args={"html_file_path": str(report), "timeout": 120},
+        result=result,
+        session_id="html-structure-session",
+        workspace_path=str(workspace),
+    )
+    receipt = next(
+        ref
+        for activation in activations
+        for ref in activation.evidence_refs
+        if ref.get("kind") == "validation_receipt"
+    )
+    assert receipt["validator_kind"] == "html_structure"
+    assert receipt["validator_version"] == "puddingclaw-html-structure/v1"
+    assert receipt["commit_authority"] is True
+
+    refused_upgrade = tool.func(
+        html_file_path=str(report),
+        browser_e2e=True,
+        timeout=120,
+        runtime=_runtime(
+            "refuse-html-e2e-upgrade",
+            session_id="html-structure-session",
+            run_id=run.run_id,
+            query_id=run.query_id,
+        ),
+    )
+    assert refused_upgrade.status == "error"
+    assert json.loads(refused_upgrade.content)["error_code"] == (
+        "html_validation_mode_contract_mismatch"
+    )
+
+
+def test_legacy_html_diagnostic_wrapper_emits_browser_receipt_for_exact_hash(
+    tmp_path,
+) -> None:
+    from graph.session_manager import session_manager
+
+    state = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    external = tmp_path / "reports"
+    for directory in (state, workspace, external):
+        directory.mkdir()
+    report = external / "report.html"
+    report.write_text("<!doctype html><title>Report</title>", encoding="utf-8")
+    session_manager.initialize(state)
+    session_manager.create_session("legacy-html-wrapper-session")
+    run = RunRecord(
+        run_id="run-legacy-html-wrapper",
+        query_id="query-legacy-html-wrapper",
+        session_id="legacy-html-wrapper-session",
+        objective=f"验证 {report}",
+        status=RunStatus.PREPARING,
+        declared_artifact_targets=[str(report)],
+    )
+    session_manager.start_harness_run(
+        "legacy-html-wrapper-session",
+        run.model_dump(mode="json"),
+    )
+    session_manager.transition_run_status(
+        "legacy-html-wrapper-session",
+        run.run_id,
+        RunStatus.RUNNING.value,
+    )
+    command = (
+        "pwd && ls -la && node "
+        "/opt/puddingclaw/bin/validate-html-report-e2e.mjs report.html"
+    )
+    activations = build_verification_activations(
+        run_id=run.run_id,
+        query_id=run.query_id,
+        tool_call_id="legacy-html-wrapper",
+        tool_name="execute_external_directory",
+        args={
+            "directory_path": str(external),
+            "command": command,
+            "mode": "read_only",
+        },
+        result=ToolMessage(
+            content=json.dumps(
+                {
+                    "status": "completed",
+                    "directory_path": str(external),
+                    "exit_code": 0,
+                    "output": json.dumps({"passed": True, "failures": []}),
+                }
+            ),
+            tool_call_id="legacy-html-wrapper",
+            name="execute_external_directory",
+            status="success",
+        ),
+        session_id="legacy-html-wrapper-session",
+        workspace_path=str(workspace),
+    )
+
+    receipt = next(
+        ref
+        for activation in activations
+        for ref in activation.evidence_refs
+        if ref.get("kind") == "validation_receipt"
+    )
+    assert receipt["validator_kind"] == "browser_runtime"
+    assert receipt["commit_authority"] is True
+    assert receipt["status"] == "passed"
+    assert receipt["artifact_refs"] == [
+        {
+            "artifact_id": receipt["artifact_refs"][0]["artifact_id"],
+            "content_sha256": _digest(report.read_text(encoding="utf-8")),
+            "path": str(report.resolve()),
+            "observed_path": str(report.resolve()),
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("failure_class", "expected_kind"),
+    [
+        ("invocation_failure", "validator_protocol_error"),
+        ("infrastructure_failure", "infrastructure_error"),
+    ],
+)
+def test_html_control_failure_class_is_not_a_task_gap(
+    tmp_path,
+    failure_class: str,
+    expected_kind: str,
+) -> None:
+    from graph.session_manager import session_manager
+
+    state = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    state.mkdir()
+    workspace.mkdir()
+    report = workspace / "report.html"
+    report.write_text("<!doctype html><title>Report</title>", encoding="utf-8")
+    session_manager.initialize(state)
+    session_manager.create_session("html-control-failure-session")
+    run = RunRecord(
+        run_id="run-html-control-failure",
+        query_id="query-html-control-failure",
+        session_id="html-control-failure-session",
+        objective=f"生成 {report}",
+        status=RunStatus.PREPARING,
+        declared_artifact_targets=[str(report)],
+    )
+    session_manager.start_harness_run(
+        "html-control-failure-session",
+        run.model_dump(mode="json"),
+    )
+    session_manager.transition_run_status(
+        "html-control-failure-session",
+        run.run_id,
+        RunStatus.RUNNING.value,
+    )
+    write_activations = build_verification_activations(
+        run_id=run.run_id,
+        query_id=run.query_id,
+        tool_call_id="write-html",
+        tool_name="write_file",
+        args={"file_path": str(report), "content": report.read_text()},
+        result=ToolMessage(
+            content=f"Wrote {report}",
+            tool_call_id="write-html",
+            name="write_file",
+            status="success",
+        ),
+        session_id="html-control-failure-session",
+        workspace_path=str(workspace),
+    )
+    failure = ToolMessage(
+        content=json.dumps(
+            {
+                "status": "io_error",
+                "failure_class": failure_class,
+                "html_file_path": str(report),
+                "exit_code": 1,
+                "output": "validator unavailable",
+            }
+        ),
+        tool_call_id="validate-html-failed",
+        name="validate_html_report",
+        status="error",
+    )
+    validation_activations = build_verification_activations(
+        run_id=run.run_id,
+        query_id=run.query_id,
+        tool_call_id="validate-html-failed",
+        tool_name="validate_html_report",
+        args={"html_file_path": str(report), "timeout": 120},
+        result=failure,
+        session_id="html-control-failure-session",
+        workspace_path=str(workspace),
+    )
+
+    evaluation = _evaluate_code_validation(
+        "code_validation",
+        {
+            "verification_activations": [
+                item.model_dump(mode="json")
+                for item in [*write_activations, *validation_activations]
+            ]
+        },
+        {},
+    )
+    assert evaluation.passed is False
+    assert evaluation.failure_kind.value == expected_kind
+
+
+@pytest.mark.parametrize(
+    ("failure_class", "expected_passed", "expected_kind"),
+    [
+        ("invocation_failure", True, None),
+        ("artifact_failure", False, "task_gap"),
+    ],
+)
+def test_same_hash_success_only_supersedes_validator_invocation_failure(
+    tmp_path,
+    failure_class: str,
+    expected_passed: bool,
+    expected_kind: str | None,
+) -> None:
+    from graph.session_manager import session_manager
+
+    state = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    state.mkdir()
+    workspace.mkdir()
+    report = workspace / "report.html"
+    report.write_text("<!doctype html><title>Report</title>", encoding="utf-8")
+    session_manager.initialize(state)
+    session_manager.create_session("same-hash-validation-session")
+    run = RunRecord(
+        run_id="run-same-hash",
+        query_id="query-same-hash",
+        session_id="same-hash-validation-session",
+        objective=f"生成 {report}",
+        status=RunStatus.PREPARING,
+        declared_artifact_targets=[str(report)],
+    )
+    session_manager.start_harness_run(
+        "same-hash-validation-session",
+        run.model_dump(mode="json"),
+    )
+    session_manager.transition_run_status(
+        "same-hash-validation-session",
+        run.run_id,
+        RunStatus.RUNNING.value,
+    )
+    write = build_verification_activations(
+        run_id=run.run_id,
+        query_id=run.query_id,
+        tool_call_id="write-html",
+        tool_name="write_file",
+        args={"file_path": str(report), "content": report.read_text()},
+        result=ToolMessage(
+            content=f"Wrote {report}",
+            tool_call_id="write-html",
+            name="write_file",
+            status="success",
+        ),
+        session_id="same-hash-validation-session",
+        workspace_path=str(workspace),
+    )
+    failed = build_verification_activations(
+        run_id=run.run_id,
+        query_id=run.query_id,
+        tool_call_id="validate-html-failed",
+        tool_name="validate_html_report",
+        args={"html_file_path": str(report), "timeout": 120},
+        result=ToolMessage(
+            content=json.dumps(
+                {
+                    "status": "io_error",
+                    "failure_class": failure_class,
+                    "html_file_path": str(report),
+                    "exit_code": 1,
+                    "output": "failed",
+                }
+            ),
+            tool_call_id="validate-html-failed",
+            name="validate_html_report",
+            status="error",
+        ),
+        session_id="same-hash-validation-session",
+        workspace_path=str(workspace),
+    )
+    passed = build_verification_activations(
+        run_id=run.run_id,
+        query_id=run.query_id,
+        tool_call_id="validate-html-passed",
+        tool_name="validate_html_report",
+        args={"html_file_path": str(report), "timeout": 120},
+        result=ToolMessage(
+            content=json.dumps(
+                {
+                    "status": "completed",
+                    "html_file_path": str(report),
+                    "exit_code": 0,
+                    "output": json.dumps({"passed": True, "failures": []}),
+                }
+            ),
+            tool_call_id="validate-html-passed",
+            name="validate_html_report",
+            status="success",
+        ),
+        session_id="same-hash-validation-session",
+        workspace_path=str(workspace),
+    )
+
+    evaluation = _evaluate_code_validation(
+        "code_validation",
+        {
+            "verification_activations": [
+                item.model_dump(mode="json")
+                for item in [*write, *failed, *passed]
+            ]
+        },
+        {},
+    )
+    assert evaluation.passed is expected_passed
+    assert (
+        evaluation.failure_kind.value if evaluation.failure_kind is not None else None
+    ) == expected_kind
 
 
 def test_heatmap_contract_receipt_binds_both_exact_drafts_and_authorizes_commits(
@@ -636,6 +1218,7 @@ def test_code_external_artifact_commit_requires_matching_draft_receipt(tmp_path)
         exit_code=1,
         checks_failed=1,
         status="failed",
+        failure_class="invocation_failure",
         blocking=True,
         commit_authority=True,
         obligation_key="javascript_syntax:node-check/v1",
@@ -775,6 +1358,51 @@ def test_code_external_artifact_commit_requires_matching_draft_receipt(tmp_path)
         {},
     )
     assert evaluation.passed is True
+
+
+def test_artifact_failure_cannot_be_cleared_by_same_hash_success() -> None:
+    from graph.middlewares.versioned_patch import _accepted_receipts_for_target
+
+    target = "/external/report.html"
+    digest = "sha256:" + "d" * 64
+    artifact_ref = [{"path": target, "content_sha256": digest}]
+    failed = {
+        "validation_receipt_id": "browser-artifact-failed",
+        "validator_kind": "browser_runtime",
+        "validator_version": "puddingclaw-html-e2e/v1",
+        "obligation_key": "browser_runtime:puddingclaw-html-e2e/v1",
+        "commit_authority": True,
+        "artifact_refs": artifact_ref,
+        "status": "failed",
+        "failure_class": "artifact_failure",
+        "exit_code": 1,
+        "checks_failed": 1,
+        "blocking": True,
+        "created_at": 1.0,
+    }
+    passed = {
+        **failed,
+        "validation_receipt_id": "browser-later-passed",
+        "status": "passed",
+        "failure_class": None,
+        "exit_code": 0,
+        "checks_failed": 0,
+        "created_at": 2.0,
+    }
+
+    accepted, blocking = _accepted_receipts_for_target(
+        [failed, passed],
+        target_path=target,
+        content_sha256=digest,
+        selected_receipt_ids={"browser-later-passed"},
+    )
+
+    assert [item["validation_receipt_id"] for item in accepted] == [
+        "browser-later-passed"
+    ]
+    assert [item["validation_receipt_id"] for item in blocking] == [
+        "browser-artifact-failed"
+    ]
 
 
 def test_external_artifact_lease_can_continue_in_another_run_of_same_goal(tmp_path):

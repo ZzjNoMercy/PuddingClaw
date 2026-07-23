@@ -81,6 +81,7 @@ export interface RunVerificationContract {
   rubric: string;
   verification_packs?: string[];
   activation_reasons?: Record<string, string[]>;
+  browser_e2e_required?: boolean;
   base_contract_id?: string | null;
   created_at: number;
 }
@@ -151,8 +152,12 @@ export interface HarnessRun {
   query_id: string;
   session_id: string;
   objective: string;
+  run_kind?: "goal_execution" | "goal_inspection" | "standalone";
   goal_id?: string | null;
+  context_goal_id?: string | null;
+  context_goal_revision?: number | null;
   goal_revision?: number | null;
+  goal_turn_intent?: "inspect_goal" | "continue_goal" | "revise_goal" | "control_goal" | "standalone_task" | "clarify" | null;
   verification_enabled?: boolean;
   task_profile?: RunTaskProfile;
   status: RunStatus;
@@ -2596,6 +2601,8 @@ export async function* streamAgent(
   analyticsModelId?: string | null,
   goalMode = false,
   goalId?: string | null,
+  contextGoalId?: string | null,
+  goalControlAction?: "start" | null,
 ): AsyncGenerator<SSEEvent> {
   const response = await fetch(`${API_BASE}/agent`, {
     method: "POST",
@@ -2609,6 +2616,8 @@ export async function* streamAgent(
       attachments: attachments || [],
       goal_mode: goalMode,
       goal_id: goalMode ? goalId || null : null,
+      context_goal_id: contextGoalId || null,
+      goal_control_action: goalControlAction || null,
       stream: true
     }),
     signal,
@@ -2680,6 +2689,26 @@ export const resumeGoal = (sessionId: string, goalId: string) =>
 
 export const cancelGoal = (sessionId: string, goalId: string) =>
   transitionGoal(sessionId, goalId, "cancel");
+
+export async function extendGoalBudget(
+  sessionId: string,
+  goalId: string,
+  additionalRounds: number,
+): Promise<HarnessGoal> {
+  const response = await fetch(
+    `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/goals/${encodeURIComponent(goalId)}/extend-budget`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ additional_rounds: additionalRounds }),
+    },
+  );
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(apiErrorMessage(text, `Failed to extend Goal budget: ${response.status}`));
+  }
+  return response.json();
+}
 
 export async function updateGoalObjective(
   sessionId: string,
@@ -3068,6 +3097,7 @@ export async function getRawMessages(
   messages: Array<{ role: string; content: string }>;
   todos?: TodoItem[];
   todos_authority?: { kind: "legacy" | "none" | "goal" | "run"; goal_id?: string; goal_revision?: number; run_id?: string };
+  todo_ledger_revision?: number;
   graph?: GraphStructure | null;
 }> {
   const resp = await fetch(
@@ -3088,6 +3118,7 @@ export async function getSessionTraces(
   latest_trace_id?: string | null;
   todos?: TodoItem[];
   todos_authority?: { kind: "legacy" | "none" | "goal" | "run"; goal_id?: string; goal_revision?: number; run_id?: string };
+  todo_ledger_revision?: number;
   graph?: GraphStructure | null;
 }> {
   const resp = await fetch(
@@ -3106,6 +3137,7 @@ export async function getSessionHistory(
   session_id: string;
   todos?: TodoItem[];
   todos_authority?: { kind: "legacy" | "none" | "goal" | "run"; goal_id?: string; goal_revision?: number; run_id?: string };
+  todo_ledger_revision?: number;
   graph?: GraphStructure | null;
   messages: Array<{
     role: string;
@@ -3118,6 +3150,22 @@ export async function getSessionHistory(
     `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/history`
   );
   if (!resp.ok) throw new Error(`Failed to get session history: ${resp.status}`);
+  return resp.json();
+}
+
+export interface CurrentTodosSnapshot {
+  session_id: string;
+  todos: TodoItem[];
+  authority: { kind: "legacy" | "none" | "goal" | "run"; goal_id?: string; goal_revision?: number; run_id?: string };
+  ledger_revision: number;
+}
+
+export async function getCurrentSessionTodos(sessionId: string): Promise<CurrentTodosSnapshot> {
+  const resp = await fetch(
+    `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/todos/current`,
+    { cache: "no-store" },
+  );
+  if (!resp.ok) throw new Error(`Failed to get current Todos: ${resp.status}`);
   return resp.json();
 }
 

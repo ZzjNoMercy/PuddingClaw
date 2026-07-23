@@ -7,7 +7,6 @@ import hashlib
 import json
 import re
 import time
-import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from contextvars import ContextVar, Token
@@ -17,6 +16,7 @@ from typing import Any
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ModelRequest, ModelResponse, ToolCallRequest
 from langchain_core.messages import ToolMessage
+from langgraph.errors import GraphInterrupt
 from langgraph.types import Command
 
 from graph.session_manager import session_manager
@@ -36,6 +36,8 @@ class _ActiveDelegation:
     last_activity_at: float
     active_operation: str = ""
     event_sequence: int = 0
+    model_calls: int = 0
+    tool_calls: int = 0
 
 
 _ACTIVE_DELEGATION: ContextVar[_ActiveDelegation | None] = ContextVar(
@@ -149,6 +151,20 @@ class DelegationControlMiddleware(AgentMiddleware[Any, Any, Any]):
             if session_manager.is_initialized and session_id and run_id
             else None
         )
+        parent_tool_call_id = str(request.tool_call.get("id") or "")
+        if isinstance(persisted, dict):
+            existing = next(
+                (
+                    item
+                    for item in persisted.get("delegation_contracts") or []
+                    if isinstance(item, dict)
+                    and str(item.get("parent_tool_call_id") or "")
+                    == parent_tool_call_id
+                ),
+                None,
+            )
+            if isinstance(existing, dict):
+                return DelegationContract.model_validate(existing)
         manifest = persisted.get("capability_manifest") if isinstance(persisted, dict) else None
         activations = persisted.get("skill_activations") if isinstance(persisted, dict) else None
         profile = persisted.get("task_profile") if isinstance(persisted, dict) else None
@@ -163,10 +179,36 @@ class DelegationControlMiddleware(AgentMiddleware[Any, Any, Any]):
             str(item)
             for item in (manifest.get("enabled_toolsets") if isinstance(manifest, dict) else []) or []
         ]
+        permission_context: dict[str, Any] = {}
+        declared_artifact_targets: list[str] = []
+        if isinstance(persisted, dict):
+            from graph.permission_policy import RunPermissionContext
+
+            permission_context = RunPermissionContext.from_config_snapshot(
+                persisted.get("config_snapshot")
+            ).grant_bindings()
+            declared_artifact_targets = sorted(
+                {
+                    str(item)
+                    for item in persisted.get("declared_artifact_targets") or []
+                    if str(item)
+                }
+            )
+        effective_limits = self._derive_limits(
+            objective=str(args.get("description") or "").strip(),
+            todo_count=len(todo_slice),
+        )
+        delegation_seed = (
+            f"{session_id}\0{run_id}\0{parent_tool_call_id}\0"
+            f"{str(args.get('subagent_type') or 'general-purpose')}"
+        )
         return DelegationContract(
-            subagent_run_id=f"subrun-{uuid.uuid4().hex[:16]}",
+            subagent_run_id=(
+                "subrun-"
+                + hashlib.sha256(delegation_seed.encode("utf-8")).hexdigest()[:16]
+            ),
             parent_run_id=run_id,
-            parent_tool_call_id=str(request.tool_call.get("id") or ""),
+            parent_tool_call_id=parent_tool_call_id,
             session_id=session_id,
             goal_id=str(context.get("goal_id") or "") or None,
             goal_revision=context.get("goal_revision"),
@@ -184,6 +226,8 @@ class DelegationControlMiddleware(AgentMiddleware[Any, Any, Any]):
                 if isinstance(item, dict) and item.get("activation_id")
             ],
             allowed_toolsets=allowed_toolsets,
+            permission_context=permission_context,
+            declared_artifact_targets=declared_artifact_targets,
             expected_output_schema=(
                 "DatabaseEvidenceBatch/v1"
                 if "database_analysis" in allowed_toolsets
@@ -194,11 +238,55 @@ class DelegationControlMiddleware(AgentMiddleware[Any, Any, Any]):
                 for item in (contract.get("criteria") if isinstance(contract, dict) else []) or []
                 if isinstance(item, dict)
             ],
-            limits=self.limits,
+            limits=effective_limits,
+        )
+
+    def _derive_limits(
+        self,
+        *,
+        objective: str,
+        todo_count: int,
+    ) -> DelegationLimits:
+        """Allocate bounded resources from observable task complexity."""
+
+        normalized = objective.lower()
+        data_or_template = any(
+            marker in normalized
+            for marker in (
+                "database",
+                "sql",
+                "查询",
+                "数据",
+                "export",
+                "materialize",
+                "source_ref",
+                "template",
+                "模板",
+                "slot",
+                "填充",
+            )
+        )
+        model_calls = max(
+            self.limits.model_calls,
+            min(32, 10 + todo_count * 2 + (8 if data_or_template else 0)),
+        )
+        tool_calls = max(
+            self.limits.tool_calls,
+            min(100, 24 + todo_count * 5 + (24 if data_or_template else 0)),
+        )
+        wall_clock_seconds = max(
+            self.limits.wall_clock_seconds,
+            min(1_800, 300 + todo_count * 90 + (300 if data_or_template else 0)),
+        )
+        return DelegationLimits(
+            wall_clock_seconds=wall_clock_seconds,
+            model_calls=model_calls,
+            tool_calls=tool_calls,
+            idle_seconds=self.limits.idle_seconds,
         )
 
     @staticmethod
-    def _same_timed_out_delegation_exists(contract: DelegationContract) -> bool:
+    def _same_nonretryable_delegation_exists(contract: DelegationContract) -> bool:
         if not session_manager.is_initialized or not contract.session_id or not contract.parent_run_id:
             return False
         run = session_manager.get_run_state(contract.session_id, contract.parent_run_id)
@@ -212,7 +300,11 @@ class DelegationControlMiddleware(AgentMiddleware[Any, Any, Any]):
             if isinstance(item, dict)
         }
         for result in run.get("delegation_results") or []:
-            if not isinstance(result, dict) or result.get("status") != "timed_out":
+            if (
+                not isinstance(result, dict)
+                or result.get("status")
+                not in {"timed_out", "failed", "blocked", "cancelled"}
+            ):
                 continue
             previous = contracts.get(str(result.get("subagent_run_id") or ""))
             if not isinstance(previous, dict):
@@ -411,6 +503,10 @@ class DelegationControlMiddleware(AgentMiddleware[Any, Any, Any]):
             recommended_parent_action=(
                 "continue_directly"
                 if status in {"timed_out", "failed", "cancelled"}
+                or (
+                    status == "blocked"
+                    and reason == "permission_denied"
+                )
                 else "ask_user"
                 if status == "blocked"
                 else "accept_result"
@@ -480,16 +576,6 @@ class DelegationControlMiddleware(AgentMiddleware[Any, Any, Any]):
             completed_todo_ids=envelope.completed_todo_ids,
             remaining_todo_ids=envelope.remaining_todo_ids,
         )
-        if status in {"timed_out", "failed"}:
-            self._event(
-                request,
-                contract,
-                "subagent_fallback_to_parent",
-                status="running",
-                reason=reason,
-                recommended_parent_action="continue_directly",
-                remaining_todo_ids=envelope.remaining_todo_ids,
-            )
         content = envelope.model_dump_json()
         if result is None:
             return ToolMessage(
@@ -502,15 +588,168 @@ class DelegationControlMiddleware(AgentMiddleware[Any, Any, Any]):
             tool_call_id=str(request.tool_call.get("id") or ""),
         )
 
+    @staticmethod
+    def _permission_blocker(result: ToolMessage | Command[Any]) -> bool:
+        content = _tool_result_content(result).strip()
+        lowered = content.lower()
+        if "permission_denied" in lowered or "permission required" in lowered:
+            return True
+        if not content.startswith("{"):
+            return False
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            return False
+        return (
+            isinstance(payload, dict)
+            and str(payload.get("status") or "") in {
+                "permission_required",
+                "permission_denied",
+            }
+        )
+
+    def _emit_parent_takeover_if_needed(
+        self,
+        request: ToolCallRequest,
+        result: ToolMessage | Command[Any],
+    ) -> None:
+        if _ACTIVE_DELEGATION.get() is not None or not session_manager.is_initialized:
+            return
+        context = _runtime_context(request)
+        session_id = str(context.get("session_id") or "")
+        run_id = str(context.get("run_id") or "")
+        run = (
+            session_manager.get_run_state(session_id, run_id)
+            if session_id and run_id
+            else None
+        )
+        if not isinstance(run, dict):
+            return
+        events = [
+            item
+            for item in run.get("delegation_events") or []
+            if isinstance(item, dict)
+        ]
+        fallback_ids = {
+            str(item.get("subagent_run_id") or "")
+            for item in events
+            if item.get("type") == "subagent_fallback_to_parent"
+        }
+        candidates = [
+            item
+            for item in run.get("delegation_results") or []
+            if isinstance(item, dict)
+            and item.get("status") in {"timed_out", "failed", "cancelled", "blocked"}
+            and item.get("recommended_parent_action") == "continue_directly"
+            and item.get("remaining_todo_ids")
+            and str(item.get("subagent_run_id") or "") not in fallback_ids
+        ]
+        if not candidates:
+            return
+        result = max(candidates, key=lambda item: float(item.get("created_at") or 0))
+        contract_raw = next(
+            (
+                item
+                for item in run.get("delegation_contracts") or []
+                if isinstance(item, dict)
+                and str(item.get("subagent_run_id") or "")
+                == str(result.get("subagent_run_id") or "")
+            ),
+            None,
+        )
+        if not isinstance(contract_raw, dict):
+            return
+        if not self._parent_work_started(
+            request,
+            result,
+            remaining_todo_ids=[
+                str(item)
+                for item in result.get("remaining_todo_ids") or []
+                if str(item)
+            ],
+        ):
+            return
+        contract = DelegationContract.model_validate(contract_raw)
+        self._event(
+            request,
+            contract,
+            "subagent_fallback_to_parent",
+            status="running",
+            reason=str(result.get("blocking_or_timeout_reason") or ""),
+            recommended_parent_action="continue_directly",
+            remaining_todo_ids=list(result.get("remaining_todo_ids") or []),
+            parent_tool=str(request.tool_call.get("name") or ""),
+            parent_tool_call_id=str(request.tool_call.get("id") or ""),
+        )
+
+    @staticmethod
+    def _parent_work_started(
+        request: ToolCallRequest,
+        result: ToolMessage | Command[Any],
+        *,
+        remaining_todo_ids: list[str],
+    ) -> bool:
+        """Require one successful parent action before announcing takeover.
+
+        A tool request alone is not evidence that the parent actually resumed
+        work: permission denial, validation failure, or an exception may stop
+        it before execution. The semantic link to the remaining Todo is carried
+        by the pending delegation result; this gate proves the first concrete
+        parent action returned successfully.
+        """
+
+        if isinstance(result, ToolMessage) and str(result.status or "") == "error":
+            return False
+        content = _tool_result_content(result).strip()
+        if content.startswith("{"):
+            try:
+                payload = json.loads(content)
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, dict) and str(
+                payload.get("status") or ""
+            ).lower() in {
+                "error",
+                "failed",
+                "permission_required",
+                "permission_denied",
+                "blocked",
+                "cancelled",
+                "timed_out",
+                "validation_failed",
+                "conflict",
+                "io_error",
+            }:
+                return False
+
+        # A successful arbitrary tool call is not evidence that the parent is
+        # taking over the delegated work. Require an explicit Todo lifecycle
+        # operation against one of the IDs the subagent returned as remaining.
+        if str(request.tool_call.get("name") or "") != "update_todos":
+            return False
+        remaining = set(remaining_todo_ids)
+        if not remaining:
+            return False
+        operations = (request.tool_call.get("args") or {}).get("operations")
+        return any(
+            isinstance(operation, dict)
+            and str(operation.get("todo_id") or "") in remaining
+            and str(operation.get("action") or "")
+            in {"start", "update", "complete", "reopen"}
+            for operation in (operations if isinstance(operations, list) else [])
+        )
+
     async def awrap_tool_call(
         self,
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
     ) -> ToolMessage | Command[Any]:
         if str(request.tool_call.get("name") or "") != "task":
-            return await handler(request)
+            result = await handler(request)
+            self._emit_parent_takeover_if_needed(request, result)
+            return result
         contract = self._contract(request)
-        if self._same_timed_out_delegation_exists(contract):
+        if self._same_nonretryable_delegation_exists(contract):
             return self._finalize(
                 request,
                 contract,
@@ -539,6 +778,14 @@ class DelegationControlMiddleware(AgentMiddleware[Any, Any, Any]):
         token: Token[_ActiveDelegation | None] = _ACTIVE_DELEGATION.set(active)
         try:
             result = await self._run_bounded(handler(request), active)
+        except GraphInterrupt:
+            self._event(
+                request,
+                contract,
+                "subagent_waiting_for_permission",
+                status="waiting_for_permission",
+            )
+            raise
         except _DelegationLimitExceeded as exc:
             return self._finalize(
                 request,
@@ -563,6 +810,14 @@ class DelegationControlMiddleware(AgentMiddleware[Any, Any, Any]):
         blocker = self._declared_blocker(result)
         if blocker:
             return self._finalize(request, contract, result, status="blocked", reason="question_for_parent")
+        if self._permission_blocker(result):
+            return self._finalize(
+                request,
+                contract,
+                result,
+                status="blocked",
+                reason="permission_denied",
+            )
         return self._finalize(request, contract, result, status="completed")
 
     def wrap_tool_call(
@@ -571,9 +826,11 @@ class DelegationControlMiddleware(AgentMiddleware[Any, Any, Any]):
         handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
     ) -> ToolMessage | Command[Any]:
         if str(request.tool_call.get("name") or "") != "task":
-            return handler(request)
+            result = handler(request)
+            self._emit_parent_takeover_if_needed(request, result)
+            return result
         contract = self._contract(request)
-        if self._same_timed_out_delegation_exists(contract):
+        if self._same_nonretryable_delegation_exists(contract):
             return self._finalize(
                 request,
                 contract,
@@ -583,10 +840,27 @@ class DelegationControlMiddleware(AgentMiddleware[Any, Any, Any]):
             )
         self._persist_contract(contract)
         self._event(request, contract, "subagent_started", status="running")
+        self._event(
+            request,
+            contract,
+            "context_mounted",
+            status="completed",
+            analytics_model_id=contract.selected_analytics_model,
+            semantic_context_refs=contract.semantic_context_refs,
+            skill_activation_ids=contract.allowed_skill_activations,
+        )
         active = _ActiveDelegation(contract=contract, last_activity_at=time.monotonic())
         token = _ACTIVE_DELEGATION.set(active)
         try:
             result = handler(request)
+        except GraphInterrupt:
+            self._event(
+                request,
+                contract,
+                "subagent_waiting_for_permission",
+                status="waiting_for_permission",
+            )
+            raise
         except Exception as exc:
             return self._finalize(
                 request,
@@ -597,6 +871,23 @@ class DelegationControlMiddleware(AgentMiddleware[Any, Any, Any]):
             )
         finally:
             _ACTIVE_DELEGATION.reset(token)
+        blocker = self._declared_blocker(result)
+        if blocker:
+            return self._finalize(
+                request,
+                contract,
+                result,
+                status="blocked",
+                reason="question_for_parent",
+            )
+        if self._permission_blocker(result):
+            return self._finalize(
+                request,
+                contract,
+                result,
+                status="blocked",
+                reason="permission_denied",
+            )
         return self._finalize(request, contract, result, status="completed")
 
 
@@ -641,6 +932,9 @@ class SubagentProgressMiddleware(AgentMiddleware[Any, Any, Any]):
     ) -> ModelResponse[Any]:
         active = _ACTIVE_DELEGATION.get()
         if active is not None:
+            active.model_calls += 1
+            if active.model_calls > active.contract.limits.model_calls:
+                raise _DelegationLimitExceeded("model_call_limit")
             active.active_operation = "model"
         self._emit(request.runtime, "subagent_stage_changed", status="running", stage="model")
         try:
@@ -658,6 +952,9 @@ class SubagentProgressMiddleware(AgentMiddleware[Any, Any, Any]):
         tool_name = str(request.tool_call.get("name") or "")
         tool_call_id = str(request.tool_call.get("id") or "")
         if active is not None:
+            active.tool_calls += 1
+            if active.tool_calls > active.contract.limits.tool_calls:
+                raise _DelegationLimitExceeded("tool_call_limit")
             active.active_operation = f"tool:{tool_name}"
         self._emit(
             request.runtime,

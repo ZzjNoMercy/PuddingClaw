@@ -13,7 +13,9 @@ from harness.coordinators import GoalActivationError, HarnessRunCoordinator
 from harness.models import (
     GoalRecord,
     GoalStatus,
+    GoalTurnIntent,
     HarnessStateError,
+    RunKind,
     RunOutcome,
     RunRecord,
     RunStatus,
@@ -68,6 +70,43 @@ def test_run_verification_mode_is_owned_by_explicit_goal_state(tmp_path: Path) -
     assert goal is not None
     assert strict.verification_mode == VerificationMode.GOAL
     assert strict.requires_goal_verification is True
+
+
+def test_goal_inspection_references_context_without_owning_goal(tmp_path: Path) -> None:
+    sessions = _sessions(tmp_path)
+    coordinator = HarnessRunCoordinator(sessions)
+    execution, goal = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-goal-owner",
+        objective="刷新完整报告",
+        goal_mode=True,
+    )
+    assert goal is not None
+    coordinator.fail(execution, outcome=RunOutcome.CANCELLED, error="manual stop")
+    goal = coordinator.goals.release_run(goal, run=execution, gap="stopped")
+
+    inspection, attached_goal = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-inspection",
+        objective="总结一下已经完成的工作",
+        goal_mode=False,
+        run_kind=RunKind.GOAL_INSPECTION,
+        context_goal_id=goal.goal_id,
+        context_goal_revision=goal.objective_revision,
+        goal_turn_intent=GoalTurnIntent.INSPECT_GOAL,
+        goal_turn_confidence=0.99,
+        goal_turn_classifier="deterministic",
+    )
+
+    assert attached_goal is None
+    assert inspection.run_kind == RunKind.GOAL_INSPECTION
+    assert inspection.goal_id is None
+    assert inspection.context_goal_id == goal.goal_id
+    assert inspection.verification_mode == VerificationMode.AGENT
+    assert inspection.requires_goal_verification is False
+    authoritative_goal = sessions.get_goal_state("session-1", goal.goal_id)
+    assert authoritative_goal is not None
+    assert inspection.run_id not in authoritative_goal["run_ids"]
 
 
 def test_historical_goal_evidence_does_not_activate_standalone_run(tmp_path: Path) -> None:
@@ -1318,7 +1357,9 @@ def test_legacy_polluted_goal_contract_is_rebuilt_from_goal_objective(tmp_path):
     legacy_goal = GoalRecord(
         goal_id="goal-legacy",
         session_id="session-1",
-        objective="生成报告到 /workspace/report.md",
+        objective=(
+            "生成报告到 /workspace/report.md，并在交付前执行 E2E 测试"
+        ),
         goal_contract=polluted,
     )
     sessions.upsert_goal_state(
@@ -1338,6 +1379,7 @@ def test_legacy_polluted_goal_contract_is_rebuilt_from_goal_objective(tmp_path):
     assert migrated.goal_contract.version == RunRubricCompiler.VERSION
     assert "artifact" in migrated.goal_contract.verification_packs
     assert "web_research" not in migrated.goal_contract.verification_packs
+    assert migrated.goal_contract.browser_e2e_required is True
     assert run.declared_verification_contract == migrated.goal_contract
 
 
@@ -1915,6 +1957,77 @@ def test_goal_max_rounds_is_enforced_before_persistence(tmp_path):
 
     harness = sessions.get_harness_state("session-1")
     assert harness["run_order"] == [first_run.run_id]
+
+
+def test_budget_exhausted_goal_can_be_explicitly_cancelled(tmp_path):
+    sessions = _sessions(tmp_path)
+    coordinator = HarnessRunCoordinator(sessions)
+    first_run, goal = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-close-budget-goal",
+        objective="已完成的 V2 报告",
+        goal_mode=True,
+        goal_max_rounds=1,
+    )
+    assert goal is not None
+    coordinator.transition(first_run, RunStatus.RUNNING)
+    _, goal, _ = coordinator.complete_from_final_state(
+        first_run,
+        goal,
+        _exhausted_final_state(tmp_path),
+    )
+    assert goal is not None and goal.status == GoalStatus.BUDGET_EXCEEDED
+
+    cancelled = coordinator.goals.cancel("session-1", goal.goal_id)
+
+    assert cancelled.status == GoalStatus.CANCELLED
+    assert cancelled.current_run_id is None
+    assert cancelled.completed_at is not None
+    assert sessions.get_goal_state("session-1", goal.goal_id)["status"] == "cancelled"
+
+
+def test_explicit_budget_extension_allows_a_new_goal_run(tmp_path):
+    sessions = _sessions(tmp_path)
+    coordinator = HarnessRunCoordinator(sessions)
+    first_run, goal = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-1",
+        objective="销量分析最多一轮",
+        goal_mode=True,
+        goal_max_rounds=1,
+    )
+    assert goal is not None
+    coordinator.transition(first_run, RunStatus.RUNNING)
+    _, exhausted, _ = coordinator.complete_from_final_state(
+        first_run,
+        goal,
+        _exhausted_final_state(tmp_path),
+    )
+    assert exhausted is not None
+    assert exhausted.status == GoalStatus.BUDGET_EXCEEDED
+
+    reopened = coordinator.goals.extend_budget(
+        "session-1",
+        exhausted.goal_id,
+        additional_rounds=2,
+    )
+    assert reopened.status == GoalStatus.PAUSED
+    assert reopened.round == 1
+    assert reopened.max_rounds == 3
+    resumed = coordinator.goals.resume("session-1", reopened.goal_id)
+    assert resumed.status == GoalStatus.ACTIVE
+
+    second_run, attached = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-2",
+        objective="继续销量分析",
+        goal_mode=True,
+        goal_id=reopened.goal_id,
+    )
+    assert attached is not None
+    assert attached.round == 2
+    assert attached.max_rounds == 3
+    assert second_run.goal_id == reopened.goal_id
 
 
 def test_first_terminal_run_outcome_is_authoritative(tmp_path):

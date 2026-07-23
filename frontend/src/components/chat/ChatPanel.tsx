@@ -2,8 +2,10 @@
 
 import { useEffect, useMemo, useRef } from "react";
 import { useApp, type SourceRecord } from "@/lib/store";
+import { shouldShowInlineBudgetRequest } from "@/lib/goalControls";
 import ChatMessage from "./ChatMessage";
 import ChatInput from "./ChatInput";
+import GoalBudgetRequestCard from "./GoalBudgetRequestCard";
 import { Loader2, Sparkles } from "lucide-react";
 
 export default function ChatPanel() {
@@ -13,12 +15,13 @@ export default function ChatPanel() {
     runActivityStatus,
     isStreaming,
     hasActiveRun,
+    activeGoal,
   } = useApp();
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, maintenanceStatus]);
+  }, [messages, maintenanceStatus, activeGoal?.status]);
 
   const lastAssistantId = [...messages].reverse().find((m) => m.role === "assistant")?.id;
   const lastMessageId = messages[messages.length - 1]?.id;
@@ -63,6 +66,12 @@ export default function ChatPanel() {
                 showInterruptionNotice={msg.id === lastMessageId}
               />
             ))}
+            {activeGoal && shouldShowInlineBudgetRequest(
+              activeGoal.status,
+              activeGoal.requested_status,
+            ) ? (
+              <GoalBudgetRequestCard />
+            ) : null}
             <div ref={bottomRef} />
           </div>
         )}

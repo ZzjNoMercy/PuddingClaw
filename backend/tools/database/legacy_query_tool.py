@@ -6,6 +6,7 @@ import asyncio
 from pathlib import Path
 from typing import Type
 
+from langchain.tools import ToolRuntime
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel
 
@@ -47,6 +48,7 @@ class DatabaseKnowledgeQueryTool(BaseTool):
         model_id: str | None = None,
         measure_ids: list[str] | None = None,
         limit: int = 100,
+        runtime: ToolRuntime | None = None,
     ) -> str:
         request = DatabaseQueryRequest(
             question=question,
@@ -57,8 +59,19 @@ class DatabaseKnowledgeQueryTool(BaseTool):
             limit=limit,
         )
         sessionmaker = get_sessionmaker()
+        context = getattr(runtime, "context", None)
+        context = context if isinstance(context, dict) else {}
         async with sessionmaker() as session:
-            result = await query_database_knowledge(session, request)
+            result = await query_database_knowledge(
+                session,
+                request,
+                session_id=str(context.get("session_id") or ""),
+                tool_call_id=str(
+                    getattr(runtime, "tool_call_id", "") or ""
+                ),
+                source_query_id=str(context.get("query_id") or ""),
+                source_run_id=str(context.get("run_id") or ""),
+            )
         emit_trace_spans(result)
         return format_result(result)
 
@@ -70,6 +83,7 @@ class DatabaseKnowledgeQueryTool(BaseTool):
         model_id: str | None = None,
         measure_ids: list[str] | None = None,
         limit: int = 100,
+        runtime: ToolRuntime | None = None,
     ) -> str:
         try:
             return await self._query(
@@ -79,6 +93,7 @@ class DatabaseKnowledgeQueryTool(BaseTool):
                 model_id=model_id,
                 measure_ids=measure_ids,
                 limit=limit,
+                runtime=runtime,
             )
         except DatabaseKnowledgeQueryError as exc:
             return format_query_error(exc)
@@ -93,6 +108,7 @@ class DatabaseKnowledgeQueryTool(BaseTool):
         model_id: str | None = None,
         measure_ids: list[str] | None = None,
         limit: int = 100,
+        runtime: ToolRuntime | None = None,
     ) -> str:
         try:
             asyncio.get_running_loop()
@@ -105,6 +121,7 @@ class DatabaseKnowledgeQueryTool(BaseTool):
                     model_id=model_id,
                     measure_ids=measure_ids,
                     limit=limit,
+                    runtime=runtime,
                 )
             )
         return "🧮 数据库问数失败：当前运行环境不支持同步调用，请使用异步工具调用。"

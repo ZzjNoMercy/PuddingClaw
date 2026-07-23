@@ -27,6 +27,7 @@ import {
 } from "lucide-react";
 import { useApp } from "@/lib/store";
 import { useProjectFolderPicker } from "@/components/projects/useProjectFolderPicker";
+import ConfirmDialog from "@/components/ui/ConfirmDialog";
 import {
   listAnalyticsModels,
   listSkills,
@@ -133,6 +134,7 @@ export default function ChatInput() {
     goalModeEnabled,
     setGoalModeEnabled,
     activeGoal,
+    cancelActiveGoal,
     currentRun,
     hasActiveRun,
     approvalMode,
@@ -153,6 +155,8 @@ export default function ChatInput() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [uploadingCount, setUploadingCount] = useState(0);
   const [inputError, setInputError] = useState<string | null>(null);
+  const [goalCancelPending, setGoalCancelPending] = useState(false);
+  const [goalCancelConfirmationOpen, setGoalCancelConfirmationOpen] = useState(false);
   const isUploading = uploadingCount > 0;
   const approvalLocked =
     hasActiveRun ||
@@ -475,7 +479,7 @@ export default function ChatInput() {
 
   return (
     <>
-    <div className="px-3 pb-4 pt-2 sm:px-6">
+    <div className="relative z-30 px-3 pb-4 pt-2 sm:px-6">
       <div className="glass-input relative mx-auto flex w-full max-w-[900px] flex-col gap-2 rounded-3xl px-3 py-3 transition-shadow hover:shadow-lg sm:px-4">
         <SlashCommandMenu
           visible={showSlashMenu}
@@ -710,7 +714,11 @@ export default function ChatInput() {
                             <span className="block">目标</span>
                             <span className="block text-[11px] text-gray-400">
                               {activeGoal
-                                ? "目标进行中，点击查看"
+                                ? activeGoal.status === "budget_exceeded"
+                                  ? "预算已耗尽，点击追加轮次"
+                                  : activeGoal.status === "paused"
+                                    ? "目标已暂停，点击查看"
+                                    : "目标进行中，点击查看"
                                 : goalModeEnabled
                                   ? "下次发送将创建跨 Run Goal"
                                   : "默认关闭；仅对下次发送生效"}
@@ -856,22 +864,40 @@ export default function ChatInput() {
             )}
 
             {runtimeMode === "agent" && (activeGoal || goalModeEnabled) && (
-              <button
-                type="button"
-                onClick={() => {
-                  if (activeGoal) {
-                    setInspectorOpen(true);
-                    setInspectorActiveTab("goal");
-                  } else {
-                    setGoalModeEnabled(false);
-                  }
-                }}
-                className="flex h-8 items-center gap-1.5 rounded-full border border-emerald-600/15 bg-emerald-50 px-3 text-[12px] text-emerald-700 transition-all hover:bg-emerald-100"
-                title={activeGoal ? "查看当前目标" : "已为下次发送启用目标；点击取消"}
-              >
-                <Target className="h-3.5 w-3.5" />
-                <span>目标</span>
-              </button>
+              <div className="flex h-8 items-center rounded-full border border-emerald-600/15 bg-emerald-50 text-[12px] text-emerald-700 transition-all hover:bg-emerald-100">
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (activeGoal) {
+                      setInspectorOpen(true);
+                      setInspectorActiveTab("goal");
+                    }
+                  }}
+                  className="flex h-full items-center gap-1.5 rounded-l-full pl-3 pr-1.5"
+                  title={activeGoal ? "查看当前目标" : "已为下次发送启用目标"}
+                >
+                  <Target className="h-3.5 w-3.5" />
+                  <span>目标</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={goalCancelPending}
+                  onClick={() => {
+                    if (!activeGoal) {
+                      setGoalModeEnabled(false);
+                      return;
+                    }
+                    setGoalCancelConfirmationOpen(true);
+                  }}
+                  className="mr-1 flex h-6 w-6 items-center justify-center rounded-full text-emerald-700/70 hover:bg-emerald-200/70 hover:text-emerald-900 disabled:cursor-wait disabled:opacity-40"
+                  title={activeGoal ? "结束当前 Goal" : "关闭目标模式"}
+                  aria-label={activeGoal ? "结束当前 Goal" : "关闭目标模式"}
+                >
+                  {goalCancelPending
+                    ? <Activity className="h-3.5 w-3.5 animate-spin" />
+                    : <X className="h-3.5 w-3.5" />}
+                </button>
+              </div>
             )}
           </div>
 
@@ -911,6 +937,30 @@ export default function ChatInput() {
         Powered by DeepSeek · PuddingClaw v0.1
       </p>
     </div>
+    <ConfirmDialog
+      open={goalCancelConfirmationOpen}
+      title="结束当前 Goal？"
+      description={
+        activeGoal?.current_run_id
+          ? "当前 Goal 和正在执行的 Run 都将停止，已完成的进度和产物记录仍会保留。"
+          : "当前 Goal 将停止，已完成的进度和产物记录仍会保留。"
+      }
+      confirmLabel="结束 Goal"
+      busy={goalCancelPending}
+      onClose={() => setGoalCancelConfirmationOpen(false)}
+      onConfirm={() => {
+        setGoalCancelPending(true);
+        setInputError(null);
+        void cancelActiveGoal()
+          .catch((error) => {
+            setInputError(error instanceof Error ? error.message : "Goal 取消失败");
+          })
+          .finally(() => {
+            setGoalCancelPending(false);
+            setGoalCancelConfirmationOpen(false);
+          });
+      }}
+    />
     {projectFolderDialog}
     </>
   );

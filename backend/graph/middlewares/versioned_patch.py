@@ -8,7 +8,7 @@ import re
 import time
 import unicodedata
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Literal
 
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain.tools import ToolRuntime
@@ -57,6 +57,74 @@ class PatchFilesInput(BaseModel):
     files: list[FilePatchSpec] = Field(min_length=2, max_length=50)
 
 
+class ReplaceFileInput(BaseModel):
+    file_path: str
+    content: str
+    expected_sha256: str = Field(
+        description="sha256:<hex> for the exact file version being replaced"
+    )
+
+
+class CopyFileInput(BaseModel):
+    source_path: str = Field(description="Exact authorized source file")
+    target_path: str = Field(
+        description="Exact new target file; existing targets are never overwritten"
+    )
+    expected_source_sha256: str | None = Field(
+        default=None,
+        description=(
+            "Optional sha256:<hex> source precondition. The actual copied hash is "
+            "always recorded and returned."
+        ),
+    )
+
+
+class MaterializeDestination(BaseModel):
+    kind: Literal["file", "slot"]
+    target_path: str | None = None
+    mode: Literal["create", "replace"] = "create"
+    expected_sha256: str | None = None
+    template_path: str | None = None
+    template_sha256: str | None = None
+    slot_id: str | None = None
+    output_path: str | None = None
+    output_mode: Literal["create", "replace"] = "replace"
+    expected_output_sha256: str | None = None
+
+    @model_validator(mode="after")
+    def validate_destination(self) -> "MaterializeDestination":
+        if self.kind == "file":
+            if not self.target_path:
+                raise ValueError("file destination requires target_path")
+            if self.mode == "replace" and not self.expected_sha256:
+                raise ValueError("file replace requires expected_sha256")
+        else:
+            if not all(
+                (
+                    self.template_path,
+                    self.template_sha256,
+                    self.slot_id,
+                    self.output_path,
+                )
+            ):
+                raise ValueError(
+                    "slot destination requires template_path, template_sha256, "
+                    "slot_id and output_path"
+                )
+            if self.output_mode == "replace" and not self.expected_output_sha256:
+                raise ValueError("slot output replace requires expected_output_sha256")
+        return self
+
+
+class MaterializeSourceRefInput(BaseModel):
+    source_ref: str
+    destination: MaterializeDestination
+    renderer: Literal["identity", "json", "csv", "js_array", "text"]
+    projection: list[str] = Field(default_factory=list)
+    expected_schema_ref: str | None = None
+    expected_item_count: int | None = Field(default=None, ge=0)
+
+
 class StageExternalArtifactInput(BaseModel):
     file_path: str = Field(description="Approved absolute external source path")
 
@@ -99,6 +167,25 @@ class ValidateArtifactContractInput(BaseModel):
     javascript_file_path: str
 
 
+class ValidateHtmlReportInput(BaseModel):
+    html_file_path: str = Field(
+        description=(
+            "Absolute HTML report path. Ordinary validation reads the report and "
+            "its local resources directly; contract-required browser E2E mounts "
+            "the exact parent directory read-only in an offline container."
+        )
+    )
+    browser_e2e: bool | None = Field(
+        default=None,
+        description=(
+            "Normally omit this server-owned parameter. Harness resolves it "
+            "from the frozen verification contract. An explicit value must "
+            "match that contract."
+        ),
+    )
+    timeout: int = Field(default=120, ge=1, le=600)
+
+
 class RewindExternalFileChangesInput(BaseModel):
     """The active Run scope is supplied by the Backend, not the model."""
 
@@ -112,13 +199,21 @@ class DeleteFileInput(BaseModel):
 
 class ExecuteExternalDirectoryInput(BaseModel):
     directory_path: str = Field(
-        description="Exact authorized external directory mounted read-only for this command only"
+        description="Exact authorized external directory bound to this command"
     )
     command: str = Field(
         min_length=1,
         description="Exact shell command; receives a separate command-level approval",
     )
     timeout: int = Field(default=120, ge=1, le=600)
+    mode: Literal["read_only", "writable_draft"] = "read_only"
+    lease_id: str | None = Field(
+        default=None,
+        description=(
+            "Required for writable_draft. The command writes only to this "
+            "server-owned external-directory snapshot, never directly to the host."
+        ),
+    )
 
 
 def _read_all(backend: Any, file_path: str) -> tuple[str | None, str | None]:
@@ -144,6 +239,65 @@ def _read_all(backend: Any, file_path: str) -> tuple[str | None, str | None]:
 
 def _digest(content: str) -> str:
     return f"sha256:{hashlib.sha256(content.encode('utf-8')).hexdigest()}"
+
+
+def _render_replacements(
+    content: str,
+    replacements: list[ReplacementHunk],
+) -> tuple[str | None, int, list[dict[str, Any]]]:
+    """Render all hunks against one immutable source without overlap."""
+
+    spans: list[tuple[int, int, str, int]] = []
+    failures: list[dict[str, Any]] = []
+    for index, hunk in enumerate(replacements, start=1):
+        starts: list[int] = []
+        offset = 0
+        while True:
+            found = content.find(hunk.old_string, offset)
+            if found < 0:
+                break
+            starts.append(found)
+            offset = found + max(1, len(hunk.old_string))
+        if not starts:
+            failures.append({"hunk": index, "error_code": "old_string_absent"})
+            continue
+        if not hunk.replace_all and len(starts) != 1:
+            failures.append(
+                {
+                    "hunk": index,
+                    "error_code": "old_string_not_unique",
+                    "occurrences": len(starts),
+                }
+            )
+            continue
+        selected = starts if hunk.replace_all else starts[:1]
+        spans.extend(
+            (
+                start,
+                start + len(hunk.old_string),
+                hunk.new_string,
+                index,
+            )
+            for start in selected
+        )
+    if failures:
+        return None, 0, failures
+    ordered = sorted(spans, key=lambda item: (item[0], item[1]))
+    for previous, current in zip(ordered, ordered[1:]):
+        if current[0] < previous[1]:
+            failures.append(
+                {
+                    "hunk": current[3],
+                    "error_code": "overlapping_hunks",
+                    "overlaps_with": previous[3],
+                }
+            )
+    if failures:
+        return None, 0, failures
+    updated = content
+    for start, end, replacement, _index in reversed(ordered):
+        updated = updated[:start] + replacement + updated[end:]
+    return updated, len(ordered), []
 
 
 def _safe_staged_filename(value: str) -> str:
@@ -239,7 +393,11 @@ def _accepted_receipts_for_target(
     blocking = [
         receipt
         for key, (failed_at, receipt) in latest_failure_by_obligation.items()
-        if failed_at >= latest_success_by_obligation.get(key, 0.0)
+        if (
+            str(receipt.get("failure_class") or "artifact_failure")
+            == "artifact_failure"
+            or failed_at >= latest_success_by_obligation.get(key, 0.0)
+        )
     ]
     return accepted, blocking
 
@@ -333,69 +491,421 @@ class VersionedPatchMiddleware(AgentMiddleware[Any, Any, Any]):
                     status="error",
                 )
             current_version = _digest(original)
-            if expected_sha256 != current_version:
+            rebased = expected_sha256 != current_version
+            updated, applied, failures = _render_replacements(
+                original,
+                replacements,
+            )
+            if updated is None:
                 return ToolMessage(
-                    content=(
-                        "Patch conflict: source version changed. "
-                        f"expected={expected_sha256}, current={current_version}. "
-                        "Call inspect_file_version again and rebase the patch."
+                    content=json.dumps(
+                        {
+                            "status": "conflict",
+                            "error_code": "patch_rebase_conflict",
+                            "expected_sha256": expected_sha256,
+                            "current_sha256": current_version,
+                            "failed_hunks": failures,
+                            "next_action": "inspect_conflicting_region",
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
                     ),
                     name="patch_file",
                     tool_call_id=runtime.tool_call_id,
                     status="error",
                 )
-            updated = original
-            applied = 0
-            for index, hunk in enumerate(replacements, start=1):
-                occurrences = updated.count(hunk.old_string)
-                if occurrences == 0:
-                    return ToolMessage(
-                        content=(
-                            f"Patch conflict at hunk {index}: old_string is absent from "
-                            f"version {current_version}. Re-inspect and rebase instead of retrying guesses."
-                        ),
-                        name="patch_file",
-                        tool_call_id=runtime.tool_call_id,
-                        status="error",
-                    )
-                if not hunk.replace_all and occurrences != 1:
-                    return ToolMessage(
-                        content=(
-                            f"Patch conflict at hunk {index}: old_string occurs {occurrences} times; "
-                            "make the hunk unique or set replace_all=true."
-                        ),
-                        name="patch_file",
-                        tool_call_id=runtime.tool_call_id,
-                        status="error",
-                    )
-                updated = updated.replace(
-                    hunk.old_string,
-                    hunk.new_string,
-                    -1 if hunk.replace_all else 1,
-                )
-                applied += occurrences if hunk.replace_all else 1
             # Commit with the entire inspected source as the compare-and-swap
             # precondition. A concurrent write becomes an exact-match conflict.
             result = self.backend.edit(file_path, original, updated, replace_all=False)
             if result.error:
                 return ToolMessage(
-                    content=(
-                        f"Patch commit conflict for {file_path}: {result.error}. "
-                        "Call inspect_file_version again and rebase."
+                    content=json.dumps(
+                        {
+                            "status": "conflict",
+                            "error_code": "concurrent_patch_commit_conflict",
+                            "current_sha256": current_version,
+                            "expected_sha256": expected_sha256,
+                            "error": str(result.error),
+                            "next_action": "retry_once_with_latest_version",
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
                     ),
                     name="patch_file",
                     tool_call_id=runtime.tool_call_id,
                     status="error",
                 )
+            target_path = str(result.path or file_path)
+            target_sha256 = _digest(updated)
+            mutation_receipt_id = ""
+            validation_receipt_ids: list[str] = []
+            context = runtime.context if isinstance(runtime.context, dict) else {}
+            session_id = str(context.get("session_id") or "")
+            run_id = str(context.get("run_id") or "")
+            if session_id and run_id and Path(target_path).is_absolute():
+                from graph.session_manager import session_manager
+
+                receipt = session_manager.find_external_mutation_receipt(
+                    session_id,
+                    run_id=run_id,
+                    canonical_path=str(Path(target_path).resolve()),
+                    after_sha256=target_sha256,
+                )
+                if isinstance(receipt, dict):
+                    mutation_receipt_id = str(receipt.get("receipt_id") or "")
+                    validation_receipt_id = str(
+                        receipt.get("validation_receipt_id") or ""
+                    )
+                    if validation_receipt_id:
+                        validation_receipt_ids.append(validation_receipt_id)
             return ToolMessage(
-                content=(
-                    f"Applied {applied} replacement(s) to {result.path or file_path}. "
-                    f"previous_version={current_version}, new_version={_digest(updated)}"
+                content=json.dumps(
+                    {
+                        "status": "completed",
+                        "target_path": target_path,
+                        "applied_replacements": applied,
+                        "previous_sha256": current_version,
+                        "target_sha256": target_sha256,
+                        "rebased": rebased,
+                        "rebased_from_sha256": expected_sha256 if rebased else None,
+                        "rebased_to_sha256": current_version if rebased else None,
+                        "mutation_receipt_id": mutation_receipt_id,
+                        "validation_receipt_ids": validation_receipt_ids,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
                 ),
                 name="patch_file",
                 tool_call_id=runtime.tool_call_id,
                 status="success",
             )
+
+        def replace_file(
+            file_path: str,
+            content: str,
+            expected_sha256: str,
+            runtime: ToolRuntime[Any, Any],
+        ) -> ToolMessage:
+            replace = getattr(self.backend, "replace_external_file", None)
+            if not callable(replace):
+                return ToolMessage(
+                    content=json.dumps(
+                        {
+                            "status": "io_error",
+                            "error_code": "replace_not_supported",
+                            "next_action": "use_versioned_patch",
+                        },
+                        sort_keys=True,
+                    ),
+                    name="replace_file",
+                    tool_call_id=runtime.tool_call_id,
+                    status="error",
+                )
+            result = replace(
+                file_path,
+                content.encode("utf-8"),
+                expected_sha256=expected_sha256,
+            )
+            status = str(result.get("status") or "io_error")
+            return ToolMessage(
+                content=json.dumps(result, ensure_ascii=False, sort_keys=True),
+                name="replace_file",
+                tool_call_id=runtime.tool_call_id,
+                status="success" if status == "completed" else "error",
+            )
+
+        def copy_file(
+            source_path: str,
+            target_path: str,
+            runtime: ToolRuntime[Any, Any],
+            expected_source_sha256: str | None = None,
+        ) -> ToolMessage:
+            copy = getattr(self.backend, "copy_external_file", None)
+            if not callable(copy):
+                return ToolMessage(
+                    content=json.dumps(
+                        {
+                            "status": "io_error",
+                            "error_code": "copy_not_supported",
+                            "next_action": "report_infrastructure_error",
+                        },
+                        sort_keys=True,
+                    ),
+                    name="copy_file",
+                    tool_call_id=runtime.tool_call_id,
+                    status="error",
+                )
+            result = copy(
+                source_path,
+                target_path,
+                expected_source_sha256=expected_source_sha256,
+            )
+            status = str(result.get("status") or "io_error")
+            return ToolMessage(
+                content=json.dumps(result, ensure_ascii=False, sort_keys=True),
+                name="copy_file",
+                tool_call_id=runtime.tool_call_id,
+                status="success" if status == "completed" else "error",
+            )
+
+        def materialize_source_ref(
+            source_ref: str,
+            destination: MaterializeDestination,
+            renderer: str,
+            runtime: ToolRuntime[Any, Any],
+            projection: list[str] | None = None,
+            expected_schema_ref: str | None = None,
+            expected_item_count: int | None = None,
+        ) -> ToolMessage:
+            from harness.source_materialization import (
+                SourceMaterializationError,
+                fill_typed_slot,
+                persist_materialization_receipt,
+                public_source_reference,
+                render_source,
+                resolve_source_bytes,
+            )
+
+            context = runtime.context if isinstance(runtime.context, dict) else {}
+            session_id = str(context.get("session_id") or "")
+            run_id = str(context.get("run_id") or "")
+            query_id = str(context.get("query_id") or "")
+            if not session_id or not run_id:
+                return ToolMessage(
+                    content=json.dumps(
+                        {
+                            "status": "error",
+                            "error_code": "active_run_required",
+                            "next_action": "retry_in_active_run",
+                        },
+                        sort_keys=True,
+                    ),
+                    name="materialize_source_ref",
+                    tool_call_id=runtime.tool_call_id,
+                    status="error",
+                )
+            try:
+                if isinstance(destination, dict):
+                    destination = MaterializeDestination.model_validate(destination)
+                source, source_bytes = resolve_source_bytes(
+                    session_id,
+                    source_ref,
+                )
+                rendered, item_count = render_source(
+                    source,
+                    source_bytes,
+                    renderer=renderer,
+                    projection=list(projection or []),
+                    expected_schema_ref=expected_schema_ref,
+                    expected_item_count=expected_item_count,
+                )
+                template_sha256: str | None = None
+                slot_id: str | None = None
+                if destination.kind == "slot":
+                    template, template_error = _read_all(
+                        self.backend,
+                        str(destination.template_path),
+                    )
+                    if template_error is not None or template is None:
+                        raise SourceMaterializationError(
+                            "template_unavailable",
+                            template_error or "unable to read template",
+                            next_action="inspect_template",
+                        )
+                    template_sha256 = _digest(template)
+                    if template_sha256 != destination.template_sha256:
+                        raise SourceMaterializationError(
+                            "template_version_changed",
+                            (
+                                f"expected {destination.template_sha256}, "
+                                f"current {template_sha256}"
+                            ),
+                            next_action="inspect_template",
+                        )
+                    slot_id = str(destination.slot_id)
+                    output_text = fill_typed_slot(
+                        template,
+                        slot_id=slot_id,
+                        renderer=renderer,
+                        rendered=rendered,
+                    )
+                    candidate = output_text.encode("utf-8")
+                    target_path = str(destination.output_path)
+                    mode = destination.output_mode
+                    expected_target = destination.expected_output_sha256
+                else:
+                    candidate = rendered
+                    target_path = str(destination.target_path)
+                    mode = destination.mode
+                    expected_target = destination.expected_sha256
+
+                virtual_target = target_path.replace("\\", "/").startswith(
+                    ("/workspace/", "/scratch/")
+                ) or not Path(target_path).is_absolute()
+                if virtual_target:
+                    try:
+                        candidate_text = candidate.decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        raise SourceMaterializationError(
+                            "virtual_binary_materialization_unsupported",
+                            "binary identity materialization requires an external target",
+                            next_action="choose_external_target",
+                        ) from exc
+                    if mode == "create":
+                        write_result = self.backend.write(
+                            target_path,
+                            candidate_text,
+                        )
+                    else:
+                        current, current_error = _read_all(
+                            self.backend,
+                            target_path,
+                        )
+                        if current_error is not None or current is None:
+                            raise SourceMaterializationError(
+                                "target_unavailable",
+                                current_error or "unable to read target",
+                                next_action="inspect_target",
+                            )
+                        current_sha256 = _digest(current)
+                        if current_sha256 != expected_target:
+                            raise SourceMaterializationError(
+                                "target_version_changed",
+                                (
+                                    f"expected {expected_target}, "
+                                    f"current {current_sha256}"
+                                ),
+                                next_action="inspect_target",
+                            )
+                        write_result = self.backend.edit(
+                            target_path,
+                            current,
+                            candidate_text,
+                            replace_all=False,
+                        )
+                    if write_result.error:
+                        raise SourceMaterializationError(
+                            "materialization_commit_failed",
+                            str(write_result.error),
+                            next_action="inspect_target",
+                        )
+                    commit_result = {
+                        "status": "completed",
+                        "target_path": str(write_result.path or target_path),
+                        "target_sha256": _digest(candidate_text),
+                        "receipt_id": "",
+                        "mutation_receipt_id": "",
+                        "validation_receipt": None,
+                        "validation_receipt_ids": [],
+                    }
+                else:
+                    if mode == "create":
+                        create = getattr(self.backend, "create_external_file", None)
+                        if not callable(create):
+                            raise SourceMaterializationError(
+                                "materialization_create_unsupported",
+                                "Backend does not support external byte creation",
+                                next_action="report_infrastructure_error",
+                            )
+                        commit_result = create(
+                            target_path,
+                            candidate,
+                            operation="materialize_create",
+                        )
+                    else:
+                        replace = getattr(self.backend, "replace_external_file", None)
+                        if not callable(replace):
+                            raise SourceMaterializationError(
+                                "materialization_replace_unsupported",
+                                "Backend does not support external byte replacement",
+                                next_action="report_infrastructure_error",
+                            )
+                        commit_result = replace(
+                            target_path,
+                            candidate,
+                            expected_sha256=str(expected_target),
+                            operation="materialize_replace",
+                        )
+                    if str(commit_result.get("status") or "") != "completed":
+                        return ToolMessage(
+                            content=json.dumps(
+                                commit_result,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            ),
+                            name="materialize_source_ref",
+                            tool_call_id=runtime.tool_call_id,
+                            status="error",
+                        )
+
+                validation_receipt = commit_result.get("validation_receipt")
+                validation_ids = [
+                    str(item)
+                    for item in commit_result.get("validation_receipt_ids") or []
+                    if str(item)
+                ]
+                if (
+                    not validation_ids
+                    and isinstance(validation_receipt, dict)
+                    and validation_receipt.get("validation_receipt_id")
+                ):
+                    validation_ids = [
+                        str(validation_receipt.get("validation_receipt_id"))
+                    ]
+                receipt = persist_materialization_receipt(
+                    session_id=session_id,
+                    run_id=run_id,
+                    query_id=query_id,
+                    source=source,
+                    renderer=renderer,
+                    target_path=str(commit_result.get("target_path") or target_path),
+                    target_sha256=str(commit_result.get("target_sha256") or ""),
+                    item_count=item_count,
+                    mutation_receipt_id=str(
+                        commit_result.get("mutation_receipt_id")
+                        or commit_result.get("receipt_id")
+                        or ""
+                    ),
+                    template_sha256=template_sha256,
+                    slot_id=slot_id,
+                    validation_receipt_ids=validation_ids,
+                )
+                return ToolMessage(
+                    content=json.dumps(
+                        {
+                            "status": "completed",
+                            "source": public_source_reference(source),
+                            "renderer": f"{renderer}/v1",
+                            "item_count": item_count,
+                            "target_path": receipt["target_path"],
+                            "target_sha256": receipt["target_sha256"],
+                            "materialization_receipt_id": receipt[
+                                "materialization_receipt_id"
+                            ],
+                            "mutation_receipt_id": receipt[
+                                "mutation_receipt_id"
+                            ],
+                            "validation_receipt_ids": validation_ids,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    name="materialize_source_ref",
+                    tool_call_id=runtime.tool_call_id,
+                    status="success",
+                    artifact={"materialization_receipt": receipt},
+                )
+            except SourceMaterializationError as exc:
+                return ToolMessage(
+                    content=json.dumps(
+                        exc.as_dict(),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    name="materialize_source_ref",
+                    tool_call_id=runtime.tool_call_id,
+                    status="error",
+                )
 
         def rewind_external_file_changes(
             runtime: ToolRuntime[Any, Any],
@@ -444,6 +954,8 @@ class VersionedPatchMiddleware(AgentMiddleware[Any, Any, Any]):
             command: str,
             timeout: int,
             runtime: ToolRuntime[Any, Any],
+            mode: Literal["read_only", "writable_draft"] = "read_only",
+            lease_id: str | None = None,
         ) -> ToolMessage:
             execute = getattr(
                 self.backend,
@@ -461,11 +973,43 @@ class VersionedPatchMiddleware(AgentMiddleware[Any, Any, Any]):
                 directory_path,
                 command,
                 timeout=timeout,
+                mode=mode,
+                lease_id=lease_id,
             )
             status = str(result.get("status") or "io_error")
             return ToolMessage(
                 content=json.dumps(result, ensure_ascii=False, sort_keys=True),
                 name="execute_external_directory",
+                tool_call_id=runtime.tool_call_id,
+                status="success" if status == "completed" else "error",
+            )
+
+        def validate_html_report(
+            html_file_path: str,
+            timeout: int,
+            runtime: ToolRuntime[Any, Any],
+            browser_e2e: bool | None = None,
+        ) -> ToolMessage:
+            """Run contract-selected HTML validation without model-authored shell."""
+
+            validate = getattr(self.backend, "validate_html_report", None)
+            if not callable(validate):
+                result = {
+                    "status": "infrastructure_error",
+                    "error_code": "html_validator_backend_unavailable",
+                    "failure_class": "infrastructure_failure",
+                    "error": "this Backend does not support HTML validation",
+                }
+            else:
+                result = validate(
+                    html_file_path,
+                    browser_e2e=browser_e2e,
+                    timeout=timeout,
+                )
+            status = str(result.get("status") or "infrastructure_error")
+            return ToolMessage(
+                content=json.dumps(result, ensure_ascii=False, sort_keys=True),
+                name="validate_html_report",
                 tool_call_id=runtime.tool_call_id,
                 status="success" if status == "completed" else "error",
             )
@@ -1235,6 +1779,7 @@ class VersionedPatchMiddleware(AgentMiddleware[Any, Any, Any]):
                     1 for value in result.get("checks", {}).values() if not value
                 ),
                 status="passed" if passed else "failed",
+                failure_class=None if passed else "artifact_failure",
                 blocking=True,
                 commit_authority=True,
                 obligation_key=f"artifact_ui_contract:{contract_id}",
@@ -1303,10 +1848,45 @@ class VersionedPatchMiddleware(AgentMiddleware[Any, Any, Any]):
                 name="patch_file",
                 description=(
                     "Apply one atomic, optimistic patch against expected_sha256. "
-                    "On conflict, inspect the latest version and rebase once; do not repeatedly guess exact strings."
+                    "If the source changed, mechanically rebase once only when every hunk "
+                    "still matches uniquely and without overlap."
                 ),
                 func=patch_file,
                 args_schema=PatchFileInput,
+                infer_schema=False,
+            ),
+            StructuredTool.from_function(
+                name="replace_file",
+                description=(
+                    "Atomically replace one authorized UTF-8 file under expected_sha256. "
+                    "Validation happens before commit and any conflict leaves the target unchanged. "
+                    "Use this instead of delete_file followed by write_file."
+                ),
+                func=replace_file,
+                args_schema=ReplaceFileInput,
+                infer_schema=False,
+            ),
+            StructuredTool.from_function(
+                name="copy_file",
+                description=(
+                    "Atomically create one exact file from an authorized source without "
+                    "streaming its body through model context. Records source/target hashes, "
+                    "validates code-like targets, and never overwrites an existing target."
+                ),
+                func=copy_file,
+                args_schema=CopyFileInput,
+                infer_schema=False,
+            ),
+            StructuredTool.from_function(
+                name="materialize_source_ref",
+                description=(
+                    "Materialize an immutable server SourceReference directly into a file "
+                    "or one typed template slot through a deterministic renderer. Full payload "
+                    "bytes never enter model context. The commit is permission-checked, atomic, "
+                    "validated, and returns a MaterializationReceipt."
+                ),
+                func=materialize_source_ref,
+                args_schema=MaterializeSourceRefInput,
                 infer_schema=False,
             ),
             StructuredTool.from_function(
@@ -1345,13 +1925,29 @@ class VersionedPatchMiddleware(AgentMiddleware[Any, Any, Any]):
             StructuredTool.from_function(
                 name="execute_external_directory",
                 description=(
-                    "Run one separately approved command in a disposable docker run --rm with exactly "
-                    "one authorized external directory mounted read-only at /external-workspace. Use only "
-                    "when a validator truly needs directory semantics; otherwise use Broker file tools. "
-                    "For editable/build work, ask the user to open the directory as the project workspace."
+                    "Run one command in a disposable offline docker run --rm. read_only mounts the exact "
+                    "authorized directory read-only. writable_draft requires a staged directory lease and "
+                    "writes only its isolated snapshot; then use prepare_external_directory_commit and "
+                    "commit_external_directory for reviewed atomic write-back. The host directory is never "
+                    "mounted writable during command execution."
                 ),
                 func=execute_external_directory,
                 args_schema=ExecuteExternalDirectoryInput,
+                infer_schema=False,
+            ),
+            StructuredTool.from_function(
+                name="validate_html_report",
+                description=(
+                    "Validate one HTML report against its current hash. Ordinary "
+                    "runs perform lightweight structure, duplicate-ID, and local-"
+                    "resource checks. The frozen verification contract enables "
+                    "PuddingClaw's fixed offline Chromium adapter only for explicit "
+                    "browser E2E requirements. Omit browser_e2e; no model-authored "
+                    "shell or per-call HITL is required after directory read "
+                    "permission exists. Returns an exact-hash ValidationReceipt."
+                ),
+                func=validate_html_report,
+                args_schema=ValidateHtmlReportInput,
                 infer_schema=False,
             ),
             StructuredTool.from_function(

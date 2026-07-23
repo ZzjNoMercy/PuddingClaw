@@ -80,6 +80,25 @@ class VerificationMode(StrEnum):
     GOAL = "goal"
 
 
+class GoalTurnIntent(StrEnum):
+    """How the current user turn relates to a standing Goal."""
+
+    INSPECT_GOAL = "inspect_goal"
+    CONTINUE_GOAL = "continue_goal"
+    REVISE_GOAL = "revise_goal"
+    CONTROL_GOAL = "control_goal"
+    STANDALONE_TASK = "standalone_task"
+    CLARIFY = "clarify"
+
+
+class RunKind(StrEnum):
+    """Execution ownership is distinct from read-only Goal context."""
+
+    GOAL_EXECUTION = "goal_execution"
+    GOAL_INSPECTION = "goal_inspection"
+    STANDALONE = "standalone"
+
+
 class VerificationFailureKind(StrEnum):
     TASK_GAP = "task_gap"
     INFRASTRUCTURE_ERROR = "infrastructure_error"
@@ -268,6 +287,7 @@ class SkillRecommendation(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     evidence: str = ""
     source: str = "task_profile"
+    activation_instruction: str = ""
 
 
 class CapabilityManifest(BaseModel):
@@ -279,7 +299,22 @@ class CapabilityManifest(BaseModel):
     recommended_inactive_skills: list[SkillRecommendation] = Field(default_factory=list)
     enabled_toolsets: list[str] = Field(default_factory=list)
     allowed_tool_names: list[str] = Field(default_factory=list)
+    unavailable_tools: list[dict[str, str]] = Field(default_factory=list)
     tool_schema_hash: str
+    created_at: float = Field(default_factory=time.time)
+
+
+class PermissionManifest(BaseModel):
+    """Model-visible permission state, separate from tool capability state."""
+
+    manifest_id: str
+    run_id: str
+    approval_mode: Literal["strict", "smart"]
+    allowed: list[dict[str, Any]] = Field(default_factory=list)
+    hitl_required: list[dict[str, Any]] = Field(default_factory=list)
+    blocked: list[dict[str, Any]] = Field(default_factory=list)
+    policy_epoch: int = 1
+    policy_version: str = ""
     created_at: float = Field(default_factory=time.time)
 
 
@@ -308,6 +343,8 @@ class DelegationContract(BaseModel):
     semantic_context_refs: list[str] = Field(default_factory=list)
     allowed_skill_activations: list[str] = Field(default_factory=list)
     allowed_toolsets: list[str] = Field(default_factory=list)
+    permission_context: dict[str, Any] = Field(default_factory=dict)
+    declared_artifact_targets: list[str] = Field(default_factory=list)
     expected_output_schema: str = "DelegationResultEnvelope/v1"
     completion_conditions: list[str] = Field(default_factory=list)
     limits: DelegationLimits = Field(default_factory=DelegationLimits)
@@ -390,6 +427,7 @@ class ValidationReceipt(BaseModel):
     goal_revision: int | None = None
     validator_kind: Literal[
         "html_structure",
+        "browser_runtime",
         "javascript_syntax",
         "artifact_ui_contract",
         "project_test",
@@ -402,6 +440,14 @@ class ValidationReceipt(BaseModel):
     checks_passed: int | None = None
     checks_failed: int = 0
     status: Literal["passed", "failed"] = "passed"
+    # A failed validator attempt must say whether the artifact bytes failed,
+    # the invocation was malformed, or the validator infrastructure failed.
+    # Only artifact failures are sticky for the same artifact hash.
+    failure_class: Literal[
+        "artifact_failure",
+        "invocation_failure",
+        "infrastructure_failure",
+    ] | None = None
     blocking: bool = True
     # Completion evidence and commit authority are deliberately separate.
     # A free-form command may still be useful evidence for the rubric, but it
@@ -457,6 +503,17 @@ class ArtifactReference(BaseModel):
     workspace_relative_path: str | None = None
     authorized: bool = True
     permission_grant_id: str | None = None
+    # External writes performed by HostFileBroker carry the immutable
+    # mutation authority that existed at commit time. This prevents a later
+    # projection from losing declared-target authority merely because it was
+    # not represented as a persistent user Grant.
+    mutation_receipt_id: str | None = None
+    authority_kind: Literal[
+        "workspace",
+        "permission_grant",
+        "declared_artifact",
+        "legacy_declared_artifact_backfill",
+    ] | None = None
     run_id: str | None = None
     query_id: str | None = None
     goal_id: str | None = None
@@ -491,6 +548,7 @@ class RunVerificationContract(BaseModel):
     rubric: str = ""
     verification_packs: list[str] = Field(default_factory=list)
     activation_reasons: dict[str, list[str]] = Field(default_factory=dict)
+    browser_e2e_required: bool = False
     base_contract_id: str | None = None
     created_at: float = Field(default_factory=time.time)
 
@@ -539,8 +597,14 @@ class RunRecord(BaseModel):
     session_id: str
     objective: str
     declared_artifact_targets: list[str] = Field(default_factory=list)
+    run_kind: RunKind = RunKind.STANDALONE
     goal_id: str | None = None
+    context_goal_id: str | None = None
+    context_goal_revision: int | None = None
     goal_revision: int | None = None
+    goal_turn_intent: GoalTurnIntent | None = None
+    goal_turn_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    goal_turn_classifier: str | None = None
     follow_up_of_goal_id: str | None = None
     follow_up_of_artifact_ids: list[str] = Field(default_factory=list)
     execution_mode: Literal["native", "delta_repair"] = "native"
@@ -556,6 +620,7 @@ class RunRecord(BaseModel):
     task_profile: RunTaskProfile = Field(default_factory=RunTaskProfile)
     skill_activations: list[SkillActivation] = Field(default_factory=list)
     capability_manifest: CapabilityManifest | None = None
+    permission_manifest: PermissionManifest | None = None
     delegation_contracts: list[DelegationContract] = Field(default_factory=list)
     delegation_results: list[DelegationResultEnvelope] = Field(default_factory=list)
     delegation_events: list[dict[str, Any]] = Field(default_factory=list)
@@ -579,14 +644,23 @@ class RunRecord(BaseModel):
     def _migrate_verification_mode(cls, value: Any) -> Any:
         """Preserve strict semantics for Goal Runs persisted before v3."""
 
-        if not isinstance(value, dict) or value.get("verification_mode"):
+        if not isinstance(value, dict):
             return value
         migrated = dict(value)
-        migrated["verification_mode"] = (
-            VerificationMode.GOAL.value
-            if migrated.get("verification_enabled", True) and migrated.get("goal_id")
-            else VerificationMode.AGENT.value
-        )
+        if not migrated.get("run_kind"):
+            migrated["run_kind"] = (
+                RunKind.GOAL_EXECUTION.value
+                if migrated.get("goal_id")
+                else RunKind.STANDALONE.value
+            )
+        if not migrated.get("verification_mode"):
+            migrated["verification_mode"] = (
+                VerificationMode.GOAL.value
+                if migrated.get("verification_enabled", True)
+                and migrated.get("run_kind") == RunKind.GOAL_EXECUTION.value
+                and migrated.get("goal_id")
+                else VerificationMode.AGENT.value
+            )
         return migrated
 
     @property
@@ -597,7 +671,16 @@ class RunRecord(BaseModel):
     def requires_goal_verification(self) -> bool:
         """Whether this Run may invoke the reviewer and repair loop."""
 
-        return self.verification_enabled and self.verification_mode == VerificationMode.GOAL
+        return (
+            self.run_kind == RunKind.GOAL_EXECUTION
+            and self.goal_id is not None
+            and self.verification_enabled
+            and self.verification_mode == VerificationMode.GOAL
+        )
+
+    @property
+    def executes_goal(self) -> bool:
+        return self.run_kind == RunKind.GOAL_EXECUTION and self.goal_id is not None
 
     def transition(self, next_status: RunStatus, *, now: float | None = None) -> None:
         timestamp = now if now is not None else time.time()

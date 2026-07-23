@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Annotated, Any, NotRequired, TypedDict
 
@@ -63,18 +62,49 @@ class SemanticAssetsMiddleware(AgentMiddleware[SemanticAssetsState, Any, Any]):
             # the user. This progressive index must remain a best-effort
             # enhancement and must never crash an otherwise valid Run.
             return []
-        return [
-            {
-                "id": str(item.get("id") or ""),
-                "name": str(item.get("name") or ""),
-                "type": str(item.get("type") or ""),
-                "description": str(item.get("description") or ""),
-                "path": f"/{str(item.get('path') or '').lstrip('/')}",
-                "frontmatter": item.get("frontmatter") or {},
-            }
-            for item in model.get("semantic_assets") or []
-            if str(item.get("id") or "").strip()
-        ]
+        metadata: list[dict[str, Any]] = []
+        for item in model.get("semantic_assets") or []:
+            asset_id = str(item.get("id") or "").strip()
+            if not asset_id:
+                continue
+            frontmatter = item.get("frontmatter") or {}
+            aliases = frontmatter.get("aliases") if isinstance(frontmatter, dict) else []
+            tags = frontmatter.get("tags") if isinstance(frontmatter, dict) else []
+            metadata.append(
+                {
+                    "id": asset_id,
+                    "name": str(item.get("name") or ""),
+                    "type": str(item.get("type") or ""),
+                    "description": str(item.get("description") or ""),
+                    "path": f"/{str(item.get('path') or '').lstrip('/')}",
+                    # State retains the complete registry metadata for audit and
+                    # non-prompt consumers. _format_assets deliberately exposes
+                    # only the stable selection index below.
+                    "frontmatter": frontmatter,
+                    "aliases": self._string_list(aliases),
+                    "tags": self._string_list(tags),
+                }
+            )
+        return metadata
+
+    @staticmethod
+    def _string_list(value: Any) -> list[str]:
+        if isinstance(value, str):
+            candidates = [value]
+        elif isinstance(value, set):
+            candidates = sorted(value, key=lambda item: str(item))
+        elif isinstance(value, (list, tuple)):
+            candidates = list(value)
+        else:
+            candidates = []
+        return list(
+            dict.fromkeys(
+                normalized
+                for item in candidates
+                for normalized in [str(item or "").strip()]
+                if normalized
+            )
+        )
 
     def before_agent(self, state: SemanticAssetsState, runtime: Any) -> SemanticAssetsStateUpdate:
         # Rebuild on every run so model switches and registry edits cannot leave
@@ -115,14 +145,16 @@ class SemanticAssetsMiddleware(AgentMiddleware[SemanticAssetsState, Any, Any]):
             return "(The selected model declares no semantic assets.)"
         blocks: list[str] = []
         for item in metadata:
-            frontmatter = json.dumps(item.get("frontmatter") or {}, ensure_ascii=False, indent=2)
+            aliases = ", ".join(item.get("aliases") or []) or "<none>"
+            tags = ", ".join(item.get("tags") or []) or "<none>"
             blocks.append(
                 "\n".join(
                     [
                         f"### {item['id']} | {item['name']}",
                         f"Type: {item['type']} | Canonical path: `{item['path']}`",
                         f"Description: {item['description'] or '<none>'}",
-                        f"```json\n{frontmatter}\n```",
+                        f"Aliases: {aliases}",
+                        f"Tags: {tags}",
                     ]
                 )
             )

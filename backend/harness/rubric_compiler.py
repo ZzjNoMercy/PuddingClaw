@@ -25,6 +25,29 @@ _TIME_PATTERN = re.compile(
     r"(?:本|上|下)(?:周|月|季度|年)|"
     r"(?:第一|第二|第三|第四|一|二|三|四)季度)"
 )
+_BROWSER_E2E_PATTERN = re.compile(
+    r"(?is)(?:"
+    r"(?:e2e|end[\s-]*to[\s-]*end|端到端|浏览器(?:运行)?|playwright)"
+    r".{0,24}?(?:测试|验证|验收|检查|跑|运行|执行|开展|进行|开启|要求|必须|需要)"
+    r"|"
+    r"(?:测试|验证|验收|检查|跑|运行|执行|开展|进行|开启|要求|必须|需要)"
+    r".{0,24}?(?:e2e|end[\s-]*to[\s-]*end|端到端|浏览器(?:运行)?|playwright)"
+    r")"
+)
+_BROWSER_E2E_NEGATION = re.compile(
+    r"(?is)(?:不要|无需|不需要|不必|跳过|关闭|禁止|请勿).{0,12}"
+    r"(?:e2e|end[\s-]*to[\s-]*end|端到端|浏览器(?:运行)?|playwright)"
+)
+
+
+def browser_e2e_requested(message: str) -> bool:
+    """Return true only for an explicit positive browser/E2E requirement."""
+
+    return bool(
+        message
+        and _BROWSER_E2E_PATTERN.search(message)
+        and not _BROWSER_E2E_NEGATION.search(message)
+    )
 
 
 @dataclass(frozen=True)
@@ -128,7 +151,7 @@ _PACK_ORDER = ("core", "web_research", "analytics", "artifact", "code")
 class RunRubricCompiler:
     """Build immutable declared contracts and material effective contracts."""
 
-    VERSION = "run-task-profile-v3"
+    VERSION = "run-task-profile-v4"
 
     @classmethod
     def rebuild_declared_contract(
@@ -218,6 +241,9 @@ class RunRubricCompiler:
             packs=packs,
             criteria=criteria,
             activation_reasons=reasons,
+            browser_e2e_required=browser_e2e_requested(
+                context.user_message
+            ),
         )
 
     @classmethod
@@ -297,6 +323,10 @@ class RunRubricCompiler:
             packs=packs,
             criteria=criteria,
             activation_reasons=reasons,
+            browser_e2e_required=bool(
+                (contract.browser_e2e_required if contract else False)
+                or browser_e2e_requested(message)
+            ),
             base_contract_id=(
                 contract.base_contract_id or contract.contract_id
                 if contract is not None
@@ -308,6 +338,8 @@ class RunRubricCompiler:
             and effective.verification_packs == contract.verification_packs
             and effective.criteria == contract.criteria
             and effective.activation_reasons == contract.activation_reasons
+            and effective.browser_e2e_required
+            == contract.browser_e2e_required
         ):
             return contract
         return effective
@@ -389,6 +421,7 @@ class RunRubricCompiler:
         packs: list[str],
         criteria: list[VerificationCriterion],
         activation_reasons: dict[str, list[str]],
+        browser_e2e_required: bool = False,
         base_contract_id: str | None = None,
     ) -> RunVerificationContract:
         rubric_lines = [
@@ -419,6 +452,8 @@ class RunRubricCompiler:
                 + "\n".join(packs)
                 + "\n"
                 + canonical_criteria
+                + "\n"
+                + f"browser_e2e_required={browser_e2e_required}"
             ).encode("utf-8")
         ).hexdigest()[:20]
         return RunVerificationContract(
@@ -429,6 +464,7 @@ class RunRubricCompiler:
             rubric="\n".join(rubric_lines),
             verification_packs=packs,
             activation_reasons=activation_reasons,
+            browser_e2e_required=browser_e2e_required,
             base_contract_id=base_contract_id,
         )
 

@@ -42,6 +42,7 @@ class TodoPatchOperation(BaseModel):
         "validation_receipt",
         "artifact_receipt",
         "query_result",
+        "delivery_bundle",
     ] | None = None
     evidence_refs: list[str] = Field(default_factory=list)
 
@@ -60,6 +61,7 @@ class TodoPatchOperation(BaseModel):
 
 class UpdateTodosInput(BaseModel):
     operations: list[TodoPatchOperation] = Field(min_length=1, max_length=50)
+    expected_revision: int | None = Field(default=None, ge=0)
 
 
 TODO_PATCH_PROMPT = """## `update_todos`
@@ -77,6 +79,10 @@ For validation, artifact delivery, or query-result work, set a
 `completion_contract` when creating the Todo. Completing such a Todo requires
 the corresponding structured IDs in `evidence_refs`; prose claims are not
 evidence. Use validation_receipt, artifact_receipt, or query_result.
+For a report/dashboard/chart Todo that combines refreshed source data, a
+written artifact, and rendered or executable validation, use delivery_bundle.
+It requires at least one query_result, artifact_receipt, and validation_receipt
+ID before completion. Do not create such delivery Todos without this contract.
 
 Do not mark a Todo complete until its result is actually produced and verified.
 Do not delete unfinished work; use `cancel` with an explicit lifecycle record.
@@ -96,6 +102,44 @@ def _stable_created_id(tool_call_id: str, operation_index: int) -> str:
     return f"todo_{digest}"
 
 
+def _normalized_todo_content(value: str) -> str:
+    """Canonical identity used to suppress cross-Run duplicate creates."""
+
+    return " ".join(str(value or "").strip().casefold().split())
+
+
+def _completion_evidence_error(
+    *,
+    todo_id: str,
+    contract: str,
+    refs: list[str],
+    available_evidence: dict[str, set[str]] | None,
+) -> str | None:
+    available = available_evidence or {}
+    if contract == "delivery_bundle":
+        missing_kinds = [
+            kind
+            for kind in ("query_result", "artifact_receipt", "validation_receipt")
+            if not any(ref in available.get(kind, set()) for ref in refs)
+        ]
+        if missing_kinds:
+            return (
+                f"Todo {todo_id} requires delivery_bundle evidence for "
+                + ", ".join(missing_kinds)
+            )
+        return None
+    accepted = available.get(contract, set())
+    if not refs:
+        return f"Todo {todo_id} requires {contract} evidence before completion"
+    unknown = [ref for ref in refs if ref not in accepted]
+    if unknown:
+        return (
+            f"Todo {todo_id} references unknown {contract} evidence: "
+            + ", ".join(unknown)
+        )
+    return None
+
+
 def _apply_operations(
     todos: list[dict[str, Any]],
     operations: list[TodoPatchOperation],
@@ -108,22 +152,39 @@ def _apply_operations(
     now = time.time()
     result = [dict(item) for item in todos if isinstance(item, dict)]
     by_id = {str(item.get("id") or ""): item for item in result if item.get("id")}
+    by_content = {
+        _normalized_todo_content(str(item.get("content") or "")): item
+        for item in result
+        if _normalized_todo_content(str(item.get("content") or ""))
+        and str(item.get("status") or "") != "cancelled"
+    }
     applied: list[dict[str, Any]] = []
 
     for index, operation in enumerate(operations):
         if operation.action == "create":
+            normalized_content = _normalized_todo_content(str(operation.content or ""))
+            duplicate = by_content.get(normalized_content)
+            if duplicate is not None:
+                applied.append(
+                    {
+                        "action": "create",
+                        "todo_id": str(duplicate.get("id") or ""),
+                        "deduplicated": True,
+                    }
+                )
+                continue
             todo_id = _stable_created_id(tool_call_id, index)
             existing = by_id.get(todo_id)
             if existing is None:
                 if operation.status == "completed" and operation.completion_contract:
-                    accepted = (available_evidence or {}).get(operation.completion_contract, set())
-                    if not operation.evidence_refs or any(
-                        ref not in accepted for ref in operation.evidence_refs
-                    ):
-                        raise ValueError(
-                            f"Todo {todo_id} requires known {operation.completion_contract} "
-                            "evidence before completion"
-                        )
+                    evidence_error = _completion_evidence_error(
+                        todo_id=todo_id,
+                        contract=operation.completion_contract,
+                        refs=list(operation.evidence_refs),
+                        available_evidence=available_evidence,
+                    )
+                    if evidence_error:
+                        raise ValueError(evidence_error)
                 item = {
                     "id": todo_id,
                     "content": str(operation.content or "").strip(),
@@ -138,6 +199,7 @@ def _apply_operations(
                 }
                 result.append(item)
                 by_id[todo_id] = item
+                by_content[normalized_content] = item
             applied.append({"action": "create", "todo_id": todo_id})
             continue
 
@@ -160,6 +222,7 @@ def _apply_operations(
         item = by_id.get(todo_id)
         if item is None:
             raise ValueError(f"Unknown todo_id: {todo_id}")
+        prior_normalized_content = _normalized_todo_content(str(item.get("content") or ""))
         if operation.action == "update":
             if operation.content is not None:
                 item["content"] = operation.content.strip()
@@ -174,27 +237,27 @@ def _apply_operations(
             if operation.status == "completed" and item.get("completion_contract"):
                 contract = str(item["completion_contract"])
                 refs = list(item.get("evidence_refs") or [])
-                accepted = (available_evidence or {}).get(contract, set())
-                if not refs or any(ref not in accepted for ref in refs):
-                    raise ValueError(
-                        f"Todo {todo_id} requires known {contract} evidence before completion"
-                    )
+                evidence_error = _completion_evidence_error(
+                    todo_id=todo_id,
+                    contract=contract,
+                    refs=refs,
+                    available_evidence=available_evidence,
+                )
+                if evidence_error:
+                    raise ValueError(evidence_error)
         else:
             if operation.action == "complete":
                 contract = str(item.get("completion_contract") or "")
                 refs = list(dict.fromkeys([*(item.get("evidence_refs") or []), *operation.evidence_refs]))
                 if contract:
-                    accepted = (available_evidence or {}).get(contract, set())
-                    if not refs:
-                        raise ValueError(
-                            f"Todo {todo_id} requires {contract} evidence before completion"
-                        )
-                    unknown = [ref for ref in refs if ref not in accepted]
-                    if unknown:
-                        raise ValueError(
-                            f"Todo {todo_id} references unknown {contract} evidence: "
-                            + ", ".join(unknown)
-                        )
+                    evidence_error = _completion_evidence_error(
+                        todo_id=todo_id,
+                        contract=contract,
+                        refs=refs,
+                        available_evidence=available_evidence,
+                    )
+                    if evidence_error:
+                        raise ValueError(evidence_error)
                     item["evidence_refs"] = refs
             item["status"] = {
                 "start": "in_progress",
@@ -202,6 +265,11 @@ def _apply_operations(
                 "cancel": "cancelled",
                 "reopen": "pending",
             }[operation.action]
+        if prior_normalized_content and by_content.get(prior_normalized_content) is item:
+            by_content.pop(prior_normalized_content, None)
+        next_normalized_content = _normalized_todo_content(str(item.get("content") or ""))
+        if next_normalized_content and str(item.get("status") or "") != "cancelled":
+            by_content[next_normalized_content] = item
         item["updated_at"] = now
         item["last_changed_run_id"] = run_id or None
         item["last_changed_query_id"] = query_id or None
@@ -218,42 +286,107 @@ def _apply_operations(
 def _update_todos(
     runtime: ToolRuntime[Any, Any],
     operations: list[TodoPatchOperation],
+    expected_revision: int | None = None,
 ) -> ToolMessage | Command[Any]:
     context = runtime.context if isinstance(runtime.context, dict) else {}
-    current_todos = list(runtime.state.get("todos") or [])
+    if str(context.get("run_kind") or "") == "goal_inspection":
+        return ToolMessage(
+            content=(
+                "Todo update rejected: this is a read-only Goal inspection Run. "
+                "The user must explicitly request Goal continuation before Todo mutation."
+            ),
+            tool_call_id=runtime.tool_call_id,
+            name="update_todos",
+            status="error",
+        )
     available_evidence = _available_todo_evidence(
         session_id=str(context.get("session_id") or ""),
         run_id=str(context.get("run_id") or ""),
     )
-    try:
-        next_todos, applied = _apply_operations(
-            current_todos,
+    goal_id = str(context.get("goal_id") or "") or None
+    goal_revision = context.get("goal_revision")
+
+    def mutate_authoritative(
+        authoritative_todos: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        next_items, applied_items = _apply_operations(
+            authoritative_todos,
             operations,
             tool_call_id=runtime.tool_call_id,
             run_id=str(context.get("run_id") or ""),
             query_id=str(context.get("query_id") or ""),
             available_evidence=available_evidence,
         )
-    except ValueError as exc:
-        # A stale model-visible ID must not abort the entire Run. Returning a
-        # tool error lets the model reconcile against the authoritative ledger
-        # and recreate genuinely missing work with a fresh stable ID.
-        return ToolMessage(
-            content=(
-                f"Todo update rejected: {exc}. Current ledger: {current_todos}. "
-                "Do not retry unknown IDs; recreate missing work with create operations."
-            ),
-            tool_call_id=runtime.tool_call_id,
-            name="update_todos",
-            status="error",
-        )
+        for item in next_items:
+            item["goal_id"] = goal_id
+            item["goal_revision"] = goal_revision
+        return next_items, applied_items
+
+    session_id = str(context.get("session_id") or "")
+    # Isolated ToolNode tests and third-party graph embeddings may not mount a
+    # Session authority. Preserve local Command semantics there; production
+    # Agent Runs always provide session_id and therefore use the durable path.
+    if not session_id or not session_manager.is_initialized:
+        try:
+            next_todos, applied = mutate_authoritative(
+                list(runtime.state.get("todos") or [])
+            )
+        except ValueError as exc:
+            return ToolMessage(
+                content=(
+                    f"Todo update rejected: {exc}. "
+                    "Do not retry unknown IDs; recreate missing work with create operations."
+                ),
+                tool_call_id=runtime.tool_call_id,
+                name="update_todos",
+                status="error",
+            )
+        receipt = {"ledger_revision": 0, "durably_persisted": False}
+    else:
+        try:
+            receipt = session_manager.apply_todo_patch(
+                session_id,
+                goal_id=goal_id,
+                goal_revision=goal_revision,
+                run_id=(
+                    None
+                    if str(context.get("goal_id") or "")
+                    else str(context.get("run_id") or "") or None
+                ),
+                operation_id=runtime.tool_call_id,
+                expected_revision=expected_revision,
+                mutator=mutate_authoritative,
+            )
+            next_todos = list(receipt["todos"])
+            applied = list(receipt["applied"])
+            receipt["durably_persisted"] = True
+        except (FileNotFoundError, ValueError) as exc:
+            # A stale model-visible ID must not abort the entire Run. Returning a
+            # tool error lets the model reconcile against the authoritative ledger
+            # and recreate genuinely missing work with a fresh stable ID.
+            return ToolMessage(
+                content=(
+                    f"Todo update rejected: {exc}. "
+                    "Do not retry unknown IDs; recreate missing work with create operations."
+                ),
+                tool_call_id=runtime.tool_call_id,
+                name="update_todos",
+                status="error",
+            )
     return Command(
         update={
             "todos": next_todos,
             "messages": [
                 ToolMessage(
-                    content=f"Applied Todo operations: {applied}. Current ledger: {next_todos}",
+                    content=(
+                        f"Applied Todo operations: {applied}. "
+                        f"Ledger revision: {receipt['ledger_revision']}. "
+                        "Durably persisted: "
+                        f"{str(bool(receipt.get('durably_persisted'))).lower()}. "
+                        f"Current ledger: {next_todos}"
+                    ),
                     tool_call_id=runtime.tool_call_id,
+                    name="update_todos",
                 )
             ],
         }
@@ -288,8 +421,9 @@ def _available_todo_evidence(*, session_id: str, run_id: str) -> dict[str, set[s
 async def _aupdate_todos(
     runtime: ToolRuntime[Any, Any],
     operations: list[TodoPatchOperation],
+    expected_revision: int | None = None,
 ) -> ToolMessage | Command[Any]:
-    return _update_todos(runtime, operations)
+    return _update_todos(runtime, operations, expected_revision)
 
 
 class HarnessTodoMiddleware(AgentMiddleware[HarnessTodoState, Any, Any]):

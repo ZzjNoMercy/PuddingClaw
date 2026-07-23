@@ -1,6 +1,9 @@
 """SessionManager 持久化与 reasoning_content 处理测试。"""
 
 import hashlib
+import json
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -91,6 +94,176 @@ def test_todo_ledgers_continue_same_goal_revision_without_cross_contamination(tm
         "todo-scope", goal_id="goal-2", goal_revision=1, run_id="run-4"
     ) == []
     assert session_manager.get_todos("todo-scope", run_id="standalone-run") == []
+
+
+def test_atomic_todo_patch_is_durable_revisioned_and_idempotent(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("todo-atomic")
+
+    def create(items):
+        return [*items, {"id": "todo-1", "content": "查询数据", "status": "pending"}], [
+            {"action": "create", "todo_id": "todo-1"}
+        ]
+
+    first = session_manager.apply_todo_patch(
+        "todo-atomic",
+        goal_id="goal-1",
+        goal_revision=1,
+        operation_id="call-1",
+        mutator=create,
+    )
+    replay = session_manager.apply_todo_patch(
+        "todo-atomic",
+        goal_id="goal-1",
+        goal_revision=1,
+        operation_id="call-1",
+        mutator=lambda _items: (_ for _ in ()).throw(AssertionError("must not replay")),
+    )
+
+    assert first["ledger_revision"] == 1
+    assert first["replayed"] is False
+    assert replay["ledger_revision"] == 1
+    assert replay["replayed"] is True
+    assert session_manager.get_todos(
+        "todo-atomic", goal_id="goal-1", goal_revision=1
+    ) == first["todos"]
+
+
+def test_atomic_todo_patches_merge_concurrent_stable_id_updates(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("todo-concurrent")
+    session_manager.apply_todo_patch(
+        "todo-concurrent",
+        run_id="run-1",
+        operation_id="seed",
+        mutator=lambda _items: (
+            [
+                {"id": "todo-a", "content": "A", "status": "pending"},
+                {"id": "todo-b", "content": "B", "status": "pending"},
+            ],
+            [{"action": "seed"}],
+        ),
+    )
+
+    def update(todo_id):
+        def mutator(items):
+            updated = [dict(item) for item in items]
+            next(item for item in updated if item["id"] == todo_id)["status"] = "completed"
+            return updated, [{"action": "complete", "todo_id": todo_id}]
+
+        return session_manager.apply_todo_patch(
+            "todo-concurrent",
+            run_id="run-1",
+            operation_id=f"complete-{todo_id}",
+            mutator=mutator,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        receipts = list(executor.map(update, ["todo-a", "todo-b"]))
+
+    assert sorted(receipt["ledger_revision"] for receipt in receipts) == [2, 3]
+    snapshot = session_manager.get_todo_snapshot("todo-concurrent", run_id="run-1")
+    assert snapshot["ledger_revision"] == 3
+    assert {item["id"]: item["status"] for item in snapshot["todos"]} == {
+        "todo-a": "completed",
+        "todo-b": "completed",
+    }
+
+
+def test_transactional_todo_ledger_rejects_stale_revision_and_list_overwrite(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("todo-conflict")
+    session_manager.apply_todo_patch(
+        "todo-conflict",
+        run_id="run-1",
+        operation_id="create",
+        mutator=lambda _items: (
+            [{"id": "todo-1", "content": "new", "status": "in_progress"}],
+            [{"action": "create", "todo_id": "todo-1"}],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="revision conflict"):
+        session_manager.apply_todo_patch(
+            "todo-conflict",
+            run_id="run-1",
+            operation_id="stale-reorder",
+            expected_revision=0,
+            mutator=lambda items: (items, [{"action": "reorder"}]),
+        )
+    with pytest.raises(ValueError, match="list replacement"):
+        session_manager.update_todos(
+            "todo-conflict",
+            [{"id": "todo-old", "content": "old", "status": "pending"}],
+            run_id="run-1",
+        )
+    assert session_manager.get_todo_snapshot("todo-conflict", run_id="run-1")["todos"][0][
+        "content"
+    ] == "new"
+
+
+def test_todo_patch_rejects_superseded_goal_revision(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("todo-goal-revision")
+    data = session_manager._read_file("todo-goal-revision")
+    data["harness"] = {
+        "active_goal_id": "goal-1",
+        "goals": {
+            "goal-1": {
+                "goal_id": "goal-1",
+                "status": "active",
+                "objective_revision": 2,
+            }
+        },
+        "runs": {},
+        "run_order": [],
+    }
+    session_manager._write_file("todo-goal-revision", data)
+
+    with pytest.raises(ValueError, match="Goal revision conflict"):
+        session_manager.apply_todo_patch(
+            "todo-goal-revision",
+            goal_id="goal-1",
+            goal_revision=1,
+            operation_id="stale-goal-write",
+            mutator=lambda items: (items, []),
+        )
+
+
+def test_running_goal_inspection_projects_context_goal_todos(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("todo-inspection")
+    todos = [{"id": "todo-1", "content": "保留进度", "status": "in_progress"}]
+    session_manager.update_todos(
+        "todo-inspection", todos, goal_id="goal-1", goal_revision=1
+    )
+    data = session_manager._read_file("todo-inspection")
+    data["harness"] = {
+        "active_goal_id": "goal-1",
+        "goals": {"goal-1": {"goal_id": "goal-1", "objective_revision": 1, "status": "active"}},
+        "runs": {
+            "run-inspect": {
+                "run_id": "run-inspect",
+                "run_kind": "goal_inspection",
+                "context_goal_id": "goal-1",
+                "context_goal_revision": 1,
+                "goal_id": None,
+                "status": "running",
+            }
+        },
+        "run_order": ["run-inspect"],
+        "latest_run_id": "run-inspect",
+    }
+    session_manager._write_file("todo-inspection", data)
+
+    snapshot = session_manager.get_todo_snapshot("todo-inspection")
+    assert snapshot["todos"] == todos
+    assert snapshot["authority"] == {
+        "kind": "goal",
+        "goal_id": "goal-1",
+        "goal_revision": 1,
+    }
+    assert snapshot["ledger_revision"] == 1
 
 
 def test_raw_message_todos_project_only_current_goal_or_nonterminal_run(tmp_path):
@@ -224,7 +397,7 @@ def test_load_session_for_agent_excludes_cross_run_reasoning(tmp_path):
     assert "reasoning_content" not in assistant
 
 
-def test_load_session_for_agent_excludes_cross_run_tool_output(tmp_path):
+def test_load_session_for_agent_restores_cross_run_tool_output_as_evidence(tmp_path):
     session_manager.initialize(tmp_path)
     session_manager.create_session("agent-tool-output-session")
 
@@ -252,10 +425,394 @@ def test_load_session_for_agent_excludes_cross_run_tool_output(tmp_path):
     messages = session_manager.load_session_for_agent("agent-tool-output-session")
     assistant = messages[0]
     assert assistant["role"] == "assistant"
-    assert "tool_calls" not in assistant
     assert assistant["content"] == "现在查询比亚迪 2023 年 5 月销量。"
-    assert "历史工具结果摘要" not in assistant["content"]
-    assert "205390" not in assistant["content"]
+    assert len(assistant["tool_calls"]) == 6
+    restored = assistant["tool_calls"][-1]
+    assert restored["output"].endswith("205390。")
+    assert restored["historical"] is True
+    assert restored["evidence_id"].startswith("evidence-")
+    assert restored["raw_output_ref"]["kind"] == "session_tool_call"
+
+
+def test_read_evidence_resolves_large_result_from_source_query(tmp_path):
+    (tmp_path / "backend").mkdir()
+    session_manager.initialize(tmp_path / "backend")
+    session_manager.create_session("evidence-session")
+    workspace = tmp_path / "workspace"
+    raw_dir = (
+        workspace
+        / ".puddingclaw"
+        / "large_tool_results"
+        / "evidence-session"
+        / "query-old"
+    )
+    raw_dir.mkdir(parents=True)
+    raw_text = "complete historical payload"
+    (raw_dir / "call-large").write_text(raw_text, encoding="utf-8")
+    source_hash = "sha256:" + hashlib.sha256(raw_text.encode()).hexdigest()
+    session_manager.upsert_assistant_message(
+        "evidence-session",
+        content="old result",
+        query_id="query-old",
+        tool_calls=[
+            {
+                "tool": "read_file",
+                "id": "call-large",
+                "input": {"file_path": "/workspace/big.txt"},
+                "output": "Result saved to /large_tool_results/call-large",
+                "source_hash": source_hash,
+            }
+        ],
+    )
+
+    history = session_manager.load_session_for_agent("evidence-session")
+    evidence_id = history[0]["tool_calls"][0]["evidence_id"]
+    restored = session_manager.read_evidence(
+        "evidence-session",
+        evidence_id,
+        workspace_path=workspace,
+    )
+
+    assert restored["status"] == "success"
+    assert restored["content"] == raw_text
+    assert restored["raw_result_available"] is True
+    assert restored["hash_matches"] is True
+
+
+def test_read_sql_evidence_pages_saved_jsonl_without_preview_fallback(tmp_path):
+    base_dir = tmp_path / "backend"
+    base_dir.mkdir()
+    session_manager.initialize(base_dir)
+    session_manager.create_session("sql-evidence-session")
+    result_dir = base_dir / "data" / "database-query-results"
+    result_dir.mkdir(parents=True)
+    (result_dir / "qr-evidence.jsonl").write_text(
+        '{"id":1}\n{"id":2}\n{"id":3}\n',
+        encoding="utf-8",
+    )
+    artifact = result_dir / "qr-evidence.jsonl"
+    catalog_dir = result_dir / ".catalog"
+    catalog_dir.mkdir()
+    (catalog_dir / "qr-evidence.json").write_text(
+        json.dumps(
+            {
+                "result_id": "qr-evidence",
+                "session_id": "sql-evidence-session",
+                "tool_call_id": "call-sql",
+                "artifact_path": "data/database-query-results/qr-evidence.jsonl",
+                "artifact_format": "jsonl",
+                "artifact_sha256": f"sha256:{hashlib.sha256(artifact.read_bytes()).hexdigest()}",
+                "row_count": 3,
+                "status": "ready",
+                "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    session_manager.upsert_assistant_message(
+        "sql-evidence-session",
+        content="query done",
+        query_id="query-sql",
+        tool_calls=[
+            {
+                "tool": "database_sql_execute",
+                "id": "call-sql",
+                "input": {"generation_id": "gen-1"},
+                "output": (
+                    "generation_id：gen-1\nvalidation_receipt_id：receipt-1\n"
+                    "sql_sha256：sha256:abc\nresult_id：qr-evidence\npreview only"
+                ),
+            }
+        ],
+    )
+
+    history = session_manager.load_session_for_agent("sql-evidence-session")
+    call = history[0]["tool_calls"][0]
+    restored = session_manager.read_evidence(
+        "sql-evidence-session",
+        call["evidence_id"],
+        page=2,
+        page_size=2,
+    )
+
+    assert call["raw_output_ref"]["generation_id"] == "gen-1"
+    assert call["raw_output_ref"]["validation_receipt_id"] == "receipt-1"
+    assert restored["rows"] == [{"id": 3}]
+    assert restored["has_next"] is False
+    (result_dir / "qr-evidence.jsonl").unlink()
+    expired = session_manager.read_evidence(
+        "sql-evidence-session",
+        call["evidence_id"],
+    )
+    assert expired["status"] == "missing"
+    assert expired["output_complete"] is False
+    assert expired["raw_result_available"] is False
+
+
+def test_sql_evidence_rejects_wrong_owner_expiry_and_tampering(tmp_path):
+    base_dir = tmp_path / "backend"
+    base_dir.mkdir()
+    session_manager.initialize(base_dir)
+    session_manager.create_session("sql-owner-session")
+    result_dir = base_dir / "data" / "database-query-results"
+    catalog_dir = result_dir / ".catalog"
+    catalog_dir.mkdir(parents=True)
+    artifact = result_dir / "qr-secure.jsonl"
+    artifact.write_text('{"id":1}\n', encoding="utf-8")
+    catalog = {
+        "result_id": "qr-secure",
+        "session_id": "sql-owner-session",
+        "tool_call_id": "call-secure",
+        "artifact_path": "data/database-query-results/qr-secure.jsonl",
+        "artifact_format": "jsonl",
+        "artifact_sha256": f"sha256:{hashlib.sha256(artifact.read_bytes()).hexdigest()}",
+        "row_count": 1,
+        "status": "ready",
+        "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+    }
+    catalog_path = catalog_dir / "qr-secure.json"
+    catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+    session_manager.upsert_assistant_message(
+        "sql-owner-session",
+        query_id="query-secure",
+        content="done",
+        tool_calls=[
+            {
+                "tool": "database_sql_execute",
+                "id": "call-secure",
+                "output": "result_id：qr-secure",
+            }
+        ],
+    )
+    evidence_id = session_manager.load_session_for_agent("sql-owner-session")[0]["tool_calls"][0][
+        "evidence_id"
+    ]
+
+    catalog["session_id"] = "another-session"
+    catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+    assert session_manager.read_evidence("sql-owner-session", evidence_id)["status"] == "unauthorized"
+
+    catalog["session_id"] = "sql-owner-session"
+    catalog["expires_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+    assert session_manager.read_evidence("sql-owner-session", evidence_id)["status"] == "expired"
+
+    catalog["expires_at"] = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+    artifact.write_text('{"id":999}\n', encoding="utf-8")
+    corrupted = session_manager.read_evidence("sql-owner-session", evidence_id)
+    assert corrupted["status"] == "corrupt"
+    assert corrupted["output_complete"] is False
+    assert corrupted["rows"] == []
+
+
+def test_standalone_run_inherits_latest_unfinished_todo_ledger(tmp_path):
+    from harness.models import RunOutcome, RunRecord
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("todo-continuation-session")
+    prior = RunRecord(
+        run_id="run-prior",
+        query_id="query-prior",
+        session_id="todo-continuation-session",
+        objective="prepare report",
+    )
+    session_manager.upsert_run_state(
+        "todo-continuation-session",
+        prior.model_dump(mode="json"),
+    )
+    session_manager.update_todos(
+        "todo-continuation-session",
+        [{"id": "todo-stable", "content": "finish report", "status": "in_progress"}],
+        run_id=prior.run_id,
+    )
+    terminal = prior.model_copy(update={"outcome": RunOutcome.FAILED})
+    session_manager.terminalize_run_state(
+        "todo-continuation-session",
+        prior.run_id,
+        terminal.model_dump(mode="json"),
+    )
+    current = RunRecord(
+        run_id="run-current",
+        query_id="query-current",
+        session_id="todo-continuation-session",
+        objective="continue",
+    )
+    session_manager.upsert_run_state(
+        "todo-continuation-session",
+        current.model_dump(mode="json"),
+    )
+
+    inherited = session_manager.inherit_unfinished_todos_for_run(
+        "todo-continuation-session",
+        current.run_id,
+        continuation_requested=True,
+    )
+
+    assert inherited == [
+        {"id": "todo-stable", "content": "finish report", "status": "in_progress"}
+    ]
+    assert session_manager.get_todos(
+        "todo-continuation-session",
+        run_id=current.run_id,
+    ) == inherited
+
+
+def test_unrelated_standalone_run_does_not_inherit_todos(tmp_path):
+    from harness.models import RunRecord
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("todo-isolation-session")
+    prior = RunRecord(
+        run_id="run-report",
+        query_id="query-report",
+        session_id="todo-isolation-session",
+        objective="prepare report",
+    )
+    current = RunRecord(
+        run_id="run-weather",
+        query_id="query-weather",
+        session_id="todo-isolation-session",
+        objective="what is the weather",
+    )
+    session_manager.upsert_run_state("todo-isolation-session", prior.model_dump(mode="json"))
+    session_manager.update_todos(
+        "todo-isolation-session",
+        [{"id": "todo-report", "content": "finish report", "status": "in_progress"}],
+        run_id=prior.run_id,
+    )
+    session_manager.upsert_run_state("todo-isolation-session", current.model_dump(mode="json"))
+
+    assert session_manager.inherit_unfinished_todos_for_run(
+        "todo-isolation-session",
+        current.run_id,
+        continuation_requested=False,
+    ) == []
+
+
+def test_read_evidence_disambiguates_reused_tool_call_ids_by_query(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("reused-evidence-session")
+    for query_id, output in (("query-one", "FIRST"), ("query-two", "SECOND")):
+        session_manager.upsert_assistant_message(
+            "reused-evidence-session",
+            query_id=query_id,
+            content=output,
+            tool_calls=[{"tool": "read_file", "id": "call-reused", "output": output}],
+        )
+
+    history = session_manager.load_session_for_agent("reused-evidence-session")
+    second_evidence = history[1]["tool_calls"][0]["evidence_id"]
+    restored = session_manager.read_evidence("reused-evidence-session", second_evidence)
+
+    assert restored["content"] == "SECOND"
+    assert restored["hash_matches"] is True
+
+
+def test_legacy_same_hash_tool_calls_keep_distinct_query_provenance(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("same-hash-evidence-session")
+    for query_id in ("query-one", "query-two"):
+        session_manager.upsert_assistant_message(
+            "same-hash-evidence-session",
+            query_id=query_id,
+            content="SAME",
+            tool_calls=[
+                {
+                    "tool": "read_file",
+                    "id": "call-reused",
+                    "output": "SAME",
+                }
+            ],
+        )
+
+    history = session_manager.load_session_for_agent(
+        "same-hash-evidence-session"
+    )
+    evidence_ids = [
+        message["tool_calls"][0]["evidence_id"]
+        for message in history
+    ]
+
+    assert len(set(evidence_ids)) == 2
+    assert session_manager.get_evidence(
+        "same-hash-evidence-session",
+        evidence_ids[0],
+    )["source_query_id"] == "query-one"
+    assert session_manager.get_evidence(
+        "same-hash-evidence-session",
+        evidence_ids[1],
+    )["source_query_id"] == "query-two"
+
+
+def test_missing_tool_output_is_incomplete_interruption() -> None:
+    status, complete = session_manager._evidence_status(
+        {
+            "output": (
+                "Tool execution did not return a result before the agent "
+                "finished."
+            ),
+            "summary_source": "missing_tool_output",
+            "is_error": True,
+            "completed_at": 1.0,
+        },
+        {"role": "assistant"},
+    )
+
+    assert status == "interrupted"
+    assert complete is False
+
+
+def test_legacy_result_owner_requires_one_occurrence_not_one_id_value(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("ambiguous-owner-session")
+    for query_id in ("query-one", "query-two"):
+        session_manager.upsert_assistant_message(
+            "ambiguous-owner-session",
+            query_id=query_id,
+            content="done",
+            tool_calls=[
+                {
+                    "tool": "database_sql_execute",
+                    "id": "call-shared",
+                    "output": "result_id：qr-shared",
+                }
+            ],
+        )
+
+    assert session_manager.result_owner_tool_call(
+        "ambiguous-owner-session",
+        "qr-shared",
+    ) is None
+
+
+def test_archive_legacy_tool_calls_get_unique_ids_and_are_deleted_with_session(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("archive-evidence-session")
+    session_manager.save_message("archive-evidence-session", "user", "head")
+    for output in ("secret-one", "secret-two"):
+        session_manager.save_message(
+            "archive-evidence-session",
+            "assistant",
+            output,
+            tool_calls=[{"tool": "read_file", "output": output}],
+        )
+    session_manager.save_message("archive-evidence-session", "user", "tail")
+    session_manager.middle_trim_history(
+        "archive-evidence-session",
+        "summary",
+        1,
+        3,
+    )
+
+    history = session_manager.load_session_for_agent("archive-evidence-session")
+    calls = [call for message in history for call in message.get("tool_calls") or []]
+    assert len({call["id"] for call in calls}) == 2
+    assert all(call["evidence_id"].startswith("evidence-") for call in calls)
+
+    session_manager.delete_session("archive-evidence-session")
+    session_manager.create_session("archive-evidence-session")
+    assert session_manager.load_session("archive-evidence-session") == []
 
 
 def test_terminal_run_persists_structured_handoff(tmp_path):
@@ -649,6 +1206,111 @@ def test_update_trace_keeps_history_without_duplicating_latest_trace(tmp_path):
     assert "trace" not in trace_sidecar
 
 
+def test_update_trace_records_cross_run_cache_continuity(tmp_path, monkeypatch):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("trace-cache-continuity")
+    metrics: list[tuple[str, int | float]] = []
+    monkeypatch.setattr(
+        "graph.session_manager.emit_harness_metric",
+        lambda _logger, name, **kwargs: metrics.append((name, kwargs["value"])),
+    )
+
+    def model_input(
+        *,
+        span_id: str,
+        call_index: int,
+        system_hash: str,
+        tool_hash: str,
+        message_hash: str,
+        messages: list[dict],
+    ) -> dict:
+        return {
+            "id": span_id,
+            "type": "model_input",
+            "started_at": float(call_index),
+            "metadata": {"model_call_index": call_index},
+            "output": {
+                "messages_preview": messages,
+                "model_call_contract": {
+                    "fingerprints": {
+                        "system_prompt_hash": system_hash,
+                        "tool_schema_hash": tool_hash,
+                        "messages_hash": message_hash,
+                    }
+                },
+            },
+        }
+
+    shared_messages = [
+        {"role": "human", "content": "first", "chars": 5},
+        {"role": "ai", "content": "working", "chars": 7},
+    ]
+    first = {
+        "trace_id": "trace-cache-1",
+        "query_id": "query-cache-1",
+        "spans": [
+            model_input(
+                span_id="first-input",
+                call_index=0,
+                system_hash="system-stable",
+                tool_hash="tools-stable",
+                message_hash="messages-first",
+                messages=[
+                    {"role": "system", "content": "stable", "chars": 6},
+                    *shared_messages,
+                ],
+            )
+        ],
+    }
+    second = {
+        "trace_id": "trace-cache-2",
+        "query_id": "query-cache-2",
+        "spans": [
+            model_input(
+                span_id="second-input",
+                call_index=0,
+                system_hash="system-stable",
+                tool_hash="tools-stable",
+                message_hash="messages-second",
+                messages=[
+                    {"role": "system", "content": "stable", "chars": 6},
+                    *shared_messages,
+                    {"role": "human", "content": "continue", "chars": 8},
+                ],
+            )
+        ],
+    }
+
+    session_manager.update_trace(
+        "trace-cache-continuity",
+        first,
+        query_id="query-cache-1",
+    )
+    saved = session_manager.update_trace(
+        "trace-cache-continuity",
+        second,
+        query_id="query-cache-2",
+    )
+
+    assert saved["cache_continuity"] == {
+        "previous_query_id": "query-cache-1",
+        "system_prompt_hash_match": True,
+        "tool_schema_hash_match": True,
+        "messages_hash_match": False,
+        "previous_message_count": 2,
+        "current_message_count": 3,
+        "message_prefix_match_count": 2,
+        "message_prefix_ratio": 1.0,
+        "stable_boundary_match": True,
+        "full_previous_request_prefix_match": True,
+    }
+    assert metrics == [
+        ("cache_continuity_system_prompt_match", 1),
+        ("cache_continuity_tool_schema_match", 1),
+        ("cache_continuity_message_prefix_ratio", 1.0),
+    ]
+
+
 def test_legacy_embedded_traces_are_migrated_once(tmp_path):
     import json
 
@@ -835,6 +1497,270 @@ def test_delivered_artifact_registry_resolves_standalone_follow_up_without_scrat
     assert session_manager.resolve_follow_up_artifacts(
         "artifact-followup-session", "刚才解释不对"
     ) == []
+
+
+def test_legacy_declared_write_is_hash_bound_and_inherited_by_same_goal(tmp_path):
+    from harness.coordinators import HarnessRunCoordinator
+    from harness.deterministic_checks import _evaluate_artifact_delivery
+    from harness.models import RunStatus
+
+    state = tmp_path / "state"
+    report_dir = tmp_path / "reports"
+    state.mkdir()
+    report_dir.mkdir()
+    report = report_dir / "product-config-v2.html"
+    content = "<!doctype html><title>V2</title>\n"
+    report.write_text(content, encoding="utf-8")
+
+    session_manager.initialize(state)
+    session_manager.create_session("legacy-write-backfill-session")
+    coordinator = HarnessRunCoordinator(session_manager)
+    run, goal = coordinator.start_run(
+        session_id="legacy-write-backfill-session",
+        query_id="query-legacy-write",
+        objective=f"写入 V2 HTML 到 {report}",
+        goal_mode=True,
+        verification_enabled=False,
+    )
+    assert goal is not None
+    assert str(report) in run.declared_artifact_targets
+    coordinator.transition(run, RunStatus.RUNNING)
+    session_manager.upsert_assistant_message(
+        "legacy-write-backfill-session",
+        query_id=run.query_id,
+        content=f"已写入 {report}",
+        tool_calls=[
+            {
+                "id": "call-legacy-write",
+                "tool": "write_file",
+                "input": {
+                    "file_path": str(report),
+                    "content": content,
+                },
+                "output": f"Wrote {report}",
+                "status": "success",
+                "source_run_id": run.run_id,
+                "completed_at": 10.0,
+            }
+        ],
+        status="completed",
+    )
+
+    backfilled = session_manager.backfill_goal_declared_artifact_writes(
+        "legacy-write-backfill-session",
+        goal.goal_id,
+        goal.objective_revision,
+    )
+
+    assert len(backfilled) == 1
+    artifact = backfilled[0]
+    assert artifact["path"] == str(report.resolve())
+    assert artifact["authorized"] is True
+    assert artifact["authority_kind"] == "legacy_declared_artifact_backfill"
+    assert artifact["permission_grant_id"] == f"declared-artifact:{run.run_id}"
+    assert artifact["mutation_receipt_id"] == (
+        "legacy-write-backfill:call-legacy-write"
+    )
+    assert artifact["content_sha256"] == (
+        "sha256:" + hashlib.sha256(content.encode()).hexdigest()
+    )
+    assert (
+        session_manager.backfill_goal_declared_artifact_writes(
+            "legacy-write-backfill-session",
+            goal.goal_id,
+            goal.objective_revision,
+        )
+        == []
+    )
+
+    inherited = [
+        item["payload"]
+        for item in session_manager.resolve_goal_evidence_records(
+            "legacy-write-backfill-session",
+            goal.goal_id,
+            goal.objective_revision,
+        )
+        if isinstance(item.get("payload"), dict)
+    ]
+    evaluation = _evaluate_artifact_delivery(
+        "artifact_delivery",
+        {
+            "run_id": "run-same-goal-continuation",
+            "goal_id": goal.goal_id,
+            "goal_revision": goal.objective_revision,
+            "declared_artifact_targets": [str(report)],
+            "goal_evidence_records": inherited,
+            "permission_grants_authoritative": True,
+            "active_permission_grant_ids": [],
+            "final_content": f"已交付 {report}",
+            "evaluation_phase": "terminal",
+        },
+    )
+    assert evaluation.passed is True
+
+    report.write_text("<!doctype html><title>changed</title>\n", encoding="utf-8")
+    changed = _evaluate_artifact_delivery(
+        "artifact_delivery",
+        {
+            "run_id": "run-same-goal-continuation",
+            "goal_id": goal.goal_id,
+            "goal_revision": goal.objective_revision,
+            "declared_artifact_targets": [str(report)],
+            "goal_evidence_records": inherited,
+            "permission_grants_authoritative": True,
+            "active_permission_grant_ids": [],
+            "final_content": f"已交付 {report}",
+            "evaluation_phase": "terminal",
+        },
+    )
+    assert changed.passed is False
+    assert "发生变化" in str(changed.gap)
+
+
+def test_goal_revision_preserves_only_hash_bound_artifact_evidence(tmp_path):
+    from harness.coordinators import HarnessRunCoordinator
+    from harness.deterministic_checks import _evaluate_artifact_delivery
+    from harness.models import RunStatus
+
+    state = tmp_path / "state"
+    report = tmp_path / "report.html"
+    content = "<!doctype html><title>stable</title>\n"
+    state.mkdir()
+    report.write_text(content, encoding="utf-8")
+    session_manager.initialize(state)
+    session_manager.create_session("revision-artifact-session")
+    coordinator = HarnessRunCoordinator(session_manager)
+    run, goal = coordinator.start_run(
+        session_id="revision-artifact-session",
+        query_id="query-write",
+        objective=f"写入报告到 {report}",
+        goal_mode=True,
+        verification_enabled=False,
+    )
+    assert goal is not None
+    coordinator.transition(run, RunStatus.RUNNING)
+    session_manager.upsert_assistant_message(
+        "revision-artifact-session",
+        query_id=run.query_id,
+        content=f"已写入 {report}",
+        tool_calls=[
+            {
+                "id": "call-write-stable",
+                "tool": "write_file",
+                "input": {"file_path": str(report), "content": content},
+                "output": f"Wrote {report}",
+                "status": "success",
+                "source_run_id": run.run_id,
+                "completed_at": 10.0,
+            }
+        ],
+        status="completed",
+    )
+    session_manager.backfill_goal_declared_artifact_writes(
+        "revision-artifact-session",
+        goal.goal_id,
+        1,
+    )
+
+    revised = session_manager.update_goal_objective(
+        "revision-artifact-session",
+        goal.goal_id,
+        objective=f"仍写入 {report}，但不要复制依赖",
+        expected_revision=1,
+        contract=None,
+    )
+
+    assert revised["objective_revision"] == 2
+    assert revised["evidence_refs"]
+    resolved = session_manager.resolve_goal_evidence_records(
+        "revision-artifact-session",
+        goal.goal_id,
+        2,
+    )
+    artifact = next(item for item in resolved if item["kind"] == "artifact")
+    assert artifact["goal_revision"] == 1
+    assert artifact["content_sha256"] == (
+        "sha256:" + hashlib.sha256(content.encode()).hexdigest()
+    )
+    inherited_records = [
+        {
+            **dict(item["payload"]),
+            "revision_inherited": item["goal_revision"] < 2,
+        }
+        for item in resolved
+        if isinstance(item.get("payload"), dict)
+    ]
+    evaluation = _evaluate_artifact_delivery(
+        "artifact_delivery",
+        {
+            "run_id": "run-revision-2",
+            "goal_id": goal.goal_id,
+            "goal_revision": 2,
+            "declared_artifact_targets": [str(report)],
+            "goal_evidence_records": inherited_records,
+            "permission_grants_authoritative": True,
+            "active_permission_grant_ids": [],
+            "final_content": f"已交付 {report}",
+            "evaluation_phase": "terminal",
+        },
+    )
+    assert evaluation.passed is True
+
+
+def test_legacy_declared_write_backfill_rejects_symlink_target(tmp_path):
+    from harness.coordinators import HarnessRunCoordinator
+    from harness.models import RunStatus
+
+    state = tmp_path / "state"
+    report_dir = tmp_path / "reports"
+    state.mkdir()
+    report_dir.mkdir()
+    real_report = report_dir / "real-report.html"
+    declared_link = report_dir / "product-config-v2.html"
+    content = "<!doctype html><title>V2</title>\n"
+    real_report.write_text(content, encoding="utf-8")
+    declared_link.symlink_to(real_report)
+
+    session_manager.initialize(state)
+    session_manager.create_session("legacy-symlink-backfill-session")
+    coordinator = HarnessRunCoordinator(session_manager)
+    run, goal = coordinator.start_run(
+        session_id="legacy-symlink-backfill-session",
+        query_id="query-legacy-symlink",
+        objective=f"写入 V2 HTML 到 {declared_link}",
+        goal_mode=True,
+        verification_enabled=False,
+    )
+    assert goal is not None
+    coordinator.transition(run, RunStatus.RUNNING)
+    session_manager.upsert_assistant_message(
+        "legacy-symlink-backfill-session",
+        query_id=run.query_id,
+        content=f"已写入 {declared_link}",
+        tool_calls=[
+            {
+                "id": "call-legacy-symlink-write",
+                "tool": "write_file",
+                "input": {
+                    "file_path": str(declared_link),
+                    "content": content,
+                },
+                "output": f"Wrote {declared_link}",
+                "status": "success",
+                "source_run_id": run.run_id,
+            }
+        ],
+        status="completed",
+    )
+
+    assert (
+        session_manager.backfill_goal_declared_artifact_writes(
+            "legacy-symlink-backfill-session",
+            goal.goal_id,
+            goal.objective_revision,
+        )
+        == []
+    )
 
 
 def test_follow_up_registry_rejects_deleted_or_externally_modified_targets(tmp_path):

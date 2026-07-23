@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -172,6 +173,8 @@ def test_completion_gate_loops_before_rubric_grader(tmp_path):
     assert "accepted_closure_methods" in update["messages"][0].content
     assert events[-1]["repair_contract"]["version"] == "repair-contract/v1"
     assert events[-1]["type"] == "deterministic_checks_completed"
+    assert events[-1]["will_continue"] is True
+    assert events[-1]["terminal"] is False
 
 
 def test_completion_gate_reads_current_run_artifact_receipt_from_session(tmp_path):
@@ -360,6 +363,61 @@ def test_completion_gate_ignores_growing_receipt_evidence_for_stagnation(tmp_pat
     assert second is not None
     assert second["_completion_gate_status"] == "failed"
     assert second["_completion_gate_stagnation_count"] == 1
+
+
+def test_completion_gate_terminates_validator_protocol_error_without_repair_loop(
+    tmp_path,
+    monkeypatch,
+):
+    from graph.deepagents_manager import PuddingClawRubricMiddleware
+    from harness.models import (
+        CriterionEvaluation,
+        VerificationFailureKind,
+        VerifierKind,
+    )
+    from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
+
+    contract = RunRubricCompiler.compile(
+        RubricBuildContext(user_message="生成 HTML 报告", force_required=True)
+    )
+    assert contract is not None
+    middleware = PuddingClawRubricMiddleware(model=SimpleNamespace(), max_iterations=2)
+    monkeypatch.setattr(
+        "graph.deepagents_manager.evaluate_deterministic_criteria",
+        lambda _contract, _state: [
+            CriterionEvaluation(
+                criterion_id="code_validation",
+                name="code_validation",
+                passed=False,
+                verifier=VerifierKind.DETERMINISTIC,
+                gap="ValidationReceipt 未生成",
+                failure_kind=VerificationFailureKind.VALIDATOR_PROTOCOL_ERROR,
+            )
+        ],
+    )
+    events: list[dict] = []
+
+    update = middleware._completion_gate_update(
+        {
+            "messages": [AIMessage(content="HTML 已生成")],
+            "rubric": contract.rubric,
+            "verification_contract": contract.model_dump(mode="json"),
+        },
+        SimpleNamespace(
+            context={"workspace_path": str(tmp_path)},
+            stream_writer=events.append,
+        ),
+    )
+
+    assert update is not None
+    assert update["_completion_gate_status"] == "infrastructure_error"
+    assert update["_rubric_status"] == "infrastructure_error"
+    assert update["_completion_gate_stagnation_count"] == 0
+    assert update["_completion_gate_failure_signature"] == ""
+    assert "jump_to" not in update
+    assert "messages" not in update
+    assert events[-1]["will_continue"] is False
+    assert events[-1]["repair_contract"] is None
 
 
 def test_non_goal_rubric_middleware_emits_no_completion_activity(tmp_path):
@@ -591,6 +649,145 @@ def test_published_verification_summary_keeps_only_user_relevant_outcomes():
     )
     assert "execute" not in summary
     assert "Harness" not in summary
+
+
+def test_terminal_verification_guidance_tells_goal_user_how_to_continue():
+    from graph.deepagents_manager import _terminal_verification_guidance
+    from harness.models import GoalStatus, VerificationStatus
+
+    task_gap = _terminal_verification_guidance(
+        VerificationStatus.FAILED,
+        has_goal=True,
+        goal_status=GoalStatus.ACTIVE,
+    )
+    infrastructure = _terminal_verification_guidance(
+        VerificationStatus.INFRASTRUCTURE_ERROR,
+        has_goal=True,
+        goal_status=GoalStatus.ACTIVE,
+    )
+
+    assert "继续完成剩余工作" in task_gap
+    assert "Goal、Todo、产物和证据均已保留" in task_gap
+    assert "重试验收" in infrastructure
+    assert "任务结果尚未被判定失败" in infrastructure
+
+
+def test_goal_turn_recent_context_projects_interrupted_copy_without_raw_output(
+    monkeypatch,
+):
+    from graph import deepagents_manager as manager_module
+
+    monkeypatch.setattr(
+        manager_module.session_manager,
+        "get_run_state",
+        lambda _session_id: {
+            "run_id": "run-copy",
+            "goal_id": "goal-1",
+            "status": "cancelled",
+            "outcome": "cancelled",
+            "error": "client_cancelled",
+        },
+    )
+    monkeypatch.setattr(
+        manager_module.session_manager,
+        "load_session",
+        lambda _session_id: [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "copy-echarts",
+                        "tool": "copy_file",
+                        "input": json.dumps(
+                            {
+                                "source_path": "/vendor/echarts.min.js",
+                                "target_path": "/report/echarts.min.js",
+                            }
+                        ),
+                        "output": "large private output that must not reach the router",
+                        "status": "running",
+                    }
+                ],
+            }
+        ],
+    )
+
+    context = manager_module.DeepAgentsAgentManager._goal_turn_recent_execution_context(
+        session_id="session-1",
+        goal={"goal_id": "goal-1"},
+    )
+
+    assert context["latest_run"]["status"] == "cancelled"
+    assert context["latest_run"]["error"] == "client_cancelled"
+    assert context["recent_tools"] == [
+        {
+            "tool": "copy_file",
+            "target": "/report/echarts.min.js",
+            "status": "running",
+            "is_error": "false",
+        }
+    ]
+    assert "private output" not in json.dumps(context)
+
+
+def test_goal_start_product_control_bypasses_semantic_router(monkeypatch, tmp_path):
+    from graph import deepagents_manager as manager_module
+    from graph.session_manager import session_manager
+    from harness.models import GoalRecord
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("goal-product-start")
+    goal = GoalRecord(
+        goal_id="goal-product-start",
+        session_id="goal-product-start",
+        objective="完成当前目标",
+    )
+    session_manager.upsert_goal_state(
+        "goal-product-start",
+        goal.model_dump(mode="json"),
+    )
+    runtime = manager_module.DeepAgentsAgentManager()
+
+    async def semantic_router_must_not_run(**_kwargs):
+        raise AssertionError("product Goal start must bypass semantic routing")
+
+    async def fake_single_run(**kwargs):
+        decision = kwargs["goal_turn_decision"]
+        assert decision.intent.value == "continue_goal"
+        assert decision.classifier == "product_control"
+        assert decision.reason == "explicit_goal_start_control"
+        assert kwargs["goal_id"] == goal.goal_id
+        assert kwargs["run_objective"] == goal.objective
+        yield runtime._sse(
+            "done",
+            {
+                "content": "",
+                "goal_id": goal.goal_id,
+            },
+        )
+
+    monkeypatch.setattr(runtime, "_classify_goal_turn", semantic_router_must_not_run)
+    monkeypatch.setattr(runtime, "_astream_single_run", fake_single_run)
+
+    async def collect():
+        return [
+            event
+            async for event in runtime.astream(
+                message="继续执行当前目标",
+                session_id="goal-product-start",
+                goal_mode=True,
+                goal_id=goal.goal_id,
+                goal_control_action="start",
+                user_message_already_persisted=True,
+            )
+        ]
+
+    events = asyncio.run(collect())
+    routed = json.loads(
+        next(event["data"] for event in events if event["event"] == "goal_turn_routed")
+    )
+    assert routed["classifier"] == "product_control"
+    assert routed["intent"] == "continue_goal"
 
 
 def test_harness_summary_envelope_is_deterministic_and_keeps_authoritative_pending_work(monkeypatch):
@@ -1399,6 +1596,20 @@ def test_task_router_timeout_is_persisted_in_trace(tmp_path, monkeypatch):
             {"outcome": "failed"},
             {"report": {"status": "infrastructure_error"}},
             {
+                "status": "active",
+                "round": 1,
+                "max_rounds": 8,
+                "consecutive_control_failure_count": 0,
+                "max_control_retries": 2,
+                "total_control_retry_count": 0,
+                "max_total_control_retries": 4,
+            },
+            "verification_control_retry",
+        ),
+        (
+            {"outcome": "failed"},
+            {"report": {"status": "infrastructure_error"}},
+            {
                 "status": "blocked",
                 "round": 1,
                 "max_rounds": 8,
@@ -1696,6 +1907,8 @@ def test_semantic_asset_middleware_owns_model_frontmatter_index(tmp_path):
         name="上市周期",
         asset_type="measure",
         description="计算相邻上市事件的自然日间隔。",
+        aliases=["换代周期", "更新周期"],
+        tags=["产品更新", "上市"],
     )
     models = AnalyticsModelRegistry(tmp_path)
     model = models.create_model(
@@ -1730,9 +1943,20 @@ def test_semantic_asset_middleware_owns_model_frontmatter_index(tmp_path):
     assert update["semantic_assets_model_id"] == model["id"]
     assert update["allowed_semantic_asset_ids"] == [measure["id"]]
     assert update["semantic_assets_metadata"][0]["frontmatter"] == measure["frontmatter"]
+    assert update["semantic_assets_metadata"][0]["aliases"] == [
+        "换代周期",
+        "更新周期",
+    ]
+    assert update["semantic_assets_metadata"][0]["tags"] == ["产品更新", "上市"]
     formatted = middleware._format_assets(update["semantic_assets_metadata"])
     assert f"### {measure['id']} | 上市周期" in formatted
     assert f"Canonical path: `/{measure['path']}`" in formatted
+    assert "Aliases: 换代周期, 更新周期" in formatted
+    assert "Tags: 产品更新, 上市" in formatted
+    assert '"resolution"' not in formatted
+    assert '"build_skill"' not in formatted
+    assert '"version"' not in formatted
+    assert '"created_at"' not in formatted
 
     unrelated = middleware.before_agent(
         {
@@ -2379,10 +2603,23 @@ def test_cancelled_agent_stream_persists_pending_tool_as_interrupted(tmp_path, m
     tool_call = assistant["tool_calls"][0]
     assert tool_call["tool"] == "database_knowledge_query"
     assert tool_call["is_error"] is True
+    assert tool_call["status"] == "interrupted"
+    assert tool_call["output_complete"] is False
     assert tool_call["summary_source"] == "stream_cancelled"
     assert "interrupted" in tool_call["output"].lower()
     timeline_tool = next(item for item in assistant["timeline"] if item["type"] == "tool")
-    assert timeline_tool["tool_call"]["status"] == "error"
+    assert timeline_tool["tool_call"]["status"] == "interrupted"
+    restored = session_manager.load_session_for_agent("cancel-pending-session")
+    restored_call = restored[1]["tool_calls"][0]
+    assert restored_call["status"] == "interrupted"
+    assert restored_call["output_complete"] is False
+    protocol = runtime._build_messages(
+        restored,
+        "继续",
+        session_id="cancel-pending-session",
+    )
+    historical_result = next(message for message in protocol if isinstance(message, ToolMessage))
+    assert historical_result.status == "error"
 
 
 def test_cancelled_agent_stream_persists_reasoning_only_partial(tmp_path, monkeypatch):
@@ -2587,9 +2824,14 @@ def test_historical_tool_messages_are_not_reemitted_on_followup(tmp_path, monkey
             assert graph_input["messages"][-1].content == "继续"
             historical_tools = [
                 msg for msg in graph_input["messages"]
-                if getattr(msg, "type", "") == "tool" and getattr(msg, "tool_call_id", "") == "call_old_db"
+                if getattr(msg, "type", "") == "tool"
+                and getattr(msg, "tool_call_id", "").startswith("historical_")
             ]
-            assert not historical_tools
+            assert len(historical_tools) == 1
+            assert historical_tools[0].additional_kwargs["puddingclaw_historical"] is True
+            assert historical_tools[0].additional_kwargs[
+                "puddingclaw_evidence_id"
+            ].startswith("evidence-")
             yield (
                 "messages",
                 (AIMessageChunk(content="继续回答。"), {"langgraph_node": "model"}),
@@ -2625,6 +2867,169 @@ def test_historical_tool_messages_are_not_reemitted_on_followup(tmp_path, monkey
     assert current_run is not None
     assert current_run["verification_activations"] == []
     assert current_run["verification_contract"] is None
+
+
+def test_historical_context_uses_total_budget_and_unique_protocol_ids() -> None:
+    from graph.deepagents_manager import DeepAgentsAgentManager
+
+    history = [
+        {
+            "role": "assistant",
+            "content": f"result {index}",
+            "query_id": f"query-{index}",
+            "tool_calls": [
+                {
+                    "tool": "read_file",
+                    "id": "call-reused",
+                    "output": f"payload-{index}-" + ("x" * 10_000),
+                    "historical": True,
+                    "evidence_id": f"evidence-{index}",
+                    "source_run_id": f"run-{index}",
+                    "status": "success",
+                }
+            ],
+        }
+        for index in range(20)
+    ]
+
+    messages = DeepAgentsAgentManager._build_messages(
+        history,
+        "continue",
+        session_id="budget-session",
+    )
+    tool_messages = [message for message in messages if isinstance(message, ToolMessage)]
+
+    assert len(tool_messages) == 20
+    assert len({message.tool_call_id for message in tool_messages}) == 20
+    assert sum(len(str(message.content)) for message in tool_messages) < 100_000
+    assert any("minimal projection" in str(message.content) for message in tool_messages)
+
+
+def test_historical_context_budget_covers_tool_args_and_many_short_messages() -> None:
+    from langchain_core.messages import messages_to_dict
+
+    from graph.deepagents_manager import DeepAgentsAgentManager
+
+    history = [
+        {
+            "role": "user",
+            "content": f"short-{index}-" + ("x" * 1_180),
+        }
+        for index in range(1_000)
+    ]
+    history.append(
+        {
+            "role": "assistant",
+            "content": "old write",
+            "query_id": "query-large-args",
+            "tool_calls": [
+                {
+                    "tool": "write_file",
+                    "id": "call-large-args",
+                    "input": {
+                        "file_path": "/workspace/report.js",
+                        "content": "SECRET_PAYLOAD_" + ("z" * 1_000_000),
+                    },
+                    "output": "written",
+                    "historical": True,
+                    "evidence_id": "evidence-large-args",
+                    "source_run_id": "run-large-args",
+                    "status": "success",
+                }
+            ],
+        }
+    )
+
+    messages = DeepAgentsAgentManager._build_messages(
+        history,
+        "continue",
+        session_id="hard-budget-session",
+    )
+    serialized = json.dumps(
+        messages_to_dict(messages),
+        ensure_ascii=False,
+        default=str,
+    )
+
+    assert "SECRET_PAYLOAD_" not in serialized
+    assert "_historical_input_omitted" in serialized
+    assert "older messages were omitted" in serialized
+    assert len(serialized) < 250_000
+
+
+def test_native_large_result_capture_hashes_origin_bytes_without_compaction(
+    tmp_path,
+) -> None:
+    from langchain_core.messages import ToolMessage
+
+    from graph.deepagents_manager import DeepAgentsAgentManager
+
+    workspace = tmp_path / "workspace"
+    artifact = (
+        workspace
+        / ".puddingclaw"
+        / "large_tool_results"
+        / "native-large-session"
+        / "query-native-large"
+        / "call:1"
+    )
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"line-one\r\nline-two\r\n")
+    pointer = (
+        "Tool result too large; saved at "
+        "/large_tool_results/call:1"
+    )
+    fields = DeepAgentsAgentManager._tool_message_context_fields(
+        ToolMessage(
+            content=pointer,
+            tool_call_id="call:1",
+            name="read_file",
+        ),
+        session_id="native-large-session",
+        tool_call_id="call:1",
+        original_output=pointer,
+        workspace_path=workspace,
+        source_query_id="query-native-large",
+    )
+
+    expected = "sha256:" + hashlib.sha256(artifact.read_bytes()).hexdigest()
+    assert fields["source_hash"] == expected
+    assert fields["raw_output_ref"]["source_hash_scope"] == "raw_bytes"
+    assert fields["raw_output_ref"]["artifact_name"] == "call:1"
+    assert fields["raw_output_ref"]["workspace_path"] == str(
+        workspace.resolve()
+    )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "继续生成报告",
+        "继续读取下一页，不要重跑 SQL",
+        "接着完成剩余图表",
+        "从中断处继续分析",
+        "请继续处理上次未完成的报告",
+    ],
+)
+def test_chinese_continuation_phrases_are_detected(message: str) -> None:
+    from graph.deepagents_manager import _is_explicit_continuation
+
+    assert _is_explicit_continuation(message) is True
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "刚才，天气不错，帮我写诗",
+        "上次，咖啡很好，推荐新豆子",
+    ],
+)
+def test_historical_discourse_markers_do_not_imply_continuation(
+    message: str,
+) -> None:
+    from graph.deepagents_manager import _is_explicit_continuation
+
+    assert _is_explicit_continuation(message) is False
 
 
 def test_agent_stream_persists_user_message_before_first_event(tmp_path, monkeypatch):
@@ -3001,6 +3406,8 @@ def test_unverified_goal_retry_never_publishes_terminal_segments(tmp_path, monke
                     "iteration": 1,
                     "attempt": 1,
                     "status": "needs_revision",
+                    "will_continue": True,
+                    "terminal": False,
                     "evaluations": [],
                 },
             )
@@ -3057,7 +3464,9 @@ def test_unverified_goal_retry_never_publishes_terminal_segments(tmp_path, monke
     assert "任务已经完成" not in assistant["content"]
     assert any(
         item.get("type") == "activity"
-        and item.get("label") == "发现完成条件缺口，继续处理"
+        and item.get("label") == "发现完成条件缺口，正在自动继续修复"
+        and item.get("detail") == "无需操作，Agent 会保留当前进度并继续处理。"
+        and item.get("status") == "running"
         for item in assistant["timeline"]
     )
 
@@ -3919,3 +4328,108 @@ def test_deepagents_manager_emits_graph_structure(tmp_path, monkeypatch):
     structure = json.loads(graph_event["data"])
     assert {n["id"] for n in structure["nodes"]} == {"__start__", "model", "tools"}
     assert any(e["source"] == "__start__" and e["target"] == "model" for e in structure["edges"])
+
+
+def test_goal_progress_question_routes_to_read_only_inspection(monkeypatch):
+    from graph import deepagents_manager as manager_module
+    from harness.models import RunKind
+
+    runtime = manager_module.DeepAgentsAgentManager()
+    goal = {
+        "goal_id": "goal-progress",
+        "objective": "生成完整报告",
+        "status": "active",
+        "objective_revision": 1,
+        "round": 1,
+        "max_rounds": 8,
+    }
+    monkeypatch.setattr(
+        manager_module.session_manager,
+        "get_goal_state",
+        lambda _session_id, _goal_id: dict(goal),
+    )
+    calls: list[dict] = []
+
+    async def fake_single_run(**kwargs):
+        calls.append(kwargs)
+        yield runtime._sse(
+            "run_outcome",
+            {"query_id": "query-inspect", "run_id": "run-inspect", "outcome": "completed"},
+        )
+        yield runtime._sse("done", {"content": "进度总结"})
+
+    monkeypatch.setattr(runtime, "_astream_single_run", fake_single_run)
+
+    async def collect():
+        return [
+            event
+            async for event in runtime.astream(
+                message="总结一下已经完成的工作",
+                session_id="session-progress",
+                goal_mode=True,
+                goal_id="goal-progress",
+                user_message_already_persisted=True,
+            )
+        ]
+
+    events = asyncio.run(collect())
+
+    assert len(calls) == 1
+    assert calls[0]["run_kind"] == RunKind.GOAL_INSPECTION
+    assert calls[0]["goal_mode"] is False
+    assert calls[0]["goal_id"] is None
+    assert calls[0]["context_goal_id"] == "goal-progress"
+    assert calls[0]["run_objective"] == "总结一下已经完成的工作"
+    assert not any(event["event"] == "goal_run_continued" for event in events)
+
+
+def test_goal_explicit_continue_keeps_execution_contract(monkeypatch):
+    from graph import deepagents_manager as manager_module
+    from harness.models import RunKind
+
+    runtime = manager_module.DeepAgentsAgentManager()
+    goal = {
+        "goal_id": "goal-continue",
+        "objective": "生成完整报告",
+        "status": "active",
+        "objective_revision": 1,
+        "round": 1,
+        "max_rounds": 8,
+    }
+    monkeypatch.setattr(
+        manager_module.session_manager,
+        "get_goal_state",
+        lambda _session_id, _goal_id: dict(goal),
+    )
+    calls: list[dict] = []
+
+    async def fake_single_run(**kwargs):
+        calls.append(kwargs)
+        yield runtime._sse(
+            "run_outcome",
+            {"query_id": "query-continue", "run_id": "run-continue", "outcome": "completed"},
+        )
+        yield runtime._sse("goal_status_changed", {"goal": {**goal, "status": "achieved"}})
+        yield runtime._sse("done", {"content": "完成"})
+
+    monkeypatch.setattr(runtime, "_astream_single_run", fake_single_run)
+
+    async def collect():
+        return [
+            event
+            async for event in runtime.astream(
+                message="继续执行",
+                session_id="session-continue",
+                goal_mode=True,
+                goal_id="goal-continue",
+                user_message_already_persisted=True,
+            )
+        ]
+
+    asyncio.run(collect())
+
+    assert len(calls) == 1
+    assert calls[0]["run_kind"] == RunKind.GOAL_EXECUTION
+    assert calls[0]["goal_mode"] is True
+    assert calls[0]["goal_id"] == "goal-continue"
+    assert calls[0]["run_objective"] == "生成完整报告"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import shlex
 from pathlib import Path
 
@@ -107,6 +108,176 @@ def test_authorized_directory_uses_direct_host_file_tools_and_receipts(tmp_path:
     assert all(item["kind"] == "external_mutation_completed" for item in receipts)
     assert all(item["before_version_token"] for item in receipts)
     assert all(item["after_version_token"] for item in receipts)
+
+
+def test_copy_and_hash_guarded_replace_are_atomic(tmp_path: Path) -> None:
+    backend, external, _outside, run = _setup(tmp_path)
+    source = external / "report.html"
+    target = external / "report-v2.html"
+    source.write_text("<html>v1</html>\n", encoding="utf-8")
+
+    copied = backend.copy_external_file(str(source), str(target))
+
+    assert copied["status"] == "completed"
+    assert copied["source_sha256"] == copied["target_sha256"]
+    assert target.read_bytes() == source.read_bytes()
+
+    refused = backend.copy_external_file(str(source), str(target))
+    assert refused["status"] == "conflict"
+    assert refused["error_code"] == "target_already_exists"
+
+    stale = backend.replace_external_file(
+        str(target),
+        b"<html>stale</html>\n",
+        expected_sha256="sha256:" + "0" * 64,
+    )
+    assert stale["status"] == "conflict"
+    assert target.read_text(encoding="utf-8") == "<html>v1</html>\n"
+
+    replaced = backend.replace_external_file(
+        str(target),
+        b"<html>v2</html>\n",
+        expected_sha256=copied["target_sha256"],
+    )
+    assert replaced["status"] == "completed"
+    assert target.read_text(encoding="utf-8") == "<html>v2</html>\n"
+    assert [
+        item["operation"]
+        for item in session_manager.list_external_mutation_receipts(
+            "broker-session",
+            run_id=run.run_id,
+        )
+    ] == ["copy", "replace"]
+
+
+def test_delete_then_create_emits_deprecation_warning(tmp_path: Path) -> None:
+    backend, external, _outside, run = _setup(tmp_path)
+    target = external / "legacy-overwrite.txt"
+    target.write_text("v1\n", encoding="utf-8")
+
+    deleted = backend.delete_external_file(
+        str(target),
+        expected_sha256=_digest("v1\n"),
+    )
+    created = backend.create_external_file(
+        str(target),
+        b"v2\n",
+    )
+
+    assert deleted["status"] == "completed"
+    assert created["status"] == "completed"
+    assert created["warnings"]
+    assert "overwrite_via_delete_deprecated" in created["warnings"][0]
+    receipts = session_manager.list_external_mutation_receipts(
+        "broker-session",
+        run_id=run.run_id,
+    )
+    assert receipts[-1]["warnings"] == created["warnings"]
+
+
+def test_declared_artifact_target_is_exact_write_authority_only(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    external = tmp_path / "external"
+    for directory in (state, workspace, external):
+        directory.mkdir()
+    source = external / "report.html"
+    source.write_text("<html>v1</html>\n", encoding="utf-8")
+    declared_target = external / "report-v2.html"
+    undeclared_target = external / "other.html"
+
+    session_manager.initialize(state)
+    session_manager.create_session("declared-copy-session")
+    coordinator = HarnessRunCoordinator(session_manager)
+    run, _goal = coordinator.start_run(
+        session_id="declared-copy-session",
+        query_id="declared-copy-query",
+        objective=f"参考 {source}，创建新的 V2 版本 HTML",
+        goal_mode=False,
+        verification_enabled=False,
+    )
+    coordinator.transition(run, RunStatus.RUNNING)
+    session_manager.add_permission_grant(
+        "declared-copy-session",
+        grant_type="external_file_read",
+        target_kind="exact_file",
+        target=str(source.resolve()),
+        capabilities=["read", "external_path"],
+        scope="session",
+    )
+    workspace_backend = FilesystemBackend(root_dir=workspace, virtual_mode=True)
+    backend = PermissionedCompositeBackend(
+        default=workspace_backend,
+        routes={"/workspace/": workspace_backend},
+        session_id="declared-copy-session",
+        run_id=run.run_id,
+        query_id=run.query_id,
+        workspace_root=workspace,
+    )
+
+    copied = backend.copy_external_file(str(source), str(declared_target))
+    denied = backend.copy_external_file(str(source), str(undeclared_target))
+
+    assert copied["status"] == "completed"
+    assert denied["status"] == "permission_required"
+    assert not undeclared_target.exists()
+    assert not session_manager.has_external_file_write_permission(
+        "declared-copy-session",
+        declared_target,
+    )
+    receipt = session_manager.list_external_mutation_receipts(
+        "declared-copy-session",
+        run_id=run.run_id,
+    )[-1]
+    assert receipt["permission_grant_id"] == f"declared-artifact:{run.run_id}"
+
+    activations = build_verification_activations(
+        run_id=run.run_id,
+        query_id=run.query_id,
+        tool_call_id="copy-declared-html",
+        tool_name="copy_file",
+        args={
+            "source_path": str(source.resolve()),
+            "target_path": str(declared_target.resolve()),
+        },
+        result=ToolMessage(
+            content=json.dumps(copied, ensure_ascii=False),
+            tool_call_id="copy-declared-html",
+            name="copy_file",
+            status="success",
+        ),
+        session_id="declared-copy-session",
+        workspace_path=str(workspace),
+    )
+    artifact_activation = next(item for item in activations if item.pack == "artifact")
+    artifact_ref = next(
+        ref
+        for ref in artifact_activation.evidence_refs
+        if ref.get("kind") == "artifact_write"
+    )
+    assert artifact_ref["authorized"] is True
+    assert artifact_ref["authority_kind"] == "declared_artifact"
+    assert artifact_ref["permission_grant_id"] == f"declared-artifact:{run.run_id}"
+    assert artifact_ref["mutation_receipt_id"] == receipt["receipt_id"]
+
+    from harness.deterministic_checks import _evaluate_artifact_delivery
+
+    evaluation = _evaluate_artifact_delivery(
+        "artifact_delivery",
+        {
+            "run_id": run.run_id,
+            "workspace_path": str(workspace),
+            "verification_activations": [
+                item.model_dump(mode="json") for item in activations
+            ],
+            "declared_artifact_targets": [str(declared_target.resolve())],
+            "permission_grants_authoritative": True,
+            "active_permission_grant_ids": [],
+            "final_content": f"已交付 {declared_target}",
+            "evaluation_phase": "terminal",
+        },
+    )
+    assert evaluation.passed is True
 
 
 def test_read_only_directory_grant_allows_search_but_not_mutation(tmp_path: Path) -> None:
@@ -267,6 +438,34 @@ def test_authorized_directory_rejects_symlink_escape(tmp_path: Path) -> None:
     assert backend.can_access_external_path(str(link), access="write") is False
 
 
+def test_authorized_directory_inode_is_bound_across_validation_and_commit(
+    tmp_path: Path,
+) -> None:
+    backend, external, outside, _run = _setup(tmp_path)
+    original = external.with_name("external-original")
+
+    def swap_authority_root(_target, _content):
+        external.rename(original)
+        external.symlink_to(outside, target_is_directory=True)
+        return {
+            "status": "completed",
+            "validation_receipt_id": "validation-toctou",
+        }
+
+    assert backend.host_file_broker is not None
+    backend.host_file_broker.validation_runner = swap_authority_root
+
+    result = backend.create_external_file(
+        str(external / "escaped.html"),
+        b"<html>must stay bounded</html>",
+    )
+
+    assert result["status"] == "io_error"
+    assert result["error_code"] == "atomic_create_failed"
+    assert not (outside / "escaped.html").exists()
+    assert not (original / "escaped.html").exists()
+
+
 class _ValidationBackend:
     def __init__(self, scratch: Path) -> None:
         self.scratch = scratch
@@ -293,8 +492,14 @@ class _ExternalDirectoryExecutionBackend:
         command: str,
         *,
         timeout: int,
+        writable: bool = False,
     ) -> ExecuteResponse:
         self.calls.append((directory_path, command, timeout))
+        if writable:
+            Path(directory_path, "report-v2.js").write_text(
+                "const version = 2;\n",
+                encoding="utf-8",
+            )
         return ExecuteResponse(output="validated read-only tree", exit_code=0)
 
 
@@ -377,6 +582,24 @@ def test_broker_validation_bridge_binds_formal_hash_and_blocks_bad_bytes(
     ) == 1
 
 
+def test_code_like_write_fails_closed_when_validator_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    backend, external, _outside, run = _setup(tmp_path)
+    target = external / "app.js"
+    target.write_text("const value = 1;\n", encoding="utf-8")
+
+    edited = backend.edit(str(target), "1", "INVALID")
+
+    assert edited.error is not None
+    assert edited.error.startswith("validation_failed:")
+    assert target.read_text(encoding="utf-8") == "const value = 1;\n"
+    assert session_manager.list_external_mutation_receipts(
+        "broker-session",
+        run_id=run.run_id,
+    ) == []
+
+
 def test_external_directory_command_requires_root_grant_and_uses_ephemeral_backend(
     tmp_path: Path,
 ) -> None:
@@ -406,6 +629,59 @@ def test_external_directory_command_requires_root_grant_and_uses_ephemeral_backe
     }
     assert execution.calls == [(str(external), "node --check app.js", 45)]
     assert denied["status"] == "permission_required"
+
+
+def test_writable_external_directory_command_only_mutates_staged_draft(
+    tmp_path: Path,
+) -> None:
+    backend, external, _outside, run = _setup(tmp_path)
+    (external / "report.js").write_text("const version = 1;\n", encoding="utf-8")
+    scratch = tmp_path / "scratch"
+    staged = scratch / "external-directories" / "directory-lease-write"
+    staged.mkdir(parents=True)
+    (staged / "report.js").write_text("const version = 1;\n", encoding="utf-8")
+    backend.execution_scratch_host_path = str(scratch)
+    backend.external_directory_writable_enabled = True
+    execution = _ExternalDirectoryExecutionBackend()
+    backend.execution_backend = execution
+    session_manager.upsert_external_directory_lease(
+        "broker-session",
+        {
+            "lease_id": "directory-lease-write",
+            "session_id": "broker-session",
+            "run_id": run.run_id,
+            "query_id": run.query_id,
+            "goal_id": "",
+            "goal_revision": None,
+            "directory_path": str(external),
+            "staged_dir": "/scratch/external-directories/directory-lease-write",
+            "status": "staged",
+            "source_manifest": {
+                "report.js": {
+                    "sha256": _digest("const version = 1;\n"),
+                    "size": len("const version = 1;\n"),
+                }
+            },
+        },
+    )
+
+    result = backend.execute_external_directory_command(
+        str(external),
+        "cp report.js report-v2.js",
+        timeout=45,
+        mode="writable_draft",
+        lease_id="directory-lease-write",
+    )
+
+    assert result["status"] == "completed"
+    assert result["draft_plan_preview"] == {
+        "added": ["report-v2.js"],
+        "modified": [],
+        "deleted": [],
+    }
+    assert result["next_action"] == "prepare_external_directory_commit"
+    assert not (external / "report-v2.js").exists()
+    assert (staged / "report-v2.js").exists()
 
 
 def test_rewind_restores_only_current_run_when_hashes_still_match(tmp_path: Path) -> None:

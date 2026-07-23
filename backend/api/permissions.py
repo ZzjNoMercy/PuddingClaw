@@ -168,18 +168,32 @@ async def grant_external_file_permission(
             detail="Session directory permission requires an active bound Run",
         )
 
+    requested_capabilities = [
+        str(item)
+        for item in (pending or {}).get("capabilities") or []
+        if str(item)
+    ]
+    if not requested_capabilities:
+        requested_capabilities = [
+            access,
+            *(["recursive"] if is_directory else []),
+            "external_path",
+        ]
+    if access not in requested_capabilities:
+        requested_capabilities.insert(0, access)
+    if not is_directory:
+        requested_capabilities = [
+            item
+            for item in requested_capabilities
+            if item in {access, "external_path"}
+        ]
     try:
         grant = session_manager.add_permission_grant(
             session_id,
             grant_type=f"external_{'directory' if is_directory else 'file'}_{access}",
             target_kind=effective_target_kind,
             target=target,
-            capabilities=[
-                access,
-                *(["delete"] if is_directory and access == "write" else []),
-                *(["recursive"] if is_directory else []),
-                "external_path",
-            ],
+            capabilities=requested_capabilities,
             scope=effective_scope if is_directory else "session",
             source="user",
             metadata=(

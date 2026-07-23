@@ -12,6 +12,18 @@ export interface SubagentActivityIdentity {
   statusOverride?: string;
 }
 
+export function getSubagentToolLabel(
+  status: string,
+  isError = false,
+): string {
+  if (status === "running") return "子代理执行中";
+  if (isError) return "子代理执行未完成";
+  // A completed `task` tool call only proves that control returned to the
+  // parent. The delegated objective may still be partial, blocked, or over its
+  // model-call budget. Only `subagent_completed` may claim task completion.
+  return "子代理已返回结果";
+}
+
 const TERMINAL_EVENTS = new Set([
   "subagent_completed",
   "subagent_blocked",
@@ -22,6 +34,7 @@ const TERMINAL_EVENTS = new Set([
 
 const LIFECYCLE_EVENTS = new Set([
   "subagent_started",
+  "subagent_waiting_for_permission",
   "subagent_completed",
   "subagent_blocked",
   "subagent_timed_out",
@@ -42,6 +55,9 @@ export function getSubagentActivityIdentity(
       activityId: `${settlePrefix}lifecycle`,
       settlePrefix,
       terminal: TERMINAL_EVENTS.has(eventType),
+      statusOverride: eventType === "subagent_waiting_for_permission"
+        ? "waiting_for_permission"
+        : undefined,
     };
   }
   if (eventType === "context_mounted") {

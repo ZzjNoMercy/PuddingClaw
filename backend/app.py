@@ -17,26 +17,32 @@ BASE_DIR = Path(__file__).resolve().parent
 async def lifespan(app: FastAPI):
     """Startup: scan skills, initialize agent, build memory index."""
     import traceback
+
+    import capabilities
+    from analytics.nl2sql.result_cleanup import query_result_cleanup_manager
+    from analytics.semantic_assets import get_semantic_asset_registry
     from db import init_database
-    from tools.skills_scanner import scan_skills
+    from graph.attachment_store import attachment_store
     from graph.agent import agent_manager
     from graph.deepagents_manager import deepagents_agent_manager
-    from graph.attachment_store import attachment_store
     from graph.memory_indexer import get_memory_indexer
+    from graph.session_manager import session_manager
     from knowledge.import_worker import knowledge_import_worker_manager
     from knowledge.semantic_dimension_worker import semantic_dimension_build_worker_manager
     from projects.registry import project_registry
-    from analytics.semantic_assets import get_semantic_asset_registry
-    import capabilities
+    from tools.skills_scanner import scan_skills
 
     scan_skills(BASE_DIR)
     semantic_assets = get_semantic_asset_registry(BASE_DIR).refresh()
     print(f"🧭 Semantic assets loaded: {semantic_assets.get('count', 0)}")
     project_registry.initialize(BASE_DIR)
     attachment_store.initialize(BASE_DIR)
+    # SQL Evidence catalog backfill needs the durable Session owner index.
+    session_manager.initialize(BASE_DIR)
     db_ready = await init_database()
     if db_ready:
         print("🗄️ Knowledge catalog database ready")
+        query_result_cleanup_manager.start()
         knowledge_import_worker_manager.start(BASE_DIR)
         semantic_dimension_build_worker_manager.start(BASE_DIR)
     else:
@@ -71,6 +77,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await query_result_cleanup_manager.stop()
         await semantic_dimension_build_worker_manager.stop()
         await knowledge_import_worker_manager.stop()
 

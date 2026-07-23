@@ -9,7 +9,9 @@ import shutil
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from copy import deepcopy
+from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -554,6 +556,7 @@ class SessionManager:
         interrupted: bool = False,
         interruption_notice: str | None = None,
         error_notice: str | None = None,
+        verification_summary: str | None = None,
         run_boundary_notice: dict[str, Any] | None = None,
         attachments: list[dict[str, Any]] | None = None,
         output_attachments: list[dict[str, Any]] | None = None,
@@ -581,6 +584,8 @@ class SessionManager:
             msg["interruption_notice"] = interruption_notice
         if error_notice:
             msg["error_notice"] = error_notice
+        if verification_summary:
+            msg["verification_summary"] = verification_summary
         if run_boundary_notice:
             msg["run_boundary_notice"] = run_boundary_notice
         if attachments:
@@ -637,6 +642,7 @@ class SessionManager:
         interrupted: bool = False,
         interruption_notice: str | None = None,
         error_notice: str | None = None,
+        verification_summary: str | None = None,
         run_boundary_notice: dict[str, Any] | None = None,
         output_attachments: list[dict[str, Any]] | None = None,
         status: str = "running",
@@ -664,6 +670,7 @@ class SessionManager:
             interrupted=interrupted,
             interruption_notice=interruption_notice,
             error_notice=error_notice,
+            verification_summary=verification_summary,
             run_boundary_notice=run_boundary_notice,
             output_attachments=output_attachments,
             query_id=query_id,
@@ -952,6 +959,73 @@ class SessionManager:
         return deepcopy(todos) if isinstance(todos, list) else []
 
     @classmethod
+    def _todo_ledger_revision(cls, data: dict[str, Any], scope_key: str) -> int:
+        metadata = data.get("todo_ledger_meta")
+        raw = metadata.get(scope_key) if isinstance(metadata, dict) else None
+        return int(raw.get("revision") or 0) if isinstance(raw, dict) else 0
+
+    @classmethod
+    def _latest_todo_operation(cls, data: dict[str, Any], scope_key: str) -> dict[str, Any]:
+        metadata = data.get("todo_ledger_meta")
+        raw = metadata.get(scope_key) if isinstance(metadata, dict) else None
+        operations = raw.get("applied_operations") if isinstance(raw, dict) else None
+        if not isinstance(operations, dict) or not operations:
+            return {}
+        operation_id = next(reversed(operations))
+        receipt = operations.get(operation_id)
+        return {
+            "operation_id": operation_id,
+            "persisted_at": receipt.get("persisted_at"),
+        } if isinstance(receipt, dict) else {}
+
+    def get_todo_snapshot(
+        self,
+        session_id: str,
+        *,
+        goal_id: str | None = None,
+        goal_revision: int | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        data = self._read_file(session_id)
+        if not data:
+            return {"todos": [], "authority": {"kind": "none"}, "ledger_revision": 0}
+        if goal_id or run_id:
+            scope_key = self._todo_scope_key(
+                goal_id=goal_id,
+                goal_revision=goal_revision,
+                run_id=run_id,
+            )
+            ledgers = data.get("todo_ledgers")
+            scoped = ledgers.get(scope_key) if isinstance(ledgers, dict) else None
+            authority = (
+                {
+                    "kind": "goal",
+                    "goal_id": goal_id,
+                    "goal_revision": int(goal_revision or 1),
+                }
+                if goal_id
+                else {"kind": "run", "run_id": run_id}
+            )
+            return {
+                "todos": deepcopy(scoped) if isinstance(scoped, list) else [],
+                "authority": authority,
+                "ledger_revision": self._todo_ledger_revision(data, scope_key),
+                **self._latest_todo_operation(data, scope_key),
+            }
+        todos, authority = self._current_todo_projection(data)
+        scope_key = self._todo_scope_key(
+            goal_id=str(authority.get("goal_id") or "") or None,
+            goal_revision=authority.get("goal_revision"),
+            run_id=str(authority.get("run_id") or "") or None,
+        )
+        return {
+            "todos": todos,
+            "authority": authority,
+            "ledger_revision": self._todo_ledger_revision(data, scope_key),
+            **self._latest_todo_operation(data, scope_key),
+        }
+
+    @classmethod
     def _current_todo_projection(
         cls,
         data: dict[str, Any],
@@ -995,6 +1069,28 @@ class SessionManager:
             "budget_exceeded",
             "verification_failed",
         }
+        if (
+            isinstance(latest_run, dict)
+            and str(latest_run.get("status") or "") not in terminal_statuses
+            and str(latest_run.get("run_kind") or "") == "goal_inspection"
+            and str(latest_run.get("context_goal_id") or "")
+        ):
+            context_goal_id = str(latest_run["context_goal_id"])
+            context_revision = int(latest_run.get("context_goal_revision") or 1)
+            scoped = ledgers.get(
+                cls._todo_scope_key(
+                    goal_id=context_goal_id,
+                    goal_revision=context_revision,
+                )
+            )
+            return (
+                deepcopy(scoped) if isinstance(scoped, list) else [],
+                {
+                    "kind": "goal",
+                    "goal_id": context_goal_id,
+                    "goal_revision": context_revision,
+                },
+            )
         if (
             isinstance(latest_run, dict)
             and str(latest_run.get("status") or "") not in terminal_statuses
@@ -1055,15 +1151,208 @@ class SessionManager:
         data["todos"] = saved
         if goal_id or run_id:
             ledgers = data.setdefault("todo_ledgers", {})
-            ledgers[
-                self._todo_scope_key(
-                    goal_id=goal_id,
-                    goal_revision=goal_revision,
-                    run_id=run_id,
+            scope_key = self._todo_scope_key(
+                goal_id=goal_id,
+                goal_revision=goal_revision,
+                run_id=run_id,
+            )
+            prior = ledgers.get(scope_key)
+            metadata = data.setdefault("todo_ledger_meta", {})
+            meta = metadata.setdefault(scope_key, {"revision": 0, "applied_operations": {}})
+            if (
+                isinstance(prior, list)
+                and prior != saved
+                and isinstance(meta.get("applied_operations"), dict)
+                and bool(meta["applied_operations"])
+            ):
+                raise ValueError(
+                    "Todo ledger is transactional; list replacement cannot overwrite committed patches"
                 )
-            ] = saved
+            ledgers[scope_key] = saved
+            if not isinstance(prior, list) or prior != saved:
+                meta["revision"] = int(meta.get("revision") or 0) + 1
+                meta["updated_at"] = time.time()
         self._write_file(session_id, data)
         return deepcopy(saved)
+
+    @_session_write_locked
+    def apply_todo_patch(
+        self,
+        session_id: str,
+        *,
+        goal_id: str | None = None,
+        goal_revision: int | None = None,
+        run_id: str | None = None,
+        operation_id: str,
+        expected_revision: int | None = None,
+        mutator: Callable[
+            [list[dict[str, Any]]],
+            tuple[list[dict[str, Any]], list[dict[str, Any]]],
+        ],
+    ) -> dict[str, Any]:
+        """Atomically apply one idempotent Todo operation batch."""
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        if goal_id:
+            harness = data.get("harness")
+            goals = harness.get("goals") if isinstance(harness, dict) else None
+            goal = goals.get(goal_id) if isinstance(goals, dict) else None
+            if isinstance(goal, dict):
+                current_goal_revision = int(goal.get("objective_revision") or 1)
+                requested_goal_revision = int(goal_revision or 1)
+                if requested_goal_revision != current_goal_revision:
+                    raise ValueError(
+                        "Todo Goal revision conflict: "
+                        f"requested {requested_goal_revision}, current {current_goal_revision}"
+                    )
+        scope_key = self._todo_scope_key(
+            goal_id=goal_id,
+            goal_revision=goal_revision,
+            run_id=run_id,
+        )
+        ledgers = data.setdefault("todo_ledgers", {})
+        current = ledgers.get(scope_key)
+        current = deepcopy(current) if isinstance(current, list) else []
+        metadata = data.setdefault("todo_ledger_meta", {})
+        meta = metadata.setdefault(scope_key, {"revision": 0, "applied_operations": {}})
+        revision = int(meta.get("revision") or 0)
+        applied_operations = meta.setdefault("applied_operations", {})
+        existing_receipt = (
+            applied_operations.get(operation_id)
+            if isinstance(applied_operations, dict)
+            else None
+        )
+        authority = (
+            {
+                "kind": "goal",
+                "goal_id": goal_id,
+                "goal_revision": int(goal_revision or 1),
+            }
+            if goal_id
+            else {"kind": "run", "run_id": run_id}
+        )
+        if isinstance(existing_receipt, dict):
+            emit_harness_metric(
+                logger,
+                "todo_patch_idempotent_replay_total",
+                session_id=session_id,
+                scope_key=scope_key,
+                operation_id=operation_id,
+                ledger_revision=revision,
+            )
+            return {
+                "todos": current,
+                "applied": deepcopy(existing_receipt.get("applied") or []),
+                "authority": authority,
+                "ledger_revision": revision,
+                "operation_id": operation_id,
+                "replayed": True,
+                "persisted_at": existing_receipt.get("persisted_at"),
+            }
+        if expected_revision is not None and expected_revision != revision:
+            emit_harness_metric(
+                logger,
+                "todo_ledger_revision_conflict_total",
+                session_id=session_id,
+                scope_key=scope_key,
+                operation_id=operation_id,
+                expected_revision=expected_revision,
+                ledger_revision=revision,
+            )
+            raise ValueError(
+                f"Todo ledger revision conflict: expected {expected_revision}, current {revision}"
+            )
+        saved, applied = mutator(current)
+        saved = deepcopy(saved)
+        next_revision = revision + 1
+        persisted_at = time.time()
+        ledgers[scope_key] = saved
+        data["todos"] = deepcopy(saved)
+        receipt = {
+            "revision": next_revision,
+            "persisted_at": persisted_at,
+            "applied": deepcopy(applied),
+        }
+        if not isinstance(applied_operations, dict):
+            applied_operations = {}
+            meta["applied_operations"] = applied_operations
+        applied_operations[operation_id] = receipt
+        # Bound durable idempotency metadata while retaining recent retries.
+        if len(applied_operations) > 500:
+            for stale_id in list(applied_operations)[: len(applied_operations) - 500]:
+                applied_operations.pop(stale_id, None)
+        meta["revision"] = next_revision
+        meta["updated_at"] = persisted_at
+        self._write_file(session_id, data)
+        emit_harness_metric(
+            logger,
+            "todo_patch_committed_total",
+            session_id=session_id,
+            scope_key=scope_key,
+            operation_id=operation_id,
+            ledger_revision=next_revision,
+            operation_count=len(applied),
+        )
+        return {
+            "todos": deepcopy(saved),
+            "applied": deepcopy(applied),
+            "authority": authority,
+            "ledger_revision": next_revision,
+            "operation_id": operation_id,
+            "replayed": False,
+            "persisted_at": persisted_at,
+        }
+
+    @_session_write_locked
+    def inherit_unfinished_todos_for_run(
+        self,
+        session_id: str,
+        run_id: str,
+        *,
+        continuation_requested: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Carry the latest unfinished standalone ledger into a new Run."""
+
+        data = self._read_file(session_id)
+        if not data:
+            return []
+        harness = data.get("harness")
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        current = runs.get(run_id) if isinstance(runs, dict) else None
+        if (
+            not continuation_requested
+            or not isinstance(current, dict)
+            or current.get("goal_id")
+        ):
+            return []
+        ledgers = data.setdefault("todo_ledgers", {})
+        current_key = self._todo_scope_key(run_id=run_id)
+        existing = ledgers.get(current_key)
+        if isinstance(existing, list) and existing:
+            return deepcopy(existing)
+        run_order = harness.get("run_order") if isinstance(harness, dict) else None
+        prior_ids = list(run_order or [])
+        if run_id in prior_ids:
+            prior_ids = prior_ids[: prior_ids.index(run_id)]
+        for prior_run_id in reversed(prior_ids):
+            prior_run = runs.get(prior_run_id) if isinstance(runs, dict) else None
+            if not isinstance(prior_run, dict) or prior_run.get("goal_id"):
+                continue
+            prior = ledgers.get(self._todo_scope_key(run_id=str(prior_run_id)))
+            if not isinstance(prior, list) or not any(
+                isinstance(item, dict)
+                and item.get("status") in {"pending", "in_progress"}
+                for item in prior
+            ):
+                continue
+            inherited = deepcopy(prior)
+            ledgers[current_key] = inherited
+            data["todos"] = deepcopy(inherited)
+            self._write_file(session_id, data)
+            return inherited
+        return []
 
     def get_harness_state(self, session_id: str) -> dict[str, Any]:
         """Return the product-level Run/Goal state stored in Session JSON."""
@@ -1448,6 +1737,7 @@ class SessionManager:
         goal_id: str | None = None,
         goal_revision: int | None = None,
         require_inheritable: bool = True,
+        allow_artifact_revision_inheritance: bool = False,
     ) -> dict[str, Any] | None:
         data = self._read_file(session_id)
         resolved = resolve_evidence_ref(
@@ -1456,8 +1746,63 @@ class SessionManager:
             goal_id=goal_id,
             goal_revision=goal_revision,
             require_inheritable=require_inheritable,
+            allow_artifact_revision_inheritance=allow_artifact_revision_inheritance,
         )
         return resolved.model_dump(mode="json") if resolved is not None else None
+
+    @staticmethod
+    def _artifact_bound_goal_evidence_refs(
+        data: dict[str, Any],
+        goal_id: str,
+    ) -> list[dict[str, str]]:
+        """Select immutable artifact-bound evidence; never carry analytics conclusions."""
+
+        ledger = data.get("evidence_ledger")
+        records = ledger.values() if isinstance(ledger, dict) else []
+        refs: dict[str, dict[str, str]] = {}
+        for raw in records:
+            if not isinstance(raw, dict):
+                continue
+            if (
+                raw.get("goal_id") != goal_id
+                or raw.get("status") != "active"
+                or raw.get("inheritable") is not True
+                or raw.get("kind")
+                not in {"artifact", "validation_receipt", "external_mutation"}
+            ):
+                continue
+            ref = {"type": str(raw["kind"]), "id": str(raw["id"])}
+            refs[ref_key(ref)] = ref
+        return list(refs.values())
+
+    @_session_write_locked
+    def restore_goal_artifact_evidence(
+        self,
+        session_id: str,
+        goal_id: str,
+    ) -> list[dict[str, str]]:
+        """Restore hash-bound artifact refs after a same-Goal objective revision."""
+
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        goals = harness.get("goals") if isinstance(harness, dict) else None
+        goal = goals.get(goal_id) if isinstance(goals, dict) else None
+        if not isinstance(goal, dict):
+            return []
+        restored = self._artifact_bound_goal_evidence_refs(data, goal_id)
+        existing = [
+            dict(item)
+            for item in goal.get("evidence_refs") or []
+            if is_evidence_ref(item)
+        ]
+        merged = {
+            ref_key(item): item
+            for item in [*existing, *restored]
+        }
+        goal["evidence_refs"] = list(merged.values())
+        goal["updated_at"] = time.time()
+        self._write_file(session_id, data)
+        return deepcopy(restored)
 
     def resolve_goal_evidence_records(
         self,
@@ -1476,10 +1821,262 @@ class SessionManager:
                 evidence_ref,
                 goal_id=goal_id,
                 goal_revision=goal_revision,
+                allow_artifact_revision_inheritance=True,
             )
             if record is not None:
                 resolved.append(record)
         return resolved
+
+    @_session_write_locked
+    def backfill_goal_declared_artifact_writes(
+        self,
+        session_id: str,
+        goal_id: str,
+        goal_revision: int,
+    ) -> list[dict[str, Any]]:
+        """Recover hash-bound Artifact evidence from legacy successful writes.
+
+        Old ``write_file`` executions could durably store the successful Tool
+        call while missing the later HostFileBroker/VerificationActivation
+        flush. Backfill is allowed only when the original Run declared the
+        exact target and the current bytes equal the exact UTF-8 ``content``
+        passed to that successful Tool call.
+        """
+
+        from harness.models import (
+            ArtifactReference,
+            ArtifactRole,
+            ArtifactScope,
+        )
+
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        goals = harness.get("goals") if isinstance(harness, dict) else None
+        goal = goals.get(goal_id) if isinstance(goals, dict) else None
+        if not isinstance(goal, dict) or not isinstance(runs, dict):
+            return []
+        if int(goal.get("objective_revision") or 1) != int(goal_revision):
+            return []
+
+        run_by_query = {
+            str(run.get("query_id") or ""): run
+            for run in runs.values()
+            if isinstance(run, dict) and run.get("query_id")
+        }
+        ledger = data.setdefault("evidence_ledger", {})
+        goal_refs = [
+            dict(item)
+            for item in goal.get("evidence_refs") or []
+            if is_evidence_ref(item)
+        ]
+        known_goal_ref_keys = {ref_key(item) for item in goal_refs}
+        backfilled: list[dict[str, Any]] = []
+        data_changed = False
+
+        for _message_index, _tool_index, message, tool_call in (
+            self._iter_persisted_tool_calls(data)
+        ):
+            tool_name = str(
+                tool_call.get("tool") or tool_call.get("name") or ""
+            )
+            if tool_name != "write_file":
+                continue
+            status, output_complete = self._evidence_status(tool_call, message)
+            if status != "success" or not output_complete:
+                continue
+            query_id = str(message.get("query_id") or "")
+            run_id = str(tool_call.get("source_run_id") or "")
+            run = (
+                runs.get(run_id)
+                if run_id
+                else run_by_query.get(query_id)
+            )
+            if not isinstance(run, dict):
+                continue
+            run_id = str(run.get("run_id") or "")
+            if (
+                str(run.get("goal_id") or "") != goal_id
+                or int(run.get("goal_revision") or 1)
+                != int(goal_revision)
+            ):
+                continue
+            raw_input = tool_call.get("input", tool_call.get("args"))
+            if isinstance(raw_input, str):
+                try:
+                    args = json.loads(raw_input)
+                except json.JSONDecodeError:
+                    continue
+            elif isinstance(raw_input, dict):
+                args = raw_input
+            else:
+                continue
+            raw_path = str(
+                args.get("file_path") or args.get("path") or ""
+            ).strip()
+            content = args.get("content")
+            if not raw_path or not isinstance(content, str):
+                continue
+            raw_target = Path(raw_path).expanduser()
+            if raw_target.is_symlink():
+                # A retroactive migration has no trustworthy record of the
+                # symlink target at original write time. Fail closed instead
+                # of authorizing whichever inode it happens to reference now.
+                continue
+            try:
+                target = raw_target.resolve(strict=True)
+            except OSError:
+                continue
+            if not target.is_file():
+                continue
+            declared_targets = [
+                str(item)
+                for item in run.get("declared_artifact_targets") or []
+                if str(item)
+            ]
+            if not any(
+                Path(item).expanduser().resolve() == target
+                for item in declared_targets
+            ):
+                continue
+            expected_bytes = content.encode("utf-8")
+            expected_sha256 = (
+                "sha256:" + hashlib.sha256(expected_bytes).hexdigest()
+            )
+            try:
+                if target.read_bytes() != expected_bytes:
+                    continue
+            except OSError:
+                continue
+
+            execution = (
+                run.get("config_snapshot", {}).get("execution", {})
+                if isinstance(run.get("config_snapshot"), dict)
+                else {}
+            )
+            workspace_id = str(execution.get("workspace_id") or "")
+            artifact_id = "artifact-" + hashlib.sha256(
+                (
+                    f"external\0{workspace_id}\0{target}\0"
+                    f"{expected_sha256}"
+                ).encode()
+            ).hexdigest()[:20]
+            ledger_key = f"artifact:{artifact_id}"
+            existing = ledger.get(ledger_key)
+            if isinstance(existing, dict):
+                existing_payload = existing.get("payload")
+                if (
+                    isinstance(existing_payload, dict)
+                    and str(existing_payload.get("content_sha256") or "")
+                    == expected_sha256
+                ):
+                    stable = {"type": "artifact", "id": artifact_id}
+                    if ref_key(stable) not in known_goal_ref_keys:
+                        goal_refs.append(stable)
+                        known_goal_ref_keys.add(ref_key(stable))
+                        data_changed = True
+                    continue
+                # Evidence identities are immutable. Never overwrite an older
+                # version under the same artifact id during migration.
+                continue
+
+            tool_call_id = str(tool_call.get("id") or "")
+            if not tool_call_id:
+                continue
+            output = str(
+                tool_call.get("raw_output", tool_call.get("output", ""))
+                or ""
+            )
+            output_digest = str(tool_call.get("source_hash") or "")
+            if not output_digest.startswith("sha256:"):
+                output_digest = (
+                    "sha256:" + hashlib.sha256(output.encode()).hexdigest()
+                )
+            stat = target.stat()
+            artifact = ArtifactReference(
+                artifact_id=artifact_id,
+                scope=ArtifactScope.EXTERNAL,
+                role=ArtifactRole.TARGET,
+                path=str(target),
+                host_path=str(target),
+                authorized=True,
+                permission_grant_id=f"declared-artifact:{run_id}",
+                mutation_receipt_id=(
+                    f"legacy-write-backfill:{tool_call_id}"
+                ),
+                authority_kind="legacy_declared_artifact_backfill",
+                run_id=run_id,
+                query_id=str(run.get("query_id") or query_id) or None,
+                goal_id=goal_id,
+                goal_revision=goal_revision,
+                backend_id=str(execution.get("backend_id") or "") or None,
+                workspace_id=workspace_id or None,
+                tool_call_id=tool_call_id,
+                output_digest=output_digest,
+                content_sha256=expected_sha256,
+                size_bytes=stat.st_size,
+                mtime_ns=stat.st_mtime_ns,
+                written_at=float(
+                    tool_call.get("completed_at")
+                    or run.get("updated_at")
+                    or time.time()
+                ),
+            )
+            activation_id = (
+                "verification-activation-legacy-write-"
+                + hashlib.sha256(
+                    f"{run_id}:{tool_call_id}:{expected_sha256}".encode()
+                ).hexdigest()[:20]
+            )
+            activation = {
+                "activation_id": activation_id,
+                "run_id": run_id,
+                "query_id": str(run.get("query_id") or query_id),
+                "tool_call_id": tool_call_id,
+                "tool_name": "write_file",
+                "pack": "artifact",
+                "source": "legacy_declared_artifact_backfill",
+                "status": "succeeded",
+                "evidence_refs": [
+                    {
+                        "kind": "artifact_write",
+                        **artifact.model_dump(mode="json"),
+                        "material": True,
+                    }
+                ],
+                "created_at": float(
+                    tool_call.get("completed_at")
+                    or run.get("updated_at")
+                    or time.time()
+                ),
+            }
+            stable_refs = register_activation_evidence(
+                data,
+                run=run,
+                activation=activation,
+            )
+            activation["stable_evidence_refs"] = stable_refs
+            activations = run.setdefault("verification_activations", [])
+            if not any(
+                isinstance(item, dict)
+                and item.get("activation_id") == activation_id
+                for item in activations
+            ):
+                activations.append(activation)
+            for stable in stable_refs:
+                key = ref_key(stable)
+                if key not in known_goal_ref_keys:
+                    goal_refs.append(dict(stable))
+                    known_goal_ref_keys.add(key)
+                    data_changed = True
+            backfilled.append(artifact.model_dump(mode="json"))
+            data_changed = True
+
+        if data_changed:
+            goal["evidence_refs"] = goal_refs
+            goal["updated_at"] = time.time()
+            self._write_file(session_id, data)
+        return deepcopy(backfilled)
 
     @_session_write_locked
     def migrate_goal_evidence_refs(
@@ -1600,6 +2197,8 @@ class SessionManager:
             )
             if leases_changed or search_leases_changed or not handoff_is_safe:
                 current.handoff_summary = self._build_run_handoff(data, current)
+            self._migrate_missing_tool_call_ids(session_id, data)
+            self._ensure_evidence_metadata(session_id, data)
             saved_terminal = current.model_dump(mode="json")
             runs[run_id] = saved_terminal
             self._write_file(session_id, data)
@@ -1634,6 +2233,11 @@ class SessionManager:
         if not current.goal_id:
             self._abandon_uncommitted_execution_leases(data, current)
         current.handoff_summary = self._build_run_handoff(data, current)
+        # Terminalization is the idempotent projection boundary. Interrupted,
+        # failed and budget-exhausted Runs receive the same Evidence contract
+        # as successful Runs before any continuation can start.
+        self._migrate_missing_tool_call_ids(session_id, data)
+        self._ensure_evidence_metadata(session_id, data)
         saved = current.model_dump(mode="json")
         runs[run_id] = saved
         harness["latest_run_id"] = run_id
@@ -2394,6 +2998,40 @@ class SessionManager:
         return parsed.model_dump(mode="json")
 
     @_session_write_locked
+    def record_run_permission_manifest(
+        self,
+        session_id: str,
+        run_id: str,
+        manifest: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist the permission projection used by one model call."""
+
+        from harness.models import PermissionManifest, RunRecord, RunStatus
+
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        raw_run = runs.get(run_id) if isinstance(runs, dict) else None
+        if not isinstance(raw_run, dict):
+            raise ValueError(f"Run {run_id} does not exist in session {session_id}")
+        run = RunRecord.model_validate(raw_run)
+        if run.status in {
+            RunStatus.COMPLETED,
+            RunStatus.CANCELLED,
+            RunStatus.FAILED,
+            RunStatus.BLOCKED,
+            RunStatus.BUDGET_EXCEEDED,
+            RunStatus.VERIFICATION_FAILED,
+        }:
+            raise ValueError(f"Terminal Run {run_id} cannot change permissions")
+        parsed = PermissionManifest.model_validate({**manifest, "run_id": run_id})
+        run.permission_manifest = parsed
+        run.updated_at = time.time()
+        runs[run_id] = run.model_dump(mode="json")
+        self._write_file(session_id, data)
+        return parsed.model_dump(mode="json")
+
+    @_session_write_locked
     def record_delegation_contract(
         self,
         session_id: str,
@@ -2626,8 +3264,13 @@ class SessionManager:
         if not isinstance(raw_goal, dict):
             raise ValueError(f"Goal {goal_id} does not exist in session {session_id}")
         status = str(raw_goal.get("status") or "")
-        if status in {"achieved", "cancelled", "budget_exceeded"}:
+        if status in {"achieved", "cancelled"}:
             raise ValueError(f"Goal {goal_id} is already terminal ({status})")
+        if status == "budget_exceeded" and requested_status != "cancelled":
+            raise ValueError(
+                f"Goal {goal_id} exhausted its budget and can only be cancelled "
+                "or explicitly extended"
+            )
         now = time.time()
         current_run_id = str(raw_goal.get("current_run_id") or "").strip()
         if current_run_id:
@@ -2651,6 +3294,52 @@ class SessionManager:
         raw_goal["updated_at"] = now
         if raw_goal.get("status") in {"cancelled", "budget_exceeded", "achieved"}:
             self._abandon_uncommitted_execution_leases(data, raw_goal)
+        self._write_file(session_id, data)
+        return deepcopy(raw_goal)
+
+    @_session_write_locked
+    def extend_goal_budget(
+        self,
+        session_id: str,
+        goal_id: str,
+        *,
+        additional_rounds: int,
+    ) -> dict[str, Any]:
+        """Atomically add user-approved Runs and reopen an exhausted Goal paused."""
+
+        if isinstance(additional_rounds, bool) or not isinstance(additional_rounds, int):
+            raise ValueError("additional_rounds must be an integer")
+        if additional_rounds < 1 or additional_rounds > 100:
+            raise ValueError("additional_rounds must be between 1 and 100")
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        goals = harness.get("goals") if isinstance(harness, dict) else None
+        raw_goal = goals.get(goal_id) if isinstance(goals, dict) else None
+        if not isinstance(raw_goal, dict):
+            raise ValueError(f"Goal {goal_id} does not exist in session {session_id}")
+        status = str(raw_goal.get("status") or "")
+        if status != "budget_exceeded":
+            raise ValueError(
+                f"Goal {goal_id} is not budget_exceeded (current status: {status})"
+            )
+        if raw_goal.get("current_run_id") or raw_goal.get("requested_status"):
+            raise ValueError("Goal still has an active control transition")
+
+        previous_max = int(raw_goal.get("max_rounds") or 0)
+        raw_goal["max_rounds"] = previous_max + additional_rounds
+        raw_goal["status"] = "paused"
+        raw_goal["completed_at"] = None
+        raw_goal["budget_exhaustion_reason"] = None
+        raw_goal["updated_at"] = time.time()
+        notice = (
+            f"用户已追加 {additional_rounds} 轮执行预算"
+            f"（{previous_max} → {raw_goal['max_rounds']}），等待继续。"
+        )
+        notices = raw_goal.setdefault("control_notices", [])
+        if notice not in notices:
+            notices.append(notice)
+        if harness.get("active_goal_id") == goal_id:
+            harness.pop("active_goal_id", None)
         self._write_file(session_id, data)
         return deepcopy(raw_goal)
 
@@ -2774,7 +3463,14 @@ class SessionManager:
         # Artifact receipts are acceptance evidence for one immutable Goal
         # revision. Runs remain in history for audit, but old receipts cannot
         # satisfy a materially revised objective.
-        raw_goal["evidence_refs"] = []
+        # A wording/constraint revision invalidates semantic conclusions, but
+        # it does not erase immutable file writes and validations. Downstream
+        # checks still require the new declared targets to match and the bytes
+        # to equal their recorded hashes before these refs can satisfy anything.
+        raw_goal["evidence_refs"] = self._artifact_bound_goal_evidence_refs(
+            data,
+            goal_id,
+        )
         raw_goal["skill_activations"] = []
         raw_goal["latest_verification_report_id"] = None
         raw_goal["latest_goal_decision"] = None
@@ -2983,6 +3679,130 @@ class SessionManager:
             return {}
         return {str(query_id): dict(trace) for query_id, trace in traces.items() if isinstance(trace, dict)}
 
+    @staticmethod
+    def _trace_model_input_spans(trace: dict[str, Any]) -> list[dict[str, Any]]:
+        spans = [
+            item
+            for item in trace.get("spans") or []
+            if isinstance(item, dict) and item.get("type") == "model_input"
+        ]
+        return sorted(
+            spans,
+            key=lambda item: (
+                int((item.get("metadata") or {}).get("model_call_index") or 0),
+                float(item.get("started_at") or 0),
+            ),
+        )
+
+    @staticmethod
+    def _model_input_fingerprints(span: dict[str, Any]) -> dict[str, str]:
+        output = span.get("output")
+        contract = (
+            output.get("model_call_contract")
+            if isinstance(output, dict)
+            and isinstance(output.get("model_call_contract"), dict)
+            else {}
+        )
+        fingerprints = contract.get("fingerprints")
+        if not isinstance(fingerprints, dict):
+            metadata = span.get("metadata")
+            fingerprints = (
+                metadata.get("fingerprints")
+                if isinstance(metadata, dict)
+                and isinstance(metadata.get("fingerprints"), dict)
+                else {}
+            )
+        return {
+            key: str(fingerprints.get(key) or "")
+            for key in (
+                "system_prompt_hash",
+                "tool_schema_hash",
+                "messages_hash",
+            )
+        }
+
+    @staticmethod
+    def _model_input_message_hashes(span: dict[str, Any]) -> list[str]:
+        output = span.get("output")
+        previews = (
+            output.get("messages_preview")
+            if isinstance(output, dict) and isinstance(output.get("messages_preview"), list)
+            else []
+        )
+        return [
+            hashlib.sha256(
+                json.dumps(
+                    item,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest()
+            for item in previews
+            if isinstance(item, dict)
+            and str(item.get("role") or "").lower()
+            not in {"system", "systemmessage"}
+        ]
+
+    @classmethod
+    def _trace_cache_continuity(
+        cls,
+        previous: dict[str, Any],
+        current: dict[str, Any],
+        *,
+        previous_query_id: str,
+    ) -> dict[str, Any] | None:
+        previous_spans = cls._trace_model_input_spans(previous)
+        current_spans = cls._trace_model_input_spans(current)
+        if not previous_spans or not current_spans:
+            return None
+        previous_span = previous_spans[-1]
+        current_span = current_spans[0]
+        previous_fingerprints = cls._model_input_fingerprints(previous_span)
+        current_fingerprints = cls._model_input_fingerprints(current_span)
+        previous_messages = cls._model_input_message_hashes(previous_span)
+        current_messages = cls._model_input_message_hashes(current_span)
+        prefix_count = 0
+        for before, after in zip(previous_messages, current_messages, strict=False):
+            if before != after:
+                break
+            prefix_count += 1
+        prefix_ratio = (
+            round(prefix_count / len(previous_messages), 6)
+            if previous_messages
+            else 1.0
+        )
+        system_match = bool(
+            previous_fingerprints["system_prompt_hash"]
+            and previous_fingerprints["system_prompt_hash"]
+            == current_fingerprints["system_prompt_hash"]
+        )
+        tool_schema_match = bool(
+            previous_fingerprints["tool_schema_hash"]
+            and previous_fingerprints["tool_schema_hash"]
+            == current_fingerprints["tool_schema_hash"]
+        )
+        return {
+            "previous_query_id": previous_query_id,
+            "system_prompt_hash_match": system_match,
+            "tool_schema_hash_match": tool_schema_match,
+            "messages_hash_match": bool(
+                previous_fingerprints["messages_hash"]
+                and previous_fingerprints["messages_hash"]
+                == current_fingerprints["messages_hash"]
+            ),
+            "previous_message_count": len(previous_messages),
+            "current_message_count": len(current_messages),
+            "message_prefix_match_count": prefix_count,
+            "message_prefix_ratio": prefix_ratio,
+            "stable_boundary_match": system_match and tool_schema_match,
+            "full_previous_request_prefix_match": (
+                system_match
+                and tool_schema_match
+                and prefix_count == len(previous_messages)
+            ),
+        }
+
     @_session_write_locked
     def update_trace(
         self,
@@ -2996,9 +3816,47 @@ class SessionManager:
         data = self._read_trace_file(session_id)
         saved = dict(trace)
         effective_query_id = query_id or saved.get("query_id")
+        previous_query_id = data.get("latest_query_id")
+        traces = data.get("traces")
+        previous = (
+            traces.get(previous_query_id)
+            if isinstance(previous_query_id, str)
+            and isinstance(traces, dict)
+            and previous_query_id != effective_query_id
+            else None
+        )
+        if isinstance(previous, dict):
+            continuity = self._trace_cache_continuity(
+                previous,
+                saved,
+                previous_query_id=previous_query_id,
+            )
+            if continuity is not None:
+                saved["cache_continuity"] = continuity
+                for metric_name, metric_value in (
+                    (
+                        "cache_continuity_system_prompt_match",
+                        int(continuity["system_prompt_hash_match"]),
+                    ),
+                    (
+                        "cache_continuity_tool_schema_match",
+                        int(continuity["tool_schema_hash_match"]),
+                    ),
+                    (
+                        "cache_continuity_message_prefix_ratio",
+                        float(continuity["message_prefix_ratio"]),
+                    ),
+                ):
+                    emit_harness_metric(
+                        logger,
+                        metric_name,
+                        session_id=session_id,
+                        value=metric_value,
+                        query_id=effective_query_id,
+                        previous_query_id=previous_query_id,
+                    )
         if isinstance(effective_query_id, str) and effective_query_id:
             saved["query_id"] = effective_query_id
-            traces = data.get("traces")
             if not isinstance(traces, dict):
                 traces = {}
             traces[effective_query_id] = saved
@@ -3024,6 +3882,9 @@ class SessionManager:
         todos, authority = self._current_todo_projection(session)
         result["todos"] = todos
         result["todos_authority"] = authority
+        result["todo_ledger_revision"] = self.get_todo_snapshot(session_id).get(
+            "ledger_revision", 0
+        )
         if isinstance(session.get("graph"), dict):
             result["graph"] = dict(session["graph"])
         return result
@@ -3048,10 +3909,30 @@ class SessionManager:
     @_session_write_locked
     def delete_session(self, session_id: str) -> None:
         """删除会话文件"""
+        data = self._read_file(session_id)
+        source_workspaces: set[str] = set()
+        if data:
+            logical = deepcopy(data)
+            logical["messages"] = deepcopy(self.load_session(session_id))
+            self._ensure_evidence_metadata(session_id, logical)
+            for item in (logical.get("evidence_index") or {}).values():
+                raw_ref = item.get("raw_output_ref") if isinstance(item, dict) else None
+                if isinstance(raw_ref, dict) and raw_ref.get("kind") == "deepagents_large_tool_result":
+                    workspace = str(raw_ref.get("workspace_path") or "")
+                    if workspace:
+                        source_workspaces.add(workspace)
+            legacy_workspace = str(data.get("workspace_path") or "")
+            if legacy_workspace:
+                source_workspaces.add(legacy_workspace)
         path = self._session_path(session_id)  # 获取文件路径
         if path.exists():  # 存在则删除
             path.unlink()
         self._trace_path(session_id).unlink(missing_ok=True)
+        archive_dir = self._sessions_dir / "archive"
+        if archive_dir.exists():
+            safe_session = "".join(c for c in session_id if c.isalnum() or c in "-_")
+            for archive in archive_dir.glob(f"{safe_session}_*.json"):
+                archive.unlink(missing_ok=True)
         # Keep attachment lifetime aligned with the authoritative Session.
         # Import lazily to avoid a module cycle at startup.
         from graph.attachment_store import attachment_store
@@ -3064,6 +3945,15 @@ class SessionManager:
             if projects_root.exists():
                 for project_root in projects_root.iterdir():
                     shutil.rmtree(project_root / safe_session, ignore_errors=True)
+            for source_workspace in source_workspaces:
+                workspace = Path(source_workspace).expanduser().resolve()
+                large_results_root = (workspace / ".puddingclaw" / "large_tool_results").resolve()
+                target = (large_results_root / safe_session).resolve()
+                try:
+                    target.relative_to(large_results_root)
+                except ValueError:
+                    continue
+                shutil.rmtree(target, ignore_errors=True)
 
     def get_raw_messages(self, session_id: str) -> dict[str, Any]:
         """Return session data without loading heavyweight trace sidecars."""
@@ -3114,6 +4004,12 @@ class SessionManager:
             )
         data["todos"] = todos
         data["todos_authority"] = authority
+        scope_key = self._todo_scope_key(
+            goal_id=str(authority.get("goal_id") or "") or None,
+            goal_revision=authority.get("goal_revision"),
+            run_id=str(authority.get("run_id") or "") or None,
+        )
+        data["todo_ledger_revision"] = self._todo_ledger_revision(data, scope_key)
         if isinstance(data.get("graph"), dict):
             data["graph"] = dict(data["graph"])
         else:
@@ -3342,7 +4238,7 @@ class SessionManager:
     def _tool_context_result_id(output: str) -> str | None:
         patterns = (
             r'"result_id"\s*:\s*"([^"\\]+)"',
-            r"\bresult[_ -]?id\s*[:=]\s*([A-Za-z0-9_.:-]+)",
+            r"\bresult[_ -]?id\s*[：:=]\s*([A-Za-z0-9_.:-]+)",
             r"\b(result-[A-Za-z0-9_-]+)\b",
         )
         for pattern in patterns:
@@ -3358,6 +4254,11 @@ class SessionManager:
         tool_call_id: str,
         output: str,
         source_hash: str,
+        *,
+        tool_name: str = "",
+        source_query_id: str = "",
+        source_hash_scope: str = "raw_result",
+        workspace_path: str = "",
     ) -> dict[str, Any]:
         result_id = cls._tool_context_result_id(output)
         session_ref = {
@@ -3365,13 +4266,171 @@ class SessionManager:
             "session_id": session_id,
             "tool_call_id": tool_call_id,
             "source_hash": source_hash,
+            "output_complete": True,
         }
-        if result_id:
-            # Query result artifacts currently have a TTL. Keep a Session-local
-            # evidence fallback so an expired result_id never makes the UI's
-            # “完整结果” reference irrecoverable.
-            return {"kind": "result_id", "value": result_id, "fallback": session_ref}
+        if source_query_id:
+            session_ref["source_query_id"] = source_query_id
+        normalized_tool = str(tool_name or "").lower().replace("-", "_")
+        if result_id and (
+            not normalized_tool
+            or normalized_tool
+            in {
+                "database_sql_execute",
+                "database_knowledge_query",
+            }
+        ):
+            # The Session record only contains the preview/profile emitted by
+            # database_sql_execute. It remains useful after expiry, but is not
+            # a truthful fallback for the complete materialized JSONL result.
+            sql_ref: dict[str, Any] = {
+                "kind": "sql_query_result",
+                "result_id": result_id,
+                "session_id": session_id,
+                "tool_call_id": tool_call_id,
+                "source_query_id": source_query_id,
+                "artifact_format": "jsonl",
+                "source_hash": source_hash,
+                "source_hash_scope": source_hash_scope,
+                "fallback": {**session_ref, "output_complete": False},
+            }
+            field_patterns = {
+                "generation_id": r"\bgeneration_id\s*[：:=]\s*([A-Za-z0-9_.:-]+)",
+                "validation_receipt_id": r"\bvalidation_receipt_id\s*[：:=]\s*([A-Za-z0-9_.:-]+)",
+                "sql_sha256": r"\bsql_sha256\s*[：:=]\s*([A-Za-z0-9_.:-]+)",
+                "expires_at": r"(?:过期时间|expires_at)\s*[：:=]\s*([^）)\s]+)",
+                "artifact_sha256": r"\bartifact_sha256\s*[：:=]\s*(sha256:[A-Fa-f0-9]{64})",
+            }
+            for key, pattern in field_patterns.items():
+                match = re.search(pattern, output, flags=re.IGNORECASE)
+                if match:
+                    sql_ref[key] = str(match.group(1))
+            return sql_ref
+        if re.search(r"(?:^|\s)/large_tool_results/[^\s`]+", output):
+            return {
+                "kind": "deepagents_large_tool_result",
+                "session_id": session_id,
+                "source_query_id": source_query_id,
+                "tool_call_id": tool_call_id,
+                "artifact_name": tool_call_id.replace(".", "_").replace("/", "_").replace("\\", "_"),
+                "workspace_path": workspace_path,
+                "source_hash": source_hash,
+                "source_hash_scope": source_hash_scope,
+            }
         return session_ref
+
+    @staticmethod
+    def _evidence_status(tool_call: dict[str, Any], message: dict[str, Any]) -> tuple[str, bool]:
+        output = str(tool_call.get("raw_output", tool_call.get("output", "")) or "")
+        call_status = str(tool_call.get("status") or "")
+        if (
+            not output
+            or "工具结果缺失" in output
+            or "未收到工具返回" in output
+            or call_status == "interrupted"
+            or str(tool_call.get("summary_source") or "")
+            in {"stream_cancelled", "missing_tool_output"}
+        ):
+            return "interrupted", False
+        if tool_call.get("is_error") or call_status in {"error", "failed"}:
+            return "failed", True
+        if call_status == "running" and not tool_call.get("completed_at"):
+            return "interrupted", False
+        return "success", True
+
+    @classmethod
+    def _ensure_evidence_metadata(cls, session_id: str, data: dict[str, Any]) -> bool:
+        """Attach stable, deterministic Evidence metadata to persisted calls."""
+
+        harness = data.get("harness")
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        run_by_query = {
+            str(run.get("query_id") or ""): str(run.get("run_id") or "")
+            for run in (runs.values() if isinstance(runs, dict) else [])
+            if isinstance(run, dict) and run.get("query_id")
+        }
+        changed = False
+        evidence_index = data.setdefault("evidence_index", {})
+        if not isinstance(evidence_index, dict):
+            evidence_index = {}
+            data["evidence_index"] = evidence_index
+            changed = True
+        for _, _, message, tool_call in cls._iter_persisted_tool_calls(data):
+            tool_call_id = str(tool_call.get("id") or "")
+            if not tool_call_id:
+                continue
+            source_query_id = str(message.get("query_id") or "")
+            source_run_id = str(tool_call.get("source_run_id") or run_by_query.get(source_query_id) or "")
+            raw_source = cls._tool_context_source(tool_call)
+            context_metadata = tool_call.get("context_compaction")
+            tagged_hash = str(
+                tool_call.get("source_hash")
+                or (
+                    context_metadata.get("source_hash")
+                    if isinstance(context_metadata, dict)
+                    else ""
+                )
+                or ""
+            )
+            source_hash = tagged_hash or cls._tool_context_source_hash(raw_source)
+            provenance_id = source_run_id or (
+                f"query:{source_query_id}" if source_query_id else ""
+            )
+            digest = hashlib.sha256(
+                "\0".join(
+                    (session_id, provenance_id, tool_call_id, source_hash)
+                ).encode("utf-8")
+            ).hexdigest()[:32]
+            evidence_id = f"evidence-{digest}"
+            status, output_complete = cls._evidence_status(tool_call, message)
+            raw_ref = tool_call.get("raw_output_ref")
+            if not isinstance(raw_ref, dict):
+                raw_ref = cls._tool_context_raw_ref(
+                    session_id,
+                    tool_call_id,
+                    raw_source,
+                    source_hash,
+                    tool_name=str(tool_call.get("tool") or tool_call.get("name") or ""),
+                    source_query_id=source_query_id,
+                    source_hash_scope=("raw_result" if tagged_hash else "pointer"),
+                )
+            elif (
+                raw_ref.get("kind") == "deepagents_large_tool_result"
+                and not raw_ref.get("source_query_id")
+            ):
+                raw_ref = {**raw_ref, "source_query_id": source_query_id}
+            metadata = {
+                "evidence_id": evidence_id,
+                "tool_call_id": tool_call_id,
+                "tool": str(tool_call.get("tool") or tool_call.get("name") or "unknown_tool"),
+                "source_session_id": session_id,
+                "source_run_id": source_run_id,
+                "source_query_id": source_query_id,
+                "source_hash": source_hash,
+                "status": status,
+                "output_complete": output_complete,
+                "raw_output_ref": deepcopy(raw_ref),
+                "projection": {
+                    "profile": "detailed",
+                    "version": "evidence-projection-v1",
+                },
+            }
+            for key in (
+                "evidence_id",
+                "source_run_id",
+                "source_query_id",
+                "source_hash",
+                "status",
+                "output_complete",
+                "raw_output_ref",
+            ):
+                value = metadata[key]
+                if tool_call.get(key) != value:
+                    tool_call[key] = deepcopy(value)
+                    changed = True
+            if evidence_index.get(evidence_id) != metadata:
+                evidence_index[evidence_id] = metadata
+                changed = True
+        return changed
 
     @staticmethod
     def _iter_persisted_tool_calls(data: dict[str, Any]):
@@ -3539,6 +4598,7 @@ class SessionManager:
         min_result_tokens: int,
         keep_recent: int,
         policy_version: str,
+        context_profile: str = "detailed",
     ) -> list[dict[str, Any]]:
         """Return immutable background candidates without changing visible output."""
 
@@ -3558,13 +4618,13 @@ class SessionManager:
                 self._write_file(session_id, data)
                 return []
 
-            completed: list[tuple[dict[str, Any], str, str, int, float]] = []
-            for _, _, _, tool_call in self._iter_persisted_tool_calls(data):
+            completed: list[tuple[dict[str, Any], str, str, int, float, str]] = []
+            for _, _, message, tool_call in self._iter_persisted_tool_calls(data):
                 tool_call_id = str(tool_call.get("id") or "")
                 output = self._tool_context_source(tool_call)
                 if not tool_call_id or not output:
                     continue
-                source_hash = self._tool_context_source_hash(output)
+                source_hash = str(tool_call.get("source_hash") or "") or self._tool_context_source_hash(output)
                 completed_at = tool_call.get("completed_at")
                 try:
                     completion_order = float(completed_at)
@@ -3579,6 +4639,7 @@ class SessionManager:
                         source_hash,
                         self._tool_context_tokens(output),
                         completion_order,
+                        str(message.get("query_id") or ""),
                     )
                 )
 
@@ -3589,8 +4650,24 @@ class SessionManager:
             )
             candidates: list[dict[str, Any]] = []
             cache_hit_count = 0
-            for tool_call, tool_call_id, source_hash, estimated_tokens, completion_order in completed:
+            for (
+                tool_call,
+                tool_call_id,
+                source_hash,
+                estimated_tokens,
+                completion_order,
+                source_query_id,
+            ) in completed:
                 if tool_call_id in protected_ids or estimated_tokens < max(1, int(min_result_tokens)):
+                    continue
+                existing_raw_ref = tool_call.get("raw_output_ref")
+                if (
+                    isinstance(existing_raw_ref, dict)
+                    and existing_raw_ref.get("kind") == "deepagents_large_tool_result"
+                ):
+                    # DeepAgents has already replaced this result with a stable
+                    # external pointer. Compacting the pointer adds no value and
+                    # risks hiding the only recovery instruction.
                     continue
                 metadata = tool_call.get("context_compaction")
                 if (
@@ -3598,6 +4675,7 @@ class SessionManager:
                     and metadata.get("status") == "ready"
                     and metadata.get("source_hash") == source_hash
                     and metadata.get("policy_version") == policy_version
+                    and metadata.get("context_profile", "detailed") == context_profile
                     and tool_call.get("context_output")
                 ):
                     cache_hit_count += 1
@@ -3620,7 +4698,10 @@ class SessionManager:
                             tool_call_id,
                             self._tool_context_source(tool_call),
                             source_hash,
+                            tool_name=str(tool_call.get("tool") or tool_call.get("name") or ""),
+                            source_query_id=source_query_id,
                         ),
+                        "context_profile": context_profile,
                     }
                 )
             candidates.sort(
@@ -3643,12 +4724,371 @@ class SessionManager:
             data = self._read_file(session_id)
             if not data:
                 return False
-            changed = self._migrate_missing_tool_call_ids(session_id, data)
-            changed = self._coalesce_replayed_tool_calls(data) or changed
+            logical = deepcopy(data)
+            logical["messages"] = deepcopy(self.load_session(session_id))
+            changed = self._migrate_missing_tool_call_ids(session_id, logical)
+            changed = self._coalesce_replayed_tool_calls(logical) or changed
+            changed = self._ensure_evidence_metadata(session_id, logical) or changed
+            if data.get("display_messages") != logical.get("messages"):
+                data["display_messages"] = deepcopy(logical.get("messages") or [])
+                changed = True
+            if data.get("evidence_index") != logical.get("evidence_index"):
+                data["evidence_index"] = deepcopy(logical.get("evidence_index") or {})
+                changed = True
             if not changed:
                 return False
             self._write_file(session_id, data)
             return True
+
+    def get_evidence(self, session_id: str, evidence_id: str) -> dict[str, Any] | None:
+        """Return one stable Evidence descriptor, backfilling legacy calls."""
+
+        with self._tool_context_lock(session_id):
+            data = self._read_file(session_id)
+            if not data:
+                return None
+            changed = self._migrate_missing_tool_call_ids(session_id, data)
+            changed = self._coalesce_replayed_tool_calls(data) or changed
+            logical = deepcopy(data)
+            logical["messages"] = deepcopy(self.load_session(session_id))
+            self._ensure_evidence_metadata(session_id, logical)
+            if data.get("evidence_index") != logical.get("evidence_index"):
+                data["evidence_index"] = deepcopy(logical.get("evidence_index") or {})
+                changed = True
+            if changed:
+                self._write_file(session_id, data)
+            index = logical.get("evidence_index")
+            item = index.get(evidence_id) if isinstance(index, dict) else None
+            if not isinstance(item, dict):
+                ledger = data.get("evidence_ledger")
+                ledger_item = ledger.get(evidence_id) if isinstance(ledger, dict) else None
+                if isinstance(ledger_item, dict):
+                    item = {
+                        "evidence_id": evidence_id,
+                        "tool_call_id": str(ledger_item.get("origin_tool_call_id") or ""),
+                        "tool": str(ledger_item.get("origin_tool_name") or ""),
+                        "source_session_id": session_id,
+                        "source_run_id": str(ledger_item.get("source_run_id") or ""),
+                        "source_query_id": str(ledger_item.get("source_query_id") or ""),
+                        "source_hash": str(ledger_item.get("output_digest") or ""),
+                        "status": str(ledger_item.get("status") or "active"),
+                        "output_complete": True,
+                        "raw_output_ref": {
+                            "kind": "evidence_ledger",
+                            "ledger_kind": str(ledger_item.get("kind") or ""),
+                            "ledger_id": evidence_id,
+                        },
+                        "payload": deepcopy(ledger_item),
+                        "projection": {
+                            "profile": "verification",
+                            "version": "evidence-projection-v1",
+                        },
+                    }
+            return deepcopy(item) if isinstance(item, dict) else None
+
+    @staticmethod
+    def _safe_evidence_component(value: str) -> str:
+        safe = re.sub(r"[^A-Za-z0-9_-]+", "_", str(value or ""))
+        if not safe or safe in {".", ".."}:
+            raise ValueError("Evidence locator contains an invalid identifier")
+        return safe
+
+    def read_evidence(
+        self,
+        session_id: str,
+        evidence_id: str,
+        *,
+        workspace_path: str | Path | None = None,
+        offset: int = 0,
+        limit: int = 20_000,
+        page: int | None = None,
+        page_size: int | None = None,
+    ) -> dict[str, Any]:
+        """Read immutable historical evidence without re-executing its tool."""
+
+        descriptor = self.get_evidence(session_id, evidence_id)
+        if descriptor is None:
+            return {"evidence_id": evidence_id, "status": "not_found", "content": ""}
+        raw_ref = descriptor.get("raw_output_ref")
+        raw_ref = raw_ref if isinstance(raw_ref, dict) else {}
+        kind = str(raw_ref.get("kind") or "session_tool_call")
+        safe_offset = max(0, int(offset or 0))
+        safe_limit = max(1, min(int(limit or 20_000), 100_000))
+        content = ""
+        available = False
+        artifact_sha256 = ""
+        hash_matches: bool | None = None
+        unavailable_status = "missing"
+        result: dict[str, Any] = {
+            **deepcopy(descriptor),
+            "historical": True,
+            "raw_result_available": False,
+        }
+
+        if kind == "evidence_ledger":
+            result["content"] = json.dumps(
+                descriptor.get("payload") or {},
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+            result["raw_result_available"] = True
+            result["hash_matches"] = None
+            return result
+        if kind == "deepagents_large_tool_result":
+            origin_workspace = str(raw_ref.get("workspace_path") or workspace_path or "")
+            if not origin_workspace:
+                return {**result, "status": "workspace_unavailable", "content": ""}
+            workspace = Path(origin_workspace).expanduser().resolve()
+            safe_session = self._safe_evidence_component(str(raw_ref.get("session_id") or session_id))
+            safe_query = self._safe_evidence_component(str(raw_ref.get("source_query_id") or ""))
+            artifact_name = str(raw_ref.get("artifact_name") or "")
+            if not artifact_name:
+                artifact_name = str(raw_ref.get("tool_call_id") or "").replace(".", "_").replace("/", "_").replace("\\", "_")
+            if not artifact_name or artifact_name in {".", ".."} or "/" in artifact_name or "\\" in artifact_name:
+                return {**result, "status": "invalid_locator", "content": ""}
+            root = (
+                workspace
+                / ".puddingclaw"
+                / "large_tool_results"
+                / safe_session
+                / safe_query
+            ).resolve()
+            artifact = (root / artifact_name).resolve()
+            try:
+                artifact.relative_to(root)
+            except ValueError:
+                return {**result, "status": "invalid_locator", "content": ""}
+            if artifact.is_file():
+                raw_bytes = artifact.read_bytes()
+                artifact_sha256 = f"sha256:{hashlib.sha256(raw_bytes).hexdigest()}"
+                text = raw_bytes.decode("utf-8", errors="replace")
+                source_text_hash = self._tool_context_source_hash(text)
+                content = text[safe_offset : safe_offset + safe_limit]
+                available = True
+                large_hash_scope = str(raw_ref.get("source_hash_scope") or "raw_result")
+                if large_hash_scope == "raw_result":
+                    hash_matches = source_text_hash == str(descriptor.get("source_hash") or "")
+                elif large_hash_scope == "raw_bytes":
+                    hash_matches = artifact_sha256 == str(descriptor.get("source_hash") or "")
+                result.update(
+                    {
+                        "offset": safe_offset,
+                        "limit": safe_limit,
+                        "total_chars": len(text),
+                        "has_more": safe_offset + safe_limit < len(text),
+                    }
+                )
+        elif kind == "sql_query_result":
+            result_id = self._safe_evidence_component(str(raw_ref.get("result_id") or ""))
+            if self._base_dir is None:
+                return {**result, "status": "store_unavailable", "content": ""}
+            root = (self._base_dir / "data" / "database-query-results").resolve()
+            catalog_path = (root / ".catalog" / f"{result_id}.json").resolve()
+            catalog: dict[str, Any] = {}
+            try:
+                catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                unavailable_status = "catalog_missing"
+            strict_owner = str(catalog.get("owner_binding_version") or "") == "strict-v1"
+            catalog_query_id = str(catalog.get("source_query_id") or "")
+            catalog_run_id = str(catalog.get("source_run_id") or "")
+            descriptor_query_id = str(descriptor.get("source_query_id") or "")
+            descriptor_run_id = str(descriptor.get("source_run_id") or "")
+            owner_matches = bool(catalog) and (
+                str(catalog.get("result_id") or "") == result_id
+                and str(catalog.get("session_id") or "") == session_id
+                and str(catalog.get("tool_call_id") or "")
+                == str(raw_ref.get("tool_call_id") or descriptor.get("tool_call_id") or "")
+                and (
+                    catalog_query_id == descriptor_query_id
+                    if strict_owner
+                    else catalog_query_id in {"", descriptor_query_id}
+                )
+                and (
+                    catalog_run_id == descriptor_run_id
+                    if strict_owner and catalog_run_id
+                    else catalog_run_id in {"", descriptor_run_id}
+                )
+            )
+            if catalog and not owner_matches:
+                unavailable_status = "unauthorized"
+            catalog_artifact = str(catalog.get("artifact_path") or "")
+            artifact = (self._base_dir / catalog_artifact).resolve() if catalog_artifact else (root / f"{result_id}.jsonl").resolve()
+            try:
+                artifact.relative_to(root)
+            except ValueError:
+                return {**result, "status": "invalid_locator", "content": ""}
+            effective_page = max(1, int(page or 1))
+            effective_page_size = max(1, min(int(page_size or 100), 500))
+            rows: list[Any] = []
+            row_count = 0
+            expired_at = str(catalog.get("expires_at") or "")
+            is_expired = False
+            if expired_at:
+                try:
+                    parsed_expiry = datetime.fromisoformat(expired_at.replace("Z", "+00:00"))
+                    if parsed_expiry.tzinfo is None:
+                        parsed_expiry = parsed_expiry.replace(tzinfo=timezone.utc)
+                    is_expired = parsed_expiry <= datetime.now(timezone.utc)
+                except ValueError:
+                    is_expired = False
+            if is_expired:
+                unavailable_status = "expired"
+            elif not artifact.is_file() and owner_matches:
+                unavailable_status = "missing"
+            if artifact.is_file() and not is_expired and owner_matches and str(catalog.get("status") or "") == "ready":
+                digest = hashlib.sha256()
+                start = (effective_page - 1) * effective_page_size
+                end = start + effective_page_size
+                corrupt = False
+                with artifact.open("rb") as handle:
+                    for index, raw_line in enumerate(handle):
+                        digest.update(raw_line)
+                        row_count += 1
+                        if start <= index < end:
+                            try:
+                                line = raw_line.decode("utf-8")
+                            except UnicodeDecodeError:
+                                corrupt = True
+                                break
+                            try:
+                                rows.append(json.loads(line))
+                            except json.JSONDecodeError:
+                                corrupt = True
+                                break
+                artifact_sha256 = f"sha256:{digest.hexdigest()}"
+                expected_artifact_hash = str(catalog.get("artifact_sha256") or "")
+                hash_matches = bool(expected_artifact_hash) and artifact_sha256 == expected_artifact_hash
+                if corrupt or not hash_matches:
+                    rows = []
+                    unavailable_status = "corrupt"
+                else:
+                    available = True
+            result.update(
+                {
+                    "result_id": result_id,
+                    "page": effective_page,
+                    "page_size": effective_page_size,
+                    "row_count": row_count,
+                    "has_next": effective_page * effective_page_size < row_count,
+                    "rows": rows,
+                }
+            )
+        else:
+            data = {"messages": self.load_session(session_id)}
+            wanted_id = str(raw_ref.get("tool_call_id") or descriptor.get("tool_call_id") or "")
+            wanted_query_id = str(raw_ref.get("source_query_id") or descriptor.get("source_query_id") or "")
+            wanted_run_id = str(descriptor.get("source_run_id") or "")
+            wanted_hash = str(descriptor.get("source_hash") or "")
+            for _, _, message, tool_call in self._iter_persisted_tool_calls(data):
+                if str(tool_call.get("id") or "") != wanted_id:
+                    continue
+                if wanted_query_id and str(message.get("query_id") or "") != wanted_query_id:
+                    continue
+                if wanted_run_id and str(tool_call.get("source_run_id") or "") not in {"", wanted_run_id}:
+                    continue
+                text = self._tool_context_source(tool_call)
+                text_hash = self._tool_context_source_hash(text) if text else ""
+                if wanted_hash and text_hash != wanted_hash:
+                    continue
+                content = text[safe_offset : safe_offset + safe_limit]
+                available = bool(text)
+                artifact_sha256 = text_hash
+                result.update(
+                    {
+                        "offset": safe_offset,
+                        "limit": safe_limit,
+                        "total_chars": len(text),
+                        "has_more": safe_offset + safe_limit < len(text),
+                    }
+                )
+                break
+
+        if kind != "sql_query_result":
+            result["content"] = content
+        result["raw_result_available"] = available
+        result["artifact_sha256"] = artifact_sha256 or None
+        expected_hash = str(descriptor.get("source_hash") or "")
+        hash_scope = str(raw_ref.get("source_hash_scope") or "raw_result")
+        if (
+            available
+            and kind != "sql_query_result"
+            and hash_scope in {"raw_result", "raw_bytes"}
+            and expected_hash
+            and (hash_matches is False or (hash_matches is None and artifact_sha256 != expected_hash))
+        ):
+            result["status"] = "hash_mismatch"
+            result["hash_matches"] = False
+            logger.warning(
+                "Evidence hash mismatch session=%s evidence=%s expected=%s actual=%s",
+                session_id,
+                evidence_id,
+                expected_hash,
+                artifact_sha256,
+            )
+            emit_harness_metric(
+                logger,
+                "evidence_hash_mismatch_count",
+                session_id=session_id,
+                evidence_id=evidence_id,
+            )
+        elif available:
+            result["hash_matches"] = hash_matches if hash_matches is not None else (
+                True if kind != "sql_query_result" and hash_scope in {"raw_result", "raw_bytes"} else None
+            )
+        if not available:
+            result["status"] = unavailable_status
+            result["output_complete"] = False
+            emit_harness_metric(
+                logger,
+                "evidence_missing_count",
+                session_id=session_id,
+                evidence_id=evidence_id,
+                kind=kind,
+            )
+        return result
+
+    def session_references_result_id(self, session_id: str, result_id: str) -> bool:
+        """Whether a live Session Evidence ledger still owns a SQL artifact."""
+
+        data = self._read_file(session_id)
+        if not data:
+            return False
+        logical = deepcopy(data)
+        logical["messages"] = deepcopy(self.load_session(session_id))
+        self._ensure_evidence_metadata(session_id, logical)
+        index = logical.get("evidence_index")
+        if not isinstance(index, dict):
+            return False
+        return any(
+            isinstance(item, dict)
+            and isinstance(item.get("raw_output_ref"), dict)
+            and item["raw_output_ref"].get("kind") == "sql_query_result"
+            and str(item["raw_output_ref"].get("result_id") or "") == result_id
+            for item in index.values()
+        )
+
+    def result_owner_tool_call(self, session_id: str, result_id: str) -> dict[str, str] | None:
+        """Resolve one legacy SQL result to exactly one persisted ToolCall occurrence."""
+
+        data = {"messages": self.load_session(session_id)}
+        matches: list[dict[str, str]] = []
+        for _, _, message, tool_call in self._iter_persisted_tool_calls(data):
+            tool_name = str(tool_call.get("tool") or tool_call.get("name") or "")
+            if tool_name not in {"database_sql_execute", "database_knowledge_query"}:
+                continue
+            tool_call_id = str(tool_call.get("id") or "")
+            if tool_call_id and self._tool_context_result_id(self._tool_context_source(tool_call)) == result_id:
+                matches.append(
+                    {
+                        "tool_call_id": tool_call_id,
+                        "source_query_id": str(message.get("query_id") or ""),
+                        "source_run_id": str(tool_call.get("source_run_id") or ""),
+                        "source_hash": str(tool_call.get("source_hash") or ""),
+                    }
+                )
+        return matches[0] if len(matches) == 1 else None
 
     def begin_tool_context_job(
         self,
@@ -3779,6 +5219,7 @@ class SessionManager:
         policy_version: str,
         context_output: str,
         method: str,
+        context_profile: str = "detailed",
     ) -> bool:
         """CAS one result to ready without changing output or tool_call_id."""
 
@@ -3795,7 +5236,9 @@ class SessionManager:
             for _, _, _, tool_call in self._iter_persisted_tool_calls(data):
                 if str(tool_call.get("id") or "") != tool_call_id:
                     continue
-                current_hash = self._tool_context_source_hash(self._tool_context_source(tool_call))
+                current_hash = str(tool_call.get("source_hash") or "") or self._tool_context_source_hash(
+                    self._tool_context_source(tool_call)
+                )
                 metadata = tool_call.get("context_compaction")
                 if current_hash != source_hash or not isinstance(metadata, dict) or metadata.get("job_id") != job_id:
                     if isinstance(metadata, dict):
@@ -3809,6 +5252,8 @@ class SessionManager:
                     "source_hash": source_hash,
                     "policy_version": policy_version,
                     "method": method,
+                    "context_profile": context_profile,
+                    "projection_version": "evidence-projection-v1",
                     "job_id": job_id,
                     "compacted_at": time.time(),
                 }
@@ -3833,6 +5278,7 @@ class SessionManager:
         context_output: str,
         method: str,
         policy_version: str,
+        context_profile: str = "detailed",
     ) -> bool:
         """Attach current-turn immediate compaction after the visible result is persisted."""
 
@@ -3859,6 +5305,8 @@ class SessionManager:
                     "source_hash": source_hash,
                     "policy_version": policy_version,
                     "method": method,
+                    "context_profile": context_profile,
+                    "projection_version": "evidence-projection-v1",
                     "compacted_at": time.time(),
                 }
                 if before_ids != self._tool_call_ids(data):
@@ -5124,7 +6572,11 @@ class SessionManager:
                     temporary.unlink(missing_ok=True)
             persisted["rewind_backup_ref"] = f"rewind-backup:{receipt_id}"
             persisted["rewindable"] = True
-        elif str(receipt.get("operation") or "") == "create":
+        elif str(receipt.get("operation") or "") in {
+            "create",
+            "copy",
+            "materialize_create",
+        }:
             # Rewinding a create deletes the exact file after a hash check; no
             # before-bytes backup is needed.
             persisted["rewindable"] = True
@@ -5192,7 +6644,11 @@ class SessionManager:
                 persisted["rewind_backup_ref"] = f"rewind-backup:{receipt_id}"
                 persisted["rewindable"] = True
                 pending_backups.append((backup_path, before_bytes))
-            elif str(persisted.get("operation") or "") == "create":
+            elif str(persisted.get("operation") or "") in {
+                "create",
+                "copy",
+                "materialize_create",
+            }:
                 persisted["rewindable"] = True
             persisted_entries.append(persisted)
 
@@ -5260,6 +6716,117 @@ class SessionManager:
             )
         ]
         return deepcopy(matches[-1]) if matches else None
+
+    # ── Immutable source references and materialization receipts ─────────────
+
+    @_session_write_locked
+    def register_source_reference(
+        self,
+        session_id: str,
+        source_reference: dict[str, Any],
+    ) -> dict[str, Any]:
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        source_ref = str(source_reference.get("source_ref") or "")
+        if not source_ref:
+            raise ValueError("source reference requires source_ref")
+        persisted = deepcopy(source_reference)
+        references = data.setdefault("source_references", {})
+        existing = references.get(source_ref)
+        if isinstance(existing, dict):
+            if existing != persisted:
+                raise ValueError(f"source reference {source_ref} is immutable")
+            return deepcopy(existing)
+        references[source_ref] = persisted
+        self._write_file(session_id, data)
+        return deepcopy(persisted)
+
+    def get_source_reference(
+        self,
+        session_id: str,
+        source_ref: str,
+    ) -> dict[str, Any] | None:
+        data = self._read_file(session_id)
+        references = data.get("source_references") if data else None
+        if not isinstance(references, dict):
+            return None
+        value = references.get(source_ref)
+        return deepcopy(value) if isinstance(value, dict) else None
+
+    def list_source_references(self, session_id: str) -> list[dict[str, Any]]:
+        data = self._read_file(session_id)
+        references = data.get("source_references") if data else None
+        if not isinstance(references, dict):
+            return []
+        return sorted(
+            (
+                deepcopy(item)
+                for item in references.values()
+                if isinstance(item, dict)
+            ),
+            key=lambda item: float(item.get("created_at") or 0),
+        )
+
+    @_session_write_locked
+    def append_materialization_receipt(
+        self,
+        session_id: str,
+        receipt: dict[str, Any],
+    ) -> dict[str, Any]:
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        receipt_id = str(receipt.get("materialization_receipt_id") or "")
+        if not receipt_id:
+            raise ValueError(
+                "materialization receipt requires materialization_receipt_id"
+            )
+        persisted = deepcopy(receipt)
+        receipts = data.setdefault("materialization_receipts", {})
+        existing = receipts.get(receipt_id)
+        if isinstance(existing, dict):
+            existing_stable = {
+                key: value
+                for key, value in existing.items()
+                if key != "created_at"
+            }
+            incoming_stable = {
+                key: value
+                for key, value in persisted.items()
+                if key != "created_at"
+            }
+            if existing_stable != incoming_stable:
+                raise ValueError(
+                    f"materialization receipt {receipt_id} is immutable"
+                )
+            return deepcopy(existing)
+        receipts[receipt_id] = persisted
+        self._write_file(session_id, data)
+        return deepcopy(persisted)
+
+    def list_materialization_receipts(
+        self,
+        session_id: str,
+        *,
+        run_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        data = self._read_file(session_id)
+        receipts = data.get("materialization_receipts") if data else None
+        if not isinstance(receipts, dict):
+            return []
+        return sorted(
+            (
+                deepcopy(item)
+                for item in receipts.values()
+                if isinstance(item, dict)
+                and (
+                    run_id is None
+                    or str(item.get("run_id") or "") == run_id
+                )
+            ),
+            key=lambda item: float(item.get("created_at") or 0),
+        )
 
     # ── Permission grants ─────────────────────────────────────────────────────
 
@@ -5684,6 +7251,52 @@ class SessionManager:
                 return True
         return False
 
+    def has_external_directory_delete_permission(
+        self,
+        session_id: str,
+        path: Path,
+        *,
+        run_id: str,
+    ) -> bool:
+        """Return whether a write Grant separately includes directory delete."""
+
+        resolved = str(path.expanduser().resolve())
+        for grant in self.list_permission_grants(session_id):
+            if (
+                grant.get("type") != "external_directory_write"
+                or "write" not in (grant.get("capabilities") or [])
+                or "delete" not in (grant.get("capabilities") or [])
+                or grant.get("target_kind") != "exact_directory"
+                or grant.get("target") != resolved
+            ):
+                continue
+            metadata = grant.get("metadata")
+            if (
+                grant.get("scope") == "run"
+                and isinstance(metadata, dict)
+                and metadata.get("run_id") == run_id
+            ):
+                return True
+            if grant.get("scope") != "session":
+                continue
+            bindings = grant.get("bindings")
+            run = self.get_run_state(session_id, run_id)
+            if not isinstance(bindings, dict) or not isinstance(run, dict):
+                continue
+            required = RunPermissionContext.from_config_snapshot(
+                run.get("config_snapshot")
+            ).grant_bindings()
+            if PermissionBindingPolicy.equivalent(
+                grant_type="external_directory_write",
+                scope="session",
+                target_kind="exact_directory",
+                target=resolved,
+                left=bindings,
+                right=required,
+            ):
+                return True
+        return False
+
     @_session_write_locked
     def consume_tool_action_permission(
         self,
@@ -5746,21 +7359,56 @@ class SessionManager:
 
     # ── 为 Agent（LLM）准备消息 ─────────────────────────────────────────────────
 
-    def load_session_for_agent(self, session_id: str) -> list[dict[str, Any]]:
+    @_session_write_locked
+    def load_session_for_agent(
+        self,
+        session_id: str,
+        *,
+        current_run_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         """加载会话历史并格式化为 LLM 可用的消息列表
 
         两个关键处理：
         1. 合并连续的普通 assistant 文本消息（保持 user/assistant 严格交替）
         2. 如有压缩摘要，在头部注入一条摘要消息让 LLM 保留历史上下文
         """
+        self.ensure_tool_call_ids(session_id)
         data = self._read_file(session_id)  # 读取会话数据
-        messages = data.get("messages", []) if data else []  # 取消息列表
+        logical = deepcopy(data) if data else {}
+        logical["messages"] = deepcopy(self.load_session(session_id)) if data else []
+        if data and self._ensure_evidence_metadata(session_id, logical):
+            if data.get("evidence_index") != logical.get("evidence_index"):
+                data["evidence_index"] = deepcopy(logical.get("evidence_index") or {})
+                self._write_file(session_id, data)
+        messages = logical.get("messages", []) if logical else []  # active + archive
+
+        if current_run_id is None and data:
+            harness = data.get("harness")
+            runs = harness.get("runs") if isinstance(harness, dict) else None
+            latest_run_id = harness.get("latest_run_id") if isinstance(harness, dict) else None
+            latest_run = runs.get(latest_run_id) if isinstance(runs, dict) and latest_run_id else None
+            if isinstance(latest_run, dict) and str(latest_run.get("status") or "") not in {
+                "completed",
+                "cancelled",
+                "failed",
+                "blocked",
+                "budget_exceeded",
+                "verification_failed",
+            }:
+                current_run_id = str(latest_run_id)
 
         merged: list[dict[str, Any]] = []  # 合并后的结果列表
 
-        # 如有压缩摘要，作为第一条 assistant 消息注入（让 LLM 知道之前聊了什么）
+        # A display/archive projection already contains the original logical
+        # history. Inject summaries only for legacy sessions whose originals
+        # are genuinely unavailable; otherwise the model sees summary + source
+        # twice and trimming increases context instead of reducing it.
+        has_full_projection = bool(
+            isinstance(data.get("display_messages"), list)
+            or len(messages) > len(data.get("messages") or [])
+        ) if data else False
         compressed = data.get("compressed_context", "") if data else ""  # 读取摘要
-        if compressed:  # 摘要存在则注入
+        if compressed and not has_full_projection:  # 摘要存在则注入
             merged.append(
                 {
                     "role": "assistant",  # 伪装为 assistant 消息
@@ -5769,7 +7417,7 @@ class SessionManager:
             )
 
         middle_trim_context = data.get("middle_trim_context", "") if data else ""
-        if middle_trim_context:
+        if middle_trim_context and not has_full_projection:
             merged.append(
                 {
                     "role": "assistant",
@@ -5784,11 +7432,21 @@ class SessionManager:
 
         for msg in messages:  # 遍历所有消息
             entry: dict[str, Any] = {"role": msg["role"], "content": msg["content"]}
-            # New Runs receive user-visible conversation only. Raw Tool
-            # inputs/outputs and reasoning belong to their source Run; legal
-            # continuity is carried by RunHandoffSummary and evidence refs.
-            # 合并判断仍依赖原始消息是否携带 tool_calls，但不要把 tool_calls 放进 entry。
             msg_has_tool_calls = bool(msg.get("tool_calls"))
+            if msg_has_tool_calls:
+                calls: list[dict[str, Any]] = []
+                for raw_call in msg.get("tool_calls") or []:
+                    if not isinstance(raw_call, dict):
+                        continue
+                    call = deepcopy(raw_call)
+                    source_run_id = str(call.get("source_run_id") or "")
+                    call["historical"] = bool(
+                        not current_run_id or source_run_id != current_run_id
+                    )
+                    calls.append(call)
+                if calls:
+                    entry["tool_calls"] = calls
+                    entry["query_id"] = str(msg.get("query_id") or "")
             prev_has_tool_calls = bool(merged[-1].get("_had_tool_calls")) if merged else False
             if (
                 merged  # 列表非空

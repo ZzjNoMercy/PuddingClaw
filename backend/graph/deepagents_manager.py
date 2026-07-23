@@ -118,17 +118,20 @@ from graph.session_manager import session_manager
 from graph.tool_result_adapter import tool_result_adapter
 from graph.trace_collector import TraceCollector, TraceSpan
 from harness.artifact_paths import (
-    extract_declared_artifact_targets,
     extract_local_directory_paths,
     extract_local_resource_paths,
+    resolve_declared_artifact_targets,
 )
 from harness.coordinators import HarnessRunCoordinator
 from harness.dependency_setup import dependency_plan_prompt
 from harness.deterministic_checks import evaluate_deterministic_criteria
 from harness.evidence_ledger import EvidenceRef, is_evidence_ref
+from harness.goal_turn_router import GoalTurnDecision, GoalTurnRouter
 from harness.models import (
     GoalRecord,
     GoalStatus,
+    GoalTurnIntent,
+    RunKind,
     RunOutcome,
     RunRecord,
     RunStatus,
@@ -154,6 +157,7 @@ from llm.model_client import (
     ModelClientChatModel,
     ModelTransportInterruptedError,
 )
+from observability import emit_harness_metric
 from projects.registry import project_registry
 from tools import get_all_tools
 from tools.package_install import create_install_packages_tool
@@ -162,6 +166,7 @@ from tools.toolsets import agent_custom_tool_names, tool_control_descriptor
 logger = logging.getLogger(__name__)
 
 _TASK_ROUTER_TIMEOUT_SECONDS = 15.0
+_GOAL_TURN_ROUTER_TIMEOUT_SECONDS = 8.0
 _TRIVIAL_TASK_ROUTER_RE = re.compile(
     r"^\s*(?:你好|您好|嗨|哈喽|hello|hi|hey|谢谢|多谢|好的|好|ok|okay|在吗|早上好|下午好|晚上好)[!！。,.，?？\s]*$",
     re.IGNORECASE,
@@ -176,6 +181,20 @@ _TASK_PROFILE_CONTINUATION_RE = re.compile(
     r"^(?:继续|继续处理|继续执行|继续完成|接着做|接着处理|再试一次|重试|重试一次|继续吧)[。.!！?？\s]*$",
     flags=re.IGNORECASE,
 )
+_EXPLICIT_CONTINUATION_RE = re.compile(
+    r"(?:^|[\s，,。.!！?？]|请)(?:继续|接着|承接|恢复|从中断处)"
+    r"|(?:上次|刚才).{0,24}(?:未完成|中断|剩余|任务|报告|查询|SQL|图表|继续|接着|恢复)"
+    r"|(?:^|[\s,。.!！?？])(?:continue|resume|pick\s+up|carry\s+on)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _is_explicit_continuation(message: str) -> bool:
+    normalized = str(message or "").strip()
+    return bool(
+        _TASK_PROFILE_CONTINUATION_RE.fullmatch(normalized)
+        or _EXPLICIT_CONTINUATION_RE.search(normalized)
+    )
 
 _INTERNAL_CONTROL_SOURCES = frozenset(
     {
@@ -189,6 +208,10 @@ _SUMMARIZATION_USAGE_CONTEXT: ContextVar[dict[str, int] | None] = ContextVar(
     "puddingclaw_summarization_usage",
     default=None,
 )
+_HISTORICAL_TOOL_INLINE_BUDGET_CHARS = 80_000
+_HISTORICAL_MESSAGE_INLINE_BUDGET_CHARS = 40_000
+_HISTORICAL_TOOL_ARGS_BUDGET_CHARS = 24_000
+_HISTORICAL_MAX_MESSAGE_COUNT = 120
 
 
 def _message_metadata(message: Any) -> tuple[str, str, dict[str, Any]]:
@@ -239,6 +262,45 @@ def _user_facing_verification_summary(detail: str) -> str:
     clipped = summary[:240]
     boundary = max(clipped.rfind(mark) for mark in "。！？；;")
     return clipped[: boundary + 1] if boundary >= 80 else clipped.rstrip() + "…"
+
+
+def _terminal_verification_guidance(
+    status: VerificationStatus,
+    *,
+    has_goal: bool,
+    goal_status: GoalStatus | None,
+) -> str:
+    """Give a rejected Run an actionable, non-technical user-visible ending."""
+
+    if status in {
+        VerificationStatus.INCOMPLETE,
+        VerificationStatus.GRADER_ERROR,
+        VerificationStatus.INFRASTRUCTURE_ERROR,
+    }:
+        return (
+            "**验收流程遇到异常，任务结果尚未被判定失败。**\n\n"
+            "当前进度和证据已保留。请发送 **“重试验收”**；"
+            "如果再次出现，可在右侧“验收”中查看技术明细。"
+        )
+    if (
+        status == VerificationStatus.BUDGET_EXCEEDED
+        or goal_status == GoalStatus.BUDGET_EXCEEDED
+    ):
+        return (
+            "**本次执行已达到预算边界。**\n\n"
+            "当前进度、Todo、产物和证据均已保留。请在右侧 **“目标”** "
+            "中输入要追加的轮数；可以仅追加，也可以选择 **“追加并继续”**。"
+        )
+    if has_goal:
+        return (
+            "**还有未完成项，但当前进度没有丢失。**\n\n"
+            "Goal、Todo、产物和证据均已保留。请发送 "
+            "**“继续完成剩余工作”**，系统会启动新的 Goal Run 并从当前进度继续。"
+        )
+    return (
+        "**还有未完成项。**\n\n"
+        "请打开右侧 **“验收”** 查看具体缺口，然后发送对应的修复要求。"
+    )
 
 
 def _harness_summary_envelope(session_id: str) -> str:
@@ -721,7 +783,9 @@ register_harness_profile(
             "ls": (
                 "List entries in a directory only when the task genuinely requires "
                 "discovering unknown children. Never call ls as a prerequisite for "
-                "read_file, grep, inspect_file_version, patch_file, or write_file when "
+                "read_file, grep, inspect_file_version, copy_file, replace_file, "
+                "materialize_source_ref, patch_file, "
+                "or write_file when "
                 "an exact path is already known from the user, system context, a Tool "
                 "result, or a persisted artifact reference; operate on that path directly."
             ),
@@ -1436,6 +1500,27 @@ details. Never invent evidence that is absent from the supplied context.
         goal_evidence_refs: list[dict[str, Any]] = []
         goal_evidence_records: list[dict[str, Any]] = []
         persisted_run = session_manager.get_run_state(session_id, run_id) if session_id and run_id else None
+        persisted_run_kind = (
+            str(persisted_run.get("run_kind") or "")
+            if isinstance(persisted_run, dict)
+            else ""
+        )
+        if not persisted_run_kind and isinstance(persisted_run, dict):
+            persisted_run_kind = (
+                RunKind.GOAL_EXECUTION.value
+                if persisted_run.get("goal_id")
+                else RunKind.STANDALONE.value
+            )
+        explicit_context_run_kind = str(context.get("run_kind") or "")
+        if (
+            persisted_run_kind
+            and persisted_run_kind == RunKind.GOAL_INSPECTION.value
+        ) or (
+            not persisted_run_kind
+            and explicit_context_run_kind
+            and explicit_context_run_kind == RunKind.GOAL_INSPECTION.value
+        ):
+            return None
         persisted_activations = (
             persisted_run.get("verification_activations") if isinstance(persisted_run, dict) else None
         )
@@ -1448,6 +1533,11 @@ details. Never invent evidence that is absent from the supplied context.
             else {}
         )
         if goal_id:
+            session_manager.backfill_goal_declared_artifact_writes(
+                session_id,
+                goal_id,
+                int(goal_revision or 1),
+            )
             persisted_goal = session_manager.get_goal_state(session_id, goal_id)
             raw_goal_refs = persisted_goal.get("evidence_refs") if isinstance(persisted_goal, dict) else None
             if any(not is_evidence_ref(item) for item in (raw_goal_refs or [])):
@@ -1499,7 +1589,7 @@ details. Never invent evidence that is absent from the supplied context.
             "declared_artifact_targets": list(
                 persisted_run.get("declared_artifact_targets")
                 if isinstance(persisted_run, dict) and isinstance(persisted_run.get("declared_artifact_targets"), list)
-                else extract_declared_artifact_targets(run_objective)
+                else resolve_declared_artifact_targets(run_objective)
             ),
             "active_permission_grant_ids": [
                 str(item.get("id")) for item in session_manager.list_permission_grants(session_id) if item.get("id")
@@ -1539,13 +1629,24 @@ details. Never invent evidence that is absent from the supplied context.
                 VerificationFailureKind.VALIDATOR_PROTOCOL_ERROR,
             }
         ]
+        actionable_failures = [
+            item
+            for item in failures
+            if item not in infrastructure_failures
+        ]
         previous_attempts = max(
             int(state.get("_verification_attempts") or 0),
             int(state.get("_completion_gate_iterations") or 0),
             int(state.get("_rubric_iterations") or 0),
         )
         current_attempt = attempt if attempt is not None else previous_attempts + 1
-        failure_payload = [self._semantic_completion_failure(item) for item in failures]
+        # Stagnation is meaningful only for gaps the model can repair. Control
+        # plane and validator-protocol failures terminate as infrastructure
+        # errors immediately and never consume a repair iteration.
+        failure_payload = [
+            self._semantic_completion_failure(item)
+            for item in actionable_failures
+        ]
         failure_signature = (
             hashlib.sha256(
                 json.dumps(
@@ -1567,12 +1668,12 @@ details. Never invent evidence that is absent from the supplied context.
         gate_status = "satisfied"
         if infrastructure_failures:
             gate_status = VerificationStatus.INFRASTRUCTURE_ERROR.value
-        elif failures and stagnation_count >= 1:
+        elif actionable_failures and stagnation_count >= 1:
             # One directed repair was already attempted with no change in the
             # failing criteria or evidence. Stop honestly instead of spending
             # the entire model-call budget on an impossible citation contract.
             gate_status = VerificationStatus.FAILED.value
-        elif failures:
+        elif actionable_failures:
             gate_status = "needs_revision"
         repair_contract = {
             "version": "repair-contract/v1",
@@ -1581,7 +1682,8 @@ details. Never invent evidence that is absent from the supplied context.
             "goal_revision": goal_revision,
             "attempt": current_attempt,
             "instructions": [
-                self._completion_repair_instruction(item) for item in failures
+                self._completion_repair_instruction(item)
+                for item in actionable_failures
             ],
         }
         writer = getattr(runtime, "stream_writer", None)
@@ -1595,8 +1697,19 @@ details. Never invent evidence that is absent from the supplied context.
                     "session_id": session_id,
                     "run_id": run_id,
                     "goal_id": goal_id,
+                    "will_continue": bool(
+                        actionable_failures and gate_status == "needs_revision"
+                    ),
+                    "terminal": gate_status
+                    in {
+                        "satisfied",
+                        VerificationStatus.FAILED.value,
+                        VerificationStatus.INFRASTRUCTURE_ERROR.value,
+                    },
                     "evaluations": [item.model_dump(mode="json") for item in evaluations],
-                    "repair_contract": repair_contract if failures else None,
+                    "repair_contract": (
+                        repair_contract if actionable_failures else None
+                    ),
                 }
             )
         update: dict[str, Any] = {
@@ -1736,7 +1849,21 @@ details. Never invent evidence that is absent from the supplied context.
             if isinstance(persisted, dict)
             else ("goal" if isinstance(dict(state).get("verification_contract"), dict) else "agent")
         )
-        if verification_mode != "goal":
+        persisted_run_kind = (
+            str(persisted.get("run_kind") or "")
+            if isinstance(persisted, dict)
+            else ""
+        )
+        if not persisted_run_kind and isinstance(persisted, dict):
+            persisted_run_kind = (
+                RunKind.GOAL_EXECUTION.value
+                if persisted.get("goal_id")
+                else RunKind.STANDALONE.value
+            )
+        if verification_mode != "goal" or (
+            persisted_run_kind
+            and persisted_run_kind != RunKind.GOAL_EXECUTION.value
+        ):
             return None
         effective_update = self._effective_contract_update(dict(state), runtime)
         effective_state = {**dict(state), **effective_update}
@@ -1797,7 +1924,21 @@ details. Never invent evidence that is absent from the supplied context.
             if isinstance(persisted, dict)
             else ("goal" if isinstance(dict(state).get("verification_contract"), dict) else "agent")
         )
-        if verification_mode != "goal":
+        persisted_run_kind = (
+            str(persisted.get("run_kind") or "")
+            if isinstance(persisted, dict)
+            else ""
+        )
+        if not persisted_run_kind and isinstance(persisted, dict):
+            persisted_run_kind = (
+                RunKind.GOAL_EXECUTION.value
+                if persisted.get("goal_id")
+                else RunKind.STANDALONE.value
+            )
+        if verification_mode != "goal" or (
+            persisted_run_kind
+            and persisted_run_kind != RunKind.GOAL_EXECUTION.value
+        ):
             return None
         effective_update = self._effective_contract_update(dict(state), runtime)
         effective_state = {**dict(state), **effective_update}
@@ -2168,7 +2309,9 @@ def _build_subagents(
             "description": "General-purpose subagent for isolated multi-step work.",
             "system_prompt": (
                 "Complete the delegated task concisely. Read an applicable project Skill before using its business tools. "
-                "Use write_file or inspect_file_version plus patch_file for file changes; use execute only when runtime "
+                "Use copy_file for versioned copies, replace_file for hash-guarded full replacement, "
+                "materialize_source_ref for server data references, "
+                "or inspect_file_version plus patch_file for local edits; use execute only when runtime "
                 "computation, validation, or tests are actually required. Harness permissions are inherited from the "
                 "parent Run, so never ask the user for a separate subagent permission. Return registered Evidence IDs, "
                 "SQL generation/validation receipt IDs and Artifact hashes instead of copying exact data through prose. "
@@ -2433,6 +2576,9 @@ class DeepAgentsAgentManager:
         backend.execution_scratch_host_path = str(scratch_scope_dir.resolve())
         backend.execution_scratch_goal_id = goal_id
         backend.execution_scratch_goal_revision = goal_revision
+        backend.external_directory_writable_enabled = bool(
+            terminal_config.get("external_directory_writable_enabled", False)
+        )
         return backend
 
     def _build_middlewares(
@@ -2493,18 +2639,18 @@ class DeepAgentsAgentManager:
             *([VersionedPatchMiddleware(workspace_backend)] if workspace_backend is not None else []),
             *([AttachmentEditMiddleware(workspace_backend)] if workspace_backend is not None else []),
             *([ExternalDirectoryMiddleware(workspace_backend)] if workspace_backend is not None else []),
+            DelegationControlMiddleware(),
+            SkillIntentRouterMiddleware(),
+            ToolsetMiddleware(
+                skills_dir=self._base_dir / "skills",
+                toolsets_by_skill=toolset_mapping,
+            ),
             ToolExecutionPipeline(
                 known_tools=set(known_tools or ()),
                 backend_mode=backend_mode,
                 permission_context=permission_context,
                 base_dir=self._base_dir,
                 reviewer=permission_reviewer,
-            ),
-            DelegationControlMiddleware(),
-            SkillIntentRouterMiddleware(),
-            ToolsetMiddleware(
-                skills_dir=self._base_dir / "skills",
-                toolsets_by_skill=toolset_mapping,
             ),
         ]
         tool_context_cfg = ToolContextConfig.from_mapping(config.get_deepagents_tool_context_config())
@@ -2635,6 +2781,16 @@ class DeepAgentsAgentManager:
                 except Exception:
                     for key, value in resource_updates.items():
                         setattr(tool, key, value)
+            elif getattr(tool, "name", "") == "read_evidence":
+                evidence_updates = {
+                    "session_id": session_id,
+                    "workspace_path": str(workspace_path),
+                }
+                try:
+                    tool = tool.model_copy(update=evidence_updates)
+                except Exception:
+                    for key, value in evidence_updates.items():
+                        setattr(tool, key, value)
             elif getattr(tool, "name", "") in {
                 "request_dimension_build_rule",
                 "inspect_dimension_build_input",
@@ -2652,6 +2808,7 @@ class DeepAgentsAgentManager:
                 "database_sql_generate",
                 "database_sql_validate",
                 "database_sql_execute",
+                "database_query_result_source",
             }:
                 database_updates = {"session_id": session_id, "query_id": query_id}
                 try:
@@ -2804,9 +2961,21 @@ class DeepAgentsAgentManager:
             {"name": "update_todos", "source": "puddingclaw.harness", "description": "按稳定 ID 增量管理 Todo ledger"},
             {"name": "ls", "source": "deepagents.builtin", "description": "列出文件"},
             {"name": "read_file", "source": "deepagents.builtin", "description": "读取文件"},
+            {"name": "read_evidence", "source": "puddingclaw.harness", "description": "按稳定 Evidence ID 读取历史原始结果"},
             {"name": "write_file", "source": "deepagents.builtin", "description": "写入文件"},
             {"name": "inspect_file_version", "source": "puddingclaw.harness", "description": "读取文件版本并生成摘要"},
+            {"name": "copy_file", "source": "puddingclaw.harness", "description": "不经模型正文传输，原子创建文件副本"},
+            {"name": "replace_file", "source": "puddingclaw.harness", "description": "按 expected_sha256 原子覆盖文件"},
+            {"name": "materialize_source_ref", "source": "puddingclaw.harness", "description": "将不可变 SourceReference 直接物化为文件或类型化 Slot"},
             {"name": "patch_file", "source": "puddingclaw.harness", "description": "按文件版本原子应用补丁"},
+            {
+                "name": "validate_html_report",
+                "source": "puddingclaw.harness",
+                "description": (
+                    "常规检查 HTML 结构与本地引用；合同明确要求 E2E 时才使用"
+                    "离线 Chromium，并生成 hash 绑定 Receipt"
+                ),
+            },
             {
                 "name": "stage_external_artifact",
                 "source": "puddingclaw.harness",
@@ -3264,7 +3433,7 @@ class DeepAgentsAgentManager:
                 paths = "\n".join(f"- {path}" for path in external_resource_paths)
                 notes.append(
                     "[外部文件授权] 检测到 workspace 外的本地文件路径。直接对原始绝对路径使用 "
-                    f"read_file/inspect_file_version/patch_file：\n{paths}\n"
+                    f"read_file/inspect_file_version/copy_file/replace_file/materialize_source_ref/patch_file：\n{paths}\n"
                     "未授权时系统会请求精确文件权限并重放原调用。若确认必须发现同目录依赖，"
                     "对直接父目录调用 ls/glob/grep；系统只请求该 exact directory，不得猜测兄弟路径或提升到更高祖先目录。"
                     "获批后的读写由 HostFileBroker 原子落到正式路径；不要创建 /workspace 或 /scratch 影子副本。"
@@ -3280,7 +3449,8 @@ class DeepAgentsAgentManager:
                 paths = "\n".join(f"- {path}" for path in external_directory_paths)
                 notes.append(
                     "[外部目录授权] 检测到 workspace 外的本地目录。直接对原始绝对路径调用 "
-                    f"ls/glob/grep/read_file/write_file/inspect_file_version/patch_file：\n{paths}\n"
+                    f"ls/glob/grep/read_file/write_file/inspect_file_version/copy_file/replace_file/"
+                    f"materialize_source_ref/patch_file：\n{paths}\n"
                     "未授权时系统会请求 exact-directory 权限并自动重放；授权后 HostFileBroker 直接访问正式文件，"
                     "不会暴露 lease、staged path 或 hash 编排。execute 仍受项目 Docker 与 container_path_expansion "
                     "约束；需要完整目录命令语义时优先建议把该目录作为项目打开。"
@@ -3427,6 +3597,136 @@ class DeepAgentsAgentManager:
             timeout=_TASK_ROUTER_TIMEOUT_SECONDS,
         )
 
+    async def _classify_goal_turn(
+        self,
+        *,
+        session_id: str,
+        message: str,
+        goal: dict[str, Any],
+        model_override: str | None = None,
+    ) -> GoalTurnDecision:
+        """Classify lifecycle ownership before a Run or contract is created."""
+
+        deterministic = GoalTurnRouter.deterministic(
+            message,
+            goal_id=str(goal.get("goal_id") or ""),
+        )
+        if deterministic is not None:
+            return deterministic
+        recent_execution_context = self._goal_turn_recent_execution_context(
+            session_id=session_id,
+            goal=goal,
+        )
+        router_model = ModelClientChatModel(
+            role="task_classifier",
+            temperature=0,
+            streaming=False,
+            thinking_enabled=False,
+            model_override=model_override or None,
+        )
+        try:
+            return await asyncio.wait_for(
+                GoalTurnRouter.classify(
+                    message=message,
+                    goal=goal,
+                    model=router_model,
+                    recent_execution_context=recent_execution_context,
+                ),
+                timeout=_GOAL_TURN_ROUTER_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            return GoalTurnRouter.contextual_fallback(
+                message=message,
+                goal=goal,
+                recent_execution_context=recent_execution_context,
+                reason="classifier_timeout",
+            )
+
+    @staticmethod
+    def _goal_turn_recent_execution_context(
+        *,
+        session_id: str,
+        goal: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Project bounded recent execution state for contextual Goal routing."""
+
+        latest_run = session_manager.get_run_state(session_id)
+        run_context: dict[str, Any] = {}
+        if (
+            isinstance(latest_run, dict)
+            and str(latest_run.get("goal_id") or "") == str(goal.get("goal_id") or "")
+        ):
+            run_context = {
+                "run_id": str(latest_run.get("run_id") or ""),
+                "status": str(latest_run.get("status") or ""),
+                "outcome": str(latest_run.get("outcome") or ""),
+                "error": str(latest_run.get("error") or "")[:300],
+                "handoff_summary": (
+                    latest_run.get("handoff_summary")
+                    if isinstance(latest_run.get("handoff_summary"), dict)
+                    else None
+                ),
+            }
+
+        recent_tools: list[dict[str, str]] = []
+        seen_tool_calls: set[str] = set()
+        messages = session_manager.load_session(session_id)
+        for persisted in reversed(messages[-20:]):
+            if not isinstance(persisted, dict) or persisted.get("role") != "assistant":
+                continue
+            tool_calls = list(persisted.get("tool_calls") or [])
+            for segment in persisted.get("segments") or []:
+                if isinstance(segment, dict):
+                    tool_calls.extend(segment.get("tool_calls") or [])
+            for tool_call in reversed(tool_calls):
+                if not isinstance(tool_call, dict):
+                    continue
+                call_id = str(tool_call.get("id") or "")
+                if call_id and call_id in seen_tool_calls:
+                    continue
+                if call_id:
+                    seen_tool_calls.add(call_id)
+                tool_name = str(tool_call.get("tool") or tool_call.get("name") or "")
+                raw_input = tool_call.get("input")
+                parsed_input: dict[str, Any] = {}
+                if isinstance(raw_input, dict):
+                    parsed_input = raw_input
+                elif isinstance(raw_input, str):
+                    try:
+                        candidate = json.loads(raw_input)
+                        if isinstance(candidate, dict):
+                            parsed_input = candidate
+                    except (TypeError, ValueError):
+                        parsed_input = {}
+                target = ""
+                for key in (
+                    "target_path",
+                    "destination_path",
+                    "file_path",
+                    "path",
+                    "source_path",
+                ):
+                    if parsed_input.get(key):
+                        target = str(parsed_input[key])[:500]
+                        break
+                recent_tools.append(
+                    {
+                        "tool": tool_name,
+                        "target": target,
+                        "status": str(tool_call.get("status") or ""),
+                        "is_error": str(bool(tool_call.get("is_error"))).lower(),
+                    }
+                )
+                if len(recent_tools) >= 8:
+                    break
+            if len(recent_tools) >= 8:
+                break
+        recent_tools.reverse()
+        return {
+            "latest_run": run_context,
+            "recent_tools": recent_tools,
+        }
+
     @staticmethod
     def _reusable_task_profile(
         *,
@@ -3551,11 +3851,68 @@ class DeepAgentsAgentManager:
         query_id: str | None = None,
     ) -> list[Any]:
         messages: list[Any] = []
-        for item in history:
+        omitted_history_count = max(
+            0,
+            len(history) - _HISTORICAL_MAX_MESSAGE_COUNT,
+        )
+        if omitted_history_count:
+            history = history[-_HISTORICAL_MAX_MESSAGE_COUNT:]
+            messages.append(
+                SystemMessage(
+                    content=(
+                        "[Historical context projection] "
+                        f"{omitted_history_count} older messages were omitted by the "
+                        "deterministic request budget. Durable Goal, Todo, Artifact and "
+                        "Evidence state remains available through control-plane tools."
+                    )
+                )
+            )
+        detailed_tool_calls: set[int] = set()
+        remaining_tool_budget = _HISTORICAL_TOOL_INLINE_BUDGET_CHARS
+        for history_item in reversed(history):
+            for historical_call in reversed(history_item.get("tool_calls") or []):
+                if not isinstance(historical_call, dict):
+                    continue
+                raw_value = str(
+                    historical_call.get("raw_output", historical_call.get("output", "")) or ""
+                )
+                raw_ref = historical_call.get("raw_output_ref")
+                ref_kind = str(raw_ref.get("kind") or "") if isinstance(raw_ref, dict) else ""
+                projected_cost = 1_200 if ref_kind in {"deepagents_large_tool_result", "sql_query_result"} else min(
+                    len(raw_value), 4_000 if len(raw_value) > 16_000 else len(raw_value)
+                )
+                if projected_cost <= remaining_tool_budget:
+                    detailed_tool_calls.add(id(historical_call))
+                    remaining_tool_budget -= projected_cost
+
+        detailed_text_messages: set[int] = set()
+        remaining_text_budget = _HISTORICAL_MESSAGE_INLINE_BUDGET_CHARS
+        for history_item in reversed(history):
+            if history_item.get("tool_calls"):
+                continue
+            historical_content = str(history_item.get("content") or "")
+            projected_cost = min(len(historical_content), 8_000)
+            if projected_cost <= remaining_text_budget:
+                detailed_text_messages.add(id(history_item))
+                remaining_text_budget -= projected_cost
+
+        remaining_args_budget = _HISTORICAL_TOOL_ARGS_BUDGET_CHARS
+        for message_index, item in enumerate(history):
             role = item.get("role")
             content = item.get("content")
             if role not in {"user", "assistant", "system"} or content is None:
                 continue
+            if not item.get("tool_calls") and id(item) not in detailed_text_messages:
+                raw_content = str(content)
+                content = (
+                    "[Historical message minimal projection]\n"
+                    f"{raw_content[:240]}"
+                    + (
+                        f"\n... [omitted {len(raw_content) - 240} chars]"
+                        if len(raw_content) > 240
+                        else ""
+                    )
+                )
             if role == "system":
                 messages.append(SystemMessage(content=content))
                 continue
@@ -3580,9 +3937,20 @@ class DeepAgentsAgentManager:
                 # frontend-facing tool role in session.json.
                 normalized_tool_calls: list[tuple[dict[str, Any], str, str]] = []
                 for index, tc in enumerate(tool_calls):
-                    tc_id = tc.get("id") or ""
-                    if not tc_id:
-                        tc_id = f"historical_tool_{index}"
+                    persisted_tc_id = str(tc.get("id") or f"missing-{message_index}-{index}")
+                    tc_id = persisted_tc_id
+                    if tc.get("historical"):
+                        identity = "\0".join(
+                            (
+                                str(session_id or ""),
+                                str(item.get("query_id") or ""),
+                                str(tc.get("source_run_id") or ""),
+                                persisted_tc_id,
+                                str(message_index),
+                                str(index),
+                            )
+                        )
+                        tc_id = f"historical_{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:24]}"
                     tool_name = tc.get("tool") or tc.get("name") or "unknown_tool"
                     normalized_tool_calls.append((tc, tool_name, tc_id))
 
@@ -3593,9 +3961,31 @@ class DeepAgentsAgentManager:
                         parsed_args = dict(tool_input)
                     else:
                         parsed_args = cls._safe_parse_tool_args(str(tool_input))
+                    serialized_args = json.dumps(
+                        parsed_args,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        default=str,
+                    )
+                    if len(serialized_args) > remaining_args_budget:
+                        parsed_args = {
+                            "_historical_input_omitted": True,
+                            "evidence_id": str(tc.get("evidence_id") or ""),
+                            "original_size_chars": len(serialized_args),
+                        }
+                    else:
+                        remaining_args_budget -= len(serialized_args)
                     lc_tool_calls.append({"name": tool_name, "args": parsed_args, "id": tc_id})
 
-                ai_kwargs: dict[str, Any] = {"content": content, "tool_calls": lc_tool_calls}
+                is_historical = any(bool(tc.get("historical")) for tc, _, _ in normalized_tool_calls)
+                ai_kwargs: dict[str, Any] = {
+                    "content": content,
+                    "tool_calls": lc_tool_calls,
+                    "additional_kwargs": {
+                        "puddingclaw_historical": is_historical,
+                        "puddingclaw_source_query_id": str(item.get("query_id") or ""),
+                    },
+                }
                 if item.get("reasoning_content"):
                     ai_kwargs["reasoning_content"] = item["reasoning_content"]
                 messages.append(AIMessage(**ai_kwargs))
@@ -3605,7 +3995,55 @@ class DeepAgentsAgentManager:
                     stored_raw_output = tc.get("raw_output", stored_output)
                     if stored_raw_output is None or str(stored_raw_output).strip() == "":
                         stored_raw_output = MISSING_TOOL_OUTPUT_PLACEHOLDER
-                    if tc.get("summary_source") in {"single_tool_overflow", "tool_result_clear"}:
+                    raw_ref = tc.get("raw_output_ref") if isinstance(tc.get("raw_output_ref"), dict) else {}
+                    evidence_id = str(tc.get("evidence_id") or "")
+                    if raw_ref.get("kind") == "deepagents_large_tool_result":
+                        model_output = (
+                            "The complete historical result is stored outside the current Query namespace. "
+                            f"Use read_evidence(evidence_id={json.dumps(evidence_id)}, offset=0, limit=20000) "
+                            "to inspect it; do not use the historical /large_tool_results path directly.\n\n"
+                            f"Historical pointer/preview:\n{stored_output}"
+                        )
+                        model_sources = list(tc.get("sources", []) or [])
+                    elif raw_ref.get("kind") == "sql_query_result":
+                        result_id = str(raw_ref.get("result_id") or "")
+                        model_output = (
+                            f"Historical SQL result is materialized as result_id={result_id}. "
+                            f"Use read_evidence(evidence_id={json.dumps(evidence_id)}, page=1, page_size=100) "
+                            "to read the saved artifact without rerunning SQL.\n\n"
+                            f"Historical preview/profile:\n{stored_output}"
+                        )
+                        model_sources = list(tc.get("sources", []) or [])
+                    elif bool(tc.get("historical")) and id(tc) not in detailed_tool_calls:
+                        raw_text = str(stored_raw_output)
+                        model_output = (
+                            "[Historical Evidence minimal projection]\n"
+                            f"evidence_id={evidence_id}; tool={tool_name}; status={tc.get('status') or 'unknown'}; "
+                            "use read_evidence for exact details.\n"
+                            f"preview={raw_text[:320]}"
+                        )
+                        model_sources = list(tc.get("sources", []) or [])
+                    elif bool(tc.get("historical")) and len(str(stored_raw_output)) > 16_000:
+                        context_metadata = tc.get("context_compaction")
+                        ready_projection = (
+                            str(tc.get("context_output") or "")
+                            if isinstance(context_metadata, dict)
+                            and context_metadata.get("status") == "ready"
+                            and context_metadata.get("source_hash") == tc.get("source_hash")
+                            else ""
+                        )
+                        if ready_projection:
+                            model_output = ready_projection
+                        else:
+                            raw_text = str(stored_raw_output)
+                            model_output = (
+                                "[Historical Evidence projection; raw result is preserved]\n"
+                                f"evidence_id={evidence_id}; use read_evidence with offset/limit for exact details.\n"
+                                f"{raw_text[:2800]}\n\n... [projection omitted {len(raw_text) - 4000} chars] ...\n\n"
+                                f"{raw_text[-1200:]}"
+                            )
+                        model_sources = list(tc.get("sources", []) or [])
+                    elif tc.get("summary_source") in {"single_tool_overflow", "tool_result_clear"}:
                         model_output = str(stored_output or stored_raw_output)
                         model_sources = list(tc.get("sources", []) or [])
                     else:
@@ -3626,12 +4064,25 @@ class DeepAgentsAgentManager:
                             tool_call_id=tc_id,
                             name=tool_name,
                             additional_kwargs={
+                                "puddingclaw_historical": bool(tc.get("historical")),
+                                "puddingclaw_evidence_id": evidence_id,
+                                "puddingclaw_source_run_id": str(tc.get("source_run_id") or ""),
+                                "puddingclaw_projection_profile": "detailed",
+                                "puddingclaw_projection_version": "evidence-projection-v1",
                                 "puddingclaw_query_id": str(item.get("query_id") or ""),
                                 "puddingclaw_tool_source_hash": str(
-                                    (tc.get("context_compaction") or {}).get("source_hash")
+                                    tc.get("source_hash")
+                                    or (tc.get("context_compaction") or {}).get("source_hash")
                                     or session_manager._tool_context_source_hash(str(stored_raw_output))
                                 ),
                             },
+                            status=(
+                                "error"
+                                if tc.get("is_error")
+                                or tc.get("status") in {"error", "failed", "interrupted"}
+                                or tc.get("output_complete") is False
+                                else "success"
+                            ),
                         )
                     )
             elif role == "assistant":
@@ -4022,28 +4473,80 @@ class DeepAgentsAgentManager:
         session_id: str,
         tool_call_id: str,
         original_output: str,
+        workspace_path: str | Path | None = None,
+        source_query_id: str = "",
     ) -> dict[str, Any]:
         artifact = cls._tool_message_artifact(tool_msg)
         context_output = artifact.get(CONTEXT_OUTPUT_ARTIFACT_KEY)
-        if not context_output or not tool_call_id:
+        if not tool_call_id:
             return {}
-        source_hash = session_manager._tool_context_source_hash(original_output)
-        return {
-            "context_output": str(context_output),
-            "raw_output_ref": session_manager._tool_context_raw_ref(
-                session_id,
-                tool_call_id,
-                original_output,
-                source_hash,
-            ),
-            "context_compaction": {
-                "status": "ready",
-                "source_hash": source_hash,
-                "policy_version": str(artifact.get(CONTEXT_POLICY_ARTIFACT_KEY) or TOOL_CONTEXT_POLICY_VERSION),
-                "method": str(artifact.get(CONTEXT_METHOD_ARTIFACT_KEY) or "immediate_head_tail"),
-                "compacted_at": time.time(),
-            },
+        extra = getattr(tool_msg, "additional_kwargs", None)
+        extra = extra if isinstance(extra, dict) else {}
+        source_hash = str(extra.get("puddingclaw_tool_source_hash") or "")
+        source_hash_scope = "raw_result" if source_hash else "pointer"
+        if not source_hash:
+            source_hash = session_manager._tool_context_source_hash(original_output)
+        source_query_id = str(
+            extra.get("puddingclaw_query_id") or source_query_id or ""
+        )
+        raw_ref = session_manager._tool_context_raw_ref(
+            session_id,
+            tool_call_id,
+            original_output,
+            source_hash,
+            tool_name=str(getattr(tool_msg, "name", "") or ""),
+            source_query_id=source_query_id,
+            source_hash_scope=source_hash_scope,
+            workspace_path=str(Path(workspace_path).expanduser().resolve()) if workspace_path else "",
+        )
+        if raw_ref.get("kind") == "deepagents_large_tool_result":
+            origin_workspace = str(raw_ref.get("workspace_path") or "")
+            artifact_name = str(raw_ref.get("artifact_name") or "")
+            if origin_workspace and artifact_name:
+                artifact = (
+                    Path(origin_workspace)
+                    / ".puddingclaw"
+                    / "large_tool_results"
+                    / str(raw_ref.get("session_id") or "")
+                    / str(raw_ref.get("source_query_id") or "")
+                    / artifact_name
+                )
+                if artifact.is_file():
+                    digest = hashlib.sha256()
+                    with artifact.open("rb") as handle:
+                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                    source_hash = f"sha256:{digest.hexdigest()}"
+                    source_hash_scope = "raw_bytes"
+                    raw_ref["source_hash"] = source_hash
+                    raw_ref["source_hash_scope"] = source_hash_scope
+        fields: dict[str, Any] = {
+            "source_hash": source_hash,
+            "raw_output_ref": raw_ref,
         }
+        if not context_output:
+            return fields
+        fields.update(
+            {
+                "context_output": str(context_output),
+                "context_compaction": {
+                    "status": "ready",
+                    "source_hash": source_hash,
+                    "policy_version": str(
+                        artifact.get(CONTEXT_POLICY_ARTIFACT_KEY)
+                        or TOOL_CONTEXT_POLICY_VERSION
+                    ),
+                    "method": str(
+                        artifact.get(CONTEXT_METHOD_ARTIFACT_KEY)
+                        or "immediate_head_tail"
+                    ),
+                    "context_profile": "detailed",
+                    "projection_version": "evidence-projection-v1",
+                    "compacted_at": time.time(),
+                },
+            }
+        )
+        return fields
 
     @staticmethod
     def _is_tool_error(tool_msg: Any, output: str) -> bool:
@@ -4395,6 +4898,8 @@ class DeepAgentsAgentManager:
                     tc["output"] = tc.get("output") or output
                     tc["summary_source"] = tc.get("summary_source") or "stream_cancelled"
                     tc["is_error"] = True
+                    tc["status"] = "interrupted"
+                    tc["output_complete"] = False
                     tc["completed_at"] = tc.get("completed_at") or time.time()
                     matched = True
                     break
@@ -4407,10 +4912,18 @@ class DeepAgentsAgentManager:
                         "output": output,
                         "summary_source": "stream_cancelled",
                         "is_error": True,
+                        "status": "interrupted",
+                        "output_complete": False,
                         "completed_at": time.time(),
                     }
                 )
             DeepAgentsAgentManager._update_tool_end_in_timeline(segment, tc_id or "", output, True)
+            for item in reversed(segment.get("timeline", [])):
+                timeline_call = item.get("tool_call") if isinstance(item, dict) else None
+                if isinstance(timeline_call, dict) and timeline_call.get("id") == tc_id:
+                    timeline_call["status"] = "interrupted"
+                    timeline_call["output_complete"] = False
+                    break
         pending_tool_starts.clear()
 
     @staticmethod
@@ -4714,6 +5227,56 @@ class DeepAgentsAgentManager:
             + handoff_text
         )
 
+    @staticmethod
+    def _goal_inspection_prompt(
+        *,
+        session_id: str,
+        run: RunRecord,
+        todos: list[dict[str, Any]],
+    ) -> str:
+        """Project bounded read-only Goal state without replaying private logs."""
+
+        goal = (
+            session_manager.get_goal_state(session_id, str(run.context_goal_id))
+            if run.context_goal_id
+            else None
+        )
+        goal = goal if isinstance(goal, dict) else {}
+        recent_runs: list[dict[str, Any]] = []
+        for prior_run_id in list(goal.get("run_ids") or [])[-5:]:
+            prior = session_manager.get_run_state(session_id, str(prior_run_id))
+            if not isinstance(prior, dict):
+                continue
+            handoff = prior.get("handoff_summary")
+            recent_runs.append(
+                {
+                    "run_id": prior.get("run_id"),
+                    "status": prior.get("status"),
+                    "outcome": prior.get("outcome"),
+                    "handoff_summary": handoff if isinstance(handoff, dict) else None,
+                }
+            )
+        projection = {
+            "goal_id": goal.get("goal_id"),
+            "objective": goal.get("objective"),
+            "status": goal.get("status"),
+            "revision": goal.get("objective_revision"),
+            "gaps": list(goal.get("gaps") or [])[:20],
+            "todos": [dict(item) for item in todos[:100] if isinstance(item, dict)],
+            "recent_runs": recent_runs,
+            "evidence_refs": list(goal.get("evidence_refs") or [])[:100],
+        }
+        return (
+            "\n\n## Goal 回合控制\n"
+            "当前用户消息是本轮最高优先级指令；standing Goal 仅为只读背景。\n"
+            "本轮已被控制面判定为 Goal 进度/证据查询。只回答当前问题，不得继续执行 Goal，"
+            "不得修改 Todo、文件、数据库或外部状态，不得启动子任务。\n"
+            "不要声称未提供的工作已经完成；区分 durable evidence、Todo 状态和计划。\n"
+            "<goal_read_only_context>\n"
+            + json.dumps(projection, ensure_ascii=False, sort_keys=True, default=str)
+            + "\n</goal_read_only_context>"
+        )
+
     async def astream(
         self,
         *,
@@ -4726,25 +5289,173 @@ class DeepAgentsAgentManager:
         user_message_already_persisted: bool = False,
         goal_mode: bool = False,
         goal_id: str | None = None,
+        context_goal_id: str | None = None,
+        goal_control_action: str | None = None,
     ) -> AsyncGenerator[dict[str, str], None]:
         """Stream one user request and autonomously advance recoverable Goal Runs."""
 
         existing_goal = (
-            session_manager.get_goal_state(session_id, goal_id)
+            session_manager.get_goal_state(session_id, context_goal_id)
+            if context_goal_id
+            else session_manager.get_goal_state(session_id, goal_id)
             if goal_id
             else session_manager.get_active_goal_state(session_id)
             if goal_mode
             else None
         )
-        current_objective = (
-            str(existing_goal.get("objective") or message) if isinstance(existing_goal, dict) else message
-        )
+        current_objective = message
         current_message = message
-        current_goal_id = (
-            str(existing_goal.get("goal_id"))
-            if isinstance(existing_goal, dict) and existing_goal.get("goal_id")
-            else goal_id
-        )
+        current_goal_id: str | None = None
+        run_context_goal_id: str | None = None
+        context_goal_revision: int | None = None
+        turn_decision: GoalTurnDecision | None = None
+        run_kind = RunKind.STANDALONE
+        if isinstance(existing_goal, dict):
+            if goal_control_action == "start":
+                if str(existing_goal.get("status") or "") != GoalStatus.ACTIVE.value:
+                    raise ValueError("Goal must be active before it can be started")
+                if existing_goal.get("requested_status"):
+                    raise ValueError("Goal has a pending control request")
+                turn_decision = GoalTurnDecision(
+                    intent=GoalTurnIntent.CONTINUE_GOAL,
+                    target_goal_id=str(existing_goal.get("goal_id") or ""),
+                    confidence=1.0,
+                    reason="explicit_goal_start_control",
+                    classifier="product_control",
+                )
+            else:
+                turn_decision = await self._classify_goal_turn(
+                    session_id=session_id,
+                    message=message,
+                    goal=existing_goal,
+                )
+            if turn_decision.classifier == "fallback":
+                emit_harness_metric(
+                    logger,
+                    "goal_turn_router_fallback_total",
+                    session_id=session_id,
+                    goal_id=str(existing_goal.get("goal_id") or ""),
+                    reason=turn_decision.reason,
+                )
+            emit_harness_metric(
+                logger,
+                "goal_turn_route_total",
+                session_id=session_id,
+                goal_id=str(existing_goal.get("goal_id") or ""),
+                intent=turn_decision.intent.value,
+                classifier=turn_decision.classifier,
+                reason=turn_decision.reason,
+            )
+            yield self._sse(
+                "goal_turn_routed",
+                {
+                    "session_id": session_id,
+                    "intent": turn_decision.intent.value,
+                    "target_goal_id": turn_decision.target_goal_id,
+                    "confidence": turn_decision.confidence,
+                    "reason": turn_decision.reason,
+                    "classifier": turn_decision.classifier,
+                },
+            )
+            if turn_decision.intent == GoalTurnIntent.CONTROL_GOAL:
+                action = str(turn_decision.control_action or "")
+                method = {
+                    "pause": self._run_coordinator.goals.pause,
+                    "resume": self._run_coordinator.goals.resume,
+                    "cancel": self._run_coordinator.goals.cancel,
+                }[action]
+                controlled = await asyncio.to_thread(
+                    method,
+                    session_id,
+                    str(existing_goal.get("goal_id") or ""),
+                )
+                if action in {"pause", "cancel"} and controlled.requested_status is not None:
+                    self.cancel_active_goal_run(
+                        session_id,
+                        str(existing_goal.get("goal_id") or ""),
+                    )
+                content = {
+                    "pause": "当前 Goal 已请求暂停。",
+                    "resume": "当前 Goal 已恢复，可以继续执行。",
+                    "cancel": "当前 Goal 已请求取消。",
+                }[action]
+                if not user_message_already_persisted:
+                    session_manager.save_message(session_id, "user", message, attachments=attachments)
+                control_query_id = f"query-{uuid.uuid4().hex[:12]}"
+                self._persist_assistant_snapshot(
+                    session_id=session_id,
+                    query_id=control_query_id,
+                    segments=[{"content": content, "tool_calls": [], "timeline": []}],
+                    accumulated_reasoning="",
+                    turn_sources=[],
+                    status="completed",
+                )
+                yield self._sse(
+                    "goal_status_changed",
+                    {"session_id": session_id, "goal": controlled.model_dump(mode="json")},
+                )
+                yield self._sse("token", {"content": content})
+                yield self._sse("done", {"content": content, "session_id": session_id})
+                return
+            if turn_decision.intent == GoalTurnIntent.CLARIFY:
+                content = (
+                    "我不确定你是想查看当前 Goal 的进度，还是继续执行它。"
+                    "请明确说“总结进度”或“继续执行”。"
+                )
+                if not user_message_already_persisted:
+                    session_manager.save_message(session_id, "user", message, attachments=attachments)
+                clarify_query_id = f"query-{uuid.uuid4().hex[:12]}"
+                self._persist_assistant_snapshot(
+                    session_id=session_id,
+                    query_id=clarify_query_id,
+                    segments=[{"content": content, "tool_calls": [], "timeline": []}],
+                    accumulated_reasoning="",
+                    turn_sources=[],
+                    status="completed",
+                )
+                yield self._sse("token", {"content": content})
+                yield self._sse("done", {"content": content, "session_id": session_id})
+                return
+            if turn_decision.intent == GoalTurnIntent.REVISE_GOAL:
+                revised = await asyncio.to_thread(
+                    self._run_coordinator.goals.update_objective,
+                    session_id,
+                    str(existing_goal.get("goal_id") or ""),
+                    objective=str(turn_decision.revised_objective or ""),
+                    expected_revision=int(existing_goal.get("objective_revision") or 1),
+                )
+                existing_goal = revised.model_dump(mode="json")
+                current_objective = revised.objective
+                current_goal_id = revised.goal_id
+                goal_mode = True
+                run_kind = RunKind.GOAL_EXECUTION
+            elif turn_decision.intent == GoalTurnIntent.CONTINUE_GOAL:
+                current_objective = str(existing_goal.get("objective") or message)
+                current_goal_id = str(existing_goal.get("goal_id") or "") or None
+                goal_mode = True
+                run_kind = RunKind.GOAL_EXECUTION
+            elif turn_decision.intent == GoalTurnIntent.INSPECT_GOAL:
+                current_objective = message
+                goal_mode = False
+                run_context_goal_id = str(existing_goal.get("goal_id") or "") or None
+                context_goal_revision = int(existing_goal.get("objective_revision") or 1)
+                run_kind = RunKind.GOAL_INSPECTION
+            else:
+                current_objective = message
+                goal_mode = False
+                run_kind = RunKind.STANDALONE
+        elif goal_mode:
+            # Explicit Goal Mode without a standing Goal creates the first
+            # execution Run. This is product state, not a semantic guess.
+            current_goal_id = goal_id
+            run_kind = RunKind.GOAL_EXECUTION
+            turn_decision = GoalTurnDecision(
+                intent=GoalTurnIntent.CONTINUE_GOAL,
+                target_goal_id=goal_id,
+                confidence=1.0,
+                reason="explicit_goal_mode_creation",
+                classifier="product_state",
+            )
         internal_continuation = False
         while True:
             if internal_continuation and current_goal_id:
@@ -4768,6 +5479,10 @@ class DeepAgentsAgentManager:
                 goal_id=current_goal_id,
                 run_objective=current_objective,
                 internal_continuation=internal_continuation,
+                run_kind=run_kind,
+                context_goal_id=run_context_goal_id,
+                context_goal_revision=context_goal_revision,
+                goal_turn_decision=turn_decision,
             ):
                 event_name = event.get("event")
                 payload = self._parse_sse_payload(event)
@@ -4799,7 +5514,7 @@ class DeepAgentsAgentManager:
                 outcome=outcome_payload,
                 verification=verification_payload,
                 goal=goal_payload,
-            )
+            ) if run_kind == RunKind.GOAL_EXECUTION else None
             previous_query_id = str(outcome_payload.get("query_id") or "")
             boundary_notice: dict[str, Any] | None = None
             if continuation_reason is not None:
@@ -4870,6 +5585,16 @@ class DeepAgentsAgentManager:
             current_goal_id = str(goal_payload["goal_id"])
             goal_mode = True
             internal_continuation = True
+            run_kind = RunKind.GOAL_EXECUTION
+            run_context_goal_id = None
+            context_goal_revision = None
+            turn_decision = GoalTurnDecision(
+                intent=GoalTurnIntent.CONTINUE_GOAL,
+                target_goal_id=current_goal_id,
+                confidence=1.0,
+                reason=continuation_reason,
+                classifier="control_plane",
+            )
             current_message = self._goal_continuation_prompt(
                 reason=continuation_reason,
                 goal=goal_payload,
@@ -4890,6 +5615,10 @@ class DeepAgentsAgentManager:
         goal_id: str | None = None,
         run_objective: str | None = None,
         internal_continuation: bool = False,
+        run_kind: RunKind = RunKind.STANDALONE,
+        context_goal_id: str | None = None,
+        context_goal_revision: int | None = None,
+        goal_turn_decision: GoalTurnDecision | None = None,
     ) -> AsyncGenerator[dict[str, str], None]:
         """Stream exactly one Harness Run; the public method owns Goal looping."""
 
@@ -5047,6 +5776,16 @@ class DeepAgentsAgentManager:
                     else []
                 ),
                 task_profile=task_profile,
+                run_kind=run_kind,
+                context_goal_id=context_goal_id,
+                context_goal_revision=context_goal_revision,
+                goal_turn_intent=(goal_turn_decision.intent if goal_turn_decision else None),
+                goal_turn_confidence=(
+                    goal_turn_decision.confidence if goal_turn_decision else None
+                ),
+                goal_turn_classifier=(
+                    goal_turn_decision.classifier if goal_turn_decision else None
+                ),
             )
 
             async def route_task_in_background() -> dict[str, Any]:
@@ -5283,12 +6022,31 @@ class DeepAgentsAgentManager:
                 current_task = asyncio.current_task()
                 if current_task is not None:
                     self._active_goal_tasks[(session_id, goal_record.goal_id)] = current_task
+            todo_goal_id = run_record.goal_id or run_record.context_goal_id
+            todo_goal_revision = (
+                run_record.goal_revision
+                if run_record.goal_id
+                else run_record.context_goal_revision
+            )
+            run_started_snapshot = session_manager.get_todo_snapshot(
+                session_id,
+                goal_id=todo_goal_id,
+                goal_revision=todo_goal_revision,
+                run_id=(run_record.run_id if not todo_goal_id else None),
+            )
+            run_started_todos = list(run_started_snapshot.get("todos") or [])
+            run_started_todo_authority = dict(run_started_snapshot.get("authority") or {})
             yield self._sse(
                 "run_started",
                 {
                     "session_id": session_id,
                     "query_id": query_id,
                     "run": run_record.model_dump(mode="json"),
+                    "todos": run_started_todos,
+                    "todos_authority": run_started_todo_authority,
+                    "todo_ledger_revision": int(
+                        run_started_snapshot.get("ledger_revision") or 0
+                    ),
                 },
             )
             if goal_record is not None:
@@ -5312,9 +6070,12 @@ class DeepAgentsAgentManager:
                     if isinstance(source, dict)
                 ]
             )
-            history = session_manager.load_session_for_agent(session_id)
-            # Cross-Run model context is the sanitized user-visible transcript,
-            # never the raw UI record containing Tool calls or reasoning.
+            history = session_manager.load_session_for_agent(
+                session_id,
+                current_run_id=run_record.run_id,
+            )
+            # Cross-Run model context is rebuilt as protocol-valid historical
+            # evidence. It remains context only and carries no current authority.
             history_for_build = history
             if user_message_persisted and raw_history:
                 persisted_display = self._display_message_with_attachments(message, attachments)
@@ -5399,9 +6160,6 @@ class DeepAgentsAgentManager:
                         **(current_human.additional_kwargs or {}),
                         "lc_source": "puddingclaw_goal_continuation",
                     }
-            historical_tool_call_ids = {
-                tc.get("id") for msg in history_for_build for tc in msg.get("tool_calls") or [] if tc.get("id")
-            }
             if not user_message_persisted:
                 session_manager.save_message(
                     session_id,
@@ -5415,10 +6173,18 @@ class DeepAgentsAgentManager:
             # instead of relying on checkpoint black-box.
             persisted_todos = session_manager.get_todos(
                 session_id,
-                goal_id=run_record.goal_id,
-                goal_revision=run_record.goal_revision,
-                run_id=run_record.run_id,
+                goal_id=todo_goal_id,
+                goal_revision=todo_goal_revision,
+                run_id=(run_record.run_id if not todo_goal_id else None),
             )
+            if not persisted_todos and run_record.goal_id is None:
+                persisted_todos = session_manager.inherit_unfinished_todos_for_run(
+                    session_id,
+                    run_record.run_id,
+                    continuation_requested=(
+                        internal_continuation or _is_explicit_continuation(message)
+                    ),
+                )
 
             model = ModelClientChatModel(role="agent", streaming=True)
             rubric_model = ModelClientChatModel(
@@ -5520,6 +6286,11 @@ class DeepAgentsAgentManager:
                     VerificationActivationMiddleware(),
                     VersionedPatchMiddleware(agent_backend),
                     ExternalDirectoryMiddleware(agent_backend),
+                    SkillIntentRouterMiddleware(),
+                    ToolsetMiddleware(
+                        skills_dir=self._base_dir / "skills",
+                        toolsets_by_skill=skill_toolsets,
+                    ),
                     ToolExecutionPipeline(
                         known_tools={
                             str(getattr(tool, "name", "")) for tool in agent_tools if getattr(tool, "name", "")
@@ -5528,11 +6299,6 @@ class DeepAgentsAgentManager:
                         permission_context=permission_context,
                         base_dir=self._base_dir,
                         reviewer=permission_reviewer,
-                    ),
-                    SkillIntentRouterMiddleware(),
-                    ToolsetMiddleware(
-                        skills_dir=self._base_dir / "skills",
-                        toolsets_by_skill=skill_toolsets,
                     ),
                     ObservableModelCallLimitMiddleware(
                         run_limit=12,
@@ -5569,6 +6335,12 @@ class DeepAgentsAgentManager:
             if analytics_model_prompt:
                 system_prompt += analytics_model_prompt
             system_prompt += _run_artifact_continuity_prompt(run_record)
+            if run_record.run_kind == RunKind.GOAL_INSPECTION:
+                system_prompt += self._goal_inspection_prompt(
+                    session_id=session_id,
+                    run=run_record,
+                    todos=persisted_todos,
+                )
             agent = create_deep_agent(
                 model=model,
                 tools=agent_tools,
@@ -5600,7 +6372,9 @@ class DeepAgentsAgentManager:
                     "session_id": session_id,
                     "query_id": query_id,
                     "run_id": run_record.run_id,
+                    "run_kind": run_record.run_kind.value,
                     "goal_id": run_record.goal_id or "",
+                    "context_goal_id": run_record.context_goal_id or "",
                     "goal_revision": run_record.goal_revision,
                     "status": run_record.status.value,
                 },
@@ -6004,7 +6778,16 @@ class DeepAgentsAgentManager:
                         if node_name == "tools":
                             for tool_msg in node_messages:
                                 tc_id = str(getattr(tool_msg, "tool_call_id", "") or "")
-                                if tc_id and tc_id in historical_tool_call_ids:
+                                tool_extra = getattr(tool_msg, "additional_kwargs", None)
+                                tool_extra = tool_extra if isinstance(tool_extra, dict) else {}
+                                historical_stream_item = bool(
+                                    tool_extra.get("puddingclaw_historical")
+                                    or (
+                                        tool_extra.get("puddingclaw_query_id")
+                                        and str(tool_extra.get("puddingclaw_query_id")) != query_id
+                                    )
+                                )
+                                if historical_stream_item:
                                     # LangGraph may echo tool messages that came
                                     # from the input history/checkpoint. They are
                                     # model context, not new work in this turn.
@@ -6095,6 +6878,8 @@ class DeepAgentsAgentManager:
                                     session_id=session_id,
                                     tool_call_id=tc_id,
                                     original_output=original_output,
+                                    workspace_path=workspace_path,
+                                    source_query_id=query_id,
                                 )
                                 if tc_id:
                                     for tc in active_segment["tool_calls"]:
@@ -6158,13 +6943,20 @@ class DeepAgentsAgentManager:
                                 tools_just_finished = True
                         else:
                             for agent_msg in node_messages:
+                                agent_extra = getattr(agent_msg, "additional_kwargs", None)
+                                agent_extra = agent_extra if isinstance(agent_extra, dict) else {}
+                                historical_agent_message = bool(
+                                    agent_extra.get("puddingclaw_historical")
+                                    or (
+                                        agent_extra.get("puddingclaw_source_query_id")
+                                        and str(agent_extra.get("puddingclaw_source_query_id")) != query_id
+                                    )
+                                )
+                                if historical_agent_message:
+                                    continue
                                 tool_calls = getattr(agent_msg, "tool_calls", None) or []
                                 for tool_call in tool_calls:
                                     tc_id = self._tool_call_id(tool_call)
-                                    if tc_id and tc_id in historical_tool_call_ids:
-                                        # Skip tool calls that originate from input history;
-                                        # they should not appear in the current turn timeline.
-                                        continue
                                     if tc_id and tc_id in emitted_tool_starts:
                                         continue
                                     tool_name = self._tool_call_name(tool_call)
@@ -6224,30 +7016,72 @@ class DeepAgentsAgentManager:
                     event_type = str(payload.get("type") or "")
                     if event_type:
                         lifecycle_label = ""
+                        lifecycle_detail = ""
+                        lifecycle_display_status = ""
                         lifecycle_status = str(
                             payload.get("status") or payload.get("result") or ""
                         )
                         if event_type == "rubric_evaluation_start":
                             lifecycle_label = "正在核对完成质量"
                             lifecycle_status = "running"
+                            lifecycle_display_status = "running"
                         elif event_type == "deterministic_checks_completed":
-                            lifecycle_label = (
-                                "完成条件检查通过"
-                                if lifecycle_status == "satisfied"
-                                else "发现完成条件缺口，继续处理"
-                                if lifecycle_status == "needs_revision"
-                                else "完成条件仍未满足"
-                                if lifecycle_status == "failed"
-                                else "完成条件检查异常"
-                            )
+                            will_continue = bool(payload.get("will_continue"))
+                            if lifecycle_status == "satisfied":
+                                lifecycle_label = "完成条件检查通过"
+                                lifecycle_display_status = "satisfied"
+                            elif will_continue:
+                                lifecycle_label = "发现完成条件缺口，正在自动继续修复"
+                                lifecycle_detail = (
+                                    "无需操作，Agent 会保留当前进度并继续处理。"
+                                )
+                                lifecycle_display_status = "running"
+                            elif lifecycle_status == VerificationStatus.INFRASTRUCTURE_ERROR.value:
+                                lifecycle_label = "验收服务异常，自动处理已停止"
+                                lifecycle_detail = (
+                                    "这不代表业务产物未通过。请发送“重试验收”继续。"
+                                )
+                                lifecycle_display_status = "failed"
+                            elif lifecycle_status in {"needs_revision", "failed"}:
+                                lifecycle_label = "完成条件仍有缺口，自动处理已停止"
+                                lifecycle_detail = (
+                                    "Goal、Todo 和证据已保留。发送"
+                                    "“继续完成剩余工作”即可从当前进度继续。"
+                                    if run_record.goal_id
+                                    else "请查看右侧验收明细，再发送具体修复要求。"
+                                )
+                                lifecycle_display_status = "failed"
+                            else:
+                                lifecycle_label = "完成条件检查异常"
+                                lifecycle_display_status = "failed"
                         elif event_type == "rubric_evaluation_end":
-                            lifecycle_label = (
-                                "完成质量检查通过"
-                                if lifecycle_status == "satisfied"
-                                else "发现质量缺口，继续处理"
-                                if lifecycle_status in {"needs_revision", "failed"}
-                                else "完成质量检查异常"
-                            )
+                            if lifecycle_status == "satisfied":
+                                lifecycle_label = "完成质量检查通过"
+                                lifecycle_display_status = "satisfied"
+                            elif lifecycle_status == "needs_revision":
+                                lifecycle_label = "发现完成质量缺口，正在自动继续修复"
+                                lifecycle_detail = (
+                                    "无需操作，Agent 会保留当前进度并继续处理。"
+                                )
+                                lifecycle_display_status = "running"
+                            elif lifecycle_status == VerificationStatus.INFRASTRUCTURE_ERROR.value:
+                                lifecycle_label = "验收服务异常，自动处理已停止"
+                                lifecycle_detail = (
+                                    "这不代表业务产物未通过。请发送“重试验收”继续。"
+                                )
+                                lifecycle_display_status = "failed"
+                            elif lifecycle_status == "failed":
+                                lifecycle_label = "完成质量仍有缺口，自动处理已停止"
+                                lifecycle_detail = (
+                                    "Goal、Todo 和证据已保留。发送"
+                                    "“继续完成剩余工作”即可从当前进度继续。"
+                                    if run_record.goal_id
+                                    else "请查看右侧验收明细，再发送具体修复要求。"
+                                )
+                                lifecycle_display_status = "failed"
+                            else:
+                                lifecycle_label = "完成质量检查异常"
+                                lifecycle_display_status = "failed"
                         if lifecycle_label:
                             self._finalize_reasoning_timeline(active_segment)
                             timeline = active_segment.setdefault("timeline", [])
@@ -6269,9 +7103,11 @@ class DeepAgentsAgentManager:
                             activity = {
                                 "type": "activity",
                                 "label": lifecycle_label,
-                                "status": lifecycle_status,
+                                "status": lifecycle_display_status or lifecycle_status,
                                 "id": activity_id,
                             }
+                            if lifecycle_detail:
+                                activity["detail"] = lifecycle_detail
                             existing_index = next(
                                 (
                                     index
@@ -6379,75 +7215,46 @@ class DeepAgentsAgentManager:
                                 session_id,
                                 exc_info=True,
                             )
-                    # HarnessTodoMiddleware owns the `todos` graph-state field.
-                    # Sync its authoritative ledger to session.json and notify
-                    # the frontend whenever it changes.
+                    # HarnessTodoMiddleware has already committed the patch to
+                    # Session JSON before returning success. Graph values are a
+                    # projection only: they may notify the frontend, but must
+                    # never become a second list-replacement write path.
                     current_todos = payload.get("todos")
                     if isinstance(current_todos, list) and current_todos != last_graph_todos:
-                        normalized = self._normalize_todos(current_todos)
-                        previous_by_id = {
-                            str(item.get("id")): item
-                            for item in previous_todos
-                            if isinstance(item, dict) and item.get("id") is not None
-                        }
-                        for todo in normalized:
-                            previous = previous_by_id.get(str(todo.get("id"))) or {}
-                            for field in (
-                                "created_at",
-                                "created_run_id",
-                                "last_changed_query_id",
-                                "last_changed_run_id",
-                            ):
-                                if field not in todo and field in previous:
-                                    todo[field] = previous[field]
-                        diff = self._todo_diff(previous_todos, normalized)
-                        now = time.time()
-                        normalized_ids = {
-                            str(item.get("id"))
-                            for item in normalized
-                            if isinstance(item, dict) and item.get("id") is not None
-                        }
-                        # Removing a Todo from the middleware array is not a
-                        # completion signal. Keep an auditable tombstone so
-                        # TodoGate cannot be bypassed by omission; the model
-                        # must first mark the item completed or cancelled.
-                        for removed in diff["removed"]:
-                            removed_id = str(removed.get("id") or "")
-                            if not removed_id or removed_id in normalized_ids:
-                                continue
-                            tombstone = dict(removed)
-                            prior_status = str(tombstone.get("status") or "").lower()
-                            if prior_status not in {"completed", "cancelled"}:
-                                tombstone["status"] = "removed_unresolved"
-                            tombstone["tombstone"] = True
-                            tombstone["removed_at"] = now
-                            normalized.append(tombstone)
-                        changed_ids = {str(item.get("id")) for item in diff["added"] if item.get("id") is not None}
-                        changed_ids.update(
-                            str(item.get("id")) for item in diff["removed"] if item.get("id") is not None
-                        )
-                        changed_ids.update(str(item.get("id")) for item in diff["updated"])
-                        for todo in normalized:
-                            if str(todo.get("id")) in changed_ids:
-                                todo["last_changed_query_id"] = query_id
-                                todo["last_changed_run_id"] = run_record.run_id
-                                todo["updated_at"] = now
-                            todo["goal_id"] = run_record.goal_id
-                            todo["goal_revision"] = run_record.goal_revision
-                            todo.setdefault("created_run_id", run_record.run_id)
-                        session_manager.update_todos(
+                        todo_snapshot = session_manager.get_todo_snapshot(
                             session_id,
-                            normalized,
                             goal_id=run_record.goal_id,
                             goal_revision=run_record.goal_revision,
-                            run_id=run_record.run_id,
+                            run_id=(run_record.run_id if not run_record.goal_id else None),
                         )
-                        previous_todos = list(normalized)
+                        authoritative_todos = list(todo_snapshot.get("todos") or [])
+                        normalized_graph_todos = self._normalize_todos(current_todos)
+                        if normalized_graph_todos != authoritative_todos:
+                            emit_harness_metric(
+                                logger,
+                                "todo_graph_projection_mismatch_total",
+                                session_id=session_id,
+                                run_id=run_record.run_id,
+                                ledger_revision=int(todo_snapshot.get("ledger_revision") or 0),
+                            )
+                        diff = self._todo_diff(previous_todos, authoritative_todos)
+                        previous_todos = authoritative_todos
                         last_graph_todos = list(current_todos)
-                        trace_collector.add_todo_span(normalized, diff=diff)
+                        trace_collector.add_todo_span(authoritative_todos, diff=diff)
                         yield self._sse(
                             "todos_updated",
-                            {"todos": normalized, "session_id": session_id, "query_id": query_id},
+                            {
+                                "todos": authoritative_todos,
+                                "session_id": session_id,
+                                "query_id": query_id,
+                                "source_run_id": run_record.run_id,
+                                "operation_id": todo_snapshot.get("operation_id"),
+                                "authority": todo_snapshot.get("authority"),
+                                "ledger_revision": int(
+                                    todo_snapshot.get("ledger_revision") or 0
+                                ),
+                                "persisted_at": todo_snapshot.get("persisted_at"),
+                            },
                         )
 
             if (
@@ -6527,6 +7334,8 @@ class DeepAgentsAgentManager:
                         "output": failed_output,
                         "summary_source": "missing_tool_output",
                         "is_error": True,
+                        "status": "interrupted",
+                        "output_complete": False,
                         "completed_at": time.time(),
                     }
                 )
@@ -6636,16 +7445,17 @@ class DeepAgentsAgentManager:
                     goal_record,
                     verification_state,
                 )
-            yield self._sse(
-                "verification_report",
-                {
-                    "session_id": session_id,
-                    "query_id": query_id,
-                    "run_id": run_record.run_id,
-                    "goal_id": run_record.goal_id,
-                    "report": verification_report.model_dump(mode="json"),
-                },
-            )
+            if run_record.run_kind != RunKind.GOAL_INSPECTION:
+                yield self._sse(
+                    "verification_report",
+                    {
+                        "session_id": session_id,
+                        "query_id": query_id,
+                        "run_id": run_record.run_id,
+                        "goal_id": run_record.goal_id,
+                        "report": verification_report.model_dump(mode="json"),
+                    },
+                )
             yield self._sse(
                 "run_outcome",
                 {
@@ -6807,6 +7617,12 @@ class DeepAgentsAgentManager:
                 )
                 if completion_accepted
                 and verification_report.status == VerificationStatus.SATISFIED
+                else _terminal_verification_guidance(
+                    verification_report.status,
+                    has_goal=goal_record is not None,
+                    goal_status=(goal_record.status if goal_record is not None else None),
+                )
+                if not completion_accepted
                 else ""
             )
             if completion_accepted:
@@ -6840,6 +7656,7 @@ class DeepAgentsAgentManager:
                     timeline=all_timeline or None,
                     segments=segments or None,
                     output_attachments=published_attachments or None,
+                    verification_summary=verification_summary or None,
                     status=(run_record.outcome.value if run_record.outcome else "failed"),
                 )
             run_messages_persisted = True
@@ -6953,6 +7770,7 @@ class DeepAgentsAgentManager:
                 "done",
                 {
                     "content": full_content if completion_accepted else "",
+                    "verification_summary": verification_summary,
                     "session_id": session_id,
                     "project_id": project_id,
                     "workspace_path": str(workspace_path),
@@ -7095,7 +7913,10 @@ class DeepAgentsAgentManager:
                         )
                     else:
                         verification_report = run_record.verification_report
-                    if verification_report is not None:
+                    if (
+                        verification_report is not None
+                        and run_record.run_kind != RunKind.GOAL_INSPECTION
+                    ):
                         yield self._sse(
                             "verification_report",
                             {

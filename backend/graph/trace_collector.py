@@ -817,6 +817,16 @@ class TraceCollector:
                 diff[f"{key}_delta"] = after_value - before_value
         diff["roles_before"] = before.get("roles", {})
         diff["roles_after"] = after.get("roles", {})
+        before_fingerprints = before.get("fingerprints")
+        after_fingerprints = after.get("fingerprints")
+        if isinstance(before_fingerprints, dict) and isinstance(after_fingerprints, dict):
+            for name in ("system_prompt_hash", "tool_schema_hash"):
+                if (
+                    before_fingerprints.get(name)
+                    and after_fingerprints.get(name)
+                    and before_fingerprints.get(name) != after_fingerprints.get(name)
+                ):
+                    diff[f"{name}_changed"] = True
         return diff
 
     @classmethod

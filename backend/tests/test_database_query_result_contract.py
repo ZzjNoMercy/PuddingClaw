@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import json
+from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import analytics.nl2sql.result_store as result_store_module
 import analytics.nl2sql.service as nl2sql_service
 import tools.database.sql_execute_tool as sql_execute_module
+import tools.database.result_source_tool as result_source_tool_module
 from analytics.nl2sql.schemas import (
     DatabaseQueryRequest,
     DatabaseSqlGenerationResult,
@@ -27,8 +32,9 @@ from analytics.nl2sql.sql_runner import (
     validate_readonly_sql,
 )
 from graph.database_sql_revision_resume import database_sql_revision_resume_registry
-from knowledge.models import Base
+from knowledge.models import AnalyticsQueryResult, Base, utcnow
 from tools.database.sql_execute_tool import DatabaseSqlExecuteTool
+from tools.database.result_source_tool import DatabaseQueryResultSourceTool
 from tools.database_knowledge_tool import _format_query_error
 
 
@@ -229,6 +235,65 @@ class _FakeSessionMaker:
 
     async def __aexit__(self, *_args: object) -> None:
         return None
+
+
+@pytest.mark.asyncio
+async def test_legacy_database_tool_forwards_strict_result_owner_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_query(_session, _request, **kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(
+        result_source_tool_module,
+        "get_sessionmaker",
+        lambda: _FakeSessionMaker(),
+    )
+    import tools.database.legacy_query_tool as legacy_query_tool_module
+
+    monkeypatch.setattr(
+        legacy_query_tool_module,
+        "get_sessionmaker",
+        lambda: _FakeSessionMaker(),
+    )
+    monkeypatch.setattr(
+        legacy_query_tool_module,
+        "query_database_knowledge",
+        fake_query,
+    )
+    monkeypatch.setattr(
+        legacy_query_tool_module,
+        "emit_trace_spans",
+        lambda _result: None,
+    )
+    monkeypatch.setattr(
+        legacy_query_tool_module,
+        "format_result",
+        lambda _result: "ok",
+    )
+    tool = legacy_query_tool_module.DatabaseKnowledgeQueryTool()
+    result = await tool._arun(
+        question="查询配置率",
+        runtime=SimpleNamespace(
+            tool_call_id="call-legacy-db",
+            context={
+                "session_id": "session-legacy-db",
+                "query_id": "query-legacy-db",
+                "run_id": "run-legacy-db",
+            },
+        ),
+    )
+
+    assert result == "ok"
+    assert captured == {
+        "session_id": "session-legacy-db",
+        "tool_call_id": "call-legacy-db",
+        "source_query_id": "query-legacy-db",
+        "source_run_id": "run-legacy-db",
+    }
 
 
 def test_profile_fixture_keeps_omitted_tengshi_group_visible() -> None:
@@ -495,6 +560,17 @@ async def test_persisted_execution_reads_all_206_rows_across_pages(
             page_3 = await result_store_module.get_query_result_page(
                 session, execution.result_id, page=3, page_size=100
             )
+            with pytest.raises(
+                result_store_module.QueryResultStoreError,
+                match="不属于当前 Session",
+            ):
+                await result_store_module.get_query_result_page(
+                    session,
+                    execution.result_id,
+                    page=1,
+                    page_size=100,
+                    session_id="another-session",
+                )
 
         assert len(page_1["rows"]) == 100
         assert page_1["has_next"] is True
@@ -505,5 +581,385 @@ async def test_persisted_execution_reads_all_206_rows_across_pages(
         assert [row["row_number"] for row in page_1["rows"] + page_2["rows"] + page_3["rows"]] == list(
             range(206)
         )
+        artifact = result_store_module.RESULT_DIR / f"{execution.result_id}.jsonl"
+        artifact.write_text('{"row_number":999}\n', encoding="utf-8")
+        async with sessionmaker() as session:
+            with pytest.raises(
+                result_store_module.QueryResultStoreError,
+                match="hash 不一致",
+            ):
+                await result_store_module.get_query_result_page(
+                    session,
+                    execution.result_id,
+                )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_database_result_adapts_to_generic_source_reference_without_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from graph.session_manager import session_manager
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+        monkeypatch.setattr(result_store_module, "BASE_DIR", tmp_path)
+        monkeypatch.setattr(
+            result_store_module,
+            "RESULT_DIR",
+            tmp_path / "data" / "database-query-results",
+        )
+        monkeypatch.setattr(
+            result_source_tool_module,
+            "get_sessionmaker",
+            lambda: sessionmaker,
+        )
+        state = tmp_path / "state"
+        state.mkdir()
+        session_manager.initialize(state)
+        session_manager.create_session("source-adapter-session")
+        rows = [
+            {"year": 2021 + index % 6, "config": f"配置-{index}"}
+            for index in range(337)
+        ]
+        execution = SqlExecutionResult(
+            columns=["year", "config"],
+            rows=rows[:20],
+            row_count=337,
+            limited=True,
+            total_row_count=337,
+            preview_count=20,
+            omitted_count=317,
+            is_complete=False,
+            materialized_rows=rows,
+            materialized_all=True,
+        )
+        async with sessionmaker() as session:
+            await result_store_module.attach_persisted_query_result(
+                session,
+                execution,
+                question="配置结果直写",
+                sql="SELECT year, config FROM vehicle_params",
+                session_id="source-adapter-session",
+                tool_call_id="call-sql",
+                source_query_id="query-sql",
+                source_run_id="run-sql",
+                producer_receipt_ids=["sql-validation-receipt"],
+            )
+
+        result = await DatabaseQueryResultSourceTool(
+            session_id="source-adapter-session"
+        )._arun(
+            result_id=str(execution.result_id),
+            runtime=SimpleNamespace(
+                context={
+                    "session_id": "source-adapter-session",
+                    "run_id": "run-sql",
+                }
+            ),
+        )
+        payload = json.loads(result)
+        source = payload["source"]
+
+        assert payload["status"] == "completed"
+        assert source["kind"] == "database_result"
+        assert source["row_count"] == 337
+        assert "locator" not in source
+        assert "配置-0" not in result
+        persisted_source = session_manager.get_source_reference(
+            "source-adapter-session",
+            source["source_ref"],
+        )
+        assert persisted_source is not None
+        assert persisted_source["producer_receipt_ids"] == [
+            f"result-store:{execution.result_id}",
+            "sql-validation-receipt",
+        ]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_backfill_query_result_catalog_recovers_legacy_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from graph.session_manager import session_manager
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+        monkeypatch.setattr(result_store_module, "BASE_DIR", tmp_path)
+        monkeypatch.setattr(
+            result_store_module,
+            "RESULT_DIR",
+            tmp_path / "data" / "database-query-results",
+        )
+        session_manager.initialize(tmp_path)
+        session_manager.create_session("legacy-result-session")
+        session_manager.upsert_assistant_message(
+            "legacy-result-session",
+            query_id="query-legacy",
+            content="done",
+            tool_calls=[
+                {
+                    "tool": "database_sql_execute",
+                    "id": "call-legacy-owner",
+                    "output": "result_id：qr-legacy-owner",
+                }
+            ],
+        )
+        artifact = result_store_module.RESULT_DIR / "qr-legacy-owner.jsonl"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_text('{"id":1}\n', encoding="utf-8")
+        now = utcnow()
+        async with sessionmaker() as session:
+            session.add(
+                AnalyticsQueryResult(
+                    id="qr-legacy-owner",
+                    session_id="legacy-result-session",
+                    tool_call_id="",
+                    question="legacy",
+                    sql="SELECT 1",
+                    columns=["id"],
+                    row_count=1,
+                    profile_json={},
+                    artifact_path="data/database-query-results/qr-legacy-owner.jsonl",
+                    artifact_format="jsonl",
+                    status="ready",
+                    created_at=now,
+                    expires_at=now + timedelta(hours=1),
+                )
+            )
+            await session.commit()
+
+            assert await result_store_module.backfill_query_result_catalogs(session) == 1
+            record = await session.get(AnalyticsQueryResult, "qr-legacy-owner")
+            assert record is not None
+            assert record.tool_call_id == "call-legacy-owner"
+
+        catalog = json.loads(
+            (result_store_module.RESULT_DIR / ".catalog" / "qr-legacy-owner.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert catalog["session_id"] == "legacy-result-session"
+        assert catalog["tool_call_id"] == "call-legacy-owner"
+        assert catalog["artifact_sha256"].startswith("sha256:")
+        immutable_hash = catalog["artifact_sha256"]
+        artifact.write_text('{"id":999}\n', encoding="utf-8")
+        async with sessionmaker() as session:
+            assert await result_store_module.backfill_query_result_catalogs(session) == 0
+        catalog_after_restart = json.loads(
+            (result_store_module.RESULT_DIR / ".catalog" / "qr-legacy-owner.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert catalog_after_restart["artifact_sha256"] == immutable_hash
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_expired_result_cleanup_retains_retryable_tombstone_on_unlink_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+        result_dir = tmp_path / "data" / "database-query-results"
+        monkeypatch.setattr(result_store_module, "BASE_DIR", tmp_path)
+        monkeypatch.setattr(result_store_module, "RESULT_DIR", result_dir)
+        artifact = result_dir / "qr-expired.jsonl"
+        catalog = result_dir / ".catalog" / "qr-expired.json"
+        catalog.parent.mkdir(parents=True)
+        artifact.write_text('{"id":1}\n', encoding="utf-8")
+        catalog.write_text('{"result_id":"qr-expired"}', encoding="utf-8")
+        now = utcnow()
+        async with sessionmaker() as session:
+            session.add(
+                AnalyticsQueryResult(
+                    id="qr-expired",
+                    session_id="",
+                    tool_call_id="",
+                    question="expired",
+                    sql="SELECT 1",
+                    columns=["id"],
+                    row_count=1,
+                    profile_json={},
+                    artifact_path=str(artifact.relative_to(tmp_path)),
+                    artifact_format="jsonl",
+                    status="ready",
+                    created_at=now - timedelta(hours=2),
+                    expires_at=now - timedelta(hours=1),
+                )
+            )
+            await session.commit()
+
+        original_unlink = Path.unlink
+        failed_once = False
+
+        def flaky_unlink(
+            path: Path,
+            missing_ok: bool = False,
+        ) -> None:
+            nonlocal failed_once
+            if path.name == "qr-expired.json" and not failed_once:
+                failed_once = True
+                raise OSError("simulated catalog unlink failure")
+            original_unlink(path, missing_ok=missing_ok)
+
+        monkeypatch.setattr(Path, "unlink", flaky_unlink)
+        async with sessionmaker() as session:
+            assert await result_store_module.cleanup_expired_query_results(session) == 0
+            record = await session.get(AnalyticsQueryResult, "qr-expired")
+            assert record is not None
+            assert record.status == "deleting"
+        assert not artifact.exists()
+        assert catalog.exists()
+
+        async with sessionmaker() as session:
+            assert await result_store_module.cleanup_expired_query_results(session) == 1
+            assert await session.get(AnalyticsQueryResult, "qr-expired") is None
+        assert not catalog.exists()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_orphan_scavenger_uses_database_ownership_and_grace_window(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+        result_dir = tmp_path / "data" / "database-query-results"
+        catalog_dir = result_dir / ".catalog"
+        catalog_dir.mkdir(parents=True)
+        monkeypatch.setattr(result_store_module, "BASE_DIR", tmp_path)
+        monkeypatch.setattr(result_store_module, "RESULT_DIR", result_dir)
+
+        owned_artifact = result_dir / "qr-owned.jsonl"
+        owned_artifact.write_text('{"id":1}\n', encoding="utf-8")
+        orphan_artifact = result_dir / "qr_orphan.jsonl"
+        orphan_catalog = catalog_dir / "qr_orphan.json"
+        orphan_artifact.write_text('{"id":2}\n', encoding="utf-8")
+        orphan_catalog.write_text('{"result_id":"qr-orphan"}', encoding="utf-8")
+        fresh_artifact = result_dir / "qr-fresh.jsonl"
+        fresh_artifact.write_text('{"id":3}\n', encoding="utf-8")
+        now = utcnow()
+        async with sessionmaker() as session:
+            session.add(
+                AnalyticsQueryResult(
+                    id="qr-owned",
+                    session_id="",
+                    tool_call_id="",
+                    question="owned",
+                    sql="SELECT 1",
+                    columns=["id"],
+                    row_count=1,
+                    profile_json={},
+                    artifact_path=str(owned_artifact.relative_to(tmp_path)),
+                    artifact_format="jsonl",
+                    status="ready",
+                    created_at=now,
+                    expires_at=now + timedelta(hours=1),
+                )
+            )
+            await session.commit()
+
+            removed = await result_store_module.scavenge_orphaned_query_result_files(
+                session,
+                grace_seconds=1,
+            )
+            assert removed == 0
+            assert orphan_artifact.exists()
+            assert fresh_artifact.exists()
+
+            old_timestamp = orphan_artifact.stat().st_mtime - 10
+            orphan_artifact.touch()
+            orphan_catalog.touch()
+            import os
+
+            os.utime(orphan_artifact, (old_timestamp, old_timestamp))
+            os.utime(orphan_catalog, (old_timestamp, old_timestamp))
+            removed = await result_store_module.scavenge_orphaned_query_result_files(
+                session,
+                grace_seconds=1,
+            )
+
+        assert removed == 1
+        assert owned_artifact.exists()
+        assert fresh_artifact.exists()
+        assert not orphan_artifact.exists()
+        assert not orphan_catalog.exists()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_persist_registers_creating_owner_before_publishing_final_files(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+        result_dir = tmp_path / "data" / "database-query-results"
+        monkeypatch.setattr(result_store_module, "BASE_DIR", tmp_path)
+        monkeypatch.setattr(result_store_module, "RESULT_DIR", result_dir)
+        monkeypatch.setattr(
+            result_store_module,
+            "get_database_qa_config",
+            lambda: {"result_store_ttl_hours": 168},
+        )
+
+        async with sessionmaker() as session:
+            original_commit = session.commit
+            committed_states: list[tuple[str, bool, bool]] = []
+
+            async def tracked_commit() -> None:
+                await original_commit()
+                result = await session.execute(
+                    select(AnalyticsQueryResult)
+                )
+                record = result.scalars().first()
+                if record is not None:
+                    committed_states.append(
+                        (
+                            record.status,
+                            (result_dir / f"{record.id}.jsonl").exists(),
+                            (result_dir / ".catalog" / f"{record.id}.json").exists(),
+                        )
+                    )
+
+            monkeypatch.setattr(session, "commit", tracked_commit)
+            stored = await result_store_module.persist_query_result(
+                session,
+                question="two phase",
+                sql="SELECT 1",
+                columns=["id"],
+                rows=[{"id": 1}],
+                profile={},
+            )
+
+        assert stored["result_id"].startswith("qr_")
+        assert committed_states[0] == ("creating", False, False)
+        assert committed_states[-1] == ("ready", True, True)
     finally:
         await engine.dispose()

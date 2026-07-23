@@ -302,6 +302,7 @@ def resolve_evidence_ref(
     goal_id: str | None = None,
     goal_revision: int | None = None,
     require_inheritable: bool = True,
+    allow_artifact_revision_inheritance: bool = False,
 ) -> EvidenceRecord | None:
     """Resolve and re-validate one stable reference against current authority."""
 
@@ -316,7 +317,14 @@ def resolve_evidence_ref(
     if goal_id is not None and record.goal_id != goal_id:
         return None
     if goal_revision is not None and record.goal_revision != goal_revision:
-        return None
+        if not (
+            allow_artifact_revision_inheritance
+            and record.kind
+            in {"artifact", "validation_receipt", "external_mutation"}
+            and record.goal_revision is not None
+            and record.goal_revision < goal_revision
+        ):
+            return None
     harness = data.get("harness")
     runs = harness.get("runs") if isinstance(harness, dict) else None
     source_run = runs.get(record.source_run_id) if isinstance(runs, dict) else None

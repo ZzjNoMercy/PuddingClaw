@@ -9,7 +9,7 @@ import uuid
 from typing import Any
 
 from graph.session_manager import SessionManager
-from harness.artifact_paths import extract_declared_artifact_targets
+from harness.artifact_paths import resolve_declared_artifact_targets
 from harness.deterministic_checks import evaluate_deterministic_criteria
 from harness.evidence_ledger import EvidenceRef, is_evidence_ref, ref_key
 from harness.models import (
@@ -17,9 +17,11 @@ from harness.models import (
     GoalRecord,
     GoalRevision,
     GoalStatus,
+    GoalTurnIntent,
     GoalVerificationDecision,
     HarnessStateError,
     RubricEvaluationReport,
+    RunKind,
     RunOutcome,
     RunRecord,
     RunStatus,
@@ -582,6 +584,25 @@ class GoalCoordinator:
             )
         return self._transition(session_id, goal_id, GoalStatus.ACTIVE)
 
+    def extend_budget(
+        self,
+        session_id: str,
+        goal_id: str,
+        *,
+        additional_rounds: int,
+    ) -> GoalRecord:
+        """Reopen an exhausted Goal with an explicit user-granted Run budget."""
+
+        try:
+            saved = self._sessions.extend_goal_budget(
+                session_id,
+                goal_id,
+                additional_rounds=additional_rounds,
+            )
+        except ValueError as exc:
+            raise HarnessStateError(str(exc)) from exc
+        return GoalRecord.model_validate(saved)
+
     def cancel(self, session_id: str, goal_id: str) -> GoalRecord:
         try:
             saved = self._sessions.request_goal_control(
@@ -743,9 +764,21 @@ class CompletionVerificationCoordinator:
             matches = raw_by_id.get(configured.id, [])
             if not matches:
                 not_evaluated = False
+                deterministic_gate_status = str(
+                    state.get("_completion_gate_status") or ""
+                )
                 if (
                     configured.verifier == VerifierKind.LLM_GRADER
-                    and raw_status in {"needs_revision", "max_iterations_reached"}
+                    and (
+                        raw_status
+                        in {"needs_revision", "max_iterations_reached"}
+                        or deterministic_gate_status
+                        in {
+                            "needs_revision",
+                            "failed",
+                            VerificationStatus.INFRASTRUCTURE_ERROR.value,
+                        }
+                    )
                     and not evaluations_payload
                 ):
                     not_evaluated = True
@@ -944,7 +977,25 @@ class HarnessRunCoordinator:
         goal_max_rounds: int = 8,
         custom_rubric_rules: list[dict[str, Any]] | None = None,
         task_profile: RunTaskProfile | None = None,
+        run_kind: RunKind | str | None = None,
+        context_goal_id: str | None = None,
+        context_goal_revision: int | None = None,
+        goal_turn_intent: GoalTurnIntent | str | None = None,
+        goal_turn_confidence: float | None = None,
+        goal_turn_classifier: str | None = None,
     ) -> tuple[RunRecord, GoalRecord | None]:
+        resolved_run_kind = RunKind(
+            run_kind
+            or (RunKind.GOAL_EXECUTION if goal_mode else RunKind.STANDALONE)
+        )
+        if goal_id and resolved_run_kind != RunKind.GOAL_EXECUTION:
+            raise GoalActivationError("goal_id was supplied while goal_mode is disabled.")
+        if resolved_run_kind == RunKind.GOAL_EXECUTION and not goal_mode:
+            raise GoalActivationError("goal_execution requires goal_mode=true")
+        if resolved_run_kind == RunKind.GOAL_INSPECTION and goal_mode:
+            raise GoalActivationError("goal_inspection cannot own a Goal")
+        if resolved_run_kind == RunKind.GOAL_INSPECTION and not context_goal_id:
+            raise GoalActivationError("goal_inspection requires context_goal_id")
         supplied_task_profile = task_profile is not None
         task_profile = (
             task_profile.model_copy(deep=True)
@@ -960,19 +1011,23 @@ class HarnessRunCoordinator:
                 analytics_model_id=analytics_model_id,
                 project_id=project_id,
                 custom_rules=custom_rubric_rules,
-                force_required=goal_mode,
+                force_required=(resolved_run_kind == RunKind.GOAL_EXECUTION),
                 task_profile=task_profile,
             )
             if verification_enabled
             else None
         )
-        goal = self.goals.resolve_for_run(
-            session_id=session_id,
-            objective=objective,
-            goal_mode=goal_mode,
-            goal_id=goal_id,
-            goal_contract=contract,
-            max_rounds=goal_max_rounds,
+        goal = (
+            self.goals.resolve_for_run(
+                session_id=session_id,
+                objective=objective,
+                goal_mode=True,
+                goal_id=goal_id,
+                goal_contract=contract,
+                max_rounds=goal_max_rounds,
+            )
+            if resolved_run_kind == RunKind.GOAL_EXECUTION
+            else None
         )
         effective_objective = goal.objective if goal is not None else objective
         if effective_objective != objective and not supplied_task_profile:
@@ -1041,9 +1096,17 @@ class HarnessRunCoordinator:
             query_id=query_id,
             session_id=session_id,
             objective=effective_objective,
-            declared_artifact_targets=extract_declared_artifact_targets(effective_objective),
+            declared_artifact_targets=resolve_declared_artifact_targets(effective_objective),
+            run_kind=resolved_run_kind,
             goal_id=goal.goal_id if goal else None,
+            context_goal_id=context_goal_id,
+            context_goal_revision=context_goal_revision,
             goal_revision=goal.objective_revision if goal else None,
+            goal_turn_intent=(
+                GoalTurnIntent(goal_turn_intent) if goal_turn_intent is not None else None
+            ),
+            goal_turn_confidence=goal_turn_confidence,
+            goal_turn_classifier=goal_turn_classifier,
             follow_up_of_goal_id=(
                 next(iter(follow_up_goal_ids))
                 if len(follow_up_goal_ids) == 1
@@ -1058,7 +1121,9 @@ class HarnessRunCoordinator:
             verification_enabled=verification_enabled,
             verification_mode=(
                 VerificationMode.GOAL
-                if verification_enabled and goal is not None
+                if verification_enabled
+                and resolved_run_kind == RunKind.GOAL_EXECUTION
+                and goal is not None
                 else VerificationMode.AGENT
             ),
             task_profile=task_profile,
@@ -1139,6 +1204,16 @@ class HarnessRunCoordinator:
             for item in run.verification_activations
             if isinstance(item, dict) or hasattr(item, "model_dump")
         ]
+        if goal is not None:
+            self._sessions.backfill_goal_declared_artifact_writes(
+                run.session_id,
+                goal.goal_id,
+                int(run.goal_revision or 1),
+            )
+            self._sessions.restore_goal_artifact_evidence(
+                run.session_id,
+                goal.goal_id,
+            )
         authoritative_goal = (
             self._sessions.get_goal_state(run.session_id, goal.goal_id)
             if goal is not None
@@ -1180,6 +1255,7 @@ class HarnessRunCoordinator:
                 evidence_ref,
                 goal_id=run.goal_id,
                 goal_revision=run.goal_revision,
+                allow_artifact_revision_inheritance=True,
             )
             if resolved is None:
                 continue
@@ -1200,6 +1276,12 @@ class HarnessRunCoordinator:
                     "generation_id": resolved.get("generation_id"),
                     "sql_validation_receipt_id": resolved.get(
                         "sql_validation_receipt_id"
+                    ),
+                    "source_goal_revision": resolved.get("goal_revision"),
+                    "revision_inherited": bool(
+                        run.goal_revision is not None
+                        and resolved.get("goal_revision") is not None
+                        and int(resolved["goal_revision"]) < int(run.goal_revision)
                     ),
                 }
             )

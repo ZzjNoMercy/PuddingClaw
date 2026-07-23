@@ -23,8 +23,8 @@ from harness.dependency_setup import (
     detect_workspace_dependency_plan,
 )
 
-DEFAULT_SANDBOX_IMAGE = "puddingclaw/sandbox:python3.12-node22-curl-v3"
-RUNTIME_CONTRACT = "python3.12+node22+curl-v3"
+DEFAULT_SANDBOX_IMAGE = "puddingclaw/sandbox:python3.12-node22-chromium-v4"
+RUNTIME_CONTRACT = "python3.12+node22+chromium-v4"
 logger = logging.getLogger(__name__)
 
 
@@ -731,13 +731,14 @@ class ProjectSandboxManager:
         command: str,
         timeout: int,
         max_output_bytes: int,
+        writable: bool = False,
     ) -> ExecuteResponse:
-        """Run one approved command with one exact external directory read-only.
+        """Run one approved command with one exact external directory mount.
 
-        This is the narrow P2 escape hatch for validators that need directory
-        semantics. It never modifies the persistent project container, never
-        enables networking, never mounts another Session root, and always uses
-        ``docker run --rm``. External mutations must use HostFileBroker.
+        Writable mounts are only for server-owned directory drafts. The caller
+        remains responsible for diff review and transactional host write-back.
+        The container root and project workspace stay read-only, networking is
+        disabled, and only this one mount can receive writes.
         """
 
         workspace = workspace.expanduser().resolve(strict=True)
@@ -762,7 +763,10 @@ class ProjectSandboxManager:
             "--mount",
             f"type=bind,src={workspace},dst=/workspace,readonly",
             "--mount",
-            f"type=bind,src={external_directory},dst=/external-workspace,readonly",
+            (
+                f"type=bind,src={external_directory},dst=/external-workspace"
+                + ("" if writable else ",readonly")
+            ),
             "--mount",
             f"type=volume,src={runtime_home_volume},dst=/home/puddingclaw",
         ]
@@ -1063,6 +1067,7 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         command: str,
         *,
         timeout: int | None = None,
+        writable: bool = False,
     ) -> ExecuteResponse:
         """Execute one approved read-only exact-directory command ephemerally."""
 
@@ -1076,6 +1081,7 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
                 command=command,
                 timeout=effective_timeout,
                 max_output_bytes=self._max_output_bytes,
+                writable=writable,
             )
         except Exception as exc:  # noqa: BLE001
             return ExecuteResponse(

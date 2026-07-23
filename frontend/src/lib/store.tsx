@@ -20,6 +20,7 @@ import {
   getRawMessages as apiGetRawMessages,
   getSessionTraces as apiGetSessionTraces,
   getSessionHistory as apiGetSessionHistory,
+  getCurrentSessionTodos as apiGetCurrentSessionTodos,
   compressSession as apiCompressSession,
   clearSession as apiClearSession,
   getRagMode as apiGetRagMode,
@@ -37,6 +38,7 @@ import {
   pauseGoal as apiPauseGoal,
   resumeGoal as apiResumeGoal,
   cancelGoal as apiCancelGoal,
+  extendGoalBudget as apiExtendGoalBudget,
   updateGoalObjective as apiUpdateGoalObjective,
   ProjectMeta,
   TodoItem,
@@ -56,6 +58,12 @@ import {
   ApprovalMode,
 } from "./api";
 import { getSubagentActivityIdentity } from "./subagentActivity";
+import { goalRemainsVisible } from "./goalControls";
+import { shouldApplyTodoSnapshot, TodoAuthority } from "./todoProjection";
+import {
+  settleRunningVerificationActivities,
+  verificationFailureActivity,
+} from "./verificationActivity";
 import {
   getSettings as apiGetSettings,
   updateSettings as apiUpdateSettings,
@@ -79,7 +87,7 @@ export interface ToolCall {
 export type TimelineItem =
   | { type: "reasoning"; content: string; id: string }
   | { type: "tool"; toolCall: ToolCall; id: string }
-  | { type: "activity"; label: string; status?: string; id: string };
+  | { type: "activity"; label: string; detail?: string; status?: string; id: string };
 
 type InspectorActiveTab = "progress" | "goal" | "verification" | "sources" | "permissions" | null;
 const INSPECTOR_ACTIVE_TAB_STORAGE_KEY = "puddingclaw_inspector_active_tab";
@@ -96,7 +104,6 @@ const TERMINAL_RUN_STATUSES = new Set([
   "budget_exceeded",
   "verification_failed",
 ]);
-const CLOSED_GOAL_STATUSES = new Set(["achieved", "cancelled", "budget_exceeded"]);
 const CONTROL_ONLY_VERIFICATION_STATUSES = new Set([
   "not_required",
   "verification_incomplete",
@@ -107,6 +114,48 @@ const CONTROL_ONLY_VERIFICATION_STATUSES = new Set([
 
 function runIsActive(run: HarnessRun | null | undefined): boolean {
   return Boolean(run && !TERMINAL_RUN_STATUSES.has(run.status));
+}
+
+function visibleGoalFromHarness(state: {
+  active_goal_id?: string | null;
+  goal_order?: string[];
+  goals: Record<string, HarnessGoal>;
+}): HarnessGoal | null {
+  if (
+    state.active_goal_id
+    && state.goals[state.active_goal_id]
+    && goalRemainsVisible(state.goals[state.active_goal_id].status)
+  ) {
+    return state.goals[state.active_goal_id];
+  }
+  const goalId = [...(state.goal_order || [])]
+    .reverse()
+    .find((candidate) => {
+      const goal = state.goals[candidate];
+      return Boolean(goal && goalRemainsVisible(goal.status));
+    });
+  return goalId ? state.goals[goalId] : null;
+}
+
+async function waitForGoalState(
+  sessionId: string,
+  goalId: string,
+  predicate: (goal: HarnessGoal) => boolean,
+  timeoutMs = 15_000,
+): Promise<HarnessGoal> {
+  const deadline = Date.now() + timeoutMs;
+  let latest: HarnessGoal | null = null;
+  while (Date.now() < deadline) {
+    const harness = await apiGetSessionHarnessState(sessionId);
+    latest = harness.goals[goalId] || null;
+    if (latest && predicate(latest)) return latest;
+    await new Promise((resolve) => window.setTimeout(resolve, 250));
+  }
+  throw new Error(
+    latest?.requested_status
+      ? `目标仍在处理“${latest.requested_status}”请求，请稍后重试`
+      : "目标状态更新超时，请刷新后重试",
+  );
 }
 
 function readActiveRunRegistry(): ActiveRunRegistry {
@@ -247,6 +296,11 @@ export interface RunActivityStatus {
   detail?: string;
 }
 
+export interface SendMessageOptions {
+  goalControlAction?: "start";
+  hiddenUserMessage?: boolean;
+}
+
 interface AppState {
   // Runtime mode
   runtimeMode: "agent" | "chat";
@@ -266,7 +320,11 @@ interface AppState {
   messages: ChatMessage[];
   isStreaming: boolean;
   hasActiveRun: boolean;
-  sendMessage: (text: string, attachments?: AgentAttachment[]) => Promise<boolean>;
+  sendMessage: (
+    text: string,
+    attachments?: AgentAttachment[],
+    options?: SendMessageOptions,
+  ) => Promise<boolean>;
   stopStreaming: () => void;
   goalModeEnabled: boolean;
   setGoalModeEnabled: (enabled: boolean) => void;
@@ -278,9 +336,10 @@ interface AppState {
   currentRun: HarnessRun | null;
   goalRuns: HarnessRun[];
   verificationReport: RubricEvaluationReport | null;
-  pauseActiveGoal: () => Promise<void>;
-  resumeActiveGoal: () => Promise<void>;
+  pauseActiveGoal: () => Promise<HarnessGoal>;
+  resumeActiveGoal: () => Promise<HarnessGoal>;
   cancelActiveGoal: () => Promise<void>;
+  extendActiveGoalBudget: (additionalRounds: number) => Promise<HarnessGoal>;
   updateActiveGoal: (objective: string) => Promise<HarnessGoal>;
 
   // Sessions
@@ -425,7 +484,15 @@ function parseHistoryMessages(
       startedAt?: number;
       endedAt?: number;
     }>;
-    timeline?: Array<{ type: string; content?: string; tool_call?: ToolCall; id?: string }>;
+    timeline?: Array<{
+      type: string;
+      content?: string;
+      tool_call?: ToolCall;
+      label?: string;
+      detail?: string;
+      status?: string;
+      id?: string;
+    }>;
     status?: string;
     segments?: Array<{ content?: string; reasoning_content?: string; tool_calls?: ToolCall[]; timeline?: TimelineItem[]; run_id?: string; goal_id?: string }>;
     sources?: SourceRecord[];
@@ -699,7 +766,7 @@ function buildHistoryTimeline(
 }
 
 function normalizeSavedTimeline(
-  saved: Array<{ type: string; content?: string; tool_call?: ToolCall; label?: string; status?: string; id?: string }>,
+  saved: Array<{ type: string; content?: string; tool_call?: ToolCall; label?: string; detail?: string; status?: string; id?: string }>,
   toolCalls: ToolCall[]
 ): TimelineItem[] {
   // Prefer the persisted tool_call from the timeline, but supplement with the
@@ -733,6 +800,7 @@ function normalizeSavedTimeline(
         return {
           type: "activity",
           label: item.label,
+          detail: item.detail,
           status: item.status,
           id: item.id || `saved-activity-${Date.now()}`,
         };
@@ -812,6 +880,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   // ── Per-session state (Map-based, supports parallel sessions) ──
   const messagesMapRef = useRef<Record<string, ChatMessage[]>>({});
   const todosMapRef = useRef<Record<string, TodoItem[]>>({});
+  const todoLedgerRevisionsMapRef = useRef<Record<string, number>>({});
+  const todoAuthoritiesMapRef = useRef<Record<string, TodoAuthority>>({});
   const tracesMapRef = useRef<Record<string, AgentTrace | null>>({});
   const traceHistoriesMapRef = useRef<Record<string, Record<string, AgentTrace>>>({});
   const selectedTraceQueryMapRef = useRef<Record<string, string | null>>({});
@@ -869,6 +939,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
   const [streamingSessions, setStreamingSessions] = useState<Set<string>>(new Set());
+  const streamingSessionsRef = useRef<Set<string>>(new Set());
+  const updateStreamingSessions = useCallback(
+    (update: (current: Set<string>) => Set<string>) => {
+      const next = update(streamingSessionsRef.current);
+      streamingSessionsRef.current = next;
+      setStreamingSessions(next);
+    },
+    [],
+  );
   const [sharedStreamingSessions, setSharedStreamingSessions] = useState<Set<string>>(new Set());
   const [sessionId, setSessionIdRaw] = useState("default");
   const [userId] = useState(() => getOrCreateUserId());
@@ -1158,7 +1237,22 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   );
 
   // ── Helper: update Agent white-box state for a session ──────────────
-  const updateSessionTodos = useCallback((sid: string, nextTodos: TodoItem[]) => {
+  const updateSessionTodos = useCallback((
+    sid: string,
+    nextTodos: TodoItem[],
+    authority?: TodoAuthority | null,
+    ledgerRevision?: number | null,
+  ) => {
+    const previousAuthority = todoAuthoritiesMapRef.current[sid];
+    const previousRevision = todoLedgerRevisionsMapRef.current[sid] ?? 0;
+    if (!shouldApplyTodoSnapshot(
+      previousAuthority,
+      previousRevision,
+      authority,
+      ledgerRevision,
+    )) {
+      return;
+    }
     const orderedTodos = nextTodos
       .map((todo, arrivalIndex) => ({ todo, arrivalIndex }))
       .sort((left, right) =>
@@ -1166,6 +1260,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       )
       .map(({ todo }) => todo);
     todosMapRef.current[sid] = orderedTodos;
+    if (authority) todoAuthoritiesMapRef.current[sid] = authority;
+    if (typeof ledgerRevision === "number") {
+      todoLedgerRevisionsMapRef.current[sid] = ledgerRevision;
+    }
     if (sessionIdRef.current === sid) {
       setTodos(orderedTodos);
     }
@@ -1495,17 +1593,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setVerificationReport(verificationReportsMapRef.current[id] ?? null);
         apiGetSessionHarnessState(id)
           .then((data) => {
-            const latestGoalId = [...(data.goal_order || [])]
-              .reverse()
-              .find((goalId) =>
-                ["active", "paused", "blocked"].includes(data.goals[goalId]?.status)
-              );
-            const loadedGoal =
-              data.active_goal_id && data.goals[data.active_goal_id]
-                ? data.goals[data.active_goal_id]
-                : latestGoalId
-                  ? data.goals[latestGoalId]
-                  : null;
+            const loadedGoal = visibleGoalFromHarness(data);
             const loadedRun =
               data.latest_run_id && data.runs[data.latest_run_id]
                 ? data.runs[data.latest_run_id]
@@ -1531,19 +1619,20 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 .at(-1);
               if (latestDelegationEvent) {
                 const restoredLabels: Record<string, string> = {
-                  subagent_started: "子代理已启动",
-                  context_mounted: "子代理上下文已挂载",
+                  subagent_started: "子代理执行中",
+                  subagent_waiting_for_permission: "子代理等待授权",
+                  context_mounted: "上下文已挂载",
                   subagent_stage_changed: "子代理正在分析与规划",
                   subagent_tool_started: latestDelegationEvent.tool
                     ? `子代理正在执行：${latestDelegationEvent.tool}`
                     : "子代理正在执行工具",
                   subagent_tool_completed: latestDelegationEvent.tool
-                    ? `子代理已完成：${latestDelegationEvent.tool}`
-                    : "子代理工具执行完成",
+                    ? `子代理工具已返回：${latestDelegationEvent.tool}`
+                    : "子代理工具已返回",
                   subagent_completed: "子代理已完成，主 Agent 正在接收结果",
                   subagent_blocked: "子代理需要主 Agent 决策",
-                  subagent_timed_out: "子代理已超时，主 Agent 正在接管剩余任务",
-                  subagent_failed: "子代理未完成，主 Agent 正在接管剩余任务",
+                  subagent_timed_out: "子代理执行超时",
+                  subagent_failed: "子代理执行未完成",
                   subagent_fallback_to_parent: "主 Agent 正在接管剩余任务",
                 };
                 const restoredLabel = restoredLabels[String(latestDelegationEvent.type || "")];
@@ -1615,7 +1704,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         apiGetSessionHistory(id)
           .then((data) => {
             if (Array.isArray(data.todos)) {
-              updateSessionTodos(id, data.todos);
+              updateSessionTodos(
+                id,
+                data.todos,
+                data.todos_authority as TodoAuthority | undefined,
+                data.todo_ledger_revision,
+              );
             }
             if (data.graph !== undefined) {
               updateSessionGraph(id, data.graph || null);
@@ -1650,18 +1744,25 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         traceHistoriesMapRef.current[sessionId] = histories;
         selectedTraceQueryMapRef.current[sessionId] = selected;
         tracesMapRef.current[sessionId] = data.trace || (selected ? histories[selected] : null) || null;
-        if (data.todos) todosMapRef.current[sessionId] = data.todos;
+        if (data.todos) {
+          updateSessionTodos(
+            sessionId,
+            data.todos,
+            data.todos_authority as TodoAuthority | undefined,
+            data.todo_ledger_revision,
+          );
+        }
         if (data.graph) graphsMapRef.current[sessionId] = data.graph;
         if (sessionIdRef.current === sessionId) {
           setTraceHistory(histories);
           setSelectedTraceQueryId(selected);
           setTrace(tracesMapRef.current[sessionId]);
-          if (data.todos) setTodos(data.todos);
+          if (data.todos) setTodos(todosMapRef.current[sessionId] || data.todos);
           if (data.graph) setGraph(data.graph);
         }
       })
       .catch(() => {});
-  }, [workspaceView, sessionId]);
+  }, [workspaceView, sessionId, updateSessionTodos]);
 
   // On mount/refresh, restore the last viewed session from storage.
   const restoredSessionRef = useRef(false);
@@ -1782,7 +1883,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         delete messagesMapRef.current[id];
         delete analyticsModelIdsMapRef.current[id];
         assistantIdsRef.current.delete(id);
-        setStreamingSessions((prev) => {
+        updateStreamingSessions((prev) => {
           const next = new Set(prev);
           next.delete(id);
           return next;
@@ -1797,7 +1898,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         // ignore
       }
     },
-    [setSessionId]
+    [setSessionId, updateStreamingSessions]
   );
 
   const loadRawMessages = useCallback(() => {
@@ -1850,6 +1951,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       await apiClearSession(sessionId);
       messagesMapRef.current[sessionId] = [];
       todosMapRef.current[sessionId] = [];
+      todoLedgerRevisionsMapRef.current[sessionId] = 0;
+      delete todoAuthoritiesMapRef.current[sessionId];
       tracesMapRef.current[sessionId] = null;
       traceHistoriesMapRef.current[sessionId] = {};
       selectedTraceQueryMapRef.current[sessionId] = null;
@@ -1895,39 +1998,42 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       );
       // Immediately drop the streaming badge so the UI responds even if the
       // SSE reader is slow to terminate.
-      setStreamingSessions((prev) => {
+      updateStreamingSessions((prev) => {
         const next = new Set(prev);
         next.delete(sessionId);
         return next;
       });
     }
-  }, [sessionId, updateSessionMessages]);
+  }, [sessionId, updateSessionMessages, updateStreamingSessions]);
 
   const pauseActiveGoal = useCallback(async () => {
-    if (!activeGoal) return;
+    if (!activeGoal) throw new Error("当前没有可暂停的目标");
     const next = await apiPauseGoal(sessionId, activeGoal.goal_id);
     activeGoalsMapRef.current[sessionId] = next;
-    setActiveGoal(next);
+    if (sessionIdRef.current === sessionId) setActiveGoal(next);
     if (next.requested_status) {
       stopStreaming();
-      for (let attempt = 0; attempt < 10; attempt += 1) {
-        await new Promise((resolve) => window.setTimeout(resolve, 120));
-        const harness = await apiGetSessionHarnessState(sessionId);
-        const settled = harness.goals[activeGoal.goal_id];
-        if (settled && !settled.requested_status && !settled.current_run_id) {
-          activeGoalsMapRef.current[sessionId] = settled;
-          if (sessionIdRef.current === sessionId) setActiveGoal(settled);
-          break;
-        }
-      }
+      const settled = await waitForGoalState(
+        sessionId,
+        activeGoal.goal_id,
+        (goal) =>
+          goal.status === "paused"
+          && !goal.requested_status
+          && !goal.current_run_id,
+      );
+      activeGoalsMapRef.current[sessionId] = settled;
+      if (sessionIdRef.current === sessionId) setActiveGoal(settled);
+      return settled;
     }
+    return next;
   }, [activeGoal, sessionId, stopStreaming]);
 
   const resumeActiveGoal = useCallback(async () => {
-    if (!activeGoal) return;
+    if (!activeGoal) throw new Error("当前没有可恢复的目标");
     const next = await apiResumeGoal(sessionId, activeGoal.goal_id);
     activeGoalsMapRef.current[sessionId] = next;
-    setActiveGoal(next);
+    if (sessionIdRef.current === sessionId) setActiveGoal(next);
+    return next;
   }, [activeGoal, sessionId]);
 
   const cancelActiveGoal = useCallback(async () => {
@@ -1939,19 +2045,28 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       return;
     }
     activeGoalsMapRef.current[sessionId] = next;
-    setActiveGoal(next);
+    if (sessionIdRef.current === sessionId) setActiveGoal(next);
     stopStreaming();
-    for (let attempt = 0; attempt < 10; attempt += 1) {
-      await new Promise((resolve) => window.setTimeout(resolve, 120));
-      const harness = await apiGetSessionHarnessState(sessionId);
-      const settled = harness.goals[activeGoal.goal_id];
-      if (settled?.status === "cancelled") {
-        activeGoalsMapRef.current[sessionId] = null;
-        if (sessionIdRef.current === sessionId) setActiveGoal(null);
-        break;
-      }
-    }
+    await waitForGoalState(
+      sessionId,
+      activeGoal.goal_id,
+      (goal) => goal.status === "cancelled",
+    );
+    activeGoalsMapRef.current[sessionId] = null;
+    if (sessionIdRef.current === sessionId) setActiveGoal(null);
   }, [activeGoal, sessionId, stopStreaming]);
+
+  const extendActiveGoalBudget = useCallback(async (additionalRounds: number) => {
+    if (!activeGoal) throw new Error("当前没有可追加预算的目标");
+    const next = await apiExtendGoalBudget(
+      sessionId,
+      activeGoal.goal_id,
+      additionalRounds,
+    );
+    activeGoalsMapRef.current[sessionId] = next;
+    if (sessionIdRef.current === sessionId) setActiveGoal(next);
+    return next;
+  }, [activeGoal, sessionId]);
 
   const updateActiveGoal = useCallback(async (objective: string) => {
     if (!activeGoal) throw new Error("当前没有可编辑的目标");
@@ -1969,12 +2084,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   // ── Send message ───────────────────────────────────
 
   const sendMessage = useCallback(
-    async (text: string, attachments: AgentAttachment[] = []): Promise<boolean> => {
+    async (
+      text: string,
+      attachments: AgentAttachment[] = [],
+      options: SendMessageOptions = {},
+    ): Promise<boolean> => {
       // Guard: only check if CURRENT session is streaming (other sessions can be)
       const originSendSessionId = sessionIdRef.current;
       if (
         (!text.trim() && attachments.length === 0) ||
-        streamingSessions.has(sessionId) ||
+        streamingSessionsRef.current.has(originSendSessionId) ||
         isCompressing ||
         sendReservationsRef.current.has(originSendSessionId)
       ) {
@@ -1993,12 +2112,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       // attachment upload and React renders may finish later, but this Run must
       // not silently inherit a newer draft selection.
       const runOptions = {
-        runtimeMode,
+        runtimeMode: options.goalControlAction === "start" ? "agent" as const : runtimeMode,
         projectId: currentProjectId,
         analyticsModelId:
           analyticsModelIdsMapRef.current[sendSessionId] ?? analyticsModelId ?? null,
         requestedGoalMode:
-          nextRunGoalModeMapRef.current[sendSessionId] ?? goalModeEnabled,
+          options.goalControlAction === "start"
+            ? true
+            : nextRunGoalModeMapRef.current[sendSessionId] ?? goalModeEnabled,
       };
       if (sendSessionId === "default") {
         const createdSessionId = await createSession();
@@ -2046,9 +2167,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const goalForRun =
         activeGoalsMapRef.current[sendSessionId] ||
         (sessionIdRef.current === sendSessionId ? activeGoal : null);
+      if (options.goalControlAction === "start" && !goalForRun) {
+        return false;
+      }
       const goalModeForRun =
         runOptions.runtimeMode === "agent" &&
-        (runOptions.requestedGoalMode || goalForRun?.status === "active");
+        runOptions.requestedGoalMode;
+      const contextGoalIdForRun =
+        runOptions.runtimeMode === "agent" && goalForRun?.status === "active"
+          ? goalForRun.goal_id
+          : null;
 
       const firstAssistantId = `assistant-${Date.now()}`;
       const assistantMsg: ChatMessage = {
@@ -2065,10 +2193,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
       // Per-session tracking
       assistantIdsRef.current.set(sendSessionId, firstAssistantId);
-      updateSessionMessages(sendSessionId, (prev) => [...prev, userMsg, assistantMsg]);
+      updateSessionMessages(
+        sendSessionId,
+        (prev) => [
+          ...prev,
+          ...(options.hiddenUserMessage ? [] : [userMsg]),
+          assistantMsg,
+        ],
+      );
 
       // Mark this session as streaming
-      setStreamingSessions((prev) => new Set(prev).add(sendSessionId));
+      updateStreamingSessions((prev) => new Set(prev).add(sendSessionId));
       updateSessionRunActivity(sendSessionId, {
         phase: "running",
         label: runOptions.runtimeMode === "agent" ? "Agent 正在处理" : "正在生成回复",
@@ -2084,7 +2219,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
       // Helper: get current assistant ID for this session
       const getAssistantId = () => assistantIdsRef.current.get(sendSessionId) || "";
-      const appendLifecycleActivity = (label: string, status = "", activityId = "") => {
+      const appendLifecycleActivity = (
+        label: string,
+        status = "",
+        activityId = "",
+        detail = "",
+      ) => {
         const targetId = getAssistantId();
         updateMsgs((prev) => prev.map((message) => {
           if (message.id !== targetId) return message;
@@ -2097,6 +2237,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           const nextActivity = {
             type: "activity" as const,
             label,
+            detail: detail || undefined,
             status,
             id,
           };
@@ -2116,11 +2257,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         const targetId = getAssistantId();
         updateMsgs((prev) => prev.map((message) => {
           if (message.id !== targetId) return message;
-          const segments = message.segments?.length
-            ? [...message.segments]
-            : [{ content: "" } as MessageSegment];
-          const last = segments.length - 1;
-          const timeline = (segments[last].timeline || []).map((item) => {
+          const settleTimeline = (timeline: TimelineItem[] | undefined) => {
+            if (activityPrefix === "verification-") {
+              return settleRunningVerificationActivities(timeline || [], status);
+            }
+            return (timeline || []).map((item) => {
             if (item.type !== "activity"
               || !item.id.startsWith(activityPrefix)
               || item.status !== "running") {
@@ -2128,8 +2269,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             }
             return { ...item, status };
           });
-          segments[last] = { ...segments[last], timeline };
-          return { ...message, segments };
+          };
+          const segments = (message.segments || []).map((segment) => ({
+            ...segment,
+            timeline: settleTimeline(segment.timeline),
+          }));
+          return {
+            ...message,
+            timeline: settleTimeline(message.timeline),
+            segments,
+          };
         }));
       };
       // Keep network consumption independent from React rendering. SSE frames
@@ -2251,7 +2400,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               attachments,
               runOptions.analyticsModelId,
               goalModeForRun,
-              goalModeForRun ? goalForRun?.goal_id || null : null,
+              options.goalControlAction === "start" ? goalForRun?.goal_id || null : null,
+              contextGoalIdForRun,
+              options.goalControlAction || null,
             )
           : streamChat(processedText, sendSessionId, controller.signal, userId);
 
@@ -2618,7 +2769,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           // Agent white-box state: todo list updates
           if (event.event === "todos_updated") {
             const nextTodos = (event.data.todos || []) as TodoItem[];
-            updateSessionTodos(sendSessionId, nextTodos);
+            updateSessionTodos(
+              sendSessionId,
+              nextTodos,
+              event.data.authority as TodoAuthority | undefined,
+              typeof event.data.ledger_revision === "number"
+                ? event.data.ledger_revision
+                : undefined,
+            );
             if (workspaceView === "chat" && nextTodos.length > 0) {
               setInspectorOpen(true);
               setInspectorActiveTab("progress");
@@ -2678,15 +2836,19 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             const objective = String(event.data.objective || "").trim();
             const tool = String(event.data.tool || "").trim();
             const labels: Record<string, { label: string; status: string }> = {
-              subagent_started: { label: "子代理已启动", status: "running" },
-              context_mounted: { label: "子代理上下文已挂载", status: "completed" },
+              subagent_started: { label: "子代理执行中", status: "running" },
+              subagent_waiting_for_permission: {
+                label: "子代理等待授权",
+                status: "waiting_for_permission",
+              },
+              context_mounted: { label: "上下文已挂载", status: "completed" },
               subagent_stage_changed: { label: "子代理正在分析与规划", status: "running" },
               subagent_tool_started: {
                 label: tool ? `子代理正在执行：${tool}` : "子代理正在执行工具",
                 status: "running",
               },
               subagent_tool_completed: {
-                label: tool ? `子代理已完成：${tool}` : "子代理工具执行完成",
+                label: tool ? `子代理工具已返回：${tool}` : "子代理工具已返回",
                 status: "completed",
               },
               subagent_tool_failed: {
@@ -2695,8 +2857,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               },
               subagent_completed: { label: "子代理已完成，主 Agent 正在接收结果", status: "completed" },
               subagent_blocked: { label: "子代理需要主 Agent 决策", status: "blocked" },
-              subagent_timed_out: { label: "子代理已超时，主 Agent 正在接管剩余任务", status: "timed_out" },
-              subagent_failed: { label: "子代理未完成，主 Agent 正在接管剩余任务", status: "failed" },
+              subagent_timed_out: { label: "子代理执行超时", status: "timed_out" },
+              subagent_failed: { label: "子代理执行未完成", status: "failed" },
               subagent_cancelled: { label: "子代理已随本轮任务取消", status: "cancelled" },
               subagent_fallback_to_parent: { label: "主 Agent 正在接管剩余任务", status: "running" },
             };
@@ -2709,11 +2871,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 // sub-run before recording its terminal lifecycle state.
                 settleLifecycleActivities(identity.settlePrefix, activityStatus);
               }
-              appendLifecycleActivity(
-                presentation.label,
-                activityStatus,
-                identity.activityId,
-              );
+              // The running `task` tool row already says "子代理执行中".
+              // Keep only the useful mounted-context signal instead of
+              // rendering a redundant "子代理已启动" row underneath it.
+              if (event.event !== "subagent_started") {
+                appendLifecycleActivity(
+                  presentation.label,
+                  activityStatus,
+                  identity.activityId,
+                );
+              }
               const terminal = identity.terminal;
               if (!terminal) {
                 updateSessionRunActivity(sendSessionId, {
@@ -2734,22 +2901,33 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           if (event.event === "run_started") {
             const run = event.data.run as unknown as HarnessRun;
             correctingVerificationGap = false;
-            // Todo ledgers are owned by the active Goal revision or standalone
-            // Run. Never display the previous terminal ledger while waiting
-            // for this Run's first todos_updated event.
-            todosMapRef.current[sendSessionId] = [];
-            if (sessionIdRef.current === sendSessionId) setTodos([]);
+            if (Array.isArray(event.data.todos)) {
+              updateSessionTodos(
+                sendSessionId,
+                event.data.todos as TodoItem[],
+                event.data.todos_authority as TodoAuthority | undefined,
+                typeof event.data.todo_ledger_revision === "number"
+                  ? event.data.todo_ledger_revision
+                  : undefined,
+              );
+            }
             updateSessionRunActivity(sendSessionId, {
               phase: "running",
-              label: "Agent 正在处理",
+              label: run?.run_kind === "goal_inspection"
+                ? "正在读取 Goal 进度"
+                : run?.run_kind === "goal_execution"
+                  ? "正在执行 Goal"
+                  : "Agent 正在处理",
             });
             if (run?.run_id) {
               currentRunsMapRef.current[sendSessionId] = run;
               const existingRuns = goalRunsMapRef.current[sendSessionId] || [];
-              goalRunsMapRef.current[sendSessionId] = [
-                ...existingRuns.filter((item) => item.run_id !== run.run_id),
-                run,
-              ];
+              if (run.goal_id) {
+                goalRunsMapRef.current[sendSessionId] = [
+                  ...existingRuns.filter((item) => item.run_id !== run.run_id),
+                  run,
+                ];
+              }
               verificationReportsMapRef.current[sendSessionId] = null;
               if (sessionIdRef.current === sendSessionId) {
                 setCurrentRun(run);
@@ -2781,7 +2959,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               if (event.event === "goal_created" && runOptions.requestedGoalMode) {
                 nextRunGoalModeMapRef.current[sendSessionId] = false;
               }
-              const nextActiveGoal = CLOSED_GOAL_STATUSES.has(goal.status) ? null : goal;
+              const nextActiveGoal = goalRemainsVisible(goal.status) ? goal : null;
               activeGoalsMapRef.current[sendSessionId] = nextActiveGoal;
               if (sessionIdRef.current === sendSessionId) {
                 setActiveGoal(nextActiveGoal);
@@ -2834,23 +3012,43 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             const verificationActivityId = event.event === "rubric_evaluation_end"
               ? `verification-quality-${String(event.data.grading_run_id || event.data.iteration || "current")}`
               : `verification-completion-${String(event.data.run_id || currentRunsMapRef.current[sendSessionId]?.run_id || "current")}`;
-            if (result === "needs_revision" || result === "failed") {
-              correctingVerificationGap = true;
+            if (
+              result === "needs_revision" ||
+              result === "failed" ||
+              result === "infrastructure_error"
+            ) {
+              const failureActivity = verificationFailureActivity(
+                event.event,
+                result,
+                Boolean(event.data.will_continue),
+                Boolean(event.data.goal_id),
+              );
+              const { willContinue } = failureActivity;
+              correctingVerificationGap = willContinue;
+              if (!willContinue) {
+                settleLifecycleActivities("verification-", failureActivity.displayStatus);
+              }
               updateSessionRunActivity(sendSessionId, {
-                phase: "revision",
+                phase: willContinue ? "revision" : "verification",
                 label: "Agent 正在处理",
               });
               appendLifecycleActivity(
-                event.event === "deterministic_checks_completed"
-                  ? result === "failed"
-                    ? "完成条件仍未满足"
-                    : "发现完成条件缺口，继续处理"
-                  : "发现质量缺口，继续处理",
-                result,
+                failureActivity.label,
+                failureActivity.displayStatus,
                 verificationActivityId,
+                failureActivity.detail,
               );
+              if (failureActivity.summary) {
+                const targetId = getAssistantId();
+                updateMsgs((prev) => prev.map((message) => (
+                  message.id === targetId
+                    ? { ...message, verificationSummary: failureActivity.summary }
+                    : message
+                )));
+              }
             } else if (result === "satisfied" || result === "passed") {
               correctingVerificationGap = false;
+              settleLifecycleActivities("verification-", result);
               updateSessionRunActivity(sendSessionId, {
                 phase: "verification",
                 label: "Agent 正在处理",
@@ -3472,6 +3670,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               }
 
               case "done":
+                {
+                  const verificationSummary = String(
+                    event.data.verification_summary || ""
+                  ).trim();
+                  if (verificationSummary) {
+                    msg.verificationSummary = verificationSummary;
+                  }
+                }
                 break;
 
               case "error":
@@ -3528,6 +3734,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       } finally {
         flushPendingTokens();
         flushPendingReasoning();
+        // A closed SSE stream cannot own a live verification spinner. Normal
+        // terminal events already settle these rows; this is the safety net
+        // for disconnects and budget/control-plane termination.
+        settleLifecycleActivities("verification-", "error");
         const targetId = getAssistantId();
         updateMsgs((prev) => {
           const updated = [...prev];
@@ -3546,17 +3756,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           setMaintenanceStatus(null);
         }
         updateSessionRunActivity(sendSessionId, null);
-        setStreamingSessions((prev) => {
+        updateStreamingSessions((prev) => {
           const next = new Set(prev);
           next.delete(sendSessionId);
           return next;
         });
         apiGetSessionHarnessState(sendSessionId)
           .then((state) => {
-            const reconciledGoal =
-              state.active_goal_id && state.goals[state.active_goal_id]
-                ? state.goals[state.active_goal_id]
-                : null;
+            const reconciledGoal = visibleGoalFromHarness(state);
             if (reconciledGoal) {
               nextRunGoalModeMapRef.current[sendSessionId] = false;
             }
@@ -3569,6 +3776,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             }
           })
           .catch(() => {});
+        apiGetCurrentSessionTodos(sendSessionId)
+          .then((snapshot) => {
+            updateSessionTodos(
+              sendSessionId,
+              snapshot.todos,
+              snapshot.authority,
+              snapshot.ledger_revision,
+            );
+          })
+          .catch(() => {});
         loadSessions();
       }
         return true;
@@ -3577,18 +3794,19 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }
     },
     [
-      streamingSessions,
       isCompressing,
       sessionId,
       createSession,
       loadSessions,
       updateSessionMessages,
+      updateSessionTodos,
       runtimeMode,
       currentProjectId,
       analyticsModelId,
       goalModeEnabled,
       activeGoal,
       updateSessionRunActivity,
+      updateStreamingSessions,
     ]
   );
 
@@ -3633,6 +3851,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         pauseActiveGoal,
         resumeActiveGoal,
         cancelActiveGoal,
+        extendActiveGoalBudget,
         updateActiveGoal,
         sessionId,
         setSessionId,

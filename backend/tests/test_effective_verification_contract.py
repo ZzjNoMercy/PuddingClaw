@@ -457,6 +457,28 @@ def test_explicit_analytics_intent_does_not_require_selected_model():
 
 
 @pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("生成一个普通静态 HTML 报告", False),
+        ("生成 HTML，并在最终交付前开展 E2E 测试", True),
+        ("用真实浏览器验证这个 HTML 报告", True),
+        ("用 Playwright 跑一下这个 HTML", True),
+        ("不要运行 E2E 测试，只做结构检查", False),
+    ],
+)
+def test_browser_e2e_contract_parameter_requires_explicit_user_intent(
+    message,
+    expected,
+):
+    contract = RunRubricCompiler.compile(
+        RubricBuildContext(user_message=message, force_required=True)
+    )
+
+    assert contract is not None
+    assert contract.browser_e2e_required is expected
+
+
+@pytest.mark.parametrize(
     "tool_name",
     [
         "database_sql_execute",
@@ -1472,6 +1494,246 @@ def test_validation_receipt_binds_only_explicit_command_input(tmp_path):
     ]
 
 
+def test_external_directory_validator_emits_artifact_bound_receipt(tmp_path):
+    from graph.session_manager import session_manager
+
+    state = tmp_path / "state"
+    external = tmp_path / "external"
+    state.mkdir()
+    external.mkdir()
+    script = external / "chart.js"
+    script.write_text("const value = 1;\n", encoding="utf-8")
+    session_manager.initialize(state)
+    session_manager.create_session("external-validator-session")
+    run = RunRecord(
+        run_id="run-external-validator",
+        query_id="query-external-validator",
+        session_id="external-validator-session",
+        objective="update chart.js",
+        status=RunStatus.PREPARING,
+        config_snapshot={"execution": {"workspace_id": "workspace-external"}},
+    )
+    session_manager.start_harness_run(
+        "external-validator-session", run.model_dump(mode="json")
+    )
+    session_manager.transition_run_status(
+        "external-validator-session", run.run_id, RunStatus.RUNNING.value
+    )
+    write_activation = next(
+        item
+        for item in build_verification_activations(
+            run_id=run.run_id,
+            query_id=run.query_id,
+            tool_call_id="call-write-external",
+            tool_name="patch_file",
+            args={"file_path": str(script)},
+            result=ToolMessage(
+                content=f"Updated {script}",
+                tool_call_id="call-write-external",
+                name="patch_file",
+                status="success",
+            ),
+            session_id="external-validator-session",
+        )
+        if item.pack == "code"
+    )
+    session_manager.append_run_verification_activation(
+        "external-validator-session",
+        run.run_id,
+        write_activation.model_dump(mode="json"),
+    )
+
+    validation = next(
+        item
+        for item in build_verification_activations(
+            run_id=run.run_id,
+            query_id=run.query_id,
+            tool_call_id="call-check-external",
+            tool_name="execute_external_directory",
+            args={
+                "directory_path": str(external),
+                "command": "node --check chart.js",
+            },
+            result=ToolMessage(
+                content=(
+                    '{"exit_code":0,"output":"JS_SYNTAX_OK\\n",'
+                    '"status":"completed"}'
+                ),
+                tool_call_id="call-check-external",
+                name="execute_external_directory",
+                status="success",
+            ),
+            session_id="external-validator-session",
+        )
+        if item.pack == "code"
+    )
+    receipt = next(
+        item
+        for item in validation.evidence_refs
+        if item.get("kind") == "validation_receipt"
+    )
+
+    assert validation.tool_name == "execute_external_directory"
+    assert receipt["status"] == "passed"
+    assert receipt["exit_code"] == 0
+    assert receipt["validator_kind"] == "javascript_syntax"
+    written_ref = next(
+        item
+        for item in write_activation.evidence_refs
+        if item.get("kind") == "artifact_write"
+    )
+    assert receipt["artifact_refs"] == [
+        {
+            "artifact_id": written_ref["artifact_id"],
+            "content_sha256": written_ref["content_sha256"],
+            "path": str(script.resolve()),
+            "observed_path": str(script.resolve()),
+        }
+    ]
+
+
+def test_external_directory_browser_validator_emits_runtime_receipt(tmp_path):
+    from graph.session_manager import session_manager
+
+    state = tmp_path / "state"
+    external = tmp_path / "external"
+    state.mkdir()
+    external.mkdir()
+    report = external / "report.html"
+    report.write_text("<html><body>Report</body></html>", encoding="utf-8")
+    session_manager.initialize(state)
+    session_manager.create_session("browser-validator-session")
+    run = RunRecord(
+        run_id="run-browser-validator",
+        query_id="query-browser-validator",
+        session_id="browser-validator-session",
+        objective="validate report.html",
+        status=RunStatus.PREPARING,
+        config_snapshot={"execution": {"workspace_id": "workspace-browser"}},
+    )
+    session_manager.start_harness_run(
+        "browser-validator-session", run.model_dump(mode="json")
+    )
+    session_manager.transition_run_status(
+        "browser-validator-session", run.run_id, RunStatus.RUNNING.value
+    )
+
+    activation = next(
+        item
+        for item in build_verification_activations(
+            run_id=run.run_id,
+            query_id=run.query_id,
+            tool_call_id="call-browser-check",
+            tool_name="execute_external_directory",
+            args={
+                "directory_path": str(external),
+                "command": (
+                    "node /opt/puddingclaw/bin/"
+                    "validate-html-report-e2e.mjs report.html"
+                ),
+            },
+            result=ToolMessage(
+                content='{"passed":true,"failures":[]}',
+                tool_call_id="call-browser-check",
+                name="execute_external_directory",
+                status="success",
+            ),
+            session_id="browser-validator-session",
+        )
+        if item.pack == "code"
+    )
+    receipt = next(
+        item
+        for item in activation.evidence_refs
+        if item.get("kind") == "validation_receipt"
+    )
+
+    assert receipt["validator_kind"] == "browser_runtime"
+    assert receipt["validator_version"] == "puddingclaw-html-e2e/v1"
+    assert receipt["commit_authority"] is True
+    assert receipt["artifact_refs"][0]["path"] == str(report.resolve())
+
+
+def test_failed_external_directory_validation_is_persisted_as_blocking_receipt(
+    tmp_path,
+):
+    from graph.session_manager import session_manager
+
+    state = tmp_path / "state"
+    external = tmp_path / "external"
+    state.mkdir()
+    external.mkdir()
+    source = external / "broken.js"
+    source.write_text("const = ;\n", encoding="utf-8")
+    session_manager.initialize(state)
+    session_manager.create_session("failed-external-validation-session")
+    run = RunRecord(
+        run_id="run-failed-external-validation",
+        query_id="query-failed-external-validation",
+        session_id="failed-external-validation-session",
+        objective="validate external broken.js",
+        status=RunStatus.PREPARING,
+    )
+    session_manager.start_harness_run(
+        "failed-external-validation-session", run.model_dump(mode="json")
+    )
+    session_manager.transition_run_status(
+        "failed-external-validation-session",
+        run.run_id,
+        RunStatus.RUNNING.value,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "id": "call-external-node-check",
+            "name": "execute_external_directory",
+            "args": {
+                "command": "node --check broken.js",
+                "directory_path": str(external),
+            },
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(
+            context={
+                "session_id": "failed-external-validation-session",
+                "run_id": run.run_id,
+                "query_id": run.query_id,
+                "workspace_path": str(tmp_path / "workspace"),
+            },
+            stream_writer=None,
+        ),
+    )
+
+    VerificationActivationMiddleware().wrap_tool_call(
+        request,
+        lambda _request: ToolMessage(
+            content=(
+                '{"directory_path":"'
+                + str(external)
+                + '","exit_code":1,"output":"SyntaxError","status":"failed"}'
+            ),
+            tool_call_id="call-external-node-check",
+            name="execute_external_directory",
+            status="error",
+        ),
+    )
+
+    saved = session_manager.get_run_state(
+        "failed-external-validation-session", run.run_id
+    )
+    assert saved is not None
+    activation = saved["verification_activations"][0]
+    receipt = next(
+        item
+        for item in activation["evidence_refs"]
+        if item.get("kind") == "validation_receipt"
+    )
+    assert receipt["status"] == "failed"
+    assert receipt["blocking"] is True
+    assert receipt["exit_code"] == 1
+    assert receipt["artifact_refs"][0]["path"] == str(source.resolve())
+
+
 def test_staged_validation_receipt_maps_observed_draft_to_external_target(tmp_path):
     from graph.middlewares.versioned_patch import _digest
     from graph.session_manager import session_manager
@@ -2048,7 +2310,8 @@ def test_unreached_llm_criteria_are_reported_as_not_evaluated():
         run_id="run-not-evaluated",
         contract=contract,
         final_state={
-            "_rubric_status": "needs_revision",
+            "_rubric_status": "failed",
+            "_completion_gate_status": "failed",
             "_harness_context": {"todos": []},
         },
     )
@@ -2434,7 +2697,8 @@ def test_code_validation_inheritance_is_invalidated_by_artifact_hash_change(tmp_
     assert "hash 已变化" in str(changed.gap)
 
 
-def test_successful_validation_without_receipt_is_protocol_error():
+@pytest.mark.parametrize("tool_name", ["execute", "execute_external_directory"])
+def test_successful_validation_without_receipt_is_protocol_error(tool_name):
     from harness.deterministic_checks import _evaluate_code_validation
     from harness.models import VerificationFailureKind
 
@@ -2457,7 +2721,7 @@ def test_successful_validation_without_receipt_is_protocol_error():
             },
             {
                 "pack": "code",
-                "tool_name": "execute",
+                "tool_name": tool_name,
                 "created_at": 2.0,
                 "status": "succeeded",
                 "evidence_refs": [
@@ -2476,6 +2740,153 @@ def test_successful_validation_without_receipt_is_protocol_error():
     assert evaluation.passed is False
     assert evaluation.failure_kind == VerificationFailureKind.VALIDATOR_PROTOCOL_ERROR
     assert "不应继续修改业务产物" in str(evaluation.gap)
+
+
+def test_code_validation_aggregates_js_and_browser_receipts_by_artifact_hash():
+    from harness.deterministic_checks import _evaluate_code_validation
+
+    html_identity = ("report.html", "sha256:html")
+    js_identity = ("chart.js", "sha256:js")
+    context = {
+        "run_id": "run-browser-bundle",
+        "browser_e2e_required": True,
+        "verification_activations": [
+            {
+                "pack": "code",
+                "tool_name": "patch_file",
+                "created_at": 1.0,
+                "status": "succeeded",
+                "evidence_refs": [
+                    {
+                        "kind": "artifact_write",
+                        "artifact_id": "artifact-html",
+                        "path": html_identity[0],
+                        "content_sha256": html_identity[1],
+                        "material": True,
+                    },
+                    {
+                        "kind": "artifact_write",
+                        "artifact_id": "artifact-js",
+                        "path": js_identity[0],
+                        "content_sha256": js_identity[1],
+                        "material": True,
+                    },
+                ],
+            },
+            {
+                "pack": "code",
+                "tool_name": "execute_external_directory",
+                "created_at": 2.0,
+                "status": "succeeded",
+                "evidence_refs": [
+                    {
+                        "kind": "validation_receipt",
+                        "validator_kind": "javascript_syntax",
+                        "status": "passed",
+                        "exit_code": 0,
+                        "checks_failed": 0,
+                        "artifact_refs": [
+                            {
+                                "artifact_id": "artifact-js",
+                                "path": js_identity[0],
+                                "content_sha256": js_identity[1],
+                            }
+                        ],
+                        "material": True,
+                    }
+                ],
+            },
+            {
+                "pack": "code",
+                "tool_name": "execute_external_directory",
+                "created_at": 3.0,
+                "status": "succeeded",
+                "evidence_refs": [
+                    {
+                        "kind": "validation_receipt",
+                        "validator_kind": "browser_runtime",
+                        "status": "passed",
+                        "exit_code": 0,
+                        "checks_failed": 0,
+                        "artifact_refs": [
+                            {
+                                "artifact_id": "artifact-html",
+                                "path": html_identity[0],
+                                "content_sha256": html_identity[1],
+                            }
+                        ],
+                        "material": True,
+                    }
+                ],
+            },
+        ],
+    }
+
+    assert _evaluate_code_validation("code_validation", context, {}).passed is True
+
+
+@pytest.mark.parametrize(
+    ("browser_e2e_required", "expected_passed"),
+    [(False, True), (True, False)],
+)
+def test_html_browser_receipt_is_required_only_by_explicit_contract_parameter(
+    browser_e2e_required,
+    expected_passed,
+):
+    from harness.deterministic_checks import _evaluate_code_validation
+
+    context = {
+        "run_id": "run-parser-only",
+        "browser_e2e_required": browser_e2e_required,
+        "verification_activations": [
+            {
+                "pack": "code",
+                "tool_name": "patch_file",
+                "created_at": 1.0,
+                "status": "succeeded",
+                "evidence_refs": [
+                    {
+                        "kind": "artifact_write",
+                        "artifact_id": "artifact-html",
+                        "path": "report.html",
+                        "content_sha256": "sha256:html",
+                        "material": True,
+                    }
+                ],
+            },
+            {
+                "pack": "code",
+                "tool_name": "execute",
+                "created_at": 2.0,
+                "status": "succeeded",
+                "evidence_refs": [
+                    {
+                        "kind": "validation_receipt",
+                        "validator_kind": "html_structure",
+                        "status": "passed",
+                        "exit_code": 0,
+                        "checks_failed": 0,
+                        "artifact_refs": [
+                            {
+                                "artifact_id": "artifact-html",
+                                "path": "report.html",
+                                "content_sha256": "sha256:html",
+                            }
+                        ],
+                        "material": True,
+                    }
+                ],
+            },
+        ],
+    }
+
+    evaluation = _evaluate_code_validation("code_validation", context, {})
+
+    assert evaluation.passed is expected_passed
+    if browser_e2e_required:
+        assert "真实浏览器运行验证" in str(evaluation.gap)
+    else:
+        assert evaluation.gap is None
 
 
 def test_runtime_pack_expansion_preserves_custom_rules():

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
+from langchain.tools import ToolRuntime
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel
 
@@ -27,11 +28,28 @@ class DatabaseQueryResultPageTool(BaseTool):
     class Config:
         arbitrary_types_allowed = True
 
-    async def _arun(self, result_id: str, page: int = 1, page_size: int | None = None) -> str:
+    async def _arun(
+        self,
+        result_id: str,
+        page: int = 1,
+        page_size: int | None = None,
+        runtime: ToolRuntime | None = None,
+    ) -> str:
         try:
+            context = (
+                runtime.context
+                if runtime is not None and isinstance(runtime.context, dict)
+                else {}
+            )
             sessionmaker = get_sessionmaker()
             async with sessionmaker() as session:
-                page_result = await read_query_result_page(session, result_id, page=page, page_size=page_size)
+                page_result = await read_query_result_page(
+                    session,
+                    result_id,
+                    page=page,
+                    page_size=page_size,
+                    session_id=str(context.get("session_id") or ""),
+                )
         except QueryResultStoreError as exc:
             return f"🧮 查询结果分页读取失败：{exc}"
         except Exception as exc:
@@ -53,9 +71,22 @@ class DatabaseQueryResultPageTool(BaseTool):
         ]
         return "\n".join(lines)
 
-    def _run(self, result_id: str, page: int = 1, page_size: int | None = None) -> str:
+    def _run(
+        self,
+        result_id: str,
+        page: int = 1,
+        page_size: int | None = None,
+        runtime: ToolRuntime | None = None,
+    ) -> str:
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            return asyncio.run(self._arun(result_id=result_id, page=page, page_size=page_size))
+            return asyncio.run(
+                self._arun(
+                    result_id=result_id,
+                    page=page,
+                    page_size=page_size,
+                    runtime=runtime,
+                )
+            )
         return "🧮 查询结果分页读取失败：当前运行环境不支持同步调用，请使用异步工具调用。"

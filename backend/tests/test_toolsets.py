@@ -202,6 +202,364 @@ def test_capability_manifest_drives_prompt_and_visible_schema_from_same_state(tm
     assert '"database_sql_generate"' in prompt
 
 
+def test_capability_manifest_prompt_is_stable_when_only_audit_time_changes(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    middleware = ToolsetMiddleware(skills_dir=tmp_path, toolsets_by_skill={})
+    request = ModelRequest(
+        model=None,
+        messages=[HumanMessage(content="hello")],
+        system_message=SystemMessage(content="base"),
+        tools=[{"name": "read_file"}, {"name": "execute"}],
+        state={"messages": [], "active_skill_ids": [], "skill_activations": []},
+        runtime=SimpleNamespace(context={"run_id": "run-cache-stability"}),
+    )
+
+    monkeypatch.setattr("graph.middlewares.toolset.time.time", lambda: 1.0)
+    first = middleware._request_with_capability_manifest(request)
+    monkeypatch.setattr("graph.middlewares.toolset.time.time", lambda: 2.0)
+    second = middleware._request_with_capability_manifest(request)
+
+    first_prompt = str(first.system_message.content)
+    second_prompt = str(second.system_message.content)
+    assert first_prompt == second_prompt
+    assert '"created_at"' not in first_prompt
+
+
+def test_capability_and_permission_prompts_are_stable_across_run_identity(
+    tmp_path,
+) -> None:
+    middleware = ToolsetMiddleware(skills_dir=tmp_path, toolsets_by_skill={})
+
+    def request_for(run_id: str) -> ModelRequest:
+        return ModelRequest(
+            model=None,
+            messages=[HumanMessage(content="same turn")],
+            system_message=SystemMessage(content="base"),
+            tools=[{"name": "read_file"}, {"name": "execute"}],
+            state={"messages": [], "active_skill_ids": [], "skill_activations": []},
+            runtime=SimpleNamespace(context={"run_id": run_id}),
+        )
+
+    first_request = request_for("run-cache-a")
+    second_request = request_for("run-cache-b")
+    first_manifest = middleware._capability_manifest(
+        first_request,
+        middleware._visible_tools(first_request),
+    )
+    second_manifest = middleware._capability_manifest(
+        second_request,
+        middleware._visible_tools(second_request),
+    )
+    first_permission = middleware._permission_manifest(
+        first_request,
+        middleware._visible_tools(first_request),
+    )
+    second_permission = middleware._permission_manifest(
+        second_request,
+        middleware._visible_tools(second_request),
+    )
+    first = middleware._request_with_capability_manifest(first_request)
+    second = middleware._request_with_capability_manifest(second_request)
+
+    assert first_manifest.run_id != second_manifest.run_id
+    assert first_manifest.manifest_id == second_manifest.manifest_id
+    assert first_permission.run_id != second_permission.run_id
+    assert first_permission.manifest_id == second_permission.manifest_id
+    assert str(first.system_message.content) == str(second.system_message.content)
+    assert '"run_id"' not in str(first.system_message.content)
+
+
+def test_permission_boundary_change_still_changes_model_visible_manifest(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from graph.session_manager import session_manager
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    session_manager.initialize(state_dir)
+    session_manager.create_session("session-policy")
+    middleware = ToolsetMiddleware(skills_dir=tmp_path, toolsets_by_skill={})
+    snapshots = {
+        "run-strict": {
+            "config_snapshot": {
+                "permissions": {
+                    "approval_mode": "strict",
+                    "policy_epoch": 1,
+                    "policy_version": "policy-a",
+                }
+            }
+        },
+        "run-smart": {
+            "config_snapshot": {
+                "permissions": {
+                    "approval_mode": "smart",
+                    "policy_epoch": 2,
+                    "policy_version": "policy-b",
+                }
+            }
+        },
+    }
+    monkeypatch.setattr(
+        "graph.middlewares.toolset.session_manager.get_run_state",
+        lambda _session_id, run_id: snapshots[run_id],
+    )
+    monkeypatch.setattr(
+        "graph.middlewares.toolset.session_manager.list_permission_grants",
+        lambda _session_id: [],
+    )
+
+    def request_for(run_id: str) -> ModelRequest:
+        return ModelRequest(
+            model=None,
+            messages=[HumanMessage(content="same turn")],
+            system_message=SystemMessage(content="base"),
+            tools=[{"name": "read_file"}],
+            state={"messages": [], "active_skill_ids": [], "skill_activations": []},
+            runtime=SimpleNamespace(
+                context={"session_id": "session-policy", "run_id": run_id}
+            ),
+        )
+
+    strict_request = request_for("run-strict")
+    smart_request = request_for("run-smart")
+    strict_manifest = middleware._permission_manifest(
+        strict_request,
+        middleware._visible_tools(strict_request),
+    )
+    smart_manifest = middleware._permission_manifest(
+        smart_request,
+        middleware._visible_tools(smart_request),
+    )
+
+    assert strict_manifest.manifest_id != smart_manifest.manifest_id
+    assert (
+        str(
+            middleware._request_with_capability_manifest(
+                strict_request
+            ).system_message.content
+        )
+        != str(
+            middleware._request_with_capability_manifest(
+                smart_request
+            ).system_message.content
+        )
+    )
+
+
+def test_run_scoped_grant_still_changes_permission_manifest_without_run_id(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from graph.session_manager import session_manager
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    session_manager.initialize(state_dir)
+    session_manager.create_session("session-run-grant")
+    monkeypatch.setattr(
+        "graph.middlewares.toolset.session_manager.get_run_state",
+        lambda _session_id, _run_id: {"config_snapshot": {}},
+    )
+    monkeypatch.setattr(
+        "graph.middlewares.toolset.session_manager.list_permission_grants",
+        lambda _session_id: [
+            {
+                "type": "external_path",
+                "scope": "run",
+                "target_kind": "directory",
+                "target": "/approved",
+                "capabilities": ["read"],
+                "metadata": {"run_id": "run-with-grant"},
+                "bindings": {},
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "graph.middlewares.toolset.PermissionBindingPolicy.equivalent",
+        lambda **_kwargs: True,
+    )
+    middleware = ToolsetMiddleware(skills_dir=tmp_path, toolsets_by_skill={})
+
+    def permission_for(run_id: str):
+        request = ModelRequest(
+            model=None,
+            messages=[HumanMessage(content="same turn")],
+            tools=[{"name": "read_file"}],
+            state={"messages": [], "active_skill_ids": [], "skill_activations": []},
+            runtime=SimpleNamespace(
+                context={"session_id": "session-run-grant", "run_id": run_id}
+            ),
+        )
+        return middleware._permission_manifest(
+            request,
+            middleware._visible_tools(request),
+        )
+
+    granted = permission_for("run-with-grant")
+    ungranted = permission_for("run-without-grant")
+
+    assert granted.manifest_id != ungranted.manifest_id
+    assert any(item.get("scope") == "run" for item in granted.allowed)
+    assert not any(item.get("scope") == "run" for item in ungranted.allowed)
+
+
+def test_soft_recommendation_changes_user_hint_not_capability_identity(
+    tmp_path,
+) -> None:
+    _install_test_skill(tmp_path, "database-analysis", {"database_analysis"})
+    middleware = ToolsetMiddleware(
+        skills_dir=tmp_path,
+        toolsets_by_skill={"database-analysis": {"database_analysis"}},
+    )
+    base_state = {
+        "messages": [],
+        "active_skill_ids": [],
+        "skill_activations": [],
+    }
+    recommended_state = {
+        **base_state,
+        "task_profile": RunTaskProfile(
+            skill_candidates=[
+                SkillCandidate(
+                    skill_id="database-analysis",
+                    confidence=0.9,
+                    evidence="database task",
+                )
+            ]
+        ).model_dump(mode="json"),
+    }
+
+    def request_for(state: dict) -> ModelRequest:
+        return ModelRequest(
+            model=None,
+            messages=[HumanMessage(content="same turn")],
+            system_message=SystemMessage(content="base"),
+            tools=[{"name": "read_file"}, {"name": "database_sql_generate"}],
+            state=state,
+            runtime=SimpleNamespace(context={"run_id": "run-recommendation"}),
+        )
+
+    plain_request = request_for(base_state)
+    recommended_request = request_for(recommended_state)
+    plain_manifest = middleware._capability_manifest(
+        plain_request,
+        middleware._visible_tools(plain_request),
+    )
+    recommended_manifest = middleware._capability_manifest(
+        recommended_request,
+        middleware._visible_tools(recommended_request),
+    )
+    plain = middleware._request_with_capability_manifest(plain_request)
+    recommended = middleware._request_with_capability_manifest(recommended_request)
+
+    assert plain_manifest.manifest_id == recommended_manifest.manifest_id
+    assert str(plain.system_message.content) == str(recommended.system_message.content)
+    assert "/skills/database-analysis/SKILL.md" not in str(plain.messages[-1].content)
+    assert "/skills/database-analysis/SKILL.md" in str(
+        recommended.messages[-1].content
+    )
+
+
+def test_capability_schema_hash_changes_with_description_or_parameters(tmp_path) -> None:
+    middleware = ToolsetMiddleware(skills_dir=tmp_path, toolsets_by_skill={})
+    base = ModelRequest(
+        model=None,
+        messages=[],
+        tools=[
+            {
+                "name": "read_file",
+                "description": "read one file",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+            }
+        ],
+        state={"messages": []},
+        runtime=SimpleNamespace(context={"run_id": "run-schema"}),
+    )
+    changed = base.override(
+        tools=[
+            {
+                "name": "read_file",
+                "description": "read one file safely",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+            }
+        ]
+    )
+
+    first = middleware._capability_manifest(base, middleware._visible_tools(base))
+    second = middleware._capability_manifest(changed, middleware._visible_tools(changed))
+
+    assert first.allowed_tool_names == second.allowed_tool_names
+    assert first.tool_schema_hash != second.tool_schema_hash
+    assert first.manifest_id != second.manifest_id
+
+
+def test_permission_manifest_marks_path_tools_argument_dependent(tmp_path) -> None:
+    middleware = ToolsetMiddleware(skills_dir=tmp_path, toolsets_by_skill={})
+    request = ModelRequest(
+        model=None,
+        messages=[],
+        tools=[{"name": "read_file"}, {"name": "update_todos"}],
+        state={"messages": []},
+        runtime=SimpleNamespace(context={"run_id": "run-path-policy"}),
+    )
+
+    visible = middleware._visible_tools(request)
+    manifest = middleware._permission_manifest(request, visible)
+
+    read_policy = next(item for item in manifest.hitl_required if item["tool"] == "read_file")
+    assert read_policy["approval_scope"] == "argument_dependent"
+    assert any(item["tool"] == "update_todos" for item in manifest.allowed)
+
+
+def test_goal_inspection_exposes_only_read_only_tools(tmp_path) -> None:
+    middleware = ToolsetMiddleware(skills_dir=tmp_path, toolsets_by_skill={})
+    request = ModelRequest(
+        model=None,
+        messages=[HumanMessage(content="总结当前进度")],
+        tools=[
+            {"name": "read_file"},
+            {"name": "read_evidence"},
+            {"name": "update_todos"},
+            {"name": "write_file"},
+            {"name": "execute"},
+            {"name": "task"},
+            {"name": "database_sql_generate"},
+            {"name": "database_sql_validate"},
+            {"name": "database_sql_execute"},
+            {"name": "database_query_result_source"},
+            {"name": "database_query_trace_inspect"},
+            {"name": "database_query_result_page"},
+            {"name": "database_schema_inspect"},
+        ],
+        state={"messages": []},
+        runtime=SimpleNamespace(
+            context={"run_id": "run-inspect", "run_kind": "goal_inspection"}
+        ),
+    )
+
+    visible = [tool["name"] for tool in middleware._visible_tools(request)]
+    manifest = middleware._capability_manifest(request, middleware._visible_tools(request))
+
+    assert visible == ["read_file", "read_evidence"]
+    assert middleware._inspection_tool_allowed(
+        "database_query_trace_inspect"
+    )
+    assert middleware._inspection_tool_allowed(
+        "database_query_result_page"
+    )
+    assert "update_todos" not in manifest.allowed_tool_names
+    assert "database_sql_execute" not in manifest.allowed_tool_names
+    assert "database_query_result_source" not in manifest.allowed_tool_names
+    assert "database_schema_inspect" not in manifest.allowed_tool_names
+    assert any(
+        item["tool"] == "update_todos" and item["reason"] == "inspection_run_read_only"
+        for item in manifest.unavailable_tools
+    )
+
+
 def test_capability_manifest_recommends_concrete_inactive_skill_without_expanding_tools(
     tmp_path,
 ) -> None:
@@ -235,14 +593,24 @@ def test_capability_manifest_recommends_concrete_inactive_skill_without_expandin
         },
     )
 
-    updated = middleware._request_with_capability_manifest(request)
+    routed = SkillIntentRouterMiddleware()._request_with_routing_prompt(request)
+    updated = middleware._request_with_capability_manifest(routed)
 
     assert [tool["name"] for tool in updated.tools] == ["read_file"]
     prompt = str(updated.system_message.content)
-    assert '"recommended_inactive_skills"' in prompt
-    assert '"skill_id": "database-analysis"' in prompt
-    assert "/skills/database-analysis/SKILL.md" in prompt
-    assert '"database_sql_generate"' not in prompt
+    assert '"recommended_inactive_skills"' not in prompt
+    assert '"skill_id": "database-analysis"' not in prompt
+    assert "/skills/database-analysis/SKILL.md" not in prompt
+    assert "/skills/database-analysis/SKILL.md" in str(updated.messages[-1].content)
+    assert '"allowed_tool_names": ["read_file"]' in prompt
+    assert '"reason": "skill_not_activated", "tool": "database_sql_generate"' in prompt
+    audit_manifest = middleware._capability_manifest(
+        request,
+        middleware._visible_tools(request),
+    )
+    assert [item.skill_id for item in audit_manifest.recommended_inactive_skills] == [
+        "database-analysis"
+    ]
 
 
 def test_artifact_contract_validator_is_unconditionally_visible(tmp_path) -> None:
@@ -349,8 +717,15 @@ def test_capability_manifest_recommends_skill_from_follow_up_artifact_without_in
 
     assert [tool["name"] for tool in updated.tools] == ["read_file"]
     prompt = str(updated.system_message.content)
-    assert '"source": "durable_artifact"' in prompt
-    assert "/skills/database-analysis/SKILL.md" in prompt
+    assert '"source": "durable_artifact"' not in prompt
+    assert "/skills/database-analysis/SKILL.md" not in prompt
+    assert "/skills/database-analysis/SKILL.md" in str(updated.messages[-1].content)
+    assert "durable_artifact" in str(updated.messages[-1].content)
+    audit_manifest = middleware._capability_manifest(
+        request,
+        middleware._visible_tools(request),
+    )
+    assert audit_manifest.recommended_inactive_skills[0].source == "durable_artifact"
 
 
 def test_skill_management_tools_are_visible_only_after_skill_activation(tmp_path) -> None:
@@ -390,7 +765,7 @@ def test_skill_management_tools_are_visible_only_after_skill_activation(tmp_path
     ]
 
 
-def test_prior_turn_skill_reads_remain_active_in_same_session(tmp_path) -> None:
+def test_current_run_skill_reads_activate_tools(tmp_path) -> None:
     _install_test_skill(tmp_path, "database-analysis", {"database_analysis"})
     middleware = ToolsetMiddleware(
         skills_dir=tmp_path,
@@ -405,6 +780,44 @@ def test_prior_turn_skill_reads_remain_active_in_same_session(tmp_path) -> None:
     assert update is not None
     assert update["active_skill_ids"] == ["database-analysis"]
     assert len(update["skill_activations"]) == 1
+
+
+def test_historical_skill_reads_do_not_activate_tools(tmp_path) -> None:
+    _install_test_skill(tmp_path, "database-analysis", {"database_analysis"})
+    middleware = ToolsetMiddleware(
+        skills_dir=tmp_path,
+        toolsets_by_skill={"database-analysis": {"database_analysis"}},
+    )
+    historical = {"puddingclaw_historical": True}
+    history = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "read_file",
+                    "args": {"file_path": "/skills/database-analysis/SKILL.md"},
+                    "id": "old",
+                    "type": "tool_call",
+                }
+            ],
+            additional_kwargs=historical,
+        ),
+        ToolMessage(
+            content="# old",
+            name="read_file",
+            tool_call_id="old",
+            status="success",
+            additional_kwargs=historical,
+        ),
+    ]
+
+    assert middleware._loaded_skill_ids(history) == []
+    update = middleware.before_agent(
+        {"messages": history},
+        runtime=SimpleNamespace(context={"run_id": "run-new"}),
+    )
+    assert update == {"active_skill_ids": [], "skill_activations": []}
+    assert "database_sql_execute" not in middleware._allowed_tool_names(update)
 
 
 def test_session_cached_skill_does_not_activate_a_new_run(
@@ -662,6 +1075,24 @@ def test_native_and_explicit_base_tools_are_unconditionally_visible_and_executab
             ),
         )
     assert calls == ["execute", "tavily_search", "fetch_url"]
+
+    bypass = ToolCallRequest(
+        tool_call={
+            "name": "stage_external_artifact",
+            "args": {"file_path": "/tmp/guessed"},
+            "id": "legacy-bypass",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={"messages": [], "active_skill_ids": []},
+        runtime=None,
+    )
+    denied = middleware.wrap_tool_call(
+        bypass,
+        lambda _request: (_ for _ in ()).throw(AssertionError("hidden legacy tool executed")),
+    )
+    assert denied.status == "error"
+    assert "legacy lease owner" in str(denied.content)
 
 
 def test_legacy_lease_tools_are_visible_only_to_active_owner_and_audited(

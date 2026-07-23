@@ -301,12 +301,13 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         },
         "terminal": {
             "docker_enabled": False,
+            "external_directory_writable_enabled": False,
             "on_unavailable": "fallback",
             "default_timeout_seconds": 120,
             "docker": {
                 "connection": "",
                 "context": "",
-                "image": "puddingclaw/sandbox:python3.12-node22-curl-v3",
+                "image": "puddingclaw/sandbox:python3.12-node22-chromium-v4",
                 "cpu_limit": "2",
                 "memory_limit_mb": 2048,
                 "pids_limit": 256,
@@ -414,8 +415,9 @@ def _migrate_legacy_config(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         "python:3.12-slim",
         "puddingclaw/sandbox:python3.12-node22-v1",
         "puddingclaw/sandbox:python3.12-node22-v2",
+        "puddingclaw/sandbox:python3.12-node22-curl-v3",
     }:
-        docker["image"] = "puddingclaw/sandbox:python3.12-node22-curl-v3"
+        docker["image"] = "puddingclaw/sandbox:python3.12-node22-chromium-v4"
         docker.setdefault("dependency_setup_enabled", False)
         migrated = True
     if isinstance(docker, dict):
@@ -1616,6 +1618,10 @@ def _normalize_harness_update(value: Any) -> dict[str, Any]:
         ):
             raise ValueError(
                 "harness.terminal.default_timeout_seconds must be in [1, 3600]"
+            )
+        if "external_directory_writable_enabled" in terminal:
+            terminal["external_directory_writable_enabled"] = bool(
+                terminal["external_directory_writable_enabled"]
             )
         docker = terminal.get("docker")
         if docker is not None:

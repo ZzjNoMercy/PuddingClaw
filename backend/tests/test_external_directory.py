@@ -347,6 +347,7 @@ def test_external_directory_code_commit_requires_receipt_for_each_exact_draft(
         exit_code=1,
         checks_failed=1,
         status="failed",
+        failure_class="invocation_failure",
         commit_authority=True,
         obligation_key="javascript_syntax:node-check/v1",
         created_at=1.0,
@@ -988,7 +989,10 @@ def test_user_supplied_external_directory_gets_host_file_broker_instructions(
 
     assert isinstance(content, str)
     assert "直接对原始绝对路径调用" in content
-    assert "ls/glob/grep/read_file/write_file/inspect_file_version/patch_file" in content
+    assert (
+        "ls/glob/grep/read_file/write_file/inspect_file_version/copy_file/"
+        "replace_file/materialize_source_ref/patch_file"
+    ) in content
     assert "HostFileBroker 直接访问正式文件" in content
     assert "不会暴露 lease、staged path 或 hash 编排" in content
     assert "execute 仍受项目 Docker" in content
@@ -1011,7 +1015,11 @@ def test_precise_external_file_does_not_infer_parent_directory(tmp_path: Path) -
     )
 
     assert isinstance(content, str)
-    assert "直接对原始绝对路径使用 read_file/inspect_file_version/patch_file" in content
+    assert (
+        "直接对原始绝对路径使用 "
+        "read_file/inspect_file_version/copy_file/replace_file/"
+        "materialize_source_ref/patch_file"
+    ) in content
     assert "若确认必须发现同目录依赖" in content
     assert "对直接父目录调用 ls/glob/grep" in content
     assert "HostFileBroker 原子落到正式路径" in content
@@ -1146,6 +1154,7 @@ def test_permission_middleware_requests_run_scoped_directory_write(tmp_path: Pat
     assert request["type"] == "external_directory_write"
     assert request["target_kind"] == "exact_directory"
     assert request["run_id"] == "run-1"
+    assert "delete" in request["capabilities"]
     assert request["change_preview"]["新增文件"] == "new.txt"
     assert request["options"] == ["exact_directory_run", "exact_directory_session"]
     assert request["grant_bindings"]["workspace_id"] == "workspace:stable"
@@ -1370,6 +1379,89 @@ def test_exact_file_sibling_discovery_never_prompts_for_broad_ancestor(
     assert calls == []
 
 
+def test_html_validator_reuses_exact_directory_read_grant_without_hitl(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from langchain_core.messages import AIMessage
+
+    import graph.permission_middleware as permission_middleware_module
+    from graph.permission_middleware import ExternalFilePermissionMiddleware
+    from graph.session_manager import session_manager
+
+    state_dir = tmp_path / "state"
+    external = tmp_path / "external"
+    workspace = tmp_path / "workspace"
+    for directory in (state_dir, external, workspace):
+        directory.mkdir()
+    report = external / "report.html"
+    report.write_text("<!doctype html><title>Report</title>", encoding="utf-8")
+    session_manager.initialize(state_dir)
+    session_manager.create_session("html-validator-permission-session")
+    from harness.models import RunRecord, RunStatus
+
+    run = RunRecord(
+        run_id="run-validate-html",
+        query_id="query-validate-html",
+        session_id="html-validator-permission-session",
+        objective=f"验证 {report}",
+        status=RunStatus.PREPARING,
+    )
+    session_manager.start_harness_run(
+        "html-validator-permission-session",
+        run.model_dump(mode="json"),
+    )
+    session_manager.transition_run_status(
+        "html-validator-permission-session",
+        run.run_id,
+        RunStatus.RUNNING.value,
+    )
+    session_manager.add_permission_grant(
+        "html-validator-permission-session",
+        grant_type="external_directory_read",
+        target_kind="exact_directory",
+        target=str(external.resolve()),
+        capabilities=["read", "recursive", "external_path"],
+        scope="run",
+        metadata={"run_id": run.run_id},
+    )
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        permission_middleware_module,
+        "interrupt",
+        lambda payload: calls.append(payload),
+    )
+    state = {
+        "messages": [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "validate_html_report",
+                        "args": {
+                            "html_file_path": str(report),
+                            "timeout": 120,
+                        },
+                        "id": "call-validate-html",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
+    }
+    runtime = SimpleNamespace(
+        context={
+            "session_id": "html-validator-permission-session",
+            "query_id": "query-validate-html",
+            "run_id": run.run_id,
+            "workspace_path": str(workspace),
+        }
+    )
+
+    assert ExternalFilePermissionMiddleware().after_model(state, runtime) is None
+    assert calls == []
+
+
 def test_permission_api_grants_exact_directory_for_current_run(tmp_path: Path) -> None:
     from fastapi.testclient import TestClient
 
@@ -1415,6 +1507,7 @@ def test_permission_api_grants_exact_directory_for_current_run(tmp_path: Path) -
     assert grant["target_kind"] == "exact_directory"
     assert grant["metadata"]["run_id"] == "run-7"
     assert grant["metadata"]["requested_target_kind"] == "exact_file"
+    assert "delete" not in grant["capabilities"]
     assert session_manager.has_external_directory_permission(
         "directory-api-session",
         external,

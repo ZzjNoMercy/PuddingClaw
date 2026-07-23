@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 
 from harness.artifact_contracts import validate_heatmap_year_contract
 
@@ -28,20 +27,31 @@ def test_heatmap_contract_rejects_missing_year_and_wrong_shape() -> None:
     assert result["checks"]["matrix_shape_valid"] is False
 
 
-def test_product_configuration_heatmap_contract_and_script_entry_are_current() -> None:
-    root = Path(__file__).resolve().parents[2]
-    artifact_dir = root / "designs" / "product-configuration-analysis"
-    html = (artifact_dir / "产品配置分析_2026.html").read_text(encoding="utf-8")
-    javascript = (artifact_dir / "product-config-charts-2026.js").read_text(
-        encoding="utf-8"
+def test_heatmap_contract_accepts_matching_selector_data_and_script() -> None:
+    matrix_2025 = [[0] * 10 for _ in range(8)]
+    matrix_2026 = [[1] * 10 for _ in range(8)]
+    result = validate_heatmap_year_contract(
+        html=(
+            '<select id="heatmapYearSelect">'
+            '<option value="2025">2025</option>'
+            '<option value="2026" selected>2026</option>'
+            "</select>"
+            '<script src="charts.js?v=synthetic"></script>'
+        ),
+        javascript=(
+            "const heatmapByYear = "
+            + json.dumps({"2025": matrix_2025, "2026": matrix_2026})
+            + '; let currentHeatYear = "2026"; '
+            + 'selector.addEventListener("change", function () {'
+            + "heatmapByYear[currentHeatYear]; });"
+        ),
+        javascript_filename="charts.js",
     )
 
-    assert 'src="product-config-charts-2026.js?v=20260722"' in html
-    assert validate_heatmap_year_contract(
-        html=html,
-        javascript=javascript,
-        javascript_filename="product-config-charts-2026.js",
-    )["passed"] is True
+    assert result["passed"] is True
+    assert result["checks"]["year_key_set_equal"] is True
+    assert result["checks"]["default_year_equal"] is True
+    assert result["checks"]["matrix_shape_valid"] is True
 
 
 def test_heatmap_contract_rejects_commented_nodes_and_invalid_javascript() -> None:

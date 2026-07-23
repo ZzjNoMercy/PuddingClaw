@@ -20,6 +20,7 @@ import {
   Wrench,
 } from "lucide-react";
 import type { TimelineItem, ToolCall } from "@/lib/store";
+import { getSubagentToolLabel } from "@/lib/subagentActivity";
 
 interface Props {
   timeline: TimelineItem[];
@@ -59,6 +60,9 @@ function getToolMeta(tool: string) {
 function getToolLabel(toolCall: ToolCall): string {
   const tool = toolCall.tool;
   const input = toolCall.input || "";
+  if (tool === "task" || tool.includes("subagent")) {
+    return getSubagentToolLabel(toolCall.status, Boolean(toolCall.is_error));
+  }
   try {
     const parsed = JSON.parse(input);
     if (tool === "read_file" && parsed.path) {
@@ -232,15 +236,40 @@ export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
               }
 
               if (item.type === "activity") {
-                const passed = ["satisfied", "passed", "completed", "done"].includes(item.status || "");
-                const failed = ["failed", "timed_out", "cancelled", "error"].includes(item.status || "");
+                const historicalVerificationContinuation =
+                  !isStreaming
+                  && item.status === "running"
+                  && item.id.startsWith("verification-");
+                const passed = historicalVerificationContinuation
+                  || ["satisfied", "passed", "completed", "done"].includes(item.status || "");
+                const failed = [
+                  "failed",
+                  "timed_out",
+                  "cancelled",
+                  "error",
+                  "infrastructure_error",
+                  "verification_failed",
+                ].includes(item.status || "");
                 const ActivityIcon = passed ? CheckCircle2 : failed ? XCircle : Loader2;
+                const activityLabel = historicalVerificationContinuation
+                  ? "已进入后续修复轮次"
+                  : item.label;
+                const activityDetail = historicalVerificationContinuation
+                  ? "该阶段已结束；以后续验收结果为准。"
+                  : item.detail;
                 return (
                   <div key={item.id} className="relative flex items-start gap-3">
                     <div className={`relative z-10 flex h-5 w-5 shrink-0 items-center justify-center rounded-full ${passed ? "bg-emerald-50 text-emerald-600" : failed ? "bg-rose-50 text-rose-600" : "bg-blue-50 text-[#002fa7]"}`}>
-                      <ActivityIcon className={`h-3 w-3 ${item.status === "running" ? "animate-spin" : ""}`} />
+                      <ActivityIcon className={`h-3 w-3 ${item.status === "running" && isStreaming ? "animate-spin" : ""}`} />
                     </div>
-                    <div className="pt-0.5 text-[12px] text-gray-500">{item.label}</div>
+                    <div className="min-w-0 flex-1 pt-0.5">
+                      <div className="text-[12px] font-medium text-gray-600">{activityLabel}</div>
+                      {activityDetail ? (
+                        <div className="mt-1 max-w-[680px] text-[11px] leading-relaxed text-gray-500">
+                          {activityDetail}
+                        </div>
+                      ) : null}
+                    </div>
                   </div>
                 );
               }

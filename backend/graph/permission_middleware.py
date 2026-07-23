@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -55,11 +56,15 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                 "old_string": str(args.get("old_string") or ""),
                 "new_string": str(args.get("new_string") or ""),
             }
-        elif tool_name in {"patch_file", "patch_files"}:
+        elif tool_name in {"patch_file", "patch_files", "replace_file"}:
             values = {
                 "expected_sha256": str(args.get("expected_sha256") or ""),
                 "replacements": str(args.get("replacements") or ""),
             }
+            if tool_name == "replace_file":
+                values["content_sha256"] = hashlib.sha256(
+                    str(args.get("content") or "").encode("utf-8")
+                ).hexdigest()
         elif tool_name == "delete_file":
             values = {
                 "expected_sha256": str(args.get("expected_sha256") or ""),
@@ -69,6 +74,22 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
             values = {
                 "lease_id": str(args.get("lease_id") or ""),
                 "expected_source_sha256": str(args.get("expected_source_sha256") or ""),
+            }
+        elif tool_name == "materialize_source_ref":
+            destination = (
+                args.get("destination")
+                if isinstance(args.get("destination"), dict)
+                else {}
+            )
+            values = {
+                "source_ref": str(args.get("source_ref") or ""),
+                "renderer": str(args.get("renderer") or ""),
+                "destination_kind": str(destination.get("kind") or ""),
+                "mode": str(
+                    destination.get("mode")
+                    or destination.get("output_mode")
+                    or ""
+                ),
             }
         else:
             values = {"content": str(args.get("content") or "")}
@@ -219,6 +240,27 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
             },
         )
 
+    @staticmethod
+    def _is_declared_artifact_target(
+        session_id: str,
+        run_id: str,
+        requested: Path,
+    ) -> bool:
+        run = session_manager.get_run_state(session_id, run_id)
+        targets = (
+            run.get("declared_artifact_targets")
+            if isinstance(run, dict)
+            else None
+        )
+        for raw_target in targets or []:
+            try:
+                candidate = Path(str(raw_target)).expanduser().resolve()
+            except OSError:
+                continue
+            if candidate == requested:
+                return True
+        return False
+
     def after_model(
         self,
         state: AgentState[Any],
@@ -249,10 +291,14 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                 "edit_file",
                 "write_file",
                 "inspect_file_version",
+                "copy_file",
+                "materialize_source_ref",
+                "replace_file",
                 "patch_file",
                 "patch_files",
                 "delete_file",
                 "execute_external_directory",
+                "validate_html_report",
                 "stage_external_artifact",
                 "commit_external_artifact",
                 "stage_external_directory",
@@ -264,6 +310,80 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
             }:
                 continue
             args = tool_call.get("args") or {}
+            if tool_name == "copy_file":
+                source_raw = str(args.get("source_path") or "").strip()
+                target_raw = str(args.get("target_path") or "").strip()
+                if not source_raw or not target_raw:
+                    continue
+                source = Path(source_raw).expanduser().resolve()
+                target = self._external_write_path(target_raw, workspace_path)
+                source_granted = (
+                    session_manager.has_external_file_read_permission(
+                        session_id,
+                        source,
+                    )
+                    or self._has_directory_permission_for_path(
+                        session_id,
+                        source,
+                        access="read",
+                        run_id=run_id,
+                    )
+                )
+                if not source_granted:
+                    request = permission_resume_registry.create_external_file_request(
+                        session_id=session_id,
+                        query_id=query_id,
+                        tool_call_id=str(tool_call.get("id") or ""),
+                        path=source,
+                        access="read",
+                        operation=tool_name,
+                    )
+                    interrupt(
+                        {
+                            "type": "permission_request",
+                            "request": request,
+                            "decisions": [{"type": "approve"}, {"type": "reject"}],
+                        }
+                    )
+                    return None
+                if target is None or (
+                    session_manager.has_external_file_write_permission(
+                        session_id,
+                        target,
+                    )
+                    or self._has_directory_permission_for_path(
+                        session_id,
+                        target,
+                        access="write",
+                        run_id=run_id,
+                    )
+                    or self._is_declared_artifact_target(
+                        session_id,
+                        run_id,
+                        target,
+                    )
+                ):
+                    continue
+                request = permission_resume_registry.create_external_file_request(
+                    session_id=session_id,
+                    query_id=query_id,
+                    tool_call_id=str(tool_call.get("id") or ""),
+                    path=target,
+                    access="write",
+                    operation=tool_name,
+                    change_preview={
+                        "source_path": str(source),
+                        "mode": "atomic_create_only",
+                    },
+                )
+                interrupt(
+                    {
+                        "type": "permission_request",
+                        "request": request,
+                        "decisions": [{"type": "approve"}, {"type": "reject"}],
+                    }
+                )
+                return None
             if tool_name == "patch_files":
                 for item in args.get("files") or []:
                     if not isinstance(item, dict):
@@ -282,6 +402,11 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                             requested,
                             access="write",
                             run_id=run_id,
+                        )
+                        or self._is_declared_artifact_target(
+                            session_id,
+                            run_id,
+                            requested,
                         )
                     ):
                         continue
@@ -306,9 +431,31 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                     )
                     return None
                 continue
+            destination = (
+                args.get("destination")
+                if isinstance(args.get("destination"), dict)
+                else {}
+            )
             raw_path = str(
-                args.get("path") or args.get("resource") or args.get("file_path") or args.get("directory_path") or ""
+                args.get("path")
+                or args.get("resource")
+                or args.get("file_path")
+                or args.get("html_file_path")
+                or args.get("directory_path")
+                or destination.get("target_path")
+                or destination.get("output_path")
+                or ""
             ).strip()
+            if tool_name == "validate_html_report" and raw_path:
+                html_path = Path(raw_path).expanduser().resolve()
+                if workspace_path:
+                    workspace = Path(workspace_path).expanduser().resolve()
+                    try:
+                        html_path.relative_to(workspace)
+                        continue
+                    except ValueError:
+                        pass
+                raw_path = str(html_path.parent)
             if not raw_path:
                 continue
             if raw_path.startswith("att_"):
@@ -319,12 +466,39 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
             if tool_name in {
                 "stage_external_directory",
                 "commit_external_directory",
+                "execute_external_directory",
+                "validate_html_report",
                 "grep",
                 "glob",
                 "ls",
             }:
                 requested = Path(raw_path).expanduser().resolve()
-                access = "write" if tool_name == "commit_external_directory" else "read"
+                access = (
+                    "write"
+                    if tool_name == "commit_external_directory"
+                    or (
+                        tool_name == "execute_external_directory"
+                        and str(args.get("mode") or "read_only")
+                        == "writable_draft"
+                    )
+                    else "read"
+                )
+                deletion_required = False
+                if tool_name == "commit_external_directory":
+                    lease = session_manager.get_external_directory_lease(
+                        session_id,
+                        str(args.get("lease_id") or ""),
+                    )
+                    plan = (
+                        lease.get("commit_plan")
+                        if isinstance(lease, dict)
+                        else None
+                    )
+                    deletion_required = bool(
+                        plan.get("deleted")
+                        if isinstance(plan, dict)
+                        else False
+                    )
                 if (
                     tool_name == "grep"
                     and requested.is_file()
@@ -347,6 +521,14 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                         run_id=run_id,
                     )
                     if tool_name in {"grep", "glob", "ls"}
+                    else self._has_directory_permission_for_path(
+                        session_id,
+                        requested,
+                        access="write",
+                        run_id=run_id,
+                        required_capability="delete",
+                    )
+                    if access == "write" and deletion_required
                     else session_manager.has_external_directory_permission(
                         session_id,
                         requested,
@@ -378,9 +560,21 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                             "目录将复制为 Docker /scratch 快照；不会直接挂载或修改原目录。"
                             if tool_name == "stage_external_directory"
                             else (
-                                "授权后仍需单独批准精确命令；目录只读挂载到一次性 docker run --rm，命令结束即销毁。"
+                                (
+                                    "命令只写服务端隔离草稿；原目录不以可写方式挂载。"
+                                    "执行后生成差异计划，删除项仍需二次批准。"
+                                    if access == "write"
+                                    else "目录只读挂载到一次性 docker run --rm，命令结束即销毁。"
+                                )
                                 if tool_name == "execute_external_directory"
-                                else "授权后由 HostFileBroker 直接重放原文件搜索；不会授予 shell 访问。"
+                                else (
+                                    "目录只读授权仅用于验证目标及其本地资源；普通模式 "
+                                    "只做结构与本地引用检查，只有合同明确要求 "
+                                    "E2E 时才启动平台固定的离线 Chromium，且不授予模型 "
+                                    "shell 能力。"
+                                    if tool_name == "validate_html_report"
+                                    else "授权后由 HostFileBroker 直接重放原文件搜索；不会授予 shell 访问。"
+                                )
                             )
                         ),
                     }
@@ -401,6 +595,7 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                     path=requested,
                     access=access,
                     operation=tool_name,
+                    require_delete=deletion_required,
                     grant_bindings=grant_bindings,
                     change_preview=change_preview,
                 )
@@ -439,6 +634,8 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                 "edit_file",
                 "write_file",
                 "patch_file",
+                "materialize_source_ref",
+                "replace_file",
                 "delete_file",
                 "commit_external_artifact",
             }:
@@ -464,7 +661,18 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                     run_id=run_id,
                     required_capability="delete" if access == "delete" else None,
                 )
-                if exact_granted or directory_granted:
+                if (
+                    exact_granted
+                    or directory_granted
+                    or (
+                        access == "write"
+                        and self._is_declared_artifact_target(
+                            session_id,
+                            run_id,
+                            requested,
+                        )
+                    )
+                ):
                     continue
                 change_preview = self._change_preview(tool_name, args)
             else:

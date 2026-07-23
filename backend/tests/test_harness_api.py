@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 
 from graph.session_manager import session_manager
 from harness.coordinators import HarnessRunCoordinator
-from harness.models import GoalRecord
+from harness.models import GoalRecord, GoalStatus
 
 
 def _client(tmp_path) -> TestClient:
@@ -80,6 +80,78 @@ def test_session_history_does_not_project_terminal_run_todos_as_current(tmp_path
     assert response.status_code == 200
     assert response.json()["todos"] == []
     assert response.json()["todos_authority"] == {"kind": "none"}
+
+
+def test_current_todos_endpoint_returns_authority_and_revision(tmp_path):
+    client = _client(tmp_path)
+    todos = [{"id": "todo-1", "content": "持久化修复", "status": "in_progress"}]
+    run, _goal = HarnessRunCoordinator(session_manager).start_run(
+        session_id="session-1",
+        query_id="query-live",
+        objective="持久化修复",
+        goal_mode=False,
+    )
+    session_manager.update_todos("session-1", todos, run_id=run.run_id)
+
+    response = client.get("/api/sessions/session-1/todos/current")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "session_id": "session-1",
+        "todos": todos,
+        "authority": {"kind": "run", "run_id": run.run_id},
+        "ledger_revision": 1,
+    }
+
+
+def test_budget_extension_reopens_exhausted_goal_without_starting_it(tmp_path):
+    client = _client(tmp_path)
+    goal = GoalRecord(
+        goal_id="goal-budget",
+        session_id="session-1",
+        objective="完成报告",
+        status=GoalStatus.BUDGET_EXCEEDED,
+        round=8,
+        max_rounds=8,
+        budget_exhaustion_reason="goal_max_runs",
+    )
+    session_manager.upsert_goal_state("session-1", goal.model_dump(mode="json"))
+
+    response = client.post(
+        "/api/sessions/session-1/goals/goal-budget/extend-budget",
+        json={"additional_rounds": 3},
+    )
+
+    assert response.status_code == 200
+    reopened = response.json()
+    assert reopened["status"] == "paused"
+    assert reopened["round"] == 8
+    assert reopened["max_rounds"] == 11
+    assert reopened["current_run_id"] is None
+    assert reopened["budget_exhaustion_reason"] is None
+    assert any("追加 3 轮" in notice for notice in reopened["control_notices"])
+
+
+def test_budget_extension_rejects_non_positive_or_non_exhausted_goal(tmp_path):
+    client = _client(tmp_path)
+    goal = GoalRecord(
+        goal_id="goal-active",
+        session_id="session-1",
+        objective="完成报告",
+    )
+    session_manager.upsert_goal_state("session-1", goal.model_dump(mode="json"))
+
+    invalid = client.post(
+        "/api/sessions/session-1/goals/goal-active/extend-budget",
+        json={"additional_rounds": 0},
+    )
+    wrong_state = client.post(
+        "/api/sessions/session-1/goals/goal-active/extend-budget",
+        json={"additional_rounds": 2},
+    )
+
+    assert invalid.status_code == 422
+    assert wrong_state.status_code == 409
 
 
 def test_permission_mode_api_rejects_stale_epoch_and_active_run(tmp_path):

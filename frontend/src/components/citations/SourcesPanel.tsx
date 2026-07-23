@@ -32,7 +32,12 @@ import {
   type PermissionGrant,
   type RubricEvaluationReport,
 } from "@/lib/api";
+import {
+  goalControlPresentation,
+  goalRevisionApplyPlan,
+} from "@/lib/goalControls";
 import { useApp, type SourceRecord, type ToolCall } from "@/lib/store";
+import ConfirmDialog from "@/components/ui/ConfirmDialog";
 
 type TodoStatus = "completed" | "in_progress" | "pending";
 
@@ -56,6 +61,7 @@ export default function SourcesPanel({
     pauseActiveGoal,
     resumeActiveGoal,
     cancelActiveGoal,
+    extendActiveGoalBudget,
     updateActiveGoal,
     sendMessage,
   } = useApp();
@@ -240,8 +246,15 @@ export default function SourcesPanel({
           onPause={pauseActiveGoal}
           onResume={resumeActiveGoal}
           onCancel={cancelActiveGoal}
+          onExtendBudget={extendActiveGoalBudget}
           onUpdate={updateActiveGoal}
-          onContinue={() => sendMessage("继续完成修改后的目标")}
+          onContinue={() =>
+            sendMessage(
+              "继续执行当前目标",
+              [],
+              { goalControlAction: "start", hiddenUserMessage: true },
+            )
+          }
           isStreaming={isStreaming}
         />
       ),
@@ -381,6 +394,7 @@ function GoalCard({
   onPause,
   onResume,
   onCancel,
+  onExtendBudget,
   onUpdate,
   onContinue,
   isStreaming,
@@ -390,9 +404,10 @@ function GoalCard({
   goal: HarnessGoal;
   run: HarnessRun | null;
   runs: HarnessRun[];
-  onPause: () => Promise<void>;
-  onResume: () => Promise<void>;
+  onPause: () => Promise<HarnessGoal>;
+  onResume: () => Promise<HarnessGoal>;
   onCancel: () => Promise<void>;
+  onExtendBudget: (additionalRounds: number) => Promise<HarnessGoal>;
   onUpdate: (objective: string) => Promise<HarnessGoal>;
   onContinue: () => Promise<boolean>;
   isStreaming: boolean;
@@ -401,7 +416,12 @@ function GoalCard({
   const [editing, setEditing] = useState(false);
   const [draftObjective, setDraftObjective] = useState(goal.objective);
   const [saving, setSaving] = useState(false);
+  const [additionalRounds, setAdditionalRounds] = useState(2);
   const [editNotice, setEditNotice] = useState("");
+  const [cancelConfirmationOpen, setCancelConfirmationOpen] = useState(false);
+  const [actionPending, setActionPending] = useState<
+    "pause" | "start" | "cancel" | null
+  >(null);
   useEffect(() => {
     if (!editing) setDraftObjective(goal.objective);
   }, [editing, goal.objective, goal.objective_revision]);
@@ -415,21 +435,49 @@ function GoalCard({
       "verification_failed",
     ].includes(run.status)
   );
+  const executionActive = Boolean(
+    goal.current_run_id
+    || (
+      isStreaming
+      && run?.goal_id === goal.goal_id
+      && runIsActive
+    )
+  );
+  const controls = goalControlPresentation(
+    goal.status,
+    goal.requested_status,
+    executionActive,
+    Boolean(goal.pending_revision),
+  );
   const requestedStatus = goal.requested_status;
-  const displayedStatus = requestedStatus
-    ? requestedStatus === "paused" ? "正在暂停" : "正在取消"
-    : goalStatusLabel[goal.status];
   const orderedRuns = useMemo(() => {
     const byId = new Map(runs.map((item) => [item.run_id, item]));
     return goal.run_ids.map((runId) => byId.get(runId)).filter((item): item is HarnessRun => Boolean(item));
   }, [goal.run_ids, runs]);
-  const performAction = async (action: () => Promise<void>) => {
+  const performAction = async (
+    pending: "pause" | "start" | "cancel",
+    action: () => Promise<void>,
+  ) => {
     setActionError("");
+    setEditNotice("");
+    setActionPending(pending);
     try {
       await action();
     } catch (error) {
       setActionError(error instanceof Error ? error.message : "目标状态更新失败");
+    } finally {
+      setActionPending(null);
     }
+  };
+  const startGoal = async () => {
+    if (goal.status === "paused" || goal.status === "blocked") {
+      await onResume();
+    }
+    const started = await onContinue();
+    if (!started) {
+      throw new Error("当前会话正在处理其他任务，暂时无法启动目标");
+    }
+    setEditNotice("目标已启动，正在创建新的 Run");
   };
   const saveRevision = async (continueAfterSave: boolean) => {
     const normalized = draftObjective.trim();
@@ -447,81 +495,111 @@ function GoalCard({
         setEditNotice(`已保存为第 ${next.objective_revision || 1} 版`);
         return;
       }
-      if (runIsActive || isStreaming) {
-        setEditNotice("已保存；当前 Run 结束后将自动按新目标继续");
-        return;
+      const applyPlan = goalRevisionApplyPlan(next.status, executionActive);
+      for (const step of applyPlan) {
+        if (step === "pause") await onPause();
+        if (step === "resume") await onResume();
+        if (step === "start") {
+          const started = await onContinue();
+          if (!started) {
+            throw new Error("目标已保存，但当前会话暂时无法启动新的 Run");
+          }
+        }
       }
-      if (next.status === "paused" || next.status === "blocked") {
-        await onResume();
-      }
-      const started = await onContinue();
-      setEditNotice(started ? "已保存并继续" : "已保存；请稍后继续目标");
+      setEditNotice(
+        executionActive
+          ? "已停止旧 Run，并按新版本重新启动"
+          : "已保存并启动目标"
+      );
     } catch (error) {
       setActionError(error instanceof Error ? error.message : "目标更新失败");
     } finally {
       setSaving(false);
     }
   };
+  const extendBudget = async (continueAfterExtension: boolean) => {
+    const rounds = Math.floor(Number(additionalRounds));
+    if (!Number.isFinite(rounds) || rounds < 1 || rounds > 100) {
+      setActionError("追加轮数必须是 1–100 的整数");
+      return;
+    }
+    await performAction("start", async () => {
+      const extended = await onExtendBudget(rounds);
+      if (!continueAfterExtension) {
+        setEditNotice(`已追加 ${rounds} 轮，Goal 保持暂停`);
+        return;
+      }
+      if (extended.status === "paused" || extended.status === "blocked") {
+        await onResume();
+      }
+      const started = await onContinue();
+      if (!started) {
+        throw new Error("预算已追加，但当前会话暂时无法启动新的 Run");
+      }
+      setEditNotice(`已追加 ${rounds} 轮并继续执行`);
+    });
+  };
   return (
     <section>
       <SectionHeader
         icon={<Target className="h-4 w-4" />}
         title="目标"
-        metric={displayedStatus}
+        metric={controls.metric}
         open={active}
         onToggle={onActivate}
         actions={
-          !["achieved", "cancelled", "budget_exceeded"].includes(goal.status) ? (
+          !["achieved", "cancelled"].includes(goal.status) ? (
             <div className="flex items-center gap-0.5">
-              <button
-                type="button"
-                aria-label="编辑目标"
-                title="编辑目标"
-                onClick={() => {
-                  setDraftObjective(goal.objective);
-                  setEditing(true);
-                  setActionError("");
-                  setEditNotice("");
-                }}
-                className="rounded-lg p-1.5 text-slate-400 hover:bg-black/[0.045] hover:text-slate-700"
-              >
-                <Pencil className="h-3.5 w-3.5" />
-              </button>
-              {goal.status === "active" ? (
+              {goal.status !== "budget_exceeded" ? (
+                <button
+                  type="button"
+                  aria-label="编辑目标"
+                  title="编辑目标"
+                  onClick={() => {
+                    if (!active) onActivate();
+                    setDraftObjective(goal.objective);
+                    setEditing(true);
+                    setActionError("");
+                    setEditNotice("");
+                  }}
+                  className="rounded-lg p-1.5 text-slate-400 hover:bg-black/[0.045] hover:text-slate-700"
+                >
+                  <Pencil className="h-3.5 w-3.5" />
+                </button>
+              ) : null}
+              {controls.primaryAction === "pause" ? (
                 <button
                   type="button"
                   aria-label="暂停目标"
-                  title={requestedStatus === "paused" ? "正在暂停" : "暂停目标"}
-                  disabled={Boolean(requestedStatus)}
-                  onClick={() => void performAction(onPause)}
+                  title={actionPending === "pause" ? "正在暂停" : controls.primaryLabel}
+                  disabled={Boolean(requestedStatus) || actionPending !== null}
+                  onClick={() => void performAction("pause", async () => {
+                    await onPause();
+                    setEditNotice("目标已暂停，当前进度已保留");
+                  })}
                   className="rounded-lg p-1.5 text-slate-400 hover:bg-black/[0.045] hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-35"
                 >
                   <Pause className="h-3.5 w-3.5" />
                 </button>
-              ) : (
+              ) : controls.primaryAction === "start"
+                || controls.primaryAction === "resume_and_start" ? (
                 <button
                   type="button"
-                  aria-label="继续目标"
-                  title="继续目标"
-                  onClick={() => void performAction(async () => {
-                    await onResume();
-                    if (!isStreaming && !runIsActive) await onContinue();
-                  })}
-                  className="rounded-lg p-1.5 text-slate-400 hover:bg-black/[0.045] hover:text-emerald-700"
+                  aria-label={controls.primaryLabel}
+                  title={actionPending === "start" ? "正在启动" : controls.primaryLabel}
+                  disabled={actionPending !== null || Boolean(requestedStatus)}
+                  onClick={() => void performAction("start", startGoal)}
+                  className="rounded-lg p-1.5 text-emerald-600 hover:bg-emerald-50 hover:text-emerald-700 disabled:cursor-not-allowed disabled:opacity-35"
                 >
                   <Play className="h-3.5 w-3.5" />
                 </button>
-              )}
+              ) : null}
               <button
                 type="button"
-                aria-label="删除目标"
-                title={requestedStatus === "cancelled" ? "正在删除" : "删除目标"}
-                disabled={Boolean(requestedStatus)}
-                onClick={() => {
-                  if (window.confirm("确定删除这个目标吗？执行记录仍会保留用于审计。")) {
-                    void performAction(onCancel);
-                  }
-                }}
+                aria-label="取消目标"
+                title={actionPending === "cancel" ? "正在取消" : "取消目标"}
+                disabled={Boolean(requestedStatus) || actionPending !== null}
+                onClick={() => setCancelConfirmationOpen(true)}
                 className="rounded-lg p-1.5 text-slate-400 hover:bg-rose-50 hover:text-rose-600 disabled:cursor-not-allowed disabled:opacity-35"
               >
                 <Trash2 className="h-3.5 w-3.5" />
@@ -532,6 +610,48 @@ function GoalCard({
       />
       {active && (
         <div className="pb-4">
+          {goal.status === "budget_exceeded" ? (
+            <div className="mb-3 rounded-2xl border border-amber-200 bg-amber-50/70 p-3">
+              <div className="text-[12px] font-semibold text-amber-900">
+                本 Goal 已用完 {goal.max_rounds} 轮预算
+              </div>
+              <p className="mt-1 text-[11px] leading-5 text-amber-800">
+                进度、Todo、产物和证据均已保留。追加预算不会自动执行，除非选择“追加并继续”。
+              </p>
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <label className="flex items-center gap-2 text-[11px] font-medium text-amber-900">
+                  追加
+                  <input
+                    type="number"
+                    min={1}
+                    max={100}
+                    step={1}
+                    value={additionalRounds}
+                    onChange={(event) => setAdditionalRounds(Number(event.target.value))}
+                    disabled={actionPending !== null}
+                    className="h-8 w-20 rounded-lg border border-amber-200 bg-white px-2 text-center text-[12px] text-slate-700 outline-none focus:border-amber-400"
+                  />
+                  轮
+                </label>
+                <button
+                  type="button"
+                  disabled={actionPending !== null}
+                  onClick={() => void extendBudget(false)}
+                  className="h-8 rounded-lg border border-amber-300 bg-white px-3 text-[11px] font-semibold text-amber-800 hover:bg-amber-100 disabled:opacity-40"
+                >
+                  仅追加
+                </button>
+                <button
+                  type="button"
+                  disabled={actionPending !== null}
+                  onClick={() => void extendBudget(true)}
+                  className="h-8 rounded-lg bg-amber-600 px-3 text-[11px] font-semibold text-white hover:bg-amber-700 disabled:opacity-40"
+                >
+                  {actionPending === "start" ? "处理中…" : "追加并继续"}
+                </button>
+              </div>
+            </div>
+          ) : null}
           {editing ? (
             <div className="rounded-2xl border border-[#002fa7]/20 bg-[#002fa7]/[0.025] p-3">
               <div className="mb-2 flex items-center justify-between gap-3">
@@ -571,7 +691,11 @@ function GoalCard({
                   onClick={() => void saveRevision(true)}
                   className="rounded-lg bg-[#002fa7] px-3 py-1.5 text-[11px] font-medium text-white hover:bg-[#002686] disabled:opacity-40"
                 >
-                  {saving ? "保存中…" : runIsActive || isStreaming ? "保存，下轮生效" : "保存并继续"}
+                  {saving
+                    ? "保存中…"
+                    : executionActive
+                      ? "保存并立即应用"
+                      : "保存并启动"}
                 </button>
               </div>
             </div>
@@ -649,9 +773,12 @@ function GoalCard({
           {(goal.control_notices || []).length > 0 && (
             <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5">
               <div className="text-[11px] font-semibold text-slate-600">运行说明</div>
-              <ul className="mt-1 space-y-1 text-[11px] leading-5 text-slate-500">
+              <ul className="mt-1 min-w-0 space-y-1 text-[11px] leading-5 text-slate-500">
                 {(goal.control_notices || []).slice(-3).map((notice, index) => (
-                  <li key={`${notice}-${index}`}>• {goalGapLabel(notice)}</li>
+                  <li key={`${notice}-${index}`} className="flex min-w-0 gap-1.5">
+                    <span className="shrink-0">•</span>
+                    <span className="min-w-0 [overflow-wrap:anywhere]">{goalGapLabel(notice)}</span>
+                  </li>
                 ))}
               </ul>
             </div>
@@ -662,9 +789,12 @@ function GoalCard({
                 <AlertTriangle className="h-3.5 w-3.5" />
                 尚待补齐
               </div>
-              <ul className="mt-1.5 space-y-1 text-[11px] leading-5 text-amber-800/90">
+              <ul className="mt-1.5 min-w-0 space-y-1 text-[11px] leading-5 text-amber-800/90">
                 {goal.gaps.map((gap, index) => (
-                  <li key={`${gap}-${index}`}>• {goalGapLabel(gap)}</li>
+                  <li key={`${gap}-${index}`} className="flex min-w-0 gap-1.5">
+                    <span className="shrink-0">•</span>
+                    <span className="min-w-0 [overflow-wrap:anywhere]">{goalGapLabel(gap)}</span>
+                  </li>
                 ))}
               </ul>
             </div>
@@ -677,6 +807,22 @@ function GoalCard({
           )}
         </div>
       )}
+      <ConfirmDialog
+        open={cancelConfirmationOpen}
+        title="结束当前 Goal？"
+        description={
+          executionActive
+            ? "当前 Goal 和正在执行的 Run 都将停止，执行记录仍会保留用于审计。"
+            : "当前 Goal 将结束，执行记录仍会保留用于审计。"
+        }
+        confirmLabel="结束 Goal"
+        busy={actionPending === "cancel"}
+        onClose={() => setCancelConfirmationOpen(false)}
+        onConfirm={() => {
+          void performAction("cancel", onCancel)
+            .finally(() => setCancelConfirmationOpen(false));
+        }}
+      />
     </section>
   );
 }

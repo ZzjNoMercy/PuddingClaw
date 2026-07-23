@@ -19,7 +19,7 @@ from langgraph.types import Command
 from graph.attachment_store import attachment_store
 from graph.session_manager import session_manager
 from graph.tool_result_adapter import tool_result_adapter
-from harness.artifact_paths import artifact_path_matches, extract_declared_artifact_targets
+from harness.artifact_paths import artifact_path_matches, resolve_declared_artifact_targets
 from harness.models import (
     ArtifactReference,
     ArtifactRole,
@@ -27,7 +27,7 @@ from harness.models import (
     ValidationReceipt,
     VerificationActivation,
 )
-from harness.tool_execution import ShellPolicyAnalyzer
+from harness.tool_execution import ShellPolicyAnalyzer, ToolExecutionPipeline
 
 _WEB_TOOLS = frozenset(
     {
@@ -76,6 +76,9 @@ _WRITE_TOOLS = frozenset(
     {
         "write_file",
         "edit_file",
+        "copy_file",
+        "materialize_source_ref",
+        "replace_file",
         "patch_file",
         "patch_files",
         "commit_external_artifact",
@@ -196,6 +199,8 @@ def verification_packs_for_tool(
         return ["web_research"]
     if tool_name in _ANALYTICS_TOOLS:
         return ["analytics"]
+    if tool_name == "validate_html_report":
+        return ["code"]
     if tool_name == "prepare_attachment_edit":
         # Taking an edit lease is a one-way capability transition: the Run may
         # no longer finish with only a scratch copy or a verbal completion.
@@ -221,11 +226,19 @@ def verification_packs_for_tool(
             if any(Path(path).suffix in _ARTIFACT_EXTENSIONS for path in paths):
                 packs.append("artifact")
             return packs
+        destination = (
+            (args or {}).get("destination")
+            if isinstance((args or {}).get("destination"), dict)
+            else {}
+        )
         raw_path = str(
             ((args or {}).get("output_name") if tool_name == "publish_attachment" else None)
             or (args or {}).get("file_path")
             or (args or {}).get("path")
+            or (args or {}).get("target_path")
             or (args or {}).get("output_path")
+            or destination.get("target_path")
+            or destination.get("output_path")
             or ""
         ).lower()
         suffix = "." + raw_path.rsplit(".", 1)[-1] if "." in raw_path else ""
@@ -235,7 +248,7 @@ def verification_packs_for_tool(
         if suffix in _ARTIFACT_EXTENSIONS:
             packs.append("artifact")
         return packs
-    if tool_name not in {"execute", "terminal"}:
+    if tool_name not in {"execute", "terminal", "execute_external_directory"}:
         return []
     command = str((args or {}).get("command") or "")
     packs: list[str] = []
@@ -349,6 +362,8 @@ def _command_performs_analytics(command: str) -> bool:
 def _command_performs_validation(command: str) -> bool:
     if re.search(r"(?:\|\||&&|;)\s*true(?:\s|$)", command, re.IGNORECASE):
         return False
+    if ToolExecutionPipeline._registered_external_validator(command):
+        return True
     tokens = _command_tokens(command)
     if not tokens:
         return False
@@ -360,7 +375,15 @@ def _command_performs_validation(command: str) -> bool:
     if executable in {"npm", "pnpm", "yarn"}:
         return bool(_TEST_COMMAND_RE.search(command))
     if executable == "node":
-        return len(tokens) > 1 and tokens[1].lower() in {"--check", "-c"}
+        return bool(
+            (len(tokens) > 1 and tokens[1].lower() in {"--check", "-c"})
+            or (
+                len(tokens) == 3
+                and tokens[1]
+                == "/opt/puddingclaw/bin/validate-html-report-e2e.mjs"
+                and tokens[2].lower().endswith((".html", ".htm"))
+            )
+        )
     if executable == "npx":
         meaningful = [
             token.lower()
@@ -660,7 +683,7 @@ def _result_evidence_refs(
                 if not target_path or not content_sha256:
                     continue
                 artifact_id = "artifact-" + hashlib.sha256(
-                    f"external\0{target_path}".encode()
+                    f"external\0{target_path}\0{content_sha256}".encode()
                 ).hexdigest()[:20]
                 artifact = ArtifactReference(
                     artifact_id=artifact_id,
@@ -695,7 +718,19 @@ def _result_evidence_refs(
                         }
                     )
         elif tool_name in _WRITE_TOOLS:
-            raw_path = str(args.get("file_path") or args.get("path") or "").strip()
+            destination = (
+                args.get("destination")
+                if isinstance(args.get("destination"), dict)
+                else {}
+            )
+            raw_path = str(
+                args.get("file_path")
+                or args.get("path")
+                or args.get("target_path")
+                or destination.get("target_path")
+                or destination.get("output_path")
+                or ""
+            ).strip()
             if raw_path:
                 artifact = _artifact_reference_for_write(
                     raw_path=raw_path,
@@ -725,6 +760,23 @@ def _result_evidence_refs(
                                     "material": True,
                                 }
                             )
+                if tool_name == "materialize_source_ref":
+                    receipts = [
+                        item
+                        for item in session_manager.list_materialization_receipts(
+                            session_id,
+                            run_id=run_id,
+                        )
+                        if str(item.get("target_path") or "")
+                        == str(artifact.host_path or artifact.path)
+                        and (
+                            not artifact.content_sha256
+                            or str(item.get("target_sha256") or "")
+                            == artifact.content_sha256
+                        )
+                    ]
+                    if receipts:
+                        refs.append(dict(receipts[-1]))
     return refs
 
 
@@ -857,7 +909,7 @@ def _artifact_reference_for_write(
     declared_targets = (
         [str(item) for item in run_payload.get("declared_artifact_targets") or [] if str(item)]
         if isinstance(run_payload.get("declared_artifact_targets"), list)
-        else extract_declared_artifact_targets(objective)
+        else resolve_declared_artifact_targets(objective)
     )
     if scope == ArtifactScope.SCRATCH:
         artifact_role = ArtifactRole.TEMPORARY
@@ -880,10 +932,41 @@ def _artifact_reference_for_write(
         content_sha256 = f"sha256:{hasher.hexdigest()}"
         size_bytes = stat.st_size
         mtime_ns = stat.st_mtime_ns
+    mutation: dict[str, Any] | None = None
+    if (
+        scope == ArtifactScope.EXTERNAL
+        and content_sha256
+        and session_id
+        and run_id
+    ):
+        mutation = session_manager.find_external_mutation_receipt(
+            session_id,
+            run_id=run_id,
+            canonical_path=str(host or canonical),
+            after_sha256=content_sha256,
+        )
+    mutation_grant_id = (
+        str(mutation.get("permission_grant_id") or "")
+        if isinstance(mutation, dict)
+        else ""
+    )
+    permission_grant_id = (
+        str(grant.get("id"))
+        if grant is not None
+        else mutation_grant_id or None
+    )
+    if scope in {ArtifactScope.WORKSPACE, ArtifactScope.SCRATCH}:
+        authority_kind = "workspace"
+    elif mutation_grant_id == f"declared-artifact:{run_id}":
+        authority_kind = "declared_artifact"
+    elif permission_grant_id:
+        authority_kind = "permission_grant"
+    else:
+        authority_kind = None
     artifact_id = "artifact-" + hashlib.sha256(
         (
             f"{scope.value}\0{execution.get('workspace_id', '')}\0"
-            f"{identity_path}"
+            f"{identity_path}\0{content_sha256 or 'unversioned'}"
         ).encode()
     ).hexdigest()[:20]
     return ArtifactReference(
@@ -894,8 +977,19 @@ def _artifact_reference_for_write(
         host_path=str(host) if host is not None else None,
         virtual_path=virtual_path,
         workspace_relative_path=relative or None,
-        authorized=(scope in {ArtifactScope.WORKSPACE, ArtifactScope.SCRATCH} or grant is not None),
-        permission_grant_id=(str(grant.get("id")) if grant is not None else None),
+        authorized=(
+            scope in {ArtifactScope.WORKSPACE, ArtifactScope.SCRATCH}
+            or grant is not None
+            or mutation is not None
+        ),
+        permission_grant_id=permission_grant_id,
+        mutation_receipt_id=(
+            str(mutation.get("receipt_id") or "")
+            if isinstance(mutation, dict)
+            else None
+        )
+        or None,
+        authority_kind=authority_kind,
         run_id=run_id or None,
         query_id=query_id or None,
         goal_id=(str(run_payload.get("goal_id")) if run_payload.get("goal_id") else None),
@@ -916,11 +1010,15 @@ def _artifact_reference_for_write(
     )
 
 
-def _validator_input_paths(command: str) -> list[str]:
+def _validator_input_paths(
+    command: str,
+    *,
+    initial_cwd: str = "/workspace",
+) -> list[str]:
     """Return file operands that the recognized validator actually received."""
 
     inputs: list[str] = []
-    for cwd, tokens in _effective_command_segments(command):
+    for cwd, tokens in _effective_command_segments(command, initial_cwd=initial_cwd):
         if not tokens:
             continue
         executable = tokens[0].rsplit("/", 1)[-1].lower()
@@ -932,6 +1030,11 @@ def _validator_input_paths(command: str) -> list[str]:
                     if index + 1 < len(tokens):
                         operands.append(tokens[index + 1])
                     break
+            if (
+                len(tokens) == 3
+                and tokens[1] == "/opt/puddingclaw/bin/validate-html-report-e2e.mjs"
+            ):
+                operands.append(tokens[2])
         elif executable in {"python", "python3"}:
             if len(tokens) > 2 and tokens[1] == "-m":
                 operands.extend(tokens[3:])
@@ -960,11 +1063,13 @@ def _validator_input_paths(command: str) -> list[str]:
 def _controlled_validator_spec(command: str) -> tuple[str, str] | None:
     """Return commit-authoritative validator kind/version for one safe argv.
 
-    This intentionally rejects compound shell programs.  Tool success belongs
-    to the whole shell expression, so accepting ``node --check bad.js || true``
-    would mint a false syntax receipt.  Free-form Python validator scripts are
-    likewise completion evidence only: argv does not prove that the script
-    opened or interpreted the named artifact.
+    Compound shell programs are rejected except the policy-owned, expansion-
+    free ``pwd && ls ... && <registered validator>`` compatibility wrapper.
+    Tool success belongs to the whole shell expression, so accepting
+    ``node --check bad.js || true`` would mint a false syntax receipt.
+    Free-form Python validator scripts are likewise completion evidence only:
+    argv does not prove that the script opened or interpreted the named
+    artifact.
     """
 
     try:
@@ -972,8 +1077,11 @@ def _controlled_validator_spec(command: str) -> tuple[str, str] | None:
     except ValueError:
         return None
     if len(raw_segments) != 1:
-        return None
-    tokens = ShellPolicyAnalyzer.unwrap_command(raw_segments[0])
+        if not ToolExecutionPipeline._registered_external_validator(command):
+            return None
+        tokens = ShellPolicyAnalyzer.unwrap_command(raw_segments[-1])
+    else:
+        tokens = ShellPolicyAnalyzer.unwrap_command(raw_segments[0])
     if not tokens:
         return None
     non_authorizing_flags = {
@@ -993,6 +1101,13 @@ def _controlled_validator_spec(command: str) -> tuple[str, str] | None:
         and not tokens[2].startswith("-")
     ):
         return "javascript_syntax", "node-check/v1"
+    if (
+        executable == "node"
+        and len(tokens) == 3
+        and tokens[1] == "/opt/puddingclaw/bin/validate-html-report-e2e.mjs"
+        and tokens[2].lower().endswith((".html", ".htm"))
+    ):
+        return "browser_runtime", "puddingclaw-html-e2e/v1"
     if (
         executable in {"python", "python3"}
         and len(tokens) >= 4
@@ -1052,6 +1167,7 @@ def _validation_artifact_refs(
     run_id: str,
     command: str,
     workspace_path: str,
+    command_cwd: str | None = None,
 ) -> list[dict[str, Any]]:
     """Resolve only explicit validator operands to server-known artifact identities."""
 
@@ -1133,7 +1249,10 @@ def _validation_artifact_refs(
 
     resolved: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
-    for observed_path in _validator_input_paths(command):
+    for observed_path in _validator_input_paths(
+        command,
+        initial_cwd=command_cwd or "/workspace",
+    ):
         normalized = posixpath.normpath(observed_path)
         matched = alias_map.get(normalized)
         lease = lease_by_staged_path.get(normalized)
@@ -1449,7 +1568,12 @@ def build_verification_activations(
                     and item.get("role") != ArtifactRole.TEMPORARY.value
                     for item in result_refs
                 )
-            elif tool_name in {"execute", "terminal"}:
+            elif tool_name in {
+                "execute",
+                "terminal",
+                "execute_external_directory",
+                "validate_html_report",
+            }:
                 material = True
         digest = hashlib.sha256(
             f"{run_id}:{query_id}:{tool_call_id}:{tool_name}:{pack}".encode()
@@ -1517,10 +1641,44 @@ def _validation_receipt_for_result(
     result: ToolMessage | Command[Any],
     workspace_path: str,
 ) -> ValidationReceipt | None:
-    if tool_name not in {"execute", "terminal"}:
+    if tool_name not in {
+        "execute",
+        "terminal",
+        "execute_external_directory",
+        "validate_html_report",
+    }:
         return None
     command = str(args.get("command") or args.get("cmd") or "")
-    controlled_spec = _controlled_validator_spec(command)
+    requested_browser_e2e = args.get("browser_e2e")
+    if tool_name == "validate_html_report" and requested_browser_e2e is None:
+        try:
+            validator_run = session_manager.get_run_state(
+                session_id,
+                run_id,
+            )
+        except (AssertionError, FileNotFoundError):
+            validator_run = None
+        validator_contract = (
+            validator_run.get("verification_contract")
+            if isinstance(validator_run, dict)
+            and isinstance(
+                validator_run.get("verification_contract"),
+                dict,
+            )
+            else {}
+        )
+        requested_browser_e2e = bool(
+            validator_contract.get("browser_e2e_required")
+        )
+    controlled_spec = (
+        (
+            ("browser_runtime", "puddingclaw-html-e2e/v1")
+            if bool(requested_browser_e2e)
+            else ("html_structure", "puddingclaw-html-structure/v1")
+        )
+        if tool_name == "validate_html_report"
+        else _controlled_validator_spec(command)
+    )
     lowered = command.lower()
     if controlled_spec is not None:
         validator_kind, validator_version = controlled_spec
@@ -1551,12 +1709,85 @@ def _validation_receipt_for_result(
         re.IGNORECASE,
     )
     checks_passed = int(passed_match.group("passed")) if passed_match else None
-    artifact_refs = _validation_artifact_refs(
-        session_id=session_id,
-        run_id=run_id,
-        command=command,
-        workspace_path=workspace_path,
-    )
+    if tool_name == "validate_html_report":
+        raw_path = str(args.get("html_file_path") or "")
+        try:
+            html_path = Path(raw_path).expanduser().resolve(strict=True)
+        except OSError:
+            html_path = None
+        actual = _file_identity(html_path) if html_path is not None else None
+        if html_path is not None and actual is not None:
+            try:
+                run_payload = session_manager.get_run_state(session_id, run_id)
+            except (AssertionError, FileNotFoundError):
+                run_payload = None
+            execution = (
+                run_payload.get("config_snapshot", {}).get("execution", {})
+                if isinstance(run_payload, dict)
+                and isinstance(run_payload.get("config_snapshot"), dict)
+                else {}
+            )
+            workspace_id = str(execution.get("workspace_id") or "")
+            artifact_refs = [
+                {
+                    "artifact_id": _artifact_identity_id(
+                        "external",
+                        workspace_id,
+                        str(html_path),
+                    ),
+                    "content_sha256": actual[0],
+                    "path": str(html_path),
+                    "observed_path": str(html_path),
+                }
+            ]
+        else:
+            artifact_refs = []
+    else:
+        artifact_refs = _validation_artifact_refs(
+            session_id=session_id,
+            run_id=run_id,
+            command=command,
+            workspace_path=workspace_path,
+            command_cwd=(
+                str(args.get("directory_path") or "")
+                if tool_name == "execute_external_directory"
+                else None
+            ),
+        )
+    failure_class: str | None = None
+    if not succeeded:
+        parsed_output: dict[str, Any] = {}
+        if tool_name == "validate_html_report":
+            try:
+                parsed_output = json.loads(output_preview)
+            except json.JSONDecodeError:
+                parsed_output = {}
+        explicit_failure_class = str(
+            parsed_output.get("failure_class") or ""
+        )
+        if explicit_failure_class in {
+            "artifact_failure",
+            "invocation_failure",
+            "infrastructure_failure",
+        }:
+            failure_class = explicit_failure_class
+        else:
+            lowered_output = output_preview.lower()
+            if (
+                not artifact_refs
+                or "err_file_not_found" in lowered_output
+                or "no such file" in lowered_output
+                or "cannot stat" in lowered_output
+            ):
+                failure_class = "invocation_failure"
+            elif (
+                exit_code == 124
+                or "timed out" in lowered_output
+                or "error executing" in lowered_output
+            ):
+                failure_class = "infrastructure_failure"
+            else:
+                failure_class = "artifact_failure"
     receipt_digest = hashlib.sha256(
         json.dumps(
             {
@@ -1583,6 +1814,7 @@ def _validation_receipt_for_result(
         checks_passed=checks_passed,
         checks_failed=0 if succeeded else 1,
         status="passed" if succeeded else "failed",
+        failure_class=failure_class,
         blocking=True,
         commit_authority=controlled_spec is not None,
         obligation_key=f"{validator_kind}:{validator_version}",
@@ -1655,7 +1887,13 @@ class VerificationActivationMiddleware(AgentMiddleware):
             except (FileNotFoundError, ValueError):
                 pass
         if not succeeded and not (
-            tool_name in {"execute", "terminal"}
+            tool_name
+            in {
+                "execute",
+                "terminal",
+                "execute_external_directory",
+                "validate_html_report",
+            }
             and "code" in verification_packs_for_tool(tool_name, normalized_args)
         ):
             return

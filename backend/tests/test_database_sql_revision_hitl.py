@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from langchain_core.messages import HumanMessage
 
 from analytics.nl2sql.schemas import DatabaseSqlGenerationResult, SqlExecutionResult, TableRoute
 from graph.database_sql_revision_resume import DatabaseSqlRevisionResumeRegistry
@@ -203,6 +204,156 @@ async def test_database_sql_generate_normalizes_unique_bare_asset_id(
 
 
 @pytest.mark.asyncio
+async def test_goal_business_subquery_is_allowed_without_physical_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.database.sql_generate_tool as module
+
+    requests: list[Any] = []
+
+    async def fake_generate(_session: object, request: Any) -> DatabaseSqlGenerationResult:
+        requests.append(request)
+        return _result(request.question)
+
+    monkeypatch.setattr(module, "get_sessionmaker", lambda: _FakeSessionMaker())
+    monkeypatch.setattr(module, "generate_database_sql", fake_generate)
+    objective = "刷新2021到2026年产品配置报告中的全部图表"
+    runtime = SimpleNamespace(
+        state={
+            "_run_objective": objective,
+            "messages": [HumanMessage(content=objective)],
+        }
+    )
+
+    output = await DatabaseSqlGenerateTool()._arun(
+        question="统计2021至2026年L2级驾驶辅助的款型配置率，按上市年份分组并排除皮卡",
+        runtime=runtime,
+    )
+
+    assert len(requests) == 1
+    assert requests[0].question.startswith("统计2021至2026年L2级驾驶辅助")
+    assert "SQL 生成结果" in output
+
+
+@pytest.mark.asyncio
+async def test_goal_subquery_rejects_agent_invented_l2_physical_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.database.sql_generate_tool as module
+
+    called = False
+
+    async def fake_generate(_session: object, request: Any) -> DatabaseSqlGenerationResult:
+        nonlocal called
+        called = True
+        return _result(request.question)
+
+    monkeypatch.setattr(module, "get_sessionmaker", lambda: _FakeSessionMaker())
+    monkeypatch.setattr(module, "generate_database_sql", fake_generate)
+    objective = "刷新2021到2026年产品配置报告中的全部图表"
+    runtime = SimpleNamespace(
+        state={
+            "_run_objective": objective,
+            "messages": [HumanMessage(content=objective)],
+        }
+    )
+
+    output = await DatabaseSqlGenerateTool()._arun(
+        question=(
+            "统计2021年到2026年每年L2级辅助驾驶的款型配备率。"
+            "L2判断依据：vehicle_params中type_name='辅助驾驶系统'且type_value不为空。"
+        ),
+        runtime=runtime,
+    )
+
+    assert called is False
+    assert "Agent 在业务子任务中新增了用户未指定的物理实现" in output
+    assert "vehicle_params" in output
+    assert "type_name" in output
+    assert "仅保留业务问题后重新调用" in output
+
+
+@pytest.mark.asyncio
+async def test_user_supplied_physical_mapping_remains_authorized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.database.sql_generate_tool as module
+
+    requests: list[Any] = []
+
+    async def fake_generate(_session: object, request: Any) -> DatabaseSqlGenerationResult:
+        requests.append(request)
+        return _result(request.question)
+
+    monkeypatch.setattr(module, "get_sessionmaker", lambda: _FakeSessionMaker())
+    monkeypatch.setattr(module, "generate_database_sql", fake_generate)
+    user_question = (
+        "按vehicle_params中type_name='驾驶辅助级别'且type_value为L2，"
+        "统计2021至2026年款型配置率"
+    )
+    runtime = SimpleNamespace(
+        state={
+            "_run_objective": user_question,
+            "messages": [HumanMessage(content=user_question)],
+        }
+    )
+
+    output = await DatabaseSqlGenerateTool()._arun(
+        question=user_question,
+        table_names=["vehicle_params"],
+        runtime=runtime,
+    )
+
+    assert len(requests) == 1
+    assert requests[0].table_names == ["vehicle_params"]
+    assert "SQL 生成结果" in output
+
+
+@pytest.mark.asyncio
+async def test_old_user_turn_does_not_authorize_new_goal_physical_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.database.sql_generate_tool as module
+
+    called = False
+
+    async def fake_generate(_session: object, request: Any) -> DatabaseSqlGenerationResult:
+        nonlocal called
+        called = True
+        return _result(request.question)
+
+    monkeypatch.setattr(module, "get_sessionmaker", lambda: _FakeSessionMaker())
+    monkeypatch.setattr(module, "generate_database_sql", fake_generate)
+    current_goal = "刷新产品配置报告"
+    runtime = SimpleNamespace(
+        state={
+            "_run_objective": current_goal,
+            "_run_query_id": "query-current",
+            "messages": [
+                HumanMessage(
+                    content="旧任务要求使用vehicle_params表",
+                    additional_kwargs={"puddingclaw_query_id": "query-old"},
+                ),
+                HumanMessage(
+                    content=current_goal,
+                    additional_kwargs={"puddingclaw_query_id": "query-current"},
+                ),
+            ],
+        }
+    )
+
+    output = await DatabaseSqlGenerateTool()._arun(
+        question="统计L2配置率，使用vehicle_params表中的配置项",
+        table_names=["vehicle_params"],
+        runtime=runtime,
+    )
+
+    assert called is False
+    assert "用户未指定的物理实现" in output
+    assert "vehicle_params" in output
+
+
+@pytest.mark.asyncio
 async def test_database_sql_generate_rejects_ambiguous_bare_asset_id() -> None:
     runtime = SimpleNamespace(
         state={
@@ -377,9 +528,7 @@ async def test_technical_sql_repair_regenerates_without_business_hitl(
     repaired = await tool._arun(
         question="ignored",
         parent_generation_id=generation_id,
-        revision_instruction=(
-            "原始 SQL 的相关 EXISTS 子查询超时，请改用 LEFT JOIN、DISTINCT 标志表和 COUNT FILTER 聚合。"
-        ),
+        revision_instruction="上一版 SQL 执行超时，数据库返回 statement timeout。",
     )
 
     assert len(requests) == 2
@@ -388,6 +537,39 @@ async def test_technical_sql_repair_regenerates_without_business_hitl(
     assert "技术修复已自动重生成" in repaired
     assert "无需业务口径确认" in repaired
     assert "SELECT 2" in repaired
+
+
+@pytest.mark.asyncio
+async def test_prescriptive_technical_revision_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.database.sql_generate_tool as module
+
+    requests: list[str] = []
+
+    async def fake_generate(_session: object, request: Any) -> DatabaseSqlGenerationResult:
+        requests.append(request.question)
+        return _result(request.question)
+
+    monkeypatch.setattr(module, "get_sessionmaker", lambda: _FakeSessionMaker())
+    monkeypatch.setattr(module, "generate_database_sql", fake_generate)
+    tool = DatabaseSqlGenerateTool(session_id="session-prescriptive", query_id="query-prescriptive")
+
+    original = await tool._arun(question="查询 L2 配置率")
+    generation_id = next(
+        line.split("：", 1)[1]
+        for line in original.splitlines()
+        if line.startswith("- generation_id：")
+    )
+    rejected = await tool._arun(
+        question="ignored",
+        parent_generation_id=generation_id,
+        revision_instruction="请改用 LEFT JOIN，并使用 type_name='辅助驾驶系统'。",
+    )
+
+    assert len(requests) == 1
+    assert "只能反馈已观察到的问题" in rejected
+    assert "不能指导使用哪个字段、表、实体或 SQL 实现" in rejected
 
 
 @pytest.mark.asyncio
@@ -407,7 +589,7 @@ async def test_mixed_business_and_technical_revision_still_requires_hitl(
         interrupted.append(payload)
         return {
             "action": "agree",
-            "revision_instruction": "分母改为车系粒度，并使用 LEFT JOIN",
+            "revision_instruction": "分母改为车系粒度",
         }
 
     monkeypatch.setattr(module, "get_sessionmaker", lambda: _FakeSessionMaker())
@@ -424,7 +606,7 @@ async def test_mixed_business_and_technical_revision_still_requires_hitl(
     await tool._arun(
         question="ignored",
         parent_generation_id=generation_id,
-        revision_instruction="分母改为车系粒度，并使用 LEFT JOIN",
+        revision_instruction="分母改为车系粒度",
     )
 
     assert len(interrupted) == 1
