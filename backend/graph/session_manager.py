@@ -28,6 +28,7 @@ from harness.evidence_ledger import (
     EvidenceRef,
     is_evidence_ref,
     migrate_legacy_refs,
+    repair_legacy_validation_wrapper_records,
     ref_key,
     register_activation_evidence,
     resolve_evidence_ref,
@@ -1739,6 +1740,7 @@ class SessionManager:
         require_inheritable: bool = True,
         allow_artifact_revision_inheritance: bool = False,
     ) -> dict[str, Any] | None:
+        self.repair_legacy_evidence_ledger(session_id)
         data = self._read_file(session_id)
         resolved = resolve_evidence_ref(
             data,
@@ -1749,6 +1751,39 @@ class SessionManager:
             allow_artifact_revision_inheritance=allow_artifact_revision_inheritance,
         )
         return resolved.model_dump(mode="json") if resolved is not None else None
+
+    @_session_write_locked
+    def repair_legacy_evidence_ledger(self, session_id: str) -> bool:
+        """Run deterministic evidence migrations under the Session write lock."""
+
+        data = self._read_file(session_id)
+        changed = repair_legacy_validation_wrapper_records(data)
+        if changed:
+            self._write_file(session_id, data)
+        return changed
+
+    @_session_write_locked
+    def migrate_run_declared_artifact_targets(
+        self,
+        session_id: str,
+        run_id: str,
+        targets: list[str],
+    ) -> list[str]:
+        """Persist one v2 target-resolution migration; never re-read templates."""
+
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        run = runs.get(run_id) if isinstance(runs, dict) else None
+        if not isinstance(run, dict):
+            return []
+        if int(run.get("declared_artifact_targets_version") or 1) >= 2:
+            return list(run.get("declared_artifact_targets") or [])
+        run["declared_artifact_targets"] = list(dict.fromkeys(targets))
+        run["declared_artifact_targets_version"] = 2
+        run["updated_at"] = time.time()
+        self._write_file(session_id, data)
+        return list(run["declared_artifact_targets"])
 
     @staticmethod
     def _artifact_bound_goal_evidence_refs(
@@ -1784,6 +1819,7 @@ class SessionManager:
         """Restore hash-bound artifact refs after a same-Goal objective revision."""
 
         data = self._read_file(session_id)
+        repair_legacy_validation_wrapper_records(data)
         harness = data.get("harness") if data else None
         goals = harness.get("goals") if isinstance(harness, dict) else None
         goal = goals.get(goal_id) if isinstance(goals, dict) else None
@@ -1810,6 +1846,7 @@ class SessionManager:
         goal_id: str,
         goal_revision: int,
     ) -> list[dict[str, Any]]:
+        self.repair_legacy_evidence_ledger(session_id)
         goal = self.get_goal_state(session_id, goal_id)
         refs = goal.get("evidence_refs") if isinstance(goal, dict) else []
         resolved: list[dict[str, Any]] = []
@@ -2152,6 +2189,7 @@ class SessionManager:
         from harness.rubric_compiler import RunRubricCompiler
 
         data = self._read_file(session_id)
+        repair_legacy_validation_wrapper_records(data)
         harness = data.get("harness") if data else None
         runs = harness.get("runs") if isinstance(harness, dict) else None
         raw_current = runs.get(run_id) if isinstance(runs, dict) else None
@@ -3411,6 +3449,7 @@ class SessionManager:
         """Atomically revise a Goal objective and its frozen acceptance contract."""
 
         data = self._read_file(session_id)
+        repair_legacy_validation_wrapper_records(data)
         harness = data.get("harness") if data else None
         goals = harness.get("goals") if isinstance(harness, dict) else None
         raw_goal = goals.get(goal_id) if isinstance(goals, dict) else None

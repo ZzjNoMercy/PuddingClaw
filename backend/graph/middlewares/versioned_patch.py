@@ -1780,6 +1780,7 @@ class VersionedPatchMiddleware(AgentMiddleware[Any, Any, Any]):
                 ),
                 status="passed" if passed else "failed",
                 failure_class=None if passed else "artifact_failure",
+                content_observed=True,
                 blocking=True,
                 commit_authority=True,
                 obligation_key=f"artifact_ui_contract:{contract_id}",
@@ -1869,11 +1870,11 @@ class VersionedPatchMiddleware(AgentMiddleware[Any, Any, Any]):
             StructuredTool.from_function(
                 name="copy_file",
                 description=(
-                    "Atomically create one exact Host file from an authorized absolute Host "
-                    "source directly at its final authorized absolute Host target, without "
-                    "streaming its body through model context. Do not use /workspace as the "
-                    "target; virtual-workspace files use write_file. Records source/target "
-                    "hashes, validates code-like targets, and never overwrites an existing target."
+                    "Create one UTF-8 file from an authorized absolute Host source without "
+                    "streaming its body through model context. A /workspace target uses the "
+                    "existing workspace boundary and needs no external write Grant; an absolute "
+                    "Host target still requires exact Host write authority. Records source/target "
+                    "hashes and never overwrites an existing target."
                 ),
                 func=copy_file,
                 args_schema=CopyFileInput,

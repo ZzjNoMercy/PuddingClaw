@@ -65,6 +65,7 @@ _DIRECT_ACTIONS = (
     "生成到",
 )
 _REFERENCE_PREFIXES = ("这个", "该", "上述", "前面的")
+_FOLLOWING_TARGET_ACTIONS = ("保存到", "写入", "输出到", "生成到")
 _NEGATED_ACTION_RE = re.compile(
     r"(?:不要|请勿|切勿|不可|不再|不必|无需|不需要|禁止|仅查看|只读)\s*"
     r"(?:修改|编辑|更新|刷新|重写|替换|覆盖|同步|保存|写入|输出|生成)\s*$"
@@ -140,7 +141,11 @@ def extract_declared_artifact_targets(message: str) -> list[str]:
         direct_before = any(action in before for action in _DIRECT_ACTIONS)
         if _NEGATED_ACTION_RE.search(before):
             direct_before = False
-        direct_after = any(after.startswith(action) for action in _DIRECT_ACTIONS)
+        direct_after = any(
+            after.startswith(action) for action in _DIRECT_ACTIONS
+        ) and not any(
+            after.startswith(action) for action in _FOLLOWING_TARGET_ACTIONS
+        )
         referential_after = any(
             after.startswith(f"{action}{reference}") for action in _DIRECT_ACTIONS for reference in _REFERENCE_PREFIXES
         )
@@ -168,21 +173,42 @@ def resolve_declared_artifact_targets(message: str) -> list[str]:
         return targets
 
     version = version_match.group(1).lower()
+    requested_year = _requested_version_year(message, version)
     lowered = message.lower()
     wants_html = "html" in lowered
     wants_js = bool(re.search(r"(?<![a-z])js(?![a-z])", lowered))
+    explicit_targets = set(targets)
     for raw_path in extract_local_resource_paths(message):
         source = Path(raw_path).expanduser()
         suffix = source.suffix.lower()
-        if suffix in {".html", ".htm"} and wants_html:
-            _append_unique(targets, str(_versioned_sibling(source, version)))
+        if (
+            suffix in {".html", ".htm"}
+            and wants_html
+            and explicit_targets
+            and raw_path not in explicit_targets
+        ):
+            # An explicit output path is authoritative. A preceding reference
+            # template remains an input and must not be version-expanded into
+            # another acceptance target.
+            pass
+        elif suffix in {".html", ".htm"} and wants_html:
+            _append_unique(
+                targets,
+                str(_versioned_sibling(source, version, requested_year)),
+            )
         if suffix in {".js", ".cjs", ".mjs"} and wants_js:
-            _append_unique(targets, str(_versioned_sibling(source, version)))
+            _append_unique(
+                targets,
+                str(_versioned_sibling(source, version, requested_year)),
+            )
         if suffix not in {".html", ".htm"} or not wants_js:
             continue
         for script in _local_script_sources(source):
             if _versioned_application_script(script):
-                _append_unique(targets, str(_versioned_sibling(script, version)))
+                _append_unique(
+                    targets,
+                    str(_versioned_sibling(script, version, requested_year)),
+                )
     return targets
 
 
@@ -191,12 +217,41 @@ def _append_unique(items: list[str], value: str) -> None:
         items.append(value)
 
 
-def _versioned_sibling(path: Path, version: str) -> Path:
+def _requested_version_year(message: str, version: str) -> str | None:
+    """Return a year explicitly coupled to the requested new version."""
+
+    coupled = re.search(
+        rf"(?i)(?:新(?:的)?|另存|创建|生成|开一个).{{0,16}}"
+        rf"(?P<year>20\d{{2}})\s*{re.escape(version)}",
+        message,
+    )
+    return coupled.group("year") if coupled else None
+
+
+def _versioned_sibling(
+    path: Path,
+    version: str,
+    requested_year: str | None = None,
+) -> Path:
     normalized = version.lower()
-    if re.search(rf"(?i)(?:[-_.\s]){re.escape(normalized)}$", path.stem):
+    stem = path.stem
+    if requested_year:
+        if re.search(r"20\d{2}", stem):
+            stem = re.sub(r"20\d{2}", requested_year, stem)
+        else:
+            stem = re.sub(
+                r"(?i)(?:模型模板|报告模板|[-_.\s]*template)$",
+                "",
+                stem,
+            ).rstrip("-_. ")
+            separator = "-" if stem.isascii() and " " not in stem else "_"
+            stem = f"{stem}{separator}{requested_year}"
+    if re.search(rf"(?i)(?:[-_.\s]){re.escape(normalized)}$", stem):
+        return path.with_name(f"{stem}{path.suffix}")
+    if not stem:
         return path
-    separator = "-" if path.stem.isascii() and " " not in path.stem else "_"
-    return path.with_name(f"{path.stem}{separator}{normalized}{path.suffix}")
+    separator = "-" if stem.isascii() and " " not in stem else "_"
+    return path.with_name(f"{stem}{separator}{normalized}{path.suffix}")
 
 
 def _versioned_application_script(path: Path) -> bool:

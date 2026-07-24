@@ -551,6 +551,7 @@ def _result_evidence_refs(
                 "tool_name": tool_name,
                 "output_digest": f"sha256:{digest}",
                 "output_preview": content[:1000],
+                "output_tail": content[-2000:] if len(content) > 1000 else "",
             }
         )
         # Normalize every ToolMessage at the authority boundary. The adapter
@@ -1388,12 +1389,20 @@ def _command_result_ref(
         "tool_name": tool_name,
         "output_digest": f"sha256:{hashlib.sha256(content.encode('utf-8')).hexdigest()}",
         "output_preview": content[:1000],
+        "output_tail": content[-2000:] if len(content) > 1000 else "",
     }
 
 
 def _command_exit_code(result_ref: dict[str, Any] | None, *, succeeded: bool) -> int:
-    preview = str((result_ref or {}).get("output_preview") or "")
-    match = _COMMAND_EXIT_RE.search(preview) or _PLAIN_EXIT_RE.search(preview)
+    output = "\n".join(
+        part
+        for part in (
+            str((result_ref or {}).get("output_preview") or ""),
+            str((result_ref or {}).get("output_tail") or ""),
+        )
+        if part
+    )
+    match = _COMMAND_EXIT_RE.search(output) or _PLAIN_EXIT_RE.search(output)
     if match is not None:
         return int(match.group("code"))
     return 0 if succeeded else 1
@@ -1484,6 +1493,25 @@ def build_verification_activations(
 ) -> list[VerificationActivation]:
     normalized_args = args or {}
     preview = json.dumps(normalized_args, ensure_ascii=False, sort_keys=True)[:1000]
+    command = str(
+        normalized_args.get("command") or normalized_args.get("cmd") or ""
+    )
+    attempted_artifact_refs = (
+        _validation_artifact_refs(
+            session_id=session_id,
+            run_id=run_id,
+            command=command,
+            workspace_path=workspace_path,
+            command_cwd=(
+                str(normalized_args.get("directory_path") or "")
+                if tool_name == "execute_external_directory"
+                else None
+            ),
+        )
+        if tool_name in {"execute", "terminal", "execute_external_directory"}
+        and command
+        else []
+    )
     succeeded = True if result is None else tool_result_succeeded(
         result, expected_call_id=tool_call_id
     )
@@ -1584,6 +1612,7 @@ def build_verification_activations(
                 "tool_call_id": tool_call_id,
                 "tool_name": tool_name,
                 "input_preview": preview,
+                "attempted_artifact_refs": attempted_artifact_refs,
                 "material": material,
             },
             *[{**item, "material": material} for item in result_refs],
@@ -1703,6 +1732,10 @@ def _validation_receipt_for_result(
     succeeded = tool_result_succeeded(result, expected_call_id=tool_call_id)
     exit_code = _command_exit_code(output_ref, succeeded=succeeded)
     output_preview = str(output_ref.get("output_preview") or "")
+    output_tail = str(output_ref.get("output_tail") or "")
+    diagnostic_output = "\n".join(
+        part for part in (output_preview, output_tail) if part
+    )
     passed_match = re.search(
         r"(?P<passed>\d+)\s*(?:/\s*(?P<total>\d+)\s*)?(?:checks?\s+)?passed",
         output_preview,
@@ -1772,12 +1805,15 @@ def _validation_receipt_for_result(
         }:
             failure_class = explicit_failure_class
         else:
-            lowered_output = output_preview.lower()
+            lowered_output = diagnostic_output.lower()
             if (
                 not artifact_refs
                 or "err_file_not_found" in lowered_output
                 or "no such file" in lowered_output
                 or "cannot stat" in lowered_output
+                or "cannot find module" in lowered_output
+                or "module_not_found" in lowered_output
+                or "enoent" in lowered_output
             ):
                 failure_class = "invocation_failure"
             elif (
@@ -1801,6 +1837,22 @@ def _validation_receipt_for_result(
             sort_keys=True,
         ).encode("utf-8")
     ).hexdigest()[:20]
+    content_observed = bool(
+        artifact_refs
+        and (
+            succeeded
+            or (
+                tool_name == "validate_html_report"
+                and failure_class == "artifact_failure"
+            )
+            or parsed_output.get("content_observed") is True
+        )
+    )
+    # A generic command mentioning a Host path does not prove that its
+    # execution environment opened those exact bytes. Without an observation
+    # proof, fail as a validator invocation rather than poisoning the hash.
+    if failure_class == "artifact_failure" and not content_observed:
+        failure_class = "invocation_failure"
     return ValidationReceipt(
         validation_receipt_id=f"validation-{receipt_digest}",
         run_id=run_id,
@@ -1815,6 +1867,7 @@ def _validation_receipt_for_result(
         checks_failed=0 if succeeded else 1,
         status="passed" if succeeded else "failed",
         failure_class=failure_class,
+        content_observed=content_observed,
         blocking=True,
         commit_authority=controlled_spec is not None,
         obligation_key=f"{validator_kind}:{validator_version}",

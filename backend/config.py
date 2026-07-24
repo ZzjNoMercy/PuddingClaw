@@ -288,6 +288,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
                 # share this non-thinking model unless a deployment overrides it.
                 "model": "deepseek-v4-pro",
                 "max_iterations": 2,
+                "max_stagnant_repairs": 2,
                 "custom_rules_enabled": False,
                 "custom_rules": [],
             },
@@ -1562,6 +1563,15 @@ def _normalize_harness_update(value: Any) -> dict[str, Any]:
             ):
                 raise ValueError(
                     "harness.completion.rubric.max_iterations must be in [1, 20]"
+                )
+            max_stagnant_repairs = rubric.get("max_stagnant_repairs", 2)
+            if (
+                not isinstance(max_stagnant_repairs, int)
+                or isinstance(max_stagnant_repairs, bool)
+                or not 1 <= max_stagnant_repairs <= 20
+            ):
+                raise ValueError(
+                    "harness.completion.rubric.max_stagnant_repairs must be in [1, 20]"
                 )
             model = rubric.get("model", "")
             if not isinstance(model, str) or len(model.strip()) > 200:

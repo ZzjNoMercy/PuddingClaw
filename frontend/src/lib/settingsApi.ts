@@ -166,6 +166,7 @@ export interface HarnessSettings {
       enabled?: boolean;
       model?: string;
       max_iterations?: number;
+      max_stagnant_repairs?: number;
       custom_rules_enabled?: boolean;
       custom_rules?: Array<{
         id: string;

@@ -826,6 +826,57 @@ def test_artifact_publication_reference_is_deferred_during_revision(tmp_path):
     assert "尚未引用" in str(terminal.gap)
 
 
+def test_declared_path_repairs_legacy_candidate_role_for_delivery(tmp_path):
+    from harness.deterministic_checks import _evaluate_artifact_delivery
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    artifact = workspace / "report.html"
+    artifact.write_text("<!doctype html><title>Report</title>", encoding="utf-8")
+    activation = next(
+        item
+        for item in build_verification_activations(
+            run_id="run-candidate-target",
+            query_id="query-candidate-target",
+            tool_call_id="call-candidate-target",
+            tool_name="write_file",
+            args={
+                "file_path": "/workspace/report.html",
+                "content": artifact.read_text(),
+            },
+            result=ToolMessage(
+                content="Updated /workspace/report.html",
+                tool_call_id="call-candidate-target",
+                name="write_file",
+                status="success",
+            ),
+            workspace_path=str(workspace),
+        )
+        if item.pack == "artifact"
+    )
+    payload = activation.model_dump(mode="json")
+    artifact_ref = next(
+        item
+        for item in payload["evidence_refs"]
+        if item.get("kind") == "artifact_write"
+    )
+    artifact_ref["role"] = "candidate"
+
+    evaluation = _evaluate_artifact_delivery(
+        "artifact_delivery",
+        {
+            "workspace_path": str(workspace),
+            "run_id": "run-candidate-target",
+            "declared_artifact_targets": ["/workspace/report.html"],
+            "final_content": "",
+            "evaluation_phase": "revision",
+            "verification_activations": [payload],
+        },
+    )
+
+    assert evaluation.passed is True
+
+
 def test_scratch_write_is_temporary_and_cannot_satisfy_artifact_delivery(tmp_path):
     from graph.session_manager import session_manager
     from harness.deterministic_checks import _evaluate_artifact_delivery
@@ -2742,6 +2793,96 @@ def test_successful_validation_without_receipt_is_protocol_error(tool_name):
     assert "不应继续修改业务产物" in str(evaluation.gap)
 
 
+def test_unreceipted_validation_survives_later_write_to_another_artifact():
+    from harness.deterministic_checks import _evaluate_code_validation
+    from harness.models import VerificationFailureKind
+
+    context = {
+        "run_id": "run-interleaved-protocol",
+        "verification_activations": [
+            {
+                "pack": "code",
+                "tool_name": "write_file",
+                "created_at": 1.0,
+                "status": "succeeded",
+                "evidence_refs": [{
+                    "kind": "artifact_write",
+                    "artifact_id": "artifact-a",
+                    "path": "/reports/a.js",
+                    "content_sha256": "sha256:a",
+                    "role": "target",
+                    "material": True,
+                }],
+            },
+            {
+                "pack": "code",
+                "tool_name": "execute_external_directory",
+                "created_at": 2.0,
+                "status": "succeeded",
+                "evidence_refs": [
+                    {
+                        "kind": "tool_execution",
+                        "input_preview": (
+                            '{"directory_path":"/reports",'
+                            '"command":"node --check a.js"}'
+                        ),
+                        "attempted_artifact_refs": [{
+                            "artifact_id": "artifact-a",
+                            "path": "/reports/a.js",
+                            "content_sha256": "sha256:a",
+                        }],
+                        "material": True,
+                    },
+                    {
+                        "kind": "tool_result",
+                        "output_digest": "sha256:a-check",
+                        "material": True,
+                    },
+                ],
+            },
+            {
+                "pack": "code",
+                "tool_name": "write_file",
+                "created_at": 3.0,
+                "status": "succeeded",
+                "evidence_refs": [{
+                    "kind": "artifact_write",
+                    "artifact_id": "artifact-b",
+                    "path": "/reports/b.js",
+                    "content_sha256": "sha256:b",
+                    "role": "target",
+                    "material": True,
+                }],
+            },
+            {
+                "pack": "code",
+                "tool_name": "execute_external_directory",
+                "created_at": 4.0,
+                "status": "succeeded",
+                "evidence_refs": [{
+                    "kind": "validation_receipt",
+                    "validator_kind": "javascript_syntax",
+                    "status": "passed",
+                    "exit_code": 0,
+                    "checks_failed": 0,
+                    "artifact_refs": [{
+                        "artifact_id": "artifact-b",
+                        "path": "/reports/b.js",
+                        "content_sha256": "sha256:b",
+                    }],
+                    "material": True,
+                }],
+            },
+        ],
+    }
+
+    evaluation = _evaluate_code_validation("code_validation", context, {})
+
+    assert evaluation.passed is False
+    assert evaluation.failure_kind == VerificationFailureKind.VALIDATOR_PROTOCOL_ERROR
+    assert "ValidationReceipt" in str(evaluation.gap)
+
+
 def test_code_validation_aggregates_js_and_browser_receipts_by_artifact_hash():
     from harness.deterministic_checks import _evaluate_code_validation
 
@@ -2823,6 +2964,382 @@ def test_code_validation_aggregates_js_and_browser_receipts_by_artifact_hash():
     }
 
     assert _evaluate_code_validation("code_validation", context, {}).passed is True
+
+
+def test_code_validation_is_monotonic_per_artifact_not_global_write_order():
+    from harness.deterministic_checks import _evaluate_code_validation
+
+    context = {
+        "run_id": "run-multi-file",
+        "verification_activations": [
+            {
+                "pack": "code",
+                "tool_name": "write_file",
+                "created_at": 1.0,
+                "status": "succeeded",
+                "evidence_refs": [{
+                    "kind": "artifact_write",
+                    "artifact_id": "artifact-html",
+                    "path": "report.html",
+                    "content_sha256": "sha256:html",
+                    "role": "target",
+                    "material": True,
+                }],
+            },
+            {
+                "pack": "code",
+                "tool_name": "validate_html_report",
+                "created_at": 2.0,
+                "status": "succeeded",
+                "evidence_refs": [{
+                    "kind": "validation_receipt",
+                    "validator_kind": "browser_runtime",
+                    "status": "passed",
+                    "exit_code": 0,
+                    "checks_failed": 0,
+                    "artifact_refs": [{
+                        "artifact_id": "artifact-html",
+                        "path": "report.html",
+                        "content_sha256": "sha256:html",
+                    }],
+                    "material": True,
+                }],
+            },
+            {
+                "pack": "code",
+                "tool_name": "write_file",
+                "created_at": 3.0,
+                "status": "succeeded",
+                "evidence_refs": [{
+                    "kind": "artifact_write",
+                    "artifact_id": "artifact-js",
+                    "path": "charts.js",
+                    "content_sha256": "sha256:js",
+                    "role": "target",
+                    "material": True,
+                }],
+            },
+            {
+                "pack": "code",
+                "tool_name": "execute_external_directory",
+                "created_at": 4.0,
+                "status": "succeeded",
+                "evidence_refs": [{
+                    "kind": "validation_receipt",
+                    "validator_kind": "javascript_syntax",
+                    "status": "passed",
+                    "exit_code": 0,
+                    "checks_failed": 0,
+                    "artifact_refs": [{
+                        "artifact_id": "artifact-js",
+                        "path": "charts.js",
+                        "content_sha256": "sha256:js",
+                    }],
+                    "material": True,
+                }],
+            },
+        ],
+    }
+
+    assert _evaluate_code_validation("code_validation", context, {}).passed is True
+
+
+def test_bundle_validation_requires_extra_dependency_to_keep_same_bytes(tmp_path):
+    from harness.deterministic_checks import _evaluate_code_validation
+
+    vendor = tmp_path / "echarts.min.js"
+    vendor.write_text("vendor-v1", encoding="utf-8")
+    vendor_sha = "sha256:" + __import__("hashlib").sha256(
+        vendor.read_bytes()
+    ).hexdigest()
+    context = {
+        "run_id": "run-bundle-dependency",
+        "verification_activations": [
+            {
+                "pack": "code",
+                "tool_name": "write_file",
+                "created_at": 1.0,
+                "status": "succeeded",
+                "evidence_refs": [
+                    {
+                        "kind": "artifact_write",
+                        "artifact_id": "artifact-html",
+                        "path": "report.html",
+                        "content_sha256": "sha256:html",
+                        "role": "target",
+                        "material": True,
+                    },
+                    {
+                        "kind": "artifact_write",
+                        "artifact_id": "artifact-js",
+                        "path": "charts.js",
+                        "content_sha256": "sha256:js",
+                        "role": "target",
+                        "material": True,
+                    },
+                ],
+            },
+            {
+                "pack": "code",
+                "tool_name": "validate_html_report",
+                "created_at": 2.0,
+                "status": "succeeded",
+                "evidence_refs": [{
+                    "kind": "validation_receipt",
+                    "validator_kind": "project_test",
+                    "status": "passed",
+                    "exit_code": 0,
+                    "checks_failed": 0,
+                    "artifact_refs": [
+                        {
+                            "artifact_id": "artifact-html",
+                            "path": "report.html",
+                            "content_sha256": "sha256:html",
+                        },
+                        {
+                            "artifact_id": "artifact-js",
+                            "path": "charts.js",
+                            "content_sha256": "sha256:js",
+                        },
+                        {
+                            "artifact_id": "vendor-js",
+                            "path": str(vendor),
+                            "content_sha256": vendor_sha,
+                        },
+                    ],
+                    "material": True,
+                }],
+            },
+        ],
+    }
+
+    assert _evaluate_code_validation("code_validation", context, {}).passed is True
+    vendor.write_text("vendor-v2", encoding="utf-8")
+    assert _evaluate_code_validation("code_validation", context, {}).passed is False
+
+
+def test_declared_targets_prevent_old_inferred_files_from_expanding_validation():
+    from harness.deterministic_checks import _evaluate_code_validation
+
+    intended = [
+        ("/reports/产品配置分析_2026_v3.html", "sha256:html"),
+        ("/reports/product-config-charts-2026-v3.js", "sha256:js"),
+    ]
+    obsolete = [
+        ("/reports/产品配置分析模型模板_v3.html", "sha256:old-html"),
+        ("/reports/product-config-charts-2024-v3.js", "sha256:old-js"),
+    ]
+    writes = [
+        {
+            "kind": "artifact_write",
+            "artifact_id": f"artifact-{index}",
+            "path": path,
+            "content_sha256": digest,
+            "role": "target",
+            "material": True,
+        }
+        for index, (path, digest) in enumerate([*intended, *obsolete])
+    ]
+    validation_refs = [
+        {
+            "artifact_id": f"artifact-{index}",
+            "path": path,
+            "content_sha256": digest,
+        }
+        for index, (path, digest) in enumerate(intended)
+    ]
+    context = {
+        "run_id": "run-target-migration",
+        "declared_artifact_targets": [path for path, _ in intended],
+        "verification_activations": [
+            {
+                "pack": "code",
+                "tool_name": "write_file",
+                "created_at": 1.0,
+                "status": "succeeded",
+                "evidence_refs": writes,
+            },
+            {
+                "pack": "code",
+                "tool_name": "validate_html_report",
+                "created_at": 2.0,
+                "status": "succeeded",
+                "evidence_refs": [{
+                    "kind": "validation_receipt",
+                    "validator_kind": "project_test",
+                    "status": "passed",
+                    "exit_code": 0,
+                    "checks_failed": 0,
+                    "artifact_refs": validation_refs,
+                    "material": True,
+                }],
+            },
+        ],
+    }
+
+    assert _evaluate_code_validation("code_validation", context, {}).passed is True
+
+
+@pytest.mark.parametrize("inherited_b_validated", [False, True])
+def test_current_and_inherited_targets_share_one_validation_acceptance_set(
+    tmp_path,
+    inherited_b_validated,
+):
+    from harness.deterministic_checks import _evaluate_code_validation
+
+    a_path = tmp_path / "a.js"
+    b_path = tmp_path / "b.js"
+    a_path.write_text("const a = 1;\n", encoding="utf-8")
+    b_path.write_text("const b = 1;\n", encoding="utf-8")
+    import hashlib
+
+    a_sha = "sha256:" + hashlib.sha256(a_path.read_bytes()).hexdigest()
+    b_sha = "sha256:" + hashlib.sha256(b_path.read_bytes()).hexdigest()
+    inherited = [
+        {
+            "kind": "artifact_write",
+            "artifact_id": "artifact-b",
+            "path": str(b_path),
+            "host_path": str(b_path),
+            "content_sha256": b_sha,
+            "size_bytes": b_path.stat().st_size,
+            "role": "target",
+            "verification_pack": "code",
+            "material": True,
+        }
+    ]
+    if inherited_b_validated:
+        inherited.append({
+            "kind": "validation_receipt",
+            "validation_receipt_id": "validation-b",
+            "verification_pack": "code",
+            "validator_kind": "javascript_syntax",
+            "validator_version": "node-check/v1",
+            "status": "passed",
+            "exit_code": 0,
+            "checks_failed": 0,
+            "artifact_refs": [{
+                "artifact_id": "artifact-b",
+                "path": str(b_path),
+                "content_sha256": b_sha,
+            }],
+            "material": True,
+        })
+    context = {
+        "run_id": "run-current-a",
+        "declared_artifact_targets": [str(a_path), str(b_path)],
+        "goal_evidence_records": inherited,
+        "verification_activations": [
+            {
+                "pack": "code",
+                "tool_name": "write_file",
+                "created_at": 2.0,
+                "status": "succeeded",
+                "evidence_refs": [{
+                    "kind": "artifact_write",
+                    "artifact_id": "artifact-a",
+                    "path": str(a_path),
+                    "host_path": str(a_path),
+                    "content_sha256": a_sha,
+                    "size_bytes": a_path.stat().st_size,
+                    "role": "target",
+                    "material": True,
+                }],
+            },
+            {
+                "pack": "code",
+                "tool_name": "execute_external_directory",
+                "created_at": 3.0,
+                "status": "succeeded",
+                "evidence_refs": [{
+                    "kind": "validation_receipt",
+                    "validator_kind": "javascript_syntax",
+                    "validator_version": "node-check/v1",
+                    "status": "passed",
+                    "exit_code": 0,
+                    "checks_failed": 0,
+                    "artifact_refs": [{
+                        "artifact_id": "artifact-a",
+                        "path": str(a_path),
+                        "content_sha256": a_sha,
+                    }],
+                    "material": True,
+                }],
+            },
+        ],
+    }
+
+    evaluation = _evaluate_code_validation("code_validation", context, {})
+
+    assert evaluation.passed is inherited_b_validated
+
+
+def test_inherited_observed_artifact_failure_stays_sticky_for_same_hash(
+    tmp_path,
+):
+    from harness.deterministic_checks import _evaluate_code_validation
+
+    target = tmp_path / "app.js"
+    target.write_text("const broken = ;\n", encoding="utf-8")
+    import hashlib
+
+    digest = "sha256:" + hashlib.sha256(target.read_bytes()).hexdigest()
+    artifact_ref = {
+        "artifact_id": "artifact-app",
+        "path": str(target),
+        "content_sha256": digest,
+    }
+    context = {
+        "run_id": "run-after-failure",
+        "declared_artifact_targets": [str(target)],
+        "verification_activations": [],
+        "goal_evidence_records": [
+            {
+                "kind": "artifact_write",
+                **artifact_ref,
+                "host_path": str(target),
+                "size_bytes": target.stat().st_size,
+                "role": "target",
+                "verification_pack": "code",
+                "material": True,
+            },
+            {
+                "kind": "validation_receipt",
+                "validation_receipt_id": "validation-failed",
+                "verification_pack": "code",
+                "validator_kind": "javascript_syntax",
+                "validator_version": "node-check/v1",
+                "obligation_key": "javascript_syntax:node-check/v1",
+                "status": "failed",
+                "failure_class": "artifact_failure",
+                "content_observed": True,
+                "exit_code": 1,
+                "checks_failed": 1,
+                "artifact_refs": [artifact_ref],
+                "material": True,
+            },
+            {
+                "kind": "validation_receipt",
+                "validation_receipt_id": "validation-later-success",
+                "verification_pack": "code",
+                "validator_kind": "javascript_syntax",
+                "validator_version": "node-check/v1",
+                "obligation_key": "javascript_syntax:node-check/v1",
+                "status": "passed",
+                "failure_class": None,
+                "exit_code": 0,
+                "checks_failed": 0,
+                "artifact_refs": [artifact_ref],
+                "material": True,
+            },
+        ],
+    }
+
+    evaluation = _evaluate_code_validation("code_validation", context, {})
+
+    assert evaluation.passed is False
+    assert evaluation.failure_kind.value == "task_gap"
+    assert "真实内容失败" in str(evaluation.gap)
 
 
 @pytest.mark.parametrize(

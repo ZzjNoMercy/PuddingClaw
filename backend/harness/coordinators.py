@@ -1097,6 +1097,7 @@ class HarnessRunCoordinator:
             session_id=session_id,
             objective=effective_objective,
             declared_artifact_targets=resolve_declared_artifact_targets(effective_objective),
+            declared_artifact_targets_version=2,
             run_kind=resolved_run_kind,
             goal_id=goal.goal_id if goal else None,
             context_goal_id=context_goal_id,

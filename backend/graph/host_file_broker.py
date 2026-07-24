@@ -322,6 +322,67 @@ class HostFileBroker:
             }
         )
 
+    def load_authorized_file(
+        self,
+        path: str | Path,
+        *,
+        expected_sha256: str | None = None,
+    ) -> tuple[bytes | None, dict[str, Any]]:
+        """Load exact source bytes for a server-side cross-backend transfer.
+
+        The bytes are returned only to the trusted backend caller. Tool and
+        model results receive metadata, never the file body.
+        """
+
+        source = self.authorize(path, access="read")
+        if source is None:
+            return None, {
+                "status": "permission_required",
+                "error_code": "source_read_permission_required",
+                "error": _broker_error(
+                    "permission_required",
+                    f"read permission is required for {path}",
+                ),
+                "next_action": "request_exact_read_permission",
+            }
+        try:
+            content = self._read_bound_bytes(source)
+        except OSError as exc:
+            return None, {
+                "status": "io_error",
+                "error_code": "authorized_path_changed",
+                "error": _broker_error("io_error", str(exc)),
+                "next_action": "request_exact_directory_permission",
+            }
+        if content is None:
+            return None, {
+                "status": "io_error",
+                "error_code": "source_not_regular_file",
+                "error": _broker_error(
+                    "io_error",
+                    f"source is not a regular file: {source.canonical_path}",
+                ),
+                "next_action": "choose_regular_source_file",
+            }
+        source_sha256 = _sha256(content)
+        if expected_sha256 and expected_sha256 != source_sha256:
+            return None, {
+                "status": "conflict",
+                "error_code": "source_version_changed",
+                "error": _broker_error(
+                    "conflict",
+                    f"source changed; expected {expected_sha256}, current {source_sha256}",
+                ),
+                "current_sha256": source_sha256,
+                "expected_sha256": expected_sha256,
+                "next_action": "retry_once_with_latest_version",
+            }
+        return content, {
+            "status": "completed",
+            "source_path": str(source.canonical_path),
+            "source_sha256": source_sha256,
+        }
+
     def ls(self, path: str) -> LsResult | None:
         target = self.authorize(path, access="read")
         if target is None:
@@ -667,6 +728,39 @@ class HostFileBroker:
             ),
         }
 
+    @staticmethod
+    def _validation_failure_result(
+        receipt: dict[str, Any] | None,
+        error: str,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        clean_error = (
+            error.split(":", 1)[1].strip()
+            if error.startswith("validation_failed:")
+            else error
+        )
+        failure_class = str((receipt or {}).get("failure_class") or "")
+        if failure_class == "infrastructure_failure":
+            status = "infrastructure_error"
+            error_code = "candidate_validation_infrastructure_failed"
+            next_action = "retry_validator_or_report_infrastructure_error"
+        elif failure_class == "invocation_failure":
+            status = "validation_invocation_failed"
+            error_code = "candidate_validation_invocation_failed"
+            next_action = "fix_validation_invocation"
+        else:
+            status = "validation_failed"
+            error_code = "candidate_validation_failed"
+            next_action = "fix_candidate_content"
+        return {
+            "status": status,
+            "error_code": error_code,
+            "error": clean_error,
+            "next_action": next_action,
+            "validation_receipt": receipt,
+            **extra,
+        }
+
     def write(self, path: str, content: str) -> WriteResult | None:
         result = self.create(path, content.encode("utf-8"))
         if result.get("status") == "permission_required":
@@ -739,13 +833,10 @@ class HostFileBroker:
         )
         validation_receipt, validation_error = self._validate_candidate(target, content)
         if validation_error is not None:
-            return {
-                "status": "validation_failed",
-                "error_code": "candidate_validation_failed",
-                "error": validation_error,
-                "next_action": "fix_candidate_content",
-                "validation_receipt": validation_receipt,
-            }
+            return self._validation_failure_result(
+                validation_receipt,
+                validation_error,
+            )
         try:
             self._atomic_replace(target, content, expected_before=None)
         except OSError as exc:
@@ -833,15 +924,12 @@ class HostFileBroker:
             content,
         )
         if validation_error is not None:
-            return {
-                "status": "validation_failed",
-                "error_code": "candidate_validation_failed",
-                "error": validation_error,
-                "current_sha256": current_sha256,
-                "expected_sha256": expected_sha256,
-                "next_action": "fix_candidate_content",
-                "validation_receipt": validation_receipt,
-            }
+            return self._validation_failure_result(
+                validation_receipt,
+                validation_error,
+                current_sha256=current_sha256,
+                expected_sha256=expected_sha256,
+            )
         try:
             self._atomic_replace(target, content, expected_before=before)
         except OSError as exc:
@@ -967,13 +1055,10 @@ class HostFileBroker:
             content,
         )
         if validation_error is not None:
-            return {
-                "status": "validation_failed",
-                "error_code": "candidate_validation_failed",
-                "error": validation_error,
-                "next_action": "fix_source_before_copy",
-                "validation_receipt": validation_receipt,
-            }
+            return self._validation_failure_result(
+                validation_receipt,
+                validation_error,
+            )
         try:
             self._atomic_replace(target, content, expected_before=None)
         except OSError as exc:
@@ -1066,7 +1151,16 @@ class HostFileBroker:
         updated = text.replace(old_string, new_string, -1 if replace_all else 1).encode("utf-8")
         validation_receipt, validation_error = self._validate_candidate(target, updated)
         if validation_error is not None:
-            return EditResult(error=validation_error)
+            failure = self._validation_failure_result(
+                validation_receipt,
+                validation_error,
+            )
+            return EditResult(
+                error=(
+                    f"{failure['status']}: {failure['error']}; "
+                    f"next_action={failure['next_action']}"
+                )
+            )
         try:
             self._atomic_replace(target, updated, expected_before=before)
         except OSError as exc:
@@ -1195,7 +1289,10 @@ class HostFileBroker:
                 after,
             )
             if validation_error is not None:
-                return {"status": "validation_failed", "error": validation_error}
+                return self._validation_failure_result(
+                    validation_receipt,
+                    validation_error,
+                )
             prepared.append((target, before, after, validation_receipt))
 
         applied: list[tuple[AuthorizedHostPath, bytes | None, bytes]] = []

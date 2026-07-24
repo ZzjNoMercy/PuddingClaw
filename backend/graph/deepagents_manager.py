@@ -13,7 +13,7 @@ import shutil
 import time
 import traceback
 import uuid
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextvars import ContextVar
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -167,6 +167,46 @@ logger = logging.getLogger(__name__)
 
 _TASK_ROUTER_TIMEOUT_SECONDS = 15.0
 _GOAL_TURN_ROUTER_TIMEOUT_SECONDS = 8.0
+_VERIFICATION_CRITERION_LABELS = {
+    "artifact_delivery": "产物交付",
+    "code_validation": "代码验证",
+    "todo_reconciliation": "Todo 收口",
+    "task_fulfillment": "任务完成度",
+    "report_integrity": "报告完整性",
+    "metric_consistency": "指标口径一致性",
+    "time_scope": "数据时间范围",
+    "analysis_traceability": "分析证据可追溯",
+}
+
+
+def _verification_gap_detail(payload: dict[str, Any]) -> str:
+    """Render structured failed criteria as a useful timeline explanation."""
+
+    raw_items = payload.get("evaluations")
+    if not isinstance(raw_items, list):
+        raw_items = payload.get("criteria")
+    issues: list[str] = []
+    for item in raw_items if isinstance(raw_items, list) else []:
+        if not isinstance(item, dict) or item.get("passed") is not False:
+            continue
+        criterion_id = str(
+            item.get("criterion_id") or item.get("name") or "未命名验收项"
+        )
+        label = _VERIFICATION_CRITERION_LABELS.get(criterion_id, criterion_id)
+        reason = str(
+            item.get("gap")
+            or item.get("reason")
+            or item.get("explanation")
+            or "未提供具体判定依据"
+        ).strip()
+        if len(reason) > 180:
+            reason = reason[:177].rstrip() + "…"
+        issues.append(f"{label}：{reason}")
+        if len(issues) == 3:
+            break
+    return "待处理：" + "；".join(issues) if issues else ""
+
+
 _TRIVIAL_TASK_ROUTER_RE = re.compile(
     r"^\s*(?:你好|您好|嗨|哈喽|hello|hi|hey|谢谢|多谢|好的|好|ok|okay|在吗|早上好|下午好|晚上好)[!！。,.，?？\s]*$",
     re.IGNORECASE,
@@ -910,6 +950,33 @@ class PuddingClawAgentState(DeepAgentState):
 class PuddingClawRubricMiddleware(RubricMiddleware):
     """Run deterministic completion gates before invoking the LLM grader."""
 
+    def __init__(
+        self,
+        *,
+        model: Any,
+        system_prompt: str | None = None,
+        tools: Sequence[Any] | None = None,
+        max_iterations: int = 3,
+        on_evaluation: Callable[[Any], None] | None = None,
+        max_stagnant_repairs: int = 2,
+    ) -> None:
+        super().__init__(
+            model=model,
+            system_prompt=system_prompt,
+            tools=tools,
+            max_iterations=max_iterations,
+            on_evaluation=on_evaluation,
+        )
+        if (
+            not isinstance(max_stagnant_repairs, int)
+            or isinstance(max_stagnant_repairs, bool)
+            or not 1 <= max_stagnant_repairs <= 20
+        ):
+            raise ValueError(
+                "PuddingClawRubricMiddleware: max_stagnant_repairs must be in [1, 20]"
+            )
+        self.max_stagnant_repairs = max_stagnant_repairs
+
     _JSON_GRADER_SUFFIX = """
 
 Return exactly one JSON object and no markdown. Do not call tools or functions.
@@ -1577,6 +1644,28 @@ details. Never invent evidence that is absent from the supplied context.
                     }
                 )
                 goal_evidence_records.append(projected)
+        persisted_targets = (
+            list(persisted_run.get("declared_artifact_targets") or [])
+            if isinstance(persisted_run, dict)
+            else []
+        )
+        if (
+            session_id
+            and isinstance(persisted_run, dict)
+            and int(
+                persisted_run.get("declared_artifact_targets_version") or 1
+            )
+            < 2
+        ):
+            resolved_targets = resolve_declared_artifact_targets(run_objective)
+            if resolved_targets:
+                persisted_targets = (
+                    session_manager.migrate_run_declared_artifact_targets(
+                        session_id,
+                        run_id,
+                        resolved_targets,
+                    )
+                )
         check_state["_harness_context"] = {
             "todos": list(state.get("todos") or []),
             "final_content": self._last_ai_text(state),
@@ -1586,11 +1675,7 @@ details. Never invent evidence that is absent from the supplied context.
             "goal_revision": goal_revision,
             "workspace_id": str(execution.get("workspace_id") or ""),
             "backend_id": str(execution.get("backend_id") or ""),
-            "declared_artifact_targets": list(
-                persisted_run.get("declared_artifact_targets")
-                if isinstance(persisted_run, dict) and isinstance(persisted_run.get("declared_artifact_targets"), list)
-                else resolve_declared_artifact_targets(run_objective)
-            ),
+            "declared_artifact_targets": persisted_targets,
             "active_permission_grant_ids": [
                 str(item.get("id")) for item in session_manager.list_permission_grants(session_id) if item.get("id")
             ]
@@ -1668,10 +1753,9 @@ details. Never invent evidence that is absent from the supplied context.
         gate_status = "satisfied"
         if infrastructure_failures:
             gate_status = VerificationStatus.INFRASTRUCTURE_ERROR.value
-        elif actionable_failures and stagnation_count >= 1:
-            # One directed repair was already attempted with no change in the
-            # failing criteria or evidence. Stop honestly instead of spending
-            # the entire model-call budget on an impossible citation contract.
+        elif actionable_failures and stagnation_count >= self.max_stagnant_repairs:
+            # Stop after the configured number of directed repairs produced no
+            # semantic change in the failing criteria or their evidence.
             gate_status = VerificationStatus.FAILED.value
         elif actionable_failures:
             gate_status = "needs_revision"
@@ -2661,10 +2745,18 @@ class DeepAgentsAgentManager:
             max_iterations = rubric_cfg.get("max_iterations", 2)
             if not isinstance(max_iterations, int) or isinstance(max_iterations, bool) or not 1 <= max_iterations <= 20:
                 max_iterations = 2
+            max_stagnant_repairs = rubric_cfg.get("max_stagnant_repairs", 2)
+            if (
+                not isinstance(max_stagnant_repairs, int)
+                or isinstance(max_stagnant_repairs, bool)
+                or not 1 <= max_stagnant_repairs <= 20
+            ):
+                max_stagnant_repairs = 2
             middlewares.append(
                 PuddingClawRubricMiddleware(
                     model=rubric_model,
                     max_iterations=max_iterations,
+                    max_stagnant_repairs=max_stagnant_repairs,
                 )
             )
         model_call_limit_cfg = config.load_config().get("harness", {}).get("model_call_limit", {})
@@ -3669,11 +3761,34 @@ class DeepAgentsAgentManager:
             }
 
         recent_tools: list[dict[str, str]] = []
+        recent_assistant_actions: list[dict[str, str]] = []
         seen_tool_calls: set[str] = set()
         messages = session_manager.load_session(session_id)
         for persisted in reversed(messages[-20:]):
             if not isinstance(persisted, dict) or persisted.get("role") != "assistant":
                 continue
+            if len(recent_assistant_actions) < 2:
+                action_text = str(persisted.get("content") or "").strip()
+                if not action_text:
+                    for segment in reversed(persisted.get("segments") or []):
+                        if not isinstance(segment, dict):
+                            continue
+                        action_text = str(segment.get("content") or "").strip()
+                        if action_text:
+                            break
+                if action_text:
+                    # The tail contains the last announced execution choice,
+                    # which is what a short user correction most often refers
+                    # to. Do not project reasoning or tool output.
+                    recent_assistant_actions.append(
+                        {
+                            "content": action_text[-1_200:],
+                            "status": str(persisted.get("status") or ""),
+                            "interrupted": str(
+                                bool(persisted.get("interrupted"))
+                            ).lower(),
+                        }
+                    )
             tool_calls = list(persisted.get("tool_calls") or [])
             for segment in persisted.get("segments") or []:
                 if isinstance(segment, dict):
@@ -3725,6 +3840,7 @@ class DeepAgentsAgentManager:
         return {
             "latest_run": run_context,
             "recent_tools": recent_tools,
+            "recent_assistant_actions": recent_assistant_actions,
         }
 
     @staticmethod
@@ -7032,8 +7148,8 @@ class DeepAgentsAgentManager:
                                 lifecycle_display_status = "satisfied"
                             elif will_continue:
                                 lifecycle_label = "发现完成条件缺口，正在自动继续修复"
-                                lifecycle_detail = (
-                                    "无需操作，Agent 会保留当前进度并继续处理。"
+                                lifecycle_detail = _verification_gap_detail(payload) or (
+                                    "验收事件未附具体缺口；Agent 正在重新核对结构化验收结果。"
                                 )
                                 lifecycle_display_status = "running"
                             elif lifecycle_status == VerificationStatus.INFRASTRUCTURE_ERROR.value:
@@ -7044,7 +7160,7 @@ class DeepAgentsAgentManager:
                                 lifecycle_display_status = "failed"
                             elif lifecycle_status in {"needs_revision", "failed"}:
                                 lifecycle_label = "完成条件仍有缺口，自动处理已停止"
-                                lifecycle_detail = (
+                                lifecycle_detail = _verification_gap_detail(payload) or (
                                     "Goal、Todo 和证据已保留。发送"
                                     "“继续完成剩余工作”即可从当前进度继续。"
                                     if run_record.goal_id
@@ -7060,8 +7176,8 @@ class DeepAgentsAgentManager:
                                 lifecycle_display_status = "satisfied"
                             elif lifecycle_status == "needs_revision":
                                 lifecycle_label = "发现完成质量缺口，正在自动继续修复"
-                                lifecycle_detail = (
-                                    "无需操作，Agent 会保留当前进度并继续处理。"
+                                lifecycle_detail = _verification_gap_detail(payload) or (
+                                    "验收事件未附具体缺口；Agent 正在重新核对结构化验收结果。"
                                 )
                                 lifecycle_display_status = "running"
                             elif lifecycle_status == VerificationStatus.INFRASTRUCTURE_ERROR.value:
@@ -7072,7 +7188,7 @@ class DeepAgentsAgentManager:
                                 lifecycle_display_status = "failed"
                             elif lifecycle_status == "failed":
                                 lifecycle_label = "完成质量仍有缺口，自动处理已停止"
-                                lifecycle_detail = (
+                                lifecycle_detail = _verification_gap_detail(payload) or (
                                     "Goal、Todo 和证据已保留。发送"
                                     "“继续完成剩余工作”即可从当前进度继续。"
                                     if run_record.goal_id

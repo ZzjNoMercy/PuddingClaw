@@ -57,6 +57,7 @@ def test_harness_settings_freeze_explicit_goal_and_validate_rules(tmp_path, monk
                         "enabled": True,
                         "model": "  grader-model  ",
                         "max_iterations": 3,
+                        "max_stagnant_repairs": 4,
                         "custom_rules": [
                             {
                                 "id": "quantified",
@@ -77,6 +78,20 @@ def test_harness_settings_freeze_explicit_goal_and_validate_rules(tmp_path, monk
     assert saved["goals"]["auto_promote_from_run"] is False
     assert saved["completion"]["rubric"]["custom_rules"][0]["statement"] == "原因必须给出影响量级"
     assert saved["completion"]["rubric"]["model"] == "grader-model"
+    assert saved["completion"]["rubric"]["max_stagnant_repairs"] == 4
+
+    with pytest.raises(ValueError, match="max_stagnant_repairs"):
+        config.update_settings(
+            {
+                "harness": {
+                    "completion": {
+                        "rubric": {
+                            "max_stagnant_repairs": 0,
+                        },
+                    },
+                },
+            }
+        )
 
     with pytest.raises(ValueError, match="verifier is not registered"):
         config.update_settings(
@@ -1187,6 +1202,42 @@ def test_artifact_target_resolver_preserves_already_versioned_script(tmp_path):
     )
 
     assert targets[-1] == str(tmp_path / "product-config-charts-2026-v2.js")
+
+
+def test_artifact_target_resolver_couples_requested_year_to_template_v3(
+    tmp_path,
+):
+    from harness.artifact_paths import resolve_declared_artifact_targets
+
+    source = tmp_path / "产品配置分析模型模板.html"
+    source.write_text(
+        '<script src="product-config-charts-2024.js"></script>',
+        encoding="utf-8",
+    )
+
+    targets = resolve_declared_artifact_targets(
+        f"参考{source}，开一个新的2026 V3版本（包含html和js），"
+        "时间范围框定2021-2026年"
+    )
+
+    assert targets == [
+        str(tmp_path / "产品配置分析_2026_v3.html"),
+        str(tmp_path / "product-config-charts-2026-v3.js"),
+    ]
+
+
+def test_explicit_output_does_not_promote_reference_template_to_target(tmp_path):
+    from harness.artifact_paths import resolve_declared_artifact_targets
+
+    source = tmp_path / "source.html"
+    target = tmp_path / "report-v3.html"
+    source.write_text("<html></html>", encoding="utf-8")
+
+    targets = resolve_declared_artifact_targets(
+        f"参考 {source}，输出到 {target}，生成 V3 html 和 js"
+    )
+
+    assert targets == [str(target)]
 
 
 def test_agent_user_content_keeps_virtual_workspace_path_as_managed_input(tmp_path):

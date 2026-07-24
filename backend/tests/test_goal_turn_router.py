@@ -159,6 +159,39 @@ async def test_interrupted_copy_correction_revises_goal_without_clarifying() -> 
 
 
 @pytest.mark.asyncio
+async def test_interrupted_workspace_plan_can_be_redirected_to_external_directory() -> None:
+    recent_context = {
+        "latest_run": {
+            "status": "cancelled",
+            "outcome": "cancelled",
+            "error": "client_cancelled",
+        },
+        "recent_tools": [],
+        "recent_assistant_actions": [
+            {
+                "content": "现在复制模板到工作区并应用所有 V3 变更。",
+                "status": "cancelled",
+                "interrupted": "true",
+            }
+        ],
+    }
+
+    decision = await GoalTurnRouter.classify(
+        message="直接在外部目录也可以完成工作",
+        goal=GOAL,
+        model=None,
+        recent_execution_context=recent_context,
+    )
+
+    assert decision.intent == GoalTurnIntent.REVISE_GOAL
+    assert decision.classifier == "fallback_contextual"
+    assert decision.reason.startswith("contextual_execution_correction:")
+    assert "用户追加约束（优先于上文冲突项）：直接在外部目录也可以完成工作" in (
+        decision.revised_objective or ""
+    )
+
+
+@pytest.mark.asyncio
 async def test_question_about_a_possible_constraint_still_clarifies_without_model() -> None:
     decision = await GoalTurnRouter.classify(
         message="这个依赖要不要复制？",

@@ -16,6 +16,47 @@ type VerificationTimelineItem = {
   status?: string;
 };
 
+type VerificationCriterion = {
+  criterion_id?: unknown;
+  name?: unknown;
+  passed?: unknown;
+  gap?: unknown;
+  reason?: unknown;
+  explanation?: unknown;
+};
+
+const criterionLabels: Record<string, string> = {
+  artifact_delivery: "产物交付",
+  code_validation: "代码验证",
+  todo_reconciliation: "Todo 收口",
+  task_fulfillment: "任务完成度",
+  report_integrity: "报告完整性",
+  metric_consistency: "指标口径一致性",
+  time_scope: "数据时间范围",
+  analysis_traceability: "分析证据可追溯",
+};
+
+function verificationGapDetail(criteria: unknown): string {
+  if (!Array.isArray(criteria)) return "";
+  const issues = criteria
+    .filter((item): item is VerificationCriterion => (
+      typeof item === "object" && item !== null && item.passed === false
+    ))
+    .slice(0, 3)
+    .map((item) => {
+      const criterionId = String(item.criterion_id || item.name || "未命名验收项");
+      const label = criterionLabels[criterionId] || criterionId;
+      const rawReason = String(
+        item.gap || item.reason || item.explanation || "未提供具体判定依据",
+      ).trim();
+      const reason = rawReason.length > 180
+        ? `${rawReason.slice(0, 177).trimEnd()}…`
+        : rawReason;
+      return `${label}：${reason}`;
+    });
+  return issues.length > 0 ? `待处理：${issues.join("；")}` : "";
+}
+
 export function settleRunningVerificationActivities<
   T extends VerificationTimelineItem,
 >(timeline: T[], status: string): T[] {
@@ -33,6 +74,7 @@ export function verificationFailureActivity(
   result: string,
   explicitWillContinue?: boolean,
   hasGoal = false,
+  criteria?: unknown,
 ): VerificationFailurePresentation {
   const willContinue = eventKind === "rubric_evaluation_end"
     ? result === "needs_revision"
@@ -40,11 +82,12 @@ export function verificationFailureActivity(
   const scope = eventKind === "deterministic_checks_completed"
     ? "完成条件"
     : "完成质量";
+  const gapDetail = verificationGapDetail(criteria);
   if (willContinue) {
     return {
       willContinue: true,
       label: `发现${scope}缺口，正在自动继续修复`,
-      detail: "无需操作，Agent 会保留当前进度并继续处理。",
+      detail: gapDetail || "验收事件未附具体缺口；Agent 正在重新核对结构化验收结果。",
       displayStatus: "running",
     };
   }
@@ -63,9 +106,9 @@ export function verificationFailureActivity(
     };
   }
 
-  const detail = hasGoal
+  const detail = gapDetail || (hasGoal
     ? "Goal、Todo 和证据已保留。发送“继续完成剩余工作”即可从当前进度继续。"
-    : "请查看右侧验收明细，再发送具体修复要求。";
+    : "请查看右侧验收明细，再发送具体修复要求。");
   return {
     willContinue: false,
     label: `${scope}仍有缺口，自动处理已停止`,

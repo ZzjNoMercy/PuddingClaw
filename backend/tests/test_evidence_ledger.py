@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from harness.evidence_ledger import (
     migrate_legacy_refs,
+    repair_legacy_validation_wrapper_records,
     register_activation_evidence,
     resolve_evidence_ref,
 )
@@ -151,4 +152,179 @@ def test_legacy_complete_evidence_migrates_and_incomplete_is_audited():
     assert resolved.query_trace_id == "trace-legacy"
     assert data["evidence_migration_audit"][-1]["reason"] == (
         "legacy_origin_lineage_incomplete"
+    )
+
+
+def test_mutation_wrapper_and_nested_validation_keep_distinct_identities():
+    run = _run()
+    validation = {
+        "kind": "validation_receipt",
+        "validation_receipt_id": "validation-1",
+        "tool_call_id": "call-write",
+        "artifact_refs": [
+            {
+                "artifact_id": "artifact-1",
+                "path": "/external/report.js",
+                "content_sha256": "sha256:bytes",
+            }
+        ],
+        "output_digest": "sha256:validation",
+        "material": True,
+    }
+    wrapper = {
+        "kind": "external_mutation_completed",
+        "receipt_id": "mutation-1",
+        "validation_receipt_id": "validation-1",
+        "tool_call_id": "call-write",
+        "output_digest": "sha256:mutation",
+        "material": True,
+    }
+    activation = {
+        "activation_id": "activation-write",
+        "status": "succeeded",
+        "pack": "code",
+        "tool_call_id": "call-write",
+        "tool_name": "patch_file",
+        "evidence_refs": [wrapper, validation],
+    }
+    data = {"harness": {"runs": {run["run_id"]: run}}}
+    activation["stable_evidence_refs"] = register_activation_evidence(
+        data,
+        run=run,
+        activation=activation,
+    )
+    run["verification_activations"].append(activation)
+
+    assert {tuple(sorted(item.items())) for item in activation["stable_evidence_refs"]} == {
+        tuple(sorted({"type": "external_mutation", "id": "mutation-1"}.items())),
+        tuple(sorted({"type": "validation_receipt", "id": "validation-1"}.items())),
+    }
+    validation_record = resolve_evidence_ref(
+        data,
+        {"type": "validation_receipt", "id": "validation-1"},
+    )
+    assert validation_record is not None
+    assert validation_record.inheritable is True
+    assert validation_record.payload["artifact_refs"][0]["artifact_id"] == "artifact-1"
+
+
+def test_legacy_mutation_wrapper_collision_is_repaired_from_activation():
+    run = _run()
+    activation = {
+        "activation_id": "activation-write",
+        "status": "succeeded",
+        "pack": "code",
+        "tool_call_id": "call-write",
+        "tool_name": "patch_file",
+        "evidence_refs": [
+            {
+                "kind": "external_mutation_completed",
+                "receipt_id": "mutation-legacy",
+                "validation_receipt_id": "validation-legacy",
+                "tool_call_id": "call-write",
+                "output_digest": "sha256:mutation",
+                "material": True,
+            },
+            {
+                "kind": "validation_receipt",
+                "validation_receipt_id": "validation-legacy",
+                "tool_call_id": "call-write",
+                "artifact_refs": [
+                    {
+                        "artifact_id": "artifact-legacy",
+                        "path": "/external/report.js",
+                        "content_sha256": "sha256:bytes",
+                    }
+                ],
+                "output_digest": "sha256:validation",
+                "material": True,
+            },
+        ],
+        "stable_evidence_refs": [
+            {"type": "validation_receipt", "id": "validation-legacy"}
+        ],
+    }
+    run["verification_activations"].append(activation)
+    data = {
+        "harness": {"runs": {run["run_id"]: run}},
+        "evidence_ledger": {
+            "validation_receipt:validation-legacy": {
+                "id": "validation-legacy",
+                "kind": "validation_receipt",
+                "source_run_id": run["run_id"],
+                "source_query_id": run["query_id"],
+                "origin_tool_call_id": "call-write",
+                "origin_tool_name": "patch_file",
+                "verification_pack": "code",
+                "goal_id": run["goal_id"],
+                "goal_revision": run["goal_revision"],
+                "output_digest": "sha256:mutation",
+                "validation_receipt_id": "validation-legacy",
+                "receipt_id": "mutation-legacy",
+                "status": "active",
+                "inheritable": False,
+                "non_inheritable_reason": "validation_artifact_binding_missing",
+                "payload": activation["evidence_refs"][0],
+                "created_at": 1.0,
+            }
+        },
+    }
+    activation["evidence_refs"].extend(
+        [
+            {
+                "kind": "external_mutation_completed",
+                "receipt_id": "mutation-legacy-2",
+                "validation_receipt_id": "validation-legacy-2",
+                "tool_call_id": "call-write",
+                "output_digest": "sha256:mutation-2",
+                "material": True,
+            },
+            {
+                "kind": "validation_receipt",
+                "validation_receipt_id": "validation-legacy-2",
+                "tool_call_id": "call-write",
+                "artifact_refs": [
+                    {
+                        "artifact_id": "artifact-legacy-2",
+                        "path": "/external/report-2.js",
+                        "content_sha256": "sha256:bytes-2",
+                    }
+                ],
+                "output_digest": "sha256:validation-2",
+                "material": True,
+            },
+        ]
+    )
+    activation["stable_evidence_refs"].append(
+        {"type": "validation_receipt", "id": "validation-legacy-2"}
+    )
+    second_collision = {
+        **data["evidence_ledger"]["validation_receipt:validation-legacy"],
+        "id": "validation-legacy-2",
+        "output_digest": "sha256:mutation-2",
+        "validation_receipt_id": "validation-legacy-2",
+        "receipt_id": "mutation-legacy-2",
+        "payload": activation["evidence_refs"][-2],
+    }
+    data["evidence_ledger"][
+        "validation_receipt:validation-legacy-2"
+    ] = second_collision
+
+    assert repair_legacy_validation_wrapper_records(data) is True
+    repaired = resolve_evidence_ref(
+        data,
+        {"type": "validation_receipt", "id": "validation-legacy"},
+    )
+    assert repaired is not None
+    assert repaired.inheritable is True
+    assert repaired.payload["kind"] == "validation_receipt"
+    assert "external_mutation:mutation-legacy" in data["evidence_ledger"]
+    assert "external_mutation:mutation-legacy-2" in data["evidence_ledger"]
+    repaired_second = resolve_evidence_ref(
+        data,
+        {"type": "validation_receipt", "id": "validation-legacy-2"},
+    )
+    assert repaired_second is not None
+    assert repaired_second.payload["artifact_refs"][0]["artifact_id"] == (
+        "artifact-legacy-2"
     )

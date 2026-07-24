@@ -69,6 +69,17 @@ _REVISE_HINT = re.compile(
     r"不要|别再|禁止|避免|无需|不用|必须|务必|只要|继续使用|继续复用|复用)",
     flags=re.IGNORECASE,
 )
+_CONTEXTUAL_EXECUTION_CORRECTION_HINT = re.compile(
+    r"(?:"
+    r"(?:直接|改在|放到|写到|保存到|输出到|也?可以).{0,20}"
+    r"(?:外部|原来|原|目标|当前|这个)?(?:目录|路径|文件夹).{0,20}"
+    r"(?:完成|处理|写|生成|保存|输出|交付|即可|就行|也行)"
+    r"|"
+    r"(?:文件|产物|报告|页面).{0,16}(?:直接|改为|改在|放到|写到|保存到|输出到)"
+    r".{0,20}(?:目录|路径|文件夹)"
+    r")",
+    flags=re.IGNORECASE,
+)
 
 _ROUTER_PROMPT = """你是 Goal 回合控制路由器，只判断当前用户消息如何关联 standing Goal，不执行任务。
 
@@ -252,12 +263,37 @@ class GoalTurnRouter:
                 flags=re.IGNORECASE,
             )
         )
-        if _REVISE_HINT.search(normalized) and not looks_interrogative:
+        context = (
+            recent_execution_context
+            if isinstance(recent_execution_context, dict)
+            else {}
+        )
+        latest_run = (
+            context.get("latest_run")
+            if isinstance(context.get("latest_run"), dict)
+            else {}
+        )
+        has_recent_execution_anchor = bool(
+            context.get("recent_tools")
+            or context.get("recent_assistant_actions")
+            or str(latest_run.get("status") or "")
+            in {"running", "cancelled", "interrupted"}
+        )
+        explicit_revision = bool(_REVISE_HINT.search(normalized))
+        contextual_correction = bool(
+            has_recent_execution_anchor
+            and _CONTEXTUAL_EXECUTION_CORRECTION_HINT.search(normalized)
+        )
+        if (explicit_revision or contextual_correction) and not looks_interrogative:
             return GoalTurnDecision(
                 intent=GoalTurnIntent.REVISE_GOAL,
                 target_goal_id=goal_id,
                 confidence=0.8,
-                reason=f"contextual_execution_constraint:{reason}",
+                reason=(
+                    f"contextual_execution_correction:{reason}"
+                    if contextual_correction and not explicit_revision
+                    else f"contextual_execution_constraint:{reason}"
+                ),
                 classifier="fallback_contextual",
                 revised_objective=cls._append_revision(
                     objective=str(goal.get("objective") or ""),

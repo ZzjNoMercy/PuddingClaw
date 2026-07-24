@@ -5,6 +5,7 @@ import json
 import shlex
 from pathlib import Path
 
+import pytest
 from deepagents.backends import FilesystemBackend
 from deepagents.backends.protocol import ExecuteResponse
 from langchain_core.messages import ToolMessage
@@ -148,6 +149,90 @@ def test_copy_and_hash_guarded_replace_are_atomic(tmp_path: Path) -> None:
             run_id=run.run_id,
         )
     ] == ["copy", "replace"]
+
+
+def test_authorized_external_source_copies_to_workspace_without_external_write_grant(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    external = tmp_path / "external"
+    for directory in (state, workspace, external):
+        directory.mkdir()
+    source = external / "template.html"
+    source.write_text("<html>template</html>\n", encoding="utf-8")
+
+    session_manager.initialize(state)
+    session_manager.create_session("workspace-copy-session")
+    coordinator = HarnessRunCoordinator(session_manager)
+    run, _goal = coordinator.start_run(
+        session_id="workspace-copy-session",
+        query_id="workspace-copy-query",
+        objective="复制外部模板到工作区",
+        goal_mode=False,
+        verification_enabled=False,
+    )
+    coordinator.transition(run, RunStatus.RUNNING)
+    session_manager.add_permission_grant(
+        "workspace-copy-session",
+        grant_type="external_file_read",
+        target_kind="exact_file",
+        target=str(source.resolve()),
+        capabilities=["read", "external_path"],
+        scope="session",
+    )
+    workspace_backend = FilesystemBackend(root_dir=workspace, virtual_mode=True)
+    backend = PermissionedCompositeBackend(
+        default=workspace_backend,
+        routes={"/workspace/": workspace_backend},
+        session_id="workspace-copy-session",
+        run_id=run.run_id,
+        query_id=run.query_id,
+        workspace_root=workspace,
+    )
+
+    copied = backend.copy_external_file(
+        str(source),
+        "/workspace/report-v3.html",
+    )
+
+    assert copied == {
+        "status": "completed",
+        "source_path": str(source.resolve()),
+        "source_sha256": _digest("<html>template</html>\n"),
+        "target_path": "/workspace/report-v3.html",
+        "target_sha256": _digest("<html>template</html>\n"),
+        "authority_kind": "virtual_workspace",
+    }
+    assert (workspace / "report-v3.html").read_bytes() == source.read_bytes()
+    assert session_manager.list_external_mutation_receipts(
+        "workspace-copy-session",
+        run_id=run.run_id,
+    ) == []
+
+    refused = backend.copy_external_file(
+        str(source),
+        "/workspace/report-v3.html",
+    )
+    assert refused["status"] == "conflict"
+    assert refused["error_code"] == "target_already_exists"
+
+
+def test_external_to_workspace_copy_still_requires_source_read_grant(
+    tmp_path: Path,
+) -> None:
+    backend, _external, outside, _run = _setup(tmp_path)
+    source = outside / "ungranted.html"
+    source.write_text("<html>private</html>\n", encoding="utf-8")
+
+    denied = backend.copy_external_file(
+        str(source),
+        "/workspace/private.html",
+    )
+
+    assert denied["status"] == "permission_required"
+    assert denied["error_code"] == "source_read_permission_required"
+    assert not (tmp_path / "workspace" / "private.html").exists()
 
 
 def test_exact_file_write_grant_can_create_an_approved_missing_target(
@@ -650,8 +735,59 @@ def test_code_like_write_fails_closed_when_validator_is_unavailable(
     edited = backend.edit(str(target), "1", "INVALID")
 
     assert edited.error is not None
-    assert edited.error.startswith("validation_failed:")
+    assert edited.error.startswith("infrastructure_error:")
+    assert "fix_candidate_content" not in edited.error
+    assert "retry_validator" in edited.error
     assert target.read_text(encoding="utf-8") == "const value = 1;\n"
+    assert session_manager.list_external_mutation_receipts(
+        "broker-session",
+        run_id=run.run_id,
+    ) == []
+
+
+@pytest.mark.parametrize(
+    ("mode", "exit_code", "output"),
+    [
+        ("exit127", 127, "node: command not found"),
+        ("timeout", 124, "timed out"),
+        ("oom", 137, "Killed: out of memory"),
+        ("exception", None, "backend exploded"),
+    ],
+)
+def test_validator_control_failures_never_request_content_changes(
+    tmp_path: Path,
+    mode: str,
+    exit_code: int | None,
+    output: str,
+) -> None:
+    backend, external, _outside, run = _setup(tmp_path)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    target = external / "app.js"
+    original = "const value = 1;\n"
+    target.write_text(original, encoding="utf-8")
+
+    class FailingValidationBackend:
+        def execute(self, command: str, *, timeout: int | None = None):
+            del command, timeout
+            if mode == "exception":
+                raise RuntimeError(output)
+            return ExecuteResponse(output=output, exit_code=exit_code)
+
+    backend.execution_backend = FailingValidationBackend()
+    backend.execution_scratch_host_path = str(scratch)
+    result = backend.replace_external_file(
+        str(target),
+        b"const value = 2;\n",
+        expected_sha256=_digest(original),
+    )
+
+    assert result["status"] == "infrastructure_error"
+    assert result["validation_receipt"]["failure_class"] == "infrastructure_failure"
+    assert result["validation_receipt"]["content_observed"] is False
+    assert result["next_action"] == "retry_validator_or_report_infrastructure_error"
+    assert "fix_candidate_content" not in json.dumps(result)
+    assert target.read_text(encoding="utf-8") == original
     assert session_manager.list_external_mutation_receipts(
         "broker-session",
         run_id=run.run_id,

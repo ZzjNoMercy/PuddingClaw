@@ -3022,6 +3022,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 result,
                 Boolean(event.data.will_continue),
                 Boolean(event.data.goal_id),
+                event.event === "rubric_evaluation_end"
+                  ? event.data.criteria
+                  : event.data.evaluations,
               );
               const { willContinue } = failureActivity;
               correctingVerificationGap = willContinue;

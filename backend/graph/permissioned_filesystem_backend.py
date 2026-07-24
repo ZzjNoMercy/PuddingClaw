@@ -229,30 +229,73 @@ class PermissionedCompositeBackend(CompositeBackend):
             scratch_root = str(
                 getattr(self, "execution_scratch_host_path", "") or ""
             )
+            execution_error: Exception | None = None
             if execution_backend is None or not scratch_root:
-                return {
-                    "status": "failed",
-                    "summary": "registered validation infrastructure is unavailable",
-                    "validator_kind": validator_kind,
-                    "validator_version": validator_version,
-                }
-            relative = Path("validation") / digest / safe_name
-            host_path = Path(scratch_root) / relative
-            host_path.parent.mkdir(parents=True, exist_ok=True)
-            host_path.write_bytes(content)
-            virtual_path = f"/scratch/{relative.as_posix()}"
-            command = f"{command_prefix} {shlex.quote(virtual_path)}"
-            try:
-                result = execution_backend.execute(command, timeout=60)
-            finally:
-                shutil.rmtree(host_path.parent, ignore_errors=True)
+                execution_error = RuntimeError(
+                    "registered validation infrastructure is unavailable"
+                )
+                virtual_path = "unavailable://validation-candidate"
+                output = str(execution_error)
+                exit_code = 1
+            else:
+                relative = Path("validation") / digest / safe_name
+                host_path = Path(scratch_root) / relative
+                host_path.parent.mkdir(parents=True, exist_ok=True)
+                host_path.write_bytes(content)
+                virtual_path = f"/scratch/{relative.as_posix()}"
+                command = f"{command_prefix} {shlex.quote(virtual_path)}"
                 try:
-                    host_path.parent.parent.rmdir()
-                except OSError:
-                    pass
-            output = str(getattr(result, "output", "") or "")
-            raw_exit_code = getattr(result, "exit_code", None)
-            exit_code = int(raw_exit_code) if isinstance(raw_exit_code, int) else 1
+                    result = execution_backend.execute(command, timeout=60)
+                except Exception as exc:  # execution boundary, not artifact bytes
+                    result = None
+                    execution_error = exc
+                finally:
+                    shutil.rmtree(host_path.parent, ignore_errors=True)
+                    try:
+                        host_path.parent.parent.rmdir()
+                    except OSError:
+                        pass
+                output = (
+                    f"validation infrastructure error: {execution_error}"
+                    if execution_error is not None
+                    else str(getattr(result, "output", "") or "")
+                )
+                raw_exit_code = getattr(result, "exit_code", None)
+                if not isinstance(raw_exit_code, int):
+                    execution_error = RuntimeError(
+                        "validation backend returned no exit code"
+                    )
+                    exit_code = 1
+                else:
+                    exit_code = raw_exit_code
+        failure_class: str | None = None
+        content_observed = True
+        if exit_code != 0:
+            lowered_output = output.lower()
+            if (
+                command_prefix != "__internal_html__"
+                and (
+                    execution_error is not None
+                    or exit_code in {124, 126, 127, 137}
+                    or "timed out" in lowered_output
+                    or "infrastructure error" in lowered_output
+                    or "command not found" in lowered_output
+                    or "out of memory" in lowered_output
+                    or "killed" in lowered_output
+                )
+            ):
+                failure_class = "infrastructure_failure"
+                content_observed = False
+            elif (
+                "cannot find module" in lowered_output
+                or "module_not_found" in lowered_output
+                or "no such file" in lowered_output
+                or "enoent" in lowered_output
+            ):
+                failure_class = "invocation_failure"
+                content_observed = False
+            else:
+                failure_class = "artifact_failure"
         receipt_seed = json.dumps(
             {
                 "run_id": self.run_id,
@@ -287,6 +330,8 @@ class PermissionedCompositeBackend(CompositeBackend):
             "checks_passed": 1 if exit_code == 0 else 0,
             "checks_failed": 0 if exit_code == 0 else 1,
             "status": "passed" if exit_code == 0 else "failed",
+            "failure_class": failure_class,
+            "content_observed": content_observed,
             "blocking": True,
             "commit_authority": True,
             "obligation_key": f"{validator_kind}:{validator_version}",
@@ -385,6 +430,48 @@ class PermissionedCompositeBackend(CompositeBackend):
                 "status": "permission_required",
                 "error_code": "host_file_broker_unavailable",
                 "error": "permission_required: no active HostFileBroker Run",
+            }
+        if self._routed_virtual_path(target_path):
+            content, source_result = self.host_file_broker.load_authorized_file(
+                source_path,
+                expected_sha256=expected_source_sha256,
+            )
+            if content is None:
+                return source_result
+            try:
+                text = content.decode("utf-8")
+            except UnicodeDecodeError:
+                return {
+                    **source_result,
+                    "status": "io_error",
+                    "error_code": "workspace_copy_requires_utf8",
+                    "error": "io_error: virtual-workspace files must be UTF-8 text",
+                    "next_action": "use_a_binary_artifact_channel",
+                }
+            written = super().write(target_path, text)
+            if written.error is not None:
+                target_exists = "already exists" in written.error.lower()
+                return {
+                    **source_result,
+                    "status": "conflict" if target_exists else "io_error",
+                    "error_code": (
+                        "target_already_exists"
+                        if target_exists
+                        else "workspace_write_failed"
+                    ),
+                    "error": written.error,
+                    "next_action": (
+                        "use_patch_file"
+                        if target_exists
+                        else "report_infrastructure_error"
+                    ),
+                }
+            return {
+                **source_result,
+                "status": "completed",
+                "target_path": target_path,
+                "target_sha256": source_result["source_sha256"],
+                "authority_kind": "virtual_workspace",
             }
         return self.host_file_broker.copy(
             source_path,

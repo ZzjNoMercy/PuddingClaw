@@ -819,6 +819,103 @@ def test_same_hash_success_only_supersedes_validator_invocation_failure(
     ) == expected_kind
 
 
+def test_long_command_output_tail_classifies_missing_host_path_as_invocation_failure(
+    tmp_path,
+) -> None:
+    from graph.session_manager import session_manager
+
+    state = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    state.mkdir()
+    workspace.mkdir()
+    target = workspace / "charts.js"
+    target.write_text("const value = 1;\n", encoding="utf-8")
+    session_manager.initialize(state)
+    session_manager.create_session("long-validation-tail-session")
+    run = RunRecord(
+        run_id="run-long-tail",
+        query_id="query-long-tail",
+        session_id="long-validation-tail-session",
+        objective=f"修改 {target}",
+        status=RunStatus.PREPARING,
+        declared_artifact_targets=[str(target)],
+    )
+    session_manager.start_harness_run(
+        "long-validation-tail-session",
+        run.model_dump(mode="json"),
+    )
+    session_manager.transition_run_status(
+        "long-validation-tail-session",
+        run.run_id,
+        RunStatus.RUNNING.value,
+    )
+    write_activation = next(
+        item
+        for item in build_verification_activations(
+            run_id=run.run_id,
+            query_id=run.query_id,
+            tool_call_id="write-long-tail",
+            tool_name="write_file",
+            args={"file_path": str(target), "content": target.read_text()},
+            result=ToolMessage(
+                content=f"Wrote {target}",
+                tool_call_id="write-long-tail",
+                name="write_file",
+                status="success",
+            ),
+            session_id=run.session_id,
+            workspace_path=str(workspace),
+        )
+        if item.pack == "code"
+    )
+    session_manager.append_run_verification_activation(
+        run.session_id,
+        run.run_id,
+        write_activation.model_dump(mode="json"),
+    )
+    noisy_failure = (
+        ("grpc warning\n" * 300)
+        + f"Error: Cannot find module '{target}'\n"
+        + "code: 'MODULE_NOT_FOUND'\nExit code: 1"
+    )
+    validation_activation = next(
+        item
+        for item in build_verification_activations(
+            run_id=run.run_id,
+            query_id=run.query_id,
+            tool_call_id="validate-long-tail",
+            tool_name="execute_external_directory",
+            args={
+                "directory_path": str(workspace),
+                "command": "node --check charts.js",
+            },
+            result=ToolMessage(
+                content=noisy_failure,
+                tool_call_id="validate-long-tail",
+                name="execute_external_directory",
+                status="error",
+            ),
+            session_id=run.session_id,
+            workspace_path=str(workspace),
+        )
+        if item.pack == "code"
+    )
+    receipt = next(
+        item
+        for item in validation_activation.evidence_refs
+        if item.get("kind") == "validation_receipt"
+    )
+
+    assert receipt["failure_class"] == "invocation_failure"
+    assert receipt["content_observed"] is False
+    execution = next(
+        item
+        for item in validation_activation.evidence_refs
+        if item.get("kind") == "tool_execution"
+    )
+    assert execution["attempted_artifact_refs"][0]["path"] == str(target)
+
+
 def test_heatmap_contract_receipt_binds_both_exact_drafts_and_authorizes_commits(
     tmp_path,
 ) -> None:
@@ -1375,6 +1472,7 @@ def test_artifact_failure_cannot_be_cleared_by_same_hash_success() -> None:
         "artifact_refs": artifact_ref,
         "status": "failed",
         "failure_class": "artifact_failure",
+        "content_observed": True,
         "exit_code": 1,
         "checks_failed": 1,
         "blocking": True,

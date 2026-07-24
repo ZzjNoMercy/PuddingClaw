@@ -106,6 +106,12 @@ def _first(values: list[dict[str, Any]], *keys: str) -> str | None:
 
 def _identity(raw: dict[str, Any]) -> tuple[str, str] | None:
     kind = str(raw.get("kind") or "")
+    # Wrapper receipts may carry nested validation ids for audit convenience.
+    # The explicit kind owns the identity; incidental fields must not steal it.
+    if kind == "external_mutation_completed" and raw.get("receipt_id"):
+        return "external_mutation", str(raw["receipt_id"])
+    if kind == "validation_receipt" and raw.get("validation_receipt_id"):
+        return "validation_receipt", str(raw["validation_receipt_id"])
     if raw.get("result_id"):
         return "analytics_result", str(raw["result_id"])
     if kind == "analytics_result" and raw.get("ref"):
@@ -119,8 +125,6 @@ def _identity(raw: dict[str, Any]) -> tuple[str, str] | None:
         return "validation_receipt", str(raw["validation_receipt_id"])
     if raw.get("artifact_id"):
         return "artifact", str(raw["artifact_id"])
-    if raw.get("receipt_id") and kind == "external_mutation_completed":
-        return "external_mutation", str(raw["receipt_id"])
     if raw.get("generation_id"):
         return "sql_generation", str(raw["generation_id"])
     if raw.get("source_id"):
@@ -149,7 +153,6 @@ def _record_for_raw(
     generation_id = str(raw.get("generation_id") or _first(evidence, "generation_id") or "") or None
     sql_validation_receipt_id = str(
         raw.get("sql_validation_receipt_id")
-        or raw.get("validation_receipt_id")
         or _first(evidence, "sql_validation_receipt_id")
         or ""
     ) or None
@@ -293,6 +296,138 @@ def register_activation_evidence(
         if raw.get("material", True) is not False:
             stable[key] = record.ref.model_dump(mode="json")
     return list(stable.values())
+
+
+def repair_legacy_validation_wrapper_records(data: dict[str, Any]) -> bool:
+    """Repair receipts whose mutation wrapper stole a validation identity.
+
+    Older sessions registered ``external_mutation_completed`` before its
+    nested ``validation_receipt`` and keyed the wrapper as
+    ``validation_receipt:<id>``. Rebuild that entry from the authoritative
+    activation payload so cross-Run inheritance sees the real artifact refs.
+    """
+
+    ledger = data.get("evidence_ledger")
+    harness = data.get("harness")
+    runs = harness.get("runs") if isinstance(harness, dict) else None
+    if not isinstance(ledger, dict) or not isinstance(runs, dict):
+        return False
+    changed = False
+    for key, stored in list(ledger.items()):
+        if not (
+            key.startswith("validation_receipt:")
+            and isinstance(stored, dict)
+            and isinstance(stored.get("payload"), dict)
+            and stored["payload"].get("kind") == "external_mutation_completed"
+        ):
+            continue
+        validation_id = key.split(":", 1)[1]
+        source_run = runs.get(str(stored.get("source_run_id") or ""))
+        if not isinstance(source_run, dict):
+            continue
+        matching_activations = [
+            item
+            for item in source_run.get("verification_activations") or []
+            if isinstance(item, dict)
+            and item.get("status") == "succeeded"
+            and str(item.get("tool_call_id") or "")
+            == str(stored.get("origin_tool_call_id") or "")
+            and any(
+                isinstance(ref, dict)
+                and ref.get("kind") == "validation_receipt"
+                and str(ref.get("validation_receipt_id") or "")
+                == validation_id
+                for ref in item.get("evidence_refs") or []
+            )
+        ]
+        activation = min(
+            matching_activations,
+            key=lambda item: (
+                item.get("pack") != "code",
+                item.get("pack") != stored.get("verification_pack"),
+            ),
+            default=None,
+        )
+        if not isinstance(activation, dict):
+            continue
+        evidence = [
+            dict(item)
+            for item in activation.get("evidence_refs") or []
+            if isinstance(item, dict)
+        ]
+        nested = next(
+            (
+                item
+                for item in evidence
+                if item.get("kind") == "validation_receipt"
+                and str(item.get("validation_receipt_id") or "")
+                == validation_id
+            ),
+            None,
+        )
+        if nested is None:
+            continue
+        rebuilt = _record_for_raw(
+            raw=nested,
+            evidence=evidence,
+            run=source_run,
+            activation=activation,
+        )
+        if rebuilt is None:
+            continue
+        rebuilt.created_at = float(stored.get("created_at") or rebuilt.created_at)
+        ledger[key] = rebuilt.model_dump(mode="json")
+        mutation: EvidenceRecord | None = None
+        stored_wrapper = stored.get("payload")
+        mutation_raw = (
+            dict(stored_wrapper)
+            if isinstance(stored_wrapper, dict)
+            and stored_wrapper.get("kind") == "external_mutation_completed"
+            and str(stored_wrapper.get("validation_receipt_id") or "")
+            == validation_id
+            else next(
+                (
+                    item
+                    for item in evidence
+                    if item.get("kind") == "external_mutation_completed"
+                    and item.get("receipt_id")
+                    and str(item.get("validation_receipt_id") or "")
+                    == validation_id
+                ),
+                None,
+            )
+        )
+        if mutation_raw is not None:
+            mutation = _record_for_raw(
+                raw=mutation_raw,
+                evidence=evidence,
+                run=source_run,
+                activation=activation,
+            )
+            if mutation is not None:
+                ledger.setdefault(
+                    ref_key(mutation.ref),
+                    mutation.model_dump(mode="json"),
+                )
+        stable_refs = [
+            item
+            for item in activation.get("stable_evidence_refs") or []
+            if is_evidence_ref(item)
+        ]
+        for ref in (
+            rebuilt.ref,
+            mutation.ref if mutation is not None else None,
+        ):
+            if ref is not None:
+                stable_refs.append(ref.model_dump(mode="json"))
+        activation["stable_evidence_refs"] = list(
+            {
+                ref_key(item): EvidenceRef.model_validate(item).model_dump(mode="json")
+                for item in stable_refs
+            }.values()
+        )
+        changed = True
+    return changed
 
 
 def resolve_evidence_ref(
@@ -477,6 +612,7 @@ __all__ = [
     "EvidenceRef",
     "is_evidence_ref",
     "migrate_legacy_refs",
+    "repair_legacy_validation_wrapper_records",
     "ref_key",
     "register_activation_evidence",
     "resolve_evidence_ref",

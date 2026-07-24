@@ -114,7 +114,13 @@ def test_build_middlewares_includes_model_call_limit(tmp_path, monkeypatch):
                         "run_limit": 7,
                         "thread_limit": None,
                         "exit_behavior": "end",
-                    }
+                    },
+                    "completion": {
+                        "rubric": {
+                            "enabled": True,
+                            "max_stagnant_repairs": 4,
+                        }
+                    },
                 }
             }
         ),
@@ -125,7 +131,10 @@ def test_build_middlewares_includes_model_call_limit(tmp_path, monkeypatch):
     manager = DeepAgentsAgentManager()
     manager.initialize(tmp_path)
 
-    middlewares = manager._build_middlewares(project_id=None)
+    middlewares = manager._build_middlewares(
+        project_id=None,
+        rubric_model=SimpleNamespace(),
+    )
     limiter = next(
         item
         for item in middlewares
@@ -135,6 +144,12 @@ def test_build_middlewares_includes_model_call_limit(tmp_path, monkeypatch):
     assert limiter.run_limit == 7
     assert limiter.thread_limit is None
     assert limiter.exit_behavior == "end"
+    rubric = next(
+        item
+        for item in middlewares
+        if item.__class__.__name__ == "PuddingClawRubricMiddleware"
+    )
+    assert rubric.max_stagnant_repairs == 4
 
 
 def test_completion_gate_loops_before_rubric_grader(tmp_path):
@@ -221,7 +236,11 @@ def test_completion_gate_reads_current_run_artifact_receipt_from_session(tmp_pat
         run.run_id,
         activation.model_dump(mode="json"),
     )
-    middleware = PuddingClawRubricMiddleware(model=SimpleNamespace(), max_iterations=2)
+    middleware = PuddingClawRubricMiddleware(
+        model=SimpleNamespace(),
+        max_iterations=2,
+        max_stagnant_repairs=2,
+    )
     update = middleware._completion_gate_update(
         {
             "messages": [AIMessage(content=f"报告已生成：{artifact}")],
@@ -317,10 +336,17 @@ def test_completion_gate_stops_after_repeated_identical_gap_without_new_evidence
     second = middleware._completion_gate_update({**initial, **first}, runtime)
 
     assert second is not None
-    assert second["_completion_gate_status"] == "failed"
-    assert second["_rubric_status"] == "failed"
-    assert "jump_to" not in second
+    assert second["_completion_gate_status"] == "needs_revision"
+    assert second["jump_to"] == "model"
     assert second["_completion_gate_stagnation_count"] == 1
+
+    third = middleware._completion_gate_update({**initial, **first, **second}, runtime)
+
+    assert third is not None
+    assert third["_completion_gate_status"] == "failed"
+    assert third["_rubric_status"] == "failed"
+    assert "jump_to" not in third
+    assert third["_completion_gate_stagnation_count"] == 2
 
 
 def test_completion_gate_ignores_growing_receipt_evidence_for_stagnation(tmp_path, monkeypatch):
@@ -332,7 +358,11 @@ def test_completion_gate_ignores_growing_receipt_evidence_for_stagnation(tmp_pat
         RubricBuildContext(user_message="完成任务", force_required=True)
     )
     assert contract is not None
-    middleware = PuddingClawRubricMiddleware(model=SimpleNamespace(), max_iterations=2)
+    middleware = PuddingClawRubricMiddleware(
+        model=SimpleNamespace(),
+        max_iterations=2,
+        max_stagnant_repairs=1,
+    )
     evidence_counts = iter((1, 2))
 
     def evaluate(_contract, _state):
@@ -694,6 +724,9 @@ def test_goal_turn_recent_context_projects_interrupted_copy_without_raw_output(
         lambda _session_id: [
             {
                 "role": "assistant",
+                "content": "现在复制模板到工作区并应用所有 V3 变更。",
+                "status": "cancelled",
+                "interrupted": True,
                 "tool_calls": [
                     {
                         "id": "copy-echarts",
@@ -725,6 +758,13 @@ def test_goal_turn_recent_context_projects_interrupted_copy_without_raw_output(
             "target": "/report/echarts.min.js",
             "status": "running",
             "is_error": "false",
+        }
+    ]
+    assert context["recent_assistant_actions"] == [
+        {
+            "content": "现在复制模板到工作区并应用所有 V3 变更。",
+            "status": "cancelled",
+            "interrupted": "true",
         }
     ]
     assert "private output" not in json.dumps(context)
@@ -3408,7 +3448,13 @@ def test_unverified_goal_retry_never_publishes_terminal_segments(tmp_path, monke
                     "status": "needs_revision",
                     "will_continue": True,
                     "terminal": False,
-                    "evaluations": [],
+                    "evaluations": [
+                        {
+                            "criterion_id": "code_validation",
+                            "passed": False,
+                            "gap": "V3 JS 尚无与当前 hash 绑定的成功验证。",
+                        }
+                    ],
                 },
             )
             yield (
@@ -3465,7 +3511,8 @@ def test_unverified_goal_retry_never_publishes_terminal_segments(tmp_path, monke
     assert any(
         item.get("type") == "activity"
         and item.get("label") == "发现完成条件缺口，正在自动继续修复"
-        and item.get("detail") == "无需操作，Agent 会保留当前进度并继续处理。"
+        and item.get("detail")
+        == "待处理：代码验证：V3 JS 尚无与当前 hash 绑定的成功验证。"
         and item.get("status") == "running"
         for item in assistant["timeline"]
     )

@@ -64,7 +64,7 @@ type HarnessSection = {
 const HARNESS_SECTIONS: HarnessSection[] = [
   { id: "subagent", label: "SubAgent", description: "子代理注册与状态", icon: Bot },
   { id: "context", label: "上下文工程", description: "摘要与工具上下文压缩", icon: Brain },
-  { id: "completion", label: "Goal 与验收", description: "Run Rubric 与显式 Goal", icon: Target },
+  { id: "completion", label: "Goal 与验收", description: "Goal Run Rubric 与执行预算", icon: Target },
   { id: "sandbox", label: "终端与沙箱", description: "Docker 后端与受控降级", icon: Box },
   { id: "runtime", label: "运行保护", description: "运行保护与权限策略", icon: ShieldCheck },
 ];
@@ -264,6 +264,7 @@ export default function SettingsPage() {
   const [modelCallExitBehavior, setModelCallExitBehavior] = useState<"end" | "error">("end");
   const [rubricEnabled, setRubricEnabled] = useState(true);
   const [rubricMaxIterations, setRubricMaxIterations] = useState("2");
+  const [rubricMaxStagnantRepairs, setRubricMaxStagnantRepairs] = useState("2");
   const [customRubricRulesEnabled, setCustomRubricRulesEnabled] = useState(false);
   const [customRubricRules, setCustomRubricRules] = useState<Array<{
     id: string;
@@ -423,6 +424,7 @@ export default function SettingsPage() {
         const rubric = s.harness?.completion?.rubric;
         setRubricEnabled(rubric?.enabled ?? true);
         setRubricMaxIterations(String(rubric?.max_iterations ?? 2));
+        setRubricMaxStagnantRepairs(String(rubric?.max_stagnant_repairs ?? 2));
         setCustomRubricRulesEnabled(rubric?.custom_rules_enabled ?? false);
         setCustomRubricRules(
           Array.isArray(rubric?.custom_rules)
@@ -660,6 +662,7 @@ export default function SettingsPage() {
             rubric: {
               enabled: rubricEnabled,
               max_iterations: positiveIntOrNull(rubricMaxIterations) ?? 2,
+              max_stagnant_repairs: positiveIntOrNull(rubricMaxStagnantRepairs) ?? 2,
               custom_rules_enabled: customRubricRulesEnabled,
               custom_rules: customRubricRules.filter((rule) => rule.statement.trim()),
             },
@@ -713,7 +716,7 @@ export default function SettingsPage() {
     } finally {
       setSaving(false);
     }
-  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaQueryTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmModel, mmDimension, mmApiKey, knowledgeRootDir, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, toolContextEnabled, immediateToolCompactionEnabled, singleToolTriggerTokens, backgroundMinResultTokens, keepRecentToolResults, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, dockerEnabled, dockerOnUnavailable, dockerConnection, dockerContext, dockerUseCustomImage, dockerImage, dockerCpuLimit, dockerMemoryLimitMb, dockerPidsLimit, dockerNetworkEnabled, dockerDependencySetupEnabled, subagentItems, showToast]);
+  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaQueryTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmModel, mmDimension, mmApiKey, knowledgeRootDir, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, toolContextEnabled, immediateToolCompactionEnabled, singleToolTriggerTokens, backgroundMinResultTokens, keepRecentToolResults, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, rubricMaxStagnantRepairs, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, dockerEnabled, dockerOnUnavailable, dockerConnection, dockerContext, dockerUseCustomImage, dockerImage, dockerCpuLimit, dockerMemoryLimitMb, dockerPidsLimit, dockerNetworkEnabled, dockerDependencySetupEnabled, subagentItems, showToast]);
 
   const handleDatabaseModeChange = useCallback((mode: "bundled" | "external") => {
     setDatabaseMode(mode);
@@ -2230,22 +2233,6 @@ export default function SettingsPage() {
                         <div className="rounded-xl border border-black/[0.06] bg-white/55 px-3.5 py-3">
                           <div className="flex items-center justify-between gap-4">
                             <div>
-                              <p className="text-[13px] font-semibold text-gray-900">Run Rubric 验收</p>
-                              <p className="mt-1 text-[11px] leading-relaxed text-gray-500">
-                                Rubric 属于 Run。完成缺口会在同一 Run 内继续修正，统一由模型调用预算控制，不再按验收轮次提前结束。
-                              </p>
-                            </div>
-                            <SwitchButton
-                              checked={rubricEnabled}
-                              onChange={setRubricEnabled}
-                              ariaLabel="启用 Run Rubric"
-                            />
-                          </div>
-                        </div>
-
-                        <div className="rounded-xl border border-black/[0.06] bg-white/55 px-3.5 py-3">
-                          <div className="flex items-center justify-between gap-4">
-                            <div>
                               <p className="text-[13px] font-semibold text-gray-900">显式 Goal Mode</p>
                               <p className="mt-1 text-[11px] leading-relaxed text-gray-500">
                                 Goal 默认关闭，只有用户在输入区主动勾选才创建。系统不会因任务复杂或 Run 失败自动升级。
@@ -2271,6 +2258,38 @@ export default function SettingsPage() {
                               <p className="mt-1 text-[10px] leading-relaxed text-gray-400">
                                 当前 Goal 总预算按跨 Run 轮数控制；模型调用次数限制是单 Run
                                 的即时熔断器，不等同于 Goal token 预算。
+                              </p>
+                            </FormField>
+                          </div>
+                        </div>
+
+                        <div className="rounded-xl border border-black/[0.06] bg-white/55 px-3.5 py-3">
+                          <div className="flex items-center justify-between gap-4">
+                            <div>
+                              <p className="text-[13px] font-semibold text-gray-900">Goal Run Rubric 验收</p>
+                              <p className="mt-1 text-[11px] leading-relaxed text-gray-500">
+                                仅对显式 Goal Run 启用模型复核与同 Run 自动修复；普通对话和非 Goal Run 不进入该验收循环。
+                              </p>
+                            </div>
+                            <SwitchButton
+                              checked={rubricEnabled}
+                              onChange={setRubricEnabled}
+                              ariaLabel="启用 Goal Run Rubric"
+                            />
+                          </div>
+                          <div className="mt-4 max-w-xs">
+                            <FormField label="相同缺口最多自动修复次数">
+                              <input
+                                type="number"
+                                min={1}
+                                max={20}
+                                value={rubricMaxStagnantRepairs}
+                                onChange={(event) => setRubricMaxStagnantRepairs(event.target.value)}
+                                className="form-input"
+                                disabled={!rubricEnabled}
+                              />
+                              <p className="mt-1 text-[10px] leading-relaxed text-gray-400">
+                                同一组可修复缺口连续没有变化时，最多再尝试 N 次；达到阈值后停止，避免无效循环。控制面或验证器故障会立即停止，不消耗该次数。
                               </p>
                             </FormField>
                           </div>

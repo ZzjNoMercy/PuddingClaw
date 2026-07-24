@@ -154,6 +154,7 @@
         "enabled": true,
         "model": "deepseek-v4-pro",
         "max_iterations": 2,
+        "max_stagnant_repairs": 2,
         "custom_rules_enabled": false,
         "custom_rules": []
       }

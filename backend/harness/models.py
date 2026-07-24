@@ -448,6 +448,10 @@ class ValidationReceipt(BaseModel):
         "invocation_failure",
         "infrastructure_failure",
     ] | None = None
+    # True only when the validator is known to have consumed the exact bytes
+    # identified by artifact_refs. A path mention plus a non-zero exit code is
+    # not proof of a content failure.
+    content_observed: bool | None = None
     blocking: bool = True
     # Completion evidence and commit authority are deliberately separate.
     # A free-form command may still be useful evidence for the rubric, but it
@@ -597,6 +601,7 @@ class RunRecord(BaseModel):
     session_id: str
     objective: str
     declared_artifact_targets: list[str] = Field(default_factory=list)
+    declared_artifact_targets_version: int = Field(default=2, ge=1)
     run_kind: RunKind = RunKind.STANDALONE
     goal_id: str | None = None
     context_goal_id: str | None = None
@@ -647,6 +652,8 @@ class RunRecord(BaseModel):
         if not isinstance(value, dict):
             return value
         migrated = dict(value)
+        if "declared_artifact_targets_version" not in migrated:
+            migrated["declared_artifact_targets_version"] = 1
         if not migrated.get("run_kind"):
             migrated["run_kind"] = (
                 RunKind.GOAL_EXECUTION.value

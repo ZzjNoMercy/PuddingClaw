@@ -39,11 +39,21 @@ test("terminal verification settles every older repair spinner", () => {
 
 test("deterministic repair copy only promises continuation when event says so", () => {
   assert.deepEqual(
-    verificationFailureActivity("deterministic_checks_completed", "needs_revision", true),
+    verificationFailureActivity(
+      "deterministic_checks_completed",
+      "needs_revision",
+      true,
+      false,
+      [{
+        criterion_id: "code_validation",
+        passed: false,
+        gap: "V3 JS 尚无与当前 hash 绑定的成功验证。",
+      }],
+    ),
     {
       willContinue: true,
       label: "发现完成条件缺口，正在自动继续修复",
-      detail: "无需操作，Agent 会保留当前进度并继续处理。",
+      detail: "待处理：代码验证：V3 JS 尚无与当前 hash 绑定的成功验证。",
       displayStatus: "running",
     },
   );
