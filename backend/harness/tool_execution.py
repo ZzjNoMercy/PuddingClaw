@@ -553,7 +553,7 @@ class ShellPolicyAnalyzer:
                     and item.lower().endswith((".py", ".js", ".mjs", ".cjs", ".rb", ".pl", ".php"))
                     for item in tokens[1:]
                 )
-            ):
+            ) and not (executable == "node" and args[:1] == ["--check"]):
                 workspace_write = True
             # Project tests can receive a remote base URL. They remain useful
             # low-risk commands, but networking still needs an explicit grant.
@@ -2056,16 +2056,22 @@ class ToolExecutionPipeline(AgentMiddleware):
         if tokens:
             return cls._registered_validator_argv(tokens)
 
-        # Backward-compatible low-friction path for the common diagnostic
-        # wrapper emitted by older prompts:
+        # Low-friction path for a read-only validation plan such as:
+        #   node --check a.js && echo "a ok" && node --check b.js
+        # or the diagnostic wrapper emitted by older prompts:
         #   pwd && ls ... && node <fixed-html-validator> report.html
-        # It remains expansion-free and read-only, permits exactly one final
-        # registered validator, and rejects pipes, fallback branches, writes,
-        # substitutions, absolute escapes, and arbitrary helper commands.
+        #
+        # Every meaningful command must be a registered validator.  We allow
+        # only literal status output and narrow directory diagnostics around
+        # those validators.  Expansions, fallback branches, pipes, writes,
+        # background jobs, path escapes, and arbitrary helper commands remain
+        # outside this deterministic allow path.
         if any(
             marker in command
             for marker in ("$", "`", "\n", "\r", ">", "<", "|", ";")
         ):
+            return False
+        if "&" in command.replace("&&", ""):
             return False
         try:
             segments = ShellPolicyAnalyzer.parse_segments(command)
@@ -2084,11 +2090,15 @@ class ToolExecutionPipeline(AgentMiddleware):
             for argv in argv_segments
         ):
             return False
-        if not cls._registered_validator_argv(argv_segments[-1]):
-            return False
-        for argv in argv_segments[:-1]:
+        validator_count = 0
+        for argv in argv_segments:
+            if cls._registered_validator_argv(argv):
+                validator_count += 1
+                continue
             executable = Path(argv[0]).name.lower()
             if executable == "pwd" and len(argv) == 1:
+                continue
+            if executable == "echo":
                 continue
             if executable != "ls":
                 return False
@@ -2102,7 +2112,7 @@ class ToolExecutionPipeline(AgentMiddleware):
                     or token.startswith("/external-workspace/")
                 ):
                     return False
-        return True
+        return validator_count > 0
 
     def _session_grant_scope(
         self,

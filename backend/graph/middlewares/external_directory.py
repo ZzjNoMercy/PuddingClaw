@@ -934,10 +934,14 @@ class ExternalDirectoryMiddleware(AgentMiddleware[Any, Any, Any]):
                     "directory plan contains deletions and requires a separate "
                     "delete-capable exact-directory approval",
                 )
-            from graph.middlewares.versioned_patch import (
-                _accepted_receipts_for_target,
-                _code_like_target,
-                _persisted_validation_receipts,
+            from tools.filesystem.validation import (
+                accepted_receipts_for_target as _accepted_receipts_for_target,
+            )
+            from tools.filesystem.validation import (
+                code_like_target as _code_like_target,
+            )
+            from tools.filesystem.validation import (
+                persisted_validation_receipts as _persisted_validation_receipts,
             )
 
             selected_receipt_ids = {

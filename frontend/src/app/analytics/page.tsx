@@ -6,12 +6,15 @@ import {
   AlertCircle,
   BookOpenText,
   CheckCircle2,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   Database,
   Download,
   FileText,
   FileSpreadsheet,
+  Folder,
+  FolderOpen,
   Layers3,
   ListTodo,
   Loader2,
@@ -119,6 +122,7 @@ import {
   type VannaTrainingData,
   type VannaTrainingRecord,
 } from "@/lib/api";
+import { buildFileTree, fileDirectoryPaths, type FileTreeNode } from "@/lib/fileTree";
 import { getSettings, updateSettings } from "@/lib/settingsApi";
 import { useApp } from "@/lib/store";
 
@@ -3538,6 +3542,70 @@ function AnalyticsModelDetailModal({
   const [draftRelations, setDraftRelations] = useState<string[]>([]);
   const [draftGuardrails, setDraftGuardrails] = useState<string[]>([]);
   const [draftDefaultTemplate, setDraftDefaultTemplate] = useState("");
+  const fileTree = useMemo(() => buildFileTree(files), [files]);
+  const [collapsedDirectories, setCollapsedDirectories] = useState<Set<string>>(() => new Set());
+
+  useEffect(() => {
+    if (!selectedFile) return;
+    const directoryPaths = fileDirectoryPaths(selectedFile.relative_path || selectedFile.name);
+    if (!directoryPaths.length) return;
+    setCollapsedDirectories((current) => {
+      if (!directoryPaths.some((path) => current.has(path))) return current;
+      const next = new Set(current);
+      directoryPaths.forEach((path) => next.delete(path));
+      return next;
+    });
+  }, [selectedFile]);
+
+  const toggleDirectory = (path: string) => {
+    setCollapsedDirectories((current) => {
+      const next = new Set(current);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  };
+
+  const renderFileTreeNodes = (nodes: FileTreeNode<AnalyticsModelFile>[], depth = 0): ReactNode =>
+    nodes.map((node) => {
+      if (node.kind === "directory") {
+        const collapsed = collapsedDirectories.has(node.path);
+        return (
+          <div key={node.path}>
+            <button
+              type="button"
+              onClick={() => toggleDirectory(node.path)}
+              aria-expanded={!collapsed}
+              className="flex h-9 w-full items-center gap-1.5 rounded-xl pr-2 text-left text-xs font-semibold text-gray-600 transition hover:bg-white hover:text-gray-900"
+              style={{ paddingLeft: `${8 + depth * 18}px` }}
+            >
+              {collapsed ? <ChevronRight className="h-3.5 w-3.5 shrink-0 text-gray-400" /> : <ChevronDown className="h-3.5 w-3.5 shrink-0 text-gray-400" />}
+              {collapsed ? <Folder className="h-4 w-4 shrink-0 text-[#002fa7]/70" /> : <FolderOpen className="h-4 w-4 shrink-0 text-[#002fa7]/70" />}
+              <span className="min-w-0 truncate">{node.name}</span>
+            </button>
+            {!collapsed ? renderFileTreeNodes(node.children, depth + 1) : null}
+          </div>
+        );
+      }
+
+      const active = selectedFile?.path === node.file.path;
+      return (
+        <button
+          type="button"
+          key={node.file.path}
+          onClick={() => onSelectFile(node.file)}
+          title={node.path}
+          className={`flex h-9 w-full items-center gap-1.5 rounded-xl pr-2 text-left text-xs font-semibold transition ${
+            active ? "bg-white text-[#002fa7] shadow-sm" : "text-gray-600 hover:bg-white"
+          }`}
+          style={{ paddingLeft: `${8 + depth * 18}px` }}
+        >
+          <span aria-hidden className="h-3.5 w-3.5 shrink-0" />
+          <FileText className={`h-4 w-4 shrink-0 ${active ? "text-[#002fa7]" : "text-[#002fa7]/70"}`} />
+          <span className="min-w-0 truncate">{node.name}</span>
+        </button>
+      );
+    });
 
   useEffect(() => {
     if (!model) return;
@@ -3692,7 +3760,7 @@ function AnalyticsModelDetailModal({
               <div className="inline-flex rounded-2xl bg-gray-100 p-1">
                 {[
                   { value: "config", label: "配置编辑" },
-                  { value: "file", label: "model.md" },
+                  { value: "file", label: "模型明细" },
                 ].map((item) => (
                   <button
                     key={item.value}
@@ -3719,7 +3787,7 @@ function AnalyticsModelDetailModal({
               ) : (
                 <button
                   type="button"
-                  disabled={!selectedFile?.editable || !dirty || editorSaving}
+                  disabled={!selectedFile?.editable || !dirty || editorLoading || editorSaving}
                   onClick={() => onSave()}
                   className="inline-flex h-9 items-center gap-2 rounded-2xl bg-[#002fa7] px-3 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-45"
                 >
@@ -3834,27 +3902,13 @@ function AnalyticsModelDetailModal({
             ) : (
               <div className="grid min-h-0 flex-1 grid-cols-[260px_minmax(0,1fr)] overflow-hidden">
                 <aside className="min-h-0 border-r border-black/[0.06] bg-slate-50/70 p-4">
-                  <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-gray-900">
-                    <FileText className="h-4 w-4 text-[#002fa7]" />
-                    文件树
-                  </div>
                   <div className="max-h-[620px] space-y-1 overflow-auto">
-                    {files.map((file) => {
-                      const active = selectedFile?.path === file.path;
-                      return (
-                        <button
-                          type="button"
-                          key={file.path}
-                          onClick={() => onSelectFile(file)}
-                          className={`w-full rounded-xl px-3 py-2 text-left text-xs transition ${
-                            active ? "bg-white text-[#002fa7] shadow-sm" : "text-gray-600 hover:bg-white"
-                          }`}
-                        >
-                          <span className="block truncate font-semibold">{file.relative_path || file.name}</span>
-                          <span className="mt-0.5 block text-[11px] text-gray-400">{file.editable ? "可编辑" : "只读"}</span>
-                        </button>
-                      );
-                    })}
+                    {renderFileTreeNodes(fileTree)}
+                    {fileTree.length === 0 ? (
+                      <div className="rounded-xl border border-dashed border-black/[0.08] px-3 py-8 text-center text-xs text-gray-400">
+                        没有文件
+                      </div>
+                    ) : null}
                   </div>
                 </aside>
                 <section className="flex min-h-0 flex-col">
@@ -3862,20 +3916,22 @@ function AnalyticsModelDetailModal({
                     <p className="truncate text-sm font-semibold text-gray-900">{selectedFile?.relative_path || selectedFile?.name || "未选择文件"}</p>
                     <p className="mt-0.5 text-xs text-gray-400">手工编辑 model.md 后保存会刷新模型 registry。</p>
                   </div>
-                  {editorLoading ? (
-                    <div className="flex flex-1 items-center justify-center text-sm text-gray-400">
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                      正在读取文件…
-                    </div>
-                  ) : (
+                  <div className="relative min-h-[520px] flex-1">
                     <textarea
                       value={editorContent}
                       onChange={(event) => onChangeContent(event.target.value)}
-                      disabled={!selectedFile?.editable}
+                      disabled={!selectedFile?.editable || editorLoading}
+                      aria-busy={editorLoading}
                       spellCheck={false}
-                      className="min-h-[520px] flex-1 resize-none bg-white p-5 font-mono text-sm leading-6 text-gray-800 outline-none disabled:bg-gray-50 disabled:text-gray-400"
+                      className="absolute inset-0 h-full w-full resize-none bg-white p-5 font-mono text-sm leading-6 text-gray-800 outline-none disabled:text-gray-400"
                     />
-                  )}
+                    {editorLoading ? (
+                      <div className="absolute inset-0 flex items-center justify-center bg-white text-sm text-gray-400">
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                        正在读取文件…
+                      </div>
+                    ) : null}
+                  </div>
                 </section>
               </div>
             )}

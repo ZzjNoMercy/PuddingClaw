@@ -108,7 +108,6 @@ from graph.middlewares.toolset import (
     discover_skill_catalog,
     discover_skill_toolsets,
 )
-from graph.middlewares.versioned_patch import VersionedPatchMiddleware
 from graph.middlewares.workspace_path_router import WorkspacePathRouterMiddleware
 from graph.permission_middleware import ExternalFilePermissionMiddleware
 from graph.permission_policy import RunPermissionContext
@@ -160,6 +159,7 @@ from llm.model_client import (
 from observability import emit_harness_metric
 from projects.registry import project_registry
 from tools import get_all_tools
+from tools.filesystem.factory import VersionedPatchMiddleware
 from tools.package_install import create_install_packages_tool
 from tools.toolsets import agent_custom_tool_names, tool_control_descriptor
 
@@ -3611,8 +3611,16 @@ class DeepAgentsAgentManager:
     def _artifact_links(
         activations: list[dict[str, Any]],
         workspace_path: Path,
+        *,
+        existing_content: str = "",
     ) -> str:
-        """Render Tool-authoritative artifacts without parsing model prose."""
+        """Render only Tool-authoritative artifacts not already published.
+
+        Artifact identity is the canonical local path, not the artifact receipt
+        id or the exact Markdown produced by either the model or this renderer.
+        This keeps retries and differently formatted links from publishing the
+        same file more than once.
+        """
 
         seen: set[str] = set()
         links: list[str] = []
@@ -3622,10 +3630,6 @@ class DeepAgentsAgentManager:
             for ref in activation.get("evidence_refs") or []:
                 if not isinstance(ref, dict) or ref.get("kind") != "artifact_write":
                     continue
-                artifact_id = str(ref.get("artifact_id") or ref.get("host_path") or ref.get("path") or "")
-                if not artifact_id or artifact_id in seen:
-                    continue
-                seen.add(artifact_id)
                 host_raw = str(ref.get("host_path") or "")
                 relative = str(ref.get("workspace_relative_path") or "")
                 if host_raw:
@@ -3636,10 +3640,44 @@ class DeepAgentsAgentManager:
                     continue
                 if not local_path.exists():
                     continue
+                artifact_identity = str(local_path)
+                if artifact_identity in seen:
+                    continue
+                seen.add(artifact_identity)
                 label_path = str(ref.get("virtual_path") or ref.get("path") or local_path)
+                literal_file_uri = f"file://{artifact_identity}"
+                published_references = {
+                    local_path.as_uri(),
+                    literal_file_uri,
+                    f"]({artifact_identity})",
+                    f"](<{artifact_identity}>)",
+                }
+                if existing_content and any(
+                    candidate and candidate in existing_content
+                    for candidate in published_references
+                ):
+                    continue
                 links.append(f"- [打开 {local_path.name}]({local_path.as_uri()})  \n  `{label_path}`")
         if not links:
             return ""
+
+        # When the model already ended with an artifact list, extend that list
+        # instead of creating a second identically titled section. The links
+        # themselves remain Tool-authoritative.
+        artifact_heading = re.compile(r"(?m)^\s*(?:#{1,6}\s+)?产物\s*[：:]\s*$")
+        matches = list(artifact_heading.finditer(existing_content))
+        if matches:
+            trailing_lines = [
+                line.strip()
+                for line in existing_content[matches[-1].end():].splitlines()
+                if line.strip()
+            ]
+            if trailing_lines and all(
+                line.startswith(("- [", "- `", "`"))
+                for line in trailing_lines
+            ):
+                return "\n" + "\n".join(links)
+
         return "\n\n产物：\n" + "\n".join(links)
 
     def _build_preflight_task_profile(
@@ -6985,6 +7023,22 @@ class DeepAgentsAgentManager:
                                             },
                                         )
                                 is_error = self._is_tool_error(tool_msg, raw_output)
+                                control_plane = tool_extra.get(
+                                    "puddingclaw_control_plane"
+                                )
+                                if (
+                                    isinstance(control_plane, dict)
+                                    and control_plane.get("type")
+                                    == "skill_cache_loaded"
+                                ):
+                                    # The requested business tool did not run,
+                                    # but the control-plane recovery succeeded.
+                                    # Keep the ToolMessage error semantics for
+                                    # the model/verifier while presenting the
+                                    # internal lazy-load as a completed context
+                                    # operation instead of a user-facing tool
+                                    # failure.
+                                    is_error = False
                                 self._update_tool_end_in_timeline(active_segment, tc_id or "", raw_output, is_error)
                                 pending_tool_starts.pop(tc_id, None)
 
@@ -7432,8 +7486,12 @@ class DeepAgentsAgentManager:
                 if isinstance(persisted_run, dict) and isinstance(persisted_run.get("verification_activations"), list)
                 else []
             )
-            artifact_links = self._artifact_links(persisted_activations, workspace_path)
-            if artifact_links and artifact_links not in active_segment.get("content", ""):
+            artifact_links = self._artifact_links(
+                persisted_activations,
+                workspace_path,
+                existing_content=active_segment.get("content", ""),
+            )
+            if artifact_links:
                 active_segment["content"] += artifact_links
                 emitted_text += artifact_links
                 final_content = f"{final_content or ''}{artifact_links}"

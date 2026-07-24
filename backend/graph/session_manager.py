@@ -28,9 +28,9 @@ from harness.evidence_ledger import (
     EvidenceRef,
     is_evidence_ref,
     migrate_legacy_refs,
-    repair_legacy_validation_wrapper_records,
     ref_key,
     register_activation_evidence,
+    repair_legacy_validation_wrapper_records,
     resolve_evidence_ref,
 )
 from observability import emit_harness_metric
@@ -438,7 +438,7 @@ class SessionManager:
 
     @_session_write_locked
     def get_loaded_skill_ids(self, session_id: str) -> list[str]:
-        """Return session-scoped Skill activations, migrating legacy traces once."""
+        """Return the legacy Session Skill index, never capability authority."""
 
         data = self._read_file(session_id)
         if not data:
@@ -455,7 +455,7 @@ class SessionManager:
 
     @_session_write_locked
     def add_loaded_skill_ids(self, session_id: str, skill_ids: list[str]) -> list[str]:
-        """Persist newly loaded Skills for subsequent turns in the same session."""
+        """Persist legacy discovery metadata without activating any tools."""
 
         data = self._read_file(session_id)
         if not data:
@@ -466,6 +466,62 @@ class SessionManager:
         data["loaded_skill_ids"] = loaded
         self._write_file(session_id, data)
         return loaded
+
+    def get_skill_cache_entry(
+        self,
+        session_id: str,
+        skill_id: str,
+        *,
+        content_sha256: str | None = None,
+        policy_epoch: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Return one Session Skill cache entry when its bindings still match."""
+
+        from harness.models import SkillCacheEntry
+
+        data = self._read_file(session_id)
+        cache = data.get("skill_cache") if isinstance(data, dict) else None
+        raw = cache.get(skill_id) if isinstance(cache, dict) else None
+        if not isinstance(raw, dict):
+            return None
+        try:
+            entry = SkillCacheEntry.model_validate(raw)
+        except ValueError:
+            return None
+        if content_sha256 is not None and entry.skill_content_sha256 != content_sha256:
+            return None
+        if policy_epoch is not None and entry.policy_epoch != policy_epoch:
+            return None
+        return entry.model_dump(mode="json")
+
+    @_session_write_locked
+    def record_skill_cache_entry(
+        self,
+        session_id: str,
+        entry: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist canonical Skill instructions without granting capability."""
+
+        from harness.models import SkillCacheEntry
+
+        parsed = SkillCacheEntry.model_validate(entry)
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        cache = data.setdefault("skill_cache", {})
+        if not isinstance(cache, dict):
+            cache = {}
+            data["skill_cache"] = cache
+        cache[parsed.skill_id] = parsed.model_dump(mode="json")
+        loaded = {
+            str(item)
+            for item in data.get("loaded_skill_ids") or []
+            if str(item)
+        }
+        loaded.add(parsed.skill_id)
+        data["loaded_skill_ids"] = sorted(loaded)
+        self._write_file(session_id, data)
+        return parsed.model_dump(mode="json")
 
     def load_session(self, session_id: str) -> list[dict[str, Any]]:
         """加载指定会话的消息列表，自动合并 archive/ 中的归档消息。

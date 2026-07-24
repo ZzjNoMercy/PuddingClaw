@@ -162,7 +162,7 @@ function KnowledgeFileTree({
           ) : (
             <ChevronRight className="h-3.5 w-3.5 shrink-0 text-gray-400" />
           )}
-          <FolderOpen className="h-3.5 w-3.5 shrink-0 text-amber-500" />
+          <FolderOpen className="h-3.5 w-3.5 shrink-0 text-[#002fa7]/75" />
           <span className="min-w-0 flex-1 truncate">{node.name}</span>
         </button>
       ) : null}

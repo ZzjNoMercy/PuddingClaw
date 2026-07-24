@@ -277,7 +277,23 @@ class SkillActivation(BaseModel):
     toolsets: list[str] = Field(default_factory=list)
     unlocked_tools: list[str] = Field(default_factory=list)
     source_tool_call_id: str
+    policy_epoch: int = Field(default=1, ge=1)
     created_at: float = Field(default_factory=time.time)
+
+
+class SkillCacheEntry(BaseModel):
+    """Hash-bound Skill instructions cached inside one Session."""
+
+    skill_id: str
+    skill_content_sha256: str
+    content: str
+    toolsets: list[str] = Field(default_factory=list)
+    policy_epoch: int = Field(default=1, ge=1)
+    source_run_id: str
+    source_goal_id: str | None = None
+    source_goal_revision: int | None = None
+    created_at: float = Field(default_factory=time.time)
+    last_used_at: float = Field(default_factory=time.time)
 
 
 class SkillRecommendation(BaseModel):

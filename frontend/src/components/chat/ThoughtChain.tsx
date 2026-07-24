@@ -63,6 +63,9 @@ function getToolLabel(toolCall: ToolCall): string {
   if (tool === "task" || tool.includes("subagent")) {
     return getSubagentToolLabel(toolCall.status, Boolean(toolCall.is_error));
   }
+  if (tool === "load_skill_context") {
+    return "加载 Skill 上下文";
+  }
   try {
     const parsed = JSON.parse(input);
     if (tool === "read_file" && parsed.path) {

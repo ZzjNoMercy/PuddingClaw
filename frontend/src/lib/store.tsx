@@ -2804,6 +2804,32 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             continue;
           }
 
+          if (event.event === "skill_loading") {
+            const skillId = String(event.data.skill_id || "").trim();
+            updateSessionRunActivity(sendSessionId, {
+              phase: "running",
+              label: skillId
+                ? `正在加载 ${skillId} 能力`
+                : "正在加载所需能力",
+              detail: "复用当前 Session 中经过哈希校验的 Skill 上下文",
+            });
+            continue;
+          }
+
+          if (
+            event.event === "skill_activated"
+            && String(event.data.source || "").startsWith("session_cache")
+          ) {
+            const skillId = String(event.data.skill_id || "").trim();
+            updateSessionRunActivity(sendSessionId, {
+              phase: "running",
+              label: skillId
+                ? `${skillId} 能力已加载，Agent 正在继续`
+                : "所需能力已加载，Agent 正在继续",
+            });
+            continue;
+          }
+
           if (event.event === "task_routing_started") {
             continue;
           }
