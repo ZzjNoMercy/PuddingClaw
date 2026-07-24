@@ -80,3 +80,7 @@ backend/skills/.skills_store_lock.json
 .pytest_cache
 notebooks/.env
 notebooks/
+
+# Local-only test suite
+backend/tests/
+
