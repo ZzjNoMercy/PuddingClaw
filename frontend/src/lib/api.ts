@@ -2977,6 +2977,8 @@ export type ApprovalMode = "strict" | "smart";
 export interface CreateSessionOptions {
   analytics_model_id?: string | null;
   approval_mode?: ApprovalMode;
+  runtime_mode?: "agent" | "chat";
+  project_id?: string | null;
 }
 
 export interface PermissionModeState {
@@ -2992,6 +2994,7 @@ export async function createSession(options: CreateSessionOptions = {}): Promise
   created_at?: number;
   updated_at?: number;
   runtime_mode?: "agent" | "chat";
+  project_id?: string | null;
   analytics_model_id?: string | null;
   approval_mode: ApprovalMode;
   policy_epoch: number;

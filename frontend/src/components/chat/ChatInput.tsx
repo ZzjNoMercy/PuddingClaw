@@ -106,7 +106,6 @@ const attachmentStyles: Record<AttachmentKind, { cls: string; label: string; Ico
 };
 
 export default function ChatInput() {
-  const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<AgentAttachment[]>([]);
   const {
     sendMessage,
@@ -121,6 +120,8 @@ export default function ChatInput() {
     setContextUsage,
     pendingInput,
     setPendingInput,
+    getInputDraft,
+    setInputDraft,
     runtimeMode,
     setRuntimeMode,
     currentProjectId,
@@ -144,6 +145,9 @@ export default function ChatInput() {
     setInspectorOpen,
     setInspectorActiveTab,
   } = useApp();
+  // Initialize from the per-session draft so typed text survives page
+  // navigation (the store outlives this component; local state does not).
+  const [text, setText] = useState(() => getInputDraft(sessionId));
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
   const controlsMenuRef = useRef<HTMLDivElement>(null);
@@ -173,6 +177,24 @@ export default function ChatInput() {
   useEffect(() => {
     currentSessionIdRef.current = sessionId;
   }, [sessionId]);
+
+  // Per-session input draft: restore the target session's draft when
+  // switching sessions; otherwise persist every text change under the
+  // current session id. Cleared on send via setText("").
+  const draftSessionRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (draftSessionRef.current === sessionId) {
+      setInputDraft(sessionId, text);
+      return;
+    }
+    draftSessionRef.current = sessionId;
+    setText(getInputDraft(sessionId));
+    if (textareaRef.current) {
+      textareaRef.current.style.height = "auto";
+      textareaRef.current.style.height = `${textareaRef.current.scrollHeight}px`;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, text]);
 
   // Fetch token count on mount, when session changes, and after a streaming
   // response finishes (so newly loaded messages are reflected immediately).

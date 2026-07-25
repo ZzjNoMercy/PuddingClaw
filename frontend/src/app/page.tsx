@@ -31,6 +31,7 @@ function ChatLayout() {
     workspaceView,
     setWorkspaceView,
     trace,
+    notice,
   } = useApp();
 
   const searchParams = useSearchParams();
@@ -137,8 +138,17 @@ function ChatLayout() {
 
           <div className="flex min-h-0 flex-1 overflow-hidden">
             {/* Chat — fills remaining space */}
-            <div className="flex-1 overflow-hidden workspace-chat-shell" style={{ minWidth: MIN_CHAT }}>
+            <div className="relative flex-1 overflow-hidden workspace-chat-shell" style={{ minWidth: MIN_CHAT }}>
               {workspaceView === "trace" ? <TraceDashboard /> : <ChatPanel />}
+              {notice && (
+                // Centered within the chat interaction area itself, so it
+                // stays centered as the sidebar / inspector open or resize.
+                <div className="pointer-events-none absolute inset-x-0 top-4 z-[60] flex justify-center">
+                  <div className="rounded-full bg-slate-900/90 px-4 py-2 text-[13px] font-medium text-white shadow-lg backdrop-blur-sm animate-fade-in">
+                    {notice}
+                  </div>
+                </div>
+              )}
             </div>
 
             {visibleInspectorOpen && (

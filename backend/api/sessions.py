@@ -36,6 +36,8 @@ class SessionAnalyticsModelRequest(BaseModel):
 class SessionCreateRequest(BaseModel):
     analytics_model_id: str | None = None
     approval_mode: Literal["strict", "smart"] = "strict"
+    runtime_mode: Literal["chat", "agent"] = "chat"
+    project_id: str | None = None
 
 
 class GoalUpdateRequest(BaseModel):
@@ -63,9 +65,18 @@ async def create_session(req: SessionCreateRequest | None = None):
     session_id = f"session-{uuid.uuid4().hex[:12]}"
     payload = req or SessionCreateRequest()
     try:
+        # Stamp the caller's UI context (runtime mode / project) at creation
+        # time so the session lands in the correct sidebar grouping
+        # immediately, instead of only after the first Run flips them.
+        metadata: dict[str, Any] = {
+            "analytics_model_id": payload.analytics_model_id,
+            "runtime_mode": payload.runtime_mode,
+        }
+        if payload.project_id:
+            metadata["project_id"] = payload.project_id
         meta = session_manager.create_session(
             session_id,
-            metadata={"analytics_model_id": payload.analytics_model_id},
+            metadata=metadata,
             approval_mode=payload.approval_mode,
         )
     except ValueError as exc:

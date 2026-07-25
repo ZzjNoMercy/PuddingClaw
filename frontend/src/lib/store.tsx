@@ -354,6 +354,15 @@ interface AppState {
   pendingInput: string | null;
   setPendingInput: (text: string | null) => void;
 
+  // Per-session input drafts (survive page navigation; cleared on send)
+  getInputDraft: (sessionId: string) => string;
+  setInputDraft: (sessionId: string, draft: string) => void;
+
+  // Lightweight transient notice (toast), rendered centered in the chat
+  // interaction area so it stays correct when side panels open/resize.
+  notice: string | null;
+  showNotice: (message: string) => void;
+
   renameSession: (id: string, title: string) => Promise<void>;
   deleteSession: (id: string) => Promise<void>;
 
@@ -1065,6 +1074,29 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     percentage: 0,
   });
   const [pendingInput, setPendingInput] = useState<string | null>(null);
+  // Per-session input drafts. Keyed by session id ("default" for an unsent
+  // new chat) so typed text survives page navigation; cleared on send.
+  // Stored in a ref: drafts change on every keystroke and must not trigger
+  // provider-level re-renders.
+  const inputDraftsRef = useRef<Map<string, string>>(new Map());
+  const getInputDraft = useCallback((sid: string): string => {
+    return inputDraftsRef.current.get(sid) ?? "";
+  }, []);
+  const setInputDraft = useCallback((sid: string, draft: string) => {
+    if (draft) {
+      inputDraftsRef.current.set(sid, draft);
+    } else {
+      inputDraftsRef.current.delete(sid);
+    }
+  }, []);
+  // Transient UI notice (toast). Auto-dismisses; re-triggering resets the timer.
+  const [notice, setNotice] = useState<string | null>(null);
+  const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showNotice = useCallback((message: string) => {
+    setNotice(message);
+    if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current);
+    noticeTimerRef.current = setTimeout(() => setNotice(null), 2000);
+  }, []);
   const [maintenanceStatus, setMaintenanceStatus] =
     useState<ContextMaintenanceStatus | null>(null);
   const [runActivityStatus, setRunActivityStatus] =
@@ -1802,12 +1834,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       analyticsModelId: analyticsModelIdsMapRef.current[originSessionId] ?? null,
       approvalMode: (approvalModesMapRef.current[originSessionId] || "strict") as ApprovalMode,
       goalModeEnabled: nextRunGoalModeMapRef.current[originSessionId] ?? false,
+      runtimeMode,
+      projectId: currentProjectId,
     };
     const creation = (async (): Promise<string | null> => {
       try {
         const meta = await apiCreateSession({
           analytics_model_id: snapshot.analyticsModelId,
           approval_mode: snapshot.approvalMode,
+          runtime_mode: snapshot.runtimeMode,
+          project_id: snapshot.projectId,
         });
         analyticsModelIdsMapRef.current[meta.id] = snapshot.analyticsModelId;
         approvalModesMapRef.current[meta.id] = meta.approval_mode;
@@ -1818,7 +1854,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             id: meta.id,
             title: meta.title,
             updated_at: meta.updated_at || Date.now() / 1000,
-            runtime_mode: meta.runtime_mode || "chat",
+            runtime_mode: meta.runtime_mode || snapshot.runtimeMode,
+            project_id: meta.project_id ?? snapshot.projectId,
             analytics_model_id: snapshot.analyticsModelId,
             approval_mode: meta.approval_mode,
             policy_epoch: meta.policy_epoch,
@@ -1848,7 +1885,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     })();
     createSessionPromisesRef.current.set(originSessionId, creation);
     return creation;
-  }, [setSessionId]);
+  }, [setSessionId, runtimeMode, currentProjectId]);
 
   // ── Ensure a real session exists before sending ────────
   const ensureSession = useCallback(async () => {
@@ -3890,6 +3927,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         triggerSkillCreator,
         pendingInput,
         setPendingInput,
+        getInputDraft,
+        setInputDraft,
+        notice,
+        showNotice,
         renameSession: renameSessionFn,
         deleteSession: deleteSessionFn,
         sidebarOpen,

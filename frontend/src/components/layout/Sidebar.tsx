@@ -47,6 +47,7 @@ export default function Sidebar() {
     updateProject,
     removeProject,
     setWorkspaceView,
+    showNotice,
   } = useApp();
   const router = useRouter();
   const pathname = usePathname();
@@ -147,6 +148,13 @@ export default function Sidebar() {
         </div>
         <button
           onClick={() => {
+            // Already sitting on an unsent new chat: keep the draft and
+            // selected options intact, just show a lightweight toast.
+            if (pathname === "/" && sessionId === "default") {
+              setWorkspaceView("chat");
+              showNotice("已经在新对话中");
+              return;
+            }
             // Don't create a session eagerly; only navigate to the chat page.
             // A new session will be created lazily when the user actually sends
             // their first message (handled inside sendMessage).
