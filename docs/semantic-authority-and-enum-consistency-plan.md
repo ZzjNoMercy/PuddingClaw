@@ -117,17 +117,19 @@ action: { type: rewrite }
 
 **"规则不用人工写"的准确边界**：知识已在资产中声明的（枚举、映射、禁止模式），检查自动成立，事故后**不再人工补正则**；资产未声明的全新操作知识（如某 EAV 字段的真实物理值，在它被写进资产之前）仍走人工 guardrail——但沉淀路径反转：**事故 → 把知识写进语义资产 → 检查自动生效**，而不是"事故 → 手写一条正则规则"。
 
-### P2：Generator 规则回声（堵 question 层覆盖）
+### P2：question 渠道三层防线（堵 question 层覆盖）
 
-柴油事故的另一半：agent 在 question 文本里自写枚举。不直接校验自然语言，改为：
+柴油事故的另一半：agent 在 question 文本里自写枚举。信任模型的根本问题：**权威按域划分——物理实现归资产/数据库证据，业务口径归 question，而 question 是 agent 写的，generator 看不到用户原文**。资产"只有用户另行明确分类口径时才可纳入"的口子，让 agent 编造的枚举伪装成"用户明确口径"。因此 P2 不是单一校验，而是三层：
 
-- generate 输出增加结构化 `applied_rules`（本次生成依据的资产规则引用，如 `dimension:energy_type#classifications`);
-- validate 时校验：`applied_rules` 存在、来自真实资产、且 SQL 字面量与之一致；
-- question 文本与 SQL 不一致时**以 SQL 为准**(SQL 才是执行对象）；二者都违规才 reject。
+- **P2a 入口校验（question vs 用户原文）**：复用 `_trusted_user_scope_text` 基础设施（`_agent_added_physical_guidance` 已用它比对物理标识，但中文枚举字面量不在其模式内——柴油事故正是从这个盲区进来的）。扩展：question 中出现所选资产 `enum_universe`/`classifications` 声明的枚举字面量、而用户原文没有 → 视为 agent 私加口径，拦截。用户原文确实写明的 → 合法 override，放行（与资产"用户明确口径可纳入"一致)。
+- **P2b Generator 规则回声（applied_rules，防 generator 漂移）**：针对 question 无枚举、generator 自由发挥（ELSE 归入、自扩映射）的场景。**第一性原理：不让 LLM 自报依据（不可信），由 detector 确定性派生**——detector 检查时本来就收集了"哪些资产的哪些声明被检查、字面量集是什么"，把这个清单作为 `applied_rules` 记入 generation trace 与 Receipt，供验收与审计对账。
+- **P2c 分类下移检测（防规避校验）**：事故的第三轮形态——agent 被拦后改要原始枚举 breakdown,SQL 零字面量、零分类结构（guardrail 无从检查），分类挪到 agent 推理层（无校验区）完成。检测信号：question 点名 classifications 标签，但 SQL 既无该标签的 CASE 映射臂、治理列上也无该映射的过滤字面量 → 分类结构缺席 → conflict，要求把分类以 CASE 物化回 SQL 层（物化后 P1 自动生效）。原则：**分类映射必须发生在机器可校验的位置**。
+
+注意：P2a/P2b/P2c 均不直接"校验自然语言的正误"，而是校验**渠道一致性**（question↔用户原文）与**结构存在性**（分类是否物化），判定仍是确定性的。
 
 ### P3：分析模型验收绑定（产物层）
 
-`analytics-models/<model>/model.md` frontmatter 增加 `acceptance:` 块（详见此前讨论）：不变量类型（grain_independence/no_extrapolation/boxplot_whisker_rule 等）由通用引擎执行，模型只写 type + target 参数（每模型 3-8 条，事故驱动积累）;`RunRubricCompiler` 编译时并入基础 packs。与 P1 互补：P1 管"查询口径",P3 管"产物口径"。
+`analytics-models/<model>/model.md` frontmatter 增加 `acceptance:` 块（详见此前讨论）：不变量类型（grain_independence/no_extrapolation/boxplot_whisker_rule 等）由通用引擎执行，模型只写 type + target 参数（每模型 3-8 条，事故驱动积累）;`RunRubricCompiler` 编译时并入基础 packs。与 P1/P2 互补：P1/P2 管"查询口径",P3 管"产物口径"——agent 脑内/JS 层的分类汇总错误（柴油事故第三轮的最终形态）只有这一层能拦。
 
 ## 5. 代码改动清单
 
@@ -140,7 +142,11 @@ action: { type: rewrite }
 | 5 | `analytics/nl2sql/service.py`(:868-887) | generate 输出增加 `applied_rules` 字段；resolver 透出资产 classifications |
 | 6 | `tools/database/sql_validate_tool.py`(:72-96) | 无改动（新 detector 自动进入 repair 协议）；只需确认 conflict 消息格式兼容 |
 | 7 | `sql-guardrails/rules/semantic_enum_consistency/guardrail.md`（新） | 一条声明式规则（P1 所示） |
-| 8 | `harness/rubric_compiler.py` + `analytics-models/产品配置分析/model.md` | P3:acceptance 编译并入 packs（独立批次） |
+| 8 | `tools/database/sql_generate_tool.py` | P2a:`_agent_added_enum_caliber`——question 中出现所选资产 enum_universe/classifications 字面量但用户原文没有 → 拦截（与物理标识检查合并报错） |
+| 9 | `analytics/nl2sql/guardrails.py` | P2c:detector 内"分类下移检测"——question 点名 classifications 但 SQL 无 CASE 映射臂且无映射值过滤 → conflict;P2b:`collect_applied_semantic_rules` 确定性派生写入 `generation_trace["applied_rules"]` |
+| 10 | `harness/analytics_invariants.py`（新） | P3:acceptance.invariants 引擎（`INVARIANT_TYPES` 注册表 + `evaluate_model_invariants`)；首个不变量 `classification_mapping_declaration`（最终答复把枚举值归入未声明分类 → 违规，否定表述豁免） |
+| 11 | `harness/rubric_compiler.py` + `harness/deterministic_checks.py` | P3 接入：模型声明 invariants 时编译期追加 criterion `analytics_model_invariants`(deterministic);执行器注册分发，缺 model_id fail-closed |
+| 12 | `analytics-models/产品配置分析/model.md` | P3:frontmatter 增加 acceptance.invariants(classification_mapping_declaration → dimension:energy_type) |
 
 不变更：现有 5 个正则 detector、validate 主流程、resolver 的 generator 注入链。
 
@@ -159,4 +165,49 @@ action: { type: rewrite }
 1. **frontmatter 与正文的关系**：推荐 frontmatter 为唯一权威 + 正文由脚本生成/校验；还是暂时双写 + CI 一致性检查过渡？
 2. **sqlglot 引入**：只用于字面量提取（本方案），还是借机把 5 个正则 detector 逐步迁移（不推荐本轮做）?
 3. **业务 override 的持久度**：用户确认"含柴油"后，效力范围 = 本 run / 本 goal / 写回资产修订？本方案建议 run 级，落 goal 需另审；
-4. **P3 批次**：acceptance 与 P1 同批，还是 P1 稳定后单独批？本方案建议分开，P1 先行。
+4. ~~P3 批次~~（已落地，见下）。
+
+## 7.1 落地状态（2026-07-25)
+
+- P0 / P1:✅ 已落地（含 CASE 派生标签别名误报修复，见 8.5);
+- P2a / P2b / P2c:✅ 已落地（改动清单 #8-#9);
+- P3:✅ 最小脊柱已落地（改动清单 #10-#12)——首个不变量 `classification_mapping_declaration` 只覆盖"最终答复文本的归类声明";**数值层对账（用 generation 原始结果行回放分类聚合、与产物数值比对）是下一迭代**,当前产物数值错误仍只能靠 P1/P2 在 SQL 层拦截。
+
+## 8. 附录：`semantic_enum_consistency` 规则文件的运行机制（落地实录）
+
+为什么 `sql-guardrails/rules/semantic_enum_consistency/guardrail.md` 只有 34 行、一条正则都没有，却全局生效——它不承担知识，只做三件事：
+
+### 8.1 加载链上它实际消费的字段
+
+`detect_guardrail_conflicts`(`backend/analytics/nl2sql/guardrails.py:865-896`）对每条规则：
+
+1. `enabled: true` → 进入判定循环；
+2. `scope_matches`(`guardrails.py:531-556`）过滤 scope；
+3. `type` → 在 `DETECTORS`(`guardrails.py:859`）查到 `_detect_semantic_enum_consistency`;
+4. `type` 命中 `_SEMANTIC_TRACE_DETECTOR_TYPES` → 分发时额外传入 `semantic_trace` + `question`（其他 5 种 detector 只拿 sql + rule);
+5. detector 产出 conflict → 按 `action` 走 validate 链已有的 repair 协议（拒发 Receipt、结构化 diff、Generator 重生成，协议见 `tools/database/sql_validate_tool.py`)。
+
+### 8.2 scope 全空 = 全局，但有自门控
+
+`scope_matches` 的三个过滤器（table_scope / semantic_assets / intent_any）对空值全部跳过、直接返回 True，所以空 scope 的规则**每次都执行**。不误伤的原因是 detector 内部自门控：
+
+- 只检查本次解析到的资产中、由 `governed` 声明的受治理列（物理列 / EAV type_name);
+- 资产没声明 `classifications` 的维度只查 `enum_universe` / `forbidden_patterns`;
+- 资产未覆盖的列一律放行，返回 `None`（无 conflict)。
+
+即：**规则文件决定"这个检查存在"，资产 frontmatter 决定"检查什么"**。
+
+### 8.3 与旧规则（如 400V）的本质区别
+
+旧规则把业务知识（"物理枚举是 `400V平台`"）硬编码成 `forbid_sql_pattern` 正则，知识死在规则文件里；新规则文件是"搬运工"，知识在 `semantic-assets/dimensions/<dim>/dimension.md` 的 frontmatter(`governed` / `enum_universe` / `classifications` / `forbidden_patterns`)。演进路径随之反转：**新增治理维度只改资产 frontmatter，不再需要新建规则文件**——除非要加新的 detector 类型。
+
+### 8.4 维护注意
+
+- `version` / `updated_at` 仅作元信息，引擎不消费，演进时靠人工同步；
+- `params: {}` 当前不被该 detector 读取，判定参数全部来自资产；
+- 修改 detector 判定逻辑（`guardrails.py:_detect_semantic_enum_consistency` 与 `sql_enum_extract.py`）后，跑 `backend/tests/test_semantic_enum_guardrail.py` + 全量回归；
+- sqlglot 依赖已锁定：`pyproject.toml` 声明 `sqlglot>=30.0`,`uv.lock` 锁定 30.13.0。
+
+### 8.5 别名归因规则（2026-07-25 误报修复）
+
+提取器只把**裸列透传**别名（`SELECT energy_type AS et`）归因到治理列；CASE / 计算表达式的别名（`CASE ... END AS energy_group`）输出的是派生值（分类标签），其上的谓词不归因。事故经过：question 被 agent 塞入柴油枚举 → 首版 SQL 被拦（正确）→ 重写版按资产口径去掉柴油（正确）→ 但重写版用 `FILTER (WHERE energy_group = '传统能源')` 按标签过滤，标签经别名映射泄漏进 `column:energy_type` 字面量集，正确 SQL 被误杀。修复见 `sql_enum_extract.py:_build_alias_map`，回归测试 `test_case_label_alias_predicates_are_not_attributed_to_governed_column`（含柴油变体仍必须被拦）。

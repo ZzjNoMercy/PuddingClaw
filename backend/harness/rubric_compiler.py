@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from harness.analytics_invariants import load_model_invariants
 from harness.models import (
     CriterionSource,
     EvidenceScope,
@@ -226,6 +227,20 @@ class RunRubricCompiler:
             message=context.user_message,
             custom_rules=context.custom_rules,
         )
+        # 模型声明 acceptance.invariants 时并入验收 criteria。不加入 managed_ids，
+        # expand_for_activations 会经 custom 规则回填保留这条 criterion。
+        if context.analytics_model_id and load_model_invariants(
+            context.analytics_model_id
+        ):
+            criteria.append(
+                _criterion(
+                    "analytics_model_invariants",
+                    "分析模型声明的验收不变量（acceptance.invariants）必须全部满足。",
+                    source=CriterionSource.SYSTEM,
+                    verifier=VerifierKind.DETERMINISTIC,
+                    evidence_scope=EvidenceScope.RUN_ONLY,
+                )
+            )
         reasons = {
             pack: [
                 reason

@@ -154,6 +154,14 @@ def evaluate_deterministic_criteria(
                     final_state,
                 )
             )
+        elif criterion.id == "analytics_model_invariants":
+            evaluations.append(
+                _evaluate_analytics_model_invariants(
+                    criterion.id,
+                    harness_context,
+                    final_state,
+                )
+            )
         else:
             evaluations.append(
                 CriterionEvaluation(
@@ -168,6 +176,59 @@ def evaluate_deterministic_criteria(
                 )
             )
     return evaluations
+
+
+def _evaluate_analytics_model_invariants(
+    criterion_id: str,
+    harness_context: dict[str, Any],
+    final_state: dict[str, Any],
+) -> CriterionEvaluation:
+    from harness.analytics_invariants import evaluate_model_invariants
+
+    model_id = str(
+        final_state.get("analytics_model_id")
+        or harness_context.get("analytics_model_id")
+        or ""
+    ).strip()
+    if not model_id:
+        # 与缺证据惯例一致 fail-closed：编译期能绑定模型，执行期取不到 id 属异常。
+        return CriterionEvaluation(
+            criterion_id=criterion_id,
+            name=criterion_id,
+            passed=False,
+            verifier=VerifierKind.DETERMINISTIC,
+            evidence=[{"kind": "analytics_model_invariants", "analytics_model_id": ""}],
+            gap="契约包含分析模型验收不变量，但最终状态缺少 analytics_model_id。",
+            failure_kind=VerificationFailureKind.INFRASTRUCTURE_ERROR,
+        )
+    try:
+        violations = evaluate_model_invariants(model_id, final_state)
+    except Exception as exc:
+        return CriterionEvaluation(
+            criterion_id=criterion_id,
+            name=criterion_id,
+            passed=False,
+            verifier=VerifierKind.DETERMINISTIC,
+            evidence=[{"kind": "analytics_model_invariants", "analytics_model_id": model_id}],
+            gap=f"分析模型验收不变量执行异常：{exc}",
+            failure_kind=VerificationFailureKind.INFRASTRUCTURE_ERROR,
+        )
+    evidence = [
+        {
+            "kind": "analytics_model_invariants",
+            "analytics_model_id": model_id,
+            "violations": violations,
+        }
+    ]
+    return CriterionEvaluation(
+        criterion_id=criterion_id,
+        name=criterion_id,
+        passed=not violations,
+        verifier=VerifierKind.DETERMINISTIC,
+        evidence=evidence,
+        gap="；".join(violations[:5]) if violations else None,
+        failure_kind=VerificationFailureKind.TASK_GAP if violations else None,
+    )
 
 
 def _evaluate_todos(

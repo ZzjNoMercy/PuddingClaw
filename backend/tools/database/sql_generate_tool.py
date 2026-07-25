@@ -42,6 +42,9 @@ _PHYSICAL_IDENTIFIER_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9_]*\.[A-Za-z][A-Za-z0-9_]*(?![A-Za-z0-9_])"
     r"|(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+(?![A-Za-z0-9_])"
 )
+_ASSET_ID_REFERENCE_PATTERN = re.compile(
+    r"\b(?:dimension|measure|grain|relation):[A-Za-z0-9_\-]+"
+)
 _SQL_IMPLEMENTATION_PATTERN = re.compile(
     r"\b(?:SELECT|FROM|JOIN|WHERE|CTE|EXISTS|DISTINCT|GROUP\s+BY|"
     r"ORDER\s+BY|COUNT|FILTER|LIKE|ILIKE)\b",
@@ -149,19 +152,25 @@ def _agent_added_physical_guidance(
     if not trusted_text:
         # Non-Agent callers and older tests do not expose message provenance.
         return []
+    # Asset-id references (dimension:energy_type) are legitimate vocabulary of
+    # the semantic channel — strip them so an id containing a column-shaped
+    # name is not misread as a bare physical hint. A bare `energy_type`
+    # elsewhere in the question is still flagged. (The SQL-level guardrail
+    # remains the deterministic backstop; this check is heuristic.)
+    scanned = _ASSET_ID_REFERENCE_PATTERN.sub(" ", question)
     trusted_lower = trusted_text.lower()
     findings: list[str] = []
-    for token in _PHYSICAL_IDENTIFIER_PATTERN.findall(question):
+    for token in _PHYSICAL_IDENTIFIER_PATTERN.findall(scanned):
         if token.lower() not in trusted_lower and token not in findings:
             findings.append(token)
-    for match in _SQL_IMPLEMENTATION_PATTERN.finditer(question):
+    for match in _SQL_IMPLEMENTATION_PATTERN.finditer(scanned):
         token = " ".join(match.group(0).upper().split())
         if token.lower() not in trusted_lower and token not in findings:
             findings.append(token)
     for marker in _PHYSICAL_DIRECTIVE_MARKERS:
-        if marker in question and marker not in trusted_text and marker not in findings:
+        if marker in scanned and marker not in trusted_text and marker not in findings:
             findings.append(marker)
-    for match in _PHYSICAL_CHOICE_DIRECTIVE_PATTERN.finditer(question):
+    for match in _PHYSICAL_CHOICE_DIRECTIVE_PATTERN.finditer(scanned):
         directive = " ".join(match.group(0).split())
         if directive not in trusted_text and directive not in findings:
             findings.append(directive)
@@ -170,6 +179,54 @@ def _agent_added_physical_guidance(
         if normalized and normalized.lower() not in trusted_lower and normalized not in findings:
             findings.append(normalized)
     return findings
+
+
+def _agent_added_enum_caliber(
+    *,
+    question: str,
+    selected_asset_ids: list[str],
+    trusted_text: str,
+) -> list[str]:
+    """Enum literals the Agent added to the question beyond the user's scope.
+
+    Chinese enum values (柴油, 汽油+48V轻混系统, ...) never match the
+    physical-identifier patterns above, so caliber injection through the
+    question channel needs its own vocabulary check. The vocabulary is driven
+    by the selected assets' declarations — nothing is hardcoded per dimension.
+    Values the user actually wrote are legitimate business overrides and pass.
+    """
+
+    if not trusted_text or not selected_asset_ids:
+        return []
+    try:
+        from analytics.semantic_assets.registry import get_semantic_asset_registry
+
+        registry = get_semantic_asset_registry()
+    except Exception:
+        return []
+    vocabulary: set[str] = set()
+    for asset_id in selected_asset_ids:
+        try:
+            detail = registry.get_asset(str(asset_id))
+        except Exception:
+            continue
+        frontmatter = detail.get("frontmatter") if isinstance(detail, dict) else None
+        if not isinstance(frontmatter, dict):
+            continue
+        for value in frontmatter.get("enum_universe") or []:
+            value = str(value).strip()
+            if value:
+                vocabulary.add(value)
+        classifications = frontmatter.get("classifications")
+        if isinstance(classifications, dict):
+            for values in classifications.values():
+                for value in values or []:
+                    value = str(value).strip()
+                    if value:
+                        vocabulary.add(value)
+    return sorted(
+        term for term in vocabulary if term in question and term not in trusted_text
+    )
 
 
 def _is_prescriptive_sql_revision(instruction: str) -> bool:
@@ -389,12 +446,22 @@ class DatabaseSqlGenerateTool(BaseTool):
                 table_names=requested_table_names,
                 runtime=runtime,
             )
-            if physical_guidance:
+            enum_caliber = _agent_added_enum_caliber(
+                question=question,
+                selected_asset_ids=list(
+                    dict.fromkeys(selected_semantic_asset_ids or semantic_asset_ids or measure_ids or [])
+                ),
+                trusted_text=_trusted_user_scope_text(runtime),
+            )
+            injected = physical_guidance + [
+                term for term in enum_caliber if term not in physical_guidance
+            ]
+            if injected:
                 return (
-                    "🧮 SQL 生成失败：检测到 Agent 在业务子任务中新增了用户未指定的物理实现："
-                    + ", ".join(physical_guidance[:12])
+                    "🧮 SQL 生成失败：检测到 Agent 在业务子任务中新增了用户未指定的物理实现或口径枚举："
+                    + ", ".join(injected[:12])
                     + "。Goal 模式允许拆解指标、维度、粒度、筛选和时间范围，但表、字段、"
-                    "EAV 配置项/枚举、实体映射及 SQL 写法必须由 SQL 生成器根据数据库证据决定。"
+                    "EAV 配置项/枚举、实体映射及 SQL 写法必须由 SQL 生成器根据数据库证据与语义资产决定。"
                     "请删除这些实现提示，仅保留业务问题后重新调用。"
                 )
         elif revision_instruction and _is_prescriptive_sql_revision(revision_instruction):

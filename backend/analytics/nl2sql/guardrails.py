@@ -283,6 +283,8 @@ def _route_table_names(route: Any) -> set[str]:
 
 def semantic_asset_ids(semantic_trace: dict[str, Any]) -> set[str]:
     ids: set[str] = set()
+    if not isinstance(semantic_trace, dict):
+        return ids
     for key in ("matched", "references"):
         items = semantic_trace.get(key)
         if not isinstance(items, list):
@@ -658,13 +660,270 @@ def _detect_forbid_exists_distinct_pattern(sql: str, rule: GuardrailRule) -> Gua
     return _conflict(rule, "SQL 命中 EXISTS + DISTINCT 慢查询模式。")
 
 
+def _governed_surface(frontmatter: dict[str, Any]) -> tuple[set[str], set[str]]:
+    """Return (columns, eav_type_names) declared by one semantic asset."""
+
+    governed = frontmatter.get("governed") if isinstance(frontmatter.get("governed"), dict) else {}
+    columns = {str(item).strip().lower() for item in governed.get("columns") or [] if str(item).strip()}
+    eav_names = {str(item).strip() for item in governed.get("eav_type_names") or [] if str(item).strip()}
+    if columns or eav_names:
+        return columns, eav_names
+    # Derive from resolution.bindings when no explicit governed block exists.
+    resolution = frontmatter.get("resolution") if isinstance(frontmatter.get("resolution"), dict) else {}
+    for binding in resolution.get("bindings") or []:
+        fields = binding.get("fields") if isinstance(binding, dict) else None
+        value = str((fields or {}).get("value") or "").strip()
+        if value:
+            columns.add(value.lower())
+    return columns, eav_names
+
+
+def _declaration_bearing_assets(semantic_trace: dict[str, Any], sql: str) -> list[dict[str, Any]]:
+    """Assets whose frontmatter declares enum rules and that apply to this SQL.
+
+    Primary set: assets resolved for the current generation. Fallback (when the
+    outer agent forgot to select the asset): declaration-bearing assets whose
+    governed column or EAV type_name literally appears in the SQL. Both sets
+    are driven by the assets themselves; nothing is hardcoded per dimension.
+    """
+
+    from analytics.semantic_assets.registry import get_semantic_asset_registry
+
+    registry = get_semantic_asset_registry()
+    snapshot = registry.list_assets()
+    declared: list[dict[str, Any]] = []
+    for item in snapshot.get("assets") or []:
+        asset_id = str(item.get("id") or "")
+        if not asset_id:
+            continue
+        try:
+            detail = registry.get_asset(asset_id)
+        except Exception:
+            continue
+        frontmatter = detail.get("frontmatter") if isinstance(detail, dict) else None
+        if not isinstance(frontmatter, dict):
+            continue
+        if not (
+            frontmatter.get("enum_universe")
+            or frontmatter.get("classifications")
+            or frontmatter.get("forbidden_patterns")
+        ):
+            continue
+        detail["_frontmatter"] = frontmatter
+        declared.append(detail)
+
+    resolved_ids = semantic_asset_ids(semantic_trace)
+    if resolved_ids:
+        chosen = [asset for asset in declared if str(asset.get("id") or "") in resolved_ids]
+        if chosen:
+            return chosen
+    lowered = sql.lower()
+    fallback: list[dict[str, Any]] = []
+    for asset in declared:
+        columns, eav_names = _governed_surface(asset["_frontmatter"])
+        if any(column in lowered for column in columns) or any(
+            f"'{name.lower()}'" in lowered for name in eav_names
+        ):
+            fallback.append(asset)
+    return fallback
+
+
+def _detect_semantic_enum_consistency(
+    sql: str,
+    rule: GuardrailRule,
+    *,
+    semantic_trace: dict[str, Any] | None = None,
+    question: str = "",
+) -> GuardrailConflict | None:
+    import re as _re
+
+    from analytics.nl2sql.sql_enum_extract import extract_enum_usage
+
+    issues: list[str] = []
+    for asset in _declaration_bearing_assets(semantic_trace or {}, sql):
+        frontmatter = asset["_frontmatter"]
+        asset_id = str(asset.get("id") or "semantic_asset")
+        universe = {str(item) for item in frontmatter.get("enum_universe") or []}
+        classifications_raw = frontmatter.get("classifications") or {}
+        classifications = {
+            str(label).strip(): {str(item) for item in values}
+            for label, values in classifications_raw.items()
+            if isinstance(values, list)
+        }
+        forbidden = frontmatter.get("forbidden_patterns") or []
+        columns, eav_names = _governed_surface(frontmatter)
+        if not (columns or eav_names):
+            continue
+        try:
+            usage = extract_enum_usage(sql, columns, eav_names)
+        except Exception:
+            # Unparseable SQL must not fail closed here; the read-only safety
+            # check upstream remains authoritative for syntax-level problems.
+            continue
+
+        all_literals: set[str] = set()
+        for literals in usage.column_literals.values():
+            all_literals.update(literals)
+
+        if universe:
+            for key, literals in sorted(usage.column_literals.items()):
+                unknown = sorted(literals - universe)
+                if unknown:
+                    issues.append(
+                        f"[{asset_id}] {key} 出现未登记取值：{'、'.join(unknown)}"
+                        f"（enum_universe 共 {len(universe)} 个合法值）"
+                    )
+        for case_label in usage.case_labels:
+            label = case_label.label.strip()
+            expected_set = classifications.get(label)
+            if not expected_set:
+                continue
+            if case_label.is_else:
+                if case_label.governed:
+                    issues.append(
+                        f"[{asset_id}] 分类「{label}」由 ELSE 归入，"
+                        "未映射取值会被一并并入；必须显式枚举"
+                    )
+                continue
+            # Narrowing to a subset of the declared mapping is a legitimate
+            # filter, not an override; only added values are violations.
+            # Labels whose condition never touched a governed column
+            # (e.g. serial_name) are not judged against this asset.
+            if not case_label.governed:
+                continue
+            extras = sorted(case_label.literals - expected_set)
+            if extras:
+                issues.append(
+                    f"[{asset_id}] 分类「{label}」多出的取值：{'、'.join(extras)}"
+                    f"（声明映射 {len(expected_set)} 个值）"
+                )
+        # The question text is the agent's declared intent: literals on this
+        # asset's governed columns must stay inside the union of the mappings
+        # for every classification the question names (a comparison query
+        # naming both 传统能源 and 新能源 allows their union). This closes the
+        # plain-WHERE bypass that skips CASE labels entirely.
+        named_mappings = [
+            (label, expected_set)
+            for label, expected_set in classifications.items()
+            if label in question
+        ]
+        if named_mappings:
+            allowed: set[str] = set()
+            for _label, expected_set in named_mappings:
+                allowed.update(expected_set)
+            extras = sorted(all_literals - allowed)
+            if extras:
+                labels_text = "、".join(label for label, _ in named_mappings)
+                issues.append(
+                    f"[{asset_id}] 问题指定「{labels_text}」，但 SQL 使用了映射外取值："
+                    f"{'、'.join(extras)}（声明映射共 {len(allowed)} 个值）"
+                )
+            # A question naming classifications must materialize the mapping
+            # inside the SQL (a governed CASE arm, or a filter over mapped
+            # values). Otherwise the classification happens in the agent's
+            # unchecked reasoning layer — the 2026-07-25 dodge: ask for a raw
+            # enum breakdown, then map labels mentally (diesel came back).
+            named_labels = {label for label, _ in named_mappings}
+            materialized = any(
+                case_label.governed and case_label.label.strip() in named_labels
+                for case_label in usage.case_labels
+            ) or any(literal in allowed for literal in all_literals)
+            if not materialized:
+                labels_text = "、".join(label for label, _ in named_mappings)
+                issues.append(
+                    f"[{asset_id}] 问题指定「{labels_text}」，但 SQL 未物化任何分类结构"
+                    "（CASE 映射或映射值过滤）；分类口径将落入无校验层，"
+                    "必须以 CASE 显式物化，或从问题中移除分类表述"
+                )
+        for item in forbidden:
+            if not isinstance(item, dict):
+                continue
+            pattern = str(item.get("pattern") or "")
+            if not pattern:
+                continue
+            # Match declared patterns only against LIKE clauses on governed
+            # columns — never against raw SQL text (car_name LIKE '%纯电%'
+            # is legitimate).
+            try:
+                matched = any(
+                    _re.search(pattern, f"LIKE '{like}'", _re.IGNORECASE)
+                    for like in usage.like_patterns
+                )
+            except _re.error:
+                # A broken pattern in an asset must not fail validation of
+                # unrelated SQL.
+                continue
+            if matched:
+                issues.append(f"[{asset_id}] 命中禁止模式：{item.get('message') or pattern}")
+
+    if not issues:
+        return None
+    return GuardrailConflict(
+        rule_id=rule.id,
+        rule_name=rule.name,
+        rule_type=rule.type,
+        action=rule.action.type,
+        message="；".join(issues),
+    )
+
+
+def collect_applied_semantic_rules(
+    sql: str,
+    semantic_trace: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Deterministically derive which asset declarations governed this SQL.
+
+    P2b: the generator never self-reports its basis (an LLM confession is not
+    trustworthy); the same declarations the detector enforces are re-derived
+    here and recorded into the generation trace for audit and acceptance
+    reconciliation.
+    """
+
+    from analytics.nl2sql.sql_enum_extract import extract_enum_usage
+
+    applied: list[dict[str, Any]] = []
+    for asset in _declaration_bearing_assets(semantic_trace or {}, sql):
+        frontmatter = asset["_frontmatter"]
+        columns, eav_names = _governed_surface(frontmatter)
+        if not (columns or eav_names):
+            continue
+        declarations = [
+            name
+            for name in ("classifications", "enum_universe", "forbidden_patterns")
+            if frontmatter.get(name)
+        ]
+        try:
+            usage = extract_enum_usage(sql, columns, eav_names)
+        except Exception:
+            continue
+        literals: set[str] = set()
+        for values in usage.column_literals.values():
+            literals.update(values)
+        applied.append(
+            {
+                "asset_id": str(asset.get("id") or "semantic_asset"),
+                "declarations": declarations,
+                "governed_columns": sorted(columns),
+                "governed_eav_type_names": sorted(eav_names),
+                "literals": sorted(literals),
+                "case_labels": [
+                    item.label for item in usage.case_labels if item.governed
+                ],
+            }
+        )
+    return applied
+
+
 DETECTORS = {
     "forbid_sql_pattern": _detect_forbid_sql_pattern,
     "require_sql_contains": _detect_require_sql_contains,
     "require_table_when_available": _detect_require_table_when_available,
     "require_group_by": _detect_require_group_by,
     "forbid_exists_distinct_pattern": _detect_forbid_exists_distinct_pattern,
+    "semantic_enum_consistency": _detect_semantic_enum_consistency,
 }
+
+_SEMANTIC_TRACE_DETECTOR_TYPES = {"semantic_enum_consistency"}
 
 
 def detect_guardrail_conflicts(
@@ -692,7 +951,10 @@ def detect_guardrail_conflicts(
         detector = DETECTORS.get(rule.type)
         if detector is None:
             continue
-        conflict = detector(sql, rule)
+        if rule.type in _SEMANTIC_TRACE_DETECTOR_TYPES:
+            conflict = detector(sql, rule, semantic_trace=semantic_trace, question=question)
+        else:
+            conflict = detector(sql, rule)
         if conflict is not None:
             conflicts.append(conflict)
     return conflicts

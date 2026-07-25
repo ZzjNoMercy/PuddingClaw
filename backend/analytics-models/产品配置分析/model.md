@@ -16,8 +16,12 @@ asset_relations: ["relation:车系配置关联","relation:1111"]
 guardrails: ["air_suspension_reference_type_value","config_rate_model_key_group","config_rate_no_exists_distinct","config_rate_use_model_base_denominator","launch_time_no_car_name_year","postgres_count_distinct_nullable_tuple_after_left_join"]
 templates: {}
 default_template: "product_config_report_html"
+acceptance:
+  invariants:
+  - type: classification_mapping_declaration
+    target: dimension:energy_type
 created: "2026-07-13 06:25:03"
-updated_at: "2026-07-14 00:00:00"
+updated_at: "2026-07-25 00:00:00"
 ---
 
 

@@ -14,7 +14,7 @@ tags:
 - vehicle_params
 - vehicle_model_base
 - 能源
-version: 0.2.0
+version: 0.3.0
 resolution_mode: source_field
 resolution:
   mode: source_field
@@ -23,8 +23,42 @@ resolution:
     display_name: insight_data · vehicle_model_base
     fields:
       value: energy_type
+governed:
+  columns:
+  - energy_type
+  eav_type_names:
+  - 能源类型
+enum_universe:
+- 纯电
+- 插电混合
+- 增程式纯电动
+- 油电混合
+- 汽油
+- 汽油电驱
+- 汽油+48V轻混系统
+- 汽油+24V轻混系统
+- 汽油+天然气
+- 柴油
+- 柴油+48V轻混系统
+- 氢燃料
+- 天然气
+classifications:
+  传统能源:
+  - 汽油
+  - 汽油+48V轻混系统
+  - 油电混合
+  - 汽油电驱
+  - 汽油+24V轻混系统
+  新能源:
+  - 纯电
+  - 插电混合
+  - 增程式纯电动
+forbidden_patterns:
+- id: no_fuzzy_like_pure_ev
+  pattern: LIKE\s*'%纯电%'
+  message: 模糊 LIKE 会误匹配增程式纯电动，必须精确匹配 energy_type = '纯电'
 created: 2026-07-08 00:00:00
-updated_at: '2026-07-13 00:00:00'
+updated_at: '2026-07-24 00:00:00'
 ---
 
 # 能源类型
@@ -58,6 +92,8 @@ updated_at: '2026-07-13 00:00:00'
 | `天然气` | 天然气车 |
 
 ## 传统能源与新能源分类
+
+> 以下映射的权威来源是本文件 frontmatter 的 `classifications` 字段；本表由该字段维护，禁止只改正文不改 frontmatter。
 
 当用户按“传统能源”和“新能源”查询、筛选、分组或对比时，必须严格使用以下业务映射，不得根据车型名称或通用行业认知自行扩展：
 

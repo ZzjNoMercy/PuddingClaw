@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from analytics.models.registry import get_analytics_model_registry
 from analytics.nl2sql.guardrails import (
     GuardrailConflict,
+    collect_applied_semantic_rules,
     conflicts_to_messages,
     detect_guardrail_conflicts,
 )
@@ -844,6 +845,7 @@ async def _generate_grounded_sql(
         guardrail_note = f"{guardrail_note}；{repair_note}" if guardrail_note else repair_note
 
     generation_trace["final_sql"] = sql
+    generation_trace["applied_rules"] = collect_applied_semantic_rules(sql, semantic_trace)
     return sql, references, guardrail_note, generation_trace
 
 
