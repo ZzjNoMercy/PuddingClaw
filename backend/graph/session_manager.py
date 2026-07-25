@@ -906,8 +906,15 @@ class SessionManager:
         session_id: str,
         query_id: str,
         notice: dict[str, Any],
+        *,
+        clear_verification_summary: bool = False,
     ) -> None:
-        """Persist a user-facing Run boundary without rewriting message content."""
+        """Persist a user-facing Run boundary without rewriting message content.
+
+        When the Goal flow auto-continues, the boundary notice is the single
+        call to action: any terminal verification guidance on the same
+        message would contradict it, so callers may clear it here.
+        """
 
         data = self._read_file(session_id)
         if not data:
@@ -924,6 +931,8 @@ class SessionManager:
                     and message.get("query_id") == query_id
                 ):
                     message["run_boundary_notice"] = dict(notice)
+                    if clear_verification_summary:
+                        message.pop("verification_summary", None)
                     updated = True
                     break
         if not updated:

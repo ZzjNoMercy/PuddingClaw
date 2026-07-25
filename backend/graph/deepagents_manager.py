@@ -283,19 +283,53 @@ def _user_facing_verification_summary(detail: str) -> str:
     cleaned = sanitize_citation_markdown(detail).strip()
     if not cleaned:
         return ""
-    internal_terms = re.compile(
-        r"SKILL\.md|ToolMessage|\bexecute\b|\bTodo\b|reconciliation|source_id|"
-        r"criterion|grader|\bRun\b|Harness|required",
-        re.IGNORECASE,
-    )
     parts = [
         part.strip().lstrip("-*• ")
         for part in re.split(r"(?<=[。！？!?；;])\s*|[\r\n]+", cleaned)
         if part.strip()
     ]
-    selected = [part for part in parts if not internal_terms.search(part)][:2]
+    selected = [part for part in parts if not _INTERNAL_TERMS_RE.search(part)][:2]
     if not selected:
         return "已核对最终交付及其关键证据，任务结果满足本次要求。"
+    summary = "".join(selected)
+    if len(summary) <= 240:
+        return summary
+    clipped = summary[:240]
+    boundary = max(clipped.rfind(mark) for mark in "。！？；;")
+    return clipped[: boundary + 1] if boundary >= 80 else clipped.rstrip() + "…"
+
+
+_INTERNAL_TERMS_RE = re.compile(
+    r"SKILL\.md|ToolMessage|\bexecute\b|\bTodo\b|reconciliation|source_id|"
+    r"criterion|grader|\bRun\b|Harness|required",
+    re.IGNORECASE,
+)
+
+_FAILURE_EXPLANATION_PREFIXES = (
+    "验收基础设施异常：",
+    "确定性检查失败：",
+    "验收未通过：",
+)
+
+
+def _user_facing_failure_detail(explanation: str) -> str:
+    """Reduce a verification failure explanation to plain, safe sentences."""
+
+    cleaned = sanitize_citation_markdown(str(explanation or "")).strip()
+    for prefix in _FAILURE_EXPLANATION_PREFIXES:
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix):]
+            break
+    if not cleaned:
+        return ""
+    parts = [
+        part.strip().lstrip("-*• ")
+        for part in re.split(r"(?<=[。！？!?；;])\s*|[\r\n]+", cleaned)
+        if part.strip()
+    ]
+    selected = [part for part in parts if not _INTERNAL_TERMS_RE.search(part)][:2]
+    if not selected:
+        return ""
     summary = "".join(selected)
     if len(summary) <= 240:
         return summary
@@ -309,18 +343,28 @@ def _terminal_verification_guidance(
     *,
     has_goal: bool,
     goal_status: GoalStatus | None,
+    explanation: str = "",
 ) -> str:
-    """Give a rejected Run an actionable, non-technical user-visible ending."""
+    """Give a rejected Run an actionable, plain-language user-visible ending."""
 
+    detail = _user_facing_failure_detail(explanation)
+    detail_block = f"{detail}\n\n" if detail else ""
+    if status == VerificationStatus.INFRASTRUCTURE_ERROR:
+        return (
+            "**验证工具发生故障，本次验收未能完成。**\n\n"
+            + detail_block
+            + "这不是产物不达标；如果同一错误重复出现，重试不会改变结果，"
+            "请先修复验证工具。技术明细见右侧“验收”。"
+        )
     if status in {
         VerificationStatus.INCOMPLETE,
         VerificationStatus.GRADER_ERROR,
-        VerificationStatus.INFRASTRUCTURE_ERROR,
     }:
         return (
-            "**验收流程遇到异常，任务结果尚未被判定失败。**\n\n"
-            "当前进度和证据已保留。请发送 **“重试验收”**；"
-            "如果再次出现，可在右侧“验收”中查看技术明细。"
+            "**验收执行异常，未能形成验收结论。**\n\n"
+            + detail_block
+            + "当前进度和证据已保留，可发送 **“重试验收”** 再试一次；"
+            "如果重复出现，可在右侧“验收”中查看技术明细。"
         )
     if (
         status == VerificationStatus.BUDGET_EXCEEDED
@@ -5705,6 +5749,10 @@ class DeepAgentsAgentManager:
                         session_id,
                         previous_query_id,
                         boundary_notice,
+                        # Auto-continuation is already the single call to
+                        # action on this message; drop any terminal
+                        # verification guidance that would contradict it.
+                        clear_verification_summary=continuation_reason is not None,
                     )
                 except (FileNotFoundError, ValueError):
                     logger.warning(
@@ -7795,6 +7843,7 @@ class DeepAgentsAgentManager:
                     verification_report.status,
                     has_goal=goal_record is not None,
                     goal_status=(goal_record.status if goal_record is not None else None),
+                    explanation=str(verification_report.explanation or ""),
                 )
                 if not completion_accepted
                 else ""

@@ -701,14 +701,23 @@ class ShellPolicyAnalyzer:
                         continue
                 # shlex places a heredoc program body in the command token
                 # stream. JSON/Python/JS list literals therefore contain `[`;
-                # that is source code, not shell pathname expansion. Keep the
-                # critical check for real wildcard/path-like tokens and for
-                # attempts to obfuscate the private Harness scratch mount.
+                # that is source code, not shell pathname expansion. Inline
+                # interpreter source (-c/-e/--eval/heredoc) never passes
+                # through shell globbing, so wildcard-looking characters
+                # there are arithmetic or code, not path expansion. The
+                # scratch-mount substring stays critical in every mode:
+                # interpreters have their own glob APIs and can enumerate
+                # /harness-scratch without the shell's help.
                 expansion_syntax = (
-                    "*" in raw
-                    or "?" in raw
-                    or "harness-scrat" in raw
-                    or ("[" in raw and not inline_program)
+                    "harness-scrat" in raw
+                    or (
+                        not inline_program
+                        and (
+                            "*" in raw
+                            or "?" in raw
+                            or "[" in raw
+                        )
+                    )
                 )
                 if (
                     self.backend_mode == "docker"

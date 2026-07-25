@@ -721,7 +721,25 @@ class PermissionedCompositeBackend(CompositeBackend):
     ) -> dict[str, Any]:
         """Validate HTML proportionally; start Chromium only when contracted."""
 
-        requested = Path(html_file_path).expanduser()
+        # Accept the same ``/workspace/`` virtual prefix every other fs tool
+        # accepts; previously the literal string hit host ``open()`` and every
+        # call failed with ENOENT, which agents then retried unchanged.
+        original_path = str(html_file_path or "").strip()
+        resolved_input = original_path
+        if original_path == "/workspace" or original_path.startswith("/workspace/"):
+            if self.workspace_root is None:
+                return {
+                    "status": "invocation_error",
+                    "error_code": "html_report_not_found",
+                    "failure_class": "invocation_failure",
+                    "error": (
+                        f"收到虚拟路径 {original_path}，但当前 Run 未绑定 workspace；"
+                        "请改用宿主机绝对路径。"
+                    ),
+                }
+            relative = original_path.removeprefix("/workspace/").strip("/")
+            resolved_input = str(self.workspace_root / relative) if relative else str(self.workspace_root)
+        requested = Path(resolved_input).expanduser()
         if not requested.is_absolute() or requested.suffix.lower() not in {
             ".html",
             ".htm",
@@ -730,17 +748,35 @@ class PermissionedCompositeBackend(CompositeBackend):
                 "status": "invocation_error",
                 "error_code": "invalid_html_report_path",
                 "failure_class": "invocation_failure",
-                "error": "html_file_path must be an absolute .html/.htm file",
+                "error": (
+                    f"html_file_path 必须是 .html/.htm 文件：收到 {original_path}；"
+                    "支持 /workspace/... 虚拟路径或宿主机绝对路径。"
+                ),
             }
         try:
             canonical = requested.resolve(strict=True)
-        except OSError as exc:
+        except OSError:
             return {
                 "status": "invocation_error",
                 "error_code": "html_report_not_found",
                 "failure_class": "invocation_failure",
-                "error": str(exc),
+                "error": (
+                    f"文件不存在：{original_path}（已解析为 {requested}）。"
+                    "请先确认产物已写入该路径，再发起验证。"
+                ),
             }
+        if original_path.startswith("/workspace") and self.workspace_root is not None:
+            try:
+                canonical.relative_to(self.workspace_root)
+            except ValueError:
+                return {
+                    "status": "invocation_error",
+                    "error_code": "html_report_not_found",
+                    "failure_class": "invocation_failure",
+                    "error": (
+                        f"虚拟路径越出 workspace：{original_path}（解析为 {canonical}）。"
+                    ),
+                }
         if not canonical.is_file():
             return {
                 "status": "invocation_error",

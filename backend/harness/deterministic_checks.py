@@ -1335,6 +1335,21 @@ def _evaluate_code_validation(
             str(item.get("failure_class") or "") == "infrastructure_failure"
             for item in unsuperseded_control_failures
         )
+        # The same validator failing the same way twice is a deterministic
+        # tool fault, not a transient error: retrying the acceptance flow
+        # cannot change the outcome, so say so instead of asking for one.
+        repeated_invocations: dict[str, int] = {}
+        for item in unsuperseded_control_failures:
+            if str(item.get("failure_class") or "") != "invocation_failure":
+                continue
+            key = str(item.get("validator_kind") or "")
+            repeated_invocations[key] = repeated_invocations.get(key, 0) + 1
+        repeated_kind, repeated_count = ("", 0)
+        if repeated_invocations:
+            repeated_kind, repeated_count = max(
+                repeated_invocations.items(), key=lambda entry: entry[1]
+            )
+        tool_fault = repeated_count >= 2 and bool(repeated_kind)
         return CriterionEvaluation(
             criterion_id=criterion_id,
             name=criterion_id,
@@ -1342,14 +1357,17 @@ def _evaluate_code_validation(
             verifier=VerifierKind.DETERMINISTIC,
             evidence=[*acceptance_writes, *unsuperseded_control_failures],
             gap=(
-                "验收基础设施执行失败；业务产物不应被要求修改。"
+                f"验证工具 {repeated_kind} 连续 {repeated_count} 次以相同方式调用失败；"
+                "判定为验证工具故障而非产物问题，重试不会改变结果，请先修复验证调用。"
+                if tool_fault
+                else "验收基础设施执行失败；业务产物不应被要求修改。"
                 if has_infrastructure_failure
                 else "验收调用参数、路径映射或内容读取证明无效；"
                 "请修复验证调用，不要修改业务产物。"
             ),
             failure_kind=(
                 VerificationFailureKind.INFRASTRUCTURE_ERROR
-                if has_infrastructure_failure
+                if has_infrastructure_failure or tool_fault
                 else VerificationFailureKind.VALIDATOR_PROTOCOL_ERROR
             ),
         )
