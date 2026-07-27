@@ -53,6 +53,7 @@ import {
   getTableAssetProfileJob,
   deleteKnowledgeDatabaseSourceVannaEntity,
   deleteKnowledgeDatabaseSourceVannaTraining,
+  analyticsProjectExportDownloadUrl,
   importAnalyticsModels,
   importKnowledgeDatabaseSourceVannaEntities,
   importSemanticAssets,
@@ -70,6 +71,7 @@ import {
   listSqlGuardrailTypes,
   listTableAssets,
   listTaskCenter,
+  planAnalyticsProjectExport,
   readFile,
   refreshAnalyticsModels,
   refreshConcatDataset,
@@ -94,6 +96,8 @@ import {
   type AnalyticsModelDetail,
   type AnalyticsModelFile,
   type AnalyticsModelSummary,
+  type AnalyticsProjectDataFileMode,
+  type AnalyticsProjectExportPlan,
   type AssetRelationDefinition,
   type ConcatDatasetPreview,
   type DatabaseQueryResultPage,
@@ -3429,19 +3433,10 @@ function AnalyticsModelImportModal({
   );
 }
 
-function yamlScalar(value: unknown): string {
-  if (value === null || value === undefined || value === "") return "null";
-  return JSON.stringify(String(value));
-}
-
-function yamlArray(values: string[]): string {
-  return JSON.stringify(values);
-}
-
 function analyticsModelBodyFromContent(content: string, fallback = ""): string {
   if (!content.startsWith("---")) return content || fallback;
-  const parts = content.split("---", 3);
-  return parts.length >= 3 ? parts[2].replace(/^\n/, "") : fallback;
+  const match = content.match(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/);
+  return match ? content.slice(match[0].length).replace(/^\r?\n/, "") : fallback;
 }
 
 function localTimestamp(): string {
@@ -3471,28 +3466,36 @@ function buildAnalyticsModelContent(
   const id = String(frontmatter.id || model.id);
   const created = String(frontmatter.created || localTimestamp());
   const body = analyticsModelBodyFromContent(currentContent, model.body || "");
-  const yaml = [
-    "formatter: analytics-model",
-    `id: ${yamlScalar(id)}`,
-    `name: ${yamlScalar(draft.name || model.name)}`,
-    "type: analysis_model",
-    `version: ${yamlScalar(draft.version || "0.1.0")}`,
-    `description: ${yamlScalar(draft.description)}`,
-    `tags: ${yamlArray(draft.tags)}`,
-    "data_assets:",
-    `  tables: ${yamlArray(draft.tables)}`,
-    "semantic_assets:",
-    `  measures: ${yamlArray(draft.measures)}`,
-    `  dimensions: ${yamlArray(draft.dimensions)}`,
-    `  grains: ${yamlArray(draft.grains)}`,
-    `asset_relations: ${yamlArray(draft.assetRelations)}`,
-    `guardrails: ${yamlArray(draft.guardrails)}`,
-    "templates: {}",
-    `default_template: ${draft.defaultTemplate.trim() ? yamlScalar(draft.defaultTemplate.trim()) : "null"}`,
-    `created: ${yamlScalar(created)}`,
-    `updated_at: ${yamlScalar(localTimestamp())}`,
-  ].join("\n");
-  return `---\n${yaml}\n---\n\n${body}`;
+  const currentDataAssets = frontmatter.data_assets && typeof frontmatter.data_assets === "object"
+    ? frontmatter.data_assets as Record<string, unknown>
+    : {};
+  const currentSemanticAssets = frontmatter.semantic_assets && typeof frontmatter.semantic_assets === "object"
+    ? frontmatter.semantic_assets as Record<string, unknown>
+    : {};
+  const nextFrontmatter: Record<string, unknown> = {
+    ...frontmatter,
+    formatter: frontmatter.formatter || "analytics-model",
+    id,
+    name: draft.name || model.name,
+    type: frontmatter.type || "analysis_model",
+    version: draft.version || "0.1.0",
+    description: draft.description,
+    tags: draft.tags,
+    data_assets: { ...currentDataAssets, tables: draft.tables },
+    semantic_assets: {
+      ...currentSemanticAssets,
+      measures: draft.measures,
+      dimensions: draft.dimensions,
+      grains: draft.grains,
+    },
+    asset_relations: draft.assetRelations,
+    guardrails: draft.guardrails,
+    templates: frontmatter.templates ?? model.templates ?? {},
+    default_template: draft.defaultTemplate.trim() || null,
+    created,
+    updated_at: localTimestamp(),
+  };
+  return `---\n${JSON.stringify(nextFrontmatter, null, 2)}\n---\n\n${body}`;
 }
 
 function AnalyticsModelDetailModal({
@@ -3529,8 +3532,8 @@ function AnalyticsModelDetailModal({
   onSave: (contentOverride?: string) => void;
 }) {
   const files = model?.files || [];
-  const dirty = editorContent !== editorOriginal;
-  const [mode, setMode] = useState<"config" | "file">("config");
+  const fileDirty = editorContent !== editorOriginal;
+  const [mode, setMode] = useState<"config" | "file" | "export">("config");
   const [draftName, setDraftName] = useState("");
   const [draftVersion, setDraftVersion] = useState("0.1.0");
   const [draftDescription, setDraftDescription] = useState("");
@@ -3542,8 +3545,18 @@ function AnalyticsModelDetailModal({
   const [draftRelations, setDraftRelations] = useState<string[]>([]);
   const [draftGuardrails, setDraftGuardrails] = useState<string[]>([]);
   const [draftDefaultTemplate, setDraftDefaultTemplate] = useState("");
+  const [draftModelId, setDraftModelId] = useState("");
+  const [exportDataMode, setExportDataMode] = useState<AnalyticsProjectDataFileMode>("copy");
+  const [exportPlan, setExportPlan] = useState<AnalyticsProjectExportPlan | null>(null);
+  const [exportPlanLoading, setExportPlanLoading] = useState(false);
+  const [exportReady, setExportReady] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState("");
+  const [exportSuccess, setExportSuccess] = useState("");
+  const [editorNotice, setEditorNotice] = useState("");
   const fileTree = useMemo(() => buildFileTree(files), [files]);
   const [collapsedDirectories, setCollapsedDirectories] = useState<Set<string>>(() => new Set());
+  const mainFile = useMemo(() => files.find((file) => file.main) || files.find((file) => file.relative_path === "model.md") || null, [files]);
 
   useEffect(() => {
     if (!selectedFile) return;
@@ -3556,6 +3569,34 @@ function AnalyticsModelDetailModal({
       return next;
     });
   }, [selectedFile]);
+
+  useEffect(() => {
+    if (mode !== "export" || !model) return;
+    let cancelled = false;
+    setExportPlanLoading(true);
+    setExportPlan(null);
+    setExportReady(false);
+    setExportError("");
+    setExportSuccess("");
+    planAnalyticsProjectExport(model.id, exportDataMode)
+      .then((result) => {
+        if (cancelled) return;
+        setExportPlan(result.plan);
+        setExportReady(result.ready);
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setExportPlan(null);
+        setExportReady(false);
+        setExportError(error instanceof Error ? error.message : "无法生成导出计划");
+      })
+      .finally(() => {
+        if (!cancelled) setExportPlanLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [exportDataMode, mode, model]);
 
   const toggleDirectory = (path: string) => {
     setCollapsedDirectories((current) => {
@@ -3593,7 +3634,14 @@ function AnalyticsModelDetailModal({
         <button
           type="button"
           key={node.file.path}
-          onClick={() => onSelectFile(node.file)}
+          onClick={() => {
+            if (fileDirty && selectedFile?.path !== node.file.path) {
+              setEditorNotice("当前文件有未保存修改；请先保存，再切换文件或返回配置编辑。");
+              return;
+            }
+            setEditorNotice("");
+            onSelectFile(node.file);
+          }}
           title={node.path}
           className={`flex h-9 w-full items-center gap-1.5 rounded-xl pr-2 text-left text-xs font-semibold transition ${
             active ? "bg-white text-[#002fa7] shadow-sm" : "text-gray-600 hover:bg-white"
@@ -3623,6 +3671,7 @@ function AnalyticsModelDetailModal({
     setDraftRelations(Array.isArray(model.asset_relations) ? model.asset_relations.map(String) : []);
     setDraftGuardrails(Array.isArray(model.guardrails) ? model.guardrails.map(String) : []);
     setDraftDefaultTemplate(model.default_template || "");
+    setDraftModelId(model.id);
   }, [model]);
 
   const tableOptions = useMemo(() => {
@@ -3657,10 +3706,48 @@ function AnalyticsModelDetailModal({
     }
     return false;
   });
+  const configDirty = useMemo(() => {
+    if (!model || draftModelId !== model.id) return false;
+    const frontmatter = model.frontmatter || {};
+    const dataAssets = frontmatter.data_assets as { tables?: unknown } | undefined;
+    const semantic = frontmatter.semantic_assets as { measures?: unknown; dimensions?: unknown; grains?: unknown } | undefined;
+    const persisted = {
+      name: model.name || "",
+      version: model.version || "0.1.0",
+      description: model.description || "",
+      tags: model.tags || [],
+      tables: Array.isArray(dataAssets?.tables) ? dataAssets.tables.map(String) : [],
+      measures: Array.isArray(semantic?.measures) ? semantic.measures.map(String) : [],
+      dimensions: Array.isArray(semantic?.dimensions) ? semantic.dimensions.map(String) : [],
+      grains: Array.isArray(semantic?.grains) ? semantic.grains.map(String) : [],
+      relations: Array.isArray(model.asset_relations) ? model.asset_relations.map(String) : [],
+      guardrails: Array.isArray(model.guardrails) ? model.guardrails.map(String) : [],
+      defaultTemplate: model.default_template || "",
+    };
+    const current = {
+      name: draftName,
+      version: draftVersion,
+      description: draftDescription,
+      tags: splitTokenList(draftTags),
+      tables: draftTables,
+      measures: draftMeasures,
+      dimensions: draftDimensions,
+      grains: draftGrains,
+      relations: draftRelations,
+      guardrails: draftGuardrails,
+      defaultTemplate: draftDefaultTemplate,
+    };
+    return JSON.stringify(current) !== JSON.stringify(persisted);
+  }, [
+    draftDefaultTemplate, draftDescription, draftDimensions, draftGrains, draftGuardrails,
+    draftMeasures, draftModelId, draftName, draftRelations, draftTables, draftTags, draftVersion, model,
+  ]);
+  const dirty = fileDirty || configDirty;
   useEffect(() => {
+    if (!model || draftModelId !== model.id) return;
     const valid = new Set(availableRelations.map((asset) => asset.id));
     setDraftRelations((current) => current.filter((relationId) => valid.has(relationId)));
-  }, [draftTables, semanticAssets]);
+  }, [draftModelId, draftTables, model, semanticAssets]);
   const toggle = (values: string[], value: string, setter: (next: string[]) => void) => {
     setter(values.includes(value) ? values.filter((item) => item !== value) : [...values, value]);
   };
@@ -3709,7 +3796,7 @@ function AnalyticsModelDetailModal({
     }
   };
   const saveConfig = () => {
-    if (!model) return;
+    if (!model || !mainFile || selectedFile?.path !== mainFile.path) return;
     const nextContent = buildAnalyticsModelContent(
       model,
       {
@@ -3729,6 +3816,23 @@ function AnalyticsModelDetailModal({
     );
     onChangeContent(nextContent);
     onSave(nextContent);
+  };
+
+  const downloadAnalysisProject = () => {
+    if (!model || dirty || !exportReady) return;
+    setExporting(true);
+    setExportError("");
+    setExportSuccess("");
+    const anchor = document.createElement("a");
+    anchor.href = analyticsProjectExportDownloadUrl(model.id, exportDataMode, exportPlan?.plan_id);
+    anchor.download = "";
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setExportSuccess("下载已开始；大文件会由浏览器直接流式保存。请保留本页直到下载任务出现。");
+    window.setTimeout(() => {
+      setExporting(false);
+    }, 500);
   };
 
   return (
@@ -3761,11 +3865,23 @@ function AnalyticsModelDetailModal({
                 {[
                   { value: "config", label: "配置编辑" },
                   { value: "file", label: "模型明细" },
+                  { value: "export", label: "导出项目" },
                 ].map((item) => (
                   <button
                     key={item.value}
                     type="button"
-                    onClick={() => setMode(item.value as "config" | "file")}
+                    onClick={() => {
+                      const nextMode = item.value as "config" | "file" | "export";
+                      if (nextMode === "config" && mainFile && selectedFile?.path !== mainFile.path) {
+                        if (fileDirty) {
+                          setEditorNotice("当前文件有未保存修改；请先保存，再返回配置编辑。");
+                          return;
+                        }
+                        setEditorNotice("");
+                        onSelectFile(mainFile);
+                      }
+                      setMode(nextMode);
+                    }}
                     className={`h-9 rounded-xl px-4 text-sm font-semibold transition ${
                       mode === item.value ? "bg-white text-[#002fa7] shadow-sm" : "text-gray-500"
                     }`}
@@ -3777,14 +3893,14 @@ function AnalyticsModelDetailModal({
               {mode === "config" ? (
                 <button
                   type="button"
-                  disabled={editorSaving || !selectedFile?.editable}
+                  disabled={fileDirty || editorLoading || editorSaving || !configDirty || !mainFile || selectedFile?.path !== mainFile.path}
                   onClick={saveConfig}
                   className="inline-flex h-9 items-center gap-2 rounded-2xl bg-[#002fa7] px-3 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-45"
                 >
                   {editorSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
                   保存配置
                 </button>
-              ) : (
+              ) : mode === "file" ? (
                 <button
                   type="button"
                   disabled={!selectedFile?.editable || !dirty || editorLoading || editorSaving}
@@ -3794,8 +3910,25 @@ function AnalyticsModelDetailModal({
                   {editorSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
                   保存文件
                 </button>
+              ) : (
+                <button
+                  type="button"
+                  disabled={dirty || !exportReady || exportPlanLoading || exporting}
+                  onClick={downloadAnalysisProject}
+                  className="inline-flex h-9 items-center gap-2 rounded-2xl bg-[#002fa7] px-3 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-45"
+                >
+                  {exporting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+                  {exporting ? "正在打包" : "导出 ZIP"}
+                </button>
               )}
             </div>
+
+            {editorNotice ? (
+              <div className="flex items-center gap-2 border-b border-amber-200 bg-amber-50 px-5 py-2.5 text-xs font-medium text-amber-800">
+                <AlertCircle className="h-4 w-4 shrink-0" />
+                {editorNotice}
+              </div>
+            ) : null}
 
             {mode === "config" ? (
               <div className="grid min-h-0 flex-1 gap-5 overflow-y-auto p-5 lg:grid-cols-2">
@@ -3899,7 +4032,7 @@ function AnalyticsModelDetailModal({
                   />
                 </section>
               </div>
-            ) : (
+            ) : mode === "file" ? (
               <div className="grid min-h-0 flex-1 grid-cols-[260px_minmax(0,1fr)] overflow-hidden">
                 <aside className="min-h-0 border-r border-black/[0.06] bg-slate-50/70 p-4">
                   <div className="max-h-[620px] space-y-1 overflow-auto">
@@ -3933,6 +4066,169 @@ function AnalyticsModelDetailModal({
                     ) : null}
                   </div>
                 </section>
+              </div>
+            ) : (
+              <div className="min-h-0 flex-1 overflow-y-auto bg-slate-50/50 p-5">
+                <div className="mx-auto max-w-4xl space-y-5">
+                  <section className="rounded-3xl border border-black/[0.06] bg-white p-5 shadow-sm shadow-black/[0.02]">
+                    <div className="flex items-start justify-between gap-4">
+                      <div>
+                        <h4 className="text-base font-semibold text-gray-950">可迁移分析项目</h4>
+                        <p className="mt-1 max-w-2xl text-sm leading-6 text-gray-500">
+                          导出模型、语义资产、关联、SQL 守卫、Profile 与本地校验脚本。解压后可直接作为 Codex 等本地 Agent 的项目目录打开。
+                        </p>
+                      </div>
+                      <span className="shrink-0 rounded-full bg-emerald-50 px-3 py-1 text-xs font-semibold text-emerald-700">
+                        analysis-project/v1
+                      </span>
+                    </div>
+
+                    <div className="mt-5 grid gap-3 md:grid-cols-2">
+                      {([
+                        {
+                          value: "copy" as const,
+                          title: "复制数据文件",
+                          description: "将 Excel、CSV、Parquet 等文件一并打包，适合跨机器迁移。",
+                          recommended: true,
+                        },
+                        {
+                          value: "reference" as const,
+                          title: "保留本机路径",
+                          description: "不复制大文件，在 bindings.local.yaml 中记录绝对路径与 hash。",
+                          recommended: false,
+                        },
+                      ]).map((option) => {
+                        const active = exportDataMode === option.value;
+                        return (
+                          <button
+                            key={option.value}
+                            type="button"
+                            onClick={() => setExportDataMode(option.value)}
+                            className={`rounded-2xl border p-4 text-left transition ${
+                              active
+                                ? "border-[#002fa7]/35 bg-[#002fa7]/[0.04] ring-4 ring-[#002fa7]/[0.05]"
+                                : "border-black/[0.07] bg-white hover:border-black/[0.14]"
+                            }`}
+                          >
+                            <div className="flex items-center justify-between gap-3">
+                              <span className={`text-sm font-semibold ${active ? "text-[#002fa7]" : "text-gray-900"}`}>
+                                {option.title}
+                              </span>
+                              {option.recommended ? (
+                                <span className="rounded-full bg-[#002fa7]/10 px-2 py-0.5 text-[11px] font-semibold text-[#002fa7]">推荐</span>
+                              ) : null}
+                            </div>
+                            <p className="mt-2 text-xs leading-5 text-gray-500">{option.description}</p>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </section>
+
+                  {dirty ? (
+                    <div className="flex gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                      <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                      <div>
+                        <p className="font-semibold">请先保存当前模型改动</p>
+                        <p className="mt-1 text-xs leading-5 text-amber-700">导出器只读取 Registry 中已保存的版本，避免将编辑器草稿与磁盘依赖混合打包。</p>
+                      </div>
+                    </div>
+                  ) : null}
+
+                  <section className="rounded-3xl border border-black/[0.06] bg-white p-5 shadow-sm shadow-black/[0.02]">
+                    <div className="flex items-center justify-between gap-4">
+                      <div>
+                        <h4 className="text-sm font-semibold text-gray-950">导出清单</h4>
+                        <p className="mt-1 text-xs text-gray-500">每次切换数据策略都会重新解析依赖，不依赖前端估算。</p>
+                      </div>
+                      {exportPlanLoading ? (
+                        <span className="inline-flex items-center gap-2 text-xs text-gray-400"><Loader2 className="h-4 w-4 animate-spin" />正在解析依赖</span>
+                      ) : exportReady ? (
+                        <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-700"><CheckCircle2 className="h-4 w-4" />可以导出</span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-rose-700"><AlertCircle className="h-4 w-4" />依赖不完整</span>
+                      )}
+                    </div>
+
+                    {exportPlan ? (
+                      <>
+                        <div className="mt-4 grid gap-3 sm:grid-cols-4">
+                          {[
+                            { label: "语义资产", value: exportPlan.semantic_asset_ids.length },
+                            { label: "资产关联", value: exportPlan.relation_ids.length },
+                            { label: "SQL 守卫", value: exportPlan.guardrail_ids.length },
+                            {
+                              label: exportDataMode === "copy" ? "复制数据" : "本地绑定",
+                              value: exportDataMode === "copy" ? formatBytes(exportPlan.copied_bytes) : exportPlan.data_assets.length,
+                            },
+                          ].map((item) => (
+                            <div key={item.label} className="rounded-2xl bg-slate-50 px-4 py-3">
+                              <p className="text-[11px] font-semibold uppercase tracking-wide text-gray-400">{item.label}</p>
+                              <p className="mt-1 text-lg font-semibold text-gray-950">{item.value}</p>
+                            </div>
+                          ))}
+                        </div>
+
+                        <div className="mt-4 space-y-2">
+                          {exportPlan.data_assets.map((asset) => (
+                            <div key={asset.ref} className="flex items-center gap-3 rounded-2xl border border-black/[0.05] px-4 py-3">
+                              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-slate-100 text-gray-500">
+                                {asset.kind === "database_table" ? <Database className="h-4 w-4" /> : <FileSpreadsheet className="h-4 w-4" />}
+                              </div>
+                              <div className="min-w-0 flex-1">
+                                <p className="truncate text-sm font-semibold text-gray-900">{asset.file_name || asset.ref}</p>
+                                <p className="mt-0.5 truncate text-xs text-gray-400">
+                                  {asset.kind === "database_table"
+                                    ? "数据库连接以环境变量占位，不导出密码"
+                                    : exportDataMode === "copy"
+                                      ? `${asset.sheet_name || "文件资产"} · ${formatBytes(asset.size_bytes)}`
+                                      : asset.source_path}
+                                </p>
+                              </div>
+                              <span className={`rounded-full px-2 py-1 text-[11px] font-semibold ${asset.status === "ready" ? "bg-emerald-50 text-emerald-700" : "bg-rose-50 text-rose-700"}`}>
+                                {asset.status === "ready" ? "就绪" : "缺失"}
+                              </span>
+                            </div>
+                          ))}
+                          {exportPlan.data_assets.length === 0 ? (
+                            <div className="rounded-2xl border border-dashed border-black/[0.08] px-4 py-6 text-center text-xs text-gray-400">模型未声明数据资产</div>
+                          ) : null}
+                        </div>
+                      </>
+                    ) : null}
+
+                    {exportPlan?.warnings.length ? (
+                      <div className="mt-4 rounded-2xl bg-amber-50 px-4 py-3 text-xs leading-5 text-amber-800">
+                        {exportPlan.warnings.map((warning) => <p key={warning}>• {warning}</p>)}
+                      </div>
+                    ) : null}
+                    {exportPlan?.missing_dependencies.length ? (
+                      <div className="mt-4 rounded-2xl bg-rose-50 px-4 py-3 text-xs leading-5 text-rose-800">
+                        <p className="font-semibold">缺少以下必需依赖：</p>
+                        {exportPlan.missing_dependencies.map((dependency) => <p key={dependency}>• {dependency}</p>)}
+                      </div>
+                    ) : null}
+                    {exportError ? <p className="mt-4 text-sm font-medium text-rose-700">{exportError}</p> : null}
+                    {exportSuccess ? <p className="mt-4 text-sm font-medium text-emerald-700">{exportSuccess}</p> : null}
+                  </section>
+
+                  <section className="grid gap-3 md:grid-cols-3">
+                    {[
+                      [ShieldCheck, "口径同源", "Measure、Dimension、Grain、Reference 与 Relation 原文件随包交付。"],
+                      [Database, "绑定解耦", "PuddingClaw ID 只保留为 provenance，外部执行读取 bindings。"],
+                      [CheckCircle2, "确定性校验", "文件 hash、项目完整性和可移植 SQL Guardrail 校验器一并生成。"],
+                    ].map(([Icon, title, description]) => {
+                      const FeatureIcon = Icon as LucideIcon;
+                      return (
+                        <div key={String(title)} className="rounded-2xl border border-black/[0.06] bg-white p-4">
+                          <FeatureIcon className="h-5 w-5 text-[#002fa7]" />
+                          <p className="mt-3 text-sm font-semibold text-gray-900">{String(title)}</p>
+                          <p className="mt-1 text-xs leading-5 text-gray-500">{String(description)}</p>
+                        </div>
+                      );
+                    })}
+                  </section>
+                </div>
               </div>
             )}
           </div>

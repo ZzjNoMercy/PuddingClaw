@@ -21,8 +21,9 @@ from deepagents.backends.protocol import (
     WriteResult,
 )
 
-from graph.host_file_broker import HostFileBroker
+from graph.host_file_broker import AuthorizedHostPath, HostFileBroker
 from graph.session_manager import session_manager
+from graph.virtual_paths import ClassifiedPath, PathAuthority, classify_path_authority
 
 
 class _CandidateHTMLValidator(HTMLParser):
@@ -119,11 +120,6 @@ class _CandidateHTMLValidator(HTMLParser):
 class PermissionedCompositeBackend(CompositeBackend):
     """Delegate approved external writes while keeping normal virtual routing."""
 
-    _ROUTED_VIRTUAL_PREFIXES = (
-        "/workspace/",
-        "/scratch/",
-        "/large_tool_results/",
-    )
     _READONLY_VIRTUAL_PREFIXES = (
         "/knowledge/",
         "/semantic-assets/",
@@ -171,6 +167,296 @@ class PermissionedCompositeBackend(CompositeBackend):
                     workspace_prefixes.append(f"/workspace/{relative}/")
         self._readonly_workspace_prefixes = tuple(workspace_prefixes)
         self.external_directory_writable_enabled = False
+
+    def _classify_path(self, file_path: str) -> ClassifiedPath:
+        return classify_path_authority(
+            file_path,
+            workspace_root=self.workspace_root,
+        )
+
+    def _has_internal_virtual_route(self, classified: ClassifiedPath) -> bool:
+        """Require writable virtual namespaces to resolve to their own route."""
+
+        if not classified.internally_writable or not classified.virtual_path:
+            return False
+        expected_prefix = f"/{classified.authority.value}"
+        expected_backend = next(
+            (
+                backend
+                for prefix, backend in self.routes.items()
+                if prefix.rstrip("/") == expected_prefix
+            ),
+            None,
+        )
+        if expected_backend is None:
+            return False
+        routed_backend, _routed_path = self._get_backend_and_key(
+            classified.virtual_path
+        )
+        return routed_backend is expected_backend
+
+    @staticmethod
+    def _content_sha256(content: bytes) -> str:
+        return f"sha256:{hashlib.sha256(content).hexdigest()}"
+
+    @staticmethod
+    def _escape_result(file_path: str) -> dict[str, Any]:
+        return {
+            "status": "io_error",
+            "error_code": "path_escape_rejected",
+            "error": f"io_error: path escapes its internal authority: {file_path}",
+            "next_action": "use_canonical_workspace_or_scratch_path",
+        }
+
+    @staticmethod
+    def _managed_write_result(file_path: str) -> dict[str, Any]:
+        return {
+            "status": "permission_required",
+            "error_code": "managed_resource_read_only",
+            "error": f"permission_required: managed resource is read-only: {file_path}",
+        }
+
+    def _internal_host_target(
+        self,
+        classified: ClassifiedPath,
+        *,
+        access: str,
+    ) -> AuthorizedHostPath | None:
+        """Bind a trusted internal path to its owning root without a Grant."""
+
+        if not classified.internally_writable or not classified.virtual_path:
+            return None
+        canonical = classified.canonical_host_path
+        authority_root: Path | None = None
+        if classified.authority is PathAuthority.WORKSPACE:
+            workspace_route = next(
+                (
+                    backend
+                    for prefix, backend in self.routes.items()
+                    if prefix.rstrip("/") == "/workspace"
+                ),
+                None,
+            )
+            if workspace_route is None:
+                return None
+            routed_backend, routed_path = self._get_backend_and_key(
+                classified.virtual_path
+            )
+            backend_root = getattr(routed_backend, "cwd", None)
+            if routed_backend is not workspace_route or backend_root is None:
+                return None
+            authority_root = Path(backend_root).resolve()
+            canonical = (authority_root / routed_path.lstrip("/")).resolve(
+                strict=False
+            )
+            if self.workspace_root is not None and authority_root != self.workspace_root:
+                return None
+        elif classified.authority is PathAuthority.SCRATCH:
+            scratch_route = next(
+                (
+                    backend
+                    for prefix, backend in self.routes.items()
+                    if prefix.rstrip("/") == "/scratch"
+                ),
+                None,
+            )
+            if scratch_route is None:
+                return None
+            routed_backend, routed_path = self._get_backend_and_key(classified.virtual_path)
+            if routed_backend is not scratch_route:
+                return None
+            backend_root = getattr(routed_backend, "cwd", None)
+            if backend_root is not None:
+                authority_root = Path(backend_root).resolve()
+                canonical = (authority_root / routed_path.lstrip("/")).resolve(strict=False)
+        if authority_root is None or canonical is None:
+            return None
+        try:
+            canonical.relative_to(authority_root)
+        except ValueError:
+            return None
+        return HostFileBroker._authorized_path(
+            canonical_path=canonical,
+            authority_root=authority_root,
+            grant_id=f"internal:{classified.authority.value}",
+            access=access,
+        )
+
+    def _read_internal_bytes(
+        self,
+        classified: ClassifiedPath,
+    ) -> tuple[bytes | None, dict[str, Any] | None]:
+        target = self._internal_host_target(classified, access="read")
+        if target is not None:
+            try:
+                content = HostFileBroker._read_bound_bytes(target)
+            except OSError as exc:
+                return None, {
+                    "status": "io_error",
+                    "error_code": "internal_read_failed",
+                    "error": f"io_error: {exc}",
+                }
+            if content is None:
+                return None, {
+                    "status": "conflict",
+                    "error_code": "source_missing",
+                    "error": f"conflict: source no longer exists: {classified.original_path}",
+                }
+            return content, None
+
+        # Non-filesystem internal backends still support the common UTF-8
+        # protocol. Keep this fallback behind the same authority decision.
+        if not self._has_internal_virtual_route(classified):
+            return None, {
+                "status": "io_error",
+                "error_code": "internal_read_route_unavailable",
+                "error": "io_error: internal read route is unavailable",
+            }
+        from tools.filesystem.inspect import read_all
+
+        content, error = read_all(self, classified.virtual_path or classified.original_path)
+        if error is not None or content is None:
+            return None, {
+                "status": "io_error",
+                "error_code": "internal_read_failed",
+                "error": f"io_error: {error or 'unable to read internal file'}",
+            }
+        return content.encode("utf-8"), None
+
+    def _replace_internal_file(
+        self,
+        classified: ClassifiedPath,
+        content: bytes,
+        *,
+        expected_sha256: str,
+    ) -> dict[str, Any]:
+        target = self._internal_host_target(classified, access="write")
+        if target is None:
+            return {
+                "status": "io_error",
+                "error_code": "internal_backend_replace_unavailable",
+                "error": "io_error: internal backend does not expose a bound writable root",
+            }
+        try:
+            before = HostFileBroker._read_bound_bytes(target)
+        except OSError as exc:
+            return {
+                "status": "io_error",
+                "error_code": "internal_read_failed",
+                "error": f"io_error: {exc}",
+            }
+        if before is None:
+            return {
+                "status": "conflict",
+                "error_code": "target_missing",
+                "error": f"conflict: target no longer exists: {classified.original_path}",
+                "current_sha256": "missing",
+                "expected_sha256": expected_sha256,
+                "next_action": "use_create_mode",
+            }
+        current_sha256 = self._content_sha256(before)
+        if current_sha256 != expected_sha256:
+            return {
+                "status": "conflict",
+                "error_code": "source_version_changed",
+                "error": (
+                    "conflict: target changed; "
+                    f"expected {expected_sha256}, current {current_sha256}"
+                ),
+                "current_sha256": current_sha256,
+                "expected_sha256": expected_sha256,
+                "next_action": "reinspect_and_rebase",
+            }
+        try:
+            HostFileBroker._atomic_replace(target, content, expected_before=before)
+        except FileExistsError as exc:
+            return {
+                "status": "conflict",
+                "error_code": "source_version_changed",
+                "error": str(exc),
+                "next_action": "reinspect_and_rebase",
+            }
+        except OSError as exc:
+            return {
+                "status": "io_error",
+                "error_code": "atomic_replace_failed",
+                "error": f"io_error: {exc}",
+            }
+        return {
+            "status": "completed",
+            "target_path": classified.virtual_path or classified.original_path,
+            "previous_sha256": current_sha256,
+            "target_sha256": self._content_sha256(content),
+            "authority_kind": classified.authority.value,
+        }
+
+    def _create_internal_file(
+        self,
+        classified: ClassifiedPath,
+        content: bytes,
+    ) -> dict[str, Any]:
+        target = self._internal_host_target(classified, access="write")
+        if not self._has_internal_virtual_route(classified):
+            return {
+                "status": "io_error",
+                "error_code": "internal_backend_create_unavailable",
+                "error": "io_error: internal writable route is unavailable",
+            }
+        if target is None:
+            try:
+                text = content.decode("utf-8")
+            except UnicodeDecodeError:
+                return {
+                    "status": "io_error",
+                    "error_code": "internal_create_requires_utf8",
+                    "error": "io_error: internal virtual files must be UTF-8 text",
+                }
+            target_path = classified.virtual_path or classified.original_path
+            written = super().write(target_path, text)
+            if written.error is not None:
+                exists = "already exists" in written.error.lower()
+                return {
+                    "status": "conflict" if exists else "io_error",
+                    "error_code": (
+                        "target_already_exists"
+                        if exists
+                        else "internal_backend_create_failed"
+                    ),
+                    "error": written.error,
+                }
+            return {
+                "status": "completed",
+                "target_path": target_path,
+                "target_sha256": self._content_sha256(content),
+                "authority_kind": classified.authority.value,
+                "atomic": False,
+            }
+        try:
+            HostFileBroker._atomic_replace(
+                target,
+                content,
+                expected_before=None,
+                create_parents=True,
+            )
+        except FileExistsError as exc:
+            return {
+                "status": "conflict",
+                "error_code": "target_already_exists",
+                "error": str(exc),
+                "next_action": "use_patch_file",
+            }
+        except OSError as exc:
+            return {
+                "status": "io_error",
+                "error_code": "internal_create_failed",
+                "error": f"io_error: {exc}",
+            }
+        return {
+            "status": "completed",
+            "target_path": classified.virtual_path or classified.original_path,
+            "target_sha256": self._content_sha256(content),
+            "authority_kind": classified.authority.value,
+        }
 
     def _validate_external_candidate(
         self,
@@ -353,6 +639,130 @@ class PermissionedCompositeBackend(CompositeBackend):
         self,
         changes: list[dict[str, Any]],
     ) -> dict[str, Any]:
+        authorities = [
+            self._classify_path(str(change.get("file_path") or ""))
+            for change in changes
+        ]
+        if any(item.authority is PathAuthority.ESCAPE for item in authorities):
+            escaped = next(
+                item for item in authorities if item.authority is PathAuthority.ESCAPE
+            )
+            return self._escape_result(escaped.original_path)
+        if any(item.authority is PathAuthority.MANAGED for item in authorities):
+            managed = next(
+                item for item in authorities if item.authority is PathAuthority.MANAGED
+            )
+            return self._managed_write_result(managed.original_path)
+        readonly_change = next(
+            (
+                change
+                for change in changes
+                if self._managed_readonly(str(change.get("file_path") or ""))
+            ),
+            None,
+        )
+        if readonly_change is not None:
+            return self._managed_write_result(
+                str(readonly_change.get("file_path") or "")
+            )
+        internal_authorities = {
+            item.authority for item in authorities if item.internally_writable
+        }
+        if len(internal_authorities) > 1:
+            return {
+                "status": "io_error",
+                "error_code": "mixed_authority_transaction_unsupported",
+                "error": (
+                    "io_error: one transaction cannot mix workspace and scratch "
+                    "authority roots"
+                ),
+                "next_action": "split_transaction_by_authority",
+            }
+        if authorities and all(item.internally_writable for item in authorities):
+            prepared: list[tuple[ClassifiedPath, bytes, bytes, str]] = []
+            for change, classified in zip(changes, authorities, strict=True):
+                target = self._internal_host_target(classified, access="write")
+                if target is None:
+                    return {
+                        "status": "io_error",
+                        "error_code": "internal_transaction_unavailable",
+                        "error": "io_error: internal transaction target is unavailable",
+                    }
+                try:
+                    before = HostFileBroker._read_bound_bytes(target)
+                except OSError as exc:
+                    return {"status": "io_error", "error": f"io_error: {exc}"}
+                if before is None:
+                    return {
+                        "status": "conflict",
+                        "error_code": "target_missing",
+                        "error": f"conflict: target missing: {classified.original_path}",
+                    }
+                expected = str(change.get("expected_sha256") or "")
+                current = self._content_sha256(before)
+                if current != expected:
+                    return {
+                        "status": "conflict",
+                        "error_code": "source_version_changed",
+                        "error": (
+                            f"conflict: {classified.original_path} expected "
+                            f"{expected}, current {current}"
+                        ),
+                    }
+                prepared.append(
+                    (
+                        classified,
+                        before,
+                        str(change.get("content") or "").encode("utf-8"),
+                        current,
+                    )
+                )
+            committed: list[tuple[AuthorizedHostPath, bytes, bytes]] = []
+            try:
+                for classified, before, after, _current in prepared:
+                    target = self._internal_host_target(classified, access="write")
+                    assert target is not None
+                    HostFileBroker._atomic_replace(target, after, expected_before=before)
+                    committed.append((target, before, after))
+            except OSError as exc:
+                rollback_errors: list[str] = []
+                for target, before, after in reversed(committed):
+                    try:
+                        HostFileBroker._atomic_replace(
+                            target,
+                            before,
+                            expected_before=after,
+                        )
+                    except OSError as rollback_exc:
+                        rollback_errors.append(str(rollback_exc))
+                return {
+                    "status": "conflict" if isinstance(exc, FileExistsError) else "io_error",
+                    "error_code": "internal_transaction_commit_failed",
+                    "error": str(exc),
+                    "rollback_errors": rollback_errors,
+                }
+            return {
+                "status": "completed",
+                "changed_files": [
+                    classified.virtual_path or classified.original_path
+                    for classified, _before, _after, _current in prepared
+                ],
+                "target_sha256": [
+                    self._content_sha256(after)
+                    for _classified, _before, after, _current in prepared
+                ],
+                "authority_kind": "internal",
+            }
+        if any(item.internally_writable for item in authorities):
+            return {
+                "status": "io_error",
+                "error_code": "mixed_authority_transaction_unsupported",
+                "error": (
+                    "io_error: one transaction cannot mix internal workspace/scratch "
+                    "files with external host files"
+                ),
+                "next_action": "split_transaction_by_authority",
+            }
         if self.host_file_broker is None:
             return {
                 "status": "permission_required",
@@ -368,12 +778,19 @@ class PermissionedCompositeBackend(CompositeBackend):
         expected_sha256: str,
         operation: str = "replace",
     ) -> dict[str, Any]:
+        classified = self._classify_path(file_path)
+        if classified.authority is PathAuthority.ESCAPE:
+            return self._escape_result(file_path)
         if self._managed_readonly(file_path):
-            return {
-                "status": "permission_required",
-                "error_code": "managed_resource_read_only",
-                "error": f"permission_required: managed resource is read-only: {file_path}",
-            }
+            return self._managed_write_result(file_path)
+        if classified.internally_writable:
+            return self._replace_internal_file(
+                classified,
+                content,
+                expected_sha256=expected_sha256,
+            )
+        if classified.authority is PathAuthority.MANAGED:
+            return self._managed_write_result(file_path)
         if self.host_file_broker is None:
             return {
                 "status": "permission_required",
@@ -394,12 +811,23 @@ class PermissionedCompositeBackend(CompositeBackend):
         *,
         operation: str = "create",
     ) -> dict[str, Any]:
+        classified = self._classify_path(file_path)
+        if classified.authority is PathAuthority.ESCAPE:
+            return self._escape_result(file_path)
         if self._managed_readonly(file_path):
-            return {
-                "status": "permission_required",
-                "error_code": "managed_resource_read_only",
-                "error": f"permission_required: managed resource is read-only: {file_path}",
-            }
+            return self._managed_write_result(file_path)
+        if classified.internally_writable:
+            try:
+                content.decode("utf-8")
+            except UnicodeDecodeError:
+                return {
+                    "status": "io_error",
+                    "error_code": "internal_create_requires_utf8",
+                    "error": "io_error: internal virtual files must be UTF-8 text",
+                }
+            return self._create_internal_file(classified, content)
+        if classified.authority is PathAuthority.MANAGED:
+            return self._managed_write_result(file_path)
         if self.host_file_broker is None:
             return {
                 "status": "permission_required",
@@ -419,27 +847,75 @@ class PermissionedCompositeBackend(CompositeBackend):
         *,
         expected_source_sha256: str | None = None,
     ) -> dict[str, Any]:
+        source_authority = self._classify_path(source_path)
+        target_authority = self._classify_path(target_path)
+        if source_authority.authority is PathAuthority.ESCAPE:
+            return self._escape_result(source_path)
+        if target_authority.authority is PathAuthority.ESCAPE:
+            return self._escape_result(target_path)
+        if target_authority.authority is PathAuthority.MANAGED:
+            return self._managed_write_result(target_path)
         if self._managed_readonly(target_path):
             return {
                 "status": "permission_required",
                 "error_code": "managed_resource_read_only",
                 "error": f"permission_required: managed resource is read-only: {target_path}",
             }
-        if self.host_file_broker is None:
-            return {
-                "status": "permission_required",
-                "error_code": "host_file_broker_unavailable",
-                "error": "permission_required: no active HostFileBroker Run",
+        source_result: dict[str, Any]
+        if source_authority.authority in {
+            PathAuthority.WORKSPACE,
+            PathAuthority.SCRATCH,
+            PathAuthority.MANAGED,
+        }:
+            if source_authority.authority is PathAuthority.MANAGED:
+                from tools.filesystem.inspect import read_all
+
+                text, error = read_all(self, source_authority.virtual_path or source_path)
+                if error is not None or text is None:
+                    return {
+                        "status": "io_error",
+                        "error_code": "internal_read_failed",
+                        "error": f"io_error: {error or 'unable to read source'}",
+                    }
+                content = text.encode("utf-8")
+            else:
+                content, error_result = self._read_internal_bytes(source_authority)
+                if content is None:
+                    return error_result or {
+                        "status": "io_error",
+                        "error_code": "internal_read_failed",
+                    }
+            source_sha256 = self._content_sha256(content)
+            if expected_source_sha256 and expected_source_sha256 != source_sha256:
+                return {
+                    "status": "conflict",
+                    "error_code": "source_version_changed",
+                    "error": (
+                        f"conflict: source expected {expected_source_sha256}, "
+                        f"current {source_sha256}"
+                    ),
+                    "source_sha256": source_sha256,
+                }
+            source_result = {
+                "source_path": source_authority.virtual_path or source_path,
+                "source_sha256": source_sha256,
             }
-        if self._routed_virtual_path(target_path):
+        else:
+            if self.host_file_broker is None:
+                return {
+                    "status": "permission_required",
+                    "error_code": "host_file_broker_unavailable",
+                    "error": "permission_required: no active HostFileBroker Run",
+                }
             content, source_result = self.host_file_broker.load_authorized_file(
-                source_path,
-                expected_sha256=expected_source_sha256,
+                source_path, expected_sha256=expected_source_sha256
             )
             if content is None:
                 return source_result
+
+        if target_authority.internally_writable:
             try:
-                text = content.decode("utf-8")
+                content.decode("utf-8")
             except UnicodeDecodeError:
                 return {
                     **source_result,
@@ -448,35 +924,32 @@ class PermissionedCompositeBackend(CompositeBackend):
                     "error": "io_error: virtual-workspace files must be UTF-8 text",
                     "next_action": "use_a_binary_artifact_channel",
                 }
-            written = super().write(target_path, text)
-            if written.error is not None:
-                target_exists = "already exists" in written.error.lower()
-                return {
-                    **source_result,
-                    "status": "conflict" if target_exists else "io_error",
-                    "error_code": (
-                        "target_already_exists"
-                        if target_exists
-                        else "workspace_write_failed"
-                    ),
-                    "error": written.error,
-                    "next_action": (
-                        "use_patch_file"
-                        if target_exists
-                        else "report_infrastructure_error"
-                    ),
-                }
+            created = self._create_internal_file(target_authority, content)
             return {
                 **source_result,
-                "status": "completed",
-                "target_path": target_path,
-                "target_sha256": source_result["source_sha256"],
-                "authority_kind": "virtual_workspace",
+                **created,
+                "authority_kind": (
+                    f"virtual_{target_authority.authority.value}"
+                    if created.get("status") == "completed"
+                    else created.get("authority_kind")
+                ),
             }
-        return self.host_file_broker.copy(
-            source_path,
+        if self.host_file_broker is None:
+            return {
+                "status": "permission_required",
+                "error_code": "host_file_broker_unavailable",
+                "error": "permission_required: no active HostFileBroker Run",
+            }
+        if source_authority.authority is PathAuthority.EXTERNAL:
+            return self.host_file_broker.copy(
+                source_path,
+                target_path,
+                expected_source_sha256=expected_source_sha256,
+            )
+        return self.host_file_broker.create(
             target_path,
-            expected_source_sha256=expected_source_sha256,
+            content,
+            operation="copy",
         )
 
     def delete_external_file(
@@ -485,11 +958,56 @@ class PermissionedCompositeBackend(CompositeBackend):
         *,
         expected_sha256: str,
     ) -> dict[str, Any]:
+        classified = self._classify_path(file_path)
+        if classified.authority is PathAuthority.ESCAPE:
+            return self._escape_result(file_path)
         if self._managed_readonly(file_path):
+            return self._managed_write_result(file_path)
+        if classified.internally_writable:
+            target = self._internal_host_target(classified, access="delete")
+            if target is None:
+                return {
+                    "status": "io_error",
+                    "error_code": "internal_delete_unavailable",
+                    "error": "io_error: internal backend does not expose a bound writable root",
+                }
+            try:
+                before = HostFileBroker._read_bound_bytes(target)
+            except OSError as exc:
+                return {"status": "io_error", "error": f"io_error: {exc}"}
+            if before is None:
+                return {
+                    "status": "conflict",
+                    "error_code": "target_missing",
+                    "error": f"conflict: target no longer exists: {file_path}",
+                }
+            current_sha256 = self._content_sha256(before)
+            if current_sha256 != expected_sha256:
+                return {
+                    "status": "conflict",
+                    "error_code": "source_version_changed",
+                    "error": (
+                        f"conflict: target expected {expected_sha256}, "
+                        f"current {current_sha256}"
+                    ),
+                }
+            try:
+                HostFileBroker._unlink_bound(target, expected_before=before)
+            except FileExistsError as exc:
+                return {
+                    "status": "conflict",
+                    "error_code": "source_version_changed",
+                    "error": str(exc),
+                }
+            except OSError as exc:
+                return {"status": "io_error", "error": f"io_error: {exc}"}
             return {
-                "status": "permission_required",
-                "error": f"permission_required: managed resource is read-only: {file_path}",
+                "status": "completed",
+                "deleted_path": classified.virtual_path or file_path,
+                "authority_kind": classified.authority.value,
             }
+        if classified.authority is PathAuthority.MANAGED:
+            return self._managed_write_result(file_path)
         if self.host_file_broker is None:
             return {
                 "status": "permission_required",
@@ -985,7 +1503,19 @@ class PermissionedCompositeBackend(CompositeBackend):
         return False
 
     def _managed_readonly(self, file_path: str) -> bool:
-        return self._readonly_virtual_path(file_path) or self._readonly_host_path(file_path)
+        if self._readonly_virtual_path(file_path) or self._readonly_host_path(file_path):
+            return True
+        classified = self._classify_path(file_path)
+        canonical = classified.canonical_host_path
+        if canonical is None:
+            return classified.authority is PathAuthority.MANAGED
+        for root in self.managed_readonly_roots:
+            try:
+                canonical.relative_to(root)
+                return True
+            except ValueError:
+                continue
+        return False
 
     def _unrouted_external_path(self, file_path: str | None) -> bool:
         """Identify a host absolute path that no normal Backend may touch.
@@ -996,30 +1526,17 @@ class PermissionedCompositeBackend(CompositeBackend):
         is not a permission decision.
         """
 
-        if not file_path or self._routed_virtual_path(file_path) or self._managed_readonly(file_path):
+        if not file_path or self._managed_readonly(file_path):
             return False
-        requested = Path(file_path).expanduser()
-        if not requested.is_absolute():
+        classified = self._classify_path(file_path)
+        if classified.authority in {
+            PathAuthority.WORKSPACE,
+            PathAuthority.SCRATCH,
+            PathAuthority.MANAGED,
+        }:
             return False
-        # DeepAgents' default virtual backend also uses root-absolute paths
-        # (for example ``/dashboard.html``). Preserve that namespace when the
-        # corresponding project target or its parent exists. Real host paths
-        # outside the workspace have no such project projection and remain
-        # fail-closed below.
-        if self.workspace_root is not None:
-            virtual_candidate = self.workspace_root / file_path.lstrip("/")
-            if virtual_candidate.exists() or virtual_candidate.parent.exists():
-                return False
-        try:
-            resolved = requested.resolve(strict=False)
-        except OSError:
+        if classified.authority is PathAuthority.ESCAPE:
             return True
-        if self.workspace_root is not None:
-            try:
-                resolved.relative_to(self.workspace_root)
-                return False
-            except ValueError:
-                pass
         return True
 
     @staticmethod
@@ -1029,15 +1546,14 @@ class PermissionedCompositeBackend(CompositeBackend):
             f"effective file Grant: {file_path}"
         )
 
-    @classmethod
-    def _routed_virtual_path(cls, file_path: str) -> bool:
+    def _routed_virtual_path(self, file_path: str) -> bool:
         """Return whether CompositeBackend, not host grants, owns this path."""
 
-        normalized = file_path.replace("\\", "/")
-        return any(
-            normalized == prefix.rstrip("/") or normalized.startswith(prefix)
-            for prefix in cls._ROUTED_VIRTUAL_PREFIXES
-        )
+        return self._classify_path(file_path).authority in {
+            PathAuthority.WORKSPACE,
+            PathAuthority.SCRATCH,
+            PathAuthority.MANAGED,
+        }
 
     def _approved_external_target(self, file_path: str) -> tuple[FilesystemBackend, str, str] | None:
         if not self.session_id:

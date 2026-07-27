@@ -1,13 +1,14 @@
-"""Soft intent routing that recommends a Skill, never a concrete tool."""
+"""Route Skill intent, separate invocation tokens, and enforce activation order."""
 
 from __future__ import annotations
 
+import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
-from langchain.agents.middleware.types import ModelRequest, ModelResponse
-from langchain_core.messages import HumanMessage
+from langchain.agents.middleware.types import ModelRequest, ModelResponse, ToolCallRequest
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from graph.session_manager import session_manager
 from harness.models import RunTaskProfile
@@ -16,7 +17,7 @@ _MARKER = "[系统 Skill 提示]"
 
 
 class SkillIntentRouterMiddleware(AgentMiddleware):
-    """Suggest the first project Skill to read from the user intent.
+    """Suggest project Skills and gate sibling tools during explicit activation.
 
     The middleware intentionally does not activate a Toolset. A successful
     ``read_file(/skills/<id>/SKILL.md)`` is the only activation signal.
@@ -32,6 +33,7 @@ class SkillIntentRouterMiddleware(AgentMiddleware):
             return {
                 "matched": False,
                 "skill_ids": [],
+                "explicit_skill_ids": [],
                 "missing_explicit_skill_ids": [],
                 "routing_prompt": "",
             }
@@ -40,46 +42,38 @@ class SkillIntentRouterMiddleware(AgentMiddleware):
             key=lambda item: (not item.explicit, -item.confidence),
         )
         skill_ids = [item.skill_id for item in candidates]
+        explicit_skill_ids = [item.skill_id for item in candidates if item.explicit]
         missing = list(profile.missing_explicit_skill_ids)
         if not skill_ids and not missing:
             return {
                 "matched": False,
                 "skill_ids": [],
+                "explicit_skill_ids": [],
                 "missing_explicit_skill_ids": [],
                 "routing_prompt": "",
             }
         paths = ", ".join(f"/skills/{skill_id}/SKILL.md" for skill_id in skill_ids)
         missing_notice = (
-            "用户明确指定但当前未安装以下 Skill："
-            f"{', '.join(missing)}。这是可恢复的安装流程，不是任务失败。"
+            f"用户明确指定但当前未安装以下 Skill：{', '.join(missing)}。这是可恢复的安装流程，不是任务失败。"
             if missing
             else ""
         )
         load_notice = (
-            "先读取以下语义匹配的 SKILL.md，再按其中流程执行："
-            f"{paths}。不要猜测尚未加载 Skill 的业务工具。"
+            f"先读取以下语义匹配的 SKILL.md，再按其中流程执行：{paths}。不要猜测尚未加载 Skill 的业务工具。"
             if skill_ids
             else ""
         )
         return {
             "matched": True,
             "skill_ids": skill_ids,
+            "explicit_skill_ids": explicit_skill_ids,
             "missing_explicit_skill_ids": missing,
             "routing_prompt": " ".join(item for item in (missing_notice, load_notice) if item),
         }
 
-    def _request_with_routing_prompt(self, request: ModelRequest) -> ModelRequest:
-        """Add a transient routing hint without writing messages back to state."""
-        messages = list(request.messages or [])
-        index = next((index for index in range(len(messages) - 1, -1, -1) if isinstance(messages[index], HumanMessage)), None)
-        if index is None or not isinstance(messages[index].content, str):
-            return request
-        original = messages[index]
-        content = original.content.split(f"\n\n{_MARKER}")[0]
+    def _profile_payload(self, request: Any) -> dict[str, Any] | None:
         profile_payload = (
-            request.state.get("task_profile")
-            if isinstance(request.state.get("task_profile"), dict)
-            else None
+            request.state.get("task_profile") if isinstance(request.state.get("task_profile"), dict) else None
         )
         runtime = request.runtime
         context = runtime.context if runtime is not None and isinstance(runtime.context, dict) else {}
@@ -87,13 +81,127 @@ class SkillIntentRouterMiddleware(AgentMiddleware):
         run_id = str(context.get("run_id") or "")
         persisted = session_manager.get_run_state(session_id, run_id) if session_id and run_id else None
         if isinstance(persisted, dict) and isinstance(persisted.get("task_profile"), dict):
-            profile_payload = persisted["task_profile"]
-        decision = self._routing_decision(profile_payload)
+            return persisted["task_profile"]
+        return profile_payload
+
+    @staticmethod
+    def _without_explicit_skill_tokens(content: str, skill_ids: list[str]) -> tuple[str, list[str]]:
+        """Separate slash Skill invocations from the task text shown to the model."""
+
+        normalized = content
+        removed: list[str] = []
+        for skill_id in skill_ids:
+            pattern = re.compile(
+                rf"(?<!\S)/{re.escape(skill_id)}(?=$|[\s，,。.!！?？；;])",
+                flags=re.IGNORECASE,
+            )
+            normalized, count = pattern.subn("", normalized)
+            if count:
+                removed.append(skill_id)
+        if removed:
+            normalized = re.sub(r"[ \t]{2,}", " ", normalized).strip()
+        return normalized, removed
+
+    def _pending_explicit_skill_ids(self, request: Any) -> list[str]:
+        decision = self._routing_decision(self._profile_payload(request))
+        if not decision["matched"]:
+            return []
+        active_skill_ids = {str(item) for item in request.state.get("active_skill_ids") or []}
+        return [skill_id for skill_id in decision["explicit_skill_ids"] if skill_id not in active_skill_ids]
+
+    @staticmethod
+    def _is_required_skill_read(tool_call: dict[str, Any], pending_skill_ids: list[str]) -> bool:
+        if str(tool_call.get("name") or "") != "read_file":
+            return False
+        args = tool_call.get("args")
+        if not isinstance(args, dict):
+            return False
+        file_path = str(args.get("file_path") or "")
+        return file_path in {f"/skills/{skill_id}/SKILL.md" for skill_id in pending_skill_ids}
+
+    def _activation_barrier_message(self, request: ToolCallRequest) -> ToolMessage | None:
+        """Block sibling work until every explicitly requested Skill is activated."""
+
+        pending_skill_ids = self._pending_explicit_skill_ids(request)
+        if not pending_skill_ids or self._is_required_skill_read(request.tool_call, pending_skill_ids):
+            return None
+        tool_name = str(request.tool_call.get("name") or "")
+        paths = ", ".join(f"/skills/{skill_id}/SKILL.md" for skill_id in pending_skill_ids)
+        return ToolMessage(
+            content=(
+                f"Tool `{tool_name}` was not executed because an explicitly requested Skill is not active yet. "
+                f"First call `read_file` for: {paths}. After those reads succeed, reconsider the original task "
+                "and issue any workspace file calls in a new model turn. A slash Skill invocation is not a file path."
+            ),
+            tool_call_id=str(request.tool_call.get("id") or ""),
+            name=tool_name,
+            status="error",
+            additional_kwargs={
+                "puddingclaw_control_plane": {
+                    "type": "explicit_skill_activation_barrier",
+                    "pending_skill_ids": pending_skill_ids,
+                    "original_tool_executed": False,
+                }
+            },
+        )
+
+    def _response_with_activation_barrier(
+        self,
+        request: ModelRequest,
+        response: ModelResponse,
+    ) -> ModelResponse:
+        """Drop sibling calls when the model already emitted the required Skill read."""
+
+        pending_skill_ids = self._pending_explicit_skill_ids(request)
+        if not pending_skill_ids:
+            return response
+        required_read_present = any(
+            self._is_required_skill_read(tool_call, pending_skill_ids)
+            for message in response.result
+            if isinstance(message, AIMessage)
+            for tool_call in message.tool_calls
+        )
+        if not required_read_present:
+            return response
+        filtered_result = [
+            message.model_copy(
+                update={
+                    "tool_calls": [
+                        tool_call
+                        for tool_call in message.tool_calls
+                        if self._is_required_skill_read(tool_call, pending_skill_ids)
+                    ]
+                }
+            )
+            if isinstance(message, AIMessage) and message.tool_calls
+            else message
+            for message in response.result
+        ]
+        return ModelResponse(
+            result=filtered_result,
+            structured_response=response.structured_response,
+        )
+
+    def _request_with_routing_prompt(self, request: ModelRequest) -> ModelRequest:
+        """Add a transient routing hint without writing messages back to state."""
+        messages = list(request.messages or [])
+        index = next(
+            (index for index in range(len(messages) - 1, -1, -1) if isinstance(messages[index], HumanMessage)), None
+        )
+        if index is None or not isinstance(messages[index].content, str):
+            return request
+        original = messages[index]
+        content = original.content.split(f"\n\n{_MARKER}")[0]
+        decision = self._routing_decision(self._profile_payload(request))
         if not decision["matched"]:
             return request
+        content, removed_skill_ids = self._without_explicit_skill_tokens(
+            content,
+            decision["explicit_skill_ids"],
+        )
         active_skill_ids = {str(item) for item in request.state.get("active_skill_ids") or []}
         missing_skill_ids = [skill_id for skill_id in decision["skill_ids"] if skill_id not in active_skill_ids]
-        if not missing_skill_ids and not decision["missing_explicit_skill_ids"]:
+        if not missing_skill_ids and not decision["missing_explicit_skill_ids"] and not removed_skill_ids:
             return request
         paths = ", ".join(f"/skills/{skill_id}/SKILL.md" for skill_id in missing_skill_ids)
         missing_notice = (
@@ -106,25 +214,51 @@ class SkillIntentRouterMiddleware(AgentMiddleware):
             else ""
         )
         load_notice = (
-            "本轮任务已由统一路由器匹配到尚未加载的项目 Skill。先读取："
-            f"{paths}。再按其中流程执行；不要猜测尚未加载 Skill 的业务工具。"
+            "本轮任务已由统一路由器匹配到尚未加载的项目 Skill。"
+            + (
+                f"用户显式指定了其中的 {', '.join(decision['explicit_skill_ids'])}；"
+                "在这些 Skill 激活前，本轮只能使用 read_file 读取对应 SKILL.md，不得并行调用其他工具。"
+                if decision["explicit_skill_ids"]
+                else ""
+            )
+            + f"先读取：{paths}。再按其中流程执行；不要猜测尚未加载 Skill 的业务工具。"
             if missing_skill_ids
             else ""
         )
-        routing_prompt = " ".join(
-            item for item in (missing_notice, load_notice) if item
+        invocation_notice = (
+            f"用户消息中的 {'、'.join('/' + item for item in removed_skill_ids)} 是 Skill 调用标记，"
+            "不是文件路径，也不得与后续任务文字拼接为 file_path。调用标记已经从下方任务正文中移除。"
+            if removed_skill_ids
+            else ""
         )
-        messages[index] = original.model_copy(
-            update={"content": f"{content}\n\n{_MARKER} {routing_prompt}"}
-        )
+        routing_prompt = " ".join(item for item in (invocation_notice, missing_notice, load_notice) if item)
+        messages[index] = original.model_copy(update={"content": f"{content}\n\n{_MARKER} {routing_prompt}"})
         return request.override(messages=messages)
 
     def wrap_model_call(self, request: ModelRequest, handler: Any) -> ModelResponse:
-        return handler(self._request_with_routing_prompt(request))
+        prepared = self._request_with_routing_prompt(request)
+        return self._response_with_activation_barrier(request, handler(prepared))
 
     async def awrap_model_call(
         self,
         request: ModelRequest,
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> ModelResponse:
-        return await handler(self._request_with_routing_prompt(request))
+        prepared = self._request_with_routing_prompt(request)
+        return self._response_with_activation_barrier(request, await handler(prepared))
+
+    def wrap_tool_call(self, request: ToolCallRequest, handler: Any) -> Any:
+        blocked = self._activation_barrier_message(request)
+        if blocked is not None:
+            return blocked
+        return handler(request)
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[Any]],
+    ) -> Any:
+        blocked = self._activation_barrier_message(request)
+        if blocked is not None:
+            return blocked
+        return await handler(request)

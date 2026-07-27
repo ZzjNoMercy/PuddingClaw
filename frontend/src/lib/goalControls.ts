@@ -2,7 +2,7 @@ export type GoalLifecycleStatus =
   | "active"
   | "paused"
   | "blocked"
-  | "achieved"
+  | "completed"
   | "cancelled"
   | "budget_exceeded";
 
@@ -16,8 +16,28 @@ export interface GoalControlPresentation {
 
 export type GoalExecutionStep = "pause" | "resume" | "start";
 
+export type GoalTodoStatus =
+  | "pending"
+  | "in_progress"
+  | "completed"
+  | "cancelled"
+  | "error";
+
+export interface GoalTodoProgress {
+  completed: number;
+  total: number;
+}
+
+export function goalTodoProgress(statuses: GoalTodoStatus[]): GoalTodoProgress {
+  const activeStatuses = statuses.filter((status) => status !== "cancelled");
+  return {
+    completed: activeStatuses.filter((status) => status === "completed").length,
+    total: activeStatuses.length,
+  };
+}
+
 export function goalRemainsVisible(status: GoalLifecycleStatus): boolean {
-  return !["achieved", "cancelled"].includes(status);
+  return !["completed", "cancelled"].includes(status);
 }
 
 export function shouldShowInlineBudgetRequest(
@@ -81,7 +101,7 @@ export function goalControlPresentation(
     active: "待启动",
     paused: "已暂停",
     blocked: "受阻",
-    achieved: "已完成",
+    completed: "已完成",
     cancelled: "已取消",
     budget_exceeded: "预算已耗尽",
   };

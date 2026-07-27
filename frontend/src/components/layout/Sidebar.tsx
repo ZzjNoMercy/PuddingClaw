@@ -11,6 +11,9 @@ import {
   Pencil,
   Trash2,
   Check,
+  ChevronDown,
+  ChevronRight,
+  ChevronUp,
   X,
   Search,
   Puzzle,
@@ -25,16 +28,21 @@ import {
   ExternalLink,
   Archive,
   Pin,
+  Loader2,
 } from "lucide-react";
 import { useApp } from "@/lib/store";
 import { openProject } from "@/lib/api";
 import { useProjectFolderPicker } from "@/components/projects/useProjectFolderPicker";
+
+const PROJECT_EXPANSION_STORAGE_KEY = "puddingclaw_sidebar_project_expansion";
 
 export default function Sidebar() {
   const {
     sessionId,
     setSessionId,
     sessions,
+    sessionsLoaded,
+    runningSessionIds,
     renameSession,
     deleteSession,
     runtimeMode,
@@ -52,6 +60,42 @@ export default function Sidebar() {
   const router = useRouter();
   const pathname = usePathname();
   const isChatRoute = pathname === "/";
+  const [expandedProjectSessions, setExpandedProjectSessions] = useState<Set<string>>(() => new Set());
+  const [expandedProjects, setExpandedProjects] = useState<Set<string>>(() => new Set());
+  const [projectExpansionRestored, setProjectExpansionRestored] = useState(false);
+  const hasSavedProjectExpansionRef = useRef(false);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(PROJECT_EXPANSION_STORAGE_KEY);
+      if (raw) {
+        const saved = JSON.parse(raw) as { projects?: unknown; sessionLists?: unknown };
+        if (Array.isArray(saved.projects)) {
+          setExpandedProjects(new Set(saved.projects.filter((id): id is string => typeof id === "string")));
+        }
+        if (Array.isArray(saved.sessionLists)) {
+          setExpandedProjectSessions(new Set(saved.sessionLists.filter((id): id is string => typeof id === "string")));
+        }
+        hasSavedProjectExpansionRef.current = true;
+      }
+    } catch {
+      // Ignore malformed or unavailable browser storage.
+    } finally {
+      setProjectExpansionRestored(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!projectExpansionRestored) return;
+    try {
+      localStorage.setItem(PROJECT_EXPANSION_STORAGE_KEY, JSON.stringify({
+        projects: Array.from(expandedProjects),
+        sessionLists: Array.from(expandedProjectSessions),
+      }));
+    } catch {
+      // Keep the sidebar usable when browser storage is unavailable.
+    }
+  }, [expandedProjectSessions, expandedProjects, projectExpansionRestored]);
 
   // Sort sessions by most recent activity first
   const sortedSessions = useMemo(
@@ -77,6 +121,22 @@ export default function Sidebar() {
     }
     return grouped;
   }, [sortedSessions, isAgentSession]);
+
+  useEffect(() => {
+    if (!projectExpansionRestored || projects.length === 0) return;
+    const activeProjectId = sessionsLoaded
+      ? sessions.find((session) => session.id === sessionId)?.project_id
+      : null;
+    const projectIdToReveal = activeProjectId
+      || (!hasSavedProjectExpansionRef.current ? projects[0]?.project_id : null);
+    if (!projectIdToReveal) return;
+    setExpandedProjects((current) => {
+      if (current.has(projectIdToReveal)) return current;
+      const next = new Set(current);
+      next.add(projectIdToReveal);
+      return next;
+    });
+  }, [projectExpansionRestored, projects, sessionId, sessions, sessionsLoaded]);
   const conversationSessions = useMemo(() => {
     if (runtimeMode === "agent") {
       return sortedSessions.filter((session) => isAgentSession(session) && !session.project_id);
@@ -104,6 +164,24 @@ export default function Sidebar() {
   const handleAddProject = useCallback(async () => {
     await openProjectFolderPicker();
   }, [openProjectFolderPicker]);
+
+  const toggleProjectSessions = useCallback((projectId: string) => {
+    setExpandedProjectSessions((current) => {
+      const next = new Set(current);
+      if (next.has(projectId)) next.delete(projectId);
+      else next.add(projectId);
+      return next;
+    });
+  }, []);
+
+  const toggleProjectCollapsed = useCallback((projectId: string) => {
+    setExpandedProjects((current) => {
+      const next = new Set(current);
+      if (next.has(projectId)) next.delete(projectId);
+      else next.add(projectId);
+      return next;
+    });
+  }, []);
 
   return (
     <>
@@ -176,7 +254,7 @@ export default function Sidebar() {
           href="/knowledge"
           className={`w-full flex items-center gap-2 px-3 py-2 text-[13px] rounded-xl transition-all ${
             runtimeReady && pathname.startsWith("/knowledge")
-              ? "bg-white/72 text-[#002fa7] font-medium shadow-sm"
+              ? "bg-[#002fa7] text-white font-medium shadow-sm shadow-[#002fa7]/20"
               : "text-gray-600 hover:text-gray-900 hover:bg-white/50"
           }`}
         >
@@ -187,7 +265,7 @@ export default function Sidebar() {
           href="/analytics"
           className={`w-full flex items-center gap-2 px-3 py-2 text-[13px] rounded-xl transition-all ${
             runtimeReady && pathname.startsWith("/analytics")
-              ? "bg-white/72 text-[#002fa7] font-medium shadow-sm"
+              ? "bg-[#002fa7] text-white font-medium shadow-sm shadow-[#002fa7]/20"
               : "text-gray-600 hover:text-gray-900 hover:bg-white/50"
           }`}
         >
@@ -198,7 +276,7 @@ export default function Sidebar() {
           href="/skills"
           className={`w-full flex items-center gap-2 px-3 py-2 text-[13px] rounded-xl transition-all ${
             runtimeReady && pathname.startsWith("/skills")
-              ? "bg-white/72 text-[#002fa7] font-medium shadow-sm"
+              ? "bg-[#002fa7] text-white font-medium shadow-sm shadow-[#002fa7]/20"
               : "text-gray-600 hover:text-gray-900 hover:bg-white/50"
           }`}
         >
@@ -231,6 +309,9 @@ export default function Sidebar() {
               <div className="space-y-1">
                 {projects.map((project) => {
                   const childSessions = projectSessions.get(project.project_id) || [];
+                  const sessionsExpanded = expandedProjectSessions.has(project.project_id);
+                  const projectCollapsed = !expandedProjects.has(project.project_id);
+                  const visibleChildSessions = sessionsExpanded ? childSessions : childSessions.slice(0, 5);
                   return (
                     <div key={project.project_id} className="relative">
                       <ProjectItem
@@ -238,6 +319,7 @@ export default function Sidebar() {
                         name={project.name}
                         path={project.path}
                         pinned={Boolean(project.pinned)}
+                        collapsed={projectCollapsed}
                         isActive={
                           isChatRoute &&
                           currentProjectId === project.project_id &&
@@ -247,6 +329,7 @@ export default function Sidebar() {
                           setRuntimeMode("agent");
                           setCurrentProjectId(project.project_id);
                         }}
+                        onToggleCollapsed={() => toggleProjectCollapsed(project.project_id)}
                         onPinToggle={async () => {
                           await updateProject(project.project_id, { pinned: !project.pinned });
                         }}
@@ -263,13 +346,14 @@ export default function Sidebar() {
                           return removed;
                         }}
                       />
-                      <div className="relative ml-5 mt-0.5 space-y-px">
+                      {!projectCollapsed && sessionsLoaded ? <div className="relative ml-5 mt-0.5 space-y-px">
                         {childSessions.length > 0 ? (
-                          childSessions.slice(0, 5).map((s) => (
+                          visibleChildSessions.map((s) => (
                             <SessionItem
                               key={s.id}
                               id={s.id}
                               title={s.title}
+                              isRunning={runningSessionIds.has(s.id)}
                               isActive={isChatRoute && sessionId === s.id}
                               onSelect={() => {
                                 setRuntimeMode("agent");
@@ -287,9 +371,17 @@ export default function Sidebar() {
                           <p className="px-3 py-1 text-[12px] text-gray-400">暂无对话</p>
                         )}
                         {childSessions.length > 5 && (
-                          <p className="px-3 py-1 text-[12px] text-gray-400">展开显示</p>
+                          <button
+                            type="button"
+                            onClick={() => toggleProjectSessions(project.project_id)}
+                            aria-expanded={sessionsExpanded}
+                            className="flex w-full items-center gap-1 rounded-lg px-3 py-1 text-left text-[12px] font-medium text-gray-400 transition hover:bg-white/50 hover:text-[#002fa7]"
+                          >
+                            {sessionsExpanded ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+                            {sessionsExpanded ? "收起显示" : `展开显示（其余 ${childSessions.length - 5} 个）`}
+                          </button>
                         )}
-                      </div>
+                      </div> : null}
                     </div>
                   );
                 })}
@@ -317,6 +409,7 @@ export default function Sidebar() {
                 key={s.id}
                 id={s.id}
                 title={s.title}
+                isRunning={runningSessionIds.has(s.id)}
                 isActive={isChatRoute && sessionId === s.id}
                 onSelect={() => {
                   if (s.runtime_mode === "agent") {
@@ -385,8 +478,10 @@ function ProjectItem({
   name,
   path,
   pinned,
+  collapsed,
   isActive,
   onSelect,
+  onToggleCollapsed,
   onPinToggle,
   onRename,
   onRemove,
@@ -395,8 +490,10 @@ function ProjectItem({
   name: string;
   path: string;
   pinned: boolean;
+  collapsed: boolean;
   isActive: boolean;
   onSelect: () => void;
+  onToggleCollapsed: () => void;
   onPinToggle: () => Promise<void>;
   onRename: (name: string) => Promise<boolean>;
   onRemove: () => Promise<boolean>;
@@ -491,12 +588,25 @@ function ProjectItem({
     <div className={`group/project relative flex items-center ${menuOpen ? "z-[70]" : "z-10"}`}>
       <button
         type="button"
+        onClick={onToggleCollapsed}
+        aria-expanded={!collapsed}
+        className={`absolute left-1.5 top-1/2 z-20 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-lg transition ${
+          isActive
+            ? "text-[#002fa7]/75 hover:bg-[#002fa7]/[0.08] hover:text-[#002fa7]"
+            : "text-gray-400 hover:bg-black/[0.05] hover:text-gray-700"
+        }`}
+        title={collapsed ? "展开项目会话" : "折叠项目会话"}
+      >
+        {collapsed ? <ChevronRight className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+      </button>
+      <button
+        type="button"
         onClick={onSelect}
-        className={`flex min-w-0 flex-1 items-center gap-2 rounded-xl px-3 py-1.5 pr-14 text-left text-[12px] transition-all ${
+        className={`flex min-w-0 flex-1 items-center gap-2 rounded-xl py-1.5 pr-14 text-left text-[12px] transition-all ${
           isActive
             ? "bg-white/68 text-gray-900 font-medium shadow-sm"
             : "text-gray-700 hover:bg-white/48"
-        }`}
+        } pl-8`}
         title={path}
       >
         <FolderKanban className="h-3.5 w-3.5 shrink-0 text-gray-500" />
@@ -647,6 +757,7 @@ function SidebarLink({
 function SessionItem({
   id,
   title,
+  isRunning,
   isActive,
   onSelect,
   onRename,
@@ -654,6 +765,7 @@ function SessionItem({
 }: {
   id: string;
   title: string;
+  isRunning: boolean;
   isActive: boolean;
   onSelect: () => void;
   onRename: (title: string) => void;
@@ -757,23 +869,39 @@ function SessionItem({
         onClick={onSelect}
         className={`w-full flex items-center gap-1.5 px-3 py-1.5 text-[12px] rounded-xl transition-all text-left relative pr-8 ${
           isActive
-            ? "bg-white/72 text-[#002fa7] font-medium shadow-sm"
+            ? "bg-[#002fa7] text-white font-medium shadow-sm shadow-[#002fa7]/20"
             : "text-gray-600 hover:bg-white/48 hover:text-gray-900"
         }`}
       >
-        <MessageSquare className="h-3 w-3 shrink-0 text-gray-500" />
+        <MessageSquare className={`h-3 w-3 shrink-0 ${isActive ? "text-white" : "text-gray-500"}`} />
         <span className="truncate">{title}</span>
       </button>
 
-      {/* More button */}
+      {/* Running state / more button */}
       <div className={`absolute right-1 top-1/2 -translate-y-1/2 ${menuOpen ? "z-[100]" : ""}`}>
+        {isRunning && !menuOpen && (
+          <span
+            className={`pointer-events-none absolute inset-0 flex items-center justify-center transition-opacity group-hover:opacity-0 ${
+              isActive ? "text-white" : "text-[#002fa7]"
+            }`}
+            title="Agent 正在运行"
+            role="status"
+            aria-label="Agent 正在运行"
+          >
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          </span>
+        )}
         <button
           ref={menuButtonRef}
           onClick={(e) => {
             e.stopPropagation();
             toggleMenu();
           }}
-          className="p-1 rounded-md text-gray-400 opacity-0 group-hover:opacity-100 hover:text-gray-700 hover:bg-black/[0.05] transition-all"
+          className={`p-1 rounded-md opacity-0 group-hover:opacity-100 transition-all ${
+            isActive
+              ? "text-white/70 hover:bg-white/15 hover:text-white"
+              : "text-gray-400 hover:bg-black/[0.05] hover:text-gray-700"
+          }`}
         >
           <MoreHorizontal className="w-3.5 h-3.5" />
         </button>

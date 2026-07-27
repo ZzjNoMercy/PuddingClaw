@@ -30,9 +30,10 @@ class PandasQueryEngineResult:
     profile: dict[str, Any]
     plan_explanation: str | None = None
     retries: int = 0
+    semantic_context: dict[str, Any] | None = None
 
     def to_metadata(self) -> dict[str, Any]:
-        return {
+        metadata = {
             "engine": "puddingclaw_pandas_query_engine",
             "generated_code": self.code,
             "plan_explanation": self.plan_explanation,
@@ -40,6 +41,16 @@ class PandasQueryEngineResult:
             "raw_result": safe_json(self.raw_result),
             "retries": self.retries,
         }
+        if self.semantic_context:
+            metadata["semantic_context_id"] = self.semantic_context.get("context_id")
+            metadata["semantic_context_hash"] = self.semantic_context.get("content_hash")
+            metadata["semantic_asset_ids"] = [
+                str(item.get("id") or "")
+                for key in ("semantic_assets", "references")
+                for item in self.semantic_context.get(key) or []
+                if isinstance(item, dict) and str(item.get("id") or "")
+            ]
+        return metadata
 
 
 def _openai_client_config() -> dict[str, Any]:
@@ -69,12 +80,14 @@ class PuddingClawPandasQueryEngine:
         preview_rows: int = 5,
         max_retries: int = 1,
         runner: PandasCodeRunner | None = None,
+        semantic_context: dict[str, Any] | None = None,
     ):
         self.df = df
         self.preview_rows = preview_rows
         self.max_retries = max(0, max_retries)
         self.profile = profile_dataframe(df, preview_rows=preview_rows)
         self.runner = runner or InProcessPandasRunner()
+        self.semantic_context = semantic_context or {}
 
     def _client(self):
         try:
@@ -99,6 +112,7 @@ class PuddingClawPandasQueryEngine:
                     "content": build_code_generation_prompt(
                         query=query,
                         profile=self.profile,
+                        semantic_context=self.semantic_context,
                         previous_error=previous_error,
                         previous_code=previous_code,
                     ),
@@ -114,7 +128,15 @@ class PuddingClawPandasQueryEngine:
             temperature=0,
             messages=[
                 {"role": "system", "content": ANSWER_SYNTHESIS_SYSTEM_PROMPT},
-                {"role": "user", "content": build_answer_synthesis_prompt(query=query, code=code, rendered_result=rendered_result)},
+                {
+                    "role": "user",
+                    "content": build_answer_synthesis_prompt(
+                        query=query,
+                        code=code,
+                        rendered_result=rendered_result,
+                        semantic_context=self.semantic_context,
+                    ),
+                },
             ],
         )
         return completion.choices[0].message.content or rendered_result
@@ -141,6 +163,7 @@ class PuddingClawPandasQueryEngine:
                     profile=self.profile,
                     plan_explanation=plan.get("explanation"),
                     retries=attempt,
+                    semantic_context=self.semantic_context,
                 )
             except Exception as exc:
                 previous_code = code

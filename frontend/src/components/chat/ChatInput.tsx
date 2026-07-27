@@ -26,6 +26,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { useApp } from "@/lib/store";
+import { isSessionSubmitting } from "@/lib/sessionConcurrency";
 import { useProjectFolderPicker } from "@/components/projects/useProjectFolderPicker";
 import ConfirmDialog from "@/components/ui/ConfirmDialog";
 import {
@@ -50,6 +51,7 @@ import SlashCommandMenu from "./SlashCommandMenu";
 
 type AttachmentKind = AgentAttachment["type"];
 type OpenPopover = null | "plus" | "plus-model" | "project" | "approval";
+type SelectedSkillHint = { name: string; start: number; end: number };
 
 const terminalRunStatuses = new Set([
   "completed",
@@ -151,12 +153,14 @@ export default function ChatInput() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
   const controlsMenuRef = useRef<HTMLDivElement>(null);
-  const submitInFlightRef = useRef(false);
+  const submitInFlightSessionsRef = useRef<Set<string>>(new Set());
   const currentSessionIdRef = useRef(sessionId);
   const contextUsageRequestRef = useRef(0);
   const [openPopover, setOpenPopover] = useState<OpenPopover>(null);
   const openPopoverRef = useRef<OpenPopover>(null);
-  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submittingSessionIds, setSubmittingSessionIds] = useState<Set<string>>(
+    () => new Set(),
+  );
   const [uploadingCount, setUploadingCount] = useState(0);
   const [inputError, setInputError] = useState<string | null>(null);
   const [goalCancelPending, setGoalCancelPending] = useState(false);
@@ -166,7 +170,8 @@ export default function ChatInput() {
     hasActiveRun ||
     approvalModeSaving ||
     Boolean(currentRun && !terminalRunStatuses.has(currentRun.status));
-  const disabled = isStreaming || isCompressing || approvalModeSaving || isSubmitting || isUploading;
+  const isSubmitting = isSessionSubmitting(submittingSessionIds, sessionId);
+  const disabled = isStreaming || isCompressing || approvalModeSaving || isSubmitting || isUploading || currentRun?.status === "waiting_hitl";
   const configurationBusy = isSubmitting || isUploading;
   const [analyticsModels, setAnalyticsModels] = useState<AnalyticsModelSummary[]>([]);
   const detectedImagePaths = useMemo(() => {
@@ -244,6 +249,7 @@ export default function ChatInput() {
   const [slashQuery, setSlashQuery] = useState("");
   const [selectedMenuIndex, setSelectedMenuIndex] = useState(0);
   const [skills, setSkills] = useState<Array<{ name: string; description: string }>>([]);
+  const selectedSkillHintsBySessionRef = useRef<Map<string, SelectedSkillHint[]>>(new Map());
   // Track the position of the `/` that triggered the menu, for replacement on select
   const slashStartPosRef = useRef<number>(-1);
   const thinkingToggleInFlightRef = useRef(false);
@@ -325,35 +331,54 @@ export default function ChatInput() {
   }, [text]);
 
   const handleSubmit = useCallback(async () => {
-    if ((!text.trim() && attachments.length === 0) || disabled || submitInFlightRef.current) return;
+    if (
+      (!text.trim() && attachments.length === 0) ||
+      disabled ||
+      submitInFlightSessionsRef.current.has(sessionId)
+    ) return;
     const submittedText = text;
     const submittedAttachments = attachments;
+    const submittedSkillHintRecords = (
+      selectedSkillHintsBySessionRef.current.get(sessionId) || []
+    ).filter((hint) => text.slice(hint.start, hint.end) === `/${hint.name}`);
+    const submittedSkillHints = Array.from(
+      new Set(submittedSkillHintRecords.map((hint) => hint.name)),
+    );
     const submittedSessionId = sessionId;
-    submitInFlightRef.current = true;
-    setIsSubmitting(true);
+    submitInFlightSessionsRef.current.add(submittedSessionId);
+    setSubmittingSessionIds((current) => new Set(current).add(submittedSessionId));
     setInputError(null);
     setOpenPopover(null);
     setText("");
+    selectedSkillHintsBySessionRef.current.delete(submittedSessionId);
     setAttachments([]);
     setPendingInput(null);
     if (textareaRef.current) textareaRef.current.style.height = "auto";
     if (attachmentInputRef.current) attachmentInputRef.current.value = "";
     try {
-      const accepted = await sendMessage(submittedText.trim(), submittedAttachments);
+      const accepted = await sendMessage(submittedText.trim(), submittedAttachments, {
+        skillHints: submittedSkillHints,
+      });
       if (!accepted && currentSessionIdRef.current === submittedSessionId) {
         setText((current) => current || submittedText);
         setAttachments((current) => current.length > 0 ? current : submittedAttachments);
+        selectedSkillHintsBySessionRef.current.set(submittedSessionId, submittedSkillHintRecords);
         setInputError("消息未发出，已恢复输入内容，请重试。");
       }
     } catch (error) {
       if (currentSessionIdRef.current === submittedSessionId) {
         setText((current) => current || submittedText);
         setAttachments((current) => current.length > 0 ? current : submittedAttachments);
+        selectedSkillHintsBySessionRef.current.set(submittedSessionId, submittedSkillHintRecords);
         setInputError(error instanceof Error ? error.message : "消息发送失败，已恢复输入内容。");
       }
     } finally {
-      submitInFlightRef.current = false;
-      setIsSubmitting(false);
+      submitInFlightSessionsRef.current.delete(submittedSessionId);
+      setSubmittingSessionIds((current) => {
+        const next = new Set(current);
+        next.delete(submittedSessionId);
+        return next;
+      });
     }
   }, [text, attachments, disabled, sendMessage, setPendingInput, sessionId]);
 
@@ -425,11 +450,22 @@ export default function ChatInput() {
     // Use textarea DOM value as source of truth to avoid stale closure (fixes I-1)
     const currentText = textareaRef.current?.value ?? "";
     const startPos = slashStartPosRef.current;
+    let insertedStart = 0;
+    let adjustedHints: SelectedSkillHint[] = [];
     if (startPos >= 0) {
       const cursorPos = textareaRef.current?.selectionStart ?? currentText.length;
       const before = currentText.slice(0, startPos);
       const after = currentText.slice(cursorPos);
       const inserted = `/${skillName} `;
+      insertedStart = startPos;
+      const delta = inserted.length - (cursorPos - startPos);
+      adjustedHints = (selectedSkillHintsBySessionRef.current.get(sessionId) || []).flatMap((hint) => {
+        if (hint.end <= startPos) return [hint];
+        if (hint.start >= cursorPos) {
+          return [{ ...hint, start: hint.start + delta, end: hint.end + delta }];
+        }
+        return [];
+      });
       const newText = before + inserted + after;
       setText(newText);
       // Schedule cursor placement after React re-render (fixes I-2)
@@ -438,9 +474,13 @@ export default function ChatInput() {
       setText(`/${skillName} `);
     }
     setShowSlashMenu(false);
+    selectedSkillHintsBySessionRef.current.set(sessionId, [
+      ...adjustedHints.filter((hint) => hint.name !== skillName),
+      { name: skillName, start: insertedStart, end: insertedStart + skillName.length + 1 },
+    ]);
     slashStartPosRef.current = -1;
     textareaRef.current?.focus();
-  }, []);
+  }, [sessionId]);
 
   // Escape closes the nearest transient UI before it can stop a Run.
   useEffect(() => {

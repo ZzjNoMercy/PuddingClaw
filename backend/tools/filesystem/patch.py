@@ -1,6 +1,7 @@
 """Optimistic single- and multi-file patch tools."""
 
 import json
+from pathlib import Path
 from typing import Any
 
 from langchain.tools import ToolRuntime
@@ -15,6 +16,70 @@ from tools.filesystem.schemas import (
     ReplaceFileInput,
     ReplacementHunk,
 )
+
+
+def _canonical_artifact_path(backend: Any, target_path: str) -> str | None:
+    """Map a tool-observed path (incl. ``/workspace/`` virtual prefixes) to the
+    canonical host path validation receipts are recorded against."""
+
+    raw = str(target_path or "").strip()
+    if not raw:
+        return None
+    workspace_root = getattr(backend, "workspace_root", None)
+    if (raw == "/workspace" or raw.startswith("/workspace/")) and workspace_root is not None:
+        relative = raw.removeprefix("/workspace/").strip("/")
+        candidate = (Path(workspace_root) / relative) if relative else Path(workspace_root)
+    else:
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            return None
+    try:
+        return str(candidate.resolve())
+    except OSError:
+        return str(candidate.absolute())
+
+
+def _stale_validation_notice(
+    backend: Any,
+    session_id: str,
+    mutations: list[tuple[str, str]],
+) -> dict[str, Any]:
+    """Warn when a just-committed mutation invalidated passing validation
+    evidence bound to the pre-mutation content hash.
+
+    ``mutations`` is a list of ``(target_path, new_sha256)`` pairs.  The cost
+    of re-validation must be visible at write time; otherwise the agent only
+    learns about the invalidation one verification round later and falls into
+    a validate → patch → re-validate loop.
+    """
+
+    if not session_id:
+        return {}
+    from graph.session_manager import session_manager
+
+    receipt_ids: list[str] = []
+    for target_path, new_sha256 in mutations:
+        canonical = _canonical_artifact_path(backend, target_path)
+        if canonical is None:
+            continue
+        for item in session_manager.find_stale_validation_receipts(
+            session_id,
+            canonical_path=canonical,
+            current_sha256=new_sha256 or None,
+        ):
+            receipt_id = str(item.get("validation_receipt_id") or "")
+            if receipt_id and receipt_id not in receipt_ids:
+                receipt_ids.append(receipt_id)
+    if not receipt_ids:
+        return {}
+    return {
+        "invalidated_validation_receipt_ids": receipt_ids,
+        "validation_invalidation_warning": (
+            f"此次修改使 {len(receipt_ids)} 份已通过的验证证据失效"
+            "（证据绑定修改前的内容 hash）。请完成全部修改、冻结产物后重新验证；"
+            "验证通过的产物不要再改动。"
+        ),
+    }
 
 
 def render_replacements(
@@ -141,8 +206,6 @@ def build_patch_tools(backend: Any) -> list[StructuredTool]:
         session_id = str(context.get("session_id") or "")
         run_id = str(context.get("run_id") or "")
         if session_id and run_id:
-            from pathlib import Path
-
             if Path(target_path).is_absolute():
                 from graph.session_manager import session_manager
 
@@ -154,9 +217,7 @@ def build_patch_tools(backend: Any) -> list[StructuredTool]:
                 )
                 if isinstance(receipt, dict):
                     mutation_receipt_id = str(receipt.get("receipt_id") or "")
-                    validation_receipt_id = str(
-                        receipt.get("validation_receipt_id") or ""
-                    )
+                    validation_receipt_id = str(receipt.get("validation_receipt_id") or "")
                     if validation_receipt_id:
                         validation_receipt_ids.append(validation_receipt_id)
         return ToolMessage(
@@ -172,6 +233,11 @@ def build_patch_tools(backend: Any) -> list[StructuredTool]:
                     "rebased_to_sha256": current_version if rebased else None,
                     "mutation_receipt_id": mutation_receipt_id,
                     "validation_receipt_ids": validation_receipt_ids,
+                    **_stale_validation_notice(
+                        backend,
+                        session_id,
+                        [(target_path, target_sha256)],
+                    ),
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -208,6 +274,15 @@ def build_patch_tools(backend: Any) -> list[StructuredTool]:
             expected_sha256=expected_sha256,
         )
         status = str(result.get("status") or "io_error")
+        if status == "completed":
+            context = runtime.context if isinstance(runtime.context, dict) else {}
+            result.update(
+                _stale_validation_notice(
+                    backend,
+                    str(context.get("session_id") or ""),
+                    [(file_path, digest(content))],
+                )
+            )
         return ToolMessage(
             content=json.dumps(result, ensure_ascii=False, sort_keys=True),
             name="replace_file",
@@ -240,10 +315,7 @@ def build_patch_tools(backend: Any) -> list[StructuredTool]:
             current = digest(original)
             if current != spec.expected_sha256:
                 return ToolMessage(
-                    content=(
-                        f"conflict: {spec.file_path} expected "
-                        f"{spec.expected_sha256}, current {current}"
-                    ),
+                    content=(f"conflict: {spec.file_path} expected {spec.expected_sha256}, current {current}"),
                     name="patch_files",
                     tool_call_id=runtime.tool_call_id,
                     status="error",
@@ -251,9 +323,7 @@ def build_patch_tools(backend: Any) -> list[StructuredTool]:
             updated = original
             for hunk in spec.replacements:
                 occurrences = updated.count(hunk.old_string)
-                if occurrences == 0 or (
-                    not hunk.replace_all and occurrences != 1
-                ):
+                if occurrences == 0 or (not hunk.replace_all and occurrences != 1):
                     return ToolMessage(
                         content=(
                             "conflict: replacement is not uniquely applicable "
@@ -277,6 +347,15 @@ def build_patch_tools(backend: Any) -> list[StructuredTool]:
             )
         result = apply_transaction(changes)
         status = str(result.get("status") or "io_error")
+        if status == "completed" and isinstance(result, dict):
+            context = runtime.context if isinstance(runtime.context, dict) else {}
+            result.update(
+                _stale_validation_notice(
+                    backend,
+                    str(context.get("session_id") or ""),
+                    [(str(change["file_path"]), digest(str(change["content"]))) for change in changes],
+                )
+            )
         return ToolMessage(
             content=json.dumps(result, ensure_ascii=False, sort_keys=True),
             name="patch_files",
@@ -310,9 +389,10 @@ def build_patch_tools(backend: Any) -> list[StructuredTool]:
         StructuredTool.from_function(
             name="patch_files",
             description=(
-                "Apply one atomic optimistic transaction across 2-50 authorized external files. "
+                "Apply one atomic optimistic transaction across 2-50 files under one authority. "
                 "Every file must carry the version returned by inspect_file_version; any permission, "
-                "version, validation, or I/O failure leaves all targets unchanged."
+                "version, validation, or I/O failure leaves all targets unchanged. Do not mix "
+                "workspace/scratch paths with external Host paths in one transaction."
             ),
             func=patch_files,
             args_schema=PatchFilesInput,

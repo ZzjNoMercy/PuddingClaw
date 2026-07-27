@@ -1,4 +1,4 @@
-"""Deterministic semantic asset resolver for database QA."""
+"""Deterministic semantic asset resolver shared by analytics runtimes."""
 
 from __future__ import annotations
 
@@ -53,6 +53,7 @@ class ResolvedSemanticAsset:
     aliases: list[str]
     tags: list[str]
     parent_id: str = ""
+    frontmatter: dict[str, Any] | None = None
 
     def to_prompt_block(self, *, full_body: bool = False) -> str:
         labels = {
@@ -78,6 +79,7 @@ class ResolvedSemanticAsset:
             "aliases": self.aliases,
             "tags": self.tags,
             "parent_id": self.parent_id,
+            "frontmatter": self.frontmatter or {},
             "body_preview": self.body[:1200],
             "body_chars": len(self.body),
         }
@@ -218,6 +220,7 @@ def _resolve_measure_references(
                     aliases=[],
                     tags=[],
                     parent_id=measure.id,
+                    frontmatter={},
                 ),
             )
         )
@@ -312,6 +315,7 @@ def resolve_semantic_assets(
                 body=str(detail.get("body") or ""),
                 aliases=[str(item) for item in detail.get("aliases") or []],
                 tags=[str(item) for item in detail.get("tags") or []],
+                frontmatter=dict(detail.get("frontmatter") or {}),
             )
         )
 
@@ -384,6 +388,7 @@ def resolve_semantic_assets_by_ids(
                 body=str(detail.get("body") or ""),
                 aliases=[str(item) for item in detail.get("aliases") or []],
                 tags=[str(item) for item in detail.get("tags") or []],
+                frontmatter=dict(detail.get("frontmatter") or {}),
             )
         )
 

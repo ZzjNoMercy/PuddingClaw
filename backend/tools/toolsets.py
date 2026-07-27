@@ -24,6 +24,8 @@ NATIVE_TOOLSETS: dict[str, frozenset[str]] = {
 # inventory and Skill documentation. Declaring one of these toolsets in a Skill
 # does not gate or expand access.
 UNCONDITIONAL_EXTENSION_TOOLSETS: dict[str, frozenset[str]] = {
+    "goal_completion": frozenset({"update_goal"}),
+    "human_input": frozenset({"request_user_input"}),
     "evidence_read": frozenset({"read_evidence"}),
     "harness_files": frozenset({
         "inspect_file_version",
@@ -192,6 +194,8 @@ TOOL_CONTROL_DESCRIPTORS: dict[str, ToolControlDescriptor] = {
     "glob": _READ_ONLY,
     "grep": _READ_ONLY,
     "update_todos": _INTERNAL_MUTATION,
+    "update_goal": _INTERNAL_MUTATION,
+    "request_user_input": _INTERNAL_MUTATION,
     "write_file": _WORKSPACE_WRITE,
     "edit_file": _WORKSPACE_WRITE,
     "execute": _DYNAMIC_EXECUTION,

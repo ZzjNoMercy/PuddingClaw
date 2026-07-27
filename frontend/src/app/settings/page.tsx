@@ -262,7 +262,7 @@ export default function SettingsPage() {
   const [modelCallRunLimit, setModelCallRunLimit] = useState("50");
   const [modelCallThreadLimit, setModelCallThreadLimit] = useState("");
   const [modelCallExitBehavior, setModelCallExitBehavior] = useState<"end" | "error">("end");
-  const [rubricEnabled, setRubricEnabled] = useState(true);
+  const [rubricEnabled, setRubricEnabled] = useState(false);
   const [rubricMaxIterations, setRubricMaxIterations] = useState("2");
   const [rubricMaxStagnantRepairs, setRubricMaxStagnantRepairs] = useState("2");
   const [customRubricRulesEnabled, setCustomRubricRulesEnabled] = useState(false);
@@ -322,10 +322,15 @@ export default function SettingsPage() {
 
   // Load settings and capabilities on mount
   useEffect(() => {
-    Promise.all([getSettings(), getCapabilities().catch(() => null)])
-      .then(([s, caps]) => {
+    // Infrastructure probes can wait on several network timeouts. They update
+    // status indicators in the background and must not block the settings form.
+    getCapabilities()
+      .then(setCapabilities)
+      .catch(() => {});
+
+    getSettings()
+      .then((s) => {
         setSettings(s);
-        setCapabilities(caps);
         setGatewayBaseUrl(s.ai_gateway.base_url);
         setGatewayHealthPath(s.ai_gateway.health_path);
         setGatewayFallback(s.ai_gateway.fallback_to_direct);
@@ -422,7 +427,7 @@ export default function SettingsPage() {
         setModelCallThreadLimit(modelLimit?.thread_limit ? String(modelLimit.thread_limit) : "");
         setModelCallExitBehavior(modelLimit?.exit_behavior === "error" ? "error" : "end");
         const rubric = s.harness?.completion?.rubric;
-        setRubricEnabled(rubric?.enabled ?? true);
+        setRubricEnabled(rubric?.enabled ?? false);
         setRubricMaxIterations(String(rubric?.max_iterations ?? 2));
         setRubricMaxStagnantRepairs(String(rubric?.max_stagnant_repairs ?? 2));
         setCustomRubricRulesEnabled(rubric?.custom_rules_enabled ?? false);
@@ -2266,9 +2271,9 @@ export default function SettingsPage() {
                         <div className="rounded-xl border border-black/[0.06] bg-white/55 px-3.5 py-3">
                           <div className="flex items-center justify-between gap-4">
                             <div>
-                              <p className="text-[13px] font-semibold text-gray-900">Goal Run Rubric 验收</p>
+                              <p className="text-[13px] font-semibold text-gray-900">Rubric 验收 <span className="ml-1 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] text-amber-800">实验性</span></p>
                               <p className="mt-1 text-[11px] leading-relaxed text-gray-500">
-                                仅对显式 Goal Run 启用模型复核与同 Run 自动修复；普通对话和非 Goal Run 不进入该验收循环。
+                                开启后，新建 Goal 统一使用独立模型复核；关闭时，新建 Goal 默认采用标准验收。
                               </p>
                             </div>
                             <SwitchButton
@@ -2277,7 +2282,21 @@ export default function SettingsPage() {
                               ariaLabel="启用 Goal Run Rubric"
                             />
                           </div>
-                          <div className="mt-4 max-w-xs">
+                          {rubricEnabled ? <div className="mt-4 grid max-w-xl gap-3 sm:grid-cols-2">
+                            <FormField label="最大 Rubric 尝试次数">
+                              <input
+                                type="number"
+                                min={1}
+                                max={20}
+                                value={rubricMaxIterations}
+                                onChange={(event) => setRubricMaxIterations(event.target.value)}
+                                className="form-input"
+                                disabled={!rubricEnabled}
+                              />
+                              <p className="mt-1 text-[10px] leading-relaxed text-gray-400">
+                                每次完成申请最多允许的独立验收次数。
+                              </p>
+                            </FormField>
                             <FormField label="相同缺口最多自动修复次数">
                               <input
                                 type="number"
@@ -2292,10 +2311,10 @@ export default function SettingsPage() {
                                 同一组可修复缺口连续没有变化时，最多再尝试 N 次；达到阈值后停止，避免无效循环。控制面或验证器故障会立即停止，不消耗该次数。
                               </p>
                             </FormField>
-                          </div>
+                          </div> : null}
                         </div>
 
-                        <div className="rounded-xl border border-black/[0.06] bg-white/55 px-3.5 py-3">
+                        {rubricEnabled && <div className="rounded-xl border border-black/[0.06] bg-white/55 px-3.5 py-3">
                           <div className="flex items-center justify-between gap-4">
                             <div>
                               <p className="text-[13px] font-semibold text-gray-900">高级自定义验收规则</p>
@@ -2404,7 +2423,7 @@ export default function SettingsPage() {
                               </button>
                             </div>
                           )}
-                        </div>
+                        </div>}
                       </div>
                     </SettingsCard>
                   </section>

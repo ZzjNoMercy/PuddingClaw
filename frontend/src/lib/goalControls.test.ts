@@ -6,14 +6,28 @@ import {
   goalControlPresentation,
   goalRemainsVisible,
   goalRevisionApplyPlan,
+  goalTodoProgress,
   parseGoalBudgetRounds,
   shouldShowInlineBudgetRequest,
 } from "./goalControls.ts";
 
+test("cancelled Todo tombstones do not dilute visible progress", () => {
+  assert.deepEqual(
+    goalTodoProgress([
+      "cancelled",
+      "cancelled",
+      "completed",
+      "completed",
+      "pending",
+    ]),
+    { completed: 2, total: 3 },
+  );
+});
+
 test("budget exhaustion remains visible because it is user-recoverable", () => {
   assert.equal(goalRemainsVisible("budget_exceeded"), true);
   assert.equal(goalRemainsVisible("paused"), true);
-  assert.equal(goalRemainsVisible("achieved"), false);
+  assert.equal(goalRemainsVisible("completed"), false);
   assert.equal(goalRemainsVisible("cancelled"), false);
 });
 

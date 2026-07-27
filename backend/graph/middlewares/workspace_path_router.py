@@ -24,6 +24,11 @@ from graph.middlewares.external_directory import (
 )
 from graph.session_manager import session_manager
 from graph.trace_collector import get_current_trace_collector
+from graph.virtual_paths import (
+    VIRTUAL_NAMESPACE_ROOTS,
+    PathAuthority,
+    classify_path_authority,
+)
 from observability import emit_harness_metric
 from tools.read_resource_tool import ReadResourceTool
 
@@ -33,6 +38,8 @@ logger = logging.getLogger(__name__)
 class WorkspacePathRouterMiddleware(AgentMiddleware):
     """Normalize workspace paths and reroute external reads before execution."""
 
+    _SEARCH_TOOLS = frozenset({"glob", "grep"})
+
     _PATH_ARGS = {
         "read_file": "file_path",
         "ls": "path",
@@ -40,19 +47,53 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
         "grep": "path",
         "read_resource": "resource",
     }
-    _VIRTUAL_PREFIXES = (
-        "/workspace/",
-        "/knowledge/",
-        "/semantic-assets/",
-        "/sql-guardrails/",
-        "/analytics-models/",
-        "/skills/",
-        "/large_tool_results/",
-        "/scratch/",
-    )
 
     def __init__(self, backend: Any | None = None) -> None:
         self.backend = backend
+
+    @classmethod
+    def _default_search_scope(
+        cls,
+        tool_name: str,
+        args: dict[str, Any],
+        path_arg: str,
+        workspace_path: str,
+    ) -> dict[str, Any]:
+        """Give implicit searches one canonical project scope.
+
+        DeepAgents' CompositeBackend interprets an omitted search path as
+        "scan the default backend and every route".  PuddingClaw intentionally
+        exposes the workspace through multiple input aliases, so that behavior
+        scans the same files repeatedly and leaks those aliases back to the
+        model.  Tool schemas, however, describe an omitted path as the current
+        working directory.  Make that contract deterministic here: ordinary
+        implicit searches mean ``/workspace``.
+
+        A glob pattern may itself name a managed virtual namespace.  Preserve
+        that explicit intent by splitting the namespace from the pattern and
+        routing the search to that single backend.
+        """
+        requested_scope = str(args.get(path_arg) or "").strip()
+        if tool_name not in cls._SEARCH_TOOLS or requested_scope not in {"", "/"}:
+            return args
+
+        normalized_args = dict(args)
+        if tool_name == "glob":
+            pattern = str(normalized_args.get("pattern") or "").replace("\\", "/")
+            for root in VIRTUAL_NAMESPACE_ROOTS:
+                if pattern.startswith(f"{root}/"):
+                    normalized_args[path_arg] = root
+                    normalized_args["pattern"] = pattern[len(root) :].lstrip("/") or "**/*"
+                    return normalized_args
+            if workspace_path:
+                workspace_root = Path(workspace_path).expanduser().resolve().as_posix().rstrip("/")
+                if pattern == workspace_root or pattern.startswith(f"{workspace_root}/"):
+                    normalized_args[path_arg] = "/workspace"
+                    normalized_args["pattern"] = pattern[len(workspace_root) :].lstrip("/") or "**/*"
+                    return normalized_args
+
+        normalized_args[path_arg] = "/workspace"
+        return normalized_args
 
     @staticmethod
     def _runtime_context(request: ToolCallRequest) -> dict[str, Any]:
@@ -75,31 +116,21 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
         workspace_path: str,
     ) -> tuple[str, str]:
         """Return (kind, routed_path): virtual/relative/workspace/external."""
-        normalized = raw_path.strip().replace("\\", "/")
-        if not normalized:
-            return "relative", normalized
-        # The namespace root itself (for example ``/analytics-models``) is a
-        # valid Backend directory.  ``str.startswith('/analytics-models/')``
-        # only covered descendants and accidentally classified the root as an
-        # external host path, causing ``ls`` to be rejected before the Backend
-        # could serve it.
-        if any(
-            normalized == prefix.rstrip("/") or normalized.startswith(prefix)
-            for prefix in cls._VIRTUAL_PREFIXES
-        ):
-            return "virtual", normalized
-
-        requested = Path(raw_path).expanduser()
-        if not requested.is_absolute():
-            return "relative", raw_path
-
-        resolved = requested.resolve()
-        if workspace_path:
-            workspace = Path(workspace_path).expanduser().resolve()
-            if cls._is_relative_to(resolved, workspace):
-                relative = resolved.relative_to(workspace).as_posix()
-                return "workspace", f"/workspace/{relative}"
-        return "external", str(resolved)
+        classified = classify_path_authority(
+            raw_path,
+            workspace_root=workspace_path or None,
+        )
+        routed = (
+            classified.virtual_path
+            or str(classified.canonical_host_path or classified.normalized_path)
+        )
+        if classified.authority is PathAuthority.WORKSPACE:
+            return "workspace", routed
+        if classified.authority in {PathAuthority.SCRATCH, PathAuthority.MANAGED}:
+            return "virtual", routed
+        if classified.authority is PathAuthority.ESCAPE:
+            return "escape", routed
+        return "external", routed
 
     @staticmethod
     def _tool_message(
@@ -349,11 +380,32 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
         if path_arg is None:
             return "execute", request
 
-        args = dict(request.tool_call.get("args") or {})
-        raw_path = str(args.get(path_arg) or "")
         context = self._runtime_context(request)
         workspace_path = str(context.get("workspace_path") or "")
+        original_args = dict(request.tool_call.get("args") or {})
+        args = self._default_search_scope(
+            tool_name,
+            original_args,
+            path_arg,
+            workspace_path,
+        )
+        if args != original_args:
+            request = request.override(
+                tool_call={**request.tool_call, "args": args}
+            )
+        raw_path = str(args.get(path_arg) or "")
         kind, routed_path = self._classify_path(raw_path, workspace_path)
+
+        if kind == "escape":
+            return "result", self._tool_message(
+                request,
+                (
+                    "❌ Path escapes its workspace or scratch authority: "
+                    f"{raw_path!r}. Use a canonical path inside `/workspace` or "
+                    "an explicitly authorized external host path."
+                ),
+                name=tool_name,
+            )
 
         if kind == "virtual" and routed_path.startswith("/scratch/"):
             recovery = session_manager.resolve_terminal_scratch_reference(

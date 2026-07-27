@@ -76,7 +76,7 @@ def build_lease_tools(backend: Any) -> list[StructuredTool]:
         delete = getattr(backend, "delete_external_file", None)
         if not callable(delete):
             return ToolMessage(
-                content="io_error: this Backend does not support external-file deletion",
+                content="io_error: this Backend does not support versioned file deletion",
                 name="delete_file",
                 tool_call_id=runtime.tool_call_id,
                 status="error",
@@ -692,9 +692,10 @@ def build_lease_tools(backend: Any) -> list[StructuredTool]:
         StructuredTool.from_function(
             name="delete_file",
             description=(
-                "Delete one exact authorized external file after verifying the version from "
-                "inspect_file_version. This never deletes directories and never performs bulk "
-                "or recursive deletion. Exact-file write permission does not imply delete permission."
+                "Delete one exact file after verifying the version from inspect_file_version. "
+                "Workspace and scratch files use their existing internal authority; external "
+                "Host files require exact delete authority. This never deletes directories and "
+                "never performs bulk or recursive deletion."
             ),
             func=delete_file,
             args_schema=DeleteFileInput,

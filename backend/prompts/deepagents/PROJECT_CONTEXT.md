@@ -21,7 +21,11 @@ fallback. If a source is available or the user asks to install, first read
 After a successful installation, read the newly installed SKILL.md and continue
 the original task in the same Session.
 
-The bare root `/` is an alias for `/workspace/`, but it MUST NOT be mixed with `/workspace/`. Pick `/workspace/` for user files and `/skills/` for skill files, and stick to those prefixes.
+`/workspace/` is the only model-visible namespace for project files. A bare root
+path such as `/report.html` is a host absolute path, not a project alias; use
+`/workspace/report.html` consistently. Host absolute paths are external unless
+the runtime authority classifier proves that they resolve inside the current
+workspace.
 
 ## Knowledge Base Paths
 

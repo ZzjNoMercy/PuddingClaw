@@ -151,31 +151,22 @@ def _record_for_raw(
         output_digest = _digest(raw)
     result_id = str(raw.get("result_id") or "") or None
     generation_id = str(raw.get("generation_id") or _first(evidence, "generation_id") or "") or None
-    sql_validation_receipt_id = str(
-        raw.get("sql_validation_receipt_id")
-        or _first(evidence, "sql_validation_receipt_id")
-        or ""
-    ) or None
-    explicit_trace_id = str(
-        raw.get("query_trace_id")
-        or raw.get("trace_id")
-        or _first(evidence, "query_trace_id", "trace_id")
-        or ""
-    ) or None
+    sql_validation_receipt_id = (
+        str(raw.get("sql_validation_receipt_id") or _first(evidence, "sql_validation_receipt_id") or "") or None
+    )
+    explicit_trace_id = (
+        str(raw.get("query_trace_id") or raw.get("trace_id") or _first(evidence, "query_trace_id", "trace_id") or "")
+        or None
+    )
     # Every successful Tool activation has a server-authored execution trace,
     # even when an upstream database adapter did not expose its own trace id.
     query_trace_id = explicit_trace_id or (
-        "tool-trace-"
-        + hashlib.sha256(
-            f"{run.get('run_id')}:{tool_call_id}:{output_digest}".encode()
-        ).hexdigest()[:24]
+        "tool-trace-" + hashlib.sha256(f"{run.get('run_id')}:{tool_call_id}:{output_digest}".encode()).hexdigest()[:24]
         if tool_call_id
         else None
     )
     material = bool(
-        raw.get("material", True) is not False
-        and raw.get("role") != "temporary"
-        and raw.get("scope") != "scratch"
+        raw.get("material", True) is not False and raw.get("role") != "temporary" and raw.get("scope") != "scratch"
     )
     base_lineage = bool(
         material
@@ -248,11 +239,7 @@ def register_activation_evidence(
 ) -> list[dict[str, str]]:
     """Register rich activation evidence and return stable references."""
 
-    evidence = [
-        dict(item)
-        for item in activation.get("evidence_refs") or []
-        if isinstance(item, dict)
-    ]
+    evidence = [dict(item) for item in activation.get("evidence_refs") or [] if isinstance(item, dict)]
     ledger = data.setdefault("evidence_ledger", {})
     conflicts = data.setdefault("evidence_ledger_conflicts", [])
     stable: dict[str, dict[str, str]] = {}
@@ -290,7 +277,15 @@ def register_activation_evidence(
                     }
                 )
                 continue
-            record = prior
+            if str(prior.payload.get("kind") or "") == "tool_execution" and str(raw.get("kind") or "") == "tool_result":
+                # ``_identity`` keys the attempt wrapper (tool_execution) and
+                # the real result (tool_result) under the same stable
+                # ``tool_result:<call_id>`` key, and the wrapper is emitted
+                # first.  Upgrade in place: evaluators need the result's
+                # output summary, not the attempt envelope.
+                ledger[key] = record.model_dump(mode="json")
+            else:
+                record = prior
         else:
             ledger[key] = record.model_dump(mode="json")
         if raw.get("material", True) is not False:
@@ -330,13 +325,11 @@ def repair_legacy_validation_wrapper_records(data: dict[str, Any]) -> bool:
             for item in source_run.get("verification_activations") or []
             if isinstance(item, dict)
             and item.get("status") == "succeeded"
-            and str(item.get("tool_call_id") or "")
-            == str(stored.get("origin_tool_call_id") or "")
+            and str(item.get("tool_call_id") or "") == str(stored.get("origin_tool_call_id") or "")
             and any(
                 isinstance(ref, dict)
                 and ref.get("kind") == "validation_receipt"
-                and str(ref.get("validation_receipt_id") or "")
-                == validation_id
+                and str(ref.get("validation_receipt_id") or "") == validation_id
                 for ref in item.get("evidence_refs") or []
             )
         ]
@@ -350,18 +343,13 @@ def repair_legacy_validation_wrapper_records(data: dict[str, Any]) -> bool:
         )
         if not isinstance(activation, dict):
             continue
-        evidence = [
-            dict(item)
-            for item in activation.get("evidence_refs") or []
-            if isinstance(item, dict)
-        ]
+        evidence = [dict(item) for item in activation.get("evidence_refs") or [] if isinstance(item, dict)]
         nested = next(
             (
                 item
                 for item in evidence
                 if item.get("kind") == "validation_receipt"
-                and str(item.get("validation_receipt_id") or "")
-                == validation_id
+                and str(item.get("validation_receipt_id") or "") == validation_id
             ),
             None,
         )
@@ -383,16 +371,14 @@ def repair_legacy_validation_wrapper_records(data: dict[str, Any]) -> bool:
             dict(stored_wrapper)
             if isinstance(stored_wrapper, dict)
             and stored_wrapper.get("kind") == "external_mutation_completed"
-            and str(stored_wrapper.get("validation_receipt_id") or "")
-            == validation_id
+            and str(stored_wrapper.get("validation_receipt_id") or "") == validation_id
             else next(
                 (
                     item
                     for item in evidence
                     if item.get("kind") == "external_mutation_completed"
                     and item.get("receipt_id")
-                    and str(item.get("validation_receipt_id") or "")
-                    == validation_id
+                    and str(item.get("validation_receipt_id") or "") == validation_id
                 ),
                 None,
             )
@@ -409,11 +395,7 @@ def repair_legacy_validation_wrapper_records(data: dict[str, Any]) -> bool:
                     ref_key(mutation.ref),
                     mutation.model_dump(mode="json"),
                 )
-        stable_refs = [
-            item
-            for item in activation.get("stable_evidence_refs") or []
-            if is_evidence_ref(item)
-        ]
+        stable_refs = [item for item in activation.get("stable_evidence_refs") or [] if is_evidence_ref(item)]
         for ref in (
             rebuilt.ref,
             mutation.ref if mutation is not None else None,
@@ -421,10 +403,87 @@ def repair_legacy_validation_wrapper_records(data: dict[str, Any]) -> bool:
             if ref is not None:
                 stable_refs.append(ref.model_dump(mode="json"))
         activation["stable_evidence_refs"] = list(
-            {
-                ref_key(item): EvidenceRef.model_validate(item).model_dump(mode="json")
-                for item in stable_refs
-            }.values()
+            {ref_key(item): EvidenceRef.model_validate(item).model_dump(mode="json") for item in stable_refs}.values()
+        )
+        changed = True
+    return changed
+
+
+def repair_legacy_tool_execution_records(data: dict[str, Any]) -> bool:
+    """Replace attempt wrappers that shadowed the authoritative Tool result.
+
+    ``tool_execution`` and ``tool_result`` intentionally share one stable
+    ``tool_result:<call_id>`` identity.  Older registration kept the first
+    record, which is the attempt wrapper, and silently discarded the following
+    result envelope.  Rebuild those entries from the originating activation so
+    cross-Run evaluators recover the output summary and analytics lineage.
+    """
+
+    ledger = data.get("evidence_ledger")
+    harness = data.get("harness")
+    runs = harness.get("runs") if isinstance(harness, dict) else None
+    if not isinstance(ledger, dict) or not isinstance(runs, dict):
+        return False
+
+    changed = False
+    for key, stored in list(ledger.items()):
+        if not (
+            key.startswith("tool_result:")
+            and isinstance(stored, dict)
+            and isinstance(stored.get("payload"), dict)
+            and stored["payload"].get("kind") == "tool_execution"
+        ):
+            continue
+
+        tool_call_id = key.split(":", 1)[1]
+        source_run = runs.get(str(stored.get("source_run_id") or ""))
+        if not isinstance(source_run, dict):
+            continue
+        matching_activations = [
+            item
+            for item in source_run.get("verification_activations") or []
+            if isinstance(item, dict)
+            and item.get("status") == "succeeded"
+            and str(item.get("tool_call_id") or "") == tool_call_id
+            and any(
+                isinstance(ref, dict)
+                and ref.get("kind") == "tool_result"
+                and str(ref.get("tool_call_id") or "") == tool_call_id
+                for ref in item.get("evidence_refs") or []
+            )
+        ]
+        activation = min(
+            matching_activations,
+            key=lambda item: item.get("pack") != stored.get("verification_pack"),
+            default=None,
+        )
+        if not isinstance(activation, dict):
+            continue
+        evidence = [dict(item) for item in activation.get("evidence_refs") or [] if isinstance(item, dict)]
+        result_raw = next(
+            (
+                item
+                for item in evidence
+                if item.get("kind") == "tool_result" and str(item.get("tool_call_id") or "") == tool_call_id
+            ),
+            None,
+        )
+        if result_raw is None:
+            continue
+        rebuilt = _record_for_raw(
+            raw=result_raw,
+            evidence=evidence,
+            run=source_run,
+            activation=activation,
+        )
+        if rebuilt is None or ref_key(rebuilt.ref) != key:
+            continue
+        rebuilt.created_at = float(stored.get("created_at") or rebuilt.created_at)
+        ledger[key] = rebuilt.model_dump(mode="json")
+        stable_refs = [item for item in activation.get("stable_evidence_refs") or [] if is_evidence_ref(item)]
+        stable_refs.append(rebuilt.ref.model_dump(mode="json"))
+        activation["stable_evidence_refs"] = list(
+            {ref_key(item): EvidenceRef.model_validate(item).model_dump(mode="json") for item in stable_refs}.values()
         )
         changed = True
     return changed
@@ -454,8 +513,7 @@ def resolve_evidence_ref(
     if goal_revision is not None and record.goal_revision != goal_revision:
         if not (
             allow_artifact_revision_inheritance
-            and record.kind
-            in {"artifact", "validation_receipt", "external_mutation"}
+            and record.kind in {"artifact", "validation_receipt", "external_mutation"}
             and record.goal_revision is not None
             and record.goal_revision < goal_revision
         ):
@@ -471,8 +529,7 @@ def resolve_evidence_ref(
             item
             for item in (activations if isinstance(activations, list) else [])
             if isinstance(item, dict)
-            if item.get("status") == "succeeded"
-            and str(item.get("tool_call_id") or "") == record.origin_tool_call_id
+            if item.get("status") == "succeeded" and str(item.get("tool_call_id") or "") == record.origin_tool_call_id
         ),
         None,
     )
@@ -484,9 +541,7 @@ def resolve_evidence_ref(
     if record.kind == "artifact":
         registry = data.get("delivered_artifacts")
         artifacts = list(registry.values()) if isinstance(registry, dict) else []
-        target_path = str(
-            record.payload.get("host_path") or record.payload.get("path") or ""
-        )
+        target_path = str(record.payload.get("host_path") or record.payload.get("path") or "")
         artifact = next(
             (
                 item
@@ -516,7 +571,14 @@ def resolve_evidence_ref(
             # into the architecture.
             authorized = record.payload.get("authorized") is True
             grant_id = str(record.payload.get("permission_grant_id") or "")
-            if not authorized or not grant_id or not target_path:
+            # Workspace writes carry no permission grant: the workspace
+            # backend itself is the write authority, recorded as
+            # ``authority_kind == "workspace"`` at write time. Requiring a
+            # grant id here silently dropped every workspace-authored
+            # artifact from goal evidence, which made the code-validation
+            # acceptance set permanently empty.
+            workspace_authority = str(record.payload.get("authority_kind") or "") == "workspace"
+            if not authorized or not (grant_id or workspace_authority) or not target_path:
                 return None
             current_digest = _file_digest(Path(target_path).expanduser())
             if not current_digest or current_digest != record.content_sha256:
@@ -574,9 +636,7 @@ def migrate_legacy_refs(
                     activation=candidate,
                 )
                 existing_stable = [
-                    item
-                    for item in activation.get("stable_evidence_refs") or []
-                    if is_evidence_ref(item)
+                    item for item in activation.get("stable_evidence_refs") or [] if is_evidence_ref(item)
                 ]
                 activation["stable_evidence_refs"] = list(
                     {
@@ -612,6 +672,7 @@ __all__ = [
     "EvidenceRef",
     "is_evidence_ref",
     "migrate_legacy_refs",
+    "repair_legacy_tool_execution_records",
     "repair_legacy_validation_wrapper_records",
     "ref_key",
     "register_activation_evidence",

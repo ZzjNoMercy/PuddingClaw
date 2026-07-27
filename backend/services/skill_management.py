@@ -83,6 +83,7 @@ class SkillManagementService:
         ref: str | None = None,
         subpath: str | None = None,
         files: list[str] | None = None,
+        request_context: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         requested_source = (source or "").strip()
         provenance = (
@@ -98,10 +99,34 @@ class SkillManagementService:
         resolved_ref = (ref or "main").strip() or "main"
         resolved_subpath = (subpath or "").strip()
         resolved_files = list(files or [])
+        normalized_context = {
+            key: str((request_context or {}).get(key) or "")
+            for key in ("session_id", "query_id", "run_id")
+            if str((request_context or {}).get(key) or "")
+        }
+        request_key = (
+            _json_digest(
+                {
+                    "action": action,
+                    "source": requested_source,
+                    "skill_name": skill_name or "",
+                    "ref": resolved_ref,
+                    "subpath": resolved_subpath,
+                    "files": resolved_files,
+                    "request_context": normalized_context,
+                }
+            )
+            if normalized_context.get("session_id") and normalized_context.get("query_id")
+            else ""
+        )
         if skill_name and not _SKILL_NAME.fullmatch(skill_name):
             raise SkillManagementError("invalid_skill_name", skill_name)
 
         self._cleanup_expired_plans()
+        if request_key:
+            existing = self._find_plan_by_request_key(request_key)
+            if existing is not None:
+                return self._public_plan(existing)
         plan_id = f"skill-plan-{uuid.uuid4().hex[:16]}"
         plan_dir = self.plans_dir / plan_id
         payload_dir = plan_dir / "payload"
@@ -153,8 +178,19 @@ class SkillManagementService:
                 "staged_metadata": staged["metadata"],
                 "diff": diff,
             }
+            if normalized_context:
+                plan["request_context"] = normalized_context
+            if request_key:
+                plan["request_key"] = request_key
             plan["plan_sha256"] = _json_digest(plan)
-            self._write_json(plan_dir / "plan.json", plan)
+            with self._lock:
+                # Tool retries can replay the exact prepare call. Keep one
+                # durable plan/card for the originating Agent request.
+                existing = self._find_plan_by_request_key(request_key) if request_key else None
+                if existing is not None:
+                    shutil.rmtree(plan_dir, ignore_errors=True)
+                    return self._public_plan(existing)
+                self._write_json(plan_dir / "plan.json", plan)
             return self._public_plan(plan)
         except Exception:
             shutil.rmtree(plan_dir, ignore_errors=True)
@@ -167,15 +203,31 @@ class SkillManagementService:
             return None
         return self._public_plan(plan)
 
+    def preview_for_session(self, plan_id: str, session_id: str) -> dict[str, Any]:
+        """Return a plan only to the Session that created it."""
+
+        self._cleanup_expired_plans()
+        plan = self._load_plan(plan_id)
+        self._validate_plan_owner(plan, session_id)
+        return self._public_plan(plan)
+
     def commit(
         self,
         *,
         action: Literal["install", "update"],
         plan_id: str,
         plan_sha256: str,
+        expected_session_id: str | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             plan = self._load_plan(plan_id)
+            if expected_session_id is not None:
+                self._validate_plan_owner(plan, expected_session_id)
+            elif isinstance(plan.get("request_context"), dict) and plan["request_context"].get("session_id"):
+                raise SkillManagementError(
+                    "plan_requires_structured_commit",
+                    "Session-bound plans must be confirmed through the structured plan card",
+                )
             if plan.get("action") != action:
                 raise SkillManagementError("plan_action_mismatch")
             if plan.get("status") != "prepared":
@@ -229,6 +281,7 @@ class SkillManagementService:
             plan["status"] = "committed"
             plan["committed_at"] = time.time()
             plan["installed_sha256"] = installed["sha256"]
+            plan["installed_path"] = f"/skills/{skill_name}"
             if snapshot is not None:
                 plan["snapshot_id"] = snapshot.name
             self._write_json(plan_dir / "plan.json", plan)
@@ -249,6 +302,59 @@ class SkillManagementService:
                 }
             )
             return result
+
+    def cancel(
+        self,
+        *,
+        plan_id: str,
+        plan_sha256: str,
+        expected_session_id: str,
+    ) -> dict[str, Any]:
+        """Persist cancellation so a historical plan card never looks pending."""
+
+        with self._lock:
+            self._cleanup_expired_plans()
+            plan = self._load_plan(plan_id)
+            self._validate_plan_owner(plan, expected_session_id)
+            if not plan_sha256 or plan.get("plan_sha256") != plan_sha256:
+                raise SkillManagementError("plan_digest_mismatch")
+            status = str(plan.get("status") or "")
+            if status == "cancelled":
+                return self._public_plan(plan)
+            if status == "committed":
+                raise SkillManagementError("plan_already_committed")
+            if status == "expired":
+                return self._public_plan(plan)
+            if status != "prepared":
+                raise SkillManagementError("plan_already_consumed")
+            plan["status"] = "cancelled"
+            plan["cancelled_at"] = time.time()
+            plan_dir = self.plans_dir / plan_id
+            self._write_json(plan_dir / "plan.json", plan)
+            shutil.rmtree(plan_dir / "payload", ignore_errors=True)
+            return self._public_plan(plan)
+
+    def delete_session_plans(self, session_id: str) -> int:
+        """Delete all staged/audit plans owned by a deleted Session."""
+
+        removed = 0
+        with self._lock:
+            if not self.plans_dir.is_dir():
+                return 0
+            for item in list(self.plans_dir.iterdir()):
+                if not item.is_dir() or item.is_symlink() or not item.name.startswith("skill-plan-"):
+                    continue
+                try:
+                    plan = self._load_plan(item.name)
+                except SkillManagementError:
+                    continue
+                context = plan.get("request_context")
+                owner = str(context.get("session_id") or "") if isinstance(context, dict) else ""
+                if owner != session_id:
+                    continue
+                shutil.rmtree(item, ignore_errors=True)
+                removed += 1
+        return removed
 
     def _stage_source(
         self,
@@ -565,7 +671,39 @@ class SkillManagementService:
             except (OSError, json.JSONDecodeError):
                 continue
             if payload.get("status") == "prepared" and now > float(payload.get("expires_at") or 0):
-                shutil.rmtree(item, ignore_errors=True)
+                # Keep the small plan record so historical UI cards can show
+                # the terminal state after reload. Only the staged payload is
+                # discarded.
+                payload["status"] = "expired"
+                payload["expired_at"] = now
+                self._write_json(item / "plan.json", payload)
+                shutil.rmtree(item / "payload", ignore_errors=True)
+
+    def _find_plan_by_request_key(self, request_key: str) -> dict[str, Any] | None:
+        if not request_key or not self.plans_dir.is_dir():
+            return None
+        for item in self.plans_dir.iterdir():
+            if not item.is_dir() or item.is_symlink() or not item.name.startswith("skill-plan-"):
+                continue
+            try:
+                plan = self._load_plan(item.name)
+            except SkillManagementError:
+                continue
+            if plan.get("request_key") == request_key:
+                return plan
+        return None
+
+    @staticmethod
+    def _validate_plan_owner(plan: dict[str, Any], session_id: str) -> None:
+        context = plan.get("request_context")
+        owner = str(context.get("session_id") or "") if isinstance(context, dict) else ""
+        if not owner:
+            raise SkillManagementError(
+                "plan_not_session_bound",
+                "This legacy plan must be committed through the approval-gated Tool path",
+            )
+        if owner != session_id:
+            raise SkillManagementError("plan_session_mismatch")
 
     def _load_plan(self, plan_id: str) -> dict[str, Any]:
         if not re.fullmatch(r"skill-plan-[0-9a-f]{16}", plan_id):
@@ -587,7 +725,7 @@ class SkillManagementService:
 
     @staticmethod
     def _public_plan(plan: dict[str, Any]) -> dict[str, Any]:
-        return {
+        public = {
             key: plan.get(key)
             for key in (
                 "plan_id",
@@ -606,9 +744,33 @@ class SkillManagementService:
                 "staged_metadata",
                 "diff",
                 "snapshot_id",
+                "installed_path",
+                "installed_sha256",
+                "committed_at",
+                "cancelled_at",
+                "expired_at",
             )
             if key in plan
-        } | {"ok": True}
+        }
+        status = str(plan.get("status") or "")
+        public.update(
+            {
+                "ok": True,
+                "phase": {
+                    "prepared": "awaiting_confirmation",
+                    "committed": "installed",
+                    "cancelled": "cancelled",
+                    "expired": "expired",
+                }.get(status, status or "unknown"),
+                "requires_confirmation": status == "prepared",
+                "installed": status == "committed",
+                "ui_commit_supported": bool(
+                    isinstance(plan.get("request_context"), dict)
+                    and plan["request_context"].get("session_id")
+                ),
+            }
+        )
+        return public
 
     @staticmethod
     def _write_json(path: Path, payload: dict[str, Any]) -> None:

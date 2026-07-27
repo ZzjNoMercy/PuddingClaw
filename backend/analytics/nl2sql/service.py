@@ -27,11 +27,12 @@ from analytics.nl2sql.sql_runner import (
     validate_readonly_sql,
 )
 from analytics.nl2sql.table_router import TableRouterError, route_database_tables, summarize_table_route
-from analytics.semantic_assets.resolver import (
-    format_semantic_assets_for_prompt,
-    resolve_semantic_assets,
-    resolve_semantic_assets_by_ids,
-    semantic_resolution_to_trace,
+from analytics.semantic_runtime import (
+    SemanticQueryContext,
+    build_execution_binding_metadata,
+    compile_semantic_query_context,
+    format_analytics_model_for_sql_prompt,
+    render_sql_semantic_context,
 )
 from config import get_vanna_config
 from knowledge.database_sources import get_database_source
@@ -51,8 +52,8 @@ VANNA_REFERENCE_TOP_K = 5
 VANNA_ENTITY_TOP_K_PER_TYPE = 10
 
 
-def _resolve_request_semantic_assets(request: DatabaseQueryRequest) -> dict[str, Any]:
-    """Resolve explicit assets first, while preserving model-scoped fallback.
+def _compile_request_semantic_context(request: DatabaseQueryRequest) -> SemanticQueryContext:
+    """Compile the shared semantic contract for one database request.
 
     A selected analytics model is an authority boundary, not a signal that the
     outer Agent necessarily supplied explicit semantic ids. When ids are
@@ -60,31 +61,18 @@ def _resolve_request_semantic_assets(request: DatabaseQueryRequest) -> dict[str,
     declared by that model. A genuine no-match stays in generalized mode.
     """
 
-    allowed_ids: list[str] | None = None
-    if request.model_id:
-        model = get_analytics_model_registry().get_model_context(request.model_id)
-        allowed_ids = [
-            str(item.get("id") or "").strip()
-            for item in model.get("semantic_assets") or []
-            if str(item.get("id") or "").strip()
-        ]
-    selected_ids = [str(item).strip() for item in request.measure_ids if str(item).strip()]
-    if selected_ids:
-        return resolve_semantic_assets_by_ids(
-            request.question,
-            requested_ids=selected_ids,
-            allowed_ids=allowed_ids,
-        )
-    if not request.model_id:
-        resolution = resolve_semantic_assets(request.question)
-    else:
-        resolution = resolve_semantic_assets(
-            request.question,
-            allowed_ids=allowed_ids,
-        )
-    if not resolution.get("matched") and not resolution.get("references"):
-        resolution["resolution_mode"] = "generalized"
-    return resolution
+    return compile_semantic_query_context(
+        question=request.semantic_question or request.question,
+        model_id=request.model_id,
+        selected_semantic_asset_ids=request.measure_ids,
+        model_registry=get_analytics_model_registry(),
+    )
+
+
+def _resolve_request_semantic_assets(request: DatabaseQueryRequest) -> dict[str, Any]:
+    """Compatibility view of the shared compiler's semantic resolution."""
+
+    return _compile_request_semantic_context(request).resolution
 
 
 _CONFIG_RATE_SQL_TEMPLATE = """
@@ -173,36 +161,12 @@ def _entity_top_k_for_type(entity_type: str, default_top_k: int, by_type: dict[s
 
 
 def _format_analytics_model_for_sql_prompt(model_id: str | None) -> tuple[str, dict[str, Any]]:
-    """Load the selected model's global playbook into the inner SQL generator."""
+    """Compatibility wrapper around the shared SQL semantic adapter."""
     normalized_id = str(model_id or "").strip()
     if not normalized_id:
         return "", {}
-
     model = get_analytics_model_registry().get_model_context(normalized_id)
-    frontmatter = model.get("frontmatter") or {}
-    body = str(model.get("body") or "").strip()
-    prompt = (
-        "<analytics_model_sql_context>\n"
-        "当前 SQL 属于用户已选择的分析模型，必须遵守模型正文中的全局业务边界和默认分析范围。\n"
-        "规则优先级：用户明确要求 > 具体 Measure/Reference > 模型全局规则 > Dimension/通用 SQL 规则。\n"
-        "只应用与本次 SQL 有关的模型规则；报告布局、HTML 和输出工作流不属于 SQL 生成任务。\n\n"
-        f"模型 ID：{model.get('id')}\n"
-        f"模型名称：{model.get('name')}\n"
-        f"模型路径：{model.get('path')}\n\n"
-        "模型 Frontmatter：\n"
-        f"```json\n{json.dumps(frontmatter, ensure_ascii=False, indent=2)}\n```\n\n"
-        "模型正文：\n"
-        f"{body}\n"
-        "</analytics_model_sql_context>"
-    )
-    trace = {
-        "id": model.get("id"),
-        "name": model.get("name"),
-        "version": model.get("version"),
-        "path": model.get("path"),
-        "body_preview": body[:2000] + ("...[truncated]" if len(body) > 2000 else ""),
-    }
-    return prompt, trace
+    return format_analytics_model_for_sql_prompt(model)
 
 
 def _detect_semantic_sql_conflicts(
@@ -872,25 +836,22 @@ async def query_database_knowledge(
         record_stage("router_ms", stage_started)
 
         stage_started = perf_counter()
-        semantic_resolution = await asyncio.to_thread(
-            _resolve_request_semantic_assets,
+        compiled_semantic_context = await asyncio.to_thread(
+            _compile_request_semantic_context,
             request,
         )
-        semantic_trace = semantic_resolution_to_trace(semantic_resolution)
-        model_context, model_trace = await asyncio.to_thread(
-            _format_analytics_model_for_sql_prompt,
-            request.model_id,
-        )
-        if model_trace:
-            semantic_trace["analytics_model"] = model_trace
-        semantic_context = "\n\n".join(
-            item
-            for item in (
-                model_context,
-                format_semantic_assets_for_prompt(semantic_resolution),
+        semantic_trace = compiled_semantic_context.to_trace()
+        semantic_trace.update(
+            build_execution_binding_metadata(
+                compiled_semantic_context,
+                adapter="sql",
+                source_refs=[
+                    f"{route.database_source_id}.{table_name}"
+                    for table_name in route.table_names
+                ],
             )
-            if item
         )
+        semantic_context = render_sql_semantic_context(compiled_semantic_context)
         record_stage("semantic_assets_ms", stage_started)
 
         stage_started = perf_counter()
@@ -996,25 +957,22 @@ async def generate_database_sql(
         record_stage("router_ms", stage_started)
 
         stage_started = perf_counter()
-        semantic_resolution = await asyncio.to_thread(
-            _resolve_request_semantic_assets,
+        compiled_semantic_context = await asyncio.to_thread(
+            _compile_request_semantic_context,
             request,
         )
-        semantic_trace = semantic_resolution_to_trace(semantic_resolution)
-        model_context, model_trace = await asyncio.to_thread(
-            _format_analytics_model_for_sql_prompt,
-            request.model_id,
-        )
-        if model_trace:
-            semantic_trace["analytics_model"] = model_trace
-        semantic_context = "\n\n".join(
-            item
-            for item in (
-                model_context,
-                format_semantic_assets_for_prompt(semantic_resolution),
+        semantic_trace = compiled_semantic_context.to_trace()
+        semantic_trace.update(
+            build_execution_binding_metadata(
+                compiled_semantic_context,
+                adapter="sql",
+                source_refs=[
+                    f"{route.database_source_id}.{table_name}"
+                    for table_name in route.table_names
+                ],
             )
-            if item
         )
+        semantic_context = render_sql_semantic_context(compiled_semantic_context)
         record_stage("semantic_assets_ms", stage_started)
 
         stage_started = perf_counter()

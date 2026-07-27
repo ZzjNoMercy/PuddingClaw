@@ -1,324 +1,695 @@
-# Goal 模式验收执行顺序优化方案
+# Goal 完成协议与 Rubric 验收分层方案
 
-日期：2026-07-20
-参考文档：`docs/harness-verification-lifecycle-iteration-plan.md`（Codex 整理）
-合并原则：以 Codex 方案为骨架，将本方案的对账、熔断、取消兜底补充为 P0 附加项。
-状态：待评审
+> 状态：待审核
+>
+> 日期：2026-07-26
+>
+> 决策摘要：Goal 默认采用 Agent 显式提交完成；完成申请是独立控制对象；标准与 Rubric 共用同一完成协议，只在“谁有权接受完成申请”上分叉。Rubric 验收保留为可选的最高级别验收，并在前端明确标注为实验性功能。
+>
+> 本文取代本文件此前的“所有 Goal Run 自然停止后强制进入 Readiness + Rubric”方案。实现前以本文为当前设计基线。
 
-## 1. 核心决策：先修完成协议顺序
+## 1. 结论
 
-本轮迭代只抓一条主链路：**任何启用验收的 Run，都不能把模型返回的 terminal AIMessage 直接当成用户最终回复。**
-
-正确协议固定为：
-
-```text
-Model / Tools 执行
-→ Agent 返回 terminal AIMessage（申请完成，暂不发布）
-→ Deterministic Readiness Gate
-   ├─ 未通过：gaps 写回同一图状态 → Model / Tools 继续
-   └─ 通过
-→ Rubric Semantic Grader
-   ├─ 未通过：gaps 写回同一图状态 → Model / Tools 继续
-   └─ 通过
-→ Commit 最终消息、证据、RunOutcome、Goal decision
-→ 发布 final_response
-→ done
-```
-
-这里不存在用户可见的“候选版本”。验收不是对话中的第二个产品流程，也不应制造“任务已经回答完、系统又开始验收”的观感。
-
-当前 session（`session-0a3405f837f3`）的几乎全部异常都是这条顺序被破坏后的派生结果：
-
-- “已经完成但 Agent 还在运行”：最终消息发布早于 `after_agent`；
-- “验收失败后又开始下一轮”：Rubric 次数提前结束 Run；
-- “run-4 没做完、run-5 才补齐”：未通过没有留在同一 Run；
-- “Goal 一直 active”：完成工作与最终验收被拆在不同 Run，后一 Run 又在验收前中断。
-
-合同作用域、跨 Run evidence 和报告数据内容检查属于后续正确性增强；在完成协议顺序修复前，它们不能解决用户先看到错误终态的问题。
-
-## 2. 已确认问题
-
-### 2.1 输出早于验收
-
-当前主模型 token 在 Agent 节点运行期间直接通过 SSE 发给前端并写入 assistant snapshot；`PuddingClawRubricMiddleware.after_agent` 只能在 Agent 节点返回 AIMessage 后介入。实际顺序是：
+PuddingClaw 的 Goal 保留跨 Run 持续执行能力，但完成协议改为：
 
 ```text
-模型生成“已完成”
-→ SSE 发布并写 snapshot
-→ after_agent 开始确定性检查与 Rubric
-→ 未通过后再回到模型
+Agent 完成任务并执行相称的自查
+→ update_goal(completed=true)
+→ Harness 幂等持久化 GoalCompletionRequest
+→ Agent 生成最终回复并自然停止
+→ 根据 Goal.completion_policy 决定申请的裁决方式
+   ├─ standard：仅通过状态安全检查后接受
+   └─ rubric：经确定性检查和独立 Rubric 通过后接受
+→ 接受后原子提交 Run 终态、Goal 终态和最终消息
 ```
 
-前端增加“候选/失败候选”标签只能掩盖症状，不能修正顺序。
+产品只提供两种完成方式：
 
-### 2.2 Rubric 修正次数错误地成为 Run 终止条件
+1. **标准验收**：默认。Agent 对完成负责，Harness 只保证状态与协议安全。
+2. **Rubric 验收（实验性）**：可选的最高级别验收。Harness 使用确定性检查、结构化证据和独立模型 Rubric 重新裁判完成声明。
 
-当前 `max_iterations` 默认值较小。达到上限后中间件移除 `jump_to=model`，当前 Run 结束，Goal 再开启下一 Run。Rubric 修正次数不应独立终止 Run。真正的 Run 边界应是：
+不再设置第三档“增强验收”。测试多少、是否构建、是否运行静态检查属于 Agent 根据任务风险选择的自查力度，不构成第三种 Harness 模式。
 
-- 全部验收通过；
-- 用户暂停或取消；
-- HITL 等待跨连接恢复；
-- 基础设施异常；
-- 单 Run 模型调用预算耗尽。
+本方案的核心不是重写 Goal 状态机，而是将“完成申请”从 `RubricEvaluationReport / GoalVerificationDecision` 中抽出，成为标准与 Rubric 共用的下层协议。
 
-### 2.3 Agent 执行完成与 Harness 外部验收被混为一谈
+## 2. “标准”不等于“少验证”
 
-本次 lidar/HUD 缺失是 Agent 在执行层读回产物后自行发现并补齐的，属于 Agent 的执行与自查职责。若内容仍缺失，Agent 就不应停止工具循环，也不应提交 terminal AIMessage 申请结束。Readiness 与 Rubric 只在 Agent 认为工作已经完成后提供外部完成控制。
-
-### 2.4 动态合同跨 Run 单调膨胀
-
-`RunRubricCompiler.merge_contracts()` 会把某一 Run 激活的 pack 合入 Goal contract。一次 Web、SQL 或 Code Tool 的成功调用可能使后续 Run 永久携带相应 criterion。跨 Run 证据策略还不一致：Web/Analytics/Artifact 可读取 `goal_evidence_refs`；Code validation 只检查当前 Run；Todo 使用 Goal 台账。
-
-### 2.5 工具调用不等于实质工作类型
-
-Pack 激活不应仅由工具名称决定，而应由“结果是否成为本轮或 Goal 的实质证据/产物”决定。
-
-### 2.6 历史消息被前端验收状态误过滤
-
-`verification_state` 是控制面状态，不能成为删除或永久过滤会话历史的依据，也不应产生“候选/失败候选”产品包装。
-
-### 2.7 续跑前缺少对账与熔断（本方案补充）
-
-Goal 自动续跑决策前不对 declared_artifact_targets 的盘上真实状态复核，相同 gap 指纹可以重复多轮，导致“永远停不下来”。用户在验收阶段取消时，已注册证据与报告丢弃，Goal gaps 永久停留在旧报告上。
-
-## 3. 目标状态机
+以下完成摘要属于标准验收：
 
 ```text
-EXECUTING
-  Agent 使用工具、修改产物并做自查
-      ↓ 返回 terminal AIMessage（仍为 Run 内部消息，不发布）
-READINESS_CHECK
-  Todo / Artifact / Evidence / Code / Tool Protocol 形式检查
-      ├─ failed → 注入结构化 gaps → EXECUTING（同一 Run）
-      └─ passed
-            ↓
-SEMANTIC_GRADING
-  task_fulfillment / metric_consistency / time_scope / custom rubric
-      ├─ needs_revision → 注入结构化 gaps → EXECUTING（同一 Run）
-      └─ satisfied
-            ↓
-COMMITTING
-  固化最终 AIMessage、RunOutcome、Goal decision、证据与产物
-            ↓
-COMPLETED
-  发布最终回复与 done
+相关矩阵共 232 passed，Ruff 和 git diff --check 通过。
 ```
 
-异常分支：
+这里的测试可以很全面，但仍由主 Agent 在执行阶段主动运行。只要没有在 Agent 提交完成后再启动独立 grader、重新聚合证据并自动驳回，就属于标准验收。
+
+因此应区分：
+
+- **Agent 自查强度**：由任务风险决定，可以很强；
+- **Harness 验收级别**：由是否启用独立 Rubric 裁判决定。
+
+`git diff --check` 只能证明补丁格式没有明显空白错误，不能单独证明功能正确；测试、构建、运行时行为和产物读回仍应由 Agent 按任务需要执行并如实汇报。
+
+## 3. 外部框架源码复核
+
+本次复核基线：
+
+| 项目 | 本地提交 | 完成协议 | 结论 |
+|---|---:|---|---|
+| Codex CLI | `61a44880a8` | `update_goal({"status":"complete"})` | Agent 按提示完成审计后显式提交；工具处理器本身不再运行独立 grader |
+| Grok Build | `b189869` | `update_goal(completed=true)` | 支持 classifier 开关；关闭时直接完成，开启时进入 skeptic 验证 |
+| Claude Code 历史源码 | `4b9d30f` | `TaskUpdate(status="completed")` | Agent 主动标记；可配置 `TaskCompleted` hook 阻断，verification agent 仅在特定功能开关和场景下提示 |
+| PuddingClaw | `c224a38` + 当前工作区 | Agent 自然停止触发 | 当前显式 Goal 默认绑定确定性检查、修复回跳、LLM Rubric 和跨 Run 聚合，完成链过重 |
+
+关键源码：
+
+- Codex：`/Users/pet/Code/AI/Agent/源码合集/codex/codex-rs/ext/goal/src/spec.rs`
+- Codex 完成审计：`/Users/pet/Code/AI/Agent/源码合集/codex/codex-rs/ext/goal/templates/goals/continuation.md`
+- Grok Build 工具：`/Users/pet/Code/AI/Agent/源码合集/grok-build/crates/codegen/xai-grok-tools/src/implementations/grok_build/update_goal/mod.rs`
+- Grok Build 完成分流：`/Users/pet/Code/AI/Agent/源码合集/grok-build/crates/codegen/xai-grok-shell/src/session/acp_session_impl/goal.rs`
+- Claude Code：`/Users/pet/Code/AI/Agent/源码合集/claude-code/src/tools/TaskUpdateTool/TaskUpdateTool.ts`
+- PuddingClaw 当前完成判定：`backend/harness/coordinators.py`
+- PuddingClaw 当前 Rubric 入口：`backend/graph/deepagents_manager.py`
+
+### 3.1 采用与不采用
+
+采用：
+
+- Grok Build 的统一完成表达：`update_goal(completed=true)`；
+- Codex/Grok/Claude 的共同原则：完成必须由 Agent 显式提交；
+- Grok Build 的可选高级 classifier 思路；
+- Claude Code 的可选 completion hook 思路；
+- 工具响应必须反映真实状态变化，不能在 Harness 尚未处理时虚报成功。
+
+不采用：
+
+- 不把 Grok Build 的多 skeptic panel 复制为默认能力；
+- 不把 Codex 较长的完成审计提示机械复制进每轮上下文；
+- 不把 Claude Code 的 Todo/Task 状态直接等同于整个 Goal 完成；
+- 不删除 PuddingClaw 已有 Rubric、Evidence Ledger 和 deterministic verifier。
+
+### 3.2 PuddingClaw 当前源码结论
+
+对当前代码与现有控制面测试的复核结论是：**标准模式可以复用现有状态机骨架，但不能通过“关闭 Rubric”直接实现。**
+
+已适配、可复用的部分：
+
+- `RunStatus` 与 `GoalStatus` 的非法迁移保护；
+- `goal_id + objective_revision + run_id` 身份关系；
+- Goal 的跨 Run attach/release、暂停、恢复、取消和预算；
+- `RUNNING → EVALUATING → RUNNING/COMPLETED` 对 Rubric 修复回跳的支持；
+- Session JSON 写锁、Evidence Ledger、Validation Receipt 和外部 mutation lease。
+
+尚未适配、必须解耦的部分：
+
+1. `HarnessRunCoordinator.start_run()` 目前将所有显式 Goal Run 映射为 `VerificationMode.GOAL`，“是否 Goal”与“是否 Rubric”仍是同一个开关。
+2. `PuddingClawRubricMiddleware` 已能在 `verification_mode != goal` 时旁路，这一机制可保留。
+3. `complete_from_final_state()` 目前无论是否真正运行 Rubric，都构造 `RubricEvaluationReport`，再通过 `GoalVerificationDecision` 推进 Goal 终态。
+4. 当 `verification_enabled=false` 且 Goal 自然停止时，当前实现会生成 `NOT_REQUIRED` report 并直接转为 `ACHIEVED`；这不等于新方案的标准验收，因为它缺少 `update_goal(completed=true)` 显式申请。
+5. `commit_accepted_completion()` 目前强制要求 accepted report 和 accepted Goal decision，标准模式不能靠伪造空 `NOT_REQUIRED` report 绕过。
+6. 当前流式结束路径会将所有 `RUNNING` Run 转为 `EVALUATING`，新实现中 `EVALUATING` 只应属于需要独立验收的完成申请。
+7. 当前还没有模型可见的 `update_goal` 工具实现。
+
+已运行现有关键测试：
 
 ```text
-模型预算耗尽 → RunOutcome.budget_exceeded → Goal 决定是否开启下一 Run
-用户暂停/取消 → 保留 checkpoint、Session 历史和 Trace，不伪造完成；
-              若取消发生在验收窗口，已注册证据照常合并并补出报告
-HITL → Run 保持等待状态，恢复后从原图状态继续
-基础设施异常 → RunOutcome.infrastructure_error
+test_run_verification_mode_is_owned_by_explicit_goal_state
+test_goal_without_verification_keeps_decision_and_run_acceptance_consistent
+test_non_goal_run_does_not_enter_completion_repair_loop
+
+3 passed
 ```
 
-## 4. 三层职责边界
+它们确认了现状，但新协议实现后前两个测试的预期必须重写。
 
-### 4.1 Agent 执行与自查
+### 3.3 第一性原理：四类事实不得混同
 
-Agent 负责查询、编辑、运行验证命令、读回产物以及根据缺口修正。Agent 的自查是提高一次通过率的执行行为，不拥有最终完成权。只要 Agent 自己的执行计划或 Todo 尚未闭环，就不应返回 terminal AIMessage。
+```text
+Goal
+= 用户希望跨 Run 持续达成的目标
 
-模型返回 terminal AIMessage 只表示“申请进入完成检查”，不等于用户可见的最终回答。
+Run
+= 一次具体执行尝试
 
-### 4.2 Completion Readiness Gate
+GoalCompletionRequest
+= Agent 针对当前 Goal revision 提交的完成声明
 
-Readiness Gate 在调用 LLM Rubric 前执行，全部为可复现的确定性检查：
+RubricEvaluationReport
+= 仅在 rubric 策略下，独立验收器对某次完成声明的裁决证据
+```
 
-- Todo 是否全部完成或明确取消；
-- 声明交付目标是否真实落盘，hash、size 和目标身份是否一致；
-- Web/SQL/RAG 关键结论是否拥有结构化 evidence ref；
-- 代码改动是否存在相称的测试、构建或静态检查结果；
-- Tool protocol 是否闭合。
+四者的权威边界：
 
-Readiness Gate 未通过时不调用 Rubric，直接将结构化 gaps 返回 Agent，并在同一 Run 继续。
+- Run 成功结束不等于 Goal 完成；
+- Agent 自然停止不等于已提交完成申请；
+- 完成申请被 Harness 接收不等于已原子发布最终回复；
+- 标准模式接受完成申请不需要 Rubric report；
+- Rubric report 不能替代 Goal revision、Run identity 和状态安全检查。
 
-领域内容完整性默认仍由 Agent 执行自查负责。若未来需要对某类报告提供硬保证，可在 P2 增加专用 deterministic verifier，但它不是本轮发布顺序修复的前置条件，也不属于通用 Rubric 的职责。
+因此新架构必须是：
 
-### 4.3 Rubric 语义验收
+```text
+Goal 生命周期状态机
+        ↑
+GoalCompletionRequest 完成申请状态机
+        ↑
+standard state-safety 或 rubric verification
+```
 
-只有 Readiness Gate 通过后才执行 LLM Rubric，负责不能完全由代码判断的语义标准：
+## 4. 统一工具协议
 
-- 是否真正完成用户目标；
-- 指标名称、口径、维度与结论是否一致；
-- 趋势分析是否合理反映图表数据；
-- 是否遵守用户要求的时间范围；
-- 高级用户自定义的语义验收规则。
+### 4.1 模型可见调用
 
-Rubric 未通过时同样返回 Agent 继续当前 Run，不创建“失败候选”实体。
+统一使用：
 
-## 5. 发布与持久化顺序
+```text
+update_goal(completed=true)
+```
 
-### 5.1 SSE 发布边界
+实际工具输入：
 
-- Reasoning、Tool、Readiness、Rubric 和修正 Activity 继续实时进入 Trace，统一归入当前 Agent 响应的可折叠“处理过程”；
-- 主对话流可以展示正常的阶段性 Agent content，但不得包含“任务已完成、最终产物如下”等终态承诺；
-- terminal AIMessage 在验收完成前由 Harness 输出层暂存，不发布最终 token、不写展示消息；
-- Readiness 或 Rubric 未通过时，不发布该 terminal message，只把 gaps 写回图状态；
-- 验收通过后发送一次 `final_response`，随后发送 `done`；
-- 前端不再理解 `candidate / failed candidate` 等概念。
+```json
+{
+  "completed": true,
+  "message": "可选的简短完成摘要"
+}
+```
 
-### 5.2 取消兜底
+同时保留阻塞上报：
 
-- 取消发生在 EXECUTING 阶段：正常 Run cancelled，保留历史与 Trace；
-- 取消发生在 READINESS_CHECK / SEMANTIC_GRADING / COMMITTING 阶段：已注册 evidence 照常合并，基于已有证据补出验收报告（可标 `incomplete`），并刷新 goal.gaps，避免旧报告污染后续续跑；
-- 前端在验收窗口对“停止”按钮加确认：「正在验收，取消将丢弃本轮验收结果」。
+```json
+{
+  "blocked_reason": "连续尝试后仍无法继续的真实阻塞",
+  "message": "已尝试的方法和所需外部条件"
+}
+```
 
-### 5.3 Session 与 checkpoint
+### 4.2 工具规则
 
-- LangGraph checkpoint：同一 Run 内 HITL 和执行循环权威；
-- Session JSON：用户消息、最终助手消息、Goal/Run/Todo/permission 等跨请求产品状态权威；
-- Trace：保存完整内部模型消息、工具执行、Readiness 与 Rubric 过程，仅用于审计；
-- 未通过的内部 AIMessage 不应提前成为 Session 中的最终展示消息；
-- Run 被用户停止或异常中断时，既有会话历史必须保留，前端不得按验收状态永久过滤。
+- `completed` 只接受 `true`；进度更新时省略该字段，不发送 `false`。
+- 只有当前 Goal 的主 Agent 可以提交完成；review/subagent 不能结束 Goal。
+- 调用绑定 `goal_id + objective_revision + run_id + tool_call_id`。
+- 同一个 `tool_call_id` 幂等；重复投递只返回同一 completion request，不得重复提交终态或重复启动 Rubric。
+- Goal 不存在、非 active、revision 已过期或调用来自错误 Run 时拒绝。
+- `update_goal` 必须是一次独立的主 Agent Tool Call；不允许与仍在执行的兄弟 Tool Call 共同构成完成声明。
+- 完成申请后只允许 Agent 生成最终回复；若又发生实质性工具操作或变更，当前申请失效，Agent 必须重新调用 `update_goal(completed=true)`。
+- 工具结果只能确认“完成申请已持久化”或返回同步协议拒绝；不得在最终消息尚未形成时声称 Goal 已完成。
+- Agent 自然停止但未调用 `update_goal(completed=true)` 时，只结束当前 Run，Goal 保持 active。
+- 自然停止本身不触发 Rubric，也不作为“未完成就自动开始下一 Run”的通用信号。新 Run 只由用户显式继续、Goal revision、可恢复的控制面错误或明确的 Run budget boundary 启动。
 
-### 5.4 原子完成
+### 4.3 工具 ack 与最终提交是两个时点
 
-最终回复、accepted report、RunOutcome 和 Goal 状态应在同一个完成事务中固化。前端只有在收到正常完成事件后才结束运行态并展示最终回复，避免“答案已显示但 Agent 仍运行”。
+`update_goal` 是模型回合中的 Tool Call。该 Tool 返回时，Agent 还没有生成 Tool Result 之后的最终 Assistant Message，因此工具不可能同时原子提交 Goal、Run 和最终消息。
 
-## 6. Run、Goal、合同与证据作用域
+第一阶段，工具返回真实的申请状态：
 
-### 6.1 合同分层
+```text
+# standard
+Completion request recorded. Finish the final response.
 
-- `Declared Goal Contract`：由用户目标、Harness 默认规则和高级自定义规则产生，跨 Run 稳定；
-- `Effective Run Contract`：Declared Contract + 本 Run 实质工作激活的 pack + 当前未解决缺口；
-- `Goal Aggregate Decision`：基于当前 Goal revision 下所有有效 Run evidence 作最终判断。
+# rubric
+Completion request recorded for Rubric verification. Finish the candidate final response.
+```
 
-后续 Run 不应直接复制上一个 effective contract 再单调扩展，而应从 declared goal contract 重新编译。
+第二阶段，Agent 自然停止后，Harness 已拥有最终回复，才能根据申请状态执行原子终结事务。只有该事务成功后，API/SSE/UI 才可声明 Goal 已完成。
 
-### 6.2 Material Activation
+### 4.4 状态词汇
 
-Tool 调用成功只产生 activation candidate。满足以下条件之一后才正式激活 pack：
+对外统一：
 
-- Tool 结果被最终回答引用；
-- Tool 结果进入 `report_payload`；
-- Tool 产生或修改目标 artifact；
-- Tool 结果被登记为 completion evidence；
-- 用户目标明确要求该工作类型。
+- Goal 终态：`completed`
+- 完成动作：`completed=true`
+- 前端文案：`已完成`
 
-### 6.3 统一跨 Run 证据策略
+Rubric 仍使用独立判定词汇：
 
-每个 criterion 必须显式声明：
+- `satisfied`
+- `needs_revision`
+- `failed`
+- `verification_incomplete`
+- `grader_error`
+- `infrastructure_error`
 
-- `run_only`：必须由当前 Run 重新完成；
-- `goal_inheritable`：同一 Goal revision 下可以继承；
-- `artifact_bound`：只要目标 artifact hash 未变化即可继承；
-- `freshness_bound`：在时间或数据版本窗口内有效。
+本方案只面向新 Session 和新 Goal。实现时直接统一模型、API、SSE 和 UI 的完成词汇，不为旧 Session 的 `achieved` 状态增加读取映射或数据迁移。
 
-建议：
+## 5. 标准验收
 
-| Criterion | 建议作用域 |
-|---|---|
-| todo_reconciliation | goal_inheritable，检查当前 Goal 台账 |
-| web_evidence_traceability | goal_inheritable，且最终内容必须真实引用；无 web 激活时降级 |
-| analytics_evidence_traceability | goal_inheritable，绑定数据源/result identity |
-| artifact_delivery | artifact_bound + 终态前盘上对账 |
-| code_validation | artifact_bound；代码 hash 不变可继承，变化后必须重跑 |
-| task_fulfillment / metric_consistency / time_scope | 最终接受时重新评审 |
+### 5.1 定位
 
-### 6.4 终态前对账与熔断（本方案补充）
+标准验收是默认完成方式。Agent 对任务质量和自查负责，Harness 不重新判断“用户目标是否真的完成”，只验证完成请求能否安全地改变状态。
 
-- `complete_from_final_state` 对 declared_artifact_targets 按盘上存在性/摘要复核（复用 `deterministic_checks._evaluate_artifact_delivery` 的校验逻辑），以盘上事实修正报告——解决“已交付但 receipts 丢失”被误判。
-- `_goal_auto_continue_reason` 增加熔断：本轮 gap 指纹（status + sorted gaps 的 sha256）与上轮相同 → 不续跑，goal 转 blocked，输出"连续两轮验收缺口完全相同，已停止自动续跑，请人工介入"。Run 内提交层面同理：相同指纹的连续提交直接终态。
+### 5.2 唯一硬阻断项
 
-## 7. 预算与循环策略
+调用 `update_goal(completed=true)` 时先检查身份与协议安全，Agent 自然停止后再检查终结安全。两阶段合计仅允许以下硬阻断：
 
-- 删除“Rubric 最大修正轮数决定 Run 结束”的语义；
-- 统一由 `run_model_call_limit` 控制同一 Run 的执行与修正总预算；
-- Grader infrastructure error 可配置有限重试，但不能被解释为业务验收失败；
-- 连续出现完全相同 gaps 时触发 stagnation 保护，结果为 blocked，而不是伪装成完成；
-- 仅当 Run 预算耗尽且 Goal 仍有总预算时，Lifecycle Control 才开启下一 Run。
+1. 当前 Goal 存在且为 active；
+2. 调用绑定当前 objective revision 和合法 Run；
+3. 调用来自主 Agent，且 `update_goal` 是该 Assistant Message 中唯一的 Tool Call；
+4. 完成申请后没有新的实质性 Tool Call 或 mutation 使申请失效；
+5. 没有仍在执行的 Tool Call；
+6. 没有未决 HITL、权限审批或外部 mutation；
+7. 当前 Run 未处于 cancelled、system failed 或 budget exceeded；
+8. 完成申请、Goal 终态、Run 终态和最终消息可以原子持久化。
 
-## 8. 前端产品行为
+上述检查只处理状态安全，不重新评审任务质量。
 
-- 运行中统一显示“Agent 处理中”或当前有价值的执行动作，不在主界面强调“第 N 轮验收、验收失败、正在反复修正”；
-- 思考、工具调用、Readiness、Rubric 与内部修正统一放入可折叠“处理过程”，保持同一套时间线和交互；
-- 不显示“候选版本、失败候选、验收后点击查看”等卡片；
-- 不因 verification report 自动打开右侧抽屉；
-- 最终回答只有在 accepted completion 后一次性发布；
-- 最终回答中的验收信息默认压缩为一句自然语言，例如“验证通过：后端 24 项测试通过，前端生产构建通过”；
-- 不在正常对话流展示 Rubric 条目、修正轮次、grader 原文或内部 completion report；这些只保存在 Trace，由用户主动查看；
-- 历史消息按 Session JSON 恢复，不依据 `verification_state` 删除；
-- 中断或异常显示对应状态，但不得把内部草稿冒充最终完成结果；
-- Trace/验收抽屉仍可由用户主动查看详细过程。
+### 5.3 不得作为标准模式硬门槛
 
-## 9. 实施优先级
+以下信息可以形成提示或完成证据，但不能阻止标准完成：
 
-### P0：修正 Run 内闭环与发布顺序
+- 是否运行测试、构建、Ruff 或 `git diff --check`；
+- 是否存在未提交修改；
+- 是否拥有完整 Evidence Ledger；
+- 所有 Todo 是否都有结构化证据；
+- 是否调用过 Web、SQL、RAG、代码或浏览器工具；
+- 是否存在旧 Run 遗留但已失效的 pending Todo；
+- 最终文本是否满足 LLM grader 的主观判断。
 
-1. 在 DeepAgents SSE 适配层截住 terminal AIMessage，验收前不发布最终 token、不写展示消息；
-2. 保持 `after_agent` 为完成拦截点，严格执行 `Readiness → Rubric → jump_to model / commit`；
-3. Readiness/Rubric 失败统一 `jump_to=model`，复用同一 `run_id / query_id / checkpoint`；
-4. `max_iterations` 不再终止业务 Run，终止权归 Run budget、用户控制、HITL 或基础设施状态；
-5. 验收通过后原子固化最终消息、报告、RunOutcome 和 Goal 状态，再发送 `final_response → done`；
-6. 前端删除候选分类逻辑，只按 Activity 与最终完成事件渲染；最终验收结果只显示一句摘要，历史消息按 Session 原样恢复；
-7. 强化 Agent 的结束纪律：执行计划或 Todo 未闭环时不得返回 terminal AIMessage；报告内容自查仍在 Model/Tools 循环内完成；
-8. 将 Readiness/Rubric 事件接入现有思考/工具调用折叠时间线，主界面统一保持“Agent 处理中”；
-9. **取消兜底**：验收窗口内取消仍合并已注册证据并补出报告，刷新 goal.gaps；
-10. **终态对账与熔断**：declared target 盘上真实状态复核；相同 gap 指纹连续两轮 → goal blocked。
+若项目确实需要强制命令，可后续增加可选的 `GoalCompleted` hook。Hook 属于项目策略，默认不配置，不能继续向通用 Harness 内堆叠隐式硬规则。
 
-### P1：修正合同和跨 Run 证据
+### 5.4 完成提交后的结果
 
-1. 拆分 declared goal contract 与 effective run contract；
-2. 将 activation 改为 material activation；
-3. 为所有 deterministic criterion 增加 evidence scope；
-4. 统一 Web/Analytics/Artifact/Code 的继承与失效规则；
-5. 迁移现有 Goal contract，避免历史 pack 永久污染后续 Run。
+标准路径中，`REQUESTED` 是 completion request 的子状态，不是 `GoalStatus`：
 
-### P2：分析产物内容硬保证（可选增强）
+```text
+Goal ACTIVE + Run RUNNING
+→ update_goal(completed=true)
+→ CompletionRequest REQUESTED
+→ Agent 生成最终回复并自然停止
+→ STATE_SAFETY_CHECK
+   ├─ rejected
+   │    → CompletionRequest REJECTED
+   │    → Goal 仍 ACTIVE
+   │    → 返回明确协议错误，不发布伪终态
+   └─ passed
+        → CompletionRequest ACCEPTED
+        → 原子提交 Run COMPLETED + Goal COMPLETED + 最终消息
+```
 
-1. 定义版本化 `report_payload` schema；
-2. 建立 SQL result → payload → chart key → artifact hash 的 lineage manifest；
-3. 实现 `report_data_consistency` deterministic verifier；
-4. 验证图表数据、文本结论和年份范围；
-5. 在 Harness 设置中允许高级用户增加领域级内容规则。
+若 Agent 自然停止但不存在 completion request：
 
-## 10. 验收测试矩阵
+```text
+Run COMPLETED
+Goal ACTIVE
+```
 
-| 场景 | 预期结果 |
-|---|---|
-| HTML 要求 lidar/HUD，但 JS 缺 key | Agent 自查继续查询和修改，不提交 terminal AIMessage，不进入 Harness 验收 |
-| Todo 未收口 | Readiness 失败；同一 Run 修正 |
-| 文件未落盘 | Readiness 失败；不得发布最终回复 |
-| 文件齐全但趋势结论与数据不一致 | Readiness 通过后 Rubric 失败；同一 Run 修正 |
-| Rubric 连续两次未通过 | 不结束 Run；继续消耗 Run model-call budget |
-| Run 模型预算耗尽 | 当前 Run budget_exceeded；Goal 在总预算允许时开启下一 Run |
-| Run-1 Web 证据有效，Run-2 未重新检索 | 可按 evidence scope 继承，不强制重复联网 |
-| 代码 hash 未变化 | 可继承验证证据；hash 变化后必须重新测试 |
-| 用户在验收前停止 | 不发布最终完成；历史和 Trace 保留 |
-| 用户在验收窗口取消 | 已注册证据合并，goal.gaps 刷新，不沿用旧报告 |
-| 盘上已交付但 receipts 缺失 | 终态对账后 artifact_delivery 不判挂 |
-| 相同 gap 连续两轮 | goal 转 blocked，不开启下一轮 |
-| 刷新或后端重启 | Session 历史、Goal、Todo、RunOutcome 恢复一致 |
-| 验收通过 | 最终回复、accepted report、RunOutcome 与 Goal achieved 同步出现 |
-| 内部经历多轮 Readiness/Rubric 修正 | 正常对话流只表现为仍在运行；最终通过后仅显示一句验收摘要 |
-| 用户展开“处理过程” | 可查看工具调用、检查、Rubric 和修正事件，但不会看到伪终态候选报告 |
+这两个 `COMPLETED` 不矛盾：Run 终态只表示本次执行已成功结束，不自动表示跨 Run Goal 已完成。
 
-## 11. 主要改动位置
+标准验收成功后，前端只展示“已完成”和 Agent 已实际执行的自查摘要，不生成空 `RubricEvaluationReport`，不生成 `GoalVerificationDecision`，不展示 VerificationCard。原子发布权威来自已接受的 `GoalCompletionRequest`。
 
-- `backend/graph/deepagents_manager.py`：SSE 缓冲、消息发布、snapshot 与 Run 内回跳；
-- `PuddingClawRubricMiddleware`（`deepagents_manager.py` 内）：Readiness/Rubric 顺序和修正终止条件；
-- `backend/harness/deterministic_checks.py`：内容完整性与 evidence scope；
-- `backend/harness/rubric_compiler.py`：Declared/Effective contract 和 material activation；
-- `backend/harness/coordinators.py`：Goal aggregate decision、跨 Run 边界、终态对账、熔断；
-- `backend/graph/session_manager.py`：最终消息与 RunOutcome 原子持久化、取消时证据合并；
-- `frontend/src/lib/store.tsx`：完成事件与运行状态同步、取消确认；
-- `frontend/src/components/chat/ChatMessage.tsx`：移除候选包装并恢复历史渲染。
+### 5.5 标准模式的 Prompt 责任
 
-## 12. 完成定义
+标准模式不生成或持久化结构化 Rubric，但必须有稳定的完成审计 Prompt。它的职责是让同一 Agent 从原始 Goal 中动态推导临时检查清单，而不是产生第二套验收对象。
 
-本轮迭代只有同时满足以下条件才算完成：
+建议在 Goal 创建/续跑上下文和 `update_goal` 工具描述中注入同一原则：
 
-- 用户不会在验收前看到“任务完成”；
-- Readiness 缺口和 Rubric 缺口均在同一 Run 内自动修正；
-- Agent 未完成 lidar/HUD 等内容自查时不会申请结束；
-- Rubric 次数不再独立终止 Run；
-- 跨 Run contract 不再因偶然工具调用永久膨胀；
-- 所有 criterion 的证据继承规则一致且可解释；
-- 历史消息刷新后不消失；
-- 验收窗口内取消仍合并证据并刷新 gaps；
-- 相同 gap 指纹连续两轮时 goal blocked；
-- 最终回复出现时，Run 和 Goal 已经同步收口；
-- 用户默认只看到一句验收摘要，不看到内部候选、Rubric 明细和反复修正过程；
-- 用户主动展开“处理过程”时仍可审计完整验收事件，折叠状态下不会感知到独立且漫长的验收流程。
+```text
+在调用 update_goal(completed=true) 前：
+1. 从原始 Goal、用户明确要求和引用文件中确定所有必需结果，不得缩小范围。
+2. 检查当前真实状态，不得用计划、意图或总结代替已实现结果。
+3. 执行与改动风险相称的验证，只报告实际执行过的检查。
+4. 若存在未完成要求、失败检查或证据不足，继续工作并保持 Goal active。
+5. 只有所有必需项完成且没有已知遗留工作时，调用 update_goal(completed=true)。
+6. 完成申请记录后只生成最终回复；若还需要调用工具或修改产物，先继续工作，并在最后重新提交完成申请。
+```
+
+不强制 Agent 将临时检查清单输出给用户，不为它分配 criterion id，不绑定 Evidence Ledger，也不计分。一旦需要结构化、持久化和独立裁判，就应进入 Rubric 验收。
+
+## 6. Rubric 验收（实验性）
+
+### 6.1 定位
+
+Rubric 验收是可选的最高级别验收，用于重要报告、关键代码交付、复杂跨 Run 任务或用户明确要求独立复核的场景。
+
+它保留当前已建设的能力：
+
+- declared/effective verification contract；
+- deterministic checks；
+- Evidence Ledger 与跨 Run evidence；
+- LLM Rubric grader；
+- 结构化 criteria、gaps 和 report；
+- 有限的定向修复。
+
+Rubric 验收不是默认 Goal 语义，也不能由任务关键词自动升级。
+
+### 6.2 唯一触发点
+
+Rubric 不再因 terminal AIMessage、自然停止或 `after_agent` 本身自动触发。`after_agent/aafter_agent` 可继续作为执行位置，但只有读到当前 Run 的有效 completion request 时才可运行验收。
+
+唯一触发条件：
+
+```text
+Goal.completion_policy == rubric
+AND Agent 调用 update_goal(completed=true)
+```
+
+这次调用的语义是“持久化一次 Rubric 完成申请”，不是立即宣告 Goal 已完成。Agent 在 Tool Result 之后生成 candidate final response，随后 Harness 进入验收。
+
+### 6.3 状态机
+
+```text
+Goal ACTIVE + Run RUNNING
+→ update_goal(completed=true)
+→ CompletionRequest REQUESTED
+→ Agent 生成 candidate final response 并自然停止
+→ CompletionRequest EVALUATING + Run EVALUATING
+   → deterministic checks
+   → LLM Rubric
+   ├─ satisfied
+   │    → CompletionRequest ACCEPTED
+   │    → 原子提交 Run COMPLETED + Goal COMPLETED
+   │       + candidate final response + accepted report
+   ├─ needs_revision
+   │    → CompletionRequest NEEDS_REVISION + Run RUNNING
+   │    → 返回结构化 gaps
+   │    → 同 Run 最多执行有限修复
+   │    → 修复后必须重新 update_goal(completed=true)
+   │    → Goal 始终保持 ACTIVE，直到新申请被接受
+   └─ grader/control/infrastructure error
+        → CompletionRequest REJECTED
+        → 显示“Rubric 验收器异常”
+        → Goal 保持 ACTIVE
+        → 不伪装成业务缺口，不消耗业务修复次数
+```
+
+`REQUESTED / EVALUATING / NEEDS_REVISION / ACCEPTED / REJECTED / INVALIDATED` 属于 `GoalCompletionRequest.status`，不新增到 `GoalStatus`。Goal 的持久业务状态在验收期间仍是 `ACTIVE`；前端“Rubric 验收中”由 active Goal 与 evaluating request 派生。
+
+### 6.4 修复与停止规则
+
+- 默认最多自动修复 1 次；设置中允许调整，但必须有硬上限。修复后的新验收必须绑定新 completion request，不得静默复用旧申请。
+- 相同 gap 指纹连续不变时立即停止自动修复，不跨 Run 无限重复。
+- Rubric 驳回不自动取消 Goal。
+- 验收器或基础设施异常不写入业务 `gaps`，改写入 `control_notices`。
+- 控制面异常不消耗 Goal round，也不自动转 `blocked`。
+- 达到 Rubric 尝试上限后，Goal 保持 active 并停止自动续跑；用户可以继续、修改目标、重试验收或关闭 Rubric 验收。
+- 用户暂停、取消、修改 objective revision 时，正在进行的验收结果不得接受为新 revision 的完成证据。
+
+### 6.5 合同与证据冻结
+
+- `completion_policy` 在 Goal 创建时冻结；修改全局设置只影响新 Goal。
+- Rubric contract 按 objective revision 冻结。
+- `update_goal(completed=true)` 时生成本次 acceptance snapshot，包含 contract version、Goal revision、有效 evidence refs、artifact identity 和支持 Run。
+- 驳回后的新证据可以进入下一次提交，但不能回写篡改已经形成的旧报告。
+
+## 7. 前端方案
+
+### 7.1 输入区
+
+Goal Mode 开启时展示完成方式：
+
+```text
+完成方式
+● 标准验收（推荐）
+○ Rubric 验收  [实验性]
+```
+
+Rubric 验收说明：
+
+> 使用确定性检查、结构化证据和独立模型 Rubric 复核完成结果。更慢、成本更高，且仍可能误判；建议仅用于重要交付。
+
+选择结果随 Goal 创建请求一起发送并冻结。active Goal 的 chip 或详情卡必须显示当前完成方式，避免用户误以为设置修改会改变正在运行的 Goal。
+
+### 7.2 设置页
+
+现有“Goal Run Rubric 验收”改为：
+
+```text
+Rubric 验收  [实验性]
+默认：关闭
+```
+
+关闭时折叠所有 Rubric 参数。开启后才展示：
+
+- 最大 Rubric 尝试次数；
+- 相同缺口最多自动修复次数；
+- 自定义 Rubric 规则；
+- grader 模型；
+- 预计的额外延迟和模型调用说明。
+
+“实验性”必须是可见 badge，不能只埋在帮助文本中。
+
+### 7.3 GoalCard 与 VerificationCard
+
+标准验收：
+
+- GoalCard 显示 active / 已完成 / 暂停 / 阻塞；
+- 完成后可显示 Agent 自查摘要，例如测试数量和构建结果；
+- 不创建空 Rubric Report；
+- 不显示 VerificationCard。
+
+Rubric 验收：
+
+- GoalCard 显示“Rubric 验收中”“待修正”“已完成”；
+- VerificationCard 展示 criteria、evidence、gaps、attempt 和 control notice；
+- verifier 异常显示为系统异常，不显示为“任务不合格”；
+- 前端不自动打开面板，不在聊天正文反复插入修复过程。
+
+## 8. 后端落点
+
+### 8.1 新增或调整的数据
+
+建议新增：
+
+```text
+GoalCompletionPolicy = "standard" | "rubric"
+GoalCompletionRequest
+  - request_id
+  - goal_id
+  - objective_revision
+  - run_id
+  - tool_call_id
+  - completed
+  - policy
+  - status: requested | evaluating | needs_revision | accepted | rejected | invalidated
+  - message
+  - invalidated_reason
+  - acceptance_snapshot_id
+  - verification_report_id
+  - requested_at
+  - decided_at
+```
+
+`GoalCompletionRequest` 既是幂等记录，也是标准与 Rubric 共用的发布权威。它必须保留每次申请，不能只在 Goal 上覆盖一个可变对象。
+
+Goal 增加：
+
+```text
+completion_policy
+latest_completion_request_id
+```
+
+Run 增加：
+
+```text
+completion_requested_at
+completion_request_id
+```
+
+Rubric report 模型继续保留，但只有 `completion_policy=rubric` 的 completion request 才可关联它。标准验收不创建空 report，也不伪造 `NOT_REQUIRED` 裁决。
+
+### 8.2 三个正交维度
+
+`RunKind`、`GoalCompletionPolicy` 和内部 `VerificationMode` 必须各自只表达一个事实：
+
+| 维度 | 回答的问题 | 建议值 |
+|---|---|---|
+| `RunKind` | 本 Run 是否执行 Goal | `goal_execution / goal_inspection / standalone` |
+| `GoalCompletionPolicy` | Goal 完成申请由谁裁决 | `standard / rubric` |
+| `VerificationMode` | 本 Run 当前使用什么内部验证强度 | `agent / proportional / rubric` |
+
+建议将当前 `VerificationMode.GOAL` 直接改名为 `RUBRIC`，避免再用“是否 Goal”表达“是否独立验收”。既然本方案仅面向新 Session/Goal，不需为旧枚举值增加生产兼容分支。
+
+| Goal 完成方式 | Run 有效 `VerificationMode` | 运行期行为 |
+|---|---|---|
+| 标准验收，无 mutation | `agent` | Agent 自查，不启动 reviewer |
+| 标准验收，已发生 mutation | `agent → proportional` | 保留 receipt/状态安全信息，不构成第三种 Goal 验收模式 |
+| Rubric 验收 | `rubric` | 完成申请后允许 deterministic checks + grader + 有限修复 |
+
+### 8.3 当前代码需要解耦的位置
+
+1. `backend/harness/coordinators.py`
+   - 当前显式 Goal Run 只要 `verification_enabled` 就强制映射为 `VerificationMode.GOAL`；
+   - 改为仅 `completion_policy=rubric` 时编译和冻结 contract；
+   - `complete_from_final_state()` 不再用 `NOT_REQUIRED` report 自动完成标准 Goal；
+   - 将 `GoalCoordinator.apply_run_report()` 收缩为 Rubric 路径，新增通用 completion request 终结入口。
+2. `backend/graph/deepagents_manager.py`
+   - 当前 `PuddingClawRubricMiddleware.after_agent/aafter_agent` 在 Goal Run 自然停止后介入；
+   - 改为检查持久化的 completion request，只处理 Rubric 模式的显式提交；
+   - 流式结束时不再把所有 Run 无条件推入 `EVALUATING`；
+   - 没有 completion request 时可发布本 Run 的进度回复，但 Goal 保持 active。
+3. `backend/graph/session_manager.py`
+   - 增加 completion request 的幂等写入和 Goal/Run/最终消息原子提交；
+   - 将 `commit_accepted_completion()` 的权威从“必须有 accepted Rubric report”改为“必须有同 Run/revision 的 accepted completion request”；
+   - Rubric 模式额外要求 request 绑定的 report 已接受；
+   - 保持 `goal_id + objective_revision` CAS 约束。
+4. `backend/harness/models.py`
+   - 增加 `GoalCompletionPolicy` 与 completion request 模型；
+   - `VerificationMode` 不再承担“是不是 Goal”的双重语义；
+   - Goal 对外终态从 `ACHIEVED` 直接统一为 `COMPLETED`。
+5. Agent Tool 注册与权限
+   - 新增主 Agent 可见的 `update_goal`；
+   - 工具绑定 session/query/run/goal/revision；
+   - 不向 subagent/reviewer 工具集暴露 `update_goal`，工具处理器仍必须再做身份校验。
+6. `frontend/src/app/settings/page.tsx`
+   - Rubric 默认关闭；
+   - 改名并增加“实验性”徽标和风险说明。
+7. `frontend/src/components/chat/ChatInput.tsx`
+   - Goal 创建时允许选择标准验收或 Rubric 验收。
+8. `frontend/src/components/citations/SourcesPanel.tsx`
+   - 标准完成不展示 VerificationCard；
+   - Rubric 模式保留现有详细报告。
+
+### 8.4 配置建议
+
+```json
+{
+  "harness": {
+    "goals": {
+      "enabled": true,
+      "default_completion_policy": "standard"
+    },
+    "completion": {
+      "rubric": {
+        "enabled": false,
+        "experimental": true,
+        "max_iterations": 2,
+        "max_stagnant_repairs": 1
+      }
+    }
+  }
+}
+```
+
+`rubric.enabled` 表示产品是否允许用户选择 Rubric 验收；不表示所有 Goal 默认启用。
+
+### 8.5 原子终结事务的最小不变式
+
+无论 standard 还是 rubric，最终发布入口只允许在同一 Session 写锁中完成以下操作：
+
+1. 重新读取权威 Goal、Run 和 completion request，不信任调用方的旧内存快照。
+2. 校验 Goal 仍为 `ACTIVE`、Run 仍绑定当前 Goal revision、request 仍是当前有效申请。
+3. 校验没有 running Tool Call、pending HITL/审批、未终结 mutation/publish lease。
+4. standard 要求 request 通过 state-safety；rubric 额外要求绑定 report 已对当前 revision 做出 accepted 裁决。
+5. 同时写入 request `ACCEPTED`、Run `COMPLETED`、Goal `COMPLETED`、最终 Assistant Message 和后续 SSE 所需的持久数据。
+6. 清除 `active_goal_id/current_run_id`，收回或终结不应跨终态存活的执行 lease。
+7. 仅在事务成功后发出 `goal_status_changed/completed`、`final_response` 和 `done`；SSE 不是事务的一部分，也不能先于权威状态。
+
+任一校验失败都不得部分写入 Goal 终态。工具 ack、grader verdict 和前端动画都不能替代这个事务。
+
+## 9. 生效边界
+
+### 9.1 新 Session 与新 Goal
+
+- 默认 `completion_policy=standard`；
+- 只有用户明确选择 Rubric 验收时才使用 `rubric`；
+- 不因任务复杂、工具类型、失败次数或模型判断自动升级。
+
+### 9.2 不迁移旧状态
+
+- 不迁移已有 active Goal；
+- 不迁移历史 Session JSON；
+- 不为旧 `achieved` 状态增加兼容读取；
+- 不要求新前端继续接受旧 Goal 状态协议；
+- 验收测试统一使用实现后新建的 Session 和 Goal；
+- 旧测试数据如与新协议冲突，直接清理或重新生成，不编写生产兼容分支。
+
+## 10. 测试矩阵
+
+### 10.1 标准验收
+
+- active Goal 调用 `update_goal(completed=true)` 后先持久化 request，工具 ack 不得声称 Goal 已完成；
+- Agent 生成最终回复并自然停止后，request、Run、Goal 和最终消息原子完成；
+- 没有完成调用时，terminal AIMessage 和 SSE done 不得完成 Goal；
+- 没有完成调用时，当前 Run 可以 `completed`，但 Goal 必须保持 `active`；
+- 重复 tool call id 幂等；
+- 旧 revision、错误 Run、非 active Goal 调用被拒绝；
+- subagent/reviewer 不可见或不可成功调用 `update_goal`；
+- `update_goal` 与兄弟 Tool Call 并发时拒绝或使完成申请无效；
+- completion request 后又发生 mutation 时，旧 request 失效并要求 Agent 重新提交；
+- 正在运行的 Tool、HITL、权限或外部 mutation 阻止状态提交；
+- 缺少测试、存在未提交修改或没有 Evidence Ledger 不阻止标准完成；
+- 标准模式不进入 `EVALUATING`、不调用 grader、不产生空 Rubric report 或 VerificationCard；
+- 完成摘要只包含真实执行过的测试和检查。
+
+### 10.2 Rubric 验收
+
+- 自然停止不触发 Rubric；
+- 显式完成调用只触发一次 Rubric；
+- deterministic 和 grader 全部通过后完成；
+- task gap 返回 Agent，Goal 保持 active，Run 回到 running；
+- Agent 修复后必须创建新 completion request，不复用旧裁决快照；
+- 相同 gap 达到阈值后停止自动修复；
+- grader error、协议错误和基础设施错误进入 `control_notices`，不冒充 task gap；
+- verifier 异常不消耗 Goal round；
+- 旧 revision 的通过结果不能完成新 revision；
+- Rubric 设置变更不影响 active Goal；
+- 前端始终显示“Rubric 验收 · 实验性”。
+
+### 10.3 新 Session 边界
+
+- 新 Session 创建的 Goal 只写入新完成协议和状态词汇；
+- 测试不得依赖旧 Session、旧 active Goal 或旧 `achieved` fixture；
+- 普通非 Goal Run 行为保持不变；
+- 用户暂停、取消、恢复和修改 Goal 的行为保持独立。
+
+## 11. 实施顺序
+
+### P0：完成协议
+
+1. 增加 `GoalCompletionPolicy` 和可追溯的 `GoalCompletionRequest`；
+2. 增加仅主 Agent 可用的 `update_goal(completed=true)` 工具，实现身份绑定与幂等 ack；
+3. 将自然停止、Run 终态和 Goal 完成解耦；
+4. 将最终发布权威从必选 Rubric report 改为 accepted completion request；
+5. 实现标准模式的两阶段申请和原子终结；
+6. 新 Goal 默认标准验收；
+7. `VerificationMode.GOAL` 改为 `RUBRIC`，Goal 完成状态的 API/UI 词汇统一为 `completed`。
+
+### P1：Rubric 改为显式触发
+
+1. 将 Rubric 从普遍 `after_agent` 拦截改为消费 completion request；
+2. 保留现有 contract、deterministic checks、Evidence Ledger 和 grader；
+3. `needs_revision` 时将 Run 恢复为 running，修复后由 Agent 显式提交新 completion request；
+4. 收紧修复次数和控制面异常处理。
+
+### P2：前端产品化与观测
+
+1. 增加完成方式选择；
+2. 增加“Rubric 验收 · 实验性”标识和默认关闭；
+3. 标准模式收起 VerificationCard；
+4. 记录标准完成后的用户重开率、Rubric 误拒率、额外模型调用、耗时和实际修复率。
+
+### P3：逐步完善 Rubric 验收
+
+- 根据真实误拒案例完善 criterion 和 evidence scope；
+- 增加领域 verifier，但不得反向进入标准模式；
+- 评估可选 project completion hook；
+- 在指标证明稳定前始终保留“实验性”标识。
+
+## 12. 非目标
+
+- 本轮不删除 Rubric 或 Evidence Ledger；
+- 不删除 Goal 的跨 Run 延续、预算、暂停、恢复和 revision；
+- 不把所有普通 Run 自动创建为 Goal；
+- 不引入多 skeptic panel；
+- 不为标准验收建立新的隐式评分器；
+- 不用前端文案掩盖后端状态错误；
+- 不迁移或兼容旧 Session、旧 active Goal 和旧 `achieved` 状态。
+
+## 13. 审核清单
+
+请按以下默认建议审核：
+
+- [ ] 对外统一使用 `update_goal(completed=true)`；
+- [ ] `GoalCompletionRequest` 成为独立、可追溯、幂等的完成控制对象；
+- [ ] 工具 ack 只声称 request 已记录，仅原子终结事务可声称 Goal 已完成；
+- [ ] Goal 默认使用标准验收；
+- [ ] 标准模式使用固定完成审计 Prompt，但不生成或持久化 Rubric；
+- [ ] Rubric 验收是最高级别且默认关闭；
+- [ ] 前端固定显示“Rubric 验收 · 实验性”；
+- [ ] Rubric 只由显式完成调用触发；
+- [ ] Run 自然结束与 Goal 完成已解耦；
+- [ ] 标准模式只保留状态安全硬门槛；
+- [ ] verifier 异常不作为任务失败、不消耗 Goal round；
+- [ ] 标准模式不展示 VerificationCard；
+- [ ] 方案仅以新建 Session 和 Goal 为验收范围，不实现旧状态兼容。
+
+审核通过后，按 P0 → P1 → P2 实施；P3 作为 Rubric 验收的持续实验迭代。

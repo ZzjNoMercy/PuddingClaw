@@ -118,9 +118,26 @@ Use the built-in `read_file`, `glob`, and `grep` for paths exposed by the DeepAg
 - `/knowledge/`
 - `/large_tool_results/`
 
+When `glob` or `grep` omits `path` (or supplies the composite root `/`), the
+search is scoped to `/workspace/` and returns only canonical
+`/workspace/...` paths. Set an explicit virtual path when searching a managed
+namespace; do not use an unscoped search as a way to enumerate every mounted
+data source.
+
 Keep virtual paths exactly as provided by the system context. In particular, read semantic asset definitions with `read_file("/semantic-assets/...", limit=1000)`; never convert a virtual path into a host-machine absolute path and never pass it to `read_resource`.
 
-For project file changes, prefer `write_file` or `inspect_file_version` followed by `patch_file`; do not wrap ordinary reads, writes, or syntax checks in repeated `python -c` commands. Use `execute` when computation, a project script, validation, or tests genuinely require a runtime. A task-launched subagent inherits the parent Run's Harness policy and must not create a separate permission ceremony.
+For project file changes, prefer `write_file` for creation, or
+`inspect_file_version` followed by `patch_file`/`replace_file` for an existing
+file. In intelligent approval mode, reads and ordinary mutations inside the
+current `/workspace/` are already authorized and must never request an external
+file Grant. `expected_sha256` is a concurrency guard, not a permission token.
+Do not stage an ordinary workspace edit under `/scratch/` and copy it back; a
+`permission_required` result naming `/workspace` or `/scratch` is an internal
+invariant failure to report, not an instruction to start a draft workflow. Do
+not wrap ordinary reads, writes, or syntax checks in repeated `python -c`
+commands. Use `execute` when computation, a project script, validation, or tests
+genuinely require a runtime. A task-launched subagent inherits the parent Run's
+Harness policy and must not create a separate permission ceremony.
 
 For a heatmap UI split across HTML controls and JavaScript data, call `validate_artifact_contract(contract_id="heatmap_year_contract/v1", ...)` on the exact final drafts. It checks selector years, data keys, selected/default year, 8×10 matrix shape, and the event-handler data reference together, and returns one receipt bound to both input hashes. Do not rewrite an ad-hoc Python validator for this registered contract.
 

@@ -47,7 +47,7 @@ class GoalStatus(StrEnum):
     ACTIVE = "active"
     PAUSED = "paused"
     BLOCKED = "blocked"
-    ACHIEVED = "achieved"
+    COMPLETED = "completed"
     CANCELLED = "cancelled"
     BUDGET_EXCEEDED = "budget_exceeded"
 
@@ -77,7 +77,23 @@ class VerificationMode(StrEnum):
 
     AGENT = "agent"
     PROPORTIONAL = "proportional"
-    GOAL = "goal"
+    RUBRIC = "rubric"
+
+
+class GoalCompletionPolicy(StrEnum):
+    """Who accepts an Agent's explicit Goal completion declaration."""
+
+    STANDARD = "standard"
+    RUBRIC = "rubric"
+
+
+class GoalCompletionRequestStatus(StrEnum):
+    REQUESTED = "requested"
+    EVALUATING = "evaluating"
+    NEEDS_REVISION = "needs_revision"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    INVALIDATED = "invalidated"
 
 
 class GoalTurnIntent(StrEnum):
@@ -161,7 +177,7 @@ TERMINAL_RUN_STATUSES = frozenset(
 
 TERMINAL_GOAL_STATUSES = frozenset(
     {
-        GoalStatus.ACHIEVED,
+        GoalStatus.COMPLETED,
         GoalStatus.CANCELLED,
         GoalStatus.BUDGET_EXCEEDED,
     }
@@ -223,7 +239,7 @@ _GOAL_TRANSITIONS: dict[GoalStatus, frozenset[GoalStatus]] = {
         {
             GoalStatus.PAUSED,
             GoalStatus.BLOCKED,
-            GoalStatus.ACHIEVED,
+            GoalStatus.COMPLETED,
             GoalStatus.CANCELLED,
             GoalStatus.BUDGET_EXCEEDED,
         }
@@ -315,7 +331,7 @@ class CapabilityManifest(BaseModel):
     recommended_inactive_skills: list[SkillRecommendation] = Field(default_factory=list)
     enabled_toolsets: list[str] = Field(default_factory=list)
     allowed_tool_names: list[str] = Field(default_factory=list)
-    unavailable_tools: list[dict[str, str]] = Field(default_factory=list)
+    unavailable_tools: list[dict[str, Any]] = Field(default_factory=list)
     tool_schema_hash: str
     created_at: float = Field(default_factory=time.time)
 
@@ -459,11 +475,14 @@ class ValidationReceipt(BaseModel):
     # A failed validator attempt must say whether the artifact bytes failed,
     # the invocation was malformed, or the validator infrastructure failed.
     # Only artifact failures are sticky for the same artifact hash.
-    failure_class: Literal[
-        "artifact_failure",
-        "invocation_failure",
-        "infrastructure_failure",
-    ] | None = None
+    failure_class: (
+        Literal[
+            "artifact_failure",
+            "invocation_failure",
+            "infrastructure_failure",
+        ]
+        | None
+    ) = None
     # True only when the validator is known to have consumed the exact bytes
     # identified by artifact_refs. A path mention plus a non-zero exit code is
     # not proof of a content failure.
@@ -528,12 +547,15 @@ class ArtifactReference(BaseModel):
     # projection from losing declared-target authority merely because it was
     # not represented as a persistent user Grant.
     mutation_receipt_id: str | None = None
-    authority_kind: Literal[
-        "workspace",
-        "permission_grant",
-        "declared_artifact",
-        "legacy_declared_artifact_backfill",
-    ] | None = None
+    authority_kind: (
+        Literal[
+            "workspace",
+            "permission_grant",
+            "declared_artifact",
+            "legacy_declared_artifact_backfill",
+        ]
+        | None
+    ) = None
     run_id: str | None = None
     query_id: str | None = None
     goal_id: str | None = None
@@ -629,9 +651,7 @@ class RunRecord(BaseModel):
     follow_up_of_goal_id: str | None = None
     follow_up_of_artifact_ids: list[str] = Field(default_factory=list)
     execution_mode: Literal["native", "delta_repair"] = "native"
-    delta_repair_kind: Literal[
-        "presentation_only", "data_refresh", "bounded_unknown"
-    ] | None = None
+    delta_repair_kind: Literal["presentation_only", "data_refresh", "bounded_unknown"] | None = None
     delta_repair_tool_budget: int | None = Field(default=None, ge=1)
     delta_repair_tool_call_ids: list[str] = Field(default_factory=list)
     project_id: str | None = None
@@ -651,6 +671,8 @@ class RunRecord(BaseModel):
     verification_contract: RunVerificationContract | None = None
     verification_activations: list[VerificationActivation] = Field(default_factory=list)
     verification_report: RubricEvaluationReport | None = None
+    completion_requested_at: float | None = None
+    completion_request_id: str | None = None
     handoff_summary: RunHandoffSummary | None = None
     model_call_count: int = 0
     budget_exhaustion_reason: str | None = None
@@ -671,14 +693,10 @@ class RunRecord(BaseModel):
         if "declared_artifact_targets_version" not in migrated:
             migrated["declared_artifact_targets_version"] = 1
         if not migrated.get("run_kind"):
-            migrated["run_kind"] = (
-                RunKind.GOAL_EXECUTION.value
-                if migrated.get("goal_id")
-                else RunKind.STANDALONE.value
-            )
+            migrated["run_kind"] = RunKind.GOAL_EXECUTION.value if migrated.get("goal_id") else RunKind.STANDALONE.value
         if not migrated.get("verification_mode"):
             migrated["verification_mode"] = (
-                VerificationMode.GOAL.value
+                VerificationMode.RUBRIC.value
                 if migrated.get("verification_enabled", True)
                 and migrated.get("run_kind") == RunKind.GOAL_EXECUTION.value
                 and migrated.get("goal_id")
@@ -698,7 +716,7 @@ class RunRecord(BaseModel):
             self.run_kind == RunKind.GOAL_EXECUTION
             and self.goal_id is not None
             and self.verification_enabled
-            and self.verification_mode == VerificationMode.GOAL
+            and self.verification_mode == VerificationMode.RUBRIC
         )
 
     @property
@@ -711,15 +729,11 @@ class RunRecord(BaseModel):
             return
         if self.terminal:
             raise HarnessStateError(
-                f"Run {self.run_id} is already terminal ({self.status}); "
-                f"cannot transition to {next_status}."
+                f"Run {self.run_id} is already terminal ({self.status}); cannot transition to {next_status}."
             )
         allowed = _RUN_TRANSITIONS.get(self.status, frozenset())
         if next_status not in allowed:
-            raise HarnessStateError(
-                f"Illegal Run transition {self.status} -> {next_status} "
-                f"for {self.run_id}."
-            )
+            raise HarnessStateError(f"Illegal Run transition {self.status} -> {next_status} for {self.run_id}.")
         self.status = next_status
         self.updated_at = timestamp
         if next_status in TERMINAL_RUN_STATUSES:
@@ -762,6 +776,29 @@ class GoalVerificationDecision(BaseModel):
     created_at: float = Field(default_factory=time.time)
 
 
+class GoalCompletionRequest(BaseModel):
+    """Immutable, idempotent Agent declaration for one Goal revision.
+
+    This is deliberately independent from a Rubric report: standard Goals use
+    the same request as their sole completion authority.
+    """
+
+    request_id: str
+    goal_id: str
+    objective_revision: int
+    run_id: str
+    tool_call_id: str
+    completed: Literal[True] = True
+    policy: GoalCompletionPolicy
+    status: GoalCompletionRequestStatus = GoalCompletionRequestStatus.REQUESTED
+    message: str = ""
+    invalidated_reason: str | None = None
+    acceptance_snapshot_id: str | None = None
+    verification_report_id: str | None = None
+    requested_at: float = Field(default_factory=time.time)
+    decided_at: float | None = None
+
+
 class GoalRecord(BaseModel):
     goal_id: str
     session_id: str
@@ -773,6 +810,8 @@ class GoalRecord(BaseModel):
     requested_status: GoalStatus | None = None
     current_run_id: str | None = None
     run_ids: list[str] = Field(default_factory=list)
+    completion_policy: GoalCompletionPolicy = GoalCompletionPolicy.STANDARD
+    latest_completion_request_id: str | None = None
     goal_contract: RunVerificationContract | None = None
     gaps: list[str] = Field(default_factory=list)
     control_notices: list[str] = Field(default_factory=list)
@@ -800,18 +839,14 @@ class GoalRecord(BaseModel):
     def attach_run(self, run_id: str, *, now: float | None = None) -> None:
         if self.terminal:
             raise HarnessStateError(
-                f"Goal {self.goal_id} is already terminal ({self.status}); "
-                "cannot attach another Run."
+                f"Goal {self.goal_id} is already terminal ({self.status}); cannot attach another Run."
             )
         if self.status != GoalStatus.ACTIVE:
             raise HarnessStateError(
-                f"Goal {self.goal_id} must be active before attaching a Run; "
-                f"current status is {self.status}."
+                f"Goal {self.goal_id} must be active before attaching a Run; current status is {self.status}."
             )
         if run_id not in self.run_ids and self.round >= self.max_rounds:
-            raise HarnessStateError(
-                f"Goal {self.goal_id} exhausted max_rounds={self.max_rounds}."
-            )
+            raise HarnessStateError(f"Goal {self.goal_id} exhausted max_rounds={self.max_rounds}.")
         if run_id not in self.run_ids:
             self.run_ids.append(run_id)
             self.round += 1
@@ -824,15 +859,11 @@ class GoalRecord(BaseModel):
             return
         if self.terminal:
             raise HarnessStateError(
-                f"Goal {self.goal_id} is already terminal ({self.status}); "
-                f"cannot transition to {next_status}."
+                f"Goal {self.goal_id} is already terminal ({self.status}); cannot transition to {next_status}."
             )
         allowed = _GOAL_TRANSITIONS.get(self.status, frozenset())
         if next_status not in allowed:
-            raise HarnessStateError(
-                f"Illegal Goal transition {self.status} -> {next_status} "
-                f"for {self.goal_id}."
-            )
+            raise HarnessStateError(f"Illegal Goal transition {self.status} -> {next_status} for {self.goal_id}.")
         self.status = next_status
         self.updated_at = timestamp
         if next_status in TERMINAL_GOAL_STATUSES:

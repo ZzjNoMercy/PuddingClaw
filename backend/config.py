@@ -283,7 +283,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         },
         "completion": {
             "rubric": {
-                "enabled": True,
+                "enabled": False,
                 # Task classification, permission review and completion grading
                 # share this non-thinking model unless a deployment overrides it.
                 "model": "deepseek-v4-pro",

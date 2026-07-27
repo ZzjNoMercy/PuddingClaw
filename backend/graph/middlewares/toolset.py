@@ -198,10 +198,7 @@ class ToolsetMiddleware(AgentMiddleware):
         toolsets = sorted(self.toolsets_by_skill.get(skill_id, ()))
         unlocked = sorted(tools_for_toolsets(set(toolsets)))
         activation_digest = hashlib.sha256(
-            (
-                f"{run_id}:{goal_id or ''}:{goal_revision or ''}:"
-                f"{skill_id}:{digest}:{policy_epoch}"
-            ).encode()
+            (f"{run_id}:{goal_id or ''}:{goal_revision or ''}:{skill_id}:{digest}:{policy_epoch}").encode()
         ).hexdigest()[:20]
         return SkillActivation(
             activation_id=f"skill-activation-{activation_digest}",
@@ -231,12 +228,8 @@ class ToolsetMiddleware(AgentMiddleware):
                 continue
             if (
                 self._refresh_installed_skill(activation.skill_id)
-                and self._skill_digest(activation.skill_id)
-                == activation.skill_content_sha256
-                and (
-                    policy_epoch is None
-                    or activation.policy_epoch == policy_epoch
-                )
+                and self._skill_digest(activation.skill_id) == activation.skill_content_sha256
+                and (policy_epoch is None or activation.policy_epoch == policy_epoch)
             ):
                 result.append(activation.model_dump(mode="json"))
         return _merge_skill_activations([], result)
@@ -288,11 +281,7 @@ class ToolsetMiddleware(AgentMiddleware):
                 call_id = str(message.tool_call_id or "")
                 if call_id in calls:
                     succeeded.add(calls[call_id])
-        return sorted(
-            skill_id
-            for skill_id in succeeded
-            if self._refresh_installed_skill(skill_id)
-        )
+        return sorted(skill_id for skill_id in succeeded if self._refresh_installed_skill(skill_id))
 
     @staticmethod
     def _context_policy_epoch(session_id: str) -> int:
@@ -339,9 +328,7 @@ class ToolsetMiddleware(AgentMiddleware):
         raw_profile = state.get("task_profile")
         if session_id and run_id:
             persisted = session_manager.get_run_state(session_id, run_id)
-            if isinstance(persisted, dict) and isinstance(
-                persisted.get("task_profile"), dict
-            ):
+            if isinstance(persisted, dict) and isinstance(persisted.get("task_profile"), dict):
                 raw_profile = persisted["task_profile"]
         try:
             profile = RunTaskProfile.model_validate(raw_profile)
@@ -466,9 +453,7 @@ class ToolsetMiddleware(AgentMiddleware):
         goal_revision = context.get("goal_revision")
         policy_epoch = self._context_policy_epoch(session_id)
         persisted = (
-            session_manager.get_effective_run_skill_activations(session_id, run_id)
-            if session_id and run_id
-            else []
+            session_manager.get_effective_run_skill_activations(session_id, run_id) if session_id and run_id else []
         )
         replayed = self._activations_from_messages(
             list(state.get("messages") or []),
@@ -481,11 +466,7 @@ class ToolsetMiddleware(AgentMiddleware):
             [*persisted, *replayed],
             policy_epoch=policy_epoch,
         )
-        active_ids = {
-            str(item.get("skill_id"))
-            for item in activations
-            if item.get("skill_id")
-        }
+        active_ids = {str(item.get("skill_id")) for item in activations if item.get("skill_id")}
         cached = self._activate_cached_profile_skills(
             state,
             session_id=session_id,
@@ -499,9 +480,7 @@ class ToolsetMiddleware(AgentMiddleware):
             [*activations, *cached],
             policy_epoch=policy_epoch,
         )
-        active = sorted(
-            {str(item.get("skill_id")) for item in activations if item.get("skill_id")}
-        )
+        active = sorted({str(item.get("skill_id")) for item in activations if item.get("skill_id")})
         return {
             "skill_activations": activations,
             "active_skill_ids": active,
@@ -532,11 +511,7 @@ class ToolsetMiddleware(AgentMiddleware):
             ],
             policy_epoch=policy_epoch,
         )
-        active_ids = {
-            str(item.get("skill_id"))
-            for item in activations
-            if item.get("skill_id")
-        }
+        active_ids = {str(item.get("skill_id")) for item in activations if item.get("skill_id")}
         cached = self._activate_cached_profile_skills(
             state,
             session_id=session_id,
@@ -550,12 +525,9 @@ class ToolsetMiddleware(AgentMiddleware):
             [*activations, *cached],
             policy_epoch=policy_epoch,
         )
-        active = sorted(
-            {str(item.get("skill_id")) for item in activations if item.get("skill_id")}
-        )
-        if (
-            activations == list(state.get("skill_activations") or [])
-            and active == sorted(state.get("active_skill_ids") or [])
+        active = sorted({str(item.get("skill_id")) for item in activations if item.get("skill_id")})
+        if activations == list(state.get("skill_activations") or []) and active == sorted(
+            state.get("active_skill_ids") or []
         ):
             return None
         return {"skill_activations": activations, "active_skill_ids": active}
@@ -667,9 +639,7 @@ class ToolsetMiddleware(AgentMiddleware):
             list(state.get("skill_activations") or []),
             policy_epoch=policy_epoch,
         )
-        return sorted(
-            {str(item.get("skill_id")) for item in activations if item.get("skill_id")}
-        )
+        return sorted({str(item.get("skill_id")) for item in activations if item.get("skill_id")})
 
     def _allowed_tool_names(
         self,
@@ -693,9 +663,7 @@ class ToolsetMiddleware(AgentMiddleware):
         policy_epoch: int,
     ) -> tuple[SkillCacheEntry, SkillActivation] | None:
         context = (
-            request.runtime.context
-            if request.runtime is not None and isinstance(request.runtime.context, dict)
-            else {}
+            request.runtime.context if request.runtime is not None and isinstance(request.runtime.context, dict) else {}
         )
         session_id = str(context.get("session_id") or "")
         run_id = str(context.get("run_id") or "")
@@ -704,8 +672,7 @@ class ToolsetMiddleware(AgentMiddleware):
         providers = sorted(
             skill_id
             for skill_id, toolsets in self.toolsets_by_skill.items()
-            if tool_name in tools_for_toolsets(set(toolsets))
-            and self._refresh_installed_skill(skill_id)
+            if tool_name in tools_for_toolsets(set(toolsets)) and self._refresh_installed_skill(skill_id)
         )
         cached = [
             (skill_id, entry)
@@ -750,10 +717,7 @@ class ToolsetMiddleware(AgentMiddleware):
             run_id=run_id,
             goal_id=str(context.get("goal_id") or "") or None,
             goal_revision=context.get("goal_revision"),
-            tool_call_id=(
-                "skill-cache:inactive-tool:"
-                + str(request.tool_call.get("id") or tool_name)
-            ),
+            tool_call_id=("skill-cache:inactive-tool:" + str(request.tool_call.get("id") or tool_name)),
             policy_epoch=policy_epoch,
         )
         if activation is None:
@@ -767,9 +731,7 @@ class ToolsetMiddleware(AgentMiddleware):
             )
             session_manager.record_skill_cache_entry(
                 session_id,
-                entry.model_copy(update={"last_used_at": time.time()}).model_dump(
-                    mode="json"
-                ),
+                entry.model_copy(update={"last_used_at": time.time()}).model_dump(mode="json"),
             )
         except (FileNotFoundError, ValueError):
             return None
@@ -787,15 +749,12 @@ class ToolsetMiddleware(AgentMiddleware):
     def _denied_tool_message(self, request: ToolCallRequest) -> ToolMessage | None:
         tool_name = str(request.tool_call.get("name") or "")
         runtime_context = (
-            request.runtime.context
-            if request.runtime is not None and isinstance(request.runtime.context, dict)
-            else {}
+            request.runtime.context if request.runtime is not None and isinstance(request.runtime.context, dict) else {}
         )
         session_id = str(runtime_context.get("session_id") or "")
         policy_epoch = self._context_policy_epoch(session_id)
-        if (
-            str(runtime_context.get("run_kind") or "") == "goal_inspection"
-            and not self._inspection_tool_allowed(tool_name)
+        if str(runtime_context.get("run_kind") or "") == "goal_inspection" and not self._inspection_tool_allowed(
+            tool_name
         ):
             emit_harness_metric(
                 logger,
@@ -815,8 +774,7 @@ class ToolsetMiddleware(AgentMiddleware):
                 status="error",
             )
         legacy_lease_denied = (
-            tool_name in _LEGACY_EXTERNAL_LEASE_TOOLS
-            and self._legacy_external_lease_context(request) is None
+            tool_name in _LEGACY_EXTERNAL_LEASE_TOOLS and self._legacy_external_lease_context(request) is None
         )
         if (
             tool_name
@@ -868,8 +826,7 @@ class ToolsetMiddleware(AgentMiddleware):
         providers = sorted(
             skill_id
             for skill_id, toolsets in self.toolsets_by_skill.items()
-            if tool_name in tools_for_toolsets(set(toolsets))
-            and self._refresh_installed_skill(skill_id)
+            if tool_name in tools_for_toolsets(set(toolsets)) and self._refresh_installed_skill(skill_id)
         )
         recovery = (
             " Read one of these authoritative Skill files first: "
@@ -887,15 +844,11 @@ class ToolsetMiddleware(AgentMiddleware):
 
     def _visible_tools(self, request: ModelRequest) -> list[Any]:
         context = (
-            request.runtime.context
-            if request.runtime is not None and isinstance(request.runtime.context, dict)
-            else {}
+            request.runtime.context if request.runtime is not None and isinstance(request.runtime.context, dict) else {}
         )
         allowed = self._allowed_tool_names(
             request.state,
-            policy_epoch=self._context_policy_epoch(
-                str(context.get("session_id") or "")
-            ),
+            policy_epoch=self._context_policy_epoch(str(context.get("session_id") or "")),
         )
         legacy_enabled = self._legacy_external_lease_tools_enabled(request)
         inspection = str(context.get("run_kind") or "") == "goal_inspection"
@@ -904,10 +857,7 @@ class ToolsetMiddleware(AgentMiddleware):
             for tool in request.tools
             if self._tool_name(tool) in allowed
             and (not inspection or self._inspection_tool_allowed(self._tool_name(tool)))
-            and (
-                legacy_enabled
-                or self._tool_name(tool) not in _LEGACY_EXTERNAL_LEASE_TOOLS
-            )
+            and (legacy_enabled or self._tool_name(tool) not in _LEGACY_EXTERNAL_LEASE_TOOLS)
         ]
 
     @staticmethod
@@ -916,9 +866,7 @@ class ToolsetMiddleware(AgentMiddleware):
             return False
         descriptor = tool_control_descriptor(tool_name)
         return (
-            tool_name in _GOAL_INSPECTION_ALLOWED_TOOLS
-            and descriptor is not None
-            and descriptor.side_effect == "none"
+            tool_name in _GOAL_INSPECTION_ALLOWED_TOOLS and descriptor is not None and descriptor.side_effect == "none"
         )
 
     @staticmethod
@@ -934,9 +882,7 @@ class ToolsetMiddleware(AgentMiddleware):
         """Resolve the active owner that authorizes a compatibility call."""
 
         context = (
-            request.runtime.context
-            if request.runtime is not None and isinstance(request.runtime.context, dict)
-            else {}
+            request.runtime.context if request.runtime is not None and isinstance(request.runtime.context, dict) else {}
         )
         session_id = str(context.get("session_id") or "")
         run_id = str(context.get("run_id") or "")
@@ -994,9 +940,7 @@ class ToolsetMiddleware(AgentMiddleware):
         if context is None:
             return
         runtime_context = (
-            request.runtime.context
-            if request.runtime is not None and isinstance(request.runtime.context, dict)
-            else {}
+            request.runtime.context if request.runtime is not None and isinstance(request.runtime.context, dict) else {}
         )
         session_id = str(runtime_context.get("session_id") or "")
         run_id = str(runtime_context.get("run_id") or "")
@@ -1042,16 +986,12 @@ class ToolsetMiddleware(AgentMiddleware):
         visible_tools: list[Any],
     ) -> CapabilityManifest:
         context = (
-            request.runtime.context
-            if request.runtime is not None and isinstance(request.runtime.context, dict)
-            else {}
+            request.runtime.context if request.runtime is not None and isinstance(request.runtime.context, dict) else {}
         )
         run_id = str(context.get("run_id") or "unscoped")
         active = self._active_skill_ids(
             request.state,
-            policy_epoch=self._context_policy_epoch(
-                str(context.get("session_id") or "")
-            ),
+            policy_epoch=self._context_policy_epoch(str(context.get("session_id") or "")),
         )
         recommendations = self._recommended_inactive_skills(
             request,
@@ -1072,35 +1012,30 @@ class ToolsetMiddleware(AgentMiddleware):
                 source=recommendation.source,
             )
         enabled_toolsets = sorted(
-            {
-                toolset
-                for skill_id in active
-                for toolset in self.toolsets_by_skill.get(skill_id, ())
-            }
+            {toolset for skill_id in active for toolset in self.toolsets_by_skill.get(skill_id, ())}
         )
         allowed = sorted(self._tool_name(tool) for tool in visible_tools if self._tool_name(tool))
-        mounted = sorted(
-            {self._tool_name(tool) for tool in request.tools if self._tool_name(tool)}
-        )
-        unavailable = [
-            {
-                "tool": name,
-                "reason": (
-                    "inspection_run_read_only"
-                    if str(context.get("run_kind") or "") == "goal_inspection"
-                    and not self._inspection_tool_allowed(name)
-                    else
-                    "skill_not_activated"
-                    if any(
-                        name in tools_for_toolsets(set(toolsets))
-                        for toolsets in self.toolsets_by_skill.values()
-                    )
-                    else "policy_unavailable"
-                ),
-            }
-            for name in mounted
-            if name not in set(allowed)
-        ]
+        mounted = sorted({self._tool_name(tool) for tool in request.tools if self._tool_name(tool)})
+        unavailable: list[dict[str, Any]] = []
+        for name in mounted:
+            if name in set(allowed):
+                continue
+            providers = sorted(
+                skill_id
+                for skill_id, toolsets in self.toolsets_by_skill.items()
+                if name in tools_for_toolsets(set(toolsets)) and self._refresh_installed_skill(skill_id)
+            )
+            reason = (
+                "inspection_run_read_only"
+                if str(context.get("run_kind") or "") == "goal_inspection" and not self._inspection_tool_allowed(name)
+                else "skill_not_activated"
+                if providers
+                else "policy_unavailable"
+            )
+            entry: dict[str, Any] = {"tool": name, "reason": reason}
+            if reason == "skill_not_activated":
+                entry["activation_skill_ids"] = providers
+            unavailable.append(entry)
         tool_schema_contracts = sorted(
             (self._tool_schema_contract(tool) for tool in visible_tools),
             key=lambda item: item["name"],
@@ -1149,14 +1084,10 @@ class ToolsetMiddleware(AgentMiddleware):
         """Project soft routing candidates without changing capability authority."""
 
         profile_payload = (
-            request.state.get("task_profile")
-            if isinstance(request.state.get("task_profile"), dict)
-            else None
+            request.state.get("task_profile") if isinstance(request.state.get("task_profile"), dict) else None
         )
         context = (
-            request.runtime.context
-            if request.runtime is not None and isinstance(request.runtime.context, dict)
-            else {}
+            request.runtime.context if request.runtime is not None and isinstance(request.runtime.context, dict) else {}
         )
         session_id = str(context.get("session_id") or "")
         run_id = str(context.get("run_id") or "")
@@ -1169,8 +1100,7 @@ class ToolsetMiddleware(AgentMiddleware):
             profile = None
         source = (
             "semantic_router"
-            if profile is not None
-            and profile.classifier not in {"deterministic_fallback", "agent_runtime"}
+            if profile is not None and profile.classifier not in {"deterministic_fallback", "agent_runtime"}
             else profile.classifier
             if profile is not None
             else "task_profile"
@@ -1197,11 +1127,7 @@ class ToolsetMiddleware(AgentMiddleware):
             )
         recommended_ids = {item.skill_id for item in result}
         follow_up_artifact_ids = (
-            {
-                str(item)
-                for item in persisted.get("follow_up_of_artifact_ids") or []
-                if str(item)
-            }
+            {str(item) for item in persisted.get("follow_up_of_artifact_ids") or [] if str(item)}
             if isinstance(persisted, dict)
             else set()
         )
@@ -1228,8 +1154,7 @@ class ToolsetMiddleware(AgentMiddleware):
                             skill_id=skill_id,
                             confidence=0.8,
                             evidence=(
-                                "本次追问关联的正式交付物由启用该 Skill 的 Run 生成；"
-                                "仅建议重新读取，不继承旧能力。"
+                                "本次追问关联的正式交付物由启用该 Skill 的 Run 生成；仅建议重新读取，不继承旧能力。"
                             ),
                             source="durable_artifact",
                             activation_instruction=f"read /skills/{skill_id}/SKILL.md",
@@ -1240,18 +1165,14 @@ class ToolsetMiddleware(AgentMiddleware):
 
     def _cached_skill_instruction_section(self, request: ModelRequest) -> str:
         context = (
-            request.runtime.context
-            if request.runtime is not None and isinstance(request.runtime.context, dict)
-            else {}
+            request.runtime.context if request.runtime is not None and isinstance(request.runtime.context, dict) else {}
         )
         session_id = str(context.get("session_id") or "")
         run_id = str(context.get("run_id") or "")
         policy_epoch = self._context_policy_epoch(session_id)
         sections: list[str] = []
         seen: set[str] = set()
-        currently_loaded = set(
-            self._loaded_skill_ids(list(request.messages or []))
-        )
+        currently_loaded = set(self._loaded_skill_ids(list(request.messages or [])))
         for raw in self._valid_activations(
             list(request.state.get("skill_activations") or []),
             policy_epoch=policy_epoch,
@@ -1259,13 +1180,8 @@ class ToolsetMiddleware(AgentMiddleware):
             activation = SkillActivation.model_validate(raw)
             cache_bound = activation.source_tool_call_id.startswith("skill-cache:")
             inherited = bool(run_id and activation.run_id != run_id)
-            if (
-                activation.skill_id in seen
-                or not (
-                    cache_bound
-                    or inherited
-                    or activation.skill_id not in currently_loaded
-                )
+            if activation.skill_id in seen or not (
+                cache_bound or inherited or activation.skill_id not in currently_loaded
             ):
                 continue
             entry = self._cached_skill_entry(
@@ -1276,17 +1192,13 @@ class ToolsetMiddleware(AgentMiddleware):
             if entry is None:
                 continue
             seen.add(activation.skill_id)
-            sections.append(
-                f"### {activation.skill_id} "
-                f"({entry.skill_content_sha256})\n\n{entry.content.rstrip()}"
-            )
+            sections.append(f"### {activation.skill_id} ({entry.skill_content_sha256})\n\n{entry.content.rstrip()}")
         if not sections:
             return ""
         return (
             "## Active Skill Instructions (authoritative cached copy)\n\n"
             "These Skills were selected for the current Run. Their cached "
-            "content is hash-bound and grants no permissions by itself.\n\n"
-            + "\n\n".join(sections)
+            "content is hash-bound and grants no permissions by itself.\n\n" + "\n\n".join(sections)
         )
 
     def _request_with_capability_manifest(self, request: ModelRequest) -> ModelRequest:
@@ -1304,13 +1216,9 @@ class ToolsetMiddleware(AgentMiddleware):
             exclude={"created_at", "run_id", "recommended_inactive_skills"},
         )
         permission_audit_payload = permission_manifest.model_dump(mode="json")
-        permission_model_payload = permission_manifest.model_dump(
-            mode="json", exclude={"created_at", "run_id"}
-        )
+        permission_model_payload = permission_manifest.model_dump(mode="json", exclude={"created_at", "run_id"})
         context = (
-            request.runtime.context
-            if request.runtime is not None and isinstance(request.runtime.context, dict)
-            else {}
+            request.runtime.context if request.runtime is not None and isinstance(request.runtime.context, dict) else {}
         )
         session_id = str(context.get("session_id") or "")
         run_id = str(context.get("run_id") or "")
@@ -1335,7 +1243,11 @@ class ToolsetMiddleware(AgentMiddleware):
             pass
         section = (
             "## Current Capability Manifest (authoritative)\n\n"
-            "Only tools listed below are callable in this model turn. Soft routing hints do not grant tools.\n\n"
+            "Only tools listed below are callable in this model turn. Soft routing hints do not grant tools. "
+            "`skill_not_activated` is a recoverable capability dependency, not proof that the system lacks the "
+            "capability: inspect its `activation_skill_ids`, read the relevant authoritative "
+            "`/skills/<skill-id>/SKILL.md`, and continue the task. Do not ask the user to provide data merely "
+            "because a required tool is waiting for Skill activation.\n\n"
             f"```json\n{json.dumps(model_payload, ensure_ascii=False, sort_keys=True)}\n```"
         )
         section += (
@@ -1367,21 +1279,13 @@ class ToolsetMiddleware(AgentMiddleware):
             return request
         messages = list(request.messages or [])
         index = next(
-            (
-                index
-                for index in range(len(messages) - 1, -1, -1)
-                if isinstance(messages[index], HumanMessage)
-            ),
+            (index for index in range(len(messages) - 1, -1, -1) if isinstance(messages[index], HumanMessage)),
             None,
         )
         if index is None or not isinstance(messages[index].content, str):
             return request
         original = messages[index]
-        missing = [
-            item
-            for item in recommendations
-            if f"/skills/{item.skill_id}/SKILL.md" not in original.content
-        ]
+        missing = [item for item in recommendations if f"/skills/{item.skill_id}/SKILL.md" not in original.content]
         if not missing:
             return request
         instructions = " ".join(
@@ -1393,12 +1297,7 @@ class ToolsetMiddleware(AgentMiddleware):
             for item in missing
         )
         messages[index] = original.model_copy(
-            update={
-                "content": (
-                    f"{original.content}\n\n{_CAPABILITY_RECOMMENDATION_MARKER} "
-                    f"{instructions}"
-                )
-            }
+            update={"content": (f"{original.content}\n\n{_CAPABILITY_RECOMMENDATION_MARKER} {instructions}")}
         )
         return request.override(messages=messages)
 
@@ -1408,9 +1307,7 @@ class ToolsetMiddleware(AgentMiddleware):
         visible_tools: list[Any],
     ) -> PermissionManifest:
         context = (
-            request.runtime.context
-            if request.runtime is not None and isinstance(request.runtime.context, dict)
-            else {}
+            request.runtime.context if request.runtime is not None and isinstance(request.runtime.context, dict) else {}
         )
         session_id = str(context.get("session_id") or "")
         run_id = str(context.get("run_id") or "unscoped")
@@ -1507,9 +1404,9 @@ class ToolsetMiddleware(AgentMiddleware):
             "policy_epoch": int(permissions.get("policy_epoch") or 1),
             "policy_version": str(permissions.get("policy_version") or ""),
         }
-        digest = hashlib.sha256(
-            json.dumps(boundary, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        ).hexdigest()[:20]
+        digest = hashlib.sha256(json.dumps(boundary, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[
+            :20
+        ]
         return PermissionManifest(
             manifest_id=f"permission-manifest-{digest}",
             run_id=run_id,
@@ -1566,9 +1463,7 @@ def _skill_toolsets(path: Path) -> set[str]:
     declared = {str(item).strip() for item in toolsets if str(item).strip()}
     unknown = validate_toolset_names(declared)
     if unknown:
-        raise ValueError(
-            f"Skill {path.parent.name} declares unknown toolsets: {', '.join(unknown)}"
-        )
+        raise ValueError(f"Skill {path.parent.name} declares unknown toolsets: {', '.join(unknown)}")
     return declared
 
 

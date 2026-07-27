@@ -245,7 +245,7 @@ def _scan_staged_directory(
     directory = backend.ls(staged_dir)
     if directory.error:
         return {}, {}, [], str(directory.error)
-    result = backend.glob(f"{staged_dir.rstrip('/')}/**/*")
+    result = backend.glob("**/*", path=staged_dir)
     if result.error:
         return {}, {}, [], str(result.error)
     prefix = staged_dir.rstrip("/") + "/"

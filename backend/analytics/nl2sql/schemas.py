@@ -15,6 +15,7 @@ class DatabaseQueryRequest:
     table_names: list[str] = field(default_factory=list)
     model_id: str | None = None
     measure_ids: list[str] = field(default_factory=list)
+    semantic_question: str | None = None
     limit: int = 100
     allow_llm_to_see_data: bool = False
 

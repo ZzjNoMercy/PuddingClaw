@@ -419,6 +419,8 @@ class HostFileBroker:
     @contextmanager
     def _bound_parent(
         target: AuthorizedHostPath,
+        *,
+        create_parents: bool = False,
     ):
         """Bind file access to the directory inode that authorized the call.
 
@@ -447,7 +449,16 @@ class HostFileBroker:
             for component in relative.parent.parts:
                 if component in {"", ".", ".."}:
                     raise PermissionError("unsafe relative path component")
-                next_fd = os.open(component, flags, dir_fd=directory_fd)
+                try:
+                    next_fd = os.open(component, flags, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    if not create_parents:
+                        raise
+                    try:
+                        os.mkdir(component, mode=0o755, dir_fd=directory_fd)
+                    except FileExistsError:
+                        pass
+                    next_fd = os.open(component, flags, dir_fd=directory_fd)
                 os.close(directory_fd)
                 directory_fd = next_fd
             yield directory_fd, relative.name
@@ -455,26 +466,39 @@ class HostFileBroker:
             os.close(directory_fd)
 
     @staticmethod
-    def _read_bound_bytes(target: AuthorizedHostPath) -> bytes | None:
+    def _read_leaf_bytes(
+        directory_fd: int,
+        leaf: str,
+        *,
+        canonical_path: Path,
+    ) -> bytes | None:
         nofollow = getattr(os, "O_NOFOLLOW", 0)
         cloexec = getattr(os, "O_CLOEXEC", 0)
+        try:
+            file_fd = os.open(
+                leaf,
+                os.O_RDONLY | nofollow | cloexec,
+                dir_fd=directory_fd,
+            )
+        except FileNotFoundError:
+            return None
+        try:
+            file_stat = os.fstat(file_fd)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise OSError(f"target is not a regular file: {canonical_path}")
+            with os.fdopen(file_fd, "rb", closefd=False) as stream:
+                return stream.read()
+        finally:
+            os.close(file_fd)
+
+    @staticmethod
+    def _read_bound_bytes(target: AuthorizedHostPath) -> bytes | None:
         with HostFileBroker._bound_parent(target) as (directory_fd, leaf):
-            try:
-                file_fd = os.open(
-                    leaf,
-                    os.O_RDONLY | nofollow | cloexec,
-                    dir_fd=directory_fd,
-                )
-            except FileNotFoundError:
-                return None
-            try:
-                file_stat = os.fstat(file_fd)
-                if not stat.S_ISREG(file_stat.st_mode):
-                    raise OSError(f"target is not a regular file: {target.canonical_path}")
-                with os.fdopen(file_fd, "rb", closefd=False) as stream:
-                    return stream.read()
-            finally:
-                os.close(file_fd)
+            return HostFileBroker._read_leaf_bytes(
+                directory_fd,
+                leaf,
+                canonical_path=target.canonical_path,
+            )
 
     @staticmethod
     def _atomic_replace(
@@ -482,11 +506,19 @@ class HostFileBroker:
         content: bytes,
         *,
         expected_before: bytes | None,
+        create_parents: bool = False,
     ) -> None:
         nofollow = getattr(os, "O_NOFOLLOW", 0)
         cloexec = getattr(os, "O_CLOEXEC", 0)
-        with HostFileBroker._bound_parent(target) as (directory_fd, leaf):
-            current = HostFileBroker._read_bound_bytes(target)
+        with HostFileBroker._bound_parent(
+            target,
+            create_parents=create_parents,
+        ) as (directory_fd, leaf):
+            current = HostFileBroker._read_leaf_bytes(
+                directory_fd,
+                leaf,
+                canonical_path=target.canonical_path,
+            )
             if current != expected_before:
                 raise FileExistsError(
                     "conflict: target changed; re-read and re-apply the edit"
@@ -517,16 +549,30 @@ class HostFileBroker:
                     stream.write(content)
                     stream.flush()
                     os.fsync(stream.fileno())
-                if HostFileBroker._read_bound_bytes(target) != expected_before:
+                if HostFileBroker._read_leaf_bytes(
+                    directory_fd,
+                    leaf,
+                    canonical_path=target.canonical_path,
+                ) != expected_before:
                     raise FileExistsError(
                         "conflict: target changed; re-read and re-apply the edit"
                     )
-                os.replace(
-                    temporary_name,
-                    leaf,
-                    src_dir_fd=directory_fd,
-                    dst_dir_fd=directory_fd,
-                )
+                if expected_before is None:
+                    os.link(
+                        temporary_name,
+                        leaf,
+                        src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                    os.unlink(temporary_name, dir_fd=directory_fd)
+                else:
+                    os.replace(
+                        temporary_name,
+                        leaf,
+                        src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd,
+                    )
                 os.fsync(directory_fd)
             finally:
                 os.close(temporary_fd)
@@ -542,7 +588,11 @@ class HostFileBroker:
         expected_before: bytes,
     ) -> None:
         with HostFileBroker._bound_parent(target) as (directory_fd, leaf):
-            if HostFileBroker._read_bound_bytes(target) != expected_before:
+            if HostFileBroker._read_leaf_bytes(
+                directory_fd,
+                leaf,
+                canonical_path=target.canonical_path,
+            ) != expected_before:
                 raise FileExistsError(
                     "conflict: target changed; re-read before deleting"
                 )

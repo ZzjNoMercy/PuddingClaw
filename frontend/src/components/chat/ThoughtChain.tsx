@@ -18,7 +18,16 @@ import {
   KeyRound,
   Play,
   Wrench,
+  PackageCheck,
+  ShieldCheck,
+  Ban,
 } from "lucide-react";
+import {
+  cancelSkillPlan,
+  commitSkillPlan,
+  getSkillPlan,
+  type SkillPlan,
+} from "@/lib/api";
 import type { TimelineItem, ToolCall } from "@/lib/store";
 import { getSubagentToolLabel } from "@/lib/subagentActivity";
 
@@ -116,6 +125,35 @@ function toolDurationMs(toolCall: ToolCall, now: number): number | null {
   const end = toolCall.endedAt || (toolCall.status === "running" ? now : undefined);
   if (!end) return null;
   return Math.max(0, end - toolCall.startedAt);
+}
+
+function skillPlanFromToolCall(toolCall: ToolCall): SkillPlan | null {
+  if (
+    !["prepare_skill_install", "prepare_skill_update"].includes(toolCall.tool)
+    || toolCall.status === "running"
+    || toolCall.is_error
+    || !toolCall.output
+  ) {
+    return null;
+  }
+  try {
+    const value = JSON.parse(toolCall.output) as Partial<SkillPlan> & { ok?: boolean };
+    if (
+      value.ok !== true
+      || typeof value.plan_id !== "string"
+      || typeof value.plan_sha256 !== "string"
+      || typeof value.skill_name !== "string"
+      || typeof value.phase !== "string"
+      || typeof value.requires_confirmation !== "boolean"
+      || value.ui_commit_supported !== true
+      || (value.action !== "install" && value.action !== "update")
+    ) {
+      return null;
+    }
+    return value as SkillPlan;
+  } catch {
+    return null;
+  }
 }
 
 export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
@@ -230,9 +268,7 @@ export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
                           <span>思考已完成</span>
                         )}
                       </div>
-                      <pre className="mt-1 max-h-40 max-w-full overflow-y-auto whitespace-pre-wrap rounded-lg bg-white/58 p-2 text-[11px] leading-relaxed text-slate-500">
-                        {item.content}
-                      </pre>
+                      <ReasoningScrollBlock content={item.content} isThinking={isThinking} />
                     </div>
                   </div>
                 );
@@ -360,5 +396,225 @@ export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
         </div>
       )}
     </div>
+  );
+}
+
+export function SkillPlanCards({
+  timeline,
+  sessionId,
+}: {
+  timeline: TimelineItem[];
+  sessionId: string;
+}) {
+  const plans = Array.from(
+    new Map(
+      timeline
+        .map((item) => item.type === "tool" && item.toolCall ? skillPlanFromToolCall(item.toolCall) : null)
+        .filter((plan): plan is SkillPlan => plan !== null)
+        .map((plan) => [plan.plan_id, plan]),
+    ).values(),
+  );
+  if (plans.length === 0) return null;
+  return (
+    <div className="mt-3 space-y-3">
+      {plans.map((plan) => (
+        <SkillPlanCard key={plan.plan_id} sessionId={sessionId} initialPlan={plan} />
+      ))}
+    </div>
+  );
+}
+
+function SkillPlanCard({
+  sessionId,
+  initialPlan,
+}: {
+  sessionId: string;
+  initialPlan: SkillPlan;
+}) {
+  const [plan, setPlan] = useState(initialPlan);
+  const [pendingAction, setPendingAction] = useState<"commit" | "cancel" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    void getSkillPlan(sessionId, initialPlan.plan_id)
+      .then((fresh) => {
+        if (active) setPlan(fresh);
+      })
+      .catch((cause) => {
+        if (active) setError(cause instanceof Error ? cause.message : "无法刷新 Skill 计划状态");
+      });
+    return () => {
+      active = false;
+    };
+  }, [initialPlan.plan_id, sessionId]);
+
+  const commit = async () => {
+    setPendingAction("commit");
+    setError(null);
+    try {
+      setPlan(await commitSkillPlan(sessionId, plan.plan_id, plan.plan_sha256));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "安装失败");
+      try {
+        const fresh = await getSkillPlan(sessionId, plan.plan_id);
+        setPlan(fresh);
+        if (fresh.status !== "prepared") setError(null);
+      } catch {
+        // Preserve the actionable commit error.
+      }
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const cancel = async () => {
+    setPendingAction("cancel");
+    setError(null);
+    try {
+      setPlan(await cancelSkillPlan(sessionId, plan.plan_id, plan.plan_sha256));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "取消失败");
+      try {
+        const fresh = await getSkillPlan(sessionId, plan.plan_id);
+        setPlan(fresh);
+        if (fresh.status !== "prepared") setError(null);
+      } catch {
+        // Preserve the actionable cancellation error.
+      }
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const isPrepared = plan.status === "prepared";
+  const isCommitted = plan.status === "committed";
+  const isCancelled = plan.status === "cancelled";
+  const title = isCommitted
+    ? `${plan.skill_name} ${plan.action === "install" ? "安装完成" : "更新完成"}`
+    : isCancelled
+      ? `${plan.skill_name} 已取消`
+      : plan.status === "expired"
+        ? `${plan.skill_name} 计划已过期`
+        : `${plan.skill_name} 待${plan.action === "install" ? "安装" : "更新"}`;
+  const description = isCommitted
+    ? "已按已确认的不可变计划提交，后续 Agent 运行可使用该 Skill。"
+    : isCancelled
+      ? "已取消，Skills 目录未被修改。"
+      : plan.status === "expired"
+        ? "暂存内容已清理，Skills 目录未被修改。请重新发起准备。"
+        : "源文件已暂存并通过校验，尚未安装。确认后才会修改 Skills 目录。";
+  const Icon = isCommitted ? ShieldCheck : isCancelled || plan.status === "expired" ? Ban : PackageCheck;
+  const tone = isCommitted
+    ? "border-emerald-200 bg-emerald-50/70"
+    : isCancelled || plan.status === "expired"
+      ? "border-slate-200 bg-slate-50"
+      : "border-blue-200 bg-blue-50/60";
+
+  return (
+    <section className={`rounded-2xl border p-4 ${tone}`} data-skill-plan-id={plan.plan_id}>
+      <div className="flex items-start gap-3">
+        <div className={`mt-0.5 rounded-xl p-2 ${isCommitted ? "bg-emerald-100 text-emerald-700" : isPrepared ? "bg-blue-100 text-[#002fa7]" : "bg-slate-200 text-slate-600"}`}>
+          <Icon className="h-4 w-4" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <h3 className="text-sm font-semibold text-slate-900">{title}</h3>
+            {plan.diff?.summary ? (
+              <span className="rounded-full border border-black/[0.06] bg-white/80 px-2 py-0.5 font-mono text-[10px] text-slate-500">
+                {plan.diff.summary}
+              </span>
+            ) : null}
+          </div>
+          <p className="mt-1 text-xs leading-5 text-slate-600">{description}</p>
+          <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-500">
+            <span>来源：<span className="break-all font-mono">{plan.source}</span></span>
+            {plan.ref ? <span>版本：{plan.ref}</span> : null}
+          </div>
+          {plan.diff && (
+            <details className="mt-2 text-[11px] text-slate-500">
+              <summary className="cursor-pointer select-none hover:text-slate-700">查看文件变更</summary>
+              <div className="mt-2 grid gap-2 sm:grid-cols-3">
+                <SkillDiffList label="新增" items={plan.diff.added} />
+                <SkillDiffList label="修改" items={plan.diff.changed} />
+                <SkillDiffList label="删除" items={plan.diff.removed} />
+              </div>
+            </details>
+          )}
+          {error ? <p className="mt-2 text-xs text-rose-600">{error}</p> : null}
+          {isPrepared ? (
+            <div className="mt-3 flex flex-wrap justify-end gap-2">
+              <button
+                type="button"
+                disabled={pendingAction !== null}
+                onClick={() => void cancel()}
+                className="h-9 rounded-xl px-3 text-sm font-semibold text-slate-500 hover:bg-white/70 disabled:opacity-50"
+              >
+                {pendingAction === "cancel" ? "正在取消…" : "取消"}
+              </button>
+              <button
+                type="button"
+                disabled={pendingAction !== null}
+                onClick={() => void commit()}
+                className="inline-flex h-9 items-center gap-2 rounded-xl bg-[#002fa7] px-4 text-sm font-semibold text-white shadow-sm disabled:opacity-50"
+              >
+                {pendingAction === "commit" ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
+                {pendingAction === "commit" ? "正在提交…" : `确认并${plan.action === "install" ? "安装" : "更新"}`}
+              </button>
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function SkillDiffList({ label, items }: { label: string; items?: string[] }) {
+  return (
+    <div className="rounded-lg bg-white/70 p-2">
+      <div className="font-semibold text-slate-600">{label} {items?.length || 0}</div>
+      {items?.length ? (
+        <div className="mt-1 max-h-24 space-y-0.5 overflow-y-auto font-mono">
+          {items.slice(0, 30).map((item) => <div key={item} className="break-all">{item}</div>)}
+          {items.length > 30 ? <div>还有 {items.length - 30} 项…</div> : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * Streaming reasoning block: follows the newest content while the model is
+ * thinking, but stops following once the user scrolls up to read earlier
+ * text (resumes when they scroll back near the bottom).
+ */
+function ReasoningScrollBlock({
+  content,
+  isThinking,
+}: {
+  content: string;
+  isThinking: boolean;
+}) {
+  const preRef = useRef<HTMLPreElement>(null);
+  const pinnedToBottomRef = useRef(true);
+
+  useEffect(() => {
+    const el = preRef.current;
+    if (!el || !isThinking || !pinnedToBottomRef.current) return;
+    el.scrollTop = el.scrollHeight;
+  }, [content, isThinking]);
+
+  return (
+    <pre
+      ref={preRef}
+      onScroll={(event) => {
+        const el = event.currentTarget;
+        pinnedToBottomRef.current =
+          el.scrollHeight - el.scrollTop - el.clientHeight < 32;
+      }}
+      className="mt-1 max-h-40 max-w-full overflow-y-auto whitespace-pre-wrap rounded-lg bg-white/58 p-2 text-[11px] leading-relaxed text-slate-500"
+    >
+      {content}
+    </pre>
   );
 }

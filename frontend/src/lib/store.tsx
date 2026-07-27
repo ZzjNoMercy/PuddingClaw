@@ -7,6 +7,7 @@ import React, {
   useCallback,
   useRef,
   useEffect,
+  useMemo,
 } from "react";
 import {
   streamChat,
@@ -25,7 +26,6 @@ import {
   clearSession as apiClearSession,
   getRagMode as apiGetRagMode,
   setRagMode as apiSetRagMode,
-  loadSkill as apiLoadSkill,
   listMcpServers as apiListMcpServers,
   listProjects as apiListProjects,
   registerProject as apiRegisterProject,
@@ -51,6 +51,7 @@ import {
   DimensionBuildRuleRequest,
   LogicalDatasetRuleRequest,
   DatabaseSqlRevisionRequest,
+  UserInputRequest,
   AgentAttachment,
   HarnessGoal,
   HarnessRun,
@@ -64,6 +65,7 @@ import {
   settleRunningVerificationActivities,
   verificationFailureActivity,
 } from "./verificationActivity";
+import { mergeRunningSessionIds } from "./sessionConcurrency";
 import {
   getSettings as apiGetSettings,
   updateSettings as apiUpdateSettings,
@@ -237,6 +239,7 @@ export interface ChatMessage {
   dimensionBuildRuleRequests?: DimensionBuildRuleRequest[];
   logicalDatasetRuleRequests?: LogicalDatasetRuleRequest[];
   databaseSqlRevisionRequests?: DatabaseSqlRevisionRequest[];
+  userInputRequests?: UserInputRequest[];
   interrupted?: boolean;
   interruptionNotice?: string;
   errorNotice?: string;
@@ -291,6 +294,7 @@ export interface RunActivityStatus {
     | "verification"
     | "revision"
     | "permission"
+    | "hitl"
     | "continuing";
   label: string;
   detail?: string;
@@ -299,6 +303,7 @@ export interface RunActivityStatus {
 export interface SendMessageOptions {
   goalControlAction?: "start";
   hiddenUserMessage?: boolean;
+  skillHints?: string[];
 }
 
 interface AppState {
@@ -318,8 +323,10 @@ interface AppState {
 
   // Chat
   messages: ChatMessage[];
+  sessionHistoryLoading: boolean;
   isStreaming: boolean;
   hasActiveRun: boolean;
+  runningSessionIds: ReadonlySet<string>;
   sendMessage: (
     text: string,
     attachments?: AgentAttachment[],
@@ -346,6 +353,7 @@ interface AppState {
   sessionId: string;
   setSessionId: (id: string) => void;
   sessions: SessionMeta[];
+  sessionsLoaded: boolean;
   loadSessions: () => void;
   createSession: () => Promise<string | null>;
   triggerSkillCreator: () => void;
@@ -915,6 +923,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   // ── UI state (reflects current session) ──
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [sessionHistoryLoading, setSessionHistoryLoading] = useState(false);
   const [todos, setTodos] = useState<TodoItem[]>([]);
   const [trace, setTrace] = useState<AgentTrace | null>(null);
   const [traceHistory, setTraceHistory] = useState<Record<string, AgentTrace>>({});
@@ -961,6 +970,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [sessionId, setSessionIdRaw] = useState("default");
   const [userId] = useState(() => getOrCreateUserId());
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
+  const [sessionsLoaded, setSessionsLoaded] = useState(false);
   const [runtimeMode, setRuntimeModeRaw] = useState<"agent" | "chat">("chat");
   const [runtimeReady, setRuntimeReady] = useState(false);
   const [currentProjectId, setCurrentProjectIdRaw] = useState<string | null>(null);
@@ -1182,9 +1192,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   // Derived: is the CURRENT session streaming?
   const isStreaming = streamingSessions.has(sessionId);
+  const runningSessionIds = useMemo(
+    () => mergeRunningSessionIds(streamingSessions, sharedStreamingSessions),
+    [streamingSessions, sharedStreamingSessions],
+  );
   // The navbar is global, so it must also reflect work that continues after
   // switching away from the session that initiated it.
-  const hasActiveRun = streamingSessions.has(sessionId) || sharedStreamingSessions.has(sessionId);
+  const hasActiveRun = runningSessionIds.has(sessionId);
 
   const setRuntimeMode = useCallback((mode: "agent" | "chat") => {
     setRuntimeModeRaw(mode);
@@ -1519,7 +1533,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         }
         setSessions(list);
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => setSessionsLoaded(true));
   }, []);
 
   const loadProjects = useCallback(() => {
@@ -1726,13 +1741,19 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       if (cachedActiveNode !== undefined) setActiveGraphNode(cachedActiveNode);
       else setActiveGraphNode(null);
 
-      // Show cached messages immediately if available
-      const cached = messagesMapRef.current[id];
-      if (cached && cached.length > 0) {
-        setMessages(cached);
+      // Show cached messages immediately. Only uncached persisted sessions
+      // need a loading state while their history is fetched.
+      const hasCachedMessages = Object.prototype.hasOwnProperty.call(messagesMapRef.current, id);
+      if (hasCachedMessages) {
+        setSessionHistoryLoading(false);
+        setMessages(messagesMapRef.current[id]);
+      } else if (id === "default") {
+        setSessionHistoryLoading(false);
+        setMessages([]);
       } else {
         // No cache — clear and load from backend
         setMessages([]);
+        setSessionHistoryLoading(true);
         apiGetSessionHistory(id)
           .then((data) => {
             if (Array.isArray(data.todos)) {
@@ -1746,17 +1767,20 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             if (data.graph !== undefined) {
               updateSessionGraph(id, data.graph || null);
             }
-            if (data.messages && data.messages.length > 0) {
-              const loaded = parseHistoryMessages(data.messages);
-              messagesMapRef.current[id] = loaded;
-              // Only update UI if still viewing this session
-              if (sessionIdRef.current === id) {
-                setMessages(loaded);
-              }
+            const loaded = data.messages?.length ? parseHistoryMessages(data.messages) : [];
+            messagesMapRef.current[id] = loaded;
+            // Only update UI if still viewing this session
+            if (sessionIdRef.current === id) {
+              setMessages(loaded);
             }
           })
           .catch(() => {
             // Session might not exist yet, that's OK
+          })
+          .finally(() => {
+            if (sessionIdRef.current === id) {
+              setSessionHistoryLoading(false);
+            }
           });
       }
 
@@ -2166,32 +2190,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
       // Capture the sessionId at send time (stable for entire SSE lifecycle)
 
-      // Slash command processing
-      // Only treat tokens like "/skill-name" as skill invocations; ignore
-      // absolute file paths such as "/Users/..." or "/home/...".
-      const SKILL_NAME_RE = /^\/[^/]+$/;
-      let processedText = text.trim() || "请分析这张图片。";
-      const tokens = text.split(/(\s+)/);
-      const skillNames: string[] = [];
-      for (const token of tokens) {
-        if (SKILL_NAME_RE.test(token)) {
-          skillNames.push(token.slice(1));
-        }
-      }
-      if (skillNames.length > 0) {
-        await Promise.allSettled(skillNames.map((name) => apiLoadSkill(name)));
-        processedText = tokens
-          .map((t) => {
-            if (SKILL_NAME_RE.test(t)) {
-              return `[使用技能: ${t.slice(1)}]`;
-            }
-            return t;
-          })
-          .join("");
-        if (!processedText.replace(/\[使用技能:\s*[^\]]+\]/g, "").trim()) {
-          processedText += " 请执行该技能的默认操作";
-        }
-      }
+      // Keep slash Skill hints in the user's original message. The backend
+      // treats `/skill-name` as one high-confidence routing signal and still
+      // performs semantic matching for every other Skill the task may need.
+      // Rewriting it into an internal marker made the chat and Goal objective
+      // disagree and incorrectly suggested an exclusive Skill selection.
+      const processedText = text.trim() || "请分析这张图片。";
 
       const userMsg: ChatMessage = {
         id: `user-${Date.now()}`,
@@ -2440,6 +2444,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               options.goalControlAction === "start" ? goalForRun?.goal_id || null : null,
               contextGoalIdForRun,
               options.goalControlAction || null,
+              options.skillHints,
             )
           : streamChat(processedText, sendSessionId, controller.signal, userId);
 
@@ -3435,6 +3440,28 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             continue;
           }
 
+          if (event.event === "user_input_required") {
+            updateSessionRunActivity(sendSessionId, {
+              phase: "hitl",
+              label: "等待你的选择",
+            });
+            const targetId = getAssistantId();
+            const request = event.data as unknown as UserInputRequest;
+            updateMsgs((prev) => {
+              const updated = [...prev];
+              const idx = updated.findIndex((message) => message.id === targetId);
+              if (idx === -1) return prev;
+              const message = { ...updated[idx] };
+              const existing = message.userInputRequests || [];
+              message.userInputRequests = existing.some((item) => item.id === request.id)
+                ? existing.map((item) => item.id === request.id ? request : item)
+                : [...existing, request];
+              updated[idx] = message;
+              return updated;
+            });
+            continue;
+          }
+
           if (event.event === "dimension_build_rule_resolved") {
             const targetId = getAssistantId();
             const requestId = String(event.data.request_id || "");
@@ -3479,6 +3506,33 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               const message = { ...updated[idx] };
               message.databaseSqlRevisionRequests = (message.databaseSqlRevisionRequests || []).map((request) =>
                 request.id === requestId ? { ...request, status: "resolved" } : request
+              );
+              updated[idx] = message;
+              return updated;
+            });
+            continue;
+          }
+
+          if (event.event === "user_input_resolved") {
+            updateSessionRunActivity(sendSessionId, {
+              phase: "continuing",
+              label: "Agent 正在继续执行",
+            });
+            const targetId = getAssistantId();
+            const requestId = String(event.data.request_id || "");
+            updateMsgs((prev) => {
+              const updated = [...prev];
+              const idx = updated.findIndex((message) => message.id === targetId);
+              if (idx === -1 || !requestId) return prev;
+              const message = { ...updated[idx] };
+              message.userInputRequests = (message.userInputRequests || []).map((request) =>
+                request.id === requestId
+                  ? {
+                      ...request,
+                      status: "resolved",
+                      decision: event.data.decision as UserInputRequest["decision"],
+                    }
+                  : request
               );
               updated[idx] = message;
               return updated;
@@ -3771,12 +3825,22 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             const updated = [...prev];
             const idx = updated.findIndex((m) => m.id === targetId);
             if (idx !== -1) {
-              updated[idx] = markMessageInterrupted(
+              const interrupted = markMessageInterrupted(
                 finalizeRunningToolsInMessage(
                   updated[idx],
                   "Stream cancelled before this tool returned a result."
                 )
               );
+              interrupted.userInputRequests = (interrupted.userInputRequests || []).map((request) =>
+                request.status === "pending"
+                  ? {
+                      ...request,
+                      status: "cancelled",
+                      decision: { action: "cancel", answers: [] },
+                    }
+                  : request
+              );
+              updated[idx] = interrupted;
             }
             return updated;
           });
@@ -3813,6 +3877,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             updated[idx],
             "Stream ended before this tool returned a result."
           );
+          finalized.userInputRequests = (finalized.userInputRequests || []).map((request) =>
+            request.status === "pending"
+              ? {
+                  ...request,
+                  status: "cancelled",
+                  decision: { action: "cancel", answers: [] },
+                }
+              : request
+          );
           updated[idx] = finalized;
           return updated;
         });
@@ -3830,11 +3903,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         apiGetSessionHarnessState(sendSessionId)
           .then((state) => {
             const reconciledGoal = visibleGoalFromHarness(state);
+            const latestRun = state.latest_run_id
+              ? state.runs[state.latest_run_id] || null
+              : null;
+            currentRunsMapRef.current[sendSessionId] = latestRun;
             if (reconciledGoal) {
               nextRunGoalModeMapRef.current[sendSessionId] = false;
             }
             activeGoalsMapRef.current[sendSessionId] = reconciledGoal;
             if (sessionIdRef.current === sendSessionId) {
+              setCurrentRun(latestRun);
               setActiveGoal(reconciledGoal);
               setGoalModeEnabledRaw(
                 nextRunGoalModeMapRef.current[sendSessionId] ?? false
@@ -3900,8 +3978,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         updateProject,
         removeProject,
         messages,
+        sessionHistoryLoading,
         isStreaming,
         hasActiveRun,
+        runningSessionIds,
         sendMessage,
         stopStreaming,
         goalModeEnabled,
@@ -3922,6 +4002,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         sessionId,
         setSessionId,
         sessions,
+        sessionsLoaded,
         loadSessions,
         createSession,
         triggerSkillCreator,

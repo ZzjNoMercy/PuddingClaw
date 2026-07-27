@@ -35,11 +35,12 @@ import {
 import {
   goalControlPresentation,
   goalRevisionApplyPlan,
+  goalTodoProgress,
 } from "@/lib/goalControls";
 import { useApp, type SourceRecord, type ToolCall } from "@/lib/store";
 import ConfirmDialog from "@/components/ui/ConfirmDialog";
 
-type TodoStatus = "completed" | "in_progress" | "pending";
+type TodoStatus = "completed" | "in_progress" | "pending" | "cancelled" | "error";
 
 export default function SourcesPanel({
   onAvailabilityChange,
@@ -345,7 +346,7 @@ const goalStatusLabel: Record<HarnessGoal["status"], string> = {
   active: "进行中",
   paused: "已暂停",
   blocked: "受阻",
-  achieved: "已完成",
+  completed: "已完成",
   cancelled: "已取消",
   budget_exceeded: "预算已耗尽",
 };
@@ -548,7 +549,7 @@ function GoalCard({
         open={active}
         onToggle={onActivate}
         actions={
-          !["achieved", "cancelled"].includes(goal.status) ? (
+          !["completed", "cancelled"].includes(goal.status) ? (
             <div className="flex items-center gap-0.5">
               {goal.status !== "budget_exceeded" ? (
                 <button
@@ -610,6 +611,9 @@ function GoalCard({
       />
       {active && (
         <div className="pb-4">
+          <div className="mb-3 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-[11px] text-slate-600">
+            完成方式：{goal.completion_policy === "rubric" ? "Rubric 验收 · 实验性" : "标准验收"}
+          </div>
           {goal.status === "budget_exceeded" ? (
             <div className="mb-3 rounded-2xl border border-amber-200 bg-amber-50/70 p-3">
               <div className="text-[12px] font-semibold text-amber-900">
@@ -1704,8 +1708,9 @@ function ProgressCard({
   onActivate: () => void;
   todos: Array<{ content: string; status: TodoStatus }>;
 }) {
-  const completed = todos.filter((todo) => todo.status === "completed").length;
-  const hasTodos = todos.length > 0;
+  const visibleTodos = todos.filter((todo) => todo.status !== "cancelled");
+  const progress = goalTodoProgress(todos.map((todo) => todo.status));
+  const hasTodos = visibleTodos.length > 0;
 
   return (
     <section>
@@ -1717,8 +1722,8 @@ function ProgressCard({
         metric={
           hasTodos ? (
             <span>
-              <span className="text-emerald-500">{completed}</span>
-              <span className="text-slate-300">/{todos.length}</span>
+              <span className="text-emerald-500">{progress.completed}</span>
+              <span className="text-slate-300">/{progress.total}</span>
             </span>
           ) : (
             <span className="text-slate-300">0</span>
@@ -1730,7 +1735,7 @@ function ProgressCard({
         <div className="pb-4 space-y-2.5">
           {hasTodos ? (
             <>
-              {todos.map((todo, index) => (
+              {visibleTodos.map((todo, index) => (
                 <div key={`${todo.content}-${index}`} className="flex items-start gap-2.5">
                   <TodoStatusIcon status={todo.status} />
                   <p
@@ -2087,6 +2092,8 @@ function normalizeTodoStatus(status: unknown): TodoStatus {
   const s = String(status || "pending").toLowerCase();
   if (s === "completed" || s === "done" || s === "finished") return "completed";
   if (s === "in_progress" || s === "doing" || s === "in progress") return "in_progress";
+  if (s === "cancelled" || s === "canceled") return "cancelled";
+  if (s === "error" || s === "failed") return "error";
   return "pending";
 }
 

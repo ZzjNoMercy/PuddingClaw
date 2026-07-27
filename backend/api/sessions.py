@@ -13,8 +13,10 @@ from graph.deepagents_manager import deepagents_agent_manager
 from graph.permission_resume import permission_resume_registry
 from graph.prompt_builder import build_system_prompt
 from graph.session_manager import session_manager
+from graph.user_input_resume import user_input_resume_registry
 from harness.coordinators import GoalActivationError, GoalCoordinator
 from harness.models import HarnessStateError
+from services.skill_management import get_skill_management_service
 
 router = APIRouter()
 
@@ -114,6 +116,8 @@ async def update_session_analytics_model(
 async def delete_session(session_id: str):
     """Delete a session."""
     permission_resume_registry.reject_session(session_id, "Session was deleted.")
+    user_input_resume_registry.reject_session(session_id, "Session was deleted.")
+    get_skill_management_service(BASE_DIR).delete_session_plans(session_id)
     session_manager.delete_session(session_id)
     return {"status": "deleted", "id": session_id}
 

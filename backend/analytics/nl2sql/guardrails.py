@@ -11,6 +11,8 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, Field
 
+from analytics.nl2sql.guardrail_runtime import detector_failed, scope_status
+
 BASE_DIR = Path(__file__).resolve().parents[2]
 GUARDRAILS_ROOT = BASE_DIR / "sql-guardrails"
 GUARDRAILS_RULES_DIR = GUARDRAILS_ROOT / "rules"
@@ -536,24 +538,14 @@ def scope_matches(
     semantic_trace: dict[str, Any],
     question: str = "",
 ) -> bool:
-    scope = rule.scope
-    route_tables = _route_table_names(route)
-    asset_ids = semantic_asset_ids(semantic_trace)
-
-    table_values = set(scope.table_scope.values)
-    if table_values:
-        if scope.table_scope.mode == "all":
-            if not table_values.issubset(route_tables):
-                return False
-        elif not table_values.intersection(route_tables):
-            return False
-    if scope.semantic_assets and not set(scope.semantic_assets).issubset(asset_ids):
-        return False
-    if scope.intent_any:
-        normalized_question = str(question or "").lower()
-        if not any(str(intent).strip().lower() in normalized_question for intent in scope.intent_any if str(intent).strip()):
-            return False
-    return True
+    return scope_status(
+        rule.model_dump(mode="json"),
+        {
+            "available_tables": sorted(_route_table_names(route)),
+            "semantic_asset_ids": sorted(semantic_asset_ids(semantic_trace)),
+            "question": question,
+        },
+    ) == "passed"
 
 
 def _sql_contains(sql: str, needle: str) -> bool:
@@ -588,76 +580,33 @@ def _conflict(rule: GuardrailRule, fallback_message: str) -> GuardrailConflict:
 
 
 def _detect_forbid_sql_pattern(sql: str, rule: GuardrailRule) -> GuardrailConflict | None:
-    pattern = str(rule.params.get("pattern") or "")
-    if not pattern:
+    if not detector_failed(sql, rule.model_dump(mode="json")):
         return None
-    flags = re.IGNORECASE
-    configured_flags = {item.lower() for item in _as_list(rule.params.get("flags"))}
-    if "case_sensitive" in configured_flags:
-        flags = 0
-    if not re.search(pattern, sql, flags):
-        return None
-    unless_contains = str(rule.params.get("unless_contains") or "")
-    if unless_contains and _sql_contains(sql, unless_contains):
-        return None
-    unless_pattern = str(rule.params.get("unless_pattern") or "")
-    if unless_pattern and re.search(unless_pattern, sql, flags):
-        return None
-    return _conflict(rule, f"SQL 命中禁止模式：{pattern}")
+    return _conflict(rule, f"SQL 命中禁止模式：{rule.params.get('pattern') or ''}")
 
 
 def _detect_require_sql_contains(sql: str, rule: GuardrailRule) -> GuardrailConflict | None:
-    contains = str(rule.params.get("contains") or "")
-    if not contains:
+    if not detector_failed(sql, rule.model_dump(mode="json")):
         return None
-    triggers = _as_list(rule.params.get("when_contains_any"))
-    if triggers and not any(_sql_contains(sql, item) for item in triggers):
-        return None
-    if _sql_contains(sql, contains):
-        return None
-    return _conflict(rule, f"SQL 必须包含：{contains}")
+    return _conflict(rule, f"SQL 必须包含：{rule.params.get('contains') or ''}")
 
 
 def _detect_require_table_when_available(sql: str, rule: GuardrailRule) -> GuardrailConflict | None:
-    required_table = str(rule.params.get("required_table") or "")
-    fallback_table = str(rule.params.get("fallback_table") or "")
-    if not required_table:
+    if not detector_failed(sql, rule.model_dump(mode="json")):
         return None
-    if _uses_table(sql, required_table):
-        return None
-    if fallback_table and not _uses_table(sql, fallback_table):
-        return None
-    return _conflict(rule, f"SQL 必须使用表：{required_table}")
+    return _conflict(rule, f"SQL 必须使用表：{rule.params.get('required_table') or ''}")
 
 
 def _detect_require_group_by(sql: str, rule: GuardrailRule) -> GuardrailConflict | None:
-    group_by_columns = set(_extract_group_by_columns(sql))
-    if not group_by_columns:
-        return None
-    require_columns = {_normalize_identifier(item) for item in _as_list(rule.params.get("require_columns"))}
-    forbidden_only = {_normalize_identifier(item) for item in _as_list(rule.params.get("forbidden_columns_only"))}
-    if forbidden_only and group_by_columns == forbidden_only:
-        return _conflict(rule, "GROUP BY 字段不符合规则。")
-    if require_columns and not require_columns.issubset(group_by_columns):
-        return _conflict(rule, "GROUP BY 缺少必需字段。")
-    return None
+    return _conflict(rule, "GROUP BY 字段不符合规则。") if detector_failed(
+        sql, rule.model_dump(mode="json")
+    ) else None
 
 
 def _detect_forbid_exists_distinct_pattern(sql: str, rule: GuardrailRule) -> GuardrailConflict | None:
-    lowered = " ".join(sql.split()).lower()
-    table = str(rule.params.get("table") or "")
-    distinct_column = str(rule.params.get("distinct_column") or "")
-    min_exists_count = int(rule.params.get("min_exists_count") or 2)
-    if table and not _uses_table(lowered, table):
-        return None
-    exists_count = len(re.findall(r"\b(?:not\s+)?exists\s*\(", lowered))
-    if exists_count < min_exists_count:
-        return None
-    if "count(distinct" not in lowered:
-        return None
-    if distinct_column and re.search(rf"\bselect\s+distinct\s+[\w.]*{re.escape(distinct_column.lower())}\b", lowered) is None:
-        return None
-    return _conflict(rule, "SQL 命中 EXISTS + DISTINCT 慢查询模式。")
+    return _conflict(rule, "SQL 命中 EXISTS + DISTINCT 慢查询模式。") if detector_failed(
+        sql, rule.model_dump(mode="json")
+    ) else None
 
 
 def _governed_surface(frontmatter: dict[str, Any]) -> tuple[set[str], set[str]]:

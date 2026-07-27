@@ -226,11 +226,7 @@ def verification_packs_for_tool(
             if any(Path(path).suffix in _ARTIFACT_EXTENSIONS for path in paths):
                 packs.append("artifact")
             return packs
-        destination = (
-            (args or {}).get("destination")
-            if isinstance((args or {}).get("destination"), dict)
-            else {}
-        )
+        destination = (args or {}).get("destination") if isinstance((args or {}).get("destination"), dict) else {}
         raw_path = str(
             ((args or {}).get("output_name") if tool_name == "publish_attachment" else None)
             or (args or {}).get("file_path")
@@ -271,10 +267,7 @@ def _command_tokens(command: str) -> list[str]:
 def _command_executes_web_skill(command: str) -> bool:
     """Recognize an executed Skill entrypoint, not a path mentioned in code."""
 
-    return any(
-        _tokens_execute_web_skill(tokens, cwd=cwd)
-        for cwd, tokens in _effective_command_segments(command)
-    )
+    return any(_tokens_execute_web_skill(tokens, cwd=cwd) for cwd, tokens in _effective_command_segments(command))
 
 
 def _effective_command_segments(
@@ -297,14 +290,10 @@ def _effective_command_segments(
         executable = tokens[0].rsplit("/", 1)[-1].lower()
         if executable == "cd" and len(tokens) > 1:
             target = tokens[1]
-            cwd = posixpath.normpath(
-                target if target.startswith("/") else posixpath.join(cwd, target)
-            )
+            cwd = posixpath.normpath(target if target.startswith("/") else posixpath.join(cwd, target))
             continue
         if executable in {"sh", "bash", "zsh"} and len(tokens) >= 3 and tokens[1] in {"-c", "-lc"}:
-            effective.extend(
-                _effective_command_segments(tokens[2], initial_cwd=cwd)
-            )
+            effective.extend(_effective_command_segments(tokens[2], initial_cwd=cwd))
             continue
         effective.append((cwd, tokens))
     return effective
@@ -317,12 +306,8 @@ def _tokens_execute_web_skill(tokens: list[str], *, cwd: str) -> bool:
     for token in tokens[1:]:
         if token.startswith("-"):
             continue
-        resolved = posixpath.normpath(
-            token if token.startswith("/") else posixpath.join(cwd, token)
-        )
-        if resolved.startswith("/skills/") and _WEB_SKILL_SCRIPT_RE.search(
-            resolved.removeprefix("/skills/")
-        ):
+        resolved = posixpath.normpath(token if token.startswith("/") else posixpath.join(cwd, token))
+        if resolved.startswith("/skills/") and _WEB_SKILL_SCRIPT_RE.search(resolved.removeprefix("/skills/")):
             return True
     return False
 
@@ -379,17 +364,12 @@ def _command_performs_validation(command: str) -> bool:
             (len(tokens) > 1 and tokens[1].lower() in {"--check", "-c"})
             or (
                 len(tokens) == 3
-                and tokens[1]
-                == "/opt/puddingclaw/bin/validate-html-report-e2e.mjs"
+                and tokens[1] == "/opt/puddingclaw/bin/validate-html-report-e2e.mjs"
                 and tokens[2].lower().endswith((".html", ".htm"))
             )
         )
     if executable == "npx":
-        meaningful = [
-            token.lower()
-            for token in tokens[1:]
-            if token and not token.startswith("-")
-        ]
+        meaningful = [token.lower() for token in tokens[1:] if token and not token.startswith("-")]
         return bool(meaningful and meaningful[0] in {"eslint", "tsc"})
     if executable in {"python", "python3"}:
         if len(tokens) > 2 and tokens[1] == "-m":
@@ -419,9 +399,7 @@ def _result_messages(
         messages = []
     if expected_call_id:
         messages = [
-            message
-            for message in messages
-            if str(getattr(message, "tool_call_id", "") or "") == expected_call_id
+            message for message in messages if str(getattr(message, "tool_call_id", "") or "") == expected_call_id
         ]
     return messages
 
@@ -435,10 +413,7 @@ def _message_succeeded(message: ToolMessage) -> bool:
         return False
     command_exit = _COMMAND_EXIT_RE.search(content)
     if command_exit is not None:
-        return (
-            command_exit.group("status").lower() == "succeeded"
-            and int(command_exit.group("code")) == 0
-        )
+        return command_exit.group("status").lower() == "succeeded" and int(command_exit.group("code")) == 0
     plain_exit = _PLAIN_EXIT_RE.search(content)
     if plain_exit is not None and int(plain_exit.group("code")) != 0:
         return False
@@ -615,11 +590,7 @@ def _result_evidence_refs(
                 refs.append({"kind": "artifact_write", **receipt.model_dump(mode="json")})
         elif tool_name == "commit_external_directory":
             message_artifact = getattr(message, "artifact", None)
-            deliveries = (
-                message_artifact.get("delivered_artifacts")
-                if isinstance(message_artifact, dict)
-                else None
-            )
+            deliveries = message_artifact.get("delivered_artifacts") if isinstance(message_artifact, dict) else None
             for delivered in deliveries if isinstance(deliveries, list) else []:
                 if not isinstance(delivered, dict):
                     continue
@@ -653,10 +624,7 @@ def _result_evidence_refs(
                         args={
                             "file_path": target_path,
                             "expected_draft_sha256": content_sha256,
-                            "validation_receipt_ids": delivered.get(
-                                "validation_receipt_ids"
-                            )
-                            or [],
+                            "validation_receipt_ids": delivered.get("validation_receipt_ids") or [],
                         },
                     )
                 )
@@ -665,11 +633,7 @@ def _result_evidence_refs(
                 transaction = json.loads(content)
             except json.JSONDecodeError:
                 transaction = {}
-            receipt_ids = {
-                str(item)
-                for item in transaction.get("receipt_ids") or []
-                if str(item)
-            }
+            receipt_ids = {str(item) for item in transaction.get("receipt_ids") or [] if str(item)}
             mutations = [
                 item
                 for item in session_manager.list_external_mutation_receipts(
@@ -683,9 +647,9 @@ def _result_evidence_refs(
                 content_sha256 = str(mutation.get("after_sha256") or "")
                 if not target_path or not content_sha256:
                     continue
-                artifact_id = "artifact-" + hashlib.sha256(
-                    f"external\0{target_path}\0{content_sha256}".encode()
-                ).hexdigest()[:20]
+                artifact_id = (
+                    "artifact-" + hashlib.sha256(f"external\0{target_path}\0{content_sha256}".encode()).hexdigest()[:20]
+                )
                 artifact = ArtifactReference(
                     artifact_id=artifact_id,
                     scope=ArtifactScope.EXTERNAL,
@@ -693,10 +657,7 @@ def _result_evidence_refs(
                     path=target_path,
                     host_path=target_path,
                     authorized=True,
-                    permission_grant_id=str(
-                        mutation.get("permission_grant_id") or ""
-                    )
-                    or None,
+                    permission_grant_id=str(mutation.get("permission_grant_id") or "") or None,
                     run_id=run_id or None,
                     query_id=query_id or None,
                     goal_id=goal_id,
@@ -705,9 +666,7 @@ def _result_evidence_refs(
                     output_digest=f"sha256:{digest}",
                     content_sha256=content_sha256,
                 )
-                refs.append(
-                    {"kind": "artifact_write", **artifact.model_dump(mode="json")}
-                )
+                refs.append({"kind": "artifact_write", **artifact.model_dump(mode="json")})
                 refs.append(dict(mutation))
                 validation_receipt = mutation.get("validation_receipt")
                 if isinstance(validation_receipt, dict):
@@ -719,11 +678,7 @@ def _result_evidence_refs(
                         }
                     )
         elif tool_name in _WRITE_TOOLS:
-            destination = (
-                args.get("destination")
-                if isinstance(args.get("destination"), dict)
-                else {}
-            )
+            destination = args.get("destination") if isinstance(args.get("destination"), dict) else {}
             raw_path = str(
                 args.get("file_path")
                 or args.get("path")
@@ -768,12 +723,10 @@ def _result_evidence_refs(
                             session_id,
                             run_id=run_id,
                         )
-                        if str(item.get("target_path") or "")
-                        == str(artifact.host_path or artifact.path)
+                        if str(item.get("target_path") or "") == str(artifact.host_path or artifact.path)
                         and (
                             not artifact.content_sha256
-                            or str(item.get("target_sha256") or "")
-                            == artifact.content_sha256
+                            or str(item.get("target_sha256") or "") == artifact.content_sha256
                         )
                     ]
                     if receipts:
@@ -812,14 +765,11 @@ def _external_write_grant(
         ):
             root = Path(str(grant.get("target") or "")).expanduser().resolve()
             requested = Path(host_path).expanduser().resolve()
-            if (
-                _is_relative_to(requested, root)
-                and session_manager.has_external_directory_permission(
-                    session_id,
-                    root,
-                    access="write",
-                    run_id=run_id,
-                )
+            if _is_relative_to(requested, root) and session_manager.has_external_directory_permission(
+                session_id,
+                root,
+                access="write",
+                run_id=run_id,
             ):
                 return grant
     return None
@@ -839,11 +789,7 @@ def _artifact_reference_for_write(
 
     workspace = Path(workspace_path).expanduser().resolve() if workspace_path else None
     try:
-        persisted_run = (
-            session_manager.get_run_state(session_id, run_id)
-            if session_id and run_id
-            else None
-        )
+        persisted_run = session_manager.get_run_state(session_id, run_id) if session_id and run_id else None
     except (AssertionError, FileNotFoundError):
         # The pure builder is also used with isolated SessionManager instances
         # in tests and migrations. Runtime middleware always has the initialized
@@ -915,12 +861,16 @@ def _artifact_reference_for_write(
     if scope == ArtifactScope.SCRATCH:
         artifact_role = ArtifactRole.TEMPORARY
     else:
-        artifact_role = ArtifactRole.TARGET if any(
-            artifact_path_matches(candidate, declared)
-            for candidate in {raw_path, canonical, virtual_path or ""}
-            if candidate
-            for declared in declared_targets
-        ) else ArtifactRole.CANDIDATE
+        artifact_role = (
+            ArtifactRole.TARGET
+            if any(
+                artifact_path_matches(candidate, declared)
+                for candidate in {raw_path, canonical, virtual_path or ""}
+                if candidate
+                for declared in declared_targets
+            )
+            else ArtifactRole.CANDIDATE
+        )
     content_sha256: str | None = None
     size_bytes: int | None = None
     mtime_ns: int | None = None
@@ -934,28 +884,15 @@ def _artifact_reference_for_write(
         size_bytes = stat.st_size
         mtime_ns = stat.st_mtime_ns
     mutation: dict[str, Any] | None = None
-    if (
-        scope == ArtifactScope.EXTERNAL
-        and content_sha256
-        and session_id
-        and run_id
-    ):
+    if scope == ArtifactScope.EXTERNAL and content_sha256 and session_id and run_id:
         mutation = session_manager.find_external_mutation_receipt(
             session_id,
             run_id=run_id,
             canonical_path=str(host or canonical),
             after_sha256=content_sha256,
         )
-    mutation_grant_id = (
-        str(mutation.get("permission_grant_id") or "")
-        if isinstance(mutation, dict)
-        else ""
-    )
-    permission_grant_id = (
-        str(grant.get("id"))
-        if grant is not None
-        else mutation_grant_id or None
-    )
+    mutation_grant_id = str(mutation.get("permission_grant_id") or "") if isinstance(mutation, dict) else ""
+    permission_grant_id = str(grant.get("id")) if grant is not None else mutation_grant_id or None
     if scope in {ArtifactScope.WORKSPACE, ArtifactScope.SCRATCH}:
         authority_kind = "workspace"
     elif mutation_grant_id == f"declared-artifact:{run_id}":
@@ -964,12 +901,15 @@ def _artifact_reference_for_write(
         authority_kind = "permission_grant"
     else:
         authority_kind = None
-    artifact_id = "artifact-" + hashlib.sha256(
-        (
-            f"{scope.value}\0{execution.get('workspace_id', '')}\0"
-            f"{identity_path}\0{content_sha256 or 'unversioned'}"
-        ).encode()
-    ).hexdigest()[:20]
+    artifact_id = (
+        "artifact-"
+        + hashlib.sha256(
+            (
+                f"{scope.value}\0{execution.get('workspace_id', '')}\0"
+                f"{identity_path}\0{content_sha256 or 'unversioned'}"
+            ).encode()
+        ).hexdigest()[:20]
+    )
     return ArtifactReference(
         artifact_id=artifact_id,
         scope=scope,
@@ -979,30 +919,17 @@ def _artifact_reference_for_write(
         virtual_path=virtual_path,
         workspace_relative_path=relative or None,
         authorized=(
-            scope in {ArtifactScope.WORKSPACE, ArtifactScope.SCRATCH}
-            or grant is not None
-            or mutation is not None
+            scope in {ArtifactScope.WORKSPACE, ArtifactScope.SCRATCH} or grant is not None or mutation is not None
         ),
         permission_grant_id=permission_grant_id,
-        mutation_receipt_id=(
-            str(mutation.get("receipt_id") or "")
-            if isinstance(mutation, dict)
-            else None
-        )
-        or None,
+        mutation_receipt_id=(str(mutation.get("receipt_id") or "") if isinstance(mutation, dict) else None) or None,
         authority_kind=authority_kind,
         run_id=run_id or None,
         query_id=query_id or None,
         goal_id=(str(run_payload.get("goal_id")) if run_payload.get("goal_id") else None),
-        goal_revision=(
-            int(run_payload.get("goal_revision"))
-            if run_payload.get("goal_revision") is not None
-            else None
-        ),
+        goal_revision=(int(run_payload.get("goal_revision")) if run_payload.get("goal_revision") is not None else None),
         backend_id=(str(execution.get("backend_id")) if execution.get("backend_id") else None),
-        workspace_id=(
-            str(execution.get("workspace_id")) if execution.get("workspace_id") else None
-        ),
+        workspace_id=(str(execution.get("workspace_id")) if execution.get("workspace_id") else None),
         tool_call_id=tool_call_id,
         output_digest=output_digest,
         content_sha256=content_sha256,
@@ -1031,10 +958,7 @@ def _validator_input_paths(
                     if index + 1 < len(tokens):
                         operands.append(tokens[index + 1])
                     break
-            if (
-                len(tokens) == 3
-                and tokens[1] == "/opt/puddingclaw/bin/validate-html-report-e2e.mjs"
-            ):
+            if len(tokens) == 3 and tokens[1] == "/opt/puddingclaw/bin/validate-html-report-e2e.mjs":
                 operands.append(tokens[2])
         elif executable in {"python", "python3"}:
             if len(tokens) > 2 and tokens[1] == "-m":
@@ -1053,9 +977,7 @@ def _validator_input_paths(
                 continue
             if raw.lower() in {"check", "test", "build", "lint"}:
                 continue
-            normalized = posixpath.normpath(
-                raw if raw.startswith("/") else posixpath.join(cwd, raw)
-            )
+            normalized = posixpath.normpath(raw if raw.startswith("/") else posixpath.join(cwd, raw))
             if normalized not in inputs:
                 inputs.append(normalized)
     return inputs
@@ -1095,12 +1017,7 @@ def _controlled_validator_spec(command: str) -> tuple[str, str] | None:
     if any(item.lower() in non_authorizing_flags for item in tokens[1:]):
         return None
     executable = tokens[0].rsplit("/", 1)[-1].lower()
-    if (
-        executable == "node"
-        and len(tokens) == 3
-        and tokens[1] in {"--check", "-c"}
-        and not tokens[2].startswith("-")
-    ):
+    if executable == "node" and len(tokens) == 3 and tokens[1] in {"--check", "-c"} and not tokens[2].startswith("-"):
         return "javascript_syntax", "node-check/v1"
     if (
         executable == "node"
@@ -1123,9 +1040,7 @@ def _controlled_validator_spec(command: str) -> tuple[str, str] | None:
         and any(not item.startswith("-") for item in tokens[2:])
     ):
         return "static_check", "ruff-check/v1"
-    if executable in {"mypy", "pyright"} and len(tokens) >= 2 and any(
-        not item.startswith("-") for item in tokens[1:]
-    ):
+    if executable in {"mypy", "pyright"} and len(tokens) >= 2 and any(not item.startswith("-") for item in tokens[1:]):
         return "static_check", f"{executable}/v1"
     if (
         executable == "npx"
@@ -1136,8 +1051,10 @@ def _controlled_validator_spec(command: str) -> tuple[str, str] | None:
         validator = tokens[1]
         kind = "html_structure" if validator == "html-validate" else "static_check"
         return kind, f"{validator}/v1"
-    if executable in {"shellcheck", "sqlfluff"} and len(tokens) >= 2 and any(
-        not item.startswith("-") for item in tokens[1:]
+    if (
+        executable in {"shellcheck", "sqlfluff"}
+        and len(tokens) >= 2
+        and any(not item.startswith("-") for item in tokens[1:])
     ):
         return "static_check", f"{executable}/v1"
     return None
@@ -1157,9 +1074,7 @@ def _file_identity(path: Path) -> tuple[str, int] | None:
 
 
 def _artifact_identity_id(scope: str, workspace_id: str, identity_path: str) -> str:
-    return "artifact-" + hashlib.sha256(
-        f"{scope}\0{workspace_id}\0{identity_path}".encode()
-    ).hexdigest()[:20]
+    return "artifact-" + hashlib.sha256(f"{scope}\0{workspace_id}\0{identity_path}".encode()).hexdigest()[:20]
 
 
 def _validation_artifact_refs(
@@ -1186,11 +1101,7 @@ def _validation_artifact_refs(
     )
     workspace_id = str(execution.get("workspace_id") or "")
     scratch_root_value = str(execution.get("scratch_host_path") or "")
-    scratch_root = (
-        Path(scratch_root_value).expanduser().resolve()
-        if scratch_root_value
-        else None
-    )
+    scratch_root = Path(scratch_root_value).expanduser().resolve() if scratch_root_value else None
     workspace = Path(workspace_path).expanduser().resolve() if workspace_path else None
 
     known_refs: list[dict[str, Any]] = []
@@ -1206,9 +1117,7 @@ def _validation_artifact_refs(
             goal = session_manager.get_goal_state(session_id, goal_id)
         except (AssertionError, FileNotFoundError):
             goal = None
-        if isinstance(goal, dict) and goal.get("objective_revision") == run_payload.get(
-            "goal_revision"
-        ):
+        if isinstance(goal, dict) and goal.get("objective_revision") == run_payload.get("goal_revision"):
             for ref in goal.get("evidence_refs") or []:
                 if isinstance(ref, dict) and ref.get("kind") == "artifact_write":
                     known_refs.append(ref)
@@ -1240,9 +1149,7 @@ def _validation_artifact_refs(
                 lease,
             )
             for lease in directory_leases
-            if isinstance(lease, dict)
-            and lease.get("staged_dir")
-            and lease.get("directory_path")
+            if isinstance(lease, dict) and lease.get("staged_dir") and lease.get("directory_path")
         ),
         key=lambda item: len(item[0]),
         reverse=True,
@@ -1263,9 +1170,7 @@ def _validation_artifact_refs(
             host_value = str((matched or {}).get("host_path") or "")
             actual = _file_identity(Path(host_value)) if host_value else None
             if actual is None and scratch_root is not None and normalized.startswith("/scratch/"):
-                actual = _file_identity(
-                    (scratch_root / normalized.removeprefix("/scratch/")).resolve()
-                )
+                actual = _file_identity((scratch_root / normalized.removeprefix("/scratch/")).resolve())
             if actual is not None:
                 digest = actual[0]
             if not digest.startswith("sha256:"):
@@ -1288,17 +1193,10 @@ def _validation_artifact_refs(
         ):
             staged_root, lease_payload = directory_lease
             relative = posixpath.relpath(normalized, staged_root)
-            target_path = str(
-                (
-                    Path(str(lease_payload["directory_path"])).expanduser().resolve()
-                    / relative
-                ).resolve()
-            )
+            target_path = str((Path(str(lease_payload["directory_path"])).expanduser().resolve() / relative).resolve())
             actual = None
             if scratch_root is not None and normalized.startswith("/scratch/"):
-                actual = _file_identity(
-                    (scratch_root / normalized.removeprefix("/scratch/")).resolve()
-                )
+                actual = _file_identity((scratch_root / normalized.removeprefix("/scratch/")).resolve())
             if actual is None:
                 continue
             artifact_id = _artifact_identity_id(
@@ -1321,10 +1219,7 @@ def _validation_artifact_refs(
             if not digest.startswith("sha256:"):
                 continue
             canonical = str(
-                matched.get("host_path")
-                or matched.get("path")
-                or matched.get("virtual_path")
-                or normalized
+                matched.get("host_path") or matched.get("path") or matched.get("virtual_path") or normalized
             )
             item = {
                 "artifact_id": str(matched.get("artifact_id") or ""),
@@ -1418,11 +1313,7 @@ def _commit_validation_receipts(
 ) -> list[dict[str, Any]]:
     """Carry the exact pre-commit receipts onto the committed artifact write."""
 
-    requested_ids = {
-        str(item)
-        for item in (args.get("validation_receipt_ids") or [])
-        if str(item)
-    }
+    requested_ids = {str(item) for item in (args.get("validation_receipt_ids") or []) if str(item)}
     target_path = str(args.get("file_path") or "").strip()
     draft_sha256 = str(args.get("expected_draft_sha256") or "").strip()
     if not session_id or not run_id or not requested_ids or not target_path or not draft_sha256:
@@ -1469,8 +1360,7 @@ def _commit_validation_receipts(
         matches_draft = any(
             isinstance(ref, dict)
             and str(ref.get("content_sha256") or "") == draft_sha256
-            and posixpath.normpath(str(ref.get("path") or "").replace("\\", "/"))
-            == normalized_target
+            and posixpath.normpath(str(ref.get("path") or "").replace("\\", "/")) == normalized_target
             for ref in receipt.get("artifact_refs") or []
         )
         if matches_draft:
@@ -1493,9 +1383,7 @@ def build_verification_activations(
 ) -> list[VerificationActivation]:
     normalized_args = args or {}
     preview = json.dumps(normalized_args, ensure_ascii=False, sort_keys=True)[:1000]
-    command = str(
-        normalized_args.get("command") or normalized_args.get("cmd") or ""
-    )
+    command = str(normalized_args.get("command") or normalized_args.get("cmd") or "")
     attempted_artifact_refs = (
         _validation_artifact_refs(
             session_id=session_id,
@@ -1503,18 +1391,13 @@ def build_verification_activations(
             command=command,
             workspace_path=workspace_path,
             command_cwd=(
-                str(normalized_args.get("directory_path") or "")
-                if tool_name == "execute_external_directory"
-                else None
+                str(normalized_args.get("directory_path") or "") if tool_name == "execute_external_directory" else None
             ),
         )
-        if tool_name in {"execute", "terminal", "execute_external_directory"}
-        and command
+        if tool_name in {"execute", "terminal", "execute_external_directory"} and command
         else []
     )
-    succeeded = True if result is None else tool_result_succeeded(
-        result, expected_call_id=tool_call_id
-    )
+    succeeded = True if result is None else tool_result_succeeded(result, expected_call_id=tool_call_id)
     result_refs = _result_evidence_refs(
         tool_call_id=tool_call_id,
         tool_name=tool_name,
@@ -1528,8 +1411,7 @@ def build_verification_activations(
         goal_revision=goal_revision,
     )
     has_external_mutation_receipt = any(
-        item.get("kind") == "external_mutation_completed"
-        and item.get("status") == "completed"
+        item.get("kind") == "external_mutation_completed" and item.get("status") == "completed"
         for item in result_refs
         if isinstance(item, dict)
     )
@@ -1553,11 +1435,7 @@ def build_verification_activations(
     if has_external_mutation_receipt and "artifact" not in packs:
         packs.append("artifact")
     if tool_name == "commit_external_directory" and succeeded:
-        written = [
-            ref
-            for ref in result_refs
-            if ref.get("kind") == "artifact_write" and ref.get("path")
-        ]
+        written = [ref for ref in result_refs if ref.get("kind") == "artifact_write" and ref.get("path")]
         packs = ["artifact"] if written else []
         if any(Path(str(ref["path"])).suffix.lower() in _CODE_EXTENSIONS for ref in written):
             packs.append("code")
@@ -1568,10 +1446,7 @@ def build_verification_activations(
         packs = [pack for pack in packs if pack == "code"]
     has_web_source = any(
         item.get("kind") == "source"
-        and (
-            item.get("source_type") == "web"
-            or str(item.get("uri") or "").startswith(("http://", "https://"))
-        )
+        and (item.get("source_type") == "web" or str(item.get("uri") or "").startswith(("http://", "https://")))
         for item in result_refs
     )
     if has_web_source and "web_research" not in packs:
@@ -1579,21 +1454,15 @@ def build_verification_activations(
     for pack in packs:
         material = bool(result_refs)
         if pack == "analytics":
-            material = material and (
-                tool_name in _MATERIAL_ANALYTICS_TOOLS
-                or tool_name in {"execute", "terminal"}
-            )
+            material = material and (tool_name in _MATERIAL_ANALYTICS_TOOLS or tool_name in {"execute", "terminal"})
         elif pack == "web_research":
             material = any(item.get("kind") == "source" for item in result_refs)
         elif pack == "artifact":
-            material = tool_name in _WRITE_TOOLS and any(
-                item.get("kind") == "artifact_write" for item in result_refs
-            )
+            material = tool_name in _WRITE_TOOLS and any(item.get("kind") == "artifact_write" for item in result_refs)
         elif pack == "code":
             if tool_name in _WRITE_TOOLS:
                 material = any(
-                    item.get("kind") == "artifact_write"
-                    and item.get("role") != ArtifactRole.TEMPORARY.value
+                    item.get("kind") == "artifact_write" and item.get("role") != ArtifactRole.TEMPORARY.value
                     for item in result_refs
                 )
             elif tool_name in {
@@ -1603,9 +1472,7 @@ def build_verification_activations(
                 "validate_html_report",
             }:
                 material = True
-        digest = hashlib.sha256(
-            f"{run_id}:{query_id}:{tool_call_id}:{tool_name}:{pack}".encode()
-        ).hexdigest()[:20]
+        digest = hashlib.sha256(f"{run_id}:{query_id}:{tool_call_id}:{tool_name}:{pack}".encode()).hexdigest()[:20]
         evidence_refs = [
             {
                 "kind": "tool_execution",
@@ -1696,9 +1563,7 @@ def _validation_receipt_for_result(
             )
             else {}
         )
-        requested_browser_e2e = bool(
-            validator_contract.get("browser_e2e_required")
-        )
+        requested_browser_e2e = bool(validator_contract.get("browser_e2e_required"))
     controlled_spec = (
         (
             ("browser_runtime", "puddingclaw-html-e2e/v1")
@@ -1733,9 +1598,7 @@ def _validation_receipt_for_result(
     exit_code = _command_exit_code(output_ref, succeeded=succeeded)
     output_preview = str(output_ref.get("output_preview") or "")
     output_tail = str(output_ref.get("output_tail") or "")
-    diagnostic_output = "\n".join(
-        part for part in (output_preview, output_tail) if part
-    )
+    diagnostic_output = "\n".join(part for part in (output_preview, output_tail) if part)
     passed_match = re.search(
         r"(?P<passed>\d+)\s*(?:/\s*(?P<total>\d+)\s*)?(?:checks?\s+)?passed",
         output_preview,
@@ -1743,7 +1606,16 @@ def _validation_receipt_for_result(
     )
     checks_passed = int(passed_match.group("passed")) if passed_match else None
     if tool_name == "validate_html_report":
-        raw_path = str(args.get("html_file_path") or "")
+        # Prefer the canonical path the validator itself resolved and echoed
+        # back in its JSON output: the tool understands ``/workspace/`` virtual
+        # prefixes, this host-side recorder does not. Re-resolving the raw
+        # agent argument here produced ENOENT for virtual paths and receipts
+        # without artifact bindings.
+        tool_path_match = re.search(
+            r'"html_file_path"\s*:\s*"(?P<path>[^"]+)"',
+            diagnostic_output,
+        )
+        raw_path = tool_path_match.group("path") if tool_path_match else str(args.get("html_file_path") or "")
         try:
             html_path = Path(raw_path).expanduser().resolve(strict=True)
         except OSError:
@@ -1756,8 +1628,7 @@ def _validation_receipt_for_result(
                 run_payload = None
             execution = (
                 run_payload.get("config_snapshot", {}).get("execution", {})
-                if isinstance(run_payload, dict)
-                and isinstance(run_payload.get("config_snapshot"), dict)
+                if isinstance(run_payload, dict) and isinstance(run_payload.get("config_snapshot"), dict)
                 else {}
             )
             workspace_id = str(execution.get("workspace_id") or "")
@@ -1781,11 +1652,7 @@ def _validation_receipt_for_result(
             run_id=run_id,
             command=command,
             workspace_path=workspace_path,
-            command_cwd=(
-                str(args.get("directory_path") or "")
-                if tool_name == "execute_external_directory"
-                else None
-            ),
+            command_cwd=(str(args.get("directory_path") or "") if tool_name == "execute_external_directory" else None),
         )
     failure_class: str | None = None
     if not succeeded:
@@ -1795,9 +1662,7 @@ def _validation_receipt_for_result(
                 parsed_output = json.loads(output_preview)
             except json.JSONDecodeError:
                 parsed_output = {}
-        explicit_failure_class = str(
-            parsed_output.get("failure_class") or ""
-        )
+        explicit_failure_class = str(parsed_output.get("failure_class") or "")
         if explicit_failure_class in {
             "artifact_failure",
             "invocation_failure",
@@ -1816,11 +1681,7 @@ def _validation_receipt_for_result(
                 or "enoent" in lowered_output
             ):
                 failure_class = "invocation_failure"
-            elif (
-                exit_code == 124
-                or "timed out" in lowered_output
-                or "error executing" in lowered_output
-            ):
+            elif exit_code == 124 or "timed out" in lowered_output or "error executing" in lowered_output:
                 failure_class = "infrastructure_failure"
             else:
                 failure_class = "artifact_failure"
@@ -1841,10 +1702,7 @@ def _validation_receipt_for_result(
         artifact_refs
         and (
             succeeded
-            or (
-                tool_name == "validate_html_report"
-                and failure_class == "artifact_failure"
-            )
+            or (tool_name == "validate_html_report" and failure_class == "artifact_failure")
             or parsed_output.get("content_observed") is True
         )
     )
@@ -1925,11 +1783,7 @@ class VerificationActivationMiddleware(AgentMiddleware):
                 command,
                 workspace_path=str(context.get("workspace_path") or "."),
             )
-            mutation = bool(
-                capabilities.workspace_write
-                or capabilities.package_install
-                or capabilities.destructive
-            )
+            mutation = bool(capabilities.workspace_write or capabilities.package_install or capabilities.destructive)
         if succeeded and mutation:
             try:
                 session_manager.upgrade_run_verification_mode(
@@ -1961,11 +1815,7 @@ class VerificationActivationMiddleware(AgentMiddleware):
             session_id=session_id,
             workspace_path=str(context.get("workspace_path") or ""),
             goal_id=(str(context.get("goal_id")) if context.get("goal_id") else None),
-            goal_revision=(
-                int(context.get("goal_revision"))
-                if context.get("goal_revision") is not None
-                else None
-            ),
+            goal_revision=(int(context.get("goal_revision")) if context.get("goal_revision") is not None else None),
         ):
             try:
                 saved, created = session_manager.append_run_verification_activation(

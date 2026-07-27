@@ -15,6 +15,10 @@ function apiErrorMessage(text: string, fallback: string): string {
     const payload = JSON.parse(text) as { detail?: unknown; message?: unknown };
     const detail = payload.detail ?? payload.message;
     if (typeof detail === "string" && detail.trim()) return detail;
+    if (detail && typeof detail === "object" && "message" in detail) {
+      const message = (detail as { message?: unknown }).message;
+      if (typeof message === "string" && message.trim()) return message;
+    }
   } catch {
     // keep raw text below
   }
@@ -39,6 +43,87 @@ async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}
   }
 }
 
+export type SkillPlanStatus = "prepared" | "committed" | "cancelled" | "expired";
+
+export interface SkillPlan {
+  plan_id: string;
+  plan_sha256: string;
+  action: "install" | "update";
+  skill_name: string;
+  source: string;
+  ref?: string;
+  subpath?: string;
+  created_at: number;
+  expires_at: number;
+  status: SkillPlanStatus;
+  phase: "awaiting_confirmation" | "installed" | "cancelled" | "expired";
+  requires_confirmation: boolean;
+  installed: boolean;
+  ui_commit_supported: boolean;
+  diff?: {
+    added?: string[];
+    changed?: string[];
+    removed?: string[];
+    summary?: string;
+  };
+  staged_metadata?: Record<string, unknown>;
+  installed_path?: string;
+  installed_sha256?: string;
+}
+
+interface SkillPlanResponse {
+  session_id: string;
+  plan: SkillPlan;
+  idempotent?: boolean;
+  permission_recorded?: boolean;
+}
+
+export async function getSkillPlan(sessionId: string, planId: string): Promise<SkillPlan> {
+  const response = await fetch(
+    `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/skill-plans/${encodeURIComponent(planId)}`,
+    { cache: "no-store" },
+  );
+  const text = await response.text();
+  if (!response.ok) throw new Error(apiErrorMessage(text, `加载 Skill 计划失败：${response.status}`));
+  return (JSON.parse(text) as SkillPlanResponse).plan;
+}
+
+export async function commitSkillPlan(
+  sessionId: string,
+  planId: string,
+  planSha256: string,
+): Promise<SkillPlan> {
+  const response = await fetch(
+    `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/skill-plans/${encodeURIComponent(planId)}/commit`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ plan_sha256: planSha256 }),
+    },
+  );
+  const text = await response.text();
+  if (!response.ok) throw new Error(apiErrorMessage(text, `提交 Skill 计划失败：${response.status}`));
+  return (JSON.parse(text) as SkillPlanResponse).plan;
+}
+
+export async function cancelSkillPlan(
+  sessionId: string,
+  planId: string,
+  planSha256: string,
+): Promise<SkillPlan> {
+  const response = await fetch(
+    `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/skill-plans/${encodeURIComponent(planId)}/cancel`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ plan_sha256: planSha256 }),
+    },
+  );
+  const text = await response.text();
+  if (!response.ok) throw new Error(apiErrorMessage(text, `取消 Skill 计划失败：${response.status}`));
+  return (JSON.parse(text) as SkillPlanResponse).plan;
+}
+
 export interface SSEEvent {
   event: string;
   data: Record<string, unknown>;
@@ -48,7 +133,7 @@ export type GoalStatus =
   | "active"
   | "paused"
   | "blocked"
-  | "achieved"
+  | "completed"
   | "cancelled"
   | "budget_exceeded";
 
@@ -200,6 +285,8 @@ export interface HarnessGoal {
   requested_status?: GoalStatus | null;
   current_run_id?: string | null;
   run_ids: string[];
+  completion_policy?: "standard" | "rubric";
+  latest_completion_request_id?: string | null;
   gaps: string[];
   control_notices?: string[];
   latest_verification_report_id?: string | null;
@@ -1914,6 +2001,40 @@ export interface AnalyticsModelCreatePayload {
   default_template?: string | null;
 }
 
+export type AnalyticsProjectDataFileMode = "copy" | "reference";
+
+export interface AnalyticsProjectExportDataAsset {
+  ref: string;
+  kind: "database_table" | "table_asset" | "logical_dataset";
+  status: "ready" | "missing";
+  asset_id: string;
+  file_name: string;
+  source_path: string;
+  virtual_path: string;
+  sheet_name?: string | null;
+  size_bytes: number;
+  profile_available: boolean;
+  source_asset_ids: string[];
+}
+
+export interface AnalyticsProjectExportPlan {
+  format: string;
+  model_id: string;
+  model_name: string;
+  model_version: string;
+  package_name: string;
+  plan_id: string;
+  data_file_mode: AnalyticsProjectDataFileMode;
+  semantic_asset_ids: string[];
+  relation_ids: string[];
+  guardrail_ids: string[];
+  data_assets: AnalyticsProjectExportDataAsset[];
+  copied_file_count: number;
+  copied_bytes: number;
+  warnings: string[];
+  missing_dependencies: string[];
+}
+
 export async function listAnalyticsModels(): Promise<AnalyticsModelListResult> {
   const response = await fetch(`${API_BASE}/analytics/models`, { cache: "no-store" });
   if (!response.ok) {
@@ -1986,6 +2107,32 @@ export async function importAnalyticsModels(files: File[]): Promise<AnalyticsMod
     models: Array.isArray(payload.models) ? payload.models : [],
     count: typeof payload.count === "number" ? payload.count : 0,
   };
+}
+
+export async function planAnalyticsProjectExport(
+  modelId: string,
+  dataFileMode: AnalyticsProjectDataFileMode
+): Promise<{ plan: AnalyticsProjectExportPlan; ready: boolean }> {
+  const response = await fetch(`${API_BASE}/analytics/models/export-plan`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model_id: modelId, data_file_mode: dataFileMode }),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to plan analytics project export: ${response.status}`));
+  }
+  return response.json();
+}
+
+export function analyticsProjectExportDownloadUrl(
+  modelId: string,
+  dataFileMode: AnalyticsProjectDataFileMode,
+  expectedPlanId?: string
+): string {
+  const params = new URLSearchParams({ model_id: modelId, data_file_mode: dataFileMode });
+  if (expectedPlanId) params.set("expected_plan_id", expectedPlanId);
+  return `${API_BASE}/analytics/models/export.zip?${params.toString()}`;
 }
 
 export type SqlGuardrailActionType = "rewrite" | "block" | "warn";
@@ -2509,6 +2656,76 @@ export interface DatabaseSqlRevisionRequest {
   };
 }
 
+export interface UserInputOption {
+  id: string;
+  label: string;
+  description?: string;
+  recommended?: boolean;
+}
+
+export interface UserInputQuestion {
+  id: string;
+  prompt: string;
+  type: "single_select" | "multi_select" | "text";
+  options?: UserInputOption[];
+  required?: boolean;
+  allow_other?: boolean;
+  min_selections?: number;
+  max_selections?: number | null;
+  max_length?: number;
+}
+
+export interface UserInputRequest {
+  id: string;
+  version: number;
+  type: "user_input" | string;
+  session_id: string;
+  query_id: string;
+  run_id: string;
+  goal_id?: string | null;
+  goal_revision?: number | null;
+  tool_call_id?: string;
+  status: "pending" | "resolved" | "cancelled" | string;
+  title: string;
+  reason: string;
+  questions: UserInputQuestion[];
+  allow_agent_decide?: boolean;
+  decision?: {
+    action?: "submit" | "cancel" | "agent_decide" | string;
+    answers?: UserInputAnswer[];
+  };
+}
+
+export interface UserInputAnswer {
+  question_id: string;
+  option_ids: string[];
+  text: string;
+}
+
+export async function resolveUserInputRequest(
+  sessionId: string,
+  requestId: string,
+  payload: {
+    request_version: number;
+    action: "submit" | "cancel" | "agent_decide";
+    answers?: UserInputAnswer[];
+  },
+): Promise<{ request_id: string; decision: Record<string, unknown>; resumed: boolean }> {
+  const response = await fetch(
+    `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/user-input-requests/${encodeURIComponent(requestId)}/resolve`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, "Failed to resolve user input request"));
+  }
+  return response.json();
+}
+
 export async function resolveDatabaseSqlRevisionRequest(
   requestId: string,
   payload: { action: "agree" | "reject" | "modify"; revision_instruction?: string }
@@ -2603,6 +2820,7 @@ export async function* streamAgent(
   goalId?: string | null,
   contextGoalId?: string | null,
   goalControlAction?: "start" | null,
+  skillHints?: string[],
 ): AsyncGenerator<SSEEvent> {
   const response = await fetch(`${API_BASE}/agent`, {
     method: "POST",
@@ -2614,6 +2832,7 @@ export async function* streamAgent(
       project_id: projectId || null,
       analytics_model_id: analyticsModelId || null,
       attachments: attachments || [],
+      skill_hints: skillHints ?? null,
       goal_mode: goalMode,
       goal_id: goalMode ? goalId || null : null,
       context_goal_id: contextGoalId || null,

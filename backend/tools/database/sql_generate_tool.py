@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-from difflib import get_close_matches
 
 from langchain.tools import ToolRuntime
 from langchain_core.messages import HumanMessage
@@ -15,6 +14,7 @@ from pydantic import BaseModel
 from analytics.nl2sql.schemas import DatabaseQueryRequest
 from analytics.nl2sql.service import DatabaseKnowledgeQueryError, generate_database_sql
 from analytics.nl2sql.table_router import summarize_table_route
+from analytics.semantic_runtime import normalize_selected_semantic_asset_ids
 from db import get_sessionmaker
 from graph.database_sql_revision_resume import (
     RegisteredDatabaseSqlGeneration,
@@ -246,48 +246,6 @@ def _is_technical_sql_revision(instruction: str) -> bool:
     )
 
 
-def _normalize_selected_semantic_asset_ids(
-    selected_ids: list[str],
-    allowed_ids: set[str],
-) -> tuple[list[str], str | None]:
-    """Resolve model-friendly bare ids against the authoritative model scope.
-
-    The semantic index exposes namespaced ids such as ``measure:launch_cycle``.
-    Models occasionally retain only the stable suffix. A unique suffix is safe
-    to normalize server-side; ambiguous or unknown values remain fail-closed.
-    """
-
-    normalized: list[str] = []
-    for raw_id in selected_ids:
-        asset_id = str(raw_id or "").strip()
-        if not asset_id:
-            continue
-        if asset_id in allowed_ids:
-            resolved = asset_id
-        else:
-            suffix_matches = sorted(
-                candidate
-                for candidate in allowed_ids
-                if candidate.rsplit(":", 1)[-1] == asset_id
-            )
-            if len(suffix_matches) == 1:
-                resolved = suffix_matches[0]
-            elif len(suffix_matches) > 1:
-                return [], (
-                    f"语义资产 ID“{asset_id}”存在多个候选："
-                    + ", ".join(suffix_matches)
-                    + "。请使用完整 namespaced id。"
-                )
-            else:
-                close = get_close_matches(asset_id, sorted(allowed_ids), n=5, cutoff=0.25)
-                candidates = close or sorted(allowed_ids)[:8]
-                suffix = f" 当前模型可用候选：{', '.join(candidates)}。" if candidates else ""
-                return [], f"语义资产 ID“{asset_id}”不属于当前分析模型或已被删除。{suffix}"
-        if resolved not in normalized:
-            normalized.append(resolved)
-    return normalized, None
-
-
 def _format_semantic_contract(semantic_assets: dict[str, object]) -> list[str]:
     """Expose the semantic evidence already used by the SQL generator."""
     analytics_model = semantic_assets.get("analytics_model")
@@ -305,6 +263,16 @@ def _format_semantic_contract(semantic_assets: dict[str, object]) -> list[str]:
         "  外层 Agent 不得凭字段名或常识直接覆盖；如用户明确改变业务口径，只能携带原 "
         "parent_generation_id 和用户确认的自然语言 revision_instruction 请求重新生成。",
     ]
+    context_id = str(semantic_assets.get("semantic_context_id") or "").strip()
+    semantic_hash = str(
+        semantic_assets.get("semantic_hash")
+        or semantic_assets.get("semantic_context_hash")
+        or ""
+    ).strip()
+    if context_id:
+        lines.append(f"  - semantic_context_id: {context_id}")
+    if semantic_hash:
+        lines.append(f"  - semantic_hash: {semantic_hash}")
     if isinstance(analytics_model, dict):
         lines.append(
             "  - analysis_model:"
@@ -479,7 +447,7 @@ class DatabaseSqlGenerateTool(BaseTool):
                 for item in runtime.state.get("allowed_semantic_asset_ids") or []
                 if str(item).strip()
             }
-            selected_asset_ids, normalization_error = _normalize_selected_semantic_asset_ids(
+            selected_asset_ids, normalization_error = normalize_selected_semantic_asset_ids(
                 selected_asset_ids,
                 allowed_asset_ids,
             )
@@ -487,6 +455,7 @@ class DatabaseSqlGenerateTool(BaseTool):
                 return "🧮 SQL 生成失败：" + normalization_error
         request_payload = {
             "question": question,
+            "semantic_question": question,
             "database_source_id": database_source_id,
             "table_names": requested_table_names,
             "model_id": effective_model_id,
@@ -512,6 +481,9 @@ class DatabaseSqlGenerateTool(BaseTool):
                 return "🧮 SQL 重新生成失败：必须提供自然语言 revision_instruction，不能提供 SQL。"
             request_payload = dict(parent.request)
             original_question = str(request_payload.get("question") or parent.result.question)
+            semantic_question = str(
+                request_payload.get("semantic_question") or original_question
+            )
             if _is_technical_sql_revision(proposed):
                 applied_instruction = proposed
                 request_payload["question"] = (
@@ -520,6 +492,7 @@ class DatabaseSqlGenerateTool(BaseTool):
                     f"SQL 技术修复反馈（只允许改变实现与性能，不得改变指标、分母、粒度、筛选或时间范围）：\n"
                     f"{proposed}"
                 )
+                request_payload["semantic_question"] = semantic_question
                 disposition = "technical_repair"
             else:
                 revision_request = database_sql_revision_resume_registry.create_revision_request(
@@ -544,10 +517,12 @@ class DatabaseSqlGenerateTool(BaseTool):
                 applied_instruction = str(decision.get("revision_instruction") or "").strip()
                 if not applied_instruction:
                     return "🧮 SQL 重新生成失败：审批结果缺少自然语言修改说明。"
-                request_payload["question"] = (
+                approved_question = (
                     f"原始问题：\n{original_question}\n\n"
                     f"用户确认的本次口径补充：\n{applied_instruction}"
                 )
+                request_payload["question"] = approved_question
+                request_payload["semantic_question"] = approved_question
                 disposition = "approved_revision"
         elif revision_instruction:
             return "🧮 SQL 重新生成失败：revision_instruction 必须与 parent_generation_id 一起使用。"
@@ -558,6 +533,7 @@ class DatabaseSqlGenerateTool(BaseTool):
             table_names=list(request_payload.get("table_names") or []),
             model_id=request_payload.get("model_id"),
             measure_ids=list(request_payload.get("measure_ids") or []),
+            semantic_question=request_payload.get("semantic_question"),
         )
         try:
             sessionmaker = get_sessionmaker()
@@ -587,7 +563,11 @@ class DatabaseSqlGenerateTool(BaseTool):
                 "duration_ms": result.stage_timings.get("total_ms"),
             },
         )
-        generation_request = dict(parent.request) if parent is not None else dict(request_payload)
+        generation_request = (
+            dict(parent.request)
+            if parent is not None and disposition == "technical_repair"
+            else dict(request_payload)
+        )
         raw_runtime_context = getattr(runtime, "context", None)
         runtime_context = raw_runtime_context if isinstance(raw_runtime_context, dict) else {}
         generation = database_sql_revision_resume_registry.register_generation(

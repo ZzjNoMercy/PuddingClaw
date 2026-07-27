@@ -320,11 +320,11 @@ def build_copy_tools(backend: Any) -> list[StructuredTool]:
         StructuredTool.from_function(
             name="copy_file",
             description=(
-                "Create one UTF-8 file from an authorized absolute Host source without "
-                "streaming its body through model context. A /workspace target uses the "
-                "existing workspace boundary and needs no external write Grant; an absolute "
-                "Host target still requires exact Host write authority. Records source/target "
-                "hashes and never overwrites an existing target."
+                "Create one UTF-8 file from a /workspace or /scratch source, a managed "
+                "read-only source, or an authorized absolute Host source without streaming "
+                "its body through model context. Internal sources and targets need no external "
+                "Grant; an external Host side requires exact Host authority. Records "
+                "source/target hashes and never overwrites an existing target."
             ),
             func=copy_file,
             args_schema=CopyFileInput,

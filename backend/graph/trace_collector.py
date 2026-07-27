@@ -152,6 +152,12 @@ class TraceCollector:
             return self._model_input_count - 1
         return None
 
+    @property
+    def model_input_count(self) -> int:
+        """Number of provider model-input boundaries observed by this Trace."""
+
+        return self._model_input_count
+
     def __enter__(self) -> TraceCollector:
         self._context_token = _current_trace_collector.set(self)
         return self
@@ -181,12 +187,14 @@ class TraceCollector:
                 pass
 
     def _event_payload(self, span: TraceSpan) -> dict[str, Any]:
-        return {
-            "span": span.to_dict(),
-            "trace_id": self.trace_id,
-            "query_id": self.query_id,
-            "session_id": self.session_id,
-        }
+        return self._canonicalize(
+            {
+                "span": span.to_dict(),
+                "trace_id": self.trace_id,
+                "query_id": self.query_id,
+                "session_id": self.session_id,
+            }
+        )
 
     def start_llm_span(
         self,
@@ -1765,33 +1773,37 @@ class TraceCollector:
         if error:
             self.root.metadata["error"] = error
         self._emit("trace_span_end", self._event_payload(self.root))
-        return {
-            "trace_id": self.trace_id,
-            "query_id": self.query_id,
-            "session_id": self.session_id,
-            "started_at": self.started_at,
-            "completed_at": self.completed_at,
-            "status": self.status,
-            "runtime_inventory": self.runtime_inventory,
-            "middleware_effects": self._middleware_effects,
-            "middleware_invocations": self._middleware_invocations,
-            "hook_boundary_snapshots": self._hook_boundary_snapshots,
-            "spans": self._flatten_spans(self.root),
-        }
+        return self._canonicalize(
+            {
+                "trace_id": self.trace_id,
+                "query_id": self.query_id,
+                "session_id": self.session_id,
+                "started_at": self.started_at,
+                "completed_at": self.completed_at,
+                "status": self.status,
+                "runtime_inventory": self.runtime_inventory,
+                "middleware_effects": self._middleware_effects,
+                "middleware_invocations": self._middleware_invocations,
+                "hook_boundary_snapshots": self._hook_boundary_snapshots,
+                "spans": self._flatten_spans(self.root),
+            }
+        )
 
     def snapshot(self) -> dict[str, Any]:
         """Return a non-final trace snapshot for incremental persistence."""
 
-        return {
-            "trace_id": self.trace_id,
-            "query_id": self.query_id,
-            "session_id": self.session_id,
-            "started_at": self.started_at,
-            "completed_at": self.completed_at,
-            "status": self.status,
-            "runtime_inventory": self.runtime_inventory,
-            "middleware_effects": self._middleware_effects,
-            "middleware_invocations": self._middleware_invocations,
-            "hook_boundary_snapshots": self._hook_boundary_snapshots,
-            "spans": self._flatten_spans(self.root),
-        }
+        return self._canonicalize(
+            {
+                "trace_id": self.trace_id,
+                "query_id": self.query_id,
+                "session_id": self.session_id,
+                "started_at": self.started_at,
+                "completed_at": self.completed_at,
+                "status": self.status,
+                "runtime_inventory": self.runtime_inventory,
+                "middleware_effects": self._middleware_effects,
+                "middleware_invocations": self._middleware_invocations,
+                "hook_boundary_snapshots": self._hook_boundary_snapshots,
+                "spans": self._flatten_spans(self.root),
+            }
+        )

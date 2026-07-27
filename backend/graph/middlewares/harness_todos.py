@@ -85,9 +85,13 @@ It requires at least one query_result, artifact_receipt, and validation_receipt
 ID before completion. Do not create such delivery Todos without this contract.
 
 Do not mark a Todo complete until its result is actually produced and verified.
+Create new Todos as pending or in_progress; `create` with status=completed is
+rejected because it bypasses the stable Todo lifecycle. Complete the existing
+Todo with its stable ID and the exact evidence IDs returned by Harness.
 Do not delete unfinished work; use `cancel` with an explicit lifecycle record.
 If an update is rejected because a todo_id is unknown, do not retry that stale
-ID. Recreate the missing work from the returned current ledger instead.
+ID. Recreate only genuinely missing work from the returned current ledger.
+Never cancel and duplicate an existing Todo merely to bypass its evidence contract.
 """
 
 
@@ -162,6 +166,11 @@ def _apply_operations(
 
     for index, operation in enumerate(operations):
         if operation.action == "create":
+            if operation.status == "completed":
+                raise ValueError(
+                    "create cannot start in completed status; complete an existing "
+                    "stable Todo after producing its evidence"
+                )
             normalized_content = _normalized_todo_content(str(operation.content or ""))
             duplicate = by_content.get(normalized_content)
             if duplicate is not None:
@@ -302,6 +311,8 @@ def _update_todos(
     available_evidence = _available_todo_evidence(
         session_id=str(context.get("session_id") or ""),
         run_id=str(context.get("run_id") or ""),
+        goal_id=str(context.get("goal_id") or ""),
+        goal_revision=context.get("goal_revision"),
     )
     goal_id = str(context.get("goal_id") or "") or None
     goal_revision = context.get("goal_revision")
@@ -335,7 +346,7 @@ def _update_todos(
             return ToolMessage(
                 content=(
                     f"Todo update rejected: {exc}. "
-                    "Do not retry unknown IDs; recreate missing work with create operations."
+                    + _todo_recovery_guidance(available_evidence)
                 ),
                 tool_call_id=runtime.tool_call_id,
                 name="update_todos",
@@ -367,7 +378,7 @@ def _update_todos(
             return ToolMessage(
                 content=(
                     f"Todo update rejected: {exc}. "
-                    "Do not retry unknown IDs; recreate missing work with create operations."
+                    + _todo_recovery_guidance(available_evidence)
                 ),
                 tool_call_id=runtime.tool_call_id,
                 name="update_todos",
@@ -393,7 +404,40 @@ def _update_todos(
     )
 
 
-def _available_todo_evidence(*, session_id: str, run_id: str) -> dict[str, set[str]]:
+def _todo_recovery_guidance(available: dict[str, set[str]]) -> str:
+    evidence_parts = []
+    for kind in ("query_result", "artifact_receipt", "validation_receipt"):
+        values = sorted(available.get(kind, set()))
+        if values:
+            evidence_parts.append(f"{kind}=[{', '.join(values[:20])}]")
+    evidence_hint = (
+        " Available evidence IDs: " + "; ".join(evidence_parts) + "."
+        if evidence_parts
+        else ""
+    )
+    return (
+        "Reconcile against the current ledger and reuse its stable todo_id; "
+        "do not cancel or duplicate an existing Todo to bypass its contract."
+        + evidence_hint
+    )
+
+
+_QUERY_RESULT_TOOLS = {
+    "database_sql_execute",
+    "database_knowledge_query",
+    "pandas_knowledge_query",
+    "execute",
+    "python_repl",
+}
+
+
+def _available_todo_evidence(
+    *,
+    session_id: str,
+    run_id: str,
+    goal_id: str = "",
+    goal_revision: int | None = None,
+) -> dict[str, set[str]]:
     available = {
         "validation_receipt": set(),
         "artifact_receipt": set(),
@@ -411,10 +455,42 @@ def _available_todo_evidence(*, session_id: str, run_id: str) -> dict[str, set[s
                 available["validation_receipt"].add(str(ref["validation_receipt_id"]))
             if ref.get("kind") == "artifact_write" and ref.get("artifact_id"):
                 available["artifact_receipt"].add(str(ref["artifact_id"]))
-            if ref.get("kind") in {"analytics_result", "tool_result"}:
+            if ref.get("kind") == "analytics_result" or (
+                ref.get("kind") == "tool_result"
+                and str(ref.get("tool_name") or "") in _QUERY_RESULT_TOOLS
+            ):
                 result_id = ref.get("result_id") or ref.get("ref") or ref.get("output_digest")
                 if result_id:
                     available["query_result"].add(str(result_id))
+
+    # Goal continuations may satisfy a Todo using material evidence produced by
+    # an earlier Run of the same immutable Goal revision. Resolve those stable
+    # refs through the Session ledger instead of forcing the Agent to rerun work.
+    goal = session_manager.get_goal_state(session_id, goal_id) if session_id and goal_id else None
+    if isinstance(goal, dict) and (
+        goal_revision is None
+        or int(goal.get("objective_revision") or 0) == int(goal_revision)
+    ):
+        resolved_goal_revision = int(goal.get("objective_revision") or 1)
+        for resolved in session_manager.resolve_goal_evidence_records(
+            session_id,
+            goal_id,
+            resolved_goal_revision,
+        ):
+            kind = str(resolved.get("kind") or "")
+            evidence_id = str(resolved.get("id") or "")
+            payload = resolved.get("payload")
+            payload = payload if isinstance(payload, dict) else {}
+            if kind == "validation_receipt" and evidence_id:
+                available["validation_receipt"].add(evidence_id)
+            elif kind == "artifact" and evidence_id:
+                available["artifact_receipt"].add(evidence_id)
+            elif (
+                kind == "tool_result"
+                and str(payload.get("tool_name") or "") in _QUERY_RESULT_TOOLS
+                and evidence_id
+            ):
+                available["query_result"].add(evidence_id)
     return available
 
 

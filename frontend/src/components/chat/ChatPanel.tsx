@@ -6,11 +6,13 @@ import { shouldShowInlineBudgetRequest } from "@/lib/goalControls";
 import ChatMessage from "./ChatMessage";
 import ChatInput from "./ChatInput";
 import GoalBudgetRequestCard from "./GoalBudgetRequestCard";
-import { Loader2, Sparkles } from "lucide-react";
+import { CircleHelp, Loader2, Sparkles } from "lucide-react";
 
 export default function ChatPanel() {
   const {
+    sessionId,
     messages,
+    sessionHistoryLoading,
     maintenanceStatus,
     runActivityStatus,
     isStreaming,
@@ -18,10 +20,22 @@ export default function ChatPanel() {
     activeGoal,
   } = useApp();
   const bottomRef = useRef<HTMLDivElement>(null);
+  const previousSessionIdRef = useRef(sessionId);
+  const previousHistoryLoadingRef = useRef(sessionHistoryLoading);
+  const hasMountedRef = useRef(false);
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, maintenanceStatus, activeGoal?.status]);
+    const initialHistoryRender = !hasMountedRef.current;
+    const sessionChanged = previousSessionIdRef.current !== sessionId;
+    const historyJustLoaded = previousHistoryLoadingRef.current && !sessionHistoryLoading;
+    bottomRef.current?.scrollIntoView({
+      behavior: initialHistoryRender || sessionChanged || historyJustLoaded ? "auto" : "smooth",
+      block: "end",
+    });
+    hasMountedRef.current = true;
+    previousSessionIdRef.current = sessionId;
+    previousHistoryLoadingRef.current = sessionHistoryLoading;
+  }, [sessionId, sessionHistoryLoading, messages, maintenanceStatus, activeGoal?.status]);
 
   const lastAssistantId = [...messages].reverse().find((m) => m.role === "assistant")?.id;
   const lastMessageId = messages[messages.length - 1]?.id;
@@ -38,7 +52,16 @@ export default function ChatPanel() {
   return (
     <div className="flex flex-col h-full">
       <div className="flex-1 overflow-y-auto">
-        {messages.length === 0 ? (
+        {sessionHistoryLoading ? (
+          <div
+            className="flex h-full flex-col items-center justify-center gap-3 px-6 pb-16 text-gray-400"
+            role="status"
+            aria-live="polite"
+          >
+            <Loader2 className="h-5 w-5 animate-spin text-[#002fa7]" />
+            <p className="text-[13px]">正在加载会话…</p>
+          </div>
+        ) : messages.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center px-6 pb-16">
             <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-xl bg-gradient-to-br from-[#002fa7] to-[#4070ff] shadow-lg shadow-blue-900/10">
               <Sparkles className="h-6 w-6 text-white" />
@@ -85,11 +108,13 @@ export default function ChatPanel() {
         >
           <div className="mx-auto flex w-full max-w-[900px]">
             <div className={`inline-flex max-w-full items-center gap-2 rounded-full border px-3 py-1.5 text-[12px] shadow-sm backdrop-blur ${
-              runActivityStatus?.phase === "permission"
+              runActivityStatus?.phase === "permission" || runActivityStatus?.phase === "hitl"
                 ? "border-amber-200 bg-amber-50/95 text-amber-800"
                 : "border-blue-100 bg-white/90 text-slate-600"
             }`}>
-              {maintenanceStatus?.phase.endsWith("_done") ? (
+              {runActivityStatus?.phase === "hitl" ? (
+                <CircleHelp className="h-3.5 w-3.5 shrink-0 text-amber-600" />
+              ) : maintenanceStatus?.phase.endsWith("_done") ? (
                 <Sparkles className="h-3.5 w-3.5 shrink-0 text-emerald-500" />
               ) : (
                 <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-[#002fa7]" />

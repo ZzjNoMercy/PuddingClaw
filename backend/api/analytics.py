@@ -3,20 +3,20 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import json
+import logging
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.background import BackgroundTask
 
-from analytics.semantic_assets import SemanticAssetError, get_semantic_asset_registry
 from analytics.models import AnalyticsModelError, get_analytics_model_registry
 from analytics.nl2sql.entity_candidates import recommend_entity_candidates
 from analytics.nl2sql.guardrails import (
@@ -34,9 +34,32 @@ from analytics.nl2sql.result_store import (
     get_query_result_summary,
     list_query_results,
 )
+from analytics.project_export import AnalysisProjectExporter, AnalysisProjectExportError
+from analytics.semantic_assets import SemanticAssetError, get_semantic_asset_registry
 from analytics.table_catalog import TableAssetCatalog, TableCatalogError
 from config import get_database_qa_config
 from db import get_db_session, get_sessionmaker
+from knowledge.import_jobs import job_to_list_dict, list_import_jobs
+from knowledge.models import SemanticDimensionBuildJob
+from knowledge.semantic_dimension_crosswalk import (
+    SemanticDimensionCrosswalkError,
+    get_matching_overview,
+    get_matching_view,
+    retain_staged_entities_as_inactive,
+    save_source_registry_entry,
+)
+from knowledge.semantic_dimension_crosswalk import (
+    delete_override as delete_semantic_dimension_override,
+)
+from knowledge.semantic_dimension_crosswalk import (
+    publish_draft_overrides as publish_semantic_dimension_draft_overrides,
+)
+from knowledge.semantic_dimension_crosswalk import (
+    save_entity_override as save_semantic_dimension_entity_override,
+)
+from knowledge.semantic_dimension_crosswalk import (
+    save_override as save_semantic_dimension_override,
+)
 from knowledge.semantic_dimension_jobs import (
     cancel_semantic_dimension_build_job,
     create_semantic_dimension_build_job,
@@ -52,20 +75,6 @@ from knowledge.semantic_dimension_jobs import (
     task_notification_to_dict,
 )
 from knowledge.semantic_dimension_publisher import publish_semantic_dimension_build
-from knowledge.semantic_dimension_crosswalk import (
-    SemanticDimensionCrosswalkError,
-    delete_override as delete_semantic_dimension_override,
-    get_matching_overview,
-    get_matching_view,
-    publish_draft_overrides as publish_semantic_dimension_draft_overrides,
-    retain_staged_entities_as_inactive,
-    save_entity_override as save_semantic_dimension_entity_override,
-    save_override as save_semantic_dimension_override,
-    save_source_registry_entry,
-)
-from knowledge.models import SemanticDimensionBuildJob
-from knowledge.import_jobs import job_to_list_dict, list_import_jobs
-
 
 logger = logging.getLogger(__name__)
 
@@ -219,6 +228,12 @@ class AnalyticsModelCreateRequest(BaseModel):
     guardrails: list[str] = Field(default_factory=list)
     templates: dict[str, object] = Field(default_factory=dict)
     default_template: str | None = None
+
+
+class AnalyticsProjectExportRequest(BaseModel):
+    model_id: str = Field(min_length=1)
+    data_file_mode: Literal["copy", "reference"] = "copy"
+    expected_plan_id: str | None = None
 
 
 class SqlGuardrailRuleRequest(BaseModel):
@@ -798,6 +813,75 @@ async def import_analytics_models(files: list[UploadFile] = File(...)):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Failed to import analytics models: {exc}") from exc
+
+
+@router.post("/models/export-plan")
+async def plan_analytics_project_export(
+    request: AnalyticsProjectExportRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        plan = await AnalysisProjectExporter(BASE_DIR).build_plan(
+            session,
+            model_id=request.model_id,
+            data_file_mode=request.data_file_mode,
+        )
+        return {"plan": plan.model_dump(mode="json"), "ready": plan.ready}
+    except AnalysisProjectExportError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to plan analytics project export: {exc}") from exc
+
+
+@router.post("/models/export")
+async def export_analytics_project(
+    request: AnalyticsProjectExportRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        artifact = await AnalysisProjectExporter(BASE_DIR).export(
+            session,
+            model_id=request.model_id,
+            data_file_mode=request.data_file_mode,
+            expected_plan_id=request.expected_plan_id,
+        )
+        return FileResponse(
+            artifact.path,
+            media_type="application/zip",
+            filename=artifact.filename,
+            background=BackgroundTask(artifact.path.unlink, missing_ok=True),
+        )
+    except AnalysisProjectExportError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to export analytics project: {exc}") from exc
+
+
+@router.get("/models/export.zip")
+async def download_analytics_project(
+    model_id: str = Query(min_length=1),
+    data_file_mode: Literal["copy", "reference"] = Query(default="copy"),
+    expected_plan_id: str | None = Query(default=None),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Stream a potentially large project archive without buffering it in browser JavaScript."""
+    try:
+        artifact = await AnalysisProjectExporter(BASE_DIR).export(
+            session,
+            model_id=model_id,
+            data_file_mode=data_file_mode,
+            expected_plan_id=expected_plan_id,
+        )
+        return FileResponse(
+            artifact.path,
+            media_type="application/zip",
+            filename=artifact.filename,
+            background=BackgroundTask(artifact.path.unlink, missing_ok=True),
+        )
+    except AnalysisProjectExportError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to export analytics project: {exc}") from exc
 
 
 @router.get("/models/{model_id:path}")

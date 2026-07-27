@@ -15,39 +15,27 @@ from graph.permission_policy import RunPermissionContext
 from graph.permission_resume import permission_resume_registry
 from graph.session_manager import session_manager
 from graph.trace_collector import get_current_trace_collector
+from graph.virtual_paths import PathAuthority, classify_path_authority, is_virtual_path
 
 
 class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
     """Interrupt unauthorized external-file reads and exact-file writes."""
 
-    _VIRTUAL_PREFIXES = (
-        "/workspace/",
-        "/knowledge/",
-        "/semantic-assets/",
-        "/sql-guardrails/",
-        "/analytics-models/",
-        "/skills/",
-        "/large_tool_results/",
-        "/scratch/",
-    )
-
     @classmethod
     def _external_write_path(cls, raw_path: str, workspace_path: str) -> Path | None:
-        normalized = raw_path.replace("\\", "/")
-        if normalized.startswith(cls._VIRTUAL_PREFIXES):
+        classified = classify_path_authority(
+            raw_path,
+            workspace_root=workspace_path or None,
+        )
+        if classified.authority is not PathAuthority.EXTERNAL:
             return None
-        requested = Path(raw_path).expanduser()
-        if not requested.is_absolute():
-            return None
-        resolved = requested.resolve()
-        if workspace_path:
-            workspace = Path(workspace_path).expanduser().resolve()
-            try:
-                resolved.relative_to(workspace)
-                return None
-            except ValueError:
-                pass
-        return resolved
+        return classified.canonical_host_path
+
+    @classmethod
+    def _external_read_path(cls, raw_path: str, workspace_path: str) -> Path | None:
+        """Return a host path only when external read authority is required."""
+
+        return cls._external_write_path(raw_path, workspace_path)
 
     @staticmethod
     def _change_preview(tool_name: str, args: dict[str, Any]) -> dict[str, str]:
@@ -315,21 +303,16 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                 target_raw = str(args.get("target_path") or "").strip()
                 if not source_raw or not target_raw:
                     continue
-                source = Path(source_raw).expanduser().resolve()
+                source = self._external_read_path(source_raw, workspace_path)
                 target = self._external_write_path(target_raw, workspace_path)
-                source_granted = (
-                    session_manager.has_external_file_read_permission(
-                        session_id,
-                        source,
-                    )
+                source_granted = source is None or (
+                    session_manager.has_external_file_read_permission(session_id, source)
                     or self._has_directory_permission_for_path(
-                        session_id,
-                        source,
-                        access="read",
-                        run_id=run_id,
+                        session_id, source, access="read", run_id=run_id
                     )
                 )
                 if not source_granted:
+                    assert source is not None
                     request = permission_resume_registry.create_external_file_request(
                         session_id=session_id,
                         query_id=query_id,
@@ -372,7 +355,7 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                     access="write",
                     operation=tool_name,
                     change_preview={
-                        "source_path": str(source),
+                        "source_path": source_raw,
                         "mode": "atomic_create_only",
                     },
                 )
@@ -460,7 +443,7 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                 continue
             if raw_path.startswith("att_"):
                 continue
-            if raw_path.replace("\\", "/").startswith(self._VIRTUAL_PREFIXES):
+            if is_virtual_path(raw_path):
                 continue
 
             if tool_name in {
@@ -676,17 +659,9 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                     continue
                 change_preview = self._change_preview(tool_name, args)
             else:
-                requested = Path(raw_path).expanduser().resolve()
-                if tool_name == "read_file":
-                    if not Path(raw_path).expanduser().is_absolute():
-                        continue
-                    if workspace_path:
-                        workspace = Path(workspace_path).expanduser().resolve()
-                        try:
-                            requested.relative_to(workspace)
-                            continue
-                        except ValueError:
-                            pass
+                requested = self._external_read_path(raw_path, workspace_path)
+                if requested is None:
+                    continue
                 access = "read"
                 if (
                     session_manager.has_external_file_read_permission(session_id, requested)

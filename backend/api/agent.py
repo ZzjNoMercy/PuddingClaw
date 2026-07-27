@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -128,6 +129,7 @@ class AgentRequest(BaseModel):
     project_id: str | None = None
     analytics_model_id: str | None = None
     attachments: list[dict] = Field(default_factory=list)
+    skill_hints: list[str] | None = Field(default=None, max_length=8)
     goal_mode: bool = False
     goal_id: str | None = None
     context_goal_id: str | None = None
@@ -136,6 +138,20 @@ class AgentRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_goal_activation(self):
+        if self.skill_hints is not None:
+            normalized = [str(item).strip() for item in self.skill_hints if str(item).strip()]
+            if any(not re.fullmatch(r"[A-Za-z0-9][\w.-]{0,127}", item) for item in normalized):
+                raise ValueError("skill_hints contains an invalid Skill id")
+            if any(
+                not re.search(
+                    rf"(?<!\S)/{re.escape(item)}(?=$|[\s，,。.!！?？；;])",
+                    self.message,
+                    flags=re.IGNORECASE,
+                )
+                for item in normalized
+            ):
+                raise ValueError("skill_hints must reference a visible slash token in message")
+            self.skill_hints = list(dict.fromkeys(normalized))
         if self.goal_id and not self.goal_mode:
             raise ValueError("goal_id requires goal_mode=true")
         if self.goal_id and self.context_goal_id and self.goal_id != self.context_goal_id:
@@ -194,6 +210,7 @@ async def agent(request: AgentRequest):
             analytics_model_id=request.analytics_model_id,
             user_id=request.user_id,
             attachments=request.attachments,
+            skill_hints=request.skill_hints,
             user_message_already_persisted=persisted_user_message,
             goal_mode=request.goal_mode,
             goal_id=request.goal_id,
@@ -219,6 +236,7 @@ async def agent(request: AgentRequest):
         analytics_model_id=request.analytics_model_id,
         user_id=request.user_id,
         attachments=request.attachments,
+        skill_hints=request.skill_hints,
         user_message_already_persisted=request.goal_control_action is not None,
         goal_mode=request.goal_mode,
         goal_id=request.goal_id,

@@ -4,6 +4,8 @@
 >
 > **文档定位**：本文是外部 Agent 机制的附属调研与演进台账，不是 PuddingClaw Harness 的主架构文档。产品设计、当前边界与长期入口以 [PuddingClaw Harness Engineering 整合说明](./puddingclaw-harness-engineering.md) 为准。
 >
+> **Goal 完成协议更新（2026-07-26，待审核）**：Goal 默认改为 Agent 显式调用 `update_goal(completed=true)` 提交完成；最高级别保留为可选的“Rubric 验收（实验性）”。完整方案见 [Goal 完成协议与 Rubric 验收分层方案](./goal模式验收执行顺序优化方案.md)。本文早期关于 Goal 默认强制 Rubric 的段落仅作为历史演进记录。
+>
 > **归因边界**：Grok Build 只为权限确定性快路径、TodoGate 等少量机制提供过参考。PuddingClaw 的三控制面、Session/Checkpoint/Trace 权威边界、Goal/Run 状态机、Rubric/Effective Contract、Docker Backend、外部 Artifact/Directory/Attachment lease、上下文压缩、Toolset、协议修复与前端产品化，主要来自 PuddingClaw 自身需求、DeepAgents/LangGraph 能力和多轮真实 Session 复盘。
 
 状态：**方案已审核并持续实现于 `main` 工作区；项目后端测试集 670 项、前端生产构建、TaskProfile/Effective Contract、Manager 级动态问数、Goal/Rubric UI 与真实 Docker Backend E2E 已通过**

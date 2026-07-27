@@ -39,6 +39,9 @@ class CommitSkillInput(BaseModel):
 class _SkillTool(BaseTool):
     model_config = ConfigDict(arbitrary_types_allowed=True)
     service: SkillManagementService = Field(exclude=True, repr=False)
+    session_id: str = Field(default="", exclude=True, repr=False)
+    query_id: str = Field(default="", exclude=True, repr=False)
+    run_id: str = Field(default="", exclude=True, repr=False)
 
     @staticmethod
     def _render(callable_):
@@ -52,13 +55,25 @@ class PrepareSkillInstallTool(_SkillTool):
     name: str = "prepare_skill_install"
     description: str = (
         "Download and validate a remote Skill into managed staging, without changing /skills. "
-        "Returns an immutable plan, file diff and digest. Call install_skill with that exact plan only after review."
+        "Returns an immutable plan, file diff and digest with status=prepared. Prepared means NOT installed. "
+        "When ui_commit_supported=true, the frontend owns confirmation and commit. Otherwise the legacy "
+        "approval-gated install_skill continuation remains available."
     )
     args_schema: type[BaseModel] = PrepareSkillInput
     risk_level: str = "network"
 
     def _run(self, **kwargs) -> str:
-        return self._render(lambda: self.service.prepare(action="install", **kwargs))
+        return self._render(
+            lambda: self.service.prepare(
+                action="install",
+                request_context={
+                    "session_id": self.session_id,
+                    "query_id": self.query_id,
+                    "run_id": self.run_id,
+                },
+                **kwargs,
+            )
+        )
 
     async def _arun(self, **kwargs) -> str:
         return await asyncio.to_thread(self._run, **kwargs)
@@ -68,13 +83,25 @@ class PrepareSkillUpdateTool(_SkillTool):
     name: str = "prepare_skill_update"
     description: str = (
         "Download and validate an update into managed staging, compare it with the installed Skill, "
-        "and return an immutable plan. This does not modify /skills."
+        "and return an immutable plan with status=prepared. This does not modify /skills. "
+        "When ui_commit_supported=true, the frontend owns confirmation and commit. Otherwise the legacy "
+        "approval-gated update_skill continuation remains available."
     )
     args_schema: type[BaseModel] = PrepareSkillInput
     risk_level: str = "network"
 
     def _run(self, **kwargs) -> str:
-        return self._render(lambda: self.service.prepare(action="update", **kwargs))
+        return self._render(
+            lambda: self.service.prepare(
+                action="update",
+                request_context={
+                    "session_id": self.session_id,
+                    "query_id": self.query_id,
+                    "run_id": self.run_id,
+                },
+                **kwargs,
+            )
+        )
 
     async def _arun(self, **kwargs) -> str:
         return await asyncio.to_thread(self._run, **kwargs)

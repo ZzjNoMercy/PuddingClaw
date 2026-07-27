@@ -14,6 +14,9 @@ from harness.deterministic_checks import evaluate_deterministic_criteria
 from harness.evidence_ledger import EvidenceRef, is_evidence_ref, ref_key
 from harness.models import (
     CriterionEvaluation,
+    GoalCompletionPolicy,
+    GoalCompletionRequest,
+    GoalCompletionRequestStatus,
     GoalRecord,
     GoalRevision,
     GoalStatus,
@@ -92,6 +95,7 @@ class GoalCoordinator:
         goal_mode: bool,
         goal_id: str | None,
         goal_contract: RunVerificationContract | None,
+        completion_policy: GoalCompletionPolicy = GoalCompletionPolicy.STANDARD,
         max_rounds: int = 8,
     ) -> GoalRecord | None:
         if not goal_mode:
@@ -116,6 +120,7 @@ class GoalCoordinator:
             session_id=session_id,
             objective=objective.strip(),
             goal_contract=goal_contract,
+            completion_policy=completion_policy,
             max_rounds=max_rounds,
             revisions=[
                 GoalRevision(
@@ -359,13 +364,13 @@ class GoalCoordinator:
             goal.gaps = aggregate_gaps
         aggregate_status = goal.latest_goal_decision.status
         if outcome == RunOutcome.COMPLETED and aggregate_status == VerificationStatus.SATISFIED:
-            goal.transition(GoalStatus.ACHIEVED)
+            goal.transition(GoalStatus.COMPLETED)
         elif (
             outcome == RunOutcome.COMPLETED
             and report.status == VerificationStatus.NOT_REQUIRED
             and goal.goal_contract is None
         ):
-            goal.transition(GoalStatus.ACHIEVED)
+            goal.transition(GoalStatus.COMPLETED)
         elif (
             outcome == RunOutcome.BUDGET_EXCEEDED
             and run.budget_exhaustion_reason
@@ -411,6 +416,7 @@ class GoalCoordinator:
                 goal_id=goal.goal_id,
                 goal_revision=goal.objective_revision,
             )
+            goal.model_call_count += max(0, run.model_call_count)
         goal.current_run_id = None
         if gap and gap not in goal.control_notices:
             goal.control_notices.append(gap)
@@ -974,6 +980,7 @@ class HarnessRunCoordinator:
         analytics_model_id: str | None = None,
         config_snapshot: dict[str, Any] | None = None,
         verification_enabled: bool = True,
+        completion_policy: GoalCompletionPolicy | str = GoalCompletionPolicy.STANDARD,
         goal_max_rounds: int = 8,
         custom_rubric_rules: list[dict[str, Any]] | None = None,
         task_profile: RunTaskProfile | None = None,
@@ -1005,6 +1012,7 @@ class HarnessRunCoordinator:
                 analytics_model_id=analytics_model_id,
             )
         )
+        resolved_completion_policy = GoalCompletionPolicy(completion_policy)
         contract = (
             self.verification.compile_contract(
                 user_message=objective,
@@ -1014,7 +1022,7 @@ class HarnessRunCoordinator:
                 force_required=(resolved_run_kind == RunKind.GOAL_EXECUTION),
                 task_profile=task_profile,
             )
-            if verification_enabled
+            if verification_enabled and resolved_completion_policy == GoalCompletionPolicy.RUBRIC
             else None
         )
         goal = (
@@ -1024,6 +1032,7 @@ class HarnessRunCoordinator:
                 goal_mode=True,
                 goal_id=goal_id,
                 goal_contract=contract,
+                completion_policy=resolved_completion_policy,
                 max_rounds=goal_max_rounds,
             )
             if resolved_run_kind == RunKind.GOAL_EXECUTION
@@ -1121,8 +1130,9 @@ class HarnessRunCoordinator:
             analytics_model_id=analytics_model_id,
             verification_enabled=verification_enabled,
             verification_mode=(
-                VerificationMode.GOAL
-                if verification_enabled
+                VerificationMode.RUBRIC
+                if resolved_completion_policy == GoalCompletionPolicy.RUBRIC
+                and verification_enabled
                 and resolved_run_kind == RunKind.GOAL_EXECUTION
                 and goal is not None
                 else VerificationMode.AGENT
@@ -1187,8 +1197,68 @@ class HarnessRunCoordinator:
         run: RunRecord,
         goal: GoalRecord | None,
         final_state: dict[str, Any] | None,
-    ) -> tuple[RunRecord, GoalRecord | None, RubricEvaluationReport]:
+    ) -> tuple[RunRecord, GoalRecord | None, RubricEvaluationReport | None]:
         self._refresh_runtime_fields(run)
+        # A standard Goal is accepted only after the Agent made an explicit,
+        # still-live completion declaration.  Natural termination completes
+        # this Run but never silently completes the cross-Run Goal.
+        if goal is not None and goal.completion_policy == GoalCompletionPolicy.STANDARD:
+            state = self._sessions.get_harness_state(run.session_id)
+            raw_requests = state.get("completion_requests") or {}
+            raw_request = (
+                raw_requests.get(run.completion_request_id)
+                if isinstance(raw_requests, dict) and run.completion_request_id
+                else None
+            )
+            request = GoalCompletionRequest.model_validate(raw_request) if isinstance(raw_request, dict) else None
+            if (
+                request is not None
+                and request.status == GoalCompletionRequestStatus.REQUESTED
+                and request.goal_id == goal.goal_id
+                and request.run_id == run.run_id
+                and request.objective_revision == goal.objective_revision == run.goal_revision
+            ):
+                run.finish(RunOutcome.COMPLETED)
+                goal.model_call_count += max(0, run.model_call_count)
+                goal.transition(GoalStatus.COMPLETED)
+                goal.latest_completion_request_id = request.request_id
+                return run, goal, None
+            run.finish(RunOutcome.COMPLETED)
+            saved = self._sessions.terminalize_run_state(
+                run.session_id, run.run_id, run.model_dump(mode="json")
+            )
+            self._replace_run(run, RunRecord.model_validate(saved))
+            goal = self.goals.release_run(goal, run=run)
+            return run, goal, None
+        if goal is not None and goal.completion_policy == GoalCompletionPolicy.RUBRIC:
+            state = self._sessions.get_harness_state(run.session_id)
+            raw_requests = state.get("completion_requests") or {}
+            raw_request = (
+                raw_requests.get(run.completion_request_id)
+                if isinstance(raw_requests, dict) and run.completion_request_id
+                else None
+            )
+            request = GoalCompletionRequest.model_validate(raw_request) if isinstance(raw_request, dict) else None
+            if not (
+                request is not None
+                and request.status == GoalCompletionRequestStatus.REQUESTED
+                and request.policy == GoalCompletionPolicy.RUBRIC
+                and request.goal_id == goal.goal_id
+                and request.run_id == run.run_id
+                and request.objective_revision == goal.objective_revision == run.goal_revision
+            ):
+                run.finish(RunOutcome.COMPLETED)
+                saved = self._sessions.terminalize_run_state(
+                    run.session_id, run.run_id, run.model_dump(mode="json")
+                )
+                self._replace_run(run, RunRecord.model_validate(saved))
+                goal = self.goals.release_run(goal, run=run)
+                return run, goal, None
+            self._sessions.update_goal_completion_request_status(
+                run.session_id,
+                request.request_id,
+                GoalCompletionRequestStatus.EVALUATING.value,
+            )
         if run.status == RunStatus.RUNNING and run.requires_goal_verification:
             self.transition(
                 run,
@@ -1329,6 +1399,25 @@ class HarnessRunCoordinator:
             )
         outcome = self.verification.outcome_for_report(report)
         run.verification_report = report
+        # Successful Rubric results remain a proposal until the candidate
+        # final response is available.  Do not terminalize either authority
+        # here: SessionManager commits request, report, Run, Goal and message
+        # together in one write.
+        if (
+            goal is not None
+            and goal.completion_policy == GoalCompletionPolicy.RUBRIC
+            and outcome == RunOutcome.COMPLETED
+            and report.status == VerificationStatus.SATISFIED
+        ):
+            report.accepted_for_goal_revision = True
+            report.goal_revision = run.goal_revision
+            report.verification_scope = "goal_aggregate"
+            report.supporting_run_ids = list(dict.fromkeys([*goal.run_ids, run.run_id]))
+            run.verification_report = report
+            run.finish(outcome)
+            goal.latest_verification_report_id = report.report_id
+            goal.transition(GoalStatus.COMPLETED)
+            return run, goal, report
         run.finish(outcome)
         saved = self._sessions.terminalize_run_state(
             run.session_id,
@@ -1338,11 +1427,29 @@ class HarnessRunCoordinator:
         self._replace_run(run, RunRecord.model_validate(saved))
         if goal is not None:
             goal = self.goals.apply_run_report(goal, run, report, outcome)
+            if run.completion_request_id:
+                request_status = (
+                    GoalCompletionRequestStatus.EVALUATING
+                    if goal.status == GoalStatus.COMPLETED
+                    else GoalCompletionRequestStatus.NEEDS_REVISION
+                    if report.status in {
+                        VerificationStatus.NEEDS_REVISION,
+                        VerificationStatus.FAILED,
+                        VerificationStatus.MAX_ITERATIONS_REACHED,
+                    }
+                    else GoalCompletionRequestStatus.REJECTED
+                )
+                self._sessions.update_goal_completion_request_status(
+                    run.session_id,
+                    run.completion_request_id,
+                    request_status.value,
+                    verification_report_id=report.report_id,
+                )
             decision = goal.latest_goal_decision
             if decision is not None and decision.objective_revision == run.goal_revision:
                 report.supporting_run_ids = list(decision.supporting_run_ids)
             report.accepted_for_goal_revision = bool(
-                goal.status == GoalStatus.ACHIEVED
+                goal.status == GoalStatus.COMPLETED
                 and goal.objective_revision == run.goal_revision
                 and (
                     report.status == VerificationStatus.NOT_REQUIRED
@@ -1364,6 +1471,14 @@ class HarnessRunCoordinator:
         return run, goal, report
 
     def _refresh_runtime_fields(self, run: RunRecord) -> None:
+        """Refresh fields that Tool middleware may persist during a live Run.
+
+        The graph holds a RunRecord created before Tool execution.  Trusted
+        middleware such as ``update_goal`` writes completion authority directly
+        to Session state, so the in-memory record must observe those fields
+        before terminal completion is decided.
+        """
+
         persisted = self._sessions.get_run_state(run.session_id, run.run_id)
         if not isinstance(persisted, dict):
             return
@@ -1371,6 +1486,8 @@ class HarnessRunCoordinator:
         run.task_profile = current.task_profile
         run.declared_verification_contract = current.declared_verification_contract
         run.verification_activations = list(current.verification_activations)
+        run.completion_request_id = current.completion_request_id
+        run.completion_requested_at = current.completion_requested_at
         if current.verification_contract is not None:
             run.verification_contract = current.verification_contract
 

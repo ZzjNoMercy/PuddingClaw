@@ -1,13 +1,13 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
-import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Database, Download, FileSpreadsheet, FileText, FolderOpen, Globe2, Key, KeyRound, Layers3, PauseCircle, Plus, Sparkles, SquareTerminal, Trash2 } from "lucide-react";
-import { denyPermissionRequest, grantExternalFilePermission, grantToolActionPermission, openLocalFile, resolveDatabaseSqlRevisionRequest, resolveDimensionBuildRuleRequest, resolveLogicalDatasetRuleRequest, type AgentAttachment, type DatabaseSqlRevisionRequest, type DimensionBuildRuleRequest, type LogicalDatasetRuleRequest, type PermissionRequest } from "@/lib/api";
+import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Database, Download, FileSpreadsheet, FileText, FolderOpen, Globe2, HelpCircle, Key, KeyRound, Layers3, PauseCircle, Plus, Sparkles, SquareTerminal, Trash2 } from "lucide-react";
+import { denyPermissionRequest, grantExternalFilePermission, grantToolActionPermission, openLocalFile, resolveDatabaseSqlRevisionRequest, resolveDimensionBuildRuleRequest, resolveLogicalDatasetRuleRequest, resolveUserInputRequest, type AgentAttachment, type DatabaseSqlRevisionRequest, type DimensionBuildRuleRequest, type LogicalDatasetRuleRequest, type PermissionRequest, type UserInputAnswer, type UserInputRequest } from "@/lib/api";
 import { markdownRemarkPlugins, markdownUrlTransform } from "@/lib/markdown";
 import { useApp, type ChatMessage as ChatMessageType, type SourceRecord, type TimelineItem } from "@/lib/store";
-import ThoughtChain from "./ThoughtChain";
+import ThoughtChain, { SkillPlanCards } from "./ThoughtChain";
 import RetrievalCard from "./RetrievalCard";
 
 interface Props {
@@ -48,6 +48,9 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
   const renderedContent = renderCitationMarkers(message, sessionSources);
   const availableSources = mergeSources(message.sources, sessionSources);
   const { sessionId, setActiveSourceId, setInspectorOpen } = useApp();
+  const skillPlanTimeline = message.segments?.length
+    ? message.segments.flatMap((segment) => segment.timeline || [])
+    : message.timeline || [];
   const pendingPermissionRequests = (message.permissionRequests || []).filter(
     (request) => request.status !== "resolved"
   );
@@ -58,8 +61,9 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
     (request) => request.status !== "resolved"
   );
   const pendingDatabaseSqlRevisionRequests = (message.databaseSqlRevisionRequests || []).filter(
-    (request) => request.status !== "resolved"
+    (request) => (request.status || "pending") === "pending"
   );
+  const visibleUserInputRequests = message.userInputRequests || [];
 
   const citationComponents: Components = {
     a: (props) => (
@@ -113,6 +117,7 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
                       verificationSummary={index === message.segments!.length - 1 ? message.verificationSummary : undefined}
                     />
                   ))}
+                  <SkillPlanCards timeline={skillPlanTimeline} sessionId={sessionId} />
                   {message.retrievals && message.retrievals.length > 0 && (
                     <RetrievalCard retrievals={message.retrievals} />
                   )}
@@ -132,7 +137,10 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
                   {pendingDatabaseSqlRevisionRequests.map((request) => (
                     <DatabaseSqlRevisionCard key={request.id} request={request} />
                   ))}
-                  {(message.segments.length > 0 || pendingPermissionRequests.length > 0 || pendingDimensionBuildRuleRequests.length > 0 || pendingLogicalDatasetRuleRequests.length > 0 || pendingDatabaseSqlRevisionRequests.length > 0) && (
+                  {visibleUserInputRequests.map((request) => (
+                    <UserInputRequestCard key={request.id} request={request} sessionId={sessionId} />
+                  ))}
+                  {(message.segments.length > 0 || pendingPermissionRequests.length > 0 || pendingDimensionBuildRuleRequests.length > 0 || pendingLogicalDatasetRuleRequests.length > 0 || pendingDatabaseSqlRevisionRequests.length > 0 || visibleUserInputRequests.length > 0) && (
                     <div className="text-[10px] text-gray-400 mt-1 pl-1">
                       {formatTime(message.timestamp)}
                     </div>
@@ -184,6 +192,7 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
                         {!hasTools && thoughtChain}
                         {contentBlock}
                         {hasTools && thoughtChain}
+                        <SkillPlanCards timeline={skillPlanTimeline} sessionId={sessionId} />
                         {pendingPermissionRequests.map((request) => (
                           <PermissionRequestCard
                             key={request.id}
@@ -200,7 +209,10 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
                         {pendingDatabaseSqlRevisionRequests.map((request) => (
                           <DatabaseSqlRevisionCard key={request.id} request={request} />
                         ))}
-                        {((message.content || thoughtChain) || pendingPermissionRequests.length > 0 || pendingDimensionBuildRuleRequests.length > 0 || pendingLogicalDatasetRuleRequests.length > 0 || pendingDatabaseSqlRevisionRequests.length > 0) && (
+                        {visibleUserInputRequests.map((request) => (
+                          <UserInputRequestCard key={request.id} request={request} sessionId={sessionId} />
+                        ))}
+                        {((message.content || thoughtChain) || pendingPermissionRequests.length > 0 || pendingDimensionBuildRuleRequests.length > 0 || pendingLogicalDatasetRuleRequests.length > 0 || pendingDatabaseSqlRevisionRequests.length > 0 || visibleUserInputRequests.length > 0) && (
                           <div className="text-[10px] text-gray-400 mt-1 pl-1">
                             {formatTime(message.timestamp)}
                           </div>
@@ -747,6 +759,209 @@ function ToolActionPermissionCard({
         </div>
       </div>
     </div>
+  );
+}
+
+function UserInputRequestCard({ request, sessionId }: { request: UserInputRequest; sessionId: string }) {
+  type Draft = { optionIds: string[]; text: string };
+  const draftStorageKey = `puddingclaw:user-input-draft:${sessionId}:${request.id}:v${request.version}`;
+  const [drafts, setDrafts] = useState<Record<string, Draft>>(() => {
+    if (typeof window !== "undefined") {
+      try {
+        const saved = window.sessionStorage.getItem(draftStorageKey);
+        if (saved) return JSON.parse(saved) as Record<string, Draft>;
+      } catch {
+        // Fall through to an empty form if storage is unavailable/corrupt.
+      }
+    }
+    return Object.fromEntries(
+      request.questions.map((question) => [question.id, { optionIds: [], text: "" }]),
+    );
+  });
+  const [status, setStatus] = useState<"idle" | "loading" | "submitted" | "cancelled" | "decided" | "error">("idle");
+  const [error, setError] = useState("");
+  const submittingRef = useRef(false);
+
+  useEffect(() => {
+    try {
+      if (request.status === "pending") {
+        window.sessionStorage.setItem(draftStorageKey, JSON.stringify(drafts));
+      } else {
+        window.sessionStorage.removeItem(draftStorageKey);
+      }
+    } catch {
+      // Draft persistence is best-effort; server validation remains authoritative.
+    }
+  }, [draftStorageKey, drafts, request.status]);
+
+  const updateChoice = (questionId: string, optionId: string, multiple: boolean) => {
+    setDrafts((current) => {
+      const draft = current[questionId] || { optionIds: [], text: "" };
+      const optionIds = multiple
+        ? draft.optionIds.includes(optionId)
+          ? draft.optionIds.filter((item) => item !== optionId)
+          : [...draft.optionIds, optionId]
+        : [optionId];
+      return {
+        ...current,
+        [questionId]: { ...draft, optionIds, text: multiple ? draft.text : "" },
+      };
+    });
+  };
+
+  if (request.status !== "pending" && request.decision) {
+    const action = request.decision.action;
+    const answerLabels = (request.decision.answers || []).flatMap((answer) => {
+      const question = request.questions.find((item) => item.id === answer.question_id);
+      const selected = answer.option_ids.map((optionId) =>
+        question?.options?.find((option) => option.id === optionId)?.label || optionId
+      );
+      return [...selected, ...(answer.text ? [answer.text] : [])];
+    });
+    const text = action === "cancel"
+      ? "已跳过这个问题，Agent 将继续执行。"
+      : action === "agent_decide"
+        ? "已交由 Agent 按推荐项或稳妥默认值继续。"
+        : `已提交：${answerLabels.join("；") || "已确认"}`;
+    const cancelled = action === "cancel";
+    return <div className={`mb-3 inline-flex items-center gap-2 rounded-xl border px-3 py-2 text-sm ${cancelled ? "border-slate-200 bg-slate-50 text-slate-600" : "border-emerald-200 bg-emerald-50 text-emerald-800"}`} role="status"><CheckCircle2 className="h-4 w-4" />{text}</div>;
+  }
+
+  const validate = (): UserInputAnswer[] | null => {
+    const answers = request.questions.map((question) => ({
+      question_id: question.id,
+      option_ids: drafts[question.id]?.optionIds || [],
+      text: (drafts[question.id]?.text || "").trim(),
+    }));
+    for (let index = 0; index < request.questions.length; index += 1) {
+      const question = request.questions[index];
+      const answer = answers[index];
+      const count = answer.option_ids.length + (answer.text ? 1 : 0);
+      if (question.required !== false && count === 0) {
+        setError(`请回答“${question.prompt}”。`);
+        return null;
+      }
+      if (question.type === "multi_select") {
+        const minimum = question.min_selections ?? (question.required === false ? 0 : 1);
+        if (count < minimum) {
+          setError(`“${question.prompt}”至少选择 ${minimum} 项。`);
+          return null;
+        }
+        if (question.max_selections != null && count > question.max_selections) {
+          setError(`“${question.prompt}”最多选择 ${question.max_selections} 项。`);
+          return null;
+        }
+      }
+    }
+    return answers;
+  };
+
+  const resolve = async (action: "submit" | "cancel" | "agent_decide") => {
+    if (submittingRef.current) return;
+    const answers = action === "submit" ? validate() : [];
+    if (action === "submit" && !answers) return;
+    submittingRef.current = true;
+    setStatus("loading");
+    setError("");
+    try {
+      await resolveUserInputRequest(sessionId, request.id, {
+        request_version: request.version,
+        action,
+        answers: answers || [],
+      });
+      setStatus(action === "submit" ? "submitted" : action === "cancel" ? "cancelled" : "decided");
+    } catch (nextError) {
+      submittingRef.current = false;
+      setStatus("error");
+      setError(nextError instanceof Error ? nextError.message : "提交选择失败，请重试");
+    }
+  };
+
+  if (["submitted", "cancelled", "decided"].includes(status)) {
+    const label = status === "submitted"
+      ? "已提交，Agent 将继续执行。"
+      : status === "decided"
+        ? "已交由 Agent 采用推荐方案继续。"
+        : "已跳过这个问题，Agent 将继续执行。";
+    const cancelled = status === "cancelled";
+    return <div className={`mb-3 inline-flex items-center gap-2 rounded-xl border px-3 py-2 text-sm ${cancelled ? "border-slate-200 bg-slate-50 text-slate-600" : "border-emerald-200 bg-emerald-50 text-emerald-800"}`} role="status"><CheckCircle2 className="h-4 w-4" />{label}</div>;
+  }
+
+  return (
+    <form
+      className="mb-4 max-w-[820px] rounded-2xl border border-blue-200 bg-white p-5 shadow-sm shadow-blue-950/[0.05]"
+      onSubmit={(event) => { event.preventDefault(); void resolve("submit"); }}
+    >
+      <div className="flex items-start gap-3">
+        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-blue-50 text-[#002fa7]"><HelpCircle className="h-5 w-5" /></div>
+        <div>
+          <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[#002fa7]">需要你的选择</p>
+          <h3 className="mt-1 text-base font-bold text-slate-950">{request.title}</h3>
+          <p className="mt-1 text-sm leading-6 text-slate-500">{request.reason}</p>
+        </div>
+      </div>
+      <div className="mt-4 space-y-4">
+        {request.questions.map((question) => {
+          const draft = drafts[question.id] || { optionIds: [], text: "" };
+          return (
+            <fieldset key={question.id} className="rounded-xl border border-slate-200 p-4" disabled={status === "loading"}>
+              <legend className="px-1 text-sm font-semibold text-slate-800">{question.prompt}{question.required === false ? <span className="ml-1 font-normal text-slate-400">（可选）</span> : null}</legend>
+              {question.type === "text" ? (
+                <textarea
+                  value={draft.text}
+                  maxLength={question.max_length || 1000}
+                  required={question.required !== false}
+                  onChange={(event) => setDrafts((current) => ({ ...current, [question.id]: { ...draft, text: event.target.value } }))}
+                  className="mt-2 min-h-24 w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-[#002fa7] focus:ring-2 focus:ring-blue-100"
+                />
+              ) : (
+                <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                  {(question.options || []).map((option) => {
+                    const checked = draft.optionIds.includes(option.id);
+                    return (
+                      <label key={option.id} className={`flex cursor-pointer gap-3 rounded-xl border p-3 transition ${checked ? "border-[#002fa7] bg-blue-50" : "border-slate-200 hover:border-slate-300"}`}>
+                        <input
+                          type={question.type === "single_select" ? "radio" : "checkbox"}
+                          name={`question-${request.id}-${question.id}`}
+                          value={option.id}
+                          checked={checked}
+                          onChange={() => updateChoice(question.id, option.id, question.type === "multi_select")}
+                          className="mt-0.5 h-4 w-4 accent-[#002fa7]"
+                        />
+                        <span><span className="block text-sm font-semibold text-slate-800">{option.label}{option.recommended ? <span className="ml-1.5 rounded-full bg-blue-100 px-1.5 py-0.5 text-[10px] text-[#002fa7]">推荐</span> : null}</span>{option.description ? <span className="mt-0.5 block text-xs leading-5 text-slate-500">{option.description}</span> : null}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+              )}
+              {question.type !== "text" && question.allow_other ? (
+                <label className="mt-3 block text-xs font-medium text-slate-600">其他
+                  <input
+                    value={draft.text}
+                    maxLength={question.max_length || 1000}
+                    onChange={(event) => setDrafts((current) => ({
+                      ...current,
+                      [question.id]: {
+                        ...draft,
+                        optionIds: question.type === "single_select" ? [] : draft.optionIds,
+                        text: event.target.value,
+                      },
+                    }))}
+                    className="mt-1.5 h-9 w-full rounded-lg border border-slate-200 px-3 text-sm font-normal outline-none focus:border-[#002fa7]"
+                  />
+                </label>
+              ) : null}
+            </fieldset>
+          );
+        })}
+      </div>
+      {error ? <p className="mt-3 text-sm text-rose-600" role="alert">{error}</p> : null}
+      <div className="mt-4 flex flex-wrap justify-end gap-2">
+        <button type="button" disabled={status === "loading"} onClick={() => void resolve("cancel")} className="h-9 rounded-xl px-4 text-sm font-semibold text-slate-500 hover:bg-slate-50 disabled:opacity-50">取消</button>
+        {request.allow_agent_decide !== false ? <button type="button" disabled={status === "loading"} onClick={() => void resolve("agent_decide")} className="h-9 rounded-xl border border-slate-300 bg-white px-4 text-sm font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50">由 Agent 决定</button> : null}
+        <button type="submit" disabled={status === "loading"} className="inline-flex h-9 items-center gap-2 rounded-xl bg-[#002fa7] px-4 text-sm font-semibold text-white hover:bg-[#00247f] disabled:opacity-50">{status === "loading" ? <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-white/40 border-t-white" /> : <CheckCircle2 className="h-4 w-4" />}确认并继续</button>
+      </div>
+    </form>
   );
 }
 
