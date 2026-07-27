@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from urllib.parse import quote
+
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 from starlette.datastructures import UploadFile
@@ -80,4 +83,38 @@ async def download_attachment(attachment_id: str, session_id: str):
         path=str(item["path"]),
         media_type=str(item.get("mime_type") or "application/octet-stream"),
         filename=str(item.get("name") or "attachment"),
+    )
+
+
+@router.get("/attachments/{attachment_id}/preview")
+async def preview_attachment(attachment_id: str, session_id: str):
+    """Render one immutable raster image inside its owning Session boundary."""
+
+    if not session_manager.session_exists(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    item = attachment_store.get(session_id, attachment_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    preview = attachment_store.preview_info(item)
+    if preview is None:
+        # SVG is deliberately excluded: it is active document content rather
+        # than an inert screenshot/QR bitmap and should remain downloadable.
+        raise HTTPException(status_code=415, detail="Attachment is not a previewable image")
+
+    filename = Path(str(item.get("name") or "image")).name
+    headers = {
+        "Cache-Control": "private, no-store",
+        "Content-Disposition": f"inline; filename*=UTF-8''{quote(filename, safe='')}",
+        "Content-Security-Policy": "default-src 'none'; sandbox",
+        "Cross-Origin-Resource-Policy": "same-origin",
+        "X-Content-Type-Options": "nosniff",
+    }
+    content_sha256 = str(item.get("sha256") or "")
+    if content_sha256:
+        headers["ETag"] = f'"{content_sha256}"'
+    return FileResponse(
+        path=str(item["path"]),
+        media_type=str(preview["mime_type"]),
+        headers=headers,
     )

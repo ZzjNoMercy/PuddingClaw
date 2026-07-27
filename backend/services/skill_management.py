@@ -35,6 +35,8 @@ _MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024
 _PLAN_TTL_SECONDS = 60 * 60
 _SNAPSHOT_RETENTION = 10
 _FORBIDDEN_SUFFIXES = {".exe", ".dll", ".dylib", ".so", ".bat", ".cmd", ".ps1"}
+_DISCOVERY_SCHEMA_V2 = "https://schemas.agentskills.io/discovery/0.2.0/schema.json"
+_WELL_KNOWN_PATHS = (".well-known/agent-skills", ".well-known/skills")
 
 
 class SkillManagementError(RuntimeError):
@@ -83,6 +85,7 @@ class SkillManagementService:
         ref: str | None = None,
         subpath: str | None = None,
         files: list[str] | None = None,
+        source_digest: str | None = None,
         request_context: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         requested_source = (source or "").strip()
@@ -94,6 +97,11 @@ class SkillManagementService:
             ref = ref if ref is not None else str(provenance.get("ref") or "main")
             subpath = subpath if subpath is not None else str(provenance.get("subpath") or "")
             files = files if files is not None else list(provenance.get("files") or [])
+            source_digest = (
+                source_digest
+                if source_digest is not None
+                else str(provenance.get("source_digest") or "") or None
+            )
         if not requested_source:
             raise SkillManagementError("source_required")
         resolved_ref = (ref or "main").strip() or "main"
@@ -113,6 +121,7 @@ class SkillManagementService:
                     "ref": resolved_ref,
                     "subpath": resolved_subpath,
                     "files": resolved_files,
+                    "source_digest": source_digest or "",
                     "request_context": normalized_context,
                 }
             )
@@ -138,6 +147,7 @@ class SkillManagementService:
                 ref=resolved_ref,
                 subpath=resolved_subpath,
                 files=resolved_files,
+                source_digest=source_digest,
             )
             staged = self._manifest(payload_dir)
             declared_name = str(staged["metadata"].get("name") or "").strip()
@@ -178,6 +188,8 @@ class SkillManagementService:
                 "staged_metadata": staged["metadata"],
                 "diff": diff,
             }
+            if source_digest:
+                plan["source_digest"] = source_digest
             if normalized_context:
                 plan["request_context"] = normalized_context
             if request_key:
@@ -195,6 +207,223 @@ class SkillManagementService:
         except Exception:
             shutil.rmtree(plan_dir, ignore_errors=True)
             raise
+
+    def prepare_npx_skills_add(
+        self,
+        *,
+        source: str,
+        skill_names: list[str] | None = None,
+        yes: bool = False,
+        install_all: bool = False,
+        list_only: bool = False,
+        request_context: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Take over ``npx skills add`` without allowing it to write the workspace.
+
+        The generic CLI's agent/scope/copy flags are intentionally irrelevant:
+        PuddingClaw has one managed destination, ``base_dir / skills``.  Each
+        discovered Skill receives its own immutable, Session-bound plan so the
+        existing plan-card confirmation and atomic commit path remains the only
+        write authority.
+        """
+
+        requested_source = source.strip()
+        if not requested_source:
+            raise SkillManagementError("source_required")
+        discovered = self._discover_well_known_skills(requested_source)
+        if not discovered:
+            raise SkillManagementError(
+                "unsupported_npx_skill_source",
+                "Managed npx takeover currently requires an HTTP(S) well-known Agent Skills endpoint",
+            )
+
+        available = [str(item["name"]) for item in discovered]
+        requested = [name.strip() for name in (skill_names or []) if name.strip()]
+        requested_keys = {name.casefold() for name in requested if name != "*"}
+        if "*" in requested or install_all:
+            selected = discovered
+        elif requested_keys:
+            selected = [item for item in discovered if str(item["name"]).casefold() in requested_keys]
+        elif len(discovered) == 1 or yes:
+            selected = discovered
+        else:
+            return {
+                "ok": True,
+                "managed_by": "skill_management",
+                "intercepted": True,
+                "source": requested_source,
+                "selection_required": True,
+                "available_skills": available,
+                "plans": [],
+            }
+
+        selected_keys = {str(item["name"]).casefold() for item in selected}
+        missing = sorted(name for name in requested if name != "*" and name.casefold() not in selected_keys)
+        if missing:
+            raise SkillManagementError(
+                "skill_not_found_in_source",
+                f"No matching skills found for: {', '.join(missing)}",
+            )
+        if list_only:
+            return {
+                "ok": True,
+                "managed_by": "skill_management",
+                "intercepted": True,
+                "source": requested_source,
+                "list_only": True,
+                "available_skills": available,
+                "plans": [],
+            }
+
+        plans: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        for item in selected:
+            name = str(item["name"])
+            target = self.skills_dir / name
+            action: Literal["install", "update"] = (
+                "update" if target.is_dir() and not target.is_symlink() else "install"
+            )
+            try:
+                plans.append(
+                    self.prepare(
+                        action=action,
+                        source=str(item["source"]),
+                        skill_name=name,
+                        files=list(item.get("files") or []),
+                        source_digest=str(item.get("digest") or "") or None,
+                        request_context=request_context,
+                    )
+                )
+            except SkillManagementError as exc:
+                errors.append({"skill_name": name, "error": exc.code, "message": exc.message})
+        return {
+            "ok": bool(plans) and not errors,
+            "managed_by": "skill_management",
+            "intercepted": True,
+            "source": requested_source,
+            "available_skills": available,
+            "plans": plans,
+            "errors": errors,
+        }
+
+    def _discover_well_known_skills(self, source: str) -> list[dict[str, Any]]:
+        parsed = urlsplit(source)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return []
+        base_path = parsed.path.rstrip("/")
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        candidates: list[tuple[str, str, str]] = []
+        for well_known_path in _WELL_KNOWN_PATHS:
+            candidates.append(
+                (
+                    f"{origin}{base_path}/{well_known_path}/index.json",
+                    f"{origin}{base_path}",
+                    well_known_path,
+                )
+            )
+            if base_path:
+                candidates.append(
+                    (
+                        f"{origin}/{well_known_path}/index.json",
+                        origin,
+                        well_known_path,
+                    )
+                )
+        for index_url, resolved_base, well_known_path in candidates:
+            try:
+                raw = self._download(index_url)
+                payload = json.loads(raw.decode("utf-8"))
+                discovered = self._normalize_well_known_index(
+                    payload,
+                    index_url=index_url,
+                    resolved_base=resolved_base,
+                    well_known_path=well_known_path,
+                )
+            except (SkillManagementError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if discovered:
+                return discovered
+        return []
+
+    @staticmethod
+    def _normalize_well_known_index(
+        payload: Any,
+        *,
+        index_url: str,
+        resolved_base: str,
+        well_known_path: str,
+    ) -> list[dict[str, Any]]:
+        if not isinstance(payload, dict) or not isinstance(payload.get("skills"), list):
+            return []
+        schema = payload.get("$schema")
+        discovered: list[dict[str, Any]] = []
+        if schema == _DISCOVERY_SCHEMA_V2:
+            for raw in payload["skills"]:
+                if not isinstance(raw, dict):
+                    continue
+                name = str(raw.get("name") or "")
+                kind = str(raw.get("type") or "")
+                description = raw.get("description")
+                digest = str(raw.get("digest") or "")
+                url = str(raw.get("url") or "")
+                if (
+                    not _SKILL_NAME.fullmatch(name)
+                    or kind not in {"skill-md", "archive"}
+                    or not isinstance(description, str)
+                    or not description
+                    or len(description) > 1024
+                    or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+                    or not url
+                ):
+                    continue
+                artifact_url = urljoin(index_url, url)
+                if kind == "archive" and not urlsplit(artifact_url).path.lower().endswith(".zip"):
+                    continue
+                discovered.append(
+                    {
+                        "name": name,
+                        "source": artifact_url,
+                        "files": [],
+                        "digest": digest,
+                    }
+                )
+            return discovered
+        if schema is not None:
+            return []
+        for raw in payload["skills"]:
+            if not isinstance(raw, dict):
+                return []
+            name = str(raw.get("name") or "")
+            description = raw.get("description")
+            files = raw.get("files")
+            if (
+                not _SKILL_NAME.fullmatch(name)
+                or not isinstance(description, str)
+                or not description
+                or not isinstance(files, list)
+                or not files
+                or len(files) > _MAX_FILES
+            ):
+                return []
+            try:
+                normalized_files = [_safe_relative(str(path)) for path in files]
+            except SkillManagementError:
+                return []
+            if not any(path.casefold() == "skill.md" for path in normalized_files):
+                return []
+            discovered.append(
+                {
+                    "name": name,
+                    "source": f"{resolved_base.rstrip('/')}/{well_known_path}/{name}",
+                    "files": [
+                        path
+                        for path in normalized_files
+                        if path.casefold() not in {"skill.md", "readme.md"}
+                    ],
+                    "digest": "",
+                }
+            )
+        return discovered
 
     def preview(self, plan_id: str) -> dict[str, Any] | None:
         try:
@@ -364,6 +593,7 @@ class SkillManagementService:
         ref: str,
         subpath: str,
         files: list[str],
+        source_digest: str | None = None,
     ) -> None:
         parsed = urlsplit(source)
         if parsed.scheme not in {"http", "https"}:
@@ -375,11 +605,34 @@ class SkillManagementService:
             archive = self._download(archive_url)
             self._extract_archive(archive, target, subpath=github_subpath, github_archive=True)
             return
+        if parsed.path.lower().endswith("/skill.md"):
+            content = self._download(source)
+            self._verify_source_digest(content, source_digest)
+            target.mkdir(parents=True, exist_ok=False)
+            (target / "SKILL.md").write_bytes(content)
+            return
         if parsed.path.lower().endswith(".zip"):
             archive = self._download(source)
+            self._verify_source_digest(archive, source_digest)
             self._extract_archive(archive, target, subpath=subpath, github_archive=False)
             return
+        if source_digest:
+            raise SkillManagementError(
+                "unsupported_digested_source",
+                "A digested well-known artifact must be SKILL.md or a ZIP archive",
+            )
         self._stage_web_directory(source, target, files)
+
+    @staticmethod
+    def _verify_source_digest(content: bytes, source_digest: str | None) -> None:
+        if not source_digest:
+            return
+        expected = source_digest.removeprefix("sha256:")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected):
+            raise SkillManagementError("invalid_source_digest")
+        actual = hashlib.sha256(content).hexdigest()
+        if actual != expected:
+            raise SkillManagementError("source_digest_mismatch")
 
     def _stage_web_directory(self, source: str, target: Path, files: list[str]) -> None:
         base = source.rstrip("/") + "/"
@@ -637,6 +890,7 @@ class SkillManagementService:
                 "ref": plan.get("ref"),
                 "subpath": plan.get("subpath"),
                 "files": list(plan.get("files") or []),
+                "source_digest": plan.get("source_digest"),
                 "installed_sha256": plan.get("installed_sha256"),
                 "updated_at": plan.get("committed_at"),
             }
@@ -736,6 +990,7 @@ class SkillManagementService:
                 "ref",
                 "subpath",
                 "files",
+                "source_digest",
                 "created_at",
                 "expires_at",
                 "status",

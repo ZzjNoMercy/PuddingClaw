@@ -3,10 +3,11 @@
 import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
-import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Database, Download, FileSpreadsheet, FileText, FolderOpen, Globe2, HelpCircle, Key, KeyRound, Layers3, PauseCircle, Plus, Sparkles, SquareTerminal, Trash2 } from "lucide-react";
+import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Database, Download, FileSpreadsheet, FileText, FolderOpen, Globe2, HelpCircle, ImageIcon, Key, KeyRound, Layers3, Maximize2, PauseCircle, Plus, Sparkles, SquareTerminal, Trash2 } from "lucide-react";
 import { denyPermissionRequest, grantExternalFilePermission, grantToolActionPermission, openLocalFile, resolveDatabaseSqlRevisionRequest, resolveDimensionBuildRuleRequest, resolveLogicalDatasetRuleRequest, resolveUserInputRequest, type AgentAttachment, type DatabaseSqlRevisionRequest, type DimensionBuildRuleRequest, type LogicalDatasetRuleRequest, type PermissionRequest, type UserInputAnswer, type UserInputRequest } from "@/lib/api";
 import { markdownRemarkPlugins, markdownUrlTransform } from "@/lib/markdown";
 import { useApp, type ChatMessage as ChatMessageType, type SourceRecord, type TimelineItem } from "@/lib/store";
+import { isPreviewableImageAttachment, isQrImageAttachment } from "@/lib/imageAttachments";
 import ThoughtChain, { SkillPlanCards } from "./ThoughtChain";
 import RetrievalCard from "./RetrievalCard";
 
@@ -47,10 +48,36 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
   const hasAuthError = !isUser && isAuthError(message.content);
   const renderedContent = renderCitationMarkers(message, sessionSources);
   const availableSources = mergeSources(message.sources, sessionSources);
-  const { sessionId, setActiveSourceId, setInspectorOpen } = useApp();
-  const skillPlanTimeline = message.segments?.length
-    ? message.segments.flatMap((segment) => segment.timeline || [])
-    : message.timeline || [];
+  const { sessionId, setActiveSourceId, setInspectorOpen, closeAttachmentPreview } = useApp();
+  // Persisted turns can carry both a message-level timeline and per-model-call
+  // segment timelines.  Neither representation is guaranteed to be a strict
+  // superset of the other (large managed-tool results in particular may only
+  // survive in one of them), so confirmation UI must inspect both.  De-dupe
+  // by timeline/tool id to avoid rendering the same plan batch twice.
+  const skillPlanTimeline = Array.from(
+    new Map(
+      [
+        ...(message.timeline || []),
+        ...(message.segments?.flatMap((segment) => segment.timeline || []) || []),
+      ].map((item, index) => [
+        item.type === "tool"
+          ? `tool:${item.toolCall?.id || item.id || index}`
+          : `${item.type}:${item.id || index}`,
+        item,
+      ]),
+    ).values(),
+  );
+  const segmentedToolIds = new Set(
+    message.segments?.flatMap((segment) =>
+      (segment.timeline || [])
+        .filter((item) => item.type === "tool")
+        .map((item) => item.toolCall?.id || item.id)
+        .filter(Boolean),
+    ) || [],
+  );
+  const orphanSkillPlanTimeline = skillPlanTimeline.filter((item) =>
+    item.type !== "tool" || !segmentedToolIds.has(item.toolCall?.id || item.id),
+  );
   const pendingPermissionRequests = (message.permissionRequests || []).filter(
     (request) => request.status !== "resolved"
   );
@@ -72,11 +99,13 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
         sessionId={sessionId}
         sources={availableSources}
         onActivate={(sourceId) => {
+          closeAttachmentPreview();
           setActiveSourceId(sourceId);
           setInspectorOpen(true);
         }}
       />
     ),
+    img: SafeMarkdownImage,
   };
 
   return (
@@ -117,7 +146,7 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
                       verificationSummary={index === message.segments!.length - 1 ? message.verificationSummary : undefined}
                     />
                   ))}
-                  <SkillPlanCards timeline={skillPlanTimeline} sessionId={sessionId} />
+                  <SkillPlanCards timeline={orphanSkillPlanTimeline} sessionId={sessionId} />
                   {message.retrievals && message.retrievals.length > 0 && (
                     <RetrievalCard retrievals={message.retrievals} />
                   )}
@@ -254,10 +283,76 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
   );
 }
 
+function SafeMarkdownImage({ alt }: React.ImgHTMLAttributes<HTMLImageElement>) {
+  return (
+    <span className="my-2 inline-flex max-w-full items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-[12px] text-slate-600">
+      <ImageIcon className="h-4 w-4 shrink-0" />
+      <span className="truncate">{alt || "图片"}（请通过附件预览）</span>
+    </span>
+  );
+}
+
+function InlineImageAttachment({
+  attachment,
+  align = "left",
+}: {
+  attachment: AgentAttachment & { id: string; preview_url: string };
+  align?: "left" | "right";
+}) {
+  const { openAttachmentPreview } = useApp();
+  const [failed, setFailed] = useState(false);
+  const isQr = isQrImageAttachment(attachment);
+  const label = attachment.name || "图片附件";
+
+  if (failed) {
+    return (
+      <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-[12px] text-slate-600">
+        <ImageIcon className="h-4 w-4" />
+        <span className="truncate">{label} · 预览失败</span>
+      </div>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      data-attachment-id={attachment.id}
+      onClick={() => openAttachmentPreview(attachment.id)}
+      className={`group relative block overflow-hidden rounded-2xl border border-slate-200 bg-white text-left shadow-sm transition hover:border-[#002fa7]/35 hover:shadow-md focus:outline-none focus:ring-2 focus:ring-[#002fa7]/30 ${
+        isQr ? "w-[220px] max-w-full p-3" : "w-full max-w-[560px]"
+      } ${align === "right" ? "ml-auto" : ""}`}
+      aria-label={`打开图片预览：${label}`}
+    >
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        src={attachment.preview_url}
+        alt={label}
+        onError={() => setFailed(true)}
+        className={`block w-full object-contain ${isQr ? "aspect-square bg-white" : "max-h-[360px] bg-slate-50"}`}
+      />
+      <span className="absolute right-2 top-2 flex h-8 w-8 items-center justify-center rounded-full bg-slate-950/65 text-white opacity-0 shadow-sm backdrop-blur-sm transition group-hover:opacity-100 group-focus:opacity-100">
+        <Maximize2 className="h-3.5 w-3.5" />
+      </span>
+      <span className="block truncate border-t border-slate-100 px-3 py-2 text-[11px] font-medium text-slate-700">
+        {label}
+      </span>
+    </button>
+  );
+}
+
 function UserAttachmentList({ attachments }: { attachments: AgentAttachment[] }) {
   return (
     <div className="mt-2 flex max-w-xl flex-wrap justify-end gap-2">
       {attachments.map((attachment, index) => {
+        if (isPreviewableImageAttachment(attachment)) {
+          return (
+            <InlineImageAttachment
+              key={`${attachment.id}-${index}`}
+              attachment={attachment}
+              align="right"
+            />
+          );
+        }
         const Icon = attachment.type === "spreadsheet" ? FileSpreadsheet : FileText;
         return (
           <div
@@ -282,9 +377,17 @@ function formatAttachmentSize(size?: number): string {
 }
 
 function AssistantAttachmentList({ attachments }: { attachments: AgentAttachment[] }) {
+  const images = attachments.filter(isPreviewableImageAttachment);
+  const files = attachments.filter((attachment) => !isPreviewableImageAttachment(attachment));
   return (
     <div className="mt-3 flex max-w-[680px] flex-col gap-2">
-      {attachments.map((attachment, index) => {
+      {images.map((attachment, index) => (
+        <InlineImageAttachment
+          key={`${attachment.id}-${index}`}
+          attachment={attachment}
+        />
+      ))}
+      {files.map((attachment, index) => {
         const Icon = attachment.type === "spreadsheet" ? FileSpreadsheet : FileText;
         const href = attachment.download_url || "";
         const content = (
@@ -539,14 +642,17 @@ function ToolActionPermissionCard({
   const installsPackages = (request.capabilities || []).includes("package_install");
   const writesWorkspace = (request.capabilities || []).includes("managed_write");
   const writesSkills = (request.capabilities || []).includes("managed_skill_write");
-  const opensSessionNetwork = request.session_target_kind === "capability"
-    && request.session_target === "session_network_access";
+  const opensSessionScope = (request.options || []).includes("session")
+    && Boolean(request.session_target_kind && request.session_target);
+  const reason = request.reason || "需要人工确认";
   const managesSkills = writesSkills || [
     "prepare_skill_install",
     "prepare_skill_update",
     "install_skill",
     "update_skill",
-  ].includes(request.tool_name || "");
+  ].includes(request.tool_name || "")
+    || reason.startsWith("managed_skill_source_download:")
+    || request.change_preview?.action === "prepare_install";
   const riskLabel = ({
     high: "脚本执行 · 需确认",
     network: "联网 · 需确认",
@@ -556,14 +662,13 @@ function ToolActionPermissionCard({
     managed_skill_write: "安装或更新 Skill · 需确认",
     critical: "禁止级风险",
   } as Record<string, string>)[request.risk || ""] || request.risk || "受控操作";
-  const reason = request.reason || "需要人工确认";
   const reasonLabel = request.policy_explanation || (reason.startsWith("arbitrary_interpreter:")
     ? "解释器可执行任意代码；Harness 会另外标明本次是否联网、写入或安装依赖。"
     : reason.startsWith("network_access:")
       ? "该命令需要访问互联网。"
       : reason.startsWith("package_management")
         ? "该操作会下载并安装运行时依赖。"
-        : reason.startsWith("skill_source_download")
+        : reason.startsWith("skill_source_download") || reason.startsWith("managed_skill_source_download:")
           ? "该操作会联网下载 Skill 到隔离暂存区，并校验文件和来源；不会修改已安装 Skill。"
         : reason.startsWith("managed_skill_write")
           ? "该操作会提交已校验的不可变计划到受管 Skill 目录。授权仅对本次计划有效。"
@@ -715,7 +820,7 @@ function ToolActionPermissionCard({
           )}
           {status === "idle" || status === "error" ? (
             <div className="mt-3 flex flex-wrap gap-2">
-              {opensSessionNetwork ? (
+              {opensSessionScope ? (
                 <button
                   type="button"
                   onClick={() => void grant("session")}
@@ -732,15 +837,13 @@ function ToolActionPermissionCard({
                   仅允许本次
                 </button>
               )}
-              {!managesSkills ? (
+              {!managesSkills && opensSessionScope ? (
                 <button
                   type="button"
-                  onClick={() => void grant(opensSessionNetwork ? "once" : "session")}
+                  onClick={() => void grant("once")}
                   className="rounded-full bg-white px-3.5 py-2 text-[12px] font-semibold text-slate-700 ring-1 ring-black/[0.08] hover:bg-slate-50"
                 >
-                  {opensSessionNetwork
-                    ? "仅允许本次"
-                    : request.session_scope_label || "本 Session 允许相同命令"}
+                  仅允许本次
                 </button>
               ) : null}
               <button
@@ -1269,7 +1372,7 @@ function SegmentBlock({
   isLast?: boolean;
   verificationSummary?: string;
 }) {
-  const { sessionId, setActiveSourceId, setInspectorOpen } = useApp();
+  const { sessionId, setActiveSourceId, setInspectorOpen, closeAttachmentPreview } = useApp();
   // Terminal text is withheld by the backend until accepted.  Segments shown
   // here are therefore process activity or the single published response;
   // verification control state must never hide history or tool progress.
@@ -1282,11 +1385,13 @@ function SegmentBlock({
         sessionId={sessionId}
         sources={availableSources}
         onActivate={(sourceId) => {
+          closeAttachmentPreview();
           setActiveSourceId(sourceId);
           setInspectorOpen(true);
         }}
       />
     ),
+    img: SafeMarkdownImage,
   };
 
   const hasTools = segment.timeline?.some((item) => item.type === "tool") ?? false;
@@ -1324,6 +1429,7 @@ function SegmentBlock({
       {!hasTools && thoughtChain}
       {contentBlock}
       {hasTools && thoughtChain}
+      <SkillPlanCards timeline={segment.timeline || []} sessionId={sessionId} />
     </div>
   );
 }
@@ -1335,6 +1441,7 @@ function VerificationSummaryText({ text }: { text?: string }) {
     <div className="mt-5 text-slate-700">
       <ReactMarkdown
         remarkPlugins={markdownRemarkPlugins}
+        components={{ img: SafeMarkdownImage }}
         urlTransform={markdownUrlTransform}
       >
         {summary}

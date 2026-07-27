@@ -77,6 +77,9 @@ designs/
 # SkillHub runtime lock
 backend/skills/.skills_store_lock.json
 
+# Feishu (lark-*) skills installed via managed skill plans
+backend/skills/lark-*/
+
 .pytest_cache
 notebooks/.env
 notebooks/

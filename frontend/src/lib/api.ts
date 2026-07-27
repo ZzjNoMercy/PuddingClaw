@@ -363,6 +363,10 @@ export interface AgentAttachment {
   created_by_goal_id?: string;
   created_by_goal_revision?: number;
   download_url?: string;
+  preview_url?: string;
+  preview_mime_type?: string;
+  width?: number;
+  height?: number;
   created_at?: number;
 }
 
@@ -2015,6 +2019,12 @@ export interface AnalyticsProjectExportDataAsset {
   size_bytes: number;
   profile_available: boolean;
   source_asset_ids: string[];
+  source_name: string;
+  source_type: string;
+  host: string;
+  port: number;
+  database: string;
+  schema_name: string;
 }
 
 export interface AnalyticsProjectExportPlan {
@@ -3364,6 +3374,9 @@ export async function getSessionHistory(
   messages: Array<{
     role: string;
     content: string;
+    query_id?: string;
+    attachments?: AgentAttachment[];
+    output_attachments?: AgentAttachment[];
     reasoning_content?: string;
     tool_calls?: Array<{ tool: string; input?: string; output?: string }>;
   }>;

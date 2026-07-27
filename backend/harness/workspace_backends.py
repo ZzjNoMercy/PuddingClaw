@@ -10,6 +10,7 @@ import re
 import shlex
 import subprocess
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,14 @@ from harness.dependency_setup import (
 DEFAULT_SANDBOX_IMAGE = "puddingclaw/sandbox:python3.12-node22-chromium-v4"
 RUNTIME_CONTRACT = "python3.12+node22+chromium-v4"
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ManagedProviderExecutionResult:
+    output: str
+    exit_code: int
+    credential_state: bytes | None
+    truncated: bool = False
 
 
 def _canonical_docker_mount_source(value: str) -> str:
@@ -190,9 +199,66 @@ class ProjectSandboxManager:
     _locks_guard = threading.Lock()
     _idle_timers: dict[str, tuple[str, threading.Timer]] = {}
     _idle_timers_guard = threading.Lock()
+    _interactive_network_jobs: dict[str, str] = {}
+    _interactive_network_jobs_guard = threading.Lock()
 
     def __init__(self, docker_config: dict[str, Any]) -> None:
         self.config = dict(docker_config)
+
+    @property
+    def runtime_contract(self) -> str:
+        return RUNTIME_CONTRACT
+
+    @staticmethod
+    def _owner_label() -> str:
+        from runtime_identity.paths import trusted_owner_user_id
+
+        return hashlib.sha256(trusted_owner_user_id().encode("utf-8")).hexdigest()[:20]
+
+    def gc_stopped_workspace_containers(self) -> int:
+        """Remove only stopped workspace containers owned by this Backend user."""
+
+        listed = self._run(
+            [
+                "ps",
+                "-aq",
+                "--filter",
+                "status=exited",
+                "--filter",
+                "label=com.puddingclaw.managed=true",
+            ],
+            timeout=30,
+        )
+        if listed.returncode != 0:
+            return 0
+        container_ids = [item.strip() for item in listed.stdout.splitlines() if item.strip()]
+        removed = 0
+        for container_id in container_ids:
+            inspected = self._run(["inspect", container_id], timeout=30)
+            if inspected.returncode != 0:
+                continue
+            try:
+                container = json.loads(inspected.stdout)[0]
+            except (json.JSONDecodeError, IndexError, TypeError):
+                continue
+            labels = container.get("Config", {}).get("Labels") or {}
+            name = str(container.get("Name") or "").lstrip("/")
+            current_workspace = (
+                labels.get("com.puddingclaw.kind") == "workspace"
+                and labels.get("com.puddingclaw.owner") == self._owner_label()
+            )
+            legacy_workspace = (
+                not labels.get("com.puddingclaw.kind")
+                and not labels.get("com.puddingclaw.owner")
+                and bool(labels.get("com.puddingclaw.spec-hash"))
+                and re.fullmatch(r"puddingclaw-project-[0-9a-f]{16}", name) is not None
+            )
+            if not (current_workspace or legacy_workspace):
+                continue
+            result = self._run(["rm", container_id], timeout=30)
+            if result.returncode == 0:
+                removed += 1
+        return removed
 
     def _docker_prefix(self) -> list[str]:
         command = ["docker"]
@@ -222,6 +288,120 @@ class ProjectSandboxManager:
             timeout=timeout,
             env=self._env(),
         )
+
+    def _run_bytes(
+        self,
+        args: list[str],
+        *,
+        input_bytes: bytes | None = None,
+        timeout: int = 30,
+    ) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            [*self._docker_prefix(), *args],
+            check=False,
+            input=input_bytes,
+            capture_output=True,
+            timeout=timeout,
+            env=self._env(),
+        )
+
+    @staticmethod
+    def _interactive_lark_authorization(argv: list[str]) -> bool:
+        """Return whether argv starts a browser-assisted Lark handshake.
+
+        These commands are not ordinary request/response programs: they emit a
+        verification URL and then remain alive while the user completes a
+        browser step.  Running them through ``subprocess.run`` hides that URL
+        until the process exits and therefore deadlocks the interaction.
+        """
+
+        if argv[:2] != ["sh", "-c"] or len(argv) != 3:
+            return False
+        command = re.sub(r"\s+2\s*>\s*&\s*1\s*$", "", argv[2].strip())
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            return False
+        return tokens in (
+            ["lark-cli", "config", "init", "--new"],
+            ["lark-cli", "auth", "login", "--recommend"],
+        )
+
+    def _expire_interactive_network_job(self, job_key: str, container_name: str) -> None:
+        """Bound one-shot network authority even if browser auth is abandoned."""
+
+        with self._interactive_network_jobs_guard:
+            if self._interactive_network_jobs.get(job_key) != container_name:
+                return
+            self._interactive_network_jobs.pop(job_key, None)
+        self._run(["rm", "-f", container_name], timeout=30)
+
+    def _interactive_network_job_output(
+        self,
+        *,
+        job_key: str,
+        container_name: str,
+        max_output_bytes: int,
+        wait_seconds: float = 20.0,
+    ) -> ExecuteResponse:
+        """Wait only for actionable auth output, not for browser completion."""
+
+        deadline = time.monotonic() + max(0.0, wait_seconds)
+        stdout = ""
+        stderr = ""
+        running = True
+        exit_code = 0
+        while True:
+            logs = self._run(["logs", container_name], timeout=10)
+            stdout = logs.stdout or stdout
+            stderr = logs.stderr or stderr
+            inspection = self._run(
+                ["inspect", "--format", "{{.State.Running}} {{.State.ExitCode}}", container_name],
+                timeout=10,
+            )
+            if inspection.returncode != 0:
+                running = False
+                exit_code = 1
+                stderr = stderr or inspection.stderr
+            else:
+                state = inspection.stdout.strip().split()
+                running = bool(state and state[0].lower() == "true")
+                if len(state) > 1 and state[1].lstrip("-").isdigit():
+                    exit_code = int(state[1])
+            combined = f"{stdout}\n{stderr}"
+            if re.search(r"https?://\S+", combined) or not running or time.monotonic() >= deadline:
+                break
+            time.sleep(0.25)
+
+        output, truncated = _bounded_output(
+            stdout,
+            stderr,
+            max_output_bytes=max_output_bytes,
+        )
+        if running:
+            output = (
+                "Managed browser authorization started.\n"
+                "Status: awaiting_user_browser\n"
+                "Authorization completed: false\n"
+                "Configuration saved: pending\n"
+                "Launch result: the detached authorization job started successfully; "
+                "this is not authorization success.\n"
+                "Next action: show the QR code/link, end the current turn, and wait for "
+                "the user. Do not continue to the next setup step until `lark-cli config "
+                "show` confirms the configuration.\n"
+                f"Job: {container_name}\n\n{output}"
+            )
+            # The detached process is the already-approved exact command.  It
+            # may keep polling only for a bounded period while the user opens
+            # the URL; no general-purpose shell remains exposed.
+            return ExecuteResponse(output=output, exit_code=0, truncated=truncated)
+
+        with self._interactive_network_jobs_guard:
+            if self._interactive_network_jobs.get(job_key) == container_name:
+                self._interactive_network_jobs.pop(job_key, None)
+        if exit_code != 0:
+            output = f"{output.rstrip()}\n\nExit code: {exit_code}"
+        return ExecuteResponse(output=output, exit_code=exit_code, truncated=truncated)
 
     def _image_id(self, image: str) -> str:
         inspected = self._run(["image", "inspect", "--format", "{{.Id}}", image])
@@ -346,11 +526,11 @@ class ProjectSandboxManager:
                 continue
             source = Path(str(item.get("source") or "")).expanduser().resolve()
             target = str(item.get("target") or "")
-            if source.is_dir() and target in {"/skills"}:
+            if source.is_dir() and target in {"/skills", "/opt/puddingclaw/toolchain/node"}:
                 workspace_target = None
                 try:
                     relative = source.relative_to(workspace.expanduser().resolve())
-                    if relative.parts:
+                    if target == "/skills" and relative.parts:
                         workspace_target = f"/workspace/{relative.as_posix()}"
                 except ValueError:
                     pass
@@ -361,6 +541,21 @@ class ProjectSandboxManager:
                         "workspace_target": workspace_target,
                     }
                 )
+        if bool(self.config.get("_managed_user_toolchain", False)):
+            from runtime_identity.paths import PuddingClawPaths
+            from runtime_identity.toolchains import ToolchainManager
+
+            toolchain = ToolchainManager(PuddingClawPaths.from_environment(), RUNTIME_CONTRACT).resolve_node()
+            readonly_mounts.append(
+                {
+                    # Resolve on every spec calculation. An atomic ``current``
+                    # switch therefore changes the source and forces stale
+                    # workspace containers to be recreated.
+                    "source": str(toolchain.mount_path.resolve()),
+                    "target": "/opt/puddingclaw/toolchain/node",
+                    "workspace_target": None,
+                }
+            )
         writable_mounts = []
         for item in self.config.get("_managed_writable_mounts") or []:
             if not isinstance(item, dict):
@@ -529,6 +724,10 @@ class ProjectSandboxManager:
                 "--label",
                 "com.puddingclaw.managed=true",
                 "--label",
+                "com.puddingclaw.kind=workspace",
+                "--label",
+                f"com.puddingclaw.owner={self._owner_label()}",
+                "--label",
                 f"com.puddingclaw.spec-hash={spec_hash}",
                 "--workdir",
                 "/workspace",
@@ -562,9 +761,17 @@ class ProjectSandboxManager:
                 "--env",
                 "npm_config_prefix=/home/puddingclaw/.npm-global",
                 "--env",
-                ("PATH=/home/puddingclaw/.local/bin:/home/puddingclaw/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"),
+                (
+                    "PATH=/opt/puddingclaw/toolchain/node/bin:/home/puddingclaw/.local/bin:"
+                    "/home/puddingclaw/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
+                ),
                 "--env",
-                "NODE_PATH=/home/puddingclaw/.npm-global/lib/node_modules",
+                (
+                    "NODE_PATH=/opt/puddingclaw/toolchain/node/lib/node_modules:"
+                    "/home/puddingclaw/.npm-global/lib/node_modules"
+                ),
+                "--tmpfs",
+                "/home/puddingclaw/.lark-cli:rw,nosuid,nodev,size=16m",
             ]
             if spec["uid"] is not None and spec["gid"] is not None:
                 create_args.extend(["--user", f"{spec['uid']}:{spec['gid']}"])
@@ -696,13 +903,89 @@ class ProjectSandboxManager:
             "--env",
             "npm_config_prefix=/home/puddingclaw/.npm-global",
             "--env",
-            ("PATH=/home/puddingclaw/.local/bin:/home/puddingclaw/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"),
+            (
+                "PATH=/opt/puddingclaw/toolchain/node/bin:/home/puddingclaw/.local/bin:"
+                "/home/puddingclaw/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
+            ),
+            "--env",
+            (
+                "NODE_PATH=/opt/puddingclaw/toolchain/node/lib/node_modules:"
+                "/home/puddingclaw/.npm-global/lib/node_modules"
+            ),
+            "--tmpfs",
+            "/home/puddingclaw/.lark-cli:rw,nosuid,nodev,size=16m",
             "--entrypoint",
             argv[0],
         ]
         if spec["uid"] is not None and spec["gid"] is not None:
             args.extend(["--user", f"{spec['uid']}:{spec['gid']}"])
         args.extend([image_id, *argv[1:]])
+        if self._interactive_lark_authorization(argv):
+            job_key = hashlib.sha256(
+                f"{workspace}:{json.dumps(argv, ensure_ascii=False)}".encode()
+            ).hexdigest()[:24]
+            with self._interactive_network_jobs_guard:
+                existing_name = self._interactive_network_jobs.get(job_key)
+            if existing_name:
+                inspection = self._run(
+                    ["inspect", "--format", "{{.State.Running}}", existing_name],
+                    timeout=10,
+                )
+                if inspection.returncode == 0:
+                    return self._interactive_network_job_output(
+                        job_key=job_key,
+                        container_name=existing_name,
+                        max_output_bytes=max_output_bytes,
+                        wait_seconds=2.0,
+                    )
+                with self._interactive_network_jobs_guard:
+                    if self._interactive_network_jobs.get(job_key) == existing_name:
+                        self._interactive_network_jobs.pop(job_key, None)
+
+            container_name = f"puddingclaw-auth-{job_key}-{uuid.uuid4().hex[:8]}"
+            ttl_seconds = max(300, min(timeout * 5, 900))
+            # Replace the blocking ``docker run --rm`` prefix with a detached,
+            # named container.  A TTY makes CLIs flush their verification URL;
+            # the exact approved process remains isolated by the same mounts,
+            # capabilities, and bridge-network policy as other one-shot runs.
+            # The in-container timeout is authoritative even if Backend
+            # restarts and loses its cleanup timer.
+            bounded_command = (
+                f"timeout --signal=TERM --kill-after=10s {ttl_seconds}s "
+                f"sh -c {shlex.quote(argv[2])}"
+            )
+            detached_args = [
+                "run",
+                "--detach",
+                "--tty",
+                "--rm",
+                "--name",
+                container_name,
+                *args[2:-1],
+                bounded_command,
+            ]
+            started = self._run(detached_args, timeout=min(timeout, 30))
+            if started.returncode != 0:
+                output, truncated = _bounded_output(
+                    started.stdout,
+                    started.stderr,
+                    max_output_bytes=max_output_bytes,
+                )
+                return ExecuteResponse(output=output, exit_code=started.returncode, truncated=truncated)
+            with self._interactive_network_jobs_guard:
+                self._interactive_network_jobs[job_key] = container_name
+            expiry = threading.Timer(
+                ttl_seconds,
+                self._expire_interactive_network_job,
+                args=(job_key, container_name),
+            )
+            expiry.daemon = True
+            expiry.start()
+            return self._interactive_network_job_output(
+                job_key=job_key,
+                container_name=container_name,
+                max_output_bytes=max_output_bytes,
+            )
         try:
             result = self._run(args, timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -722,6 +1005,258 @@ class ProjectSandboxManager:
             exit_code=result.returncode,
             truncated=truncated,
         )
+
+    def install_managed_node_cli(
+        self,
+        workspace: Path,
+        *,
+        distribution: str,
+        toolchain_path: Path,
+        container_path: str,
+        timeout: int = 600,
+        max_output_bytes: int = 100_000,
+    ) -> ExecuteResponse:
+        """Install one Adapter-approved distribution into a shared Toolchain."""
+
+        workspace = workspace.expanduser().resolve()
+        toolchain_path = toolchain_path.expanduser().resolve()
+        toolchain_path.mkdir(parents=True, exist_ok=True)
+        spec = self._spec(workspace)
+        image_id = self.ensure_image(spec["image"])
+        args = [
+            "run",
+            "--rm",
+            "--label",
+            "com.puddingclaw.managed=true",
+            "--label",
+            "com.puddingclaw.kind=installer",
+            "--label",
+            f"com.puddingclaw.owner={self._owner_label()}",
+            "--network",
+            "bridge",
+            "--read-only",
+            "--tmpfs",
+            "/tmp:rw,nosuid,nodev,size=256m",
+            "--tmpfs",
+            "/home/puddingclaw:rw,nosuid,nodev,size=256m",
+            "--mount",
+            f"type=bind,src={toolchain_path},dst={container_path}",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--pids-limit",
+            str(spec["pids_limit"]),
+            "--memory",
+            f"{spec['memory_limit_mb']}m",
+            "--cpus",
+            spec["cpu_limit"],
+            "--env",
+            "HOME=/home/puddingclaw",
+            "--env",
+            "npm_config_cache=/home/puddingclaw/.cache/npm",
+            "--env",
+            f"npm_config_prefix={container_path}",
+            "--env",
+            f"PATH={container_path}/bin:/usr/local/bin:/usr/bin:/bin",
+            "--entrypoint",
+            "npm",
+        ]
+        if spec["uid"] is not None and spec["gid"] is not None:
+            args.extend(["--user", f"{spec['uid']}:{spec['gid']}"])
+        args.extend([image_id, "install", "--global", distribution])
+        try:
+            installed = self._run(args, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return ExecuteResponse(
+                output=f"Error: Managed CLI installation timed out after {timeout} seconds.",
+                exit_code=124,
+            )
+        output, truncated = _bounded_output(
+            installed.stdout,
+            installed.stderr,
+            max_output_bytes=max_output_bytes,
+        )
+        if installed.returncode != 0:
+            return ExecuteResponse(output=output, exit_code=installed.returncode, truncated=truncated)
+        verified = self._run(
+            [
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--read-only",
+                "--mount",
+                f"type=bind,src={toolchain_path},dst={container_path},readonly",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges",
+                "--entrypoint",
+                f"{container_path}/bin/lark-cli",
+                image_id,
+                "--version",
+            ],
+            timeout=60,
+        )
+        verification, verification_truncated = _bounded_output(
+            verified.stdout,
+            verified.stderr,
+            max_output_bytes=max_output_bytes,
+        )
+        combined = f"{output.rstrip()}\n\nVerification:\n{verification}"
+        return ExecuteResponse(
+            output=combined,
+            exit_code=verified.returncode,
+            truncated=truncated or verification_truncated,
+        )
+
+    def run_managed_provider_cli(
+        self,
+        workspace: Path,
+        *,
+        argv: list[str],
+        environment: dict[str, str],
+        toolchain_path: Path,
+        container_path: str,
+        credential_state: bytes,
+        network_enabled: bool,
+        workspace_writable: bool,
+        timeout: int = 120,
+        max_output_bytes: int = 100_000,
+    ) -> ManagedProviderExecutionResult:
+        """Run exact Adapter-owned argv with credentials only in container tmpfs."""
+
+        if not argv or argv[0] != "lark-cli":
+            raise ValueError("provider runner accepts only Adapter-normalized lark-cli argv")
+        workspace = workspace.expanduser().resolve()
+        toolchain_path = toolchain_path.expanduser().resolve(strict=True)
+        spec = self._spec(workspace)
+        image_id = self.ensure_image(spec["image"])
+        name = f"puddingclaw-provider-{uuid.uuid4().hex[:20]}"
+        workspace_mount = f"type=bind,src={workspace},dst=/workspace"
+        if not workspace_writable:
+            workspace_mount += ",readonly"
+        home_tmpfs = "/home/puddingclaw:rw,nosuid,nodev,size=128m"
+        if spec["uid"] is not None and spec["gid"] is not None:
+            home_tmpfs += f",uid={spec['uid']},gid={spec['gid']}"
+        create = [
+            "create",
+            "--name",
+            name,
+            "--label",
+            "com.puddingclaw.managed=true",
+            "--label",
+            "com.puddingclaw.kind=provider-runner",
+            "--label",
+            f"com.puddingclaw.owner={self._owner_label()}",
+            "--network",
+            "bridge" if network_enabled else "none",
+            "--read-only",
+            "--tmpfs",
+            "/tmp:rw,nosuid,nodev,size=256m",
+            "--tmpfs",
+            home_tmpfs,
+            "--mount",
+            workspace_mount,
+            "--mount",
+            f"type=bind,src={toolchain_path},dst={container_path},readonly",
+            "--workdir",
+            "/workspace",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--pids-limit",
+            str(spec["pids_limit"]),
+            "--memory",
+            f"{spec['memory_limit_mb']}m",
+            "--cpus",
+            spec["cpu_limit"],
+            "--env",
+            "HOME=/home/puddingclaw",
+            "--env",
+            f"PATH={container_path}/bin:/usr/local/bin:/usr/bin:/bin",
+            "--env",
+            f"NODE_PATH={container_path}/lib/node_modules",
+        ]
+        if spec["uid"] is not None and spec["gid"] is not None:
+            create.extend(["--user", f"{spec['uid']}:{spec['gid']}"])
+        create.extend(
+            [
+                image_id,
+                "sh",
+                "-c",
+                f"mkdir -p /home/puddingclaw/.lark-cli && timeout {max(timeout + 60, 300)}s sleep infinity",
+            ]
+        )
+        created = self._run(create, timeout=60)
+        if created.returncode != 0:
+            output, truncated = _bounded_output(
+                created.stdout,
+                created.stderr,
+                max_output_bytes=max_output_bytes,
+            )
+            return ManagedProviderExecutionResult(output, created.returncode, None, truncated)
+        try:
+            started = self._run(["start", name], timeout=30)
+            if started.returncode != 0:
+                output, truncated = _bounded_output(
+                    started.stdout,
+                    started.stderr,
+                    max_output_bytes=max_output_bytes,
+                )
+                return ManagedProviderExecutionResult(output, started.returncode, None, truncated)
+            if credential_state:
+                imported = self._run_bytes(
+                    ["exec", "-i", name, "tar", "-xzf", "-", "-C", "/home/puddingclaw"],
+                    input_bytes=credential_state,
+                    timeout=30,
+                )
+                if imported.returncode != 0:
+                    raise RuntimeError(imported.stderr.decode("utf-8", errors="replace"))
+            exec_args = ["exec", "--workdir", "/workspace"]
+            for key, value in sorted(environment.items()):
+                exec_args.extend(["--env", f"{key}={value}"])
+            exec_args.extend([name, *argv])
+            try:
+                result = self._run(exec_args, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                return ManagedProviderExecutionResult(
+                    f"Error: Managed provider command timed out after {timeout} seconds. Use a non-blocking auth form.",
+                    124,
+                    None,
+                )
+            output, truncated = _bounded_output(
+                result.stdout,
+                result.stderr,
+                max_output_bytes=max_output_bytes,
+            )
+            exported = self._run_bytes(
+                [
+                    "exec",
+                    name,
+                    "tar",
+                    "-czf",
+                    "-",
+                    "-C",
+                    "/home/puddingclaw",
+                    ".lark-cli",
+                ],
+                timeout=30,
+            )
+            if exported.returncode != 0:
+                raise RuntimeError(exported.stderr.decode("utf-8", errors="replace"))
+            if result.returncode != 0:
+                output = f"{output.rstrip()}\n\nExit code: {result.returncode}"
+            return ManagedProviderExecutionResult(
+                output=output,
+                exit_code=result.returncode,
+                credential_state=exported.stdout,
+                truncated=truncated,
+            )
+        finally:
+            self._run(["rm", "-f", name], timeout=30)
 
     def run_ephemeral_external_directory_command(
         self,
@@ -816,7 +1351,12 @@ class ProjectSandboxManager:
             "--env",
             "HOME=/home/puddingclaw",
             "--env",
-            "PATH=/home/puddingclaw/.local/bin:/home/puddingclaw/.npm-global/bin:/usr/local/bin:/usr/bin:/bin",
+            (
+                "PATH=/opt/puddingclaw/toolchain/node/bin:/home/puddingclaw/.local/bin:"
+                "/home/puddingclaw/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
+            ),
+            "--tmpfs",
+            "/home/puddingclaw/.lark-cli:rw,nosuid,nodev,size=16m",
             "--entrypoint",
             "sh",
         ]
@@ -910,7 +1450,7 @@ class ProjectSandboxManager:
             )
 
     def mark_activity(self, container_name: str) -> None:
-        """Re-arm the project container's idle-stop timer after use."""
+        """Re-arm the project container's idle-removal timer after use."""
 
         idle_minutes = self.config.get("idle_stop_minutes", 30)
         if not isinstance(idle_minutes, int) or isinstance(idle_minutes, bool) or idle_minutes <= 0:
@@ -934,13 +1474,16 @@ class ProjectSandboxManager:
         container_name: str,
         generation: str,
     ) -> None:
-        with self._idle_timers_guard:
-            current = self._idle_timers.get(container_name)
-            if current is None or current[0] != generation:
-                return
-            self._idle_timers.pop(container_name, None)
         with self._lock(container_name):
-            self._run(["stop", "--time", "10", container_name], timeout=30)
+            # A command may have been running while this timer waited for the
+            # keyed container lock. Re-check only after acquiring it so a
+            # freshly re-armed generation cannot be removed by a stale timer.
+            with self._idle_timers_guard:
+                current = self._idle_timers.get(container_name)
+                if current is None or current[0] != generation:
+                    return
+                self._idle_timers.pop(container_name, None)
+            self._run(["rm", "-f", container_name], timeout=30)
 
     @classmethod
     def _lock(cls, key: str) -> threading.RLock:
@@ -1121,6 +1664,46 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
             )
             self.manager.mark_activity(self.container_name)
             return result
+
+    def install_managed_node_cli(
+        self,
+        *,
+        distribution: str,
+        toolchain_path: Path,
+        container_path: str,
+    ) -> ExecuteResponse:
+        return self.manager.install_managed_node_cli(
+            self.workspace_path,
+            distribution=distribution,
+            toolchain_path=toolchain_path,
+            container_path=container_path,
+            timeout=max(self._default_timeout, 600),
+            max_output_bytes=self._max_output_bytes,
+        )
+
+    def run_managed_provider_cli(
+        self,
+        *,
+        argv: list[str],
+        environment: dict[str, str],
+        toolchain_path: Path,
+        container_path: str,
+        credential_state: bytes,
+        network_enabled: bool,
+        workspace_writable: bool,
+    ) -> ManagedProviderExecutionResult:
+        return self.manager.run_managed_provider_cli(
+            self.workspace_path,
+            argv=argv,
+            environment=environment,
+            toolchain_path=toolchain_path,
+            container_path=container_path,
+            credential_state=credential_state,
+            network_enabled=network_enabled,
+            workspace_writable=workspace_writable,
+            timeout=self._default_timeout,
+            max_output_bytes=self._max_output_bytes,
+        )
 
 
 @dataclass(frozen=True)

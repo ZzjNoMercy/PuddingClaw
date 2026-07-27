@@ -1,0 +1,610 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="用于每月定期刷新的产品配置分析 HTML 报告模板" />
+  <title>月度产品配置分析报告模板</title>
+  <style>
+    :root {
+      --ink: #17232b;
+      --muted: #687781;
+      --soft: #eef3f5;
+      --line: #d8e1e5;
+      --paper: #ffffff;
+      --page: #e9eef0;
+      --blue: #2389ad;
+      --blue-deep: #12627f;
+      --cyan: #55b7bf;
+      --green: #79bca8;
+      --lime: #b8cf9f;
+      --amber: #d7ad66;
+      --red: #c85c55;
+      --nav-width: 238px;
+      --radius: 2px;
+      --shadow: 0 12px 36px rgba(28, 47, 58, 0.08);
+      font-family: -apple-system, "SF Pro Text", "PingFang SC", "Noto Sans SC", sans-serif;
+      color: var(--ink);
+      background: var(--page);
+      font-synthesis: none;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: auto; }
+    body { margin: 0; min-width: 1120px; background: var(--page); }
+    button, select { font: inherit; }
+    button { color: inherit; }
+    a { color: inherit; text-decoration: none; }
+    [hidden] { display: none !important; }
+
+    .app-shell {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: var(--nav-width) minmax(660px, 1fr);
+      grid-template-rows: 66px auto;
+    }
+
+    .topbar {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 20;
+      grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: var(--nav-width) 1fr auto;
+      align-items: center;
+      min-height: 66px;
+      border-bottom: 1px solid var(--line);
+      background: #ffffff;
+    }
+
+    .brand {
+      height: 100%;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 0 22px;
+      border-right: 1px solid var(--line);
+    }
+
+    .brand-mark {
+      width: 28px;
+      height: 28px;
+      display: grid;
+      grid-template-columns: 5px 5px 5px;
+      gap: 3px;
+      align-items: end;
+      transform: skew(-7deg);
+    }
+
+    .brand-mark i { display: block; background: var(--blue); }
+    .brand-mark i:nth-child(1) { height: 20px; }
+    .brand-mark i:nth-child(2) { height: 25px; }
+    .brand-mark i:nth-child(3) { height: 17px; background: var(--cyan); }
+    .brand strong { font-size: 13px; letter-spacing: .12em; }
+    .brand span { display: block; margin-top: 2px; color: var(--muted); font-size: 10px; letter-spacing: .06em; }
+
+    .document-title { padding: 0 26px; min-width: 0; }
+    .document-title strong { display: block; overflow: hidden; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+    .document-title span { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; }
+
+    .actions { display: flex; align-items: center; gap: 8px; padding-right: 18px; }
+    .button {
+      min-height: 34px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 0 13px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--paper);
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 650;
+      transition: border-color .18s ease, background .18s ease, color .18s ease;
+    }
+    .button:hover { border-color: var(--blue); color: var(--blue-deep); }
+    .button.primary { border-color: var(--blue-deep); background: var(--blue-deep); color: #fff; }
+    .button.primary:hover { background: var(--blue); }
+    .button.active { border-color: var(--blue); background: #e8f5f8; color: var(--blue-deep); }
+    .button-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+
+    .sidebar {
+      position: fixed;
+      top: 66px;
+      left: 0;
+      z-index: 10;
+      width: var(--nav-width);
+      height: calc(100vh - 66px);
+      overflow: auto;
+      border-right: 1px solid var(--line);
+      background: #f7f9fa;
+      padding: 24px 14px 32px;
+    }
+
+    .side-label { padding: 0 10px 9px; color: #829099; font-size: 10px; font-weight: 750; letter-spacing: .12em; }
+    .nav-list { display: flex; flex-direction: column; gap: 4px; }
+    .nav-item {
+      display: grid;
+      grid-template-columns: 26px 1fr auto;
+      gap: 8px;
+      align-items: center;
+      min-height: 42px;
+      padding: 0 10px;
+      border: 1px solid transparent;
+      border-radius: var(--radius);
+      color: #56656e;
+      font-size: 12px;
+      font-weight: 620;
+    }
+    .nav-item:hover { background: #edf3f5; }
+    .nav-item.active { border-color: #c7dce3; background: var(--paper); color: var(--blue-deep); box-shadow: 0 6px 18px rgba(34, 85, 104, .06); }
+    .nav-index { font-size: 10px; color: #9aa6ad; font-variant-numeric: tabular-nums; }
+    .nav-item.active .nav-index { color: var(--blue); }
+    .nav-state { width: 5px; height: 5px; border-radius: 50%; background: #b9c3c8; }
+    .nav-item.active .nav-state { background: var(--cyan); box-shadow: 0 0 0 3px #dff2f4; }
+
+    .scope-card { margin: 28px 6px 0; border-top: 1px solid var(--line); padding: 18px 4px 0; }
+    .scope-card h3 { margin: 0 0 11px; font-size: 11px; letter-spacing: .04em; }
+    .scope-grid { display: grid; grid-template-columns: auto 1fr; gap: 7px 10px; font-size: 10px; line-height: 1.5; }
+    .scope-grid dt { color: #8b989f; }
+    .scope-grid dd { margin: 0; color: #495960; font-weight: 600; }
+
+    main { grid-column: 2; grid-row: 2; min-width: 0; padding: 30px 30px 80px; }
+    .report { max-width: 1240px; margin: 0 auto; display: flex; flex-direction: column; gap: 22px; }
+    .section {
+      scroll-margin-top: 88px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--paper);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .section-head {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 22px 24px 17px;
+      border-bottom: 1px solid var(--line);
+    }
+    .eyebrow { margin-bottom: 6px; color: var(--blue); font-size: 10px; font-weight: 760; letter-spacing: .14em; text-transform: uppercase; }
+    h1, h2, h3, p { text-wrap: pretty; }
+    h1 { margin: 0; font-size: 30px; line-height: 1.22; letter-spacing: -.03em; }
+    h2 { margin: 0; font-size: 20px; line-height: 1.3; letter-spacing: -.02em; }
+    h3 { margin: 0; font-size: 14px; }
+    .section-subtitle { margin: 7px 0 0; color: var(--muted); font-size: 12px; line-height: 1.65; }
+    .section-number { color: #c6d1d6; font-size: 36px; font-weight: 270; letter-spacing: -.05em; font-variant-numeric: tabular-nums; }
+    .section-body { padding: 24px; }
+    .appendix .section-head { background: #f5f7f8; }
+    .appendix .eyebrow { color: #718088; }
+
+    .hero { position: relative; min-height: 300px; display: flex; align-items: center; padding: 48px; background: #102c39; color: #fff; overflow: hidden; }
+    .hero::after {
+      content: "";
+      position: absolute;
+      width: 360px;
+      height: 360px;
+      right: -170px;
+      top: -195px;
+      border: 58px solid rgba(85, 183, 191, .12);
+      border-radius: 50%;
+    }
+    .hero-top { position: relative; z-index: 1; display: grid; grid-template-columns: 1fr auto; gap: 28px; }
+    .hero .eyebrow { color: #78d1d5; }
+    .hero h1 { max-width: 660px; font-size: 34px; }
+    .hero-cover { position: relative; z-index: 1; max-width: 760px; }
+    .hero-cover h1 { max-width: 760px; font-size: clamp(36px, 4.2vw, 52px); line-height: 1.22; letter-spacing: -.045em; }
+    .report-date { display: block; margin-top: 24px; color: #9fc1ce; font-size: 14px; font-weight: 650; letter-spacing: .08em; }
+    .hero-copy { max-width: 780px; margin: 12px 0 0; color: #c7d8df; font-size: 13px; line-height: 1.75; }
+    .report-stamp { min-width: 132px; border-left: 1px solid rgba(255,255,255,.18); padding-left: 20px; }
+    .report-stamp span { display: block; color: #8db1bf; font-size: 10px; letter-spacing: .1em; }
+    .report-stamp strong { display: block; margin-top: 7px; font-size: 14px; }
+
+    .filters { position: relative; z-index: 1; display: flex; flex-wrap: wrap; gap: 8px; margin-top: 25px; }
+    .filter {
+      min-height: 32px;
+      padding: 0 30px 0 10px;
+      border: 1px solid rgba(255,255,255,.2);
+      border-radius: var(--radius);
+      background-color: rgba(255,255,255,.07);
+      color: #e9f4f6;
+      font-size: 11px;
+      cursor: pointer;
+    }
+    .filter option { color: var(--ink); background: #fff; }
+
+    .metric-grid { display: grid; grid-template-columns: repeat(4, 1fr); border-top: 1px solid var(--line); }
+    .metric { min-height: 116px; padding: 21px 23px; border-right: 1px solid var(--line); }
+    .metric:last-child { border-right: 0; }
+    .metric-label { color: var(--muted); font-size: 10px; letter-spacing: .04em; }
+    .metric-value { display: flex; align-items: baseline; gap: 5px; margin-top: 10px; font-size: 31px; font-weight: 720; letter-spacing: -.04em; font-variant-numeric: tabular-nums; }
+    .metric-value small { color: var(--muted); font-size: 12px; font-weight: 600; letter-spacing: 0; }
+    .metric-note { margin-top: 5px; color: var(--muted); font-size: 10px; }
+    .positive { color: var(--blue-deep); }
+    .attention { color: var(--red); }
+
+    .insight-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); }
+    .insight { min-height: 170px; padding: 22px 18px; border-right: 1px solid var(--line); }
+    .insight:last-child { border-right: 0; }
+    .insight-kicker { color: var(--blue); font-size: 10px; font-weight: 760; letter-spacing: .08em; }
+    .insight h3 { margin-top: 11px; font-size: 15px; line-height: 1.4; }
+    .insight p { margin: 9px 0 0; color: var(--muted); font-size: 11px; line-height: 1.7; }
+    .insight-marker { width: 28px; height: 3px; margin-top: 17px; background: var(--cyan); }
+
+    .chart-grid { display: grid; grid-template-columns: 1.15fr .85fr; gap: 24px; }
+    .chart-card { min-width: 0; }
+    .chart-title-row { display: flex; align-items: start; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
+    .chart-title-row p { margin: 4px 0 0; color: var(--muted); font-size: 10px; }
+    .legend { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 10px; color: var(--muted); font-size: 9px; }
+    .legend span { display: flex; align-items: center; gap: 5px; }
+    .legend i { width: 12px; height: 4px; display: block; background: var(--blue); }
+
+    .stack-chart { height: 238px; display: flex; align-items: end; gap: 16px; padding: 22px 10px 25px; border-bottom: 1px solid var(--line); background-image: linear-gradient(to bottom, transparent calc(25% - 1px), #edf1f3 25%, transparent calc(25% + 1px), transparent calc(50% - 1px), #edf1f3 50%, transparent calc(50% + 1px), transparent calc(75% - 1px), #edf1f3 75%, transparent calc(75% + 1px)); }
+    .year-bar { flex: 1; height: var(--height); display: flex; flex-direction: column; justify-content: end; position: relative; min-width: 40px; }
+    .year-bar::after { content: attr(data-year); position: absolute; left: 50%; bottom: -21px; transform: translateX(-50%); color: var(--muted); font-size: 9px; }
+    .year-bar .new { height: var(--new); display: flex; align-items: center; justify-content: center; background: var(--cyan); color: #fff; font-size: 9px; }
+    .year-bar .ice { flex: 1; display: flex; align-items: center; justify-content: center; background: var(--blue); color: #fff; font-size: 9px; }
+    .year-bar strong { position: absolute; left: 50%; top: -18px; transform: translateX(-50%); font-size: 9px; font-weight: 650; }
+
+    .table-wrap { overflow: auto; border: 1px solid var(--line); }
+    table { width: 100%; border-collapse: collapse; font-size: 10px; }
+    th, td { padding: 10px 11px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+    th:first-child, td:first-child { text-align: left; }
+    th { background: #edf4f6; color: #5e6d75; font-weight: 720; }
+    tbody tr:last-child td { border-bottom: 0; }
+    tbody tr:hover td { background: #f8fafb; }
+    .delta-up { color: var(--red); font-weight: 700; }
+    .delta-down { color: var(--blue-deep); font-weight: 700; }
+
+    .matrix-wrap { display: grid; grid-template-columns: 54px 1fr; grid-template-rows: 1fr 26px; gap: 8px; }
+    .matrix-y { display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 9px; writing-mode: vertical-rl; transform: rotate(180deg); }
+    .matrix-x { grid-column: 2; display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 9px; }
+    .matrix { display: grid; grid-template-columns: repeat(6, 1fr); gap: 2px; padding: 10px; background: #eff3f5; }
+    .matrix-cell { aspect-ratio: 1.5; display: flex; align-items: center; justify-content: center; min-height: 40px; background: color-mix(in srgb, var(--blue) calc(var(--heat) * 1%), #fff); color: color-mix(in srgb, #fff calc(var(--heat) * 1.1%), var(--ink)); font-size: 9px; font-variant-numeric: tabular-nums; }
+    .matrix-cell.focus { outline: 3px solid var(--red); outline-offset: -3px; font-weight: 750; }
+    .axis-labels { grid-column: 2; display: grid; grid-template-columns: repeat(6, 1fr); gap: 2px; color: #74828a; font-size: 8px; text-align: center; }
+
+    .split-stat { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+    .stat-panel { border: 1px solid var(--line); padding: 18px; }
+    .stat-panel h3 { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+    .stat-panel h3 strong { color: var(--blue-deep); font-size: 26px; letter-spacing: -.04em; }
+    .stat-panel p { margin: 6px 0 15px; color: var(--muted); font-size: 10px; line-height: 1.6; }
+    .progress-list { display: flex; flex-direction: column; gap: 11px; }
+    .progress-row { display: grid; grid-template-columns: 74px 1fr 38px; gap: 10px; align-items: center; font-size: 9px; }
+    .track { height: 7px; background: #edf1f3; overflow: hidden; }
+    .fill { width: var(--value); height: 100%; background: var(--blue); }
+    .fill.alt { background: var(--green); }
+
+    .price-chart { display: grid; grid-template-columns: repeat(5, 1fr); gap: 13px; align-items: end; min-height: 220px; padding: 18px 8px 30px; border-bottom: 1px solid var(--line); }
+    .price-bar { position: relative; display: flex; flex-direction: column; justify-content: end; height: 178px; background: #eef3f5; }
+    .price-fill { height: var(--value); background: var(--green); }
+    .price-bar.hot .price-fill { background: var(--blue); }
+    .price-bar::after { content: attr(data-label); position: absolute; left: 50%; bottom: -22px; transform: translateX(-50%); color: var(--muted); font-size: 8px; white-space: nowrap; }
+    .price-fill span { display: block; transform: translateY(-16px); font-size: 9px; font-weight: 720; text-align: center; }
+
+    .feature-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+    .feature { position: relative; min-height: 146px; border: 1px solid var(--line); padding: 17px; overflow: hidden; }
+    .feature::before { content: ""; position: absolute; top: 0; left: 0; width: var(--value); height: 3px; background: var(--blue); }
+    .feature-label { color: var(--muted); font-size: 9px; }
+    .feature-value { margin-top: 14px; font-size: 28px; font-weight: 720; letter-spacing: -.04em; }
+    .feature h3 { margin-top: 6px; font-size: 12px; }
+    .feature p { margin: 7px 0 0; color: var(--muted); font-size: 9px; line-height: 1.55; }
+
+    .chart-gallery { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .chart-gallery.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .chart-panel { min-width: 0; border: 1px solid var(--line); background: #fff; }
+    .chart-panel.wide { grid-column: 1 / -1; }
+    .chart-panel-head { display: flex; align-items: start; justify-content: space-between; gap: 14px; padding: 15px 16px 0; }
+    .chart-panel-head h3 { font-size: 12px; line-height: 1.45; }
+    .chart-panel-head p { margin: 4px 0 0; color: var(--muted); font-size: 9px; line-height: 1.55; }
+    .source-chip { flex: 0 0 auto; padding: 4px 6px; background: #edf4f6; color: var(--blue-deep); font-size: 8px; font-weight: 720; letter-spacing: .06em; }
+    .echart { width: 100%; height: 288px; }
+    .echart.tall { height: 360px; }
+    .echart.compact { height: 224px; }
+    .echart-fallback { display: none; padding: 18px; color: var(--muted); font-size: 10px; }
+    .chart-runtime-error .echart { display: none; }
+    .chart-runtime-error .echart-fallback { display: block; }
+    .chart-empty .echart { display: none; }
+    .chart-empty .echart-fallback {
+      min-height: 180px;
+      display: grid;
+      place-items: center;
+      border-top: 1px solid var(--line);
+      background: #f8fafb;
+      text-align: center;
+      line-height: 1.7;
+    }
+    .template-banner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 10px 24px;
+      border-bottom: 1px solid #d7e8ed;
+      background: #eef7f8;
+      color: #47636e;
+      font-size: 10px;
+      line-height: 1.6;
+    }
+    .template-banner strong { color: var(--blue-deep); letter-spacing: .06em; }
+    .placeholder { color: #94a1a8; }
+    .table-empty td { height: 88px; color: #8b989f; text-align: center !important; }
+    .chart-section-note { margin: 18px 0 0; padding: 12px 14px; background: #f0f6f7; color: #4f646e; font-size: 10px; line-height: 1.7; }
+    .subsection-title { display: flex; align-items: center; gap: 10px; margin: 28px 0 14px; font-size: 12px; }
+    .subsection-title::before { content: ""; width: 18px; height: 3px; background: var(--blue); }
+
+    .query-toolbar {
+      display: grid;
+      grid-template-columns: minmax(150px, 1fr) minmax(130px, .8fr) minmax(150px, 1fr);
+      gap: 12px;
+      align-items: end;
+      margin-bottom: 16px;
+      padding: 16px;
+      border: 1px solid var(--line);
+      background: #f7f9fa;
+    }
+    .query-field { display: flex; flex-direction: column; gap: 6px; }
+    .query-field label { color: #718088; font-size: 9px; font-weight: 720; letter-spacing: .06em; }
+    .query-select {
+      width: 100%;
+      height: 36px;
+      border: 1px solid #cbd7dc;
+      border-radius: 0;
+      background: #fff;
+      padding: 0 32px 0 10px;
+      color: var(--ink);
+      font: inherit;
+      font-size: 10px;
+    }
+    .query-button {
+      height: 36px;
+      border: 1px solid var(--blue-deep);
+      background: var(--blue-deep);
+      padding: 0 18px;
+      color: #fff;
+      font: inherit;
+      font-size: 10px;
+      font-weight: 720;
+      cursor: pointer;
+    }
+    .query-button:hover { background: #0f536c; }
+    .query-button:focus-visible, .query-select:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+
+    .method-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1px; background: var(--line); border: 1px solid var(--line); }
+    .method { background: #fff; padding: 20px; }
+    .method-index { display: block; margin-bottom: 8px; color: var(--blue); font-size: 9px; font-weight: 760; }
+    .method h3 { font-size: 12px; }
+    .method p { margin: 7px 0 0; color: var(--muted); font-size: 10px; line-height: 1.7; }
+
+    .variable {
+      display: none !important;
+      padding: 1px 4px;
+      background: #fff0c9;
+      color: #765214;
+      font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+      font-size: .85em;
+      box-decoration-break: clone;
+    }
+    .toast { position: fixed; right: 24px; bottom: 24px; z-index: 50; transform: translateY(20px); opacity: 0; padding: 11px 14px; background: #132d39; color: #fff; font-size: 11px; box-shadow: var(--shadow); transition: all .2s ease; pointer-events: none; }
+    .toast.show { transform: translateY(0); opacity: 1; }
+
+    @media (max-width: 1320px) {
+      :root { --nav-width: 218px; }
+      main { padding-inline: 22px; }
+      .insight-grid { grid-template-columns: repeat(3, 1fr); }
+      .insight:nth-child(3) { border-right: 0; }
+      .insight:nth-child(n+4) { border-top: 1px solid var(--line); }
+      .chart-gallery.three { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .query-toolbar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    @media print {
+      @page { size: A4 landscape; margin: 10mm; }
+      body { min-width: 0; background: #fff; }
+      .app-shell { display: block; }
+      .topbar, .sidebar, .filters, .actions { display: none !important; }
+      main { padding: 0; }
+      .report { max-width: none; gap: 10mm; }
+      .section { break-inside: avoid; box-shadow: none; }
+      .section:first-child { break-after: page; }
+      .section + .section { margin-top: 0; }
+      .chart-gallery, .chart-gallery.three { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .echart { height: 68mm; }
+    }
+  </style>
+</head>
+<body>
+  <template id="__bundler_thumbnail" data-bg-color="#e9eef0">
+    <svg viewBox="0 0 1200 800" xmlns="http://www.w3.org/2000/svg">
+      <rect width="1200" height="800" fill="#e9eef0" />
+      <rect x="120" y="90" width="960" height="620" fill="#ffffff" />
+      <rect x="120" y="90" width="960" height="128" fill="#102c39" />
+      <rect x="168" y="142" width="410" height="20" fill="#ffffff" opacity=".92" />
+      <rect x="168" y="258" width="194" height="138" fill="#2389ad" />
+      <rect x="382" y="298" width="194" height="98" fill="#55b7bf" />
+      <rect x="596" y="330" width="194" height="66" fill="#79bca8" />
+      <rect x="810" y="276" width="194" height="120" fill="#2389ad" />
+      <rect x="168" y="448" width="836" height="8" fill="#d8e1e5" />
+      <rect x="168" y="496" width="560" height="16" fill="#17232b" opacity=".9" />
+      <rect x="168" y="538" width="704" height="10" fill="#687781" opacity=".45" />
+      <rect x="168" y="568" width="640" height="10" fill="#687781" opacity=".35" />
+    </svg>
+  </template>
+
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><div><strong>PRODUCT INTELLIGENCE</strong><span>MONTHLY CONFIGURATION ANALYSIS</span></div></div>
+      <div class="document-title"><strong data-bind="report.title">待生成报告标题</strong><span>数据截止日：<span data-bind="report.data_cutoff">待生成</span></span></div>
+      <div class="actions"><button class="button primary" id="printButton" type="button">打印 / PDF</button></div>
+    </header>
+
+    <aside class="sidebar" aria-label="报告章节">
+      <div class="side-label">REPORT INDEX</div>
+      <nav class="nav-list">
+        <a class="nav-item active" href="#overview"><span class="nav-index">01</span><span>执行摘要</span><i class="nav-state"></i></a>
+        <a class="nav-item" href="#iteration"><span class="nav-index">02</span><span>新车迭代</span><i class="nav-state"></i></a>
+        <a class="nav-item" href="#power"><span class="nav-index">03</span><span>尺寸与动力</span><i class="nav-state"></i></a>
+        <a class="nav-item" href="#platform"><span class="nav-index">04</span><span>高压平台</span><i class="nav-state"></i></a>
+        <a class="nav-item" href="#adas"><span class="nav-index">05</span><span>智能驾驶</span><i class="nav-state"></i></a>
+        <a class="nav-item" href="#cockpit"><span class="nav-index">06</span><span>座舱与舒适</span><i class="nav-state"></i></a>
+        <a class="nav-item" href="#core-config"><span class="nav-index">07</span><span>核心配置率查询</span><i class="nav-state"></i></a>
+        <a class="nav-item" href="#method"><span class="nav-index">08</span><span>附件 · 数据口径</span><i class="nav-state"></i></a>
+      </nav>
+      <div class="scope-card"><h3>当前分析范围</h3><dl class="scope-grid">
+        <dt>市场</dt><dd data-bind="report.scope.market">待生成</dd>
+        <dt>能源</dt><dd data-bind="report.scope.energy">待生成</dd>
+        <dt>周期</dt><dd data-bind="report.scope.period">待生成</dd>
+        <dt>基数</dt><dd data-bind="report.scope.grain">待生成</dd>
+      </dl></div>
+    </aside>
+
+    <main>
+      <article class="report">
+        <section class="section" id="overview" data-screen-label="01 执行摘要">
+          <div class="template-banner"><strong>月度产品配置分析报告模板</strong><span>按月复制报告，只更新页尾 <code>#report-payload</code> 的 JSON；不要覆盖基准模板，也不要改 DOM id、章节结构或渲染器。</span></div>
+          <div class="hero"><div class="hero-cover"><h1 data-bind="report.title">待生成报告标题</h1><time class="report-date" data-bind="report.report_date">待生成报告日期</time></div></div>
+          <div class="metric-grid" data-repeat="report.metrics" data-repeat-count="4"></div>
+          <div class="insight-grid" data-repeat="report.insights" data-repeat-count="5"></div>
+        </section>
+
+        <section class="section" id="iteration" data-screen-label="02 新车迭代">
+          <header class="section-head"><div><div class="eyebrow">Product Renewal</div><h2 data-bind="report.sections.iteration.headline">待生成章节结论</h2><p class="section-subtitle" data-bind="report.sections.iteration.summary">待生成章节摘要</p></div><div class="section-number">02</div></header>
+          <div class="section-body"><div class="chart-gallery">
+            <article class="chart-panel" data-chart-panel="renewalChart"><div class="chart-panel-head"><div><h3>年度更新次数与更新周期</h3><p>堆叠柱：更新次数；折线：平均上市周期</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart tall" id="renewalChart"></div><p class="echart-fallback">等待 Agent 填充已验证数据。</p></article>
+            <article class="chart-panel"><div class="chart-panel-head"><div><h3>重点竞企更新节奏</h3><p>表格行由 <code>report.tables.competitor_updates</code> 生成</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="table-wrap"><table data-table="competitor_updates"></table></div></article>
+          </div></div>
+        </section>
+
+        <section class="section" id="power" data-screen-label="03 尺寸与动力">
+          <header class="section-head"><div><div class="eyebrow">Size × Power</div><h2 data-bind="report.sections.power.headline">待生成章节结论</h2><p class="section-subtitle" data-bind="report.sections.power.summary">待生成章节摘要</p></div><div class="section-number">03</div></header>
+          <div class="section-body"><div class="chart-gallery">
+            <article class="chart-panel" data-chart-panel="wheelbaseTrendChart"><div class="chart-panel-head"><div><h3>乘用车轴距结构变化</h3><p>100% 堆叠，排除皮卡</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart" id="wheelbaseTrendChart"></div><p class="echart-fallback">等待轴距结构数据。</p></article>
+            <article class="chart-panel" data-chart-panel="motorPowerTrendChart"><div class="chart-panel-head"><div><h3>新能源电机总功率结构变化</h3><p>100% 堆叠，仅新能源且非空功率</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart" id="motorPowerTrendChart"></div><p class="echart-fallback">等待电机功率结构数据。</p></article>
+            <article class="chart-panel wide" data-chart-panel="sizePowerHeatmapChart"><div class="chart-panel-head"><div><h3>纯电轴距 × 电机功率组合密度</h3><p>切片：<select id="heatmapVariantSelect" class="query-select" style="display:inline-block;width:auto;height:28px;margin-left:4px;"><option>待生成</option></select></p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart tall" id="sizePowerHeatmapChart"></div><p class="echart-fallback">等待组合热力图数据。</p></article>
+          </div></div>
+        </section>
+
+        <section class="section" id="platform" data-screen-label="04 高压平台">
+          <header class="section-head"><div><div class="eyebrow">High-voltage Platform</div><h2 data-bind="report.sections.platform.headline">待生成章节结论</h2><p class="section-subtitle" data-bind="report.sections.platform.summary">待生成章节摘要</p></div><div class="section-number">04</div></header>
+          <div class="section-body"><div class="chart-gallery">
+            <article class="chart-panel" data-chart-panel="bevVoltageTrendChart"><div class="chart-panel-head"><div><h3>纯电高压平台年度趋势</h3><p>各电压平台结构与高压平台占比</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart" id="bevVoltageTrendChart"></div><p class="echart-fallback">等待纯电年度数据。</p></article>
+            <article class="chart-panel" data-chart-panel="bevVoltagePriceChart"><div class="chart-panel-head"><div><h3>纯电高压平台价格带</h3><p>价格带内部占比</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart" id="bevVoltagePriceChart"></div><p class="echart-fallback">等待纯电价格带数据。</p></article>
+            <article class="chart-panel" data-chart-panel="nevVoltageTrendChart"><div class="chart-panel-head"><div><h3>全新能源高压平台年度趋势</h3><p>纳入纯电、插混与增程</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart" id="nevVoltageTrendChart"></div><p class="echart-fallback">等待全新能源年度数据。</p></article>
+            <article class="chart-panel" data-chart-panel="nevVoltagePriceChart"><div class="chart-panel-head"><div><h3>全新能源高压平台价格带</h3><p>价格带内部占比</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart" id="nevVoltagePriceChart"></div><p class="echart-fallback">等待全新能源价格带数据。</p></article>
+          </div><p class="chart-section-note" data-bind="report.sections.platform.note">待生成分母口径说明</p></div>
+        </section>
+
+        <section class="section" id="adas" data-screen-label="05 智能驾驶">
+          <header class="section-head"><div><div class="eyebrow">Intelligent Driving</div><h2 data-bind="report.sections.adas.headline">待生成章节结论</h2><p class="section-subtitle" data-bind="report.sections.adas.summary">待生成章节摘要</p></div><div class="section-number">05</div></header>
+          <div class="section-body">
+            <div class="feature-grid" data-repeat="report.features.adas" data-repeat-count="4"></div>
+            <h3 class="subsection-title">L2 普及与价格下探</h3><div class="chart-gallery">
+              <article class="chart-panel" data-chart-panel="l2TrendChart"><div class="chart-panel-head"><div><h3>L2 配备率趋势</h3><p>车系维度与款型维度</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart" id="l2TrendChart"></div><p class="echart-fallback">等待 L2 趋势数据。</p></article>
+              <article class="chart-panel" data-chart-panel="l2PriceBandChart"><div class="chart-panel-head"><div><h3>L2+ 分价格带配备率</h3><p>价格带序列与行业均值</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart" id="l2PriceBandChart"></div><p class="echart-fallback">等待 L2 价格带数据。</p></article>
+              <article class="chart-panel wide" data-chart-panel="l2PriceBoxplotChart"><div class="chart-panel-head"><div><h3>L2 款型指导价分布</h3><p>五数概括：最小值、Q1、中位数、Q3、最大值</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart tall" id="l2PriceBoxplotChart"></div><p class="echart-fallback">等待 L2 指导价分布数据。</p></article>
+            </div>
+            <h3 class="subsection-title">高阶智驾</h3><div class="chart-gallery">
+              <article class="chart-panel wide" data-chart-panel="highAdasTrendChart"><div class="chart-panel-head"><div><h3>高阶智驾配备率</h3><p>高速 NOA 口径；不再输出芯片平台和雷达供应商份额图</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart compact" id="highAdasTrendChart"></div><p class="echart-fallback">等待高阶智驾趋势数据。</p></article>
+            </div>
+            <h3 class="subsection-title">主要企业 NOA 搭载</h3><div class="table-wrap"><table data-table="noa_coverage"></table></div>
+          </div>
+        </section>
+
+        <section class="section" id="cockpit" data-screen-label="06 座舱与舒适">
+          <header class="section-head"><div><div class="eyebrow">Cockpit & Comfort</div><h2 data-bind="report.sections.cockpit.headline">待生成章节结论</h2><p class="section-subtitle" data-bind="report.sections.cockpit.summary">待生成章节摘要</p></div><div class="section-number">06</div></header>
+          <div class="section-body">
+            <div class="feature-grid" data-repeat="report.features.cockpit" data-repeat-count="3"></div>
+            <h3 class="subsection-title">座舱电子趋势</h3><div class="chart-gallery">
+              <article class="chart-panel" data-chart-panel="hudRateChart"><div class="chart-panel-head"><div><h3>HUD 配备率</h3><p>按报告周期输出</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart compact" id="hudRateChart"></div><p class="echart-fallback">等待 HUD 趋势数据。</p></article>
+              <article class="chart-panel" data-chart-panel="screenSizeChart"><div class="chart-panel-head"><div><h3>中控屏幕尺寸</h3><p>平均尺寸与有效样本数</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart compact" id="screenSizeChart"></div><p class="echart-fallback">等待中控屏尺寸数据。</p></article>
+            </div>
+            <h3 class="subsection-title">舒适配置趋势</h3><div class="chart-gallery">
+              <article class="chart-panel" data-chart-panel="fridgeRateChart"><div class="chart-panel-head"><div><h3>车载冰箱</h3><p>款型配备率</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart compact" id="fridgeRateChart"></div><p class="echart-fallback">等待车载冰箱数据。</p></article>
+              <article class="chart-panel" data-chart-panel="rearScreenRateChart"><div class="chart-panel-head"><div><h3>后排多媒体屏</h3><p>款型配备率</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart compact" id="rearScreenRateChart"></div><p class="echart-fallback">等待后排屏数据。</p></article>
+              <article class="chart-panel" data-chart-panel="zeroGravityRateChart"><div class="chart-panel-head"><div><h3>零重力座椅</h3><p>款型配备率</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart compact" id="zeroGravityRateChart"></div><p class="echart-fallback">等待零重力座椅数据。</p></article>
+              <article class="chart-panel" data-chart-panel="rearMassageRateChart"><div class="chart-panel-head"><div><h3>后排按摩座椅</h3><p>款型配备率</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart compact" id="rearMassageRateChart"></div><p class="echart-fallback">等待后排按摩座椅数据。</p></article>
+            </div>
+          </div>
+        </section>
+
+        <section class="section" id="core-config" data-screen-label="07 核心配置率查询">
+          <header class="section-head"><div><div class="eyebrow">Core Configuration Query</div><h2 data-bind="report.sections.core_config.headline">核心配置率查询</h2><p class="section-subtitle" data-bind="report.sections.core_config.summary">待生成章节摘要</p></div><div class="section-number">07</div></header>
+          <div class="section-body"><div class="query-toolbar" aria-label="核心配置率查询条件">
+            <div class="query-field"><label for="coreConfigSelect">配置项</label><select class="query-select" id="coreConfigSelect"><option>待生成</option></select></div>
+            <div class="query-field"><label for="coreGrainSelect">统计维度</label><select class="query-select" id="coreGrainSelect"><option>待生成</option></select></div>
+            <div class="query-field"><label for="coreHeatDimensionSelect">热力图维度</label><select class="query-select" id="coreHeatDimensionSelect"><option>待生成</option></select></div>
+          </div><div class="chart-gallery">
+            <article class="chart-panel" data-chart-panel="coreConfigTrendChart"><div class="chart-panel-head"><div><h3 id="coreTrendTitle">核心配置趋势</h3><p>柱形：搭载数；折线：配置率</p></div></div><div class="echart tall" id="coreConfigTrendChart"></div><p class="echart-fallback">等待核心配置趋势数据。</p></article>
+            <article class="chart-panel" data-chart-panel="coreConfigHeatmapChart"><div class="chart-panel-head"><div><h3 id="coreHeatmapTitle">核心配置热力图</h3><p>单元格为配置率</p></div></div><div class="echart tall" id="coreConfigHeatmapChart"></div><p class="echart-fallback">等待核心配置热力图数据。</p></article>
+          </div></div>
+        </section>
+
+        <section class="section appendix" id="method" data-screen-label="08 附件 · 数据口径">
+          <header class="section-head"><div><div class="eyebrow">Appendix · Methodology</div><h2>附件 · 数据口径与模型输出约束</h2><p class="section-subtitle">每条口径必须可追溯到查询证据。</p></div><div class="section-number">08</div></header>
+          <div class="section-body"><div class="method-grid" data-repeat="report.methodology" data-repeat-count="4"></div></div>
+        </section>
+      </article>
+    </main>
+  </div>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script id="report-payload" type="application/json">
+{
+  "schema_version": "2.0",
+  "report": {
+    "title": null,
+    "report_date": null,
+    "data_cutoff": null,
+    "scope": {"market": null, "energy": null, "period": null, "grain": null},
+    "metrics": [],
+    "insights": [],
+    "sections": {
+      "iteration": {"headline": null, "summary": null},
+      "power": {"headline": null, "summary": null},
+      "platform": {"headline": null, "summary": null, "note": null},
+      "adas": {"headline": null, "summary": null},
+      "cockpit": {"headline": null, "summary": null},
+      "core_config": {"headline": null, "summary": null}
+    },
+    "features": {"adas": [], "cockpit": []},
+    "tables": {
+      "competitor_updates": {"status": "pending", "columns": [], "rows": [], "reason": "Agent 必须先查询竞企更新数据"},
+      "noa_coverage": {"status": "pending", "columns": [], "rows": [], "reason": "Agent 必须先查询品牌 NOA 搭载数据"}
+    },
+    "methodology": []
+  },
+  "controls": {"core_configs": [], "grains": [], "heatmap_dimensions": []},
+  "charts": {
+    "renewalChart": {"status": "pending", "kind": "combo", "categories": [], "series": [], "reason": "等待更新次数和周期查询"},
+    "wheelbaseTrendChart": {"status": "pending", "kind": "percent_stack", "categories": [], "series": [], "reason": "等待轴距结构查询"},
+    "motorPowerTrendChart": {"status": "pending", "kind": "percent_stack", "categories": [], "series": [], "reason": "等待功率结构查询"},
+    "sizePowerHeatmapChart": {"status": "pending", "kind": "heatmap_variants", "variants": [], "reason": "等待轴距与功率交叉查询"},
+    "bevVoltageTrendChart": {"status": "pending", "kind": "percent_stack", "categories": [], "series": [], "reason": "等待纯电年度平台查询"},
+    "bevVoltagePriceChart": {"status": "pending", "kind": "percent_stack", "categories": [], "series": [], "reason": "等待纯电价格带查询"},
+    "nevVoltageTrendChart": {"status": "pending", "kind": "percent_stack", "categories": [], "series": [], "reason": "等待全新能源年度平台查询"},
+    "nevVoltagePriceChart": {"status": "pending", "kind": "percent_stack", "categories": [], "series": [], "reason": "等待全新能源价格带查询"},
+    "l2TrendChart": {"status": "pending", "kind": "line", "categories": [], "series": [], "reason": "等待 L2 趋势查询"},
+    "l2PriceBandChart": {"status": "pending", "kind": "line", "categories": [], "series": [], "reason": "等待 L2 价格带查询"},
+    "l2PriceBoxplotChart": {"status": "pending", "kind": "boxplot", "categories": [], "series": [], "reason": "等待 L2 指导价查询"},
+    "highAdasTrendChart": {"status": "pending", "kind": "line", "categories": [], "series": [], "reason": "等待高阶智驾查询"},
+    "hudRateChart": {"status": "pending", "kind": "line", "categories": [], "series": [], "reason": "等待 HUD 查询"},
+    "screenSizeChart": {"status": "pending", "kind": "line", "categories": [], "series": [], "reason": "等待中控屏尺寸查询"},
+    "fridgeRateChart": {"status": "pending", "kind": "line", "categories": [], "series": [], "reason": "等待车载冰箱查询"},
+    "rearScreenRateChart": {"status": "pending", "kind": "line", "categories": [], "series": [], "reason": "等待后排屏查询"},
+    "zeroGravityRateChart": {"status": "pending", "kind": "line", "categories": [], "series": [], "reason": "等待零重力座椅查询"},
+    "rearMassageRateChart": {"status": "pending", "kind": "line", "categories": [], "series": [], "reason": "等待后排按摩座椅查询"},
+    "coreConfigTrendChart": {"status": "pending", "kind": "combo_variants", "variants": [], "reason": "等待核心配置趋势查询"},
+    "coreConfigHeatmapChart": {"status": "pending", "kind": "heatmap_variants", "variants": [], "reason": "等待核心配置热力查询"}
+  },
+  "evidence": {},
+  "quality": {"status": "template", "plan_tasks": 0, "completed_tasks": 0, "missing_tasks": [], "warnings": []}
+}
+  </script>
+  <script src="./echarts-6.1.0.min.js"></script>
+  <script src="./report-renderer.js"></script>
+</body>
+</html>

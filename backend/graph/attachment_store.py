@@ -10,12 +10,24 @@ import shutil
 import time
 import threading
 import uuid
+import warnings
 from functools import wraps
 from pathlib import Path
 from typing import BinaryIO, Any
 from urllib.parse import quote
 
+import filetype
+from PIL import Image
+
 IMAGE_MIME_PREFIX = "image/"
+INLINE_IMAGE_MIME_TYPES = frozenset(
+    {
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+    }
+)
+MAX_INLINE_IMAGE_PIXELS = 40_000_000
 MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024
 
 
@@ -282,7 +294,50 @@ class AttachmentStore:
                 f"/api/attachments/{quote(attachment_id, safe='')}/download"
                 f"?session_id={quote(session_id, safe='')}"
             )
+            preview = AttachmentStore.preview_info(item)
+            if preview is not None:
+                public["preview_url"] = (
+                    f"/api/attachments/{quote(attachment_id, safe='')}/preview"
+                    f"?session_id={quote(session_id, safe='')}"
+                )
+                public["preview_mime_type"] = preview["mime_type"]
+                public["width"] = preview["width"]
+                public["height"] = preview["height"]
         return public
+
+    @staticmethod
+    def preview_info(item: dict[str, Any]) -> dict[str, Any] | None:
+        """Verify that stored bytes are an inert raster image suitable for inline display."""
+
+        path = Path(str(item.get("path") or ""))
+        if not path.is_file():
+            return None
+        try:
+            detected = filetype.guess(path)
+            detected_mime = str(getattr(detected, "mime", "") or "").lower()
+            if detected_mime not in INLINE_IMAGE_MIME_TYPES:
+                return None
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                with Image.open(path) as image:
+                    width, height = image.size
+                    if width < 1 or height < 1 or width * height > MAX_INLINE_IMAGE_PIXELS:
+                        return None
+                    # Animated WebP/APNG can contain substantially more decoded
+                    # data than the first frame suggests.  Screenshot and QR
+                    # preview intentionally supports inert, single-frame images.
+                    if bool(getattr(image, "is_animated", False)) or int(
+                        getattr(image, "n_frames", 1)
+                    ) != 1:
+                        return None
+                    image.verify()
+            return {
+                "mime_type": detected_mime,
+                "width": width,
+                "height": height,
+            }
+        except (OSError, ValueError, Image.DecompressionBombError, Image.DecompressionBombWarning):
+            return None
 
 
 attachment_store = AttachmentStore()

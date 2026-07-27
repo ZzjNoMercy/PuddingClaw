@@ -23,6 +23,12 @@ class ExportDataAssetPlan(BaseModel):
     size_bytes: int = 0
     profile_available: bool = False
     source_asset_ids: list[str] = Field(default_factory=list)
+    source_name: str = ""
+    source_type: str = ""
+    host: str = ""
+    port: int = 0
+    database: str = ""
+    schema_name: str = ""
 
 
 class AnalysisProjectExportPlan(BaseModel):

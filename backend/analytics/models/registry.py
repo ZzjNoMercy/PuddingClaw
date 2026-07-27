@@ -23,6 +23,16 @@ class AnalyticsModelError(ValueError):
 
 SAFE_EXTRA_SUFFIXES = {".md", ".txt", ".json", ".yaml", ".yml", ".html", ".css", ".csv", ".tsv"}
 SLUG_RE = re.compile(r"[^0-9A-Za-z_\-\u4e00-\u9fff]+")
+IGNORED_MODEL_FILE_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
+IGNORED_MODEL_PATH_PARTS = {"__MACOSX", ".git", ".svn"}
+
+
+def _is_ignored_model_file(path: Path) -> bool:
+    return (
+        path.name in IGNORED_MODEL_FILE_NAMES
+        or path.name.startswith("._")
+        or any(part in IGNORED_MODEL_PATH_PARTS for part in path.parts)
+    )
 
 
 @dataclass(frozen=True)
@@ -286,7 +296,7 @@ class AnalyticsModelRegistry:
         table_refs = [str(item).strip() for item in ((model.get("frontmatter") or {}).get("data_assets") or {}).get("tables") or []]
         for table_ref in table_refs:
             if not table_ref.startswith("table_asset:"):
-                database_source_id, separator, table_name = table_ref.rpartition(".")
+                database_source_id, separator, table_name = table_ref.partition(".")
                 data_asset_context.append(
                     {
                         "ref": table_ref,
@@ -530,14 +540,15 @@ class AnalyticsModelRegistry:
         model_dir = _ensure_under_root(self.root_dir, main_path.parent)
         files: list[dict[str, Any]] = []
         for path in sorted(model_dir.rglob("*")):
-            if not path.is_file():
+            relative_path = path.relative_to(model_dir)
+            if not path.is_file() or _is_ignored_model_file(relative_path):
                 continue
             stat = path.stat()
             files.append(
                 {
                     "name": path.name,
                     "path": path.relative_to(self.base_dir).as_posix(),
-                    "relative_path": path.relative_to(model_dir).as_posix(),
+                    "relative_path": relative_path.as_posix(),
                     "size_bytes": stat.st_size,
                     "mtime": stat.st_mtime,
                     "editable": path.suffix.lower() in SAFE_EXTRA_SUFFIXES,

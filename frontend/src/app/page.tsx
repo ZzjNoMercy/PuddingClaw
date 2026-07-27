@@ -8,7 +8,9 @@ import Sidebar from "@/components/layout/Sidebar";
 import ChatPanel from "@/components/chat/ChatPanel";
 import ResizeHandle from "@/components/layout/ResizeHandle";
 import SourcesPanel from "@/components/citations/SourcesPanel";
+import AttachmentPreviewPanel from "@/components/attachments/AttachmentPreviewPanel";
 import TraceDashboard from "@/components/agent/TraceDashboard";
+import { collectSessionArtifacts } from "@/lib/imageAttachments";
 
 const MIN_SIDEBAR = 200;
 const MIN_CHAT = 360;
@@ -32,6 +34,9 @@ function ChatLayout() {
     setWorkspaceView,
     trace,
     notice,
+    messages,
+    activeAttachmentPreview,
+    closeAttachmentPreview,
   } = useApp();
 
   const searchParams = useSearchParams();
@@ -45,9 +50,15 @@ function ChatLayout() {
   const handleInspectorAvailabilityChange = useCallback((available: boolean) => {
     setInspectorAvailability({ sessionId, available });
   }, [sessionId]);
-  const inspectorAvailable =
+  const sessionArtifacts = useMemo(
+    () => collectSessionArtifacts(messages),
+    [messages],
+  );
+  const sourcesAvailable =
     inspectorAvailability.sessionId === sessionId && inspectorAvailability.available;
+  const inspectorAvailable = sourcesAvailable || sessionArtifacts.length > 0;
   const visibleInspectorOpen = inspectorOpen && inspectorAvailable;
+  const imagePreviewActive = activeAttachmentPreview?.sessionId === sessionId;
 
   const sessionTitle = useMemo(() => {
     if (sessionId === "default") return "新对话";
@@ -73,6 +84,17 @@ function ChatLayout() {
       setInspectorOpen(false);
     }
   }, [inspectorAvailable, setInspectorOpen]);
+
+  useEffect(() => {
+    if (!inspectorOpen && activeAttachmentPreview) {
+      closeAttachmentPreview();
+    }
+  }, [activeAttachmentPreview, closeAttachmentPreview, inspectorOpen]);
+
+  const closeInspector = useCallback(() => {
+    closeAttachmentPreview();
+    setInspectorOpen(false);
+  }, [closeAttachmentPreview, setInspectorOpen]);
 
   const handleSidebarResize = (delta: number) => {
     setSidebarWidth((prev: number) => Math.max(MIN_SIDEBAR, prev + delta));
@@ -151,16 +173,31 @@ function ChatLayout() {
               )}
             </div>
 
+            {visibleInspectorOpen ? (
+              <button
+                type="button"
+                className="fixed inset-0 z-[65] hidden bg-slate-950/20 backdrop-blur-[1px] max-md:block"
+                onClick={closeInspector}
+                aria-label="关闭检查器"
+              />
+            ) : null}
+
             {visibleInspectorOpen && (
-              <ResizeHandle onResize={handleInspectorResize} direction="right" />
+              <div className="hidden md:block">
+                <ResizeHandle onResize={handleInspectorResize} direction="right" />
+              </div>
             )}
 
             <div
-              className="workspace-inspector-shell shrink-0 panel-transition overflow-hidden"
+              className={`workspace-inspector-shell shrink-0 panel-transition overflow-hidden ${visibleInspectorOpen ? "workspace-inspector-shell-open" : ""}`}
               style={{ width: visibleInspectorOpen ? inspectorWidth : 0 }}
             >
               <div style={{ width: inspectorWidth, minWidth: MIN_INSPECTOR }} className="h-full">
-                <SourcesPanel onAvailabilityChange={handleInspectorAvailabilityChange} />
+                {imagePreviewActive ? (
+                  <AttachmentPreviewPanel />
+                ) : (
+                  <SourcesPanel onAvailabilityChange={handleInspectorAvailabilityChange} />
+                )}
               </div>
             </div>
           </div>

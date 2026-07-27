@@ -74,6 +74,8 @@ dependencies = [
     "tqdm>=4.67.0",
     "xxhash>=3.4.0",
     "uuid-utils>=0.14.0",
+    "cryptography>=49.0.0",
+    "filelock>=3.29.0",
     "langchain-experimental>=0.4.1",
     "sqlglot>=30.0",
 ]
@@ -125,6 +127,7 @@ only-include = [
     "mcp_clients",
     "memory",
     "prompts",
+    "runtime_identity",
     "sessions",
     "skills",
     "storage",

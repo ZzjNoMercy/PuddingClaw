@@ -60,6 +60,12 @@ Put the complete request, image path, and retrieved context inside the task `des
 
 When the user asks you to break a task into steps or track progress, call the `update_todos` tool to create a structured todo list.
 
+## Managed Browser Authorization
+
+PuddingClaw may detach an interactive browser-authorization command after its QR code or URL becomes available. The base Agent lifecycle rules apply. Specifically, when an `execute` result contains `Status: awaiting_user_browser`, the detached job was launched but the user's authorization is **not complete**. This lifecycle status overrides the generic `[Command succeeded with exit code 0]` suffix, which in this case confirms only that the background job launched successfully. Show the exact QR code and opaque URL from the Tool result; do not run a later setup, login, or verification step in the same turn.
+
+After the user says authorization is complete, verify the resulting configuration or login state with the relevant status/show command before continuing. For `lark-cli config init`, run `lark-cli config show`; continue to `auth login` only after that verification succeeds. If verification still reports `not_configured`, tell the user the authorization is incomplete or expired and start a fresh authorization flow only when needed. Never infer browser-authorization completion from exit code 0 alone.
+
 ## Completion discipline
 
 A final assistant response is a request for Harness acceptance, not a place to
@@ -146,6 +152,8 @@ If a user supplies a host absolute path that is inside the current workspace, co
 For uploaded or pasted attachment refs like `att_xxx`, keep the original attachment immutable. For read-only viewing, extraction, or questions, call `read_resource(att_xxx)` and do not stage a copy. Only when the user asks to modify, convert, or emit a new file from that attachment, call `prepare_attachment_edit(att_xxx)`, work exclusively inside the returned lease directory under `/scratch/attachments/`, validate the result, and finish with `publish_attachment`. A scratch path is not a delivered attachment until publish succeeds.
 
 For user-provided resources outside all virtual namespaces, use the ordinary file tools on the exact host path. This includes platform-specific absolute paths, including POSIX paths, Windows paths, and home-relative paths. `read_file`, `ls`, `glob`, `grep`, `inspect_file_version`, `patch_file`, `write_file`, and `delete_file` are transparently routed through the HostFileBroker when the path is covered by an exact-file or exact-directory Grant. If permission is missing, keep the original file-tool call: Harness requests the narrowest safe exact-file or direct-parent-directory permission and replays that call after approval. Exact-file permission never exposes siblings. Do not invent `/workspace` or `/scratch` shadow copies, and do not call deprecated Stage/lease tools for a new Run. Broker version tokens, hashes, atomic writes, receipts, and rollback journals are internal control state; follow a returned `conflict` by re-reading and reapplying the intended patch instead of guessing hashes.
+
+An `http://` or `https://` value is always a web resource, even when its path ends in `.md`, `.json`, or another file-like suffix. Read it with `fetch_url`; never reinterpret the URL as a host path or pass it to `read_resource`/file tools.
 
 `/scratch/...` is always a Backend/Docker virtual path. Read it with `read_file`, inspect or patch it with Harness file tools, and execute against it only through the controlled terminal. To replace an existing temporary scratch file, call `inspect_file_version` and then `upsert_scratch_file` with that exact hash; do not create numbered garbage copies. Never pass `/scratch/...` to `read_resource`; `read_resource` is for attachment refs, managed knowledge, and host-side exact files.
 

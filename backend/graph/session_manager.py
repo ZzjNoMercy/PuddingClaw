@@ -656,7 +656,14 @@ class SessionManager:
                     "name": str(item.get("name") or item.get("id") or "attachment"),
                     "type": str(item.get("type") or "file"),
                     "mime_type": str(item.get("mime_type") or ""),
+                    "size": int(item.get("size") or 0),
                     "source": str(item.get("source") or "upload"),
+                    "sha256": str(item.get("sha256") or ""),
+                    "download_url": str(item.get("download_url") or ""),
+                    "preview_url": str(item.get("preview_url") or ""),
+                    "preview_mime_type": str(item.get("preview_mime_type") or ""),
+                    "width": int(item.get("width") or 0),
+                    "height": int(item.get("height") or 0),
                 }
                 for item in attachments
                 if isinstance(item, dict) and item.get("id")
@@ -677,6 +684,10 @@ class SessionManager:
                     "created_by_goal_id": str(item.get("created_by_goal_id") or ""),
                     "created_by_goal_revision": item.get("created_by_goal_revision"),
                     "download_url": str(item.get("download_url") or ""),
+                    "preview_url": str(item.get("preview_url") or ""),
+                    "preview_mime_type": str(item.get("preview_mime_type") or ""),
+                    "width": int(item.get("width") or 0),
+                    "height": int(item.get("height") or 0),
                 }
                 for item in output_attachments
                 if isinstance(item, dict) and item.get("id")
@@ -7306,6 +7317,7 @@ class SessionManager:
         existing: Any,
         required: Any,
         *,
+        target_kind: str,
         target: str,
     ) -> bool:
         """Compare authority bindings without coupling them to an instance.
@@ -7319,8 +7331,13 @@ class SessionManager:
 
         return PermissionBindingPolicy.equivalent(
             grant_type="tool_action",
-            scope="session" if target == "session_network_access" else "once",
-            target_kind="capability" if target == "session_network_access" else "fingerprint",
+            scope=(
+                "session"
+                if target_kind in {"network_origin", "network_profile"}
+                or target == "session_network_access"
+                else "once"
+            ),
+            target_kind=target_kind,
             target=target,
             left=existing if isinstance(existing, dict) else None,
             right=required if isinstance(required, dict) else None,
@@ -7507,6 +7524,7 @@ class SessionManager:
             if required_bindings is not None and not self._permission_bindings_match(
                 grant.get("bindings"),
                 required_bindings,
+                target_kind=str(session_target_kind or grant.get("target_kind") or "fingerprint"),
                 target=binding_target,
             ):
                 continue

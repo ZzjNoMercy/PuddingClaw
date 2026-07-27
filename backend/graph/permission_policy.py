@@ -18,7 +18,7 @@ class ApprovalMode(StrEnum):
 
 
 DEFAULT_APPROVAL_MODE = ApprovalMode.STRICT
-PERMISSION_POLICY_VERSION = "tool-execution-v3"
+PERMISSION_POLICY_VERSION = "tool-execution-v4"
 PERMISSION_BINDING_SCHEMA_VERSION = 2
 
 
@@ -45,7 +45,8 @@ class PermissionBindingPolicy:
     ) -> dict[str, Any]:
         bindings = runtime_bindings if isinstance(runtime_bindings, Mapping) else {}
         if scope == "session" and (
-            target == "session_network_access"
+            target_kind in {"network_origin", "network_profile"}
+            or target == "session_network_access"
             or grant_type.startswith("external_directory_")
         ):
             return {key: bindings.get(key) for key in cls._COMMON_KEYS}

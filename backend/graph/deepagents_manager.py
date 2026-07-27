@@ -74,6 +74,7 @@ from graph.citations import (
 from graph.database_sql_revision_resume import database_sql_revision_resume_registry
 from graph.deepagents_prompt_builder import build_deepagents_system_prompt
 from graph.dimension_build_resume import dimension_build_resume_registry
+from graph.live_tool_output import project_live_tool_output
 from graph.logical_dataset_resume import logical_dataset_resume_registry
 from graph.managed_paths import is_managed_resource_path
 from graph.middleware_trace_proxy import wrap_middlewares_for_trace
@@ -119,6 +120,7 @@ from graph.permission_policy import RunPermissionContext
 from graph.permission_resume import permission_resume_registry
 from graph.permissioned_filesystem_backend import PermissionedCompositeBackend
 from graph.session_manager import session_manager
+from graph.skill_plan_resume import skill_plan_resume_registry
 from graph.tool_result_adapter import tool_result_adapter
 from graph.trace_collector import TraceCollector, TraceSpan
 from graph.user_input_resume import user_input_resume_registry
@@ -2566,17 +2568,19 @@ class DeepAgentsAgentManager:
         scratch_scope_dir = scratch_project_root / safe_session / scratch_scope
         scratch_scope_dir.mkdir(parents=True, exist_ok=True)
         terminal_config = config.load_config().get("harness", {}).get("terminal", {})
+        managed_readonly_mounts = [
+            {
+                "source": str(skills_dir.resolve()),
+                "target": "/skills",
+            }
+        ]
         terminal_config = {
             **terminal_config,
             "_scratch_host_path": str(scratch_scope_dir.resolve()),
             "docker": {
                 **dict(terminal_config.get("docker") or {}),
-                "_managed_readonly_mounts": [
-                    {
-                        "source": str(skills_dir.resolve()),
-                        "target": "/skills",
-                    }
-                ],
+                "_managed_user_toolchain": True,
+                "_managed_readonly_mounts": managed_readonly_mounts,
                 "_managed_writable_mounts": [
                     {
                         "source": str(scratch_project_root.resolve()),
@@ -2709,12 +2713,16 @@ class DeepAgentsAgentManager:
                 skills_dir=self._base_dir / "skills",
                 toolsets_by_skill=toolset_mapping,
             ),
+            # Keep execution policy in the Agent middleware chain: its
+            # before_model hook owns durable HITL boundaries such as a prepared
+            # Skill Manager batch and must run before another model turn.
             ToolExecutionPipeline(
                 known_tools=set(known_tools or ()),
                 backend_mode=backend_mode,
                 permission_context=permission_context,
                 base_dir=self._base_dir,
                 reviewer=permission_reviewer,
+                workspace_backend=getattr(workspace_backend, "execution_backend", workspace_backend),
             ),
         ]
         tool_context_cfg = ToolContextConfig.from_mapping(config.get_deepagents_tool_context_config())
@@ -4481,6 +4489,7 @@ class DeepAgentsAgentManager:
             "logical_dataset_rule_request",
             "database_sql_revision_request",
             "user_input_request",
+            "skill_plan_confirmation_request",
         }
         extracted: list[tuple[str, dict[str, Any], str]] = []
         for interrupt_item in interrupts:
@@ -4572,6 +4581,7 @@ class DeepAgentsAgentManager:
                 "logical_dataset_rule_request": "logical_dataset_rule_required",
                 "database_sql_revision_request": "database_sql_revision_required",
                 "user_input_request": "user_input_required",
+                "skill_plan_confirmation_request": "skill_plan_confirmation_required",
             }
             for interrupted_type, interrupted_request, _interrupt_id in pending_interrupts:
                 yield self._sse(required_events[interrupted_type], interrupted_request)
@@ -4582,6 +4592,7 @@ class DeepAgentsAgentManager:
                 "logical_dataset_rule_request": logical_dataset_resume_registry,
                 "database_sql_revision_request": database_sql_revision_resume_registry,
                 "user_input_request": user_input_resume_registry,
+                "skill_plan_confirmation_request": skill_plan_resume_registry,
             }
             span_names = {
                 "permission_request": "permission.decision",
@@ -4589,6 +4600,7 @@ class DeepAgentsAgentManager:
                 "logical_dataset_rule_request": "logical_dataset_rule.decision",
                 "database_sql_revision_request": "database_sql_revision.decision",
                 "user_input_request": "user_input.decision",
+                "skill_plan_confirmation_request": "skill_plan_confirmation.decision",
             }
             resolved_events = {
                 "permission_request": "permission_resolved",
@@ -4596,6 +4608,7 @@ class DeepAgentsAgentManager:
                 "logical_dataset_rule_request": "logical_dataset_rule_resolved",
                 "database_sql_revision_request": "database_sql_revision_resolved",
                 "user_input_request": "user_input_resolved",
+                "skill_plan_confirmation_request": "skill_plan_confirmation_resolved",
             }
             goal_id = str(context.get("goal_id") or "")
             decision_tasks = [
@@ -6624,6 +6637,7 @@ class DeepAgentsAgentManager:
                         permission_context=permission_context,
                         base_dir=self._base_dir,
                         reviewer=permission_reviewer,
+                        workspace_backend=getattr(agent_backend, "execution_backend", agent_backend),
                     ),
                     ObservableModelCallLimitMiddleware(
                         run_limit=12,
@@ -6901,6 +6915,7 @@ class DeepAgentsAgentManager:
                     "goal_id": run_record.goal_id or "",
                     "goal_revision": run_record.goal_revision,
                     "user_id": user_id,
+                    "project_id": project_id,
                     "workspace_path": str(workspace_path),
                     "permission_policy": permission_context.grant_bindings(),
                     # The main agent receives cross-Run history, but the grader
@@ -7184,6 +7199,7 @@ class DeepAgentsAgentManager:
                                             "attachment_published",
                                             {
                                                 "tool_call_id": tc_id,
+                                                "query_id": query_id,
                                                 "attachment": published_attachment,
                                             },
                                         )
@@ -7264,7 +7280,11 @@ class DeepAgentsAgentManager:
                                     {
                                         "tool": tool_name,
                                         "id": tc_id,
-                                        "output": raw_output[:4000],
+                                        "output": project_live_tool_output(
+                                            tool_name=tool_name,
+                                            raw_output=raw_output,
+                                            fallback_output=raw_output[:4000],
+                                        ),
                                         "output_full_length": len(raw_output),
                                         "summary_source": None,
                                         "is_error": is_error,
@@ -8108,6 +8128,7 @@ class DeepAgentsAgentManager:
                             "attachment_published",
                             {
                                 "tool_call_id": attachment.get("tool_call_id"),
+                                "query_id": query_id,
                                 "attachment": attachment,
                             },
                         )

@@ -29,6 +29,7 @@ import {
   type SkillPlan,
 } from "@/lib/api";
 import type { TimelineItem, ToolCall } from "@/lib/store";
+import { skillPlanGroupsFromToolCall } from "@/lib/skillPlanProjection";
 import { getSubagentToolLabel } from "@/lib/subagentActivity";
 
 interface Props {
@@ -127,33 +128,73 @@ function toolDurationMs(toolCall: ToolCall, now: number): number | null {
   return Math.max(0, end - toolCall.startedAt);
 }
 
-function skillPlanFromToolCall(toolCall: ToolCall): SkillPlan | null {
-  if (
-    !["prepare_skill_install", "prepare_skill_update"].includes(toolCall.tool)
-    || toolCall.status === "running"
-    || toolCall.is_error
-    || !toolCall.output
-  ) {
-    return null;
-  }
-  try {
-    const value = JSON.parse(toolCall.output) as Partial<SkillPlan> & { ok?: boolean };
-    if (
-      value.ok !== true
-      || typeof value.plan_id !== "string"
-      || typeof value.plan_sha256 !== "string"
-      || typeof value.skill_name !== "string"
-      || typeof value.phase !== "string"
-      || typeof value.requires_confirmation !== "boolean"
-      || value.ui_commit_supported !== true
-      || (value.action !== "install" && value.action !== "update")
-    ) {
-      return null;
-    }
-    return value as SkillPlan;
-  } catch {
-    return null;
-  }
+function larkAuthorizationDetails(output?: string): { url: string; qr: string } | null {
+  const text = String(output || "");
+  if (!text.includes("Status: awaiting_user_browser")) return null;
+  const url = text.match(/https:\/\/open\.feishu\.cn\/page\/cli\?[^\s]+/)?.[0];
+  if (!url) return null;
+  const qrSection = text.split("使用飞书 / Lark 扫码配置应用：")[1]?.split("或打开以下链接完成配置：")[0] || "";
+  const qr = qrSection
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => /[█▀▄]/.test(line))
+    .join("\n");
+  return { url, qr };
+}
+
+function TerminalQrCode({ value }: { value: string }) {
+  const lines = value.split("\n");
+  const width = Math.max(...lines.map((line) => Array.from(line).length));
+  const height = lines.length * 2;
+  const modules: string[] = [];
+  lines.forEach((line, lineIndex) => {
+    const cells = Array.from(line.padEnd(width, " "));
+    cells.forEach((cell, x) => {
+      // lark-cli prints an inverted half-block QR: terminal ink is the light
+      // module, while spaces are the dark module. Decode both vertical halves
+      // into ordinary square SVG modules so font metrics cannot distort it.
+      const topIsDark = cell === " " || cell === "▄";
+      const bottomIsDark = cell === " " || cell === "▀";
+      if (topIsDark) modules.push(`M${x} ${lineIndex * 2}h1v1h-1z`);
+      if (bottomIsDark) modules.push(`M${x} ${lineIndex * 2 + 1}h1v1h-1z`);
+    });
+  });
+  return (
+    <svg
+      role="img"
+      aria-label="飞书授权二维码"
+      viewBox={`0 0 ${width} ${height}`}
+      className="h-64 w-64 max-w-full rounded-lg bg-white"
+      shapeRendering="crispEdges"
+      preserveAspectRatio="xMidYMid meet"
+    >
+      <rect width={width} height={height} fill="white" />
+      <path d={modules.join("")} fill="black" />
+    </svg>
+  );
+}
+
+function LarkAuthorizationCard({ output }: { output?: string }) {
+  const details = larkAuthorizationDetails(output);
+  if (!details) return null;
+  return (
+    <div className="mt-3 rounded-2xl border border-blue-200 bg-blue-50/70 p-4">
+      <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
+        <KeyRound className="h-4 w-4 text-[#002fa7]" />
+        飞书授权配置
+        <span className="rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-semibold text-[#002fa7]">等待扫码</span>
+      </div>
+      <p className="mt-1 text-xs leading-5 text-slate-600">使用飞书 / Lark 扫描二维码，或打开下方链接。</p>
+      {details.qr ? (
+        <div className="mt-3 flex w-fit max-w-full rounded-xl bg-white p-4">
+          <TerminalQrCode value={details.qr} />
+        </div>
+      ) : null}
+      <a href={details.url} target="_blank" rel="noreferrer" className="mt-3 block break-all text-xs font-medium text-[#002fa7] underline underline-offset-2">
+        {details.url}
+      </a>
+    </div>
+  );
 }
 
 export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
@@ -388,6 +429,7 @@ export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
                         )}
                       </div>
                     )}
+                    <LarkAuthorizationCard output={tc.output} />
                   </div>
                 </div>
               );
@@ -406,21 +448,166 @@ export function SkillPlanCards({
   timeline: TimelineItem[];
   sessionId: string;
 }) {
-  const plans = Array.from(
+  const groups = Array.from(
     new Map(
       timeline
-        .map((item) => item.type === "tool" && item.toolCall ? skillPlanFromToolCall(item.toolCall) : null)
-        .filter((plan): plan is SkillPlan => plan !== null)
-        .map((plan) => [plan.plan_id, plan]),
+        .flatMap((item) => (
+          item.type === "tool" && item.toolCall ? skillPlanGroupsFromToolCall(item.toolCall) : []
+        ))
+        .map((group) => [group.id, group]),
     ).values(),
   );
-  if (plans.length === 0) return null;
+  if (groups.length === 0) return null;
   return (
     <div className="mt-3 space-y-3">
-      {plans.map((plan) => (
-        <SkillPlanCard key={plan.plan_id} sessionId={sessionId} initialPlan={plan} />
+      {groups.map((group) => group.plans.length > 1 ? (
+        <SkillPlanBatchCard
+          key={group.id}
+          sessionId={sessionId}
+          initialPlans={group.plans}
+          source={group.source}
+          errorCount={group.errorCount}
+        />
+      ) : (
+        <SkillPlanCard
+          key={group.plans[0].plan_id}
+          sessionId={sessionId}
+          initialPlan={group.plans[0]}
+        />
       ))}
     </div>
+  );
+}
+
+function SkillPlanBatchCard({
+  sessionId,
+  initialPlans,
+  source,
+  errorCount = 0,
+}: {
+  sessionId: string;
+  initialPlans: SkillPlan[];
+  source?: string;
+  errorCount?: number;
+}) {
+  const [plans, setPlans] = useState(initialPlans);
+  const [pendingAction, setPendingAction] = useState<"commit" | "cancel" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const planIds = initialPlans.map((plan) => plan.plan_id).join(",");
+  const initialPlansRef = useRef(initialPlans);
+  initialPlansRef.current = initialPlans;
+
+  useEffect(() => {
+    let active = true;
+    void Promise.all(initialPlansRef.current.map((plan) => getSkillPlan(sessionId, plan.plan_id)))
+      .then((fresh) => {
+        if (active) setPlans(fresh);
+      })
+      .catch((cause) => {
+        if (active) setError(cause instanceof Error ? cause.message : "无法刷新 Skill 批次状态");
+      });
+    return () => {
+      active = false;
+    };
+  }, [planIds, sessionId]);
+
+  const runBatch = async (action: "commit" | "cancel") => {
+    setPendingAction(action);
+    setError(null);
+    const next = [...plans];
+    const failures: string[] = [];
+    for (let index = 0; index < next.length; index += 1) {
+      const plan = next[index];
+      if (plan.status !== "prepared") continue;
+      try {
+        next[index] = action === "commit"
+          ? await commitSkillPlan(sessionId, plan.plan_id, plan.plan_sha256)
+          : await cancelSkillPlan(sessionId, plan.plan_id, plan.plan_sha256);
+      } catch (cause) {
+        failures.push(`${plan.skill_name}: ${cause instanceof Error ? cause.message : "操作失败"}`);
+        try {
+          next[index] = await getSkillPlan(sessionId, plan.plan_id);
+        } catch {
+          // Keep the last known plan state and report the original failure.
+        }
+      }
+      setPlans([...next]);
+    }
+    if (failures.length > 0) setError(failures.join("；"));
+    setPendingAction(null);
+  };
+
+  const prepared = plans.filter((plan) => plan.status === "prepared").length;
+  const committed = plans.filter((plan) => plan.status === "committed").length;
+  const cancelled = plans.filter((plan) => plan.status === "cancelled").length;
+  const expired = plans.filter((plan) => plan.status === "expired").length;
+  const allCommitted = committed === plans.length;
+  const allInactive = prepared === 0;
+  const title = allCommitted
+    ? `${plans.length} 个 Skills 安装完成`
+    : allInactive
+      ? `${plans.length} 个 Skills 批次已结束`
+      : `${plans.length} 个 Skills 待确认`;
+  const description = allCommitted
+    ? "整批计划已提交，后续 Agent 运行可使用这些 Skills。"
+    : allInactive
+      ? `已安装 ${committed} 个，已取消 ${cancelled} 个，已过期 ${expired} 个。`
+      : `已分别完成来源校验和文件校验；一次确认将提交剩余 ${prepared} 个计划。${errorCount > 0 ? `另有 ${errorCount} 个未能生成计划。` : ""}`;
+  const names = plans.map((plan) => plan.skill_name);
+  const tone = allCommitted
+    ? "border-emerald-200 bg-emerald-50/70"
+    : allInactive
+      ? "border-slate-200 bg-slate-50"
+      : "border-blue-200 bg-blue-50/60";
+  const Icon = allCommitted ? ShieldCheck : allInactive ? Ban : PackageCheck;
+
+  return (
+    <section className={`rounded-2xl border p-4 ${tone}`} data-skill-plan-batch={planIds}>
+      <div className="flex items-start gap-3">
+        <div className={`mt-0.5 rounded-xl p-2 ${allCommitted ? "bg-emerald-100 text-emerald-700" : prepared > 0 ? "bg-blue-100 text-[#002fa7]" : "bg-slate-200 text-slate-600"}`}>
+          <Icon className="h-4 w-4" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <h3 className="text-sm font-semibold text-slate-900">{title}</h3>
+          <p className="mt-1 text-xs leading-5 text-slate-600">{description}</p>
+          <div className="mt-2 text-[11px] text-slate-500">
+            来源：<span className="break-all font-mono">{source || plans[0]?.source}</span>
+          </div>
+          <details className="mt-2 text-[11px] text-slate-500">
+            <summary className="cursor-pointer select-none hover:text-slate-700">
+              查看 {names.length} 个 Skill 名称
+            </summary>
+            <div className="mt-2 flex max-h-28 flex-wrap gap-1.5 overflow-y-auto">
+              {names.map((name) => (
+                <span key={name} className="rounded-full bg-white/80 px-2 py-1 font-mono">{name}</span>
+              ))}
+            </div>
+          </details>
+          {error ? <p className="mt-2 text-xs text-rose-600">{error}</p> : null}
+          {prepared > 0 ? (
+            <div className="mt-3 flex flex-wrap justify-end gap-2">
+              <button
+                type="button"
+                disabled={pendingAction !== null}
+                onClick={() => void runBatch("cancel")}
+                className="h-9 rounded-xl px-3 text-sm font-semibold text-slate-500 hover:bg-white/70 disabled:opacity-50"
+              >
+                {pendingAction === "cancel" ? "正在取消…" : "取消整批"}
+              </button>
+              <button
+                type="button"
+                disabled={pendingAction !== null}
+                onClick={() => void runBatch("commit")}
+                className="inline-flex h-9 items-center gap-2 rounded-xl bg-[#002fa7] px-4 text-sm font-semibold text-white shadow-sm disabled:opacity-50"
+              >
+                {pendingAction === "commit" ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
+                {pendingAction === "commit" ? "正在提交整批…" : `确认并安装/更新 ${prepared} 个 Skills`}
+              </button>
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </section>
   );
 }
 

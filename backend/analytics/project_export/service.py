@@ -7,8 +7,10 @@ import hashlib
 import json
 import os
 import re
+import stat
 import tempfile
 import zipfile
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -19,6 +21,7 @@ from analytics.models import AnalyticsModelError, get_analytics_model_registry
 from analytics.nl2sql import guardrail_runtime
 from analytics.nl2sql.guardrails import list_guardrail_rules
 from analytics.semantic_assets import SemanticAssetError, get_semantic_asset_registry
+from knowledge.database_sources import KnowledgeDatabaseSourceError, get_database_source
 from knowledge.models import KnowledgeTableAsset
 
 from .portable_guardrails import PORTABLE_SQL_VALIDATOR
@@ -33,6 +36,8 @@ from .schemas import (
 
 EXPORT_FORMAT = "analysis-project/v1"
 MUTABLE_PROJECT_FILES = ("bindings.local.yaml",)
+IGNORED_MODEL_FILE_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
+IGNORED_MODEL_PATH_PARTS = {"__MACOSX", ".git", ".svn"}
 PORTABLE_GUARDRAIL_TYPES = {
     "forbid_sql_pattern",
     "require_sql_contains",
@@ -121,6 +126,9 @@ class AnalysisProjectExporter:
         if data_file_mode not in {"copy", "reference"}:
             raise AnalysisProjectExportError("data_file_mode must be copy or reference")
         try:
+            # Export plans must reflect the files currently on disk. Models are often
+            # edited by local Agents, outside the API path that refreshes the registry.
+            self.models.refresh()
             model = self.models.get_model(model_id)
         except AnalyticsModelError as exc:
             raise AnalysisProjectExportError(str(exc)) from exc
@@ -179,13 +187,53 @@ class AnalysisProjectExporter:
             return asset
 
         data_plans: list[ExportDataAssetPlan] = []
+        database_sources: dict[str, Any] = {}
         table_refs = ((model.get("frontmatter") or {}).get("data_assets") or {}).get("tables") or []
         for raw_ref in table_refs:
             ref = str(raw_ref).strip()
             if not ref:
                 continue
             if not ref.startswith("table_asset:"):
-                data_plans.append(ExportDataAssetPlan(ref=ref, kind="database_table"))
+                source_id, separator, table_name = ref.partition(".")
+                if not separator or not source_id or not table_name:
+                    missing.append(f"database_table_ref:{ref}")
+                    data_plans.append(ExportDataAssetPlan(ref=ref, kind="database_table", status="missing"))
+                    continue
+                source = database_sources.get(source_id)
+                if source is None:
+                    try:
+                        source = await get_database_source(session, source_id)
+                    except KnowledgeDatabaseSourceError:
+                        missing.append(f"database_source:{source_id}")
+                        data_plans.append(ExportDataAssetPlan(ref=ref, kind="database_table", status="missing"))
+                        continue
+                    database_sources[source_id] = source
+                value = source.get if isinstance(source, dict) else lambda key, default=None: getattr(source, key, default)
+                source_metadata = value("source_metadata", {})
+                if not isinstance(source_metadata, dict):
+                    source_metadata = {}
+                source_type = str(value("source_type", "postgresql") or "postgresql")
+                host = str(value("host", "") or "")
+                port = int(value("port", 0) or 0)
+                database = str(value("database", "") or "")
+                if not host or port <= 0 or not database:
+                    missing.append(f"database_connection_metadata:{source_id}")
+                schema_name = str(source_metadata.get("schema") or "").strip()
+                if "." in table_name:
+                    schema_name = table_name.rsplit(".", 1)[0]
+                data_plans.append(
+                    ExportDataAssetPlan(
+                        ref=ref,
+                        kind="database_table",
+                        file_name=table_name,
+                        source_name=str(value("name", "") or ""),
+                        source_type=source_type,
+                        host=host,
+                        port=port,
+                        database=database,
+                        schema_name=schema_name,
+                    )
+                )
                 continue
             asset_id = ref.removeprefix("table_asset:").strip()
             asset = await resolve_table_asset(asset_id)
@@ -241,6 +289,7 @@ class AnalysisProjectExporter:
             relation_ids=relation_ids,
             guardrails=[_guardrail_snapshot(guardrails[item], self.base_dir) for item in guardrail_ids if item in guardrails],
             table_assets=resolved_assets,
+            database_assets=[item for item in data_plans if item.kind == "database_table"],
             data_file_mode=data_file_mode,
         )
         return AnalysisProjectExportPlan(
@@ -268,6 +317,7 @@ class AnalysisProjectExporter:
         relation_ids: list[str],
         guardrails: list[dict[str, Any]],
         table_assets: dict[str, KnowledgeTableAsset],
+        database_assets: list[ExportDataAssetPlan],
         data_file_mode: DataFileMode,
     ) -> str:
         files: list[dict[str, Any]] = []
@@ -313,6 +363,18 @@ class AnalysisProjectExporter:
             "files": sorted(files, key=lambda item: item["path"]),
             "guardrails": guardrails,
             "data": data,
+            "database": [
+                {
+                    "ref": item.ref,
+                    "source_name": item.source_name,
+                    "source_type": item.source_type,
+                    "host": item.host,
+                    "port": item.port,
+                    "database": item.database,
+                    "schema_name": item.schema_name,
+                }
+                for item in database_assets
+            ],
         }
         return "export-plan-" + _sha256_bytes(_json_bytes(payload))[:24]
 
@@ -393,15 +455,34 @@ class AnalysisProjectExporter:
         }
         templates = model.get("templates") if isinstance(model.get("templates"), dict) else {}
         declared_templates: dict[str, str] = {}
+        declared_template_guides: dict[str, str] = {}
         for template_id, definition in templates.items():
             if isinstance(definition, str):
                 declared_templates[str(template_id)] = definition
             elif isinstance(definition, dict) and str(definition.get("path") or "").strip():
                 declared_templates[str(template_id)] = str(definition["path"])
+                guide_path = str(definition.get("guide") or "").strip()
+                if guide_path:
+                    declared_template_guides[str(template_id)] = guide_path
         for template_id, template_path in declared_templates.items():
             candidates = {template_path, f"templates/{template_path}"}
             if not candidates.intersection(model_files):
                 missing.append(f"template:{template_id}:{template_path}")
+        for template_id, guide_path in declared_template_guides.items():
+            candidates = {guide_path, f"templates/{guide_path}"}
+            if not candidates.intersection(model_files):
+                missing.append(f"template_guide:{template_id}:{guide_path}")
+
+        references = (model.get("frontmatter") or {}).get("references")
+        if isinstance(references, dict):
+            for reference_id, definition in references.items():
+                reference_path = (
+                    str(definition.get("path") or "").strip()
+                    if isinstance(definition, dict)
+                    else str(definition or "").strip()
+                )
+                if reference_path and reference_path not in model_files:
+                    missing.append(f"reference:{reference_id}:{reference_path}")
         default_template = str(model.get("default_template") or "").strip()
         if default_template:
             default_path = declared_templates.get(default_template, default_template)
@@ -461,9 +542,16 @@ class AnalysisProjectExporter:
             "bindings.example.yaml",
             _json_bytes({"bindings": self._example_bindings(bindings, plan.data_file_mode)}),
         )
+        env_example = self._database_env_example(bindings)
+        if env_example:
+            self._put_entry(entries, ".env.example", env_example.encode("utf-8"))
         self._put_entry(entries, "AGENTS.md", self._agents_markdown(plan).encode("utf-8"))
         self._put_entry(entries, "README.md", self._readme_markdown(plan).encode("utf-8"))
-        self._put_entry(entries, ".gitignore", b"bindings.local.yaml\n/data/*\n")
+        self._put_entry(
+            entries,
+            ".gitignore",
+            b"bindings.local.yaml\n.env\n.env.*\n!.env.example\n/data/*\n",
+        )
         self._put_entry(entries, "tests/validate_project.py", self._project_validator().encode("utf-8"))
 
         archive_root = plan.package_name
@@ -521,7 +609,19 @@ class AnalysisProjectExporter:
                         binding_id: {
                             key: value
                             for key, value in binding.items()
-                            if key in {"kind", "sha256", "profile", "source_asset_ids", "materializer", "url_env"}
+                            if key in {
+                                "kind",
+                                "sha256",
+                                "profile",
+                                "source_asset_ids",
+                                "materializer",
+                                "source_id",
+                                "source_name",
+                                "connection",
+                                "table",
+                                "credentials",
+                                "url_env",
+                            }
                         }
                         for binding_id, binding in bindings.items()
                     },
@@ -612,6 +712,13 @@ class AnalysisProjectExporter:
         for item in model.get("files") or []:
             source = self.base_dir / str(item.get("path") or "")
             relative = str(item.get("relative_path") or source.name)
+            relative_parts = PurePosixPath(relative).parts
+            if (
+                source.name in IGNORED_MODEL_FILE_NAMES
+                or source.name.startswith("._")
+                or any(part in IGNORED_MODEL_PATH_PARTS for part in relative_parts)
+            ):
+                continue
             if relative == "model.md":
                 destination = "model/model.md"
             elif relative.startswith("templates/"):
@@ -765,17 +872,84 @@ class AnalysisProjectExporter:
         for item in plan.data_assets:
             if item.kind != "database_table":
                 continue
-            source_id, separator, table_name = item.ref.rpartition(".")
+            source_id, separator, table_name = item.ref.partition(".")
             binding_id = _database_binding_id(item.ref)
             env_suffix = re.sub(r"[^0-9A-Za-z]+", "_", source_id or "DATABASE").strip("_").upper() or "DATABASE"
+            username_env = f"ANALYSIS_DB_{env_suffix}_USERNAME"
+            password_env = f"ANALYSIS_DB_{env_suffix}_PASSWORD"
+            url_env = f"ANALYSIS_DB_{env_suffix}_URL"
             bindings[binding_id] = {
                 "kind": "database_table",
                 "source_id": source_id if separator else "",
+                "source_name": item.source_name,
+                "connection": {
+                    "type": item.source_type,
+                    "host": item.host,
+                    "port": item.port,
+                    "database": item.database,
+                    "schema": item.schema_name,
+                },
                 "table": table_name if separator else item.ref,
-                "url_env": f"ANALYSIS_DB_{env_suffix}_URL",
+                "credentials": {
+                    "mode": "agent_configured",
+                    "username_env": username_env,
+                    "password_env": password_env,
+                    "url_env": url_env,
+                },
+                "url_env": url_env,
                 "portable": False,
             }
         return sorted(f"./{item}" for item in copied_by_source.values()), profile_paths, bindings
+
+    @staticmethod
+    def _database_env_example(bindings: dict[str, dict[str, Any]]) -> str:
+        sources: dict[str, dict[str, Any]] = {}
+        for binding in bindings.values():
+            if binding.get("kind") != "database_table":
+                continue
+            source_id = str(binding.get("source_id") or "database")
+            source = sources.setdefault(
+                source_id,
+                {
+                    "name": binding.get("source_name") or source_id,
+                    "connection": binding.get("connection") or {},
+                    "credentials": binding.get("credentials") or {},
+                    "tables": [],
+                },
+            )
+            table_name = str(binding.get("table") or "").strip()
+            if table_name and table_name not in source["tables"]:
+                source["tables"].append(table_name)
+        if not sources:
+            return ""
+
+        lines = [
+            "# Database credentials are intentionally not exported.",
+            "# Configure them with the target Agent's secret manager, or copy this file to .env.",
+            "# Never commit .env or paste credentials into bindings.*.yaml.",
+            "",
+        ]
+        for source_id, source in sorted(sources.items()):
+            connection = source["connection"]
+            credentials = source["credentials"]
+            endpoint = (
+                f"{connection.get('type') or 'database'}://"
+                f"{connection.get('host') or '<host>'}:{connection.get('port') or '<port>'}/"
+                f"{connection.get('database') or '<database>'}"
+            )
+            lines.extend(
+                [
+                    f"# Source: {source['name']} ({source_id})",
+                    f"# Endpoint: {endpoint}",
+                    f"# Required tables: {', '.join(sorted(source['tables']))}",
+                    f"{credentials.get('username_env') or 'DATABASE_USERNAME'}=",
+                    f"{credentials.get('password_env') or 'DATABASE_PASSWORD'}=",
+                    "# Optional full connection URL override; leave blank when the Agent builds a connection from metadata above.",
+                    f"{credentials.get('url_env') or 'DATABASE_URL'}=",
+                    "",
+                ]
+            )
+        return "\n".join(lines).rstrip() + "\n"
 
     def _analysis_project_manifest(
         self,
@@ -822,12 +996,57 @@ class AnalysisProjectExporter:
                     ],
                 }
             )
+        frontmatter = model.get("frontmatter") or {}
+        project_references: dict[str, dict[str, Any]] = {}
+        raw_references = frontmatter.get("references")
+        if isinstance(raw_references, dict):
+            for reference_id, definition in raw_references.items():
+                if isinstance(definition, dict):
+                    reference_path = str(definition.get("path") or "").strip()
+                    item = {
+                        key: value
+                        for key, value in definition.items()
+                        if key != "path"
+                    }
+                else:
+                    reference_path = str(definition or "").strip()
+                    item = {}
+                if not reference_path:
+                    continue
+                item["path"] = f"./model/{reference_path.removeprefix('./')}"
+                project_references[str(reference_id)] = item
+
+        project_templates: dict[str, dict[str, Any]] = {}
+        raw_templates = model.get("templates") if isinstance(model.get("templates"), dict) else {}
+        for template_id, definition in raw_templates.items():
+            if isinstance(definition, str):
+                template_path = definition.strip()
+                item = {}
+            elif isinstance(definition, dict):
+                template_path = str(definition.get("path") or "").strip()
+                item = {
+                    key: value
+                    for key, value in definition.items()
+                    if key not in {"path", "guide"}
+                }
+                guide_path = str(definition.get("guide") or "").strip()
+                if guide_path:
+                    item["guide"] = f"./templates/{guide_path.removeprefix('./')}"
+            else:
+                continue
+            if not template_path:
+                continue
+            item["path"] = f"./templates/{template_path.removeprefix('./')}"
+            project_templates[str(template_id)] = item
         return {
             "format": EXPORT_FORMAT,
             "id": plan.model_id,
             "name": plan.model_name,
             "version": plan.model_version,
             "entry_model": "./model/model.md",
+            "references": project_references,
+            "templates": project_templates,
+            "template_selection": {"mode": "query_routed"},
             "semantic_assets": semantic_paths,
             "data_sources": data_sources,
             "relations": semantic_paths.get("relations") or [],
@@ -888,6 +1107,8 @@ Read `analysis-project.yaml` first, then `model/model.md`. Load only the semanti
 4. Before executing generated SQL, copy `guardrails/context.example.json` to a local context file, fill the current tables, semantic asset IDs and question, then run `python guardrails/runtime/validate_sql.py <sql-file> --context <context-file>`.
 5. Run `python tests/validate_project.py` before relying on this project after moving it to another machine.
 6. If a required binding, profile, semantic asset, or guardrail is missing, stop and report the missing dependency.
+7. Templates are selected by the user's Query. Never assume a default template. When a template's `use_when` matches, read its `guide` before copying its `path`; otherwise answer without a template.
+8. Database host, port, database, schema and required tables are declared in `bindings.local.yaml`. Credentials are intentionally absent: use the target Agent's secret configuration, or the environment-variable names documented in `.env.example`. Never write credentials into tracked project files.
 
 PuddingClaw asset IDs are provenance only. External execution must use the project-relative or absolute paths in the binding file.
 """
@@ -907,11 +1128,12 @@ PuddingClaw asset IDs are provenance only. External execution must use the proje
 
 ## 开始使用
 
-1. 检查 `bindings.local.yaml` 中的数据路径或数据库环境变量。
-2. 运行 `python tests/validate_project.py` 检查文件完整性与 hash。
-3. 向 Agent 提出分析问题；项目级执行规范位于 `AGENTS.md`。
+1. 检查 `bindings.local.yaml` 中的数据路径或数据库连接元数据。
+2. 数据库账号密码使用目标 Agent 自己的 Secret 配置；如需环境变量，复制 `.env.example` 为 `.env` 后填写。
+3. 运行 `python tests/validate_project.py` 检查文件完整性与 hash。
+4. 向 Agent 提出分析问题；项目级执行规范位于 `AGENTS.md`。
 
-数据库密码和连接 URL 不会写入导出包。数据库绑定使用 `url_env` 指定的环境变量。
+数据库主机、端口、数据库、Schema 和必需表会完整导出；账号、密码和实际连接 URL 不会写入导出包。
 """
 
     @staticmethod
@@ -980,8 +1202,17 @@ for binding_id, expected in contract.items():
             profile = (ROOT / profile).resolve()
         if raw_profile and not profile.is_file():
             failures.append({"binding": binding_id, "path": raw_profile, "reason": "profile_missing"})
-    elif kind == "database_table" and not binding.get("url_env"):
-        failures.append({"binding": binding_id, "reason": "database_url_env_missing"})
+    elif kind == "database_table":
+        connection = binding.get("connection") or {}
+        for key in ("type", "host", "port", "database"):
+            if not connection.get(key):
+                failures.append({"binding": binding_id, "reason": "database_connection_metadata_missing", "field": key})
+        if not binding.get("table"):
+            failures.append({"binding": binding_id, "reason": "database_table_missing"})
+        credentials = binding.get("credentials") or {}
+        for key in ("username_env", "password_env", "url_env"):
+            if not credentials.get(key):
+                failures.append({"binding": binding_id, "reason": "database_credential_hint_missing", "field": key})
 
 def visit(binding_id, stack=()):
     if binding_id in stack:
@@ -1029,10 +1260,31 @@ raise SystemExit(0 if result["passed"] else 1)
 """
 
     @staticmethod
-    def _zip_info(path: str, *, executable: bool = False) -> zipfile.ZipInfo:
-        info = zipfile.ZipInfo(path, date_time=(1980, 1, 1, 0, 0, 0))
+    def _zip_info(
+        path: str,
+        *,
+        executable: bool = False,
+        timestamp: float | None = None,
+    ) -> zipfile.ZipInfo:
+        modified_at = datetime.fromtimestamp(timestamp) if timestamp is not None else datetime.now()
+        if modified_at.year < 1980:
+            date_time = (1980, 1, 1, 0, 0, 0)
+        elif modified_at.year > 2107:
+            date_time = (2107, 12, 31, 23, 59, 58)
+        else:
+            date_time = (
+                modified_at.year,
+                modified_at.month,
+                modified_at.day,
+                modified_at.hour,
+                modified_at.minute,
+                modified_at.second,
+            )
+        info = zipfile.ZipInfo(path, date_time=date_time)
+        info.create_system = 3
         info.compress_type = zipfile.ZIP_DEFLATED
-        info.external_attr = ((0o755 if executable else 0o644) & 0xFFFF) << 16
+        mode = 0o755 if executable else 0o644
+        info.external_attr = ((stat.S_IFREG | mode) & 0xFFFF) << 16
         return info
 
     @classmethod
@@ -1047,7 +1299,10 @@ raise SystemExit(0 if result["passed"] else 1)
         digest = hashlib.sha256()
         with (
             source.open("rb") as source_handle,
-            archive.open(cls._zip_info(path, executable=executable), "w") as target_handle,
+            archive.open(
+                cls._zip_info(path, executable=executable, timestamp=before.st_mtime),
+                "w",
+            ) as target_handle,
         ):
             for chunk in iter(lambda: source_handle.read(1024 * 1024), b""):
                 digest.update(chunk)

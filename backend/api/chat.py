@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from graph.agent import agent_manager
+from graph.live_tool_output import project_live_tool_output
 from graph.session_manager import session_manager
 from graph.citations import dedupe_sources, finalize_citations, normalize_source
 from config import get_cache_config, get_memory_backend, get_middleware_config
@@ -149,6 +150,25 @@ def _missing_tool_end_events(segment: dict) -> list[dict]:
             "is_error": True,
         })
     return events
+
+
+def _live_tool_output(event: dict) -> str:
+    """Return a bounded but structurally complete output for live UI control data.
+
+    Ordinary tool results use a short preview over SSE.  Skill Manager plans
+    are different: the frontend must parse their identifiers and hashes to
+    render the confirmation boundary.  Slicing that JSON at 2 KB silently
+    destroys the card, so emit a compact typed envelope while the durable
+    session record retains the full result.
+    """
+
+    raw = str(event.get("raw_output", event.get("output", "")))
+    preview = str(event.get("output_preview", event.get("output", "")))
+    return project_live_tool_output(
+        tool_name=str(event.get("tool") or ""),
+        raw_output=raw,
+        fallback_output=preview,
+    )
 
 
 async def _detect_and_retry_memory_write(
@@ -759,7 +779,7 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
                         {
                             "tool": event["tool"],
                             "id": event.get("id", ""),
-                            "output": event.get("output_preview", event["output"]),
+                            "output": _live_tool_output(event),
                             "output_full_length": len(event["output"]),
                             "summary_source": event.get("summary_source"),
                             "is_error": bool(event.get("is_error")),

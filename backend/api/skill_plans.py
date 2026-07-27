@@ -16,6 +16,7 @@ from starlette.concurrency import run_in_threadpool
 
 from graph.permission_resume import permission_resume_registry
 from graph.session_manager import session_manager
+from graph.skill_plan_resume import skill_plan_resume_registry
 from services.skill_management import (
     SkillManagementError,
     SkillManagementService,
@@ -208,6 +209,12 @@ def _commit_skill_plan_sync(
         except SkillManagementError as error:
             _raise_http(error)
 
+        skill_plan_resume_registry.record(
+            session_id=session_id,
+            plan_id=plan_id,
+            status=str(result.get("status") or "committed"),
+        )
+
         return {
             "session_id": session_id,
             "plan": result,
@@ -240,4 +247,9 @@ def _cancel_skill_plan_sync(
             )
         except SkillManagementError as error:
             _raise_http(error)
+        skill_plan_resume_registry.record(
+            session_id=session_id,
+            plan_id=plan_id,
+            status=str(plan.get("status") or "cancelled"),
+        )
     return {"session_id": session_id, "plan": plan}

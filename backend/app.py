@@ -22,11 +22,12 @@ async def lifespan(app: FastAPI):
     from analytics.nl2sql.result_cleanup import query_result_cleanup_manager
     from analytics.semantic_assets import get_semantic_asset_registry
     from db import init_database
-    from graph.attachment_store import attachment_store
     from graph.agent import agent_manager
+    from graph.attachment_store import attachment_store
     from graph.deepagents_manager import deepagents_agent_manager
     from graph.memory_indexer import get_memory_indexer
     from graph.session_manager import session_manager
+    from harness.workspace_backends import ProjectSandboxManager
     from knowledge.import_worker import knowledge_import_worker_manager
     from knowledge.semantic_dimension_worker import semantic_dimension_build_worker_manager
     from projects.registry import project_registry
@@ -49,6 +50,16 @@ async def lifespan(app: FastAPI):
         print("⚠️ Knowledge catalog database unavailable; knowledge management API will report degraded status")
     caps = await capabilities.detect_capabilities(force=True)
     print(f"🔌 Capabilities: {caps.to_dict()}")
+    from config import load_config
+
+    docker_config = load_config().get("harness", {}).get("terminal", {}).get("docker", {})
+    if load_config().get("harness", {}).get("terminal", {}).get("docker_enabled", False):
+        try:
+            removed = ProjectSandboxManager(dict(docker_config or {})).gc_stopped_workspace_containers()
+            if removed:
+                print(f"🧹 Removed {removed} stopped PuddingClaw workspace container(s)")
+        except Exception as exc:
+            print(f"⚠️ Workspace container startup GC skipped: {exc}")
     try:
         agent_manager.initialize(BASE_DIR)
     except Exception as e:

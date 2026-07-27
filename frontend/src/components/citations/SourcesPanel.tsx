@@ -8,10 +8,12 @@ import {
   ChevronDown,
   Circle,
   ExternalLink,
+  Download,
   FileText,
   FolderOpen,
   Globe2,
   KeyRound,
+  Images,
   ListChecks,
   Pause,
   Pencil,
@@ -30,6 +32,7 @@ import {
   type HarnessGoal,
   type HarnessRun,
   type PermissionGrant,
+  type AgentAttachment,
   type RubricEvaluationReport,
 } from "@/lib/api";
 import {
@@ -38,6 +41,11 @@ import {
   goalTodoProgress,
 } from "@/lib/goalControls";
 import { useApp, type SourceRecord, type ToolCall } from "@/lib/store";
+import {
+  collectSessionArtifacts,
+  isPreviewableImageAttachment,
+  isQrImageAttachment,
+} from "@/lib/imageAttachments";
 import ConfirmDialog from "@/components/ui/ConfirmDialog";
 
 type TodoStatus = "completed" | "in_progress" | "pending" | "cancelled" | "error";
@@ -176,6 +184,10 @@ export default function SourcesPanel({
       .map((source) => ({ source, index: undefined }));
     return { cited: citedSources, retrieved: retrievedSources };
   }, [messages]);
+  const sessionArtifacts = useMemo(
+    () => collectSessionArtifacts(messages),
+    [messages],
+  );
 
   // The default Sources list intentionally stays scoped to the latest turn.
   // A citation in an older message can still be activated, though, so resolve
@@ -227,7 +239,8 @@ export default function SourcesPanel({
     (permissionGrants.some((grant) => grant.scope !== "once") ||
       permissionHistory.length > 0);
   const showSources = hasSources || selectedHistoricalSource !== null;
-  const hasContent = Boolean(activeGoal || verificationReport || hasProgress || hasPermissions || showSources);
+  const hasArtifacts = sessionArtifacts.length > 0;
+  const hasContent = Boolean(activeGoal || verificationReport || hasProgress || hasPermissions || hasArtifacts || showSources);
 
   useEffect(() => {
     onAvailabilityChange?.(hasContent);
@@ -306,6 +319,18 @@ export default function SourcesPanel({
       ),
     });
   }
+  if (hasArtifacts) {
+    cards.push({
+      key: "attachments",
+      content: (
+        <ArtifactsCard
+          active={inspectorActiveTab === "attachments"}
+          onActivate={() => setInspectorActiveTab(inspectorActiveTab === "attachments" ? null : "attachments")}
+          artifacts={sessionArtifacts}
+        />
+      ),
+    });
+  }
   if (showSources) {
     cards.push({
       key: "sources",
@@ -324,6 +349,11 @@ export default function SourcesPanel({
 
   return (
     <div className="h-full overflow-y-auto px-5 py-5">
+      {cards.length > 0 ? (
+        <h2 className="mb-4 px-1 text-[18px] font-semibold tracking-tight text-slate-900">
+          概览
+        </h2>
+      ) : null}
       {cards.length > 0 && (
         <div className="workspace-side-card overflow-hidden rounded-[28px] px-5 py-3">
           {cards.map((card, index) => (
@@ -1660,10 +1690,13 @@ function permissionGrantPresentation(grant: PermissionGrant): {
     const executable = extractCommandExecutable(command);
     const isSessionNetwork = grant.target_kind === "capability"
       && grant.target === "session_network_access";
+    const isNetworkProfile = grant.target_kind === "network_profile";
     const name = isSessionNetwork
       ? "Session 联网授权"
       : grant.target_kind === "network_origin"
       ? "网站访问授权"
+      : isNetworkProfile
+        ? "联网工具授权"
       : grant.target_kind === "tool_name"
         ? "联网搜索授权"
         : grant.capabilities.includes("package_install")
@@ -1673,7 +1706,7 @@ function permissionGrantPresentation(grant: PermissionGrant): {
       name,
       target: isSessionNetwork
         ? "所有网络来源"
-        : String(grant.metadata?.session_target || command || `命令指纹 ${grant.target.slice(0, 20)}…`),
+        : String(grant.metadata?.session_target || (isNetworkProfile ? grant.target : command) || `命令指纹 ${grant.target.slice(0, 20)}…`),
       changes: "",
       isSkill: false,
       isNetwork,
@@ -1788,6 +1821,96 @@ function SourcesEmptyState() {
       </div>
       <p className="text-[14px] font-medium text-slate-400">来源将显示在这里</p>
     </div>
+  );
+}
+
+function ArtifactsCard({
+  active,
+  onActivate,
+  artifacts,
+}: {
+  active: boolean;
+  onActivate: () => void;
+  artifacts: Array<AgentAttachment & { id: string }>;
+}) {
+  const { openAttachmentPreview } = useApp();
+
+  return (
+    <section>
+      <SectionHeader
+        icon={<Images className="h-4 w-4" />}
+        title="产物"
+        open={active}
+        onToggle={onActivate}
+        metric={<span>{artifacts.length}</span>}
+      />
+      {active ? (
+        <div className="space-y-1 pb-4">
+          {artifacts.map((artifact) => {
+            const isImage = isPreviewableImageAttachment(artifact);
+            const canPreview = isImage || (
+              (artifact.type === "markdown" || artifact.type === "text") &&
+              Boolean(artifact.download_url)
+            );
+            const isQr = isImage && isQrImageAttachment(artifact);
+            const label = artifact.name || "未命名产物";
+            const mainClassName = "inspector-transient-action flex min-w-0 flex-1 items-center gap-3 rounded-xl px-2.5 py-2.5 text-left transition hover:bg-black/[0.035] focus:bg-black/[0.035]";
+            const content = (
+              <>
+                <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${isImage ? "bg-blue-50 text-[#376ed8]" : "bg-teal-50 text-teal-600"}`}>
+                  {isImage ? <Images className="h-4 w-4" /> : <FileText className="h-4 w-4" />}
+                </span>
+                <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-slate-800">
+                  {label}
+                </span>
+                {isQr ? (
+                  <span className="shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-[9px] font-medium text-slate-500">
+                    二维码
+                  </span>
+                ) : null}
+              </>
+            );
+            return (
+              <div key={artifact.id} className="flex min-w-0 items-center gap-1">
+                {canPreview ? (
+                  <button
+                    type="button"
+                    data-inspector-attachment-id={artifact.id}
+                    onClick={() => openAttachmentPreview(artifact.id)}
+                    className={mainClassName}
+                    aria-label={`查看 ${label}`}
+                  >
+                    {content}
+                  </button>
+                ) : artifact.download_url ? (
+                  <a
+                    href={artifact.download_url}
+                    download={label}
+                    className={mainClassName}
+                    aria-label={`下载 ${label}`}
+                  >
+                    {content}
+                  </a>
+                ) : (
+                  <div className={mainClassName}>{content}</div>
+                )}
+                {artifact.download_url && canPreview ? (
+                  <a
+                    href={artifact.download_url}
+                    download={label}
+                    className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-100 hover:text-[#002fa7]"
+                    aria-label={`下载 ${label}`}
+                    title="下载"
+                  >
+                    <Download className="h-3.5 w-3.5" />
+                  </a>
+                ) : null}
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
+    </section>
   );
 }
 

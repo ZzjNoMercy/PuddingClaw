@@ -72,10 +72,38 @@ body {
   background: transparent;
 }
 
-@media (max-width: 720px) {
+/* Inspector rows and drill-down controls are momentary actions, not selected
+   items. Mouse focus must not be rendered as a persistent blue selection. */
+.inspector-transient-action,
+.inspector-transient-action:focus,
+.inspector-transient-action:focus-visible,
+.inspector-transient-action:active {
+  outline: none !important;
+  box-shadow: none !important;
+  -webkit-tap-highlight-color: transparent;
+}
+
+@media (max-width: 767px) {
   .workspace-content-frame {
     margin: 6px;
     border-radius: 16px;
+  }
+
+  .workspace-inspector-shell {
+    position: fixed;
+    inset: 0 0 0 auto;
+    z-index: 70;
+    max-width: 100vw;
+    background: #ffffff;
+    box-shadow: -20px 0 60px rgba(15, 23, 42, 0.18);
+  }
+
+  .workspace-inspector-shell-open {
+    width: min(100vw, 420px) !important;
+  }
+
+  .workspace-inspector-shell-open > div {
+    width: min(100vw, 420px) !important;
   }
 }
 

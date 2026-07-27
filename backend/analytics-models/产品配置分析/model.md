@@ -14,14 +14,29 @@ semantic_assets:
   grains: ["grain:car_model","grain:series"]
 asset_relations: ["relation:车系配置关联","relation:1111"]
 guardrails: ["air_suspension_reference_type_value","config_rate_model_key_group","config_rate_no_exists_distinct","config_rate_use_model_base_denominator","launch_time_no_car_name_year","postgres_count_distinct_nullable_tuple_after_left_join"]
-templates: {}
-default_template: "product_config_report_html"
+references:
+  analysis_rules:
+    path: references/analysis-rules.md
+    use_when: "所有产品配置分析任务"
+templates:
+  monthly_product_config_report:
+    path: monthly_product_config_report/index.html
+    guide: monthly_product_config_report/TEMPLATE.md
+    format: html
+    use_when:
+      - "刷新月度产品配置分析报告"
+      - "生成产品配置分析月报"
+      - "更新本月产品配置分析报告"
+    do_not_use_when:
+      - "单一车型配置查询"
+      - "多车型配置对比"
+      - "临时专题分析或普通问答"
 acceptance:
   invariants:
   - type: classification_mapping_declaration
     target: dimension:energy_type
 created: "2026-07-13 06:25:03"
-updated_at: "2026-07-25 00:00:00"
+updated_at: "2026-07-27 00:00:00"
 ---
 
 
@@ -36,7 +51,15 @@ updated_at: "2026-07-25 00:00:00"
 - 单一车型或多个车型的配置查询与横向对比。
 - 指定配置在不同年份、品牌、车系、能源、级别或价格带的配备率趋势。
 - 新车迭代、尺寸动力、高压平台、智能驾驶、座舱舒适等行业专题分析。
-- 生成包含完整章节、ECharts 图表和数据口径的产品配置分析 HTML 报告。
+- 生成包含完整章节、ECharts 图表和数据口径的月度产品配置分析 HTML 报告。
+
+## 模板路由
+
+- 模板必须根据用户 Query 的输出意图选择，不设置全局默认模板。
+- 当用户明确要求“刷新月度产品配置分析报告”“生成产品配置分析月报”“更新本月报告”或同义表达时，选择 `templates.monthly_product_config_report`。
+- 选择月度模板后，必须依次读取 `references.analysis_rules.path`、模板的 `guide` 和 `path`，再执行查询与报告生成。
+- 单一车型配置查询、多车型配置对比、临时专题分析或普通问答不使用月度模板，直接按用户要求输出。
+- 如果未来注册多个模板，先比较每个模板的 `use_when` 与 `do_not_use_when`；无法唯一匹配时先确认用户需要的交付物类型。
 
 ## 分析原则
 
@@ -56,5 +79,8 @@ updated_at: "2026-07-25 00:00:00"
 ## 输出要求
 
 - 先输出结论，再给数据证据、口径和异常说明。
+- 选择月度模板时，标题使用“YYYY年MM月产品配置分析报告”，分析周期使用 `YYYY-MM`。
 - 报告封面只显示报告标题与报告日期。
-- 使用默认 HTML 模板时必须保留全部必需章节；无数据图表必须显示缺失原因，不得用示例值冒充真实结果。
+- 使用月度 HTML 模板时必须保留全部必需章节；无数据图表必须显示缺失原因，不得用示例值冒充真实结果。
+- 生成 HTML 时只替换报告副本的 `#report-payload` 完整 JSON，不修改模板 DOM id 或 `report-renderer.js`。
+- 月度报告固定输出 20 张图；不生成智驾芯片份额、激光雷达供应商份额、车机芯片披露率和车机芯片型号结构图。

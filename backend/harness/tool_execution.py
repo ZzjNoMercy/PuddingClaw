@@ -7,6 +7,7 @@ before both Docker and restricted-host execution.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import json
 import re
@@ -19,14 +20,19 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from langchain.agents.middleware import AgentMiddleware
-from langchain.agents.middleware.types import ToolCallRequest
-from langchain_core.messages import ToolMessage
+from langchain.agents.middleware.types import ToolCallRequest, hook_config
+from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.types import Command, interrupt
 
 from graph.permission_policy import RunPermissionContext
 from graph.permission_resume import permission_resume_registry
 from graph.session_manager import session_manager
+from graph.skill_plan_resume import skill_plan_resume_registry
 from harness.permission_reviewer import PermissionReviewer
+from runtime_identity.adapters import (
+    ManagedCliRegistry,
+    UnsupportedManagedCliCommand,
+)
 from tools.toolsets import tool_control_descriptor
 
 
@@ -53,6 +59,33 @@ class ShellCapabilities:
     workspace_write: bool = False
     package_install: bool = False
     destructive: bool = False
+
+
+@dataclass(frozen=True)
+class NetworkIntent:
+    """Network authority requested by a command, separate from connectivity.
+
+    ``ShellCapabilities.network`` controls backend routing.  This richer value
+    prevents a reusable approval for one transport surface from silently
+    becoming authority for a different tool or destination.
+    """
+
+    required: bool = False
+    origins: tuple[str, ...] = ()
+    target_known: bool = False
+    remote_effect: str = "none"
+    transport_profile: str = "none"
+
+
+@dataclass(frozen=True)
+class ManagedNpxSkillsAdd:
+    """Parsed standalone ``npx skills add`` call owned by Skill Manager."""
+
+    source: str
+    skill_names: tuple[str, ...] = ()
+    yes: bool = False
+    install_all: bool = False
+    list_only: bool = False
 
 
 _HARD_DENY_COMMANDS = frozenset(
@@ -312,6 +345,84 @@ class ShellPolicyAnalyzer:
         return cls._unwrap(tokens)
 
     @staticmethod
+    def _lark_cli_requires_network(tokens: list[str]) -> bool:
+        """Keep purely local CLI discovery offline; all real actions need net."""
+
+        lowered = [item.lower() for item in tokens[1:]]
+        if not lowered:
+            return False
+        return not (
+            any(item in {"-h", "--help"} for item in lowered)
+            or lowered[0] in {"help", "version", "--version", "schema"}
+        )
+
+    @classmethod
+    def network_intent(cls, command: str) -> NetworkIntent:
+        """Describe only statically provable network intent.
+
+        Unknown programs deliberately remain opaque.  A normal Docker bridge
+        is not an origin firewall, so this metadata narrows approval reuse; it
+        must never be interpreted as transport-level enforcement.
+        """
+
+        effects = cls.capabilities(command)
+        if not effects.network:
+            return NetworkIntent()
+        try:
+            segments, _ = cls._segments(command)
+        except ValueError:
+            return NetworkIntent(required=True, remote_effect="unknown", transport_profile="opaque")
+        if len(segments) != 1:
+            return NetworkIntent(required=True, remote_effect="unknown", transport_profile="opaque")
+        tokens = cls._unwrap(segments[0])
+        if not tokens:
+            return NetworkIntent(required=True, remote_effect="unknown", transport_profile="opaque")
+        executable = Path(tokens[0]).name.lower()
+        if executable == "lark-cli":
+            lowered = [item.lower() for item in tokens[1:]]
+            effect = "auth" if lowered[:1] in (["auth"], ["config"]) else "unknown"
+            return NetworkIntent(
+                required=True,
+                target_known=False,
+                remote_effect=effect,
+                transport_profile="declared_cli:lark",
+            )
+        if executable != "curl":
+            return NetworkIntent(required=True, remote_effect="unknown", transport_profile="opaque")
+        origins: set[str] = set()
+        for token in tokens[1:]:
+            if not token.lower().startswith(("http://", "https://")):
+                continue
+            try:
+                parsed = urlsplit(token)
+                port = parsed.port
+            except ValueError:
+                continue
+            if not parsed.hostname or parsed.username or parsed.password:
+                continue
+            scheme = parsed.scheme.lower()
+            default_port = 443 if scheme == "https" else 80
+            origins.add(f"{scheme}://{parsed.hostname.lower()}:{port or default_port}")
+        lowered = [item.lower() for item in tokens[1:]]
+        mutating_flags = {
+            "-d", "--data", "--data-ascii", "--data-binary", "--data-raw",
+            "--data-urlencode", "-f", "--form", "--form-string", "-t",
+            "--upload-file", "--json",
+        }
+        remote_effect = "mutate" if any(
+            item in mutating_flags
+            or item.startswith(tuple(f"{flag}=" for flag in mutating_flags if flag.startswith("--")))
+            for item in lowered
+        ) else "read"
+        return NetworkIntent(
+            required=True,
+            origins=tuple(sorted(origins)),
+            target_known=bool(origins),
+            remote_effect=remote_effect,
+            transport_profile="validated_http" if origins else "opaque",
+        )
+
+    @staticmethod
     def _curl_writes_material_output(tokens: list[str]) -> bool:
         """Return whether curl stores response bytes in a material file.
 
@@ -408,6 +519,11 @@ class ShellPolicyAnalyzer:
                     and cls._curl_writes_material_output(tokens)
                 ):
                     workspace_write = True
+            if executable == "lark-cli" and cls._lark_cli_requires_network(tokens):
+                # Routing and authorization are intentionally separate.  This
+                # marks every non-local lark action for the one-shot network
+                # container without claiming the action itself is safe.
+                network = True
             if executable in _DESTRUCTIVE_OR_WRITE_COMMANDS:
                 workspace_write = True
             if executable == "rm" and any(
@@ -869,6 +985,18 @@ class ShellPolicyAnalyzer:
                 f"network_access:{command}",
                 "network",
             )
+        if command == "lark-cli":
+            if not self._lark_cli_requires_network(tokens):
+                return ToolPolicyResult(
+                    PolicyDecision.ALLOW,
+                    "declared_cli_local_inspection:lark-cli",
+                    "low",
+                )
+            return ToolPolicyResult(
+                PolicyDecision.ASK,
+                "network_access:lark-cli",
+                "network",
+            )
         if command in _PACKAGE_COMMANDS:
             if command in {"pip", "pip3"} and args[:1] not in (["install"], ["uninstall"]):
                 return ToolPolicyResult(PolicyDecision.ASK, f"python_tool:{command}", "high")
@@ -1188,11 +1316,25 @@ class ToolExecutionPipeline(AgentMiddleware):
         permission_context: RunPermissionContext | None = None,
         base_dir: Path | None = None,
         reviewer: PermissionReviewer | None = None,
+        workspace_backend: Any | None = None,
+        managed_cli_service: Any | None = None,
     ) -> None:
         self.known_tools = set(known_tools) | set(self.BUILTIN_TOOLS)
         self.backend_mode = backend_mode
         self.base_dir = base_dir.expanduser().resolve() if base_dir is not None else None
         self.reviewer = reviewer
+        self.workspace_backend = workspace_backend
+        self.managed_cli_registry = ManagedCliRegistry()
+        self.managed_cli_service = managed_cli_service
+        if self.managed_cli_service is None and workspace_backend is not None and backend_mode == "docker":
+            try:
+                from runtime_identity.service import ManagedCliService
+
+                self.managed_cli_service = ManagedCliService(workspace_backend)
+            except Exception:
+                # Home/Keychain access is deferred until a managed command is
+                # actually invoked; construction failures remain fail-closed.
+                self.managed_cli_service = None
         self.permission_context = permission_context or RunPermissionContext.from_config_snapshot(
             {
                 "permissions": {"approval_mode": "strict"},
@@ -1200,18 +1342,434 @@ class ToolExecutionPipeline(AgentMiddleware):
             }
         )
 
+    @staticmethod
+    def _awaiting_skill_confirmation(message: Any) -> bool:
+        if not isinstance(message, ToolMessage) or message.name != "execute":
+            return False
+        try:
+            value = json.loads(str(message.content or ""))
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            isinstance(value, dict)
+            and value.get("managed_by") == "skill_management"
+            and value.get("intercepted") is True
+            and isinstance(value.get("plans"), list)
+            and value["plans"]
+            and any(
+                isinstance(plan, dict)
+                and plan.get("status") == "prepared"
+                and plan.get("phase") == "awaiting_confirmation"
+                and plan.get("ui_commit_supported") is True
+                for plan in value["plans"]
+            )
+        )
+
+    @staticmethod
+    def _awaiting_user_browser(message: Any) -> bool:
+        if not isinstance(message, ToolMessage) or message.name != "execute":
+            return False
+        try:
+            value = json.loads(str(message.content or ""))
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            isinstance(value, dict)
+            and value.get("managed_by") == "managed_cli"
+            and value.get("status") == "awaiting_user_browser"
+        )
+
+    @hook_config(can_jump_to=["end"])
+    def before_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
+        """Pause the Agent loop at the durable Skill confirmation boundary.
+
+        A ``Command(goto=END)`` returned from a wrapped tool is not a reliable
+        loop exit in LangChain's ToolNode: its static tools-to-model edge can
+        route back to the model.  ``before_model`` is the framework-supported
+        control point before another model turn. A structured interrupt keeps
+        the Run alive until the immutable plans are committed or cancelled;
+        an approved batch then continues from this exact model boundary.
+        """
+
+        for message in reversed(list(state.get("messages") or [])):
+            if isinstance(message, ToolMessage):
+                if self._awaiting_skill_confirmation(message):
+                    value = json.loads(str(message.content or ""))
+                    context = runtime.context if isinstance(getattr(runtime, "context", None), dict) else {}
+                    request = skill_plan_resume_registry.create(
+                        session_id=str(context.get("session_id") or ""),
+                        query_id=str(context.get("query_id") or ""),
+                        run_id=str(context.get("run_id") or ""),
+                        tool_call_id=str(message.tool_call_id or ""),
+                        plans=[plan for plan in value["plans"] if isinstance(plan, dict)],
+                    )
+                    decision = interrupt({"type": "skill_plan_confirmation_request", "request": request})
+                    statuses = decision.get("statuses") if isinstance(decision, dict) else {}
+                    if isinstance(statuses, dict):
+                        for plan in value["plans"]:
+                            if not isinstance(plan, dict):
+                                continue
+                            status = statuses.get(str(plan.get("plan_id") or ""))
+                            if status:
+                                plan["status"] = status
+                                plan["phase"] = status
+                                plan["installed"] = status == "committed"
+                    value["confirmation_completed"] = True
+                    value["confirmation_action"] = decision.get("action") if isinstance(decision, dict) else "cancel"
+                    updated = message.model_copy(update={"content": json.dumps(value, ensure_ascii=False, sort_keys=True)})
+                    if value["confirmation_action"] == "confirm":
+                        return {"messages": [updated]}
+                    return {"messages": [updated], "jump_to": "end"}
+                continue
+            break
+        return None
+
+    @hook_config(can_jump_to=["end"])
+    def after_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
+        """Allow one user-facing auth summary, but never another dependent tool."""
+
+        del runtime
+        messages = list(state.get("messages") or [])
+        if not messages or not isinstance(messages[-1], AIMessage):
+            return None
+        latest = messages[-1]
+        boundary: ToolMessage | None = None
+        for message in reversed(messages[:-1]):
+            if isinstance(message, ToolMessage):
+                if self._awaiting_user_browser(message):
+                    boundary = message
+                break
+            if isinstance(message, AIMessage):
+                break
+        if boundary is None:
+            return None
+        if not latest.tool_calls:
+            return {"jump_to": "end"}
+        try:
+            payload = json.loads(str(boundary.content or ""))
+        except (TypeError, ValueError):
+            payload = {}
+        output = str(payload.get("output") or "") if isinstance(payload, dict) else ""
+        url_match = re.search(r"https?://[^\s]+", output)
+        link = f"\n\n授权链接：{url_match.group(0)}" if url_match else ""
+        replacement = latest.model_copy(
+            update={
+                "content": (
+                    "飞书授权流程已启动，但尚未完成。请使用上方二维码或授权链接在浏览器中完成操作。"
+                    "完成后告诉我；下一轮会先验证配置和登录状态，再继续后续步骤。"
+                    f"{link}"
+                ),
+                "tool_calls": [],
+            }
+        )
+        return {"messages": [replacement], "jump_to": "end"}
+
+    @staticmethod
+    def _segment_is_npx_skills_add(tokens: list[str]) -> bool:
+        tokens = ShellPolicyAnalyzer.unwrap_command(tokens)
+        if not tokens or Path(tokens[0]).name.lower() != "npx":
+            return False
+        lowered = [token.lower() for token in tokens[1:]]
+        return any(
+            lowered[index : index + 2] == ["skills", "add"]
+            for index in range(max(0, len(lowered) - 1))
+        )
+
+    @classmethod
+    def _contains_npx_skills_add(cls, command: str) -> bool:
+        try:
+            parsed_match = any(
+                cls._segment_is_npx_skills_add(segment)
+                for segment in ShellPolicyAnalyzer.parse_segments(command)
+            )
+        except ValueError:
+            parsed_match = False
+        # Also catch commands hidden behind a shell wrapper such as
+        # ``sh -c 'npx skills add ...'``.  They are deliberately denied rather
+        # than partially unwrapped and executed.
+        return parsed_match or bool(
+            re.search(
+                r"(?:^|[\s'\"/])npx\b[^;&|\n]*?\bskills\s+add\b",
+                command,
+                re.IGNORECASE,
+            )
+        )
+
+    @classmethod
+    def _managed_npx_skills_add(cls, command: str) -> ManagedNpxSkillsAdd | None:
+        """Parse only a standalone add command; mixed shell programs never partly execute."""
+
+        # Agents commonly append ``2>&1`` so stderr is visible in the same
+        # tool result.  It has no filesystem or process-composition effect and
+        # is safe to remove before parsing. Pipes, file redirects, background
+        # jobs, command substitution, and compound commands remain rejected.
+        command = re.sub(r"\s+2\s*>\s*&\s*1\s*$", "", command.strip())
+        try:
+            segments = ShellPolicyAnalyzer.parse_segments(command)
+        except ValueError:
+            return None
+        if len(segments) != 1 or not cls._segment_is_npx_skills_add(segments[0]):
+            return None
+        tokens = ShellPolicyAnalyzer.unwrap_command(segments[0])
+        lowered = [token.lower() for token in tokens]
+        try:
+            skills_index = next(
+                index
+                for index in range(1, len(tokens) - 1)
+                if lowered[index : index + 2] == ["skills", "add"]
+            )
+        except StopIteration:
+            return None
+        args = tokens[skills_index + 2 :]
+        source = ""
+        skill_names: list[str] = []
+        yes = any(
+            token.lower() in {"-y", "--yes"}
+            for token in tokens[1:skills_index]
+        )
+        install_all = False
+        list_only = False
+        index = 0
+        while index < len(args):
+            value = args[index]
+            lowered_value = value.lower()
+            if lowered_value in {"-y", "--yes"}:
+                yes = True
+                index += 1
+                continue
+            if lowered_value == "--all":
+                install_all = True
+                yes = True
+                index += 1
+                continue
+            if lowered_value in {"-l", "--list"}:
+                list_only = True
+                index += 1
+                continue
+            if lowered_value in {"-g", "--global", "--copy", "--full-depth"}:
+                index += 1
+                continue
+            if lowered_value.startswith("--skill="):
+                skill_names.append(value.partition("=")[2])
+                index += 1
+                continue
+            if lowered_value in {"-s", "--skill"}:
+                index += 1
+                while index < len(args) and not args[index].startswith("-"):
+                    skill_names.append(args[index])
+                    index += 1
+                continue
+            if lowered_value.startswith("--agent="):
+                index += 1
+                continue
+            if lowered_value in {"-a", "--agent", "--subagent"}:
+                index += 1
+                while index < len(args) and not args[index].startswith("-"):
+                    index += 1
+                continue
+            if value.startswith("-"):
+                # Unknown CLI options remain under Skill Manager authority but
+                # are rejected rather than passed through to an arbitrary npx.
+                return None
+            if not source:
+                source = value
+                index += 1
+                continue
+            return None
+        if not source:
+            return None
+        return ManagedNpxSkillsAdd(
+            source=source,
+            skill_names=tuple(skill_names),
+            yes=yes,
+            install_all=install_all,
+            list_only=list_only,
+        )
+
+    async def _invoke_authorized(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+        managed_add: ManagedNpxSkillsAdd | None,
+        managed_cli: Any | None = None,
+    ) -> ToolMessage | Command[Any]:
+        if managed_cli is not None:
+            if self.managed_cli_service is None:
+                return ToolMessage(
+                    content=json.dumps(
+                        {
+                            "ok": False,
+                            "managed_by": "managed_cli",
+                            "error": "managed_cli_service_unavailable",
+                            "message": "Managed CLI execution requires the Docker runtime.",
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    name="execute",
+                    tool_call_id=str(request.tool_call.get("id") or ""),
+                    status="error",
+                )
+            context = self._context(request)
+            result = await asyncio.to_thread(self.managed_cli_service.execute, managed_cli, context)
+            return ToolMessage(
+                content=result.content,
+                name="execute",
+                tool_call_id=str(request.tool_call.get("id") or ""),
+                status="success" if result.exit_code == 0 else "error",
+            )
+        if managed_add is None:
+            return await handler(request)
+        if self.base_dir is None:
+            return ToolMessage(
+                content=json.dumps(
+                    {
+                        "ok": False,
+                        "managed_by": "skill_management",
+                        "error": "skill_manager_unavailable",
+                    },
+                    ensure_ascii=False,
+                ),
+                name="execute",
+                tool_call_id=str(request.tool_call.get("id") or ""),
+                status="error",
+            )
+        context = self._context(request)
+        from services.skill_management import SkillManagementError, get_skill_management_service
+
+        try:
+            service = get_skill_management_service(self.base_dir)
+            result = await asyncio.to_thread(
+                service.prepare_npx_skills_add,
+                source=managed_add.source,
+                skill_names=list(managed_add.skill_names),
+                yes=managed_add.yes,
+                install_all=managed_add.install_all,
+                list_only=managed_add.list_only,
+                request_context={
+                    key: str(context.get(key) or "")
+                    for key in ("session_id", "query_id", "run_id")
+                    if str(context.get(key) or "")
+                },
+            )
+            status = (
+                "success"
+                if result.get("ok")
+                or result.get("selection_required")
+                or result.get("list_only")
+                or bool(result.get("plans"))
+                else "error"
+            )
+            content = json.dumps(result, ensure_ascii=False, sort_keys=True)
+        except SkillManagementError as exc:
+            payload = exc.as_dict()
+            payload["managed_by"] = "skill_management"
+            payload["intercepted"] = True
+            status = "error"
+            content = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        except Exception as exc:
+            content = json.dumps(
+                {
+                    "ok": False,
+                    "managed_by": "skill_management",
+                    "intercepted": True,
+                    "error": "managed_skill_prepare_failed",
+                    "message": str(exc),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            status = "error"
+        return ToolMessage(
+            content=content,
+            name="execute",
+            tool_call_id=str(request.tool_call.get("id") or ""),
+            status=status,
+        )
+
+    @classmethod
+    def _managed_npx_rejection(cls, request: ToolCallRequest) -> ToolMessage:
+        """Return a Skill Manager-owned error without ever invoking a shell."""
+
+        return ToolMessage(
+            content=json.dumps(
+                {
+                    "ok": False,
+                    "managed_by": "skill_management",
+                    "intercepted": True,
+                    "error": "unsupported_npx_skills_add_form",
+                    "message": (
+                        "Skill Manager intercepted npx skills add, but the command must be one "
+                        "standalone supported add operation. Pipes, file redirects, shell wrappers, "
+                        "compound commands, and unknown options are not executed."
+                    ),
+                    "command": cls._command(request),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            name="execute",
+            tool_call_id=str(request.tool_call.get("id") or ""),
+            status="error",
+        )
+
+    @classmethod
+    def _managed_cli_rejection(cls, request: ToolCallRequest, message: str) -> ToolMessage:
+        return ToolMessage(
+            content=json.dumps(
+                {
+                    "ok": False,
+                    "managed_by": "managed_cli",
+                    "error": "unsupported_managed_cli_command",
+                    "message": message,
+                    "command": cls._command(request),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            name="execute",
+            tool_call_id=str(request.tool_call.get("id") or ""),
+            status="error",
+        )
+
     async def awrap_tool_call(
         self,
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
     ) -> ToolMessage | Command[Any]:
+        is_execute = str(request.tool_call.get("name") or "") == "execute"
+        command = self._command(request) if is_execute else ""
+        contains_managed_add = is_execute and self._contains_npx_skills_add(command)
+        managed_add = self._managed_npx_skills_add(command) if contains_managed_add else None
+        if contains_managed_add and managed_add is None:
+            # Ownership begins before policy evaluation: unsupported syntax is
+            # a Skill Manager validation error, never a raw terminal command.
+            return self._managed_npx_rejection(request)
+        managed_cli: Any | None = None
+        if is_execute and not contains_managed_add:
+            try:
+                managed_match = self.managed_cli_registry.match(command)
+                managed_cli = (
+                    self.managed_cli_service.plan(managed_match, self._context(request))
+                    if managed_match is not None and self.managed_cli_service is not None
+                    else managed_match
+                )
+            except UnsupportedManagedCliCommand as exc:
+                # Like Skill Manager ownership, Adapter ownership begins
+                # before generic shell policy and never falls through.
+                return self._managed_cli_rejection(request, str(exc))
+            except Exception as exc:  # noqa: BLE001
+                return self._managed_cli_rejection(
+                    request,
+                    f"Managed CLI planning failed: {type(exc).__name__}: {exc}",
+                )
         result = await self._apreflight(request)
         if result.decision == PolicyDecision.ALLOW:
             self._record_reviewer_decision(request, result)
             delta_denial = self._delta_repair_denial(request)
             if delta_denial is not None:
                 return delta_denial
-            return await handler(request)
+            return await self._invoke_authorized(request, handler, managed_add, managed_cli)
         if result.decision == PolicyDecision.DENY:
             self._record_reviewer_decision(request, result)
             return self._denied_message(request, result)
@@ -1219,7 +1777,11 @@ class ToolExecutionPipeline(AgentMiddleware):
         context = self._context(request)
         session_id = str(context.get("session_id") or "")
         query_id = str(context.get("query_id") or "")
-        command = self._action_preview(request)
+        command = (
+            managed_cli.approval_preview()
+            if managed_cli is not None and hasattr(managed_cli, "approval_preview")
+            else self._action_preview(request)
+        )
         tool_name = str(request.tool_call.get("name") or "")
         fingerprint = permission_resume_registry.tool_action_fingerprint(
             tool_name=tool_name,
@@ -1248,7 +1810,7 @@ class ToolExecutionPipeline(AgentMiddleware):
             delta_denial = self._delta_repair_denial(request)
             if delta_denial is not None:
                 return delta_denial
-            return await handler(request)
+            return await self._invoke_authorized(request, handler, managed_add, managed_cli)
         preview = permission_resume_registry.create_tool_action_request(
             session_id=session_id,
             query_id=query_id,
@@ -1302,7 +1864,7 @@ class ToolExecutionPipeline(AgentMiddleware):
                 delta_denial = self._delta_repair_denial(request)
                 if delta_denial is not None:
                     return delta_denial
-                return await handler(request)
+                return await self._invoke_authorized(request, handler, managed_add, managed_cli)
         return self._denied_message(request, result)
 
     def wrap_tool_call(
@@ -1310,11 +1872,37 @@ class ToolExecutionPipeline(AgentMiddleware):
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
     ) -> ToolMessage | Command[Any]:
+        managed_cli: Any | None = None
+        if str(request.tool_call.get("name") or "") == "execute":
+            try:
+                managed_match = self.managed_cli_registry.match(self._command(request))
+                managed_cli = (
+                    self.managed_cli_service.plan(managed_match, self._context(request))
+                    if managed_match is not None and self.managed_cli_service is not None
+                    else managed_match
+                )
+            except UnsupportedManagedCliCommand as exc:
+                return self._managed_cli_rejection(request, str(exc))
+            except Exception as exc:  # noqa: BLE001
+                return self._managed_cli_rejection(
+                    request,
+                    f"Managed CLI planning failed: {type(exc).__name__}: {exc}",
+                )
         result = self._preflight(request)
         if result.decision == PolicyDecision.ALLOW:
             delta_denial = self._delta_repair_denial(request)
             if delta_denial is not None:
                 return delta_denial
+            if managed_cli is not None:
+                if self.managed_cli_service is None:
+                    return self._managed_cli_rejection(request, "Managed CLI execution requires the Docker runtime.")
+                managed = self.managed_cli_service.execute(managed_cli, self._context(request))
+                return ToolMessage(
+                    content=managed.content,
+                    name="execute",
+                    tool_call_id=str(request.tool_call.get("id") or ""),
+                    status="success" if managed.exit_code == 0 else "error",
+                )
             return handler(request)
         return self._denied_message(request, result)
 
@@ -1398,6 +1986,20 @@ class ToolExecutionPipeline(AgentMiddleware):
                 "versioned_patch_required: use inspect_file_version then patch_file",
                 "managed_write",
             )
+        if tool_name == "execute":
+            command = self._command(request)
+            if self._contains_npx_skills_add(command):
+                if self._managed_npx_skills_add(command) is None:
+                    return ToolPolicyResult(
+                        PolicyDecision.DENY,
+                        "managed_skill_add_requires_standalone_supported_command",
+                        "critical",
+                    )
+                return ToolPolicyResult(
+                    PolicyDecision.ASK,
+                    "managed_skill_source_download:npx_skills_add",
+                    "network",
+                )
         # The registration-boundary control descriptor is the authority for
         # tools whose effects are entirely read-only or internal.  Do not
         # require a second hand-maintained allowlist entry for every new query
@@ -1925,6 +2527,19 @@ class ToolExecutionPipeline(AgentMiddleware):
     def _skill_change_preview(self, request: ToolCallRequest) -> dict[str, str] | None:
         tool_name = str(request.tool_call.get("name") or "")
         args = request.tool_call.get("args") or {}
+        if tool_name == "execute":
+            managed_add = self._managed_npx_skills_add(self._command(request))
+            if managed_add is not None:
+                skill_names = ", ".join(managed_add.skill_names)
+                return {
+                    key: value
+                    for key, value in {
+                        "action": "prepare_install",
+                        "skill_name": skill_names or "all discovered skills",
+                        "source": managed_add.source,
+                    }.items()
+                    if value
+                }
         if tool_name in {"prepare_skill_install", "prepare_skill_update"}:
             preview = {
                 "action": "prepare_update" if tool_name.endswith("update") else "prepare_install",
@@ -1966,6 +2581,8 @@ class ToolExecutionPipeline(AgentMiddleware):
     @classmethod
     def _required_capabilities(cls, request: ToolCallRequest) -> list[str]:
         tool_name = str(request.tool_call.get("name") or "")
+        if tool_name == "execute" and cls._managed_npx_skills_add(cls._command(request)) is not None:
+            return ["execute", "temporary_network"]
         if tool_name == "install_packages":
             return ["execute", "package_install", "temporary_network"]
         if tool_name in {"prepare_skill_install", "prepare_skill_update"}:
@@ -2134,11 +2751,22 @@ class ToolExecutionPipeline(AgentMiddleware):
             # Skill writes are always bound to the exact immutable plan and
             # may never become reusable Session authority.
             return None
-        if tool_name in {"tavily_search", "fetch_url"}:
+        if tool_name == "tavily_search":
             return {
-                "target_kind": "capability",
-                "target": "session_network_access",
-                "label": "本 Session 允许访问所有网络来源",
+                "target_kind": "network_profile",
+                "target": "web_search:tavily",
+                "label": "本 Session 允许 Tavily 网页搜索",
+            }
+        if tool_name == "fetch_url":
+            args = request.tool_call.get("args") or {}
+            origin = self._normalized_network_origin(str(args.get("url") or ""))
+            if origin is None:
+                return None
+            host = urlsplit(origin).hostname or origin
+            return {
+                "target_kind": "network_origin",
+                "target": origin,
+                "label": f"本 Session 允许读取 {host}",
             }
         if tool_name == "install_packages":
             if not self.permission_context.smart or self.permission_context.backend_mode != "docker":
@@ -2151,21 +2779,25 @@ class ToolExecutionPipeline(AgentMiddleware):
         if tool_name != "execute":
             return None
 
-        context = self._context(request)
-        effects = ShellPolicyAnalyzer.capabilities(
-            self._command(request),
-            workspace_path=str(context.get("workspace_path") or "."),
-        )
-        # A Session network grant authorizes connectivity only. Package
-        # installation, project writes and destructive actions keep their own
-        # capability checks and can never hitchhike on this broad grant.
-        if not effects.network or effects.workspace_write or effects.package_install or effects.destructive:
+        # Raw shell commands have unrestricted bridge egress once approved.
+        # Even a static GET can read workspace/HOME data through program flags
+        # or a replaced executable, so shell networking is always exact-once.
+        return None
+
+    @staticmethod
+    def _normalized_network_origin(raw_url: str) -> str | None:
+        try:
+            parsed = urlsplit(raw_url.strip())
+            port = parsed.port
+        except ValueError:
             return None
-        return {
-            "target_kind": "capability",
-            "target": "session_network_access",
-            "label": "本 Session 允许访问所有网络来源",
-        }
+        scheme = parsed.scheme.lower()
+        if scheme not in {"http", "https"} or not parsed.hostname:
+            return None
+        if parsed.username or parsed.password:
+            return None
+        default_port = 443 if scheme == "https" else 80
+        return f"{scheme}://{parsed.hostname.lower()}:{port or default_port}"
 
     @staticmethod
     def _denied_message(

@@ -323,7 +323,7 @@ async def grant_tool_action_permission(
         "prepare_skill_update",
         "install_skill",
         "update_skill",
-    }
+    } or str(pending.get("reason") or "").startswith("managed_skill_source_download:")
     if is_skill_management and req.scope != "once":
         raise HTTPException(
             status_code=400,
@@ -334,6 +334,11 @@ async def grant_tool_action_permission(
         raise HTTPException(status_code=400, detail="permission fingerprint missing")
     session_target_kind = str(pending.get("session_target_kind") or "")
     session_target = str(pending.get("session_target") or "")
+    if req.scope == "session" and not (session_target_kind and session_target):
+        raise HTTPException(
+            status_code=400,
+            detail="This action only supports one-time approval",
+        )
     use_reusable_scope = req.scope == "session" and session_target_kind and session_target
     target_kind = session_target_kind if use_reusable_scope else "fingerprint"
     target = session_target if use_reusable_scope else fingerprint

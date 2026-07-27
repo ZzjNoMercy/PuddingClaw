@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
@@ -22,6 +23,7 @@ class ReadResourceInput(BaseModel):
             "Resource to read. Pass either an attachment id like att_11d3cfb4dc67 for uploaded/pasted "
             "attachments, a /knowledge/... virtual path, or the exact non-workspace path the user provided. "
             "This includes POSIX absolute paths, Windows absolute paths, and home-relative paths. "
+            "HTTP(S) URLs are web resources and must be passed to fetch_url, not read_resource. "
             "Do not pass /workspace or /scratch virtual paths here."
         )
     )
@@ -168,6 +170,12 @@ class ReadResourceTool(BaseTool):
         value = resource.strip()
         if not value:
             return "❌ Missing resource."
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            parsed = None
+        if parsed is not None and parsed.scheme.lower() in {"http", "https"} and parsed.netloc:
+            return "❌ Web URL supplied to read_resource; use fetch_url for HTTP(S) resources."
         if value.startswith("att_"):
             return self._read_attachment(value)
         workspace_path = self._resolve_workspace_virtual_path(value)

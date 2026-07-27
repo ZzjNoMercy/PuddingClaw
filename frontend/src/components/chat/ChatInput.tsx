@@ -114,6 +114,7 @@ export default function ChatInput() {
     stopStreaming,
     isStreaming,
     isCompressing,
+    sessionHistoryLoading,
     sessionId,
     setSessionId,
     createSession,
@@ -146,6 +147,8 @@ export default function ChatInput() {
     setApprovalMode,
     setInspectorOpen,
     setInspectorActiveTab,
+    activeAttachmentPreview,
+    closeAttachmentPreview,
   } = useApp();
   // Initialize from the per-session draft so typed text survives page
   // navigation (the store outlives this component; local state does not).
@@ -171,7 +174,7 @@ export default function ChatInput() {
     approvalModeSaving ||
     Boolean(currentRun && !terminalRunStatuses.has(currentRun.status));
   const isSubmitting = isSessionSubmitting(submittingSessionIds, sessionId);
-  const disabled = isStreaming || isCompressing || approvalModeSaving || isSubmitting || isUploading || currentRun?.status === "waiting_hitl";
+  const disabled = sessionHistoryLoading || isStreaming || isCompressing || approvalModeSaving || isSubmitting || isUploading || currentRun?.status === "waiting_hitl";
   const configurationBusy = isSubmitting || isUploading;
   const [analyticsModels, setAnalyticsModels] = useState<AnalyticsModelSummary[]>([]);
   const detectedImagePaths = useMemo(() => {
@@ -181,6 +184,14 @@ export default function ChatInput() {
 
   useEffect(() => {
     currentSessionIdRef.current = sessionId;
+  }, [sessionId]);
+
+  // Attachment drafts are Session-owned. Never carry a selected/uploaded file
+  // into a different conversation when the user switches quickly.
+  useEffect(() => {
+    setAttachments([]);
+    setInputError(null);
+    if (attachmentInputRef.current) attachmentInputRef.current.value = "";
   }, [sessionId]);
 
   // Per-session input draft: restore the target session's draft when
@@ -387,13 +398,17 @@ export default function ChatInput() {
     const fileList = Array.from(files).slice(0, 8);
     setUploadingCount((count) => count + 1);
     setInputError(null);
+    let targetSessionId = sessionId;
     try {
-      const targetSessionId = sessionId === "default" ? await createSession() : sessionId;
+      targetSessionId = sessionId === "default" ? (await createSession() || "") : sessionId;
       if (!targetSessionId) throw new Error("无法创建会话，附件尚未上传。");
       const next = await uploadAgentAttachments(fileList, targetSessionId, source);
+      if (currentSessionIdRef.current !== targetSessionId) return;
       setAttachments((current) => [...current, ...next].slice(0, 8));
     } catch (error) {
-      setInputError(error instanceof Error ? error.message : "附件上传失败，请重试。");
+      if (currentSessionIdRef.current === targetSessionId) {
+        setInputError(error instanceof Error ? error.message : "附件上传失败，请重试。");
+      }
     } finally {
       setUploadingCount((count) => Math.max(0, count - 1));
       if (attachmentInputRef.current) attachmentInputRef.current.value = "";
@@ -486,6 +501,12 @@ export default function ChatInput() {
   useEffect(() => {
     const handleGlobalKeyDown = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
+      if (activeAttachmentPreview?.sessionId === currentSessionIdRef.current) {
+        e.preventDefault();
+        closeAttachmentPreview();
+        setInspectorOpen(false);
+        return;
+      }
       if (openPopoverRef.current) {
         e.preventDefault();
         setOpenPopover(null);
@@ -498,7 +519,7 @@ export default function ChatInput() {
     };
     window.addEventListener("keydown", handleGlobalKeyDown);
     return () => window.removeEventListener("keydown", handleGlobalKeyDown);
-  }, [isStreaming, stopStreaming]);
+  }, [activeAttachmentPreview, closeAttachmentPreview, isStreaming, setInspectorOpen, stopStreaming]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (showSlashMenu) {
@@ -894,7 +915,7 @@ export default function ChatInput() {
                     </div>
                     {([
                       ["strict", "严格审批", "所有需要授权的操作都由你确认。"],
-                      ["smart", "智能审批", "网页检索与低风险联网自动放行；Docker 安装依赖仍按 Session 询问。"],
+                      ["smart", "智能审批", "受控网页读取与搜索自动联网；Shell、CLI、上传和依赖安装仍按影响授权。"],
                     ] as Array<[ApprovalMode, string, string]>).map(([mode, label, description]) => (
                       <button
                         type="button"

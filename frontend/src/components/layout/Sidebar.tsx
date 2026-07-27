@@ -312,6 +312,8 @@ export default function Sidebar() {
                   const sessionsExpanded = expandedProjectSessions.has(project.project_id);
                   const projectCollapsed = !expandedProjects.has(project.project_id);
                   const visibleChildSessions = sessionsExpanded ? childSessions : childSessions.slice(0, 5);
+                  const containsSelectedSession = childSessions.some((session) => session.id === sessionId);
+                  const projectContextSelected = sessionId === "default" && currentProjectId === project.project_id;
                   return (
                     <div key={project.project_id} className="relative">
                       <ProjectItem
@@ -322,12 +324,16 @@ export default function Sidebar() {
                         collapsed={projectCollapsed}
                         isActive={
                           isChatRoute &&
-                          currentProjectId === project.project_id &&
-                          !childSessions.some((s) => s.id === sessionId)
+                          (projectContextSelected || (projectCollapsed && containsSelectedSession))
                         }
                         onSelect={() => {
                           setRuntimeMode("agent");
                           setCurrentProjectId(project.project_id);
+                          setWorkspaceView("chat");
+                          setSessionId("default");
+                          if (pathname !== "/") {
+                            router.push("/");
+                          }
                         }}
                         onToggleCollapsed={() => toggleProjectCollapsed(project.project_id)}
                         onPinToggle={async () => {
@@ -592,7 +598,7 @@ function ProjectItem({
         aria-expanded={!collapsed}
         className={`absolute left-1.5 top-1/2 z-20 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-lg transition ${
           isActive
-            ? "text-[#002fa7]/75 hover:bg-[#002fa7]/[0.08] hover:text-[#002fa7]"
+            ? "text-white/75 hover:bg-white/15 hover:text-white"
             : "text-gray-400 hover:bg-black/[0.05] hover:text-gray-700"
         }`}
         title={collapsed ? "展开项目会话" : "折叠项目会话"}
@@ -604,15 +610,17 @@ function ProjectItem({
         onClick={onSelect}
         className={`flex min-w-0 flex-1 items-center gap-2 rounded-xl py-1.5 pr-14 text-left text-[12px] transition-all ${
           isActive
-            ? "bg-white/68 text-gray-900 font-medium shadow-sm"
+            ? "bg-[#002fa7] text-white font-medium shadow-sm shadow-[#002fa7]/20"
             : "text-gray-700 hover:bg-white/48"
         } pl-8`}
         title={path}
       >
-        <FolderKanban className="h-3.5 w-3.5 shrink-0 text-gray-500" />
+        <FolderKanban className={`h-3.5 w-3.5 shrink-0 ${isActive ? "text-white" : "text-gray-500"}`} />
         <span className="truncate">{name}</span>
         {pinned && (
-          <span className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-[#002fa7]/10 text-[#002fa7]" title="已置顶">
+          <span className={`inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full ${
+            isActive ? "bg-white/15 text-white" : "bg-[#002fa7]/10 text-[#002fa7]"
+          }`} title="已置顶">
             <Pin className="h-2.5 w-2.5" />
           </span>
         )}
@@ -630,7 +638,11 @@ function ProjectItem({
             event.stopPropagation();
             setMenuOpen((open) => !open);
           }}
-          className={`flex h-7 w-7 items-center justify-center rounded-lg text-gray-400 transition-all hover:bg-black/[0.05] hover:text-gray-700 focus:bg-black/[0.05] focus:text-gray-700 focus:outline-none ${
+          className={`flex h-7 w-7 items-center justify-center rounded-lg transition-all focus:outline-none ${
+            isActive
+              ? "text-white/70 hover:bg-white/15 hover:text-white focus:bg-white/15 focus:text-white"
+              : "text-gray-400 hover:bg-black/[0.05] hover:text-gray-700 focus:bg-black/[0.05] focus:text-gray-700"
+          } ${
             menuOpen ? "opacity-100" : "opacity-0 group-hover/project:opacity-100 focus:opacity-100"
           }`}
           title="项目操作"

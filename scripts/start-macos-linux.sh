@@ -159,7 +159,9 @@ UV_CACHE_DIR="${UV_CACHE_DIR:-/private/tmp/puddingclaw-uv-cache}" uv run --all-e
     python -m uvicorn app:app --host "$BACKEND_HOST" --port "$BACKEND_PORT" --reload \
     --reload-dir api \
     --reload-dir graph \
+    --reload-dir harness \
     --reload-dir projects \
+    --reload-dir services \
     --reload-dir tools \
     --reload-dir analytics \
     --reload-include "*.py" \

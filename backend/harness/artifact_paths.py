@@ -358,7 +358,23 @@ def _path_starts(message: str) -> list[int]:
                 or is_known_root
             ):
                 starts.append(index)
-        elif char.isalpha() and index + 2 < len(message) and message[index + 1] == ":" and message[index + 2] in "\\/":
+        elif (
+            char.isalpha()
+            and index + 2 < len(message)
+            and message[index + 1] == ":"
+            and message[index + 2] in "\\/"
+            # ``https://.../guide.md`` contains the substring ``s:/``.
+            # A Windows drive must start at a token boundary and has exactly
+            # one slash after the colon; otherwise a web URL becomes a fake
+            # local path such as ``backend/s:/open.feishu.cn/...``.
+            and message[index + 2 : index + 4] not in {"//", "\\\\"}
+            and (
+                index == 0
+                or message[index - 1].isspace()
+                or message[index - 1] in "`'\"([：:，,"
+                or "\u4e00" <= message[index - 1] <= "\u9fff"
+            )
+        ):
             starts.append(index)
 
     return starts

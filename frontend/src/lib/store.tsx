@@ -9,6 +9,7 @@ import React, {
   useEffect,
   useMemo,
 } from "react";
+import type { AttachmentPreviewSelection } from "./imageAttachments";
 import {
   streamChat,
   streamAgent,
@@ -91,7 +92,7 @@ export type TimelineItem =
   | { type: "tool"; toolCall: ToolCall; id: string }
   | { type: "activity"; label: string; detail?: string; status?: string; id: string };
 
-type InspectorActiveTab = "progress" | "goal" | "verification" | "sources" | "permissions" | null;
+type InspectorActiveTab = "progress" | "goal" | "verification" | "sources" | "permissions" | "attachments" | null;
 const INSPECTOR_ACTIVE_TAB_STORAGE_KEY = "puddingclaw_inspector_active_tab";
 const ACTIVE_RUNS_STORAGE_KEY = "puddingclaw_active_runs";
 const ACTIVE_RUNS_HEARTBEAT_MS = 5_000;
@@ -224,6 +225,7 @@ export interface RunBoundaryNotice {
 
 export interface ChatMessage {
   id: string;
+  queryId?: string;
   role: "user" | "assistant";
   content: string;
   attachments?: AgentAttachment[];
@@ -453,6 +455,12 @@ interface AppState {
   // Active citation source (syncs chat click with right panel)
   activeSourceId: string | null;
   setActiveSourceId: (id: string | null) => void;
+
+  // Image preview selection is an identity only. The panel resolves the
+  // attachment from the current Session's messages before rendering it.
+  activeAttachmentPreview: AttachmentPreviewSelection | null;
+  openAttachmentPreview: (attachmentId: string) => void;
+  closeAttachmentPreview: () => void;
 }
 
 const AppContext = createContext<AppState | null>(null);
@@ -489,6 +497,7 @@ function parseHistoryMessages(
   backendMessages: Array<{
     role: string;
     content: string;
+    query_id?: string;
     attachments?: AgentAttachment[];
     output_attachments?: AgentAttachment[];
     reasoning_content?: string;
@@ -537,6 +546,7 @@ function parseHistoryMessages(
       const userMessage = splitPersistedUserMessage(msg.content);
       loaded.push({
         id: `hist-user-${msgIndex++}`,
+        queryId: msg.query_id,
         role: "user",
         content: userMessage.content,
         attachments: msg.attachments?.length ? msg.attachments : userMessage.attachments,
@@ -585,6 +595,7 @@ function parseHistoryMessages(
         : undefined;
       const restored: ChatMessage = {
         id: `hist-asst-${msgIndex++}`,
+        queryId: msg.query_id,
         role: "assistant",
         content: stripPersistedModelCallLimitNotice(msg.content),
         reasoning: msg.reasoning_content,
@@ -970,6 +981,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [sessionId, setSessionIdRaw] = useState("default");
   const [userId] = useState(() => getOrCreateUserId());
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
+  const sessionsRef = useRef<SessionMeta[]>([]);
   const [sessionsLoaded, setSessionsLoaded] = useState(false);
   const [runtimeMode, setRuntimeModeRaw] = useState<"agent" | "chat">("chat");
   const [runtimeReady, setRuntimeReady] = useState(false);
@@ -1004,7 +1016,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         saved === "goal" ||
         saved === "verification" ||
         saved === "sources" ||
-        saved === "permissions"
+        saved === "permissions" ||
+        saved === "attachments"
       ) {
         setInspectorActiveTabRaw(saved);
       } else if (saved === "collapsed") {
@@ -1114,6 +1127,20 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const toolContextPollingJobsRef = useRef<Set<string>>(new Set());
 
   const [activeSourceId, setActiveSourceId] = useState<string | null>(null);
+  const [activeAttachmentPreview, setActiveAttachmentPreview] =
+    useState<AttachmentPreviewSelection | null>(null);
+  const openAttachmentPreview = useCallback((attachmentId: string) => {
+    setActiveSourceId(null);
+    setInspectorActiveTab("attachments");
+    setActiveAttachmentPreview({
+      sessionId: sessionIdRef.current,
+      attachmentId,
+    });
+    setInspectorOpen(true);
+  }, [setInspectorActiveTab]);
+  const closeAttachmentPreview = useCallback(() => {
+    setActiveAttachmentPreview(null);
+  }, []);
 
   const setAnalyticsModelId = useCallback((id: string | null) => {
     const sid = sessionIdRef.current;
@@ -1522,6 +1549,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const loadSessions = useCallback(() => {
     apiListSessions()
       .then((list) => {
+        sessionsRef.current = list;
         for (const session of list) {
           if (!Object.prototype.hasOwnProperty.call(analyticsModelIdsMapRef.current, session.id)) {
             analyticsModelIdsMapRef.current[session.id] = session.analytics_model_id ?? null;
@@ -1606,6 +1634,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     (id: string) => {
       // Switch view — do NOT abort any SSE streams (they continue in background)
       sessionIdRef.current = id;
+      setActiveAttachmentPreview(null);
+      setActiveSourceId(null);
       // Persist the selected session so refresh returns to it instead of
       // falling back to the latest/new-chat page.
       try {
@@ -1616,6 +1646,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       setSessionIdRaw(id);
       setRawMessages(null);
       setRunActivityStatus(runActivityStatusesMapRef.current[id] ?? null);
+
+      if (id !== "default") {
+        const targetSession = sessionsRef.current.find((session) => session.id === id);
+        setCurrentProjectId(targetSession?.project_id ?? null);
+      }
 
       if (id === "default") {
         setAnalyticsModelIdRaw(analyticsModelIdsMapRef.current.default ?? null);
@@ -1785,7 +1820,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }
 
     },
-    [updateSessionGraph, updateSessionRunActivity, updateSessionTodos]
+    [setCurrentProjectId, updateSessionGraph, updateSessionRunActivity, updateSessionTodos]
   );
 
   // Trace history is intentionally lazy: switching conversations reads only
@@ -1873,20 +1908,24 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         approvalModesMapRef.current[meta.id] = meta.approval_mode;
         approvalPolicyEpochsMapRef.current[meta.id] = meta.policy_epoch;
         nextRunGoalModeMapRef.current[meta.id] = snapshot.goalModeEnabled;
-        setSessions((prev) => [
-          {
-            id: meta.id,
-            title: meta.title,
-            updated_at: meta.updated_at || Date.now() / 1000,
-            runtime_mode: meta.runtime_mode || snapshot.runtimeMode,
-            project_id: meta.project_id ?? snapshot.projectId,
-            analytics_model_id: snapshot.analyticsModelId,
-            approval_mode: meta.approval_mode,
-            policy_epoch: meta.policy_epoch,
-            policy_version: meta.policy_version,
-          },
-          ...prev,
-        ]);
+        setSessions((prev) => {
+          const next = [
+            {
+              id: meta.id,
+              title: meta.title,
+              updated_at: meta.updated_at || Date.now() / 1000,
+              runtime_mode: meta.runtime_mode || snapshot.runtimeMode,
+              project_id: meta.project_id ?? snapshot.projectId,
+              analytics_model_id: snapshot.analyticsModelId,
+              approval_mode: meta.approval_mode,
+              policy_epoch: meta.policy_epoch,
+              policy_version: meta.policy_version,
+            },
+            ...prev,
+          ];
+          sessionsRef.current = next;
+          return next;
+        });
         // Pre-populate the message cache so setSessionId shows the empty state
         // immediately and doesn't overwrite locally-added messages with a later
         // history fetch.
@@ -2512,6 +2551,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               }
               return {
                 ...message,
+                queryId: String(event.data.query_id || message.queryId || "") || undefined,
                 content: currentContent ? message.content : finalContent || message.content,
                 segments,
                 verificationSummary: verificationSummary || message.verificationSummary,
@@ -2768,6 +2808,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 const existing = updated[idx].outputAttachments || [];
                 updated[idx] = {
                   ...updated[idx],
+                  queryId: String(event.data.query_id || updated[idx].queryId || "") || undefined,
                   outputAttachments: existing.some((item) => item.id === attachment.id)
                     ? existing.map((item) => item.id === attachment.id ? { ...item, ...attachment } : item)
                     : [...existing, attachment],
@@ -4058,6 +4099,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         runActivityStatus,
         activeSourceId,
         setActiveSourceId,
+        activeAttachmentPreview,
+        openAttachmentPreview,
+        closeAttachmentPreview,
       }}
     >
       {children}
