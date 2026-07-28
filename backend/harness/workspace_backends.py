@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from deepagents.backends import FilesystemBackend
@@ -23,10 +23,17 @@ from harness.dependency_setup import (
     WorkspaceDependencyPlan,
     detect_workspace_dependency_plan,
 )
+from runtime_identity.adapters import CredentialStateSpec, ManagedCliRegistry
+from runtime_identity.profiles import validate_credential_archive
 
 DEFAULT_SANDBOX_IMAGE = "puddingclaw/sandbox:python3.12-node22-chromium-v4"
 RUNTIME_CONTRACT = "python3.12+node22+chromium-v4"
 logger = logging.getLogger(__name__)
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_LARK_CONFIG_URL = re.compile(
+    r"https://(?:open\.feishu\.cn|open\.larksuite\.com)/page/cli\?[^\s\x1b<>\"']+",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -35,6 +42,91 @@ class ManagedProviderExecutionResult:
     exit_code: int
     credential_state: bytes | None
     truncated: bool = False
+    browser_status: str | None = None
+    browser_job_id: str | None = None
+
+
+def _lark_config_verification_url(output: str) -> str | None:
+    cleaned = _ANSI_ESCAPE.sub("", str(output or ""))
+    match = _LARK_CONFIG_URL.search(cleaned)
+    return match.group(0).rstrip(".,;:!?)]]}") if match else None
+
+
+def _credential_state_paths(
+    paths: tuple[str, ...] | list[str],
+    *,
+    allow_empty: bool = False,
+) -> tuple[str, ...]:
+    """Validate Adapter-declared paths before using them in Docker argv."""
+
+    if not paths and allow_empty:
+        return ()
+    if not paths:
+        raise ValueError("managed credential state requires at least one path")
+    normalized: list[str] = []
+    for raw_path in paths:
+        value = str(raw_path or "")
+        path = PurePosixPath(value)
+        if (
+            not value
+            or value.startswith("/")
+            or "\\" in value
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)
+            or value != path.as_posix()
+            or path == PurePosixPath(".")
+            or any(part in {"", ".", ".."} for part in path.parts)
+            or any(part.startswith("-") for part in path.parts)
+        ):
+            raise ValueError("managed credential state path must be normalized and HOME-relative")
+        normalized.append(value)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("managed credential state paths must be unique")
+    normalized_parts = tuple(PurePosixPath(path).parts for path in normalized)
+    for index, path in enumerate(normalized_parts):
+        for other in normalized_parts[index + 1 :]:
+            if path[: len(other)] == other or other[: len(path)] == path:
+                raise ValueError("managed credential state paths must not overlap")
+    return tuple(normalized)
+
+
+def _credential_state_mkdir_command(paths: tuple[str, ...] | list[str]) -> str:
+    absolute = [f"/home/puddingclaw/{path}" for path in _credential_state_paths(paths)]
+    return "umask 077; mkdir -p -- " + " ".join(shlex.quote(path) for path in absolute)
+
+
+def _credential_state_export_argv(
+    container_name: str,
+    paths: tuple[str, ...] | list[str],
+) -> list[str]:
+    return [
+        "exec",
+        container_name,
+        "tar",
+        "-czf",
+        "-",
+        "-C",
+        "/home/puddingclaw",
+        "--",
+        *_credential_state_paths(paths),
+    ]
+
+
+def _managed_credential_state_tmpfs_args() -> list[str]:
+    """Mask every Adapter-owned secret path in ordinary workspace runners."""
+
+    roots: list[str] = []
+    for spec in ManagedCliRegistry.credential_state_specs():
+        roots.extend(_credential_state_paths(spec.paths))
+    unique_roots = tuple(dict.fromkeys(roots))
+    args: list[str] = []
+    for root in unique_roots:
+        args.extend(
+            [
+                "--tmpfs",
+                f"/home/puddingclaw/{root}:rw,nosuid,nodev,size=16m",
+            ]
+        )
+    return args
 
 
 def _canonical_docker_mount_source(value: str) -> str:
@@ -260,6 +352,70 @@ class ProjectSandboxManager:
                 removed += 1
         return removed
 
+    def gc_legacy_unscoped_workspace_containers(self, unscoped_root: Path) -> int:
+        """Remove obsolete per-Session containers while preserving their files.
+
+        Before unscoped Sessions shared a default workspace, each direct child
+        of ``unscoped_root`` received its own project container.  The bind
+        mounted workspace remains on the host after container removal.
+        """
+
+        root = _canonical_docker_mount_source(str(unscoped_root.expanduser().resolve()))
+        listed = self._run(
+            [
+                "ps",
+                "-aq",
+                "--filter",
+                "label=com.puddingclaw.managed=true",
+                "--filter",
+                "label=com.puddingclaw.kind=workspace",
+                "--filter",
+                f"label=com.puddingclaw.owner={self._owner_label()}",
+            ],
+            timeout=30,
+        )
+        if listed.returncode != 0:
+            return 0
+        removed = 0
+        for container_id in (item.strip() for item in listed.stdout.splitlines()):
+            if not container_id:
+                continue
+            inspected = self._run(["inspect", container_id], timeout=30)
+            if inspected.returncode != 0:
+                continue
+            try:
+                container = json.loads(inspected.stdout)[0]
+            except (json.JSONDecodeError, IndexError, TypeError):
+                continue
+            labels = container.get("Config", {}).get("Labels") or {}
+            if (
+                labels.get("com.puddingclaw.managed") != "true"
+                or labels.get("com.puddingclaw.kind") != "workspace"
+                or labels.get("com.puddingclaw.owner") != self._owner_label()
+            ):
+                continue
+            workspace_mount = next(
+                (
+                    item
+                    for item in container.get("Mounts") or []
+                    if isinstance(item, dict) and item.get("Type") == "bind" and item.get("Destination") == "/workspace"
+                ),
+                None,
+            )
+            if workspace_mount is None:
+                continue
+            source = _canonical_docker_mount_source(str(workspace_mount.get("Source") or ""))
+            try:
+                relative = Path(source).relative_to(root)
+            except ValueError:
+                continue
+            if len(relative.parts) != 1 or relative.name == "default":
+                continue
+            result = self._run(["rm", "-f", container_id], timeout=30)
+            if result.returncode == 0:
+                removed += 1
+        return removed
+
     def _docker_prefix(self) -> list[str]:
         command = ["docker"]
         context = str(self.config.get("context") or "").strip()
@@ -454,6 +610,14 @@ class ProjectSandboxManager:
     @staticmethod
     def _container_name(workspace: Path) -> str:
         digest = hashlib.sha256(str(workspace).encode("utf-8")).hexdigest()[:16]
+        if (
+            workspace.name == "default"
+            and workspace.parent.name == "unscoped"
+            and workspace.parent.parent.name == "agent-workspaces"
+        ):
+            # Keep the role visible in Docker Desktop while retaining enough
+            # path entropy to avoid collisions across local installations.
+            return f"puddingclaw-project-default-{digest[:8]}"
         # One long-lived execution container belongs to one project path, not
         # to a Session or Run. The explicit prefix makes that lifecycle visible
         # in Docker Desktop while the stable path hash prevents duplicates.
@@ -770,8 +934,7 @@ class ProjectSandboxManager:
                     "NODE_PATH=/opt/puddingclaw/toolchain/node/lib/node_modules:"
                     "/home/puddingclaw/.npm-global/lib/node_modules"
                 ),
-                "--tmpfs",
-                "/home/puddingclaw/.lark-cli:rw,nosuid,nodev,size=16m",
+                *_managed_credential_state_tmpfs_args(),
             ]
             if spec["uid"] is not None and spec["gid"] is not None:
                 create_args.extend(["--user", f"{spec['uid']}:{spec['gid']}"])
@@ -912,8 +1075,7 @@ class ProjectSandboxManager:
                 "NODE_PATH=/opt/puddingclaw/toolchain/node/lib/node_modules:"
                 "/home/puddingclaw/.npm-global/lib/node_modules"
             ),
-            "--tmpfs",
-            "/home/puddingclaw/.lark-cli:rw,nosuid,nodev,size=16m",
+            *_managed_credential_state_tmpfs_args(),
             "--entrypoint",
             argv[0],
         ]
@@ -921,9 +1083,7 @@ class ProjectSandboxManager:
             args.extend(["--user", f"{spec['uid']}:{spec['gid']}"])
         args.extend([image_id, *argv[1:]])
         if self._interactive_lark_authorization(argv):
-            job_key = hashlib.sha256(
-                f"{workspace}:{json.dumps(argv, ensure_ascii=False)}".encode()
-            ).hexdigest()[:24]
+            job_key = hashlib.sha256(f"{workspace}:{json.dumps(argv, ensure_ascii=False)}".encode()).hexdigest()[:24]
             with self._interactive_network_jobs_guard:
                 existing_name = self._interactive_network_jobs.get(job_key)
             if existing_name:
@@ -950,10 +1110,7 @@ class ProjectSandboxManager:
             # capabilities, and bridge-network policy as other one-shot runs.
             # The in-container timeout is authoritative even if Backend
             # restarts and loses its cleanup timer.
-            bounded_command = (
-                f"timeout --signal=TERM --kill-after=10s {ttl_seconds}s "
-                f"sh -c {shlex.quote(argv[2])}"
-            )
+            bounded_command = f"timeout --signal=TERM --kill-after=10s {ttl_seconds}s sh -c {shlex.quote(argv[2])}"
             detached_args = [
                 "run",
                 "--detach",
@@ -1111,17 +1268,414 @@ class ProjectSandboxManager:
             truncated=truncated or verification_truncated,
         )
 
+    @staticmethod
+    def _managed_browser_job_id(owner_user_id: str, provider: str, profile_id: str) -> str:
+        return hashlib.sha256(f"{owner_user_id}\0{provider}\0{profile_id}".encode()).hexdigest()[:24]
+
+    @classmethod
+    def _managed_browser_container_name(
+        cls,
+        owner_user_id: str,
+        provider: str,
+        profile_id: str,
+    ) -> str:
+        return f"puddingclaw-browser-{cls._managed_browser_job_id(owner_user_id, provider, profile_id)}"
+
+    def collect_managed_browser_auth_cli(
+        self,
+        *,
+        owner_user_id: str,
+        provider: str,
+        profile_id: str,
+        credential_state_spec: CredentialStateSpec,
+        max_output_bytes: int = 100_000,
+    ) -> ManagedProviderExecutionResult:
+        """Poll and prepare one browser-auth result without destroying it.
+
+        The caller persists and verifies ``credential_state`` before ACKing
+        with :meth:`finalize_managed_browser_auth_cli`. This two-phase order
+        keeps a Vault failure or Backend crash recoverable.
+        """
+
+        state_paths = _credential_state_paths(credential_state_spec.paths)
+        credential_state_fingerprint = credential_state_spec.fingerprint
+        job_id = self._managed_browser_job_id(owner_user_id, provider, profile_id)
+        name = self._managed_browser_container_name(owner_user_id, provider, profile_id)
+        inspection = self._run(
+            [
+                "inspect",
+                "--format",
+                '{{.State.Running}} {{ index .Config.Labels "com.puddingclaw.credential-state" }}',
+                name,
+            ],
+            timeout=10,
+        )
+        inspection_parts = inspection.stdout.strip().split()
+        if (
+            inspection.returncode != 0
+            or inspection_parts[:1] != ["true"]
+            or inspection_parts[1:] != [credential_state_fingerprint]
+        ):
+            return ManagedProviderExecutionResult(
+                output="Managed browser authorization job is missing or expired.",
+                exit_code=1,
+                credential_state=None,
+                browser_status="missing",
+                browser_job_id=job_id,
+            )
+
+        output_result = self._run(["exec", name, "cat", "/tmp/puddingclaw-browser-output"], timeout=10)
+        raw_output = output_result.stdout if output_result.returncode == 0 else ""
+        output, truncated = _bounded_output(raw_output, "", max_output_bytes=max_output_bytes)
+        exit_result = self._run(["exec", name, "cat", "/tmp/puddingclaw-browser-exit"], timeout=10)
+        if exit_result.returncode != 0:
+            awaiting_output = (
+                "Managed browser authorization started.\n"
+                "Status: awaiting_user_browser\n"
+                "Authorization completed: false\n"
+                f"Job: {job_id}\n\n{output}"
+            )
+            return ManagedProviderExecutionResult(
+                output=awaiting_output,
+                exit_code=0,
+                credential_state=None,
+                truncated=truncated,
+                browser_status="awaiting_user_browser",
+                browser_job_id=job_id,
+            )
+
+        try:
+            exit_code = int(exit_result.stdout.strip())
+        except ValueError:
+            exit_code = 1
+        exported = self._run_bytes(
+            _credential_state_export_argv(name, state_paths),
+            timeout=30,
+        )
+        credential_state = exported.stdout if exported.returncode == 0 else None
+        if exported.returncode != 0:
+            export_error = exported.stderr.decode("utf-8", errors="replace")
+            output = f"{output.rstrip()}\n\nCredential export failed: {export_error}"
+            exit_code = exit_code or 1
+        if exit_code != 0:
+            output = f"{output.rstrip()}\n\nExit code: {exit_code}"
+        return ManagedProviderExecutionResult(
+            output=output,
+            exit_code=exit_code,
+            credential_state=credential_state,
+            truncated=truncated,
+            browser_status="completed" if exit_code == 0 else "failed",
+            browser_job_id=job_id,
+        )
+
+    def finalize_managed_browser_auth_cli(
+        self,
+        *,
+        owner_user_id: str,
+        provider: str,
+        profile_id: str,
+        browser_job_id: str,
+    ) -> bool:
+        """ACK and remove a browser-auth job after durable Vault commit."""
+
+        expected = self._managed_browser_job_id(owner_user_id, provider, profile_id)
+        if browser_job_id != expected:
+            raise ValueError("browser authorization job identity mismatch")
+        name = self._managed_browser_container_name(owner_user_id, provider, profile_id)
+        inspection = self._run(
+            [
+                "inspect",
+                "--format",
+                '{{ index .Config.Labels "com.puddingclaw.browser-job" }}',
+                name,
+            ],
+            timeout=10,
+        )
+        if inspection.returncode != 0:
+            return False
+        if inspection.stdout.strip() != expected:
+            raise ValueError("browser authorization container label mismatch")
+        acknowledged = self._run(
+            ["exec", name, "touch", "/tmp/puddingclaw-browser-collected"],
+            timeout=10,
+        )
+        if acknowledged.returncode != 0:
+            return False
+        return self._run(["rm", "-f", name], timeout=30).returncode == 0
+
+    def list_managed_browser_auth_jobs(self, *, owner_user_id: str) -> list[dict[str, str]]:
+        """Discover valid live browser jobs for Backend restart recovery."""
+
+        listed = self._run(
+            [
+                "ps",
+                "-q",
+                "--filter",
+                "label=com.puddingclaw.managed=true",
+                "--filter",
+                "label=com.puddingclaw.kind=browser-auth",
+                "--filter",
+                f"label=com.puddingclaw.owner={self._owner_label()}",
+                "--filter",
+                f"label=com.puddingclaw.owner-user={owner_user_id}",
+            ],
+            timeout=30,
+        )
+        if listed.returncode != 0:
+            return []
+        jobs: list[dict[str, str]] = []
+        for container_id in (item.strip() for item in listed.stdout.splitlines()):
+            if not container_id:
+                continue
+            inspected = self._run(
+                ["inspect", "--format", "{{json .Config.Labels}}", container_id],
+                timeout=10,
+            )
+            if inspected.returncode != 0:
+                continue
+            try:
+                labels = json.loads(inspected.stdout)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(labels, dict) or labels.get("com.puddingclaw.owner-user") != owner_user_id:
+                continue
+            provider = str(labels.get("com.puddingclaw.provider") or "")
+            profile_id = str(labels.get("com.puddingclaw.profile") or "")
+            job_id = str(labels.get("com.puddingclaw.browser-job") or "")
+            credential_state_fingerprint = str(labels.get("com.puddingclaw.credential-state") or "")
+            if (
+                not provider
+                or not profile_id
+                or not re.fullmatch(r"[0-9a-f]{64}", credential_state_fingerprint)
+                or job_id != self._managed_browser_job_id(owner_user_id, provider, profile_id)
+            ):
+                continue
+            jobs.append(
+                {
+                    "provider": provider,
+                    "profile_id": profile_id,
+                    "browser_job_id": job_id,
+                    "credential_state_fingerprint": credential_state_fingerprint,
+                }
+            )
+        return jobs
+
+    def run_managed_browser_auth_cli(
+        self,
+        workspace: Path,
+        *,
+        argv: list[str],
+        environment: dict[str, str],
+        credential_state_spec: CredentialStateSpec,
+        toolchain_path: Path,
+        container_path: str,
+        credential_state: bytes,
+        owner_user_id: str,
+        provider: str,
+        profile_id: str,
+        wait_for_url_seconds: float = 30.0,
+        max_output_bytes: int = 100_000,
+    ) -> ManagedProviderExecutionResult:
+        """Launch exact blocking browser auth and return once its URL appears."""
+
+        if argv != ["lark-cli", "config", "init", "--new"]:
+            raise ValueError("managed browser runner currently owns only config init --new")
+        workspace = workspace.expanduser().resolve()
+        toolchain_path = toolchain_path.expanduser().resolve(strict=True)
+        spec = self._spec(workspace)
+        image_id = self.ensure_image(spec["image"])
+        job_id = self._managed_browser_job_id(owner_user_id, provider, profile_id)
+        name = self._managed_browser_container_name(owner_user_id, provider, profile_id)
+        state_paths = _credential_state_paths(credential_state_spec.paths)
+        credential_state_environment = dict(credential_state_spec.env)
+        credential_state_fingerprint = credential_state_spec.fingerprint
+        if credential_state:
+            credential_state = validate_credential_archive(
+                credential_state,
+                allowed_roots=state_paths,
+            )
+        if set(environment) & set(credential_state_environment):
+            raise ValueError("command environment cannot override Adapter credential-state environment")
+        if not re.fullmatch(r"[0-9a-f]{64}", credential_state_fingerprint):
+            raise ValueError("Adapter credential-state fingerprint is invalid")
+
+        existing = self.collect_managed_browser_auth_cli(
+            owner_user_id=owner_user_id,
+            provider=provider,
+            profile_id=profile_id,
+            credential_state_spec=credential_state_spec,
+            max_output_bytes=max_output_bytes,
+        )
+        if existing.browser_status != "missing":
+            return existing
+
+        home_tmpfs = "/home/puddingclaw:rw,nosuid,nodev,size=128m"
+        if spec["uid"] is not None and spec["gid"] is not None:
+            home_tmpfs += f",uid={spec['uid']},gid={spec['gid']}"
+        exact_command = shlex.join([f"{container_path}/bin/lark-cli", *argv[1:]])
+        supervisor = (
+            f"set +e; {_credential_state_mkdir_command(state_paths)}; "
+            "ready_wait=0; while [ ! -f /tmp/puddingclaw-browser-ready ]; do "
+            'ready_wait=$((ready_wait + 1)); [ "$ready_wait" -ge 600 ] && exit 124; '
+            "sleep 0.1; done; "
+            f"timeout --signal=TERM --kill-after=10s 1500s {exact_command} "
+            ">/tmp/puddingclaw-browser-output 2>&1; code=$?; "
+            "printf '%s' \"$code\" >/tmp/puddingclaw-browser-exit; "
+            'retain=0; while [ "$retain" -lt 86400 ]; do '
+            "[ -f /tmp/puddingclaw-browser-collected ] && exit 0; "
+            "retain=$((retain + 1)); sleep 1; done; exit 0"
+        )
+        create = [
+            "create",
+            "--rm",
+            "--name",
+            name,
+            "--label",
+            "com.puddingclaw.managed=true",
+            "--label",
+            "com.puddingclaw.kind=browser-auth",
+            "--label",
+            f"com.puddingclaw.owner={self._owner_label()}",
+            "--label",
+            f"com.puddingclaw.owner-user={owner_user_id}",
+            "--label",
+            f"com.puddingclaw.browser-job={job_id}",
+            "--label",
+            f"com.puddingclaw.provider={provider}",
+            "--label",
+            f"com.puddingclaw.profile={profile_id}",
+            "--label",
+            f"com.puddingclaw.credential-state={credential_state_fingerprint}",
+            "--network",
+            "bridge",
+            "--read-only",
+            "--tmpfs",
+            "/tmp:rw,nosuid,nodev,size=32m",
+            "--tmpfs",
+            home_tmpfs,
+            "--mount",
+            f"type=bind,src={workspace},dst=/workspace,readonly",
+            "--mount",
+            f"type=bind,src={toolchain_path},dst={container_path},readonly",
+            "--workdir",
+            "/workspace",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--pids-limit",
+            str(spec["pids_limit"]),
+            "--memory",
+            f"{spec['memory_limit_mb']}m",
+            "--cpus",
+            spec["cpu_limit"],
+            "--env",
+            "HOME=/home/puddingclaw",
+            "--env",
+            f"PATH={container_path}/bin:/usr/local/bin:/usr/bin:/bin",
+            "--env",
+            f"NODE_PATH={container_path}/lib/node_modules",
+        ]
+        for key, value in sorted(credential_state_environment.items()):
+            create.extend(["--env", f"{key}={value}"])
+        for key, value in sorted(environment.items()):
+            create.extend(["--env", f"{key}={value}"])
+        if spec["uid"] is not None and spec["gid"] is not None:
+            create.extend(["--user", f"{spec['uid']}:{spec['gid']}"])
+        create.extend([image_id, "sh", "-c", supervisor])
+        created = self._run(create, timeout=60)
+        if created.returncode != 0:
+            output, truncated = _bounded_output(
+                created.stdout,
+                created.stderr,
+                max_output_bytes=max_output_bytes,
+            )
+            return ManagedProviderExecutionResult(
+                output,
+                created.returncode,
+                None,
+                truncated,
+                "failed",
+                job_id,
+            )
+        try:
+            started = self._run(["start", name], timeout=30)
+            if started.returncode != 0:
+                output, truncated = _bounded_output(
+                    started.stdout,
+                    started.stderr,
+                    max_output_bytes=max_output_bytes,
+                )
+                return ManagedProviderExecutionResult(
+                    output,
+                    started.returncode,
+                    None,
+                    truncated,
+                    "failed",
+                    job_id,
+                )
+            if credential_state:
+                imported = self._run_bytes(
+                    [
+                        "exec",
+                        "-i",
+                        name,
+                        "tar",
+                        "-xzf",
+                        "-",
+                        "-C",
+                        "/home/puddingclaw",
+                        "--no-same-owner",
+                        "--no-same-permissions",
+                    ],
+                    input_bytes=credential_state,
+                    timeout=30,
+                )
+                if imported.returncode != 0:
+                    raise RuntimeError(imported.stderr.decode("utf-8", errors="replace"))
+            ready = self._run(["exec", name, "touch", "/tmp/puddingclaw-browser-ready"], timeout=10)
+            if ready.returncode != 0:
+                raise RuntimeError(ready.stderr)
+            deadline = time.monotonic() + max(1.0, wait_for_url_seconds)
+            while True:
+                result = self.collect_managed_browser_auth_cli(
+                    owner_user_id=owner_user_id,
+                    provider=provider,
+                    profile_id=profile_id,
+                    credential_state_spec=credential_state_spec,
+                    max_output_bytes=max_output_bytes,
+                )
+                if result.browser_status != "awaiting_user_browser":
+                    return result
+                if _lark_config_verification_url(result.output) is not None:
+                    return result
+                if time.monotonic() >= deadline:
+                    self._run(["rm", "-f", name], timeout=30)
+                    return ManagedProviderExecutionResult(
+                        output="Browser authorization did not emit a verification URL in time.",
+                        exit_code=1,
+                        credential_state=None,
+                        browser_status="failed",
+                        browser_job_id=job_id,
+                    )
+                time.sleep(0.25)
+        except Exception:
+            self._run(["rm", "-f", name], timeout=30)
+            raise
+
     def run_managed_provider_cli(
         self,
         workspace: Path,
         *,
         argv: list[str],
         environment: dict[str, str],
+        credential_state_spec: CredentialStateSpec | None,
         toolchain_path: Path,
         container_path: str,
         credential_state: bytes,
         network_enabled: bool,
         workspace_writable: bool,
+        continuation_secret: bytes | None = None,
         timeout: int = 120,
         max_output_bytes: int = 100_000,
     ) -> ManagedProviderExecutionResult:
@@ -1134,6 +1688,22 @@ class ProjectSandboxManager:
         spec = self._spec(workspace)
         image_id = self.ensure_image(spec["image"])
         name = f"puddingclaw-provider-{uuid.uuid4().hex[:20]}"
+        state_paths = _credential_state_paths(
+            credential_state_spec.paths if credential_state_spec is not None else (),
+            allow_empty=True,
+        )
+        credential_state_environment = (
+            dict(credential_state_spec.env) if credential_state_spec is not None else {}
+        )
+        if not state_paths and (credential_state_environment or credential_state):
+            raise ValueError("credentialless managed command cannot receive provider state")
+        if credential_state:
+            credential_state = validate_credential_archive(
+                credential_state,
+                allowed_roots=state_paths,
+            )
+        if set(environment) & set(credential_state_environment):
+            raise ValueError("command environment cannot override Adapter credential-state environment")
         workspace_mount = f"type=bind,src={workspace},dst=/workspace"
         if not workspace_writable:
             workspace_mount += ",readonly"
@@ -1180,14 +1750,20 @@ class ProjectSandboxManager:
             "--env",
             f"NODE_PATH={container_path}/lib/node_modules",
         ]
+        for key, value in sorted(credential_state_environment.items()):
+            create.extend(["--env", f"{key}={value}"])
         if spec["uid"] is not None and spec["gid"] is not None:
             create.extend(["--user", f"{spec['uid']}:{spec['gid']}"])
+        state_setup = _credential_state_mkdir_command(state_paths) if state_paths else "true"
         create.extend(
             [
                 image_id,
                 "sh",
                 "-c",
-                f"mkdir -p /home/puddingclaw/.lark-cli && timeout {max(timeout + 60, 300)}s sleep infinity",
+                (
+                    f"{state_setup} && "
+                    f"timeout {max(timeout + 60, 300)}s sleep infinity"
+                ),
             ]
         )
         created = self._run(create, timeout=60)
@@ -1209,7 +1785,18 @@ class ProjectSandboxManager:
                 return ManagedProviderExecutionResult(output, started.returncode, None, truncated)
             if credential_state:
                 imported = self._run_bytes(
-                    ["exec", "-i", name, "tar", "-xzf", "-", "-C", "/home/puddingclaw"],
+                    [
+                        "exec",
+                        "-i",
+                        name,
+                        "tar",
+                        "-xzf",
+                        "-",
+                        "-C",
+                        "/home/puddingclaw",
+                        "--no-same-owner",
+                        "--no-same-permissions",
+                    ],
                     input_bytes=credential_state,
                     timeout=30,
                 )
@@ -1218,41 +1805,95 @@ class ProjectSandboxManager:
             exec_args = ["exec", "--workdir", "/workspace"]
             for key, value in sorted(environment.items()):
                 exec_args.extend(["--env", f"{key}={value}"])
-            exec_args.extend([name, *argv])
+            if continuation_secret is not None and argv != ["lark-cli", "auth", "login"]:
+                raise ValueError("continuation secret is supported only by the fixed lark auth-resume command")
+            provider_timeout = max(1, int(timeout))
+            docker_exec_timeout = provider_timeout + 10
             try:
-                result = self._run(exec_args, timeout=timeout)
+                if continuation_secret is None:
+                    exec_args.extend(
+                        [
+                            name,
+                            "timeout",
+                            "--signal=TERM",
+                            "--kill-after=5s",
+                            f"{provider_timeout}s",
+                            *argv,
+                        ]
+                    )
+                    result = self._run(exec_args, timeout=docker_exec_timeout)
+                else:
+                    # The provider continuation secret must not appear in
+                    # Docker's host argv, process inspection, traces, or logs.
+                    # Only this fixed Backend-owned wrapper may receive it,
+                    # over stdin, inside the credential-isolated runner.
+                    # docker exec does not attach stdin unless -i is explicit;
+                    # without it `cat` returns an empty string and lark-cli
+                    # silently starts/validates a new authorization instead of
+                    # consuming the browser-approved device code.
+                    exec_args.insert(1, "-i")
+                    exec_args.extend(
+                        [
+                            name,
+                            "sh",
+                            "-c",
+                            (
+                                'secret="$(cat)"; exec timeout --signal=TERM --kill-after=5s '
+                                f'{provider_timeout}s lark-cli auth login '
+                                '--device-code "$secret" --json'
+                            ),
+                        ]
+                    )
+                    result = self._run_bytes(
+                        exec_args,
+                        input_bytes=continuation_secret,
+                        timeout=docker_exec_timeout,
+                    )
             except subprocess.TimeoutExpired:
-                return ManagedProviderExecutionResult(
-                    f"Error: Managed provider command timed out after {timeout} seconds. Use a non-blocking auth form.",
-                    124,
-                    None,
+                # The command itself has a shorter in-container timeout, so by
+                # the time Docker's host-side grace period expires its writer
+                # has already been terminated. Keep the container running:
+                # /home/puddingclaw is tmpfs and stop/start may erase the very
+                # credential state that must be recovered.
+                timeout_message = (
+                    f"Error: Managed provider command timed out after {timeout} seconds; "
+                    "credential state was collected for independent verification."
                 )
+                result = subprocess.CompletedProcess(
+                    args=exec_args,
+                    returncode=124,
+                    stdout="",
+                    stderr=timeout_message,
+                )
+            result_stdout = (
+                result.stdout.decode("utf-8", errors="replace")
+                if isinstance(result.stdout, bytes)
+                else result.stdout
+            )
+            result_stderr = (
+                result.stderr.decode("utf-8", errors="replace")
+                if isinstance(result.stderr, bytes)
+                else result.stderr
+            )
             output, truncated = _bounded_output(
-                result.stdout,
-                result.stderr,
+                result_stdout,
+                result_stderr,
                 max_output_bytes=max_output_bytes,
             )
-            exported = self._run_bytes(
-                [
-                    "exec",
-                    name,
-                    "tar",
-                    "-czf",
-                    "-",
-                    "-C",
-                    "/home/puddingclaw",
-                    ".lark-cli",
-                ],
-                timeout=30,
-            )
-            if exported.returncode != 0:
-                raise RuntimeError(exported.stderr.decode("utf-8", errors="replace"))
+            exported = None
+            if state_paths:
+                exported = self._run_bytes(
+                    _credential_state_export_argv(name, state_paths),
+                    timeout=30,
+                )
+                if exported.returncode != 0:
+                    raise RuntimeError(exported.stderr.decode("utf-8", errors="replace"))
             if result.returncode != 0:
                 output = f"{output.rstrip()}\n\nExit code: {result.returncode}"
             return ManagedProviderExecutionResult(
                 output=output,
                 exit_code=result.returncode,
-                credential_state=exported.stdout,
+                credential_state=exported.stdout if exported is not None else None,
                 truncated=truncated,
             )
         finally:
@@ -1298,10 +1939,7 @@ class ProjectSandboxManager:
             "--mount",
             f"type=bind,src={workspace},dst=/workspace,readonly",
             "--mount",
-            (
-                f"type=bind,src={external_directory},dst=/external-workspace"
-                + ("" if writable else ",readonly")
-            ),
+            (f"type=bind,src={external_directory},dst=/external-workspace" + ("" if writable else ",readonly")),
             "--mount",
             f"type=volume,src={runtime_home_volume},dst=/home/puddingclaw",
         ]
@@ -1355,8 +1993,7 @@ class ProjectSandboxManager:
                 "PATH=/opt/puddingclaw/toolchain/node/bin:/home/puddingclaw/.local/bin:"
                 "/home/puddingclaw/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
             ),
-            "--tmpfs",
-            "/home/puddingclaw/.lark-cli:rw,nosuid,nodev,size=16m",
+            *_managed_credential_state_tmpfs_args(),
             "--entrypoint",
             "sh",
         ]
@@ -1392,23 +2029,15 @@ class ProjectSandboxManager:
         except (json.JSONDecodeError, IndexError, TypeError) as exc:
             raise RuntimeError("Docker sandbox inspect output is invalid") from exc
         mounts = {
-            str(item.get("Destination") or ""): item
-            for item in inspected.get("Mounts") or []
-            if isinstance(item, dict)
+            str(item.get("Destination") or ""): item for item in inspected.get("Mounts") or [] if isinstance(item, dict)
         }
         for expected in spec.get("writable_mounts") or []:
             target = str(expected.get("target") or "")
             actual = mounts.get(target)
-            expected_source = _canonical_docker_mount_source(
-                str(expected.get("source") or "")
-            )
-            actual_source = _canonical_docker_mount_source(
-                str(actual.get("Source") or "")
-            ) if actual else ""
+            expected_source = _canonical_docker_mount_source(str(expected.get("source") or ""))
+            actual_source = _canonical_docker_mount_source(str(actual.get("Source") or "")) if actual else ""
             if actual is None or actual_source != expected_source or actual.get("RW") is not True:
-                raise RuntimeError(
-                    f"Docker sandbox writable mount contract mismatch for {target or '<empty>'}."
-                )
+                raise RuntimeError(f"Docker sandbox writable mount contract mismatch for {target or '<empty>'}.")
         expected_user = ""
         if spec.get("uid") is not None and spec.get("gid") is not None:
             expected_user = f"{spec['uid']}:{spec['gid']}"
@@ -1549,9 +2178,7 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
                 # cleanup, then serialize commands for this project.
                 container_name, spec_hash = self.manager.ensure_container(self.workspace_path)
                 if container_name != self.container_name or spec_hash != self.spec_hash:
-                    raise RuntimeError(
-                        "Docker sandbox specification changed after this Run started; start a new Run."
-                    )
+                    raise RuntimeError("Docker sandbox specification changed after this Run started; start a new Run.")
                 from harness.tool_execution import ShellPolicyAnalyzer
 
                 effects = ShellPolicyAnalyzer.capabilities(
@@ -1653,9 +2280,7 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
             # not attach the long-lived container to a network.
             container_name, spec_hash = self.manager.ensure_container(self.workspace_path)
             if container_name != self.container_name or spec_hash != self.spec_hash:
-                raise RuntimeError(
-                    "Docker sandbox specification changed after this Run started; start a new Run."
-                )
+                raise RuntimeError("Docker sandbox specification changed after this Run started; start a new Run.")
             result = self.manager.run_ephemeral_network_command(
                 self.workspace_path,
                 argv=argv,
@@ -1686,24 +2311,89 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         *,
         argv: list[str],
         environment: dict[str, str],
+        credential_state_spec: CredentialStateSpec | None,
         toolchain_path: Path,
         container_path: str,
         credential_state: bytes,
         network_enabled: bool,
         workspace_writable: bool,
+        continuation_secret: bytes | None = None,
     ) -> ManagedProviderExecutionResult:
         return self.manager.run_managed_provider_cli(
             self.workspace_path,
             argv=argv,
             environment=environment,
+            credential_state_spec=credential_state_spec,
             toolchain_path=toolchain_path,
             container_path=container_path,
             credential_state=credential_state,
             network_enabled=network_enabled,
             workspace_writable=workspace_writable,
+            continuation_secret=continuation_secret,
             timeout=self._default_timeout,
             max_output_bytes=self._max_output_bytes,
         )
+
+    def run_managed_browser_auth_cli(
+        self,
+        *,
+        argv: list[str],
+        environment: dict[str, str],
+        credential_state_spec: CredentialStateSpec,
+        toolchain_path: Path,
+        container_path: str,
+        credential_state: bytes,
+        owner_user_id: str,
+        provider: str,
+        profile_id: str,
+    ) -> ManagedProviderExecutionResult:
+        return self.manager.run_managed_browser_auth_cli(
+            self.workspace_path,
+            argv=argv,
+            environment=environment,
+            credential_state_spec=credential_state_spec,
+            toolchain_path=toolchain_path,
+            container_path=container_path,
+            credential_state=credential_state,
+            owner_user_id=owner_user_id,
+            provider=provider,
+            profile_id=profile_id,
+            max_output_bytes=self._max_output_bytes,
+        )
+
+    def collect_managed_browser_auth_cli(
+        self,
+        *,
+        owner_user_id: str,
+        provider: str,
+        profile_id: str,
+        credential_state_spec: CredentialStateSpec,
+    ) -> ManagedProviderExecutionResult:
+        return self.manager.collect_managed_browser_auth_cli(
+            owner_user_id=owner_user_id,
+            provider=provider,
+            profile_id=profile_id,
+            credential_state_spec=credential_state_spec,
+            max_output_bytes=self._max_output_bytes,
+        )
+
+    def finalize_managed_browser_auth_cli(
+        self,
+        *,
+        owner_user_id: str,
+        provider: str,
+        profile_id: str,
+        browser_job_id: str,
+    ) -> bool:
+        return self.manager.finalize_managed_browser_auth_cli(
+            owner_user_id=owner_user_id,
+            provider=provider,
+            profile_id=profile_id,
+            browser_job_id=browser_job_id,
+        )
+
+    def list_managed_browser_auth_jobs(self, *, owner_user_id: str) -> list[dict[str, str]]:
+        return self.manager.list_managed_browser_auth_jobs(owner_user_id=owner_user_id)
 
 
 @dataclass(frozen=True)

@@ -11,6 +11,8 @@
 
 ---
 
+> Credential Profile 的交互式创建、修复、多阶段授权、自然语言续跑和前端授权卡生命周期由 [ADR-005](ADR-005-managed-external-authorization-flow.md) 进一步约束。
+
 ## 0. 实施状态
 
 截至 2026-07-27，控制面核心已经开始落地：
@@ -18,7 +20,7 @@
 - `backend/runtime_identity/adapters.py`：Adapter-first 的独立 argv 解析、飞书命令分类和未知全局工具安装拒绝。
 - `backend/runtime_identity/toolchains.py`：用户级 Node Toolchain、跨进程安装锁、release staging 和 `current` 原子切换。
 - `backend/runtime_identity/profiles.py`：Profile 注册表、Project binding、Keychain/fallback master key、AES-256-GCM 保险库和归档安全校验。
-- `backend/runtime_identity/service.py`：冻结 owner/Profile revision/Toolchain revision 的执行计划、Installer/Provider 分发和输出脱敏。
+- `backend/runtime_identity/service.py`：冻结 owner/Profile revision/Toolchain revision 的执行计划、Installer/Provider 分发、BrowserAuth 生命周期回收、exit-10 确认协议和输出脱敏。
 - `backend/harness/tool_execution.py`：在 workspace handler 前认领 managed CLI，审批后只交给控制面；浏览器授权只能总结并结束当前 Agent 轮次。
 - `backend/harness/workspace_backends.py`：独立 Installer/Provider runner 契约、普通容器遮蔽 `.lark-cli`、空闲删除和启动 GC。
 
@@ -183,7 +185,7 @@ PATH=/opt/puddingclaw/toolchain/node/bin:...
 ```text
 ~/.puddingclaw/users/<owner-user-id>/credentials/lark/<profile-id>/
   ├── profile.json       # 非敏感、脱敏后的连接元数据
-  └── vault.enc          # 加密后的 .lark-cli Secret State
+  └── vault.enc          # 加密后的 Adapter Credential State archive
 ```
 
 保险库主密钥优先保存在操作系统 Keychain/Credential Manager，service 为 `PuddingClaw Credential Vault`、account 为 `owner_user_id`。无系统 Keychain 的环境才允许使用权限为 `0600` 的本地 fallback key，并在设置页显示安全降级提示。主密钥不得与 `vault.enc` 一起同步、导出或进入 Project。
@@ -192,16 +194,27 @@ PATH=/opt/puddingclaw/toolchain/node/bin:...
 
 1. Backend 在内存中解密保险库。
 2. 将 Secret State 流式注入 runner 的 tmpfs，不写入宿主临时明文文件。
-3. runner 内呈现为：
+3. Runner 根据 `CredentialStateSpec` 在 HOME tmpfs 中恢复 Adapter 声明的精确目录。Lark v1 状态契约为：
 
 ```text
 /home/puddingclaw/.lark-cli
+/home/puddingclaw/.local/share/lark-cli  # Linux keychain 旧/降级路径
 ```
 
-4. `lark-cli` 退出后，Backend 从 tmpfs 流式读取更新后的状态，在内存中重新加密并原子替换 `vault.enc`。
+   同时由 Backend 强制注入：
+
+```text
+LARKSUITE_CLI_DATA_DIR=/home/puddingclaw/.lark-cli/.credential-data
+```
+
+   这使新版本 Linux 文件 Keychain 的 `master.key` 和 `*.enc` 收敛到 `.lark-cli` 内；旧路径仍作为 Adapter 精确白名单保留，不能扩展成任意 HOME 归档。
+
+4. `lark-cli` 退出后，Backend 只从 `CredentialStateSpec.paths` 流式读取更新后的状态，在内存中重新加密并原子替换 `vault.enc`。
 5. 销毁 runner 和 tmpfs，释放 Profile 锁。
 
 `/home/puddingclaw/.lark-cli` 仍是 `lark-cli` 在容器内看到的路径，但持久真相源是宿主 Home 下的加密保险库。普通工作区容器不挂载保险库或解密后的 Secret State。
+
+`CredentialStateSpec` 是 Adapter-first 的安全契约，而不是 Runner 的自由参数。它声明 schema version、HOME 相对状态根、Backend-owned 环境变量和稳定 fingerprint；同一对象统一驱动 BrowserAuth/Provider 的目录创建、归档导入导出、Vault 校验、普通容器秘密路径遮蔽以及 Browser job 跨重启恢复。状态路径必须规范化、不可重叠，归档只允许普通文件和目录，并拒绝绝对路径、父目录跳转、链接、设备文件和重复成员。运行中的 Browser job 把 fingerprint 同时冻结在 Profile lease 和容器 label 中，部署后契约不一致时 fail closed，不能用新规范收集旧容器。
 
 ### 3.4 Credential Profile 到底是什么
 
@@ -385,7 +398,11 @@ Agent execute("lark-cli auth status --json --verify")
 
 允许识别少量 allowlisted 环境变量前缀，例如 `LARKSUITE_CLI_NO_UPDATE_NOTIFIER=1`。禁止通过 `sh -c`、管道、命令替换或拼接绕过专用 runner；需要重定向的日志由 runner 自己合并。
 
-浏览器授权采用 CLI 的非阻塞 split-flow：runner 输出 `Status: awaiting_user_browser` 后，Graph 允许模型生成一次面向用户的二维码/链接总结，然后强制结束当前轮；退出码 0 只表示授权流程已发起，不表示用户已授权。用户完成操作后，新的 runner 解密同一 `vault.enc`，执行 device-code 完成步骤（如 CLI 协议需要），并先用 `config show`/`auth status --verify` 验证。控制面不依赖一个跨 Agent 轮次常驻的容器进程。
+Provider Runner 使用个人自治策略：Adapter 已冻结的 Lark 非删除操作默认获得 Provider 网络并直接执行，不再逐次发起联网 HITL。它覆盖消息发送、文档创建/更新、多维表格更新、上传和分享权限修改。共享 Toolchain 安装仍需确认；删除资源、清空内容、移除本地配置和注销登录仍需确认。
+
+当非删除命令返回 lark-cli 的 exit 10 时，Backend 只接受 `ok=false`、`type=confirmation`、`subtype=confirmation_required`、`risk=high-risk-write` 且 action 与冻结 argv 一致的结构化信封，然后对同一 argv 仅追加一次 Backend-owned `--yes`。删除类 action 则把 canonical argv、Profile revision、Toolchain revision 和 confirmation action 绑定到 HITL，批准后才能重试。模型提供的任何 `--yes` 形态都被 Adapter 拒绝。
+
+浏览器授权按 CLI 能力分两类。`auth login --no-wait --json` 继续采用非阻塞 split-flow；`config init --new` 是真实阻塞命令，由专用 BrowserAuth Runner 保持。两者输出 `Status: awaiting_user_browser` 后，Graph 都只允许模型生成一次二维码/链接总结并结束当前轮；退出码 0 只表示授权流程已发起。
 
 ### 5.4 如何截获：控制面路由，不做容器内 hook
 
@@ -525,7 +542,7 @@ Provider 路由决定只来自可信控制面：tool name、解析后的 argv、
 
 ### 5.5 `lark-cli config init --new` 如何执行
 
-首次配置/重新配置使用 browser-auth route。飞书 Adapter 当前采用 CLI 支持的非阻塞 split-flow，而不是把一个阻塞 shell 进程跨 Agent 轮次保活：
+首次配置/重新配置使用 browser-auth route。`config init --new` 本身会等待用户浏览器操作，因此由 Backend 管理一个身份固定、生命周期有界的专用 runner；它不是普通 workspace 后台进程，也不会把 Secret State 交给 Agent：
 
 ```text
 1. Agent: execute("lark-cli config init --new")
@@ -537,18 +554,20 @@ Provider 路由决定只来自可信控制面：tool name、解析后的 argv、
      toolchain   = ~/.puddingclaw/runtime/toolchains/...（只读）
      credentials = runner tmpfs /home/puddingclaw/.lark-cli
      workspace   = 当前 Session/Project（按最小需要挂载）
-     network     = 经过网络授权后开启
+     network     = Provider 默认网络
      entrypoint  = credential-runner -> lark-cli（argv 数组，无通用 shell）
 6. credential-runner 从 Backend 的受控 stdin 接收 Secret State，写入 tmpfs
-7. lark-cli 以 `--no-wait --json`（登录）或等价的非阻塞配置协议输出二维码/URL与 device code
-8. runner 把 CLI 写入的 pending state 流式交回 Broker；Broker 加密并原子替换 `vault.enc`，随后删除 runner
-9. Backend 返回 `Status: awaiting_user_browser`；Graph 允许一次用户可见总结后强制结束当前轮，禁止继续调用下一条工具
-10. 用户扫码并回复完成后，新 runner 从同一个 `profile_id` 恢复 pending state
-11. Adapter 执行 `auth login --device-code ...`（如需要），再执行 `config show`/`auth status --verify`
-12. 只有验证成功才把 Profile 标为 active；否则保持 pending/expired 并提示重新发起流程
+7. lark-cli 输出严格匹配飞书/Lark 配置页 origin 和 path 的授权 URL；Backend 返回 `Status: awaiting_user_browser`
+8. Graph 允许一次用户可见二维码/链接总结后强制结束当前轮，禁止模型继续执行下一条工具
+9. Backend-owned Lifecycle Worker 轮询 runner 的私有 tmpfs；用户完成浏览器操作后立即导出 `.lark-cli`，不依赖用户再发一条消息
+10. Broker 先把 Secret State 加密并原子写入 `vault.enc`，再读回校验；只有成功后才 ACK 并删除 runner/tmpfs
+11. 若 Vault 写入、读回或 Backend 进程失败，runner 保留可恢复状态；Backend 重启后按 owner/provider/profile/job labels 恢复 worker
+12. 后续 `config show`/`auth status --verify` 从同一 Profile 验证状态；`auth login --no-wait --json` 仍使用 device-code split-flow
 ```
 
 Secret State 通道不能复用普通 stdout/stderr，因为工具日志和 Session JSON 会持久化。当前实现通过 `docker exec -i` 的二进制 stdin/stdout 单独传输 tar archive；业务命令 stdout/stderr 走另一条调用并在返回前脱敏。不得把 archive、vault key 或明文 token 写入 Docker logs。
+
+Lifecycle Worker 是 BrowserAuth 资源的完成回调与故障恢复机制，不是 cron、scheduler 或用户定时任务。本 ADR 当前不创建或执行任何定时飞书任务。
 
 ### 5.6 容器在方案中的角色
 
@@ -557,7 +576,7 @@ Secret State 通道不能复用普通 stdout/stderr，因为工具日志和 Sess
 | Workspace container | Session/Project 活跃期，空闲删除 | 只读 | 否 | 是 | 普通项目命令、测试、计算 |
 | Installer container | 单次安装，`--rm` | 读写 | 否 | 通常只读 | 安装/更新通用 CLI |
 | Provider runner | 单条 provider 命令，`--rm` | 只读 | tmpfs 中短暂接触 | 按需 | 执行带身份的 `lark-cli` 命令 |
-| Browser-auth runner | 单次发起或完成 split-flow | 只读 | tmpfs 中短暂接触 | 按需 | 生成授权材料或完成 device-code；Graph 负责跨轮暂停 |
+| Browser-auth runner | 授权窗口内有界存活 | 只读 | tmpfs 中短暂接触 | 只读 | 承载阻塞式 config init；Lifecycle Worker 负责完成回收，Graph 负责跨轮暂停 |
 
 不存在一个共享所有进程和 HOME 的“顶层容器”。顶层是 Backend 管理的用户级资源域：宿主 `~/.puddingclaw`、Profile registry、Credential Broker 和 Toolchain；容器只是按任务临时获得最小挂载的执行隔离单元。
 
@@ -628,6 +647,9 @@ Workspace/Project 容器仍负责：
 - Agent 只能选择注册表中的 `profile_id`，不能提供保险库路径或宿主路径。
 - Backend 根据可信 `user_id/project_id` 解析 Profile，并校验 owner。
 - Profile 锁覆盖 config、login、refresh、logout 和所有可能写 token 的命令。
+- BrowserAuth Profile lease 跨 Agent 轮次持久化；同一 Profile 在授权完成或过期前不能执行其他 provider 命令。
+- BrowserAuth 回收必须遵循“导出 -> Vault 原子写入并读回 -> ACK -> 删除 runner”，禁止提前删除 tmpfs。
+- Lark Provider 非删除操作默认联网自动执行；删除类操作及 Toolchain 安装仍需 HITL。
 - 工具结果默认脱敏；secret/token 不进入 SSE、Session JSON、Evidence、日志或模型上下文。
 - Toolchain 更新不能修改 Credential 保险库；Credential 操作不能修改 Toolchain。
 - 容器/volume 清理必须依赖 PuddingClaw 标签和注册表引用，禁止按名称前缀盲删；该清理流程无权删除 `~/.puddingclaw`。

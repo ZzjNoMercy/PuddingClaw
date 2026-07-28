@@ -7275,6 +7275,13 @@ class DeepAgentsAgentManager:
                                 )
                                 if tc_id:
                                     emitted_tool_ends.add(tc_id)
+                                # Control-plane tool results (Skill plans,
+                                # browser authorization requests) must be
+                                # durable before the frontend can act on them.
+                                # Persist all tool ends in this order so a
+                                # crash after SSE publication cannot create a
+                                # card that disappears on history reload.
+                                persist_assistant_snapshot(force=True)
                                 yield self._sse(
                                     "tool_end",
                                     {
@@ -7291,7 +7298,6 @@ class DeepAgentsAgentManager:
                                         "sources": sources,
                                     },
                                 )
-                                persist_assistant_snapshot(force=True)
                                 tools_just_finished = True
                         else:
                             for agent_msg in node_messages:

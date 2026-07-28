@@ -2,14 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 // @ts-expect-error Node's native TypeScript runner requires the source suffix.
-import {
-  goalControlPresentation,
-  goalRemainsVisible,
-  goalRevisionApplyPlan,
-  goalTodoProgress,
-  parseGoalBudgetRounds,
-  shouldShowInlineBudgetRequest,
-} from "./goalControls.ts";
+import { goalControlPresentation, goalRemainsVisible, goalRevisionApplyPlan, goalTodoProgress, parseGoalBudgetRounds, shouldShowInlineBudgetRequest } from "./goalControls.ts";
 
 test("cancelled Todo tombstones do not dilute visible progress", () => {
   assert.deepEqual(

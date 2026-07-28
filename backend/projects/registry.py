@@ -184,13 +184,25 @@ class ProjectRegistry:
             raise FileNotFoundError(f"Registered project path unavailable: {path}")
         return path
 
-    def ensure_unscoped_workspace(self, session_id: str) -> Path:
-        """Return a private workspace for an Agent session without project_id."""
+    @property
+    def unscoped_workspaces_dir(self) -> Path:
+        """Return the server-owned root for unscoped Agent workspaces."""
 
         self._assert_ready()
         assert self._workspaces_dir is not None
-        safe_id = "".join(c for c in session_id if c.isalnum() or c in "-_") or "default"
-        workspace = (self._workspaces_dir / "unscoped" / safe_id).resolve()
+        return (self._workspaces_dir / "unscoped").resolve()
+
+    def ensure_unscoped_workspace(self, session_id: str) -> Path:
+        """Return the shared default workspace for Agents without a project.
+
+        Docker sandboxes are scoped by workspace path.  Keeping this path
+        stable makes every unscoped Session reuse the same default project
+        container instead of creating one container per Session.
+        """
+
+        self._assert_ready()
+        del session_id  # Unscoped Sessions intentionally share one workspace/container.
+        workspace = (self.unscoped_workspaces_dir / "default").resolve()
         workspace.mkdir(parents=True, exist_ok=True)
         return workspace
 

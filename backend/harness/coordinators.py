@@ -1038,6 +1038,11 @@ class HarnessRunCoordinator:
             if resolved_run_kind == RunKind.GOAL_EXECUTION
             else None
         )
+        # A continuation inherits the Goal's frozen completion policy.  The
+        # caller's default is only meaningful while creating a new Goal; it
+        # must not silently downgrade an existing Rubric Goal to Agent mode.
+        if goal is not None:
+            resolved_completion_policy = goal.completion_policy
         effective_objective = goal.objective if goal is not None else objective
         if effective_objective != objective and not supplied_task_profile:
             task_profile = TaskProfileClassifier.classify(

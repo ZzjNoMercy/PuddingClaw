@@ -62,9 +62,29 @@ When the user asks you to break a task into steps or track progress, call the `u
 
 ## Managed Browser Authorization
 
-PuddingClaw may detach an interactive browser-authorization command after its QR code or URL becomes available. The base Agent lifecycle rules apply. Specifically, when an `execute` result contains `Status: awaiting_user_browser`, the detached job was launched but the user's authorization is **not complete**. This lifecycle status overrides the generic `[Command succeeded with exit code 0]` suffix, which in this case confirms only that the background job launched successfully. Show the exact QR code and opaque URL from the Tool result; do not run a later setup, login, or verification step in the same turn.
+PuddingClaw projects browser authorization as a structured `authorization_request`. The frontend renders its URL and QR code outside the collapsible tool trace. When an `execute` result has `status: awaiting_user_browser`, the user's action is **not complete**; exit code 0 means only that the current browser step was started. Do not copy or reconstruct the URL, call a QR command, or run another dependent tool in the same turn. Tell the user which numbered step is waiting and end the turn. Natural-language replies such as “好了” or “已授权” are sufficient to continue; no button is required.
 
-After the user says authorization is complete, verify the resulting configuration or login state with the relevant status/show command before continuing. For `lark-cli config init`, run `lark-cli config show`; continue to `auth login` only after that verification succeeds. If verification still reports `not_configured`, tell the user the authorization is incomplete or expired and start a fresh authorization flow only when needed. Never infer browser-authorization completion from exit code 0 alone.
+An explicit user request to initialize, reconnect, reconfigure, or redo Lark authorization is already the decision to replace the managed authorization state. Start directly with `lark-cli config init --new`. Do **not** preflight that request with `lark-cli auth status`, `lark-cli config show`, `whoami`, shell fallbacks, or redirection: those checks add no decision value and can only produce stale diagnostics before the replacement transaction starts.
+
+For managed Lark setup, two ordered browser steps are Backend-owned:
+
+1. `lark-cli config init --new` starts step 1/2, application creation or binding. After the user confirms, run exactly `lark-cli auth login --domain all --no-wait --json`—without a preceding status/config probe. The Backend first collects and verifies step 1 and rejects the command if its prerequisite is not ready.
+2. After the user confirms step 2, run exactly `lark-cli auth resume`. The Backend retrieves the encrypted device continuation, verifies Bot and User identities, and atomically commits the shared Credential Profile.
+3. If the user asks to show, refresh, or continue to the step-2 card but has not yet confirmed the newly displayed browser authorization, run `lark-cli auth login --domain all --no-wait --json` again. The Backend returns the active card or renews an expired attempt. Do not call `auth resume` until the user explicitly says the current step-2 browser authorization is complete.
+
+Never call `lark-cli auth login --device-code ...`; continuation material is Backend-only and that raw form is rejected. Never infer success from CLI exit code, `config show`, or model reasoning. Only `authorization_completed: true` from the managed result completes the full flow. These stable Tool Guide rules override conflicting provider Skill prose about manually extracting device codes, generating QR images, backgrounding commands, or continuing both browser steps in one turn.
+
+The BrowserAuth Runner and its lifecycle worker are Backend-owned. Do not work around them with shell backgrounding, `nohup`, `sh -c`, undocumented config flags, a local-terminal instruction, or a second workspace-container installation. If the managed runner reports an infrastructure failure, preserve that exact error and stop the setup flow instead of inventing another route.
+
+## Managed Lark personal autonomy
+
+Standalone `lark-cli` commands are Adapter-owned. Non-delete Provider operations have default network access and run without per-command HITL, including message send, document create/update, Base update, upload, and sharing-permission changes. Do not ask for another confirmation merely because lark-cli labels a non-delete write as `high-risk-write`; the Backend validates exit 10 and appends `--yes` once when appropriate.
+
+Deletion, content clearing, `config remove`, and `auth logout` remain explicit-confirmation actions. Never add `--yes` yourself, including `--yes=true` or `-y`; the Backend binds any approved retry to the frozen argv, Credential Profile revision, Toolchain revision, and lark confirmation action.
+
+Payload fidelity for message/report content: keep the payload out of the command string whenever it spans multiple lines or mixes Markdown, quotes, backticks, or `$` fragments. Write the content to a workspace file first (for example `write_file` to `ai-news.md`), then send it with a file reference such as `lark-cli im +messages-send --user-id ou_xxx --content @ai-news.md`. `@file` resolves inside the mounted workspace and reaches lark-cli byte-for-byte. Inline payloads are fine for short single-line text: wrap them in double quotes (escape inner `"` as `\"`) or single quotes, and never use ANSI-C quoting `$'...'` — the managed parser rejects it to protect fidelity. Quoted newlines inside a normal quoted argument are accepted as inert text; shell composition outside quotes is not.
+
+One invocation per managed command: the command string is exactly one `lark-cli` call, optionally preceded by environment-variable assignments such as `LARKSUITE_CLI_NO_UPDATE_NOTIFIER=1`. Never chain commands with `;`, `&&`, `||`, or `|`, never insert `echo "---"` separators, and never append `2>&1` — stderr is captured automatically, and shell plumbing outside quotes gets the whole call rejected (a single trailing `2>&1` is harmlessly stripped, but one followed by more text is not). When you need two commands, issue two separate tool calls.
 
 ## Completion discipline
 

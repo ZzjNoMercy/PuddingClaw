@@ -55,9 +55,15 @@ async def lifespan(app: FastAPI):
     docker_config = load_config().get("harness", {}).get("terminal", {}).get("docker", {})
     if load_config().get("harness", {}).get("terminal", {}).get("docker_enabled", False):
         try:
-            removed = ProjectSandboxManager(dict(docker_config or {})).gc_stopped_workspace_containers()
+            sandbox_manager = ProjectSandboxManager(dict(docker_config or {}))
+            removed = sandbox_manager.gc_stopped_workspace_containers()
             if removed:
                 print(f"🧹 Removed {removed} stopped PuddingClaw workspace container(s)")
+            removed = sandbox_manager.gc_legacy_unscoped_workspace_containers(
+                project_registry.unscoped_workspaces_dir
+            )
+            if removed:
+                print(f"🧹 Removed {removed} obsolete unscoped Session container(s)")
         except Exception as exc:
             print(f"⚠️ Workspace container startup GC skipped: {exc}")
     try:
@@ -134,6 +140,7 @@ from api.dimension_build_rules import router as dimension_build_rules_router
 from api.logical_dataset_rules import router as logical_dataset_rules_router
 from api.database_sql_revisions import router as database_sql_revisions_router
 from api.user_input_requests import router as user_input_requests_router
+from api.connectors import router as connectors_router
 
 app.include_router(chat_router, prefix="/api")
 app.include_router(agent_router, prefix="/api")
@@ -157,6 +164,7 @@ app.include_router(dimension_build_rules_router, prefix="/api")
 app.include_router(logical_dataset_rules_router, prefix="/api")
 app.include_router(database_sql_revisions_router, prefix="/api")
 app.include_router(user_input_requests_router, prefix="/api")
+app.include_router(connectors_router, prefix="/api")
 
 
 @app.get("/")

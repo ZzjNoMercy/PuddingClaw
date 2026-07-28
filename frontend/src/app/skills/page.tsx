@@ -8,6 +8,7 @@ import Navbar from "@/components/layout/Navbar";
 import Sidebar from "@/components/layout/Sidebar";
 import ResizeHandle from "@/components/layout/ResizeHandle";
 import FileTree from "@/components/skills/FileTree";
+import ConnectorCatalog from "@/components/extensions/ConnectorCatalog";
 import { useApp } from "@/lib/store";
 import ReactMarkdown from "react-markdown";
 import { markdownRemarkPlugins } from "@/lib/markdown";
@@ -33,7 +34,7 @@ import {
   HardDrive,
   Upload,
   Sparkles,
-  Server,
+  Link2,
 } from "lucide-react";
 import {
   listSkills,
@@ -66,12 +67,10 @@ export default function SkillsPage() {
     toggleSidebar,
     sidebarWidth,
     setSidebarWidth,
-    mcpServers,
-    loadMcpServers,
     triggerSkillCreator,
     setPendingInput,
   } = useApp();
-  const [extensionView, setExtensionView] = useState<"mcp" | "skills">("skills");
+  const [extensionView, setExtensionView] = useState<"connectors" | "skills">("skills");
   const [skills, setSkills] = useState<SkillInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedSkill, setSelectedSkill] = useState<string | null>(null);
@@ -134,10 +133,6 @@ export default function SkillsPage() {
   useEffect(() => {
     loadSkills();
   }, [loadSkills]);
-
-  useEffect(() => {
-    if (extensionView === "mcp") loadMcpServers();
-  }, [extensionView, loadMcpServers]);
 
   // ── Load skill detail ────────────────────────────────
   const loadSkillDetail = useCallback(
@@ -369,7 +364,7 @@ export default function SkillsPage() {
   );
 
   const handleExtensionViewChange = useCallback(
-    (view: "mcp" | "skills") => {
+    (view: "connectors" | "skills") => {
       if (view === extensionView) return;
       if (isDirty && !window.confirm("当前文件有未保存的更改，确定要切换吗？")) return;
       setExtensionView(view);
@@ -443,11 +438,42 @@ export default function SkillsPage() {
         )}
 
         <main className="workspace-content-frame flex min-w-0 flex-1 flex-col overflow-hidden">
-      {extensionView === "mcp" ? (
-        <McpServerCatalog
-          servers={mcpServers}
-          extensionView={extensionView}
-          onExtensionViewChange={handleExtensionViewChange}
+      <nav className="shrink-0 bg-white/60" aria-label="扩展类型">
+        <div className="flex w-full items-center gap-1.5 px-5 py-2">
+          <button
+            type="button"
+            aria-current={extensionView === "skills" ? "page" : undefined}
+            onClick={() => handleExtensionViewChange("skills")}
+            className={`flex items-center gap-2 rounded-xl px-3 py-1.5 text-[14px] font-semibold transition-colors ${
+              extensionView === "skills"
+                ? "bg-[#002fa7] text-white shadow-sm"
+                : "text-gray-500 hover:bg-[#002fa7]/[0.06] hover:text-[#002fa7]"
+            }`}
+          >
+            <Zap className="h-4 w-4" />
+            技能
+          </button>
+          <button
+            type="button"
+            aria-current={extensionView === "connectors" ? "page" : undefined}
+            onClick={() => handleExtensionViewChange("connectors")}
+            className={`flex items-center gap-2 rounded-xl px-3 py-1.5 text-[14px] font-semibold transition-colors ${
+              extensionView === "connectors"
+                ? "bg-[#002fa7] text-white shadow-sm"
+                : "text-gray-500 hover:bg-[#002fa7]/[0.06] hover:text-[#002fa7]"
+            }`}
+          >
+            <Link2 className="h-4 w-4" />
+            连接器
+          </button>
+        </div>
+      </nav>
+      {extensionView === "connectors" ? (
+        <ConnectorCatalog
+          onUse={(prompt) => {
+            setPendingInput(prompt);
+            router.push("/");
+          }}
         />
       ) : (
       <div className="flex-1 flex overflow-hidden">
@@ -458,35 +484,7 @@ export default function SkillsPage() {
             : "flex-1"
         } glass-panel flex min-w-0 flex-col`}>
           {/* Header */}
-          <div className={selectedSkill ? "border-b border-black/[0.06] p-3" : "mx-auto w-full max-w-4xl px-6 pb-4 pt-5"}>
-            {!selectedSkill && (
-              <div className="mb-6 flex items-end justify-between gap-4">
-                <div>
-                  <h1 className="text-2xl font-semibold text-gray-900">技能</h1>
-                  <p className="mt-1 text-[13px] text-gray-500">通过任务专用技能扩展 PuddingClaw 的能力</p>
-                </div>
-                <div className="flex items-center gap-1 rounded-lg bg-gray-100 p-1" role="tablist" aria-label="扩展类型">
-                  <button
-                    type="button"
-                    role="tab"
-                    aria-selected
-                    onClick={() => handleExtensionViewChange("skills")}
-                    className="rounded-md px-3 py-1 text-[12px] font-medium transition-colors bg-white text-gray-900 shadow-sm"
-                  >
-                    技能
-                  </button>
-                  <button
-                    type="button"
-                    role="tab"
-                    aria-selected={false}
-                    onClick={() => handleExtensionViewChange("mcp")}
-                    className="rounded-md px-3 py-1 text-[12px] font-medium transition-colors text-gray-500 hover:text-gray-800"
-                  >
-                    MCP
-                  </button>
-                </div>
-              </div>
-            )}
+          <div className={selectedSkill ? "border-b border-black/[0.06] p-3" : "w-full px-5 pb-3 pt-3"}>
             <div className="flex items-center justify-between mb-2.5">
               <div className="flex items-center gap-2">
                 {selectedSkill && (
@@ -540,16 +538,16 @@ export default function SkillsPage() {
                 className={`w-full border border-black/[0.06] bg-white outline-none transition-all placeholder:text-gray-400 focus:border-[#002fa7]/40 focus:ring-1 focus:ring-[#002fa7]/10 ${
                   selectedSkill
                     ? "rounded-lg py-1.5 pl-8 pr-3 text-[12px]"
-                    : "rounded-xl py-3 pl-10 pr-4 text-[13px] shadow-sm"
+                    : "rounded-xl py-2.5 pl-10 pr-4 text-[13px] shadow-sm"
                 }`}
               />
             </div>
           </div>
 
           {/* List */}
-          <div className={selectedSkill ? "flex-1 space-y-0.5 overflow-y-auto p-2" : "mx-auto w-full max-w-4xl flex-1 space-y-1 overflow-y-auto px-6 pb-10"}>
+          <div className={selectedSkill ? "flex-1 space-y-0.5 overflow-y-auto p-2" : "grid w-full flex-1 auto-rows-min grid-cols-1 gap-3 overflow-y-auto px-5 pb-8 md:grid-cols-2"}>
             {filteredSkills.length === 0 ? (
-              <div className="flex flex-col items-center justify-center py-12 text-gray-400">
+              <div className="flex flex-col items-center justify-center py-12 text-gray-400 md:col-span-2">
                 <FolderOpen className="w-8 h-8 mb-2 opacity-40" />
                 <span className="text-[12px]">
                   {searchQuery ? "无匹配结果" : "暂无 Skills"}
@@ -564,12 +562,14 @@ export default function SkillsPage() {
                     e.preventDefault();
                     setContextMenu({ skillName: skill.name, x: e.clientX, y: e.clientY });
                   }}
-                  className={`group flex cursor-pointer items-center transition-all ${
-                    selectedSkill ? "gap-2.5 rounded-lg px-2.5 py-2" : "gap-3 rounded-lg px-4 py-3"
+                  className={`group flex cursor-pointer transition-all ${
+                    selectedSkill ? "items-center gap-2.5 rounded-lg px-2.5 py-2" : "min-h-[88px] items-start gap-3 rounded-xl px-3 py-3"
                   } ${
                     selectedSkill === skill.name
                       ? "bg-[#002fa7]/10 border border-[#002fa7]/20"
-                      : "hover:bg-white/70 border border-transparent"
+                      : selectedSkill
+                        ? "border border-transparent hover:bg-white/70"
+                        : "border border-black/[0.06] bg-white shadow-sm hover:border-[#002fa7]/20 hover:shadow-md"
                   }`}
                 >
                   <div
@@ -813,94 +813,6 @@ export default function SkillsPage() {
           {toast.message}
         </div>
       )}
-    </div>
-  );
-}
-
-function McpServerCatalog({
-  servers,
-  extensionView,
-  onExtensionViewChange,
-}: {
-  servers: Array<{ key: string; name: string; url: string; transport: string }>;
-  extensionView: "skills" | "mcp";
-  onExtensionViewChange: (view: "skills" | "mcp") => void;
-}) {
-  return (
-    <div className="flex-1 overflow-y-auto bg-white/30">
-      <div className="mx-auto w-full max-w-4xl px-6 pb-10 pt-5">
-        <div className="mb-6 flex items-end justify-between gap-4">
-          <div>
-            <h1 className="text-2xl font-semibold text-gray-900">MCP</h1>
-            <p className="mt-1 text-[13px] text-gray-500">连接外部服务，为对话提供工具与数据能力</p>
-          </div>
-          <div className="flex items-center gap-1 rounded-lg bg-gray-100 p-1" role="tablist" aria-label="扩展类型">
-            <button
-              type="button"
-              role="tab"
-              aria-selected={extensionView === "skills"}
-              onClick={() => onExtensionViewChange("skills")}
-              className={`rounded-md px-3 py-1 text-[12px] font-medium transition-colors ${
-                extensionView === "skills"
-                  ? "bg-white text-gray-900 shadow-sm"
-                  : "text-gray-500 hover:text-gray-800"
-              }`}
-            >
-              技能
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={extensionView === "mcp"}
-              onClick={() => onExtensionViewChange("mcp")}
-              className={`rounded-md px-3 py-1 text-[12px] font-medium transition-colors ${
-                extensionView === "mcp"
-                  ? "bg-white text-gray-900 shadow-sm"
-                  : "text-gray-500 hover:text-gray-800"
-              }`}
-            >
-              MCP
-            </button>
-          </div>
-        </div>
-
-        <div className="mb-2 flex items-center gap-2 text-[13px] font-semibold text-gray-700">
-          <Server className="h-4 w-4 text-sky-500" />
-          已启用
-          <span className="rounded-full bg-gray-100 px-1.5 py-0.5 text-[10px] font-normal text-gray-500">
-            {servers.length}
-          </span>
-        </div>
-
-        {servers.length === 0 ? (
-          <div className="rounded-lg border border-dashed border-black/[0.08] px-4 py-8 text-center text-[12px] text-gray-400">
-            暂无已配置 MCP Server
-          </div>
-        ) : (
-          <div className="space-y-1">
-            {servers.map((server) => (
-              <div
-                key={server.key}
-                className="flex items-center gap-3 rounded-lg border border-transparent px-4 py-3 transition-colors hover:border-black/[0.05] hover:bg-white/70"
-              >
-                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-sky-50 text-sky-600">
-                  <Server className="h-5 w-5" />
-                </div>
-                <div className="min-w-0 flex-1">
-                  <p className="truncate text-[14px] font-medium text-gray-800">{server.name}</p>
-                  <p className="mt-0.5 truncate text-[12px] text-gray-400">
-                    {server.transport} · {server.url}
-                  </p>
-                </div>
-                <div className="flex shrink-0 items-center gap-1 text-[11px] text-emerald-600">
-                  <CheckCircle2 className="h-3.5 w-3.5" />
-                  已启用
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
     </div>
   );
 }

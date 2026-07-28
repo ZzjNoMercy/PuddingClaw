@@ -273,10 +273,7 @@ class ShellPolicyAnalyzer:
             if (
                 len(operands) >= 2
                 and operands[-1].startswith("/scratch/external-directories/")
-                and any(
-                    source == "/workspace" or source.startswith("/workspace/")
-                    for source in operands[:-1]
-                )
+                and any(source == "/workspace" or source.startswith("/workspace/") for source in operands[:-1])
             ):
                 return ToolPolicyResult(
                     PolicyDecision.DENY,
@@ -405,15 +402,28 @@ class ShellPolicyAnalyzer:
             origins.add(f"{scheme}://{parsed.hostname.lower()}:{port or default_port}")
         lowered = [item.lower() for item in tokens[1:]]
         mutating_flags = {
-            "-d", "--data", "--data-ascii", "--data-binary", "--data-raw",
-            "--data-urlencode", "-f", "--form", "--form-string", "-t",
-            "--upload-file", "--json",
+            "-d",
+            "--data",
+            "--data-ascii",
+            "--data-binary",
+            "--data-raw",
+            "--data-urlencode",
+            "-f",
+            "--form",
+            "--form-string",
+            "-t",
+            "--upload-file",
+            "--json",
         }
-        remote_effect = "mutate" if any(
-            item in mutating_flags
-            or item.startswith(tuple(f"{flag}=" for flag in mutating_flags if flag.startswith("--")))
-            for item in lowered
-        ) else "read"
+        remote_effect = (
+            "mutate"
+            if any(
+                item in mutating_flags
+                or item.startswith(tuple(f"{flag}=" for flag in mutating_flags if flag.startswith("--")))
+                for item in lowered
+            )
+            else "read"
+        )
         return NetworkIntent(
             required=True,
             origins=tuple(sorted(origins)),
@@ -437,10 +447,7 @@ class ShellPolicyAnalyzer:
             if argument in {"-O", "--remote-name", "--remote-header-name", "-OJ"}:
                 return True
             if argument in {"-o", "--output"}:
-                if (
-                    index + 1 >= len(tokens)
-                    or tokens[index + 1] not in _NON_MATERIAL_REDIRECT_SINKS
-                ):
+                if index + 1 >= len(tokens) or tokens[index + 1] not in _NON_MATERIAL_REDIRECT_SINKS:
                     return True
                 index += 2
                 continue
@@ -514,10 +521,7 @@ class ShellPolicyAnalyzer:
                         continue
             if executable in _NETWORK_COMMANDS:
                 network = True
-                if executable == "wget" or (
-                    executable == "curl"
-                    and cls._curl_writes_material_output(tokens)
-                ):
+                if executable == "wget" or (executable == "curl" and cls._curl_writes_material_output(tokens)):
                     workspace_write = True
             if executable == "lark-cli" and cls._lark_cli_requires_network(tokens):
                 # Routing and authorization are intentionally separate.  This
@@ -527,9 +531,7 @@ class ShellPolicyAnalyzer:
             if executable in _DESTRUCTIVE_OR_WRITE_COMMANDS:
                 workspace_write = True
             if executable == "rm" and any(
-                arg in _RECURSIVE_RM_FLAGS
-                or arg.startswith("--recursive=")
-                or (arg.startswith("-") and "r" in arg[1:])
+                arg in _RECURSIVE_RM_FLAGS or arg.startswith("--recursive=") or (arg.startswith("-") and "r" in arg[1:])
                 for arg in tokens[1:]
             ):
                 destructive = True
@@ -636,14 +638,15 @@ class ShellPolicyAnalyzer:
                 normalized_subcommand = item
                 break
             if executable in {"npm", "npx", "pnpm", "yarn", "uvx"} and (
-                executable in {"npx", "uvx"}
-                or normalized_subcommand in {"ci", "install", "add", "remove", "uninstall"}
+                executable in {"npx", "uvx"} or normalized_subcommand in {"ci", "install", "add", "remove", "uninstall"}
             ):
                 network = True
                 package_install = True
                 workspace_write = True
-            if executable in {"python", "python3"} and args[:2] == ["-m", "pip"] and any(
-                item in package_subcommands for item in args[2:]
+            if (
+                executable in {"python", "python3"}
+                and args[:2] == ["-m", "pip"]
+                and any(item in package_subcommands for item in args[2:])
             ):
                 network = True
                 package_install = True
@@ -656,20 +659,21 @@ class ShellPolicyAnalyzer:
                 _NETWORK_URL_PATTERN.search(joined_args)
                 or _EMBEDDED_NETWORK_API_PATTERN.search(joined_args)
                 or _KNOWN_NETWORK_SKILL_ENTRYPOINT_PATTERN.search(" ".join(tokens))
-                or any(
-                    item.startswith(("/skills/aihot/", "/skills/tavily-search/"))
-                    for item in args
-                )
+                or any(item.startswith(("/skills/aihot/", "/skills/tavily-search/")) for item in args)
             ):
                 network = True
-            if executable in {"python", "python3", "node", "ruby", "perl", "php"} and (
-                _EMBEDDED_WRITE_API_PATTERN.search(joined_args)
-                or any(
-                    not item.startswith("-")
-                    and item.lower().endswith((".py", ".js", ".mjs", ".cjs", ".rb", ".pl", ".php"))
-                    for item in tokens[1:]
+            if (
+                executable in {"python", "python3", "node", "ruby", "perl", "php"}
+                and (
+                    _EMBEDDED_WRITE_API_PATTERN.search(joined_args)
+                    or any(
+                        not item.startswith("-")
+                        and item.lower().endswith((".py", ".js", ".mjs", ".cjs", ".rb", ".pl", ".php"))
+                        for item in tokens[1:]
+                    )
                 )
-            ) and not (executable == "node" and args[:1] == ["--check"]):
+                and not (executable == "node" and args[:1] == ["--check"])
+            ):
                 workspace_write = True
             # Project tests can receive a remote base URL. They remain useful
             # low-risk commands, but networking still needs an explicit grant.
@@ -720,9 +724,7 @@ class ShellPolicyAnalyzer:
     @staticmethod
     def _normalize_shell_script(content: str) -> str:
         return "; ".join(
-            line.strip()
-            for line in content.splitlines()
-            if line.strip() and not line.lstrip().startswith("#")
+            line.strip() for line in content.splitlines() if line.strip() and not line.lstrip().startswith("#")
         )
 
     def _check_absolute_paths(self, segments: list[list[str]]) -> ToolPolicyResult | None:
@@ -767,7 +769,7 @@ class ShellPolicyAnalyzer:
         fragments: list[str] = []
         index = 0
         anchors = "=:'\"([{,"
-        terminators = set("\t\r\n,;|&<>)]}\"")
+        terminators = set('\t\r\n,;|&<>)]}"')
         while index < len(token):
             start = token.find("/", index)
             if start < 0:
@@ -824,25 +826,13 @@ class ShellPolicyAnalyzer:
                 # scratch-mount substring stays critical in every mode:
                 # interpreters have their own glob APIs and can enumerate
                 # /harness-scratch without the shell's help.
-                expansion_syntax = (
-                    "harness-scrat" in raw
-                    or (
-                        not inline_program
-                        and (
-                            "*" in raw
-                            or "?" in raw
-                            or "[" in raw
-                        )
-                    )
+                expansion_syntax = "harness-scrat" in raw or (
+                    not inline_program and ("*" in raw or "?" in raw or "[" in raw)
                 )
                 if (
                     self.backend_mode == "docker"
                     and expansion_syntax
-                    and (
-                        "/" in raw
-                        or "harness-scrat" in raw
-                        or raw.startswith(("*", "?", ".", "~"))
-                    )
+                    and ("/" in raw or "harness-scrat" in raw or raw.startswith(("*", "?", ".", "~")))
                 ):
                     # The project container currently reuses one host scratch
                     # mount. Shell pathname expansion can otherwise conceal
@@ -933,10 +923,7 @@ class ShellPolicyAnalyzer:
                 if ">" in token:
                     target = tokens[index + 1] if index + 1 < len(tokens) else ""
                     duplicates_fd = token == ">&" and target.isdigit()
-                    if (
-                        not duplicates_fd
-                        and target not in _NON_MATERIAL_REDIRECT_SINKS
-                    ):
+                    if not duplicates_fd and target not in _NON_MATERIAL_REDIRECT_SINKS:
                         has_write_redirect = True
                 continue
             current.append(token)
@@ -1024,9 +1011,7 @@ class ShellPolicyAnalyzer:
             )
         if command == "rm":
             recursive = any(
-                arg in _RECURSIVE_RM_FLAGS
-                or arg.startswith("--recursive=")
-                or (arg.startswith("-") and "r" in arg[1:])
+                arg in _RECURSIVE_RM_FLAGS or arg.startswith("--recursive=") or (arg.startswith("-") and "r" in arg[1:])
                 for arg in args
             )
             return ToolPolicyResult(
@@ -1300,12 +1285,14 @@ class ToolExecutionPipeline(AgentMiddleware):
             "apply_logical_dataset_rule",
         }
     )
-    NETWORK_TOOLS = frozenset({
-        "tavily_search",
-        "fetch_url",
-        "prepare_skill_install",
-        "prepare_skill_update",
-    })
+    NETWORK_TOOLS = frozenset(
+        {
+            "tavily_search",
+            "fetch_url",
+            "prepare_skill_install",
+            "prepare_skill_update",
+        }
+    )
     SKILL_COMMIT_TOOLS = frozenset({"install_skill", "update_skill"})
 
     def __init__(
@@ -1379,6 +1366,36 @@ class ToolExecutionPipeline(AgentMiddleware):
             and value.get("status") == "awaiting_user_browser"
         )
 
+    @staticmethod
+    def _managed_authorization_error(message: Any) -> dict[str, Any] | None:
+        """Return a terminal managed-auth failure envelope, if present.
+
+        These failures describe Backend state-machine or provider-initiation
+        boundaries. Letting the model improvise another command (for example
+        ``auth resume`` before a user-consent attempt exists) only obscures the
+        original failure and can roll the user back to an earlier phase.
+        """
+
+        if not isinstance(message, ToolMessage) or message.name != "execute":
+            return None
+        try:
+            value = json.loads(str(message.content or ""))
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(value, dict) or value.get("managed_by") != "managed_cli":
+            return None
+        error = str(value.get("error") or "")
+        if error in {
+            "managed_authorization_failed",
+            "authorization_prerequisite_failed",
+            "authorization_flow_missing",
+            "lark_user_authorization_failed",
+            "lark_user_authorization_invalid_response",
+            "lark_user_authorization_untrusted_url",
+        }:
+            return value
+        return None
+
     @hook_config(can_jump_to=["end"])
     def before_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
         """Pause the Agent loop at the durable Skill confirmation boundary.
@@ -1416,7 +1433,9 @@ class ToolExecutionPipeline(AgentMiddleware):
                                 plan["installed"] = status == "committed"
                     value["confirmation_completed"] = True
                     value["confirmation_action"] = decision.get("action") if isinstance(decision, dict) else "cancel"
-                    updated = message.model_copy(update={"content": json.dumps(value, ensure_ascii=False, sort_keys=True)})
+                    updated = message.model_copy(
+                        update={"content": json.dumps(value, ensure_ascii=False, sort_keys=True)}
+                    )
                     if value["confirmation_action"] == "confirm":
                         return {"messages": [updated]}
                     return {"messages": [updated], "jump_to": "end"}
@@ -1434,30 +1453,47 @@ class ToolExecutionPipeline(AgentMiddleware):
             return None
         latest = messages[-1]
         boundary: ToolMessage | None = None
+        authorization_error: dict[str, Any] | None = None
         for message in reversed(messages[:-1]):
             if isinstance(message, ToolMessage):
                 if self._awaiting_user_browser(message):
                     boundary = message
+                else:
+                    authorization_error = self._managed_authorization_error(message)
                 break
             if isinstance(message, AIMessage):
                 break
-        if boundary is None:
+        if boundary is None and authorization_error is None:
             return None
+        if authorization_error is not None:
+            if not latest.tool_calls:
+                return {"jump_to": "end"}
+            message = str(authorization_error.get("message") or "托管授权流程未能继续。")
+            replacement = latest.model_copy(
+                update={
+                    "content": f"{message} 已停止本轮操作；不会尝试其他授权命令或回退到上一步。",
+                    "tool_calls": [],
+                }
+            )
+            return {"messages": [replacement], "jump_to": "end"}
+        assert boundary is not None
         if not latest.tool_calls:
             return {"jump_to": "end"}
         try:
             payload = json.loads(str(boundary.content or ""))
         except (TypeError, ValueError):
             payload = {}
-        output = str(payload.get("output") or "") if isinstance(payload, dict) else ""
-        url_match = re.search(r"https?://[^\s]+", output)
-        link = f"\n\n授权链接：{url_match.group(0)}" if url_match else ""
+        request = payload.get("authorization_request") if isinstance(payload, dict) else None
+        phase = request.get("phase") if isinstance(request, dict) else None
+        step = phase.get("step") if isinstance(phase, dict) else None
+        total = phase.get("total") if isinstance(phase, dict) else None
+        title = phase.get("title") if isinstance(phase, dict) else None
+        step_label = f"第 {step}/{total} 步 · {title}" if step and total and title else "当前授权步骤"
         replacement = latest.model_copy(
             update={
                 "content": (
-                    "飞书授权流程已启动，但尚未完成。请使用上方二维码或授权链接在浏览器中完成操作。"
-                    "完成后告诉我；下一轮会先验证配置和登录状态，再继续后续步骤。"
-                    f"{link}"
+                    f"{step_label}已启动，但尚未完成。请使用上方卡片中的二维码或链接完成浏览器操作。"
+                    "完成后直接告诉我即可；Backend 验证通过后才会进入下一步。"
                 ),
                 "tool_calls": [],
             }
@@ -1470,17 +1506,13 @@ class ToolExecutionPipeline(AgentMiddleware):
         if not tokens or Path(tokens[0]).name.lower() != "npx":
             return False
         lowered = [token.lower() for token in tokens[1:]]
-        return any(
-            lowered[index : index + 2] == ["skills", "add"]
-            for index in range(max(0, len(lowered) - 1))
-        )
+        return any(lowered[index : index + 2] == ["skills", "add"] for index in range(max(0, len(lowered) - 1)))
 
     @classmethod
     def _contains_npx_skills_add(cls, command: str) -> bool:
         try:
             parsed_match = any(
-                cls._segment_is_npx_skills_add(segment)
-                for segment in ShellPolicyAnalyzer.parse_segments(command)
+                cls._segment_is_npx_skills_add(segment) for segment in ShellPolicyAnalyzer.parse_segments(command)
             )
         except ValueError:
             parsed_match = False
@@ -1514,19 +1546,14 @@ class ToolExecutionPipeline(AgentMiddleware):
         lowered = [token.lower() for token in tokens]
         try:
             skills_index = next(
-                index
-                for index in range(1, len(tokens) - 1)
-                if lowered[index : index + 2] == ["skills", "add"]
+                index for index in range(1, len(tokens) - 1) if lowered[index : index + 2] == ["skills", "add"]
             )
         except StopIteration:
             return None
         args = tokens[skills_index + 2 :]
         source = ""
         skill_names: list[str] = []
-        yes = any(
-            token.lower() in {"-y", "--yes"}
-            for token in tokens[1:skills_index]
-        )
+        yes = any(token.lower() in {"-y", "--yes"} for token in tokens[1:skills_index])
         install_all = False
         list_only = False
         index = 0
@@ -1592,6 +1619,8 @@ class ToolExecutionPipeline(AgentMiddleware):
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
         managed_add: ManagedNpxSkillsAdd | None,
         managed_cli: Any | None = None,
+        *,
+        destructive_approval: str | None = None,
     ) -> ToolMessage | Command[Any]:
         if managed_cli is not None:
             if self.managed_cli_service is None:
@@ -1610,13 +1639,69 @@ class ToolExecutionPipeline(AgentMiddleware):
                     tool_call_id=str(request.tool_call.get("id") or ""),
                     status="error",
                 )
-            context = self._context(request)
+            context = {
+                **self._context(request),
+                "_managed_cli_destructive_approval": destructive_approval,
+            }
             result = await asyncio.to_thread(self.managed_cli_service.execute, managed_cli, context)
+            managed_payload = getattr(result, "payload", {})
+            if (
+                destructive_approval is None
+                and isinstance(managed_payload, dict)
+                and managed_payload.get("status") == "confirmation_required"
+            ):
+                return await self._request_managed_cli_destructive_confirmation(
+                    request,
+                    handler,
+                    managed_cli,
+                    managed_payload,
+                )
+            model_content = result.content
+            artifact = None
+            if (
+                isinstance(managed_payload, dict)
+                and managed_payload.get("status") == "awaiting_user_browser"
+                and isinstance(managed_payload.get("authorization_request"), dict)
+            ):
+                request_payload = managed_payload["authorization_request"]
+                model_request = {
+                    key: request_payload.get(key)
+                    for key in (
+                        "type",
+                        "flow_id",
+                        "revision",
+                        "attempt",
+                        "provider",
+                        "profile_id",
+                        "status",
+                        "phase",
+                        "completion_hint",
+                    )
+                    if request_payload.get(key) is not None
+                }
+                model_content = json.dumps(
+                    {
+                        "ok": True,
+                        "managed_by": "managed_cli",
+                        "status": "awaiting_user_browser",
+                        "authorization_completed": False,
+                        "authorization_request": model_request,
+                        "output": managed_payload.get("output"),
+                        "next_action": managed_payload.get("next_action"),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                # DeepAgents persists/adapts this raw artifact for the UI and
+                # strips it from serialized model context. Thus browser URLs
+                # and QR material never need to enter ToolMessage content.
+                artifact = {"puddingclaw_raw_tool_output": result.content}
             return ToolMessage(
-                content=result.content,
+                content=model_content,
                 name="execute",
                 tool_call_id=str(request.tool_call.get("id") or ""),
                 status="success" if result.exit_code == 0 else "error",
+                artifact=artifact,
             )
         if managed_add is None:
             return await handler(request)
@@ -1763,7 +1848,9 @@ class ToolExecutionPipeline(AgentMiddleware):
                     request,
                     f"Managed CLI planning failed: {type(exc).__name__}: {exc}",
                 )
-        result = await self._apreflight(request)
+        result = (
+            self._managed_cli_preflight(managed_cli) if managed_cli is not None else await self._apreflight(request)
+        )
         if result.decision == PolicyDecision.ALLOW:
             self._record_reviewer_decision(request, result)
             delta_denial = self._delta_repair_denial(request)
@@ -1789,7 +1876,7 @@ class ToolExecutionPipeline(AgentMiddleware):
             reason=result.reason,
         )
         session_scope = self._session_grant_scope(request)
-        required_capabilities = self._required_capabilities(request)
+        required_capabilities = self._required_capabilities(request, managed_cli=managed_cli)
         run_id = str(context.get("run_id") or "")
         if session_manager.consume_tool_action_permission(
             session_id,
@@ -1810,7 +1897,19 @@ class ToolExecutionPipeline(AgentMiddleware):
             delta_denial = self._delta_repair_denial(request)
             if delta_denial is not None:
                 return delta_denial
-            return await self._invoke_authorized(request, handler, managed_add, managed_cli)
+            return await self._invoke_authorized(
+                request,
+                handler,
+                managed_add,
+                managed_cli,
+                destructive_approval=(
+                    managed_cli.destructive_approval_binding()
+                    if managed_cli is not None
+                    and getattr(getattr(managed_cli, "match", managed_cli), "destructive", False)
+                    and hasattr(managed_cli, "destructive_approval_binding")
+                    else None
+                ),
+            )
         preview = permission_resume_registry.create_tool_action_request(
             session_id=session_id,
             query_id=query_id,
@@ -1864,7 +1963,19 @@ class ToolExecutionPipeline(AgentMiddleware):
                 delta_denial = self._delta_repair_denial(request)
                 if delta_denial is not None:
                     return delta_denial
-                return await self._invoke_authorized(request, handler, managed_add, managed_cli)
+                return await self._invoke_authorized(
+                    request,
+                    handler,
+                    managed_add,
+                    managed_cli,
+                    destructive_approval=(
+                        managed_cli.destructive_approval_binding()
+                        if managed_cli is not None
+                        and getattr(getattr(managed_cli, "match", managed_cli), "destructive", False)
+                        and hasattr(managed_cli, "destructive_approval_binding")
+                        else None
+                    ),
+                )
         return self._denied_message(request, result)
 
     def wrap_tool_call(
@@ -1888,7 +1999,7 @@ class ToolExecutionPipeline(AgentMiddleware):
                     request,
                     f"Managed CLI planning failed: {type(exc).__name__}: {exc}",
                 )
-        result = self._preflight(request)
+        result = self._managed_cli_preflight(managed_cli) if managed_cli is not None else self._preflight(request)
         if result.decision == PolicyDecision.ALLOW:
             delta_denial = self._delta_repair_denial(request)
             if delta_denial is not None:
@@ -1928,11 +2039,7 @@ class ToolExecutionPipeline(AgentMiddleware):
                     "commit_external_directory",
                 }
             )
-            forbidden.update(
-                name
-                for name in self.known_tools
-                if name.startswith("database_")
-            )
+            forbidden.update(name for name in self.known_tools if name.startswith("database_"))
         reservation = session_manager.reserve_delta_repair_tool_call(
             session_id,
             run_id,
@@ -1964,6 +2071,98 @@ class ToolExecutionPipeline(AgentMiddleware):
                 status="error",
             )
         return None
+
+    async def _request_managed_cli_destructive_confirmation(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+        managed_cli: Any,
+        payload: dict[str, Any],
+    ) -> ToolMessage | Command[Any]:
+        """Turn a dynamic Lark exit-10 delete gate into the normal HITL flow."""
+
+        confirmation = payload.get("confirmation")
+        if not isinstance(confirmation, dict):
+            return self._managed_cli_rejection(request, "Invalid managed CLI confirmation payload.")
+        approval_binding = str(confirmation.get("approval_binding") or "")
+        if not approval_binding:
+            return self._managed_cli_rejection(request, "Managed CLI confirmation is not bound to its plan.")
+        context = self._context(request)
+        session_id = str(context.get("session_id") or "")
+        query_id = str(context.get("query_id") or "")
+        run_id = str(context.get("run_id") or "")
+        command = json.dumps(
+            {
+                "plan": managed_cli.approval_preview(),
+                "confirmation": confirmation,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        reason = "managed_cli_destructive_action"
+        fingerprint = permission_resume_registry.tool_action_fingerprint(
+            tool_name="execute",
+            command=command,
+            reason=reason,
+        )
+        required_capabilities = self._required_capabilities(request, managed_cli=managed_cli)
+        if "destructive_write" not in required_capabilities:
+            required_capabilities.append("destructive_write")
+        preview = permission_resume_registry.create_tool_action_request(
+            session_id=session_id,
+            query_id=query_id,
+            tool_call_id=str(request.tool_call.get("id") or ""),
+            tool_name="execute",
+            command=command,
+            reason=reason,
+            risk="high",
+            run_id=run_id,
+            grant_bindings=self.permission_context.grant_bindings(),
+            required_capabilities=required_capabilities,
+            policy_source="managed_cli",
+            policy_explanation="删除类飞书操作需要用户明确确认。",
+            control_descriptor=self._control_descriptor("execute"),
+        )
+        if run_id:
+            session_manager.transition_run_status(
+                session_id,
+                run_id,
+                "waiting_hitl",
+                expected_statuses={"running", "waiting_hitl"},
+            )
+        decision = interrupt(
+            {
+                "type": "permission_request",
+                "request": preview,
+                "decisions": [{"type": "approve"}, {"type": "reject"}],
+            }
+        )
+        if run_id:
+            session_manager.transition_run_status(
+                session_id,
+                run_id,
+                "running",
+                expected_statuses={"running", "waiting_hitl"},
+            )
+        if isinstance(decision, dict) and decision.get("type") == "approve":
+            if session_manager.consume_tool_action_permission(
+                session_id,
+                fingerprint,
+                required_bindings=self.permission_context.grant_bindings(),
+                required_capabilities=required_capabilities,
+                current_run_id=run_id,
+            ):
+                return await self._invoke_authorized(
+                    request,
+                    handler,
+                    None,
+                    managed_cli,
+                    destructive_approval=approval_binding,
+                )
+        return self._denied_message(
+            request,
+            ToolPolicyResult(PolicyDecision.ASK, reason, "high", source="managed_cli"),
+        )
 
     def _preflight(self, request: ToolCallRequest) -> ToolPolicyResult:
         tool_name = str(request.tool_call.get("name") or "")
@@ -2108,10 +2307,8 @@ class ToolExecutionPipeline(AgentMiddleware):
                     "critical",
                 )
             if self._registered_external_validator(command):
-                if (
-                    "/opt/puddingclaw/bin/validate-html-report-e2e.mjs"
-                    in command
-                    and not self._browser_e2e_required(request)
+                if "/opt/puddingclaw/bin/validate-html-report-e2e.mjs" in command and not self._browser_e2e_required(
+                    request
                 ):
                     return ToolPolicyResult(
                         PolicyDecision.DENY,
@@ -2415,8 +2612,7 @@ class ToolExecutionPipeline(AgentMiddleware):
         run = session_manager.get_run_state(session_id, run_id)
         contract = (
             run.get("verification_contract")
-            if isinstance(run, dict)
-            and isinstance(run.get("verification_contract"), dict)
+            if isinstance(run, dict) and isinstance(run.get("verification_contract"), dict)
             else {}
         )
         return bool(contract.get("browser_e2e_required"))
@@ -2427,7 +2623,12 @@ class ToolExecutionPipeline(AgentMiddleware):
         if any(char in normalized for char in "*?[") or ".." in Path(normalized).parts:
             return False
         if normalized.startswith("/"):
-            return normalized == "/workspace" or normalized.startswith("/workspace/") or normalized == "/scratch" or normalized.startswith("/scratch/")
+            return (
+                normalized == "/workspace"
+                or normalized.startswith("/workspace/")
+                or normalized == "/scratch"
+                or normalized.startswith("/scratch/")
+            )
         return True
 
     @staticmethod
@@ -2579,7 +2780,58 @@ class ToolExecutionPipeline(AgentMiddleware):
         return {key: value for key, value in preview.items() if value}
 
     @classmethod
-    def _required_capabilities(cls, request: ToolCallRequest) -> list[str]:
+    def _managed_cli_preflight(cls, plan: Any) -> ToolPolicyResult:
+        """Apply the frozen Adapter decision instead of re-parsing managed argv.
+
+        Lark Provider operations run in the credential control plane, where
+        networking is an execution requirement rather than a per-command
+        permission prompt.  Installer mutations and deletion semantics retain
+        their explicit approval boundaries.
+        """
+
+        match = getattr(plan, "match", plan)
+        route = str(getattr(getattr(match, "route", None), "value", ""))
+        if route == "installer":
+            return ToolPolicyResult(
+                PolicyDecision.ASK,
+                "managed_cli_toolchain_install",
+                "package_install",
+                explanation="共享 Toolchain 安装或更新需要确认。",
+            )
+        if bool(getattr(match, "destructive", False)):
+            return ToolPolicyResult(
+                PolicyDecision.ASK,
+                "managed_cli_destructive_action",
+                "high",
+                explanation="删除类飞书操作仍需用户明确确认。",
+            )
+        return ToolPolicyResult(
+            PolicyDecision.ALLOW,
+            "managed_cli_personal_autonomy",
+            "managed_write",
+            explanation="受管飞书非删除操作默认联网并自动执行。",
+        )
+
+    @classmethod
+    def _required_capabilities(
+        cls,
+        request: ToolCallRequest,
+        *,
+        managed_cli: Any | None = None,
+    ) -> list[str]:
+        if managed_cli is not None:
+            match = getattr(managed_cli, "match", managed_cli)
+            route = str(getattr(getattr(match, "route", None), "value", ""))
+            capabilities = ["execute"]
+            if bool(getattr(match, "requires_network", False)):
+                capabilities.append("network_access")
+            if route == "installer":
+                capabilities.extend(["package_install", "temporary_network"])
+            if bool(getattr(match, "workspace_writable", False)):
+                capabilities.append("managed_write")
+            if bool(getattr(match, "destructive", False)):
+                capabilities.append("destructive_write")
+            return list(dict.fromkeys(capabilities))
         tool_name = str(request.tool_call.get("name") or "")
         if tool_name == "execute" and cls._managed_npx_skills_add(cls._command(request)) is not None:
             return ["execute", "temporary_network"]
@@ -2623,8 +2875,7 @@ class ToolExecutionPipeline(AgentMiddleware):
             if path_value.startswith("/") and not (
                 path_value == "/external-workspace"
                 or path_value.startswith("/external-workspace/")
-                or path_value
-                == "/opt/puddingclaw/bin/validate-html-report-e2e.mjs"
+                or path_value == "/opt/puddingclaw/bin/validate-html-report-e2e.mjs"
             ):
                 return False
         return True
@@ -2660,13 +2911,9 @@ class ToolExecutionPipeline(AgentMiddleware):
         executable = Path(tokens[0]).name.lower()
         args = tokens[1:]
         if executable == "node":
-            return (
-                len(args) >= 2
-                and args[0] == "--check"
-            ) or (
+            return (len(args) >= 2 and args[0] == "--check") or (
                 len(args) == 2
-                and args[0]
-                == "/opt/puddingclaw/bin/validate-html-report-e2e.mjs"
+                and args[0] == "/opt/puddingclaw/bin/validate-html-report-e2e.mjs"
                 and args[1].lower().endswith((".html", ".htm"))
             )
         if executable in {"python", "python3"}:
@@ -2692,10 +2939,7 @@ class ToolExecutionPipeline(AgentMiddleware):
         # those validators.  Expansions, fallback branches, pipes, writes,
         # background jobs, path escapes, and arbitrary helper commands remain
         # outside this deterministic allow path.
-        if any(
-            marker in command
-            for marker in ("$", "`", "\n", "\r", ">", "<", "|", ";")
-        ):
+        if any(marker in command for marker in ("$", "`", "\n", "\r", ">", "<", "|", ";")):
             return False
         if "&" in command.replace("&&", ""):
             return False
@@ -2705,16 +2949,10 @@ class ToolExecutionPipeline(AgentMiddleware):
             return False
         if len(segments) < 2 or "&&" not in command:
             return False
-        argv_segments = [
-            ShellPolicyAnalyzer.unwrap_command(segment)
-            for segment in segments
-        ]
+        argv_segments = [ShellPolicyAnalyzer.unwrap_command(segment) for segment in segments]
         if any(not argv for argv in argv_segments):
             return False
-        if any(
-            not cls._safe_external_argv_paths(argv)
-            for argv in argv_segments
-        ):
+        if any(not cls._safe_external_argv_paths(argv) for argv in argv_segments):
             return False
         validator_count = 0
         for argv in argv_segments:
@@ -2734,8 +2972,7 @@ class ToolExecutionPipeline(AgentMiddleware):
                 if ".." in Path(token).parts:
                     return False
                 if token.startswith("/") and not (
-                    token == "/external-workspace"
-                    or token.startswith("/external-workspace/")
+                    token == "/external-workspace" or token.startswith("/external-workspace/")
                 ):
                     return False
         return validator_count > 0

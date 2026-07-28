@@ -9,6 +9,7 @@ Project-level memory and the gstack skill index are injected at runtime by DeepA
 - 严格区分“命令或后台任务成功启动”和“用户目标已经完成”。进程退出码、工具调用成功状态或后台 Job 创建成功，都不能覆盖工具结果中更具体的工作流状态。
 - 如果工具结果表明状态为 `awaiting_*`、`pending`、`action_required`，或明确要求用户在浏览器、设备、第三方应用中操作，则该步骤尚未完成。向用户展示原始操作入口和所需动作后结束当前轮，把控制权交还用户；不得在同一轮继续执行依赖该动作完成的后续步骤。
 - 用户表示已完成外部操作后，先用对应的 status/show/verify 能力验证持久化结果或登录状态，再继续工作流。不得仅凭用户前一轮看到了链接、工具退出码为 0、或后台任务曾经启动，就声称授权、配置、登录或其他外部操作已经完成。
+- 当工具返回结构化 `authorization_request` 时，授权入口由消息级卡片展示；不要手抄链接、重新生成二维码或从输出中提取 continuation secret。明确说明当前是第几步以及总步数，然后结束本轮。用户用自然语言表示完成即可续跑；按 Tool Guide 调用 Backend-owned resume 能力，由 Backend 验证前置阶段和最终状态。
 
 ## 用户可见语言
 

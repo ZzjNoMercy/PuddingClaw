@@ -18,6 +18,22 @@ _LIVE_SKILL_PLAN_FIELDS = (
     "expires_at",
 )
 
+_LIVE_AUTHORIZATION_FIELDS = (
+    "type",
+    "flow_id",
+    "revision",
+    "attempt",
+    "provider",
+    "profile_id",
+    "status",
+    "phase",
+    "verification_url",
+    "user_code",
+    "qr_ascii",
+    "expires_at",
+    "completion_hint",
+)
+
 
 def project_live_tool_output(
     *,
@@ -39,6 +55,33 @@ def project_live_tool_output(
         value = json.loads(raw_output)
     except (TypeError, ValueError):
         return fallback_output
+    if (
+        isinstance(value, dict)
+        and value.get("managed_by") == "managed_cli"
+        and value.get("status") == "awaiting_user_browser"
+        and isinstance(value.get("authorization_request"), dict)
+        and value["authorization_request"].get("type") == "managed_authorization_request"
+    ):
+        request = value["authorization_request"]
+        projected_request = {
+            key: request[key]
+            for key in _LIVE_AUTHORIZATION_FIELDS
+            if key in request
+        }
+        return json.dumps(
+            {
+                "ok": True,
+                "managed_by": "managed_cli",
+                "event_kind": "managed_authorization_request",
+                "status": "awaiting_user_browser",
+                "authorization_completed": False,
+                "authorization_request": projected_request,
+                "output": value.get("output"),
+                "next_action": value.get("next_action"),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
     if not (
         isinstance(value, dict)
         and value.get("managed_by") == "skill_management"

@@ -128,75 +128,6 @@ function toolDurationMs(toolCall: ToolCall, now: number): number | null {
   return Math.max(0, end - toolCall.startedAt);
 }
 
-function larkAuthorizationDetails(output?: string): { url: string; qr: string } | null {
-  const text = String(output || "");
-  if (!text.includes("Status: awaiting_user_browser")) return null;
-  const url = text.match(/https:\/\/open\.feishu\.cn\/page\/cli\?[^\s]+/)?.[0];
-  if (!url) return null;
-  const qrSection = text.split("使用飞书 / Lark 扫码配置应用：")[1]?.split("或打开以下链接完成配置：")[0] || "";
-  const qr = qrSection
-    .split("\n")
-    .map((line) => line.trimEnd())
-    .filter((line) => /[█▀▄]/.test(line))
-    .join("\n");
-  return { url, qr };
-}
-
-function TerminalQrCode({ value }: { value: string }) {
-  const lines = value.split("\n");
-  const width = Math.max(...lines.map((line) => Array.from(line).length));
-  const height = lines.length * 2;
-  const modules: string[] = [];
-  lines.forEach((line, lineIndex) => {
-    const cells = Array.from(line.padEnd(width, " "));
-    cells.forEach((cell, x) => {
-      // lark-cli prints an inverted half-block QR: terminal ink is the light
-      // module, while spaces are the dark module. Decode both vertical halves
-      // into ordinary square SVG modules so font metrics cannot distort it.
-      const topIsDark = cell === " " || cell === "▄";
-      const bottomIsDark = cell === " " || cell === "▀";
-      if (topIsDark) modules.push(`M${x} ${lineIndex * 2}h1v1h-1z`);
-      if (bottomIsDark) modules.push(`M${x} ${lineIndex * 2 + 1}h1v1h-1z`);
-    });
-  });
-  return (
-    <svg
-      role="img"
-      aria-label="飞书授权二维码"
-      viewBox={`0 0 ${width} ${height}`}
-      className="h-64 w-64 max-w-full rounded-lg bg-white"
-      shapeRendering="crispEdges"
-      preserveAspectRatio="xMidYMid meet"
-    >
-      <rect width={width} height={height} fill="white" />
-      <path d={modules.join("")} fill="black" />
-    </svg>
-  );
-}
-
-function LarkAuthorizationCard({ output }: { output?: string }) {
-  const details = larkAuthorizationDetails(output);
-  if (!details) return null;
-  return (
-    <div className="mt-3 rounded-2xl border border-blue-200 bg-blue-50/70 p-4">
-      <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
-        <KeyRound className="h-4 w-4 text-[#002fa7]" />
-        飞书授权配置
-        <span className="rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-semibold text-[#002fa7]">等待扫码</span>
-      </div>
-      <p className="mt-1 text-xs leading-5 text-slate-600">使用飞书 / Lark 扫描二维码，或打开下方链接。</p>
-      {details.qr ? (
-        <div className="mt-3 flex w-fit max-w-full rounded-xl bg-white p-4">
-          <TerminalQrCode value={details.qr} />
-        </div>
-      ) : null}
-      <a href={details.url} target="_blank" rel="noreferrer" className="mt-3 block break-all text-xs font-medium text-[#002fa7] underline underline-offset-2">
-        {details.url}
-      </a>
-    </div>
-  );
-}
-
 export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
   const [isExpanded, setIsExpanded] = useState(isStreaming);
   const wasStreamingRef = useRef(isStreaming);
@@ -429,7 +360,6 @@ export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
                         )}
                       </div>
                     )}
-                    <LarkAuthorizationCard output={tc.output} />
                   </div>
                 </div>
               );

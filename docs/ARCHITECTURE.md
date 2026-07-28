@@ -4,6 +4,7 @@
 > 适用范围：backend / ingestion-worker / AI Gateway / Milvus / MinerU
 > 目标读者：所有后端开发者、DevOps、想了解调用链的 AI 工程师
 > 用户级 Toolchain、第三方 Credential Profile 与沙箱容器生命周期见 [ADR-004](adr/ADR-004-user-runtime-toolchain-and-credential-profiles.md)。
+> 多阶段外部授权、自然语言续跑与 Provider Adapter 边界见 [ADR-005](adr/ADR-005-managed-external-authorization-flow.md)。
 
 ---
 

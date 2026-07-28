@@ -83,7 +83,3 @@ backend/skills/lark-*/
 .pytest_cache
 notebooks/.env
 notebooks/
-
-# Local-only test suite
-backend/tests/
-

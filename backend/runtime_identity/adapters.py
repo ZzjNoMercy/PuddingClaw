@@ -7,11 +7,13 @@ compound syntax remains outside the managed identity control plane.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import shlex
 from dataclasses import dataclass
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
 
@@ -28,6 +30,79 @@ class ManagedCliAction(StrEnum):
     CREDENTIAL_WRITE = "credential_write"
     PROVIDER_OPERATION = "provider_operation"
     BROWSER_AUTH = "browser_auth"
+    AUTHORIZATION_RESUME = "authorization_resume"
+
+
+@dataclass(frozen=True)
+class CredentialStateSpec:
+    """Adapter-owned provider state injected only into managed runners.
+
+    ``paths`` are normalized paths relative to the runner's HOME. They are the
+    complete allow-list for archive import/export and Vault validation. ``env``
+    contains Backend-owned variables that keep provider-native state inside
+    those roots; an Agent command cannot override them.
+    """
+
+    paths: tuple[str, ...]
+    env: tuple[tuple[str, str], ...] = ()
+    schema_version: int = 1
+
+    @property
+    def fingerprint(self) -> str:
+        payload = {
+            "schema_version": self.schema_version,
+            "paths": list(self.paths),
+            "env": [list(item) for item in self.env],
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def __post_init__(self) -> None:
+        if self.schema_version < 1:
+            raise ValueError("credential state schema version must be positive")
+        if not self.paths:
+            raise ValueError("credential state requires at least one path")
+        normalized_paths: list[str] = []
+        for raw_path in self.paths:
+            value = str(raw_path or "")
+            path = PurePosixPath(value)
+            if (
+                not value
+                or value.startswith("/")
+                or "\\" in value
+                or any(ord(character) < 32 or ord(character) == 127 for character in value)
+                or value != path.as_posix()
+                or path in {PurePosixPath("."), PurePosixPath("")}
+                or any(part in {"", ".", ".."} for part in path.parts)
+                or any(part.startswith("-") for part in path.parts)
+            ):
+                raise ValueError("credential state paths must be normalized HOME-relative paths")
+            normalized_paths.append(value)
+        if len(set(normalized_paths)) != len(normalized_paths):
+            raise ValueError("credential state paths must be unique")
+        for index, path in enumerate(PurePosixPath(item) for item in normalized_paths):
+            for other in (PurePosixPath(item) for item in normalized_paths[index + 1 :]):
+                if path == other or path in other.parents or other in path.parents:
+                    raise ValueError("credential state paths must not overlap")
+        env_names: set[str] = set()
+        reserved_env = {"HOME", "PATH", "NODE_PATH", "NODE_OPTIONS"}
+        for name, value in self.env:
+            if (
+                not re.fullmatch(r"[A-Z][A-Z0-9_]*", name)
+                or name in reserved_env
+                or name.startswith("LD_")
+                or not value
+                or "\x00" in value
+            ):
+                raise ValueError("credential state environment is invalid")
+            if name in env_names:
+                raise ValueError("credential state environment names must be unique")
+            env_names.add(name)
+            if value.startswith("/"):
+                state_prefixes = tuple(f"/home/puddingclaw/{path}" for path in normalized_paths)
+                if not any(value == prefix or value.startswith(f"{prefix}/") for prefix in state_prefixes):
+                    raise ValueError("credential state path environment must stay inside a declared root")
 
 
 @dataclass(frozen=True)
@@ -42,6 +117,10 @@ class ManagedCliMatch:
     requires_network: bool = False
     workspace_writable: bool = False
     distribution: str | None = None
+    destructive: bool = False
+    credential_state: CredentialStateSpec | None = None
+    authorization_phase: str | None = None
+    requested_identity: str | None = None
 
 
 class UnsupportedManagedCliCommand(ValueError):
@@ -56,13 +135,140 @@ _LARK_ALLOWED_ENV = frozenset(
     }
 )
 _LARK_PACKAGE = re.compile(r"^@larksuite/cli(?:@([0-9A-Za-z][0-9A-Za-z.+_-]*))?$")
-_SHELL_CONTROL = re.compile(r"(?:\n|\r|`|\$\(|\$\{|[;&|<>])")
+_DISPLAY_EXIT_DIAGNOSTIC = re.compile(
+    # Agents habitually append a display-only fallback such as
+    # `2>&1 || echo "EXIT:$?"` (with arbitrary echo wording).  The managed
+    # runner already captures stderr and the real exit code, so the suffix
+    # carries no information; strip it wholesale.  The stripped text never
+    # reaches argv, and the remainder must still pass _shell_surface_error.
+    r"(?:\s+2\s*>\s*&\s*1)?\s*\|\|\s*echo\s+(?:\"[^\"]*\"|'[^']*'|\S+)\s*$"
+)
+_DISPLAY_REDIRECT = re.compile(r"\s+2\s*>\s*&\s*1\s*$")
+_DESTRUCTIVE_LARK_TERMS = frozenset(
+    {
+        "clear",
+        "delete",
+        "destroy",
+        "purge",
+        "trash",
+    }
+)
+_LARK_CREDENTIAL_STATE = CredentialStateSpec(
+    # Lark's Linux keychain normally falls back to
+    # ~/.local/share/lark-cli. Redirect new writes into .lark-cli so the
+    # provider's native state has one canonical root, while retaining the
+    # legacy path as an exact Adapter allow-list entry for compatibility.
+    paths=(".lark-cli", ".local/share/lark-cli"),
+    env=(("LARKSUITE_CLI_DATA_DIR", "/home/puddingclaw/.lark-cli/.credential-data"),),
+)
+
+
+def is_lark_destructive_argv(argv: tuple[str, ...] | list[str]) -> bool:
+    """Conservatively identify deletion/revocation semantics in Lark argv.
+
+    Personal autonomy deliberately allows every non-delete provider action.
+    False positives only add a confirmation; false negatives are additionally
+    caught from lark-cli's structured exit-10 action before ``--yes`` retry.
+    """
+
+    values = [str(item).lower() for item in argv[1:]]
+    if values[:2] in (["config", "remove"], ["auth", "logout"]):
+        return True
+    for value in values:
+        if value.startswith("--method=") and value.partition("=")[2] == "delete":
+            return True
+        if value == "--method":
+            continue
+        normalized = value.lstrip("+")
+        terms = {part for part in re.split(r"[.:/_-]+", normalized) if part}
+        if terms & _DESTRUCTIVE_LARK_TERMS:
+            return True
+    for index, value in enumerate(values[:-1]):
+        if value == "--method" and values[index + 1] == "delete":
+            return True
+    return False
+
+
+def _shell_surface_error(value: str) -> str | None:
+    """Explain why raw text is not provably standalone argv, or return None.
+
+    The managed runner executes argv via ``docker exec`` with no shell
+    involved, so characters that are only dangerous under shell re-parsing
+    (newlines, ``;``, ``|``, backticks, ``$( )`` inside quotes) are inert
+    payload text and must round-trip byte-for-byte — Markdown messages
+    legitimately contain backticks and ``$VAR`` fragments.  Only shell
+    syntax OUTSIDE quotes is rejected: that is the only place it could
+    chain commands.  This module's invariant is that normalized argv never
+    reaches a shell; do not re-parse it with one downstream.
+    """
+
+    state = "outside"  # outside | single | double
+    index = 0
+    length = len(value)
+    while index < length:
+        char = value[index]
+        nxt = value[index + 1] if index + 1 < length else ""
+        if state == "outside":
+            if char == "\\":
+                index += 2  # escaped character is literal in argv too
+                continue
+            if char == "'":
+                state = "single"
+            elif char == '"':
+                state = "double"
+            elif char == "$" and nxt == "'":
+                return (
+                    "ANSI-C quoting $'...' is not supported in managed commands "
+                    "(it corrupts payload fidelity); use plain double quotes"
+                )
+            elif char in "\n\r;&|<>":
+                name = {"\n": "a newline", "\r": "a carriage return"}.get(char, repr(char))
+                if char in "<>":
+                    advice = (
+                        "redirection is not supported in managed commands; "
+                        "stdout and stderr are captured automatically, so drop "
+                        "the redirect and run the bare command"
+                    )
+                else:
+                    advice = (
+                        "run exactly one command per call — chaining, pipes, and "
+                        "echo separators are not supported; issue separate tool "
+                        "calls and keep payload text inside quotes"
+                    )
+                return (
+                    f"command contains {name} outside quotes, which would chain "
+                    f"commands under a shell; {advice}"
+                )
+            elif char == "`" or (char == "$" and nxt in "({"):
+                return "command substitution is not allowed in managed commands"
+        elif state == "single":
+            if char == "'":
+                state = "outside"
+        else:  # double — inert payload until the closing quote
+            if char == "\\":
+                index += 2
+                continue
+            if char == '"':
+                state = "outside"
+        index += 1
+    if state != "outside":
+        return "unterminated quote in command"
+    return None
 
 
 def _standalone_argv(command: str) -> tuple[list[str], dict[str, str]] | None:
     value = str(command or "").strip()
-    value = re.sub(r"\s+2\s*>\s*&\s*1\s*$", "", value)
-    if not value or _SHELL_CONTROL.search(value):
+    # Common Agent diagnostic plumbing (`... || echo "<wording>"`). The
+    # managed runner already captures stderr and the real exit code, so
+    # executing this shell fallback would add no information and would
+    # incorrectly turn failures into shell success.  Strip the suffix;
+    # arbitrary ``||`` commands with anything but a bare echo stay denied.
+    value = _DISPLAY_EXIT_DIAGNOSTIC.sub("", value)
+    # Trailing 2>&1 is display plumbing, not payload.  A match can only sit at
+    # the absolute end of the string, which is necessarily outside quotes
+    # (a quoted payload would end with its closing quote instead).
+    value = _DISPLAY_REDIRECT.sub("", value)
+    if not value or _shell_surface_error(value) is not None:
         return None
     try:
         tokens = shlex.split(value, posix=True)
@@ -126,8 +332,7 @@ def _claims_unregistered_toolchain_mutation(tokens: list[str]) -> bool:
     lowered = [item.lower() for item in tokens[1:]]
     if executable in {"npm", "pnpm", "yarn"}:
         return any(item in {"-g", "--global"} for item in lowered) and any(
-            item in {"install", "add", "i", "remove", "uninstall", "update", "upgrade"}
-            for item in lowered
+            item in {"install", "add", "i", "remove", "uninstall", "update", "upgrade"} for item in lowered
         )
     if executable == "pipx":
         return bool(lowered and lowered[0] in {"install", "uninstall", "upgrade", "upgrade-all"})
@@ -147,20 +352,33 @@ def _lark_command(tokens: list[str], env: dict[str, str]) -> ManagedCliMatch | N
         raise UnsupportedManagedCliCommand("managed lark-cli environment flags must use a fixed enabled value")
     argv = tuple(["lark-cli", *tokens[1:]])
     lowered = [item.lower() for item in tokens[1:]]
+    requested_identity: str | None = None
+    for index, item in enumerate(lowered):
+        if item == "--as" and index + 1 < len(lowered):
+            requested_identity = lowered[index + 1]
+        elif item.startswith("--as="):
+            requested_identity = item.partition("=")[2]
+    if requested_identity not in {None, "bot", "user", "auto"}:
+        raise UnsupportedManagedCliCommand("managed lark-cli --as must be bot, user, or auto")
     if any(item == "--profile" or item.startswith("--profile=") for item in lowered):
         raise UnsupportedManagedCliCommand(
             "lark-cli --profile is controlled by PuddingClaw Credential Profile selection"
         )
-    if "--yes" in lowered or "-y" in lowered:
+    if any(item in {"--yes", "-y"} or item.startswith("--yes=") or item.startswith("-y=") for item in lowered):
         raise UnsupportedManagedCliCommand(
             "lark-cli confirmation flags are added only by the managed high-risk action flow"
         )
-    if not lowered or any(item in {"-h", "--help"} for item in lowered) or lowered[0] in {
-        "help",
-        "version",
-        "--version",
-        "schema",
-    }:
+    if (
+        not lowered
+        or any(item in {"-h", "--help"} for item in lowered)
+        or lowered[0]
+        in {
+            "help",
+            "version",
+            "--version",
+            "schema",
+        }
+    ):
         return ManagedCliMatch(
             adapter_id="lark-cli",
             action=ManagedCliAction.LOCAL_INSPECTION,
@@ -169,9 +387,7 @@ def _lark_command(tokens: list[str], env: dict[str, str]) -> ManagedCliMatch | N
             env=tuple(sorted(env.items())),
         )
     if lowered[:2] == ["config", "init"] and lowered != ["config", "init", "--new"]:
-        raise UnsupportedManagedCliCommand(
-            "managed lark-cli config init requires the exact --new form"
-        )
+        raise UnsupportedManagedCliCommand("managed lark-cli config init requires the exact --new form")
     if lowered == ["config", "init", "--new"]:
         return ManagedCliMatch(
             adapter_id="lark-cli",
@@ -182,6 +398,8 @@ def _lark_command(tokens: list[str], env: dict[str, str]) -> ManagedCliMatch | N
             provider="lark",
             requires_profile=True,
             requires_network=True,
+            credential_state=_LARK_CREDENTIAL_STATE,
+            authorization_phase="app_configuration",
         )
     if lowered[:2] == ["auth", "qrcode"]:
         if len(tokens) < 4:
@@ -226,21 +444,9 @@ def _lark_command(tokens: list[str], env: dict[str, str]) -> ManagedCliMatch | N
             workspace_writable=bool(output_paths),
         )
     if lowered[:2] == ["auth", "login"]:
-        if "--device-code" in lowered:
-            device_index = lowered.index("--device-code")
-            if device_index + 1 >= len(lowered) or device_index + 2 != len(lowered):
-                raise UnsupportedManagedCliCommand(
-                    "managed lark-cli device-code completion requires exactly one device code"
-                )
-            return ManagedCliMatch(
-                adapter_id="lark-cli",
-                action=ManagedCliAction.CREDENTIAL_WRITE,
-                route=ManagedCliRoute.PROVIDER,
-                argv=argv,
-                env=tuple(sorted(env.items())),
-                provider="lark",
-                requires_profile=True,
-                requires_network=True,
+        if any(item == "--device-code" or item.startswith("--device-code=") for item in lowered):
+            raise UnsupportedManagedCliCommand(
+                "device-code continuation is Backend-owned; use `lark-cli auth resume` after the user confirms"
             )
         if "--no-wait" not in lowered or "--json" not in lowered:
             raise UnsupportedManagedCliCommand(
@@ -255,21 +461,32 @@ def _lark_command(tokens: list[str], env: dict[str, str]) -> ManagedCliMatch | N
             provider="lark",
             requires_profile=True,
             requires_network=True,
+            credential_state=_LARK_CREDENTIAL_STATE,
+            authorization_phase="user_consent",
+        )
+    if lowered == ["auth", "resume"]:
+        return ManagedCliMatch(
+            adapter_id="lark-cli",
+            action=ManagedCliAction.AUTHORIZATION_RESUME,
+            route=ManagedCliRoute.PROVIDER,
+            argv=argv,
+            env=tuple(sorted(env.items())),
+            provider="lark",
+            requires_profile=True,
+            requires_network=True,
+            credential_state=_LARK_CREDENTIAL_STATE,
+            authorization_phase="user_consent",
         )
     if lowered[:2] in (["config", "remove"], ["auth", "logout"]):
         action = ManagedCliAction.CREDENTIAL_WRITE
     elif lowered[:2] in (["config", "show"], ["auth", "status"]):
         action = ManagedCliAction.CREDENTIAL_READ
     elif lowered[:1] == ["update"]:
-        raise UnsupportedManagedCliCommand(
-            "lark-cli update must be performed through the managed installer"
-        )
+        raise UnsupportedManagedCliCommand("lark-cli update must be performed through the managed installer")
     else:
         action = ManagedCliAction.PROVIDER_OPERATION
     workspace_writable = any(
-        item in {"download", "export", "save", "output"}
-        or item.startswith(("--output=", "--out="))
-        for item in lowered
+        item in {"download", "export", "save", "output"} or item.startswith(("--output=", "--out=")) for item in lowered
     )
     return ManagedCliMatch(
         adapter_id="lark-cli",
@@ -281,6 +498,9 @@ def _lark_command(tokens: list[str], env: dict[str, str]) -> ManagedCliMatch | N
         requires_profile=True,
         requires_network=True,
         workspace_writable=workspace_writable,
+        destructive=is_lark_destructive_argv(argv),
+        credential_state=_LARK_CREDENTIAL_STATE,
+        requested_identity=requested_identity or "auto",
     )
 
 
@@ -296,8 +516,15 @@ class ManagedCliRegistry:
         parsed = _standalone_argv(command)
         if parsed is None:
             if self.claims(command):
+                surface = str(command or "").strip()
+                normalized_surface = _DISPLAY_REDIRECT.sub(
+                    "",
+                    _DISPLAY_EXIT_DIAGNOSTIC.sub("", surface),
+                )
+                reason = _shell_surface_error(normalized_surface)
                 raise UnsupportedManagedCliCommand(
-                    "managed lark-cli commands must be standalone argv without pipes, redirects, or shell composition"
+                    reason
+                    or "managed lark-cli commands must be standalone argv without pipes, redirects, or shell composition"
                 )
             return None
         tokens, env = parsed
@@ -319,3 +546,15 @@ class ManagedCliRegistry:
 
     def claims(self, command: str) -> bool:
         return bool(self._CLAIMED.search(str(command or "")))
+
+    @staticmethod
+    def credential_state_for_provider(provider: str) -> CredentialStateSpec:
+        if provider == "lark":
+            return _LARK_CREDENTIAL_STATE
+        raise ValueError("provider has no managed credential state contract")
+
+    @staticmethod
+    def credential_state_specs() -> tuple[CredentialStateSpec, ...]:
+        """Return every trusted state contract used to mask ordinary sandboxes."""
+
+        return (_LARK_CREDENTIAL_STATE,)

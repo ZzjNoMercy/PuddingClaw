@@ -2,10 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 // @ts-expect-error Node's native TypeScript runner requires the source suffix.
-import {
-  settleRunningVerificationActivities,
-  verificationFailureActivity,
-} from "./verificationActivity.ts";
+import { settleRunningVerificationActivities, verificationFailureActivity } from "./verificationActivity.ts";
 
 test("terminal verification settles every older repair spinner", () => {
   const settled = settleRunningVerificationActivities(

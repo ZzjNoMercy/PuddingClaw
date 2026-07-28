@@ -8,8 +8,10 @@ import { denyPermissionRequest, grantExternalFilePermission, grantToolActionPerm
 import { markdownRemarkPlugins, markdownUrlTransform } from "@/lib/markdown";
 import { useApp, type ChatMessage as ChatMessageType, type SourceRecord, type TimelineItem } from "@/lib/store";
 import { isPreviewableImageAttachment, isQrImageAttachment } from "@/lib/imageAttachments";
+import { splitTimelineAtManagedAuthorizations } from "@/lib/managedAuthorization";
 import ThoughtChain, { SkillPlanCards } from "./ThoughtChain";
 import RetrievalCard from "./RetrievalCard";
+import ManagedAuthorizationCards from "./ManagedAuthorizationCard";
 
 interface Props {
   message: ChatMessageType;
@@ -181,7 +183,10 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
                     const hasTools = message.timeline?.some((item) => item.type === "tool") ?? false;
 
                     const thoughtChain = message.timeline && message.timeline.length > 0 ? (
-                      <ThoughtChain timeline={message.timeline} isStreaming={isStreaming} />
+                      <TimelineWithManagedAuthorization
+                        timeline={message.timeline}
+                        isStreaming={isStreaming}
+                      />
                       ) : message.reasoning ? (
                       <ReasoningBlock
                           content={message.reasoning}
@@ -1398,7 +1403,10 @@ function SegmentBlock({
 
   const thoughtChain =
     segment.timeline && segment.timeline.length > 0 ? (
-      <ThoughtChain timeline={segment.timeline} isStreaming={isStreaming && isLast} />
+      <TimelineWithManagedAuthorization
+        timeline={segment.timeline}
+        isStreaming={isStreaming && isLast}
+      />
     ) : segment.reasoning ? (
       <ReasoningBlock
         content={segment.reasoning}
@@ -1430,6 +1438,33 @@ function SegmentBlock({
       {contentBlock}
       {hasTools && thoughtChain}
       <SkillPlanCards timeline={segment.timeline || []} sessionId={sessionId} />
+    </div>
+  );
+}
+
+function TimelineWithManagedAuthorization({
+  timeline,
+  isStreaming,
+}: {
+  timeline: TimelineItem[];
+  isStreaming?: boolean;
+}) {
+  const slices = splitTimelineAtManagedAuthorizations(timeline);
+  return (
+    <div className="space-y-2">
+      {slices.map((slice, index) => (
+        <div key={`${slice.timeline[0]?.id || "timeline"}-${index}`} className="space-y-2">
+          {slice.timeline.length > 0 ? (
+            <ThoughtChain
+              timeline={slice.timeline}
+              isStreaming={Boolean(isStreaming && index === slices.length - 1)}
+            />
+          ) : null}
+          {slice.authorization ? (
+            <ManagedAuthorizationCards timeline={[slice.authorization]} />
+          ) : null}
+        </div>
+      ))}
     </div>
   );
 }

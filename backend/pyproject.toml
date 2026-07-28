@@ -165,6 +165,13 @@ extra-index-url = [
     "https://download.pytorch.org/whl/cpu",
 ]
 
+[tool.pytest.ini_options]
+# Runtime Skill sources and managed Skill snapshots may contain their own
+# upstream tests with duplicate module names and independent dependencies.
+# The backend's authoritative suite lives under tests/; Skill tests are run by
+# their own adapters, not by an unscoped backend pytest invocation.
+testpaths = ["tests"]
+
 [tool.ruff]
 line-length = 120
 target-version = "py310"

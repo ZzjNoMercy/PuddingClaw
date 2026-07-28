@@ -157,13 +157,7 @@ echo -e "${BLUE}[信息] 启动后端服务...${NC}"
 cd backend
 UV_CACHE_DIR="${UV_CACHE_DIR:-/private/tmp/puddingclaw-uv-cache}" uv run --all-extras --group dev --group deepagents-test \
     python -m uvicorn app:app --host "$BACKEND_HOST" --port "$BACKEND_PORT" --reload \
-    --reload-dir api \
-    --reload-dir graph \
-    --reload-dir harness \
-    --reload-dir projects \
-    --reload-dir services \
-    --reload-dir tools \
-    --reload-dir analytics \
+    --reload-dir . \
     --reload-include "*.py" \
     --log-level info \
     --log-config ../logging.yaml &
