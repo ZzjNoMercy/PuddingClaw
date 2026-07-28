@@ -18,6 +18,7 @@ import yaml
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from analytics.models import AnalyticsModelError, get_analytics_model_registry
+from analytics.models.registry import canonical_model_resource_path
 from analytics.nl2sql import guardrail_runtime
 from analytics.nl2sql.guardrails import list_guardrail_rules
 from analytics.semantic_assets import SemanticAssetError, get_semantic_asset_registry
@@ -145,13 +146,16 @@ class AnalysisProjectExporter:
                 self.semantic_assets.get_asset(asset_id)
             except (SemanticAssetError, ValueError):
                 missing.append(f"semantic_asset:{asset_id}")
-        self._validate_dependency_closure(
-            model=model,
-            semantic_ids=semantic_ids,
-            relation_ids=relation_ids,
-            missing=missing,
-            warnings=warnings,
-        )
+        try:
+            self._validate_dependency_closure(
+                model=model,
+                semantic_ids=semantic_ids,
+                relation_ids=relation_ids,
+                missing=missing,
+                warnings=warnings,
+            )
+        except AnalyticsModelError as exc:
+            raise AnalysisProjectExportError(str(exc)) from exc
 
         guardrails = {str(item.get("id") or ""): item for item in list_guardrail_rules().get("guardrails") or []}
         for guardrail_id in guardrail_ids:
@@ -456,22 +460,38 @@ class AnalysisProjectExporter:
         templates = model.get("templates") if isinstance(model.get("templates"), dict) else {}
         declared_templates: dict[str, str] = {}
         declared_template_guides: dict[str, str] = {}
+        declared_template_assets: dict[str, list[str]] = {}
         for template_id, definition in templates.items():
             if isinstance(definition, str):
-                declared_templates[str(template_id)] = definition
+                declared_templates[str(template_id)] = canonical_model_resource_path(
+                    definition, root="templates"
+                )
             elif isinstance(definition, dict) and str(definition.get("path") or "").strip():
-                declared_templates[str(template_id)] = str(definition["path"])
+                declared_templates[str(template_id)] = canonical_model_resource_path(
+                    definition["path"], root="templates"
+                )
                 guide_path = str(definition.get("guide") or "").strip()
                 if guide_path:
-                    declared_template_guides[str(template_id)] = guide_path
+                    declared_template_guides[str(template_id)] = canonical_model_resource_path(
+                        guide_path, root="templates"
+                    )
+                raw_assets = definition.get("assets") or []
+                if not isinstance(raw_assets, list):
+                    raise AnalyticsModelError(f"Template {template_id} assets must be a list")
+                declared_template_assets[str(template_id)] = [
+                    canonical_model_resource_path(asset_path, root="templates")
+                    for asset_path in raw_assets
+                ]
         for template_id, template_path in declared_templates.items():
-            candidates = {template_path, f"templates/{template_path}"}
-            if not candidates.intersection(model_files):
+            if template_path not in model_files:
                 missing.append(f"template:{template_id}:{template_path}")
         for template_id, guide_path in declared_template_guides.items():
-            candidates = {guide_path, f"templates/{guide_path}"}
-            if not candidates.intersection(model_files):
+            if guide_path not in model_files:
                 missing.append(f"template_guide:{template_id}:{guide_path}")
+        for template_id, asset_paths in declared_template_assets.items():
+            for asset_path in asset_paths:
+                if asset_path not in model_files:
+                    missing.append(f"template_asset:{template_id}:{asset_path}")
 
         references = (model.get("frontmatter") or {}).get("references")
         if isinstance(references, dict):
@@ -481,13 +501,15 @@ class AnalysisProjectExporter:
                     if isinstance(definition, dict)
                     else str(definition or "").strip()
                 )
-                if reference_path and reference_path not in model_files:
-                    missing.append(f"reference:{reference_id}:{reference_path}")
+                if reference_path:
+                    canonical_reference = canonical_model_resource_path(reference_path, root="references")
+                    if canonical_reference not in model_files:
+                        missing.append(f"reference:{reference_id}:{canonical_reference}")
         default_template = str(model.get("default_template") or "").strip()
         if default_template:
             default_path = declared_templates.get(default_template, default_template)
-            candidates = {default_path, f"templates/{default_path}"}
-            if not candidates.intersection(model_files):
+            canonical_default = canonical_model_resource_path(default_path, root="templates")
+            if canonical_default not in model_files:
                 missing.append(f"default_template:{default_template}")
 
     async def export(
@@ -587,6 +609,33 @@ class AnalysisProjectExporter:
     ) -> None:
         """Perform compression and file hashing off the async request loop."""
 
+        project_manifest_content = entries.get("analysis-project.yaml")
+        project_manifest = (
+            yaml.safe_load(project_manifest_content.decode("utf-8"))
+            if isinstance(project_manifest_content, bytes)
+            else {}
+        )
+        resource_paths: list[str] = []
+        if isinstance(project_manifest, dict):
+            for key in ("entry_model", "bindings"):
+                value = str(project_manifest.get(key) or "").strip()
+                if value:
+                    resource_paths.append(value)
+            for definition in (project_manifest.get("references") or {}).values():
+                if isinstance(definition, dict) and str(definition.get("path") or "").strip():
+                    resource_paths.append(str(definition["path"]).strip())
+            for definition in (project_manifest.get("templates") or {}).values():
+                if not isinstance(definition, dict):
+                    continue
+                for key in ("path", "guide"):
+                    value = str(definition.get(key) or "").strip()
+                    if value:
+                        resource_paths.append(value)
+                for value in definition.get("assets") or []:
+                    value = str(value or "").strip()
+                    if value:
+                        resource_paths.append(value)
+
         with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
             checksums: dict[str, str] = {}
             for relative_path, content in sorted(entries.items()):
@@ -605,6 +654,7 @@ class AnalysisProjectExporter:
                     "files": checksums,
                     "mutable_files": list(MUTABLE_PROJECT_FILES),
                     "copied_data_paths": copied_paths,
+                    "project_resource_paths": list(dict.fromkeys(resource_paths)),
                     "binding_contract": {
                         binding_id: {
                             key: value
@@ -1013,7 +1063,8 @@ class AnalysisProjectExporter:
                     item = {}
                 if not reference_path:
                     continue
-                item["path"] = f"./model/{reference_path.removeprefix('./')}"
+                canonical_reference = canonical_model_resource_path(reference_path, root="references")
+                item["path"] = f"./model/{canonical_reference}"
                 project_references[str(reference_id)] = item
 
         project_templates: dict[str, dict[str, Any]] = {}
@@ -1027,16 +1078,25 @@ class AnalysisProjectExporter:
                 item = {
                     key: value
                     for key, value in definition.items()
-                    if key not in {"path", "guide"}
+                    if key not in {"path", "guide", "assets"}
                 }
                 guide_path = str(definition.get("guide") or "").strip()
                 if guide_path:
-                    item["guide"] = f"./templates/{guide_path.removeprefix('./')}"
+                    canonical_guide = canonical_model_resource_path(guide_path, root="templates")
+                    item["guide"] = f"./{canonical_guide}"
+                raw_assets = definition.get("assets") or []
+                if not isinstance(raw_assets, list):
+                    raise AnalysisProjectExportError(f"Template {template_id} assets must be a list")
+                item["assets"] = [
+                    f"./{canonical_model_resource_path(asset_path, root='templates')}"
+                    for asset_path in raw_assets
+                ]
             else:
                 continue
             if not template_path:
                 continue
-            item["path"] = f"./templates/{template_path.removeprefix('./')}"
+            canonical_template = canonical_model_resource_path(template_path, root="templates")
+            item["path"] = f"./{canonical_template}"
             project_templates[str(template_id)] = item
         return {
             "format": EXPORT_FORMAT,
@@ -1138,7 +1198,7 @@ PuddingClaw asset IDs are provenance only. External execution must use the proje
 
     @staticmethod
     def _project_validator() -> str:
-        return """#!/usr/bin/env python3
+        return r"""#!/usr/bin/env python3
 from __future__ import annotations
 
 import hashlib
@@ -1156,8 +1216,25 @@ def sha256(path):
             digest.update(chunk)
     return digest.hexdigest()
 
+def project_path(raw_path):
+    value = str(raw_path or "").strip()
+    normalized = value[2:] if value.startswith("./") else value
+    candidate = Path(normalized)
+    if "\x00" in value or "\\" in value or not normalized or candidate.is_absolute() or ".." in candidate.parts:
+        failures.append({"path": value, "reason": "unsafe_project_resource_path"})
+        return None
+    try:
+        resolved = (ROOT / candidate).resolve()
+        resolved.relative_to(ROOT.resolve())
+    except (OSError, RuntimeError, ValueError):
+        failures.append({"path": value, "reason": "project_resource_path_escape"})
+        return None
+    return resolved
+
 for relative_path, expected in (manifest.get("files") or {}).items():
-    path = ROOT / relative_path
+    path = project_path(relative_path)
+    if path is None:
+        continue
     if not path.is_file():
         failures.append({"path": relative_path, "reason": "missing"})
         continue
@@ -1165,8 +1242,14 @@ for relative_path, expected in (manifest.get("files") or {}).items():
     if actual != expected:
         failures.append({"path": relative_path, "reason": "hash_mismatch", "expected": expected, "actual": actual})
 for relative_path in manifest.get("mutable_files") or []:
-    if not (ROOT / relative_path).is_file():
+    path = project_path(relative_path)
+    if path is not None and not path.is_file():
         failures.append({"path": relative_path, "reason": "missing_mutable_file"})
+
+for relative_path in manifest.get("project_resource_paths") or []:
+    path = project_path(relative_path)
+    if path is not None and not path.is_file():
+        failures.append({"path": relative_path, "reason": "project_resource_missing"})
 
 bindings_path = ROOT / "bindings.local.yaml"
 try:

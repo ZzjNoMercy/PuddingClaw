@@ -183,6 +183,22 @@ async def test_export_copy_mode_builds_self_contained_project(tmp_path: Path, mo
         )
         assert validation.returncode == 0, validation.stdout + validation.stderr
 
+        package_manifest_path = project_root / "package-manifest.json"
+        package_manifest = json.loads(package_manifest_path.read_text(encoding="utf-8"))
+        package_manifest["files"]["../outside.txt"] = "0" * 64
+        package_manifest_path.write_text(json.dumps(package_manifest), encoding="utf-8")
+        unsafe_manifest_validation = subprocess.run(
+            [sys.executable, "tests/validate_project.py"],
+            cwd=project_root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert unsafe_manifest_validation.returncode == 1
+        assert "unsafe_project_resource_path" in unsafe_manifest_validation.stdout
+        package_manifest["files"].pop("../outside.txt")
+        package_manifest_path.write_text(json.dumps(package_manifest), encoding="utf-8")
+
         # Mutable bindings may be edited, but required bindings cannot disappear.
         (project_root / "bindings.local.yaml").write_text("bindings: {}\n", encoding="utf-8")
         rebound_validation = subprocess.run(
@@ -306,7 +322,15 @@ async def test_export_fails_closed_when_required_asset_is_missing(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_export_plan_refreshes_model_registry_after_external_template_rename(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "resource_prefix",
+    ["", "templates/"],
+)
+async def test_export_plan_refreshes_model_registry_after_external_template_rename(
+    tmp_path: Path,
+    monkeypatch,
+    resource_prefix: str,
+) -> None:
     _write_model_tree(tmp_path)
     asset = _table_asset(tmp_path)
     monkeypatch.setattr("analytics.project_export.service.list_guardrail_rules", _guardrails)
@@ -320,16 +344,41 @@ async def test_export_plan_refreshes_model_registry_after_external_template_rena
     model_path = model_dir / "model.md"
     updated_model = model_path.read_text(encoding="utf-8").replace(
         "templates: {}\ndefault_template: report.md",
-        "templates:\n  monthly_report:\n    path: monthly_report.html\ndefault_template: monthly_report",
+        "templates:\n  monthly_report:\n"
+        f"    path: {resource_prefix}monthly_report.html\n"
+        f"    guide: {resource_prefix}TEMPLATE.md\n"
+        "    assets:\n"
+        f"      - {resource_prefix}renderer.js\n"
+        "default_template: monthly_report",
     )
     model_path.write_text(updated_model, encoding="utf-8")
     (model_dir / "templates" / "report.md").rename(model_dir / "templates" / "monthly_report.html")
+    (model_dir / "templates" / "TEMPLATE.md").write_text("# Guide\n", encoding="utf-8")
+    (model_dir / "templates" / "renderer.js").write_text("window.render = () => {};\n", encoding="utf-8")
 
     refreshed_plan = await exporter.build_plan(session, model_id="sales-analysis", data_file_mode="copy")
 
     assert refreshed_plan.ready
     assert refreshed_plan.missing_dependencies == []
     assert refreshed_plan.plan_id != initial_plan.plan_id
+
+    artifact = await exporter.export(session, model_id="sales-analysis", data_file_mode="copy")
+    try:
+        with zipfile.ZipFile(artifact.path) as archive:
+            manifest = yaml.safe_load(archive.read("sales-analysis/analysis-project.yaml"))
+            assert manifest["templates"]["monthly_report"]["path"] == "./templates/monthly_report.html"
+            assert manifest["templates"]["monthly_report"]["guide"] == "./templates/TEMPLATE.md"
+            assert manifest["templates"]["monthly_report"]["assets"] == ["./templates/renderer.js"]
+            package_manifest = json.loads(archive.read("sales-analysis/package-manifest.json"))
+            assert "./templates/monthly_report.html" in package_manifest["project_resource_paths"]
+            assert "./templates/TEMPLATE.md" in package_manifest["project_resource_paths"]
+            assert "./templates/renderer.js" in package_manifest["project_resource_paths"]
+            assert "sales-analysis/templates/renderer.js" in archive.namelist()
+            assert "templates/templates" not in archive.read(
+                "sales-analysis/analysis-project.yaml"
+            ).decode("utf-8")
+    finally:
+        artifact.path.unlink(missing_ok=True)
 
 
 @pytest.mark.asyncio

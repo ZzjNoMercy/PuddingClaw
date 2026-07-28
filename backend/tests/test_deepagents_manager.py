@@ -2276,6 +2276,61 @@ def test_semantic_asset_middleware_owns_model_frontmatter_index(tmp_path):
     assert inherited_goal["allowed_semantic_asset_ids"] == [measure["id"]]
 
 
+def test_analytics_model_prompt_exposes_server_resolved_active_template() -> None:
+    from graph.deepagents_manager import DeepAgentsAgentManager
+
+    base_dir = Path(__file__).resolve().parents[1]
+    manager = DeepAgentsAgentManager()
+    manager.initialize(base_dir)
+
+    prompt, payload = manager._analytics_model_context(
+        "产品配置分析",
+        query="刷新2026年6月月报",
+    )
+
+    assert payload is not None
+    assert payload["template_route"] == {
+        "status": "matched",
+        "template_id": "monthly_product_config_report",
+    }
+    assert payload["active_template"]["guide_virtual_path"].endswith(
+        "/templates/monthly_product_config_report/TEMPLATE.md"
+    )
+    assert "/analytics-models/产品配置分析/templates/monthly_product_config_report/index.html" in prompt
+    assert "不得从原始 metadata 手工拼接" in prompt
+
+
+def test_run_scope_middleware_initializes_private_template_scope_for_subagents() -> None:
+    from graph.deepagents_manager import RunScopeMiddleware
+
+    active_template = {
+        "model_id": "产品配置分析",
+        "template_id": "monthly_product_config_report",
+        "semantic_scope": {},
+    }
+    middleware = RunScopeMiddleware()
+    parent_update = middleware.before_agent(
+        {},
+        SimpleNamespace(
+            context={
+                "query_id": "query-1",
+                "run_objective": "刷新月报",
+                "active_analysis_template": active_template,
+            }
+        ),
+    )
+
+    assert parent_update == {
+        "_run_query_id": "query-1",
+        "_run_objective": "刷新月报",
+        "_active_analysis_template": active_template,
+    }
+    child_state = dict(parent_update)
+    assert middleware.before_agent(child_state, SimpleNamespace(context=None)) is None
+    assert child_state["_run_objective"] == "刷新月报"
+    assert child_state["_active_analysis_template"] == active_template
+
+
 def test_runtime_inventory_lists_subagents_for_mount_panel(tmp_path, monkeypatch):
     """SubAgents inventory should expose default and configured delegates."""
 

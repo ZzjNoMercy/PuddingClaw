@@ -415,139 +415,184 @@ legacy_detected → credentials_prepared → registry_committed
 
 #### 设置页界面设计
 
-当前设置侧栏中的“AI 网关”改名为**模型服务**。这里管理的是 Provider 直连配置，不再出现 Higress、Gateway Console、网关健康检查或“Fallback 直连配置”等概念。
+当前设置侧栏中的“AI 网关”改为两个相邻入口：**模型服务**和**默认模型**。这里管理的是 Provider 直连配置，不再出现 Higress、Gateway Console、网关健康检查或“Fallback 直连配置”等概念。
 
-页面沿用 PuddingData 现有设置页的左侧分类导航、白色卡片、钴蓝主色和紧凑桌面布局。信息层级采用“默认用途在前，基础设施在后”：普通用户先完成模型选择，高级用户再进入 Provider 细节。
+页面参考用户提供界面的三栏信息架构，同时沿用 PuddingData 现有浅色、白色卡片、钴蓝主色和紧凑桌面密度，不照搬参考图的深色视觉。
+
+##### A. 设置内信息架构
 
 ```text
-设置 / 模型服务                                      [刷新状态]
-管理模型来源、凭证和默认用途。凭证仅保存在本机。
-
-┌ 默认模型 ────────────────────────────────────────────┐
-│ 主对话模型          文本向量模型       多模态向量模型  │
-│ Qwen Plus           text-embedding-v4  mm-embedding-v1 │
-│ DashScope · 正常    1024 维 · 正常     图/文 · 正常    │
-│ [更换]              [更换]             [更换]          │
-└──────────────────────────────────────────────────────┘
-
-模型供应商                         [搜索供应商] [新增供应商]
-┌ DashScope ───────────────────────────────────────────┐
-│ 已启用 · 凭证已配置     3 个端点 · 8 个模型            │
-│ Chat · Text Embedding · Multimodal Embedding          │
-│ 默认用途：主对话 / 文本向量 / 多模态向量              │
-│                              [测试] [管理模型与端点]    │
-└──────────────────────────────────────────────────────┘
+设置导航              Provider 列表              Provider 详情
+────────────          ────────────────           ─────────────────────
+模型服务              搜索 Provider              DashScope       [启用]
+默认模型              ┌ DashScope · 正常 ┐       凭证 / Endpoint / 模型
+────────────          │ 8 个模型         │       API Key        [测试]
+常规设置              └──────────────────┘       Chat Endpoint
+数据设置              ┌ DeepSeek · 正常  ┐       Embedding Endpoint
+知识库                └──────────────────┘       模型 (8) [获取列表] [+]
+Harness               [+ 添加 Provider]
 ```
 
-##### A. 默认模型区
+- **模型服务**：配置 Provider、凭证、Endpoint、模型发现和已启用模型；
+- **默认模型**：只配置运行时 Binding，不暴露 API Key 和 Base URL；
+- 两者共享同一 Provider Registry，不能再维护两套模型配置。
 
-首屏固定展示三个 Binding 卡片：
+桌面宽度充足时，“模型服务”采用三栏布局；窗口较窄时 Provider 列表变为页面，详情使用右侧抽屉。设置主导航仍是 PuddingData 现有导航，不额外复制一层完整侧栏。
 
-1. **主对话模型**：显示模型名、Provider、文本/图像输入能力和连接状态；
-2. **文本向量模型**：显示模型名、Provider、维度和连接状态；
-3. **多模态向量模型**：显示模型名、Provider、输入模态、维度和连接状态。
+##### B. 模型服务页
 
-点击“更换”打开统一模型选择器：
+中间 Provider 列表参考截图：
 
-- 只显示满足该 Binding 能力的已启用模型；
-- 支持按 Provider、模型名和模态筛选；
-- 模型行展示协议、上下文或维度、最近一次测试状态；
-- 选择后先显示影响说明，再明确保存；
-- 更换 Embedding 时若向量空间指纹变化，必须提示哪些索引会变为 `stale`，不能静默保存。
+- 顶部提供搜索、状态/能力筛选；
+- 内置模板优先显示 OpenAI、DeepSeek、DashScope，自定义 Provider 排在其后；
+- 列表项显示图标、名称、启用状态、凭证状态和模型数量；
+- 底部或工具栏提供“添加 Provider”；
+- 点击 Provider 后在右侧原位显示详情，避免反复打开/关闭多层 Modal。
 
-这里不允许直接输入任意 Model ID；未登记模型必须先进入 Provider 管理添加。
+右侧详情区从上到下排列：
 
-##### B. Provider 总览区
+1. Provider 名称、文档链接、启用开关；
+2. **API Key**：只显示是否配置和末四位，提供替换、删除、测试；OAuth 登录仅在 Provider 确实支持时显示，普通模型厂商不伪造登录流程；
+3. **Endpoint**：按用途展示 Chat、Text Embedding、Multimodal Embedding 的 Base URL 和协议；
+4. **模型**：显示已启用数量、“获取模型列表”和“手动添加”；
+5. 折叠的高级设置：Headers、timeout、额外参数和模型发现路径；
+6. 页面底部的停用/删除危险操作。
 
-参考 Yuxi 的 Provider 卡片、搜索和统计，但放在设置页内，不建立独立“管理员模型管理”产品页面。
+同一个 Base URL 可以对应多个逻辑 Endpoint。例如 DashScope 的 OpenAI-compatible Chat 与 Text Embedding 地址可能相同，但协议分别是 `openai_chat` 和 `openai_embeddings`；多模态 Embedding 可以使用另一个原生 Endpoint。
 
-每张 Provider 卡片展示：
+##### C. 默认模型页
 
-- 图标、展示名和稳定 `provider_id`；
-- `已启用 / 已停用 / 凭证缺失 / 部分异常` 状态；
-- Endpoint 数、已启用模型数；
-- 能力摘要：Chat、Vision、Text Embedding、Multimodal Embedding；
-- 当前承载的默认 Binding；
-- 最近一次连接测试的时间与结果；
-- “测试”和“管理模型与端点”两个主要操作。
+参考截图的卡片式默认模型选择，但换成 PuddingData 的真实运行用途：
 
-页面顶部只保留“搜索供应商”“新增供应商”和“刷新状态”。不在首屏展示 Base URL、协议 JSON 或 API Key 输入框。
+1. **主对话模型**：Data Agent 规划、工具调用和最终回答；
+2. **文本向量模型**：文本知识、语义资产与 NL2SQL 召回；
+3. **多模态向量模型**：图片、图文 PDF 等跨模态索引与召回。
 
-##### C. 新增 Provider 流程
+每张卡片展示模型、Provider、模态/维度和最近连接状态。点击选择器只显示满足该 Binding 能力的已启用模型；旁边的设置按钮直接定位到对应 Provider 的模型详情。
 
-使用分步抽屉，而不是把所有技术字段塞进一个大表单：
+- 未登记模型不能在这里手输 Model ID，必须先去“模型服务”添加；
+- 模型选择后明确保存，不因为新增 Provider 自动改变默认值；
+- 更换 Embedding 时若向量空间指纹变化，必须提示受影响索引将变为 `stale`；
+- “思考模式”是运行参数，不作为第四个 Provider Binding 混在这个页面。
+
+##### D. 新增 Provider 流程
+
+使用分步抽屉：
 
 1. **选择模板**：OpenAI、DeepSeek、DashScope、自定义 OpenAI-compatible；
-2. **配置凭证**：输入 API Key，保存后只显示“已配置”和末四位；
-3. **确认端点**：模板自动生成 Endpoint；自定义 Provider 才需要填写 Base URL 和协议；
-4. **测试并发现模型**：逐 Endpoint 测试，成功后获取远端候选模型；
-5. **启用模型**：勾选需要的模型，必要时填写无法发现的维度、模态等信息。
+2. **配置凭证**：输入 API Key，第一版保存到用户数据目录的 `LocalCredentialStore`；
+3. **确认端点**：模板自动生成 Endpoint，自定义 Provider 才要求填写 Base URL 和协议；
+4. **测试连接**：逐 Endpoint 验证鉴权和协议；
+5. **获取模型列表**：从远端发现候选模型；
+6. **启用模型**：用户确认后写入 Registry，必要时补充维度和模态。
 
-创建成功后返回 Provider 总览。默认 Binding 不在向导中自动替换；用户需要在顶部默认模型区显式选择，避免新增 Provider 意外改变当前运行配置。
+创建成功后返回 Provider 详情。默认 Binding 不在向导中自动替换。
 
-##### D. Provider 管理抽屉
+##### E. 模型列表发现机制
 
-点击“管理模型与端点”打开右侧宽抽屉，分为三个页签：
+通常优先调用 Provider 的模型枚举接口，但不能假设所有 Provider 都完整支持 `GET /v1/models`。
 
-**概览**
+调用链固定为：
 
-- 展示名、Provider ID、启用状态；
-- 凭证状态，以及“替换凭证”“删除凭证”；
-- 该 Provider 承载的默认 Binding；
-- 删除 Provider 的危险操作。
+```text
+Settings UI
+  → PuddingData Backend
+    → ProviderAdapter.discover_models(endpoint, credential)
+      → Provider API / built-in catalog / unsupported
+```
 
-**端点**
+前端不能直接请求 Provider：API Key 只由 Backend 从 CredentialStore 解析，Backend 负责处理 CORS、鉴权、超时和响应格式归一化。
 
-采用表格而不是多个散落的 Base URL 字段：
+Backend 接口建议：
 
-| 用途 | 协议 | Base URL | 状态 | 操作 |
-| --- | --- | --- | --- | --- |
-| Chat | `openai_chat` | `…/compatible-mode/v1` | 正常 | 测试 / 编辑 |
-| Text Embedding | `openai_embeddings` | `…/compatible-mode/v1` | 正常 | 测试 / 编辑 |
-| Multimodal Embedding | `dashscope_multimodal_embedding` | `…/api/v1` | 正常 | 测试 / 编辑 |
+```http
+POST /api/model-providers/{provider_id}/discover-models
+Content-Type: application/json
 
-“新增端点”只在高级操作中出现。Headers、超时和扩展参数放入折叠的“高级配置”，普通模板无需用户处理。
+{
+  "endpoint_id": "compatible_chat",
+  "kind": "llm"
+}
+```
 
-**模型**
+返回统一候选模型：
 
-参考 Yuxi 的“已启用模型 + 远端候选模型”，但不再用上下堆叠的长列表：
+```json
+{
+  "models": [
+    {
+      "id": "qwen-plus",
+      "display_name": "Qwen Plus",
+      "kind": "llm",
+      "input_modalities": ["text"],
+      "output_modalities": ["text"],
+      "context_length": null,
+      "dimension": null,
+      "source": "remote"
+    }
+  ],
+  "discovery": {
+    "supported": true,
+    "partial": true,
+    "endpoint_id": "compatible_chat"
+  }
+}
+```
 
-- 默认显示已启用模型表；
-- 工具栏提供搜索、类型筛选、“发现远端模型”和“手动添加”；
-- 远端发现结果使用独立选择弹窗，支持多选后一次添加；
-- 模型表列为：模型、类型、输入模态、Endpoint、上下文/维度、Binding、状态、操作；
+ProviderAdapter 采用三级策略：
+
+1. **远端枚举**：OpenAI-compatible Endpoint 默认请求规范化后的 `GET {base_url}/models`；原生 Provider 使用自己的列表 API；
+2. **内置 Catalog 补全**：用 Provider 模板补充远端只返回 ID、缺失的 kind/modality/context/dimension，但不得覆盖远端明确值；
+3. **手动添加**：Provider 不支持发现、鉴权限制或接口失败时，用户仍可明确填写 Model ID 和能力。
+
+模型枚举结果只是候选，不直接成为运行配置：
+
+- 远端常常只返回模型 ID/owner，未必包含 Chat、Embedding、模态、上下文和维度；
+- 模型类型命名规则只能作为 UI 建议，不能未经确认写入能力事实；
+- 用户勾选“启用”后才写入 Registry；
+- 刷新列表不会自动删除本地模型，远端消失的模型只标记为 `stale`；
+- 候选列表可短期缓存，点击“获取模型列表”执行显式刷新；
+- “连接测试”和“获取模型列表”是两个操作，能调用模型但不能枚举时不能标记 Provider 故障。
+
+OpenAI 官方 Models API 也只保证返回模型的基础信息，因此 capability 补全和人工确认仍然必要：[OpenAI Models API](https://platform.openai.com/docs/api-reference/models/list)。
+
+##### F. Provider 详情中的模型表
+
+- 默认显示已启用模型；
+- 工具栏提供搜索、kind/模态筛选、“获取模型列表”和“手动添加”；
+- 远端候选使用独立选择弹窗，支持多选后一次添加；
+- 表格列为：模型、kind、输入模态、Endpoint、上下文/维度、Binding、状态、操作；
 - 每个模型可测试、编辑、停用或移除；
-- 手动添加必须选择 Endpoint，并明确声明 `kind`、输入/输出 modalities；Embedding 必须提供或探测 dimension。
+- 手动添加必须选择 Endpoint 并声明 `kind` 和 modalities；Embedding 必须填写或探测 dimension。
 
-##### E. 状态与保护规则
+##### G. 状态与保护规则
 
 - API Key 永不回显完整值，前端只能看到 `has_credential` 和可选末四位；
-- Provider 被默认 Binding 使用时，不能停用或删除，必须先更换 Binding；
-- 模型被默认 Binding 使用时，不能移除；
-- Endpoint 被启用模型引用时，不能删除；
-- “测试 Provider”实际逐个测试其启用 Endpoint，并分别返回结果，不用一个绿色状态掩盖局部故障；
-- “测试模型”必须调用确切的 Endpoint + Model，结果显示耗时、协议和错误摘要；
-- 环境变量覆盖存在时只读展示来源，不允许页面保存造成“看似成功、运行时未变化”；
-- 模型发现只生成候选项，必须经用户确认才能写入 Registry；
+- Provider 被默认 Binding 使用时不能停用或删除，必须先更换 Binding；
+- 模型被默认 Binding 使用时不能移除；
+- Endpoint 被启用模型引用时不能删除；
+- “测试 Provider”逐个测试启用 Endpoint，不用一个绿色状态掩盖局部故障；
+- “测试模型”必须调用确切的 Endpoint + Model，显示耗时、协议和错误摘要；
+- 环境变量覆盖存在时只读展示来源，不能出现“页面保存成功但运行值未变”；
 - 任何默认模型切换、Embedding 指纹变化和跨模型 fallback 都需要明确提示。
 
-##### F. 从 Yuxi 借鉴与调整
+##### H. 参考界面的取舍
 
 直接借鉴：
 
-- Provider 卡片总览、搜索、启停状态和模型数量；
-- 远端模型发现与手动添加两条路径；
-- 已启用模型的类型、上下文/维度和连接测试；
-- 默认模型使用中禁止删除的保护逻辑。
+- “模型服务 / 默认模型”两个相邻入口；
+- Provider 搜索列表与右侧原位详情；
+- Key、API 地址、测试、获取模型列表和手动添加的操作顺序；
+- 默认模型使用大卡片选择，并能快速跳回具体模型配置。
 
-针对 PuddingData 调整：
+结合 Yuxi 与 PuddingData 调整：
 
-- 管理入口放入设置页，并将名称从“AI 网关”改为“模型服务”；
-- 默认 Binding 提升到页面首屏，而不是藏在 Agent 或 Provider 配置中；
 - Provider、Endpoint、Model 三层分开，不使用 Provider 级单一 Base URL/Protocol；
+- 默认项不是“助手/快速/翻译”，而是主 LLM、文本 Embedding、多模态 Embedding；
 - 增加 Vision 和 Multimodal Embedding 的完整模态展示；
-- 凭证进入本机安全存储，不像 Yuxi 当前表单那样回填 API Key；
-- 模型管理采用宽抽屉和独立远端选择弹窗，避免一个 Modal 内同时堆两套长列表。
+- Key 第一版移出仓库进入 LocalCredentialStore，页面不会回填明文；
+- 模型发现经过 Backend ProviderAdapter，前端不持有 Key；
+- 保留远端发现与手动添加双路径，不把 `/v1/models` 当成所有 Provider 的强制能力。
 
 ### Phase D：清理 Higress 运行依赖
 

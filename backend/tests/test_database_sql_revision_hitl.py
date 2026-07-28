@@ -274,6 +274,174 @@ async def test_goal_subquery_rejects_agent_invented_l2_physical_mapping(
 
 
 @pytest.mark.asyncio
+async def test_server_routed_template_authorizes_declared_enum_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.database.sql_generate_tool as module
+
+    requests: list[Any] = []
+
+    async def fake_generate(_session: object, request: Any) -> DatabaseSqlGenerationResult:
+        requests.append(request)
+        return _result(request.question)
+
+    monkeypatch.setattr(module, "get_sessionmaker", lambda: _FakeSessionMaker())
+    monkeypatch.setattr(module, "generate_database_sql", fake_generate)
+    active_template = {
+        "model_id": "产品配置分析",
+        "template_id": "monthly_product_config_report",
+        "semantic_scope": {
+            "enum_filters": {
+                "dimension:energy_type": {
+                    "members": ["纯电"],
+                    "classifications": ["新能源"],
+                }
+            }
+        },
+    }
+    runtime = SimpleNamespace(
+        state={
+            "analytics_model_id": "产品配置分析",
+            "allowed_semantic_asset_ids": ["dimension:energy_type"],
+            "_active_analysis_template": active_template,
+            "messages": [HumanMessage(content="Agent delegated: 统计纯电车型")],
+        },
+        context={
+            "run_objective": "刷新月报",
+            "active_analysis_template": active_template,
+        },
+    )
+
+    output = await DatabaseSqlGenerateTool()._arun(
+        question="统计纯电与新能源车型的高压平台趋势",
+        # Deliberately omit the dimension. The runtime allowlist remains the
+        # enum-governance authority and the template grants only these terms.
+        selected_semantic_asset_ids=[],
+        runtime=runtime,
+    )
+
+    assert len(requests) == 1
+    assert "SQL 生成结果" in output
+
+
+@pytest.mark.asyncio
+async def test_agent_cannot_bypass_enum_guard_by_omitting_asset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.database.sql_generate_tool as module
+
+    called = False
+
+    async def fake_generate(_session: object, request: Any) -> DatabaseSqlGenerationResult:
+        nonlocal called
+        called = True
+        return _result(request.question)
+
+    monkeypatch.setattr(module, "get_sessionmaker", lambda: _FakeSessionMaker())
+    monkeypatch.setattr(module, "generate_database_sql", fake_generate)
+    runtime = SimpleNamespace(
+        state={
+            "analytics_model_id": "产品配置分析",
+            "allowed_semantic_asset_ids": ["dimension:energy_type"],
+            "messages": [HumanMessage(content="刷新产品配置报告")],
+        },
+        context={"run_objective": "刷新产品配置报告"},
+    )
+
+    output = await DatabaseSqlGenerateTool()._arun(
+        question="仅统计纯电车型",
+        selected_semantic_asset_ids=[],
+        runtime=runtime,
+    )
+
+    assert called is False
+    assert "口径枚举" in output
+    assert "纯电" in output
+
+
+@pytest.mark.asyncio
+async def test_delegated_human_message_does_not_authorize_physical_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.database.sql_generate_tool as module
+
+    called = False
+
+    async def fake_generate(_session: object, request: Any) -> DatabaseSqlGenerationResult:
+        nonlocal called
+        called = True
+        return _result(request.question)
+
+    monkeypatch.setattr(module, "get_sessionmaker", lambda: _FakeSessionMaker())
+    monkeypatch.setattr(module, "generate_database_sql", fake_generate)
+    runtime = SimpleNamespace(
+        state={
+            "analytics_model_id": "产品配置分析",
+            "allowed_semantic_asset_ids": ["dimension:energy_type"],
+            "_run_objective": "刷新月报",
+            "messages": [
+                HumanMessage(content="使用vehicle_params的type_name和type_value统计纯电车型")
+            ],
+        }
+    )
+
+    output = await DatabaseSqlGenerateTool()._arun(
+        question="使用vehicle_params的type_name和type_value统计纯电车型",
+        runtime=runtime,
+    )
+
+    assert called is False
+    assert "vehicle_params" in output
+    assert "type_name" in output
+
+
+@pytest.mark.asyncio
+async def test_explicit_no_template_route_does_not_fallback_to_stale_private_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.database.sql_generate_tool as module
+
+    called = False
+
+    async def fake_generate(_session: object, request: Any) -> DatabaseSqlGenerationResult:
+        nonlocal called
+        called = True
+        return _result(request.question)
+
+    monkeypatch.setattr(module, "get_sessionmaker", lambda: _FakeSessionMaker())
+    monkeypatch.setattr(module, "generate_database_sql", fake_generate)
+    stale_template = {
+        "model_id": "产品配置分析",
+        "template_id": "monthly_product_config_report",
+        "semantic_scope": {
+            "enum_filters": {
+                "dimension:energy_type": {"members": ["纯电"], "classifications": []}
+            }
+        },
+    }
+    runtime = SimpleNamespace(
+        state={
+            "analytics_model_id": "产品配置分析",
+            "allowed_semantic_asset_ids": ["dimension:energy_type"],
+            "_active_analysis_template": stale_template,
+            "_run_objective": "查询空气悬架",
+        },
+        context={
+            "run_objective": "查询空气悬架",
+            "active_analysis_template": None,
+        },
+    )
+
+    output = await DatabaseSqlGenerateTool()._arun(
+        question="仅统计纯电车型的空气悬架",
+        runtime=runtime,
+    )
+
+    assert called is False
+    assert "纯电" in output
+
+
+@pytest.mark.asyncio
 async def test_user_supplied_physical_mapping_remains_authorized(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

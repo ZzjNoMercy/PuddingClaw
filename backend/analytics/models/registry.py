@@ -8,7 +8,7 @@ import re
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from threading import RLock
 from typing import Any, BinaryIO
 
@@ -21,7 +21,18 @@ class AnalyticsModelError(ValueError):
     """Raised when analytics model input or filesystem state is invalid."""
 
 
-SAFE_EXTRA_SUFFIXES = {".md", ".txt", ".json", ".yaml", ".yml", ".html", ".css", ".csv", ".tsv"}
+SAFE_EXTRA_SUFFIXES = {
+    ".md",
+    ".txt",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".html",
+    ".css",
+    ".js",
+    ".csv",
+    ".tsv",
+}
 SLUG_RE = re.compile(r"[^0-9A-Za-z_\-\u4e00-\u9fff]+")
 IGNORED_MODEL_FILE_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
 IGNORED_MODEL_PATH_PARTS = {"__MACOSX", ".git", ".svn"}
@@ -82,6 +93,73 @@ class AnalyticsModel:
 
 def _base_dir_from_here() -> Path:
     return Path(__file__).resolve().parents[2]
+
+
+def canonical_model_resource_path(raw_path: object, *, root: str) -> str:
+    """Return one model-relative resource path with a single declared root.
+
+    Model metadata paths are always relative to the directory containing
+    ``model.md``.  Older template declarations omitted the leading
+    ``templates/`` segment; keep that one compatibility rule here so runtime
+    loading and project export cannot drift apart.
+    """
+
+    value = str(raw_path or "").strip()
+    if not value:
+        raise AnalyticsModelError(f"{root} resource path is required")
+    if (
+        "\x00" in value
+        or "\\" in value
+        or value.startswith("/")
+        or "://" in value
+        or re.match(r"^[A-Za-z]:/", value)
+    ):
+        raise AnalyticsModelError(f"Invalid {root} resource path: {value}")
+    while value.startswith("./"):
+        value = value[2:]
+    path = PurePosixPath(value)
+    if not path.parts or any(part in {"", ".", ".."} for part in path.parts):
+        raise AnalyticsModelError(f"Invalid {root} resource path: {value}")
+    reserved_roots = {"templates", "references", "examples"}
+    if path.parts[0] in reserved_roots and path.parts[0] != root:
+        raise AnalyticsModelError(f"Invalid {root} resource path: {value}")
+    if path.parts[0] != root:
+        path = PurePosixPath(root) / path
+    return path.as_posix()
+
+
+def model_resource_virtual_path(model_path: object, model_relative_path: object) -> str:
+    """Resolve a validated model-relative path into the managed namespace."""
+
+    model_file = PurePosixPath(str(model_path or "").strip())
+    resource = PurePosixPath(str(model_relative_path or "").strip())
+    if not model_file.parts or model_file.name != "model.md":
+        raise AnalyticsModelError(f"Invalid analytics model path: {model_path}")
+    return "/" + (model_file.parent / resource).as_posix()
+
+
+def _query_matches_template(definition: dict[str, Any], query: str) -> bool:
+    """Match a template through bounded token sets, never executable regex."""
+
+    match = definition.get("query_match")
+    if not isinstance(match, dict) or not query.strip():
+        return False
+
+    def token_sets(key: str) -> list[list[str]]:
+        result: list[list[str]] = []
+        for raw_set in match.get(key) or []:
+            if not isinstance(raw_set, list):
+                continue
+            tokens = [str(token).strip() for token in raw_set if str(token).strip()]
+            if tokens:
+                result.append(tokens)
+        return result
+
+    excluded = token_sets("exclude_any_token_sets")
+    if any(all(token in query for token in tokens) for tokens in excluded):
+        return False
+    allowed = token_sets("any_token_sets")
+    return bool(allowed and any(all(token in query for token in tokens) for tokens in allowed))
 
 
 def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
@@ -221,7 +299,7 @@ class AnalyticsModelRegistry:
         detail["files"] = self._model_files(model.path)
         return detail
 
-    def get_model_context(self, model_id: str) -> dict[str, Any]:
+    def get_model_context(self, model_id: str, *, query: str = "") -> dict[str, Any]:
         model = self.get_model(model_id)
         missing_references: list[str] = []
         relation_context: list[dict[str, Any]] = []
@@ -397,6 +475,167 @@ class AnalyticsModelRegistry:
                     },
                 }
             )
+        model_file_paths = {
+            str(item.get("relative_path") or "").strip()
+            for item in model.get("files") or []
+            if str(item.get("relative_path") or "").strip()
+        }
+        resolved_references: dict[str, dict[str, Any]] = {}
+        raw_references = (model.get("frontmatter") or {}).get("references")
+        if isinstance(raw_references, dict):
+            for reference_id, raw_definition in raw_references.items():
+                definition = raw_definition if isinstance(raw_definition, dict) else {"path": raw_definition}
+                declared_path = str(definition.get("path") or "").strip()
+                if not declared_path:
+                    continue
+                relative_path = canonical_model_resource_path(declared_path, root="references")
+                if relative_path not in model_file_paths:
+                    missing_references.append(f"reference:{reference_id}:{relative_path}")
+                resolved_references[str(reference_id)] = {
+                    **{key: value for key, value in definition.items() if key != "path"},
+                    "declared_path": declared_path,
+                    "model_relative_path": relative_path,
+                    "virtual_path": model_resource_virtual_path(model["path"], relative_path),
+                    "available": relative_path in model_file_paths,
+                }
+
+        semantic_by_id = {
+            str(item.get("id") or ""): item
+            for item in semantic_asset_context
+            if str(item.get("id") or "")
+        }
+        resolved_templates: dict[str, dict[str, Any]] = {}
+        raw_templates = model.get("templates") if isinstance(model.get("templates"), dict) else {}
+        for template_id, raw_definition in raw_templates.items():
+            definition = raw_definition if isinstance(raw_definition, dict) else {"path": raw_definition}
+            declared_path = str(definition.get("path") or "").strip()
+            if not declared_path:
+                continue
+            relative_path = canonical_model_resource_path(declared_path, root="templates")
+            missing_template_paths: list[str] = []
+            if relative_path not in model_file_paths:
+                missing_references.append(f"template:{template_id}:{relative_path}")
+                missing_template_paths.append(relative_path)
+            resolved: dict[str, Any] = {
+                **{key: value for key, value in definition.items() if key not in {"path", "guide", "assets"}},
+                "declared_path": declared_path,
+                "model_relative_path": relative_path,
+                "virtual_path": model_resource_virtual_path(model["path"], relative_path),
+            }
+            declared_guide = str(definition.get("guide") or "").strip()
+            if declared_guide:
+                guide_relative_path = canonical_model_resource_path(declared_guide, root="templates")
+                if guide_relative_path not in model_file_paths:
+                    missing_references.append(f"template_guide:{template_id}:{guide_relative_path}")
+                    missing_template_paths.append(guide_relative_path)
+                resolved.update(
+                    {
+                        "declared_guide": declared_guide,
+                        "guide_model_relative_path": guide_relative_path,
+                        "guide_virtual_path": model_resource_virtual_path(model["path"], guide_relative_path),
+                    }
+                )
+            asset_relative_paths: list[str] = []
+            asset_virtual_paths: list[str] = []
+            raw_assets = definition.get("assets") or []
+            if not isinstance(raw_assets, list):
+                raise AnalyticsModelError(f"Template {template_id} assets must be a list")
+            for raw_asset_path in raw_assets:
+                asset_relative_path = canonical_model_resource_path(raw_asset_path, root="templates")
+                if asset_relative_path not in model_file_paths:
+                    missing_references.append(f"template_asset:{template_id}:{asset_relative_path}")
+                    missing_template_paths.append(asset_relative_path)
+                asset_relative_paths.append(asset_relative_path)
+                asset_virtual_paths.append(model_resource_virtual_path(model["path"], asset_relative_path))
+            resolved["asset_model_relative_paths"] = list(dict.fromkeys(asset_relative_paths))
+            resolved["asset_virtual_paths"] = list(dict.fromkeys(asset_virtual_paths))
+
+            semantic_scope = definition.get("semantic_scope")
+            compiled_filters: dict[str, dict[str, list[str]]] = {}
+            if isinstance(semantic_scope, dict):
+                unknown_scope_keys = sorted(set(semantic_scope) - {"enum_filters"})
+                if unknown_scope_keys:
+                    raise AnalyticsModelError(
+                        f"Template {template_id} semantic_scope has unknown keys: {', '.join(unknown_scope_keys)}"
+                    )
+                enum_filters = semantic_scope.get("enum_filters")
+                if enum_filters is not None and not isinstance(enum_filters, dict):
+                    raise AnalyticsModelError(f"Template {template_id} semantic_scope.enum_filters must be a mapping")
+                for asset_id, raw_filter in (enum_filters or {}).items():
+                    asset_id = str(asset_id).strip()
+                    asset = semantic_by_id.get(asset_id)
+                    if not asset or str(asset.get("type") or "") != "dimension":
+                        raise AnalyticsModelError(
+                            f"Template {template_id} enum filter references an unselected dimension: {asset_id}"
+                        )
+                    if not isinstance(raw_filter, dict):
+                        raise AnalyticsModelError(f"Template {template_id} enum filter {asset_id} must be a mapping")
+                    unknown_filter_keys = sorted(set(raw_filter) - {"members", "classifications"})
+                    if unknown_filter_keys:
+                        raise AnalyticsModelError(
+                            f"Template {template_id} enum filter {asset_id} has unknown keys: "
+                            + ", ".join(unknown_filter_keys)
+                        )
+                    frontmatter = asset.get("frontmatter") if isinstance(asset.get("frontmatter"), dict) else {}
+                    enum_universe = {str(value).strip() for value in frontmatter.get("enum_universe") or []}
+                    classifications = (
+                        frontmatter.get("classifications")
+                        if isinstance(frontmatter.get("classifications"), dict)
+                        else {}
+                    )
+                    members = [str(value).strip() for value in raw_filter.get("members") or [] if str(value).strip()]
+                    labels = [
+                        str(value).strip()
+                        for value in raw_filter.get("classifications") or []
+                        if str(value).strip()
+                    ]
+                    unknown_members = sorted(set(members) - enum_universe)
+                    unknown_labels = sorted(set(labels) - {str(key) for key in classifications})
+                    if unknown_members or unknown_labels:
+                        invalid = ", ".join([*unknown_members, *unknown_labels])
+                        raise AnalyticsModelError(
+                            f"Template {template_id} enum filter {asset_id} contains undeclared values: {invalid}"
+                        )
+                    compiled_filters[asset_id] = {
+                        "members": list(dict.fromkeys(members)),
+                        "classifications": list(dict.fromkeys(labels)),
+                    }
+            resolved["compiled_semantic_scope"] = {"enum_filters": compiled_filters}
+            resolved["available"] = not missing_template_paths
+            resolved["missing_paths"] = missing_template_paths
+            resolved_templates[str(template_id)] = resolved
+
+        matched_template_ids = [
+            template_id
+            for template_id, definition in raw_templates.items()
+            if isinstance(definition, dict) and _query_matches_template(definition, query)
+        ]
+        template_route: dict[str, Any]
+        active_template: dict[str, Any] | None = None
+        if len(matched_template_ids) == 1:
+            template_id = matched_template_ids[0]
+            active = resolved_templates.get(template_id)
+            if active is not None and active.get("available") is True:
+                template_route = {"status": "matched", "template_id": template_id}
+                active_template = {
+                    "model_id": model["id"],
+                    "template_id": template_id,
+                    "virtual_path": active["virtual_path"],
+                    "guide_virtual_path": active.get("guide_virtual_path"),
+                    "asset_virtual_paths": active.get("asset_virtual_paths") or [],
+                    "semantic_scope": active.get("compiled_semantic_scope") or {},
+                }
+            else:
+                template_route = {
+                    "status": "invalid",
+                    "template_id": template_id,
+                    "missing_paths": (active or {}).get("missing_paths") or [],
+                }
+        elif len(matched_template_ids) > 1:
+            template_route = {"status": "ambiguous", "candidate_ids": matched_template_ids}
+        else:
+            template_route = {"status": "not_matched"}
+
         return {
             "id": model["id"],
             "name": model["name"],
@@ -413,6 +652,10 @@ class AnalyticsModelRegistry:
             "data_assets": data_asset_context,
             "missing_data_assets": list(dict.fromkeys(missing_data_assets)),
             "logical_datasets": logical_dataset_context,
+            "resolved_references": resolved_references,
+            "resolved_templates": resolved_templates,
+            "template_route": template_route,
+            "active_template": active_template,
         }
 
     def create_model(
@@ -541,7 +784,7 @@ class AnalyticsModelRegistry:
         files: list[dict[str, Any]] = []
         for path in sorted(model_dir.rglob("*")):
             relative_path = path.relative_to(model_dir)
-            if not path.is_file() or _is_ignored_model_file(relative_path):
+            if path.is_symlink() or not path.is_file() or _is_ignored_model_file(relative_path):
                 continue
             stat = path.stat()
             files.append(

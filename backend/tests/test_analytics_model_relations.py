@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
-from analytics.models.registry import AnalyticsModelError, AnalyticsModelRegistry
+from analytics.models.registry import (
+    AnalyticsModelError,
+    AnalyticsModelRegistry,
+    canonical_model_resource_path,
+)
 from analytics.semantic_assets.registry import SemanticAssetRegistry
 
 
@@ -35,6 +40,108 @@ def _prepare_relations(tmp_path) -> tuple[str, str]:
         },
     )
     return binding["id"], direct["id"]
+
+
+def test_template_paths_have_one_model_relative_canonical_form() -> None:
+    assert canonical_model_resource_path(
+        "monthly/index.html", root="templates"
+    ) == "templates/monthly/index.html"
+    assert canonical_model_resource_path(
+        "templates/monthly/index.html", root="templates"
+    ) == "templates/monthly/index.html"
+    assert canonical_model_resource_path(
+        "references/rules.md", root="references"
+    ) == "references/rules.md"
+    for invalid in (
+        "/tmp/report.html",
+        "C:/tmp/report.html",
+        "../report.html",
+        "templates/../report.html",
+        "templates\\report.html",
+        "references/rules.md",
+        "https://example.com/report.html",
+    ):
+        with pytest.raises(AnalyticsModelError):
+            canonical_model_resource_path(invalid, root="templates")
+
+
+def test_product_config_monthly_template_is_server_routed_with_resolved_paths() -> None:
+    base_dir = Path(__file__).resolve().parents[1]
+    models = AnalyticsModelRegistry(base_dir)
+    models.refresh()
+
+    context = models.get_model_context("产品配置分析", query="刷新2026年6月月报")
+
+    template = context["resolved_templates"]["monthly_product_config_report"]
+    assert template["virtual_path"] == (
+        "/analytics-models/产品配置分析/templates/monthly_product_config_report/index.html"
+    )
+    assert template["guide_virtual_path"] == (
+        "/analytics-models/产品配置分析/templates/monthly_product_config_report/TEMPLATE.md"
+    )
+    assert template["asset_virtual_paths"] == [
+        "/analytics-models/产品配置分析/templates/monthly_product_config_report/report-renderer.js",
+        "/analytics-models/产品配置分析/templates/monthly_product_config_report/echarts-6.1.0.min.js",
+    ]
+    assert context["template_route"] == {
+        "status": "matched",
+        "template_id": "monthly_product_config_report",
+    }
+    assert context["active_template"]["semantic_scope"]["enum_filters"] == {
+        "dimension:energy_type": {
+            "members": ["纯电"],
+            "classifications": ["新能源"],
+        }
+    }
+
+
+def test_product_config_monthly_template_respects_explicit_negative_route() -> None:
+    base_dir = Path(__file__).resolve().parents[1]
+    models = AnalyticsModelRegistry(base_dir)
+    models.refresh()
+
+    context = models.get_model_context("产品配置分析", query="不要刷新月报，只查询空气悬架")
+
+    assert context["template_route"] == {"status": "not_matched"}
+    assert context["active_template"] is None
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "这个月报不用生成，只更新空气悬架数据",
+        "解释一下“刷新月报”是什么意思",
+    ],
+)
+def test_product_config_monthly_template_does_not_route_negated_or_quoted_intent(query: str) -> None:
+    base_dir = Path(__file__).resolve().parents[1]
+    models = AnalyticsModelRegistry(base_dir)
+    models.refresh()
+
+    context = models.get_model_context("产品配置分析", query=query)
+
+    assert context["template_route"] == {"status": "not_matched"}
+    assert context["active_template"] is None
+
+
+def test_model_import_keeps_javascript_template_bundle(tmp_path: Path) -> None:
+    models = AnalyticsModelRegistry(tmp_path)
+    result = models.import_files(
+        [
+            (
+                "analytics-models/monthly/model.md",
+                b"---\nformatter: analytics-model\nid: monthly\nname: Monthly\ntemplates: {}\n---\n",
+            ),
+            ("analytics-models/monthly/templates/report/index.html", b"<script src='renderer.js'></script>"),
+            ("analytics-models/monthly/templates/report/renderer.js", b"window.renderReport = () => {};"),
+        ]
+    )
+
+    assert "monthly/templates/report/renderer.js" in result["imported"]
+    detail = models.get_model("monthly")
+    assert "templates/report/renderer.js" in {
+        item["relative_path"] for item in detail["files"]
+    }
 
 
 def test_model_requires_connected_selected_relation(tmp_path) -> None:

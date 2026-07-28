@@ -17,10 +17,10 @@ test("cancelled Todo tombstones do not dilute visible progress", () => {
   );
 });
 
-test("budget exhaustion remains visible because it is user-recoverable", () => {
+test("completed goals remain visible for review while cancelled goals disappear", () => {
   assert.equal(goalRemainsVisible("budget_exceeded"), true);
   assert.equal(goalRemainsVisible("paused"), true);
-  assert.equal(goalRemainsVisible("completed"), false);
+  assert.equal(goalRemainsVisible("completed"), true);
   assert.equal(goalRemainsVisible("cancelled"), false);
 });
 

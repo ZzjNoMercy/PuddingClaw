@@ -381,6 +381,36 @@ def test_enum_caliber_user_stated_values_pass():
     assert findings == []
 
 
+def test_enum_caliber_classification_label_is_governed():
+    from tools.database.sql_generate_tool import _agent_added_enum_caliber
+
+    findings = _agent_added_enum_caliber(
+        question="仅统计新能源车型",
+        selected_asset_ids=["dimension:energy_type"],
+        trusted_text="刷新产品配置报告",
+    )
+
+    assert "新能源" in findings
+
+
+def test_enum_caliber_allows_only_server_routed_template_terms():
+    from tools.database.sql_generate_tool import _agent_added_enum_caliber
+
+    findings = _agent_added_enum_caliber(
+        question="分别统计纯电、新能源、柴油和传统能源车型",
+        selected_asset_ids=["dimension:energy_type"],
+        trusted_text="刷新月报",
+        authorized_terms_by_asset={
+            "dimension:energy_type": {"纯电", "新能源"},
+        },
+    )
+
+    assert "纯电" not in findings
+    assert "新能源" not in findings
+    assert "柴油" in findings
+    assert "传统能源" in findings
+
+
 def test_enum_caliber_without_trusted_text_escapes():
     from tools.database.sql_generate_tool import _agent_added_enum_caliber
 

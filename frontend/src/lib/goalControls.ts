@@ -37,7 +37,10 @@ export function goalTodoProgress(statuses: GoalTodoStatus[]): GoalTodoProgress {
 }
 
 export function goalRemainsVisible(status: GoalLifecycleStatus): boolean {
-  return !["completed", "cancelled"].includes(status);
+  // Completion closes execution authority, not inspection authority. Keep the
+  // finished Goal in the drawer so its Runs, Todos, evidence, and verification
+  // remain reviewable; only an explicitly cancelled Goal leaves the surface.
+  return status !== "cancelled";
 }
 
 export function shouldShowInlineBudgetRequest(

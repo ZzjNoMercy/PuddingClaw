@@ -797,7 +797,9 @@ export default function ChatInput() {
                             <span className="block">目标</span>
                             <span className="block text-[11px] text-gray-400">
                               {activeGoal
-                                ? activeGoal.status === "budget_exceeded"
+                                ? activeGoal.status === "completed"
+                                  ? "目标已完成，点击复盘"
+                                  : activeGoal.status === "budget_exceeded"
                                   ? "预算已耗尽，点击追加轮次"
                                   : activeGoal.status === "paused"
                                     ? "目标已暂停，点击查看"
@@ -946,7 +948,9 @@ export default function ChatInput() {
               </div>
             )}
 
-            {runtimeMode === "agent" && (activeGoal || goalModeEnabled) && (
+            {runtimeMode === "agent"
+              && ((activeGoal && activeGoal.status !== "completed") || (!activeGoal && goalModeEnabled))
+              && (
               <div className="flex h-8 items-center rounded-full border border-emerald-600/15 bg-emerald-50 text-[12px] text-emerald-700 transition-all hover:bg-emerald-100">
                 <button
                   type="button"

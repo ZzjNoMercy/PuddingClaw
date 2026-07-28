@@ -7,12 +7,15 @@
 仅当用户 Query 明确要求以下交付物或同义表达时使用：
 
 - 刷新月度产品配置分析报告。
+- 刷新月报。
 - 生成产品配置分析月报。
 - 更新本月产品配置分析报告。
 
 单一车型配置查询、多车型配置对比、临时专题分析或普通问答不得使用本模板。使用前先读取 `model.md` 注册的通用 `references.analysis_rules.path`。
 
 ## 模板文件
+
+平台内运行时必须使用 `analytics_model_context.resolved_templates` 给出的完整虚拟路径；导出项目中必须使用 `analysis-project.yaml` 中的项目相对路径。不得从 `model.md` 手工拼接路径，也不得使用 `glob` 猜测模板位置。
 
 - HTML 基准模板：`index.html`。
 - 文本与图表渲染器：`report-renderer.js`。
@@ -22,7 +25,9 @@
 
 ## 不可变约束
 
-Agent 必须复制 `index.html` 为新报告，完成全部查询和计算后，一次性替换页尾 `<script id="report-payload" type="application/json">` 内的完整 JSON。
+Agent 必须把模板当作一个不可拆分的资源包：从 `resolved_templates` 读取 `virtual_path`、`guide_virtual_path` 和全部 `asset_virtual_paths`，将 `index.html`、`report-renderer.js` 与 `echarts-6.1.0.min.js` 复制到新报告的同一目录。导出项目中对应使用 `analysis-project.yaml` 里的 `path`、`guide` 和 `assets`。
+
+完成全部查询和计算后，只对报告副本一次性替换页尾 `<script id="report-payload" type="application/json">` 内的完整 JSON。任一资源缺失时必须停止并报告缺失路径，不得生成只有 HTML 外壳的报告。
 
 不得修改：
 
@@ -81,6 +86,8 @@ S0 解析 Query，确认命中月报模板
 ### S2：查询与计算
 
 - 遵守模型顶层通用分析规则。
+- 调用 `database_sql_generate` 时，`question` 只描述业务指标、维度、颗粒度、筛选、时间范围和所需输出；语义资产通过 `selected_semantic_asset_ids` 传递。不得把 S1 计划中的 Payload 键、物理字段、表名、EAV 名/值或 SQL 实现复制进 `question`。
+- 本模板命中时，服务端已根据 `model.md` 的结构化 `semantic_scope` 授权“纯电”与“新能源”业务筛选；必须使用这些标准业务词，不得改写为 BEV、纯电动或其他同义词规避校验。
 - 每个查询结果保存 `query_id`、SQL/工具调用摘要、行数、颗粒度、筛选、数据截止日和异常。
 - 每个派生指标保存 `value`、`unit`、`numerator`、`denominator`、`grain` 和 `source_query_ids`。
 - 完成整个计划后才能组装 Payload。

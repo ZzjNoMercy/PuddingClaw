@@ -962,11 +962,49 @@ class PuddingClawAgentState(DeepAgentState):
     _deterministic_evaluations: NotRequired[Annotated[list[dict[str, Any]], PrivateStateAttr]]
     _run_query_id: NotRequired[Annotated[str, PrivateStateAttr]]
     _run_objective: NotRequired[Annotated[str, PrivateStateAttr]]
+    _active_analysis_template: NotRequired[Annotated[dict[str, Any] | None, PrivateStateAttr]]
     _goal_verification_context: NotRequired[Annotated[dict[str, Any], PrivateStateAttr]]
     _goal_completion_reminder_count: NotRequired[Annotated[int, PrivateStateAttr]]
     run_model_call_count: NotRequired[Annotated[int, PrivateStateAttr]]
     thread_model_call_count: NotRequired[Annotated[int, PrivateStateAttr]]
     _model_call_limit_exceeded: NotRequired[Annotated[dict[str, Any], PrivateStateAttr]]
+
+
+class RunScopeMiddleware(AgentMiddleware):
+    """Initialize immutable Run authorization in private graph state.
+
+    Graph input rejects ``PrivateStateAttr`` fields, and DeepAgents subagents
+    do not receive the parent's runtime context. The main Run therefore copies
+    server-owned context here; delegated subagents inherit the resulting state
+    without treating their delegated HumanMessage as user authorization.
+    """
+
+    @staticmethod
+    def _update(state: Any, runtime: Any) -> dict[str, Any]:
+        runtime_context = getattr(runtime, "context", None)
+        context = runtime_context if isinstance(runtime_context, dict) else {}
+        if not context:
+            return {}
+        update: dict[str, Any] = {}
+        query_id = context.get("query_id")
+        objective = context.get("run_objective")
+        if isinstance(query_id, str) and query_id and state.get("_run_query_id") != query_id:
+            update["_run_query_id"] = query_id
+        if isinstance(objective, str) and objective and state.get("_run_objective") != objective:
+            update["_run_objective"] = objective
+        if "active_analysis_template" in context:
+            active_template = context.get("active_analysis_template")
+            if active_template is not None and not isinstance(active_template, dict):
+                active_template = None
+            if state.get("_active_analysis_template") != active_template:
+                update["_active_analysis_template"] = active_template
+        return update
+
+    def before_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:
+        return self._update(state, runtime) or None
+
+    async def abefore_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:
+        return self._update(state, runtime) or None
 
 
 class PuddingClawRubricMiddleware(RubricMiddleware):
@@ -2698,6 +2736,7 @@ class DeepAgentsAgentManager:
         toolset_mapping = skill_toolsets or discover_skill_toolsets(self._base_dir / "skills")
         middlewares: list[Any] = [
             MemoryMiddleware(backend=memory_backend, sources=sources),
+            RunScopeMiddleware(),
             SemanticAssetsMiddleware(base_dir=self._base_dir),
             ExternalFilePermissionMiddleware(),
             WorkspacePathRouterMiddleware(workspace_backend),
@@ -3984,12 +4023,20 @@ class DeepAgentsAgentManager:
         profile.classifier = "session_continuation"
         return profile
 
-    def _analytics_model_context(self, analytics_model_id: str | None) -> tuple[str, dict[str, Any] | None]:
+    def _analytics_model_context(
+        self,
+        analytics_model_id: str | None,
+        *,
+        query: str = "",
+    ) -> tuple[str, dict[str, Any] | None]:
         if not analytics_model_id:
             return "", None
         assert self._base_dir is not None
         try:
-            model = get_analytics_model_registry(self._base_dir).get_model_context(analytics_model_id)
+            model = get_analytics_model_registry(self._base_dir).get_model_context(
+                analytics_model_id,
+                query=query,
+            )
         except Exception as exc:
             payload = {
                 "id": analytics_model_id,
@@ -4033,11 +4080,18 @@ class DeepAgentsAgentManager:
             "asset_relations": model.get("asset_relations") or [],
             "derived_dimension_paths": model.get("derived_dimension_paths") or [],
             "logical_datasets": model.get("logical_datasets") or [],
+            "resolved_references": model.get("resolved_references") or {},
+            "resolved_templates": model.get("resolved_templates") or {},
+            "template_route": model.get("template_route") or {"status": "not_matched"},
+            "active_template": model.get("active_template"),
         }
         relation_context = model.get("asset_relations") or []
         relation_text = json.dumps(relation_context, ensure_ascii=False, indent=2)
         derived_path_text = json.dumps(model.get("derived_dimension_paths") or [], ensure_ascii=False, indent=2)
         data_asset_text = json.dumps(model.get("data_assets") or [], ensure_ascii=False, indent=2)
+        resolved_reference_text = json.dumps(model.get("resolved_references") or {}, ensure_ascii=False, indent=2)
+        resolved_template_text = json.dumps(model.get("resolved_templates") or {}, ensure_ascii=False, indent=2)
+        template_route_text = json.dumps(model.get("template_route") or {}, ensure_ascii=False, indent=2)
         prompt = (
             "\n\n"
             "<analytics_model_context>\n"
@@ -4051,6 +4105,14 @@ class DeepAgentsAgentManager:
             f"文件路径：{virtual_path}\n\n"
             "机器可读 metadata：\n"
             f"```json\n{yaml_text}\n```\n\n"
+            "服务端已解析 Reference（virtual_path 可直接用于 read_file）：\n"
+            f"```json\n{resolved_reference_text}\n```\n\n"
+            "服务端已解析模板（virtual_path/guide_virtual_path 可直接用于 read_file）：\n"
+            f"```json\n{resolved_template_text}\n```\n"
+            "必须使用这些完整路径，不得从原始 metadata 手工拼接，也不得用 glob 猜测模板位置。\n\n"
+            "本轮服务端模板路由：\n"
+            f"```json\n{template_route_text}\n```\n"
+            "只有 status=matched 时才使用对应模板；ambiguous 时先向用户确认；invalid 时报告缺失路径并停止模板任务。\n\n"
             "已解析资产关联：\n"
             f"```json\n{relation_text}\n```\n\n"
             "已推导共同维度路径：\n"
@@ -6604,7 +6666,10 @@ class DeepAgentsAgentManager:
                 checkpointer=self._checkpointer_info,
                 execution_backend=agent_backend,
             )
-            analytics_model_prompt, analytics_model_payload = self._analytics_model_context(analytics_model_id)
+            analytics_model_prompt, analytics_model_payload = self._analytics_model_context(
+                analytics_model_id,
+                query=run_record.objective,
+            )
             if analytics_model_payload:
                 runtime_inventory["analytics_model"] = analytics_model_payload
             traced_middlewares = wrap_middlewares_for_trace(agent_middlewares)
@@ -6618,6 +6683,7 @@ class DeepAgentsAgentManager:
             def build_subagent_middlewares() -> list[Any]:
                 middlewares: list[Any] = [
                     SubagentProgressMiddleware(),
+                    RunScopeMiddleware(),
                     SemanticAssetsMiddleware(base_dir=self._base_dir),
                     ExternalFilePermissionMiddleware(),
                     WorkspacePathRouterMiddleware(agent_backend),
@@ -6889,6 +6955,11 @@ class DeepAgentsAgentManager:
                 "analytics_model_id": analytics_model_id,
                 "task_profile": run_record.task_profile.model_dump(mode="json"),
             }
+            active_analysis_template = (
+                analytics_model_payload.get("active_template")
+                if isinstance(analytics_model_payload, dict)
+                else None
+            )
             if run_record.verification_contract is not None and run_record.verification_contract.required:
                 initial_state["rubric"] = run_record.verification_contract.rubric
                 initial_state["verification_contract"] = run_record.verification_contract.model_dump(mode="json")
@@ -6923,6 +6994,7 @@ class DeepAgentsAgentManager:
                     # objective into private state and matches query_id against
                     # the marker on the current HumanMessage.
                     "run_objective": run_record.objective,
+                    "active_analysis_template": active_analysis_template,
                 },
                 trace_collector=trace_collector,
             ):

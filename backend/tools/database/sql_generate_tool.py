@@ -99,13 +99,26 @@ def _trusted_user_scope_text(runtime: ToolRuntime | None) -> str:
     the user's Goal request.
     """
 
-    if runtime is None or not isinstance(runtime.state, dict):
+    if runtime is None:
+        return ""
+    context = getattr(runtime, "context", None)
+    if isinstance(context, dict):
+        run_objective = context.get("run_objective")
+        if isinstance(run_objective, str) and run_objective.strip():
+            # Runtime context is server-owned and is inherited by subagents.
+            # Never let a delegated HumanMessage redefine user authorization.
+            return run_objective.strip()
+    if not isinstance(runtime.state, dict):
         return ""
     state = runtime.state
-    parts: list[str] = []
     objective = state.get("_run_objective")
     if isinstance(objective, str) and objective.strip():
-        parts.append(objective.strip())
+        # PrivateState is populated from the server-owned Run objective and is
+        # inherited by delegated subagents. Once present it is the complete
+        # authorization boundary; a delegated HumanMessage is an instruction
+        # from another Agent, not new user consent.
+        return objective.strip()
+    parts: list[str] = []
     messages = list(state.get("messages") or [])
     run_query_id = str(state.get("_run_query_id") or "").strip()
     for message in reversed(messages):
@@ -186,6 +199,8 @@ def _agent_added_enum_caliber(
     question: str,
     selected_asset_ids: list[str],
     trusted_text: str,
+    authorized_terms_by_asset: dict[str, set[str]] | None = None,
+    strict: bool = False,
 ) -> list[str]:
     """Enum literals the Agent added to the question beyond the user's scope.
 
@@ -202,31 +217,81 @@ def _agent_added_enum_caliber(
         from analytics.semantic_assets.registry import get_semantic_asset_registry
 
         registry = get_semantic_asset_registry()
-    except Exception:
+    except Exception as exc:
+        if strict:
+            raise RuntimeError("semantic asset registry unavailable") from exc
         return []
-    vocabulary: set[str] = set()
+    vocabulary: dict[str, set[str]] = {}
     for asset_id in selected_asset_ids:
         try:
             detail = registry.get_asset(str(asset_id))
-        except Exception:
+        except Exception as exc:
+            if strict:
+                raise RuntimeError(f"governed semantic asset unavailable: {asset_id}") from exc
             continue
         frontmatter = detail.get("frontmatter") if isinstance(detail, dict) else None
         if not isinstance(frontmatter, dict):
             continue
+        asset_vocabulary: set[str] = set()
         for value in frontmatter.get("enum_universe") or []:
             value = str(value).strip()
             if value:
-                vocabulary.add(value)
+                asset_vocabulary.add(value)
         classifications = frontmatter.get("classifications")
         if isinstance(classifications, dict):
-            for values in classifications.values():
+            for label, values in classifications.items():
+                label = str(label).strip()
+                if label:
+                    asset_vocabulary.add(label)
                 for value in values or []:
                     value = str(value).strip()
                     if value:
-                        vocabulary.add(value)
+                        asset_vocabulary.add(value)
+        vocabulary[str(asset_id)] = asset_vocabulary
+    authorized = authorized_terms_by_asset or {}
     return sorted(
-        term for term in vocabulary if term in question and term not in trusted_text
+        term
+        for asset_id, terms in vocabulary.items()
+        for term in terms
+        if term in question
+        and term not in trusted_text
+        and term not in authorized.get(asset_id, set())
     )
+
+
+def _trusted_template_enum_terms(runtime: ToolRuntime | None) -> dict[str, set[str]]:
+    """Load enum authorization only from the server-routed active template."""
+
+    if runtime is None:
+        return {}
+    context = getattr(runtime, "context", None)
+    if isinstance(context, dict) and "active_analysis_template" in context:
+        active = context.get("active_analysis_template")
+        if not isinstance(active, dict):
+            return {}
+    else:
+        active = None
+    if active is None and isinstance(runtime.state, dict):
+        active = runtime.state.get("_active_analysis_template")
+    if not isinstance(active, dict) or not isinstance(runtime.state, dict):
+        return {}
+    if str(active.get("model_id") or "") != str(runtime.state.get("analytics_model_id") or ""):
+        return {}
+    scope = active.get("semantic_scope") if isinstance(active.get("semantic_scope"), dict) else {}
+    filters = scope.get("enum_filters") if isinstance(scope.get("enum_filters"), dict) else {}
+    result: dict[str, set[str]] = {}
+    for asset_id, definition in filters.items():
+        if not isinstance(definition, dict):
+            continue
+        result[str(asset_id)] = {
+            str(value).strip()
+            for value in [
+                *(definition.get("members") or []),
+                *(definition.get("classifications") or []),
+            ]
+            if str(value).strip()
+        }
+    return result
 
 
 def _is_prescriptive_sql_revision(instruction: str) -> bool:
@@ -408,19 +473,50 @@ class DatabaseSqlGenerateTool(BaseTool):
             state_model_id = str(runtime.state.get("analytics_model_id") or "").strip()
         effective_model_id = state_model_id or model_id
         requested_table_names = list(table_names or [])
+        selected_asset_ids = list(
+            dict.fromkeys(selected_semantic_asset_ids or semantic_asset_ids or measure_ids or [])
+        )
+        allowed_asset_ids: set[str] = set()
+        if state_model_id and runtime is not None and isinstance(runtime.state, dict):
+            if "allowed_semantic_asset_ids" not in runtime.state:
+                return "🧮 SQL 生成失败：当前分析模型的可信语义资产范围不可用，请重新开始本轮任务。"
+            allowed_asset_ids = {
+                str(item).strip()
+                for item in runtime.state.get("allowed_semantic_asset_ids") or []
+                if str(item).strip()
+            }
+            selected_asset_ids, normalization_error = normalize_selected_semantic_asset_ids(
+                selected_asset_ids,
+                allowed_asset_ids,
+            )
+            if normalization_error:
+                return "🧮 SQL 生成失败：" + normalization_error
         if not parent_generation_id:
             physical_guidance = _agent_added_physical_guidance(
                 question=question,
                 table_names=requested_table_names,
                 runtime=runtime,
             )
-            enum_caliber = _agent_added_enum_caliber(
-                question=question,
-                selected_asset_ids=list(
-                    dict.fromkeys(selected_semantic_asset_ids or semantic_asset_ids or measure_ids or [])
-                ),
-                trusted_text=_trusted_user_scope_text(runtime),
-            )
+            template_terms = _trusted_template_enum_terms(runtime)
+            unauthorized_scope_assets = sorted(set(template_terms) - allowed_asset_ids)
+            if state_model_id and unauthorized_scope_assets:
+                return (
+                    "🧮 SQL 生成失败：当前模板的语义范围引用了模型未授权资产："
+                    + ", ".join(unauthorized_scope_assets)
+                )
+            try:
+                enum_caliber = _agent_added_enum_caliber(
+                    question=question,
+                    # The Agent must not bypass enum governance by omitting an
+                    # asset from selected_semantic_asset_ids. In model mode the
+                    # server-owned allowlist is the vocabulary authority.
+                    selected_asset_ids=sorted(allowed_asset_ids) if state_model_id else selected_asset_ids,
+                    trusted_text=_trusted_user_scope_text(runtime),
+                    authorized_terms_by_asset=template_terms,
+                    strict=bool(state_model_id),
+                )
+            except RuntimeError as exc:
+                return f"🧮 SQL 生成失败：当前分析模型的可信枚举范围不可用：{exc}"
             injected = physical_guidance + [
                 term for term in enum_caliber if term not in physical_guidance
             ]
@@ -438,21 +534,6 @@ class DatabaseSqlGenerateTool(BaseTool):
                 "不能指导使用哪个字段、表、实体或 SQL 实现。请保留 parent_generation_id，"
                 "仅描述错误、超时、空结果、校验冲突或结果异常后重试。"
             )
-        selected_asset_ids = list(
-            dict.fromkeys(selected_semantic_asset_ids or semantic_asset_ids or measure_ids or [])
-        )
-        if state_model_id and runtime is not None and isinstance(runtime.state, dict):
-            allowed_asset_ids = {
-                str(item).strip()
-                for item in runtime.state.get("allowed_semantic_asset_ids") or []
-                if str(item).strip()
-            }
-            selected_asset_ids, normalization_error = normalize_selected_semantic_asset_ids(
-                selected_asset_ids,
-                allowed_asset_ids,
-            )
-            if normalization_error:
-                return "🧮 SQL 生成失败：" + normalization_error
         request_payload = {
             "question": question,
             "semantic_question": question,
