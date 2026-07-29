@@ -4,7 +4,7 @@
 
 PuddingClaw 目前主打两条产品主线：
 
-- **知识库**：把 PDF、Markdown、图片、Excel / CSV / TSV 和数据库源沉淀为用户自己拥有的知识与数据资产，支持精确检索、混合检索和图文多模态 RAG。
+- **知识库**：把 PDF、Markdown、图片、Excel / CSV / TSV 和数据库源沉淀为用户自己拥有的知识与数据资产；当前支持精确检索、混合检索和图文多模态 RAG，并已规划通过 LLM Wiki + gbrain 建立可持续整理、跨 Session 召回和跨 Agent 携带的统一知识体系。
 - **智能问数**：用 Profile、语义资产、分析模型和 SQL Guardrails 约束 Agent，让自然语言问题能够落到可解释、可复算的 SQL / Pandas 分析和报告产物。
 
 贯穿两条主线的是两个原则：
@@ -22,7 +22,8 @@ PuddingClaw 目前主打两条产品主线：
 原始文件 / 数据库
         │
         ├─ 知识资产：原件、Markdown、图片、引用元数据
-        │              └─ 本地精确检索 + 文本/图片向量检索
+        │              ├─ 当前：本地精确检索 + 文本/图片向量检索
+        │              └─ 规划：LLM Wiki 编译 → gbrain 图谱/记忆 → MCP
         │
         └─ 数据资产：表格、数据库表、逻辑数据集、Profile
                        └─ 度量值 / 维度 / 颗粒度 / 资产关联
@@ -46,6 +47,45 @@ PuddingClaw 目前主打两条产品主线：
 - 检索结果携带来源信息，可进入对话右侧的来源与证据面板。
 
 知识库目录是用户资产目录，不是缓存目录。PostgreSQL 保存 Catalog、任务和引用元数据；Milvus 保存可重建的检索索引，两者都不替代本地原始资产。
+
+#### 已规划：LLM Wiki + gbrain 统一知识与记忆体系
+
+> **状态：设计方案已完成，尚未实现。** 该方案不会替换现有 MinerU + Milvus 多模态 RAG，也不改动智能问数的 Analytics / Vanna 域。
+
+现有 RAG 更适合高频变化的文档问答；规划中的 LLM Wiki + gbrain 面向稳定知识、跨来源合成、关系治理和跨 Session 记忆。两者的目标分工是：
+
+| 层 | 职责 | 资产边界 |
+| --- | --- | --- |
+| LLM Wiki / 编译式 RAG | 按 schema 将原始资料整理为互链 Wiki，执行 Ingest / Query / Lint 契约 | `raw/` 由人拥有且只读；`content/` 由 LLM 按契约维护；`schema/` 由人定义 |
+| gbrain | 为 Wiki 提供 pages、typed links、全文/向量检索、facts 记忆、版本与软删除 | `brain.pglite/` 是可重建的运行时索引，不是唯一知识源 |
+| MCP | 为 PuddingClaw Agent 和外部 Agent 提供统一的 search / recall / write-back 接口 | 接口声明可迁移，凭证在目标环境重新绑定 |
+
+目标链路：
+
+```text
+原始文档 / MinerU 产物 / 聊天捕获
+                │
+                ▼
+       raw/（原料，LLM 只读）
+                │  brain-capture / brain-ingest
+                ▼
+ content/（互链 Wiki） + schema/ + AGENTS.md
+                │  brain_sync：校验、记录、同步
+                ▼
+   gbrain / PGLite（索引、图谱、facts）
+                │
+                └─ MCP ──► PuddingClaw / Codex / Claude Code / 其他宿主
+```
+
+核心约束：
+
+- LLM 不直接写 `brain.pglite`；它只按 schema 编译 Wiki，确定性的 `brain_sync` 是索引同步入口。
+- 真正可迁移的知识资产是 `raw + content(wiki) + schema`；gbrain 数据库可以携带，也可以在目标环境重建。
+- PuddingClaw 负责 gbrain 的 fork、构建、配置、进程生命周期和前端管理；内部 Agent 与外部 Agent 都通过 MCP 使用它。
+- 模型配置只携带 `provider:model` 能力引用，不携带 API Key；导入新环境后通过 Provider Registry 重新绑定。
+- 后续再评估稳定知识 gbrain 与实时文档 Milvus RAG 的查询路由和结果融合，不在首期实现中提前耦合。
+
+详细方案见 [gbrain 融合：统一知识库与 Agent 记忆体系方案](docs/gbrain融合统一知识库与记忆体系方案.md)。
 
 ### 2. AI Native 智能问数
 
@@ -126,6 +166,8 @@ analysis-project/
 
 向量库、临时结果和平台运行状态不是业务资产的唯一事实源。即使离开 PuddingClaw，模型说明、语义口径、守卫、模板和数据绑定仍然可读、可版本化、可继续执行。
 
+知识库的目标迁移单元则是一个 Brain 目录：`raw/`、`content/`、`schema/` 和 `mcp.json` 可以整体打包；`brain.pglite/` 可选携带或按 Wiki 重建。该导出/导入链路属于 LLM Wiki + gbrain 方案，当前尚未实现。
+
 ## 典型使用流程
 
 1. 在“设置 → 模型服务”登记 Provider、接口和凭证，并为对话、视觉、文本 Embedding、多模态 Embedding、Rerank 绑定默认模型。
@@ -152,6 +194,8 @@ analysis-project/
 | 系统状态 | PostgreSQL、Milvus、MinerU、模型接入等能力探测与降级状态 |
 
 正常桌面使用以设置页和 `backend/config.json` 为事实源；环境变量主要用于部署覆盖。不要把包含真实 API Key、数据库密码或本机路径的配置提交到版本库。
+
+LLM Wiki + gbrain 落地后，知识库设置还将增加 gbrain 启停与健康状态、`GBRAIN_HOME`、PGLite / 外部 PostgreSQL、Embedding / Chat / Reranker 绑定、MCP 暴露、Schema Pack、Lint、导入和导出。以上均为规划项，当前设置页尚未提供。
 
 ## 快速开始
 
@@ -272,6 +316,7 @@ PuddingClaw/
 | 本地文件系统 | 原始知识、解析 Artifact、语义资产、模型、模板、会话与导出项目 |
 | Milvus | 知识库文本 / 图片向量与 Vanna 训练索引；均应可重建 |
 | MinerU | 可选的高质量 PDF 解析服务，不拥有最终知识资产 |
+| LLM Wiki + gbrain（规划） | 稳定知识编译、关系图谱、跨 Session facts、MCP 接入与 Brain 打包；尚未实现 |
 | Provider / AI Gateway | 对话、视觉、Embedding 与 Rerank；支持直连和可选网关模式 |
 
 增强服务失败时按能力降级，但不会伪装成“能力仍然可用”：状态页和 Trace 会展示实际 Backend、缺失能力和降级路径。
@@ -308,6 +353,7 @@ npm run build
 
 - [知识库双管道技术方案与实施计划](docs/知识库双管道技术方案与实施计划.md)
 - [知识库与结构化数据统一架构方案](docs/知识库与结构化数据统一架构方案.md)
+- [gbrain 融合：统一知识库与 Agent 记忆体系方案（未实施）](docs/gbrain融合统一知识库与记忆体系方案.md)
 - [智能问数工作台开发计划](docs/plans/2026-07-06-analytics-workbench-plan.md)
 - [语义资产与资产关联统一建模方案](docs/语义资产与资产关联统一建模方案.md)
 - [跨源车系实体解析 Demo](docs/demos/比亚迪奇瑞跨源车系实体解析Demo.md)
@@ -327,7 +373,7 @@ npm run build
 
 仍在持续演进或尚未实施的方向包括：
 
-- gbrain 统一知识库与跨 Session 记忆融合；
+- LLM Wiki 编译契约、gbrain 托管运行时、跨 Session 记忆、MCP 使用面与 Brain 可移植打包；
 - 多用户 / 组织级 RBAC 与完整企业权限后台；
 - 更通用的外部 HTTP / MCP 副作用 receipt 与幂等执行层；
 - 语义资产的更强确定性编译、自动评估与版本治理；
