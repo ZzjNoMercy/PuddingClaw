@@ -85,8 +85,6 @@ PuddingClaw 目前主打两条产品主线：
 - 模型配置只携带 `provider:model` 能力引用，不携带 API Key；导入新环境后通过 Provider Registry 重新绑定。
 - 后续再评估稳定知识 gbrain 与实时文档 Milvus RAG 的查询路由和结果融合，不在首期实现中提前耦合。
 
-详细方案见 [gbrain 融合：统一知识库与 Agent 记忆体系方案](docs/gbrain融合统一知识库与记忆体系方案.md)。
-
 ### 2. AI Native 智能问数
 
 智能问数工作台把结构化数据组织为五类对象：
@@ -299,7 +297,6 @@ PuddingClaw/
 ├── frontend/                # Next.js 工作台
 ├── electron/                # 桌面壳与本机服务管理
 ├── scripts/                 # 应用、基础设施与 MinerU 启动脚本
-├── docs/                    # 架构、ADR、实施计划、Runbook 与复盘
 ├── designs/                 # UI 设计验证稿
 ├── docker-compose.yml       # 容器化核心服务
 └── docker-compose.infra.yml # 本地 PostgreSQL / Milvus 基础设施
@@ -338,35 +335,6 @@ npm run build
 
 后端 OpenAPI 以运行中的 `/docs` 为准；README 不再手工维护容易过期的完整端点列表。
 
-## 文档导航
-
-文档的权威顺序是：**当前代码与运行时契约 > Living Reference / 整合说明 > 专题方案 > 历史计划与研究记录**。部分 `docs/plans/` 文件用于保留设计演进，不代表其中所有内容都已实现。
-
-### 产品与总架构
-
-- [后端架构总览](docs/ARCHITECTURE.md)
-- [PuddingClaw Harness Engineering 整合说明](docs/puddingclaw-harness-engineering.md)
-- [AgentState Living Reference](docs/agent-state-schema.md)
-- [上下文工程设计](docs/context-engineering-design.md)
-
-### 知识库与智能问数
-
-- [知识库双管道技术方案与实施计划](docs/知识库双管道技术方案与实施计划.md)
-- [知识库与结构化数据统一架构方案](docs/知识库与结构化数据统一架构方案.md)
-- [gbrain 融合：统一知识库与 Agent 记忆体系方案（未实施）](docs/gbrain融合统一知识库与记忆体系方案.md)
-- [智能问数工作台开发计划](docs/plans/2026-07-06-analytics-workbench-plan.md)
-- [语义资产与资产关联统一建模方案](docs/语义资产与资产关联统一建模方案.md)
-- [跨源车系实体解析 Demo](docs/demos/比亚迪奇瑞跨源车系实体解析Demo.md)
-
-### 白盒、安全与迁移
-
-- [可迁移分析项目与 SQL/Pandas 同源语义运行时](docs/portable-analysis-project-and-shared-semantic-runtime-plan.md)
-- [权限机制与执行边界整体方案](docs/权限机制与执行边界整体方案.md)
-- [跨 Run 上下文、Evidence 与能力解耦](docs/cross-run-context-evidence-and-capability-decoupling-plan.md)
-- [托管资源白名单机制](docs/托管资源白名单机制.md)
-- [用户级 Toolchain 与 Credential Profile](docs/adr/ADR-004-user-runtime-toolchain-and-credential-profiles.md)
-- [托管外部授权状态机](docs/adr/ADR-005-managed-external-authorization-flow.md)
-
 ## 当前状态与边界
 
 已经形成可用闭环的能力包括知识导入与检索、表格 / 数据库资产管理、Profile、语义资产、分析模型、SQL Guardrails、跨源维度任务、查询结果存储、结构化 Trace，以及分析项目导出。
@@ -379,7 +347,7 @@ npm run build
 - 语义资产的更强确定性编译、自动评估与版本治理；
 - 开源发行所需的根目录 License、CONTRIBUTING、SECURITY、CI 与完整脱敏检查。
 
-这些内容在文档中可能已经有设计稿，但不应被理解为当前稳定功能。
+以上方向仍处于规划或持续演进阶段，不应被理解为当前稳定功能。
 
 ## License
 

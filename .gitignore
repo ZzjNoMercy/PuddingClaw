@@ -57,6 +57,9 @@ backend/.pytest_cache/
 .playwright-cli/
 iterm2_workspace.iterm2arrangement
 
+# Private design notes and project documentation
+/docs/
+
 # Logs
 *.log
 
