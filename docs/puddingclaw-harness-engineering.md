@@ -632,6 +632,7 @@ PuddingClaw 明确不采用的外部做法：
 | Todo | `backend/graph/middlewares/harness_todos.py` |
 | Tool protocol | `backend/graph/middlewares/tool_protocol.py` |
 | DeepAgents 装配/summary/checkpoint | `backend/graph/deepagents_manager.py` |
+| AgentState 长期参考 | [AgentState Schema Living Reference](./agent-state-schema.md)：主 Agent 39 键联合 schema、渐进状态、Runtime/Session/Model Input 边界与定期复盘清单 |
 | Session 权威存储 | `backend/graph/session_manager.py` |
 | Harness 设置 UI | `frontend/src/app/settings/page.tsx` |
 | Goal/验收/权限面板 | `frontend/src/components/citations/SourcesPanel.tsx` |

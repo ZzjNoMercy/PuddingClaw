@@ -1,3 +1,15 @@
+---
+formatter: analytics-template
+id: monthly_product_config_report
+name: 月度产品配置分析报告模板
+version: "1.0.0"
+semantic_scope:
+  enum_filters:
+    dimension:energy_type:
+      members: ["纯电", "插电混合", "增程式纯电动", "汽油", "汽油+48V轻混系统", "油电混合", "汽油电驱", "汽油+24V轻混系统"]
+      classifications: ["新能源", "传统能源"]
+---
+
 # 月度产品配置分析报告模板
 
 这是 `monthly_product_config_report` 的唯一使用说明，包含触发条件、生成流程、Payload、页面结构、图表和验收契约。不要在模型顶层 reference 中追加本模板专属规则。
@@ -50,7 +62,7 @@ Agent 必须把模板当作一个不可拆分的资源包：从 `resolved_templa
 ## Agent 执行契约
 
 ```text
-S0 解析 Query，确认命中月报模板
+S0 解析 Query，确认命中月报模板，并先解析目标报告月份
   → S1 从 8 个章节和 20 个图表编译报告计划
   → Gate 1：计划完整
   → S2 查询与计算
@@ -63,6 +75,27 @@ S0 解析 Query，确认命中月报模板
 ```
 
 任何 Gate 失败时只能回到上一阶段修复，不得跳过失败项继续交付。
+
+### S0：先识别报告月份
+
+月报中的“最新一年”“本年累计”和“同比”都依赖目标月份。Agent 必须先确定 `report.scope.period`，再规划或查询任何更新次数数据。
+
+目标月份按以下优先级确定：
+
+1. 用户 Query 明确给出的 `YYYY-MM` 或“YYYY 年 MM 月”。
+2. 用户只说“本月”时，使用运行时当前日期所在月份，时区固定为 `Asia/Shanghai`。
+3. 不得用数据库最大年份替代目标月份；`report.data_cutoff` 是数据实际截止日，可以早于目标月份月末，但其年月不得晚于 `report.scope.period`。
+
+解析后必须派生并保存在计划或证据中：
+
+```text
+report_year          = YYYY
+report_month         = MM
+current_ytd_window   = YYYY-01-01 至 report.data_cutoff
+prior_ytd_window     = (YYYY-1)-01-01 至 report.data_cutoff 向前平移 1 年
+```
+
+若 `report.data_cutoff` 尚未确定，先查询数据最大有效日期；不得先计算竞企同比，再补月份。
 
 ### S1：编译报告计划
 
@@ -83,14 +116,42 @@ S0 解析 Query，确认命中月报模板
 
 计划必须覆盖 8 个章节、20 个图表、封面、KPI、结论、竞企表格和口径说明，并为每个任务声明颗粒度、维度、度量、筛选、输出路径和空数据策略。
 
+其中新车迭代必须拆成两个不可互换的任务：
+
+```text
+chart.renewalChart
+  默认年份：以 report_year 结尾的连续 6 年
+  四条固定系列：传统能源更新、新能源更新、传统能源周期、新能源周期
+  最新年份更新次数：current_ytd_window；历史年份：自然年全年
+
+table.competitor_updates
+  默认时间：只输出 report_year 的 current_ytd_window
+  固定企业与顺序：比亚迪集团、长安集团、奇瑞集团、长城汽车、吉利汽车
+  同比：本年累计更新次数减上年同期累计更新次数
+  周期：本年截至数据截止日的平均更新周期，不要求与上年同期对齐
+```
+
 ### S2：查询与计算
 
 - 遵守模型顶层通用分析规则。
 - 调用 `database_sql_generate` 时，`question` 只描述业务指标、维度、颗粒度、筛选、时间范围和所需输出；语义资产通过 `selected_semantic_asset_ids` 传递。不得把 S1 计划中的 Payload 键、物理字段、表名、EAV 名/值或 SQL 实现复制进 `question`。
-- 本模板命中时，服务端已根据 `model.md` 的结构化 `semantic_scope` 授权“纯电”与“新能源”业务筛选；必须使用这些标准业务词，不得改写为 BEV、纯电动或其他同义词规避校验。
+- Agent 成功读取本文件后，服务端会校验并激活本文件 frontmatter 的结构化 `semantic_scope`，授权模板任务使用“纯电”、“插电混合”、“增程式纯电动”、“新能源”与“传统能源”业务筛选/分组；必须使用这些标准业务词，不得改写为 BEV、纯电动或其他同义词规避校验。
 - 每个查询结果保存 `query_id`、SQL/工具调用摘要、行数、颗粒度、筛选、数据截止日和异常。
 - 每个派生指标保存 `value`、`unit`、`numerator`、`denominator`、`grain` 和 `source_query_ids`。
 - 完成整个计划后才能组装 Payload。
+
+#### 新车迭代固定口径
+
+- `renewalChart` 的柱形不得拆成“新增款型/改款换代”，固定为“传统能源更新/新能源更新”。
+- `renewalChart` 的折线不得合并成一条“平均更新周期”，固定为“传统能源周期/新能源周期”。
+- 默认展示以 `report_year` 结尾的连续 6 个自然年；当前年更新次数统计 `current_ytd_window`，以前年度统计自然年全年。
+- 平均周期按同一分析对象相邻有效更新日期计算。当前年只聚合截至 `report.data_cutoff` 已发生的更新事件；允许当前半年或年内数据与上一完整自然年直接并列，不做上年同期折算。
+- `competitor_updates` 默认只保留目标报告年份，不得同时逐行输出上年和本年，也不得出现“年份”列。
+- 竞企“更新”是本年累计更新次数；“同比”是 `本年累计更新次数 - 上年同期累计更新次数`，单位为“次”，显示为 `+N`、`−N` 或 `0`，不是同比百分比。
+- 竞企“周期”是目标报告年截至数据截止日的平均更新周期，单位为“天”；无需计算周期同比。
+- 重点竞企不是动态 Top 5，也不得由 Agent 自行替换。必须按固定顺序输出：`比亚迪集团`、`长安集团`、`奇瑞集团`、`长城汽车`、`吉利汽车`。
+- 查询时必须在品牌集团维度显式过滤上述五个标准值；不得以“比亚迪”“长安”“奇瑞”“长城”“吉利”等下属品牌或简称替代品牌集团口径。
+- 即使其他品牌更新次数更高，也不得进入该表；即使固定企业当期数值为 0，也必须保留其行。除非用户明确要求修改模板名单，否则报告刷新指令不得改变这五家企业及顺序。
 
 ### S3：统一 Payload
 
@@ -161,6 +222,37 @@ report.tables.<table_id> = {
 }
 ```
 
+`report.tables.competitor_updates` 不是自由表格，必须使用以下固定结构：
+
+```json
+{
+  "status": "ready",
+  "as_of_period": "YYYY-MM",
+  "comparison_period": "YYYY-01-01~YYYY-MM-DD vs (YYYY-1)-01-01~(YYYY-1)-MM-DD",
+  "columns": [
+    {"key": "brand_group", "label": "品牌集团"},
+    {"key": "update_count", "label": "更新"},
+    {"key": "ytd_yoy_delta", "label": "同比"},
+    {"key": "average_cycle_days", "label": "周期"}
+  ],
+  "rows": [
+    {"brand_group": "比亚迪集团", "update_count": 0, "ytd_yoy_delta": 0, "average_cycle_days": 0},
+    {"brand_group": "长安集团", "update_count": 0, "ytd_yoy_delta": 0, "average_cycle_days": 0},
+    {"brand_group": "奇瑞集团", "update_count": 0, "ytd_yoy_delta": 0, "average_cycle_days": 0},
+    {"brand_group": "长城汽车", "update_count": 0, "ytd_yoy_delta": 0, "average_cycle_days": 0},
+    {"brand_group": "吉利汽车", "update_count": 0, "ytd_yoy_delta": 0, "average_cycle_days": 0}
+  ],
+  "query_ids": ["<query_id>"]
+}
+```
+
+约束：
+
+- `as_of_period` 必须等于 `report.scope.period`。
+- 行内不得包含或展示 `year`、`new_model_count`、`renewal_count` 等替代列。
+- `update_count`、`ytd_yoy_delta` 和 `average_cycle_days` 写入数字，由渲染器负责 `+N/−N` 与“天”的显示格式。
+- `status: "ready"` 时必须恰好 5 行，名称和顺序必须与固定名单完全一致；无数据时使用 `status: "no_data"`。
+
 ### 图表
 
 普通折线、柱状、组合图和 100% 堆叠图：
@@ -174,6 +266,25 @@ charts.<DOM id> = {
   query_ids: [<query_id>]
 }
 ```
+
+`charts.renewalChart` 使用固定四系列结构，系列名称、类型、轴和堆叠组不得改写：
+
+```json
+{
+  "status": "ready",
+  "kind": "combo",
+  "categories": ["YYYY-5", "YYYY-4", "YYYY-3", "YYYY-2", "YYYY-1", "YYYY"],
+  "series": [
+    {"name": "传统能源更新", "type": "bar", "axis": 0, "stack": "updates", "data": []},
+    {"name": "新能源更新", "type": "bar", "axis": 0, "stack": "updates", "data": []},
+    {"name": "传统能源周期", "type": "line", "axis": 1, "data": []},
+    {"name": "新能源周期", "type": "line", "axis": 1, "data": []}
+  ],
+  "query_ids": ["<query_id>"]
+}
+```
+
+不得输出图二式的“新增款型/改款换代/平均更新周期”三系列结构。当前年数据不满一年时仍保留当前年份，并在图表副标题标注“截至 MM 月数据”。
 
 热力图变体：
 
@@ -243,7 +354,7 @@ charts.<DOM id> = {
 ## 必需章节
 
 1. **执行摘要**：封面只显示标题与报告日期；下方展示 3–5 个 KPI 和 3–5 条结论。
-2. **新车迭代**：更新次数、更新周期、能源结构与重点竞企节奏。
+2. **新车迭代**：传统/新能源更新次数、两类平均更新周期，以及仅展示目标年份本年累计的重点竞企节奏。
 3. **尺寸与动力**：轴距、电机功率及尺寸 × 功率组合。
 4. **高压平台**：纯电与全新能源分别统计年度趋势和价格带结构。
 5. **智能驾驶**：L2/L2+、高阶 NOA、指导价分布和主要企业 NOA 搭载。
@@ -271,7 +382,7 @@ charts.<DOM id> = {
 
 | DOM id | 图表类型 | 必需输入 |
 | --- | --- | --- |
-| `renewalChart` | 堆叠柱 + 双折线 | 年份、两类更新次数、两类更新周期 |
+| `renewalChart` | 堆叠柱 + 双折线 | 连续 6 年；传统/新能源更新次数；传统/新能源平均周期；当前年更新次数为截至报告月的年累值 |
 | `wheelbaseTrendChart` | 100% 堆叠柱 | 年份、轴距段、款型占比 |
 | `motorPowerTrendChart` | 100% 堆叠柱 | 年份、功率段、款型占比 |
 | `sizePowerHeatmapChart` | 热力图 | 轴距段 × 功率段 × 款型数/占比 |
@@ -316,6 +427,8 @@ cockpitChipShareChart
 - 所有比率都有分子、分母和颗粒度。
 - 所有结论至少引用一个 `query_id`。
 - 所有图表系列可追溯到计算结果。
+- 已先解析 `report.scope.period`，竞企更新数有本年累计与上年同期两个查询窗口。
+- 平均周期保留事件范围和计算对象，但不强制按上年同期折算。
 
 ### Gate 3 — Payload 校验
 
@@ -324,6 +437,8 @@ cockpitChipShareChart
 - 百分比在 `[0, 100]`，计数非负，日期可解析。
 - 100% 堆叠图逐列合计满足误差规则。
 - 示例状态和真实报告状态不可混用。
+- `renewalChart` 恰好包含四条固定系列，柱形使用同一 `updates` 堆叠组，最新年份等于 `report.scope.period` 的年份。
+- `competitor_updates` 只含固定四列，`as_of_period === report.scope.period`，恰好包含固定五家企业且顺序正确，并且没有“年份”列。
 
 ### Gate 4 — 页面验收
 
@@ -332,6 +447,8 @@ cockpitChipShareChart
 - 有数据图生成 SVG，无数据图显示明确空状态。
 - ECharts 实例数量正确，控制台无 JavaScript 错误。
 - 页面不存在示例值标记或未解析的 `{{variable}}`。
+- 新车迭代页面与设计基准一致：左侧为传统/新能源堆叠柱和双周期折线，右侧为“品牌集团/更新/同比/周期”四列表格。
+- 前台不显示 `query_id` 或 `QUERY REQUIRED`；查询证据只保存在 Payload 的 `query_ids` 与 `evidence`。
 
 ## 交付检查
 
@@ -348,3 +465,6 @@ cockpitChipShareChart
 - [ ] 纯电与全新能源分母未混用。
 - [ ] 价格、尺寸、功率和电压单位明确。
 - [ ] 时间序列连续性、缺失值和异常值已说明。
+- [ ] 已先识别目标报告月份；当前年更新次数为年初至数据截止日累计。
+- [ ] 竞企表仅展示目标年份，固定为比亚迪集团、长安集团、奇瑞集团、长城汽车、吉利汽车，次数同比为本年累计减上年同期累计。
+- [ ] 平均周期允许当前年内区间与历史完整自然年直接并列。

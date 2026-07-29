@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import logging
+import httpx
 from dataclasses import dataclass
-from http import HTTPStatus
 from typing import Any
 
-from config import get_fallback_embedding_config, get_multimodal_embedding_config, get_rag_rerank_config
+from config import get_rag_rerank_config, load_config
+from provider_registry import get_provider_registry
 
 logger = logging.getLogger(__name__)
 
@@ -16,14 +17,6 @@ logger = logging.getLogger(__name__)
 class RerankItem:
     index: int
     score: float | None = None
-
-
-def _dashscope_api_key(config: dict[str, Any]) -> str:
-    return (
-        str(config.get("api_key") or "")
-        or str(get_multimodal_embedding_config().get("api_key") or "")
-        or str(get_fallback_embedding_config().get("api_key") or "")
-    )
 
 
 def rerank_documents(
@@ -51,23 +44,16 @@ def rerank_documents(
         logger.warning("[rerank] unsupported provider=%s", config.get("provider"))
         return []
 
-    api_key = _dashscope_api_key(config)
+    resolved = get_provider_registry().resolve_binding("rerank", legacy_config=load_config())
+    api_key = str(resolved.get("api_key") or "")
     if not api_key:
         logger.warning("[rerank] skipped because api key is not configured")
         return []
 
-    try:
-        import dashscope
-    except ImportError:
-        logger.warning("[rerank] skipped because dashscope is not installed")
+    if resolved.get("protocol") != "dashscope_multimodal_embedding":
+        logger.warning("[rerank] selected endpoint does not support DashScope native rerank")
         return []
-
-    base_url = str(config.get("base_url") or "").strip()
-    previous_base_url = getattr(dashscope, "base_http_api_url", None)
-    if base_url:
-        dashscope.base_http_api_url = base_url.rstrip("/")
-
-    model = str(config.get("model") or "qwen3-vl-rerank")
+    model = str(resolved.get("name") or config.get("model") or "qwen3-vl-rerank")
     top_n = max(1, min(top_n or int(config.get("top_n") or 5), len(documents)))
     try:
         if model == "qwen3-vl-rerank":
@@ -79,19 +65,23 @@ def rerank_documents(
             query_payload = query
             document_payloads = [str(doc.get("text") if isinstance(doc, dict) else doc) for doc in documents]
 
-        response = dashscope.TextReRank.call(
-            model=model,
-            api_key=api_key,
-            query=query_payload,  # type: ignore[arg-type]
-            documents=document_payloads,  # type: ignore[arg-type]
-            top_n=top_n,
-            return_documents=True,
-            **({"instruct": instruct} if instruct and model != "qwen3-vl-rerank" else {}),
-        )
-        if response.status_code != HTTPStatus.OK:
-            logger.warning("[rerank] model=%s failed: %s", model, getattr(response, "message", response))
-            return []
-        output = getattr(response, "output", None) or {}
+        base_url = str(resolved.get("base_url") or "").rstrip("/")
+        route_path = str(resolved.get("route_path") or "/api/v1/services/rerank/text-rerank/text-rerank")
+        # Rerank has a native DashScope contract, not the OpenAI embeddings
+        # contract. The client is request-scoped so concurrent jobs never
+        # mutate shared SDK configuration.
+        with httpx.Client(timeout=120.0) as client:
+            response = client.post(
+                f"{base_url}{route_path if route_path.startswith('/') else '/' + route_path}",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": model,
+                    "input": {"query": query_payload, "documents": document_payloads},
+                    "parameters": {"top_n": top_n, "return_documents": True, **({"instruct": instruct} if instruct and model != "qwen3-vl-rerank" else {})},
+                },
+            )
+            response.raise_for_status()
+            output = response.json().get("output", {})
         results = output.get("results", []) if isinstance(output, dict) else []
         reranked: list[RerankItem] = []
         for item in results:
@@ -111,6 +101,3 @@ def rerank_documents(
     except Exception as exc:  # noqa: BLE001
         logger.warning("[rerank] failed: %s: %s", type(exc).__name__, exc)
         return []
-    finally:
-        if base_url and previous_base_url:
-            dashscope.base_http_api_url = previous_base_url

@@ -3,7 +3,7 @@ formatter: analytics-model
 id: "产品配置分析"
 name: "产品配置分析"
 type: analysis_model
-version: "0.3.2"
+version: "0.3.4"
 description: "汽车行业已上市车型的配置分析，当用户询问单一车型的配置、多车型的配置对比以及行业的配置率发展趋势等场景使用。"
 tags: ["汽车产品配置","配置率","行业趋势报告","ECharts"]
 data_assets:
@@ -31,38 +31,17 @@ templates:
       - "刷新月度产品配置分析报告"
       - "生成产品配置分析月报"
       - "更新本月产品配置分析报告"
+      - "按照月报模板说明重新更新图表"
     do_not_use_when:
       - "单一车型配置查询"
       - "多车型配置对比"
       - "临时专题分析或普通问答"
-    query_match:
-      any_token_sets:
-        - ["刷新", "月报"]
-        - ["生成", "月报"]
-        - ["更新", "月报"]
-        - ["刷新", "月度", "产品配置分析报告"]
-        - ["刷新", "产品配置分析", "报告"]
-        - ["更新", "本月", "产品配置分析报告"]
-        - ["更新", "本月", "报告"]
-      exclude_any_token_sets:
-        - ["不要", "月报"]
-        - ["不需要", "月报"]
-        - ["不用", "月报"]
-        - ["无需", "月报"]
-        - ["取消", "月报"]
-        - ["不使用", "月报模板"]
-        - ["解释", "刷新月报"]
-    semantic_scope:
-      enum_filters:
-        dimension:energy_type:
-          members: ["纯电"]
-          classifications: ["新能源"]
 acceptance:
   invariants:
   - type: classification_mapping_declaration
     target: dimension:energy_type
 created: "2026-07-13 06:25:03"
-updated_at: "2026-07-28 00:00:00"
+updated_at: "2026-07-29 00:00:00"
 ---
 
 

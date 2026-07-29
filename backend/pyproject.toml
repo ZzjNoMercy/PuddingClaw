@@ -119,6 +119,9 @@ build-backend = "hatchling.build"
 only-include = [
     "app.py",
     "capabilities.py",
+    "config.py",
+    "provider_registry.py",
+    "higress_config_reader.py",
     "api",
     "analytics",
     "graph",

@@ -10,7 +10,6 @@ export default function AppControlPage() {
   const [infraStatus, setInfraStatus] = useState<{
     docker: boolean;
     postgres: string;
-    higress: string;
     milvus: string;
     status: string;
     error: string | null;
@@ -44,7 +43,7 @@ export default function AppControlPage() {
       setBackendStatus(status as { status: string; error: string | null; url: string });
     };
     const handleInfraStatus = (_event: unknown, status: unknown) => {
-      setInfraStatus(status as { docker: boolean; postgres: string; higress: string; milvus: string; status: string; error: string | null });
+      setInfraStatus(status as { docker: boolean; postgres: string; milvus: string; status: string; error: string | null });
     };
 
     window.electron?.onBackendStatusChange(handleBackendStatus);
@@ -161,10 +160,6 @@ export default function AppControlPage() {
               <div className="flex justify-between">
                 <span className="text-gray-600">PostgreSQL</span>
                 <span className="capitalize text-gray-900">{infraStatus.postgres}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-gray-600">Higress</span>
-                <span className="capitalize text-gray-900">{infraStatus.higress}</span>
               </div>
               <div className="flex justify-between">
                 <span className="text-gray-600">Milvus</span>

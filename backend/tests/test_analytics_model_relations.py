@@ -65,12 +65,12 @@ def test_template_paths_have_one_model_relative_canonical_form() -> None:
             canonical_model_resource_path(invalid, root="templates")
 
 
-def test_product_config_monthly_template_is_server_routed_with_resolved_paths() -> None:
+def test_product_config_monthly_template_resolves_guide_manifest_and_paths() -> None:
     base_dir = Path(__file__).resolve().parents[1]
     models = AnalyticsModelRegistry(base_dir)
     models.refresh()
 
-    context = models.get_model_context("产品配置分析", query="刷新2026年6月月报")
+    context = models.get_model_context("产品配置分析")
 
     template = context["resolved_templates"]["monthly_product_config_report"]
     assert template["virtual_path"] == (
@@ -83,45 +83,125 @@ def test_product_config_monthly_template_is_server_routed_with_resolved_paths() 
         "/analytics-models/产品配置分析/templates/monthly_product_config_report/report-renderer.js",
         "/analytics-models/产品配置分析/templates/monthly_product_config_report/echarts-6.1.0.min.js",
     ]
-    assert context["template_route"] == {
-        "status": "matched",
-        "template_id": "monthly_product_config_report",
-    }
-    assert context["active_template"]["semantic_scope"]["enum_filters"] == {
+    assert template["guide_frontmatter"]["formatter"] == "analytics-template"
+    assert template["guide_frontmatter"]["id"] == "monthly_product_config_report"
+    assert template["compiled_semantic_scope"]["enum_filters"] == {
         "dimension:energy_type": {
-            "members": ["纯电"],
-            "classifications": ["新能源"],
+            "members": [
+                "纯电",
+                "插电混合",
+                "增程式纯电动",
+                "汽油",
+                "汽油+48V轻混系统",
+                "油电混合",
+                "汽油电驱",
+                "汽油+24V轻混系统",
+            ],
+            "classifications": ["新能源", "传统能源"],
         }
     }
+    assert template["guide_content_sha256"].startswith("sha256:")
+    assert "template_route" not in context
+    assert "active_template" not in context
 
 
-def test_product_config_monthly_template_respects_explicit_negative_route() -> None:
+def test_template_discovery_does_not_change_with_query_wording() -> None:
     base_dir = Path(__file__).resolve().parents[1]
     models = AnalyticsModelRegistry(base_dir)
     models.refresh()
 
-    context = models.get_model_context("产品配置分析", query="不要刷新月报，只查询空气悬架")
+    positive = models.get_model_context("产品配置分析", query="刷新2026年6月月报")
+    negative = models.get_model_context("产品配置分析", query="不要刷新月报，只查询空气悬架")
 
-    assert context["template_route"] == {"status": "not_matched"}
-    assert context["active_template"] is None
+    assert positive["resolved_templates"] == negative["resolved_templates"]
+    assert "template_route" not in positive
+    assert "template_route" not in negative
 
 
-@pytest.mark.parametrize(
-    "query",
-    [
-        "这个月报不用生成，只更新空气悬架数据",
-        "解释一下“刷新月报”是什么意思",
-    ],
-)
-def test_product_config_monthly_template_does_not_route_negated_or_quoted_intent(query: str) -> None:
-    base_dir = Path(__file__).resolve().parents[1]
-    models = AnalyticsModelRegistry(base_dir)
+def test_template_semantic_scope_is_rejected_from_model_registration(tmp_path: Path) -> None:
+    model_dir = tmp_path / "analytics-models" / "monthly"
+    template_dir = model_dir / "templates" / "report"
+    template_dir.mkdir(parents=True)
+    (template_dir / "index.html").write_text("<html></html>", encoding="utf-8")
+    (template_dir / "TEMPLATE.md").write_text(
+        "---\nformatter: analytics-template\nid: report\n---\n# Report\n",
+        encoding="utf-8",
+    )
+    (model_dir / "model.md").write_text(
+        """---
+formatter: analytics-model
+id: monthly
+name: Monthly
+semantic_assets: {dimensions: []}
+templates:
+  report:
+    path: templates/report/index.html
+    guide: templates/report/TEMPLATE.md
+    semantic_scope: {enum_filters: {}}
+---
+""",
+        encoding="utf-8",
+    )
+    models = AnalyticsModelRegistry(tmp_path)
     models.refresh()
 
-    context = models.get_model_context("产品配置分析", query=query)
+    with pytest.raises(AnalyticsModelError, match="must be declared in its guide frontmatter"):
+        models.get_model_context("monthly")
 
-    assert context["template_route"] == {"status": "not_matched"}
-    assert context["active_template"] is None
+
+def test_template_frontmatter_scope_keeps_server_enum_validation(tmp_path: Path) -> None:
+    dimension_dir = tmp_path / "semantic-assets" / "dimensions" / "energy"
+    dimension_dir.mkdir(parents=True)
+    (dimension_dir / "dimension.md").write_text(
+        """---
+formatter: semantic-asset
+name: Energy
+type: dimension
+enum_universe: [pure]
+classifications:
+  electric: [pure]
+---
+""",
+        encoding="utf-8",
+    )
+    model_dir = tmp_path / "analytics-models" / "monthly"
+    template_dir = model_dir / "templates" / "report"
+    template_dir.mkdir(parents=True)
+    (template_dir / "index.html").write_text("<html></html>", encoding="utf-8")
+    (template_dir / "TEMPLATE.md").write_text(
+        """---
+formatter: analytics-template
+id: report
+semantic_scope:
+  enum_filters:
+    dimension:energy:
+      members: [diesel]
+      classifications: [electric]
+---
+# Report
+""",
+        encoding="utf-8",
+    )
+    (model_dir / "model.md").write_text(
+        """---
+formatter: analytics-model
+id: monthly
+name: Monthly
+semantic_assets:
+  dimensions: [dimension:energy]
+templates:
+  report:
+    path: templates/report/index.html
+    guide: templates/report/TEMPLATE.md
+---
+""",
+        encoding="utf-8",
+    )
+    models = AnalyticsModelRegistry(tmp_path)
+    models.refresh()
+
+    with pytest.raises(AnalyticsModelError, match="contains undeclared values: diesel"):
+        models.get_model_context("monthly")
 
 
 def test_model_import_keeps_javascript_template_bundle(tmp_path: Path) -> None:

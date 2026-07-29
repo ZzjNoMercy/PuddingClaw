@@ -1,27 +1,17 @@
 # PuddingClaw Docker Compose（旧 full-stack 部署文件）
 #
 # 当前推荐部署方式：
-#   1. Higress/Milvus: docker compose -f docker-compose.infra.yml up -d
+#   1. PostgreSQL/Milvus: docker compose -f docker-compose.infra.yml up -d
 #   2. frontend/backend: scripts/start-macos-linux.sh
 #
 # Core 模式：
 #   docker compose up --build -d
 #
-# Full 模式（含 AI Gateway、向量库）：
-#   docker compose --profile full up --build -d
-#
 # 访问：
 #   前端：http://localhost:3000
 #   后端 API：http://localhost:8888
 #   API 文档：http://localhost:8888/docs
-#   Higress Gateway：http://localhost:8080
-#   Higress Console：http://localhost:8001
-#   Higress Prometheus：http://localhost:19090  # 避免占用常见的宿主机 9090
-#
-# 注意：
-#   Full 模式为旧部署路径；当前本地模式下 backend 不再运行在 Docker 容器内。
-#   首次启动 Higress 后需要访问 Console 配置 Provider：
-#   http://localhost:8001
+# Provider 凭证和模型绑定由本地客户端 Provider Registry 管理，模型请求直连 Provider。
 
 services:
   postgres:
@@ -61,7 +51,7 @@ services:
       - BACKEND_PORT=9100
       - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
       - DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://puddingclaw:puddingclaw@postgres:5432/puddingclaw}
-      # 其他环境变量在 backend/.env 中配置（如 MINERU_URL、AI_GATEWAY_URL）
+      # 其他环境变量在 backend/.env 中配置（如 MINERU_URL）
     volumes:
       # 持久化会话、workspace、memory、日志到宿主机
       - ./backend/sessions:/app/sessions
@@ -78,8 +68,6 @@ services:
       - ./backend/.env:/app/.env:ro
       - ./backend/config.json:/app/config.json
       - ./logging.yaml:/app/logging.yaml:ro
-      # 挂载 Higress 配置目录，backend 可读取路由模型列表
-      - ./data/higress:/app/data/higress:ro
     restart: unless-stopped
     depends_on:
       postgres:
@@ -106,35 +94,6 @@ services:
       backend:
         condition: service_healthy
     restart: unless-stopped
-
-  higress:
-    # 必须使用带 -o11y 后缀的镜像，才能启用内置 Prometheus/Grafana/Loki 套件
-    image: higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/all-in-one:latest-o11y
-    container_name: puddingclaw-higress
-    profiles: ["full"]
-    ports:
-      - "8080:8080"
-      - "8001:8001"
-      # 可观测套件端口（Prometheus / Grafana / Envoy metrics）
-      - "${HIGRESS_PROMETHEUS_PORT:-19090}:9090"
-      - "${HIGRESS_GRAFANA_PORT:-3001}:3000"
-      - "${HIGRESS_ENVOY_METRICS_PORT:-15020}:15020"
-      - "${HIGRESS_ENVOY_HEALTH_PORT:-15021}:15021"
-    environment:
-      - MODE=full
-      - USE_PLUGIN_SERVER=on
-      - ENABLE_CONSOLE_ROUTE=1
-      - O11Y=on
-    volumes:
-      # 持久化 Higress 配置，避免每次重启后 Provider 配置丢失
-      - ./data/higress:/data
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
 
 # 可选：使用外部网络，便于与其他服务（如 Milvus）集成
 # networks:

@@ -397,6 +397,35 @@ def test_load_session_for_agent_excludes_cross_run_reasoning(tmp_path):
     assert "reasoning_content" not in assistant
 
 
+def test_load_session_for_agent_preserves_attachment_references(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("agent-attachment-session")
+    attachment = {
+        "id": "att_image123",
+        "name": "image.png",
+        "type": "image",
+        "mime_type": "image/png",
+        "size": 128,
+        "source": "clipboard",
+        "sha256": "sha256:test",
+        "download_url": "/api/attachments/att_image123/download?session_id=agent-attachment-session",
+        "preview_url": "/api/attachments/att_image123/preview?session_id=agent-attachment-session",
+    }
+
+    session_manager.save_message(
+        "agent-attachment-session",
+        "user",
+        "这图讲了什么",
+        attachments=[attachment],
+    )
+
+    messages = session_manager.load_session_for_agent("agent-attachment-session")
+
+    assert messages[0]["role"] == "user"
+    assert messages[0]["attachments"][0]["id"] == "att_image123"
+    assert messages[0]["attachments"][0]["name"] == "image.png"
+
+
 def test_load_session_for_agent_restores_cross_run_tool_output_as_evidence(tmp_path):
     session_manager.initialize(tmp_path)
     session_manager.create_session("agent-tool-output-session")

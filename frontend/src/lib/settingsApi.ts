@@ -256,6 +256,60 @@ export interface SystemSettings {
   harness: HarnessSettings;
   subagents: SubAgentSettings;
   subagent?: SubAgentSettings;
+  provider_registry?: ProviderRegistry;
+}
+
+export type ProviderCapability = "llm" | "text_embedding" | "multimodal_embedding" | "rerank";
+export type ProviderModelCategory = "llm" | "multimodal_llm" | "text_embedding" | "multimodal_embedding" | "rerank";
+export type ThinkingLevel = "low" | "high" | "max";
+
+export interface ThinkingProfile {
+  kind: "qwen_fixed" | "kimi_bailian_fixed" | "kimi_levels" | "deepseek_levels" | "none";
+  thinking_enabled: boolean;
+  strength_control: "levels" | "disabled" | "hidden";
+  levels: ThinkingLevel[];
+  default_level: ThinkingLevel | null;
+  disabled_label: string;
+}
+
+export interface ProviderEndpoint {
+  id: string;
+  protocol: string;
+  base_url: string;
+  route_path?: string;
+  capabilities: ProviderCapability[];
+  credential_configured: boolean;
+  api_key_masked: string;
+  credential_source: "" | "environment" | "local_file";
+}
+
+export interface ProviderModel {
+  id: string;
+  name: string;
+  endpoint_id: string;
+  capability: ProviderCapability;
+  categories?: ProviderModelCategory[];
+  dimension?: number;
+  batch_size?: number;
+  concurrency?: number;
+  thinking_profile?: ThinkingProfile;
+}
+
+export interface ProviderService {
+  id: string;
+  name: string;
+  enabled: boolean;
+  website?: string;
+  credential_scope?: "provider" | "endpoint";
+  endpoints: ProviderEndpoint[];
+  models: ProviderModel[];
+}
+
+export interface ProviderRegistry {
+  version: number;
+  providers: ProviderService[];
+  bindings: Record<string, string>;
+  migration: { state: string };
 }
 
 export async function getSettings(): Promise<SystemSettings> {
@@ -273,6 +327,94 @@ export async function updateSettings(updates: Record<string, unknown>): Promise<
   if (!resp.ok) {
     const data = await resp.json().catch(() => ({}));
     throw new Error(data.detail || `Failed to save settings: ${resp.status}`);
+  }
+}
+
+export async function getProviders(): Promise<ProviderRegistry> {
+  const resp = await fetch(`${API_BASE}/providers`);
+  if (!resp.ok) throw new Error(`Failed to get providers: ${resp.status}`);
+  return resp.json();
+}
+
+export async function updateProvider(providerId: string, update: {
+  name?: string;
+  enabled?: boolean;
+  endpoints?: Array<{ id: string; base_url?: string; route_path?: string; api_key?: string }>;
+}): Promise<ProviderRegistry> {
+  const resp = await fetch(`${API_BASE}/providers/${providerId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(update),
+  });
+  if (!resp.ok) {
+    const data = await resp.json().catch(() => ({}));
+    throw new Error(data.detail || `Failed to update provider: ${resp.status}`);
+  }
+  return resp.json();
+}
+
+export async function bindProviderModel(binding: string, modelId: string): Promise<void> {
+  const resp = await fetch(`${API_BASE}/providers/bindings/${binding}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model_id: modelId }),
+  });
+  if (!resp.ok) {
+    const data = await resp.json().catch(() => ({}));
+    throw new Error(data.detail || `Failed to bind model: ${resp.status}`);
+  }
+}
+
+export async function discoverProviderModels(providerId: string, endpointId: string): Promise<Array<{ id: string; name: string }>> {
+  const resp = await fetch(`${API_BASE}/providers/${providerId}/endpoints/${endpointId}/discover-models`, { method: "POST" });
+  if (!resp.ok) {
+    const data = await resp.json().catch(() => ({}));
+    throw new Error(data.detail || `Failed to discover models: ${resp.status}`);
+  }
+  return (await resp.json()).models;
+}
+
+export interface ProviderConnectionTestResult {
+  success: boolean;
+  reachable: boolean;
+  status_code: number;
+  latency_ms: number;
+}
+
+export async function testProviderConnection(
+  providerId: string,
+  endpointId: string,
+  params: { base_url?: string; api_key?: string },
+): Promise<ProviderConnectionTestResult> {
+  const resp = await fetch(`${API_BASE}/providers/${providerId}/endpoints/${endpointId}/test-connection`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(params),
+  });
+  if (!resp.ok) {
+    const data = await resp.json().catch(() => ({}));
+    throw new Error(data.detail || `Provider connection test failed: ${resp.status}`);
+  }
+  return resp.json();
+}
+
+export async function addProviderModel(providerId: string, model: {
+  endpoint_id: string;
+  capability: ProviderCapability;
+  name: string;
+  categories: ProviderModelCategory[];
+  dimension?: number;
+  batch_size?: number;
+  concurrency?: number;
+}): Promise<void> {
+  const resp = await fetch(`${API_BASE}/providers/${providerId}/models`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(model),
+  });
+  if (!resp.ok) {
+    const data = await resp.json().catch(() => ({}));
+    throw new Error(data.detail || `Failed to add model: ${resp.status}`);
   }
 }
 

@@ -14,6 +14,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, model_validator
 from sse_starlette.sse import EventSourceResponse
 
+from config import get_fallback_llm_config
 from graph.deepagents_manager import deepagents_agent_manager
 from graph.session_manager import session_manager
 
@@ -128,6 +129,8 @@ class AgentRequest(BaseModel):
     user_id: str = "default_user"
     project_id: str | None = None
     analytics_model_id: str | None = None
+    llm_model_id: str | None = None
+    thinking_level: Literal["low", "high", "max"] | None = None
     attachments: list[dict] = Field(default_factory=list)
     skill_hints: list[str] | None = Field(default=None, max_length=8)
     goal_mode: bool = False
@@ -177,10 +180,65 @@ async def agent(request: AgentRequest):
         len(request.message),
         len(request.attachments),
     )
+    # A conversation-level model choice is durable.  New clients include the
+    # complete route in every Run request, while older/stale renderer bundles
+    # may only have persisted it through PATCH /sessions/{id}.  In that case,
+    # read the Session choice instead of silently falling back to the global
+    # default model.
+    session_selection = session_manager.get_metadata(request.session_id)
+    persisted_model_id = str(session_selection.get("llm_model_id") or "").strip() or None
+    persisted_thinking_level = str(session_selection.get("thinking_level") or "").strip() or None
+    if persisted_thinking_level not in {"low", "high", "max"}:
+        persisted_thinking_level = None
+
+    requested_model_id = str(request.llm_model_id or "").strip() or None
+    selected_model_id = requested_model_id or persisted_model_id
+    selected_thinking_level = request.thinking_level
+    if selected_thinking_level is None and requested_model_id is None:
+        selected_thinking_level = persisted_thinking_level
+
+    # Validate the complete Provider route and its normalized thinking level
+    # before an SSE response is opened.  This also prevents a model name from
+    # being sent through the endpoint of a different Provider.
+    try:
+        effective_llm = get_fallback_llm_config(
+            model_id_override=selected_model_id,
+            thinking_level=selected_thinking_level,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    selection_explicit = bool(selected_model_id or selected_thinking_level)
+    runtime_model_id = str(effective_llm.get("model_id") or "") if selection_explicit else None
+    runtime_thinking_level = effective_llm.get("thinking_level") if selection_explicit else None
+    selection_source = (
+        "request"
+        if requested_model_id or request.thinking_level is not None
+        else "session"
+        if persisted_model_id or persisted_thinking_level
+        else "default"
+    )
+    logger.info(
+        "[agent-model] session=%s source=%s route=%s provider=%s model=%s thinking_level=%s",
+        request.session_id,
+        selection_source,
+        runtime_model_id or effective_llm.get("model_id") or "<default>",
+        effective_llm.get("provider") or "<unknown>",
+        effective_llm.get("model") or "<unknown>",
+        runtime_thinking_level or "<none>",
+    )
     persisted_user_message = False
+    session_metadata = {"runtime_mode": "agent"}
+    if selection_explicit:
+        session_metadata.update(
+            {
+                "llm_model_id": runtime_model_id,
+                "thinking_level": runtime_thinking_level,
+            }
+        )
     if request.stream and request.goal_control_action is None:
         try:
-            session_manager.update_metadata(request.session_id, {"runtime_mode": "agent"})
+            session_manager.update_metadata(request.session_id, session_metadata)
             session_manager.save_message(
                 request.session_id,
                 "user",
@@ -197,7 +255,7 @@ async def agent(request: AgentRequest):
         # Product controls are audited by the Run/Goal ledger. They are not
         # synthetic user chat messages and must not pollute the transcript.
         try:
-            session_manager.update_metadata(request.session_id, {"runtime_mode": "agent"})
+            session_manager.update_metadata(request.session_id, session_metadata)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="Session not found") from exc
         persisted_user_message = True
@@ -208,6 +266,8 @@ async def agent(request: AgentRequest):
             session_id=request.session_id,
             project_id=request.project_id,
             analytics_model_id=request.analytics_model_id,
+            llm_model_id=runtime_model_id,
+            thinking_level=runtime_thinking_level,
             user_id=request.user_id,
             attachments=request.attachments,
             skill_hints=request.skill_hints,
@@ -234,6 +294,8 @@ async def agent(request: AgentRequest):
         session_id=request.session_id,
         project_id=request.project_id,
         analytics_model_id=request.analytics_model_id,
+        llm_model_id=runtime_model_id,
+        thinking_level=runtime_thinking_level,
         user_id=request.user_id,
         attachments=request.attachments,
         skill_hints=request.skill_hints,

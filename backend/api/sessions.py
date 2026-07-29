@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from config import get_rag_mode
+from config import get_fallback_llm_config, get_rag_mode
 from graph.deepagents_manager import deepagents_agent_manager
 from graph.permission_resume import permission_resume_registry
 from graph.prompt_builder import build_system_prompt
@@ -35,8 +35,15 @@ class SessionAnalyticsModelRequest(BaseModel):
     analytics_model_id: str | None = None
 
 
+class SessionLlmSelectionRequest(BaseModel):
+    llm_model_id: str
+    thinking_level: Literal["low", "high", "max"] | None = None
+
+
 class SessionCreateRequest(BaseModel):
     analytics_model_id: str | None = None
+    llm_model_id: str | None = None
+    thinking_level: Literal["low", "high", "max"] | None = None
     approval_mode: Literal["strict", "smart"] = "strict"
     runtime_mode: Literal["chat", "agent"] = "chat"
     project_id: str | None = None
@@ -74,6 +81,13 @@ async def create_session(req: SessionCreateRequest | None = None):
             "analytics_model_id": payload.analytics_model_id,
             "runtime_mode": payload.runtime_mode,
         }
+        if payload.llm_model_id:
+            effective_llm = get_fallback_llm_config(
+                model_id_override=payload.llm_model_id,
+                thinking_level=payload.thinking_level,
+            )
+            metadata["llm_model_id"] = effective_llm.get("model_id")
+            metadata["thinking_level"] = effective_llm.get("thinking_level")
         if payload.project_id:
             metadata["project_id"] = payload.project_id
         meta = session_manager.create_session(
@@ -110,6 +124,31 @@ async def update_session_analytics_model(
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Session not found") from exc
     return meta
+
+
+@router.patch("/sessions/{session_id}/llm-selection")
+async def update_session_llm_selection(
+    session_id: str,
+    req: SessionLlmSelectionRequest,
+):
+    """Persist a validated conversation model and reasoning strength."""
+
+    try:
+        effective = get_fallback_llm_config(
+            model_id_override=req.llm_model_id,
+            thinking_level=req.thinking_level,
+        )
+        return session_manager.update_metadata(
+            session_id,
+            {
+                "llm_model_id": effective.get("model_id"),
+                "thinking_level": effective.get("thinking_level"),
+            },
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Session not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.delete("/sessions/{session_id}")

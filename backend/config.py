@@ -3,6 +3,8 @@
 import copy
 import json
 import logging
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -447,8 +449,16 @@ def load_config() -> dict[str, Any]:
         data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
         data, migrated = _migrate_legacy_config(data)
         merged = _deep_merge(_DEFAULT_CONFIG, data)
-        # 若发生迁移，立即回写，避免下次仍读取旧键
-        if migrated:
+        # One-time provider migration imports all effective credentials into
+        # the user-local CredentialStore before stripping repository-local
+        # plaintext copies. It never deletes Higress data; that remains a
+        # read-only migration source for rollback/audit.
+        from provider_registry import get_provider_registry
+
+        get_provider_registry().ensure_migrated(merged)
+        credentials_migrated = _strip_provider_credentials(merged)
+        # 若发生迁移，立即回写，避免下次仍读取旧键/明文凭证
+        if migrated or credentials_migrated:
             save_config(merged)
         return merged
     except Exception:
@@ -456,11 +466,46 @@ def load_config() -> dict[str, Any]:
 
 
 def save_config(config: dict[str, Any]) -> None:
-    """Persist configuration to disk."""
-    CONFIG_FILE.write_text(
-        json.dumps(config, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    """Persist non-secret configuration atomically with owner-only permissions."""
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw_path = tempfile.mkstemp(prefix=".config.", dir=CONFIG_FILE.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            if os.name != "nt":
+                os.fchmod(handle.fileno(), 0o600)
+            handle.write(json.dumps(config, ensure_ascii=False, indent=2))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(raw_path, CONFIG_FILE)
+        if os.name != "nt":
+            os.chmod(CONFIG_FILE, 0o600)
+    finally:
+        if os.path.exists(raw_path):
+            os.unlink(raw_path)
+
+
+def _strip_provider_credentials(config: dict[str, Any]) -> bool:
+    """Remove only migrated provider credentials from the legacy config file."""
+    changed = False
+    paths = [
+        ("fallback_llm",),
+        ("fallback_embedding",),
+        ("multimodal_embedding",),
+        ("rag", "rerank"),
+        ("vanna", "llm"),
+        ("vanna", "embedding"),
+    ]
+    for path in paths:
+        current: Any = config
+        for key in path:
+            if not isinstance(current, dict):
+                current = None
+                break
+            current = current.get(key)
+        if isinstance(current, dict) and current.get("api_key"):
+            current["api_key"] = ""
+            changed = True
+    return changed
 
 
 def get_middleware_config() -> dict:
@@ -532,6 +577,10 @@ def set_rag_mode(enabled: bool) -> None:
     """Set RAG mode on/off."""
     config = load_config()
     config["rag_mode"] = enabled
+    from provider_registry import get_provider_registry
+
+    get_provider_registry().ensure_migrated(config)
+    _strip_provider_credentials(config)
     save_config(config)
 
 
@@ -709,33 +758,66 @@ def get_gateway_config() -> dict[str, Any]:
 def get_fallback_llm_config(
     *,
     thinking_enabled_override: bool | None = None,
+    binding: str = "agent",
+    model_id_override: str | None = None,
+    thinking_level: str | None = None,
 ) -> dict[str, Any]:
-    """从 config.json 读取 fallback LLM 直连配置，fallback 到环境变量。
+    """Resolve one LLM workload binding from the local Provider Registry.
 
-    返回 model/api_key/base_url 三个字段。
-    temperature 由调用方自行指定（不同场景需要不同值）。
-    当 thinking_mode 开启时，使用 thinking 下的模型与参数。
+    ``agent`` is the main assistant model. Other workloads, such as the
+    built-in image analyzer, can select a different Provider model while
+    sharing the same direct-connection implementation.
     """
-    import os
     config = load_config()
-    llm = config.get("fallback_llm", {})
-    thinking = llm.get("thinking", {})
+    from provider_registry import get_provider_registry
+
+    registry = get_provider_registry()
+    resolved = (
+        registry.resolve_model(model_id_override, legacy_config=config)
+        if model_id_override
+        else registry.resolve_binding(binding, legacy_config=config)
+    )
+    if model_id_override or thinking_level is not None:
+        from llm.thinking_mapping import map_thinking_request
+
+        mapped_thinking = map_thinking_request(
+            resolved.get("thinking_profile", {}),
+            thinking_level,
+        )
+        return {
+            "provider": resolved.get("provider_id", "deepseek"),
+            "model": resolved.get("name") or "deepseek-chat",
+            "api_key": resolved.get("api_key", ""),
+            "base_url": resolved.get("base_url", "https://api.deepseek.com"),
+            "protocol": resolved.get("protocol", "deepseek"),
+            "model_id": resolved.get("id", ""),
+            "temperature": float(resolved.get("temperature", 0.7)),
+            "max_tokens": int(resolved.get("max_tokens", 4096)),
+            "context_window": int(resolved.get("context_window", 1000000)),
+            **mapped_thinking,
+        }
+    thinking = resolved.get("thinking", {})
     thinking_enabled = (
         bool(config.get("thinking_mode", False))
         if thinking_enabled_override is None
         else thinking_enabled_override
     )
-    base_model = llm.get("model") or os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    base_model = resolved.get("name") or "deepseek-chat"
     effective_model = thinking["model"] if thinking_enabled and thinking.get("model") else base_model
     return {
-        "provider": llm.get("provider", "deepseek"),
+        "provider": resolved.get("provider_id", "deepseek"),
         "model": effective_model,
-        "api_key": llm.get("api_key") or os.getenv("DEEPSEEK_API_KEY", ""),
-        "base_url": llm.get("base_url") or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-        "temperature": float(llm.get("temperature", 0.7)),
-        "max_tokens": int(llm.get("max_tokens", 4096)),
+        "api_key": resolved.get("api_key", ""),
+        "base_url": resolved.get("base_url", "https://api.deepseek.com"),
+        "protocol": resolved.get("protocol", "deepseek"),
+        "model_id": resolved.get("id", ""),
+        "temperature": float(resolved.get("temperature", 0.7)),
+        "max_tokens": int(resolved.get("max_tokens", 4096)),
+        "context_window": int(resolved.get("context_window", 1000000)),
         "reasoning_effort": thinking.get("reasoning_effort") if thinking_enabled else None,
         "extra_body": thinking.get("extra_body") if thinking_enabled else None,
+        "thinking_enabled": thinking_enabled,
+        "thinking_level": thinking.get("reasoning_effort") if thinking_enabled else None,
     }
 
 
@@ -775,59 +857,45 @@ def get_fallback_embedding_config() -> dict[str, Any]:
     返回 model/api_key/api_base 三个字段。
     注意：api_base 是 OpenAIEmbedding 的参数名，与 config.json 中的 base_url 做了映射。
     """
-    import os
     config = load_config()
-    emb = config.get("fallback_embedding", {})
-    model = emb.get("model") or os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-    default_dimension = "1024" if str(model).startswith("text-embedding-v") else "1536"
+    from provider_registry import get_provider_registry
+
+    resolved = get_provider_registry().resolve_binding("text_embedding", legacy_config=config)
     return {
-        "provider": emb.get("provider", "openai"),
-        "model": model,
-        "api_key": emb.get("api_key") or os.getenv("OPENAI_API_KEY", ""),
-        "api_base": emb.get("base_url") or os.getenv("OPENAI_BASE_URL", "https://ai.devtool.tech/proxy/v1"),
-        "dimension": int(emb.get("dimension") or os.getenv("EMBEDDING_DIMENSION", default_dimension)),
-        "batch_size": max(1, int(emb.get("batch_size") or os.getenv("EMBEDDING_BATCH_SIZE", "20"))),
+        "provider": resolved.get("provider_id", "dashscope"),
+        "model": resolved.get("name", "text-embedding-v4"),
+        "api_key": resolved.get("api_key", ""),
+        "api_base": resolved.get("base_url", "https://api.openai.com/v1"),
+        "protocol": resolved.get("protocol", "openai_compatible"),
+        "model_id": resolved.get("id", ""),
+        "dimension": int(resolved.get("dimension", 1024)),
+        "batch_size": max(1, int(resolved.get("batch_size", 20))),
     }
 
 
 def get_multimodal_embedding_config() -> dict[str, Any]:
-    """Read multimodal embedding config.
-
-    Qwen-VL embedding is DashScope-native rather than OpenAI-compatible. It can
-    run in direct SDK mode, or through a user-managed Higress native passthrough
-    route when base_url is configured.
-    """
-
-    import os
-
-    from higress_config_reader import get_higress_dashscope_api_key
+    """Resolve the Model Services binding plus knowledge-index concurrency."""
 
     config = load_config()
-    mm = config.get("multimodal_embedding", {})
+    from provider_registry import get_provider_registry
+
+    resolved = get_provider_registry().resolve_binding("multimodal_embedding", legacy_config=config)
+    # Model identity, endpoint, dimension and credential belong to Model
+    # Services. Request concurrency is an indexing runtime concern and remains
+    # configurable from Knowledge settings for compatibility with existing
+    # installations.
+    runtime = config.get("multimodal_embedding", {})
     return {
-        "provider": mm.get("provider", "dashscope"),
-        "model": mm.get("model") or os.getenv("PUDDINGCLAW_MULTIMODAL_EMBED_MODEL", "qwen2.5-vl-embedding"),
-        "dimension": int(mm.get("dimension") or os.getenv("PUDDINGCLAW_MULTIMODAL_EMBED_DIM", "1024")),
-        "batch_size": max(1, int(mm.get("batch_size") or os.getenv("PUDDINGCLAW_MULTIMODAL_EMBED_BATCH_SIZE", "10"))),
-        "api_key": (
-            mm.get("api_key")
-            or os.getenv("DASHSCOPE_API_KEY", "")
-            or os.getenv("EMBEDDING_API_KEY", "")
-            or get_higress_dashscope_api_key()
-        ),
-        "base_url": (
-            mm.get("base_url")
-            or os.getenv("PUDDINGCLAW_MULTIMODAL_EMBED_BASE_URL", "")
-            or os.getenv("PUDDINGCLAW_MULTIMODAL_EMBEDDING_BASE_URL", "")
-        ),
-        "route_path": (
-            mm.get("route_path")
-            or os.getenv(
-                "PUDDINGCLAW_MULTIMODAL_EMBED_ROUTE_PATH",
-                "/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding",
-            )
-        ),
-        "prefer_gateway": bool(mm.get("prefer_gateway", False)),
+        "provider": resolved.get("provider_id", "dashscope"),
+        "model": resolved.get("name", "qwen2.5-vl-embedding"),
+        "dimension": int(resolved.get("dimension", 1024)),
+        "batch_size": max(1, int(runtime.get("batch_size", resolved.get("concurrency", 10)))),
+        "api_key": resolved.get("api_key", ""),
+        "base_url": resolved.get("base_url", "https://dashscope.aliyuncs.com"),
+        "route_path": resolved.get("route_path", "/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding"),
+        "protocol": resolved.get("protocol", "dashscope_multimodal_embedding"),
+        "model_id": resolved.get("id", ""),
+        "prefer_gateway": False,
     }
 
 
@@ -934,10 +1002,8 @@ def get_vanna_config() -> dict[str, Any]:
     training = vanna.get("training", {})
     query = vanna.get("query", {})
     knowledge_index = config.get("knowledge", {}).get("multimodal_index", {})
-    fallback_embedding = config.get("fallback_embedding", {})
-    gateway_llm = get_gateway_llm_config()
     fallback_llm = get_fallback_llm_config()
-    gateway = get_gateway_config()
+    fallback_embedding = get_fallback_embedding_config()
 
     def _positive_int(value: Any, default: int) -> int:
         try:
@@ -959,15 +1025,12 @@ def get_vanna_config() -> dict[str, Any]:
                 continue
         return normalized
 
-    llm_reuse = str(llm.get("reuse") or "gateway_llm")
-    if llm_reuse == "fallback_llm":
-        default_llm_model = fallback_llm.get("model", "")
-        default_llm_base = fallback_llm.get("base_url", "")
-        default_llm_key = fallback_llm.get("api_key", "")
-    else:
-        default_llm_model = gateway_llm.get("model") or fallback_llm.get("model", "")
-        default_llm_base = gateway.get("base_url") or fallback_llm.get("base_url", "")
-        default_llm_key = fallback_llm.get("api_key", "")
+    # ``gateway_llm`` is a legacy storage label. Both legacy reuse modes now
+    # resolve through the same explicit direct Provider binding.
+    llm_reuse = str(llm.get("reuse") or "vanna_llm")
+    default_llm_model = fallback_llm.get("model", "")
+    default_llm_base = fallback_llm.get("base_url", "")
+    default_llm_key = fallback_llm.get("api_key", "")
 
     embedding_reuse = str(embedding.get("reuse") or "fallback_embedding")
     default_embedding_model = fallback_embedding.get("model", "")
@@ -1154,8 +1217,7 @@ def _normalize_subagent_config(raw: dict[str, Any]) -> dict[str, Any]:
 def get_settings_for_display() -> dict[str, Any]:
     """Get settings with masked API keys for frontend display."""
     import os
-
-    from higress_config_reader import get_higress_routed_models
+    from provider_registry import get_provider_registry
 
     config = load_config()
     effective_gateway = get_gateway_config()
@@ -1169,6 +1231,7 @@ def get_settings_for_display() -> dict[str, Any]:
     effective_vanna = get_vanna_config()
     effective_database_qa = get_database_qa_config()
     raw_vanna = config.get("vanna", {})
+    provider_registry = get_provider_registry().display(legacy_config=config)
     result = {
         "memory_backend": config.get("memory_backend", "markdown"),
         "thinking_mode": bool(config.get("thinking_mode", False)),
@@ -1177,8 +1240,11 @@ def get_settings_for_display() -> dict[str, Any]:
             "environment_override": bool(os.getenv("AI_GATEWAY_URL")),
             # 是否启用由 backend 自动探测决定，前端不再展示开关
             "enabled": bool(effective_gateway.get("base_url")),
-            "routed_models": get_higress_routed_models(),
+            # Compatibility-only field; runtime and the new settings UI use
+            # provider_registry instead of scanning Higress files.
+            "routed_models": [],
         },
+        "provider_registry": provider_registry,
         "gateway_llm": {
             **config.get("gateway_llm", {}),
             "model": get_gateway_llm_config().get("model", effective_llm.get("model", "deepseek-chat")),
@@ -1522,6 +1588,10 @@ def update_settings(updates: dict[str, Any]) -> None:
             config["subagents"] = _subagent_config_from_items(_subagent_items_for_display(sub_update))
             config.pop("subagent", None)
 
+    from provider_registry import get_provider_registry
+
+    get_provider_registry().ensure_migrated(config)
+    _strip_provider_credentials(config)
     save_config(config)
 
 
@@ -1673,7 +1743,7 @@ def get_max_history_messages() -> int:
 
 def get_context_window() -> int:
     """获取当前模型的上下文窗口大小。"""
-    return load_config().get("fallback_llm", {}).get("context_window", 1000000)
+    return int(get_fallback_llm_config().get("context_window", 1000000))
 
 
 def get_compaction_trigger_tokens() -> int:

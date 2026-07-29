@@ -29,8 +29,6 @@ from config import (
     get_cache_config,
     get_tool_intent_router_config,
     get_write_middleware_config,
-    get_gateway_config,
-    get_gateway_llm_config,
     get_fallback_llm_config,
 )
 
@@ -111,24 +109,13 @@ MISSING_TOOL_OUTPUT_PLACEHOLDER = (
 def _agent_model_config_signature() -> tuple[str, str]:
     """Return stable signature and display model for AgentManager cache refresh.
 
-    ModelClient now reads the split model config:
-    - ai_gateway: gateway URL/fallback behavior
-    - gateway_llm: model name sent through Higress
-    - fallback_llm: direct provider config used when gateway is disabled/fallback
-
     AgentManager only needs a cache invalidation signature here; actual model
-    construction stays delegated to ModelClientChatModel.
+    construction stays delegated to ModelClientChatModel and Provider Registry.
     """
-    gateway_cfg = get_gateway_config()
-    gateway_llm_cfg = get_gateway_llm_config()
     fallback_llm_cfg = get_fallback_llm_config()
-    signature_payload = {
-        "ai_gateway": gateway_cfg,
-        "gateway_llm": gateway_llm_cfg,
-        "fallback_llm": fallback_llm_cfg,
-    }
+    signature_payload = {"provider_binding": fallback_llm_cfg}
     signature = json.dumps(signature_payload, ensure_ascii=False, sort_keys=True, default=str)
-    display_model = gateway_llm_cfg.get("model") or fallback_llm_cfg.get("model", "deepseek-chat")
+    display_model = fallback_llm_cfg.get("model", "deepseek-chat")
     return signature, str(display_model)
 
 

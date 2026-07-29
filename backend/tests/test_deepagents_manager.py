@@ -2276,7 +2276,7 @@ def test_semantic_asset_middleware_owns_model_frontmatter_index(tmp_path):
     assert inherited_goal["allowed_semantic_asset_ids"] == [measure["id"]]
 
 
-def test_analytics_model_prompt_exposes_server_resolved_active_template() -> None:
+def test_analytics_model_prompt_exposes_agent_selected_template_workflow() -> None:
     from graph.deepagents_manager import DeepAgentsAgentManager
 
     base_dir = Path(__file__).resolve().parents[1]
@@ -2289,25 +2289,22 @@ def test_analytics_model_prompt_exposes_server_resolved_active_template() -> Non
     )
 
     assert payload is not None
-    assert payload["template_route"] == {
-        "status": "matched",
-        "template_id": "monthly_product_config_report",
-    }
-    assert payload["active_template"]["guide_virtual_path"].endswith(
+    template = payload["resolved_templates"]["monthly_product_config_report"]
+    assert template["guide_virtual_path"].endswith(
         "/templates/monthly_product_config_report/TEMPLATE.md"
     )
+    assert "guide_frontmatter" not in template
+    assert "compiled_semantic_scope" not in template
+    assert "template_route" not in payload
+    assert "active_template" not in payload
     assert "/analytics-models/产品配置分析/templates/monthly_product_config_report/index.html" in prompt
-    assert "不得从原始 metadata 手工拼接" in prompt
+    assert "自主比较模板的 use_when/do_not_use_when" in prompt
+    assert "成功读取会把模板 manifest 渐进写入本轮可信 state" in prompt
 
 
-def test_run_scope_middleware_initializes_private_template_scope_for_subagents() -> None:
+def test_run_scope_middleware_does_not_preselect_analysis_template() -> None:
     from graph.deepagents_manager import RunScopeMiddleware
 
-    active_template = {
-        "model_id": "产品配置分析",
-        "template_id": "monthly_product_config_report",
-        "semantic_scope": {},
-    }
     middleware = RunScopeMiddleware()
     parent_update = middleware.before_agent(
         {},
@@ -2315,7 +2312,6 @@ def test_run_scope_middleware_initializes_private_template_scope_for_subagents()
             context={
                 "query_id": "query-1",
                 "run_objective": "刷新月报",
-                "active_analysis_template": active_template,
             }
         ),
     )
@@ -2323,12 +2319,89 @@ def test_run_scope_middleware_initializes_private_template_scope_for_subagents()
     assert parent_update == {
         "_run_query_id": "query-1",
         "_run_objective": "刷新月报",
-        "_active_analysis_template": active_template,
     }
     child_state = dict(parent_update)
     assert middleware.before_agent(child_state, SimpleNamespace(context=None)) is None
     assert child_state["_run_objective"] == "刷新月报"
-    assert child_state["_active_analysis_template"] == active_template
+
+
+def test_template_guide_read_progressively_activates_private_state() -> None:
+    from graph.middlewares.analysis_templates import AnalysisTemplateMiddleware
+
+    base_dir = Path(__file__).resolve().parents[1]
+    middleware = AnalysisTemplateMiddleware(base_dir=base_dir)
+    request = SimpleNamespace(
+        tool_call={
+            "name": "read_file",
+            "id": "read-template-1",
+            "args": {
+                "file_path": (
+                    "/analytics-models/产品配置分析/templates/"
+                    "monthly_product_config_report/TEMPLATE.md"
+                )
+            },
+        },
+        state={"analytics_model_id": "产品配置分析"},
+    )
+
+    result = middleware.wrap_tool_call(
+        request,
+        lambda _request: ToolMessage(
+            content="template guide",
+            tool_call_id="read-template-1",
+            name="read_file",
+            status="success",
+        ),
+    )
+
+    activation = result.update["_active_analysis_template"]
+    assert activation["model_id"] == "产品配置分析"
+    assert activation["template_id"] == "monthly_product_config_report"
+    assert activation["source"] == "authoritative_guide_read"
+    assert activation["guide_content_sha256"].startswith("sha256:")
+    assert activation["semantic_scope"]["enum_filters"]["dimension:energy_type"] == {
+        "members": [
+            "纯电",
+            "插电混合",
+            "增程式纯电动",
+            "汽油",
+            "汽油+48V轻混系统",
+            "油电混合",
+            "汽油电驱",
+            "汽油+24V轻混系统",
+        ],
+        "classifications": ["新能源", "传统能源"],
+    }
+
+
+def test_non_guide_read_does_not_activate_analysis_template() -> None:
+    from graph.middlewares.analysis_templates import AnalysisTemplateMiddleware
+
+    base_dir = Path(__file__).resolve().parents[1]
+    middleware = AnalysisTemplateMiddleware(base_dir=base_dir)
+    request = SimpleNamespace(
+        tool_call={
+            "name": "read_file",
+            "id": "read-template-entry",
+            "args": {
+                "file_path": (
+                    "/analytics-models/产品配置分析/templates/"
+                    "monthly_product_config_report/index.html"
+                )
+            },
+        },
+        state={"analytics_model_id": "产品配置分析"},
+    )
+    original = ToolMessage(
+        content="template entry",
+        tool_call_id="read-template-entry",
+        name="read_file",
+        status="success",
+    )
+
+    result = middleware.wrap_tool_call(request, lambda _request: original)
+
+    assert result is original
 
 
 def test_runtime_inventory_lists_subagents_for_mount_panel(tmp_path, monkeypatch):

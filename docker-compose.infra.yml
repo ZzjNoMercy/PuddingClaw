@@ -2,13 +2,10 @@
 #
 # 用途：
 #   本地客户端/本地开发模式下，frontend 和 backend 直接在宿主机运行；
-#   Docker 负责基础设施：Higress、Milvus，以及可选 bundled PostgreSQL。
+#   Docker 负责基础设施：Milvus，以及可选 bundled PostgreSQL。
 #   MinerU 按本机服务运行，使用 scripts/setup-mineru.py 或 scripts/start-mineru-host.sh 启动。
 #
 # 端口保持与现有部署约定一致：
-#   Higress Gateway: http://localhost:8080
-#   Higress Console: http://localhost:8001
-#   Higress Prometheus: http://localhost:19090  # 避免占用常见的宿主机 9090
 #   Milvus:          grpc://localhost:19530
 #   PostgreSQL:      postgresql://localhost:5432  # 可选 bundled；已有本机 PostgreSQL 时可外接
 #   MinerU API:      http://localhost:8002  # 本机运行，不在本 compose 内
@@ -29,7 +26,6 @@
 #
 # 本地 backend 推荐环境变量：
 #   DATABASE_URL=postgresql+asyncpg://puddingclaw:puddingclaw@127.0.0.1:5432/puddingclaw
-#   AI_GATEWAY_URL=http://localhost:8080/v1
 #   MINERU_URL=http://localhost:8002
 
 services:
@@ -50,32 +46,6 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
-
-  higress:
-    image: ${HIGRESS_IMAGE:-higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/all-in-one:latest-o11y}
-    container_name: puddingclaw-higress
-    ports:
-      - "8080:8080"
-      - "8001:8001"
-      # 可观测套件端口（Prometheus / Grafana / Envoy metrics）
-      - "${HIGRESS_PROMETHEUS_PORT:-19090}:9090"
-      - "${HIGRESS_GRAFANA_PORT:-3001}:3000"
-      - "${HIGRESS_ENVOY_METRICS_PORT:-15020}:15020"
-      - "${HIGRESS_ENVOY_HEALTH_PORT:-15021}:15021"
-    environment:
-      - MODE=full
-      - USE_PLUGIN_SERVER=on
-      - ENABLE_CONSOLE_ROUTE=1
-      - O11Y=on
-    volumes:
-      - ./data/higress:/data
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
 
   milvus-etcd:
     image: ${ETCD_IMAGE:-quay.io/coreos/etcd:v3.5.18}

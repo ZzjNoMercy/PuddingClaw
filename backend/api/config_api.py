@@ -4,6 +4,7 @@ import asyncio
 import re
 from typing import Any, Optional
 
+import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
@@ -15,7 +16,9 @@ from config import (
     set_rag_mode,
     get_settings_for_display,
     update_settings,
+    load_config,
 )
+from provider_registry import get_provider_registry
 
 router = APIRouter()
 
@@ -59,6 +62,31 @@ class SettingsUpdateRequest(BaseModel):
     subagent: Optional[dict[str, Any]] = None
 
 
+class ProviderUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    enabled: Optional[bool] = None
+    endpoints: list[dict[str, Any]] = []
+
+
+class ProviderBindingRequest(BaseModel):
+    model_id: str
+
+
+class ProviderModelRequest(BaseModel):
+    endpoint_id: str
+    capability: str
+    name: str
+    categories: Optional[list[str]] = None
+    dimension: Optional[int] = None
+    batch_size: Optional[int] = None
+    concurrency: Optional[int] = None
+
+
+class ProviderConnectionTestRequest(BaseModel):
+    base_url: str = ""
+    api_key: str = ""
+
+
 @router.get("/settings")
 async def get_settings():
     """Get current settings with masked API keys."""
@@ -78,6 +106,91 @@ async def put_settings(request: SettingsUpdateRequest):
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save settings: {e}")
+
+
+# ── Direct Provider Registry ───────────────────────────────
+
+
+@router.get("/providers")
+async def get_providers():
+    """Provider/endpoint/model metadata only; credentials are always masked."""
+    return get_provider_registry().display(legacy_config=load_config())
+
+
+@router.patch("/providers/{provider_id}")
+async def patch_provider(provider_id: str, request: ProviderUpdateRequest):
+    try:
+        return get_provider_registry().update_provider(
+            provider_id,
+            request.model_dump(exclude_none=True),
+            legacy_config=load_config(),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.put("/providers/bindings/{binding}")
+async def put_provider_binding(binding: str, request: ProviderBindingRequest):
+    try:
+        get_provider_registry().set_binding(binding, request.model_id)
+        return {"success": True, "binding": binding, "model_id": request.model_id}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/providers/{provider_id}/models")
+async def upsert_provider_model(provider_id: str, request: ProviderModelRequest):
+    try:
+        model = get_provider_registry().upsert_model(provider_id, request.model_dump(exclude_none=True))
+        return {"model": model}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/providers/{provider_id}/endpoints/{endpoint_id}/discover-models")
+async def discover_provider_models(provider_id: str, endpoint_id: str):
+    """Discover models from this specific Provider endpoint, never a fallback binding."""
+    try:
+        models = await run_in_threadpool(get_provider_registry().discover_models, provider_id, endpoint_id)
+        return {"models": models}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Provider model discovery failed: {exc}") from exc
+
+
+@router.post("/providers/{provider_id}/endpoints/{endpoint_id}/test-connection")
+async def test_provider_connection(
+    provider_id: str,
+    endpoint_id: str,
+    request: ProviderConnectionTestRequest,
+):
+    """Test endpoint reachability/authentication; model discovery is separate."""
+    import time
+
+    started_at = time.time()
+    try:
+        result = await run_in_threadpool(
+            get_provider_registry().test_endpoint,
+            provider_id,
+            endpoint_id,
+            base_url=request.base_url,
+            api_key=request.api_key,
+        )
+        return {
+            "success": True,
+            "latency_ms": int((time.time() - started_at) * 1000),
+            **result,
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except httpx.HTTPStatusError as exc:
+        status_code = exc.response.status_code
+        if status_code in {401, 403}:
+            raise HTTPException(status_code=status_code, detail="Provider authentication failed") from exc
+        raise HTTPException(status_code=502, detail=f"Provider connectivity failed: HTTP {status_code}") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Provider connectivity failed: {exc}") from exc
 
 
 # ── Connection testing ─────────────────────────────────────

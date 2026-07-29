@@ -24,10 +24,11 @@ function getBackendCommand() {
         '--host', '0.0.0.0',
         '--port', String(BACKEND_PORT),
         '--reload',
-        '--reload-dir', 'api',
-        '--reload-dir', 'graph',
-        '--reload-dir', 'projects',
-        '--reload-dir', 'tools',
+        // Provider registry and other shared backend modules live at the
+        // backend root, not only beneath API/graph/tool folders.
+        '--reload-dir', '.',
+        '--reload-exclude', '.venv',
+        '--reload-exclude', '__pycache__',
         '--reload-include', '*.py',
         '--log-level', 'info',
         '--log-config', '../logging.yaml',
@@ -120,7 +121,10 @@ async function startBackend() {
       cwd,
       env: {
         ...process.env,
-        AI_GATEWAY_URL: process.env.AI_GATEWAY_URL || 'http://localhost:8080/v1',
+        // Backend credentials and Provider Registry are user-local, never
+        // stored in the packaged repository. Electron owns the cross-platform
+        // userData path (including Windows APPDATA handling).
+        PUDDINGDATA_USER_DATA_DIR: app.getPath('userData'),
         MINERU_URL: process.env.MINERU_URL || 'http://localhost:8002',
         VIRTUAL_ENV: '',
       },

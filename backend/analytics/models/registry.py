@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import re
@@ -136,30 +137,6 @@ def model_resource_virtual_path(model_path: object, model_relative_path: object)
     if not model_file.parts or model_file.name != "model.md":
         raise AnalyticsModelError(f"Invalid analytics model path: {model_path}")
     return "/" + (model_file.parent / resource).as_posix()
-
-
-def _query_matches_template(definition: dict[str, Any], query: str) -> bool:
-    """Match a template through bounded token sets, never executable regex."""
-
-    match = definition.get("query_match")
-    if not isinstance(match, dict) or not query.strip():
-        return False
-
-    def token_sets(key: str) -> list[list[str]]:
-        result: list[list[str]] = []
-        for raw_set in match.get(key) or []:
-            if not isinstance(raw_set, list):
-                continue
-            tokens = [str(token).strip() for token in raw_set if str(token).strip()]
-            if tokens:
-                result.append(tokens)
-        return result
-
-    excluded = token_sets("exclude_any_token_sets")
-    if any(all(token in query for token in tokens) for tokens in excluded):
-        return False
-    allowed = token_sets("any_token_sets")
-    return bool(allowed and any(all(token in query for token in tokens) for tokens in allowed))
 
 
 def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
@@ -523,6 +500,7 @@ class AnalyticsModelRegistry:
                 "virtual_path": model_resource_virtual_path(model["path"], relative_path),
             }
             declared_guide = str(definition.get("guide") or "").strip()
+            guide_frontmatter: dict[str, Any] = {}
             if declared_guide:
                 guide_relative_path = canonical_model_resource_path(declared_guide, root="templates")
                 if guide_relative_path not in model_file_paths:
@@ -535,6 +513,32 @@ class AnalyticsModelRegistry:
                         "guide_virtual_path": model_resource_virtual_path(model["path"], guide_relative_path),
                     }
                 )
+                if guide_relative_path in model_file_paths:
+                    model_main_path = _ensure_under_root(self.root_dir, self.base_dir / str(model["path"]))
+                    guide_path = _ensure_under_root(
+                        self.root_dir,
+                        model_main_path.parent / guide_relative_path,
+                    )
+                    guide_bytes = guide_path.read_bytes()
+                    try:
+                        guide_text = guide_bytes.decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        raise AnalyticsModelError(
+                            f"Template {template_id} guide must be UTF-8: {guide_relative_path}"
+                        ) from exc
+                    guide_frontmatter, _guide_body = _parse_frontmatter(guide_text)
+                    if guide_frontmatter:
+                        if str(guide_frontmatter.get("formatter") or "") != "analytics-template":
+                            raise AnalyticsModelError(
+                                f"Template {template_id} guide frontmatter formatter must be analytics-template"
+                            )
+                        manifest_id = str(guide_frontmatter.get("id") or "").strip()
+                        if manifest_id != str(template_id):
+                            raise AnalyticsModelError(
+                                f"Template {template_id} guide frontmatter id must match its model registration"
+                            )
+                    resolved["guide_content_sha256"] = "sha256:" + hashlib.sha256(guide_bytes).hexdigest()
+                    resolved["guide_frontmatter"] = guide_frontmatter
             asset_relative_paths: list[str] = []
             asset_virtual_paths: list[str] = []
             raw_assets = definition.get("assets") or []
@@ -550,7 +554,11 @@ class AnalyticsModelRegistry:
             resolved["asset_model_relative_paths"] = list(dict.fromkeys(asset_relative_paths))
             resolved["asset_virtual_paths"] = list(dict.fromkeys(asset_virtual_paths))
 
-            semantic_scope = definition.get("semantic_scope")
+            if "semantic_scope" in definition:
+                raise AnalyticsModelError(
+                    f"Template {template_id} semantic_scope must be declared in its guide frontmatter"
+                )
+            semantic_scope = guide_frontmatter.get("semantic_scope")
             compiled_filters: dict[str, dict[str, list[str]]] = {}
             if isinstance(semantic_scope, dict):
                 unknown_scope_keys = sorted(set(semantic_scope) - {"enum_filters"})
@@ -605,37 +613,6 @@ class AnalyticsModelRegistry:
             resolved["missing_paths"] = missing_template_paths
             resolved_templates[str(template_id)] = resolved
 
-        matched_template_ids = [
-            template_id
-            for template_id, definition in raw_templates.items()
-            if isinstance(definition, dict) and _query_matches_template(definition, query)
-        ]
-        template_route: dict[str, Any]
-        active_template: dict[str, Any] | None = None
-        if len(matched_template_ids) == 1:
-            template_id = matched_template_ids[0]
-            active = resolved_templates.get(template_id)
-            if active is not None and active.get("available") is True:
-                template_route = {"status": "matched", "template_id": template_id}
-                active_template = {
-                    "model_id": model["id"],
-                    "template_id": template_id,
-                    "virtual_path": active["virtual_path"],
-                    "guide_virtual_path": active.get("guide_virtual_path"),
-                    "asset_virtual_paths": active.get("asset_virtual_paths") or [],
-                    "semantic_scope": active.get("compiled_semantic_scope") or {},
-                }
-            else:
-                template_route = {
-                    "status": "invalid",
-                    "template_id": template_id,
-                    "missing_paths": (active or {}).get("missing_paths") or [],
-                }
-        elif len(matched_template_ids) > 1:
-            template_route = {"status": "ambiguous", "candidate_ids": matched_template_ids}
-        else:
-            template_route = {"status": "not_matched"}
-
         return {
             "id": model["id"],
             "name": model["name"],
@@ -654,8 +631,6 @@ class AnalyticsModelRegistry:
             "logical_datasets": logical_dataset_context,
             "resolved_references": resolved_references,
             "resolved_templates": resolved_templates,
-            "template_route": template_route,
-            "active_template": active_template,
         }
 
     def create_model(

@@ -8,7 +8,6 @@ const INFRA_COMPOSE = getInfraComposePath();
 
 const INFRA_SERVICES = {
   postgres: { type: 'tcp', host: '127.0.0.1', port: Number(process.env.POSTGRES_PORT || 5432), name: 'PostgreSQL' },
-  higress: { url: 'http://127.0.0.1:8080/health', name: 'Higress' },
   milvus: { url: 'http://127.0.0.1:19530', name: 'Milvus' },
 };
 
@@ -92,7 +91,6 @@ async function checkInfraStatus() {
     return {
       docker: false,
       postgres: 'stopped',
-      higress: 'stopped',
       milvus: 'stopped',
       status: 'stopped',
       error: dockerError,
@@ -100,13 +98,12 @@ async function checkInfraStatus() {
   }
 
   const postgres = await checkInfraService('postgres');
-  const higress = await checkInfraService('higress');
   const milvus = await checkInfraService('milvus');
 
-  if (postgres === 'running' && higress === 'running' && milvus === 'running') {
+  if (postgres === 'running' && milvus === 'running') {
     dockerStatus = 'running';
     dockerError = null;
-  } else if (postgres === 'stopped' && higress === 'stopped' && milvus === 'stopped') {
+  } else if (postgres === 'stopped' && milvus === 'stopped') {
     dockerStatus = 'stopped';
   } else {
     dockerStatus = 'partial';
@@ -115,7 +112,6 @@ async function checkInfraStatus() {
   return {
     docker: true,
     postgres,
-    higress,
     milvus,
     status: dockerStatus,
     error: dockerError,

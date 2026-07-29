@@ -36,6 +36,7 @@
           "app.py",
           "capabilities.py",
           "config.py",
+          "provider_registry.py",
           "config.json",
           "higress_config_reader.py",
           "logging.yaml",

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   Bot,
   Database,
@@ -26,6 +26,15 @@ import {
   Box,
   Target,
   X,
+  Search,
+  Filter,
+  Plus,
+  ChevronDown,
+  ChevronUp,
+  KeyRound,
+  RotateCcw,
+  Globe2,
+  Sparkles,
 } from "lucide-react";
 import {
   getSettings,
@@ -35,9 +44,19 @@ import {
   testDatabaseConnection,
   getCapabilities,
   probeHarnessDocker,
+  getProviders,
+  updateProvider,
+  bindProviderModel,
+  discoverProviderModels,
+  testProviderConnection,
+  addProviderModel,
   type SystemSettings,
   type Capabilities,
   type SubAgentItem,
+  type ProviderRegistry,
+  type ProviderService,
+  type ProviderCapability,
+  type ProviderModelCategory,
 } from "@/lib/settingsApi";
 import { useApp } from "@/lib/store";
 import {
@@ -49,9 +68,19 @@ import MemoryEditor from "@/components/settings/MemoryEditor";
 import CapabilitiesStatus from "@/components/settings/CapabilitiesStatus";
 import Navbar from "@/components/layout/Navbar";
 import Link from "next/link";
+import deepseekLogo from "@lobehub/icons-static-svg/icons/deepseek-color.svg";
+import bailianLogo from "@lobehub/icons-static-svg/icons/bailian-color.svg";
+import moonshotLogo from "@lobehub/icons-static-svg/icons/moonshot.svg";
+import siliconFlowLogo from "@lobehub/icons-static-svg/icons/siliconcloud-color.svg";
 
 type SettingsCategory = "ai" | "project" | "databaseQa" | "rag" | "knowledge" | "memory" | "harness" | "advanced" | "system";
 type SubAgentConfigMap = Record<string, Omit<SubAgentItem, "name">>;
+type PendingModelCategoryEdit = {
+  providerId: string;
+  endpointId: string;
+  name: string;
+  capability?: ProviderCapability;
+};
 
 type HarnessSection = {
   id: string;
@@ -70,7 +99,7 @@ const HARNESS_SECTIONS: HarnessSection[] = [
 ];
 
 const CATEGORIES: { key: SettingsCategory; label: string; icon: React.ElementType; color: string }[] = [
-  { key: "ai", label: "AI 网关", icon: Network, color: "#002fa7" },
+  { key: "ai", label: "模型服务", icon: Network, color: "#002fa7" },
   { key: "project", label: "项目上下文", icon: FileText, color: "#002fa7" },
   { key: "databaseQa", label: "智能问数设置", icon: Database, color: "#002fa7" },
   { key: "rag", label: "RAG 设置", icon: Database, color: "#002fa7" },
@@ -106,6 +135,213 @@ const DOCKER_MEMORY_OPTIONS = [
 ];
 const DEFAULT_IMAGE_ANALYZER_PROMPT =
   "You are an image analysis specialist. When given an image, describe its contents in detail and answer any questions about it. Return your findings as concise, structured text.";
+
+const PROVIDER_LOGOS: Record<string, string | { src: string }> = {
+  deepseek: deepseekLogo,
+  dashscope: bailianLogo,
+  kimi: moonshotLogo,
+  siliconflow: siliconFlowLogo,
+};
+
+const PROVIDER_ACCENTS: Record<string, string> = {
+  deepseek: "#4d6bfe",
+  dashscope: "#6757ff",
+  kimi: "#e8e8e8",
+  siliconflow: "#6e29f6",
+};
+
+const PROTOCOL_LABELS: Record<string, string> = {
+  deepseek: "DeepSeek 接口",
+  openai_compatible: "OpenAI 兼容接口",
+  dashscope_multimodal_embedding: "百炼原生多模态接口",
+};
+
+function protocolLabel(protocol: string): string {
+  return PROTOCOL_LABELS[protocol] || "自定义接口";
+}
+
+function providerCredentialStateKey(provider: ProviderService, endpointId: string): string {
+  return provider.credential_scope === "provider" ? provider.id : `${provider.id}:${endpointId}`;
+}
+
+const MODEL_CATEGORY_OPTIONS: Array<{ id: ProviderModelCategory; label: string; description: string; capability: ProviderCapability }> = [
+  { id: "llm", label: "对话模型", description: "文本对话、规划与工具调用", capability: "llm" },
+  { id: "multimodal_llm", label: "视觉模型", description: "支持图片等多模态输入的对话模型", capability: "llm" },
+  { id: "text_embedding", label: "文本 Embedding", description: "文本向量化与语义检索", capability: "text_embedding" },
+  { id: "multimodal_embedding", label: "多模态 Embedding", description: "图片、文本等跨模态向量化", capability: "multimodal_embedding" },
+  { id: "rerank", label: "Rerank", description: "召回候选相关性重排", capability: "rerank" },
+];
+
+const MODEL_CATEGORY_LABELS = Object.fromEntries(MODEL_CATEGORY_OPTIONS.map((item) => [item.id, item.label])) as Record<ProviderModelCategory, string>;
+
+const MODEL_CATEGORY_BINDINGS: Partial<Record<ProviderModelCategory, string>> = {
+  llm: "agent",
+  multimodal_llm: "image_analyzer",
+  text_embedding: "text_embedding",
+  multimodal_embedding: "multimodal_embedding",
+  rerank: "rerank",
+};
+
+type DiscoveredModelFilter = "all" | "reasoning" | "vision" | "web" | "free" | "embedding" | "rerank" | "tools";
+
+const DISCOVERED_MODEL_FILTERS: Array<{ id: DiscoveredModelFilter; label: string }> = [
+  { id: "all", label: "全部" },
+  { id: "reasoning", label: "推理" },
+  { id: "vision", label: "视觉" },
+  { id: "web", label: "联网" },
+  { id: "free", label: "免费" },
+  { id: "embedding", label: "嵌入" },
+  { id: "rerank", label: "重排" },
+  { id: "tools", label: "工具" },
+];
+
+function modelCategories(model: { capability: ProviderCapability; categories?: ProviderModelCategory[] }): ProviderModelCategory[] {
+  if (model.categories?.length) return model.categories;
+  return [model.capability];
+}
+
+function suggestModelCategories(name: string, supported: ProviderCapability[]): ProviderModelCategory[] {
+  const value = name.toLowerCase();
+  if (supported.includes("rerank") && /(rerank|re-rank)/.test(value)) return ["rerank"];
+  if (/(embedding|embed|vector)/.test(value)) {
+    if (supported.includes("multimodal_embedding") && /(multimodal|vision|\bvl\b|image|video)/.test(value)) {
+      return ["multimodal_embedding"];
+    }
+    if (supported.includes("text_embedding")) return ["text_embedding"];
+  }
+  if (supported.includes("llm")) {
+    const categories: ProviderModelCategory[] = ["llm"];
+    if (/(multimodal|vision|\bvl\b|ocr|image|video|audio|omni|qwen3[._-]?7)/.test(value)) categories.push("multimodal_llm");
+    return categories;
+  }
+  const fallback = MODEL_CATEGORY_OPTIONS.find((option) => supported.includes(option.capability));
+  return fallback ? [fallback.id] : [];
+}
+
+function inferDiscoveredFilters(name: string, categories: ProviderModelCategory[]): DiscoveredModelFilter[] {
+  const value = name.toLowerCase();
+  const filters: DiscoveredModelFilter[] = [];
+  if (/(reason|thinking|\br1\b|\bqwq\b|\bo[1-9](?:[-_.]|$))/.test(value)) filters.push("reasoning");
+  if (categories.includes("multimodal_llm") || categories.includes("multimodal_embedding")) filters.push("vision");
+  if (/(search|web|online)/.test(value)) filters.push("web");
+  if (/(?:^|[-_/.])free(?:[-_/.]|$)/.test(value)) filters.push("free");
+  if (categories.includes("text_embedding") || categories.includes("multimodal_embedding")) filters.push("embedding");
+  if (categories.includes("rerank")) filters.push("rerank");
+  if (/(tool|function|coder|coding|code)/.test(value)) filters.push("tools");
+  return filters;
+}
+
+function matchesDiscoveredFilter(filters: DiscoveredModelFilter[], filter: DiscoveredModelFilter): boolean {
+  return filter === "all" || filters.includes(filter);
+}
+
+function discoveredModelFamily(name: string, providerName: string): string {
+  if (name.includes("/")) {
+    const namespace = name.split("/", 1)[0];
+    const normalized = namespace.toLowerCase();
+    if (normalized === "kimi" || normalized === "moonshot") return "Kimi";
+    if (normalized === "minimax") return "MiniMax";
+    if (normalized === "zhipu") return "GLM";
+    if (normalized === "siliconflow") return "SiliconFlow";
+    if (normalized === "xiaomi") return "Xiaomi";
+    return namespace;
+  }
+  const value = name.toLowerCase();
+  if (value.startsWith("qwen")) return "Qwen";
+  if (value.startsWith("deepseek")) return "DeepSeek";
+  if (value.startsWith("kimi") || value.startsWith("moonshot")) return "Kimi";
+  if (value.startsWith("glm") || value.startsWith("zhipu")) return "GLM";
+  if (value.startsWith("minimax")) return "MiniMax";
+  if (/(embedding|embed)/.test(value)) return "Embedding";
+  return providerName;
+}
+
+function ProviderLogo({ provider, size = "md" }: { provider: ProviderService; size?: "sm" | "md" | "lg" }) {
+  const dimensions = size === "lg" ? "h-12 w-12" : size === "md" ? "h-9 w-9" : "h-6 w-6";
+  const logo = PROVIDER_LOGOS[provider.id];
+  const logoSrc = typeof logo === "string" ? logo : logo?.src;
+  return (
+    <span
+      className={`${dimensions} flex shrink-0 items-center justify-center overflow-hidden rounded-full bg-white p-1.5 shadow-[0_0_0_1px_rgba(255,255,255,0.12)]`}
+      style={{ backgroundColor: provider.id === "kimi" ? "#ffffff" : undefined }}
+    >
+      {logoSrc ? <img src={logoSrc} alt="" className="h-full w-full object-contain" /> : <span className="text-[10px] font-bold" style={{ color: PROVIDER_ACCENTS[provider.id] || "#7c879a" }}>{provider.name.slice(0, 1)}</span>}
+    </span>
+  );
+}
+
+function ModelBindingSelect({
+  value,
+  options,
+  onChange,
+  emptyLabel = "尚无可用模型",
+  variant = "dark",
+}: {
+  value: string;
+  options: Array<{ id: string; label: string }>;
+  onChange: (modelId: string) => void | Promise<void>;
+  emptyLabel?: string;
+  variant?: "dark" | "light";
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const selected = options.find((option) => option.id === value);
+
+  useEffect(() => {
+    if (!open) return;
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePointer);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePointer);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [open]);
+
+  return (
+    <div ref={rootRef} className={`relative ${open ? "z-40" : ""}`}>
+      <button
+        type="button"
+        disabled={!options.length}
+        onClick={() => setOpen((current) => !current)}
+        className={`flex h-11 w-full items-center gap-3 rounded-xl px-3 text-left text-[12px] outline-none transition-colors disabled:cursor-not-allowed disabled:opacity-55 ${variant === "light" ? "border border-slate-200 bg-white text-slate-800 hover:border-slate-300 focus:border-[#002fa7]" : "border border-white/[0.12] bg-[#1d1d1d] text-white hover:border-white/[0.2] focus:border-[#8d9cff]"}`}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+      >
+        <span className="min-w-0 flex-1 truncate">{selected?.label || emptyLabel}</span>
+        <ChevronDown className={`h-4 w-4 shrink-0 transition-transform ${variant === "light" ? "text-slate-500" : "text-white/45"} ${open ? "rotate-180" : ""}`} />
+      </button>
+      {open && options.length > 0 && (
+        <div role="listbox" className="absolute left-0 right-0 top-[calc(100%+6px)] z-50 max-h-56 overflow-y-auto rounded-xl border border-slate-200 bg-white p-1.5 shadow-xl shadow-slate-950/20">
+          {options.map((option) => {
+            const active = option.id === value;
+            return (
+              <button
+                type="button"
+                role="option"
+                aria-selected={active}
+                key={option.id}
+                onClick={() => {
+                  setOpen(false);
+                  if (!active) void onChange(option.id);
+                }}
+                className={`flex w-full items-center gap-2 rounded-lg px-3 py-2.5 text-left text-[12px] transition ${active ? "bg-[#002fa7]/[0.08] font-semibold text-[#002fa7]" : "text-slate-700 hover:bg-slate-100"}`}
+              >
+                <span className="min-w-0 flex-1 truncate">{option.label}</span>
+                {active && <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function subagentItemsToConfig(items: SubAgentItem[]): SubAgentConfigMap {
   return items.reduce<SubAgentConfigMap>((acc, item, index) => {
@@ -150,6 +386,38 @@ export default function SettingsPage() {
     return (valid ? (saved as SettingsCategory) : "ai");
   });
   const [settings, setSettings] = useState<SystemSettings | null>(null);
+  const [providerRegistry, setProviderRegistry] = useState<ProviderRegistry | null>(null);
+  const multimodalEmbeddingSelection = (() => {
+    const modelId = providerRegistry?.bindings?.multimodal_embedding;
+    if (!modelId) return null;
+    for (const provider of providerRegistry.providers) {
+      const model = provider.models.find((item) => item.id === modelId);
+      if (model) return { provider, model };
+    }
+    return null;
+  })();
+  const [providerBusy, setProviderBusy] = useState<string | null>(null);
+  const [providerUrls, setProviderUrls] = useState<Record<string, string>>({});
+  const [providerKeys, setProviderKeys] = useState<Record<string, string>>({});
+  const [discoveredProviderModels, setDiscoveredProviderModels] = useState<Record<string, string[]>>({});
+  const [providerConnectionResults, setProviderConnectionResults] = useState<Record<string, { ok: boolean; message: string }>>({});
+  const providerConnectionResultTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const providerKeyInputRef = useRef<HTMLInputElement>(null);
+  const [providerModelPicker, setProviderModelPicker] = useState<{ providerId: string; endpointId: string } | null>(null);
+  const [providerModelSearch, setProviderModelSearch] = useState("");
+  const [providerModelFilter, setProviderModelFilter] = useState<DiscoveredModelFilter>("all");
+  const [providerModelPickerError, setProviderModelPickerError] = useState("");
+  const [providerModelAdding, setProviderModelAdding] = useState<string | null>(null);
+  const [pendingModelCategoryEdit, setPendingModelCategoryEdit] = useState<PendingModelCategoryEdit | null>(null);
+  const [selectedModelCategories, setSelectedModelCategories] = useState<ProviderModelCategory[]>([]);
+  const [expandedDiscoveredFamilies, setExpandedDiscoveredFamilies] = useState<Record<string, boolean>>({});
+  const [providerSearch, setProviderSearch] = useState("");
+  const [providerSearchEnabled, setProviderSearchEnabled] = useState(false);
+  const [onlyConfiguredProviders, setOnlyConfiguredProviders] = useState(false);
+  const [selectedProviderId, setSelectedProviderId] = useState<string | "defaults">("defaults");
+  const [selectedEndpointId, setSelectedEndpointId] = useState("");
+  const [showProviderKey, setShowProviderKey] = useState(false);
+  const [expandedModelGroups, setExpandedModelGroups] = useState<Record<string, boolean>>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [toast, setToast] = useState<{ type: "success" | "error"; message: string } | null>(null);
@@ -234,12 +502,7 @@ export default function SettingsPage() {
   const [knowledgeRootDir, setKnowledgeRootDir] = useState("");
   const [knowledgeConfiguredBy, setKnowledgeConfiguredBy] = useState("default");
   const [knowledgeEnvOverride, setKnowledgeEnvOverride] = useState(false);
-  const [mmModel, setMmModel] = useState("qwen2.5-vl-embedding");
-  const [mmDimension, setMmDimension] = useState("1024");
   const [mmConcurrency, setMmConcurrency] = useState("10");
-  const [mmApiKey, setMmApiKey] = useState("");
-  const [mmApiKeyMasked, setMmApiKeyMasked] = useState("");
-  const [showMmKey, setShowMmKey] = useState(false);
   const [kbIndexEnabled, setKbIndexEnabled] = useState(true);
   const [kbVectorStore, setKbVectorStore] = useState("milvus");
   const [kbMilvusUri, setKbMilvusUri] = useState("http://localhost:19530");
@@ -331,6 +594,7 @@ export default function SettingsPage() {
     getSettings()
       .then((s) => {
         setSettings(s);
+        setProviderRegistry(s.provider_registry || null);
         setGatewayBaseUrl(s.ai_gateway.base_url);
         setGatewayHealthPath(s.ai_gateway.health_path);
         setGatewayFallback(s.ai_gateway.fallback_to_direct);
@@ -393,10 +657,7 @@ export default function SettingsPage() {
         setKnowledgeRootDir(s.knowledge?.root_dir || "");
         setKnowledgeConfiguredBy(s.knowledge?.configured_by || "default");
         setKnowledgeEnvOverride(Boolean(s.knowledge?.environment_override));
-        setMmModel(s.multimodal_embedding?.model || "qwen2.5-vl-embedding");
-        setMmDimension(String(s.multimodal_embedding?.dimension || 1024));
         setMmConcurrency(String(s.multimodal_embedding?.batch_size || 10));
-        setMmApiKeyMasked(s.multimodal_embedding?.api_key_masked || "");
         setKbIndexEnabled(s.knowledge?.multimodal_index?.enabled ?? true);
         setKbVectorStore(s.knowledge?.multimodal_index?.vector_store || "milvus");
         setKbMilvusUri(s.knowledge?.multimodal_index?.milvus_uri || "http://localhost:19530");
@@ -482,6 +743,214 @@ export default function SettingsPage() {
     setToast({ type, message });
     setTimeout(() => setToast(null), 3000);
   }, []);
+
+  const refreshProviders = useCallback(async () => {
+    const fresh = await getProviders();
+    setProviderRegistry(fresh);
+  }, []);
+
+  useEffect(() => {
+    if (!providerRegistry) return;
+    setProviderUrls(Object.fromEntries(providerRegistry.providers.flatMap((provider) => provider.endpoints.map((endpoint) => [`${provider.id}:${endpoint.id}`, endpoint.base_url]))));
+  }, [providerRegistry]);
+
+  useEffect(() => {
+    if (!providerRegistry) return;
+    const provider = providerRegistry.providers.find((item) => item.id === selectedProviderId);
+    if (!provider && selectedProviderId !== "defaults") {
+      setSelectedProviderId(providerRegistry.providers[0]?.id || "defaults");
+      return;
+    }
+    if (provider && !provider.endpoints.some((endpoint) => endpoint.id === selectedEndpointId)) {
+      setSelectedEndpointId(provider.endpoints[0]?.id || "");
+      setShowProviderKey(false);
+    }
+  }, [providerRegistry, selectedEndpointId, selectedProviderId]);
+
+  const handleProviderSave = useCallback(async (provider: ProviderService, endpointId: string, baseUrl: string | undefined, apiKey: string) => {
+    const keyToSave = apiKey.trim();
+    if (baseUrl === undefined && !keyToSave) {
+      showToast("error", "请输入要保存的 API 密钥");
+      return;
+    }
+    setProviderBusy(`${provider.id}:${endpointId}`);
+    try {
+      const fresh = await updateProvider(provider.id, {
+        enabled: provider.enabled,
+        endpoints: [{ id: endpointId, ...(baseUrl !== undefined ? { base_url: baseUrl } : {}), ...(keyToSave ? { api_key: keyToSave } : {}) }],
+      });
+      const savedEndpoint = fresh.providers
+        .find((item) => item.id === provider.id)
+        ?.endpoints.find((item) => item.id === endpointId);
+      const savedMaskMatches = keyToSave.length <= 8
+        || savedEndpoint?.api_key_masked.endsWith(keyToSave.slice(-4));
+      if (keyToSave && (
+        !savedEndpoint?.credential_configured
+        || savedEndpoint.credential_source !== "local_file"
+        || !savedMaskMatches
+      )) {
+        throw new Error("新密钥未写入本地凭证存储，保存已被判定为失败");
+      }
+      setProviderRegistry(fresh);
+      setProviderKeys((current) => {
+        const next = { ...current };
+        delete next[providerCredentialStateKey(provider, endpointId)];
+        return next;
+      });
+      showToast("success", keyToSave ? `${provider.name} 密钥已保存至本地用户目录` : `${provider.name} API 地址已保存`);
+    } catch (err) {
+      showToast("error", err instanceof Error ? err.message : "保存 Provider 失败");
+    } finally {
+      setProviderBusy(null);
+    }
+  }, [showToast]);
+
+  const handleBindProvider = useCallback(async (binding: string, modelId: string) => {
+    try {
+      await bindProviderModel(binding, modelId);
+      await refreshProviders();
+      showToast("success", "默认模型已更新");
+    } catch (err) {
+      showToast("error", err instanceof Error ? err.message : "更新默认模型失败");
+    }
+  }, [refreshProviders, showToast]);
+
+  const handleDiscoverProvider = useCallback(async (provider: ProviderService, endpointId: string) => {
+    setProviderModelPickerError("");
+    setProviderBusy(`${provider.id}:${endpointId}:discover`);
+    try {
+      const models = await discoverProviderModels(provider.id, endpointId);
+      setDiscoveredProviderModels((current) => ({ ...current, [`${provider.id}:${endpointId}`]: models.map((model) => model.name) }));
+      if (!models.length) setProviderModelPickerError("Provider 未返回模型列表");
+    } catch (err) {
+      setProviderModelPickerError(err instanceof Error ? err.message : "获取模型列表失败");
+    } finally {
+      setProviderBusy(null);
+    }
+  }, []);
+
+  const handleOpenProviderModelPicker = useCallback((provider: ProviderService, endpointId: string) => {
+    setProviderModelPicker({ providerId: provider.id, endpointId });
+    setProviderModelSearch("");
+    setProviderModelFilter("all");
+    setProviderModelPickerError("");
+    void handleDiscoverProvider(provider, endpointId);
+  }, [handleDiscoverProvider]);
+
+  const showProviderConnectionResult = useCallback((key: string, result: { ok: boolean; message: string }) => {
+    const previousTimer = providerConnectionResultTimers.current[key];
+    if (previousTimer) clearTimeout(previousTimer);
+
+    setProviderConnectionResults((current) => ({ ...current, [key]: result }));
+    providerConnectionResultTimers.current[key] = setTimeout(() => {
+      setProviderConnectionResults((current) => {
+        const next = { ...current };
+        delete next[key];
+        return next;
+      });
+      delete providerConnectionResultTimers.current[key];
+    }, 5_000);
+  }, []);
+
+  const handleTestProviderConnection = useCallback(async (provider: ProviderService, endpointId: string) => {
+    const key = `${provider.id}:${endpointId}`;
+    setProviderBusy(`${key}:test`);
+    const previousTimer = providerConnectionResultTimers.current[key];
+    if (previousTimer) {
+      clearTimeout(previousTimer);
+      delete providerConnectionResultTimers.current[key];
+    }
+    setProviderConnectionResults((current) => {
+      const next = { ...current };
+      delete next[key];
+      return next;
+    });
+    try {
+      const result = await testProviderConnection(provider.id, endpointId, {
+        base_url: providerUrls[key] || "",
+        api_key: providerKeyInputRef.current?.value.trim() || providerKeys[providerCredentialStateKey(provider, endpointId)] || "",
+      });
+      const message = `连接成功 · HTTP ${result.status_code} · ${result.latency_ms}ms`;
+      showProviderConnectionResult(key, { ok: true, message });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "连通性检测失败";
+      showProviderConnectionResult(key, { ok: false, message });
+    } finally {
+      setProviderBusy(null);
+    }
+  }, [providerKeys, providerUrls, showProviderConnectionResult]);
+
+  useEffect(() => () => {
+    Object.values(providerConnectionResultTimers.current).forEach((timer) => clearTimeout(timer));
+  }, []);
+
+  const openModelCategoryEditor = useCallback((
+    provider: ProviderService,
+    endpointId: string,
+    name: string,
+    existing?: { capability: ProviderCapability; categories?: ProviderModelCategory[] },
+  ) => {
+    setPendingModelCategoryEdit({ providerId: provider.id, endpointId, name, capability: existing?.capability });
+    const endpoint = provider.endpoints.find((item) => item.id === endpointId);
+    setSelectedModelCategories(existing ? modelCategories(existing) : suggestModelCategories(name, endpoint?.capabilities || []));
+  }, []);
+
+  const handleSaveModelCategories = useCallback(async () => {
+    if (!pendingModelCategoryEdit || selectedModelCategories.length === 0) {
+      showToast("error", "请至少选择一个模型分类");
+      return;
+    }
+    const selectedOptions = MODEL_CATEGORY_OPTIONS.filter((option) => selectedModelCategories.includes(option.id));
+    const capability = selectedOptions[0]?.capability;
+    if (!capability || selectedOptions.some((option) => option.capability !== capability)) {
+      showToast("error", "一个模型的分类必须使用同一种调用协议");
+      return;
+    }
+    const provider = providerRegistry?.providers.find((item) => item.id === pendingModelCategoryEdit.providerId);
+    const endpoint = provider?.endpoints.find((item) => item.id === pendingModelCategoryEdit.endpointId);
+    if (!provider || !endpoint?.capabilities.includes(capability)) {
+      showToast("error", "该 Endpoint 不支持所选模型分类");
+      return;
+    }
+    setProviderModelAdding(pendingModelCategoryEdit.name);
+    try {
+      await addProviderModel(provider.id, {
+        endpoint_id: endpoint.id,
+        capability,
+        name: pendingModelCategoryEdit.name,
+        categories: selectedModelCategories,
+      });
+      await refreshProviders();
+      showToast("success", `${pendingModelCategoryEdit.name} 的分类已保存`);
+      setPendingModelCategoryEdit(null);
+    } catch (err) {
+      showToast("error", err instanceof Error ? err.message : "保存模型分类失败");
+    } finally {
+      setProviderModelAdding(null);
+    }
+  }, [pendingModelCategoryEdit, providerRegistry, refreshProviders, selectedModelCategories, showToast]);
+
+  useEffect(() => {
+    if (!providerModelPicker) return;
+    const previousOverflow = document.body.style.overflow;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (pendingModelCategoryEdit) setPendingModelCategoryEdit(null);
+      else setProviderModelPicker(null);
+    };
+    document.body.style.overflow = "hidden";
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [pendingModelCategoryEdit, providerModelPicker]);
+
+  const handleAddManualProviderModel = useCallback((provider: ProviderService, endpointId: string) => {
+    const name = window.prompt("输入模型 ID，例如 qwen-plus");
+    if (!name?.trim()) return;
+    openModelCategoryEditor(provider, endpointId, name.trim());
+  }, [openModelCategoryEditor]);
 
   useEffect(() => {
     if (!currentProjectId) {
@@ -623,13 +1092,7 @@ export default function SettingsPage() {
           url: "",
         },
         multimodal_embedding: {
-          provider: "dashscope",
-          model: mmModel,
-          dimension: Number.parseInt(mmDimension, 10) || 1024,
           batch_size: Number.parseInt(mmConcurrency, 10) || 10,
-          base_url: "",
-          prefer_gateway: false,
-          ...(mmApiKey ? { api_key: mmApiKey } : {}),
         },
         knowledge: {
           root_dir: knowledgeRootDir,
@@ -706,12 +1169,10 @@ export default function SettingsPage() {
       // Clear raw keys after save
       setLlmApiKey("");
       setEmbApiKey("");
-      setMmApiKey("");
       // Reload to get fresh masked keys
       const fresh = await getSettings();
       setLlmApiKeyMasked(fresh.fallback_llm.api_key_masked);
       setEmbApiKeyMasked(fresh.fallback_embedding.api_key_masked);
-      setMmApiKeyMasked(fresh.multimodal_embedding.api_key_masked);
       setDatabaseConfiguredBy(fresh.database?.configured_by || "default");
       setDatabaseEnvOverride(Boolean(fresh.database?.environment_override));
       setKnowledgeConfiguredBy(fresh.knowledge?.configured_by || "default");
@@ -721,7 +1182,7 @@ export default function SettingsPage() {
     } finally {
       setSaving(false);
     }
-  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaQueryTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmModel, mmDimension, mmApiKey, knowledgeRootDir, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, toolContextEnabled, immediateToolCompactionEnabled, singleToolTriggerTokens, backgroundMinResultTokens, keepRecentToolResults, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, rubricMaxStagnantRepairs, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, dockerEnabled, dockerOnUnavailable, dockerConnection, dockerContext, dockerUseCustomImage, dockerImage, dockerCpuLimit, dockerMemoryLimitMb, dockerPidsLimit, dockerNetworkEnabled, dockerDependencySetupEnabled, subagentItems, showToast]);
+  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaQueryTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmConcurrency, knowledgeRootDir, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, toolContextEnabled, immediateToolCompactionEnabled, singleToolTriggerTokens, backgroundMinResultTokens, keepRecentToolResults, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, rubricMaxStagnantRepairs, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, dockerEnabled, dockerOnUnavailable, dockerConnection, dockerContext, dockerUseCustomImage, dockerImage, dockerCpuLimit, dockerMemoryLimitMb, dockerPidsLimit, dockerNetworkEnabled, dockerDependencySetupEnabled, subagentItems, showToast]);
 
   const handleDatabaseModeChange = useCallback((mode: "bundled" | "external") => {
     setDatabaseMode(mode);
@@ -1004,6 +1465,59 @@ export default function SettingsPage() {
     );
   }
 
+  const activeProvider = providerRegistry?.providers.find((provider) => provider.id === selectedProviderId) || null;
+  const activeEndpoint = activeProvider?.endpoints.find((endpoint) => endpoint.id === selectedEndpointId) || activeProvider?.endpoints[0] || null;
+  const activeEndpointKey = activeProvider && activeEndpoint ? `${activeProvider.id}:${activeEndpoint.id}` : "";
+  const activeProviderCredentialKey = activeProvider && activeEndpoint ? providerCredentialStateKey(activeProvider, activeEndpoint.id) : "";
+  const filteredProviders = (providerRegistry?.providers || []).filter((provider) => {
+    const query = providerSearch.trim().toLowerCase();
+    const searchable = `${provider.name} ${provider.id}`.toLowerCase();
+    const matchesSearch = !query || searchable.includes(query);
+    const matchesStatus = !onlyConfiguredProviders || provider.endpoints.some((endpoint) => endpoint.credential_configured);
+    return matchesSearch && matchesStatus;
+  });
+  const allProviderModels = providerRegistry?.providers.flatMap((provider) => provider.models.map((model) => ({ ...model, provider }))) || [];
+  const imageAnalyzerBoundId = providerRegistry?.bindings.image_analyzer || "";
+  const imageAnalyzerProviderModels = allProviderModels.filter((model) => (
+    model.capability === "llm"
+    && (modelCategories(model).includes("multimodal_llm") || model.id === imageAnalyzerBoundId)
+  ));
+  const providerHasDefaultModel = (provider: ProviderService) => Object.values(providerRegistry?.bindings || {}).some(
+    (modelId) => provider.models.some((model) => model.id === modelId),
+  );
+  const modelPickerProvider = providerRegistry?.providers.find((provider) => provider.id === providerModelPicker?.providerId) || null;
+  const modelPickerEndpoint = modelPickerProvider?.endpoints.find((endpoint) => endpoint.id === providerModelPicker?.endpointId) || null;
+  const modelPickerKey = modelPickerProvider && modelPickerEndpoint ? `${modelPickerProvider.id}:${modelPickerEndpoint.id}` : "";
+  const modelPickerModels = (discoveredProviderModels[modelPickerKey] || [])
+    .map((name) => {
+      const existing = modelPickerProvider?.models.find((model) => model.endpoint_id === modelPickerEndpoint?.id && model.name === name);
+      const categories = existing ? modelCategories(existing) : suggestModelCategories(name, modelPickerEndpoint?.capabilities || []);
+      return {
+        name,
+        categories,
+        filters: inferDiscoveredFilters(name, categories),
+        family: discoveredModelFamily(name, modelPickerProvider?.name || "其他"),
+      };
+    })
+    .filter((model) => {
+      const matchesSearch = !providerModelSearch.trim() || model.name.toLowerCase().includes(providerModelSearch.trim().toLowerCase());
+      return matchesSearch && matchesDiscoveredFilter(model.filters, providerModelFilter);
+    });
+  const groupedModelPickerModels = Object.entries(
+    modelPickerModels.reduce<Record<string, typeof modelPickerModels>>((groups, model) => {
+      (groups[model.family] ||= []).push(model);
+      return groups;
+    }, {}),
+  ).sort(([left], [right]) => left.localeCompare(right));
+  const pendingModelProvider = providerRegistry?.providers.find((provider) => provider.id === pendingModelCategoryEdit?.providerId) || null;
+  const pendingModelEndpoint = pendingModelProvider?.endpoints.find((endpoint) => endpoint.id === pendingModelCategoryEdit?.endpointId) || null;
+  const pendingCategoryCapability = pendingModelCategoryEdit?.capability
+    || MODEL_CATEGORY_OPTIONS.find((option) => selectedModelCategories.includes(option.id))?.capability;
+  const editableModelCategories = MODEL_CATEGORY_OPTIONS.filter((option) => (
+    pendingModelEndpoint?.capabilities.includes(option.capability)
+    && (!pendingModelCategoryEdit?.capability || option.capability === pendingModelCategoryEdit.capability)
+  ));
+
   return (
     <div className="h-screen app-bg">
       <div className="fixed left-3 top-3 z-[80]">
@@ -1059,9 +1573,176 @@ export default function SettingsPage() {
         <main className="workspace-content-frame flex min-w-0 flex-1 flex-col overflow-hidden">
           <div className="flex-1 overflow-y-auto px-8 pb-8 pt-6">
             <div className={`${
-              category === "ai" || category === "databaseQa" ? "max-w-4xl" : category === "harness" || category === "project" ? "max-w-6xl" : "max-w-2xl"
+              category === "ai" ? "max-w-none" : category === "databaseQa" ? "max-w-4xl" : category === "harness" || category === "project" ? "max-w-6xl" : "max-w-2xl"
             } mx-auto space-y-6`}>
             {category === "ai" && (
+              <section className="provider-light min-h-[calc(100vh-96px)] overflow-hidden rounded-2xl border border-slate-200 bg-white text-slate-900 shadow-xl shadow-slate-200/50" data-screen-label="模型服务">
+                <style jsx>{`
+                  .provider-light :global([class*="border-white"]) { border-color: rgb(226 232 240 / 0.9) !important; }
+                  .provider-light :global([class*="text-white"]) { color: #1e293b !important; }
+                  .provider-light :global([class*="text-white/25"]) { color: #64748b !important; }
+                  .provider-light :global([class*="text-white/30"]), .provider-light :global([class*="text-white/35"]) { color: #64748b !important; }
+                  .provider-light :global([class*="text-white/40"]), .provider-light :global([class*="text-white/45"]) { color: #475569 !important; }
+                  .provider-light :global([class*="text-white/55"]), .provider-light :global([class*="text-white/65"]) { color: #334155 !important; }
+                  .provider-light :global([class*="text-white/75"]), .provider-light :global([class*="text-white/90"]) { color: #1e293b !important; }
+                  .provider-light :global([class*="text-[#8d9cff]"]), .provider-light :global([class*="text-[#b1b8ff]"]), .provider-light :global([class*="text-[#b8bfff]"]) { color: #002fa7 !important; }
+                  .provider-light :global([class*="text-emerald-300"]) { color: #047857 !important; }
+                  .provider-light :global([class*="bg-[#161616]"]) { background-color: #ffffff !important; }
+                  .provider-light :global([class*="bg-[#151515]"]) { background-color: #ffffff !important; }
+                  .provider-light :global([class*="bg-[#171717]"]) { background-color: #f8fafc !important; }
+                  .provider-light :global([class*="bg-[#1a1a1a]"]), .provider-light :global([class*="bg-[#1d1d1d]"]) { background-color: #ffffff !important; }
+                  .provider-light :global([class*="bg-black/"]) { background-color: #f8fafc !important; }
+                  .provider-light :global([class*="bg-white/[0.025]"]) { background-color: #ffffff !important; }
+                  .provider-light :global([class*="bg-white/[0.04]"]) { background-color: #f8fafc !important; }
+                  .provider-light :global([class*="bg-white/[0.055]"]) { background-color: #f8fafc !important; }
+                  .provider-light :global([class*="bg-white/[0.06]"]), .provider-light :global([class*="bg-white/[0.07]"]), .provider-light :global([class*="bg-white/[0.08]"]) { background-color: #f1f5f9 !important; }
+                  .provider-light :global([class*="bg-white/[0.1]"]) { background-color: #e8edff !important; }
+                  .provider-light :global([class*="bg-white/[0.15]"]) { background-color: #cbd5e1 !important; }
+                  .provider-light :global([class*="hover:bg-white/"]:hover) { background-color: #eef2ff !important; }
+                  .provider-light :global([class*="focus:border-[#8d9cff]"]:focus) { border-color: #002fa7 !important; }
+                  .provider-light :global(input::placeholder) { color: #94a3b8 !important; }
+                  .provider-light :global(button[class*="bg-[#727eff]"]), .provider-light :global(button[class*="bg-emerald-500"]) { background-color: #002fa7 !important; color: #ffffff !important; }
+                  .provider-light :global(button[class*="bg-[#727eff]"] *), .provider-light :global(button[class*="bg-emerald-500"] *) { color: #ffffff !important; }
+                  .provider-light :global(.provider-primary-action) { background-color: #002fa7 !important; border: 1px solid #001f7a !important; color: #ffffff !important; }
+                  .provider-light :global(.provider-primary-action:hover) { background-color: #001f7a !important; }
+                `}</style>
+                <div className="grid min-h-[calc(100vh-96px)] grid-cols-1 lg:grid-cols-[300px_minmax(0,1fr)]">
+                  <aside className="border-b border-white/[0.1] bg-[#171717] lg:border-b-0 lg:border-r">
+                    <div className="border-b border-white/[0.1] px-5 py-5">
+                      <div className="mb-4 flex items-center gap-2 text-[13px] font-semibold tracking-[0.02em] text-white">
+                        <Network className="h-4 w-4 text-[#8d9cff]" /> 模型服务
+                      </div>
+                      <div className="flex items-center gap-2 rounded-xl border border-white/[0.12] bg-black/20 px-3 py-2.5 transition-colors focus-within:border-[#8d9cff]/70">
+                        <Search className="h-4 w-4 shrink-0 text-white/35" />
+                        <input
+                          name="provider-platform-filter"
+                          autoComplete="off"
+                          data-1p-ignore="true"
+                          data-lpignore="true"
+                          readOnly={!providerSearchEnabled}
+                          onPointerDown={() => setProviderSearchEnabled(true)}
+                          onFocus={() => setProviderSearchEnabled(true)}
+                          value={providerSearch}
+                          onChange={(event) => setProviderSearch(event.target.value)}
+                          placeholder="搜索模型平台…"
+                          className="min-w-0 flex-1 bg-transparent text-[13px] text-white outline-none placeholder:text-white/30"
+                        />
+                        <button type="button" onClick={() => setOnlyConfiguredProviders((current) => !current)} className={`rounded-md p-1 transition-colors ${onlyConfiguredProviders ? "bg-[#6875ff]/20 text-[#9da7ff]" : "text-white/40 hover:bg-white/[0.08] hover:text-white"}`} title="仅显示已配置的平台"><Filter className="h-4 w-4" /></button>
+                      </div>
+                    </div>
+
+                    <div className="p-3">
+                      <button type="button" onClick={() => setSelectedProviderId("defaults")} className={`mb-2 flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left transition-all ${selectedProviderId === "defaults" ? "bg-white/[0.1] text-white shadow-sm ring-1 ring-white/[0.12]" : "text-white/65 hover:bg-white/[0.055] hover:text-white"}`}>
+                        <span className="flex h-8 w-8 items-center justify-center rounded-full bg-[#6875ff]/15 text-[#aeb6ff]"><Bot className="h-4 w-4" /></span>
+                        <span className="min-w-0 flex-1"><span className="block text-[13px] font-semibold">默认模型</span><span className="mt-0.5 block text-[10px] text-white/40">为工作负载分配模型</span></span>
+                      </button>
+                      <div className="mb-2 px-3 pt-2 text-[10px] font-medium uppercase tracking-[0.12em] text-white/30">Provider</div>
+                      <div className="space-y-1">
+                        {filteredProviders.map((provider) => {
+                          const selected = selectedProviderId === provider.id;
+                          const configured = provider.endpoints.some((endpoint) => endpoint.credential_configured);
+                          const hasDefaultModel = providerHasDefaultModel(provider);
+                          return <button type="button" key={provider.id} onClick={() => setSelectedProviderId(provider.id)} className={`group flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left transition-all ${selected ? "bg-white/[0.1] text-white shadow-sm ring-1 ring-white/[0.12]" : "text-white/65 hover:bg-white/[0.055] hover:text-white"}`}>
+                            <ProviderLogo provider={provider} />
+                            <span className="min-w-0 flex-1"><span className="block truncate text-[13px] font-semibold">{provider.name}</span><span className="mt-0.5 block text-[10px] text-white/40">{configured ? "已配置" : "待配置"}</span></span>
+                            {hasDefaultModel && <span className="h-2.5 w-2.5 rounded-full bg-emerald-400" title="包含默认模型" aria-label="包含默认模型" />}
+                          </button>;
+                        })}
+                        {filteredProviders.length === 0 && <div className="px-3 py-8 text-center text-[12px] text-white/35">没有匹配的平台</div>}
+                      </div>
+                    </div>
+                  </aside>
+
+                  <div className="min-w-0 bg-[#151515]">
+                    {selectedProviderId === "defaults" && (
+                      <div className="mx-auto max-w-4xl px-6 py-7 sm:px-10">
+                        <div className="border-b border-white/[0.1] pb-6">
+                          <div className="flex items-start gap-4"><span className="flex h-11 w-11 items-center justify-center rounded-2xl bg-[#6875ff]/15 text-[#abb3ff]"><Sparkles className="h-5 w-5" /></span><div><h1 className="text-[22px] font-semibold tracking-tight text-white">默认模型</h1><p className="mt-1 text-[12px] leading-5 text-white/45">为每类工作负载选择一个已登记模型。Provider 的地址与凭证不会在运行中切换。</p></div></div>
+                        </div>
+                        <div className="mt-7 grid gap-4 sm:grid-cols-2">
+                          {([
+                            ["agent", "默认助手模型", "对话、规划与工具调用"],
+                            ["image_analyzer", "图片理解模型", "图片分析 SubAgent 使用，需选择支持视觉输入的对话模型"],
+                            ["text_embedding", "文本 Embedding", "文档、表格与知识库文本"],
+                            ["multimodal_embedding", "多模态 Embedding", "图片与图文混合内容"],
+                            ["rerank", "Rerank", "召回结果的相关性重排"],
+                          ] as const).map(([binding, label, description]) => {
+                            const capability = binding === "agent" || binding === "image_analyzer" ? "llm" : binding;
+                            const boundId = providerRegistry?.bindings[binding] || "";
+                            const requiredCategory: ProviderModelCategory = binding === "agent"
+                              ? "llm"
+                              : binding === "image_analyzer"
+                                ? "multimodal_llm"
+                                : binding;
+                            const models = allProviderModels.filter((model) => (
+                              model.capability === capability
+                              && (modelCategories(model).includes(requiredCategory) || model.id === boundId)
+                            ));
+                            const activeModel = models.find((model) => model.id === boundId);
+                            return <div key={binding} className="rounded-2xl border border-white/[0.1] bg-white/[0.025] p-4 transition-colors hover:border-white/[0.16]">
+                              <div className="flex items-start justify-between gap-3">
+                                <p className="text-[13px] font-semibold text-white">{label}</p>
+                                {activeModel && <button type="button" onClick={() => openModelCategoryEditor(activeModel.provider, activeModel.endpoint_id, activeModel.name, activeModel)} className="shrink-0 rounded-md px-2 py-1 text-[10px] font-medium text-white/55 transition hover:bg-white/[0.07] hover:text-white">编辑分类</button>}
+                              </div>
+                              <p className="mt-1 text-[11px] text-white/40">{description}</p>
+                              <div className="mt-4"><ModelBindingSelect value={boundId} onChange={(modelId) => handleBindProvider(binding, modelId)} options={models.map((model) => ({ id: model.id, label: `${model.provider.name} · ${model.name}` }))} /></div>
+                            </div>;
+                          })}
+                        </div>
+                      </div>
+                    )}
+
+                    {activeProvider && activeEndpoint && selectedProviderId !== "defaults" && (
+                      <div className="min-h-full">
+                        <header className="flex min-h-[78px] items-center justify-between gap-4 border-b border-white/[0.1] px-6 sm:px-10">
+                          <div className="flex min-w-0 items-center gap-3"><ProviderLogo provider={activeProvider} size="md" /><h1 className="truncate text-[20px] font-semibold tracking-tight text-white">{activeProvider.name}</h1>{activeProvider.website && <a href={activeProvider.website} target="_blank" rel="noreferrer" className="rounded-md p-1.5 text-white/55 transition hover:bg-white/[0.08] hover:text-white" title="打开 Provider 控制台"><ExternalLink className="h-4 w-4" /></a>}</div>
+                        </header>
+
+                        <div className="mx-auto max-w-5xl px-6 py-7 sm:px-10">
+                          <section className="border-b border-white/[0.1] pb-7">
+                            <div className="mb-3 flex items-center justify-between gap-4"><label className="text-[15px] font-semibold text-white">API 密钥</label><span className="text-[10px] text-white/35">{activeEndpoint.credential_source === "environment" ? "由环境变量提供" : activeEndpoint.credential_configured ? "已保存在本地用户目录" : "尚未配置"}</span></div>
+                            <div className="flex overflow-hidden rounded-xl border border-white/[0.13] bg-[#1a1a1a] transition-colors focus-within:border-[#8d9cff]">
+                              <input ref={providerKeyInputRef} type={showProviderKey ? "text" : "password"} name={`provider-api-key-${activeProvider.id}`} autoComplete="new-password" data-1p-ignore="true" data-lpignore="true" spellCheck={false} value={providerKeys[activeProviderCredentialKey] || ""} onChange={(event) => setProviderKeys((current) => ({ ...current, [activeProviderCredentialKey]: event.target.value }))} placeholder={activeEndpoint.api_key_masked || "输入 API 密钥"} className="min-w-0 flex-1 bg-transparent px-4 py-3 text-[14px] text-white outline-none placeholder:text-white/25" aria-label={`${activeProvider.name} API Key`} />
+                              <button type="button" onClick={() => setShowProviderKey((value) => !value)} className="px-3 text-white/45 transition hover:bg-white/[0.07] hover:text-white" title={showProviderKey ? "隐藏密钥" : "显示密钥"}>{showProviderKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}</button>
+                              {activeEndpoint.protocol !== "dashscope_multimodal_embedding" && <button type="button" disabled={providerBusy === `${activeEndpointKey}:test`} onClick={() => handleTestProviderConnection(activeProvider, activeEndpoint.id)} className="border-l border-white/[0.13] px-4 text-[12px] font-semibold text-white transition hover:bg-white/[0.07] disabled:opacity-45">{providerBusy === `${activeEndpointKey}:test` ? "检测中…" : "检测"}</button>}
+                              <button type="button" disabled={providerBusy === activeEndpointKey} onClick={() => handleProviderSave(activeProvider, activeEndpoint.id, undefined, providerKeyInputRef.current?.value || providerKeys[activeProviderCredentialKey] || "")} className="provider-primary-action border-l border-white/[0.13] px-4 text-[12px] font-semibold transition disabled:opacity-45">{providerBusy === activeEndpointKey ? "保存中…" : "保存"}</button>
+                            </div>
+                            {providerConnectionResults[activeEndpointKey] && <p className={`mt-2 text-[11px] ${providerConnectionResults[activeEndpointKey].ok ? "text-emerald-600" : "text-rose-600"}`}>{providerConnectionResults[activeEndpointKey].message}</p>}
+                            {activeProvider.website && <a href={activeProvider.website} target="_blank" rel="noreferrer" className="mt-3 inline-flex items-center gap-1.5 text-[11px] text-[#8d9cff] transition hover:text-[#b1b8ff]"><KeyRound className="h-3.5 w-3.5" /> 前往 {activeProvider.name} 获取密钥</a>}
+                          </section>
+
+                          <section className="border-b border-white/[0.1] py-7">
+                            <div className="mb-3 flex flex-wrap items-center justify-between gap-4"><div className="flex flex-wrap items-center gap-2"><label className="mr-1 text-[15px] font-semibold text-white">API 地址</label>{activeProvider.endpoints.length > 1 ? activeProvider.endpoints.map((endpoint) => <button type="button" key={endpoint.id} onClick={() => { setSelectedEndpointId(endpoint.id); setShowProviderKey(false); }} className={`rounded-md px-2.5 py-1 text-[10px] font-medium transition-colors ${activeEndpoint.id === endpoint.id ? "bg-[#727eff] text-white" : "bg-white/[0.07] text-white/45 hover:bg-white/[0.11] hover:text-white"}`}>{protocolLabel(endpoint.protocol)}</button>) : <span className="rounded-md bg-white/[0.07] px-2.5 py-1 text-[10px] text-white/40">{protocolLabel(activeEndpoint.protocol)}</span>}</div><button type="button" onClick={() => setProviderUrls((current) => ({ ...current, [activeEndpointKey]: activeEndpoint.base_url }))} className="inline-flex items-center gap-1.5 text-[11px] text-white/45 transition hover:text-white"><RotateCcw className="h-3.5 w-3.5" />撤销本次编辑</button></div>
+                            <input value={providerUrls[activeEndpointKey] ?? activeEndpoint.base_url} onChange={(event) => setProviderUrls((current) => ({ ...current, [activeEndpointKey]: event.target.value }))} className="h-12 w-full rounded-xl border border-white/[0.13] bg-[#1a1a1a] px-4 font-mono text-[13px] text-white outline-none transition-colors focus:border-[#8d9cff]" aria-label={`${activeProvider.name} endpoint`} />
+                            <p className="mt-3 flex items-center gap-1.5 text-[11px] text-white/35"><Globe2 className="h-3.5 w-3.5" />{activeEndpoint.protocol === "dashscope_multimodal_embedding" ? `${(providerUrls[activeEndpointKey] ?? activeEndpoint.base_url).replace(/\/$/, "")}${activeEndpoint.route_path || ""}` : `${(providerUrls[activeEndpointKey] ?? activeEndpoint.base_url).replace(/\/$/, "")}/models`}</p>
+                            <div className="mt-5 flex justify-end"><button type="button" disabled={providerBusy === activeEndpointKey} onClick={() => handleProviderSave(activeProvider, activeEndpoint.id, providerUrls[activeEndpointKey] ?? activeEndpoint.base_url, "")} className="rounded-lg bg-[#727eff] px-4 py-2 text-[12px] font-semibold text-white transition hover:bg-[#8690ff] disabled:cursor-not-allowed disabled:opacity-50">{providerBusy === activeEndpointKey ? "保存中…" : "保存地址"}</button></div>
+                          </section>
+
+                          <section className="pt-7">
+                            <div className="mb-5 flex flex-wrap items-center justify-between gap-3"><div className="flex items-center gap-3"><h2 className="text-[16px] font-semibold text-white">全部模型</h2><span className="rounded-full bg-white/[0.08] px-2.5 py-1 text-[10px] text-white/45">{activeProvider.models.length}</span></div><button type="button" onClick={() => handleOpenProviderModelPicker(activeProvider, activeEndpoint.id)} className="inline-flex items-center gap-1.5 rounded-lg border border-white/[0.14] px-3 py-2 text-[11px] font-semibold text-white/75 transition hover:bg-white/[0.07] hover:text-white"><RefreshCw className="h-3.5 w-3.5" />获取当前接口模型</button></div>
+
+                            <div className="space-y-3">
+                              {MODEL_CATEGORY_OPTIONS.map((categoryOption) => {
+                                const models = activeProvider.models.filter((model) => modelCategories(model).includes(categoryOption.id));
+                                if (!models.length) return null;
+                                const groupKey = `${activeProvider.id}:${categoryOption.id}`;
+                                const expanded = expandedModelGroups[groupKey] !== false;
+                                return <div key={categoryOption.id} className="overflow-hidden rounded-xl border border-white/[0.1] bg-white/[0.025]">
+                                  <button type="button" onClick={() => setExpandedModelGroups((current) => ({ ...current, [groupKey]: !expanded }))} className="flex w-full items-center gap-3 bg-white/[0.04] px-4 py-3 text-left transition hover:bg-white/[0.07]"><span className="text-white/45">{expanded ? <ChevronDown className="h-4 w-4" /> : <ChevronUp className="h-4 w-4" />}</span><span className="flex-1 text-[13px] font-semibold text-white">{categoryOption.label}</span><span className="rounded-full bg-white/[0.07] px-2 py-0.5 text-[10px] text-white/45">{models.length}</span></button>
+                                  {expanded && <div>{models.map((model) => { const binding = MODEL_CATEGORY_BINDINGS[categoryOption.id]; const isDefault = binding && providerRegistry?.bindings[binding] === model.id; const modelEndpoint = activeProvider.endpoints.find((endpoint) => endpoint.id === model.endpoint_id); return <div key={`${categoryOption.id}:${model.id}`} className="flex items-center gap-3 border-t border-white/[0.08] px-4 py-4"><ProviderLogo provider={activeProvider} size="sm" /><span className="min-w-0 flex-1 truncate font-mono text-[13px] font-medium text-white/90">{model.name}</span>{modelEndpoint && <span className="hidden rounded-md bg-white/[0.06] px-2 py-1 text-[10px] text-white/45 md:inline">{protocolLabel(modelEndpoint.protocol)}</span>}{model.dimension && <span className="hidden rounded-md bg-white/[0.06] px-2 py-1 text-[10px] text-white/45 sm:inline">{model.dimension} dim</span>}<button type="button" onClick={() => openModelCategoryEditor(activeProvider, model.endpoint_id, model.name, model)} className="rounded-full bg-white/[0.07] px-2.5 py-1 text-[10px] font-semibold text-white/65 transition hover:bg-white/[0.12] hover:text-white">编辑分类</button>{isDefault ? <span className="rounded-full bg-emerald-400/10 px-2.5 py-1 text-[10px] font-semibold text-emerald-300">默认</span> : binding && <button type="button" onClick={() => handleBindProvider(binding, model.id)} className="rounded-full bg-white/[0.07] px-2.5 py-1 text-[10px] font-semibold text-white/65 transition hover:bg-[#727eff]/25 hover:text-[#bec4ff]">设为默认</button>}</div>; })}</div>}
+                                </div>;
+                              })}
+                              {activeProvider.models.length === 0 && <div className="rounded-xl border border-dashed border-white/[0.15] px-5 py-10 text-center text-[12px] text-white/40">尚未登记模型。可以从当前接口获取列表，或手动添加模型 ID。</div>}
+                            </div>
+                          </section>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </section>
+            )}
+            {false && category === "ai" && (
               <>
                 <div className="flex items-center justify-between gap-4">
                   <div>
@@ -1139,7 +1820,7 @@ export default function SettingsPage() {
                         测试网关
                       </button>
                     </div>
-                    {gatewayTestResult && <div className="col-span-2"><ConnectionResult result={gatewayTestResult} /></div>}
+                    {gatewayTestResult && <div className="col-span-2"><ConnectionResult result={gatewayTestResult!} /></div>}
                   </div>
 
                   {/* Higress Routed Models */}
@@ -1375,7 +2056,7 @@ export default function SettingsPage() {
             )}
 
             {/* Fallback Settings */}
-            {category === "ai" && (
+            {false && category === "ai" && (
               <SettingsCard title="Fallback 直连配置" icon={Bot} color="#6b7280">
                 <div className="rounded-xl border border-amber-100/80 bg-amber-50/50 px-3.5 py-3 mb-4">
                   <p className="text-[11px] leading-relaxed text-amber-700">
@@ -1444,9 +2125,9 @@ export default function SettingsPage() {
                     </button>
                   </div>
                   {llmTestResult && (
-                    <div className={`mt-1.5 flex items-center gap-1 text-[11px] ${llmTestResult.ok ? "text-emerald-600" : "text-red-500"}`}>
-                      {llmTestResult.ok ? <CheckCircle2 className="w-3 h-3" /> : <XCircle className="w-3 h-3" />}
-                      {llmTestResult.msg}
+                    <div className={`mt-1.5 flex items-center gap-1 text-[11px] ${llmTestResult!.ok ? "text-emerald-600" : "text-red-500"}`}>
+                      {llmTestResult!.ok ? <CheckCircle2 className="w-3 h-3" /> : <XCircle className="w-3 h-3" />}
+                      {llmTestResult!.msg}
                     </div>
                   )}
                 </FormField>
@@ -1562,9 +2243,9 @@ export default function SettingsPage() {
                     </button>
                   </div>
                   {embTestResult && (
-                    <div className={`mt-1.5 flex items-center gap-1 text-[11px] ${embTestResult.ok ? "text-emerald-600" : "text-red-500"}`}>
-                      {embTestResult.ok ? <CheckCircle2 className="w-3 h-3" /> : <XCircle className="w-3 h-3" />}
-                      {embTestResult.msg}
+                    <div className={`mt-1.5 flex items-center gap-1 text-[11px] ${embTestResult!.ok ? "text-emerald-600" : "text-red-500"}`}>
+                      {embTestResult!.ok ? <CheckCircle2 className="w-3 h-3" /> : <XCircle className="w-3 h-3" />}
+                      {embTestResult!.msg}
                     </div>
                   )}
                 </FormField>
@@ -1852,41 +2533,36 @@ export default function SettingsPage() {
                 </SettingsCard>
 
                 <SettingsCard title="多模态 Embedding" icon={Database} color="#002fa7">
-                  <div className="rounded-xl border border-[#002fa7]/10 bg-[#002fa7]/[0.04] px-3.5 py-3">
-                    <p className="text-[11px] leading-relaxed text-[#002fa7]">
-                      图文混排 PDF 默认使用 DashScope Qwen-VL Embedding 直连。通常只需要配置 API Key；如果 Higress 已有同一 DashScope Key，后端会自动复用。
-                    </p>
+                  <div className="rounded-xl border border-slate-200 bg-slate-50 px-3.5 py-3">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <p className="text-[12px] font-medium text-slate-700">
+                          {multimodalEmbeddingSelection
+                            ? `${multimodalEmbeddingSelection.provider.name} · ${multimodalEmbeddingSelection.model.name}`
+                            : "尚未绑定多模态 Embedding 模型"}
+                        </p>
+                        <p className="mt-1 text-[11px] leading-relaxed text-slate-500">
+                          {multimodalEmbeddingSelection?.model.dimension
+                            ? `${multimodalEmbeddingSelection.model.dimension} 维 · 模型、接口和密钥由「模型服务」统一管理`
+                            : "模型、维度、接口和密钥由「模型服务」统一管理"}
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setCategory("ai")}
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-[11px] font-medium text-slate-700 transition hover:border-[#002fa7]/20 hover:text-[#002fa7]"
+                      >
+                        前往模型服务
+                        <ExternalLink className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
                   </div>
-                  <div className="grid gap-4 md:grid-cols-2">
-                    <FormField label="Model">
-                      <input value={mmModel} onChange={(e) => setMmModel(e.target.value)} className="form-input" placeholder="qwen2.5-vl-embedding" />
-                    </FormField>
-                    <FormField label="Dimension">
-                      <input value={mmDimension} onChange={(e) => setMmDimension(e.target.value)} className="form-input" placeholder="1024" />
-                    </FormField>
-                    <FormField label="并发数">
+                  <div className="max-w-sm">
+                    <FormField label="索引并发数">
                       <input value={mmConcurrency} onChange={(e) => setMmConcurrency(e.target.value)} className="form-input" placeholder="10" />
                       <p className="mt-1 text-[11px] leading-relaxed text-gray-400">
-                        DashScope 多模态接口不支持同类型批量输入，这里控制同时发起多少个单条请求。
+                        控制知识库建索引时同时发起的单条向量化请求数。
                       </p>
-                    </FormField>
-                    <FormField label="API Key（可选）">
-                      <div className="relative">
-                        <input
-                          type={showMmKey ? "text" : "password"}
-                          value={mmApiKey}
-                          onChange={(e) => setMmApiKey(e.target.value)}
-                          className="form-input pr-8"
-                          placeholder={mmApiKeyMasked || "可留空：自动复用 Higress DashScope Key"}
-                        />
-                        <button
-                          type="button"
-                          onClick={() => setShowMmKey((v) => !v)}
-                          className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
-                        >
-                          {showMmKey ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                        </button>
-                      </div>
                     </FormField>
                   </div>
                 </SettingsCard>
@@ -2082,9 +2758,13 @@ export default function SettingsPage() {
                               index={selectedSubagentIndex}
                               item={subagentItems[selectedSubagentIndex]}
                               gatewayModels={gatewayModels}
+                              imageAnalyzerModels={imageAnalyzerProviderModels
+                                .map((model) => ({ id: model.id, name: model.name, providerName: model.provider.name }))}
+                              imageAnalyzerModelId={imageAnalyzerBoundId}
                               refreshingModels={refreshingModels}
                               onChange={updateSubAgentItem}
                               onRefreshModels={handleRefreshGatewayModels}
+                              onBindImageAnalyzer={(modelId) => handleBindProvider("image_analyzer", modelId)}
                               onDelete={handleDeleteSubAgent}
                               onClose={() => setSelectedSubagentIndex(null)}
                             />
@@ -2650,9 +3330,13 @@ export default function SettingsPage() {
                           index={selectedSubagentIndex}
                           item={subagentItems[selectedSubagentIndex]}
                           gatewayModels={gatewayModels}
+                          imageAnalyzerModels={imageAnalyzerProviderModels
+                            .map((model) => ({ id: model.id, name: model.name, providerName: model.provider.name }))}
+                          imageAnalyzerModelId={imageAnalyzerBoundId}
                           refreshingModels={refreshingModels}
                           onChange={updateSubAgentItem}
                           onRefreshModels={handleRefreshGatewayModels}
+                          onBindImageAnalyzer={(modelId) => handleBindProvider("image_analyzer", modelId)}
                           onDelete={handleDeleteSubAgent}
                           onClose={() => setSelectedSubagentIndex(null)}
                           isMobile
@@ -2728,7 +3412,7 @@ export default function SettingsPage() {
             )}
 
             {/* Save Button */}
-            <div className="flex justify-end pt-2 pb-8">
+            {category !== "ai" && <div className="flex justify-end pt-2 pb-8">
               <button
                 onClick={handleSave}
                 disabled={saving}
@@ -2737,15 +3421,123 @@ export default function SettingsPage() {
                 {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
                 保存设置
               </button>
-            </div>
+            </div>}
           </div>
         </div>
       </main>
     </div>
 
+    {providerModelPicker && modelPickerProvider && modelPickerEndpoint && (
+      <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/35 p-4 backdrop-blur-[2px] sm:p-8" onMouseDown={() => setProviderModelPicker(null)}>
+        <section
+          role="dialog"
+          aria-modal="true"
+          aria-label={`${modelPickerProvider.name} 模型列表`}
+          data-screen-label="Provider 模型选择弹窗"
+          className="flex max-h-[86vh] min-h-[520px] w-full max-w-5xl flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl shadow-slate-950/20"
+          onMouseDown={(event) => event.stopPropagation()}
+        >
+          <header className="flex items-center justify-between gap-4 border-b border-slate-200 px-6 py-5">
+            <div className="flex min-w-0 items-center gap-3">
+              <ProviderLogo provider={modelPickerProvider} size="md" />
+              <div className="min-w-0">
+                <h2 className="truncate text-[19px] font-semibold text-slate-900">{modelPickerProvider.name} 模型</h2>
+                <p className="mt-0.5 text-[11px] text-slate-500">从 Provider 返回的模型列表中搜索并登记</p>
+              </div>
+            </div>
+            <button type="button" onClick={() => setProviderModelPicker(null)} className="rounded-lg p-2 text-slate-500 transition hover:bg-slate-100 hover:text-slate-900" aria-label="关闭模型列表"><X className="h-5 w-5" /></button>
+          </header>
+
+          <div className="border-b border-slate-200 px-6 pt-5">
+            <div className="flex gap-2">
+              <label className="flex min-w-0 flex-1 items-center gap-3 rounded-xl border border-slate-300 bg-white px-4 py-3 shadow-sm transition focus-within:border-[#002fa7] focus-within:ring-2 focus-within:ring-[#002fa7]/10">
+                <Search className="h-4 w-4 shrink-0 text-slate-500" />
+                <input autoFocus value={providerModelSearch} onChange={(event) => setProviderModelSearch(event.target.value)} placeholder="搜索模型 ID 或名称" className="min-w-0 flex-1 bg-transparent text-[13px] text-slate-900 outline-none placeholder:text-slate-400" />
+                {providerModelSearch && <button type="button" onClick={() => setProviderModelSearch("")} className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700" aria-label="清空搜索"><X className="h-3.5 w-3.5" /></button>}
+              </label>
+              <button type="button" disabled={providerBusy === `${modelPickerKey}:discover`} onClick={() => handleDiscoverProvider(modelPickerProvider, modelPickerEndpoint.id)} className="flex h-[46px] w-[46px] shrink-0 items-center justify-center rounded-xl border border-slate-300 bg-white text-slate-600 transition hover:border-slate-400 hover:bg-slate-50 disabled:opacity-50" title="刷新模型列表"><RefreshCw className={`h-4 w-4 ${providerBusy === `${modelPickerKey}:discover` ? "animate-spin" : ""}`} /></button>
+            </div>
+            <nav className="mt-4 flex gap-6 overflow-x-auto" aria-label="模型预分类筛选">
+              {DISCOVERED_MODEL_FILTERS.map((filter) => <button type="button" key={filter.id} onClick={() => setProviderModelFilter(filter.id)} className={`shrink-0 border-b-2 px-0.5 pb-3 text-[12px] font-medium transition ${providerModelFilter === filter.id ? "border-[#002fa7] text-[#002fa7]" : "border-transparent text-slate-500 hover:text-slate-800"}`}>{filter.label}</button>)}
+            </nav>
+          </div>
+
+          <div className="min-h-0 flex-1 overflow-y-auto bg-slate-50/70 p-5 sm:p-6">
+            {providerModelPickerError && <div className="mb-4 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-[12px] text-rose-700">{providerModelPickerError}</div>}
+            {providerBusy === `${modelPickerKey}:discover` && !(discoveredProviderModels[modelPickerKey] || []).length ? (
+              <div className="flex min-h-[260px] flex-col items-center justify-center gap-3 text-slate-500"><Loader2 className="h-6 w-6 animate-spin text-[#002fa7]" /><span className="text-[12px]">正在获取模型列表…</span></div>
+            ) : groupedModelPickerModels.length === 0 ? (
+              <div className="flex min-h-[260px] flex-col items-center justify-center gap-2 text-center"><Search className="h-6 w-6 text-slate-400" /><p className="text-[13px] font-medium text-slate-700">没有匹配的模型</p><p className="text-[11px] text-slate-500">请调整搜索词或切换分类</p></div>
+            ) : (
+              <div className="space-y-3">
+                {groupedModelPickerModels.map(([family, models]) => {
+                  const familyKey = `${modelPickerKey}:${family}`;
+                  const expanded = providerModelSearch.trim()
+                    ? true
+                    : expandedDiscoveredFamilies[familyKey] ?? models.length <= 20;
+                  return <div key={family} className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+                    <button type="button" onClick={() => setExpandedDiscoveredFamilies((current) => ({ ...current, [familyKey]: !expanded }))} className="flex w-full items-center gap-3 bg-slate-100/80 px-4 py-3 text-left transition hover:bg-slate-100">
+                      {expanded ? <ChevronDown className="h-4 w-4 text-slate-500" /> : <ChevronUp className="h-4 w-4 text-slate-500" />}
+                      <span className="min-w-0 flex-1 truncate text-[13px] font-semibold text-slate-800">{family}</span>
+                      <span className="rounded-full bg-white px-2 py-0.5 text-[10px] font-medium text-slate-500 shadow-sm">{models.length}</span>
+                    </button>
+                    {expanded && <div>{models.map((model) => {
+                      const existingModel = modelPickerProvider.models.find((item) => item.endpoint_id === modelPickerEndpoint.id && item.name === model.name);
+                      const adding = providerModelAdding === model.name;
+                      return <div key={model.name} className="flex min-h-[58px] items-center gap-3 border-t border-slate-100 px-4 py-3 transition hover:bg-slate-50">
+                        <span className="min-w-0 flex-1 truncate font-mono text-[12px] font-medium text-slate-800" title={model.name}>{model.name}</span>
+                        {existingModel && <div className="hidden flex-wrap justify-end gap-1 sm:flex">{modelCategories(existingModel).map((category) => <span key={category} className="rounded-md bg-slate-100 px-2 py-1 text-[10px] text-slate-600">{MODEL_CATEGORY_LABELS[category]}</span>)}</div>}
+                        {existingModel ? <button type="button" disabled={adding || providerModelAdding !== null} onClick={() => openModelCategoryEditor(modelPickerProvider, modelPickerEndpoint.id, model.name, existingModel)} className="rounded-lg border border-slate-200 px-2.5 py-1.5 text-[10px] font-medium text-slate-600 transition hover:border-[#002fa7]/30 hover:bg-[#002fa7]/5 hover:text-[#002fa7]">编辑分类</button> : <button type="button" disabled={adding || providerModelAdding !== null} onClick={() => openModelCategoryEditor(modelPickerProvider, modelPickerEndpoint.id, model.name)} className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-slate-200 text-slate-600 transition hover:border-[#002fa7]/40 hover:bg-[#002fa7]/5 hover:text-[#002fa7] disabled:opacity-45" title={`添加 ${model.name}`}>{adding ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}</button>}
+                      </div>;
+                    })}</div>}
+                  </div>;
+                })}
+              </div>
+            )}
+          </div>
+
+          <footer className="flex items-center justify-between gap-4 border-t border-slate-200 bg-white px-6 py-3.5">
+            <p className="text-[11px] text-slate-500">共 {(discoveredProviderModels[modelPickerKey] || []).length} 个模型 · 当前显示 {modelPickerModels.length} 个</p>
+            <button type="button" onClick={() => setProviderModelPicker(null)} className="rounded-lg border border-slate-300 px-4 py-2 text-[11px] font-medium text-slate-700 transition hover:bg-slate-50">完成</button>
+          </footer>
+        </section>
+      </div>
+    )}
+
+    {pendingModelCategoryEdit && pendingModelProvider && pendingModelEndpoint && (
+      <div className="fixed inset-0 z-[80] flex items-center justify-center bg-slate-950/35 p-4 backdrop-blur-[2px]" onMouseDown={() => setPendingModelCategoryEdit(null)}>
+        <section role="dialog" aria-modal="true" aria-label="编辑模型分类" className="w-full max-w-lg overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl shadow-slate-950/25" onMouseDown={(event) => event.stopPropagation()}>
+          <header className="flex items-start justify-between gap-4 border-b border-slate-200 px-5 py-4">
+            <div className="min-w-0">
+              <h3 className="text-[16px] font-semibold text-slate-900">选择模型分类</h3>
+              <p className="mt-1 truncate font-mono text-[11px] text-slate-500">{pendingModelProvider.name} · {pendingModelCategoryEdit.name}</p>
+            </div>
+            <button type="button" onClick={() => setPendingModelCategoryEdit(null)} className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-slate-700" aria-label="关闭分类设置"><X className="h-4 w-4" /></button>
+          </header>
+          <div className="p-5">
+            <p className="mb-3 text-[11px] leading-5 text-slate-500">已按模型名完成一次预选，请确认后保存。分类可以增删；同一个模型只能使用一种调用协议。</p>
+            <div className="space-y-2">
+              {editableModelCategories.map((option) => {
+                const checked = selectedModelCategories.includes(option.id);
+                const disabled = !checked && Boolean(pendingCategoryCapability && pendingCategoryCapability !== option.capability);
+                return <button type="button" key={option.id} disabled={disabled} onClick={() => setSelectedModelCategories((current) => checked ? current.filter((category) => category !== option.id) : [...current, option.id])} className={`flex w-full items-center gap-3 rounded-xl border px-4 py-3 text-left transition ${checked ? "border-[#002fa7]/35 bg-[#002fa7]/[0.06]" : disabled ? "cursor-not-allowed border-slate-100 bg-slate-50 opacity-45" : "border-slate-200 bg-white hover:border-slate-300 hover:bg-slate-50"}`}>
+                  <span className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-md border ${checked ? "border-[#002fa7] bg-[#002fa7] text-white" : "border-slate-300 bg-white text-transparent"}`}><CheckCircle2 className="h-3.5 w-3.5" /></span>
+                  <span className="min-w-0 flex-1"><span className="block text-[12px] font-semibold text-slate-800">{option.label}</span><span className="mt-0.5 block text-[10px] text-slate-500">{option.description}</span></span>
+                </button>;
+              })}
+            </div>
+          </div>
+          <footer className="flex items-center justify-end gap-2 border-t border-slate-200 bg-slate-50/70 px-5 py-4">
+            <button type="button" onClick={() => setPendingModelCategoryEdit(null)} className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-[11px] font-medium text-slate-700 transition hover:bg-slate-50">取消</button>
+            <button type="button" disabled={selectedModelCategories.length === 0 || providerModelAdding !== null} onClick={() => void handleSaveModelCategories()} className="inline-flex min-w-[88px] items-center justify-center gap-1.5 rounded-lg bg-[#002fa7] px-4 py-2 text-[11px] font-semibold text-white transition hover:bg-[#001f7a] disabled:cursor-not-allowed disabled:opacity-45">{providerModelAdding ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}保存</button>
+          </footer>
+        </section>
+      </div>
+    )}
+
     {/* Toast */}
     {toast && (
-      <div className={`fixed bottom-6 right-6 flex items-center gap-2 px-4 py-2.5 rounded-xl text-[13px] font-medium shadow-lg animate-fade-in ${
+      <div className={`fixed bottom-6 right-6 z-[70] flex items-center gap-2 px-4 py-2.5 rounded-xl text-[13px] font-medium shadow-lg animate-fade-in ${
         toast.type === "success"
           ? "bg-emerald-500 text-white"
           : "bg-red-500 text-white"
@@ -2773,9 +3565,12 @@ function SubAgentEditorPanel({
   index,
   item,
   gatewayModels,
+  imageAnalyzerModels,
+  imageAnalyzerModelId,
   refreshingModels,
   onChange,
   onRefreshModels,
+  onBindImageAnalyzer,
   onDelete,
   onClose,
   isMobile,
@@ -2783,14 +3578,18 @@ function SubAgentEditorPanel({
   index: number;
   item: SubAgentItem;
   gatewayModels: string[];
+  imageAnalyzerModels: Array<{ id: string; name: string; providerName: string }>;
+  imageAnalyzerModelId: string;
   refreshingModels: boolean;
   onChange: (index: number, updater: (item: SubAgentItem) => SubAgentItem) => void;
   onRefreshModels: () => void;
+  onBindImageAnalyzer: (modelId: string) => void | Promise<void>;
   onDelete: (index: number) => void;
   onClose: () => void;
   isMobile?: boolean;
 }) {
   const [activeTab, setActiveTab] = useState<SubAgentEditorTab>("basic");
+  const isImageAnalyzer = item.name === "image_analyzer" || item.route_trigger === "image_input";
 
   return (
     <div className={`flex h-full flex-col rounded-xl border border-black/[0.06] bg-white ${isMobile ? "p-4" : "p-5"}`}>
@@ -2861,37 +3660,52 @@ function SubAgentEditorPanel({
                 />
               </FormField>
               <div>
-                <div className="mb-1.5 flex items-center justify-between">
-                  <label className="text-[12px] font-medium text-gray-700">模型 *</label>
-                  <button
-                    type="button"
-                    onClick={onRefreshModels}
-                    disabled={refreshingModels}
-                    className="flex items-center gap-1 text-[10px] text-[#002fa7] hover:text-[#001f7a] disabled:opacity-50"
-                  >
-                    <RefreshCw className={`h-3 w-3 ${refreshingModels ? "animate-spin" : ""}`} />
-                    刷新路由模型
-                  </button>
-                </div>
-                <select
-                  value={item.model}
-                  onChange={(e) => onChange(index, (it) => ({ ...it, model: e.target.value }))}
-                  className="form-select"
-                  disabled={gatewayModels.length === 0}
-                >
-                  {gatewayModels.length === 0 ? (
-                    <option value="">未检测到 Higress 路由模型</option>
-                  ) : (
-                    gatewayModels.map((model) => (
-                      <option key={model} value={model}>
-                        {model}
-                      </option>
-                    ))
-                  )}
-                </select>
-                <p className="mt-1 text-[10px] text-gray-400">
-                  从 Higress 网关路由的模型中选择，点右上角「刷新路由模型」可同步最新配置。
-                </p>
+                {isImageAnalyzer ? (
+                  <>
+                    <label className="mb-1.5 block text-[12px] font-medium text-gray-700">图片理解模型 *</label>
+                    <ModelBindingSelect
+                      value={imageAnalyzerModelId}
+                      onChange={onBindImageAnalyzer}
+                      emptyLabel="请先添加多模态模型"
+                      variant="light"
+                      options={imageAnalyzerModels.map((model) => ({ id: model.id, label: `${model.providerName} · ${model.name}` }))}
+                    />
+                    <p className="mt-1 text-[10px] text-gray-500">
+                      与「模型服务 → 默认模型 → 图片理解模型」同步，运行时由 image_analyzer 绑定读取。请选择支持图片输入的模型。
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <div className="mb-1.5 flex items-center justify-between">
+                      <label className="text-[12px] font-medium text-gray-700">模型 *</label>
+                      <button
+                        type="button"
+                        onClick={onRefreshModels}
+                        disabled={refreshingModels}
+                        className="flex items-center gap-1 text-[10px] text-[#002fa7] hover:text-[#001f7a] disabled:opacity-50"
+                      >
+                        <RefreshCw className={`h-3 w-3 ${refreshingModels ? "animate-spin" : ""}`} />
+                        刷新模型
+                      </button>
+                    </div>
+                    <select
+                      value={item.model}
+                      onChange={(e) => onChange(index, (it) => ({ ...it, model: e.target.value }))}
+                      className="form-select"
+                      disabled={gatewayModels.length === 0}
+                    >
+                      {gatewayModels.length === 0 ? (
+                        <option value="">暂无可用模型</option>
+                      ) : (
+                        gatewayModels.map((model) => (
+                          <option key={model} value={model}>
+                            {model}
+                          </option>
+                        ))
+                      )}
+                    </select>
+                  </>
+                )}
               </div>
             </div>
             <FormField label="描述 *">

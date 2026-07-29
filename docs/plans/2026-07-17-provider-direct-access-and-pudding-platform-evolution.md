@@ -118,7 +118,7 @@ Data Agent / Harness
 - 凭证只通过 `credential_ref` 引用安全存储，不写入普通配置、API 响应或缓存；
 - 明确记录端点协议，不用“是否 OpenAI-compatible”一个布尔值覆盖所有能力；
 - 模型必须声明输入/输出模态，能力检查不能依靠模型名称猜测；
-- 文本 Embedding 和多模态 Embedding 是两个独立 Binding；
+- 主 Agent、图片分析 SubAgent、文本 Embedding 和多模态 Embedding 使用独立 Binding；
 - 评测时禁止静默切换模型、端点或降级路径；
 - 检索索引必须绑定 Embedding 模型和向量空间指纹。
 
@@ -164,7 +164,8 @@ providers:
         dimension: 1024
 
 bindings:
-  llm: dashscope:qwen-plus
+  agent: dashscope:qwen-plus
+  image_analyzer: dashscope:qwen-vl-max
   text_embedding: dashscope:text-embedding-v4
   multimodal_embedding: dashscope:multimodal-embedding-v1
 ```
@@ -465,13 +466,16 @@ Harness               [+ 添加 Provider]
 参考截图的卡片式默认模型选择，但换成 PuddingData 的真实运行用途：
 
 1. **主对话模型**：Data Agent 规划、工具调用和最终回答；
-2. **文本向量模型**：文本知识、语义资产与 NL2SQL 召回；
-3. **多模态向量模型**：图片、图文 PDF 等跨模态索引与召回。
+2. **图片理解模型**：`image_analyzer` SubAgent 的图片内容理解，必须选择支持视觉输入的对话模型；
+3. **文本向量模型**：文本知识、语义资产与 NL2SQL 召回；
+4. **多模态向量模型**：图片、图文 PDF 等跨模态索引与召回；
+5. **Rerank 模型**：召回候选的相关性重排。
 
 每张卡片展示模型、Provider、模态/维度和最近连接状态。点击选择器只显示满足该 Binding 能力的已启用模型；旁边的设置按钮直接定位到对应 Provider 的模型详情。
 
 - 未登记模型不能在这里手输 Model ID，必须先去“模型服务”添加；
 - 模型选择后明确保存，不因为新增 Provider 自动改变默认值；
+- 图片理解模型也可以在 Harness 的 `image_analyzer` 编辑页选择；两个入口读写同一个 `image_analyzer` Binding，运行时不再读取旧的 SubAgent 模型字符串；
 - 更换 Embedding 时若向量空间指纹变化，必须提示受影响索引将变为 `stale`；
 - “思考模式”是运行参数，不作为第四个 Provider Binding 混在这个页面。
 
@@ -484,7 +488,9 @@ Harness               [+ 添加 Provider]
 3. **确认端点**：模板自动生成 Endpoint，自定义 Provider 才要求填写 Base URL 和协议；
 4. **测试连接**：逐 Endpoint 验证鉴权和协议；
 5. **获取模型列表**：从远端发现候选模型；
-6. **启用模型**：用户确认后写入 Registry，必要时补充维度和模态。
+6. **启用模型**：先按模型名预选一次分类，再由用户确认、增加或移除分类后写入 Registry；模型名推断不能直接成为最终能力事实。
+
+一个 LLM 可以同时属于「对话模型」和「多模态模型」，例如用户可把 `qwen3.7` 同时登记到两个分类。分类保存为模型的显式 `categories` 数组；跨调用协议的分类不能混用，例如 LLM 不能同时登记为文本 Embedding。
 
 创建成功后返回 Provider 详情。默认 Binding 不在向导中自动替换。
 
@@ -848,3 +854,20 @@ EvaluationScore
 - `../Yuxi/docs/intro/model-config.md`
 
 其中值得保留的是协议和生命周期设计，不是其具体基础设施组合。
+
+## 11. 2026-07-29 第一版实施记录
+
+已实施第一版直连 Provider Control Plane：
+
+- `backend/provider_registry.py` 将 Provider、Endpoint、Model、Binding 和 CredentialRef 分离；预置 DeepSeek、阿里云百炼、Kimi、硅基流动；
+- 首次读取旧配置时导入 DeepSeek LLM、DashScope 文本 Embedding、DashScope 原生多模态 Embedding，以及 Higress 持久化 YAML 中的 DashScope token；Higress 原始数据只读保留、不删除；
+- API Key 从 `backend/config.json` 迁移到客户端用户目录的 `credentials.json`，以 `local-file://` 引用；环境变量保持 `env://NAME` 引用，不复制明文；文件采用原子写入与 owner-only 权限。第二版可将同一引用实现替换为系统 Keyring；
+- `ModelClient`、图片分析 SubAgent、文本 Embedding、多模态 Embedding、rerank 改为按 Binding 直连；取消“网关失败后静默换 Provider”的行为。多模态与 rerank 使用请求级 HTTP client，避免 DashScope SDK 全局 Key/Base URL 在并发下串用；
+- 设置页以「模型服务」展示 Provider/Endpoint，并以「默认模型」管理 Agent、图片理解、文本 Embedding、多模态 Embedding、Rerank Binding；`image_analyzer` 编辑页与图片理解默认项同步；OpenAI-compatible Endpoint 的模型发现使用 Provider `/models`；DashScope-native Endpoint 使用百炼可部署模型目录并合并官方原生多模态 Embedding / Rerank 基础目录，之后仍由用户确认分类再登记；
+- 远端候选模型列表保留「推理 / 视觉 / 联网 / 免费 / 嵌入 / 重排 / 工具」名称预筛选；写入 Registry 的运行时分类只允许五类：对话模型、视觉模型、文本 Embedding、多模态 Embedding、Rerank。添加时以名称预分类映射出的运行时分类作为默认勾选，用户不修改则直接采用，修改后以用户选择为准；默认模型选择器使用固定向下展开的应用内菜单，不再依赖操作系统可能向上弹出的原生 `select`；
+- Provider 详情的 Endpoint 配置仍按接口切换，但模型区跨该 Provider 的全部 Endpoint 聚合展示，并在模型行标注所属接口；“获取模型列表 / 添加模型”只作用于当前 Endpoint，避免原生多模态模型因接口切换而看似丢失；
+- 百炼凭证按 Provider 共享，切换 OpenAI 兼容接口与百炼原生多模态接口不会切换密钥；已有双凭证配置以 OpenAI 兼容接口当前保存的密钥为准完成一次归并，所有百炼运行时 Binding 复用同一 Credential Ref；
+- 对话输入区支持按会话选择已登记的对话模型，并在发送时把完整 Model ID 与推理强度冻结到本次 Run；运行时不再通过只替换模型名的方式跨 Provider。推理能力由统一映射表维护：DeepSeek 显示「高 / 最大」，直连 Kimi K3 显示「低 / 高 / 最大」，百炼 Kimi K3 固定「最大」，Qwen 3.7 固定开启思考并将强度控件置灰为「默认」。前端只消费映射表给出的展示能力，后端负责转换为 `reasoning_effort`、`extra_body.thinking` 或 `enable_thinking`；
+- Docker/Electron 启动链不再启动或注入 Higress；`ai_gateway` 只保留兼容状态字段，返回 retired，不参与请求路由。
+
+尚未在无用户显式授权的情况下执行真实 Key E2E。真实验收应在迁移后的本地客户端上，分别验证 DeepSeek 流式/工具调用、DashScope 文本向量（1024 维）、DashScope 原生多模态文本+图片向量（1024 维）与 rerank，并确认重启后 Binding 与凭证引用一致。

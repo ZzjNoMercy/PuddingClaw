@@ -38,6 +38,11 @@ import {
   type AnalyticsModelSummary,
   type ApprovalMode,
 } from "@/lib/api";
+import {
+  getProviders,
+  type ProviderRegistry,
+  type ThinkingLevel,
+} from "@/lib/settingsApi";
 
 function formatTokens(n: number): string {
   return `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k`;
@@ -50,8 +55,14 @@ function formatContextPercentage(percentage: number, used: number): string {
 import SlashCommandMenu from "./SlashCommandMenu";
 
 type AttachmentKind = AgentAttachment["type"];
-type OpenPopover = null | "plus" | "plus-model" | "project" | "approval";
+type OpenPopover = null | "plus" | "plus-model" | "project" | "approval" | "llm";
 type SelectedSkillHint = { name: string; start: number; end: number };
+
+const thinkingLevelLabels: Record<ThinkingLevel, string> = {
+  low: "低",
+  high: "高",
+  max: "最大",
+};
 
 const terminalRunStatuses = new Set([
   "completed",
@@ -131,8 +142,9 @@ export default function ChatInput() {
     setCurrentProjectId,
     projects,
     registerProject,
-    thinkingMode,
-    setThinkingMode,
+    llmModelId,
+    thinkingLevel,
+    setLlmSelection,
     analyticsModelId,
     setAnalyticsModelId,
     goalModeEnabled,
@@ -177,6 +189,7 @@ export default function ChatInput() {
   const disabled = sessionHistoryLoading || isStreaming || isCompressing || approvalModeSaving || isSubmitting || isUploading || currentRun?.status === "waiting_hitl";
   const configurationBusy = isSubmitting || isUploading;
   const [analyticsModels, setAnalyticsModels] = useState<AnalyticsModelSummary[]>([]);
+  const [providerRegistry, setProviderRegistry] = useState<ProviderRegistry | null>(null);
   const detectedImagePaths = useMemo(() => {
     const matches = text.match(/(?:~|\/|[A-Za-z]:[\\/])(?:[^\s'"<>]|\\ )+\.(?:png|jpe?g|webp|gif|bmp|tiff?)/gi);
     return Array.from(new Set(matches || [])).slice(0, 4);
@@ -263,7 +276,6 @@ export default function ChatInput() {
   const selectedSkillHintsBySessionRef = useRef<Map<string, SelectedSkillHint[]>>(new Map());
   // Track the position of the `/` that triggered the menu, for replacement on select
   const slashStartPosRef = useRef<number>(-1);
-  const thinkingToggleInFlightRef = useRef(false);
   // Pending cursor position to set after React re-render (fixes I-2: rAF race)
   const pendingCursorRef = useRef<number | null>(null);
 
@@ -293,6 +305,40 @@ export default function ChatInput() {
     () => analyticsModels.find((model) => model.id === analyticsModelId) || null,
     [analyticsModelId, analyticsModels]
   );
+  const conversationModels = useMemo(() => {
+    if (!providerRegistry) return [];
+    return providerRegistry.providers.flatMap((provider) =>
+      provider.models
+        .filter((model) => {
+          const endpoint = provider.endpoints.find((item) => item.id === model.endpoint_id);
+          return model.capability === "llm"
+            && model.categories?.includes("llm")
+            && Boolean(endpoint?.credential_configured);
+        })
+        .map((model) => ({ provider, model }))
+    );
+  }, [providerRegistry]);
+  const selectedConversationModel = useMemo(
+    () => conversationModels.find(({ model }) => model.id === llmModelId) || null,
+    [conversationModels, llmModelId],
+  );
+  const selectedThinkingProfile = selectedConversationModel?.model.thinking_profile;
+
+  useEffect(() => {
+    if (runtimeMode !== "agent") return;
+    getProviders()
+      .then((registry) => setProviderRegistry(registry))
+      .catch(() => setProviderRegistry(null));
+  }, [runtimeMode]);
+
+  useEffect(() => {
+    if (!providerRegistry || llmModelId) return;
+    const defaultModelId = providerRegistry.bindings.agent;
+    const fallback = conversationModels[0]?.model;
+    const model = conversationModels.find((item) => item.model.id === defaultModelId)?.model || fallback;
+    if (!model) return;
+    setLlmSelection(model.id, model.thinking_profile?.default_level ?? null);
+  }, [conversationModels, llmModelId, providerRegistry, setLlmSelection]);
 
   useEffect(() => {
     if (runtimeMode !== "agent") return;
@@ -426,20 +472,6 @@ export default function ChatInput() {
     event.preventDefault();
     void handleAttachmentFiles(pastedFiles, "paste");
   }, [handleAttachmentFiles]);
-
-  const handleToggleThinking = useCallback(async () => {
-    if (thinkingToggleInFlightRef.current) return;
-    setOpenPopover(null);
-    thinkingToggleInFlightRef.current = true;
-    const next = !thinkingMode;
-    try {
-      await setThinkingMode(next);
-    } catch (err) {
-      console.error("Failed to toggle thinking mode:", err);
-    } finally {
-      thinkingToggleInFlightRef.current = false;
-    }
-  }, [thinkingMode, setThinkingMode]);
 
   const handleProjectPathSelected = useCallback(async (path: string) => {
     const project = await registerProject(path.trim());
@@ -778,38 +810,25 @@ export default function ChatInput() {
                         <button
                           type="button"
                           role="menuitemcheckbox"
-                          aria-checked={Boolean(activeGoal || goalModeEnabled)}
+                          aria-checked={goalModeEnabled}
                           onClick={() => {
                             setOpenPopover(null);
-                            if (activeGoal) {
-                              setInspectorOpen(true);
-                              setInspectorActiveTab("goal");
-                            } else {
-                              setGoalModeEnabled(!goalModeEnabled);
-                            }
+                            setGoalModeEnabled(!goalModeEnabled);
                           }}
                           className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-[13px] hover:bg-black/[0.04] ${
-                            activeGoal || goalModeEnabled ? "text-emerald-700" : "text-gray-700"
+                            goalModeEnabled ? "text-emerald-700" : "text-gray-700"
                           }`}
                         >
                           <Target className="h-4 w-4" />
                           <span className="min-w-0 flex-1">
                             <span className="block">目标</span>
                             <span className="block text-[11px] text-gray-400">
-                              {activeGoal
-                                ? activeGoal.status === "completed"
-                                  ? "目标已完成，点击复盘"
-                                  : activeGoal.status === "budget_exceeded"
-                                  ? "预算已耗尽，点击追加轮次"
-                                  : activeGoal.status === "paused"
-                                    ? "目标已暂停，点击查看"
-                                    : "目标进行中，点击查看"
-                                : goalModeEnabled
-                                  ? "下次发送将创建跨 Run Goal"
-                                  : "默认关闭；仅对下次发送生效"}
+                              {goalModeEnabled
+                                ? "下次发送将开启 Goal"
+                                : "默认关闭；仅对下次发送生效"}
                             </span>
                           </span>
-                          {(activeGoal || goalModeEnabled) && <Check className="h-4 w-4" />}
+                          {goalModeEnabled && <Check className="h-4 w-4" />}
                         </button>
                       </>
                     )}
@@ -949,19 +968,19 @@ export default function ChatInput() {
             )}
 
             {runtimeMode === "agent"
-              && ((activeGoal && activeGoal.status !== "completed") || (!activeGoal && goalModeEnabled))
+              && (goalModeEnabled || (activeGoal && activeGoal.status !== "completed"))
               && (
               <div className="flex h-8 items-center rounded-full border border-emerald-600/15 bg-emerald-50 text-[12px] text-emerald-700 transition-all hover:bg-emerald-100">
                 <button
                   type="button"
                   onClick={() => {
-                    if (activeGoal) {
+                    if (!goalModeEnabled && activeGoal) {
                       setInspectorOpen(true);
                       setInspectorActiveTab("goal");
                     }
                   }}
                   className="flex h-full items-center gap-1.5 rounded-l-full pl-3 pr-1.5"
-                  title={activeGoal ? "查看当前目标" : "已为下次发送启用目标"}
+                  title={goalModeEnabled ? "已为下次发送启用目标" : "查看当前目标"}
                 >
                   <Target className="h-3.5 w-3.5" />
                   <span>目标</span>
@@ -970,15 +989,15 @@ export default function ChatInput() {
                   type="button"
                   disabled={goalCancelPending}
                   onClick={() => {
-                    if (!activeGoal) {
+                    if (goalModeEnabled) {
                       setGoalModeEnabled(false);
                       return;
                     }
-                    setGoalCancelConfirmationOpen(true);
+                    if (activeGoal) setGoalCancelConfirmationOpen(true);
                   }}
                   className="mr-1 flex h-6 w-6 items-center justify-center rounded-full text-emerald-700/70 hover:bg-emerald-200/70 hover:text-emerald-900 disabled:cursor-wait disabled:opacity-40"
-                  title={activeGoal ? "结束当前 Goal" : "关闭目标模式"}
-                  aria-label={activeGoal ? "结束当前 Goal" : "关闭目标模式"}
+                  title={goalModeEnabled ? "关闭目标模式" : "结束当前 Goal"}
+                  aria-label={goalModeEnabled ? "关闭目标模式" : "结束当前 Goal"}
                 >
                   {goalCancelPending
                     ? <Activity className="h-3.5 w-3.5 animate-spin" />
@@ -990,22 +1009,108 @@ export default function ChatInput() {
 
           <div
             className="flex w-full shrink-0 items-center justify-end gap-1.5 sm:ml-auto sm:w-auto sm:gap-2"
-            onPointerDown={() => setOpenPopover(null)}
           >
-            <button
-              type="button"
-              onClick={handleToggleThinking}
-              aria-pressed={thinkingMode}
-              title={thinkingMode ? "思考模式已开启" : "思考模式已关闭"}
-              className={`flex h-8 items-center gap-1.5 rounded-full border px-2.5 text-[12px] transition-all sm:px-3 ${
-                thinkingMode
-                  ? "border-[#002fa7]/15 bg-[#e8edff] text-[#002fa7] hover:bg-[#dfe7ff]"
-                  : "border-black/[0.06] bg-white/42 text-gray-600 hover:bg-white/70 hover:text-gray-900"
-              }`}
-            >
-              <Brain className="h-3.5 w-3.5 shrink-0" />
-              <span className="hidden sm:inline">思考</span>
-            </button>
+            {runtimeMode === "agent" && (
+              <div className="relative" onPointerDown={(event) => event.stopPropagation()}>
+                <div className="flex h-8 items-center overflow-hidden rounded-full border border-black/[0.07] bg-white/55 shadow-sm shadow-black/[0.02]">
+                  <button
+                    type="button"
+                    onClick={() => togglePopover("llm")}
+                    aria-expanded={openPopover === "llm"}
+                    className="flex h-full max-w-[15rem] items-center gap-1.5 px-3 text-[12px] text-gray-700 transition hover:bg-white/80 hover:text-gray-950"
+                    title={selectedConversationModel ? `${selectedConversationModel.provider.name} · ${selectedConversationModel.model.name}` : "选择对话模型"}
+                  >
+                    <span className="truncate">
+                      {selectedConversationModel?.model.name || "选择模型"}
+                    </span>
+                    <ChevronDown className="h-3.5 w-3.5 shrink-0" />
+                  </button>
+                  <span className="h-4 w-px bg-black/[0.08]" />
+                  <button
+                    type="button"
+                    disabled={selectedThinkingProfile?.strength_control !== "levels"}
+                    onClick={() => togglePopover("llm")}
+                    className="flex h-full min-w-[4.25rem] items-center justify-center gap-1.5 px-2.5 text-[12px] text-[#002fa7] transition hover:bg-[#e8edff] disabled:cursor-not-allowed disabled:bg-black/[0.025] disabled:text-gray-400"
+                    title={selectedThinkingProfile?.strength_control === "disabled" ? "该模型使用固定思考模式，不支持选择推理强度" : "选择推理强度"}
+                  >
+                    <Brain className="h-3.5 w-3.5 shrink-0" />
+                    <span>
+                      {selectedThinkingProfile?.strength_control === "levels" && thinkingLevel
+                        ? thinkingLevelLabels[thinkingLevel]
+                        : selectedThinkingProfile?.disabled_label || "默认"}
+                    </span>
+                  </button>
+                </div>
+
+                {openPopover === "llm" && (
+                  <div role="menu" className="absolute bottom-full right-0 z-50 mb-2 w-[min(26rem,calc(100vw-2rem))] overflow-hidden rounded-2xl border border-black/[0.10] bg-white p-2 shadow-2xl shadow-slate-900/15 animate-fade-in-scale">
+                    <div className="px-3 pb-2 pt-1">
+                      <p className="text-[12px] font-semibold text-gray-800">对话模型</p>
+                      <p className="mt-0.5 text-[11px] text-gray-400">仅影响当前对话；发送时会冻结本次 Run 的选择。</p>
+                    </div>
+                    <div className="max-h-52 overflow-y-auto py-1">
+                      {conversationModels.map(({ provider, model }) => {
+                        const selected = model.id === llmModelId;
+                        return (
+                          <button
+                            key={model.id}
+                            type="button"
+                            role="menuitemradio"
+                            aria-checked={selected}
+                            onClick={() => setLlmSelection(
+                              model.id,
+                              model.thinking_profile?.default_level ?? null,
+                            )}
+                            className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left transition ${selected ? "bg-[#002fa7]/[0.07] text-[#002fa7]" : "text-gray-700 hover:bg-black/[0.04]"}`}
+                          >
+                            <span className="min-w-0 flex-1">
+                              <span className="block truncate text-[13px] font-medium">{model.name}</span>
+                              <span className="block truncate text-[11px] text-gray-400">{provider.name}</span>
+                            </span>
+                            {selected && <Check className="h-4 w-4 shrink-0" />}
+                          </button>
+                        );
+                      })}
+                      {conversationModels.length === 0 && (
+                        <p className="px-3 py-5 text-center text-[12px] text-gray-400">请先在设置中登记对话模型。</p>
+                      )}
+                    </div>
+                    {selectedConversationModel && (
+                      <div className="border-t border-black/[0.06] px-3 pb-2 pt-3">
+                        <div className="flex items-center justify-between gap-3">
+                          <div>
+                            <p className="text-[12px] font-semibold text-gray-800">推理强度</p>
+                            <p className="mt-0.5 text-[11px] text-gray-400">
+                              {selectedThinkingProfile?.strength_control === "levels"
+                                ? "按模型能力映射为 Provider 请求参数"
+                                : "该模型使用固定思考模式"}
+                            </p>
+                          </div>
+                          {selectedThinkingProfile?.strength_control === "levels" ? (
+                            <div className="flex rounded-xl bg-slate-100 p-1">
+                              {selectedThinkingProfile.levels.map((level) => (
+                                <button
+                                  key={level}
+                                  type="button"
+                                  onClick={() => setLlmSelection(selectedConversationModel.model.id, level)}
+                                  className={`rounded-lg px-3 py-1.5 text-[11px] font-medium transition ${thinkingLevel === level ? "bg-white text-[#002fa7] shadow-sm" : "text-gray-500 hover:text-gray-800"}`}
+                                >
+                                  {thinkingLevelLabels[level]}
+                                </button>
+                              ))}
+                            </div>
+                          ) : (
+                            <span className="rounded-lg bg-slate-100 px-3 py-1.5 text-[11px] font-medium text-gray-400">
+                              {selectedThinkingProfile?.disabled_label || "默认"}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
             <ContextUsageTooltip usage={contextUsage} />
             {isStreaming ? (
               <button onClick={stopStreaming} className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-red-500 text-white transition-all hover:bg-red-600 active:scale-95" title="停止生成 (Esc)" aria-label="停止生成">

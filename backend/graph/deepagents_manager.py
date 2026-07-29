@@ -78,6 +78,7 @@ from graph.live_tool_output import project_live_tool_output
 from graph.logical_dataset_resume import logical_dataset_resume_registry
 from graph.managed_paths import is_managed_resource_path
 from graph.middleware_trace_proxy import wrap_middlewares_for_trace
+from graph.middlewares.analysis_templates import AnalysisTemplateMiddleware
 from graph.middlewares.attachment_edit import AttachmentEditMiddleware
 from graph.middlewares.delegation_control import (
     DelegationControlMiddleware,
@@ -992,12 +993,6 @@ class RunScopeMiddleware(AgentMiddleware):
             update["_run_query_id"] = query_id
         if isinstance(objective, str) and objective and state.get("_run_objective") != objective:
             update["_run_objective"] = objective
-        if "active_analysis_template" in context:
-            active_template = context.get("active_analysis_template")
-            if active_template is not None and not isinstance(active_template, dict):
-                active_template = None
-            if state.get("_active_analysis_template") != active_template:
-                update["_active_analysis_template"] = active_template
         return update
 
     def before_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:
@@ -2152,36 +2147,32 @@ IMAGE_MIME_BY_EXT = {
 }
 
 
-def _resolve_subagent_model(model_name: str) -> str | BaseChatModel:
+def _resolve_subagent_model(model_name: str, *, binding: str = "agent") -> str | BaseChatModel:
     """Resolve a subagent model spec.
 
     - Strings containing a colon (e.g. "qwen:qwen3.7") are passed through for
       LangChain init_chat_model resolution (direct provider).
-    - Bare model names that match a Higress AI route (e.g. "qwen3.7-plus") are
-      wired to the gateway via ChatOpenAI.
-    - Anything else is returned as-is.
+    - Provider Registry-backed model bindings are used by the
+      application-owned ModelClient; a bare model name is
+      wrapped with the currently bound direct Provider rather than inferred
+      from a legacy Higress route.
     """
-    if ":" in model_name:
-        return model_name
+    if binding != "agent":
+        from llm.model_client import ModelClientChatModel
 
-    try:
-        from langchain_openai import ChatOpenAI
+        return ModelClientChatModel(
+            role="subagent",
+            streaming=True,
+            binding=binding,
+        )
+    if ":" not in model_name:
+        from llm.model_client import ModelClientChatModel
 
-        from capabilities import get_effective_gateway_url
-        from higress_config_reader import get_higress_routed_models
-
-        routed = set(get_higress_routed_models())
-        if model_name in routed:
-            gateway_url = get_effective_gateway_url()
-            if gateway_url:
-                return ChatOpenAI(
-                    model=model_name,
-                    api_key="puddingclaw-gateway",
-                    base_url=gateway_url,
-                    streaming=True,
-                )
-    except Exception as exc:
-        logger.debug("[subagent] failed to resolve gateway model %r: %s", model_name, exc)
+        return ModelClientChatModel(
+            role="subagent",
+            streaming=True,
+            model_override=model_name,
+        )
     return model_name
 
 
@@ -2328,15 +2319,22 @@ def _build_subagent_item(
 ) -> SubAgent:
     """Build a single SubAgent spec from a settings item."""
     name = item.get("name", "subagent") or "subagent"
+    is_image_analyzer = _is_image_analyzer_item(item)
     model_name = item.get("model", "") or ""
-    model = _resolve_subagent_model(model_name) if model_name else None
+    # ``subagents.image_analyzer.model`` is retained in config.json for
+    # backwards-compatible display/import only. The built-in image workload
+    # has one authoritative Provider binding shared by both settings entries.
+    model = (
+        _resolve_subagent_model(model_name, binding="image_analyzer")
+        if is_image_analyzer
+        else _resolve_subagent_model(model_name) if model_name else None
+    )
     description = item.get("description") or f"Subagent `{name}`."
     route_trigger = str(item.get("route_trigger") or "").strip()
     if route_trigger and route_trigger not in description:
         description = (
             f"{description} Use this subagent when the main request matches this routing hint: `{route_trigger}`."
         )
-    is_image_analyzer = _is_image_analyzer_item(item)
     native_hint = (
         "Use this subagent via the native task tool whenever the user provides image attachments "
         "or local image paths. Preserve the harness_attachment_session_id and image refs from the user "
@@ -2737,6 +2735,7 @@ class DeepAgentsAgentManager:
         middlewares: list[Any] = [
             MemoryMiddleware(backend=memory_backend, sources=sources),
             RunScopeMiddleware(),
+            AnalysisTemplateMiddleware(base_dir=self._base_dir),
             SemanticAssetsMiddleware(base_dir=self._base_dir),
             ExternalFilePermissionMiddleware(),
             WorkspacePathRouterMiddleware(workspace_backend),
@@ -4058,6 +4057,16 @@ class DeepAgentsAgentManager:
         yaml_text = json.dumps(frontmatter, ensure_ascii=False, indent=2)
         rel_path = str(model.get("path") or "").strip()
         virtual_path = f"/{rel_path}" if rel_path.startswith("analytics-models/") else rel_path
+        resolved_templates = model.get("resolved_templates") or {}
+        model_visible_templates = {
+            str(template_id): {
+                key: value
+                for key, value in template.items()
+                if key not in {"guide_frontmatter", "compiled_semantic_scope"}
+            }
+            for template_id, template in resolved_templates.items()
+            if isinstance(template, dict)
+        }
         payload = {
             "id": model.get("id"),
             "name": model.get("name"),
@@ -4081,17 +4090,14 @@ class DeepAgentsAgentManager:
             "derived_dimension_paths": model.get("derived_dimension_paths") or [],
             "logical_datasets": model.get("logical_datasets") or [],
             "resolved_references": model.get("resolved_references") or {},
-            "resolved_templates": model.get("resolved_templates") or {},
-            "template_route": model.get("template_route") or {"status": "not_matched"},
-            "active_template": model.get("active_template"),
+            "resolved_templates": model_visible_templates,
         }
         relation_context = model.get("asset_relations") or []
         relation_text = json.dumps(relation_context, ensure_ascii=False, indent=2)
         derived_path_text = json.dumps(model.get("derived_dimension_paths") or [], ensure_ascii=False, indent=2)
         data_asset_text = json.dumps(model.get("data_assets") or [], ensure_ascii=False, indent=2)
         resolved_reference_text = json.dumps(model.get("resolved_references") or {}, ensure_ascii=False, indent=2)
-        resolved_template_text = json.dumps(model.get("resolved_templates") or {}, ensure_ascii=False, indent=2)
-        template_route_text = json.dumps(model.get("template_route") or {}, ensure_ascii=False, indent=2)
+        resolved_template_text = json.dumps(model_visible_templates, ensure_ascii=False, indent=2)
         prompt = (
             "\n\n"
             "<analytics_model_context>\n"
@@ -4109,10 +4115,10 @@ class DeepAgentsAgentManager:
             f"```json\n{resolved_reference_text}\n```\n\n"
             "服务端已解析模板（virtual_path/guide_virtual_path 可直接用于 read_file）：\n"
             f"```json\n{resolved_template_text}\n```\n"
-            "必须使用这些完整路径，不得从原始 metadata 手工拼接，也不得用 glob 猜测模板位置。\n\n"
-            "本轮服务端模板路由：\n"
-            f"```json\n{template_route_text}\n```\n"
-            "只有 status=matched 时才使用对应模板；ambiguous 时先向用户确认；invalid 时报告缺失路径并停止模板任务。\n\n"
+            "你必须结合当前用户意图与对话上下文，自主比较模板的 use_when/do_not_use_when。"
+            "决定使用某个模板后，先 read_file 读取它的 guide_virtual_path；成功读取会把模板 manifest "
+            "渐进写入本轮可信 state，供 SQL 等后续工具使用。然后按 guide 继续读取入口与所需 assets。"
+            "不使用模板时不要读取其 guide。必须使用上述完整路径，不得从原始 metadata 手工拼接，也不得用 glob 猜测。\n\n"
             "已解析资产关联：\n"
             f"```json\n{relation_text}\n```\n\n"
             "已推导共同维度路径：\n"
@@ -5671,6 +5677,8 @@ class DeepAgentsAgentManager:
         session_id: str,
         project_id: str | None = None,
         analytics_model_id: str | None = None,
+        llm_model_id: str | None = None,
+        thinking_level: str | None = None,
         user_id: str = "default_user",
         attachments: list[dict[str, Any]] | None = None,
         skill_hints: list[str] | None = None,
@@ -5857,6 +5865,8 @@ class DeepAgentsAgentManager:
                 session_id=session_id,
                 project_id=project_id,
                 analytics_model_id=analytics_model_id,
+                llm_model_id=llm_model_id,
+                thinking_level=thinking_level,
                 user_id=user_id,
                 attachments=[] if internal_continuation else attachments,
                 skill_hints=[] if internal_continuation else skill_hints,
@@ -6002,6 +6012,8 @@ class DeepAgentsAgentManager:
         session_id: str,
         project_id: str | None = None,
         analytics_model_id: str | None = None,
+        llm_model_id: str | None = None,
+        thinking_level: str | None = None,
         user_id: str = "default_user",
         attachments: list[dict[str, Any]] | None = None,
         skill_hints: list[str] | None = None,
@@ -6042,8 +6054,17 @@ class DeepAgentsAgentManager:
         router_skipped_trivial = False
         checkpoint_thread_id = f"{session_id}:{query_id}"
         try:
-            thinking_enabled = bool(config.load_config().get("thinking_mode", False))
-            logger.info("Agent stream thinking_mode=%s for session=%s", thinking_enabled, session_id)
+            effective_llm = config.get_fallback_llm_config(
+                model_id_override=llm_model_id,
+                thinking_level=thinking_level,
+            )
+            thinking_enabled = bool(effective_llm.get("thinking_enabled", False))
+            logger.info(
+                "Agent stream model_id=%s thinking_level=%s for session=%s",
+                effective_llm.get("model_id"),
+                effective_llm.get("thinking_level"),
+                session_id,
+            )
 
             initial_history = session_manager.load_session(session_id)
             initial_user_count = sum(1 for item in initial_history if item.get("role") == "user")
@@ -6578,7 +6599,12 @@ class DeepAgentsAgentManager:
                     continuation_requested=(internal_continuation or _is_explicit_continuation(message)),
                 )
 
-            model = ModelClientChatModel(role="agent", streaming=True)
+            model = ModelClientChatModel(
+                role="agent",
+                streaming=True,
+                model_id_override=llm_model_id,
+                thinking_level=thinking_level,
+            )
             rubric_model = ModelClientChatModel(
                 role="rubric",
                 streaming=False,
@@ -6684,6 +6710,7 @@ class DeepAgentsAgentManager:
                 middlewares: list[Any] = [
                     SubagentProgressMiddleware(),
                     RunScopeMiddleware(),
+                    AnalysisTemplateMiddleware(base_dir=self._base_dir),
                     SemanticAssetsMiddleware(base_dir=self._base_dir),
                     ExternalFilePermissionMiddleware(),
                     WorkspacePathRouterMiddleware(agent_backend),
@@ -6955,11 +6982,6 @@ class DeepAgentsAgentManager:
                 "analytics_model_id": analytics_model_id,
                 "task_profile": run_record.task_profile.model_dump(mode="json"),
             }
-            active_analysis_template = (
-                analytics_model_payload.get("active_template")
-                if isinstance(analytics_model_payload, dict)
-                else None
-            )
             if run_record.verification_contract is not None and run_record.verification_contract.required:
                 initial_state["rubric"] = run_record.verification_contract.rubric
                 initial_state["verification_contract"] = run_record.verification_contract.model_dump(mode="json")
@@ -6994,7 +7016,6 @@ class DeepAgentsAgentManager:
                     # objective into private state and matches query_id against
                     # the marker on the current HumanMessage.
                     "run_objective": run_record.objective,
-                    "active_analysis_template": active_analysis_template,
                 },
                 trace_collector=trace_collector,
             ):

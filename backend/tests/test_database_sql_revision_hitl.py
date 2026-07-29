@@ -274,7 +274,7 @@ async def test_goal_subquery_rejects_agent_invented_l2_physical_mapping(
 
 
 @pytest.mark.asyncio
-async def test_server_routed_template_authorizes_declared_enum_scope(
+async def test_agent_read_template_state_authorizes_declared_enum_scope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import tools.database.sql_generate_tool as module
@@ -293,8 +293,8 @@ async def test_server_routed_template_authorizes_declared_enum_scope(
         "semantic_scope": {
             "enum_filters": {
                 "dimension:energy_type": {
-                    "members": ["纯电"],
-                    "classifications": ["新能源"],
+                    "members": ["纯电", "插电混合", "增程式纯电动"],
+                    "classifications": ["新能源", "传统能源"],
                 }
             }
         },
@@ -302,25 +302,45 @@ async def test_server_routed_template_authorizes_declared_enum_scope(
     runtime = SimpleNamespace(
         state={
             "analytics_model_id": "产品配置分析",
-            "allowed_semantic_asset_ids": ["dimension:energy_type"],
+            "allowed_semantic_asset_ids": [
+                "measure:launch_update_count",
+                "measure:launch_cycle",
+                "dimension:launch_time",
+                "dimension:energy_type",
+                "grain:car_model",
+            ],
             "_active_analysis_template": active_template,
             "messages": [HumanMessage(content="Agent delegated: 统计纯电车型")],
         },
         context={
             "run_objective": "刷新月报",
-            "active_analysis_template": active_template,
         },
     )
 
     output = await DatabaseSqlGenerateTool()._arun(
-        question="统计纯电与新能源车型的高压平台趋势",
-        # Deliberately omit the dimension. The runtime allowlist remains the
-        # enum-governance authority and the template grants only these terms.
-        selected_semantic_asset_ids=[],
+        question=(
+            "统计2021年至2026年中国狭义乘用车（排除皮卡）的新车迭代情况，"
+            "按能源类型（新能源和传统能源）和年份分组。对每年每个能源类型统计："
+            "更新次数和平均更新周期天数。2026年只统计2026-01-01至2026-06-30。"
+        ),
+        selected_semantic_asset_ids=[
+            "measure:launch_update_count",
+            "measure:launch_cycle",
+            "dimension:launch_time",
+            "dimension:energy_type",
+            "grain:car_model",
+        ],
         runtime=runtime,
     )
 
     assert len(requests) == 1
+    assert requests[0].measure_ids == [
+        "measure:launch_update_count",
+        "measure:launch_cycle",
+        "dimension:launch_time",
+        "dimension:energy_type",
+        "grain:car_model",
+    ]
     assert "SQL 生成结果" in output
 
 
@@ -396,7 +416,7 @@ async def test_delegated_human_message_does_not_authorize_physical_guidance(
 
 
 @pytest.mark.asyncio
-async def test_explicit_no_template_route_does_not_fallback_to_stale_private_state(
+async def test_runtime_context_cannot_inject_template_authorization_without_guide_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import tools.database.sql_generate_tool as module
@@ -410,7 +430,7 @@ async def test_explicit_no_template_route_does_not_fallback_to_stale_private_sta
 
     monkeypatch.setattr(module, "get_sessionmaker", lambda: _FakeSessionMaker())
     monkeypatch.setattr(module, "generate_database_sql", fake_generate)
-    stale_template = {
+    server_suggested_template = {
         "model_id": "产品配置分析",
         "template_id": "monthly_product_config_report",
         "semantic_scope": {
@@ -423,12 +443,11 @@ async def test_explicit_no_template_route_does_not_fallback_to_stale_private_sta
         state={
             "analytics_model_id": "产品配置分析",
             "allowed_semantic_asset_ids": ["dimension:energy_type"],
-            "_active_analysis_template": stale_template,
             "_run_objective": "查询空气悬架",
         },
         context={
             "run_objective": "查询空气悬架",
-            "active_analysis_template": None,
+            "active_analysis_template": server_suggested_template,
         },
     )
 

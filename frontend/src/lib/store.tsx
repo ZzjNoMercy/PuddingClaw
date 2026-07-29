@@ -33,6 +33,7 @@ import {
   updateProject as apiUpdateProject,
   removeProject as apiRemoveProject,
   updateSessionAnalyticsModel as apiUpdateSessionAnalyticsModel,
+  updateSessionLlmSelection as apiUpdateSessionLlmSelection,
   getSessionApprovalMode as apiGetSessionApprovalMode,
   updateSessionApprovalMode as apiUpdateSessionApprovalMode,
   getSessionHarnessState as apiGetSessionHarnessState,
@@ -260,6 +261,8 @@ export interface SessionMeta {
   workspace_type?: string;
   workspace_path?: string;
   analytics_model_id?: string | null;
+  llm_model_id?: string | null;
+  thinking_level?: "low" | "high" | "max" | null;
   approval_mode?: ApprovalMode;
   policy_epoch?: number;
   policy_version?: string;
@@ -317,6 +320,12 @@ interface AppState {
   setCurrentProjectId: (id: string | null) => void;
   analyticsModelId: string | null;
   setAnalyticsModelId: (id: string | null) => void;
+  llmModelId: string | null;
+  thinkingLevel: "low" | "high" | "max" | null;
+  setLlmSelection: (
+    modelId: string,
+    thinkingLevel: "low" | "high" | "max" | null,
+  ) => void;
   projects: ProjectMeta[];
   loadProjects: () => void;
   registerProject: (path: string) => Promise<ProjectMeta | null>;
@@ -916,6 +925,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const graphsMapRef = useRef<Record<string, GraphStructure | null>>({});
   const graphActiveNodesRef = useRef<Record<string, string | null>>({});
   const analyticsModelIdsMapRef = useRef<Record<string, string | null>>({});
+  const llmSelectionsMapRef = useRef<Record<string, {
+    modelId: string | null;
+    thinkingLevel: "low" | "high" | "max" | null;
+  }>>({});
+  const llmSelectionSaveChainsRef = useRef<Record<string, Promise<void>>>({});
   const approvalModesMapRef = useRef<Record<string, ApprovalMode>>({ default: "strict" });
   const approvalPolicyEpochsMapRef = useRef<Record<string, number>>({ default: 1 });
   const nextRunGoalModeMapRef = useRef<Record<string, boolean>>({ default: false });
@@ -987,6 +1001,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [runtimeReady, setRuntimeReady] = useState(false);
   const [currentProjectId, setCurrentProjectIdRaw] = useState<string | null>(null);
   const [analyticsModelId, setAnalyticsModelIdRaw] = useState<string | null>(null);
+  const [llmModelId, setLlmModelIdRaw] = useState<string | null>(null);
+  const [thinkingLevel, setThinkingLevelRaw] = useState<"low" | "high" | "max" | null>(null);
   const [goalModeEnabled, setGoalModeEnabledRaw] = useState(false);
   const [approvalMode, setApprovalModeRaw] = useState<ApprovalMode>("strict");
   const [approvalModeSaving, setApprovalModeSaving] = useState(false);
@@ -1156,6 +1172,44 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     apiUpdateSessionAnalyticsModel(sid, id).catch(() => {
       // Keep the optimistic session-local selection. A subsequent Agent turn
       // also persists the same value through its request metadata.
+    });
+  }, []);
+
+  const setLlmSelection = useCallback((
+    modelId: string,
+    nextThinkingLevel: "low" | "high" | "max" | null,
+  ) => {
+    const sid = sessionIdRef.current;
+    llmSelectionsMapRef.current[sid] = {
+      modelId,
+      thinkingLevel: nextThinkingLevel,
+    };
+    setLlmModelIdRaw(modelId);
+    setThinkingLevelRaw(nextThinkingLevel);
+
+    if (sid === "default") return;
+    setSessions((current) => current.map((session) =>
+      session.id === sid
+        ? {
+            ...session,
+            llm_model_id: modelId,
+            thinking_level: nextThinkingLevel,
+          }
+        : session
+    ));
+    const previousSave = llmSelectionSaveChainsRef.current[sid] || Promise.resolve();
+    const nextSave = previousSave
+      .catch(() => undefined)
+      .then(() => apiUpdateSessionLlmSelection(sid, modelId, nextThinkingLevel))
+      .then(() => undefined)
+      .catch(() => {
+        // The next Agent request validates and persists the same frozen values.
+      });
+    llmSelectionSaveChainsRef.current[sid] = nextSave;
+    void nextSave.finally(() => {
+      if (llmSelectionSaveChainsRef.current[sid] === nextSave) {
+        delete llmSelectionSaveChainsRef.current[sid];
+      }
     });
   }, []);
 
@@ -1554,6 +1608,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           if (!Object.prototype.hasOwnProperty.call(analyticsModelIdsMapRef.current, session.id)) {
             analyticsModelIdsMapRef.current[session.id] = session.analytics_model_id ?? null;
           }
+          if (!Object.prototype.hasOwnProperty.call(llmSelectionsMapRef.current, session.id)) {
+            llmSelectionsMapRef.current[session.id] = {
+              modelId: session.llm_model_id ?? null,
+              thinkingLevel: session.thinking_level ?? null,
+            };
+          }
           approvalModesMapRef.current[session.id] = session.approval_mode || "strict";
           if (session.policy_epoch) {
             approvalPolicyEpochsMapRef.current[session.id] = session.policy_epoch;
@@ -1654,6 +1714,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
       if (id === "default") {
         setAnalyticsModelIdRaw(analyticsModelIdsMapRef.current.default ?? null);
+        setLlmModelIdRaw(llmSelectionsMapRef.current.default?.modelId ?? null);
+        setThinkingLevelRaw(llmSelectionsMapRef.current.default?.thinkingLevel ?? null);
         setGoalModeEnabledRaw(nextRunGoalModeMapRef.current.default ?? false);
         setApprovalModeRaw(approvalModesMapRef.current.default || "strict");
         setApprovalModeSaving(approvalModeSavingSessionsRef.current.has("default"));
@@ -1664,6 +1726,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setVerificationReport(null);
       } else {
         setAnalyticsModelIdRaw(analyticsModelIdsMapRef.current[id] ?? null);
+        setLlmModelIdRaw(llmSelectionsMapRef.current[id]?.modelId ?? null);
+        setThinkingLevelRaw(llmSelectionsMapRef.current[id]?.thinkingLevel ?? null);
         setApprovalModeRaw(approvalModesMapRef.current[id] || "strict");
         setApprovalModeSaving(approvalModeSavingSessionsRef.current.has(id));
         setApprovalModeError(approvalModeErrorsMapRef.current[id] ?? null);
@@ -1891,6 +1955,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     if (existing) return existing;
     const snapshot = {
       analyticsModelId: analyticsModelIdsMapRef.current[originSessionId] ?? null,
+      llmSelection: llmSelectionsMapRef.current[originSessionId] || {
+        modelId: null,
+        thinkingLevel: null,
+      },
       approvalMode: (approvalModesMapRef.current[originSessionId] || "strict") as ApprovalMode,
       goalModeEnabled: nextRunGoalModeMapRef.current[originSessionId] ?? false,
       runtimeMode,
@@ -1900,11 +1968,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       try {
         const meta = await apiCreateSession({
           analytics_model_id: snapshot.analyticsModelId,
+          llm_model_id: snapshot.llmSelection.modelId,
+          thinking_level: snapshot.llmSelection.thinkingLevel,
           approval_mode: snapshot.approvalMode,
           runtime_mode: snapshot.runtimeMode,
           project_id: snapshot.projectId,
         });
         analyticsModelIdsMapRef.current[meta.id] = snapshot.analyticsModelId;
+        llmSelectionsMapRef.current[meta.id] = { ...snapshot.llmSelection };
         approvalModesMapRef.current[meta.id] = meta.approval_mode;
         approvalPolicyEpochsMapRef.current[meta.id] = meta.policy_epoch;
         nextRunGoalModeMapRef.current[meta.id] = snapshot.goalModeEnabled;
@@ -1917,6 +1988,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               runtime_mode: meta.runtime_mode || snapshot.runtimeMode,
               project_id: meta.project_id ?? snapshot.projectId,
               analytics_model_id: snapshot.analyticsModelId,
+              llm_model_id: snapshot.llmSelection.modelId,
+              thinking_level: snapshot.llmSelection.thinkingLevel,
               approval_mode: meta.approval_mode,
               policy_epoch: meta.policy_epoch,
               policy_version: meta.policy_version,
@@ -1935,6 +2008,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         }
         if (originSessionId === "default") {
           analyticsModelIdsMapRef.current.default = null;
+          llmSelectionsMapRef.current.default = { modelId: null, thinkingLevel: null };
           approvalModesMapRef.current.default = "strict";
           approvalPolicyEpochsMapRef.current.default = 1;
           nextRunGoalModeMapRef.current.default = false;
@@ -1982,6 +2056,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         // Clean up map entries
         delete messagesMapRef.current[id];
         delete analyticsModelIdsMapRef.current[id];
+        delete llmSelectionsMapRef.current[id];
+        delete llmSelectionSaveChainsRef.current[id];
         assistantIdsRef.current.delete(id);
         updateStreamingSessions((prev) => {
           const next = new Set(prev);
@@ -2216,6 +2292,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         projectId: currentProjectId,
         analyticsModelId:
           analyticsModelIdsMapRef.current[sendSessionId] ?? analyticsModelId ?? null,
+        llmSelection: llmSelectionsMapRef.current[sendSessionId] || {
+          modelId: llmModelId,
+          thinkingLevel,
+        },
         requestedGoalMode:
           options.goalControlAction === "start"
             ? true
@@ -2484,6 +2564,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               contextGoalIdForRun,
               options.goalControlAction || null,
               options.skillHints,
+              runOptions.llmSelection.modelId,
+              runOptions.llmSelection.thinkingLevel,
             )
           : streamChat(processedText, sendSessionId, controller.signal, userId);
 
@@ -3988,6 +4070,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       runtimeMode,
       currentProjectId,
       analyticsModelId,
+      llmModelId,
+      thinkingLevel,
       goalModeEnabled,
       activeGoal,
       updateSessionRunActivity,
@@ -4013,6 +4097,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setCurrentProjectId,
         analyticsModelId,
         setAnalyticsModelId,
+        llmModelId,
+        thinkingLevel,
+        setLlmSelection,
         projects,
         loadProjects,
         registerProject,

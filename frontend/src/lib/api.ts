@@ -2831,6 +2831,8 @@ export async function* streamAgent(
   contextGoalId?: string | null,
   goalControlAction?: "start" | null,
   skillHints?: string[],
+  llmModelId?: string | null,
+  thinkingLevel?: "low" | "high" | "max" | null,
 ): AsyncGenerator<SSEEvent> {
   const response = await fetch(`${API_BASE}/agent`, {
     method: "POST",
@@ -2843,6 +2845,8 @@ export async function* streamAgent(
       analytics_model_id: analyticsModelId || null,
       attachments: attachments || [],
       skill_hints: skillHints ?? null,
+      llm_model_id: llmModelId || null,
+      thinking_level: thinkingLevel || null,
       goal_mode: goalMode,
       goal_id: goalMode ? goalId || null : null,
       context_goal_id: contextGoalId || null,
@@ -3019,6 +3023,8 @@ export async function listSessions(): Promise<
     workspace_type?: string;
     workspace_path?: string;
     analytics_model_id?: string | null;
+    llm_model_id?: string | null;
+    thinking_level?: "low" | "high" | "max" | null;
     approval_mode?: ApprovalMode;
     policy_epoch?: number;
     policy_version?: string;
@@ -3205,6 +3211,8 @@ export type ApprovalMode = "strict" | "smart";
 
 export interface CreateSessionOptions {
   analytics_model_id?: string | null;
+  llm_model_id?: string | null;
+  thinking_level?: "low" | "high" | "max" | null;
   approval_mode?: ApprovalMode;
   runtime_mode?: "agent" | "chat";
   project_id?: string | null;
@@ -3225,6 +3233,8 @@ export async function createSession(options: CreateSessionOptions = {}): Promise
   runtime_mode?: "agent" | "chat";
   project_id?: string | null;
   analytics_model_id?: string | null;
+  llm_model_id?: string | null;
+  thinking_level?: "low" | "high" | "max" | null;
   approval_mode: ApprovalMode;
   policy_epoch: number;
   policy_version: string;
@@ -3235,6 +3245,33 @@ export async function createSession(options: CreateSessionOptions = {}): Promise
     body: JSON.stringify(options),
   });
   if (!resp.ok) throw new Error(`Failed to create session: ${resp.status}`);
+  return resp.json();
+}
+
+export async function updateSessionLlmSelection(
+  sessionId: string,
+  llmModelId: string,
+  thinkingLevel: "low" | "high" | "max" | null,
+): Promise<{
+  id: string;
+  llm_model_id?: string | null;
+  thinking_level?: "low" | "high" | "max" | null;
+}> {
+  const resp = await fetch(
+    `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/llm-selection`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        llm_model_id: llmModelId,
+        thinking_level: thinkingLevel,
+      }),
+    },
+  );
+  if (!resp.ok) {
+    const data = await resp.json().catch(() => ({}));
+    throw new Error(data.detail || `Failed to update conversation model: ${resp.status}`);
+  }
   return resp.json();
 }
 

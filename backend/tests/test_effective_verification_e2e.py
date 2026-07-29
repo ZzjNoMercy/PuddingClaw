@@ -675,7 +675,7 @@ def test_manager_loads_selected_model_context_without_enabling_analytics_verific
     monkeypatch.setattr(
         manager_module.DeepAgentsAgentManager,
         "_analytics_model_context",
-        lambda self, model_id: (
+        lambda self, model_id, **_kwargs: (
             "\n\nANALYTICS_FULL_CONTEXT",
             {"id": model_id},
         ),

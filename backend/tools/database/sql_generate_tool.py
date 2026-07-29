@@ -260,20 +260,17 @@ def _agent_added_enum_caliber(
 
 
 def _trusted_template_enum_terms(runtime: ToolRuntime | None) -> dict[str, set[str]]:
-    """Load enum authorization only from the server-routed active template."""
+    """Load enum authorization from the template guide selected by the Agent.
 
-    if runtime is None:
+    AnalysisTemplateMiddleware writes this private field only after a
+    successful read of a registered TEMPLATE.md manifest.  The SQL tool never
+    infers template use from query keywords or delegated messages.
+    """
+
+    if runtime is None or not isinstance(runtime.state, dict):
         return {}
-    context = getattr(runtime, "context", None)
-    if isinstance(context, dict) and "active_analysis_template" in context:
-        active = context.get("active_analysis_template")
-        if not isinstance(active, dict):
-            return {}
-    else:
-        active = None
-    if active is None and isinstance(runtime.state, dict):
-        active = runtime.state.get("_active_analysis_template")
-    if not isinstance(active, dict) or not isinstance(runtime.state, dict):
+    active = runtime.state.get("_active_analysis_template")
+    if not isinstance(active, dict):
         return {}
     if str(active.get("model_id") or "") != str(runtime.state.get("analytics_model_id") or ""):
         return {}

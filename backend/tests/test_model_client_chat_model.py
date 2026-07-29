@@ -178,37 +178,6 @@ def test_model_client_bind_tools_preserves_provider_kwargs():
     }
 
 
-def test_model_client_gateway_fallback_preserves_tools_config_stop_and_kwargs():
-    """Fallback direct provider must keep tool schema and invocation params."""
-
-    tool_def = {"type": "function", "function": {"name": "probe", "description": "probe"}}
-    gateway = FakeBoundModel(fail=True)
-    direct = FakeBoundModel(content="fallback")
-    client = ModelClient(
-        tools=[tool_def],
-        bind_tools_kwargs={"tool_choice": "required", "strict": True},
-    )
-    client.gateway_cfg = {"fallback_to_direct": True}
-
-    with mock.patch.object(client, "_should_use_gateway", return_value=True):
-        with mock.patch.object(client, "get_chat_model", return_value=gateway):
-            with mock.patch.object(client, "_direct_model", return_value=direct):
-                with mock.patch("llm.model_client.record_token_usage"):
-                    result = client.invoke(
-                        [HumanMessage(content="hello")],
-                        config={"tags": ["probe"]},
-                        stop=["END"],
-                        timeout=3,
-                    )
-
-    assert result.content == "fallback"
-    assert direct.bound_tools == [tool_def]
-    assert direct.bound_kwargs == {"tool_choice": "required", "strict": True}
-    assert direct.invoke_calls[0]["config"] == {"tags": ["probe"]}
-    assert direct.invoke_calls[0]["stop"] == ["END"]
-    assert direct.invoke_calls[0]["kwargs"] == {"timeout": 3}
-
-
 def test_model_client_chat_model_uses_base_chat_model_input_conversion_and_kwargs():
     """The wrapper should accept string input like a standard BaseChatModel."""
 
@@ -253,27 +222,43 @@ def test_bind_tools_preserves_explicit_non_thinking_mode():
     assert wrapped._client.cfg.get("extra_body") is None
 
 
-def test_gateway_model_override_wins_over_gateway_default(monkeypatch):
-    client = ModelClient(
-        thinking_enabled=False,
-        model_override="structured-output-model",
-    )
-    monkeypatch.setattr(
-        "llm.model_client.get_gateway_llm_config",
-        lambda **_kwargs: {
-            "model": "thinking-only-model",
-            "reasoning_effort": None,
-            "extra_body": None,
-        },
-    )
+def test_bind_tools_preserves_conversation_model_route_and_thinking_level():
+    route = "kimi:kimi-openai:kimi-k3:llm"
+    resolution_calls: list[dict[str, Any]] = []
 
-    with mock.patch("capabilities.get_effective_gateway_url", return_value="http://gateway/v1"):
-        with mock.patch("langchain_openai.ChatOpenAI") as chat_openai:
-            client._gateway_model()
+    def fake_llm_config(**kwargs: Any) -> dict[str, Any]:
+        resolution_calls.append(dict(kwargs))
+        return {
+            "provider": "kimi",
+            "model": "kimi-k3",
+            "protocol": "openai_compatible",
+            "model_id": route,
+            "temperature": 0.7,
+            "thinking_level": "max",
+            "reasoning_effort": "max",
+        }
 
-    assert chat_openai.call_args.kwargs["model"] == "structured-output-model"
-    assert "reasoning_effort" not in chat_openai.call_args.kwargs
-    assert "extra_body" not in chat_openai.call_args.kwargs
+    with mock.patch(
+        "llm.model_client.get_fallback_llm_config",
+        side_effect=fake_llm_config,
+    ):
+        wrapped = ModelClientChatModel(
+            force_direct=True,
+            streaming=True,
+            model_id_override=route,
+            thinking_level="max",
+        ).bind_tools(
+            [{"type": "function", "function": {"name": "probe"}}],
+            tool_choice="auto",
+        )
+
+    assert len(resolution_calls) == 2
+    assert all(call["model_id_override"] == route for call in resolution_calls)
+    assert all(call["thinking_level"] == "max" for call in resolution_calls)
+    assert wrapped._client.model_id_override == route
+    assert wrapped._client.thinking_level == "max"
+    assert wrapped._client.cfg["provider"] == "kimi"
+    assert wrapped._client.cfg["model"] == "kimi-k3"
 
 
 def test_model_client_chat_model_marks_context_summary_as_internal():
@@ -395,28 +380,6 @@ async def test_model_client_chat_model_astream_preserves_chunk_order_stop_and_kw
     assert fake.astream_calls[0]["kwargs"] == {"timeout": 3}
 
 
-def test_model_client_stream_fallback_before_first_chunk_preserves_tools_and_kwargs():
-    """Gateway stream failure before the first chunk may fallback to direct with tools kept."""
-
-    tool_def = {"type": "function", "function": {"name": "probe", "description": "probe"}}
-    gateway = FakeBoundModel(fail=True)
-    direct = FakeBoundModel()
-    client = ModelClient(tools=[tool_def], bind_tools_kwargs={"tool_choice": "required"})
-    client.gateway_cfg = {"fallback_to_direct": True}
-
-    with mock.patch.object(client, "_should_use_gateway", return_value=True):
-        with mock.patch.object(client, "get_chat_model", return_value=gateway):
-            with mock.patch.object(client, "_direct_model", return_value=direct):
-                with mock.patch("llm.model_client.record_token_usage"):
-                    chunks = list(client.stream([HumanMessage(content="hello")], stop=["END"], timeout=3))
-
-    assert [chunk.content for chunk in chunks] == ["hel", "lo"]
-    assert direct.bound_tools == [tool_def]
-    assert direct.bound_kwargs == {"tool_choice": "required"}
-    assert direct.stream_calls[0]["stop"] == ["END"]
-    assert direct.stream_calls[0]["kwargs"] == {"timeout": 3}
-
-
 def test_model_client_stream_does_not_fallback_after_first_chunk():
     """Gateway stream failure after emitting a chunk must not duplicate content via fallback."""
 
@@ -426,13 +389,9 @@ def test_model_client_stream_does_not_fallback_after_first_chunk():
             raise RuntimeError("stream broke")
 
     client = ModelClient()
-    client.gateway_cfg = {"fallback_to_direct": True}
-
-    with mock.patch.object(client, "_should_use_gateway", return_value=True):
-        with mock.patch.object(client, "get_chat_model", return_value=FailsAfterFirstChunk()):
-            with mock.patch.object(client, "_direct_model", return_value=FakeBoundModel(content="fallback")):
-                with pytest.raises(RuntimeError, match="stream broke"):
-                    list(client.stream([HumanMessage(content="hello")]))
+    with mock.patch.object(client, "get_chat_model", return_value=FailsAfterFirstChunk()):
+        with pytest.raises(RuntimeError, match="stream broke"):
+            list(client.stream([HumanMessage(content="hello")]))
 
 
 @pytest.mark.asyncio
@@ -450,13 +409,12 @@ async def test_model_client_astream_emits_first_chunk_before_provider_finishes()
     provider = PausesAfterFirstChunk()
     client = ModelClient()
 
-    with mock.patch.object(client, "_should_use_gateway", return_value=False):
-        with mock.patch.object(client, "get_chat_model", return_value=provider):
-            stream = client.astream([HumanMessage(content="hello")])
-            first = await asyncio.wait_for(anext(stream), timeout=0.1)
-            assert first.content == "first"
-            provider.release.set()
-            remaining = [chunk async for chunk in stream]
+    with mock.patch.object(client, "get_chat_model", return_value=provider):
+        stream = client.astream([HumanMessage(content="hello")])
+        first = await asyncio.wait_for(anext(stream), timeout=0.1)
+        assert first.content == "first"
+        provider.release.set()
+        remaining = [chunk async for chunk in stream]
 
     assert [chunk.content for chunk in remaining] == ["second"]
 
@@ -471,21 +429,15 @@ async def test_model_client_astream_stops_without_retry_after_emitting_partial_c
             yield AIMessageChunk(content="discarded-partial")
             raise RemoteProtocolError("peer closed connection: incomplete chunked read")
 
-    direct = FakeBoundModel(content="fallback")
     client = ModelClient()
-    client.gateway_cfg = {"fallback_to_direct": True}
-
-    with mock.patch.object(client, "_should_use_gateway", return_value=True):
-        with mock.patch.object(client, "get_chat_model", return_value=FailsAfterFirstChunk()):
-            with mock.patch.object(client, "_direct_model", return_value=direct):
-                chunks = []
-                with pytest.raises(ModelTransportInterruptedError) as exc_info:
-                    async for chunk in client.astream([HumanMessage(content="hello")]):
-                        chunks.append(chunk)
+    with mock.patch.object(client, "get_chat_model", return_value=FailsAfterFirstChunk()):
+        chunks = []
+        with pytest.raises(ModelTransportInterruptedError) as exc_info:
+            async for chunk in client.astream([HumanMessage(content="hello")]):
+                chunks.append(chunk)
 
     assert [chunk.content for chunk in chunks] == ["discarded-partial"]
     assert exc_info.value.chunks_received == 1
-    assert not direct.astream_calls
 
 
 def test_model_client_chat_model_callbacks_receive_success_lifecycle():

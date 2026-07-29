@@ -59,10 +59,45 @@ def test_model_client_temperature_override(mock_config):
     assert llm.temperature == 0.3
 
 
+def test_model_client_forces_kimi_k3_temperature_to_one():
+    cfg = {
+        "provider": "kimi",
+        "model": "kimi-k3",
+        "protocol": "openai_compatible",
+        "base_url": "https://api.moonshot.cn/v1",
+        "api_key": "test-key",
+        "temperature": 0.7,
+    }
+    with mock.patch("llm.model_client.get_fallback_llm_config", return_value=cfg):
+        client = ModelClient(role="agent", temperature=0.2, force_direct=True)
+
+    assert client.temperature == 1.0
+    assert client.cfg["temperature"] == 1.0
+
+
 def test_model_client_role_passed():
     """role 应被正确保存。"""
     client = ModelClient(role="summary")
     assert client.role == "summary"
+
+
+def test_model_client_resolves_explicit_workload_binding():
+    cfg = {
+        "provider": "openai",
+        "model": "qwen-vl-max",
+        "base_url": "https://example.test/v1",
+        "api_key": "test-key",
+        "temperature": 0.2,
+    }
+    with mock.patch("llm.model_client.get_fallback_llm_config", return_value=cfg) as resolve:
+        client = ModelClient(role="subagent", binding="image_analyzer")
+
+    resolve.assert_called_once_with(
+        thinking_enabled_override=None,
+        binding="image_analyzer",
+    )
+    assert client.binding == "image_analyzer"
+    assert client.cfg["model"] == "qwen-vl-max"
 
 
 def test_model_client_unknown_provider(mock_config):
@@ -103,32 +138,6 @@ async def test_model_client_ainvoke_records_usage(mock_config):
             assert kwargs["output_tokens"] == 5
 
 
-@pytest.mark.asyncio
-async def test_model_client_gateway_failure_falls_back_to_direct(mock_config):
-    """Gateway 在首个响应前失败时，应回退直连 Provider。"""
-    from langchain_core.messages import AIMessage
-
-    client = ModelClient(role="title")
-    client.gateway_cfg = {
-        "enabled": True,
-        "base_url": "http://gateway:8080/v1",
-        "fallback_to_direct": True,
-    }
-    gateway = mock.AsyncMock()
-    gateway.ainvoke.side_effect = RuntimeError("gateway down")
-    direct = mock.AsyncMock()
-    direct.ainvoke.return_value = AIMessage(content="fallback")
-
-    with mock.patch.object(client, "_should_use_gateway", return_value=True):
-        with mock.patch.object(client, "get_chat_model", return_value=gateway):
-            with mock.patch.object(client, "_direct_model", return_value=direct):
-                with mock.patch("llm.model_client.record_token_usage"):
-                    result = await client.ainvoke([])
-
-    assert result.content == "fallback"
-    direct.ainvoke.assert_awaited_once()
-
-
 def test_model_client_patches_chatopenai_to_preserve_reasoning_content():
     """ChatOpenAI drops provider-specific reasoning_content; our patch preserves it."""
     from langchain_core.messages import AIMessageChunk
@@ -143,35 +152,6 @@ def test_model_client_patches_chatopenai_to_preserve_reasoning_content():
     chunk = _convert_delta_to_message_chunk(delta, AIMessageChunk)
     assert isinstance(chunk, AIMessageChunk)
     assert chunk.additional_kwargs.get("reasoning_content") == "step 1"
-
-
-def test_model_client_gateway_uses_thinking_model_when_thinking_mode_enabled(mock_config):
-    """thinking_mode 开启时，gateway 使用 thinking 模型；OpenAI 风格参数保留。"""
-    thinking_cfg = {
-        "model": "o1",
-        "reasoning_effort": "high",
-        "extra_body": {"thinking": {"type": "enabled"}},
-    }
-
-    with mock.patch(
-        "llm.model_client.get_gateway_llm_config",
-        return_value={**thinking_cfg, "base_model": "gpt-4o"},
-    ):
-        with mock.patch(
-            "llm.model_client.get_gateway_config",
-            return_value={"base_url": "http://gateway/v1", "fallback_to_direct": True},
-        ):
-            with mock.patch(
-                "capabilities.get_effective_gateway_url",
-                return_value="http://gateway/v1",
-            ):
-                client = ModelClient(role="agent", force_direct=False)
-                with mock.patch.object(client, "_should_use_gateway", return_value=True):
-                    llm = client.get_chat_model()
-
-    assert llm.model_name == "o1"
-    assert llm.reasoning_effort == "high"
-    assert llm.extra_body == {"thinking": {"type": "enabled"}}
 
 
 def test_model_client_direct_deepseek_passes_thinking_params():
@@ -196,35 +176,5 @@ def test_model_client_direct_deepseek_passes_thinking_params():
 
     assert llm.__class__.__name__ == "ChatDeepSeek"
     assert llm.model == "deepseek-v4-pro"
-    assert llm.reasoning_effort == "high"
-    assert llm.extra_body == {"thinking": {"type": "enabled"}}
-
-
-def test_model_client_gateway_deepseek_passes_thinking_params():
-    """走 Higress 网关且模型为 deepseek-v4-pro 时，thinking 参数正常透传。"""
-    gateway_cfg = {
-        "model": "deepseek-v4-pro",
-        "reasoning_effort": "high",
-        "extra_body": {"thinking": {"type": "enabled"}},
-    }
-
-    with mock.patch(
-        "llm.model_client.get_gateway_llm_config",
-        return_value=gateway_cfg,
-    ):
-        with mock.patch(
-            "llm.model_client.get_gateway_config",
-            return_value={"base_url": "http://gateway/v1", "fallback_to_direct": True},
-        ):
-            with mock.patch(
-                "capabilities.get_effective_gateway_url",
-                return_value="http://gateway/v1",
-            ):
-                client = ModelClient(role="agent", force_direct=False)
-                with mock.patch.object(client, "_should_use_gateway", return_value=True):
-                    llm = client.get_chat_model()
-
-    assert llm.__class__.__name__ == "ChatOpenAI"
-    assert llm.model_name == "deepseek-v4-pro"
     assert llm.reasoning_effort == "high"
     assert llm.extra_body == {"thinking": {"type": "enabled"}}

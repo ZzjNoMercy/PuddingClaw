@@ -3,7 +3,7 @@
 # ============================================
 #   PuddingClaw - 本地基础设施启动脚本
 #   frontend/backend/MinerU 在本机运行；
-#   Docker 启动 Higress + Milvus，并可选启动 PuddingClaw bundled PostgreSQL。
+#   Docker 启动 Milvus，并可选启动 PuddingClaw bundled PostgreSQL。
 # ============================================
 
 set -e
@@ -119,20 +119,20 @@ PY
 }
 
 if ! command -v docker >/dev/null 2>&1; then
-    echo -e "${RED}[错误] 未找到 Docker。Higress/Milvus infra 需要 Docker。${NC}"
+    echo -e "${RED}[错误] 未找到 Docker。Milvus / bundled PostgreSQL 需要 Docker。${NC}"
     exit 1
 fi
 
 if [ "$START_BUNDLED_POSTGRES" = "true" ]; then
-    echo -e "${YELLOW}[步骤 1/2] 启动 bundled PostgreSQL + Higress + Milvus...${NC}"
+    echo -e "${YELLOW}[步骤 1/2] 启动 bundled PostgreSQL + Milvus...${NC}"
     COMPOSE_SERVICES=()
     DB_CONFIG_MODE="bundled"
     DB_CONFIG_DB="${POSTGRES_DB}"
     DB_CONFIG_USER="${POSTGRES_USER}"
     DB_CONFIG_PASSWORD="${POSTGRES_PASSWORD}"
 else
-    echo -e "${YELLOW}[步骤 1/2] 启动 Higress + Milvus（跳过 bundled PostgreSQL）...${NC}"
-    COMPOSE_SERVICES=(higress milvus)
+    echo -e "${YELLOW}[步骤 1/2] 启动 Milvus（跳过 bundled PostgreSQL）...${NC}"
+    COMPOSE_SERVICES=(milvus)
     DB_CONFIG_MODE="external"
     DB_CONFIG_DB="${LOCAL_POSTGRES_DB}"
     DB_CONFIG_USER="${LOCAL_POSTGRES_USER}"
@@ -158,7 +158,7 @@ if ! docker compose -f docker-compose.infra.yml up -d "${COMPOSE_SERVICES[@]}"; 
     echo "3. 如果只需要 PuddingClaw bundled PostgreSQL，可先执行："
     echo "   docker compose -f docker-compose.infra.yml up -d postgres"
     echo ""
-    echo "4. 如果只需要 Higress，可先继续使用已有 puddingclaw-higress 容器；Milvus 可稍后再启动。"
+    echo "4. Provider 请求已直连；Milvus 可稍后再启动。"
     echo ""
     echo "5. 如果本机已有 PostgreSQL，请在 Settings -> 知识库中配置端口、库名、账号和密码。"
     echo "   如需命令行强制覆盖，可设置专用变量，例如："
@@ -183,8 +183,6 @@ else
     echo "    username:      ${DB_CONFIG_USER}"
     echo "    password:      ${DB_CONFIG_PASSWORD:-<empty>}"
 fi
-echo "  Higress Gateway: http://localhost:8080"
-echo "  Higress Console: http://localhost:8001"
 echo "  Milvus:          grpc://localhost:19530"
 echo "  MinerU API:      http://localhost:8002  (本机运行，不由本脚本启动)"
 echo ""
@@ -201,6 +199,5 @@ if [ "$START_BUNDLED_POSTGRES" = "true" ]; then
 else
     echo "  已写入 backend/config.json；如需覆盖，可在 Settings -> 知识库 -> Catalog Database 中调整。"
 fi
-echo "  AI_GATEWAY_URL=http://localhost:8080/v1"
 echo ""
 echo -e "${GREEN}[完成] 基础设施启动命令已执行。${NC}"

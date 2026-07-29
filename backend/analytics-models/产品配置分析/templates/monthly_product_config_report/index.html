@@ -331,6 +331,14 @@
       line-height: 1.6;
     }
     .template-banner strong { color: var(--blue-deep); letter-spacing: .06em; }
+    html[data-report-status="final"] .template-banner { display: none; }
+    #iteration .chart-gallery { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    #iteration .chart-panel-head { padding: 17px 18px 0; }
+    #iteration .chart-panel-head h3 { font-size: 14px; }
+    #iteration .chart-panel-head p { font-size: 10px; }
+    #iteration .table-wrap { margin-top: 14px; border-inline: 0; border-bottom: 0; }
+    #iteration table { font-size: 11px; }
+    #iteration th, #iteration td { height: 48px; padding: 11px 14px; }
     .placeholder { color: #94a1a8; }
     .table-empty td { height: 88px; color: #8b989f; text-align: center !important; }
     .chart-section-note { margin: 18px 0 0; padding: 12px 14px; background: #f0f6f7; color: #4f646e; font-size: 10px; line-height: 1.7; }
@@ -474,27 +482,27 @@
         <section class="section" id="iteration" data-screen-label="02 新车迭代">
           <header class="section-head"><div><div class="eyebrow">Product Renewal</div><h2 data-bind="report.sections.iteration.headline">待生成章节结论</h2><p class="section-subtitle" data-bind="report.sections.iteration.summary">待生成章节摘要</p></div><div class="section-number">02</div></header>
           <div class="section-body"><div class="chart-gallery">
-            <article class="chart-panel" data-chart-panel="renewalChart"><div class="chart-panel-head"><div><h3>年度更新次数与更新周期</h3><p>堆叠柱：更新次数；折线：平均上市周期</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart tall" id="renewalChart"></div><p class="echart-fallback">等待 Agent 填充已验证数据。</p></article>
-            <article class="chart-panel"><div class="chart-panel-head"><div><h3>重点竞企更新节奏</h3><p>表格行由 <code>report.tables.competitor_updates</code> 生成</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="table-wrap"><table data-table="competitor_updates"></table></div></article>
+            <article class="chart-panel" data-chart-panel="renewalChart"><div class="chart-panel-head"><div><h3 id="renewalTitle">年度更新次数与更新周期</h3><p id="renewalSubtitle">堆叠柱：传统能源·新能源更新次数；折线：两类平均上市周期（天）</p></div><span class="source-chip">PPT 05</span></div><div class="echart tall" id="renewalChart"></div><p class="echart-fallback">等待 Agent 填充已验证数据。</p></article>
+            <article class="chart-panel"><div class="chart-panel-head"><div><h3>重点竞企更新节奏</h3><p id="competitorSubtitle">固定五家企业；默认展示报告年份，更新同比为年初累计相对上年同期</p></div><span class="source-chip">PPT 05</span></div><div class="table-wrap"><table data-table="competitor_updates"></table></div></article>
           </div></div>
         </section>
 
         <section class="section" id="power" data-screen-label="03 尺寸与动力">
           <header class="section-head"><div><div class="eyebrow">Size × Power</div><h2 data-bind="report.sections.power.headline">待生成章节结论</h2><p class="section-subtitle" data-bind="report.sections.power.summary">待生成章节摘要</p></div><div class="section-number">03</div></header>
           <div class="section-body"><div class="chart-gallery">
-            <article class="chart-panel" data-chart-panel="wheelbaseTrendChart"><div class="chart-panel-head"><div><h3>乘用车轴距结构变化</h3><p>100% 堆叠，排除皮卡</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart" id="wheelbaseTrendChart"></div><p class="echart-fallback">等待轴距结构数据。</p></article>
-            <article class="chart-panel" data-chart-panel="motorPowerTrendChart"><div class="chart-panel-head"><div><h3>新能源电机总功率结构变化</h3><p>100% 堆叠，仅新能源且非空功率</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart" id="motorPowerTrendChart"></div><p class="echart-fallback">等待电机功率结构数据。</p></article>
-            <article class="chart-panel wide" data-chart-panel="sizePowerHeatmapChart"><div class="chart-panel-head"><div><h3>纯电轴距 × 电机功率组合密度</h3><p>切片：<select id="heatmapVariantSelect" class="query-select" style="display:inline-block;width:auto;height:28px;margin-left:4px;"><option>待生成</option></select></p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart tall" id="sizePowerHeatmapChart"></div><p class="echart-fallback">等待组合热力图数据。</p></article>
+            <article class="chart-panel" data-chart-panel="wheelbaseTrendChart"><div class="chart-panel-head"><div><h3>乘用车轴距结构变化</h3><p>100% 堆叠，排除皮卡</p></div><span class="source-chip">PPT 06</span></div><div class="echart" id="wheelbaseTrendChart"></div><p class="echart-fallback">等待轴距结构数据。</p></article>
+            <article class="chart-panel" data-chart-panel="motorPowerTrendChart"><div class="chart-panel-head"><div><h3>新能源电机总功率结构变化</h3><p>100% 堆叠，仅新能源且非空功率</p></div><span class="source-chip">PPT 06</span></div><div class="echart" id="motorPowerTrendChart"></div><p class="echart-fallback">等待电机功率结构数据。</p></article>
+            <article class="chart-panel wide" data-chart-panel="sizePowerHeatmapChart"><div class="chart-panel-head"><div><h3>纯电轴距 × 电机功率组合密度</h3><p>切片：<select id="heatmapVariantSelect" class="query-select" style="display:inline-block;width:auto;height:28px;margin-left:4px;"><option>待生成</option></select></p></div><span class="source-chip">PPT 07</span></div><div class="echart tall" id="sizePowerHeatmapChart"></div><p class="echart-fallback">等待组合热力图数据。</p></article>
           </div></div>
         </section>
 
         <section class="section" id="platform" data-screen-label="04 高压平台">
           <header class="section-head"><div><div class="eyebrow">High-voltage Platform</div><h2 data-bind="report.sections.platform.headline">待生成章节结论</h2><p class="section-subtitle" data-bind="report.sections.platform.summary">待生成章节摘要</p></div><div class="section-number">04</div></header>
           <div class="section-body"><div class="chart-gallery">
-            <article class="chart-panel" data-chart-panel="bevVoltageTrendChart"><div class="chart-panel-head"><div><h3>纯电高压平台年度趋势</h3><p>各电压平台结构与高压平台占比</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart" id="bevVoltageTrendChart"></div><p class="echart-fallback">等待纯电年度数据。</p></article>
-            <article class="chart-panel" data-chart-panel="bevVoltagePriceChart"><div class="chart-panel-head"><div><h3>纯电高压平台价格带</h3><p>价格带内部占比</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart" id="bevVoltagePriceChart"></div><p class="echart-fallback">等待纯电价格带数据。</p></article>
-            <article class="chart-panel" data-chart-panel="nevVoltageTrendChart"><div class="chart-panel-head"><div><h3>全新能源高压平台年度趋势</h3><p>纳入纯电、插混与增程</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart" id="nevVoltageTrendChart"></div><p class="echart-fallback">等待全新能源年度数据。</p></article>
-            <article class="chart-panel" data-chart-panel="nevVoltagePriceChart"><div class="chart-panel-head"><div><h3>全新能源高压平台价格带</h3><p>价格带内部占比</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart" id="nevVoltagePriceChart"></div><p class="echart-fallback">等待全新能源价格带数据。</p></article>
+            <article class="chart-panel" data-chart-panel="bevVoltageTrendChart"><div class="chart-panel-head"><div><h3>纯电高压平台年度趋势</h3><p>各电压平台结构与高压平台占比</p></div><span class="source-chip">PPT 08</span></div><div class="echart" id="bevVoltageTrendChart"></div><p class="echart-fallback">等待纯电年度数据。</p></article>
+            <article class="chart-panel" data-chart-panel="bevVoltagePriceChart"><div class="chart-panel-head"><div><h3>纯电高压平台价格带</h3><p>价格带内部占比</p></div><span class="source-chip">PPT 08</span></div><div class="echart" id="bevVoltagePriceChart"></div><p class="echart-fallback">等待纯电价格带数据。</p></article>
+            <article class="chart-panel" data-chart-panel="nevVoltageTrendChart"><div class="chart-panel-head"><div><h3>全新能源高压平台年度趋势</h3><p>纳入纯电、插混与增程</p></div><span class="source-chip">PPT 19</span></div><div class="echart" id="nevVoltageTrendChart"></div><p class="echart-fallback">等待全新能源年度数据。</p></article>
+            <article class="chart-panel" data-chart-panel="nevVoltagePriceChart"><div class="chart-panel-head"><div><h3>全新能源高压平台价格带</h3><p>价格带内部占比</p></div><span class="source-chip">PPT 19</span></div><div class="echart" id="nevVoltagePriceChart"></div><p class="echart-fallback">等待全新能源价格带数据。</p></article>
           </div><p class="chart-section-note" data-bind="report.sections.platform.note">待生成分母口径说明</p></div>
         </section>
 
@@ -503,12 +511,12 @@
           <div class="section-body">
             <div class="feature-grid" data-repeat="report.features.adas" data-repeat-count="4"></div>
             <h3 class="subsection-title">L2 普及与价格下探</h3><div class="chart-gallery">
-              <article class="chart-panel" data-chart-panel="l2TrendChart"><div class="chart-panel-head"><div><h3>L2 配备率趋势</h3><p>车系维度与款型维度</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart" id="l2TrendChart"></div><p class="echart-fallback">等待 L2 趋势数据。</p></article>
-              <article class="chart-panel" data-chart-panel="l2PriceBandChart"><div class="chart-panel-head"><div><h3>L2+ 分价格带配备率</h3><p>价格带序列与行业均值</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart" id="l2PriceBandChart"></div><p class="echart-fallback">等待 L2 价格带数据。</p></article>
-              <article class="chart-panel wide" data-chart-panel="l2PriceBoxplotChart"><div class="chart-panel-head"><div><h3>L2 款型指导价分布</h3><p>五数概括：最小值、Q1、中位数、Q3、最大值</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart tall" id="l2PriceBoxplotChart"></div><p class="echart-fallback">等待 L2 指导价分布数据。</p></article>
+              <article class="chart-panel" data-chart-panel="l2TrendChart"><div class="chart-panel-head"><div><h3>L2 配备率趋势</h3><p>车系维度与款型维度</p></div><span class="source-chip">PPT 09</span></div><div class="echart" id="l2TrendChart"></div><p class="echart-fallback">等待 L2 趋势数据。</p></article>
+              <article class="chart-panel" data-chart-panel="l2PriceBandChart"><div class="chart-panel-head"><div><h3>L2+ 分价格带配备率</h3><p>价格带序列与行业均值</p></div><span class="source-chip">PPT 09</span></div><div class="echart" id="l2PriceBandChart"></div><p class="echart-fallback">等待 L2 价格带数据。</p></article>
+              <article class="chart-panel wide" data-chart-panel="l2PriceBoxplotChart"><div class="chart-panel-head"><div><h3>L2 款型指导价分布</h3><p>五数概括：最小值、Q1、中位数、Q3、最大值</p></div><span class="source-chip">PPT 10</span></div><div class="echart tall" id="l2PriceBoxplotChart"></div><p class="echart-fallback">等待 L2 指导价分布数据。</p></article>
             </div>
             <h3 class="subsection-title">高阶智驾</h3><div class="chart-gallery">
-              <article class="chart-panel wide" data-chart-panel="highAdasTrendChart"><div class="chart-panel-head"><div><h3>高阶智驾配备率</h3><p>高速 NOA 口径；不再输出芯片平台和雷达供应商份额图</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart compact" id="highAdasTrendChart"></div><p class="echart-fallback">等待高阶智驾趋势数据。</p></article>
+              <article class="chart-panel wide" data-chart-panel="highAdasTrendChart"><div class="chart-panel-head"><div><h3>高阶智驾配备率</h3><p>高速 NOA 口径；不再输出芯片平台和雷达供应商份额图</p></div><span class="source-chip">PPT 11</span></div><div class="echart compact" id="highAdasTrendChart"></div><p class="echart-fallback">等待高阶智驾趋势数据。</p></article>
             </div>
             <h3 class="subsection-title">主要企业 NOA 搭载</h3><div class="table-wrap"><table data-table="noa_coverage"></table></div>
           </div>
@@ -519,14 +527,14 @@
           <div class="section-body">
             <div class="feature-grid" data-repeat="report.features.cockpit" data-repeat-count="3"></div>
             <h3 class="subsection-title">座舱电子趋势</h3><div class="chart-gallery">
-              <article class="chart-panel" data-chart-panel="hudRateChart"><div class="chart-panel-head"><div><h3>HUD 配备率</h3><p>按报告周期输出</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart compact" id="hudRateChart"></div><p class="echart-fallback">等待 HUD 趋势数据。</p></article>
-              <article class="chart-panel" data-chart-panel="screenSizeChart"><div class="chart-panel-head"><div><h3>中控屏幕尺寸</h3><p>平均尺寸与有效样本数</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart compact" id="screenSizeChart"></div><p class="echart-fallback">等待中控屏尺寸数据。</p></article>
+              <article class="chart-panel" data-chart-panel="hudRateChart"><div class="chart-panel-head"><div><h3>HUD 配备率</h3><p>按报告周期输出</p></div><span class="source-chip">PPT 13</span></div><div class="echart compact" id="hudRateChart"></div><p class="echart-fallback">等待 HUD 趋势数据。</p></article>
+              <article class="chart-panel" data-chart-panel="screenSizeChart"><div class="chart-panel-head"><div><h3>中控屏幕尺寸</h3><p>平均尺寸与有效样本数</p></div><span class="source-chip">PPT 13</span></div><div class="echart compact" id="screenSizeChart"></div><p class="echart-fallback">等待中控屏尺寸数据。</p></article>
             </div>
             <h3 class="subsection-title">舒适配置趋势</h3><div class="chart-gallery">
-              <article class="chart-panel" data-chart-panel="fridgeRateChart"><div class="chart-panel-head"><div><h3>车载冰箱</h3><p>款型配备率</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart compact" id="fridgeRateChart"></div><p class="echart-fallback">等待车载冰箱数据。</p></article>
-              <article class="chart-panel" data-chart-panel="rearScreenRateChart"><div class="chart-panel-head"><div><h3>后排多媒体屏</h3><p>款型配备率</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart compact" id="rearScreenRateChart"></div><p class="echart-fallback">等待后排屏数据。</p></article>
-              <article class="chart-panel" data-chart-panel="zeroGravityRateChart"><div class="chart-panel-head"><div><h3>零重力座椅</h3><p>款型配备率</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart compact" id="zeroGravityRateChart"></div><p class="echart-fallback">等待零重力座椅数据。</p></article>
-              <article class="chart-panel" data-chart-panel="rearMassageRateChart"><div class="chart-panel-head"><div><h3>后排按摩座椅</h3><p>款型配备率</p></div><span class="source-chip">QUERY REQUIRED</span></div><div class="echart compact" id="rearMassageRateChart"></div><p class="echart-fallback">等待后排按摩座椅数据。</p></article>
+              <article class="chart-panel" data-chart-panel="fridgeRateChart"><div class="chart-panel-head"><div><h3>车载冰箱</h3><p>款型配备率</p></div><span class="source-chip">PPT 14</span></div><div class="echart compact" id="fridgeRateChart"></div><p class="echart-fallback">等待车载冰箱数据。</p></article>
+              <article class="chart-panel" data-chart-panel="rearScreenRateChart"><div class="chart-panel-head"><div><h3>后排多媒体屏</h3><p>款型配备率</p></div><span class="source-chip">PPT 14</span></div><div class="echart compact" id="rearScreenRateChart"></div><p class="echart-fallback">等待后排屏数据。</p></article>
+              <article class="chart-panel" data-chart-panel="zeroGravityRateChart"><div class="chart-panel-head"><div><h3>零重力座椅</h3><p>款型配备率</p></div><span class="source-chip">PPT 14</span></div><div class="echart compact" id="zeroGravityRateChart"></div><p class="echart-fallback">等待零重力座椅数据。</p></article>
+              <article class="chart-panel" data-chart-panel="rearMassageRateChart"><div class="chart-panel-head"><div><h3>后排按摩座椅</h3><p>款型配备率</p></div><span class="source-chip">PPT 14</span></div><div class="echart compact" id="rearMassageRateChart"></div><p class="echart-fallback">等待后排按摩座椅数据。</p></article>
             </div>
           </div>
         </section>
@@ -572,7 +580,19 @@
     },
     "features": {"adas": [], "cockpit": []},
     "tables": {
-      "competitor_updates": {"status": "pending", "columns": [], "rows": [], "reason": "Agent 必须先查询竞企更新数据"},
+      "competitor_updates": {
+        "status": "pending",
+        "as_of_period": null,
+        "comparison_period": null,
+        "columns": [
+          {"key": "brand_group", "label": "品牌集团"},
+          {"key": "update_count", "label": "更新"},
+          {"key": "ytd_yoy_delta", "label": "同比"},
+          {"key": "average_cycle_days", "label": "周期"}
+        ],
+        "rows": [],
+        "reason": "Agent 必须先识别报告月份，再按固定五家企业查询本年累计与上年同期竞企更新数据"
+      },
       "noa_coverage": {"status": "pending", "columns": [], "rows": [], "reason": "Agent 必须先查询品牌 NOA 搭载数据"}
     },
     "methodology": []

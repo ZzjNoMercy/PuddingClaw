@@ -9,8 +9,7 @@ from __future__ import annotations
 import logging
 from llama_index.embeddings.openai import OpenAIEmbedding
 
-import capabilities
-from config import get_fallback_embedding_config, get_gateway_config
+from config import get_fallback_embedding_config
 
 logger = logging.getLogger(__name__)
 
@@ -18,19 +17,13 @@ logger = logging.getLogger(__name__)
 def get_embedding_model() -> OpenAIEmbedding:
     """获取配置好的 OpenAI-compatible Embedding 模型。
 
-    如果 AI_GATEWAY_URL 可用，优先通过网关路由 embedding 请求；
-    否则使用 config.json 中 embedding.base_url 直连。
+    Endpoint、凭证与模型由 Provider Registry 的 ``text_embedding``
+    binding 一次性解析，调用过程中不会切换网关或其他 Provider。
     """
     cfg = get_fallback_embedding_config()
-    gateway = get_gateway_config()
-    use_gateway = False
-    if gateway.get("base_url"):
-        try:
-            use_gateway = capabilities.detect_capabilities_sync().ai_gateway.available
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[EmbedClient] gateway detection failed: %s", exc)
-
-    api_base = gateway.get("base_url") if use_gateway else cfg.get("api_base", "https://api.openai.com/v1")
+    if cfg.get("protocol") != "openai_compatible":
+        raise ValueError(f"Text embedding requires an OpenAI-compatible endpoint, got {cfg.get('protocol')}")
+    api_base = cfg.get("api_base", "https://api.openai.com/v1")
     model = cfg.get("model", "text-embedding-3-small")
     embed_batch_size = int(cfg.get("batch_size", 100))
     if str(model).startswith("text-embedding-v") and "dashscope" in str(api_base).lower():
@@ -39,13 +32,9 @@ def get_embedding_model() -> OpenAIEmbedding:
         # but never send an invalid provider batch at runtime.
         embed_batch_size = min(embed_batch_size, 20)
 
-    # When routing through Higress AI Gateway, the gateway's ai-proxy plugin
-    # replaces the Authorization header with the configured upstream provider
-    # token. The client only needs a non-empty placeholder unless Higress
-    # consumer auth is enabled on the route.
     api_key = cfg.get("api_key", "")
-    if use_gateway and not api_key:
-        api_key = "higress-placeholder"
+    if not api_key:
+        raise ValueError("Text embedding credential is not configured for the selected Provider endpoint")
 
     logger.debug("[EmbedClient] api_base=%s model=%s", api_base, model)
 

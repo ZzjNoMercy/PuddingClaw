@@ -278,6 +278,8 @@ class SessionManager:
             "workspace_type",
             "workspace_path",
             "analytics_model_id",
+            "llm_model_id",
+            "thinking_level",
         ):
             if key in data:
                 meta[key] = data.get(key)
@@ -377,6 +379,8 @@ class SessionManager:
             "workspace_type",
             "workspace_path",
             "analytics_model_id",
+            "llm_model_id",
+            "thinking_level",
         }
         forbidden = set(metadata) - allowed_keys
         if forbidden:
@@ -4306,6 +4310,8 @@ class SessionManager:
                     "workspace_type",
                     "workspace_path",
                     "analytics_model_id",
+                    "llm_model_id",
+                    "thinking_level",
                 ):
                     if key in raw:
                         meta[key] = raw.get(key)
@@ -7630,6 +7636,13 @@ class SessionManager:
 
         for msg in messages:  # 遍历所有消息
             entry: dict[str, Any] = {"role": msg["role"], "content": msg["content"]}
+            # Attachments are durable session-scoped references, not transient
+            # request payloads. Keep their structured metadata in the agent
+            # history so a later Run (for example after a reload or "continue")
+            # can rebuild att_xxx references and let read_resource/image_analyzer
+            # materialize the original file on demand.
+            if isinstance(msg.get("attachments"), list):
+                entry["attachments"] = deepcopy(msg["attachments"])
             msg_has_tool_calls = bool(msg.get("tool_calls"))
             if msg_has_tool_calls:
                 calls: list[dict[str, Any]] = []

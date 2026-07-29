@@ -1,9 +1,7 @@
 """统一 LLM 调用客户端。
 
 业务代码只依赖 ModelClient，不再直接实例化 ChatDeepSeek / ChatOpenAI。
-调用链：
-    业务代码 -> ModelClient -> Higress（若可用）-> 实际模型
-                          └-> 直连 DeepSeek / OpenAI / Qwen
+调用链：业务代码 -> ModelClient -> Provider Registry -> 直连 Provider。
 """
 
 from __future__ import annotations
@@ -19,9 +17,9 @@ from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResu
 from langchain_core.runnables.config import var_child_runnable_config
 from langgraph.config import get_stream_writer
 
-import capabilities
-from config import get_fallback_llm_config, get_gateway_config, get_gateway_llm_config
+from config import get_fallback_llm_config
 from graph.token_usage_store import record_token_usage
+from llm.thinking_mapping import normalize_model_temperature
 
 logger = logging.getLogger(__name__)
 
@@ -251,45 +249,53 @@ class ModelClient:
         record_usage: bool = True,
         thinking_enabled: bool | None = None,
         model_override: str | None = None,
+        model_id_override: str | None = None,
+        thinking_level: str | None = None,
+        binding: str = "agent",
     ) -> None:
         self.role = role
+        self.binding = binding
         self.thinking_enabled = thinking_enabled
         self.model_override = str(model_override or "").strip() or None
-        self.cfg = get_fallback_llm_config(
-            thinking_enabled_override=thinking_enabled,
-        )
+        self.model_id_override = str(model_id_override or "").strip() or None
+        self.thinking_level = str(thinking_level or "").strip() or None
+        resolution_kwargs: dict[str, Any] = {
+            "thinking_enabled_override": thinking_enabled,
+            "binding": binding,
+        }
+        if self.model_id_override is not None:
+            resolution_kwargs["model_id_override"] = self.model_id_override
+        if self.thinking_level is not None:
+            resolution_kwargs["thinking_level"] = self.thinking_level
+        self.cfg = get_fallback_llm_config(**resolution_kwargs)
         if self.model_override is not None:
             self.cfg["model"] = self.model_override
-        self.temperature = temperature if temperature is not None else self.cfg.get("temperature", 0.7)
+        requested_temperature = float(
+            temperature if temperature is not None else self.cfg.get("temperature", 0.7)
+        )
+        self.temperature = normalize_model_temperature(
+            provider_id=str(self.cfg.get("provider") or ""),
+            model_name=str(self.cfg.get("model") or ""),
+            temperature=requested_temperature,
+        )
+        self.cfg["temperature"] = self.temperature
+        if self.temperature != requested_temperature:
+            logger.info(
+                "[ModelClient] normalized temperature: role=%s provider=%s model=%s requested=%s effective=%s",
+                self.role,
+                self.cfg.get("provider") or "<unknown>",
+                self.cfg.get("model") or "<unknown>",
+                requested_temperature,
+                self.temperature,
+            )
         self.streaming = streaming
         self.force_direct = force_direct
         self.tools = tools or []
         self.bind_tools_kwargs = bind_tools_kwargs or {}
         self.record_usage = record_usage
-        self.gateway_cfg = get_gateway_config()
-
-    def _should_use_gateway(self) -> bool:
-        """判断是否应该走 AI Gateway。
-
-        不再要求用户在 config.json 里显式启用 gateway。只要 Higress 被探测到可用，
-        就优先走网关；未探测到则自动 fallback 到直连。
-        """
-        if self.force_direct:
-            return False
-        try:
-            caps = capabilities.detect_capabilities_sync()
-            return caps.ai_gateway.available
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[ModelClient] capability detection failed: %s", exc)
-            return False
-
     def get_chat_model(self) -> BaseChatModel:
-        """获取配置好的 LangChain Chat Model。"""
-        if self._should_use_gateway():
-            model = self._gateway_model()
-        else:
-            model = self._direct_model()
-        return self._apply_tools(model)
+        """获取已绑定的直连 Provider 模型。"""
+        return self._apply_tools(self._direct_model())
 
     def _apply_tools(self, model: BaseChatModel) -> BaseChatModel:
         """将工具绑定到模型，保持 LangChain `bind_tools` 参数不丢失。"""
@@ -316,43 +322,13 @@ class ModelClient:
             kwargs["extra_body"] = extra_body
         return kwargs
 
-    def _gateway_model(self) -> BaseChatModel:
-        """通过 Higress（OpenAI-compatible）调用模型。"""
-        from langchain_openai import ChatOpenAI
-
-        gateway_url = capabilities.get_effective_gateway_url()
-        gateway_cfg = get_gateway_llm_config(
-            thinking_enabled_override=self.thinking_enabled,
-        )
-        gateway_model = self.model_override or gateway_cfg.get(
-            "model",
-            self.cfg["model"],
-        )
-        thinking_kwargs = self._thinking_kwargs(gateway_cfg)
-        logger.info(
-            "[ModelClient] using AI Gateway: url=%s model=%s thinking=%s",
-            gateway_url,
-            gateway_model,
-            bool(thinking_kwargs),
-        )
-        if thinking_kwargs:
-            logger.info("[ModelClient] thinking kwargs: %s", thinking_kwargs)
-        return ChatOpenAI(
-            model=gateway_model,
-            # Higress 管理上游 Provider key，PuddingClaw 只传一个占位 key。
-            api_key="puddingclaw-gateway",
-            base_url=gateway_url,
-            temperature=self.temperature,
-            streaming=self.streaming,
-            **thinking_kwargs,
-        )
-
     def _direct_model(self) -> BaseChatModel:
         """直连模型 provider。"""
         provider = self.cfg.get("provider", "deepseek")
-        if provider == "deepseek":
+        protocol = self.cfg.get("protocol") or ("deepseek" if provider == "deepseek" else "openai_compatible" if provider in {"openai", "qwen", "custom", "kimi", "siliconflow"} else "")
+        if provider == "deepseek" or protocol == "deepseek":
             return self._deepseek_model()
-        if provider in {"openai", "qwen", "custom"}:
+        if protocol == "openai_compatible":
             return self._openai_model()
         raise ValueError(f"Unsupported LLM provider: {provider}")
 
@@ -361,7 +337,8 @@ class ModelClient:
 
         thinking_kwargs = self._thinking_kwargs(self.cfg)
         logger.info(
-            "[ModelClient] using direct DeepSeek: model=%s thinking=%s",
+            "[ModelClient] using direct DeepSeek: role=%s model=%s thinking=%s",
+            self.role,
             self.cfg["model"],
             bool(thinking_kwargs),
         )
@@ -382,7 +359,9 @@ class ModelClient:
 
         thinking_kwargs = self._thinking_kwargs(self.cfg)
         logger.info(
-            "[ModelClient] using direct OpenAI: model=%s thinking=%s",
+            "[ModelClient] using direct OpenAI-compatible: role=%s provider=%s model=%s thinking=%s",
+            self.role,
+            self.cfg.get("provider", "openai"),
             self.cfg["model"],
             bool(thinking_kwargs),
         )
@@ -435,16 +414,9 @@ class ModelClient:
         **kwargs: Any,
     ) -> BaseMessage:
         """异步调用 LLM 并记录 token 用量。"""
-        using_gateway = self._should_use_gateway()
         llm = self.get_chat_model()
         start = time.time()
-        try:
-            response = await llm.ainvoke(messages, config=config, stop=stop, **kwargs)
-        except Exception:
-            if not using_gateway or not self.gateway_cfg.get("fallback_to_direct", True):
-                raise
-            logger.warning("[ModelClient] gateway invoke failed; retrying direct provider", exc_info=True)
-            response = await self._direct_model_with_tools().ainvoke(messages, config=config, stop=stop, **kwargs)
+        response = await llm.ainvoke(messages, config=config, stop=stop, **kwargs)
         usage = getattr(response, "usage_metadata", {}) or {}
         self._record_usage(
             usage,
@@ -471,11 +443,9 @@ class ModelClient:
         注意：流式用量的聚合依赖底层模型在最后一个 chunk 返回 usage_metadata，
         不同 provider 行为不一致，这里做 best-effort 记录。
         """
-        using_gateway = self._should_use_gateway()
         llm = self.get_chat_model()
         start = time.time()
-        fallback_to_direct = bool(self.gateway_cfg.get("fallback_to_direct", True))
-        route = "gateway" if using_gateway else "direct"
+        route = "direct"
         max_attempts = 2
         for attempt in range(1, max_attempts + 1):
             emitted_chunks = 0
@@ -514,13 +484,10 @@ class ModelClient:
                     yield chunk
             except Exception as exc:
                 retryable = _retryable_stream_error(exc)
-                legacy_gateway_fallback = (
-                    emitted_chunks == 0 and route == "gateway" and fallback_to_direct
-                )
                 can_retry = (
                     emitted_chunks == 0
                     and attempt < max_attempts
-                    and (retryable or legacy_gateway_fallback)
+                    and retryable
                 )
                 _emit_model_stream_event(
                     {
@@ -551,9 +518,6 @@ class ModelClient:
                         emitted_chunks,
                         exc_info=True,
                     )
-                    if route == "gateway" and fallback_to_direct:
-                        llm = self._direct_model_with_tools()
-                        route = "direct"
                     await asyncio.sleep(0.25 * (2 ** (attempt - 1)))
                     continue
                 if retryable:
@@ -596,16 +560,9 @@ class ModelClient:
         **kwargs: Any,
     ) -> BaseMessage:
         """同步调用 LLM 并记录 token 用量。"""
-        using_gateway = self._should_use_gateway()
         llm = self.get_chat_model()
         start = time.time()
-        try:
-            response = llm.invoke(messages, config=config, stop=stop, **kwargs)
-        except Exception:
-            if not using_gateway or not self.gateway_cfg.get("fallback_to_direct", True):
-                raise
-            logger.warning("[ModelClient] gateway invoke failed; retrying direct provider", exc_info=True)
-            response = self._direct_model_with_tools().invoke(messages, config=config, stop=stop, **kwargs)
+        response = llm.invoke(messages, config=config, stop=stop, **kwargs)
         usage = getattr(response, "usage_metadata", {}) or {}
         self._record_usage(
             usage,
@@ -628,11 +585,9 @@ class ModelClient:
         **kwargs: Any,
     ) -> Any:
         """同步流式调用 LLM 并记录 token 用量。"""
-        using_gateway = self._should_use_gateway()
         llm = self.get_chat_model()
         start = time.time()
-        fallback_to_direct = bool(self.gateway_cfg.get("fallback_to_direct", True))
-        route = "gateway" if using_gateway else "direct"
+        route = "direct"
         max_attempts = 2
         for attempt in range(1, max_attempts + 1):
             emitted_chunks = 0
@@ -667,13 +622,10 @@ class ModelClient:
                     yield chunk
             except Exception as exc:
                 retryable = _retryable_stream_error(exc)
-                legacy_gateway_fallback = (
-                    emitted_chunks == 0 and route == "gateway" and fallback_to_direct
-                )
                 can_retry = (
                     emitted_chunks == 0
                     and attempt < max_attempts
-                    and (retryable or legacy_gateway_fallback)
+                    and retryable
                 )
                 _emit_model_stream_event(
                     {
@@ -704,9 +656,6 @@ class ModelClient:
                         emitted_chunks,
                         exc_info=True,
                     )
-                    if route == "gateway" and fallback_to_direct:
-                        llm = self._direct_model_with_tools()
-                        route = "direct"
                     time.sleep(0.25 * (2 ** (attempt - 1)))
                     continue
                 if retryable:
@@ -743,7 +692,7 @@ class ModelClientChatModel(BaseChatModel):
     """把 ModelClient 包装成 LangChain BaseChatModel。
 
     这样 LangGraph / create_agent 的主 Agent 调用也会完整经过 ModelClient，
-    从而统一走 Higress 网关路由、fallback 重试和 token 用量记录。
+    从而统一走 Provider Registry 解析、同一绑定内的传输重试和 token 用量记录。
     """
 
     def __init__(
@@ -757,6 +706,9 @@ class ModelClientChatModel(BaseChatModel):
         bind_tools_kwargs: dict[str, Any] | None = None,
         thinking_enabled: bool | None = None,
         model_override: str | None = None,
+        model_id_override: str | None = None,
+        thinking_level: str | None = None,
+        binding: str = "agent",
     ) -> None:
         # BaseChatModel otherwise may route ``ainvoke`` through ``_astream``
         # when callbacks request streaming, even though the wrapped provider
@@ -773,6 +725,9 @@ class ModelClientChatModel(BaseChatModel):
             record_usage=False,
             thinking_enabled=thinking_enabled,
             model_override=model_override,
+            model_id_override=model_id_override,
+            thinking_level=thinking_level,
+            binding=binding,
         )
 
     @property
@@ -783,6 +738,7 @@ class ModelClientChatModel(BaseChatModel):
     def _identifying_params(self) -> dict[str, Any]:
         return {
             "role": self._client.role,
+            "binding": self._client.binding,
             "model": self._client.cfg.get("model"),
             "temperature": self._client.temperature,
             "streaming": self._client.streaming,
@@ -907,17 +863,23 @@ class ModelClientChatModel(BaseChatModel):
             bind_tools_kwargs=kwargs,
             thinking_enabled=self._client.thinking_enabled,
             model_override=self._client.model_override,
+            model_id_override=self._client.model_id_override,
+            thinking_level=self._client.thinking_level,
+            binding=self._client.binding,
         )
 
     def _model_trace_params(self) -> dict[str, Any]:
         return {
             "role": self._client.role,
+            "binding": self._client.binding,
             "model": self._client.cfg.get("model"),
             "temperature": self._client.temperature,
             "streaming": self._client.streaming,
             "force_direct": self._client.force_direct,
             "thinking_enabled": self._client.thinking_enabled,
             "model_override": self._client.model_override,
+            "model_id_override": self._client.model_id_override,
+            "thinking_level": self._client.thinking_level,
             "tool_choice": self._client.bind_tools_kwargs.get("tool_choice"),
             "strict": self._client.bind_tools_kwargs.get("strict"),
         }

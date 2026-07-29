@@ -41,6 +41,19 @@
   ];
 
   var COLORS = ["#2389ad", "#55b7bf", "#79bca8", "#b8cf9f", "#d7ad66", "#7a8c8e", "#c85c55"];
+  var RENEWAL_SERIES_CONTRACT = [
+    { name: "传统能源更新", type: "bar", axis: 0, stack: "updates", color: "#2389ad" },
+    { name: "新能源更新", type: "bar", axis: 0, stack: "updates", color: "#55b7bf" },
+    { name: "传统能源周期", type: "line", axis: 1, color: "#d7ad66" },
+    { name: "新能源周期", type: "line", axis: 1, color: "#c85c55" }
+  ];
+  var COMPETITOR_COLUMNS = [
+    { key: "brand_group", label: "品牌集团" },
+    { key: "update_count", label: "更新" },
+    { key: "ytd_yoy_delta", label: "同比" },
+    { key: "average_cycle_days", label: "周期" }
+  ];
+  var COMPETITOR_BRAND_GROUPS = ["比亚迪集团", "长安集团", "奇瑞集团", "长城汽车", "吉利汽车"];
   var chartInstances = {};
   var currentPayload = null;
 
@@ -79,6 +92,92 @@
     });
   }
 
+  function reportPeriod(payload) {
+    var value = getPath(payload, "report.scope.period");
+    var match = /^(\d{4})-(0[1-9]|1[0-2])$/.exec(String(value || ""));
+    return match ? { value: match[0], year: Number(match[1]), month: Number(match[2]) } : null;
+  }
+
+  function validateRenewalChart(spec, payload, errors) {
+    var period = reportPeriod(payload);
+    var categories = Array.isArray(spec.categories) ? spec.categories.map(String) : [];
+    var series = Array.isArray(spec.series) ? spec.series : [];
+    if (categories.length !== 6) errors.push("renewalChart: default view requires 6 consecutive years");
+    var years = categories.map(Number);
+    if (years.some(function (year) { return !Number.isInteger(year); })) {
+      errors.push("renewalChart: categories must be calendar years");
+    } else if (years.some(function (year, index) { return index > 0 && year !== years[index - 1] + 1; })) {
+      errors.push("renewalChart: categories must be consecutive years");
+    }
+    if (period && years.length && years[years.length - 1] !== period.year) {
+      errors.push("renewalChart: latest year must match report.scope.period");
+    }
+    if (series.length !== RENEWAL_SERIES_CONTRACT.length) {
+      errors.push("renewalChart: exactly four fixed series are required");
+      return;
+    }
+    RENEWAL_SERIES_CONTRACT.forEach(function (expected, index) {
+      var actual = series[index] || {};
+      if (actual.name !== expected.name) errors.push("renewalChart: series[" + index + "] must be " + expected.name);
+      if (actual.type !== expected.type) errors.push("renewalChart: " + expected.name + " must use " + expected.type);
+      if (Number(actual.axis || 0) !== expected.axis) errors.push("renewalChart: " + expected.name + " uses the wrong axis");
+      if (expected.stack && actual.stack !== expected.stack) errors.push("renewalChart: update bars must use stack=updates");
+    });
+  }
+
+  function validateCompetitorTable(payload, errors) {
+    var spec = getPath(payload, "report.tables.competitor_updates");
+    if (!isObject(spec)) {
+      errors.push("competitor_updates: table contract is required");
+      return;
+    }
+    if (["pending", "ready", "no_data"].indexOf(spec.status) === -1) {
+      errors.push("competitor_updates: status must be pending, ready, or no_data");
+    }
+    if (spec.status === "no_data" && !spec.reason) errors.push("competitor_updates: no_data requires reason");
+    if (spec.status !== "ready") return;
+    var period = reportPeriod(payload);
+    if (!period) errors.push("competitor_updates: report.scope.period must be YYYY-MM");
+    if (period && spec.as_of_period !== period.value) errors.push("competitor_updates: as_of_period must equal report.scope.period");
+    if (!spec.comparison_period) errors.push("competitor_updates: comparison_period is required");
+    var columns = Array.isArray(spec.columns) ? spec.columns : [];
+    if (columns.length !== COMPETITOR_COLUMNS.length) {
+      errors.push("competitor_updates: exactly four fixed columns are required");
+    } else {
+      COMPETITOR_COLUMNS.forEach(function (expected, index) {
+        var actual = columns[index] || {};
+        if (actual.key !== expected.key || actual.label !== expected.label) {
+          errors.push("competitor_updates: column[" + index + "] must be " + expected.label + " (" + expected.key + ")");
+        }
+      });
+    }
+    var rows = Array.isArray(spec.rows) ? spec.rows : [];
+    if (rows.length !== COMPETITOR_BRAND_GROUPS.length) {
+      errors.push("competitor_updates: ready table requires exactly five fixed brand groups");
+    }
+    rows.forEach(function (row, index) {
+      if (!row || !row.brand_group) errors.push("competitor_updates: row[" + index + "] requires brand_group");
+      if (row && row.brand_group !== COMPETITOR_BRAND_GROUPS[index]) {
+        errors.push("competitor_updates: row[" + index + "] must be " + COMPETITOR_BRAND_GROUPS[index]);
+      }
+      ["update_count", "ytd_yoy_delta", "average_cycle_days"].forEach(function (key) {
+        if (!Number.isFinite(Number(row && row[key]))) errors.push("competitor_updates: row[" + index + "]." + key + " must be numeric");
+      });
+      if (row && (!Number.isInteger(Number(row.update_count)) || Number(row.update_count) < 0)) {
+        errors.push("competitor_updates: row[" + index + "].update_count must be a non-negative integer");
+      }
+      if (row && !Number.isInteger(Number(row.ytd_yoy_delta))) {
+        errors.push("competitor_updates: row[" + index + "].ytd_yoy_delta must be an integer count delta");
+      }
+      if (row && Number(row.average_cycle_days) < 0) {
+        errors.push("competitor_updates: row[" + index + "].average_cycle_days must be non-negative");
+      }
+    });
+    if (!Array.isArray(spec.query_ids) || !spec.query_ids.length) {
+      errors.push("competitor_updates: ready table requires query_ids");
+    }
+  }
+
   function validatePayload(payload) {
     var errors = [];
     var warnings = [];
@@ -109,6 +208,7 @@
         if (!Array.isArray(spec.query_ids) || !spec.query_ids.length) {
           errors.push(chartId + ": ready chart requires query_ids");
         }
+        if (chartId === "renewalChart") validateRenewalChart(spec, payload, errors);
       }
       if (spec.status === "no_data" && !spec.reason) errors.push(chartId + ": no_data requires reason");
     });
@@ -117,6 +217,8 @@
       if (payload.charts && payload.charts[chartId]) errors.push("Removed chart must not be present: " + chartId);
       if (document.getElementById(chartId)) errors.push("Removed chart DOM still exists: " + chartId);
     });
+
+    validateCompetitorTable(payload, errors);
 
     var quality = isObject(payload.quality) ? payload.quality : {};
     if (quality.status === "final" && quality.completed_tasks !== quality.plan_tasks) {
@@ -137,6 +239,27 @@
         else node.setAttribute("datetime", String(value));
       }
     });
+  }
+
+  function renderIterationMeta(payload) {
+    var period = reportPeriod(payload);
+    var spec = getPath(payload, "charts.renewalChart") || {};
+    var categories = Array.isArray(spec.categories) ? spec.categories : [];
+    var firstYear = categories.length ? categories[0] : period && period.year - 5;
+    var lastYear = categories.length ? categories[categories.length - 1] : period && period.year;
+    var title = document.getElementById("renewalTitle");
+    var subtitle = document.getElementById("renewalSubtitle");
+    var competitorSubtitle = document.getElementById("competitorSubtitle");
+    if (title && firstYear && lastYear) title.textContent = "年度更新次数与更新周期（" + firstYear + "–" + lastYear + "）";
+    if (subtitle) {
+      subtitle.textContent = "堆叠柱：传统能源·新能源更新次数；折线：两类平均上市周期（天）" +
+        (period ? " | " + period.year + " 年为截至 " + period.month + " 月数据" : "");
+    }
+    if (competitorSubtitle) {
+      competitorSubtitle.textContent = period
+        ? "固定五家企业；" + period.year + " 年 1–" + period.month + " 月累计，同比为上年同期累计增减"
+        : "固定五家企业；默认展示报告年份，更新同比为年初累计相对上年同期";
+    }
   }
 
   function metricMarkup(item) {
@@ -246,6 +369,10 @@
       var spec = getPath(payload, "report.tables." + key) || {};
       var columns = Array.isArray(spec.columns) ? spec.columns : [];
       var rows = Array.isArray(spec.rows) ? spec.rows : [];
+      if (key === "competitor_updates") {
+        columns = COMPETITOR_COLUMNS;
+        rows = rows.slice(0, 5);
+      }
       table.textContent = "";
       var thead = document.createElement("thead");
       var headerRow = document.createElement("tr");
@@ -271,7 +398,17 @@
           var tr = document.createElement("tr");
           columns.forEach(function (column) {
             var td = document.createElement("td");
-            td.textContent = displayValue(row[column.key], "—");
+            var rawValue = row[column.key];
+            if (key === "competitor_updates" && column.key === "ytd_yoy_delta" && Number.isFinite(Number(rawValue))) {
+              var delta = Number(rawValue);
+              td.textContent = delta > 0 ? "+" + delta : delta < 0 ? "−" + Math.abs(delta) : "0";
+              if (delta > 0) td.classList.add("delta-up");
+              if (delta < 0) td.classList.add("delta-down");
+            } else if (key === "competitor_updates" && column.key === "average_cycle_days" && Number.isFinite(Number(rawValue))) {
+              td.textContent = Number(rawValue).toLocaleString("zh-CN", { maximumFractionDigits: 1 }) + " 天";
+            } else {
+              td.textContent = displayValue(rawValue, "—");
+            }
             tr.appendChild(td);
           });
           tbody.appendChild(tr);
@@ -299,7 +436,7 @@
     };
   }
 
-  function makeCartesianOption(spec) {
+  function makeCartesianOption(spec, chartId) {
     var option = baseOption();
     option.xAxis.data = spec.categories || [];
     var usesSecondAxis = (spec.series || []).some(function (series) { return Number(series.axis || 0) === 1; });
@@ -318,26 +455,40 @@
       return option;
     }
     option.series = (spec.series || []).map(function (series, index) {
+      var renewalStyle = chartId === "renewalChart" ? RENEWAL_SERIES_CONTRACT[index] : null;
       var type = series.type || (spec.kind === "line" ? "line" : "bar");
       var output = {
         name: series.name,
         type: type,
         data: series.data,
         yAxisIndex: Number(series.axis || 0),
-        itemStyle: { color: series.color || COLORS[index % COLORS.length] }
+        itemStyle: { color: (renewalStyle && renewalStyle.color) || series.color || COLORS[index % COLORS.length] }
       };
       if (type === "bar") {
-        output.barMaxWidth = 38;
-        if (spec.kind === "percent_stack" || series.stack) output.stack = series.stack || "total";
+        output.barMaxWidth = chartId === "renewalChart" ? 42 : 38;
+        if (chartId === "renewalChart") output.stack = "updates";
+        else if (spec.kind === "percent_stack" || series.stack) output.stack = series.stack || "total";
       }
       if (type === "line") {
         output.smooth = series.smooth !== false;
         output.symbol = "circle";
-        output.symbolSize = 6;
-        output.lineStyle = { width: 2 };
+        output.symbolSize = chartId === "renewalChart" ? 7 : 6;
+        output.lineStyle = { width: chartId === "renewalChart" ? 2.5 : 2, color: renewalStyle && renewalStyle.color };
       }
       return output;
     });
+    if (chartId === "renewalChart") {
+      if (!Array.isArray(option.yAxis)) {
+        option.yAxis = [option.yAxis, { type: "value", splitLine: { show: false }, axisLabel: axisLabel(), axisLine: { show: false }, axisTick: { show: false } }];
+      }
+      option.color = RENEWAL_SERIES_CONTRACT.map(function (item) { return item.color; });
+      option.grid = { left: 52, right: 50, top: 42, bottom: 56, containLabel: true };
+      option.yAxis[0].name = "更新次数";
+      option.yAxis[0].nameTextStyle = { color: "#73828a", fontSize: 9 };
+      option.yAxis[1].name = "周期/天";
+      option.yAxis[1].nameTextStyle = { color: "#73828a", fontSize: 9 };
+      option.tooltip.axisPointer = { type: "line", lineStyle: { color: "#aebbc1", type: "dashed" } };
+    }
     return option;
   }
 
@@ -371,17 +522,9 @@
     if (fallback) fallback.textContent = displayValue(reason, "等待 Agent 填充已验证数据");
   }
 
-  function updateQueryChip(chartId, queryIds) {
-    var panel = document.querySelector('[data-chart-panel="' + chartId + '"]');
-    var chip = panel && panel.querySelector(".source-chip");
-    if (!chip) return;
-    chip.textContent = Array.isArray(queryIds) && queryIds.length ? "QUERY: " + queryIds.join(" / ") : "QUERY REQUIRED";
-  }
-
   function renderChart(chartId, spec) {
     var element = document.getElementById(chartId);
     if (!element || !spec) return;
-    updateQueryChip(chartId, spec.query_ids);
     var panel = document.querySelector('[data-chart-panel="' + chartId + '"]');
     if (spec.status !== "ready") {
       setChartEmpty(chartId, spec.reason);
@@ -406,7 +549,7 @@
     }
     destroyChart(chartId);
     if (panel) panel.classList.remove("chart-empty");
-    var option = chartSpec.kind === "heatmap" ? makeHeatmapOption(chartSpec) : makeCartesianOption(chartSpec);
+    var option = chartSpec.kind === "heatmap" ? makeHeatmapOption(chartSpec) : makeCartesianOption(chartSpec, chartId);
     var chart = window.echarts.init(element, null, { renderer: "svg" });
     chart.setOption(option, { notMerge: true, lazyUpdate: false, silent: true });
     chartInstances[chartId] = chart;
@@ -499,6 +642,7 @@
     currentPayload = payload;
     var validation = validatePayload(payload);
     renderBindings(payload);
+    renderIterationMeta(payload);
     renderRepeaters(payload);
     renderTables(payload);
     renderCharts(payload);

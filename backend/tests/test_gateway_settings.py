@@ -10,6 +10,7 @@ from langchain_core.messages import ToolMessage
 
 import config
 import higress_config_reader
+import provider_registry
 from app import app
 from graph.attachment_store import attachment_store
 from graph.deepagents_manager import (
@@ -17,6 +18,13 @@ from graph.deepagents_manager import (
     DeepAgentsAgentManager,
     _build_subagent_item,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_provider_registry(tmp_path, monkeypatch):
+    """Legacy config fixtures must not share a migrated user profile."""
+    monkeypatch.setenv("PUDDINGDATA_USER_DATA_DIR", str(tmp_path / "user-data"))
+    monkeypatch.setattr(provider_registry, "_default_registry_instance", None)
 
 
 def _stored_image_attachment(tmp_path, session_id: str = "session-attachments"):
@@ -274,6 +282,38 @@ def test_gateway_has_no_key_and_provider_key_is_masked(tmp_path, monkeypatch):
     assert "enabled" not in saved["ai_gateway"]
 
 
+def test_provider_connection_check_is_separate_from_model_discovery(monkeypatch):
+    called: dict[str, object] = {}
+
+    def fake_test_endpoint(self, provider_id, endpoint_id, *, base_url="", api_key=""):
+        called.update(
+            provider_id=provider_id,
+            endpoint_id=endpoint_id,
+            base_url=base_url,
+            api_key=api_key,
+        )
+        return {"reachable": True, "status_code": 204}
+
+    monkeypatch.setattr(provider_registry.ProviderRegistry, "test_endpoint", fake_test_endpoint)
+
+    response = TestClient(app).post(
+        "/api/providers/deepseek/endpoints/deepseek-openai/test-connection",
+        json={"base_url": "https://example.test/v1", "api_key": "unsaved-test-key"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True
+    assert body["reachable"] is True
+    assert body["status_code"] == 204
+    assert called == {
+        "provider_id": "deepseek",
+        "endpoint_id": "deepseek-openai",
+        "base_url": "https://example.test/v1",
+        "api_key": "unsaved-test-key",
+    }
+
+
 def test_multimodal_embedding_settings_are_separate_from_openai_embedding(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     config_path.write_text(
@@ -302,11 +342,15 @@ def test_multimodal_embedding_settings_are_separate_from_openai_embedding(tmp_pa
     mm = config.get_multimodal_embedding_config()
     assert mm["model"] == "qwen2.5-vl-embedding"
     assert mm["dimension"] == 1024
-    assert mm["base_url"] == "http://localhost:8080"
+    # Legacy Higress passthrough is retained as an archived config value, but
+    # the active multimodal binding resolves to DashScope's native endpoint.
+    assert mm["base_url"] == "https://dashscope.aliyuncs.com"
     assert mm["route_path"].endswith("/multimodal-embedding")
 
     displayed = config.get_settings_for_display()
-    assert displayed["multimodal_embedding"]["api_key_masked"].endswith("5678")
+    # Bailian endpoints share the OpenAI-compatible credential selected during
+    # the lossless Provider migration.
+    assert displayed["multimodal_embedding"]["api_key_masked"].endswith("1234")
     assert displayed["multimodal_embedding"]["openai_compatible"] is False
     assert "api_key" not in displayed["multimodal_embedding"]
 
@@ -316,6 +360,7 @@ def test_multimodal_embedding_settings_are_separate_from_openai_embedding(tmp_pa
                 "base_url": "http://higress:8080",
                 "model": "qwen3-vl-embedding",
                 "dimension": 2560,
+                "batch_size": 6,
             }
         }
     )
@@ -323,6 +368,9 @@ def test_multimodal_embedding_settings_are_separate_from_openai_embedding(tmp_pa
     assert saved["multimodal_embedding"]["base_url"] == "http://higress:8080"
     assert saved["multimodal_embedding"]["model"] == "qwen3-vl-embedding"
     assert saved["multimodal_embedding"]["dimension"] == 2560
+    # Provider Registry owns the selected model and its dimensions, while the
+    # knowledge-index runtime keeps a separately tunable request concurrency.
+    assert config.get_multimodal_embedding_config()["batch_size"] == 6
 
 
 def test_multimodal_embedding_can_reuse_higress_qwen_token(tmp_path, monkeypatch):
@@ -891,6 +939,7 @@ def test_subagent_route_hint_is_exposed_through_native_description():
     assert "Use this subagent when the main request matches this routing hint: `image_input`." in spec["description"]
     assert "native task tool" in spec["description"]
     assert "runnable" not in spec
+    assert spec["model"]._client.binding == "image_analyzer"
     assert any(isinstance(item, AttachmentImageContentMiddleware) for item in spec["middleware"])
 
 
@@ -962,6 +1011,29 @@ def test_agent_messages_do_not_inline_images_for_main_agent():
     assert isinstance(messages[-1].content, str)
     assert "image_analyzer" in messages[-1].content
     assert "subagent_type=image_analyzer" in messages[-1].content
+
+
+def test_agent_messages_rebuild_attachment_refs_from_history():
+    messages = DeepAgentsAgentManager._build_messages(
+        [
+            {
+                "role": "user",
+                "content": "这图讲了什么",
+                "attachments": [
+                    {"id": "att_history1", "type": "image", "name": "image.png"}
+                ],
+            }
+        ],
+        "继续",
+        session_id="session-history",
+    )
+
+    historical_content = messages[0].content
+    assert isinstance(historical_content, str)
+    assert "harness_attachment_session_id: session-history" in historical_content
+    assert "att_history1: image.png (image)" in historical_content
+    assert "subagent_type=image_analyzer" in historical_content
+    assert "data:image" not in historical_content
 
 
 def test_agent_collects_image_inputs_for_native_task_subagent(tmp_path):

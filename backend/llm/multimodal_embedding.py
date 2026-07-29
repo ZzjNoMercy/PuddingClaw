@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import os
+import asyncio
 import base64
 import mimetypes
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from http import HTTPStatus
 from pathlib import Path
 from typing import Any, Callable
 
@@ -16,8 +15,7 @@ from llama_index.core.embeddings import MultiModalEmbedding
 from llama_index.core.schema import ImageType
 from pydantic import PrivateAttr
 
-import capabilities
-from config import get_gateway_config, get_multimodal_embedding_config
+from config import get_multimodal_embedding_config
 
 EmbeddingProgressCallback = Callable[[str, int, int], None]
 
@@ -34,7 +32,6 @@ class DashScopeMultiModalEmbedding(MultiModalEmbedding):
     _dimension: int = PrivateAttr(default=1024)
     _base_url: str = PrivateAttr(default="")
     _route_path: str = PrivateAttr(default="")
-    _use_http: bool = PrivateAttr(default=False)
     _progress_callback: EmbeddingProgressCallback | None = PrivateAttr(default=None)
     _progress_totals: dict[str, int] = PrivateAttr(default_factory=dict)
     _progress_done: dict[str, int] = PrivateAttr(default_factory=dict)
@@ -48,23 +45,24 @@ class DashScopeMultiModalEmbedding(MultiModalEmbedding):
         dimension: int = 1024,
         base_url: str = "",
         route_path: str = "/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding",
-        use_http: bool = False,
+        use_http: bool = True,
         progress_callback: EmbeddingProgressCallback | None = None,
         progress_totals: dict[str, int] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(model_name=model_name, **kwargs)
-        self._api_key = api_key or os.getenv("DASHSCOPE_API_KEY") or os.getenv("EMBEDDING_API_KEY") or ""
+        self._api_key = api_key or ""
         self._dimension = dimension
         self._base_url = base_url.rstrip("/")
         self._route_path = route_path if route_path.startswith("/") else f"/{route_path}"
-        self._use_http = bool(use_http and self._base_url)
         self._progress_callback = progress_callback
         self._progress_totals = progress_totals or {}
         self._progress_done = {"text": 0, "image": 0}
         self._progress_lock = threading.Lock()
-        if not self._api_key and not self._use_http:
-            raise ValueError("DashScope multimodal embedding requires DASHSCOPE_API_KEY or EMBEDDING_API_KEY.")
+        if not self._api_key:
+            raise ValueError("DashScope multimodal embedding credential is not configured for the selected Provider endpoint.")
+        if not self._base_url:
+            raise ValueError("DashScope multimodal embedding endpoint is not configured.")
 
     def set_progress_callback(
         self,
@@ -111,48 +109,21 @@ class DashScopeMultiModalEmbedding(MultiModalEmbedding):
         return [embedding for embedding in results if embedding is not None]
 
     def _call_api(self, input_data: list[dict[str, str]]) -> list[list[float]]:
-        if self._use_http:
-            return self._call_http_api(input_data)
-
-        try:
-            import dashscope
-        except ImportError as exc:
-            raise RuntimeError(
-                "dashscope is not installed. Install the optional multimodal dependencies first."
-            ) from exc
-
-        dashscope.api_key = self._api_key
-        response = dashscope.MultiModalEmbedding.call(model=self.model_name, input=input_data)
-        if response.status_code != HTTPStatus.OK:
-            message = getattr(response, "message", "") or str(response)
-            raise RuntimeError(f"DashScope multimodal embedding failed: {message}")
-        embeddings = response.output.get("embeddings", []) if getattr(response, "output", None) else []
-        if not embeddings:
-            raise RuntimeError(f"DashScope multimodal embedding returned no embeddings: {response}")
-        return [list(item["embedding"]) for item in embeddings]
+        # Use a per-request client rather than DashScope's module globals.
+        # This prevents different projects/providers from crossing keys or URLs
+        # when multimodal indexing runs concurrently.
+        return self._call_http_api(input_data)
 
     def _call_http_api(self, input_data: list[dict[str, str]]) -> list[list[float]]:
-        """Call a DashScope-native endpoint, optionally exposed through Higress.
-
-        This is intentionally not OpenAI-compatible. A Higress route for this
-        mode should proxy DashScope's native multimodal embedding path.
-        """
+        """Call the explicit DashScope-native Provider endpoint."""
 
         url = f"{self._base_url}{self._route_path}"
         headers = {"Content-Type": "application/json"}
-        if self._api_key:
-            headers["Authorization"] = f"Bearer {self._api_key}"
-        else:
-            # For a user-managed Higress route that injects upstream auth.
-            headers["Authorization"] = "Bearer puddingclaw-gateway"
-        response = httpx.post(
-            url,
-            headers=headers,
-            json={"model": self.model_name, "input": input_data},
-            timeout=120.0,
-        )
-        response.raise_for_status()
-        payload = response.json()
+        headers["Authorization"] = f"Bearer {self._api_key}"
+        with httpx.Client(timeout=120.0) as client:
+            response = client.post(url, headers=headers, json={"model": self.model_name, "input": input_data})
+            response.raise_for_status()
+            payload = response.json()
         output = payload.get("output", {}) if isinstance(payload, dict) else {}
         embeddings = output.get("embeddings", [])
         if not embeddings:
@@ -174,7 +145,7 @@ class DashScopeMultiModalEmbedding(MultiModalEmbedding):
         input_items: list[dict[str, str]] = []
         for img_file_path in img_file_paths:
             abs_path = Path(str(img_file_path)).expanduser().resolve()
-            image = self._image_payload_for_http(abs_path) if self._use_http else f"file://{abs_path}"
+            image = self._image_payload_for_http(abs_path)
             input_items.append({"image": image})
         # DashScope multimodal embedding rejects repeated input types in one
         # request, e.g. [{"image": ...}, {"image": ...}]. Keep the LlamaIndex
@@ -194,38 +165,31 @@ class DashScopeMultiModalEmbedding(MultiModalEmbedding):
         return self._call_api([{"text": query}])[0]
 
     async def _aget_image_embedding(self, img_file_path: ImageType) -> list[float]:
-        return self._get_image_embedding(img_file_path)
+        return await asyncio.to_thread(self._get_image_embedding, img_file_path)
 
     async def _aget_image_embeddings(self, img_file_paths: list[ImageType]) -> list[list[float]]:
-        return self._get_image_embeddings(img_file_paths)
+        return await asyncio.to_thread(self._get_image_embeddings, img_file_paths)
 
     async def _aget_text_embedding(self, text: str) -> list[float]:
-        return self._get_text_embedding(text)
+        return await asyncio.to_thread(self._get_text_embedding, text)
 
     async def _aget_text_embeddings(self, texts: list[str]) -> list[list[float]]:
-        return self._get_text_embeddings(texts)
+        return await asyncio.to_thread(self._get_text_embeddings, texts)
 
     async def _aget_query_embedding(self, query: str) -> list[float]:
-        return self._get_query_embedding(query)
+        return await asyncio.to_thread(self._get_query_embedding, query)
 
 
 def get_multimodal_embedding_model() -> DashScopeMultiModalEmbedding:
     cfg = get_multimodal_embedding_config()
-    gateway = get_gateway_config()
-    use_gateway = bool(cfg.get("prefer_gateway") and (cfg.get("base_url") or gateway.get("base_url")))
-    if use_gateway:
-        try:
-            use_gateway = capabilities.detect_capabilities_sync().ai_gateway.available
-        except Exception:
-            use_gateway = bool(cfg.get("base_url"))
-
-    base_url = cfg.get("base_url") or (gateway.get("base_url", "").removesuffix("/v1") if use_gateway else "")
+    if cfg.get("protocol") != "dashscope_multimodal_embedding":
+        raise ValueError(f"Multimodal embedding requires a DashScope native endpoint, got {cfg.get('protocol')}")
     return DashScopeMultiModalEmbedding(
         model_name=cfg.get("model", "qwen2.5-vl-embedding"),
         dimension=int(cfg.get("dimension", 1024)),
         embed_batch_size=int(cfg.get("batch_size", 10)),
         api_key=cfg.get("api_key", ""),
-        base_url=base_url,
+        base_url=cfg.get("base_url", ""),
         route_path=cfg.get("route_path", "/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding"),
-        use_http=use_gateway,
+        use_http=True,
     )

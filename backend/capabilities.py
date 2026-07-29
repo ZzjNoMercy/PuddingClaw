@@ -1,7 +1,7 @@
 """可选基础设施能力探测。
 
-在 core/full 混合部署下，backend 启动时异步检测 PostgreSQL、Higress、Milvus、MinerU 是否可用，
-业务代码通过 detect_capabilities() 获取结果并自动 fallback。
+在 core/full 混合部署下，backend 启动时异步检测 PostgreSQL、Milvus、MinerU 是否可用。
+``ai_gateway`` 仅保留为兼容状态字段，恒为 retired；业务请求不再依赖它。
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import httpx
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from config import get_database_config, get_gateway_config, get_knowledge_mineru_config
+from config import get_database_config, get_knowledge_mineru_config
 
 logger = logging.getLogger(__name__)
 
@@ -31,28 +31,6 @@ _CACHE_TTL = timedelta(seconds=60)
 DEFAULT_MILVUS_URL = "http://localhost:19530"
 DEFAULT_MINERU_URL = "http://localhost:8002"
 DEFAULT_POSTGRES_URL = ""
-
-# 当 AI_GATEWAY_URL 未配置时，自动探测这些地址
-# Higress 统一走 Docker full profile，backend 与 higress 在同一个 compose 网络内
-_DEFAULT_GATEWAY_URLS = [
-    "http://higress:8080/v1",
-]
-
-# 最后一次成功探测到的 Higress URL，供 ModelClient 等业务代码使用
-_EFFECTIVE_GATEWAY_URL: str | None = None
-
-
-def get_effective_gateway_url() -> str | None:
-    """返回当前生效的 Higress URL。
-
-    优先级：
-    1. 最近一次成功探测到的 URL（含自动探测）。
-    2. 显式配置的 URL（config.json / AI_GATEWAY_URL 环境变量）。
-    """
-    if _EFFECTIVE_GATEWAY_URL:
-        return _EFFECTIVE_GATEWAY_URL
-    return _resolve_explicit_gateway_url()
-
 
 @dataclass
 class CapabilityStatus:
@@ -157,84 +135,9 @@ async def _check_postgres(url: str | None) -> CapabilityStatus:
             await engine.dispose()
 
 
-def _normalize_gateway_url(url: str) -> str:
-    """把以 /v1 结尾的 gateway URL 归一化为 base URL（供 health check 使用）。"""
-    url = url.rstrip("/")
-    if url.endswith("/v1"):
-        return url[:-3]
-    return url
-
-
-def _resolve_explicit_gateway_url() -> str | None:
-    """返回用户显式配置的 Higress URL（参数 / config.json / 环境变量），未配置则返回 None。"""
-    gateway_config = get_gateway_config()
-    return gateway_config.get("base_url") or os.getenv("AI_GATEWAY_URL")
-
-
-def _build_gateway_urls(explicit_url: str | None = None) -> list[str]:
-    """构建待探测的 Higress URL 列表。
-
-    如果用户显式配置了 URL（参数 / config.json / 环境变量），只探测该 URL；
-    未配置时才 fallback 到默认 URL 列表。
-    """
-    urls: list[str] = []
-    if explicit_url:
-        urls.append(explicit_url)
-    explicit_config = _resolve_explicit_gateway_url()
-    if explicit_config and explicit_config not in urls:
-        urls.append(explicit_config)
-    # 只有完全没有显式配置时，才尝试自动探测默认地址
-    if not urls:
-        urls.extend(_DEFAULT_GATEWAY_URLS)
-    return urls
-
-
-
-async def _check_gateway_urls(health_path: str, explicit_url: str | None = None) -> CapabilityStatus:
-    """按优先级探测 Higress URL。"""
-    global _EFFECTIVE_GATEWAY_URL
-    urls_to_try = _build_gateway_urls(explicit_url)
-
-    if not urls_to_try:
-        return CapabilityStatus(available=False, reason="URL not configured")
-
-    last_status: CapabilityStatus | None = None
-    for url in urls_to_try:
-        base_url = _normalize_gateway_url(url)
-        # Higress all-in-one 启动初期可能响应较慢，给 5 秒
-        last_status = await _check_http_get(base_url, health_path, timeout=5.0)
-        if last_status.available:
-            _EFFECTIVE_GATEWAY_URL = url
-            logger.info("[capabilities] Higress detected at %s", url)
-            return CapabilityStatus(available=True)
-    _EFFECTIVE_GATEWAY_URL = None
-    return last_status or CapabilityStatus(available=False, reason="URL not configured")
-
-
-def _check_gateway_urls_sync(health_path: str, explicit_url: str | None = None) -> CapabilityStatus:
-    """_check_gateway_urls 的同步版本。"""
-    global _EFFECTIVE_GATEWAY_URL
-    urls_to_try = _build_gateway_urls(explicit_url)
-
-    if not urls_to_try:
-        return CapabilityStatus(available=False, reason="URL not configured")
-
-    last_status: CapabilityStatus | None = None
-    for url in urls_to_try:
-        base_url = _normalize_gateway_url(url)
-        last_status = _check_http_get_sync(base_url, health_path, timeout=5.0)
-        if last_status.available:
-            _EFFECTIVE_GATEWAY_URL = url
-            logger.info("[capabilities] Higress detected at %s", url)
-            return CapabilityStatus(available=True)
-    _EFFECTIVE_GATEWAY_URL = None
-    return last_status or CapabilityStatus(available=False, reason="URL not configured")
-
-
 async def detect_capabilities(
     *,
     force: bool = False,
-    ai_gateway_url: str | None = None,
     postgres_url: str | None = None,
     milvus_url: str | None = None,
     mineru_url: str | None = None,
@@ -243,7 +146,6 @@ async def detect_capabilities(
 
     Args:
         force: 是否强制重新探测，忽略缓存。
-        ai_gateway_url: 显式指定 Higress URL；默认读 AI_GATEWAY_URL 环境变量。
         postgres_url: 显式指定 PostgreSQL URL；默认读 Settings 中的数据库配置。
         milvus_url: 显式指定 Milvus URL；默认读 MILVUS_URL 环境变量。
         mineru_url: 显式指定 MinerU URL；默认读 config.json 的 knowledge.mineru.base_url。
@@ -257,8 +159,6 @@ async def detect_capabilities(
         if datetime.now(timezone.utc) - _CAPABILITIES_CACHED_AT < _CACHE_TTL:
             return _CAPABILITIES_CACHE
 
-    gateway_config = get_gateway_config()
-    gateway_health_path = str(gateway_config.get("health_path", "/health"))
     postgres_target = _resolve_postgres_url(postgres_url)
     milvus_target = milvus_url or os.getenv("MILVUS_URL") or DEFAULT_MILVUS_URL
     mineru_config = get_knowledge_mineru_config()
@@ -266,16 +166,15 @@ async def detect_capabilities(
 
     results = await asyncio.gather(
         _check_postgres(postgres_target),
-        _check_gateway_urls(gateway_health_path, explicit_url=ai_gateway_url),
         _check_milvus(milvus_target),
         _check_http_get(mineru_target, "/health"),
     )
 
     caps = Capabilities(
         database=results[0],
-        ai_gateway=results[1],
-        milvus=results[2],
-        mineru=results[3],
+        ai_gateway=CapabilityStatus(available=False, reason="Retired: use direct Provider endpoints"),
+        milvus=results[1],
+        mineru=results[2],
     )
 
     _CAPABILITIES_CACHE = caps
@@ -287,7 +186,6 @@ async def detect_capabilities(
 def detect_capabilities_sync(
     *,
     force: bool = False,
-    ai_gateway_url: str | None = None,
     postgres_url: str | None = None,
     milvus_url: str | None = None,
     mineru_url: str | None = None,
@@ -307,7 +205,6 @@ def detect_capabilities_sync(
         logger.debug("[capabilities] running loop detected, using sync checks")
         return _detect_capabilities_sync_fallback(
             force=force,
-            ai_gateway_url=ai_gateway_url,
             postgres_url=postgres_url,
             milvus_url=milvus_url,
             mineru_url=mineru_url,
@@ -316,7 +213,6 @@ def detect_capabilities_sync(
         return asyncio.run(
             detect_capabilities(
                 force=force,
-                ai_gateway_url=ai_gateway_url,
                 postgres_url=postgres_url,
                 milvus_url=milvus_url,
                 mineru_url=mineru_url,
@@ -327,7 +223,6 @@ def detect_capabilities_sync(
         logger.debug("[capabilities] asyncio.run failed (%s), falling back to sync checks", exc)
         return _detect_capabilities_sync_fallback(
             force=force,
-            ai_gateway_url=ai_gateway_url,
             postgres_url=postgres_url,
             milvus_url=milvus_url,
             mineru_url=mineru_url,
@@ -337,7 +232,6 @@ def detect_capabilities_sync(
 def _detect_capabilities_sync_fallback(
     *,
     force: bool = False,
-    ai_gateway_url: str | None = None,
     postgres_url: str | None = None,
     milvus_url: str | None = None,
     mineru_url: str | None = None,
@@ -349,8 +243,6 @@ def _detect_capabilities_sync_fallback(
         if datetime.now(timezone.utc) - _CAPABILITIES_CACHED_AT < _CACHE_TTL:
             return _CAPABILITIES_CACHE
 
-    gateway_config = get_gateway_config()
-    gateway_health_path = str(gateway_config.get("health_path", "/health"))
     postgres_target = _resolve_postgres_url(postgres_url)
     milvus_target = milvus_url or os.getenv("MILVUS_URL") or DEFAULT_MILVUS_URL
     mineru_config = get_knowledge_mineru_config()
@@ -358,7 +250,7 @@ def _detect_capabilities_sync_fallback(
 
     caps = Capabilities(
         database=_check_postgres_sync(postgres_target),
-        ai_gateway=_check_gateway_urls_sync(gateway_health_path, explicit_url=ai_gateway_url),
+        ai_gateway=CapabilityStatus(available=False, reason="Retired: use direct Provider endpoints"),
         milvus=_check_milvus_sync(milvus_target),
         mineru=_check_http_get_sync(mineru_target, "/health"),
     )

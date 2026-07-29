@@ -15,7 +15,6 @@ export interface ElectronAPI {
   getInfraStatus: () => Promise<{
     docker: boolean;
     postgres: string;
-    higress: string;
     milvus: string;
     status: string;
     error: string | null;
