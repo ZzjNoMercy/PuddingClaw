@@ -14,8 +14,12 @@ the returned Schema Bundle as authoritative.
 
 For Ingest, read only the selected raw snapshots returned by the context tool.
 Generate complete Wiki pages with the required frontmatter, then call
-`llm_wiki_publish` with the unchanged bundle hash and raw paths. Do not write
-`raw/`, `wiki/`, `index.md`, or `log.md` through generic filesystem tools.
+`llm_wiki_publish` with the unchanged bundle hash and raw paths. Every
+frontmatter `sources` entry must copy the context's `snapshot_path` verbatim;
+never add a `raw/` prefix. Page slugs and wikilinks are relative to the
+`wiki/` root: use `concepts/<slug>` and `[[concepts/<slug>]]`, never
+`wiki/concepts/<slug>`. Do not write `raw/`, `wiki/`, `index.md`, or `log.md`
+through generic filesystem tools.
 
 For Query, prefer the allowlisted gbrain MCP tools when available. Otherwise
 use `llm_wiki_query`. Cite Wiki slugs and their `sources`; report a knowledge

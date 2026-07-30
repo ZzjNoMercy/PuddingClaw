@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import asyncio
+import hashlib
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 JOB_TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
 VECTOR_PUBLISH_KIND = "vector_publish"
 VANNA_ENTITY_IMPORT_KIND = "vanna_entity_import"
+LLM_WIKI_INGEST_KIND = "llm_wiki_ingest"
 
 
 def job_kind(job: KnowledgeImportJob) -> str:
@@ -163,6 +164,16 @@ def job_to_list_dict(job: KnowledgeImportJob) -> dict[str, Any]:
         "alias_columns",
         "max_values",
         "progress_detail",
+        "raw_paths",
+        "raw_count",
+        "bundle_hash",
+        "agents_sha256",
+        "compiler_model_id",
+        "compiler_model",
+        "compiler_provider",
+        "compiler_runtime",
+        "published_pages",
+        "lint_ok",
     ):
         if key in metadata:
             slim_metadata[key] = metadata[key]
@@ -260,6 +271,84 @@ async def create_import_job(
     )
     session.add(job)
     session.add(KnowledgeImportEvent(job_id=job.id, level="info", message="任务已加入导入队列"))
+    await session.commit()
+    await session.refresh(job)
+    return job
+
+
+async def create_llm_wiki_ingest_job(
+    session: AsyncSession,
+    *,
+    base_dir: Path,
+    raw_paths: list[str],
+    knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+) -> KnowledgeImportJob:
+    """Queue one immutable, Schema-bound LLM Wiki compilation."""
+
+    from config import get_llm_wiki_compiler_agent_config
+    from knowledge.llm_wiki import get_llm_wiki_service
+
+    service = KnowledgeService(base_dir)
+    await service.ensure_default_knowledge_base(session)
+    selected_paths = list(dict.fromkeys(str(path).strip() for path in raw_paths if str(path).strip()))
+    if not selected_paths:
+        raise KnowledgeServiceError("请至少选择一个待编译的 Raw 快照。")
+
+    wiki = get_llm_wiki_service(base_dir)
+    context = wiki.operation_context("ingest", raw_paths=selected_paths)
+    manifest = context.get("raw_manifest") if isinstance(context.get("raw_manifest"), list) else []
+    if len(manifest) != len(selected_paths):
+        raise KnowledgeServiceError("部分 Raw 快照不在当前不可变清单中，请刷新后重试。")
+    manifest_by_path = {str(item.get("snapshot_path") or ""): item for item in manifest if isinstance(item, dict)}
+    ordered_manifest = [manifest_by_path[path] for path in selected_paths]
+    bundle = context.get("schema_bundle") if isinstance(context.get("schema_bundle"), dict) else {}
+    agents = bundle.get("agents") if isinstance(bundle.get("agents"), dict) else {}
+    file_size = sum(int(item.get("size_bytes") or 0) for item in ordered_manifest)
+    raw_hashes = {path: str(manifest_by_path[path].get("sha256") or "") for path in selected_paths}
+    compiler = get_llm_wiki_compiler_agent_config()
+
+    job = KnowledgeImportJob(
+        id=new_id("job"),
+        knowledge_base_id=knowledge_base_id,
+        status="queued",
+        file_name=f"{len(selected_paths)} 个 Raw 快照",
+        file_type="llm_wiki",
+        file_size=file_size,
+        source_path="llm-wiki://raw",
+        source_sha256=hashlib.sha256(
+            "\n".join(f"{path}:{raw_hashes[path]}" for path in selected_paths).encode("utf-8")
+        ).hexdigest(),
+        title=f"LLM Wiki 编译（{len(selected_paths)} 个 Raw）",
+        publish_targets=["llm_wiki", "gbrain"],
+        current_step="queued",
+        progress=0,
+        job_metadata={
+            "kind": LLM_WIKI_INGEST_KIND,
+            "raw_paths": selected_paths,
+            "raw_count": len(selected_paths),
+            "raw_hashes": raw_hashes,
+            "bundle_hash": str(bundle.get("bundle_hash") or ""),
+            "agents_sha256": str(agents.get("sha256") or ""),
+            "compiler_model_id": str(compiler.get("model_id") or ""),
+            "compiler_model": str(compiler.get("model") or ""),
+            "compiler_provider": str(compiler.get("provider") or ""),
+            "compiler_runtime": "llm_wiki_compiler_agent",
+            "deepagents_backend": "/knowledge/brain/wiki/",
+        },
+    )
+    session.add(job)
+    session.add(
+        KnowledgeImportEvent(
+            job_id=job.id,
+            level="info",
+            message=f"LLM Wiki 编译任务已加入队列，共 {len(selected_paths)} 个 Raw 快照",
+            event_metadata={
+                "raw_paths": selected_paths,
+                "compiler_model_id": str(compiler.get("model_id") or ""),
+                "compiler_model": str(compiler.get("model") or ""),
+            },
+        )
+    )
     await session.commit()
     await session.refresh(job)
     return job
@@ -549,6 +638,8 @@ async def claim_next_job(session: AsyncSession) -> KnowledgeImportJob | None:
         message = "开始导入向量"
     elif kind == VANNA_ENTITY_IMPORT_KIND:
         message = "开始导入实体"
+    elif kind == LLM_WIKI_INGEST_KIND:
+        message = "开始编译 LLM Wiki"
     else:
         message = "开始导入"
     session.add(KnowledgeImportEvent(job_id=job.id, level="info", message=message))

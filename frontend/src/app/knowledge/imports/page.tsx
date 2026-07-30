@@ -2,13 +2,14 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import {
   AlertCircle,
-  ArrowLeft,
   CheckCircle2,
   Clock3,
   Database,
   FileText,
+  BookOpenCheck,
   Loader2,
   RefreshCw,
   RotateCcw,
@@ -74,7 +75,7 @@ function JobIcon({ status }: { status: string }) {
   return <Clock3 className="h-5 w-5 text-gray-400" />;
 }
 
-type JobFilter = "all" | "file" | "vector" | "entity";
+type JobFilter = "all" | "wiki" | "file" | "vector" | "entity";
 const JOB_PAGE_SIZE = 10;
 
 function isVectorPublishJob(job: KnowledgeImportJob): boolean {
@@ -85,17 +86,24 @@ function isVannaEntityJob(job: KnowledgeImportJob): boolean {
   return job.metadata?.kind === "vanna_entity_import" || job.file_type === "vanna_entity";
 }
 
+function isLlmWikiJob(job: KnowledgeImportJob): boolean {
+  return job.metadata?.kind === "llm_wiki_ingest" || job.file_type === "llm_wiki";
+}
+
 function jobKindLabel(job: KnowledgeImportJob): string {
+  if (isLlmWikiJob(job)) return "Wiki 编译";
   if (isVannaEntityJob(job)) return "实体导入";
   return isVectorPublishJob(job) ? "向量导入" : "文件导入";
 }
 
 function jobKindClass(job: KnowledgeImportJob): string {
+  if (isLlmWikiJob(job)) return "bg-violet-50 text-violet-700";
   if (isVannaEntityJob(job)) return "bg-amber-50 text-amber-700";
   return isVectorPublishJob(job) ? "bg-[#002fa7]/10 text-[#002fa7]" : "bg-emerald-50 text-emerald-700";
 }
 
 function filterLabel(filter: JobFilter): string {
+  if (filter === "wiki") return "Wiki 编译";
   if (filter === "file") return "文件导入";
   if (filter === "vector") return "向量导入";
   if (filter === "entity") return "实体导入";
@@ -103,6 +111,7 @@ function filterLabel(filter: JobFilter): string {
 }
 
 export default function KnowledgeImportJobsPage() {
+  const router = useRouter();
   const { sidebarOpen, toggleSidebar, sidebarWidth, setSidebarWidth } = useApp();
   const [mounted, setMounted] = useState(false);
   const [jobs, setJobs] = useState<KnowledgeImportJob[]>([]);
@@ -116,6 +125,7 @@ export default function KnowledgeImportJobsPage() {
 
   useEffect(() => {
     setMounted(true);
+    if (new URLSearchParams(window.location.search).get("filter") === "wiki") setJobFilter("wiki");
   }, []);
 
   useEffect(() => {
@@ -208,11 +218,13 @@ export default function KnowledgeImportJobsPage() {
 
   const vectorJobCount = useMemo(() => jobs.filter(isVectorPublishJob).length, [jobs]);
   const entityJobCount = useMemo(() => jobs.filter(isVannaEntityJob).length, [jobs]);
-  const fileJobCount = Math.max(0, jobs.length - vectorJobCount - entityJobCount);
+  const wikiJobCount = useMemo(() => jobs.filter(isLlmWikiJob).length, [jobs]);
+  const fileJobCount = Math.max(0, jobs.length - vectorJobCount - entityJobCount - wikiJobCount);
   const visibleJobs = useMemo(() => {
+    if (jobFilter === "wiki") return jobs.filter(isLlmWikiJob);
     if (jobFilter === "vector") return jobs.filter(isVectorPublishJob);
     if (jobFilter === "entity") return jobs.filter(isVannaEntityJob);
-    if (jobFilter === "file") return jobs.filter((job) => !isVectorPublishJob(job) && !isVannaEntityJob(job));
+    if (jobFilter === "file") return jobs.filter((job) => !isVectorPublishJob(job) && !isVannaEntityJob(job) && !isLlmWikiJob(job));
     return jobs;
   }, [jobFilter, jobs]);
   const jobPageCount = Math.max(1, Math.ceil(visibleJobs.length / JOB_PAGE_SIZE));
@@ -255,16 +267,9 @@ export default function KnowledgeImportJobsPage() {
             <div className="mx-auto flex w-full max-w-6xl flex-col gap-5 px-5 py-6">
               <div className="flex items-center justify-between gap-4">
                 <div>
-                  <Link
-                    href="/knowledge"
-                    className="inline-flex items-center gap-2 rounded-full border border-black/[0.08] bg-white px-3 py-1.5 text-xs font-medium text-gray-600 shadow-sm transition hover:text-[#002fa7]"
-                  >
-                    <ArrowLeft className="h-3.5 w-3.5" />
-                    返回知识库
-                  </Link>
-                  <h1 className="mt-4 text-2xl font-semibold tracking-tight text-gray-950">导入任务</h1>
+                  <h1 className="text-2xl font-semibold tracking-tight text-gray-950">任务中心</h1>
                   <p className="mt-2 max-w-2xl text-sm leading-6 text-gray-500">
-                    这里看文件解析和向量导入的进度。大文件不用等页面卡住，后台会继续处理。
+                    统一查看 Wiki 编译、文件解析、向量与实体导入。离开页面后，后台仍会继续处理。
                   </p>
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
@@ -311,11 +316,11 @@ export default function KnowledgeImportJobsPage() {
                   <div>
                     <h2 className="text-base font-semibold text-gray-950">任务队列</h2>
                     <p className="mt-1 text-xs text-gray-400">
-                      文件导入 {fileJobCount} 条 · 向量导入 {vectorJobCount} 条 · 实体导入 {entityJobCount} 条
+                      Wiki 编译 {wikiJobCount} 条 · 文件导入 {fileJobCount} 条 · 向量导入 {vectorJobCount} 条 · 实体导入 {entityJobCount} 条
                     </p>
                   </div>
                   <div className="inline-flex rounded-2xl bg-black/[0.035] p-1">
-                    {(["all", "file", "vector", "entity"] as JobFilter[]).map((filter) => (
+                    {(["all", "wiki", "file", "vector", "entity"] as JobFilter[]).map((filter) => (
                       <button
                         key={filter}
                         type="button"
@@ -340,7 +345,7 @@ export default function KnowledgeImportJobsPage() {
                         <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
                           <Link href={`/knowledge/imports/${job.id}`} className="flex min-w-0 flex-1 items-start gap-3">
                             <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-white text-[#002fa7] shadow-sm ring-1 ring-black/[0.04]">
-                              {isVectorPublishJob(job) ? <Database className="h-5 w-5 text-[#002fa7]" /> : <JobIcon status={job.status} />}
+                              {isLlmWikiJob(job) ? <BookOpenCheck className="h-5 w-5 text-violet-600" /> : isVectorPublishJob(job) ? <Database className="h-5 w-5 text-[#002fa7]" /> : <JobIcon status={job.status} />}
                             </div>
                             <div className="min-w-0 flex-1">
                               <div className="flex flex-wrap items-center gap-2">
@@ -418,14 +423,15 @@ export default function KnowledgeImportJobsPage() {
                     <div className="flex min-h-[220px] flex-col items-center justify-center rounded-[24px] border border-dashed border-black/[0.08] bg-black/[0.015] px-6 text-center">
                       <FileText className="h-8 w-8 text-gray-300" />
                       <p className="mt-3 text-sm font-medium text-gray-500">
-                        {jobs.length === 0 ? "还没有导入任务" : `没有${filterLabel(jobFilter)}任务`}
+                        {jobs.length === 0 ? "还没有后台任务" : `没有${filterLabel(jobFilter)}任务`}
                       </p>
-                      <Link
-                        href="/knowledge"
+                      <button
+                        type="button"
+                        onClick={() => router.push(jobFilter === "wiki" ? "/knowledge/schema" : "/knowledge")}
                         className="mt-4 inline-flex h-10 items-center rounded-full bg-[#002fa7] px-4 text-sm font-semibold text-white transition hover:bg-[#001f7a]"
                       >
-                        去上传文件
-                      </Link>
+                        {jobFilter === "wiki" ? "去 LLM Wiki Studio" : "去上传文件"}
+                      </button>
                     </div>
                   )}
                 </div>

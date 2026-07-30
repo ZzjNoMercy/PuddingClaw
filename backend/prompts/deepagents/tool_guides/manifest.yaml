@@ -1,0 +1,39 @@
+version: 1
+# Registration and activation rules:
+# docs/puddingclaw-harness-engineering.md, section 8.4.
+guides:
+  - id: database-analysis
+    file: database-analysis.md
+    skills:
+      - database-analysis
+      - sql-guardrail-designer
+    tool_prefixes:
+      - database_
+  - id: semantic-dimension-builds
+    file: semantic-dimension-builds.md
+    skills:
+      - build-semantic-dimension
+    tools:
+      - enqueue_semantic_dimension_build
+      - get_semantic_dimension_build_job
+      - inspect_dimension_build_input
+      - publish_semantic_dimension_build
+      - request_dimension_build_rule
+  - id: table-analysis
+    file: table-analysis.md
+    skills:
+      - build-logical-dataset
+      - hv-analysis
+      - table-analysis
+    tools:
+      - pandas_knowledge_query
+  - id: knowledge-retrieval
+    file: knowledge-retrieval.md
+    skills:
+      - knowledge-search
+    tools:
+      - llamaindex_knowledge_query
+  - id: managed-lark-autonomy
+    file: managed-lark-autonomy.md
+    skill_prefixes:
+      - lark-

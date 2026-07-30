@@ -277,6 +277,7 @@ export interface ContextUsage {
   used: number;
   total: number;
   percentage: number;
+  measured: boolean;
 }
 
 export interface ContextMaintenanceStatus {
@@ -1118,6 +1119,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     used: 0,
     total: 200000,
     percentage: 0,
+    measured: false,
   });
   const [pendingInput, setPendingInput] = useState<string | null>(null);
   // Per-session input drafts. Keyed by session id ("default" for an unsent
@@ -2764,6 +2766,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               used: usage.used_tokens,
               total: usage.total_tokens,
               percentage: usage.percentage,
+              measured: true,
             });
             continue;
           }
@@ -2790,6 +2793,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                   used,
                   total,
                   percentage: Math.round((used / total) * 1000) / 10,
+                  measured: true,
                 });
               }
               setMaintenanceStatus({
@@ -2835,6 +2839,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                                   used: usage.total_tokens,
                                   total: usage.compaction_trigger,
                                   percentage: Math.min(100, usage.percentage),
+                                  measured: usage.measured,
                                 });
                               }
                             } catch {

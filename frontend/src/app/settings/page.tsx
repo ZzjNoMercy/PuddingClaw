@@ -34,7 +34,6 @@ import {
   KeyRound,
   RotateCcw,
   Globe2,
-  Sparkles,
 } from "lucide-react";
 import {
   getSettings,
@@ -61,7 +60,10 @@ import {
 import { useApp } from "@/lib/store";
 import {
   getProjectContext,
+  getLlmWikiWorkspaceStatus,
+  initializeLlmWikiGbrain,
   updateProjectContext,
+  type LlmWikiWorkspaceStatus,
   type ProjectContextDocument,
 } from "@/lib/api";
 import MemoryEditor from "@/components/settings/MemoryEditor";
@@ -366,6 +368,21 @@ function positiveIntOrNull(value: string): number | null {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
+function postgresConnectionUrl(input: {
+  host: string;
+  port: number;
+  database: string;
+  username: string;
+  password: string;
+}): string {
+  const rawHost = input.host.trim() || "127.0.0.1";
+  const host = rawHost.includes(":") && !rawHost.startsWith("[") ? `[${rawHost}]` : rawHost;
+  const credentials = input.password
+    ? `${encodeURIComponent(input.username)}:${encodeURIComponent(input.password)}`
+    : encodeURIComponent(input.username);
+  return `postgresql://${credentials}@${host}:${input.port}/${encodeURIComponent(input.database)}`;
+}
+
 export default function SettingsPage() {
   const {
     sidebarOpen,
@@ -522,6 +539,24 @@ export default function SettingsPage() {
   const [knowledgeRootDir, setKnowledgeRootDir] = useState("");
   const [knowledgeConfiguredBy, setKnowledgeConfiguredBy] = useState("default");
   const [knowledgeEnvOverride, setKnowledgeEnvOverride] = useState(false);
+  const [wikiCompilerModelId, setWikiCompilerModelId] = useState("");
+  const [wikiGbrainEmbeddingModelId, setWikiGbrainEmbeddingModelId] = useState("");
+  const [wikiGbrainThinkModelId, setWikiGbrainThinkModelId] = useState("");
+  const [gbrainWorkspace, setGbrainWorkspace] = useState<LlmWikiWorkspaceStatus | null>(null);
+  const [gbrainDatabaseHost, setGbrainDatabaseHost] = useState("127.0.0.1");
+  const [gbrainDatabasePort, setGbrainDatabasePort] = useState("5432");
+  const [gbrainDatabaseName, setGbrainDatabaseName] = useState("llm_wiki");
+  const [gbrainDatabaseUsername, setGbrainDatabaseUsername] = useState("pet");
+  const [gbrainDatabasePassword, setGbrainDatabasePassword] = useState("");
+  const [gbrainDatabaseTesting, setGbrainDatabaseTesting] = useState(false);
+  const [gbrainInitializing, setGbrainInitializing] = useState(false);
+  const [gbrainDatabaseTestResult, setGbrainDatabaseTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
+
+  useEffect(() => {
+    if (!gbrainDatabaseTestResult?.ok) return;
+    const timer = window.setTimeout(() => setGbrainDatabaseTestResult(null), 3000);
+    return () => window.clearTimeout(timer);
+  }, [gbrainDatabaseTestResult]);
   const [mmConcurrency, setMmConcurrency] = useState("10");
   const [kbIndexEnabled, setKbIndexEnabled] = useState(true);
   const [kbVectorStore, setKbVectorStore] = useState("milvus");
@@ -676,6 +711,27 @@ export default function SettingsPage() {
         setKnowledgeRootDir(s.knowledge?.root_dir || "");
         setKnowledgeConfiguredBy(s.knowledge?.configured_by || "default");
         setKnowledgeEnvOverride(Boolean(s.knowledge?.environment_override));
+        setWikiCompilerModelId(s.knowledge?.llm_wiki?.compiler_agent?.model_id || "");
+        setWikiGbrainEmbeddingModelId(s.knowledge?.llm_wiki?.gbrain?.embedding_model_id || "");
+        setWikiGbrainThinkModelId(s.knowledge?.llm_wiki?.gbrain?.think_model_id || "");
+        setGbrainDatabaseHost(s.database?.host || "127.0.0.1");
+        setGbrainDatabasePort(String(s.database?.port || 5432));
+        setGbrainDatabaseName("llm_wiki");
+        setGbrainDatabaseUsername(s.database?.username || "puddingclaw");
+        setGbrainDatabasePassword(s.database?.password || "");
+        getLlmWikiWorkspaceStatus()
+          .then((workspace) => {
+            setGbrainWorkspace(workspace);
+            const postgres = workspace.gbrain.postgres;
+            if (postgres?.configured) {
+              setGbrainDatabaseHost(postgres.host || "127.0.0.1");
+              setGbrainDatabasePort(String(postgres.port || 5432));
+              setGbrainDatabaseName(postgres.database || "llm_wiki");
+              setGbrainDatabaseUsername(postgres.username || "puddingclaw");
+              setGbrainDatabasePassword("");
+            }
+          })
+          .catch(() => {});
         setMmConcurrency(String(s.multimodal_embedding?.batch_size || 10));
         setKbIndexEnabled(s.knowledge?.multimodal_index?.enabled ?? true);
         setKbVectorStore(s.knowledge?.multimodal_index?.vector_store || "milvus");
@@ -1118,6 +1174,15 @@ export default function SettingsPage() {
         },
         knowledge: {
           root_dir: knowledgeRootDir,
+          llm_wiki: {
+            compiler_agent: {
+              model_id: wikiCompilerModelId,
+            },
+            gbrain: {
+              embedding_model_id: wikiGbrainEmbeddingModelId,
+              think_model_id: wikiGbrainThinkModelId,
+            },
+          },
           multimodal_index: {
             enabled: kbIndexEnabled,
             vector_store: kbVectorStore,
@@ -1200,12 +1265,13 @@ export default function SettingsPage() {
       setDatabaseEnvOverride(Boolean(fresh.database?.environment_override));
       setKnowledgeConfiguredBy(fresh.knowledge?.configured_by || "default");
       setKnowledgeEnvOverride(Boolean(fresh.knowledge?.environment_override));
+      getLlmWikiWorkspaceStatus().then(setGbrainWorkspace).catch(() => {});
     } catch (err) {
       showToast("error", err instanceof Error ? err.message : "保存失败");
     } finally {
       setSaving(false);
     }
-  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaQueryTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmConcurrency, knowledgeRootDir, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, toolContextEnabled, immediateToolCompactionEnabled, singleToolTriggerTokens, backgroundMinResultTokens, keepRecentToolResults, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, rubricMaxStagnantRepairs, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, sandboxMode, dockerConnection, dockerContext, dockerUseCustomImage, dockerImage, dockerCpuLimit, dockerMemoryLimitMb, dockerPidsLimit, dockerNetworkEnabled, dockerDependencySetupEnabled, subagentItems, showToast]);
+  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaQueryTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmConcurrency, knowledgeRootDir, wikiCompilerModelId, wikiGbrainEmbeddingModelId, wikiGbrainThinkModelId, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, toolContextEnabled, immediateToolCompactionEnabled, singleToolTriggerTokens, backgroundMinResultTokens, keepRecentToolResults, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, rubricMaxStagnantRepairs, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, sandboxMode, dockerConnection, dockerContext, dockerUseCustomImage, dockerImage, dockerCpuLimit, dockerMemoryLimitMb, dockerPidsLimit, dockerNetworkEnabled, dockerDependencySetupEnabled, subagentItems, showToast]);
 
   const handleDatabaseModeChange = useCallback((mode: "bundled" | "external") => {
     setDatabaseMode(mode);
@@ -1238,8 +1304,14 @@ export default function SettingsPage() {
     try {
       const result = await testDatabaseConnection(databaseConnectionPayload(false));
       if (result.success) {
-        setDatabaseTestResult({ ok: true, msg: result.created ? "数据库已创建并连接成功" : `连接成功 · ${result.latency_ms}ms` });
-        showToast("success", result.created ? "数据库已创建并连接成功" : "数据库连接成功");
+        if (result.pgvector && !result.pgvector.available) {
+          const message = `PostgreSQL 已连接，但缺少必备 pgvector。请运行：${result.pgvector.install_command}`;
+          setDatabaseTestResult({ ok: false, msg: message });
+          showToast("error", "PostgreSQL 缺少 pgvector");
+        } else {
+          setDatabaseTestResult({ ok: true, msg: result.created ? "数据库已创建并连接成功，pgvector 可用" : `连接成功 · pgvector 可用 · ${result.latency_ms}ms` });
+          showToast("success", result.created ? "数据库已创建并连接成功" : "数据库连接成功");
+        }
       } else if (result.database_missing && result.can_create) {
         setDatabaseTesting(false);
         const shouldCreate = window.confirm(
@@ -1251,8 +1323,13 @@ export default function SettingsPage() {
         }
         setDatabaseTesting(true);
         const created = await testDatabaseConnection(databaseConnectionPayload(true));
-        setDatabaseTestResult({ ok: true, msg: `数据库已创建并连接成功 · ${created.latency_ms}ms` });
-        showToast("success", "数据库已创建并连接成功");
+        if (created.pgvector && !created.pgvector.available) {
+          setDatabaseTestResult({ ok: false, msg: `数据库已创建，但缺少必备 pgvector。请运行：${created.pgvector.install_command}` });
+          showToast("error", "数据库已创建，但 pgvector 未安装");
+        } else {
+          setDatabaseTestResult({ ok: true, msg: `数据库已创建并连接成功 · pgvector 可用 · ${created.latency_ms}ms` });
+          showToast("success", "数据库已创建并连接成功");
+        }
       } else {
         setDatabaseTestResult({ ok: false, msg: result.message || "数据库连接失败" });
       }
@@ -1264,6 +1341,87 @@ export default function SettingsPage() {
       setDatabaseTesting(false);
     }
   }, [databaseConnectionPayload, databaseName, showToast]);
+
+  const gbrainDatabaseConnectionPayload = useCallback((createIfMissing = false) => ({
+    mode: "external" as const,
+    host: gbrainDatabaseHost || "127.0.0.1",
+    port: positiveIntOrNull(gbrainDatabasePort) ?? 5432,
+    database: gbrainDatabaseName || "llm_wiki",
+    username: gbrainDatabaseUsername || "puddingclaw",
+    password: gbrainDatabasePassword,
+    create_if_missing: createIfMissing,
+  }), [gbrainDatabaseHost, gbrainDatabaseName, gbrainDatabasePassword, gbrainDatabasePort, gbrainDatabaseUsername]);
+
+  const ensureGbrainDatabase = useCallback(async () => {
+    let result = await testDatabaseConnection(gbrainDatabaseConnectionPayload(false));
+    if (result.database_missing && result.can_create) {
+      const shouldCreate = window.confirm(
+        `gbrain 独立数据库“${gbrainDatabaseName || "llm_wiki"}”不存在。是否现在创建？`
+      );
+      if (!shouldCreate) return result;
+      result = await testDatabaseConnection(gbrainDatabaseConnectionPayload(true));
+    }
+    return result;
+  }, [gbrainDatabaseConnectionPayload, gbrainDatabaseName]);
+
+  const handleTestGbrainDatabase = useCallback(async () => {
+    setGbrainDatabaseTesting(true);
+    setGbrainDatabaseTestResult(null);
+    try {
+      const result = await ensureGbrainDatabase();
+      if (!result.success) {
+        setGbrainDatabaseTestResult({ ok: false, msg: result.message || "gbrain 数据库连接失败" });
+        return;
+      }
+      if (result.pgvector && !result.pgvector.available) {
+        const message = `PostgreSQL 已连接，但缺少必备 pgvector。请运行：${result.pgvector.install_command}`;
+        setGbrainDatabaseTestResult({ ok: false, msg: message });
+        showToast("error", "PostgreSQL 缺少 pgvector");
+        return;
+      }
+      const message = result.created
+        ? "gbrain 独立数据库已创建并连接成功，pgvector 可用"
+        : `连接成功 · pgvector 可用 · ${result.latency_ms}ms`;
+      setGbrainDatabaseTestResult({ ok: true, msg: message });
+      showToast("success", "gbrain 数据库连接成功");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "gbrain 数据库连接失败";
+      setGbrainDatabaseTestResult({ ok: false, msg: message });
+      showToast("error", message);
+    } finally {
+      setGbrainDatabaseTesting(false);
+    }
+  }, [ensureGbrainDatabase, showToast]);
+
+  const handleInitializeGbrain = useCallback(async () => {
+    setGbrainInitializing(true);
+    setGbrainDatabaseTestResult(null);
+    try {
+      const result = await ensureGbrainDatabase();
+      if (!result.success) throw new Error(result.message || "gbrain 数据库连接失败");
+      if (result.pgvector && !result.pgvector.available) {
+        throw new Error(`PostgreSQL 缺少必备 pgvector。请运行：${result.pgvector.install_command}`);
+      }
+      const payload = gbrainDatabaseConnectionPayload(false);
+      await initializeLlmWikiGbrain(postgresConnectionUrl({
+        host: payload.host,
+        port: payload.port,
+        database: payload.database,
+        username: payload.username,
+        password: payload.password || "",
+      }));
+      const workspace = await getLlmWikiWorkspaceStatus();
+      setGbrainWorkspace(workspace);
+      setGbrainDatabaseTestResult({ ok: true, msg: "gbrain 数据库已连接，Schema Pack 已安装" });
+      showToast("success", "gbrain 数据库配置已生效");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "gbrain 初始化失败";
+      setGbrainDatabaseTestResult({ ok: false, msg: message });
+      showToast("error", message);
+    } finally {
+      setGbrainInitializing(false);
+    }
+  }, [ensureGbrainDatabase, gbrainDatabaseConnectionPayload, showToast]);
 
   const handleProbeDocker = useCallback(async () => {
     setDockerProbeStatus("loading");
@@ -1657,7 +1815,7 @@ export default function SettingsPage() {
 
                     <div className="p-3">
                       <button type="button" onClick={() => setSelectedProviderId("defaults")} className={`mb-2 flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left transition-all ${selectedProviderId === "defaults" ? "bg-white/[0.1] text-white shadow-sm ring-1 ring-white/[0.12]" : "text-white/65 hover:bg-white/[0.055] hover:text-white"}`}>
-                        <span className="flex h-8 w-8 items-center justify-center rounded-full bg-[#6875ff]/15 text-[#aeb6ff]"><Bot className="h-4 w-4" /></span>
+                        <span className="flex h-8 w-8 items-center justify-center rounded-full bg-[#6875ff]/15 text-[#aeb6ff]"><Route className="h-4 w-4" /></span>
                         <span className="min-w-0 flex-1"><span className="block text-[13px] font-semibold">默认模型</span><span className="mt-0.5 block text-[10px] text-white/40">为工作负载分配模型</span></span>
                       </button>
                       <div className="mb-2 px-3 pt-2 text-[10px] font-medium uppercase tracking-[0.12em] text-white/30">Provider</div>
@@ -1681,7 +1839,7 @@ export default function SettingsPage() {
                     {selectedProviderId === "defaults" && (
                       <div className="mx-auto max-w-4xl px-6 py-7 sm:px-10">
                         <div className="border-b border-white/[0.1] pb-6">
-                          <div className="flex items-start gap-4"><span className="flex h-11 w-11 items-center justify-center rounded-2xl bg-[#6875ff]/15 text-[#abb3ff]"><Sparkles className="h-5 w-5" /></span><div><h1 className="text-[22px] font-semibold tracking-tight text-white">默认模型</h1><p className="mt-1 text-[12px] leading-5 text-white/45">为每类工作负载选择一个已登记模型。Provider 的地址与凭证不会在运行中切换。</p></div></div>
+                          <div className="flex items-start gap-4"><span className="flex h-11 w-11 items-center justify-center rounded-2xl bg-[#6875ff]/15 text-[#abb3ff]"><Route className="h-5 w-5" /></span><div><h1 className="text-[22px] font-semibold tracking-tight text-white">默认模型</h1><p className="mt-1 text-[12px] leading-5 text-white/45">为每类工作负载选择一个已登记模型。Provider 的地址与凭证不会在运行中切换。</p></div></div>
                         </div>
                         <div className="mt-7 grid gap-4 sm:grid-cols-2">
                           {([
@@ -2515,6 +2673,111 @@ export default function SettingsPage() {
                   ) : null}
                 </SettingsCard>
 
+                <div id="gbrain-database" className="scroll-mt-6">
+                  <SettingsCard title="GBrain 数据库" icon={Database} color="#0f766e">
+                    <div className="rounded-xl border border-teal-100 bg-teal-50/50 px-3.5 py-3">
+                      <p className="text-[11px] leading-relaxed text-teal-700">
+                        GBrain 使用独立 PostgreSQL 数据库保存 Wiki 页面、关系和向量，不与 PuddingClaw 主数据库混用。这里负责数据库连接与初始化，Studio 只执行预检和入库。
+                      </p>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2 text-[11px]">
+                      <span className={`rounded-full px-2.5 py-1 font-medium ${gbrainWorkspace?.gbrain.postgres_configured ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-700"}`}>
+                        PostgreSQL {gbrainWorkspace?.gbrain.postgres_configured ? "已配置" : "未配置"}
+                      </span>
+                      <span className={`rounded-full px-2.5 py-1 font-medium ${gbrainWorkspace?.gbrain.cli_installed ? "bg-emerald-50 text-emerald-700" : "bg-red-50 text-red-700"}`}>
+                        CLI {gbrainWorkspace?.gbrain.cli_installed ? "已安装" : "未安装"}
+                      </span>
+                      <span className={`rounded-full px-2.5 py-1 font-medium ${gbrainWorkspace?.gbrain.models.configured ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-700"}`}>
+                        模型 {gbrainWorkspace?.gbrain.models.configured ? "已配置" : "未配置"}
+                      </span>
+                    </div>
+
+                    <div className="grid gap-4 md:grid-cols-2">
+                      <FormField label="模式">
+                        <select value="external" disabled className="form-select disabled:cursor-not-allowed disabled:bg-gray-50 disabled:text-gray-500">
+                          <option value="external">本机 PostgreSQL</option>
+                        </select>
+                      </FormField>
+                      <FormField label="本机端口">
+                        <input
+                          type="number"
+                          min="1"
+                          max="65535"
+                          value={gbrainDatabasePort}
+                          onChange={(event) => setGbrainDatabasePort(event.target.value)}
+                          className="form-input"
+                          placeholder="5432"
+                        />
+                      </FormField>
+                      <FormField label="数据库名">
+                        <input
+                          value={gbrainDatabaseName}
+                          onChange={(event) => setGbrainDatabaseName(event.target.value)}
+                          className="form-input"
+                          placeholder="llm_wiki"
+                        />
+                      </FormField>
+                      <FormField label="用户名">
+                        <input
+                          value={gbrainDatabaseUsername}
+                          onChange={(event) => setGbrainDatabaseUsername(event.target.value)}
+                          className="form-input"
+                          placeholder="pet"
+                        />
+                      </FormField>
+                      <FormField label="密码">
+                        <input
+                          type="password"
+                          value={gbrainDatabasePassword}
+                          onChange={(event) => setGbrainDatabasePassword(event.target.value)}
+                          className="form-input"
+                          placeholder={gbrainWorkspace?.gbrain.postgres_configured ? "重新配置时输入数据库密码" : "数据库密码（本机免密可留空）"}
+                          autoComplete="new-password"
+                        />
+                      </FormField>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => void handleTestGbrainDatabase()}
+                        disabled={gbrainDatabaseTesting || gbrainInitializing || !gbrainDatabaseName.trim() || !gbrainDatabaseUsername.trim()}
+                        className="inline-flex items-center gap-1.5 rounded-lg bg-gray-950 px-3 py-2 text-[11px] font-medium text-white hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {gbrainDatabaseTesting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Zap className="h-3.5 w-3.5" />}
+                        测试连接
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void handleInitializeGbrain()}
+                        disabled={gbrainDatabaseTesting || gbrainInitializing || !gbrainDatabaseName.trim() || !gbrainDatabaseUsername.trim() || !gbrainWorkspace?.gbrain.cli_installed || !gbrainWorkspace?.gbrain.models.configured}
+                        className="inline-flex items-center gap-1.5 rounded-lg bg-[#002fa7] px-3 py-2 text-[11px] font-medium text-white hover:bg-[#001f7a] disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        {gbrainInitializing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Database className="h-3.5 w-3.5" />}
+                        {gbrainWorkspace?.gbrain.postgres_configured ? "重新连接并初始化" : "连接并初始化"}
+                      </button>
+                      {gbrainWorkspace?.gbrain.postgres?.configured ? (
+                        <span className="text-[11px] text-gray-400">
+                          当前：{gbrainWorkspace.gbrain.postgres.username}@{gbrainWorkspace.gbrain.postgres.host}:{gbrainWorkspace.gbrain.postgres.port}/{gbrainWorkspace.gbrain.postgres.database}
+                        </span>
+                      ) : null}
+                    </div>
+
+                    {!gbrainWorkspace?.gbrain.models.configured ? (
+                      <p className="rounded-xl border border-amber-100 bg-amber-50/60 px-3.5 py-3 text-[11px] leading-relaxed text-amber-700">
+                        连接并初始化前，请先在下方选择 GBrain 的 Embedding 与 Think 模型并保存设置。
+                      </p>
+                    ) : null}
+
+                    {gbrainDatabaseTestResult ? (
+                      <div className={`rounded-xl border px-3.5 py-3 text-[11px] ${gbrainDatabaseTestResult.ok ? "border-emerald-100 bg-emerald-50 text-emerald-700" : "border-red-100 bg-red-50 text-red-700"}`}>
+                        {gbrainDatabaseTestResult.msg}
+                      </div>
+                    ) : null}
+                  </SettingsCard>
+                </div>
+
                 <SettingsCard title="本地知识库目录" icon={FolderOpen} color="#002fa7">
                   <div className="rounded-xl border border-blue-100 bg-blue-50/50 px-3.5 py-3">
                     <p className="text-[11px] leading-relaxed text-blue-700">
@@ -2550,6 +2813,95 @@ export default function SettingsPage() {
                     打开知识库管理页
                     <ExternalLink className="h-3.5 w-3.5" />
                   </Link>
+                </SettingsCard>
+
+                <SettingsCard title="LLM Wiki 编译 Agent" icon={Bot} color="#7c3aed">
+                  <div className="rounded-xl border border-violet-100 bg-violet-50/50 px-3.5 py-3">
+                    <p className="text-[11px] leading-relaxed text-violet-700">
+                      专门在后台把 Raw 编译成 Wiki。它不进入聊天 Session，只加载 Context、Publish 和 Lint 三个工具；模型接口与密钥仍由「模型服务」统一管理。
+                    </p>
+                  </div>
+                  <FormField label="编译模型">
+                    <ModelBindingSelect
+                      value={wikiCompilerModelId}
+                      onChange={setWikiCompilerModelId}
+                      variant="light"
+                      options={[
+                        { id: "", label: "跟随主 Agent 模型" },
+                        ...allProviderModels
+                          .filter((model) => model.capability === "llm")
+                          .map((model) => ({
+                            id: model.id,
+                            label: `${model.provider.name} · ${model.name}`,
+                          })),
+                      ]}
+                    />
+                    <p className="mt-1 text-[11px] leading-relaxed text-gray-400">
+                      新任务会锁定提交时的模型；修改设置不会改变已经排队或正在运行的任务。
+                    </p>
+                  </FormField>
+                  <button
+                    type="button"
+                    onClick={() => setCategory("ai")}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-[11px] font-medium text-slate-700 transition hover:border-[#002fa7]/20 hover:text-[#002fa7]"
+                  >
+                    管理模型与密钥
+                    <ExternalLink className="h-3.5 w-3.5" />
+                  </button>
+                </SettingsCard>
+
+                <SettingsCard title="GBrain 检索与推理" icon={Brain} color="#0f766e">
+                  <div className="rounded-xl border border-teal-100 bg-teal-50/50 px-3.5 py-3">
+                    <p className="text-[11px] leading-relaxed text-teal-700">
+                      Embedding 用于 Wiki 入库与语义检索，Think 模型用于多跳综合回答。模型、接口和密钥均复用「模型服务」，不会写进知识库。
+                    </p>
+                  </div>
+                  <FormField label="Embedding 模型">
+                    <ModelBindingSelect
+                      value={wikiGbrainEmbeddingModelId}
+                      onChange={setWikiGbrainEmbeddingModelId}
+                      variant="light"
+                      options={[
+                        { id: "", label: "跟随文本 Embedding 模型" },
+                        ...allProviderModels
+                          .filter((model) => model.capability === "text_embedding")
+                          .map((model) => ({
+                            id: model.id,
+                            label: `${model.provider.name} · ${model.name}${model.dimension ? ` · ${model.dimension} 维` : ""}`,
+                          })),
+                      ]}
+                    />
+                    <p className="mt-1 text-[11px] leading-relaxed text-gray-400">
+                      初始化 PostgreSQL Brain 时固定向量维度；更换后需重新初始化或迁移 Embedding。
+                    </p>
+                  </FormField>
+                  <FormField label="Think 模型">
+                    <ModelBindingSelect
+                      value={wikiGbrainThinkModelId}
+                      onChange={setWikiGbrainThinkModelId}
+                      variant="light"
+                      options={[
+                        { id: "", label: "跟随主 Agent 模型" },
+                        ...allProviderModels
+                          .filter((model) => model.capability === "llm")
+                          .map((model) => ({
+                            id: model.id,
+                            label: `${model.provider.name} · ${model.name}`,
+                          })),
+                      ]}
+                    />
+                    <p className="mt-1 text-[11px] leading-relaxed text-gray-400">
+                      用于 GBrain Think 的多跳综合；可独立调整，不要求重建向量。
+                    </p>
+                  </FormField>
+                  <button
+                    type="button"
+                    onClick={() => setCategory("ai")}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-[11px] font-medium text-slate-700 transition hover:border-[#002fa7]/20 hover:text-[#002fa7]"
+                  >
+                    管理模型与密钥
+                    <ExternalLink className="h-3.5 w-3.5" />
+                  </button>
                 </SettingsCard>
 
                 <SettingsCard title="多模态 Embedding" icon={Database} color="#002fa7">
@@ -3690,7 +4042,7 @@ function SubAgentEditorPanel({
                   type="text"
                   value={item.name}
                   onChange={(e) => onChange(index, (it) => ({ ...it, name: e.target.value }))}
-                  className="form-input"
+                  className="form-input h-11"
                   placeholder="image_analyzer"
                 />
               </FormField>

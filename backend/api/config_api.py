@@ -13,11 +13,12 @@ from config import (
     get_fallback_embedding_config,
     get_fallback_llm_config,
     get_rag_mode,
-    set_rag_mode,
     get_settings_for_display,
-    update_settings,
     load_config,
+    set_rag_mode,
+    update_settings,
 )
+from postgres_dependencies import PGVECTOR_STATUS_SQL, normalize_pgvector_status
 from provider_registry import get_provider_registry
 
 router = APIRouter()
@@ -328,6 +329,7 @@ async def _test_database_connection(request: DatabaseConnectionRequest) -> dict[
         )
         try:
             server_version = await conn.fetchval("select version()")
+            pgvector = normalize_pgvector_status(dict(await conn.fetchrow(PGVECTOR_STATUS_SQL) or {}))
         finally:
             await conn.close()
         latency_ms = int((time.time() - start) * 1000)
@@ -339,6 +341,7 @@ async def _test_database_connection(request: DatabaseConnectionRequest) -> dict[
             "latency_ms": latency_ms,
             "message": "PostgreSQL connection ok",
             "server_version": server_version,
+            "pgvector": pgvector,
         }
     except asyncpg.InvalidCatalogNameError:
         if not request.create_if_missing:
@@ -377,6 +380,7 @@ async def _test_database_connection(request: DatabaseConnectionRequest) -> dict[
         )
         try:
             server_version = await verify_conn.fetchval("select version()")
+            pgvector = normalize_pgvector_status(dict(await verify_conn.fetchrow(PGVECTOR_STATUS_SQL) or {}))
         finally:
             await verify_conn.close()
 
@@ -390,6 +394,7 @@ async def _test_database_connection(request: DatabaseConnectionRequest) -> dict[
             "latency_ms": latency_ms,
             "message": f"Database '{database}' created and connection ok",
             "server_version": server_version,
+            "pgvector": pgvector,
             "safe_url": safe_url,
         }
     except asyncpg.InvalidPasswordError as exc:

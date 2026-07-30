@@ -43,8 +43,6 @@ async def lifespan(app: FastAPI):
     if db_ready:
         print("🗄️ Knowledge catalog database ready")
         query_result_cleanup_manager.start()
-        knowledge_import_worker_manager.start(BASE_DIR)
-        semantic_dimension_build_worker_manager.start(BASE_DIR)
     else:
         print("⚠️ Knowledge catalog database unavailable; knowledge management API will report degraded status")
     caps = await capabilities.detect_capabilities(force=True)
@@ -61,6 +59,12 @@ async def lifespan(app: FastAPI):
         print(f"⚠️ DeepAgents initialization failed: {e}")
         traceback.print_exc()
         print("ℹ️ Server will continue running, but /api/agent requires DeepAgents runtime.")
+    if db_ready:
+        # LLM Wiki jobs use the Agent harness without creating a user-visible
+        # conversation, so workers may only claim jobs after the harness owner
+        # has been initialized.
+        knowledge_import_worker_manager.start(BASE_DIR)
+        semantic_dimension_build_worker_manager.start(BASE_DIR)
 
     # Initialize memory indexer only when RAG mode is enabled (requires Embedding API)
     from config import get_rag_mode

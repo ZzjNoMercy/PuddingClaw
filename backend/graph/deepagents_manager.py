@@ -103,6 +103,7 @@ from graph.middlewares.tool_context_compaction import (
 from graph.middlewares.tool_context_compaction import (
     POLICY_VERSION as TOOL_CONTEXT_POLICY_VERSION,
 )
+from graph.middlewares.tool_guides import ToolGuideMiddleware
 from graph.middlewares.tool_protocol import (
     ToolProtocolIntegrityMiddleware,
     pending_executable_tool_call_ids,
@@ -2752,6 +2753,7 @@ class DeepAgentsAgentManager:
                 skills_dir=self._base_dir / "skills",
                 toolsets_by_skill=toolset_mapping,
             ),
+            ToolGuideMiddleware(base_dir=self._base_dir),
             # Keep execution policy in the Agent middleware chain: its
             # before_model hook owns durable HITL boundaries such as a prepared
             # Skill Manager batch and must run before another model turn.
@@ -6714,6 +6716,7 @@ class DeepAgentsAgentManager:
                         skills_dir=self._base_dir / "skills",
                         toolsets_by_skill=skill_toolsets,
                     ),
+                    ToolGuideMiddleware(base_dir=self._base_dir),
                     ToolExecutionPipeline(
                         known_tools={
                             str(getattr(tool, "name", "")) for tool in subagent_tools if getattr(tool, "name", "")

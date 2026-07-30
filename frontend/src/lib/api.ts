@@ -651,6 +651,84 @@ export interface BrainSchemaPreview {
   validation_mode?: "structural" | "official";
 }
 
+export interface LlmWikiWorkspaceStatus {
+  brain_root: string;
+  bundle_hash: string;
+  schema_version: string;
+  agents: { path: string; sha256: string; content: string };
+  raw: Array<{
+    source_id?: string;
+    asset_id?: string;
+    title?: string;
+    snapshot_path: string;
+    sha256?: string;
+    size_bytes?: number;
+    created_at?: string;
+    integrity: string;
+    compiled: boolean;
+    compiled_at?: string | null;
+    compiled_pages: string[];
+    compiled_job_ids: string[];
+  }>;
+  wiki: Array<{
+    slug: string;
+    title: string;
+    type: string;
+    updated?: string;
+    valid: boolean;
+    error?: string;
+  }>;
+  files: { index: boolean; log: boolean };
+  gbrain: {
+    cli_installed: boolean;
+    postgres_configured: boolean;
+    postgres?: {
+      configured: boolean;
+      host: string;
+      port: number;
+      database: string;
+      username: string;
+    };
+    runtime_home: string;
+    imports: {
+      available: boolean;
+      counts: { pages: number; links: number; chunks: number; imports: number };
+      records: Array<{
+        id: number;
+        source_id: string;
+        source_type: string;
+        pages_updated: string[];
+        summary: string;
+        created_at: string;
+      }>;
+    };
+    models: {
+      configured: boolean;
+      embedding: { model_id: string; name: string; provider: string; dimension: number; uses_default_binding: boolean } | null;
+      think: { model_id: string; name: string; provider: string; uses_default_binding: boolean } | null;
+      error: string;
+    };
+  };
+}
+
+export interface LlmWikiLintResult {
+  ok: boolean;
+  errors: Array<{ code: string; path: string; message: string }>;
+  warnings: Array<{ code: string; path: string; message: string }>;
+  counts: { pages: number; errors: number; warnings: number };
+  bundle_hash: string;
+}
+
+export interface LlmWikiCompileResult {
+  ok: boolean;
+  phase: string;
+  bundle_hash?: string;
+  runtime_home?: string;
+  checks?: Array<Record<string, unknown>>;
+  import?: Record<string, unknown> | null;
+  lint?: LlmWikiLintResult;
+}
+
 export interface KnowledgeMarkdownFile {
   name: string;
   path: string;
@@ -1019,6 +1097,83 @@ export async function saveBrainCustomSchema(
   return JSON.parse(text) as BrainSchemaBundle;
 }
 
+export async function rebuildLlmWikiAgents(): Promise<BrainSchemaBundle> {
+  const response = await fetch(`${API_BASE}/knowledge/brain/agents/rebuild`, { method: "POST" });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(apiErrorMessage(text, `重建 AGENTS.md 失败：${response.status}`));
+  }
+  return JSON.parse(text) as BrainSchemaBundle;
+}
+
+export async function getLlmWikiWorkspaceStatus(): Promise<LlmWikiWorkspaceStatus> {
+  const response = await fetch(`${API_BASE}/knowledge/brain/wiki/status`, { cache: "no-store" });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(apiErrorMessage(text, `加载 LLM Wiki 工作区失败：${response.status}`));
+  }
+  return JSON.parse(text) as LlmWikiWorkspaceStatus;
+}
+
+export async function snapshotLlmWikiRaw(payload: {
+  source_id: string;
+  asset_id: string;
+  title: string;
+  content: string;
+  source_path?: string;
+}): Promise<Record<string, unknown>> {
+  const response = await fetch(`${API_BASE}/knowledge/brain/wiki/raw`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(apiErrorMessage(text, `导入 Raw 快照失败：${response.status}`));
+  }
+  return JSON.parse(text) as Record<string, unknown>;
+}
+
+export async function lintLlmWiki(): Promise<LlmWikiLintResult> {
+  const response = await fetch(`${API_BASE}/knowledge/brain/wiki/lint`, { cache: "no-store" });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(apiErrorMessage(text, `检查 Wiki 失败：${response.status}`));
+  }
+  return JSON.parse(text) as LlmWikiLintResult;
+}
+
+export async function compileLlmWikiGbrain(importPages = false): Promise<LlmWikiCompileResult> {
+  const response = await fetch(`${API_BASE}/knowledge/brain/wiki/compile`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ import_pages: importPages }),
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(apiErrorMessage(text, `运行 gbrain 编译失败：${response.status}`));
+  }
+  return JSON.parse(text) as LlmWikiCompileResult;
+}
+
+export async function initializeLlmWikiGbrain(databaseUrl: string): Promise<{
+  ok: boolean;
+  runtime_home: string;
+  schema_pack: string;
+  postgresql: string;
+}> {
+  const response = await fetch(`${API_BASE}/knowledge/brain/wiki/gbrain/initialize`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ database_url: databaseUrl }),
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(apiErrorMessage(text, `初始化 gbrain PostgreSQL 运行时失败：${response.status}`));
+  }
+  return JSON.parse(text) as { ok: boolean; runtime_home: string; schema_pack: string; postgresql: string };
+}
+
 export async function listKnowledgeDocuments(): Promise<KnowledgeDocument[]> {
   const response = await fetch(`${API_BASE}/knowledge/documents`, { cache: "no-store" });
   if (!response.ok) {
@@ -1373,6 +1528,20 @@ export async function createKnowledgeImportJob(
   if (!response.ok) {
     const text = await response.text().catch(() => "");
     throw new Error(apiErrorMessage(text, `Failed to create knowledge import job: ${response.status}`));
+  }
+  const payload = await response.json();
+  return payload.job;
+}
+
+export async function createLlmWikiIngestJob(rawPaths: string[]): Promise<KnowledgeImportJob> {
+  const response = await fetch(`${API_BASE}/knowledge/brain/wiki/ingest-jobs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ raw_paths: rawPaths }),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to create LLM Wiki ingest job: ${response.status}`));
   }
   const payload = await response.json();
   return payload.job;
@@ -3742,6 +3911,47 @@ export async function listMcpServers(): Promise<
   return data.servers;
 }
 
+export interface McpServerStatus {
+  key: string;
+  name: string;
+  url: string;
+  transport: string;
+  enabled: boolean;
+  auto_enabled: boolean;
+  ready: boolean;
+  loaded: boolean;
+  status: "ready" | "loaded" | "not_ready" | "error";
+  reason: string;
+  tools: string[];
+  tool_count: number;
+}
+
+export interface McpServersStatus {
+  servers: Array<{ key: string; name: string; url: string; transport: string }>;
+  catalog: McpServerStatus[];
+  gbrain: {
+    configured: boolean;
+    ready: boolean;
+    reason: string;
+    home?: string;
+    binary?: string;
+    config_exists?: boolean;
+    pack_exists?: boolean;
+    models?: {
+      embedding?: { name: string; provider: string; dimension: number };
+      think?: { name: string; provider: string };
+    } | null;
+  };
+}
+
+export async function getMcpServersStatus(probe = true): Promise<McpServersStatus> {
+  const resp = await fetch(`${API_BASE}/mcp/servers?probe=${probe ? "true" : "false"}`, {
+    cache: "no-store",
+  });
+  if (!resp.ok) throw new Error(`Failed to inspect MCP servers: ${resp.status}`);
+  return resp.json() as Promise<McpServersStatus>;
+}
+
 /**
  * Load a skill into the current session.
  */
@@ -3774,7 +3984,14 @@ export async function generateTitle(
 export async function getSessionTokenCount(
   sessionId: string,
   runtimeMode?: "agent" | "chat",
-): Promise<{ system_tokens: number; message_tokens: number; total_tokens: number; compaction_trigger: number; percentage: number }> {
+): Promise<{
+  system_tokens: number;
+  message_tokens: number;
+  total_tokens: number;
+  compaction_trigger: number;
+  percentage: number;
+  measured: boolean;
+}> {
   const params = new URLSearchParams();
   if (runtimeMode) params.set("runtime_mode", runtimeMode);
   const query = params.toString();

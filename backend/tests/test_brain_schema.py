@@ -52,9 +52,32 @@ def test_initialize_creates_schema_bundle_and_resolved_preview(schema_env: Brain
     assert (root / "wiki" / "index.md").read_text() == "# Wiki Index\n"
     assert (root / "wiki" / "log.md").read_text() == "# Wiki Ingest Log\n"
     assert (root / "AGENTS.md").exists()
+    agents = (root / "AGENTS.md").read_text(encoding="utf-8")
+    assert "# LLM Wiki Agent 操作契约" in agents
+    assert "## Ingest（摄取）" in agents
+    assert "`raw/` 只读" in agents
+    assert "`research_paper`：`papers/<slug>.md`" in agents
+    assert "`concept`：`concepts/<slug>.md`、`concept/<slug>.md`" in agents
+    assert "[[wiki/" not in agents
     assert bundle["custom"]["manifest"]["extends"] == "gbrain-base-v2"
     resolved_types = {item["name"] for item in bundle["resolved"]["manifest"]["page_types"]}
-    assert {"person", "company", "concept", "system", "debate"}.issubset(resolved_types)
+    assert {
+        "person",
+        "company",
+        "concept",
+        "system",
+        "debate",
+        "research_paper",
+        "software_framework",
+        "ai_model",
+        "programming_language",
+        "engineering_practice",
+    }.issubset(resolved_types)
+    custom_types = {item["name"]: item for item in bundle["custom"]["manifest"]["page_types"]}
+    assert custom_types["research_paper"]["path_prefixes"] == ["papers/"]
+    assert custom_types["software_framework"]["path_prefixes"] == ["frameworks/"]
+    assert custom_types["ai_model"]["aliases"] == ["model", "llm", "foundation-model"]
+    assert "subtypes" not in custom_types["engineering_practice"]
 
     # Initialization is non-destructive.
     index_path = root / "wiki" / "index.md"
@@ -119,6 +142,10 @@ def test_brain_schema_api_e2e(schema_env: BrainSchemaService) -> None:
     init_response = client.post("/api/knowledge/brain/initialize")
     assert init_response.status_code == 200
     bundle = init_response.json()
+
+    agents_response = client.post("/api/knowledge/brain/agents/rebuild")
+    assert agents_response.status_code == 200
+    assert agents_response.json()["agents"]["sha256"] == bundle["agents"]["sha256"]
 
     manifest = deepcopy(bundle["custom"]["manifest"])
     manifest["version"] = "0.1.1"

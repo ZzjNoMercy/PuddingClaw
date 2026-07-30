@@ -4,17 +4,17 @@ from pathlib import Path
 from typing import Any, Literal
 
 import tiktoken
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from pydantic import BaseModel
 
-from graph.session_manager import session_manager
-from graph.prompt_builder import build_system_prompt
 from config import (
     get_compaction_trigger_tokens,
     get_deepagents_summarization_config,
     get_deepagents_tool_context_config,
     get_rag_mode,
 )
+from graph.prompt_builder import build_system_prompt
+from graph.session_manager import session_manager
 
 router = APIRouter()
 
@@ -84,6 +84,7 @@ async def get_session_token_count(
         else runtime_mode or metadata.get("runtime_mode")
     )
     is_agent = effective_runtime_mode == "agent"
+    measured = True
     if is_agent:
         # Agent keeps the complete transcript for the UI, but DeepAgents may
         # send a much smaller summarized context to the model. Never replace
@@ -95,8 +96,19 @@ async def get_session_token_count(
             session_id,
             use_tool_context=tool_context_enabled,
         )
-        total_tokens = current_usage or (system_tokens + message_tokens)
-        message_tokens = max(0, total_tokens - system_tokens)
+        if current_usage > 0:
+            total_tokens = current_usage
+            message_tokens = max(0, total_tokens - system_tokens)
+        else:
+            # DeepAgents assembles Skills, middleware prompts, capability
+            # manifests, and filtered tool schemas only when a Run is built.
+            # The legacy Chat prompt is not a valid Agent baseline, so expose
+            # an explicit pending state until the first model request records
+            # its effective context.
+            measured = False
+            system_tokens = 0
+            message_tokens = 0
+            total_tokens = 0
         compaction_trigger = int(
             get_deepagents_summarization_config().get("trigger_tokens", 200000)
         )
@@ -112,6 +124,7 @@ async def get_session_token_count(
         "total_tokens": total_tokens,
         "compaction_trigger": compaction_trigger,
         "percentage": round(total_tokens / compaction_trigger * 100, 1),
+        "measured": measured,
     }
 
 

@@ -504,6 +504,79 @@ def test_knowledge_root_dir_settings_live_in_config_json(tmp_path, monkeypatch):
     assert saved["knowledge"]["root_dir"] == str(tmp_path / "next-kb")
 
 
+def test_llm_wiki_compiler_model_setting_uses_provider_registry(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
+
+    class FakeRegistry:
+        def ensure_migrated(self, legacy_config):
+            return None
+
+        def resolve_model(self, model_id, *, legacy_config, expected_capability="llm"):
+            models = {
+                "provider:endpoint:wiki-model": ("wiki-model", "llm", 0),
+                "provider:endpoint:wiki-embedding": ("wiki-embedding", "text_embedding", 1024),
+                "provider:endpoint:wiki-think": ("wiki-think", "llm", 0),
+            }
+            assert model_id in models
+            name, capability, dimension = models[model_id]
+            assert capability == expected_capability
+            return {
+                "id": model_id,
+                "name": name,
+                "provider_id": "provider",
+                "capability": capability,
+                "dimension": dimension,
+                "base_url": "https://example.test/v1",
+                "api_key": "secret",
+                "protocol": "openai_compatible",
+            }
+
+        def resolve_binding(self, binding, *, legacy_config):
+            assert binding == "agent"
+            return {
+                "id": "provider:endpoint:agent-model",
+                "name": "agent-model",
+                "provider_id": "provider",
+                "capability": "llm",
+            }
+
+    fake_registry = FakeRegistry()
+    monkeypatch.setattr(provider_registry, "get_provider_registry", lambda: fake_registry)
+
+    config.update_settings(
+        {
+            "knowledge": {
+                "llm_wiki": {
+                    "compiler_agent": {"model_id": "provider:endpoint:wiki-model"},
+                    "gbrain": {
+                        "embedding_model_id": "provider:endpoint:wiki-embedding",
+                        "think_model_id": "provider:endpoint:wiki-think",
+                    },
+                }
+            }
+        }
+    )
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["knowledge"]["llm_wiki"]["compiler_agent"]["model_id"] == "provider:endpoint:wiki-model"
+    assert saved["knowledge"]["llm_wiki"]["gbrain"] == {
+        "embedding_model_id": "provider:endpoint:wiki-embedding",
+        "think_model_id": "provider:endpoint:wiki-think",
+    }
+    assert config.get_llm_wiki_compiler_agent_config() == {
+        "model_id": "provider:endpoint:wiki-model",
+        "configured_model_id": "provider:endpoint:wiki-model",
+        "model": "wiki-model",
+        "provider": "provider",
+        "uses_agent_default": False,
+    }
+    gbrain = config.get_llm_wiki_gbrain_config()
+    assert gbrain["embedding"]["name"] == "wiki-embedding"
+    assert gbrain["embedding"]["dimension"] == 1024
+    assert gbrain["think"]["name"] == "wiki-think"
+
+
 def test_database_settings_live_in_config_json(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     config_path.write_text(

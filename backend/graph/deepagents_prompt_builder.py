@@ -11,7 +11,6 @@ from pathlib import Path
 
 from projects.project_context import read_project_context
 
-
 PROMPT_DIR = Path("prompts") / "deepagents"
 
 
@@ -27,11 +26,11 @@ def build_deepagents_system_prompt(base_dir: Path, workspace_path: Path) -> str:
     prompt_dir = base_dir / PROMPT_DIR
     agents = _read_prompt_component(prompt_dir / "AGENTS.md")
     project_context, _source, _is_project_local = read_project_context(workspace_path, base_dir)
-    tool_guides = _read_prompt_component(prompt_dir / "TOOL_GUIDES.md")
+    core_tool_guides = _read_prompt_component(prompt_dir / "tool_guides" / "core.md")
 
     parts = [
         agents,
         project_context.strip(),
-        tool_guides,
+        core_tool_guides,
     ]
     return "\n\n".join(part for part in parts if part)

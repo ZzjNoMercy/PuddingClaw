@@ -30,6 +30,20 @@ export POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-puddingclaw}"
 LOCAL_POSTGRES_USER="${LOCAL_POSTGRES_USER:-$(whoami)}"
 LOCAL_POSTGRES_DB="${LOCAL_POSTGRES_DB:-puddingclaw}"
 LOCAL_POSTGRES_PASSWORD="${LOCAL_POSTGRES_PASSWORD:-}"
+PGVECTOR_DATABASE="${PUDDINGCLAW_PGVECTOR_DATABASE:-$LOCAL_POSTGRES_DB}"
+PGVECTOR_VERSION="${PUDDINGCLAW_PGVECTOR_VERSION:-0.8.6}"
+PGVECTOR_DEFAULT_VERSION="0.8.6"
+PGVECTOR_DEFAULT_SHA256="10bf9938906e5d643bbc4a7eea104b6f57ba4898e5b76b20e60484ea1d5a7f8f"
+PGVECTOR_SHA256="${PUDDINGCLAW_PGVECTOR_SHA256:-}"
+
+if ! echo "$PGVECTOR_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+    echo -e "${RED}[错误] PUDDINGCLAW_PGVECTOR_VERSION 必须是 x.y.z 格式，当前为：${PGVECTOR_VERSION}${NC}"
+    exit 1
+fi
+
+if [ -z "$PGVECTOR_SHA256" ] && [ "$PGVECTOR_VERSION" = "$PGVECTOR_DEFAULT_VERSION" ]; then
+    PGVECTOR_SHA256="$PGVECTOR_DEFAULT_SHA256"
+fi
 
 # PostgreSQL 模式：
 #   detect   默认。若 5432 已被非 Docker 本机服务占用，则写入“本机 PostgreSQL”配置；
@@ -118,6 +132,199 @@ path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
 PY
 }
 
+print_pgvector_install_guide() {
+    local server_major="${1:-16}"
+    echo -e "${YELLOW}[依赖] 当前 PostgreSQL 缺少必备 pgvector 扩展。${NC}"
+    case "$(uname -s)" in
+        Darwin)
+            echo "       本脚本可为 Homebrew PostgreSQL ${server_major} 自动编译 pgvector ${PGVECTOR_VERSION}。"
+            echo "       请确认已安装 Xcode Command Line Tools，且 postgresql@${server_major} 由 Homebrew 管理。"
+            ;;
+        Linux)
+            echo "       安装：sudo apt install postgresql-${server_major}-pgvector"
+            echo "       然后重启 PostgreSQL 服务。"
+            ;;
+        *)
+            echo "       安装说明：https://github.com/pgvector/pgvector"
+            ;;
+    esac
+    echo "       安装后重新运行本脚本；脚本会在目标数据库自动启用 vector 扩展。"
+}
+
+external_psql() {
+    PGPASSWORD="${LOCAL_POSTGRES_PASSWORD}" psql \
+        -X \
+        -v ON_ERROR_STOP=1 \
+        -h 127.0.0.1 \
+        -p "${POSTGRES_PORT}" \
+        -U "${LOCAL_POSTGRES_USER}" \
+        "$@"
+}
+
+resolve_pg_config() {
+    local server_major="$1"
+    local candidate=""
+    local candidate_major=""
+
+    if [ "$(uname -s)" = "Darwin" ] && command -v brew >/dev/null 2>&1; then
+        candidate="$(brew --prefix "postgresql@${server_major}" 2>/dev/null || true)/bin/pg_config"
+        if [ -x "$candidate" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    fi
+
+    candidate="/usr/lib/postgresql/${server_major}/bin/pg_config"
+    if [ -x "$candidate" ]; then
+        echo "$candidate"
+        return 0
+    fi
+
+    if command -v pg_config >/dev/null 2>&1; then
+        candidate="$(command -v pg_config)"
+        candidate_major="$("$candidate" --version | awk '{split($2, version, "."); print version[1]}')"
+        if [ "$candidate_major" = "$server_major" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+install_pgvector_for_homebrew_postgres() {
+    local server_major="$1"
+    local pg_config_path=""
+    local build_dir=""
+    local archive_path=""
+    local source_dir=""
+    local actual_sha256=""
+
+    if [ "$(uname -s)" != "Darwin" ]; then
+        print_pgvector_install_guide "$server_major"
+        return 1
+    fi
+
+    for command_name in curl make shasum tar; do
+        if ! command -v "$command_name" >/dev/null 2>&1; then
+            echo -e "${RED}[错误] 自动安装 pgvector 需要命令：${command_name}${NC}"
+            return 1
+        fi
+    done
+
+    if [ -z "$PGVECTOR_SHA256" ]; then
+        echo -e "${RED}[错误] 非默认 pgvector 版本必须同时设置 PUDDINGCLAW_PGVECTOR_SHA256。${NC}"
+        return 1
+    fi
+
+    pg_config_path="$(resolve_pg_config "$server_major" || true)"
+    if [ -z "$pg_config_path" ]; then
+        echo -e "${RED}[错误] 找不到与 PostgreSQL ${server_major} 匹配的 pg_config。${NC}"
+        echo "       Homebrew 安装：brew install postgresql@${server_major}"
+        return 1
+    fi
+
+    build_dir="$(mktemp -d "/private/tmp/puddingclaw-pgvector-${PGVECTOR_VERSION}.XXXXXX")"
+    archive_path="${build_dir}/pgvector-${PGVECTOR_VERSION}.tar.gz"
+    source_dir="${build_dir}/source"
+    mkdir -p "$source_dir"
+
+    echo -e "${YELLOW}[依赖] 正在下载 pgvector ${PGVECTOR_VERSION} 源码...${NC}"
+    if ! curl --fail --location --retry 3 \
+        "https://github.com/pgvector/pgvector/archive/refs/tags/v${PGVECTOR_VERSION}.tar.gz" \
+        --output "$archive_path"; then
+        echo -e "${RED}[错误] pgvector ${PGVECTOR_VERSION} 源码下载失败。${NC}"
+        return 1
+    fi
+
+    actual_sha256="$(shasum -a 256 "$archive_path" | awk '{print $1}')"
+    if [ "$actual_sha256" != "$PGVECTOR_SHA256" ]; then
+        echo -e "${RED}[错误] pgvector 源码 SHA256 校验失败，已停止安装。${NC}"
+        echo "       expected: ${PGVECTOR_SHA256}"
+        echo "       actual:   ${actual_sha256}"
+        return 1
+    fi
+
+    tar -xzf "$archive_path" -C "$source_dir" --strip-components=1
+    echo -e "${YELLOW}[依赖] 正在为 PostgreSQL ${server_major} 编译 pgvector ${PGVECTOR_VERSION}...${NC}"
+    make -s -C "$source_dir" PG_CONFIG="$pg_config_path"
+    make -s -C "$source_dir" PG_CONFIG="$pg_config_path" install
+    echo -e "${GREEN}[完成] pgvector ${PGVECTOR_VERSION} 已安装到 PostgreSQL ${server_major}。${NC}"
+}
+
+ensure_external_pgvector() {
+    if ! command -v psql >/dev/null 2>&1; then
+        echo -e "${RED}[错误] 未找到 psql，无法配置本机 PostgreSQL。${NC}"
+        print_pgvector_install_guide "16"
+        return 1
+    fi
+
+    local server_major
+    local available_version
+    local installed_version
+
+    server_major="$(external_psql -d postgres -Atqc "show server_version_num" 2>/dev/null | awk '{print int($1 / 10000)}' || true)"
+    if [ -z "$server_major" ]; then
+        echo -e "${RED}[错误] 无法连接本机 PostgreSQL，请检查端口、用户和密码。${NC}"
+        return 1
+    fi
+
+    available_version="$(external_psql -d postgres -Atqc "select default_version from pg_available_extensions where name = 'vector'" 2>/dev/null || true)"
+    if [ "$available_version" != "$PGVECTOR_VERSION" ]; then
+        if [ -n "$available_version" ]; then
+            echo -e "${YELLOW}[依赖] PostgreSQL ${server_major} 当前可用 pgvector ${available_version}，项目锁定 ${PGVECTOR_VERSION}。${NC}"
+        fi
+        install_pgvector_for_homebrew_postgres "$server_major"
+        available_version="$(external_psql -d postgres -Atqc "select default_version from pg_available_extensions where name = 'vector'" 2>/dev/null || true)"
+    fi
+
+    if [ "$available_version" != "$PGVECTOR_VERSION" ]; then
+        echo -e "${RED}[错误] PostgreSQL ${server_major} 仍未发现 pgvector ${PGVECTOR_VERSION}。${NC}"
+        print_pgvector_install_guide "$server_major"
+        return 1
+    fi
+
+    if ! external_psql -d "$PGVECTOR_DATABASE" -Atqc "select 1" >/dev/null 2>&1; then
+        echo -e "${RED}[错误] 无法连接 pgvector 目标数据库 ${PGVECTOR_DATABASE}，未启用扩展。${NC}"
+        return 1
+    fi
+
+    installed_version="$(external_psql -d "$PGVECTOR_DATABASE" -Atqc "select extversion from pg_extension where extname = 'vector'" 2>/dev/null || true)"
+    if [ -z "$installed_version" ]; then
+        echo -e "${YELLOW}[依赖] 正在为数据库 ${PGVECTOR_DATABASE} 启用 pgvector ${PGVECTOR_VERSION}...${NC}"
+        external_psql -d "$PGVECTOR_DATABASE" -qc "create extension vector version '${PGVECTOR_VERSION}'"
+    elif [ "$installed_version" != "$PGVECTOR_VERSION" ]; then
+        echo -e "${YELLOW}[依赖] 正在将数据库 ${PGVECTOR_DATABASE} 的 pgvector 从 ${installed_version} 升级到 ${PGVECTOR_VERSION}...${NC}"
+        external_psql -d "$PGVECTOR_DATABASE" -qc "alter extension vector update to '${PGVECTOR_VERSION}'"
+    fi
+
+    installed_version="$(external_psql -d "$PGVECTOR_DATABASE" -Atqc "select extversion from pg_extension where extname = 'vector'")"
+    echo -e "${GREEN}[完成] 数据库 ${PGVECTOR_DATABASE} 已启用 pgvector ${installed_version}。${NC}"
+}
+
+ensure_bundled_pgvector() {
+    local attempts=30
+    local installed_version=""
+
+    while ! docker compose -f docker-compose.infra.yml exec -T postgres \
+        pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1; do
+        attempts=$((attempts - 1))
+        if [ "$attempts" -le 0 ]; then
+            echo -e "${RED}[错误] Bundled PostgreSQL 未在预期时间内就绪。${NC}"
+            return 1
+        fi
+        sleep 1
+    done
+
+    docker compose -f docker-compose.infra.yml exec -T postgres \
+        psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+        -qc "create extension if not exists vector"
+    installed_version="$(docker compose -f docker-compose.infra.yml exec -T postgres \
+        psql -X -Atqc "select extversion from pg_extension where extname = 'vector'" \
+        -U "$POSTGRES_USER" -d "$POSTGRES_DB")"
+    echo -e "${GREEN}[完成] Bundled 数据库 ${POSTGRES_DB} 已启用 pgvector ${installed_version}。${NC}"
+}
+
 if ! command -v docker >/dev/null 2>&1; then
     echo -e "${RED}[错误] 未找到 Docker。Milvus / bundled PostgreSQL 需要 Docker。${NC}"
     exit 1
@@ -168,6 +375,12 @@ if ! docker compose -f docker-compose.infra.yml up -d "${COMPOSE_SERVICES[@]}"; 
     exit 1
 fi
 
+if [ "$START_BUNDLED_POSTGRES" = "true" ]; then
+    ensure_bundled_pgvector
+else
+    ensure_external_pgvector
+fi
+
 echo ""
 echo -e "${YELLOW}[步骤 2/2] 本机服务地址${NC}"
 echo ""
@@ -178,10 +391,13 @@ if [ "$START_BUNDLED_POSTGRES" = "true" ]; then
     echo "    password:      ${POSTGRES_PASSWORD}"
 else
     echo "  PostgreSQL:      local/user-managed"
-    echo "    本脚本没有启动或修改你的本机 PostgreSQL。"
+    echo "    本脚本不会启动或替换你的本机 PostgreSQL，只维护目标库的 pgvector 扩展。"
     echo "    database:      ${DB_CONFIG_DB}"
     echo "    username:      ${DB_CONFIG_USER}"
     echo "    password:      ${DB_CONFIG_PASSWORD:-<empty>}"
+    if [ "$PGVECTOR_DATABASE" != "$DB_CONFIG_DB" ]; then
+        echo "    pgvector db:   ${PGVECTOR_DATABASE}"
+    fi
 fi
 echo "  Milvus:          grpc://localhost:19530"
 echo "  MinerU API:      http://localhost:8002  (本机运行，不由本脚本启动)"

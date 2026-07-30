@@ -1,6 +1,8 @@
-"""MCP Servers API — list configured/enabled MCP servers."""
+"""MCP Servers API — list and optionally probe configured MCP servers."""
 
-from fastapi import APIRouter
+import asyncio
+
+from fastapi import APIRouter, Query
 
 from config import load_config
 
@@ -14,8 +16,8 @@ _MCP_DISPLAY_NAMES: dict[str, str] = {
 
 
 @router.get("/mcp/servers")
-async def list_mcp_servers():
-    """List enabled MCP servers for frontend panel display."""
+async def list_mcp_servers(probe: bool = Query(False)):
+    """List effective servers and secret-free discovery/load status."""
     cfg = load_config()
     mcp_config = cfg.get("mcp", {})
 
@@ -32,6 +34,40 @@ async def list_mcp_servers():
         )
         servers = get_mcp_server_display_info(enabled)
         gbrain = gbrain_runtime_status()
+        catalog_names = list(dict.fromkeys([*enabled, "gbrain"]))
+        catalog = get_mcp_server_display_info(catalog_names)
+        enabled_set = set(enabled)
+        explicitly_enabled = set(mcp_config.get("enabled", []))
+        for item in catalog:
+            key = item["key"]
+            item["enabled"] = key in enabled_set
+            item["auto_enabled"] = key == "gbrain" and key in enabled_set and key not in explicitly_enabled
+            item["ready"] = bool(gbrain.get("ready")) if key == "gbrain" else True
+            item["status"] = "ready" if item["enabled"] and item["ready"] else "not_ready"
+            item["reason"] = str(gbrain.get("reason") or "") if key == "gbrain" else ""
+            item["loaded"] = False
+            item["tools"] = []
+            item["tool_count"] = 0
+
+        if probe:
+            from mcp_clients import load_filtered_mcp_tools
+
+            for item in catalog:
+                if not item["enabled"] or not item["ready"]:
+                    continue
+                try:
+                    tools = await asyncio.wait_for(
+                        load_filtered_mcp_tools([item["key"]]),
+                        timeout=20,
+                    )
+                    names = [str(getattr(tool, "name", "")) for tool in tools]
+                    item["loaded"] = True
+                    item["status"] = "loaded"
+                    item["tools"] = names
+                    item["tool_count"] = len(names)
+                except Exception as exc:
+                    item["status"] = "error"
+                    item["reason"] = str(exc)[:500]
     except Exception:
         # Fallback: return minimal info from config when MCP client deps are missing.
         servers = [
@@ -44,5 +80,19 @@ async def list_mcp_servers():
             for name in mcp_config.get("enabled", [])
         ]
         gbrain = {"configured": False, "ready": False, "reason": "runtime status unavailable"}
+        catalog = [
+            {
+                **server,
+                "enabled": True,
+                "auto_enabled": False,
+                "ready": False,
+                "loaded": False,
+                "status": "error",
+                "reason": "runtime status unavailable",
+                "tools": [],
+                "tool_count": 0,
+            }
+            for server in servers
+        ]
 
-    return {"servers": servers, "gbrain": gbrain}
+    return {"servers": servers, "catalog": catalog, "gbrain": gbrain}

@@ -4289,6 +4289,10 @@ class SessionManager:
         for f in sorted(
             self._sessions_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True
         ):  # 遍历所有 JSON 文件，按修改时间倒序
+            # Background jobs may reuse the Agent harness for one isolated run,
+            # but they are task-center records rather than user conversations.
+            if f.stem.startswith("background-job-"):
+                continue
             raw: Any = None
             try:
                 # Reuse the canonical reader so legacy embedded traces are

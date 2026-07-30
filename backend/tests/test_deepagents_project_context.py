@@ -6,7 +6,9 @@ def _write_prompt_templates(base_dir: Path) -> None:
     prompt_dir.mkdir(parents=True)
     (prompt_dir / "AGENTS.md").write_text("AGENTS PROMPT", encoding="utf-8")
     (prompt_dir / "PROJECT_CONTEXT.md").write_text("DEFAULT PROJECT CONTEXT", encoding="utf-8")
-    (prompt_dir / "TOOL_GUIDES.md").write_text("TOOL GUIDES", encoding="utf-8")
+    tool_guide_dir = prompt_dir / "tool_guides"
+    tool_guide_dir.mkdir()
+    (tool_guide_dir / "core.md").write_text("CORE TOOL GUIDES", encoding="utf-8")
 
 
 def test_register_project_creates_project_context(tmp_path):
@@ -43,13 +45,17 @@ def test_deepagents_prompt_builder_uses_project_local_context(tmp_path):
     assert "AGENTS PROMPT" in prompt
     assert "LOCAL PROJECT CONTEXT" in prompt
     assert "DEFAULT PROJECT CONTEXT" not in prompt
-    assert "TOOL GUIDES" in prompt
+    assert "CORE TOOL GUIDES" in prompt
 
 
 def test_default_tool_guides_route_product_config_metrics_to_database() -> None:
-    prompt = (Path(__file__).resolve().parent.parent / "prompts" / "deepagents" / "TOOL_GUIDES.md").read_text(
-        encoding="utf-8"
-    )
+    prompt = (
+        Path(__file__).resolve().parent.parent
+        / "prompts"
+        / "deepagents"
+        / "tool_guides"
+        / "database-analysis.md"
+    ).read_text(encoding="utf-8")
 
     assert "Current Capability Manifest lists `database_sql_generate`" in prompt
     assert "`/skills/database-analysis/SKILL.md`" in prompt
@@ -67,7 +73,7 @@ def test_default_tool_guides_route_product_config_metrics_to_database() -> None:
 
 
 def test_default_tool_guides_require_execution_self_check_before_completion() -> None:
-    prompt = (Path(__file__).resolve().parent.parent / "prompts" / "deepagents" / "TOOL_GUIDES.md").read_text(
+    prompt = (Path(__file__).resolve().parent.parent / "prompts" / "deepagents" / "tool_guides" / "core.md").read_text(
         encoding="utf-8"
     )
 
@@ -81,7 +87,7 @@ def test_default_tool_guides_require_execution_self_check_before_completion() ->
 
 
 def test_default_tool_guides_define_managed_browser_authorization_lifecycle() -> None:
-    prompt = (Path(__file__).resolve().parent.parent / "prompts" / "deepagents" / "TOOL_GUIDES.md").read_text(
+    prompt = (Path(__file__).resolve().parent.parent / "prompts" / "deepagents" / "tool_guides" / "core.md").read_text(
         encoding="utf-8"
     )
 
@@ -107,7 +113,7 @@ def test_default_agent_prompt_defines_async_lifecycle_invariant() -> None:
 
 
 def test_default_tool_guides_use_virtual_filesystem_for_semantic_assets() -> None:
-    prompt = (Path(__file__).resolve().parent.parent / "prompts" / "deepagents" / "TOOL_GUIDES.md").read_text(
+    prompt = (Path(__file__).resolve().parent.parent / "prompts" / "deepagents" / "tool_guides" / "core.md").read_text(
         encoding="utf-8"
     )
 
@@ -121,6 +127,19 @@ def test_default_tool_guides_use_virtual_filesystem_for_semantic_assets() -> Non
     assert "The default runner is the kernel sandbox" in prompt
     assert "stage_external_artifact" not in prompt
     assert "stage_external_directory" not in prompt
+
+
+def test_base_prompt_excludes_request_scoped_tool_guides() -> None:
+    prompt = (Path(__file__).resolve().parent.parent / "prompts" / "deepagents" / "tool_guides" / "core.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "## Resource Access" in prompt
+    assert "## Completion discipline" in prompt
+    assert "## Managed Browser Authorization" in prompt
+    assert "## Source Citation Rules" in prompt
+    assert "## Database Analysis" not in prompt
+    assert "## Semantic Dimension Builds" not in prompt
 
 
 def test_default_agent_prompt_requires_chinese_user_visible_output() -> None:

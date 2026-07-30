@@ -15,7 +15,7 @@
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: ${POSTGRES_IMAGE:-pgvector/pgvector:pg16}
     container_name: puddingclaw-postgres
     environment:
       - POSTGRES_DB=${POSTGRES_DB:-puddingclaw}
@@ -25,8 +25,9 @@ services:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./scripts/postgres-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB} && psql -U $${POSTGRES_USER} -d $${POSTGRES_DB} -Atqc \"select 1 from pg_available_extensions where name='vector'\" | grep -qx 1"]
       interval: 10s
       timeout: 5s
       retries: 5

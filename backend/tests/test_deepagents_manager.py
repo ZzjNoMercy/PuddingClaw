@@ -328,6 +328,8 @@ def test_build_middlewares_includes_model_call_limit(tmp_path, monkeypatch):
         project_id=None,
         rubric_model=SimpleNamespace(),
     )
+    middleware_names = [item.__class__.__name__ for item in middlewares]
+    assert middleware_names.index("ToolGuideMiddleware") == middleware_names.index("ToolsetMiddleware") + 1
     limiter = next(item for item in middlewares if item.__class__.__name__ == "ObservableModelCallLimitMiddleware")
 
     assert limiter.run_limit == 7

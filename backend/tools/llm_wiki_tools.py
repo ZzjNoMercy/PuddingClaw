@@ -9,6 +9,7 @@ from typing import Any, Literal
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
 
+from graph.citations import encode_tool_result
 from knowledge.llm_wiki import LlmWikiError, LlmWikiService
 
 
@@ -125,7 +126,37 @@ class LlmWikiQueryTool(_WikiTool):
 
     def _run(self, question: str, limit: int = 6) -> str:
         try:
-            return self.encode(self.service.query(question, limit=limit))
+            payload = self.service.query(question, limit=limit)
+            pages = {
+                str(page.get("slug") or ""): page
+                for page in payload.get("pages", [])
+                if isinstance(page, dict)
+            }
+            sources = []
+            for reference in payload.get("references", []):
+                if not isinstance(reference, dict):
+                    continue
+                slug = str(reference.get("slug") or "")
+                page = pages.get(slug, {})
+                content = str(reference.get("excerpt") or page.get("content") or "")
+                sources.append(
+                    {
+                        "title": str(reference.get("title") or slug),
+                        "uri": str(reference.get("uri") or ""),
+                        "document_id": f"llm-wiki:{slug}",
+                        "chunk_id": slug,
+                        "source_type": "llm_wiki",
+                        "quote": content[:1200],
+                        "score": reference.get("score"),
+                        "metadata": {
+                            "wiki_slug": slug,
+                            "page_type": reference.get("type"),
+                            "raw_sources": reference.get("sources", []),
+                            "virtual_path": reference.get("uri"),
+                        },
+                    }
+                )
+            return encode_tool_result(self.encode(payload), sources)
         except (LlmWikiError, OSError) as exc:
             return self.error(exc)
 

@@ -372,7 +372,13 @@ class ProviderRegistry:
                     return self._resolved_model(provider, endpoint, model, binding=binding)
         raise ValueError(f"Bound model not found: {model_id}")
 
-    def resolve_model(self, model_id: str, *, legacy_config: dict[str, Any]) -> dict[str, Any]:
+    def resolve_model(
+        self,
+        model_id: str,
+        *,
+        legacy_config: dict[str, Any],
+        expected_capability: str = "llm",
+    ) -> dict[str, Any]:
         """Resolve an explicit registered model without switching providers."""
 
         self.ensure_migrated(legacy_config)
@@ -382,8 +388,10 @@ class ProviderRegistry:
                 if model.get("id") != model_id:
                     continue
                 endpoint = self._endpoint(provider, str(model["endpoint_id"]))
-                if model.get("capability") != "llm":
-                    raise ValueError("The selected conversation model must be an LLM")
+                if model.get("capability") != expected_capability:
+                    raise ValueError(
+                        f"The selected model must have capability {expected_capability}"
+                    )
                 if model.get("capability") not in endpoint.get("capabilities", []):
                     raise ValueError(f"Model {model_id} is incompatible with endpoint {endpoint['id']}")
                 if not self.credentials.get(str(endpoint.get("credential_ref") or "")):

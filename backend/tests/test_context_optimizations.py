@@ -1139,6 +1139,7 @@ class TestTokensAPI:
         assert result["total_tokens"] == 6800
         assert result["compaction_trigger"] == 160000
         assert result["percentage"] == 4.2
+        assert result["measured"] is True
 
     @pytest.mark.asyncio
     async def test_unpersisted_agent_placeholder_uses_agent_trigger(self, tmp_path):
@@ -1159,8 +1160,34 @@ class TestTokensAPI:
                 runtime_mode="agent",
             )
 
-        assert result["total_tokens"] == 11
+        assert result["total_tokens"] == 0
         assert result["compaction_trigger"] == 272000
+        assert result["measured"] is False
+
+    @pytest.mark.asyncio
+    async def test_persisted_agent_without_run_is_unmeasured(self, tmp_path):
+        from api.tokens import get_session_token_count
+        from graph.session_manager import session_manager
+
+        session_manager.initialize(tmp_path)
+        sid = "persisted-agent-without-run"
+        session_manager.create_session(sid, metadata={"runtime_mode": "agent"})
+
+        with (
+            patch("api.tokens.build_system_prompt", return_value="legacy chat prompt"),
+            patch("api.tokens._count_tokens", return_value=11392),
+            patch(
+                "api.tokens.get_deepagents_summarization_config",
+                return_value={"trigger_tokens": 160000},
+            ),
+        ):
+            result = await get_session_token_count(sid)
+
+        assert result["system_tokens"] == 0
+        assert result["message_tokens"] == 0
+        assert result["total_tokens"] == 0
+        assert result["percentage"] == 0.0
+        assert result["measured"] is False
 
     @pytest.mark.asyncio
     async def test_persisted_chat_ignores_agent_runtime_hint(self, tmp_path):
@@ -1185,3 +1212,4 @@ class TestTokensAPI:
             )
 
         assert result["compaction_trigger"] == 500000
+        assert result["measured"] is True

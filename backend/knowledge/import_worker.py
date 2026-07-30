@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 
 from db import get_sessionmaker
 from knowledge.import_jobs import (
+    LLM_WIKI_INGEST_KIND,
     VANNA_ENTITY_IMPORT_KIND,
     claim_next_job,
     job_kind,
@@ -86,7 +87,12 @@ class KnowledgeImportWorkerManager:
             if job is None:
                 return True
             try:
-                await process_import_job(session, base_dir=base_dir, job=job)
+                if kind == LLM_WIKI_INGEST_KIND:
+                    from knowledge.llm_wiki_job_runner import process_llm_wiki_ingest_job
+
+                    await process_llm_wiki_ingest_job(session, base_dir=base_dir, job=job)
+                else:
+                    await process_import_job(session, base_dir=base_dir, job=job)
                 logger.info("[knowledge-worker] completed job_id=%s", job.id)
             except Exception as exc:
                 logger.exception("[knowledge-worker] failed job_id=%s", job.id)

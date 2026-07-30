@@ -13,6 +13,7 @@ import type {
   GbrainSchemaPackManifest,
   GbrainSubtypeField,
 } from "@/lib/api";
+import { schemaFieldLabel } from "./schema-ui-labels";
 
 const inputClass =
   "h-9 w-full rounded-xl border border-black/[0.08] bg-white px-3 text-sm text-gray-800 outline-none transition focus:border-[#002fa7]/35 focus:ring-2 focus:ring-[#002fa7]/10";
@@ -22,10 +23,13 @@ const subtypeFields: GbrainSubtypeField[] = ["subtype", "legacy_type", "origin",
 const aggregators: GbrainAggregator[] = ["scalar_brier", "weighted_brier", "count_based", "cluster_summary"];
 
 function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
+  const translated = schemaFieldLabel(label);
   return (
     <label className="block min-w-0">
       <span className="mb-1.5 flex items-baseline gap-2 text-xs font-medium text-gray-700">
-        {label}{hint ? <span className="font-normal text-gray-400">{hint}</span> : null}
+        {translated || label}
+        {translated ? <code className="font-mono text-[10px] font-normal text-gray-400">{label}</code> : null}
+        {hint ? <span className="font-normal text-gray-400">{hint}</span> : null}
       </span>
       {children}
     </label>
@@ -213,7 +217,7 @@ export function PageTypeAdvancedEditor({
   };
   return (
     <details className="mt-3 rounded-xl border border-black/[0.055] bg-white/70 p-3">
-      <summary className="cursor-pointer text-xs font-medium text-gray-600">高级：ExtractableSpec 与 subtypes</summary>
+      <summary className="cursor-pointer text-xs font-medium text-gray-600">高级设置：提取规则与子类型</summary>
       <div className="mt-3 space-y-4">
         <div>
           <Field label="extractable mode">
@@ -242,8 +246,8 @@ export function PageTypeAdvancedEditor({
         </div>
         <div>
           <div className="flex items-center justify-between">
-            <p className="text-xs font-medium text-gray-700">subtypes ({subtypes.length})</p>
-            <button type="button" onClick={() => onChange({ subtypes: [...subtypes, { name: "", when: {} }] })} className="text-xs font-medium text-[#002fa7]">+ 添加 subtype</button>
+            <p className="text-xs font-medium text-gray-700">子类型 <code className="text-[10px] font-normal text-gray-400">subtypes</code> ({subtypes.length})</p>
+            <button type="button" onClick={() => onChange({ subtypes: [...subtypes, { name: "", when: {} }] })} className="text-xs font-medium text-[#002fa7]">+ 添加子类型</button>
           </div>
           <div className="mt-2 space-y-2">
             {subtypes.map((subtype, index) => (
@@ -298,7 +302,7 @@ function MappingRuleEditor({
           <Field label="inverse"><input className={inputClass} value={rule.inverse || ""} onChange={(event) => onChange({ ...rule, inverse: event.target.value || undefined })} /></Field>
           <div className="md:col-span-2"><ResolverEditor label="source_slug_from" value={rule.source_slug_from} onChange={(value) => value && onChange({ ...rule, source_slug_from: value })} /></div>
           <div className="md:col-span-2"><ResolverEditor label="target_slug_from" value={rule.target_slug_from} onChange={(value) => value && onChange({ ...rule, target_slug_from: value })} /></div>
-          <label className="inline-flex items-center gap-2 text-xs text-gray-600"><input type="checkbox" checked={rule.preserve_notes ?? false} onChange={(event) => onChange({ ...rule, preserve_notes: event.target.checked })} /> preserve_notes</label>
+          <label className="inline-flex items-center gap-2 text-xs text-gray-600"><input type="checkbox" checked={rule.preserve_notes ?? false} onChange={(event) => onChange({ ...rule, preserve_notes: event.target.checked })} /> 保留备注 <code className="text-[10px] text-gray-400">preserve_notes</code></label>
         </> : null}
         {rule.kind === "page_to_alias" ? <>
           <div className="md:col-span-2"><ResolverEditor label="canonical_from" value={rule.canonical_from} onChange={(value) => value && onChange({ ...rule, canonical_from: value })} /></div>
@@ -322,7 +326,7 @@ export default function AdvancedSchemaEditor({
   const calibration = draft.calibration_domains || [];
   return (
     <div className="space-y-4">
-      <Section title="Borrow From" description="从其他官方 pack 选择性借用 page_types 或 link_types；空列表不会借用该类。" count={draft.borrow_from.length} onAdd={() => onChange({ ...draft, borrow_from: [...draft.borrow_from, { pack: "", types: [], link_types: [] }] })}>
+      <Section title="借用官方类型" description="从其他官方 pack 选择性借用 page_types 或 link_types；空列表不会借用该类。" count={draft.borrow_from.length} onAdd={() => onChange({ ...draft, borrow_from: [...draft.borrow_from, { pack: "", types: [], link_types: [] }] })}>
         {draft.borrow_from.map((item, index) => <div key={index} className="grid gap-3 rounded-xl bg-black/[0.025] p-3 md:grid-cols-[1fr_1fr_1fr_auto]">
           <Field label="pack"><input className={inputClass} value={item.pack} onChange={(event) => onChange({ ...draft, borrow_from: draft.borrow_from.map((value, itemIndex) => itemIndex === index ? { ...value, pack: event.target.value } : value) })} /></Field>
           <Field label="types"><StringListEditor value={item.types || []} onChange={(types) => onChange({ ...draft, borrow_from: draft.borrow_from.map((value, itemIndex) => itemIndex === index ? { ...value, types } : value) })} /></Field>
@@ -331,7 +335,7 @@ export default function AdvancedSchemaEditor({
         </div>)}
       </Section>
 
-      <Section title="Enrichable Types" description="声明允许 enrich 的页面类型及可选 rubric。" count={draft.enrichable_types.length} onAdd={() => onChange({ ...draft, enrichable_types: [...draft.enrichable_types, { type: "" }] })}>
+      <Section title="可增强类型" description="声明允许 enrich 的页面类型及可选 rubric。" count={draft.enrichable_types.length} onAdd={() => onChange({ ...draft, enrichable_types: [...draft.enrichable_types, { type: "" }] })}>
         {draft.enrichable_types.map((item, index) => <div key={index} className="grid gap-3 rounded-xl bg-black/[0.025] p-3 md:grid-cols-[1fr_2fr_auto]">
           <Field label="type"><input className={inputClass} value={item.type} onChange={(event) => onChange({ ...draft, enrichable_types: draft.enrichable_types.map((value, itemIndex) => itemIndex === index ? { ...value, type: event.target.value } : value) })} /></Field>
           <Field label="rubric"><input className={inputClass} value={item.rubric || ""} onChange={(event) => onChange({ ...draft, enrichable_types: draft.enrichable_types.map((value, itemIndex) => itemIndex === index ? { ...value, rubric: event.target.value || undefined } : value) })} /></Field>
@@ -339,7 +343,7 @@ export default function AdvancedSchemaEditor({
         </div>)}
       </Section>
 
-      <Section title="Filing Rules" description="定义 kind 到目录的归档规则。" count={draft.filing_rules.length} onAdd={() => onChange({ ...draft, filing_rules: [...draft.filing_rules, { kind: "", directory: "", examples: [] }] })}>
+      <Section title="归档规则" description="定义 kind 到目录的归档规则。" count={draft.filing_rules.length} onAdd={() => onChange({ ...draft, filing_rules: [...draft.filing_rules, { kind: "", directory: "", examples: [] }] })}>
         {draft.filing_rules.map((item, index) => <div key={index} className="grid gap-3 rounded-xl bg-black/[0.025] p-3 md:grid-cols-2">
           <Field label="kind"><input className={inputClass} value={item.kind} onChange={(event) => onChange({ ...draft, filing_rules: draft.filing_rules.map((value, itemIndex) => itemIndex === index ? { ...value, kind: event.target.value } : value) })} /></Field>
           <Field label="directory"><input className={inputClass} value={item.directory} onChange={(event) => onChange({ ...draft, filing_rules: draft.filing_rules.map((value, itemIndex) => itemIndex === index ? { ...value, directory: event.target.value } : value) })} /></Field>
@@ -349,11 +353,11 @@ export default function AdvancedSchemaEditor({
         </div>)}
       </Section>
 
-      <Section title="Phases" description="声明额外参与的 cycle phases；不改变 gbrain 核心 phases。">
+      <Section title="扩展阶段" description="声明额外参与的 cycle phases；不改变 gbrain 核心 phases。">
         <Field label="phases"><StringListEditor value={draft.phases || []} onChange={(phases) => onChange({ ...draft, phases })} /></Field>
       </Section>
 
-      <Section title="Calibration Domains" description="名称开放，aggregator 使用官方闭合枚举。" count={calibration.length} onAdd={() => onChange({ ...draft, calibration_domains: [...calibration, { name: "", aggregator: "scalar_brier", page_types: [] }] })}>
+      <Section title="校准域" description="名称开放，aggregator 使用官方闭合枚举。" count={calibration.length} onAdd={() => onChange({ ...draft, calibration_domains: [...calibration, { name: "", aggregator: "scalar_brier", page_types: [] }] })}>
         {calibration.map((item, index) => <div key={index} className="grid gap-3 rounded-xl bg-black/[0.025] p-3 md:grid-cols-[1fr_1fr_1.5fr_auto]">
           <Field label="name"><input className={inputClass} value={item.name} onChange={(event) => onChange({ ...draft, calibration_domains: calibration.map((value, itemIndex) => itemIndex === index ? { ...value, name: event.target.value } : value) })} /></Field>
           <Field label="aggregator"><select className={inputClass} value={item.aggregator} onChange={(event) => onChange({ ...draft, calibration_domains: calibration.map((value, itemIndex) => itemIndex === index ? { ...value, aggregator: event.target.value as GbrainAggregator } : value) })}>{aggregators.map((value) => <option key={value}>{value}</option>)}</select></Field>
@@ -362,12 +366,12 @@ export default function AdvancedSchemaEditor({
         </div>)}
       </Section>
 
-      <Section title="Migration From" description="声明可升级来源 pack 与版本范围（例如 1.x、1.2.x 或精确 SemVer）。">
-        <label className="inline-flex items-center gap-2 text-xs text-gray-600"><input type="checkbox" checked={Boolean(draft.migration_from)} onChange={(event) => onChange({ ...draft, migration_from: event.target.checked ? { pack: "", version: "" } : undefined })} /> 启用 migration_from</label>
+      <Section title="迁移来源" description="声明可升级来源 pack 与版本范围（例如 1.x、1.2.x 或精确 SemVer）。">
+        <label className="inline-flex items-center gap-2 text-xs text-gray-600"><input type="checkbox" checked={Boolean(draft.migration_from)} onChange={(event) => onChange({ ...draft, migration_from: event.target.checked ? { pack: "", version: "" } : undefined })} /> 启用迁移来源 <code className="text-[10px] text-gray-400">migration_from</code></label>
         {draft.migration_from ? <div className="grid gap-3 md:grid-cols-2"><Field label="pack"><input className={inputClass} value={draft.migration_from.pack} onChange={(event) => onChange({ ...draft, migration_from: { ...draft.migration_from!, pack: event.target.value } })} /></Field><Field label="version"><input className={inputClass} value={draft.migration_from.version} onChange={(event) => onChange({ ...draft, migration_from: { ...draft.migration_from!, version: event.target.value } })} /></Field></div> : null}
       </Section>
 
-      <Section title="Mapping Rules" description="官方 discriminated union：retype、page_to_link、page_to_alias。规则顺序有语义。" count={mappingRules.length} onAdd={() => onChange({ ...draft, mapping_rules: [...mappingRules, { kind: "retype", from_type: "", to_type: "", subtype_field: "subtype" }] })}>
+      <Section title="映射规则" description="官方 discriminated union：retype、page_to_link、page_to_alias。规则顺序有语义。" count={mappingRules.length} onAdd={() => onChange({ ...draft, mapping_rules: [...mappingRules, { kind: "retype", from_type: "", to_type: "", subtype_field: "subtype" }] })}>
         {mappingRules.map((rule, index) => <MappingRuleEditor key={index} rule={rule} index={index} count={mappingRules.length} onChange={(next) => onChange({ ...draft, mapping_rules: mappingRules.map((value, itemIndex) => itemIndex === index ? next : value) })} onMove={(delta) => { const target = index + delta; if (target < 0 || target >= mappingRules.length) return; const next = [...mappingRules]; [next[index], next[target]] = [next[target], next[index]]; onChange({ ...draft, mapping_rules: next }); }} onDelete={() => onChange({ ...draft, mapping_rules: mappingRules.filter((_, itemIndex) => itemIndex !== index) })} />)}
       </Section>
     </div>

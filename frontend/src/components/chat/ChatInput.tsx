@@ -258,6 +258,7 @@ export default function ChatInput() {
           used,
           total,
           percentage,
+          measured: data.measured,
         });
       })
       .catch(() => {});
@@ -1195,12 +1196,18 @@ function AttachmentChip({ item, onRemove }: { item: AgentAttachment; onRemove: (
 function ContextUsageTooltip({
   usage,
 }: {
-  usage: { used: number; total: number; percentage: number };
+  usage: { used: number; total: number; percentage: number; measured: boolean };
 }) {
   const [open, setOpen] = useState(false);
-  const formattedPercentage = formatContextPercentage(usage.percentage, usage.used);
+  const formattedPercentage = usage.measured
+    ? formatContextPercentage(usage.percentage, usage.used)
+    : "待测量";
   const color =
-    usage.percentage >= 90 ? "text-red-500" : usage.percentage >= 70 ? "text-amber-500" : "text-gray-400";
+    usage.measured && usage.percentage >= 90
+      ? "text-red-500"
+      : usage.measured && usage.percentage >= 70
+        ? "text-amber-500"
+        : "text-gray-400";
 
   return (
     <div
@@ -1221,11 +1228,13 @@ function ContextUsageTooltip({
         <div className="absolute bottom-full right-0 mb-2 w-56 rounded-xl bg-[#1f2937] px-3.5 py-2.5 text-[12px] text-white shadow-xl animate-fade-in-scale z-50">
           <p className="font-medium text-gray-200">背景信息窗口</p>
           <p className="mt-1 text-[16px] font-semibold">
-            {formattedPercentage} 已用
+            {usage.measured ? `${formattedPercentage} 已用` : "等待首轮上下文"}
           </p>
-          <p className="mt-1 text-[11px] text-gray-400">
-            已用 {formatTokens(usage.used)}，共 {formatTokens(usage.total)}
-          </p>
+          {usage.measured && (
+            <p className="mt-1 text-[11px] text-gray-400">
+              已用 {formatTokens(usage.used)}，共 {formatTokens(usage.total)}
+            </p>
+          )}
           <div className="absolute bottom-[-5px] right-4 h-2.5 w-2.5 rotate-45 bg-[#1f2937]" />
         </div>
       )}

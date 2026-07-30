@@ -1,6 +1,6 @@
-"""可选基础设施能力探测。
+"""基础设施能力探测。
 
-在 core/full 混合部署下，backend 启动时异步检测 PostgreSQL、Docker、Milvus、MinerU 是否可用。
+在 core/full 混合部署下，backend 启动时异步检测 PostgreSQL、pgvector、Docker、Milvus、MinerU 是否可用。
 模型请求由内部网关统一路由，不属于外部基础设施健康探测。
 """
 
@@ -20,6 +20,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from config import get_database_config, get_knowledge_mineru_config, load_config
+from postgres_dependencies import PGVECTOR_STATUS_SQL, normalize_pgvector_status
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,7 @@ class CapabilityStatus:
 @dataclass
 class Capabilities:
     database: CapabilityStatus
+    pgvector: CapabilityStatus
     docker: CapabilityStatus
     milvus: CapabilityStatus
     mineru: CapabilityStatus
@@ -51,6 +53,7 @@ class Capabilities:
     def to_dict(self) -> dict[str, Any]:
         return {
             "database": self.database.to_dict(),
+            "pgvector": self.pgvector.to_dict(),
             "docker": self.docker.to_dict(),
             "milvus": self.milvus.to_dict(),
             "mineru": self.mineru.to_dict(),
@@ -159,6 +162,32 @@ async def _check_postgres(url: str | None) -> CapabilityStatus:
             await engine.dispose()
 
 
+async def _check_pgvector(url: str | None) -> CapabilityStatus:
+    """Check server-side pgvector availability independently of DB health."""
+
+    target = _resolve_postgres_url(url)
+    if not _is_postgres_url(target):
+        return CapabilityStatus(available=False, reason="PostgreSQL URL not configured")
+    engine = None
+    try:
+        engine = create_async_engine(_normalize_async_postgres_url(target), pool_pre_ping=True)
+        async with engine.connect() as conn:
+            row = (await conn.execute(text(PGVECTOR_STATUS_SQL))).mappings().one()
+        status = normalize_pgvector_status(row)
+        if status["available"]:
+            version = status["version"] or "available"
+            return CapabilityStatus(available=True, reason=f"pgvector {version}")
+        return CapabilityStatus(
+            available=False,
+            reason=f"Required PostgreSQL extension is missing. Install: {status['install_command']}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return CapabilityStatus(available=False, reason=f"{type(exc).__name__}: {exc}")
+    finally:
+        if engine is not None:
+            await engine.dispose()
+
+
 async def detect_capabilities(
     *,
     force: bool = False,
@@ -190,6 +219,7 @@ async def detect_capabilities(
 
     results = await asyncio.gather(
         _check_postgres(postgres_target),
+        _check_pgvector(postgres_target),
         _check_docker(),
         _check_milvus(milvus_target),
         _check_http_get(mineru_target, "/health"),
@@ -197,9 +227,10 @@ async def detect_capabilities(
 
     caps = Capabilities(
         database=results[0],
-        docker=results[1],
-        milvus=results[2],
-        mineru=results[3],
+        pgvector=results[1],
+        docker=results[2],
+        milvus=results[3],
+        mineru=results[4],
     )
 
     _CAPABILITIES_CACHE = caps
@@ -275,6 +306,10 @@ def _detect_capabilities_sync_fallback(
 
     caps = Capabilities(
         database=_check_postgres_sync(postgres_target),
+        pgvector=CapabilityStatus(
+            available=False,
+            reason="pgvector status is verified by the asynchronous infrastructure probe",
+        ),
         docker=_check_docker_sync(),
         milvus=_check_milvus_sync(milvus_target),
         mineru=_check_http_get_sync(mineru_target, "/health"),

@@ -9,6 +9,7 @@ import Sidebar from "@/components/layout/Sidebar";
 import ResizeHandle from "@/components/layout/ResizeHandle";
 import FileTree from "@/components/skills/FileTree";
 import ConnectorCatalog from "@/components/extensions/ConnectorCatalog";
+import McpCatalog from "@/components/extensions/McpCatalog";
 import { useApp } from "@/lib/store";
 import ReactMarkdown from "react-markdown";
 import { markdownRemarkPlugins } from "@/lib/markdown";
@@ -35,6 +36,7 @@ import {
   Upload,
   Sparkles,
   Link2,
+  Server,
 } from "lucide-react";
 import {
   listSkills,
@@ -70,7 +72,7 @@ export default function SkillsPage() {
     triggerSkillCreator,
     setPendingInput,
   } = useApp();
-  const [extensionView, setExtensionView] = useState<"connectors" | "skills">("skills");
+  const [extensionView, setExtensionView] = useState<"connectors" | "skills" | "mcp">("skills");
   const [skills, setSkills] = useState<SkillInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedSkill, setSelectedSkill] = useState<string | null>(null);
@@ -364,7 +366,7 @@ export default function SkillsPage() {
   );
 
   const handleExtensionViewChange = useCallback(
-    (view: "connectors" | "skills") => {
+    (view: "connectors" | "skills" | "mcp") => {
       if (view === extensionView) return;
       if (isDirty && !window.confirm("当前文件有未保存的更改，确定要切换吗？")) return;
       setExtensionView(view);
@@ -466,9 +468,24 @@ export default function SkillsPage() {
             <Link2 className="h-4 w-4" />
             连接器
           </button>
+          <button
+            type="button"
+            aria-current={extensionView === "mcp" ? "page" : undefined}
+            onClick={() => handleExtensionViewChange("mcp")}
+            className={`flex items-center gap-2 rounded-xl px-3 py-1.5 text-[14px] font-semibold transition-colors ${
+              extensionView === "mcp"
+                ? "bg-[#002fa7] text-white shadow-sm"
+                : "text-gray-500 hover:bg-[#002fa7]/[0.06] hover:text-[#002fa7]"
+            }`}
+          >
+            <Server className="h-4 w-4" />
+            MCP
+          </button>
         </div>
       </nav>
-      {extensionView === "connectors" ? (
+      {extensionView === "mcp" ? (
+        <McpCatalog />
+      ) : extensionView === "connectors" ? (
         <ConnectorCatalog
           onUse={(prompt) => {
             setPendingInput(prompt);

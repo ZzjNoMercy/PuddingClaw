@@ -12,7 +12,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 from contextlib import contextmanager
@@ -24,6 +23,7 @@ from typing import Annotated, Any, Literal
 import yaml
 from pydantic import AnyUrl, BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from gbrain_runtime import gbrain_subprocess_environment, resolve_gbrain_binary
 from knowledge.paths import get_knowledge_root
 
 SCHEMA_API_VERSION = "gbrain-schema-pack-v1"
@@ -71,6 +71,26 @@ class PageType(StrictModel):
     extractable: bool | ExtractableSpec = False
     expert_routing: bool = False
     subtypes: list[PageSubtype] | None = None
+
+
+def workspace_page_prefixes(page_type: PageType | dict[str, Any]) -> list[str]:
+    """Project gbrain paths into paths relative to PuddingClaw's wiki/ root.
+
+    Some official packs describe paths from a whole-brain import root and
+    therefore include ``wiki/``. PuddingClaw imports the contents of its
+    ``wiki/`` directory as the gbrain source root, so retaining that segment
+    would create ``wiki/wiki/...`` and incorrect page slugs.
+    """
+
+    raw_prefixes = page_type.path_prefixes if isinstance(page_type, PageType) else page_type.get("path_prefixes", [])
+    normalized: list[str] = []
+    for value in raw_prefixes:
+        prefix = str(value).strip().lstrip("/")
+        if prefix.startswith("wiki/"):
+            prefix = prefix.removeprefix("wiki/")
+        if prefix and prefix not in normalized:
+            normalized.append(prefix)
+    return normalized
 
 
 class LinkInference(StrictModel):
@@ -221,7 +241,9 @@ class SchemaPackManifest(StrictModel):
 
 
 class WikiContract(StrictModel):
-    layout: Literal["flat"] = "flat"
+    # ``flat`` remains readable for already-created Brains. New saves project
+    # the Schema Pack's path_prefixes into the typed directory layout.
+    layout: Literal["flat", "typed_directories"] = "typed_directories"
     allowed_page_types: list[str] = Field(default_factory=lambda: ["concept", "system", "debate"])
     allowed_link_types: list[str] = Field(default_factory=lambda: ["relates_to", "supports", "challenges"])
     required_frontmatter: list[str] = Field(
@@ -341,8 +363,7 @@ class BrainSchemaService:
                 return candidate
             raise BrainSchemaError(f"PUDDINGCLAW_GBRAIN_SCHEMA_DIR is not a directory: {candidate}")
 
-        binary_name = os.getenv("PUDDINGCLAW_GBRAIN_BIN", "").strip() or "gbrain"
-        executable = shutil.which(binary_name)
+        executable = resolve_gbrain_binary()
         candidates: list[Path] = []
         if executable:
             resolved = Path(executable).resolve()
@@ -427,12 +448,58 @@ class BrainSchemaService:
             gbrain_min_version="0.42.0",
             extends=DEFAULT_PARENT_PACK,
             page_types=[
-                PageType(name="system", primitive="concept"),
-                PageType(name="debate", primitive="concept"),
+                PageType(
+                    name="system",
+                    primitive="entity",
+                    path_prefixes=["systems/"],
+                    aliases=["agent-system", "ai-system", "agent-product"],
+                ),
+                PageType(
+                    name="debate",
+                    primitive="concept",
+                    path_prefixes=["debates/"],
+                    aliases=["comparison", "controversy", "tradeoff"],
+                ),
+                PageType(
+                    name="research_paper",
+                    primitive="media",
+                    path_prefixes=["papers/"],
+                    aliases=["paper", "arxiv-paper", "technical-report"],
+                ),
+                PageType(
+                    name="software_framework",
+                    primitive="entity",
+                    path_prefixes=["frameworks/"],
+                    aliases=["agent-framework", "ai-framework", "sdk"],
+                ),
+                PageType(
+                    name="ai_model",
+                    primitive="entity",
+                    path_prefixes=["models/"],
+                    aliases=["model", "llm", "foundation-model"],
+                ),
+                PageType(
+                    name="programming_language",
+                    primitive="entity",
+                    path_prefixes=["languages/"],
+                    aliases=["language", "programming-language"],
+                ),
+                PageType(
+                    name="engineering_practice",
+                    primitive="concept",
+                    path_prefixes=["practices/"],
+                    aliases=["practice", "engineering-experience", "lesson-learned", "best-practice"],
+                ),
             ],
             link_types=[
                 LinkType(name="supports", inverse="supported_by"),
                 LinkType(name="challenges", inverse="challenged_by"),
+                LinkType(name="introduces", inverse="introduced_by"),
+                LinkType(name="implements", inverse="implemented_by"),
+                LinkType(name="uses", inverse="used_by"),
+                LinkType(name="depends_on", inverse="dependency_of"),
+                LinkType(name="evaluates", inverse="evaluated_by"),
+                LinkType(name="applies_to", inverse="applied_by"),
             ],
         )
 
@@ -454,7 +521,7 @@ class BrainSchemaService:
             insertion = required_frontmatter.index("updated") if "updated" in required_frontmatter else len(required_frontmatter)
             required_frontmatter.insert(insertion, "created")
         return WikiContract(
-            layout=current.layout if current else "flat",
+            layout="typed_directories",
             allowed_page_types=[item.name for item in resolved.page_types],
             allowed_link_types=[item.name for item in resolved.link_types],
             required_frontmatter=required_frontmatter,
@@ -463,6 +530,23 @@ class BrainSchemaService:
     def initialize(self) -> dict[str, Any]:
         with _file_lock(self.bundle_lock_path):
             return self._initialize_unlocked()
+
+    def rebuild_agents(self) -> dict[str, Any]:
+        """Rebuild the generated AGENTS.md projection from the active Brain Schema."""
+
+        with _file_lock(self.bundle_lock_path):
+            if not self.brain_schema_path.is_file() or not self.custom_pack_path.is_file():
+                raise BrainSchemaError("LLM Wiki Brain has not been initialized")
+            brain_schema = BrainSchemaDocument.model_validate(
+                _load_yaml_mapping(
+                    self.brain_schema_path.read_text(encoding="utf-8"),
+                    source=str(self.brain_schema_path),
+                )
+            )
+            agents_path = self.brain_root / "AGENTS.md"
+            custom, _raw, _digest = self._read_pack(self.custom_pack_path)
+            _atomic_write(agents_path, self._render_agents(brain_schema, self.resolve_manifest(custom)))
+            return self._bundle_unlocked()
 
     def _initialize_unlocked(self) -> dict[str, Any]:
         self.catalog()  # Fail before writing if the pinned runtime is unavailable.
@@ -509,37 +593,67 @@ class BrainSchemaService:
                 _atomic_write(path, initial)
         # AGENTS.md is a generated projection, not user-authored Wiki content.
         # Rebuild it idempotently so template upgrades cannot strand old Brains.
-        _atomic_write(self.brain_root / "AGENTS.md", self._render_agents(brain_schema))
+        _atomic_write(self.brain_root / "AGENTS.md", self._render_agents(brain_schema, resolved))
         return self._bundle_unlocked()
 
-    def _render_agents(self, schema: BrainSchemaDocument) -> str:
+    def _render_agents(
+        self,
+        schema: BrainSchemaDocument,
+        resolved: SchemaPackManifest | None = None,
+    ) -> str:
+        if resolved is None:
+            custom, _raw, _digest = self._read_pack(self.custom_pack_path)
+            resolved = self.resolve_manifest(custom)
         page_types = ", ".join(schema.wiki.allowed_page_types)
         link_types = ", ".join(schema.wiki.allowed_link_types)
         fields = ", ".join(schema.wiki.required_frontmatter)
+        path_rules = [
+            f"- `{page_type.name}`：{'、'.join(f'`{prefix}<slug>.md`' for prefix in prefixes)}。"
+            for page_type in resolved.page_types
+            if (prefixes := workspace_page_prefixes(page_type))
+        ]
+        path_section = "\n".join(path_rules)
         return (
-            "# LLM Wiki Agent Contract\n\n"
+            "# LLM Wiki Agent 操作契约\n\n"
             f"> schema: {schema.schema_id}@{schema.bundle_version}\n\n"
-            "## Ownership\n\n"
-            "- `raw/` is read-only. Never modify, rename, or delete its contents.\n"
-            "- Ingest writes patches only under `.puddingclaw/staging/`; the publisher updates `wiki/`.\n"
-            "- Query and Lint are read-only.\n"
-            "- `wiki/log.md` is append-only.\n\n"
-            "## Schema\n\n"
-            f"- Allowed page types: {page_types}.\n"
-            f"- Allowed link types: {link_types}.\n"
-            f"- Required frontmatter: {fields}.\n"
-            "- Wiki pages are flat, lowercase hyphen slugs and use `[[slug]]` links.\n\n"
-            "## Ingest\n\n"
-            "Read AGENTS.md, the active Schema Bundle, selected raw files, and current Wiki. "
-            "Produce a staging patch, update index coverage, and append an ingest log entry. "
-            "Every added or updated page must cite at least one raw file selected for this operation; "
-            "store sources only as the exact immutable `raw/manifest.jsonl` snapshot_path.\n\n"
-            "## Query\n\n"
-            "Read `wiki/index.md` first, then only relevant Wiki pages. Do not read raw during Query. "
-            "Cite Wiki slugs and sources; report a knowledge gap when the Wiki is insufficient.\n\n"
-            "## Lint\n\n"
-            "Report invalid frontmatter, unknown types, broken links, orphan pages, index omissions, "
-            "log rewrites, and stale raw hashes. Do not modify files.\n"
+            "## 所有权与操作边界\n\n"
+            "- `raw/` 只读，严禁修改、重命名或删除其中的内容。\n"
+            "- Ingest 只能在 `.puddingclaw/staging/` 下写入补丁；由发布流程更新 `wiki/`。\n"
+            "- Query 和 Lint 均为只读操作。\n"
+            "- `wiki/log.md` 只允许追加，禁止改写已有记录。\n\n"
+            "## Schema 约束\n\n"
+            f"- 允许的 page types：{page_types}。\n"
+            f"- 允许的 link types：{link_types}。\n"
+            f"- 必填 frontmatter：{fields}。\n"
+            "- Wiki 页面按 Page Type 的 `path_prefixes` 分目录存放；文件名 slug 使用小写连字符格式。\n"
+            f"{path_section}\n"
+            "- 所有 wikilink 必须写出与 gbrain 页面 slug 完全一致的目录前缀："
+            "使用 `[[<type-directory>/<slug>]]` 或 `[[<type-directory>/<slug>|显示文本]]`；"
+            "禁止裸写 `[[<slug>]]`，否则 gbrain 无法抽取关系边。\n\n"
+            "## AI Agent Wiki 分类准则\n\n"
+            "- `research_paper`：论文、预印本和技术报告；保留作者、年份、URL/DOI/arXiv 标识及核心结论。\n"
+            "- `software_framework`：LangGraph、AutoGen 等具体软件框架；抽象方法论仍使用 `concept`。\n"
+            "- `ai_model`：具体模型或模型系列；模型背后的技术方法使用 `concept`。\n"
+            "- `programming_language`：Python、TypeScript、Rust 等具体编程语言。\n"
+            "- `system`：具体 Agent 系统、产品或可运行实现；项目过程使用 `project`。\n"
+            "- `engineering_practice`：从开发记录中提炼的可复用工程经验，必须说明问题、根因、方案、验证、适用范围和失效条件。\n"
+            "- 普通文章、博客、视频等来源优先使用内置 `media` 或 `source`，不要重复增加 `article`。\n"
+            "- 一份 raw 可以编译出多个 Wiki 页面；一个 Wiki 页面只描述一个长期稳定的主题，不按 raw 文件机械地一对一建页。\n"
+            "- 优先使用 `introduces`、`implements`、`uses`、`depends_on`、`evaluates`、`applies_to`、"
+            "`supports`、`challenges` 以及内置关系；关系两端只使用相对 `wiki/` 根目录的完整页面 slug，"
+            "例如 `[[concepts/compiled-rag]]`，不得再次添加 `wiki/`。\n\n"
+            "## Ingest（摄取）\n\n"
+            "开始前读取 `AGENTS.md`、当前 Schema Bundle、本次选中的 raw 文件和现有 Wiki。"
+            "生成 staging patch、更新索引覆盖情况，并追加一条 Ingest 日志。"
+            "每个新增或更新的页面必须引用至少一个本次选中的 raw 文件；"
+            "sources 只能填写 `raw/manifest.jsonl` 中不可变的精确 `snapshot_path`；"
+            "直接复制 context 返回的路径，例如 `manual-upload-.../document.md`，不要添加 `raw/` 前缀。\n\n"
+            "## Query（查询）\n\n"
+            "先读取 `wiki/index.md`，再按需读取相关 Wiki 页面；Query 期间不得读取 raw。"
+            "回答时引用 Wiki slug 和 sources；若 Wiki 信息不足，明确报告知识缺口。\n\n"
+            "## Lint（检查）\n\n"
+            "报告无效 frontmatter、未知类型、断链、孤立页面、索引遗漏、日志改写和过期 raw hash。"
+            "Lint 不得修改任何文件。\n"
         )
 
     @staticmethod
@@ -646,7 +760,7 @@ class BrainSchemaService:
     def validate_with_gbrain(self, manifest: SchemaPackManifest) -> list[dict[str, Any]]:
         """Run gbrain's own shape, semantic lint, and resolver gates."""
 
-        binary = shutil.which(os.getenv("PUDDINGCLAW_GBRAIN_BIN", "gbrain"))
+        binary = resolve_gbrain_binary()
         if not binary:
             raise BrainSchemaError("gbrain CLI is required to validate an official Schema Pack")
         raw = _dump_yaml(_model_dict(manifest))
@@ -656,7 +770,7 @@ class BrainSchemaService:
             pack_dir = home / ".gbrain" / "schema-packs" / manifest.name
             pack_dir.mkdir(parents=True)
             (pack_dir / "pack.yaml").write_text(raw, encoding="utf-8")
-            environment = os.environ.copy()
+            environment = gbrain_subprocess_environment(binary)
             environment["GBRAIN_HOME"] = str(home)
             environment["GBRAIN_SCHEMA_PACK"] = manifest.name
             for command in (
@@ -709,7 +823,7 @@ class BrainSchemaService:
         if not agents_path.is_file():
             raise BrainSchemaError("LLM Wiki AGENTS.md is missing")
         agents_raw = agents_path.read_text(encoding="utf-8")
-        expected_agents_raw = self._render_agents(brain_schema)
+        expected_agents_raw = self._render_agents(brain_schema, self.resolve_manifest(custom))
         if agents_raw != expected_agents_raw:
             raise BrainSchemaError("LLM Wiki AGENTS.md does not match the active Schema Bundle")
         if brain_schema.gbrain_pack.name != custom.name or brain_schema.gbrain_pack.version != custom.version:
@@ -797,28 +911,29 @@ class BrainSchemaService:
         wiki_dir = self.brain_root / "wiki"
         allowed_types = {item.name for item in resolved.page_types}
         updates: dict[Path, str] = {}
-        for path in sorted(wiki_dir.glob("*.md")):
-            if path.name in {"index.md", "log.md"}:
+        for path in sorted(wiki_dir.rglob("*.md")):
+            relative = path.relative_to(wiki_dir)
+            if relative.as_posix() in {"index.md", "log.md"}:
                 continue
             content = path.read_text(encoding="utf-8")
             if not content.startswith("---\n"):
-                raise BrainSchemaError(f"Cannot migrate {path.name}: missing YAML frontmatter")
+                raise BrainSchemaError(f"Cannot migrate {relative}: missing YAML frontmatter")
             end = content.find("\n---\n", 4)
             if end < 0:
-                raise BrainSchemaError(f"Cannot migrate {path.name}: unterminated YAML frontmatter")
+                raise BrainSchemaError(f"Cannot migrate {relative}: unterminated YAML frontmatter")
             metadata = _load_yaml_mapping(content[4:end], source=str(path))
             missing = [field for field in required_frontmatter if metadata.get(field) in (None, "", [])]
             if missing:
-                raise BrainSchemaError(f"Cannot migrate {path.name}: missing frontmatter {', '.join(missing)}")
+                raise BrainSchemaError(f"Cannot migrate {relative}: missing frontmatter {', '.join(missing)}")
             page_type = str(metadata.get("type") or "")
             if page_type not in allowed_types:
                 raise BrainSchemaError(
-                    f"Cannot activate Schema {next_version}: wiki/{path.name} uses removed type {page_type!r}"
+                    f"Cannot activate Schema {next_version}: wiki/{relative} uses removed type {page_type!r}"
                 )
             page_version = str(metadata.get("schema_version") or "")
             if page_version not in {previous_version, next_version}:
                 raise BrainSchemaError(
-                    f"Cannot migrate {path.name}: schema_version {page_version!r} is not active version "
+                    f"Cannot migrate {relative}: schema_version {page_version!r} is not active version "
                     f"{previous_version!r}"
                 )
             migrated, count = re.subn(
@@ -827,7 +942,7 @@ class BrainSchemaService:
                 content,
             )
             if count != 1:
-                raise BrainSchemaError(f"Cannot migrate {path.name}: expected one schema_version field")
+                raise BrainSchemaError(f"Cannot migrate {relative}: expected one schema_version field")
             updates[path] = migrated
         if updates:
             log_path = wiki_dir / "log.md"
@@ -837,7 +952,7 @@ class BrainSchemaService:
                 f"## [{datetime.now(UTC).date().isoformat()}] schema-migrate\n\n"
                 f"- from: {previous_version}\n"
                 f"- to: {next_version}\n"
-                f"- pages: {', '.join(path.stem for path in updates)}\n"
+                f"- pages: {', '.join(path.relative_to(wiki_dir).with_suffix('').as_posix() for path in updates)}\n"
             )
             updates[log_path] = prior_log + separator + entry
         return updates
@@ -850,23 +965,26 @@ class BrainSchemaService:
         pages = {path: content for path, content in updates.items() if path.name not in {"index.md", "log.md"}}
         if not pages:
             return
-        binary = shutil.which(os.getenv("PUDDINGCLAW_GBRAIN_BIN", "gbrain"))
+        binary = resolve_gbrain_binary()
         if not binary:
             raise BrainSchemaError("gbrain CLI is required to validate a Wiki schema migration")
         with tempfile.TemporaryDirectory(prefix="puddingclaw-wiki-schema-migrate-") as temporary:
             root = Path(temporary)
             pack_dir = root / ".gbrain" / "schema-packs" / manifest.name
-            source_dir = root / "wiki"
+            source_root = root / "source"
             pack_dir.mkdir(parents=True)
-            source_dir.mkdir()
+            source_root.mkdir(parents=True)
             (pack_dir / "pack.yaml").write_text(_dump_yaml(_model_dict(manifest)), encoding="utf-8")
             for path, content in pages.items():
-                (source_dir / path.name).write_text(content, encoding="utf-8")
-            environment = os.environ.copy()
+                relative = path.relative_to(self.brain_root / "wiki")
+                destination = source_root / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(content, encoding="utf-8")
+            environment = gbrain_subprocess_environment(binary)
             environment["GBRAIN_HOME"] = str(root)
             environment["GBRAIN_SCHEMA_PACK"] = manifest.name
             result = subprocess.run(
-                [binary, "lint", str(source_dir)],
+                [binary, "lint", str(source_root)],
                 capture_output=True,
                 text=True,
                 env=environment,
@@ -930,7 +1048,7 @@ class BrainSchemaService:
         updated_brain_raw = _dump_yaml(_model_dict(updated))
         agents_path = self.brain_root / "AGENTS.md"
         agents_raw = agents_path.read_text(encoding="utf-8") if agents_path.exists() else ""
-        updated_agents_raw = self._render_agents(updated)
+        updated_agents_raw = self._render_agents(updated, resolved)
         wiki_updates: dict[Path, str] = {}
         if manifest.version != current_manifest.version:
             wiki_updates = self._prepare_wiki_schema_migration(
@@ -961,7 +1079,9 @@ class BrainSchemaService:
             "from_version": current_manifest.version,
             "to_version": manifest.version,
             "migrated_pages": sorted(
-                path.stem for path in wiki_updates if path.name not in {"index.md", "log.md"}
+                path.relative_to(self.brain_root / "wiki").with_suffix("").as_posix()
+                for path in wiki_updates
+                if path.relative_to(self.brain_root / "wiki").as_posix() not in {"index.md", "log.md"}
             ),
         }
         return result

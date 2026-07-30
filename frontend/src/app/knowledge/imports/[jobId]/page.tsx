@@ -11,6 +11,7 @@ import {
   Database,
   FileImage,
   FileText,
+  BookOpenCheck,
   Layers3,
   Loader2,
   RefreshCw,
@@ -110,6 +111,10 @@ function isVectorPublishJob(job: KnowledgeImportJob | null): boolean {
 
 function isVannaEntityJob(job: KnowledgeImportJob | null): boolean {
   return job?.metadata?.kind === "vanna_entity_import" || job?.file_type === "vanna_entity";
+}
+
+function isLlmWikiJob(job: KnowledgeImportJob | null): boolean {
+  return job?.metadata?.kind === "llm_wiki_ingest" || job?.file_type === "llm_wiki";
 }
 
 function sourceJobId(job: KnowledgeImportJob | null): string {
@@ -637,6 +642,59 @@ function StatCard({ label, value, tone = "blue" }: { label: string; value: strin
   );
 }
 
+function LlmWikiJobDetail({ job, events }: { job: KnowledgeImportJob; events: KnowledgeImportEvent[] }) {
+  const metadata = (job.metadata || {}) as Record<string, unknown>;
+  const rawPaths = Array.isArray(metadata.raw_paths)
+    ? metadata.raw_paths.filter((item): item is string => typeof item === "string")
+    : [];
+  const publishedPages = Array.isArray(metadata.published_pages)
+    ? metadata.published_pages.filter((item): item is string => typeof item === "string")
+    : [];
+  const bundleHash = typeof metadata.bundle_hash === "string" ? metadata.bundle_hash : "";
+  const agentsHash = typeof metadata.agents_sha256 === "string" ? metadata.agents_sha256 : "";
+  const compilerModel = typeof metadata.compiler_model === "string" ? metadata.compiler_model : "";
+  return (
+    <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(320px,0.75fr)]">
+      <section className="rounded-[28px] border border-black/[0.06] bg-white p-5 shadow-sm">
+        <div className="flex items-center gap-3">
+          <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-violet-50 text-violet-600">
+            <BookOpenCheck className="h-5 w-5" />
+          </span>
+          <div>
+            <h2 className="text-base font-semibold text-gray-950">编译输入</h2>
+            <p className="mt-0.5 text-xs text-gray-400">提交时已锁定，后台不会改读其他 Raw。</p>
+          </div>
+        </div>
+        <div className="mt-5 grid gap-3 sm:grid-cols-2">
+          <InfoRow label="当前步骤" value={job.current_step || job.status} />
+          <InfoRow label="Raw 数量" value={String(rawPaths.length)} />
+          <InfoRow label="Bundle" value={bundleHash ? bundleHash.slice(0, 16) : "-"} title={bundleHash} />
+          <InfoRow label="AGENTS.md" value={agentsHash ? agentsHash.slice(0, 16) : "-"} title={agentsHash} />
+          <InfoRow label="编译模型" value={compilerModel || "主 Agent 默认模型"} />
+        </div>
+        <div className="mt-5 space-y-2">
+          {rawPaths.map((path) => (
+            <div key={path} className="truncate rounded-xl bg-black/[0.025] px-3 py-2 font-mono text-xs text-gray-600" title={path}>{path}</div>
+          ))}
+        </div>
+        {publishedPages.length > 0 ? (
+          <div className="mt-6 border-t border-black/[0.05] pt-5">
+            <h3 className="text-sm font-semibold text-gray-900">发布页面</h3>
+            <div className="mt-3 flex flex-wrap gap-2">
+              {publishedPages.map((page) => <code key={page} className="rounded-lg bg-emerald-50 px-2.5 py-1.5 text-xs text-emerald-700">{page}</code>)}
+            </div>
+          </div>
+        ) : null}
+      </section>
+      <section className="rounded-[28px] border border-black/[0.06] bg-white p-5 shadow-sm">
+        <h2 className="text-base font-semibold text-gray-950">任务日志</h2>
+        <p className="mt-1 text-xs text-gray-400">Context → Agent 编译 → Publish → Lint</p>
+        <div className="mt-5"><EventList events={events} /></div>
+      </section>
+    </div>
+  );
+}
+
 function VannaEntityJobDetail({ job, events }: { job: KnowledgeImportJob | null; events: KnowledgeImportEvent[] }) {
   const metadata = (job?.metadata || {}) as Record<string, unknown>;
   const source = metadata.database_source && typeof metadata.database_source === "object"
@@ -894,6 +952,7 @@ export default function KnowledgeImportJobDetailPage() {
   const relatedVectorStatus = vectorJobStatus(job);
   const relatedVectorError = vectorJobError(job);
   const currentIsVannaEntityJob = isVannaEntityJob(job);
+  const currentIsLlmWikiJob = isLlmWikiJob(job);
   const vectorJobRunning =
     (currentIsVectorJob && isImportJobActive(job)) || relatedVectorStatus === "queued" || relatedVectorStatus === "running";
   const currentVectorProgress = vectorProgress(job);
@@ -975,7 +1034,7 @@ export default function KnowledgeImportJobDetailPage() {
                       返回
                     </Link>
                     <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-[#002fa7]/10 text-[#002fa7]">
-                      <FileText className="h-6 w-6" />
+                      {currentIsLlmWikiJob ? <BookOpenCheck className="h-6 w-6" /> : <FileText className="h-6 w-6" />}
                     </div>
                     <div className="min-w-0">
                       <h1 className="truncate text-xl font-semibold tracking-tight text-gray-950" title={displayName}>
@@ -1005,7 +1064,7 @@ export default function KnowledgeImportJobDetailPage() {
                               </>
                             ) : null}
                             <span>
-                              {currentIsVannaEntityJob ? "实体导入" : currentIsVectorJob ? "向量导入" : job.file_type.toUpperCase()}
+                              {currentIsLlmWikiJob ? "Wiki 编译" : currentIsVannaEntityJob ? "实体导入" : currentIsVectorJob ? "向量导入" : job.file_type.toUpperCase()}
                             </span>
                             <span>·</span>
                             <span>{formatTime(job.created_at)}</span>
@@ -1073,6 +1132,8 @@ export default function KnowledgeImportJobDetailPage() {
                     加载任务详情...
                   </div>
                 </section>
+              ) : currentIsLlmWikiJob ? (
+                <LlmWikiJobDetail job={job} events={events} />
               ) : currentIsVannaEntityJob ? (
                 <VannaEntityJobDetail job={job} events={events} />
               ) : (

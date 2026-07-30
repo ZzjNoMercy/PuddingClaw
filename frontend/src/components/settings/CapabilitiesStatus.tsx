@@ -40,6 +40,17 @@ const SERVICE_META: Record<
       { label: "降级策略", value: "不可用时，知识库管理降级，聊天能力保持可用" },
     ],
   },
+  pgvector: {
+    label: "pgvector 数据库扩展",
+    description: "LLM Wiki / GBrain 的向量字段与相似度检索",
+    icon: Database,
+    color: "#0891b2",
+    details: [
+      { label: "依赖级别", value: "PostgreSQL 必备服务端扩展，不由 uv 管理" },
+      { label: "macOS", value: "brew install pgvector" },
+      { label: "Docker", value: "Bundled PostgreSQL 镜像已默认包含 pgvector" },
+    ],
+  },
   docker: {
     label: "Docker 本地沙箱",
     description: "项目级隔离运行、依赖安装与浏览器验证",
@@ -226,6 +237,7 @@ export default function CapabilitiesStatus({ refreshIntervalMs = 30000, onChange
   const [lastChecked, setLastChecked] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Record<keyof Capabilities, boolean>>({
     database: false,
+    pgvector: false,
     docker: false,
     milvus: false,
     mineru: false,
@@ -310,7 +322,7 @@ export default function CapabilitiesStatus({ refreshIntervalMs = 30000, onChange
         ))}
       </div>
       <p className="text-[11px] text-gray-500 leading-relaxed px-1">
-        PostgreSQL 是知识库功能的核心基础设施；Docker 用于本地隔离运行，Milvus、MinerU 可按能力逐步启用。模型请求统一通过内部网关路由，不参与外部服务健康检测。
+        PostgreSQL 与 pgvector 是知识库数据库基础设施；Docker 用于本地隔离运行，Milvus、MinerU 可按能力逐步启用。模型请求统一通过内部网关路由，不参与外部服务健康检测。
       </p>
     </div>
   );

@@ -118,6 +118,17 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         # means backend/knowledge for development; PUDDINGCLAW_KNOWLEDGE_DIR can
         # still override this temporarily.
         "root_dir": "",
+        "llm_wiki": {
+            # Dedicated background compiler Agent. An empty model_id follows
+            # the main Agent binding from Model Services.
+            "compiler_agent": {"model_id": ""},
+            # gbrain uses a text embedding model while importing/searching and
+            # a chat model for `think`. Empty ids follow the global bindings.
+            "gbrain": {
+                "embedding_model_id": "",
+                "think_model_id": "",
+            },
+        },
         "mineru": {
             "base_url": "http://localhost:8002",
             # MinerU service writes its own runtime scratch files under
@@ -829,6 +840,95 @@ def get_fallback_llm_config(
     }
 
 
+def get_llm_wiki_compiler_agent_config(
+    *,
+    model_id_override: str | None = None,
+) -> dict[str, Any]:
+    """Resolve the dedicated LLM Wiki compiler model from Model Services.
+
+    The knowledge setting stores only a registry model id. Credentials and
+    endpoint details remain owned by Provider Registry and are never copied
+    into the knowledge configuration or background job metadata.
+    """
+
+    config = load_config()
+    compiler = (
+        config.get("knowledge", {})
+        .get("llm_wiki", {})
+        .get("compiler_agent", {})
+    )
+    configured_model_id = str(
+        model_id_override
+        if model_id_override is not None
+        else compiler.get("model_id") or ""
+    ).strip()
+
+    from provider_registry import get_provider_registry
+
+    registry = get_provider_registry()
+    resolved = (
+        registry.resolve_model(configured_model_id, legacy_config=config)
+        if configured_model_id
+        else registry.resolve_binding("agent", legacy_config=config)
+    )
+    return {
+        "model_id": str(resolved.get("id") or ""),
+        "configured_model_id": configured_model_id,
+        "model": str(resolved.get("name") or ""),
+        "provider": str(resolved.get("provider_id") or ""),
+        "uses_agent_default": not configured_model_id,
+    }
+
+
+def get_llm_wiki_gbrain_config() -> dict[str, Any]:
+    """Resolve gbrain's embedding and Think models from Model Services."""
+
+    config = load_config()
+    settings = (
+        config.get("knowledge", {})
+        .get("llm_wiki", {})
+        .get("gbrain", {})
+    )
+    if not isinstance(settings, dict):
+        settings = {}
+    embedding_model_id = str(settings.get("embedding_model_id") or "").strip()
+    think_model_id = str(settings.get("think_model_id") or "").strip()
+
+    from provider_registry import get_provider_registry
+
+    registry = get_provider_registry()
+    embedding = (
+        registry.resolve_model(
+            embedding_model_id,
+            legacy_config=config,
+            expected_capability="text_embedding",
+        )
+        if embedding_model_id
+        else registry.resolve_binding("text_embedding", legacy_config=config)
+    )
+    think = (
+        registry.resolve_model(think_model_id, legacy_config=config)
+        if think_model_id
+        else registry.resolve_binding("agent", legacy_config=config)
+    )
+    dimension = int(embedding.get("dimension") or 0)
+    if dimension <= 0:
+        raise ValueError("GBrain Embedding 模型必须配置有效维度")
+    return {
+        "embedding": {
+            **embedding,
+            "configured_model_id": embedding_model_id,
+            "uses_default_binding": not embedding_model_id,
+            "dimension": dimension,
+        },
+        "think": {
+            **think,
+            "configured_model_id": think_model_id,
+            "uses_default_binding": not think_model_id,
+        },
+    }
+
+
 def get_gateway_llm_config(
     *,
     thinking_enabled_override: bool | None = None,
@@ -1492,6 +1592,51 @@ def update_settings(updates: dict[str, Any]) -> None:
             config["knowledge"] = {}
         if isinstance(knowledge_update, dict) and "root_dir" in knowledge_update:
             config["knowledge"]["root_dir"] = str(knowledge_update.get("root_dir") or "").strip()
+        if isinstance(knowledge_update, dict) and "llm_wiki" in knowledge_update:
+            llm_wiki_update = knowledge_update.get("llm_wiki")
+            existing_llm_wiki = config["knowledge"].get("llm_wiki", {})
+            if not isinstance(existing_llm_wiki, dict):
+                existing_llm_wiki = {}
+            if isinstance(llm_wiki_update, dict) and "compiler_agent" in llm_wiki_update:
+                compiler_update = llm_wiki_update.get("compiler_agent")
+                existing_compiler = existing_llm_wiki.get("compiler_agent", {})
+                if not isinstance(existing_compiler, dict):
+                    existing_compiler = {}
+                if isinstance(compiler_update, dict) and "model_id" in compiler_update:
+                    model_id = str(compiler_update.get("model_id") or "").strip()
+                    if model_id:
+                        from provider_registry import get_provider_registry
+
+                        resolved = get_provider_registry().resolve_model(model_id, legacy_config=config)
+                        if str(resolved.get("capability") or "") != "llm":
+                            raise ValueError("LLM Wiki 编译 Agent 只能选择 LLM 模型")
+                    existing_compiler["model_id"] = model_id
+                existing_llm_wiki["compiler_agent"] = existing_compiler
+            if isinstance(llm_wiki_update, dict) and "gbrain" in llm_wiki_update:
+                gbrain_update = llm_wiki_update.get("gbrain")
+                existing_gbrain = existing_llm_wiki.get("gbrain", {})
+                if not isinstance(existing_gbrain, dict):
+                    existing_gbrain = {}
+                if isinstance(gbrain_update, dict):
+                    capability_by_key = {
+                        "embedding_model_id": "text_embedding",
+                        "think_model_id": "llm",
+                    }
+                    for key, capability in capability_by_key.items():
+                        if key not in gbrain_update:
+                            continue
+                        model_id = str(gbrain_update.get(key) or "").strip()
+                        if model_id:
+                            from provider_registry import get_provider_registry
+
+                            get_provider_registry().resolve_model(
+                                model_id,
+                                legacy_config=config,
+                                expected_capability=capability,
+                            )
+                        existing_gbrain[key] = model_id
+                existing_llm_wiki["gbrain"] = existing_gbrain
+            config["knowledge"]["llm_wiki"] = existing_llm_wiki
         if isinstance(knowledge_update, dict) and "mineru" in knowledge_update:
             mineru_update = knowledge_update["mineru"]
             existing_mineru = config["knowledge"].get("mineru", {})

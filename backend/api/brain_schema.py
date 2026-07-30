@@ -53,6 +53,14 @@ async def initialize_brain() -> dict[str, Any]:
         raise _http_error(exc) from exc
 
 
+@router.post("/agents/rebuild")
+async def rebuild_agents() -> dict[str, Any]:
+    try:
+        return await run_in_threadpool(_service().rebuild_agents)
+    except (BrainSchemaError, ValidationError, OSError) as exc:
+        raise _http_error(exc) from exc
+
+
 @router.get("/schema/bundle")
 async def get_schema_bundle() -> dict[str, Any]:
     try:

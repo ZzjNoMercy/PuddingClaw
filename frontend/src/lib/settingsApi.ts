@@ -108,6 +108,15 @@ export interface KnowledgeSettings {
   root_dir: string;
   configured_by?: string;
   environment_override?: boolean;
+  llm_wiki?: {
+    compiler_agent?: {
+      model_id: string;
+    };
+    gbrain?: {
+      embedding_model_id: string;
+      think_model_id: string;
+    };
+  };
   mineru?: {
     base_url: string;
     runtime_output_dir: string;
@@ -472,6 +481,14 @@ export interface TestDatabaseConnectionResult {
   message: string;
   server_version?: string;
   safe_url?: string;
+  pgvector?: {
+    required: boolean;
+    available: boolean;
+    installed: boolean;
+    version: string;
+    server_major?: number | null;
+    install_command: string;
+  };
 }
 
 export async function testDatabaseConnection(params: {
@@ -502,6 +519,7 @@ export interface CapabilityStatus {
 
 export interface Capabilities {
   database: CapabilityStatus;
+  pgvector: CapabilityStatus;
   docker: CapabilityStatus;
   milvus: CapabilityStatus;
   mineru: CapabilityStatus;

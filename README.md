@@ -217,13 +217,16 @@ analysis-project/
 - [uv](https://docs.astral.sh/uv/)
 - Node.js 18+
 - Docker（启动内置 PostgreSQL / Milvus 时需要）
+- PostgreSQL 16 + pgvector（本机 PostgreSQL 模式；Bundled Docker 镜像已内置 pgvector）
 - gbrain CLI（Schema 官方校验、Wiki 编译和筛选 MCP 查询需要）
 
 MinerU、Milvus 和 Docker Agent Sandbox 都是按能力启用的增强组件。知识库 Catalog 和任务管理依赖 PostgreSQL；不使用图文向量检索时可以关闭 Milvus 索引，继续使用本地文件检索。
 
 ### macOS / Linux（推荐）
 
-先启动本地基础设施。脚本会检测 5432 端口：已有本机 PostgreSQL 时保留它，否则启动 PuddingClaw 内置 PostgreSQL；同时启动 Milvus。
+先启动本地基础设施。脚本会检测 5432 端口：已有本机 PostgreSQL 时保留它，根据实际 PostgreSQL 主版本自动安装锁定的 pgvector，并在目标数据库中创建或升级 `vector` 扩展；否则启动已内置 pgvector 的 PuddingClaw PostgreSQL；同时启动 Milvus。
+
+如果选择完全本机安装，macOS 只需先安装数据库：`brew install postgresql@16`。`scripts/start-local-infra.sh` 默认锁定 pgvector `0.8.6`，并在 Homebrew Bottle 不包含当前 PostgreSQL 主版本时自动进行源码编译。独立的 gbrain 库可通过 `PUDDINGCLAW_PGVECTOR_DATABASE=llm_wiki` 指定；升级版本时设置 `PUDDINGCLAW_PGVECTOR_VERSION` 和对应的 `PUDDINGCLAW_PGVECTOR_SHA256`。`pgvector` 是 PostgreSQL 服务端依赖，不属于 `uv` 管理的 Python 依赖。
 
 ```bash
 chmod +x scripts/start-local-infra.sh scripts/start-macos-linux.sh

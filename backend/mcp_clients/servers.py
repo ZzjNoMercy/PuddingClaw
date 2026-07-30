@@ -4,9 +4,15 @@
 """
 
 import os
-import shutil
 from pathlib import Path
 from typing import Any
+
+from gbrain_runtime import (
+    apply_gbrain_ai_environment,
+    gbrain_subprocess_environment,
+    resolve_gbrain_ai_runtime,
+    resolve_gbrain_binary,
+)
 
 
 def _get_env(name: str, default: str = "") -> str:
@@ -51,6 +57,7 @@ _GBRAIN_ALLOWED_TOOLS = frozenset(
         "list_pages",
         "search",
         "query",
+        "think",
         "get_links",
         "get_backlinks",
         "traverse_graph",
@@ -70,7 +77,7 @@ _GBRAIN_ALLOWED_TOOLS = frozenset(
 _SERVER_DISPLAY_NAMES: dict[str, str] = {
     # "technical_qa": "技术研发问答",
     "zhihuiya_patents": "智慧芽专利检索",
-    "gbrain": "LLM Wiki · gbrain（只读）",
+    "gbrain": "gbrain",
 }
 
 
@@ -99,29 +106,43 @@ def gbrain_runtime_status() -> dict[str, Any]:
     """
 
     configured_home = _get_env("PUDDINGCLAW_GBRAIN_HOME").strip()
-    binary_name = _get_env("PUDDINGCLAW_GBRAIN_BIN", "gbrain").strip() or "gbrain"
-    binary = shutil.which(binary_name)
-    if not configured_home:
+    binary = resolve_gbrain_binary()
+    if configured_home:
+        home = Path(configured_home).expanduser().resolve()
+    else:
+        from knowledge.paths import get_knowledge_root
+
+        backend_root = Path(__file__).resolve().parent.parent
+        home = get_knowledge_root(backend_root) / "llm-wiki" / ".puddingclaw" / "gbrain-home"
+    config_exists = (home / ".gbrain" / "config.json").is_file()
+    if not configured_home and not config_exists:
         return {
             "configured": False,
             "ready": False,
-            "reason": "PUDDINGCLAW_GBRAIN_HOME is not configured",
-            "home": "",
+            "reason": "dedicated gbrain home is not initialized",
+            "home": str(home),
             "binary": binary or "",
             "config_exists": False,
             "pack_exists": False,
         }
 
-    home = Path(configured_home).expanduser().resolve()
-    config_exists = (home / ".gbrain" / "config.json").is_file()
     pack_exists = (home / ".gbrain" / "schema-packs" / "puddingclaw-wiki" / "pack.yaml").is_file()
     reasons: list[str] = []
+    models: dict[str, Any] | None = None
     if not binary:
         reasons.append("gbrain CLI is not installed")
     if not config_exists:
         reasons.append("dedicated gbrain home is not initialized")
     if not pack_exists:
         reasons.append("puddingclaw-wiki schema pack is not compiled")
+    try:
+        ai_runtime = resolve_gbrain_ai_runtime()
+        models = {
+            "embedding": ai_runtime["embedding"],
+            "think": ai_runtime["think"],
+        }
+    except (OSError, ValueError) as exc:
+        reasons.append(str(exc))
     return {
         "configured": True,
         "ready": not reasons,
@@ -130,6 +151,7 @@ def gbrain_runtime_status() -> dict[str, Any]:
         "binary": binary or "",
         "config_exists": config_exists,
         "pack_exists": pack_exists,
+        "models": models,
     }
 
 
@@ -165,11 +187,17 @@ def build_mcp_servers_config(enabled_names: list[str] | None = None) -> dict[str
     if not gbrain_status["ready"]:
         registry.pop("gbrain", None)
     elif "gbrain" in registry:
-        registry["gbrain"]["command"] = _get_env("PUDDINGCLAW_GBRAIN_BIN", "gbrain")
-        registry["gbrain"]["env"] = {
+        registry["gbrain"]["command"] = str(gbrain_status["binary"])
+        environment = {
             "GBRAIN_HOME": gbrain_home,
             "GBRAIN_SCHEMA_PACK": "puddingclaw-wiki",
+            "PATH": gbrain_subprocess_environment(str(gbrain_status["binary"]))["PATH"],
         }
+        try:
+            environment, _runtime = apply_gbrain_ai_environment(environment)
+            registry["gbrain"]["env"] = environment
+        except ValueError:
+            registry.pop("gbrain", None)
 
     if enabled_names is not None:
         return {k: v for k, v in registry.items() if k in enabled_names}

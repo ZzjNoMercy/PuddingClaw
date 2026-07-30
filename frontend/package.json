@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev -H 0.0.0.0",
+    "dev": "node scripts/next-dev.mjs",
     "build": "node scripts/next-build.mjs",
     "start": "node scripts/next-start.mjs",
     "lint": "next lint"

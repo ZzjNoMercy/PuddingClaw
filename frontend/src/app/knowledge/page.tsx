@@ -9,6 +9,7 @@ import {
   CheckCircle2,
   Database,
   FileText,
+  BookOpenCheck,
   FileUp,
   FolderOpen,
   Loader2,
@@ -62,7 +63,7 @@ function errorMessage(error: unknown): string {
 
 function jobStatusLabel(job: KnowledgeImportJob): string {
   if (job.status === "queued") return "排队中";
-  if (job.status === "running") return "导入中";
+  if (job.status === "running") return "处理中";
   if (job.status === "succeeded") return "已完成";
   if (job.status === "failed") return "失败";
   if (job.status === "cancelled") return "已取消";
@@ -80,7 +81,12 @@ function isVectorPublishJob(job: KnowledgeImportJob): boolean {
   return job.metadata?.kind === "vector_publish" || job.file_type === "vector";
 }
 
+function isLlmWikiJob(job: KnowledgeImportJob): boolean {
+  return job.metadata?.kind === "llm_wiki_ingest" || job.file_type === "llm_wiki";
+}
+
 function jobKindLabel(job: KnowledgeImportJob): string {
+  if (isLlmWikiJob(job)) return "Wiki 编译";
   return isVectorPublishJob(job) ? "向量导入" : "文件导入";
 }
 
@@ -450,25 +456,25 @@ export default function KnowledgePage() {
         <main className="workspace-content-frame flex min-w-0 flex-1 flex-col overflow-hidden">
           <div className="flex-1 overflow-y-auto">
             <div className="mx-auto flex w-full max-w-6xl flex-col gap-5 px-5 py-6">
-        <div className="flex items-center justify-between gap-4">
-          <div>
+        <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
+          <div className="min-w-0">
             <h1 className="text-2xl font-semibold tracking-tight text-gray-950">知识库</h1>
             <p className="mt-2 max-w-2xl text-sm leading-6 text-gray-500">
               当前打通 PDF/MinerU 与 Markdown 双管道：PDF 解析成 md 后写入 <code className="rounded bg-black/[0.04] px-1.5 py-0.5">/knowledge/imported/</code>，
               同时发布到本地知识库目录和多模态向量索引。
             </p>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex shrink-0 flex-wrap items-center gap-2 xl:max-w-[620px] xl:justify-end">
             <Link
               href="/knowledge/schema"
-              className="inline-flex h-10 items-center gap-2 rounded-full border border-[#002fa7]/10 bg-white px-4 text-sm font-medium text-[#002fa7] shadow-sm transition hover:bg-[#002fa7]/[0.04]"
+              className="inline-flex h-9 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border border-[#002fa7]/10 bg-white px-3.5 text-xs font-semibold text-[#002fa7] shadow-sm transition hover:bg-[#002fa7]/[0.04]"
             >
               <Database className="h-4 w-4" />
-              Schema Studio
+              LLM Wiki Studio
             </Link>
             <Link
               href="/settings?category=knowledge"
-              className="inline-flex h-10 items-center gap-2 rounded-full bg-[#002fa7]/10 px-4 text-sm font-medium text-[#002fa7] transition hover:bg-[#002fa7]/15"
+              className="inline-flex h-9 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full bg-[#002fa7]/10 px-3.5 text-xs font-semibold text-[#002fa7] transition hover:bg-[#002fa7]/15"
             >
               <Settings className="h-4 w-4" />
               知识库设置
@@ -477,7 +483,7 @@ export default function KnowledgePage() {
               type="button"
               onClick={refresh}
               disabled={loading}
-              className="inline-flex h-10 items-center gap-2 rounded-full border border-black/[0.08] bg-white px-4 text-sm font-medium text-gray-700 shadow-sm transition hover:bg-gray-50 disabled:cursor-wait disabled:opacity-60"
+              className="inline-flex h-9 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border border-black/[0.08] bg-white px-3.5 text-xs font-semibold text-gray-600 shadow-sm transition hover:bg-gray-50 disabled:cursor-wait disabled:opacity-60"
             >
               <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
               刷新
@@ -725,7 +731,7 @@ export default function KnowledgePage() {
                 <div>
                   <h3 className="text-sm font-semibold text-gray-950">任务队列</h3>
                   <p className="mt-1 text-xs text-gray-400">
-                    文件 {importJobs.filter((job) => !isVectorPublishJob(job)).length} 条 · 向量{" "}
+                    Wiki {importJobs.filter(isLlmWikiJob).length} 条 · 文件 {importJobs.filter((job) => !isVectorPublishJob(job) && !isLlmWikiJob(job)).length} 条 · 向量{" "}
                     {importJobs.filter(isVectorPublishJob).length} 条
                   </p>
                 </div>
@@ -747,7 +753,9 @@ export default function KnowledgePage() {
                       <div className="flex items-start justify-between gap-3">
                         <div className="min-w-0 flex-1">
                           <div className="flex min-w-0 items-center gap-2">
-                            {isVectorPublishJob(job) ? (
+                            {isLlmWikiJob(job) ? (
+                              <BookOpenCheck className="h-4 w-4 shrink-0 text-violet-600" />
+                            ) : isVectorPublishJob(job) ? (
                               <Database className="h-4 w-4 shrink-0 text-[#002fa7]" />
                             ) : (
                               <FileText className="h-4 w-4 shrink-0 text-emerald-600" />

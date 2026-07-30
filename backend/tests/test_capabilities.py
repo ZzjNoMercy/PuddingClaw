@@ -43,6 +43,14 @@ def _mock_postgres_unavailable():
 
 
 @pytest.fixture(autouse=True)
+def _mock_pgvector_unavailable():
+    """默认将 pgvector 探测 mock 为不可用，避免连接测试机数据库。"""
+    with mock.patch("capabilities._check_pgvector") as mock_check:
+        mock_check.return_value = CapabilityStatus(available=False, reason="mocked unavailable")
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _mock_milvus_unavailable():
     """默认将 Milvus 探测 mock 为不可用，避免测试机本地 Milvus 干扰。"""
     with mock.patch("capabilities._check_milvus") as mock_check:
@@ -65,6 +73,7 @@ async def test_detect_capabilities_no_services(httpx_mock):
     caps = await detect_capabilities(force=True)
     assert isinstance(caps, Capabilities)
     assert caps.database.available is False
+    assert caps.pgvector.available is False
     assert caps.docker.available is False
     assert caps.milvus.available is False
     assert caps.mineru.available is False
@@ -108,12 +117,14 @@ async def test_capabilities_to_dict():
     """Capabilities.to_dict 输出正确。"""
     caps = Capabilities(
         database=CapabilityStatus(available=True),
+        pgvector=CapabilityStatus(available=True, reason="pgvector 0.8.5"),
         docker=CapabilityStatus(available=True),
         milvus=CapabilityStatus(available=False, reason="refused"),
         mineru=CapabilityStatus(available=True),
     )
     assert caps.to_dict() == {
         "database": {"available": True, "reason": None},
+        "pgvector": {"available": True, "reason": "pgvector 0.8.5"},
         "docker": {"available": True, "reason": None},
         "milvus": {"available": False, "reason": "refused"},
         "mineru": {"available": True, "reason": None},

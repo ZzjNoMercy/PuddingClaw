@@ -63,6 +63,14 @@ def test_analytics_model_id_round_trips_in_session_metadata(tmp_path):
     assert session_manager.get_metadata("analytics-model-session")["analytics_model_id"] is None
 
 
+def test_background_job_execution_context_is_not_listed_as_conversation(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("visible-session", metadata={"runtime_mode": "agent"})
+    session_manager.create_session("background-job-job_123", metadata={"runtime_mode": "agent"})
+
+    assert [item["id"] for item in session_manager.list_sessions()] == ["visible-session"]
+
+
 def test_todo_ledgers_continue_same_goal_revision_without_cross_contamination(tmp_path):
     session_manager.initialize(tmp_path)
     session_manager.create_session("todo-scope")
