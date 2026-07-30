@@ -20,6 +20,28 @@ class ApprovalMode(StrEnum):
 DEFAULT_APPROVAL_MODE = ApprovalMode.STRICT
 PERMISSION_POLICY_VERSION = "tool-execution-v4"
 PERMISSION_BINDING_SCHEMA_VERSION = 2
+SHELL_PERMISSION_BINDING_SCHEMA_VERSION = 3
+SHELL_ISOLATION_POLICY_ID = "kernel-docker-shared-v1"
+SHELL_PROFILE_SCHEMA = "sandbox-grant-profile-v1"
+
+
+@dataclass(frozen=True)
+class ShellDirectoryGrantSpec:
+    """One server-authored member of an atomic shell directory grant set."""
+
+    target: str
+    access: str
+    delete: bool = False
+
+    @property
+    def capabilities(self) -> list[str]:
+        return [
+            self.access,
+            *(["delete"] if self.delete else []),
+            "recursive",
+            "external_path",
+            "shell_access",
+        ]
 
 
 class PermissionBindingPolicy:
@@ -111,6 +133,57 @@ class PermissionBindingPolicy:
             runtime_bindings=right,
         )
 
+    @staticmethod
+    def shell_v3_equivalent(
+        left: Mapping[str, Any] | None,
+        right: Mapping[str, Any] | None,
+    ) -> bool:
+        """Strictly compare native shell authority bindings."""
+
+        required = (
+            "approval_mode",
+            "policy_epoch",
+            "policy_version",
+            "workspace_id",
+            "isolation_policy_id",
+            "profile_schema",
+        )
+        if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+            return False
+        if any(left.get(key) in {None, ""} or right.get(key) in {None, ""} for key in required):
+            return False
+        return {key: left.get(key) for key in required} == {key: right.get(key) for key in required}
+
+    @staticmethod
+    def shell_v3_semantic_key(
+        *,
+        session_id: str,
+        scope: str,
+        run_id: str,
+        grant_type: str,
+        target: str,
+        capabilities: list[str],
+        bindings: Mapping[str, Any],
+    ) -> tuple[str, dict[str, Any]]:
+        if not PermissionBindingPolicy.shell_v3_equivalent(bindings, bindings):
+            raise ValueError("Native shell grant bindings are incomplete")
+        stable = dict(bindings)
+        payload = {
+            "binding_schema_version": SHELL_PERMISSION_BINDING_SCHEMA_VERSION,
+            "session_id": session_id,
+            "scope": scope,
+            "run_id": run_id if scope == "run" else "",
+            "grant_type": grant_type,
+            "target_kind": "exact_directory",
+            "target": target,
+            "capabilities": sorted(set(capabilities)),
+            "stable_bindings": stable,
+        }
+        digest = hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        return f"sha256:{digest}", stable
+
 
 def normalize_approval_mode(value: Any) -> ApprovalMode:
     """Return one supported mode or raise instead of silently weakening policy."""
@@ -166,9 +239,7 @@ class RunPermissionContext:
             policy_epoch=int(current_permissions["policy_epoch"]),
             # A Run snapshot is historical authority. Preserve the version it
             # actually started with instead of upgrading it during restore.
-            policy_version=str(
-                frozen_permissions.get("policy_version") or current_permissions["policy_version"]
-            ),
+            policy_version=str(frozen_permissions.get("policy_version") or current_permissions["policy_version"]),
             backend_mode=str(execution.get("backend_mode") or "restricted_host"),
             backend_id=str(execution.get("backend_id") or ""),
             workspace_id=str(execution.get("workspace_id") or ""),
@@ -186,4 +257,16 @@ class RunPermissionContext:
             "backend_mode": self.backend_mode,
             "backend_id": self.backend_id,
             "workspace_id": self.workspace_id,
+        }
+
+    def shell_grant_bindings(self) -> dict[str, Any]:
+        """Return runner-neutral bindings required by native shell grants."""
+
+        return {
+            "approval_mode": self.approval_mode.value,
+            "policy_epoch": self.policy_epoch,
+            "policy_version": self.policy_version,
+            "workspace_id": self.workspace_id,
+            "isolation_policy_id": SHELL_ISOLATION_POLICY_ID,
+            "profile_schema": SHELL_PROFILE_SCHEMA,
         }

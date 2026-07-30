@@ -27,7 +27,6 @@ async def lifespan(app: FastAPI):
     from graph.deepagents_manager import deepagents_agent_manager
     from graph.memory_indexer import get_memory_indexer
     from graph.session_manager import session_manager
-    from harness.workspace_backends import ProjectSandboxManager
     from knowledge.import_worker import knowledge_import_worker_manager
     from knowledge.semantic_dimension_worker import semantic_dimension_build_worker_manager
     from projects.registry import project_registry
@@ -50,22 +49,6 @@ async def lifespan(app: FastAPI):
         print("⚠️ Knowledge catalog database unavailable; knowledge management API will report degraded status")
     caps = await capabilities.detect_capabilities(force=True)
     print(f"🔌 Capabilities: {caps.to_dict()}")
-    from config import load_config
-
-    docker_config = load_config().get("harness", {}).get("terminal", {}).get("docker", {})
-    if load_config().get("harness", {}).get("terminal", {}).get("docker_enabled", False):
-        try:
-            sandbox_manager = ProjectSandboxManager(dict(docker_config or {}))
-            removed = sandbox_manager.gc_stopped_workspace_containers()
-            if removed:
-                print(f"🧹 Removed {removed} stopped PuddingClaw workspace container(s)")
-            removed = sandbox_manager.gc_legacy_unscoped_workspace_containers(
-                project_registry.unscoped_workspaces_dir
-            )
-            if removed:
-                print(f"🧹 Removed {removed} obsolete unscoped Session container(s)")
-        except Exception as exc:
-            print(f"⚠️ Workspace container startup GC skipped: {exc}")
     try:
         agent_manager.initialize(BASE_DIR)
     except Exception as e:
@@ -141,6 +124,8 @@ from api.logical_dataset_rules import router as logical_dataset_rules_router
 from api.database_sql_revisions import router as database_sql_revisions_router
 from api.user_input_requests import router as user_input_requests_router
 from api.connectors import router as connectors_router
+from api.brain_schema import router as brain_schema_router
+from api.llm_wiki import router as llm_wiki_router
 
 app.include_router(chat_router, prefix="/api")
 app.include_router(agent_router, prefix="/api")
@@ -165,6 +150,8 @@ app.include_router(logical_dataset_rules_router, prefix="/api")
 app.include_router(database_sql_revisions_router, prefix="/api")
 app.include_router(user_input_requests_router, prefix="/api")
 app.include_router(connectors_router, prefix="/api")
+app.include_router(brain_schema_router, prefix="/api")
+app.include_router(llm_wiki_router, prefix="/api")
 
 
 @app.get("/")

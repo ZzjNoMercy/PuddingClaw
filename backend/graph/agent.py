@@ -212,6 +212,7 @@ class AgentManager:
         self._cached_agent = None
         self._cached_agent_key: str = ""
         self._mcp_client = None
+        self._mcp_server_names: list[str] = []
 
     def initialize(self, base_dir: Path) -> None:
         self._base_dir = base_dir
@@ -256,6 +257,7 @@ class AgentManager:
 
     def _get_full_cache_key(self, rag_mode: bool, memory_backend: str, tool_reminder: bool) -> str:
         import json as _json
+
         from config import get_middleware_config, get_write_middleware_config, get_tool_intent_router_config, get_cache_config
         config_sig = self._config_sig
         prompt_sig = self._get_prompt_files_sig()
@@ -347,22 +349,40 @@ class AgentManager:
 
         cfg = load_config()
         mcp_cfg = cfg.get("mcp", {})
-        enabled = mcp_cfg.get("enabled", [])
+        from mcp_clients.servers import effective_mcp_server_names
+
+        enabled = effective_mcp_server_names(
+            mcp_cfg.get("enabled", []),
+            auto_enable_gbrain=bool(mcp_cfg.get("auto_enable_gbrain", False)),
+        )
         if not enabled:
             return
 
         try:
             from mcp_clients import create_mcp_client
-            self._mcp_client = create_mcp_client(enabled_names=enabled)
-            logger.info("MCP client created, servers=%s", enabled)
+            from mcp_clients.servers import build_mcp_servers_config
+
+            configured = build_mcp_servers_config(enabled)
+            if not configured:
+                return
+            self._mcp_server_names = list(configured)
+            self._mcp_client = create_mcp_client(enabled_names=self._mcp_server_names)
+            logger.info("MCP client created, servers=%s", self._mcp_server_names)
         except Exception as e:
             logger.warning("Failed to create MCP client: %s", e)
 
     def _get_mcp_enabled(self) -> list[str]:
         """获取当前启用的 MCP 服务器列表."""
+        if self._mcp_client is not None:
+            return list(self._mcp_server_names)
         cfg = load_config()
         mcp_cfg = cfg.get("mcp", {})
-        return mcp_cfg.get("enabled", [])
+        from mcp_clients.servers import effective_mcp_server_names
+
+        return effective_mcp_server_names(
+            mcp_cfg.get("enabled", []),
+            auto_enable_gbrain=bool(mcp_cfg.get("auto_enable_gbrain", False)),
+        )
 
     @staticmethod
     def _looks_like_mcp_required(message: str, history: list[dict[str, Any]]) -> bool:
@@ -986,7 +1006,9 @@ class AgentManager:
                             session = await stack.enter_async_context(
                                 self._mcp_client.session(server_name)
                             )
-                            tools = await load_mcp_tools(session)
+                            from mcp_clients.servers import filter_mcp_tools
+
+                            tools = filter_mcp_tools(server_name, await load_mcp_tools(session))
                             all_mcp_tools.extend(tools)
 
                         logger.info(
@@ -1071,7 +1093,9 @@ class AgentManager:
                             session = await stack.enter_async_context(
                                 self._mcp_client.session(server_name)
                             )
-                            tools = await load_mcp_tools(session)
+                            from mcp_clients.servers import filter_mcp_tools
+
+                            tools = filter_mcp_tools(server_name, await load_mcp_tools(session))
                             all_mcp_tools.extend(tools)
 
                         agent = self._build_agent_core(

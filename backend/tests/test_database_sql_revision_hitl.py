@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
 
@@ -599,6 +601,38 @@ async def test_revision_registry_has_exactly_three_natural_language_decisions() 
     ) == {"action": "modify", "revision_instruction": "只统计皮卡"}
 
 
+@pytest.mark.asyncio
+async def test_revision_request_normalizes_nested_datetime_metadata() -> None:
+    registry = DatabaseSqlRevisionResumeRegistry()
+    result = _result("空气悬架配置率")
+    result.semantic_assets = {
+        "matched": [
+            {
+                "id": "dimension:launch_time",
+                "indexed_at": datetime(2026, 7, 29, 13, 42, tzinfo=timezone.utc),
+            }
+        ],
+        "references": [],
+    }
+    generation = registry.register_generation(
+        session_id="session-json",
+        query_id="query-json",
+        result=result,
+        request={"question": "空气悬架配置率"},
+    )
+
+    request = registry.create_revision_request(
+        generation=generation,
+        proposed_revision_instruction="修改统计口径",
+        tool_call_id="tool-json",
+    )
+
+    assert request["semantic_assets"]["matched"][0]["indexed_at"] == (
+        "2026-07-29T13:42:00+00:00"
+    )
+    json.dumps(request, ensure_ascii=False)
+
+
 class _FakeSessionMaker:
     def __call__(self) -> _FakeSessionMaker:
         return self
@@ -688,8 +722,20 @@ async def test_rejected_revision_reuses_original_generation_without_regeneration
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "revision_instruction",
+    [
+        "上一版 SQL 执行超时，数据库返回 statement timeout。",
+        (
+            'SQL执行失败：column "wb_order" does not exist。VALUES 子句中定义了 '
+            "AS wb(ord, seg)，但后续引用了 wb.wb_order 和 pw.pwr_order 列名，"
+            "与实际别名 ord 不匹配。"
+        ),
+    ],
+)
 async def test_technical_sql_repair_regenerates_without_business_hitl(
     monkeypatch: pytest.MonkeyPatch,
+    revision_instruction: str,
 ) -> None:
     import tools.database.sql_generate_tool as module
 
@@ -716,7 +762,7 @@ async def test_technical_sql_repair_regenerates_without_business_hitl(
     repaired = await tool._arun(
         question="ignored",
         parent_generation_id=generation_id,
-        revision_instruction="上一版 SQL 执行超时，数据库返回 statement timeout。",
+        revision_instruction=revision_instruction,
     )
 
     assert len(requests) == 2

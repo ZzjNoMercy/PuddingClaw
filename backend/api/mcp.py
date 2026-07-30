@@ -17,12 +17,21 @@ _MCP_DISPLAY_NAMES: dict[str, str] = {
 async def list_mcp_servers():
     """List enabled MCP servers for frontend panel display."""
     cfg = load_config()
-    enabled = cfg.get("mcp", {}).get("enabled", [])
+    mcp_config = cfg.get("mcp", {})
 
     # Import server registry lazily to avoid heavy deps at module load time.
     try:
-        from mcp_clients.servers import get_mcp_server_display_info
+        from mcp_clients.servers import (
+            effective_mcp_server_names,
+            gbrain_runtime_status,
+            get_mcp_server_display_info,
+        )
+        enabled = effective_mcp_server_names(
+            mcp_config.get("enabled", []),
+            auto_enable_gbrain=bool(mcp_config.get("auto_enable_gbrain", False)),
+        )
         servers = get_mcp_server_display_info(enabled)
+        gbrain = gbrain_runtime_status()
     except Exception:
         # Fallback: return minimal info from config when MCP client deps are missing.
         servers = [
@@ -32,7 +41,8 @@ async def list_mcp_servers():
                 "url": "",
                 "transport": "",
             }
-            for name in enabled
+            for name in mcp_config.get("enabled", [])
         ]
+        gbrain = {"configured": False, "ready": False, "reason": "runtime status unavailable"}
 
-    return {"servers": servers}
+    return {"servers": servers, "gbrain": gbrain}

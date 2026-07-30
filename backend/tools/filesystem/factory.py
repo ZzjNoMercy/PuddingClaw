@@ -14,7 +14,7 @@ from tools.filesystem.validation import build_validation_tools
 class VersionedPatchMiddleware(AgentMiddleware[Any, Any, Any]):
     """Expose PuddingClaw filesystem tools through the DeepAgents middleware slot."""
 
-    def __init__(self, backend: Any) -> None:
+    def __init__(self, backend: Any, *, compact_model_surface: bool = False) -> None:
         super().__init__()
         groups = (
             build_inspect_tools(backend),
@@ -24,7 +24,7 @@ class VersionedPatchMiddleware(AgentMiddleware[Any, Any, Any]):
             build_validation_tools(backend),
         )
         by_name = {tool.name: tool for group in groups for tool in group}
-        order = (
+        internal_order = (
             "inspect_file_version",
             "patch_file",
             "replace_file",
@@ -40,4 +40,16 @@ class VersionedPatchMiddleware(AgentMiddleware[Any, Any, Any]):
             "upsert_scratch_file",
             "validate_artifact_contract",
         )
+        # Product Agents use native write_file plus standard shell cp/mv/mkdir.
+        # Keep the broader HostFileBroker adapters callable internally and in
+        # focused tests, but do not make the model choose among overlapping
+        # copy/replace/stage/transaction orchestration surfaces.
+        model_order = (
+            "patch_file",
+            "materialize_source_ref",
+            "delete_file",
+            "validate_html_report",
+            "validate_artifact_contract",
+        )
+        order = model_order if compact_model_surface else internal_order
         self.tools = [by_name[name] for name in order]

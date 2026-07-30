@@ -33,7 +33,13 @@ class RevokeConnectorRequest(BaseModel):
 
 def _sandbox_manager(*, require_enabled: bool) -> ProjectSandboxManager:
     terminal = load_config().get("harness", {}).get("terminal", {})
-    if require_enabled and not bool(terminal.get("docker_enabled", False)):
+    sandbox_mode = str(terminal.get("sandbox_mode") or "")
+    docker_allowed = (
+        sandbox_mode in {"auto", "docker"}
+        if sandbox_mode
+        else bool(terminal.get("docker_enabled", False))
+    )
+    if require_enabled and not docker_allowed:
         raise HTTPException(status_code=503, detail="托管连接器需要启用 Docker runtime。")
     return ProjectSandboxManager(dict(terminal.get("docker", {}) or {}))
 

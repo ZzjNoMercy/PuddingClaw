@@ -411,24 +411,27 @@ class DatabaseSqlRevisionResumeRegistry:
             if existing is not None:
                 return dict(existing)
         request_id = f"sql-revision-{uuid.uuid4().hex[:12]}"
-        semantic_assets = generation.result.semantic_assets
-        request = {
-            "id": request_id,
-            "type": "database_sql_revision",
-            "session_id": generation.session_id,
-            "query_id": effective_query_id,
-            "tool_call_id": tool_call_id,
-            "status": "pending",
-            "created_at": time.time(),
-            "generation_id": generation.id,
-            "original_question": generation.request.get("question") or generation.result.question,
-            "original_sql": generation.result.sql,
-            "proposed_revision_instruction": proposed_revision_instruction,
-            "semantic_assets": {
-                "matched": semantic_assets.get("matched", []),
-                "references": semantic_assets.get("references", []),
-            },
-        }
+        semantic_assets = to_plain_dict(generation.result.semantic_assets)
+        request = to_plain_dict(
+            {
+                "id": request_id,
+                "type": "database_sql_revision",
+                "session_id": generation.session_id,
+                "query_id": effective_query_id,
+                "tool_call_id": tool_call_id,
+                "status": "pending",
+                "created_at": time.time(),
+                "generation_id": generation.id,
+                "original_question": generation.request.get("question")
+                or generation.result.question,
+                "original_sql": generation.result.sql,
+                "proposed_revision_instruction": proposed_revision_instruction,
+                "semantic_assets": {
+                    "matched": semantic_assets.get("matched", []),
+                    "references": semantic_assets.get("references", []),
+                },
+            }
+        )
         self._requests[request_id] = request
         self._revision_keys[replay_key] = request_id
         self._pending[request_id] = asyncio.get_running_loop().create_future()

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Any
+
+from utils.json_serialization import to_json_compatible
 
 
 @dataclass(slots=True)
@@ -102,6 +104,4 @@ class DatabaseSqlGenerationResult:
 def to_plain_dict(value: Any) -> Any:
     """Convert dataclass contracts to JSON-serializable Python structures."""
 
-    if hasattr(value, "__dataclass_fields__"):
-        return asdict(value)
-    return value
+    return to_json_compatible(value)

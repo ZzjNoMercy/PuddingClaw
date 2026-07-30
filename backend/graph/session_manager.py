@@ -19,8 +19,10 @@ from typing import Any
 from graph.permission_policy import (
     DEFAULT_APPROVAL_MODE,
     PERMISSION_BINDING_SCHEMA_VERSION,
+    SHELL_PERMISSION_BINDING_SCHEMA_VERSION,
     PermissionBindingPolicy,
     RunPermissionContext,
+    ShellDirectoryGrantSpec,
     normalize_approval_mode,
     permission_policy_snapshot,
 )
@@ -253,6 +255,7 @@ class SessionManager:
             "permissions": {
                 "approval_mode": normalize_approval_mode(approval_mode or DEFAULT_APPROVAL_MODE).value,
                 "policy_epoch": 1,
+                "grants_revision": 0,
                 "grants": [],
             },
         }
@@ -350,6 +353,7 @@ class SessionManager:
         now = time.time()
         grants = permissions.get("grants")
         if isinstance(grants, list):
+            revoked_any = False
             for grant in grants:
                 grant_type = str(grant.get("type") or "") if isinstance(grant, dict) else ""
                 invalidated_session_capability = (
@@ -363,6 +367,9 @@ class SessionManager:
                 if invalidated_session_capability and not grant.get("revoked_at"):
                     grant["revoked_at"] = now
                     grant["revocation_reason"] = "permission_policy_changed"
+                    revoked_any = True
+            if revoked_any:
+                permissions["grants_revision"] = int(permissions.get("grants_revision") or 0) + 1
         self._write_file(session_id, data)
         return permission_policy_snapshot(permissions)
 
@@ -7035,6 +7042,26 @@ class SessionManager:
             if isinstance(grant, dict) and not grant.get("revoked_at") and not grant.get("superseded_at")
         ]
 
+    def permission_grants_snapshot(
+        self,
+        session_id: str,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Return active grants and their monotonic revision from one read."""
+
+        with self._tool_context_lock(session_id):
+            data = self._read_file(session_id)
+            if not data:
+                return [], 0
+            permissions = data.get("permissions")
+            grants = permissions.get("grants") if isinstance(permissions, dict) else None
+            revision = int(permissions.get("grants_revision") or 0) if isinstance(permissions, dict) else 0
+            active = [
+                dict(grant)
+                for grant in (grants if isinstance(grants, list) else [])
+                if isinstance(grant, dict) and not grant.get("revoked_at") and not grant.get("superseded_at")
+            ]
+            return active, revision
+
     def list_permission_grant_history(
         self,
         session_id: str,
@@ -7068,7 +7095,7 @@ class SessionManager:
 
     @_session_write_locked
     def migrate_permission_grants(self, session_id: str) -> int:
-        """Persist v2 semantic bindings and supersede active duplicates."""
+        """Persist current semantic bindings and supersede active duplicates."""
 
         data = self._read_file(session_id)
         if not data:
@@ -7079,6 +7106,7 @@ class SessionManager:
             return 0
         changed = self._migrate_permission_grants(session_id, grants)
         if changed:
+            permissions["grants_revision"] = int(permissions.get("grants_revision") or 0) + 1
             self._write_file(session_id, data)
         return sum(
             1
@@ -7234,9 +7262,158 @@ class SessionManager:
             grant["consumed_at"] = now
         grants.append(grant)
         permissions["grants"] = grants
+        permissions["grants_revision"] = int(permissions.get("grants_revision") or 0) + 1
         data["permissions"] = permissions
         self._write_file(session_id, data)
         return dict(grant)
+
+    @_session_write_locked
+    def add_shell_directory_grants_atomic(
+        self,
+        session_id: str,
+        *,
+        grant_specs: list[ShellDirectoryGrantSpec],
+        scope: str,
+        run_id: str,
+        bindings: dict[str, Any],
+        source: str = "user",
+    ) -> list[dict[str, Any]]:
+        """Validate and persist one native shell authority set atomically."""
+
+        if not grant_specs or len(grant_specs) > 16:
+            raise ValueError("Shell directory grant set must contain 1-16 entries")
+        if scope not in {"run", "session"} or not run_id:
+            raise ValueError("Shell directory grants require an active Run scope")
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        harness = data.get("harness")
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        run = runs.get(run_id) if isinstance(runs, dict) else None
+        if not isinstance(run, dict) or run.get("status") in {
+            "completed",
+            "cancelled",
+            "failed",
+            "blocked",
+            "budget_exceeded",
+            "verification_failed",
+        }:
+            raise ValueError(
+                "Shell directory grant request no longer belongs to an active Run"
+            )
+        expected = RunPermissionContext.from_config_snapshot(
+            run.get("config_snapshot")
+        ).shell_grant_bindings()
+        if not PermissionBindingPolicy.shell_v3_equivalent(bindings, expected):
+            raise ValueError("Shell directory grant bindings do not match the active Run")
+
+        normalized: list[tuple[ShellDirectoryGrantSpec, str]] = []
+        seen: set[tuple[str, str]] = set()
+        workspace_root = str(data.get("workspace_path") or "") or None
+        for spec in grant_specs:
+            if spec.access not in {"read", "write"} or (
+                spec.delete and spec.access != "write"
+            ):
+                raise ValueError("Invalid shell directory grant capability")
+            path = Path(spec.target).expanduser()
+            if (
+                not path.is_absolute()
+                or path.is_symlink()
+                or not path.is_dir()
+                or str(path.resolve()) != str(path)
+            ):
+                raise ValueError(
+                    "Shell directory grant target must be a canonical real directory"
+                )
+            classified = classify_path_authority(
+                str(path),
+                workspace_root=workspace_root,
+            )
+            if classified.authority is not PathAuthority.EXTERNAL:
+                raise ValueError(
+                    "Shell directory grants may target only external directories"
+                )
+            key = (str(path), spec.access)
+            if key in seen:
+                raise ValueError("Shell directory grant set contains duplicate entries")
+            seen.add(key)
+            normalized.append((spec, str(path)))
+        targets_with_read = {
+            target for spec, target in normalized if spec.access == "read"
+        }
+        for spec, target in normalized:
+            if spec.access == "write" and target not in targets_with_read:
+                raise ValueError(
+                    "Shell write authority requires an atomic matching read grant"
+                )
+
+        permissions = data.get("permissions")
+        if not isinstance(permissions, dict):
+            permissions = {}
+        grants = permissions.get("grants")
+        if not isinstance(grants, list):
+            grants = []
+        migrated = self._migrate_permission_grants(session_id, grants)
+        now = time.time()
+        results: list[dict[str, Any]] = []
+        appended = migrated
+        for spec, target in normalized:
+            grant_type = f"external_directory_{spec.access}"
+            capabilities = spec.capabilities
+            semantic_key, stable_bindings = (
+                PermissionBindingPolicy.shell_v3_semantic_key(
+                    session_id=session_id,
+                    scope=scope,
+                    run_id=run_id,
+                    grant_type=grant_type,
+                    target=target,
+                    capabilities=capabilities,
+                    bindings=bindings,
+                )
+            )
+            existing = next(
+                (
+                    item
+                    for item in grants
+                    if isinstance(item, dict)
+                    and not item.get("revoked_at")
+                    and not item.get("superseded_at")
+                    and item.get("binding_schema_version")
+                    == SHELL_PERMISSION_BINDING_SCHEMA_VERSION
+                    and item.get("semantic_key") == semantic_key
+                ),
+                None,
+            )
+            if existing is not None:
+                results.append(dict(existing))
+                continue
+            grant = {
+                "id": f"grant-{uuid.uuid4().hex[:12]}",
+                "type": grant_type,
+                "scope": scope,
+                "target_kind": "exact_directory",
+                "target": target,
+                "capabilities": capabilities,
+                "source": source,
+                "created_at": now,
+                "binding_schema_version": SHELL_PERMISSION_BINDING_SCHEMA_VERSION,
+                "semantic_key": semantic_key,
+                "stable_bindings": stable_bindings,
+                "bindings": dict(bindings),
+                "metadata": {"run_id": run_id, "authority_plane": "shell"},
+                "runtime_observations": {},
+            }
+            grants.append(grant)
+            results.append(dict(grant))
+            appended = True
+        if appended:
+            permissions["grants"] = grants
+            permissions["grants_revision"] = int(
+                permissions.get("grants_revision") or 0
+            ) + 1
+            data["permissions"] = permissions
+            self._write_file(session_id, data)
+        return results
 
     @staticmethod
     def _permission_semantic_runtime_bindings(
@@ -7272,22 +7449,46 @@ class SessionManager:
                 continue
             bindings = raw.get("bindings") if isinstance(raw.get("bindings"), dict) else None
             metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else None
-            semantic_bindings = SessionManager._permission_semantic_runtime_bindings(
-                scope=str(raw.get("scope") or "session"),
-                metadata=metadata,
-                bindings=bindings,
+            grant_type = str(raw.get("type") or "")
+            scope = str(raw.get("scope") or "session")
+            target_kind = str(raw.get("target_kind") or "")
+            target = str(raw.get("target") or "")
+            capabilities = [str(item) for item in raw.get("capabilities") or []]
+            native_shell = (
+                grant_type in {"external_directory_read", "external_directory_write"}
+                and target_kind == "exact_directory"
+                and "shell_access" in capabilities
+                and PermissionBindingPolicy.shell_v3_equivalent(bindings, bindings)
             )
-            key, stable = PermissionBindingPolicy.semantic_key(
-                session_id=session_id,
-                grant_type=str(raw.get("type") or ""),
-                scope=str(raw.get("scope") or "session"),
-                target_kind=str(raw.get("target_kind") or ""),
-                target=str(raw.get("target") or ""),
-                capabilities=[str(item) for item in raw.get("capabilities") or []],
-                runtime_bindings=semantic_bindings,
-            )
+            if native_shell:
+                key, stable = PermissionBindingPolicy.shell_v3_semantic_key(
+                    session_id=session_id,
+                    scope=scope,
+                    run_id=str((metadata or {}).get("run_id") or ""),
+                    grant_type=grant_type,
+                    target=target,
+                    capabilities=capabilities,
+                    bindings=bindings or {},
+                )
+                schema_version = SHELL_PERMISSION_BINDING_SCHEMA_VERSION
+            else:
+                semantic_bindings = SessionManager._permission_semantic_runtime_bindings(
+                    scope=scope,
+                    metadata=metadata,
+                    bindings=bindings,
+                )
+                key, stable = PermissionBindingPolicy.semantic_key(
+                    session_id=session_id,
+                    grant_type=grant_type,
+                    scope=scope,
+                    target_kind=target_kind,
+                    target=target,
+                    capabilities=capabilities,
+                    runtime_bindings=semantic_bindings,
+                )
+                schema_version = PERMISSION_BINDING_SCHEMA_VERSION
             desired = {
-                "binding_schema_version": PERMISSION_BINDING_SCHEMA_VERSION,
+                "binding_schema_version": schema_version,
                 "semantic_key": key,
                 "stable_bindings": stable,
             }
@@ -7365,6 +7566,8 @@ class SessionManager:
                 changed = True
                 break
         if changed:
+            assert isinstance(permissions, dict)
+            permissions["grants_revision"] = int(permissions.get("grants_revision") or 0) + 1
             self._write_file(session_id, data)
         return changed
 

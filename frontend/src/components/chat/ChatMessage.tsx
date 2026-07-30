@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Database, Download, FileSpreadsheet, FileText, FolderOpen, Globe2, HelpCircle, ImageIcon, Key, KeyRound, Layers3, Maximize2, PauseCircle, Plus, Sparkles, SquareTerminal, Trash2 } from "lucide-react";
-import { denyPermissionRequest, grantExternalFilePermission, grantToolActionPermission, openLocalFile, resolveDatabaseSqlRevisionRequest, resolveDimensionBuildRuleRequest, resolveLogicalDatasetRuleRequest, resolveUserInputRequest, type AgentAttachment, type DatabaseSqlRevisionRequest, type DimensionBuildRuleRequest, type LogicalDatasetRuleRequest, type PermissionRequest, type UserInputAnswer, type UserInputRequest } from "@/lib/api";
+import { denyPermissionRequest, grantExternalFilePermission, grantShellDirectoryPermission, grantToolActionPermission, openLocalFile, resolveDatabaseSqlRevisionRequest, resolveDimensionBuildRuleRequest, resolveLogicalDatasetRuleRequest, resolveUserInputRequest, type AgentAttachment, type DatabaseSqlRevisionRequest, type DimensionBuildRuleRequest, type LogicalDatasetRuleRequest, type PermissionRequest, type UserInputAnswer, type UserInputRequest } from "@/lib/api";
 import { markdownRemarkPlugins, markdownUrlTransform } from "@/lib/markdown";
 import { useApp, type ChatMessage as ChatMessageType, type SourceRecord, type TimelineItem } from "@/lib/store";
 import { isPreviewableImageAttachment, isQrImageAttachment } from "@/lib/imageAttachments";
@@ -627,7 +627,98 @@ function PermissionRequestCard({
   if (request.type === "tool_action") {
     return <ToolActionPermissionCard request={request} sessionId={sessionId} />;
   }
+  if (request.type === "shell_directory_access") {
+    return <ShellDirectoryPermissionCard request={request} sessionId={sessionId} />;
+  }
   return <ExternalFilePermissionCard request={request} sessionId={sessionId} />;
+}
+
+function ShellDirectoryPermissionCard({
+  request,
+  sessionId,
+}: {
+  request: PermissionRequest;
+  sessionId: string;
+}) {
+  const [status, setStatus] = useState<"idle" | "loading" | "granted" | "denied" | "error">("idle");
+  const [error, setError] = useState("");
+  const specs = request.grant_specs || [];
+  const directories = Array.from(new Set((request.paths || specs.map((spec) => spec.target)).filter(Boolean)));
+  const permissionsFor = (target: string) => {
+    const targetSpecs = specs.filter((spec) => spec.target === target);
+    const writable = targetSpecs.some((spec) => spec.access === "write");
+    const deletable = targetSpecs.some((spec) => spec.delete);
+    return deletable ? "读取、修改和删除" : writable ? "读取和修改" : "只读";
+  };
+
+  const grant = async (scope: "run" | "session") => {
+    setStatus("loading");
+    setError("");
+    try {
+      await grantShellDirectoryPermission(sessionId, request.id, scope);
+      setStatus("granted");
+      window.dispatchEvent(new CustomEvent("puddingclaw:permissions-changed"));
+    } catch (err) {
+      setStatus("error");
+      setError(err instanceof Error ? err.message : "授权失败");
+    }
+  };
+
+  const deny = async () => {
+    setStatus("loading");
+    setError("");
+    try {
+      await denyPermissionRequest(sessionId, request.id, "User denied shell directory access.");
+      setStatus("denied");
+    } catch (err) {
+      setStatus("error");
+      setError(err instanceof Error ? err.message : "拒绝失败");
+    }
+  };
+
+  return (
+    <div className="mb-3 max-w-[680px] rounded-2xl border border-sky-200 bg-white/90 p-4 shadow-sm">
+      <div className="flex gap-3">
+        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-sky-100 text-sky-700">
+          {status === "granted" ? <CheckCircle2 className="h-5 w-5" /> : <FolderOpen className="h-5 w-5" />}
+        </div>
+        <div className="min-w-0 flex-1">
+          <h3 className="text-[15px] font-bold text-slate-950">允许终端访问这些目录</h3>
+          <p className="mt-1 text-[11px] leading-relaxed text-slate-600">
+            此授权会直接开放给当前沙箱中的标准 shell 命令；只包含下列目录，不会扩展到父目录或其他已授权目录。
+          </p>
+          {request.command ? (
+            <pre className="mt-2 overflow-auto rounded-xl bg-slate-950 px-3 py-2 text-[11px] text-slate-100">{request.command}</pre>
+          ) : null}
+          <div className="mt-2 space-y-1.5">
+            {directories.map((path) => (
+              <div key={path} className="rounded-xl border border-slate-100 bg-slate-50 px-3 py-2">
+                <div className="font-mono text-[11px] text-slate-700">{path}</div>
+                <div className="mt-0.5 text-[10px] font-semibold text-sky-700">{permissionsFor(path)}</div>
+              </div>
+            ))}
+          </div>
+          {status === "idle" || status === "error" ? (
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button type="button" onClick={() => grant("run")} className="rounded-full bg-[#002fa7] px-3.5 py-2 text-[12px] font-semibold text-white">
+                仅本次 Run
+              </button>
+              <button type="button" onClick={() => grant("session")} className="rounded-full bg-white px-3.5 py-2 text-[12px] font-semibold text-slate-700 ring-1 ring-black/[0.08]">
+                本 Session 允许
+              </button>
+              <button type="button" onClick={deny} className="rounded-full px-3 py-2 text-[12px] font-semibold text-slate-500">
+                拒绝
+              </button>
+            </div>
+          ) : null}
+          {status === "loading" ? <div className="mt-2 text-[11px] text-slate-500">处理中...</div> : null}
+          {status === "granted" ? <div className="mt-2 text-[11px] text-emerald-700">已授权，命令将继续执行。</div> : null}
+          {status === "denied" ? <div className="mt-2 text-[11px] text-slate-500">已拒绝</div> : null}
+          {status === "error" ? <div className="mt-2 text-[11px] text-rose-600">{error}</div> : null}
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function ToolActionPermissionCard({

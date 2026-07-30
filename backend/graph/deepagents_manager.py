@@ -84,7 +84,6 @@ from graph.middlewares.delegation_control import (
     DelegationControlMiddleware,
     SubagentProgressMiddleware,
 )
-from graph.middlewares.external_directory import ExternalDirectoryMiddleware
 from graph.middlewares.goal_completion import (
     GOAL_COMPLETION_REMINDER_SOURCE,
     GoalCompletionMiddleware,
@@ -174,6 +173,7 @@ from tools.package_install import create_install_packages_tool
 from tools.request_user_input_tool import create_request_user_input_tool
 from tools.toolsets import agent_custom_tool_names, tool_control_descriptor
 from tools.update_goal_tool import create_update_goal_tool
+from utils.json_serialization import to_json_compatible
 
 logger = logging.getLogger(__name__)
 
@@ -840,13 +840,12 @@ register_harness_profile(
         tool_description_overrides={
             "edit_file": (
                 "Deprecated by PuddingClaw Harness: direct exact-string editing is disabled. "
-                "Call inspect_file_version and then patch_file with expected_sha256."
+                "Call patch_file with unique replacement anchors; expected_sha256 is optional."
             ),
             "ls": (
                 "List entries in a directory only when the task genuinely requires "
                 "discovering unknown children. Never call ls as a prerequisite for "
-                "read_file, grep, inspect_file_version, copy_file, replace_file, "
-                "materialize_source_ref, patch_file, "
+                "read_file, grep, materialize_source_ref, patch_file, "
                 "or write_file when "
                 "an exact path is already known from the user, system context, a Tool "
                 "result, or a persisted artifact reference; operate on that path directly."
@@ -2413,10 +2412,9 @@ def _build_subagents(
             "description": "General-purpose subagent for isolated multi-step work.",
             "system_prompt": (
                 "Complete the delegated task concisely. Read an applicable project Skill before using its business tools. "
-                "Use copy_file for versioned copies, replace_file for hash-guarded full replacement, "
-                "materialize_source_ref for server data references, "
-                "or inspect_file_version plus patch_file for local edits; use execute only when runtime "
-                "computation, validation, or tests are actually required. Harness permissions are inherited from the "
+                "Use standard shell cp/mv/mkdir for directory-authorized filesystem operations, "
+                "write_file for full writes, patch_file for anchored local edits, and "
+                "materialize_source_ref for server data references. Harness permissions are inherited from the "
                 "parent Run, so never ask the user for a separate subagent permission. Return registered Evidence IDs, "
                 "SQL generation/validation receipt IDs and Artifact hashes instead of copying exact data through prose. "
                 "Never ask the user directly; return a concise blocker and question to the parent Agent instead."
@@ -2740,9 +2738,12 @@ class DeepAgentsAgentManager:
             ExternalFilePermissionMiddleware(),
             WorkspacePathRouterMiddleware(workspace_backend),
             VerificationActivationMiddleware(),
-            *([VersionedPatchMiddleware(workspace_backend)] if workspace_backend is not None else []),
+            *(
+                [VersionedPatchMiddleware(workspace_backend, compact_model_surface=True)]
+                if workspace_backend is not None
+                else []
+            ),
             *([AttachmentEditMiddleware(workspace_backend)] if workspace_backend is not None else []),
-            *([ExternalDirectoryMiddleware(workspace_backend)] if workspace_backend is not None else []),
             DelegationControlMiddleware(),
             GoalCompletionMiddleware(),
             UserInputBoundaryMiddleware(),
@@ -2816,16 +2817,19 @@ class DeepAgentsAgentManager:
         SSE generator, and each thread is deleted when that Run terminates.
         """
 
+        from langgraph.checkpoint.memory import InMemorySaver
+
         if self._checkpointer is not None:
             return self._checkpointer
-
-        from langgraph.checkpoint.memory import InMemorySaver
 
         self._checkpointer = InMemorySaver()
         self._checkpointer_info = {
             "type": "memory",
             "scope": "active_sse_run",
         }
+        logger.info(
+            "Initialized live DeepAgents checkpointer: type=memory scope=active_sse_run"
+        )
         return self._checkpointer
 
     async def _delete_checkpoint_thread(self, thread_id: str) -> None:
@@ -3123,46 +3127,19 @@ class DeepAgentsAgentManager:
                 "description": "按稳定 Evidence ID 读取历史原始结果",
             },
             {"name": "write_file", "source": "deepagents.builtin", "description": "写入文件"},
-            {"name": "inspect_file_version", "source": "puddingclaw.harness", "description": "读取文件版本并生成摘要"},
-            {"name": "copy_file", "source": "puddingclaw.harness", "description": "不经模型正文传输，原子创建文件副本"},
-            {"name": "replace_file", "source": "puddingclaw.harness", "description": "按 expected_sha256 原子覆盖文件"},
             {
                 "name": "materialize_source_ref",
                 "source": "puddingclaw.harness",
                 "description": "将不可变 SourceReference 直接物化为文件或类型化 Slot",
             },
             {"name": "patch_file", "source": "puddingclaw.harness", "description": "按文件版本原子应用补丁"},
+            {"name": "delete_file", "source": "puddingclaw.harness", "description": "删除精确授权的文件"},
             {
                 "name": "validate_html_report",
                 "source": "puddingclaw.harness",
                 "description": (
                     "常规检查 HTML 结构与本地引用；合同明确要求 E2E 时才使用离线 Chromium，并生成 hash 绑定 Receipt"
                 ),
-            },
-            {
-                "name": "stage_external_artifact",
-                "source": "puddingclaw.harness",
-                "description": "暂存精确授权的外部文件",
-            },
-            {
-                "name": "commit_external_artifact",
-                "source": "puddingclaw.harness",
-                "description": "提交已验证的外部文件产物",
-            },
-            {
-                "name": "stage_external_directory",
-                "source": "puddingclaw.harness",
-                "description": "将授权外部目录快照到当前 Run 的 Docker scratch",
-            },
-            {
-                "name": "prepare_external_directory_commit",
-                "source": "puddingclaw.harness",
-                "description": "生成外部目录新增、修改、删除计划",
-            },
-            {
-                "name": "commit_external_directory",
-                "source": "puddingclaw.harness",
-                "description": "经用户审批后提交外部目录变更计划",
             },
             {
                 "name": "prepare_attachment_edit",
@@ -3596,7 +3573,7 @@ class DeepAgentsAgentManager:
                 paths = "\n".join(f"- {path}" for path in external_resource_paths)
                 notes.append(
                     "[外部文件授权] 检测到 workspace 外的本地文件路径。直接对原始绝对路径使用 "
-                    f"read_file/inspect_file_version/copy_file/replace_file/materialize_source_ref/patch_file：\n{paths}\n"
+                    f"read_file/write_file/materialize_source_ref/patch_file：\n{paths}\n"
                     "未授权时系统会请求精确文件权限并重放原调用。若确认必须发现同目录依赖，"
                     "对直接父目录调用 ls/glob/grep；系统只请求该 exact directory，不得猜测兄弟路径或提升到更高祖先目录。"
                     "获批后的读写由 HostFileBroker 原子落到正式路径；不要创建 /workspace 或 /scratch 影子副本。"
@@ -3611,12 +3588,11 @@ class DeepAgentsAgentManager:
             if external_directory_paths:
                 paths = "\n".join(f"- {path}" for path in external_directory_paths)
                 notes.append(
-                    "[外部目录授权] 检测到 workspace 外的本地目录。直接对原始绝对路径调用 "
-                    f"ls/glob/grep/read_file/write_file/inspect_file_version/copy_file/replace_file/"
-                    f"materialize_source_ref/patch_file：\n{paths}\n"
-                    "未授权时系统会请求 exact-directory 权限并自动重放；授权后 HostFileBroker 直接访问正式文件，"
-                    "不会暴露 lease、staged path 或 hash 编排。execute 仍受项目 Docker 与 container_path_expansion "
-                    "约束；需要完整目录命令语义时优先建议把该目录作为项目打开。"
+                    "[外部目录授权] 检测到 workspace 外的本地目录。读取可直接使用 "
+                    f"ls/glob/grep/read_file；复制、移动、建目录直接使用 execute 中的标准 cp/mv/mkdir：\n{paths}\n"
+                    "首次 shell 访问会一次性请求所需目录及 read/write/delete 能力；授权后命令原样重放，"
+                    "默认由内核沙箱执行。write_file/patch_file 的精确或事务写入仍由内部 HostFileBroker 原子提交，"
+                    "模型无需处理 lease、staged path 或 hash 编排。"
                 )
             return f"{message}\n\n" + "\n\n".join(notes)
 
@@ -4538,7 +4514,7 @@ class DeepAgentsAgentManager:
     def _sse(event: str, payload: dict[str, Any]) -> dict[str, str]:
         return {
             "event": event,
-            "data": json.dumps(payload, ensure_ascii=False),
+            "data": json.dumps(to_json_compatible(payload), ensure_ascii=False),
         }
 
     @staticmethod
@@ -6643,6 +6619,23 @@ class DeepAgentsAgentManager:
                     None,
                 ),
             )
+            mcp_config = config.load_config().get("mcp", {})
+            from mcp_clients.servers import effective_mcp_server_names
+
+            enabled_mcp = effective_mcp_server_names(
+                mcp_config.get("enabled", []),
+                auto_enable_gbrain=bool(mcp_config.get("auto_enable_gbrain", False)),
+            )
+            if enabled_mcp:
+                try:
+                    from mcp_clients import load_filtered_mcp_tools
+
+                    agent_tools.extend(await load_filtered_mcp_tools(enabled_mcp))
+                except Exception:
+                    logger.warning(
+                        "Failed to load filtered MCP tools for DeepAgents; continuing with local tools",
+                        exc_info=True,
+                    )
             if not run_record.executes_goal:
                 agent_tools = [tool for tool in agent_tools if str(getattr(tool, "name", "")) != "update_goal"]
             backend_mode = str(getattr(agent_backend, "execution_mode", "restricted_host"))
@@ -6715,8 +6708,7 @@ class DeepAgentsAgentManager:
                     ExternalFilePermissionMiddleware(),
                     WorkspacePathRouterMiddleware(agent_backend),
                     VerificationActivationMiddleware(),
-                    VersionedPatchMiddleware(agent_backend),
-                    ExternalDirectoryMiddleware(agent_backend),
+                    VersionedPatchMiddleware(agent_backend, compact_model_surface=True),
                     SkillIntentRouterMiddleware(),
                     ToolsetMiddleware(
                         skills_dir=self._base_dir / "skills",
@@ -8400,6 +8392,9 @@ class DeepAgentsAgentManager:
                 trace_collector.__exit__(asyncio.CancelledError, None, None)
             raise
         except Exception as exc:
+            error_traceback = "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            )
             if terminal_authority_committed:
                 # Post-commit maintenance is best-effort. Never turn a
                 # committed success into a user-visible Run error.
@@ -8713,6 +8708,12 @@ class DeepAgentsAgentManager:
                 )
             try:
                 if trace_collector is not None:
+                    # Keep a bounded server-side traceback in the diagnostic
+                    # Trace. The user-facing SSE remains sanitized, while a
+                    # pre-provider failure can be located without asking the
+                    # user to reproduce it repeatedly or scrape a terminal.
+                    trace_collector.root.metadata["error_type"] = type(exc).__name__
+                    trace_collector.root.metadata["error_traceback"] = error_traceback[-20000:]
                     record_task_router_trace(trace_collector, settle_pending=True)
                     trace = trace_collector.finish(status="error", error=error_msg)
                     await asyncio.to_thread(

@@ -9,6 +9,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -34,6 +35,15 @@ _LARK_CONFIG_URL = re.compile(
     r"https://(?:open\.feishu\.cn|open\.larksuite\.com)/page/cli\?[^\s\x1b<>\"']+",
     re.IGNORECASE,
 )
+
+
+def _macos_seatbelt_available() -> bool:
+    if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").is_file():
+        return False
+    from harness.kernel_sandbox import MacOSSeatbeltRunner
+
+    available, _reason = MacOSSeatbeltRunner.probe()
+    return available
 
 
 @dataclass(frozen=True)
@@ -282,6 +292,78 @@ class RestrictedHostWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
     def _workspace_lock(cls, key: str) -> threading.RLock:
         with cls._workspace_locks_guard:
             return cls._workspace_locks.setdefault(key, threading.RLock())
+
+
+class KernelWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
+    """Workspace filesystem whose shell is always backed by an OS sandbox."""
+
+    mode = "kernel"
+
+    def __init__(
+        self,
+        *,
+        root_dir: Path,
+        scratch_path: Path,
+        timeout: int = 120,
+    ) -> None:
+        super().__init__(root_dir=root_dir, virtual_mode=True)
+        self.workspace_path = root_dir.expanduser().resolve()
+        self.scratch_path = scratch_path.expanduser().resolve()
+        if not self.workspace_path.is_dir() or not self.scratch_path.is_dir():
+            raise ValueError("Kernel workspace and scratch roots must exist")
+        if not _macos_seatbelt_available():
+            raise RuntimeError("No supported kernel sandbox is available on this host")
+        self._default_timeout = timeout
+        workspace_digest = hashlib.sha256(
+            str(self.workspace_path).encode("utf-8")
+        ).hexdigest()[:16]
+        self._id = f"kernel:macos-seatbelt:{workspace_digest}"
+
+    @property
+    def id(self) -> str:
+        return self._id
+
+    def execute(
+        self,
+        command: str,
+        *,
+        timeout: int | None = None,
+    ) -> ExecuteResponse:
+        from harness.execution_context import current_authorized_execution
+        from harness.kernel_sandbox import MacOSSeatbeltRunner
+
+        authorized = current_authorized_execution()
+        if authorized is None:
+            return ExecuteResponse(
+                output="Error: Kernel execution requires a Tool Gate execution permit.",
+                exit_code=126,
+            )
+        profile = authorized.profile
+        if (
+            profile.workspace_root != self.workspace_path
+            or profile.scratch_root != self.scratch_path
+        ):
+            return ExecuteResponse(
+                output="Error: Execution permit belongs to another workspace.",
+                exit_code=126,
+            )
+        runner = MacOSSeatbeltRunner(profile)
+        if not authorized.valid_at_spawn(
+            command=command,
+            selected_runner=runner.mode,
+        ):
+            return ExecuteResponse(
+                output="Error: Kernel execution permit became invalid before process spawn.",
+                exit_code=126,
+            )
+        return runner.execute(
+            authorized.execution_command,
+            timeout=timeout or self._default_timeout,
+            spawn_guard=lambda: authorized.valid_at_spawn(
+                command=command,
+                selected_runner=runner.mode,
+            ),
+        )
 
 
 class ProjectSandboxManager:
@@ -2020,6 +2102,110 @@ class ProjectSandboxManager:
             truncated=truncated,
         )
 
+    def run_ephemeral_grant_profile_command(
+        self,
+        workspace: Path,
+        *,
+        command: str,
+        profile: Any,
+        timeout: int,
+        max_output_bytes: int,
+    ) -> ExecuteResponse:
+        """Project one runner-neutral Grant Profile into a disposable container."""
+
+        workspace = workspace.expanduser().resolve(strict=True)
+        if profile.workspace_root != workspace or not profile.valid_at_spawn():
+            return ExecuteResponse(
+                output="Error: Docker Grant Profile is invalid at spawn.",
+                exit_code=126,
+            )
+        spec = self._spec(workspace)
+        image_id = self.ensure_image(spec["image"])
+        runtime_home_volume = self._runtime_home_volume_name(
+            workspace,
+            image=image_id,
+        )
+        mount_args = [
+            "--mount",
+            f"type=bind,src={workspace},dst=/workspace",
+            "--mount",
+            f"type=bind,src={profile.scratch_root},dst=/scratch",
+            "--mount",
+            f"type=volume,src={runtime_home_volume},dst=/home/puddingclaw",
+        ]
+        external_roots = {
+            root
+            for root in (*profile.read_roots, *profile.write_roots)
+            if root not in {profile.workspace_root, profile.scratch_root}
+        }
+        for root in sorted(external_roots, key=str):
+            writable = root in profile.write_roots
+            mount = f"type=bind,src={root},dst={root}"
+            if not writable:
+                mount += ",readonly"
+            mount_args.extend(["--mount", mount])
+        for mount in spec["readonly_mounts"]:
+            mount_args.extend(
+                [
+                    "--mount",
+                    f"type=bind,src={mount['source']},dst={mount['target']},readonly",
+                ]
+            )
+        args = [
+            "run",
+            "--rm",
+            "--network",
+            "bridge" if profile.network_allowed else "none",
+            "--read-only",
+            "--tmpfs",
+            "/tmp:rw,nosuid,nodev,size=256m",
+            "--workdir",
+            "/workspace",
+            *mount_args,
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--pids-limit",
+            str(min(int(spec["pids_limit"]), int(profile.max_processes))),
+            "--memory",
+            f"{spec['memory_limit_mb']}m",
+            "--cpus",
+            spec["cpu_limit"],
+            "--env",
+            "HOME=/home/puddingclaw",
+            "--env",
+            (
+                "PATH=/opt/puddingclaw/toolchain/node/bin:/home/puddingclaw/.local/bin:"
+                "/home/puddingclaw/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
+            ),
+            *_managed_credential_state_tmpfs_args(),
+            "--entrypoint",
+            "sh",
+        ]
+        if spec["uid"] is not None and spec["gid"] is not None:
+            args.extend(["--user", f"{spec['uid']}:{spec['gid']}"])
+        args.extend([image_id, "-c", command])
+        try:
+            result = self._run(args, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return ExecuteResponse(
+                output=f"Error: Command timed out after {timeout} seconds.",
+                exit_code=124,
+            )
+        output, truncated = _bounded_output(
+            result.stdout,
+            result.stderr,
+            max_output_bytes=max_output_bytes,
+        )
+        if result.returncode != 0:
+            output = f"{output.rstrip()}\n\nExit code: {result.returncode}"
+        return ExecuteResponse(
+            output=output,
+            exit_code=result.returncode,
+            truncated=truncated,
+        )
+
     def _validate_runtime(self, container_name: str, spec: dict[str, Any]) -> None:
         inspect_result = self._run(["inspect", container_name])
         if inspect_result.returncode != 0:
@@ -2130,17 +2316,36 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         *,
         root_dir: Path,
         manager: ProjectSandboxManager,
+        scratch_path: Path | None = None,
         timeout: int = 120,
         max_output_bytes: int = 100_000,
+        require_execution_permit: bool = False,
     ) -> None:
         super().__init__(root_dir=root_dir, virtual_mode=True)
         self.workspace_path = root_dir.expanduser().resolve()
         self.manager = manager
         self._default_timeout = timeout
         self._max_output_bytes = max_output_bytes
+        self._require_execution_permit = require_execution_permit
         self.dependency_plan = manager.dependency_plan(self.workspace_path)
         scratch_relative = str(manager.config.get("_scratch_relative") or "").strip("/")
         spec = manager._spec(self.workspace_path)
+        scratch_mount = next(
+            (
+                item
+                for item in spec.get("writable_mounts") or []
+                if item.get("target") == "/scratch"
+            ),
+            None,
+        )
+        scratch_source = str((scratch_mount or {}).get("source") or "").strip()
+        self.scratch_path = (
+            scratch_path.expanduser().resolve()
+            if scratch_path is not None
+            else Path(scratch_source).expanduser().resolve()
+            if scratch_source
+            else None
+        )
         self.scratch_container_path = (
             "/scratch"
             if any(item.get("target") == "/scratch" for item in spec.get("writable_mounts") or [])
@@ -2159,18 +2364,47 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         command: str,
         *,
         timeout: int | None = None,
+        _trusted_typed: bool = False,
     ) -> ExecuteResponse:
+        original_command = command
         traversal = _reject_scratch_traversal(command)
         if traversal is not None:
             return traversal
         effective_timeout = timeout if timeout is not None else self._default_timeout
         if not isinstance(effective_timeout, int) or effective_timeout <= 0:
             raise ValueError("timeout must be a positive integer")
+        from harness.execution_context import current_authorized_execution
+
+        authorized = current_authorized_execution()
+        if authorized is not None and authorized.permit.selected_runner == "docker":
+            command = authorized.execution_command
         command = re.sub(
             r"(?<![A-Za-z0-9_./-])/scratch(?=(?:/|\s|$|[\"']))",
             self.scratch_container_path,
             command,
         )
+        if authorized is not None and authorized.permit.selected_runner == "docker":
+            profile = authorized.profile
+            has_external_roots = any(
+                root not in {profile.workspace_root, profile.scratch_root}
+                for root in (*profile.read_roots, *profile.write_roots)
+            )
+            if has_external_roots:
+                if not authorized.valid_at_spawn(
+                    command=original_command,
+                    selected_runner="docker",
+                ):
+                    return ExecuteResponse(
+                        output="Error: Docker execution permit became invalid before process spawn.",
+                        exit_code=126,
+                    )
+                return self.manager.run_ephemeral_grant_profile_command(
+                    self.workspace_path,
+                    command=command,
+                    profile=profile,
+                    timeout=effective_timeout,
+                    max_output_bytes=self._max_output_bytes,
+                )
         try:
             with self.manager._lock(self.container_name):
                 # An idle timer may stop a project container between Runs.
@@ -2179,6 +2413,18 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
                 container_name, spec_hash = self.manager.ensure_container(self.workspace_path)
                 if container_name != self.container_name or spec_hash != self.spec_hash:
                     raise RuntimeError("Docker sandbox specification changed after this Run started; start a new Run.")
+                if self._require_execution_permit and not _trusted_typed:
+                    from harness.execution_context import current_authorized_execution
+
+                    authorized = current_authorized_execution()
+                    if authorized is None or not authorized.valid_at_spawn(
+                        command=original_command,
+                        selected_runner="docker",
+                    ):
+                        return ExecuteResponse(
+                            output="Error: Docker execution permit became invalid before process spawn.",
+                            exit_code=126,
+                        )
                 from harness.tool_execution import ShellPolicyAnalyzer
 
                 effects = ShellPolicyAnalyzer.capabilities(
@@ -2396,9 +2642,135 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         return self.manager.list_managed_browser_auth_jobs(owner_user_id=owner_user_id)
 
 
+class AdaptiveWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
+    """Kernel-first backend with a Docker delegate constructed only on use."""
+
+    mode = "adaptive"
+    _MANAGED_DOCKER_METHODS = frozenset(
+        {
+            "install_managed_node_cli",
+            "run_managed_provider_cli",
+            "run_managed_browser_auth_cli",
+            "collect_managed_browser_auth_cli",
+            "finalize_managed_browser_auth_cli",
+            "list_managed_browser_auth_jobs",
+        }
+    )
+
+    def __init__(
+        self,
+        *,
+        root_dir: Path,
+        scratch_path: Path,
+        docker_config: dict[str, Any],
+        timeout: int = 120,
+    ) -> None:
+        super().__init__(root_dir=root_dir, virtual_mode=True)
+        self.workspace_path = root_dir.expanduser().resolve()
+        self.scratch_path = scratch_path.expanduser().resolve()
+        self.kernel = KernelWorkspaceBackend(
+            root_dir=self.workspace_path,
+            scratch_path=self.scratch_path,
+            timeout=timeout,
+        )
+        self._docker_config = dict(docker_config)
+        self._default_timeout = timeout
+        self._docker: DockerWorkspaceBackend | None = None
+        self._docker_lock = threading.RLock()
+        workspace_digest = hashlib.sha256(
+            str(self.workspace_path).encode("utf-8")
+        ).hexdigest()[:16]
+        self._id = f"adaptive:kernel-first:{workspace_digest}"
+
+    @property
+    def id(self) -> str:
+        return self._id
+
+    def _docker_backend(self) -> DockerWorkspaceBackend:
+        with self._docker_lock:
+            if self._docker is not None:
+                return self._docker
+            manager = ProjectSandboxManager(self._docker_config)
+            available, reason = manager.probe()
+            if not available:
+                raise RuntimeError(f"Docker sandbox is unavailable: {reason}")
+            self._docker = DockerWorkspaceBackend(
+                root_dir=self.workspace_path,
+                manager=manager,
+                scratch_path=self.scratch_path,
+                timeout=self._default_timeout,
+                require_execution_permit=True,
+            )
+            return self._docker
+
+    def execute(
+        self,
+        command: str,
+        *,
+        timeout: int | None = None,
+    ) -> ExecuteResponse:
+        from harness.execution_context import current_authorized_execution
+
+        authorized = current_authorized_execution()
+        if authorized is None:
+            # Fixed platform-owned browser validation is already authorized by
+            # its typed Tool Gate and cannot run in the host kernel runtime.
+            if "/opt/puddingclaw/bin/validate-html-report-e2e.mjs" in command:
+                try:
+                    return self._docker_backend().execute(
+                        command,
+                        timeout=timeout,
+                        _trusted_typed=True,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    return ExecuteResponse(
+                        output=f"Error starting lazy Docker runner ({type(exc).__name__}): {exc}",
+                        exit_code=1,
+                    )
+            return ExecuteResponse(
+                output="Error: Adaptive execution requires a Tool Gate execution permit.",
+                exit_code=126,
+            )
+        if authorized.permit.selected_runner == "kernel_macos_seatbelt":
+            return self.kernel.execute(command, timeout=timeout)
+        if authorized.permit.selected_runner != "docker":
+            return ExecuteResponse(
+                output="Error: Execution permit selected an unknown runner.",
+                exit_code=126,
+            )
+        if not authorized.valid_at_spawn(command=command, selected_runner="docker"):
+            return ExecuteResponse(
+                output="Error: Docker execution permit became invalid before lazy startup.",
+                exit_code=126,
+            )
+        try:
+            return self._docker_backend().execute(command, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001
+            return ExecuteResponse(
+                output=f"Error starting lazy Docker runner ({type(exc).__name__}): {exc}",
+                exit_code=1,
+            )
+
+    def execute_external_directory(self, *args: Any, **kwargs: Any) -> ExecuteResponse:
+        return self._docker_backend().execute_external_directory(*args, **kwargs)
+
+    def install_packages(self, *args: Any, **kwargs: Any) -> ExecuteResponse:
+        return self._docker_backend().install_packages(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        if name in self._MANAGED_DOCKER_METHODS:
+            return getattr(self._docker_backend(), name)
+        raise AttributeError(name)
+
+
 @dataclass(frozen=True)
 class WorkspaceBackendSelection:
-    backend: RestrictedHostWorkspaceBackend | DockerWorkspaceBackend
+    backend: (
+        RestrictedHostWorkspaceBackend
+        | KernelWorkspaceBackend
+        | AdaptiveWorkspaceBackend
+        | DockerWorkspaceBackend
+    )
     mode: str
     fallback_reason: str | None = None
     dependency_plan: WorkspaceDependencyPlan | None = None
@@ -2408,13 +2780,53 @@ def build_workspace_execution_backend(
     workspace_path: Path,
     terminal_config: dict[str, Any],
 ) -> WorkspaceBackendSelection:
-    """Select Docker when explicitly enabled, otherwise controlled host fallback."""
+    """Build the configured kernel-first, kernel-only, or forced-Docker backend."""
 
     timeout = int(terminal_config.get("default_timeout_seconds") or 120)
-    docker_enabled = bool(terminal_config.get("docker_enabled", False))
+    sandbox_mode = str(terminal_config.get("sandbox_mode") or "").strip().lower()
+    if sandbox_mode not in {"", "auto", "kernel", "docker"}:
+        raise ValueError("sandbox_mode must be auto, kernel, or docker")
+    docker_enabled = (
+        sandbox_mode == "docker"
+        if sandbox_mode
+        else bool(terminal_config.get("docker_enabled", False))
+    )
     docker_config = dict(terminal_config.get("docker") or {})
     scratch_host_path_raw = str(terminal_config.get("_scratch_host_path") or "").strip()
     scratch_host_path = Path(scratch_host_path_raw) if scratch_host_path_raw else None
+    if sandbox_mode in {"auto", "kernel"}:
+        if scratch_host_path is None:
+            raise ValueError("Kernel sandbox requires a Harness scratch path")
+        try:
+            if sandbox_mode == "auto":
+                adaptive = AdaptiveWorkspaceBackend(
+                    root_dir=workspace_path,
+                    scratch_path=scratch_host_path,
+                    docker_config=docker_config,
+                    timeout=timeout,
+                )
+                return WorkspaceBackendSelection(
+                    backend=adaptive,
+                    mode="adaptive",
+                )
+            return WorkspaceBackendSelection(
+                backend=KernelWorkspaceBackend(
+                    root_dir=workspace_path,
+                    scratch_path=scratch_host_path,
+                    timeout=timeout,
+                ),
+                mode="kernel",
+            )
+        except RuntimeError as exc:
+            if sandbox_mode == "kernel":
+                raise
+            # Auto only touches Docker when the default kernel boundary is
+            # genuinely unavailable. Capability-based lazy upgrades are
+            # handled by the execution router, not during Run construction.
+            docker_enabled = True
+            kernel_fallback_reason = str(exc)
+    else:
+        kernel_fallback_reason = None
     if docker_enabled:
         manager = ProjectSandboxManager(docker_config)
         available, reason = manager.probe()
@@ -2423,11 +2835,13 @@ def build_workspace_execution_backend(
                 backend = DockerWorkspaceBackend(
                     root_dir=workspace_path,
                     manager=manager,
+                    scratch_path=scratch_host_path,
                     timeout=timeout,
                 )
                 return WorkspaceBackendSelection(
                     backend=backend,
                     mode="docker",
+                    fallback_reason=kernel_fallback_reason,
                     dependency_plan=backend.dependency_plan,
                 )
             except Exception as exc:

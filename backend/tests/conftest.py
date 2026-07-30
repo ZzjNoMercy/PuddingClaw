@@ -32,6 +32,7 @@ def isolate_deepagents_from_real_docker(monkeypatch):
 
     def build_isolated(workspace_path, terminal_config):
         isolated = deepcopy(terminal_config)
+        isolated.pop("sandbox_mode", None)
         isolated["docker_enabled"] = False
         return original(workspace_path, isolated)
 

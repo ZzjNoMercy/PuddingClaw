@@ -54,6 +54,24 @@
     { key: "average_cycle_days", label: "周期" }
   ];
   var COMPETITOR_BRAND_GROUPS = ["比亚迪集团", "长安集团", "奇瑞集团", "长城汽车", "吉利汽车"];
+  var SIZE_POWER_X_CATEGORIES = ["0-50", "50-100", "100-150", "150-200", "200-250", "250-300", "300-350", "350-400", "400-450", "450-500", "500kW以上"];
+  var SIZE_POWER_Y_CATEGORIES = ["2600以下", "2600-2650", "2650-2700", "2700-2750", "2750-2800", "2800-2850", "2850-2900", "2900-2950", "2950-3000", "3000以上"];
+  var CORE_CONFIG_CONTROLS = [
+    { value: "airSuspension", label: "空气悬架", title: "空气悬架" },
+    { value: "lidar", label: "激光雷达", title: "激光雷达" },
+    { value: "hud", label: "HUD", title: "HUD抬头显示" }
+  ];
+  var CORE_GRAIN_CONTROLS = [
+    { value: "trim", label: "款型" },
+    { value: "series", label: "车系" }
+  ];
+  var CORE_DIMENSION_CONTROLS = [
+    { value: "price", label: "价格段", bands: ["10万以下", "10-15万", "15-20万", "20-30万", "30-50万", "50万以上"] },
+    { value: "wheelbase", label: "轴距段", bands: ["2600以下", "2600-2700", "2700-2800", "2800-2900", "2900-3000", "3000以上"] },
+    { value: "level", label: "级别", bands: ["A0级", "A级", "B级", "C级", "D级", "MPV"] }
+  ];
+  var CORE_CHART_IDS = ["coreConfigTrendChart", "coreConfigHeatmapChart"];
+  var L2_PRICE_BAND_SERIES = ["10-15 万", "15-20 万", "20-30 万", "30 万以上", "行业均值"];
   var chartInstances = {};
   var currentPayload = null;
 
@@ -178,15 +196,175 @@
     }
   }
 
+  function validateSizePowerHeatmap(spec, payload, errors) {
+    var period = reportPeriod(payload);
+    var variants = Array.isArray(spec.variants) ? spec.variants : [];
+    var expectedScope = {
+      energy_type: "纯电",
+      excluded_vehicle_types: ["皮卡"],
+      required_fields: ["轴距", "电机总功率"],
+      grain: "款型",
+      measure: "款型数"
+    };
+    if (spec.kind !== "heatmap_variants") {
+      errors.push("sizePowerHeatmapChart: kind must be heatmap_variants");
+      return;
+    }
+    if (!period) {
+      errors.push("sizePowerHeatmapChart: report.scope.period must be YYYY-MM");
+      return;
+    }
+    if (JSON.stringify(spec.scope || {}) !== JSON.stringify(expectedScope)) {
+      errors.push("sizePowerHeatmapChart: scope must be pure-electric trims, excluding pickups, with non-null wheelbase and motor power");
+    }
+    if (String(spec.default_year || "") !== String(period.year)) {
+      errors.push("sizePowerHeatmapChart: default_year must equal the report year");
+    }
+    var expectedYears = Array.from({ length: 6 }, function (_, index) { return String(period.year - 5 + index); });
+    if (variants.length !== expectedYears.length) {
+      errors.push("sizePowerHeatmapChart: exactly six yearly variants are required");
+    }
+    variants.forEach(function (variant, index) {
+      var expectedYear = expectedYears[index];
+      var actualYear = String(getPath(variant, "filters.year") || "");
+      if (variant.kind !== "heatmap") errors.push("sizePowerHeatmapChart: variant[" + index + "].kind must be heatmap");
+      if (String(variant.label || "") !== expectedYear || actualYear !== expectedYear) {
+        errors.push("sizePowerHeatmapChart: variant[" + index + "] must represent year " + expectedYear);
+      }
+      if (variant.name !== "款型数") errors.push("sizePowerHeatmapChart: variant[" + index + "].name must be 款型数");
+      var xCategories = Array.isArray(variant.x_categories) ? variant.x_categories : [];
+      var yCategories = Array.isArray(variant.y_categories) ? variant.y_categories : [];
+      if (JSON.stringify(xCategories) !== JSON.stringify(SIZE_POWER_X_CATEGORIES)) {
+        errors.push("sizePowerHeatmapChart: variant[" + index + "] must use the fixed power bands on the x-axis");
+      }
+      if (JSON.stringify(yCategories) !== JSON.stringify(SIZE_POWER_Y_CATEGORIES)) {
+        errors.push("sizePowerHeatmapChart: variant[" + index + "] must use the fixed wheelbase bands on the y-axis");
+      }
+      var values = Array.isArray(variant.values) ? variant.values : [];
+      var cells = {};
+      values.forEach(function (cell, cellIndex) {
+        var x = Number(cell && cell[0]);
+        var y = Number(cell && cell[1]);
+        var value = Number(cell && cell[2]);
+        if (!Number.isInteger(x) || x < 0 || x >= SIZE_POWER_X_CATEGORIES.length ||
+            !Number.isInteger(y) || y < 0 || y >= SIZE_POWER_Y_CATEGORIES.length) {
+          errors.push("sizePowerHeatmapChart: variant[" + index + "].values[" + cellIndex + "] has an invalid cell index");
+        }
+        if (!Number.isInteger(value) || value < 0) {
+          errors.push("sizePowerHeatmapChart: variant[" + index + "].values[" + cellIndex + "] must be a non-negative integer trim count");
+        }
+        cells[x + ":" + y] = true;
+      });
+      if (values.length !== SIZE_POWER_X_CATEGORIES.length * SIZE_POWER_Y_CATEGORIES.length ||
+          Object.keys(cells).length !== SIZE_POWER_X_CATEGORIES.length * SIZE_POWER_Y_CATEGORIES.length) {
+        errors.push("sizePowerHeatmapChart: variant[" + index + "] must contain the complete 10x11 matrix, including zero cells");
+      }
+    });
+  }
+
+  function validateCoreConfiguration(payload, errors) {
+    var spec = payload.core_configuration;
+    if (!isObject(spec)) {
+      errors.push("core_configuration: v3 module contract is required");
+      return;
+    }
+    if (["pending", "ready", "no_data"].indexOf(spec.status) === -1) {
+      errors.push("core_configuration: status must be pending, ready, or no_data");
+      return;
+    }
+    if (spec.status === "no_data" && !spec.reason) errors.push("core_configuration: no_data requires reason");
+    if (spec.status !== "ready") return;
+    if (spec.kind !== "v3_core_configuration") {
+      errors.push("core_configuration: kind must be v3_core_configuration");
+    }
+    if (!Array.isArray(spec.query_ids) || !spec.query_ids.length) {
+      errors.push("core_configuration: ready module requires query_ids");
+    }
+    var period = reportPeriod(payload);
+    if (!period) {
+      errors.push("core_configuration: report.scope.period must be YYYY-MM");
+      return;
+    }
+    var years = Array.from({ length: 6 }, function (_, index) { return String(period.year - 5 + index); });
+    if (JSON.stringify(spec.years || []) !== JSON.stringify(years)) {
+      errors.push("core_configuration: years must be six consecutive years ending in the report year");
+    }
+    var dimensions = isObject(spec.dimensions) ? spec.dimensions : {};
+    CORE_DIMENSION_CONTROLS.forEach(function (dimension) {
+      var actual = dimensions[dimension.value] || {};
+      if (actual.label !== dimension.label || JSON.stringify(actual.bands || []) !== JSON.stringify(dimension.bands)) {
+        errors.push("core_configuration: dimension " + dimension.value + " must match the v3 bands");
+      }
+    });
+    if (Object.keys(dimensions).sort().join("|") !== CORE_DIMENSION_CONTROLS.map(function (item) { return item.value; }).sort().join("|")) {
+      errors.push("core_configuration: dimensions must contain only price, wheelbase, and level");
+    }
+    var configurations = isObject(spec.configurations) ? spec.configurations : {};
+    if (Object.keys(configurations).sort().join("|") !== CORE_CONFIG_CONTROLS.map(function (item) { return item.value; }).sort().join("|")) {
+      errors.push("core_configuration: configurations must contain only airSuspension, lidar, and hud");
+    }
+    CORE_CONFIG_CONTROLS.forEach(function (config) {
+      var configData = configurations[config.value] || {};
+      if (configData.label !== config.title) {
+        errors.push("core_configuration: " + config.value + ".label must be " + config.title);
+      }
+      CORE_GRAIN_CONTROLS.forEach(function (grain) {
+        var trend = configData[grain.value] || {};
+        if (!Array.isArray(trend.counts) || trend.counts.length !== years.length || trend.counts.some(function (value) { return !Number.isInteger(Number(value)) || Number(value) < 0; })) {
+          errors.push("core_configuration: " + config.value + "." + grain.value + ".counts must contain six non-negative integers");
+        }
+        if (!Array.isArray(trend.rates) || trend.rates.length !== years.length || trend.rates.some(function (value) { return !Number.isFinite(Number(value)) || Number(value) < 0 || Number(value) > 100; })) {
+          errors.push("core_configuration: " + config.value + "." + grain.value + ".rates must contain six values in [0,100]");
+        }
+        CORE_DIMENSION_CONTROLS.forEach(function (dimension) {
+          var matrix = getPath(configData, "heatmaps." + grain.value + "." + dimension.value);
+          var validMatrix = Array.isArray(matrix) && matrix.length === dimension.bands.length && matrix.every(function (row) {
+            return Array.isArray(row) && row.length === years.length && row.every(function (value) {
+              return Number.isFinite(Number(value)) && Number(value) >= 0 && Number(value) <= 100;
+            });
+          });
+          if (!validMatrix) {
+            errors.push("core_configuration: " + config.value + ".heatmaps." + grain.value + "." + dimension.value + " must be a complete 6x6 rate matrix");
+          }
+        });
+      });
+    });
+  }
+
+  function validateL2PriceBandChart(spec, payload, errors) {
+    var period = reportPeriod(payload);
+    var years = period ? Array.from({ length: 6 }, function (_, index) { return String(period.year - 5 + index); }) : [];
+    if (spec.kind !== "line") errors.push("l2PriceBandChart: kind must be line");
+    if (JSON.stringify((spec.categories || []).map(String)) !== JSON.stringify(years)) {
+      errors.push("l2PriceBandChart: x-axis must be six consecutive years ending in the report year");
+    }
+    var series = Array.isArray(spec.series) ? spec.series : [];
+    if (series.length !== L2_PRICE_BAND_SERIES.length) {
+      errors.push("l2PriceBandChart: exactly four price-band trends plus the industry average are required");
+      return;
+    }
+    L2_PRICE_BAND_SERIES.forEach(function (name, index) {
+      var item = series[index] || {};
+      if (item.name !== name) errors.push("l2PriceBandChart: series[" + index + "] must be " + name);
+      if (item.type !== "line") errors.push("l2PriceBandChart: " + name + " must be a line series");
+      if (!Array.isArray(item.data) || item.data.length !== years.length || item.data.some(function (value) {
+        return !Number.isFinite(Number(value)) || Number(value) < 0 || Number(value) > 100;
+      })) {
+        errors.push("l2PriceBandChart: " + name + " must contain six annual rates in [0,100]");
+      }
+    });
+  }
+
   function validatePayload(payload) {
     var errors = [];
     var warnings = [];
     if (!isObject(payload)) return { valid: false, errors: ["Payload must be an object"], warnings: [] };
-    if (payload.schema_version !== "2.0") errors.push("schema_version must be 2.0");
+    if (payload.schema_version !== "2.1") errors.push("schema_version must be 2.1");
     if (!isObject(payload.report)) errors.push("report is required");
     if (!isObject(payload.charts)) errors.push("charts is required");
 
     REQUIRED_CHART_IDS.forEach(function (chartId) {
+      if (CORE_CHART_IDS.indexOf(chartId) !== -1) return;
       var spec = payload.charts && payload.charts[chartId];
       if (!isObject(spec)) {
         errors.push("Missing chart contract: " + chartId);
@@ -209,6 +387,8 @@
           errors.push(chartId + ": ready chart requires query_ids");
         }
         if (chartId === "renewalChart") validateRenewalChart(spec, payload, errors);
+        if (chartId === "sizePowerHeatmapChart") validateSizePowerHeatmap(spec, payload, errors);
+        if (chartId === "l2PriceBandChart") validateL2PriceBandChart(spec, payload, errors);
       }
       if (spec.status === "no_data" && !spec.reason) errors.push(chartId + ": no_data requires reason");
     });
@@ -219,6 +399,7 @@
     });
 
     validateCompetitorTable(payload, errors);
+    validateCoreConfiguration(payload, errors);
 
     var quality = isObject(payload.quality) ? payload.quality : {};
     if (quality.status === "final" && quality.completed_tasks !== quality.plan_tasks) {
@@ -489,20 +670,63 @@
       option.yAxis[1].nameTextStyle = { color: "#73828a", fontSize: 9 };
       option.tooltip.axisPointer = { type: "line", lineStyle: { color: "#aebbc1", type: "dashed" } };
     }
+    if (chartId === "l2PriceBandChart") {
+      option.yAxis.min = 0;
+      option.yAxis.max = 100;
+      option.yAxis.axisLabel.formatter = "{value}%";
+      option.series.forEach(function (series, index) {
+        series.type = "line";
+        series.smooth = true;
+        series.symbol = "circle";
+        series.symbolSize = 5;
+        series.lineStyle = { width: 2, color: COLORS[index % COLORS.length] };
+        series.itemStyle = { color: COLORS[index % COLORS.length] };
+      });
+    }
+    if (chartId === "coreConfigTrendChart") {
+      if (!Array.isArray(option.yAxis)) {
+        option.yAxis = [option.yAxis, { type: "value", splitLine: { show: false }, axisLabel: axisLabel(), axisLine: { show: false }, axisTick: { show: false } }];
+      }
+      option.color = ["#2389ad", "#79bca8"];
+      option.yAxis[0].min = 0;
+      option.yAxis[1].min = 0;
+      option.yAxis[1].max = 100;
+      option.yAxis[1].axisLabel.formatter = "{value}%";
+      if (option.series[0]) {
+        option.series[0].barMaxWidth = 34;
+        option.series[0].itemStyle = { color: "#2389ad" };
+        option.series[0].label = { show: true, position: "top", color: "#40545e", fontSize: 8 };
+      }
+      if (option.series[1]) {
+        option.series[1].symbolSize = 7;
+        option.series[1].z = 6;
+        option.series[1].itemStyle = { color: "#79bca8" };
+        option.series[1].lineStyle = { width: 3, color: "#79bca8" };
+        option.series[1].label = { show: true, position: "top", distance: 9, color: "#456b5d", fontSize: 8, fontWeight: 700, backgroundColor: "rgba(255,255,255,.94)", borderColor: "#9bcbbb", borderWidth: 1, borderRadius: 2, padding: [2, 4], formatter: "{c}%" };
+      }
+    }
     return option;
   }
 
-  function makeHeatmapOption(spec) {
+  function makeHeatmapOption(spec, chartId) {
     var values = spec.values || [];
     var max = values.reduce(function (current, item) { return Math.max(current, Number(item[2]) || 0); }, 0);
+    var isSizePower = chartId === "sizePowerHeatmapChart";
+    var isCoreConfig = chartId === "coreConfigHeatmapChart";
     return {
       animation: false,
-      tooltip: { position: "top" },
-      grid: { left: 24, right: 24, top: 28, bottom: 66, containLabel: true },
-      xAxis: { type: "category", data: spec.x_categories || [], axisLabel: axisLabel(), axisTick: { show: false }, splitArea: { show: true } },
-      yAxis: { type: "category", data: spec.y_categories || [], axisLabel: axisLabel(), axisTick: { show: false }, splitArea: { show: true } },
-      visualMap: { min: 0, max: Math.max(max, 1), calculable: false, orient: "horizontal", left: "center", bottom: 8, inRange: { color: ["#f4f6eb", "#b8d5c4", "#55b7bf", "#12627f"] }, textStyle: axisLabel() },
-      series: [{ name: spec.name || "数值", type: "heatmap", data: values, label: { show: true, fontSize: 8 }, itemStyle: { borderColor: "#fff", borderWidth: 1 } }]
+      tooltip: isCoreConfig
+        ? { position: "top", formatter: function (params) { return (spec.x_categories || [])[params.data[0]] + "<br>" + (spec.y_categories || [])[params.data[1]] + "：" + params.data[2] + "%"; } }
+        : { position: "top" },
+      grid: isSizePower
+        ? { left: 80, right: 30, top: 20, bottom: 60 }
+        : isCoreConfig
+          ? { left: 22, right: 24, top: 32, bottom: 66, containLabel: true }
+          : { left: 24, right: 24, top: 28, bottom: 66, containLabel: true },
+      xAxis: { type: "category", data: spec.x_categories || [], axisLabel: isSizePower ? { color: "#73828a", fontSize: 8, rotate: 30 } : axisLabel(), axisTick: { show: false }, splitArea: { show: true } },
+      yAxis: { type: "category", data: spec.y_categories || [], axisLabel: isSizePower ? { color: "#73828a", fontSize: 8 } : axisLabel(), axisTick: { show: false }, splitArea: { show: true } },
+      visualMap: { min: 0, max: isCoreConfig ? 100 : Math.max(max, 1), calculable: false, orient: "horizontal", left: "center", bottom: isSizePower ? 5 : isCoreConfig ? 10 : 8, itemWidth: isCoreConfig ? 10 : undefined, itemHeight: isCoreConfig ? 150 : undefined, text: isCoreConfig ? ["高", "低"] : undefined, inRange: { color: ["#f4f6eb", "#b8d5c4", "#55b7bf", "#12627f"] }, textStyle: axisLabel() },
+      series: [{ name: spec.name || "数值", type: "heatmap", data: values, label: { show: true, color: isCoreConfig ? "#17313b" : undefined, fontSize: isSizePower ? 7 : 8, formatter: isCoreConfig ? function (params) { return params.data[2] ? params.data[2] : ""; } : undefined }, itemStyle: { borderColor: "#fff", borderWidth: isCoreConfig ? 2 : 1 }, emphasis: isCoreConfig ? { disabled: true } : undefined }]
     };
   }
 
@@ -530,6 +754,14 @@
       setChartEmpty(chartId, spec.reason);
       return;
     }
+    if (chartId === "l2PriceBandChart") {
+      var l2Errors = [];
+      validateL2PriceBandChart(spec, currentPayload || {}, l2Errors);
+      if (l2Errors.length) {
+        setChartEmpty(chartId, "L2+ 年度价格带趋势未通过模板校验");
+        return;
+      }
+    }
     if (typeof window.echarts === "undefined") {
       setChartEmpty(chartId, "ECharts 运行时未加载");
       return;
@@ -549,7 +781,7 @@
     }
     destroyChart(chartId);
     if (panel) panel.classList.remove("chart-empty");
-    var option = chartSpec.kind === "heatmap" ? makeHeatmapOption(chartSpec) : makeCartesianOption(chartSpec, chartId);
+    var option = chartSpec.kind === "heatmap" ? makeHeatmapOption(chartSpec, chartId) : makeCartesianOption(chartSpec, chartId);
     var chart = window.echarts.init(element, null, { renderer: "svg" });
     chart.setOption(option, { notMerge: true, lazyUpdate: false, silent: true });
     chartInstances[chartId] = chart;
@@ -568,50 +800,95 @@
 
   function setupHeatmapVariants(payload) {
     var spec = payload.charts.sizePowerHeatmapChart;
-    var select = document.getElementById("heatmapVariantSelect");
+    var select = document.getElementById("heatmapYearSelect");
     var variants = Array.isArray(spec.variants) ? spec.variants : [];
     fillSelect(select, variants.map(function (variant, index) {
-      return { value: String(index), label: variant.label || "切片 " + (index + 1) };
+      return { value: String(index), label: variant.label || displayValue(getPath(variant, "filters.year"), "年份 " + (index + 1)) };
     }));
     select.onchange = function () {
       var variant = variants[Number(select.value)];
       renderChart("sizePowerHeatmapChart", variant ? Object.assign({}, variant, { status: "ready", query_ids: spec.query_ids || variant.query_ids }) : spec);
     };
-    if (spec.status === "ready" && variants.length) select.onchange();
+    if (spec.status === "ready" && variants.length) {
+      select.value = String(variants.length - 1);
+      select.onchange();
+    }
     else renderChart("sizePowerHeatmapChart", spec);
   }
 
-  function matchesFilters(variant, filters) {
-    return Object.keys(filters).every(function (key) {
-      return String((variant.filters || {})[key]) === String(filters[key]);
+  function coreMatrixValues(matrix) {
+    var values = [];
+    (matrix || []).forEach(function (row, yIndex) {
+      (row || []).forEach(function (value, xIndex) {
+        values.push([xIndex, yIndex, value]);
+      });
     });
+    return values;
   }
 
-  function setupCoreVariants(payload) {
-    var controls = payload.controls || {};
+  function buildCoreTrendSpec(spec, configKey, grainKey) {
+    var config = spec.configurations[configKey];
+    var grain = CORE_GRAIN_CONTROLS.find(function (item) { return item.value === grainKey; }) || CORE_GRAIN_CONTROLS[0];
+    var trend = config[grainKey];
+    return {
+      status: "ready",
+      kind: "combo",
+      categories: spec.years,
+      series: [
+        { name: grain.label + "数", type: "bar", axis: 0, data: trend.counts },
+        { name: "配置率", type: "line", axis: 1, data: trend.rates }
+      ],
+      query_ids: spec.query_ids
+    };
+  }
+
+  function buildCoreHeatmapSpec(spec, configKey, grainKey, dimensionKey) {
+    var dimension = spec.dimensions[dimensionKey];
+    return {
+      status: "ready",
+      kind: "heatmap",
+      name: "配置率",
+      x_categories: spec.years,
+      y_categories: dimension.bands,
+      values: coreMatrixValues(spec.configurations[configKey].heatmaps[grainKey][dimensionKey]),
+      query_ids: spec.query_ids
+    };
+  }
+
+  function setupCoreConfiguration(payload) {
+    var spec = payload.core_configuration || {};
     var configSelect = document.getElementById("coreConfigSelect");
     var grainSelect = document.getElementById("coreGrainSelect");
     var dimensionSelect = document.getElementById("coreHeatDimensionSelect");
-    fillSelect(configSelect, controls.core_configs);
-    fillSelect(grainSelect, controls.grains);
-    fillSelect(dimensionSelect, controls.heatmap_dimensions);
+    fillSelect(configSelect, CORE_CONFIG_CONTROLS.map(function (item) { return { value: item.value, label: item.label }; }));
+    fillSelect(grainSelect, CORE_GRAIN_CONTROLS);
+    fillSelect(dimensionSelect, CORE_DIMENSION_CONTROLS);
+    configSelect.value = "airSuspension";
+    grainSelect.value = "trim";
+    dimensionSelect.value = "price";
 
     function update() {
-      var filters = { config: configSelect.value, grain: grainSelect.value };
-      var trendSpec = payload.charts.coreConfigTrendChart;
-      var heatmapSpec = payload.charts.coreConfigHeatmapChart;
-      var trend = (trendSpec.variants || []).find(function (variant) { return matchesFilters(variant, filters); });
-      var heatmapFilters = { config: configSelect.value, grain: grainSelect.value, dimension: dimensionSelect.value };
-      var heatmap = (heatmapSpec.variants || []).find(function (variant) { return matchesFilters(variant, heatmapFilters); });
-      document.getElementById("coreTrendTitle").textContent = trend && trend.title ? trend.title : "核心配置趋势";
-      document.getElementById("coreHeatmapTitle").textContent = heatmap && heatmap.title ? heatmap.title : "核心配置热力图";
-      renderChart("coreConfigTrendChart", trend ? Object.assign({}, trend, { status: "ready", query_ids: trendSpec.query_ids || trend.query_ids }) : trendSpec);
-      renderChart("coreConfigHeatmapChart", heatmap ? Object.assign({}, heatmap, { status: "ready", query_ids: heatmapSpec.query_ids || heatmap.query_ids }) : heatmapSpec);
+      var config = CORE_CONFIG_CONTROLS.find(function (item) { return item.value === configSelect.value; }) || CORE_CONFIG_CONTROLS[0];
+      var grain = CORE_GRAIN_CONTROLS.find(function (item) { return item.value === grainSelect.value; }) || CORE_GRAIN_CONTROLS[0];
+      var dimension = CORE_DIMENSION_CONTROLS.find(function (item) { return item.value === dimensionSelect.value; }) || CORE_DIMENSION_CONTROLS[0];
+      document.getElementById("coreTrendTitle").textContent = config.title + "趋势分析（" + grain.label + "口径）";
+      var subtitle = document.getElementById("coreTrendSubtitle");
+      if (subtitle) subtitle.textContent = "柱形：搭载" + grain.label + "数；折线：配置率";
+      document.getElementById("coreHeatmapTitle").textContent = config.title + dimension.label + "热力图（" + grain.label + "口径）";
+      renderChart("coreConfigTrendChart", buildCoreTrendSpec(spec, config.value, grain.value));
+      renderChart("coreConfigHeatmapChart", buildCoreHeatmapSpec(spec, config.value, grain.value, dimension.value));
     }
     configSelect.onchange = update;
     grainSelect.onchange = update;
     dimensionSelect.onchange = update;
-    update();
+    var coreErrors = [];
+    validateCoreConfiguration(payload, coreErrors);
+    if (spec.status === "ready" && !coreErrors.length) update();
+    else {
+      var reason = spec.status === "ready" ? "核心配置数据未通过 v3 模块校验" : displayValue(spec.reason, "等待核心配置查询");
+      setChartEmpty("coreConfigTrendChart", reason);
+      setChartEmpty("coreConfigHeatmapChart", reason);
+    }
   }
 
   function renderCharts(payload) {
@@ -621,7 +898,7 @@
       }
     });
     setupHeatmapVariants(payload);
-    setupCoreVariants(payload);
+    setupCoreConfiguration(payload);
   }
 
   function setupPageActions() {

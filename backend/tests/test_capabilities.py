@@ -50,6 +50,14 @@ def _mock_milvus_unavailable():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _mock_docker_unavailable():
+    """默认将 Docker 探测 mock 为不可用，避免依赖测试机 daemon 状态。"""
+    with mock.patch("capabilities._check_docker") as mock_check:
+        mock_check.return_value = CapabilityStatus(available=False, reason="mocked unavailable")
+        yield
+
+
 @pytest.mark.asyncio
 async def test_detect_capabilities_no_services(httpx_mock):
     """无服务配置时，所有能力应为不可用。"""
@@ -57,7 +65,7 @@ async def test_detect_capabilities_no_services(httpx_mock):
     caps = await detect_capabilities(force=True)
     assert isinstance(caps, Capabilities)
     assert caps.database.available is False
-    assert caps.ai_gateway.available is False
+    assert caps.docker.available is False
     assert caps.milvus.available is False
     assert caps.mineru.available is False
 
@@ -100,13 +108,13 @@ async def test_capabilities_to_dict():
     """Capabilities.to_dict 输出正确。"""
     caps = Capabilities(
         database=CapabilityStatus(available=True),
-        ai_gateway=CapabilityStatus(available=True),
+        docker=CapabilityStatus(available=True),
         milvus=CapabilityStatus(available=False, reason="refused"),
         mineru=CapabilityStatus(available=True),
     )
     assert caps.to_dict() == {
         "database": {"available": True, "reason": None},
-        "ai_gateway": {"available": True, "reason": None},
+        "docker": {"available": True, "reason": None},
         "milvus": {"available": False, "reason": "refused"},
         "mineru": {"available": True, "reason": None},
     }
@@ -121,7 +129,6 @@ async def test_detect_capabilities_custom_urls(httpx_mock):
         mineru_url="http://custom-mineru:9000",
     )
     assert caps.mineru.available is True
-    assert caps.ai_gateway.available is False
 
 
 @pytest.mark.asyncio
@@ -139,6 +146,10 @@ async def test_detect_capabilities_sync_inside_event_loop_does_not_leak_coroutin
             return_value=CapabilityStatus(available=False, reason="mock milvus"),
         ),
         mock.patch(
+            "capabilities._check_docker_sync",
+            return_value=CapabilityStatus(available=False, reason="mock docker"),
+        ),
+        mock.patch(
             "capabilities._check_http_get_sync",
             return_value=CapabilityStatus(available=False, reason="mock mineru"),
         ),
@@ -148,7 +159,7 @@ async def test_detect_capabilities_sync_inside_event_loop_does_not_leak_coroutin
         caps = detect_capabilities_sync(force=True)
 
     assert caps.database.reason == "mock postgres"
-    assert "Retired" in (caps.ai_gateway.reason or "")
+    assert caps.docker.reason == "mock docker"
     assert not [
         warning for warning in caught
         if "coroutine 'detect_capabilities' was never awaited" in str(warning.message)

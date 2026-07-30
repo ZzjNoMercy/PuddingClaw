@@ -114,6 +114,179 @@ def _start_bound_run(
     return coordinator, run
 
 
+def _active_shell_bindings(session_manager, run_id: str) -> dict:
+    from graph.permission_policy import RunPermissionContext
+
+    state = session_manager.get_run_state("directory-session", run_id)
+    return RunPermissionContext.from_config_snapshot(
+        state["config_snapshot"]
+    ).shell_grant_bindings()
+
+
+def test_shell_directory_grants_are_atomic_and_idempotent(tmp_path: Path) -> None:
+    from graph.permission_policy import ShellDirectoryGrantSpec
+
+    external, _scratch, _tools, session_manager = _setup(tmp_path)
+    _coordinator, run = _start_bound_run(
+        session_manager,
+        query_id="query-shell-atomic",
+        backend_id="container:atomic",
+    )
+    bindings = _active_shell_bindings(session_manager, run.run_id)
+    specs = [
+        ShellDirectoryGrantSpec(target=str(external.resolve()), access="read"),
+        ShellDirectoryGrantSpec(target=str(external.resolve()), access="write"),
+    ]
+
+    before_grants, before_revision = session_manager.permission_grants_snapshot(
+        "directory-session"
+    )
+    first = session_manager.add_shell_directory_grants_atomic(
+        "directory-session",
+        grant_specs=specs,
+        scope="run",
+        run_id=run.run_id,
+        bindings=bindings,
+    )
+    after_grants, after_revision = session_manager.permission_grants_snapshot(
+        "directory-session"
+    )
+    repeated = session_manager.add_shell_directory_grants_atomic(
+        "directory-session",
+        grant_specs=specs,
+        scope="run",
+        run_id=run.run_id,
+        bindings=bindings,
+    )
+    final_grants, final_revision = session_manager.permission_grants_snapshot(
+        "directory-session"
+    )
+
+    assert before_grants == []
+    assert len(first) == 2
+    assert {grant["binding_schema_version"] for grant in first} == {3}
+    assert all("shell_access" in grant["capabilities"] for grant in first)
+    assert len(after_grants) == 2
+    assert after_revision == before_revision + 1
+    assert [grant["id"] for grant in repeated] == [grant["id"] for grant in first]
+    assert final_grants == after_grants
+    assert final_revision == after_revision
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    ["write_without_read", "invalid_late_entry"],
+)
+def test_shell_directory_grant_batch_failure_leaves_no_authority(
+    tmp_path: Path,
+    failure_mode: str,
+) -> None:
+    from graph.permission_policy import ShellDirectoryGrantSpec
+
+    external, _scratch, _tools, session_manager = _setup(tmp_path)
+    _coordinator, run = _start_bound_run(
+        session_manager,
+        query_id="query-shell-atomic-failure",
+        backend_id="container:atomic-failure",
+    )
+    bindings = _active_shell_bindings(session_manager, run.run_id)
+    target = str(external.resolve())
+    specs = (
+        [ShellDirectoryGrantSpec(target=target, access="write")]
+        if failure_mode == "write_without_read"
+        else [
+            ShellDirectoryGrantSpec(target=target, access="read"),
+            ShellDirectoryGrantSpec(target=target, access="write"),
+            ShellDirectoryGrantSpec(target=target, access="execute"),
+        ]
+    )
+    _grants, before_revision = session_manager.permission_grants_snapshot(
+        "directory-session"
+    )
+
+    with pytest.raises(ValueError):
+        session_manager.add_shell_directory_grants_atomic(
+            "directory-session",
+            grant_specs=specs,
+            scope="run",
+            run_id=run.run_id,
+            bindings=bindings,
+        )
+    grants, revision = session_manager.permission_grants_snapshot(
+        "directory-session"
+    )
+    assert grants == []
+    assert revision == before_revision
+
+
+def test_permission_migration_repairs_downgraded_native_shell_grants(
+    tmp_path: Path,
+) -> None:
+    from graph.permission_policy import ShellDirectoryGrantSpec
+
+    external, _scratch, _tools, session_manager = _setup(tmp_path)
+    _coordinator, run = _start_bound_run(
+        session_manager,
+        query_id="query-shell-repair",
+        backend_id="kernel:shell-repair",
+    )
+    bindings = _active_shell_bindings(session_manager, run.run_id)
+    grants = session_manager.add_shell_directory_grants_atomic(
+        "directory-session",
+        grant_specs=[ShellDirectoryGrantSpec(target=str(external), access="read")],
+        scope="run",
+        run_id=run.run_id,
+        bindings=bindings,
+    )
+    data = session_manager._read_file("directory-session")
+    stored = next(
+        item for item in data["permissions"]["grants"] if item["id"] == grants[0]["id"]
+    )
+    stored["binding_schema_version"] = 2
+    stored["semantic_key"] = "sha256:stale-v2-key"
+    session_manager._write_file("directory-session", data)
+
+    session_manager.migrate_permission_grants("directory-session")
+
+    active = session_manager.list_permission_grants("directory-session")
+    assert len(active) == 1
+    assert active[0]["binding_schema_version"] == 3
+    assert active[0]["semantic_key"] != "sha256:stale-v2-key"
+
+
+def test_shell_directory_grants_reject_incomplete_run_bindings(tmp_path: Path) -> None:
+    from graph.permission_policy import ShellDirectoryGrantSpec
+
+    external, _scratch, _tools, session_manager = _setup(tmp_path)
+    _coordinator, run = _start_bound_run(
+        session_manager,
+        query_id="query-shell-binding-failure",
+        backend_id="container:binding-failure",
+    )
+    bindings = _active_shell_bindings(session_manager, run.run_id)
+    bindings.pop("isolation_policy_id")
+
+    with pytest.raises(ValueError, match="bindings"):
+        session_manager.add_shell_directory_grants_atomic(
+            "directory-session",
+            grant_specs=[
+                ShellDirectoryGrantSpec(
+                    target=str(external.resolve()),
+                    access="read",
+                )
+            ],
+            scope="run",
+            run_id=run.run_id,
+            bindings=bindings,
+        )
+
+    grants, revision = session_manager.permission_grants_snapshot(
+        "directory-session"
+    )
+    assert grants == []
+    assert revision == 0
+
+
 def test_external_directory_snapshot_prepare_and_commit(tmp_path: Path) -> None:
     external, scratch, tools, session_manager = _setup(tmp_path)
     (external / "src").mkdir()
@@ -988,14 +1161,11 @@ def test_user_supplied_external_directory_gets_host_file_broker_instructions(
     )
 
     assert isinstance(content, str)
-    assert "直接对原始绝对路径调用" in content
-    assert (
-        "ls/glob/grep/read_file/write_file/inspect_file_version/copy_file/"
-        "replace_file/materialize_source_ref/patch_file"
-    ) in content
-    assert "HostFileBroker 直接访问正式文件" in content
-    assert "不会暴露 lease、staged path 或 hash 编排" in content
-    assert "execute 仍受项目 Docker" in content
+    assert "复制、移动、建目录直接使用 execute 中的标准 cp/mv/mkdir" in content
+    assert "ls/glob/grep/read_file" in content
+    assert "默认由内核沙箱执行" in content
+    assert "内部 HostFileBroker 原子提交" in content
+    assert "模型无需处理 lease、staged path 或 hash 编排" in content
 
 
 def test_precise_external_file_does_not_infer_parent_directory(tmp_path: Path) -> None:
@@ -1017,8 +1187,7 @@ def test_precise_external_file_does_not_infer_parent_directory(tmp_path: Path) -
     assert isinstance(content, str)
     assert (
         "直接对原始绝对路径使用 "
-        "read_file/inspect_file_version/copy_file/replace_file/"
-        "materialize_source_ref/patch_file"
+        "read_file/write_file/materialize_source_ref/patch_file"
     ) in content
     assert "若确认必须发现同目录依赖" in content
     assert "对直接父目录调用 ls/glob/grep" in content
@@ -1616,4 +1785,72 @@ def test_permission_api_persists_session_directory_scope_and_resolves_compatible
     )
 
     first_coordinator.transition(first, RunStatus.COMPLETED)
+    loop.close()
+
+
+def test_shell_directory_permission_api_persists_atomic_v3_grant_set(
+    tmp_path: Path,
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from app import app
+    from graph.permission_resume import permission_resume_registry
+    from graph.session_manager import session_manager
+
+    state = tmp_path / "state"
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    for path in (state, source, destination):
+        path.mkdir()
+    session_manager.initialize(state)
+    session_manager.create_session("directory-session")
+    _coordinator, run = _start_bound_run(
+        session_manager,
+        query_id="query-shell-api",
+        backend_id="container:shell-api",
+    )
+    bindings = _active_shell_bindings(session_manager, run.run_id)
+    request_id = "perm-req-shell-api"
+    loop = asyncio.new_event_loop()
+    future = loop.create_future()
+    permission_resume_registry._pending[request_id] = future
+    permission_resume_registry._requests[request_id] = {
+        "id": request_id,
+        "type": "shell_directory_access",
+        "authority_plane": "shell",
+        "session_id": "directory-session",
+        "query_id": run.query_id,
+        "run_id": run.run_id,
+        "tool_call_id": "call-shell-api",
+        "grant_bindings": bindings,
+        "grant_specs": [
+            {"target": str(source), "access": "read", "delete": False},
+            {"target": str(destination), "access": "read", "delete": False},
+            {"target": str(destination), "access": "write", "delete": False},
+        ],
+        "status": "pending",
+    }
+
+    response = TestClient(app).post(
+        "/api/sessions/directory-session/permissions/shell-directories",
+        json={"permission_request_id": request_id, "scope": "run"},
+    )
+
+    assert response.status_code == 200
+    grants = response.json()["grants"]
+    assert len(grants) == 3
+    assert {grant["binding_schema_version"] for grant in grants} == {3}
+    assert {grant["metadata"]["authority_plane"] for grant in grants} == {"shell"}
+    assert future.result()["grant_ids"] == [grant["id"] for grant in grants]
+    active, revision = session_manager.permission_grants_snapshot("directory-session")
+    assert len(active) == 3
+    assert revision == 1
+    listed = TestClient(app).get("/api/sessions/directory-session/permissions")
+    assert listed.status_code == 200
+    assert {
+        grant["binding_schema_version"] for grant in listed.json()["grants"]
+    } == {3}
+    assert {
+        grant["id"] for grant in listed.json()["grants"]
+    } == {grant["id"] for grant in grants}
     loop.close()

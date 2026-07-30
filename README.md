@@ -4,7 +4,7 @@
 
 PuddingClaw 目前主打两条产品主线：
 
-- **知识库**：把 PDF、Markdown、图片、Excel / CSV / TSV 和数据库源沉淀为用户自己拥有的知识与数据资产；当前支持精确检索、混合检索和图文多模态 RAG，并已规划通过 LLM Wiki + gbrain 建立可持续整理、跨 Session 召回和跨 Agent 携带的统一知识体系。
+- **知识库**：把 PDF、Markdown、图片、Excel / CSV / TSV 和数据库源沉淀为用户自己拥有的知识与数据资产；当前支持精确检索、混合检索和图文多模态 RAG，并已规划以贯穿 raw、Wiki 和 gbrain 的统一 Schema 增加稳定知识补充层。
 - **智能问数**：用 Profile、语义资产、分析模型和 SQL Guardrails 约束 Agent，让自然语言问题能够落到可解释、可复算的 SQL / Pandas 分析和报告产物。
 
 贯穿两条主线的是两个原则：
@@ -48,40 +48,54 @@ PuddingClaw 目前主打两条产品主线：
 
 知识库目录是用户资产目录，不是缓存目录。PostgreSQL 保存 Catalog、任务和引用元数据；Milvus 保存可重建的检索索引，两者都不替代本地原始资产。
 
-#### 已规划：LLM Wiki + gbrain 统一知识与记忆体系
+#### P0 开发中：LLM Wiki + gbrain 稳定知识补充层
 
-> **状态：设计方案已完成，尚未实现。** 该方案不会替换现有 MinerU + Milvus 多模态 RAG，也不改动智能问数的 Analytics / Vanna 域。
+> **状态：首个纵向切片已实现。** 已包含统一 Schema Bundle、LLM Wiki 文件协议、Agent 工具、gbrain 编译校验、现有 PostgreSQL 上隔离的 pgvector database、MCP allowlist 和 Schema Studio；Schema generation 级崩溃原子切换仍在后续阶段。该能力不会替换现有 MinerU + Milvus 多模态 RAG，也不改动智能问数的 Analytics / Vanna 域。
 
-现有 RAG 更适合高频变化的文档问答；规划中的 LLM Wiki + gbrain 面向稳定知识、跨来源合成、关系治理和跨 Session 记忆。两者的目标分工是：
+现有 RAG 更适合原始文档问答和证据定位；规划中的 LLM Wiki + gbrain 面向稳定知识、跨来源合成和关系查询。它们补充现有知识库，不替代现有 MinerU / Milvus 链路。目标分工是：
 
 | 层 | 职责 | 资产边界 |
 | --- | --- | --- |
-| LLM Wiki / 编译式 RAG | 按 schema 将原始资料整理为互链 Wiki，执行 Ingest / Query / Lint 契约 | `raw/` 由人拥有且只读；`content/` 由 LLM 按契约维护；`schema/` 由人定义 |
-| gbrain | 为 Wiki 提供 pages、typed links、全文/向量检索、facts 记忆、版本与软删除 | `brain.pglite/` 是可重建的运行时索引，不是唯一知识源 |
-| MCP | 为 PuddingClaw Agent 和外部 Agent 提供统一的 search / recall / write-back 接口 | 接口声明可迁移，凭证在目标环境重新绑定 |
+| Canonical Schema Bundle | 统一约束 raw、Wiki 页面/关系、index/log、gbrain pack 和查询结果 | official `pack.yaml` 保存 gbrain 扩展，`brain.schema.yaml` 保存 Wiki/Agent 规则；通过锁、CAS、SemVer 和 hash 门禁生成 `AGENTS.md`、validator 和 resolved pack |
+| LLM Wiki / 编译式 RAG | 按同一 Schema 将 raw 快照整理为互链 Wiki，执行 Ingest / Query / Lint | `raw/` 对 Compiler 只读；`wiki/` 由编译发布流程维护；`index.md` 是查询入口；`log.md` 只追加 |
+| gbrain | 按同一 Schema 将 Wiki 编译为 pages、typed links 和全文/向量索引 | 默认复用现有 PostgreSQL server 中的独立 database/owner；它是可重建运行时索引，不是唯一知识源 |
+| MCP | 向 PuddingClaw Agent 暴露筛选后的 gbrain 查询工具 | 只加载 allowlist；首期不暴露 mutation/admin operations |
 
 目标链路：
 
 ```text
-原始文档 / MinerU 产物 / 聊天捕获
-                │
-                ▼
-       raw/（原料，LLM 只读）
-                │  brain-capture / brain-ingest
-                ▼
- content/（互链 Wiki） + schema/ + AGENTS.md
-                │  brain_sync：校验、记录、同步
-                ▼
-   gbrain / PGLite（索引、图谱、facts）
-                │
-                └─ MCP ──► PuddingClaw / Codex / Claude Code / 其他宿主
+        brain.schema.yaml + official custom pack.yaml
+                  │      │       │
+                  │      │       └─► selected parent + custom resolved pack
+                  │      └─────────► Wiki/raw validator
+                  └────────────────► AGENTS.md
+                                      │ PuddingClaw LLM Agent
+                                      │ Ingest / Query / Lint
+原始文档 / MinerU 产物 ─► raw/ ── Ingest ─► wiki/
+                                              ├─ index.md
+                                              ├─ log.md
+                                              └─ <slug>.md
+                                                   │ brain_sync
+                                                   ▼
+                                        gbrain / PostgreSQL
+                                                   │
+                                    筛选后的 MCP 查询 tools
+                                                   │
+                                                   ▼
+                                         PuddingClaw Agent
 ```
 
 核心约束：
 
-- LLM 不直接写 `brain.pglite`；它只按 schema 编译 Wiki，确定性的 `brain_sync` 是索引同步入口。
-- 真正可迁移的知识资产是 `raw + content(wiki) + schema`；gbrain 数据库可以携带，也可以在目标环境重建。
-- PuddingClaw 负责 gbrain 的 fork、构建、配置、进程生命周期和前端管理；内部 Agent 与外部 Agent 都通过 MCP 使用它。
+- P0 同时落最小 Schema、`raw/ + wiki/ + wiki/index.md + wiki/log.md + AGENTS.md` 文件协议和 Ingest / Query / Lint；PostgreSQL 索引运行时后接。
+- Schema Bundle 贯穿 raw、Wiki 与 gbrain：官方 `pack.yaml` 只保存 gbrain 原生字段，`brain.schema.yaml` 只保存 Wiki/Agent/MCP 补充规则，两者统一 version/hash 和发布事务。
+- `AGENTS.md` 专门约束我们的 LLM Agent 如何执行 Ingest / Query / Lint；gbrain 不读取它，只读取 custom/resolved schema pack。
+- gbrain Schema 默认采用 `gbrain-base-v2 + puddingclaw-wiki custom pack`；用户可选择其他兼容内置 parent，再增量补充业务类型和关系，系统锁定 parent/custom/resolved hash。
+- 前端展示全部 gbrain 内置 packs 及真实 YAML；用户可选择兼容 parent 或 `extends: null`，按官方 `SchemaPackManifest v1` 结构化编辑 page/link type、frontmatter link、ExtractableSpec、subtype、borrow、filing、calibration、migration 和三类 mapping rule，并预览 custom/parent/resolved 原始 YAML。数组逐项编辑并保留顺序和含逗号文本。
+- LLM 不直接写 raw 或 gbrain 数据库；确定性的 Wiki 发布和 `brain_sync` 分别是文件与索引写入入口。
+- 真正可迁移的知识资产是 `schema + AGENTS.md + raw + wiki`；gbrain PostgreSQL 数据可按需重建。
+- gbrain 首期复用用户现有 PostgreSQL 服务，但使用独立的 `puddingclaw_gbrain` database 与 owner，避免和 Catalog 共表、共享迁移权限；不要求第二个 PostgreSQL 进程或容器。PGLite 仅作为后续可选实验，不是零依赖目标。
+- PuddingClaw 负责 gbrain 的构建、配置、进程生命周期、MCP allowlist 和前端管理；首期只供内部 Agent 查询。
 - 模型配置只携带 `provider:model` 能力引用，不携带 API Key；导入新环境后通过 Provider Registry 重新绑定。
 - 后续再评估稳定知识 gbrain 与实时文档 Milvus RAG 的查询路由和结果融合，不在首期实现中提前耦合。
 
@@ -164,7 +178,7 @@ analysis-project/
 
 向量库、临时结果和平台运行状态不是业务资产的唯一事实源。即使离开 PuddingClaw，模型说明、语义口径、守卫、模板和数据绑定仍然可读、可版本化、可继续执行。
 
-知识库的目标迁移单元则是一个 Brain 目录：`raw/`、`content/`、`schema/` 和 `mcp.json` 可以整体打包；`brain.pglite/` 可选携带或按 Wiki 重建。该导出/导入链路属于 LLM Wiki + gbrain 方案，当前尚未实现。
+知识库未来的目标迁移单元是一个 Brain 目录：`schema/`、`AGENTS.md`、`raw/` 和 `wiki/` 可以整体打包；gbrain PostgreSQL 数据不作为必需资产，可从 Schema + Wiki 重建。该导出/导入链路属于 LLM Wiki + gbrain 方案，当前尚未实现。
 
 ## 典型使用流程
 
@@ -193,7 +207,7 @@ analysis-project/
 
 正常桌面使用以设置页和 `backend/config.json` 为事实源；环境变量主要用于部署覆盖。不要把包含真实 API Key、数据库密码或本机路径的配置提交到版本库。
 
-LLM Wiki + gbrain 落地后，知识库设置还将增加 gbrain 启停与健康状态、`GBRAIN_HOME`、PGLite / 外部 PostgreSQL、Embedding / Chat / Reranker 绑定、MCP 暴露、Schema Pack、Lint、导入和导出。以上均为规划项，当前设置页尚未提供。
+知识库现已提供 Schema Studio：可查看 gbrain 内置 Schema、选择父 pack、结构化编辑完整官方 manifest，并预览 custom/parent/resolved YAML。当前还缺少可视化 diff、官方 YAML CST 导入/注释保留、Ingest / Query / Lint 运维页、raw/Wiki drift 看板、Embedding 绑定与托管式重建入口。
 
 ## 快速开始
 
@@ -203,6 +217,7 @@ LLM Wiki + gbrain 落地后，知识库设置还将增加 gbrain 启停与健康
 - [uv](https://docs.astral.sh/uv/)
 - Node.js 18+
 - Docker（启动内置 PostgreSQL / Milvus 时需要）
+- gbrain CLI（Schema 官方校验、Wiki 编译和筛选 MCP 查询需要）
 
 MinerU、Milvus 和 Docker Agent Sandbox 都是按能力启用的增强组件。知识库 Catalog 和任务管理依赖 PostgreSQL；不使用图文向量检索时可以关闭 Milvus 索引，继续使用本地文件检索。
 
@@ -313,7 +328,7 @@ PuddingClaw/
 | 本地文件系统 | 原始知识、解析 Artifact、语义资产、模型、模板、会话与导出项目 |
 | Milvus | 知识库文本 / 图片向量与 Vanna 训练索引；均应可重建 |
 | MinerU | 可选的高质量 PDF 解析服务，不拥有最终知识资产 |
-| LLM Wiki + gbrain（规划） | 稳定知识编译、关系图谱、跨 Session facts、MCP 接入与 Brain 打包；尚未实现 |
+| LLM Wiki + gbrain（P0 开发中） | 已落统一 Schema、raw/Wiki/index/log/AGENTS 协议、gbrain 校验、Agent 工具、筛选 MCP 与 Schema Studio；PostgreSQL 托管和 generation 迁移待续 |
 | Provider / AI Gateway | 对话、视觉、Embedding 与 Rerank；支持直连和可选网关模式 |
 
 增强服务失败时按能力降级，但不会伪装成“能力仍然可用”：状态页和 Trace 会展示实际 Backend、缺失能力和降级路径。
@@ -341,7 +356,7 @@ npm run build
 
 仍在持续演进或尚未实施的方向包括：
 
-- LLM Wiki 编译契约、gbrain 托管运行时、跨 Session 记忆、MCP 使用面与 Brain 可移植打包；
+- LLM Wiki 文件协议与编译契约、贯穿式 Schema、gbrain/PostgreSQL 托管运行时、筛选后的 MCP 查询与 Brain 可移植打包；
 - 多用户 / 组织级 RBAC 与完整企业权限后台；
 - 更通用的外部 HTTP / MCP 副作用 receipt 与幂等执行层；
 - 语义资产的更强确定性编译、自动评估与版本治理；

@@ -30,8 +30,12 @@ class InspectFileVersionInput(BaseModel):
 
 class PatchFileInput(BaseModel):
     file_path: str
-    expected_sha256: str = Field(
-        description="sha256:<hex> returned by inspect_file_version for the exact source version"
+    expected_sha256: str | None = Field(
+        default=None,
+        description=(
+            "Optional sha256:<hex> precondition. Omit it for a unique-anchor patch "
+            "against the current content; the observed base hash is still recorded."
+        ),
     )
     replacements: list[ReplacementHunk] = Field(min_length=1, max_length=100)
 

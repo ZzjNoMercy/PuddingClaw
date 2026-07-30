@@ -45,9 +45,9 @@ def test_trace_finish_and_snapshot_are_json_safe_for_nested_datetimes():
 
     json.dumps(snapshot)
     json.dumps(trace)
-    assert snapshot["runtime_inventory"]["analytics_model"]["frontmatter"]["created"] == str(value)
+    assert snapshot["runtime_inventory"]["analytics_model"]["frontmatter"]["created"] == value.isoformat()
     span = next(item for item in trace["spans"] if item["name"] == "semantic-assets")
-    assert span["output"]["rows"][0]["updated_at"] == str(value)
+    assert span["output"]["rows"][0]["updated_at"] == value.isoformat()
     assert any(event == "trace_span_end" for event, _payload in emitted)
     for _event, payload in emitted:
         json.dumps(payload)
@@ -734,6 +734,24 @@ def test_middleware_trace_proxy_records_wrap_model_call_attribution():
         "DemoWrapModelMiddleware.wrap_model_call.request_sent_to_handler",
         "DemoWrapModelMiddleware.wrap_model_call.response_observed",
     ]
+
+
+def test_model_request_trace_handles_pydantic_tool_schema_class():
+    """Tracing an activated database tool must never abort the model call."""
+
+    from tools.database.sql_generate_tool import DatabaseSqlGenerateTool
+
+    request = ModelRequest(
+        model=object(),
+        messages=[{"role": "user", "content": "continue"}],
+        tools=[DatabaseSqlGenerateTool()],
+    )
+
+    summary = TraceCollector.summarize_hook_payload(request)
+
+    assert summary["payload_kind"] == "model_request"
+    assert summary["tool_schema_count"] == 1
+    assert summary["tool_schema_hash"]
 
 
 def test_trace_collector_records_langgraph_node_as_graph_span():

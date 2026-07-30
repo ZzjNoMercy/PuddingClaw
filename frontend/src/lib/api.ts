@@ -15,6 +15,18 @@ function apiErrorMessage(text: string, fallback: string): string {
     const payload = JSON.parse(text) as { detail?: unknown; message?: unknown };
     const detail = payload.detail ?? payload.message;
     if (typeof detail === "string" && detail.trim()) return detail;
+    if (Array.isArray(detail)) {
+      const messages = detail
+        .map((item) => {
+          if (!item || typeof item !== "object") return "";
+          const issue = item as { loc?: unknown; msg?: unknown };
+          const location = Array.isArray(issue.loc) ? issue.loc.slice(1).join(".") : "";
+          const message = typeof issue.msg === "string" ? issue.msg : "";
+          return [location, message].filter(Boolean).join(": ");
+        })
+        .filter(Boolean);
+      if (messages.length) return messages.join("；");
+    }
     if (detail && typeof detail === "object" && "message" in detail) {
       const message = (detail as { message?: unknown }).message;
       if (typeof message === "string" && message.trim()) return message;
@@ -470,6 +482,175 @@ export interface KnowledgeStatus {
   };
 }
 
+export type GbrainPrimitive = "entity" | "media" | "temporal" | "annotation" | "concept";
+export type GbrainAggregator = "scalar_brier" | "weighted_brier" | "count_based" | "cluster_summary";
+export type GbrainSubtypeField = "subtype" | "legacy_type" | "origin" | "format" | "kind" | "period" | "domain";
+export type GbrainResolver =
+  | "frontmatter"
+  | "body_first_link"
+  | "slug"
+  | "body_excerpt"
+  | { frontmatter_field: string };
+
+export interface GbrainExtractableSpec {
+  prompt_template?: string;
+  fixture_corpus?: string;
+  eval_dimensions: string[];
+  benchmark_min_recall?: number;
+  verifier_path?: string;
+}
+
+export interface GbrainPageSubtype {
+  name: string;
+  when: {
+    path_pattern?: string;
+    frontmatter_field?: string;
+    frontmatter_value?: string | number | boolean;
+  };
+}
+
+export interface GbrainPageType {
+  name: string;
+  primitive: GbrainPrimitive;
+  path_prefixes: string[];
+  aliases: string[];
+  extractable: boolean | GbrainExtractableSpec;
+  expert_routing: boolean;
+  subtypes?: GbrainPageSubtype[];
+}
+
+export interface GbrainLinkType {
+  name: string;
+  inverse?: string;
+  inference?: {
+    regex?: string;
+    page_type?: string;
+    target_type?: string;
+  };
+}
+
+export interface GbrainFrontmatterLink {
+  page_type: string;
+  fields: string[];
+  link_type: string;
+}
+
+export type GbrainMappingRule =
+  | {
+      kind: "retype";
+      from_type: string;
+      to_type: string;
+      subtype?: string;
+      subtype_field: GbrainSubtypeField;
+      path_filter?: string;
+    }
+  | {
+      kind: "page_to_link";
+      from_type: string;
+      link_type: string;
+      source_slug_from: GbrainResolver;
+      target_slug_from: GbrainResolver;
+      inverse?: string;
+      preserve_notes?: boolean;
+    }
+  | {
+      kind: "page_to_alias";
+      from_type: string;
+      canonical_from: GbrainResolver;
+      alias_slug_from: GbrainResolver;
+      notes_from?: GbrainResolver;
+    };
+
+export interface GbrainSchemaPackManifest {
+  api_version: "gbrain-schema-pack-v1";
+  name: string;
+  version: string;
+  description: string;
+  author?: string;
+  license?: string;
+  homepage?: string;
+  gbrain_min_version: string;
+  extends?: string | null;
+  borrow_from: Array<{ pack: string; types?: string[]; link_types?: string[] }>;
+  page_types: GbrainPageType[];
+  link_types: GbrainLinkType[];
+  frontmatter_links: GbrainFrontmatterLink[];
+  takes_kinds: string[];
+  enrichable_types: Array<{ type: string; rubric?: string }>;
+  filing_rules: Array<{ kind: string; directory: string; examples: string[]; description?: string }>;
+  phases?: string[];
+  calibration_domains?: Array<{ name: string; aggregator: GbrainAggregator; page_types: string[] }>;
+  migration_from?: { pack: string; version: string };
+  mapping_rules?: GbrainMappingRule[];
+}
+
+export interface GbrainSchemaCatalogPack {
+  name: string;
+  version: string;
+  description: string;
+  gbrain_min_version: string;
+  extends?: string | null;
+  borrow_from: GbrainSchemaPackManifest["borrow_from"];
+  manifest_sha256: string;
+  page_type_count: number;
+  link_type_count: number;
+  manifest: GbrainSchemaPackManifest;
+  raw_yaml: string;
+  recommended: boolean;
+  legacy: boolean;
+}
+
+export interface GbrainSchemaCatalog {
+  source_dir: string;
+  packs: GbrainSchemaCatalogPack[];
+  count: number;
+}
+
+export interface BrainSchemaBundle {
+  initialized: true;
+  brain_root: string;
+  custom: {
+    path: string;
+    manifest: GbrainSchemaPackManifest;
+    raw_yaml: string;
+    manifest_sha256: string;
+  };
+  parent: {
+    name: string;
+    version: string;
+    manifest_sha256: string;
+  } | null;
+  brain_schema: {
+    path: string;
+    document: Record<string, unknown>;
+    raw_yaml: string;
+    sha256: string;
+  };
+  agents: {
+    path: string;
+    raw_markdown: string;
+    sha256: string;
+  };
+  resolved: {
+    manifest: GbrainSchemaPackManifest;
+    raw_yaml: string;
+    sha256: string;
+  };
+  bundle_hash: string;
+}
+
+export interface BrainSchemaPreview {
+  valid: true;
+  custom: {
+    manifest: GbrainSchemaPackManifest;
+    raw_yaml: string;
+    manifest_sha256: string;
+  };
+  resolved: BrainSchemaBundle["resolved"];
+  gbrain_validation: Array<Record<string, unknown>>;
+  validation_mode?: "structural" | "official";
+}
+
 export interface KnowledgeMarkdownFile {
   name: string;
   path: string;
@@ -772,6 +953,70 @@ export async function getKnowledgeStatus(): Promise<KnowledgeStatus> {
     throw new Error(`Failed to load knowledge status: ${response.status}`);
   }
   return response.json();
+}
+
+export async function getBrainSchemaCatalog(): Promise<GbrainSchemaCatalog> {
+  const response = await fetch(`${API_BASE}/knowledge/brain/schema/catalog`, { cache: "no-store" });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(apiErrorMessage(text, `加载 gbrain Schema 目录失败：${response.status}`));
+  }
+  return JSON.parse(text) as GbrainSchemaCatalog;
+}
+
+export async function getBrainSchemaBundle(): Promise<BrainSchemaBundle | null> {
+  const response = await fetch(`${API_BASE}/knowledge/brain/schema/bundle`, { cache: "no-store" });
+  if (response.status === 404) return null;
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(apiErrorMessage(text, `加载 Schema Bundle 失败：${response.status}`));
+  }
+  return JSON.parse(text) as BrainSchemaBundle;
+}
+
+export async function initializeBrainSchema(): Promise<BrainSchemaBundle> {
+  const response = await fetch(`${API_BASE}/knowledge/brain/initialize`, { method: "POST" });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(apiErrorMessage(text, `初始化 LLM Wiki Brain 失败：${response.status}`));
+  }
+  return JSON.parse(text) as BrainSchemaBundle;
+}
+
+export async function previewBrainCustomSchema(
+  manifest: GbrainSchemaPackManifest,
+): Promise<BrainSchemaPreview> {
+  const response = await fetch(`${API_BASE}/knowledge/brain/schema/custom/preview`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ manifest }),
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(apiErrorMessage(text, `Schema 校验失败：${response.status}`));
+  }
+  return JSON.parse(text) as BrainSchemaPreview;
+}
+
+export async function saveBrainCustomSchema(
+  manifest: GbrainSchemaPackManifest,
+  expectedSha256: string,
+  expectedBundleHash: string,
+): Promise<BrainSchemaBundle> {
+  const response = await fetch(`${API_BASE}/knowledge/brain/schema/custom`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      manifest,
+      expected_sha256: expectedSha256,
+      expected_bundle_hash: expectedBundleHash,
+    }),
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(apiErrorMessage(text, `保存自定义 Schema 失败：${response.status}`));
+  }
+  return JSON.parse(text) as BrainSchemaBundle;
 }
 
 export async function listKnowledgeDocuments(): Promise<KnowledgeDocument[]> {
@@ -2540,6 +2785,14 @@ export interface PermissionRequest {
   query_id?: string;
   tool_call_id?: string;
   path?: string;
+  paths?: string[];
+  authority_plane?: "shell" | string;
+  grant_specs?: Array<{
+    target: string;
+    access: "read" | "write" | string;
+    delete?: boolean;
+    capabilities?: string[];
+  }>;
   target_kind?: string;
   capabilities?: string[];
   operation?: string;
@@ -3183,6 +3436,30 @@ export async function grantToolActionPermission(
   return data.grant;
 }
 
+export async function grantShellDirectoryPermission(
+  sessionId: string,
+  permissionRequestId: string,
+  scope: "run" | "session",
+): Promise<PermissionGrant[]> {
+  const resp = await fetch(
+    `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/permissions/shell-directories`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        permission_request_id: permissionRequestId,
+        scope,
+      }),
+    },
+  );
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(apiErrorMessage(text, `Failed to grant shell directory permission: ${resp.status}`));
+  }
+  const data = await resp.json();
+  return Array.isArray(data.grants) ? data.grants : [];
+}
+
 export async function revokePermissionGrant(sessionId: string, grantId: string): Promise<void> {
   const resp = await fetch(
     `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/permissions/${encodeURIComponent(grantId)}/revoke`,
@@ -3495,10 +3772,14 @@ export async function generateTitle(
  * Get token count for a session (system + messages).
  */
 export async function getSessionTokenCount(
-  sessionId: string
+  sessionId: string,
+  runtimeMode?: "agent" | "chat",
 ): Promise<{ system_tokens: number; message_tokens: number; total_tokens: number; compaction_trigger: number; percentage: number }> {
+  const params = new URLSearchParams();
+  if (runtimeMode) params.set("runtime_mode", runtimeMode);
+  const query = params.toString();
   const resp = await fetch(
-    `${API_BASE}/tokens/session/${encodeURIComponent(sessionId)}`
+    `${API_BASE}/tokens/session/${encodeURIComponent(sessionId)}${query ? `?${query}` : ""}`
   );
   if (!resp.ok) throw new Error(`Failed to get token count: ${resp.status}`);
   return resp.json();

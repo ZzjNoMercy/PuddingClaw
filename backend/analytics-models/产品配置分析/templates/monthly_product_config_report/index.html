@@ -492,7 +492,7 @@
           <div class="section-body"><div class="chart-gallery">
             <article class="chart-panel" data-chart-panel="wheelbaseTrendChart"><div class="chart-panel-head"><div><h3>乘用车轴距结构变化</h3><p>100% 堆叠，排除皮卡</p></div><span class="source-chip">PPT 06</span></div><div class="echart" id="wheelbaseTrendChart"></div><p class="echart-fallback">等待轴距结构数据。</p></article>
             <article class="chart-panel" data-chart-panel="motorPowerTrendChart"><div class="chart-panel-head"><div><h3>新能源电机总功率结构变化</h3><p>100% 堆叠，仅新能源且非空功率</p></div><span class="source-chip">PPT 06</span></div><div class="echart" id="motorPowerTrendChart"></div><p class="echart-fallback">等待电机功率结构数据。</p></article>
-            <article class="chart-panel wide" data-chart-panel="sizePowerHeatmapChart"><div class="chart-panel-head"><div><h3>纯电轴距 × 电机功率组合密度</h3><p>切片：<select id="heatmapVariantSelect" class="query-select" style="display:inline-block;width:auto;height:28px;margin-left:4px;"><option>待生成</option></select></p></div><span class="source-chip">PPT 07</span></div><div class="echart tall" id="sizePowerHeatmapChart"></div><p class="echart-fallback">等待组合热力图数据。</p></article>
+            <article class="chart-panel wide" data-chart-panel="sizePowerHeatmapChart"><div class="chart-panel-head"><div><h3>纯电轴距 × 电机功率组合密度（款型数）</h3><p>仅纯电·排皮卡·非空轴距/功率 | 选择年份：<select id="heatmapYearSelect" class="query-select" style="display:inline-block;width:auto;height:28px;margin-left:4px;"><option>待生成</option></select></p></div><span class="source-chip">PPT 07</span></div><div class="echart tall" id="sizePowerHeatmapChart"></div><p class="echart-fallback">等待纯电款型组合密度数据。</p></article>
           </div></div>
         </section>
 
@@ -512,7 +512,7 @@
             <div class="feature-grid" data-repeat="report.features.adas" data-repeat-count="4"></div>
             <h3 class="subsection-title">L2 普及与价格下探</h3><div class="chart-gallery">
               <article class="chart-panel" data-chart-panel="l2TrendChart"><div class="chart-panel-head"><div><h3>L2 配备率趋势</h3><p>车系维度与款型维度</p></div><span class="source-chip">PPT 09</span></div><div class="echart" id="l2TrendChart"></div><p class="echart-fallback">等待 L2 趋势数据。</p></article>
-              <article class="chart-panel" data-chart-panel="l2PriceBandChart"><div class="chart-panel-head"><div><h3>L2+ 分价格带配备率</h3><p>价格带序列与行业均值</p></div><span class="source-chip">PPT 09</span></div><div class="echart" id="l2PriceBandChart"></div><p class="echart-fallback">等待 L2 价格带数据。</p></article>
+              <article class="chart-panel" data-chart-panel="l2PriceBandChart"><div class="chart-panel-head"><div><h3>L2+ 分价格带配备率年度趋势</h3><p>连续六年；四个价格带与行业均值均为折线</p></div><span class="source-chip">PPT 09</span></div><div class="echart" id="l2PriceBandChart"></div><p class="echart-fallback">等待 L2+ 年度价格带趋势数据。</p></article>
               <article class="chart-panel wide" data-chart-panel="l2PriceBoxplotChart"><div class="chart-panel-head"><div><h3>L2 款型指导价分布</h3><p>五数概括：最小值、Q1、中位数、Q3、最大值</p></div><span class="source-chip">PPT 10</span></div><div class="echart tall" id="l2PriceBoxplotChart"></div><p class="echart-fallback">等待 L2 指导价分布数据。</p></article>
             </div>
             <h3 class="subsection-title">高阶智驾</h3><div class="chart-gallery">
@@ -539,15 +539,15 @@
           </div>
         </section>
 
-        <section class="section" id="core-config" data-screen-label="07 核心配置率查询">
-          <header class="section-head"><div><div class="eyebrow">Core Configuration Query</div><h2 data-bind="report.sections.core_config.headline">核心配置率查询</h2><p class="section-subtitle" data-bind="report.sections.core_config.summary">待生成章节摘要</p></div><div class="section-number">07</div></header>
+        <section class="section" id="core-config" data-screen-label="07 核心配置率查询" data-template-component="v3-core-configuration">
+          <header class="section-head"><div><div class="eyebrow">Core Configuration Query</div><h2>核心配置率查询</h2><p class="section-subtitle">按核心配置、统计维度和分组维度查询历年搭载规模与配置率。</p></div><div class="section-number">07</div></header>
           <div class="section-body"><div class="query-toolbar" aria-label="核心配置率查询条件">
-            <div class="query-field"><label for="coreConfigSelect">配置项</label><select class="query-select" id="coreConfigSelect"><option>待生成</option></select></div>
-            <div class="query-field"><label for="coreGrainSelect">统计维度</label><select class="query-select" id="coreGrainSelect"><option>待生成</option></select></div>
-            <div class="query-field"><label for="coreHeatDimensionSelect">热力图维度</label><select class="query-select" id="coreHeatDimensionSelect"><option>待生成</option></select></div>
+            <div class="query-field"><label for="coreConfigSelect">配置项</label><select class="query-select" id="coreConfigSelect"><option value="airSuspension">空气悬架</option><option value="lidar">激光雷达</option><option value="hud">HUD</option></select></div>
+            <div class="query-field"><label for="coreGrainSelect">统计维度</label><select class="query-select" id="coreGrainSelect"><option value="trim">款型</option><option value="series">车系</option></select></div>
+            <div class="query-field"><label for="coreHeatDimensionSelect">热力图维度</label><select class="query-select" id="coreHeatDimensionSelect"><option value="price">价格段</option><option value="wheelbase">轴距段</option><option value="level">级别</option></select></div>
           </div><div class="chart-gallery">
-            <article class="chart-panel" data-chart-panel="coreConfigTrendChart"><div class="chart-panel-head"><div><h3 id="coreTrendTitle">核心配置趋势</h3><p>柱形：搭载数；折线：配置率</p></div></div><div class="echart tall" id="coreConfigTrendChart"></div><p class="echart-fallback">等待核心配置趋势数据。</p></article>
-            <article class="chart-panel" data-chart-panel="coreConfigHeatmapChart"><div class="chart-panel-head"><div><h3 id="coreHeatmapTitle">核心配置热力图</h3><p>单元格为配置率</p></div></div><div class="echart tall" id="coreConfigHeatmapChart"></div><p class="echart-fallback">等待核心配置热力图数据。</p></article>
+            <article class="chart-panel" data-chart-panel="coreConfigTrendChart"><div class="chart-panel-head"><div><h3 id="coreTrendTitle">空气悬架趋势分析（款型口径）</h3><p id="coreTrendSubtitle">柱形：搭载款型数；折线：配置率</p></div></div><div class="echart tall" id="coreConfigTrendChart"></div><p class="echart-fallback">等待核心配置趋势数据。</p></article>
+            <article class="chart-panel" data-chart-panel="coreConfigHeatmapChart"><div class="chart-panel-head"><div><h3 id="coreHeatmapTitle">空气悬架价格段热力图（款型口径）</h3><p>单元格数值为配置率（跟随统计维度），颜色越深代表配置率越高</p></div></div><div class="echart tall" id="coreConfigHeatmapChart"></div><p class="echart-fallback">等待核心配置热力图数据。</p></article>
           </div></div>
         </section>
 
@@ -562,7 +562,7 @@
 
   <script id="report-payload" type="application/json">
 {
-  "schema_version": "2.0",
+  "schema_version": "2.1",
   "report": {
     "title": null,
     "report_date": null,
@@ -597,18 +597,30 @@
     },
     "methodology": []
   },
-  "controls": {"core_configs": [], "grains": [], "heatmap_dimensions": []},
+  "core_configuration": {
+    "status": "pending",
+    "kind": "v3_core_configuration",
+    "years": [],
+    "dimensions": {
+      "price": {"label": "价格段", "bands": ["10万以下", "10-15万", "15-20万", "20-30万", "30-50万", "50万以上"]},
+      "wheelbase": {"label": "轴距段", "bands": ["2600以下", "2600-2700", "2700-2800", "2800-2900", "2900-3000", "3000以上"]},
+      "level": {"label": "级别", "bands": ["A0级", "A级", "B级", "C级", "D级", "MPV"]}
+    },
+    "configurations": {},
+    "query_ids": [],
+    "reason": "等待按 v3 嵌套结构填充三项核心配置数据"
+  },
   "charts": {
     "renewalChart": {"status": "pending", "kind": "combo", "categories": [], "series": [], "reason": "等待更新次数和周期查询"},
     "wheelbaseTrendChart": {"status": "pending", "kind": "percent_stack", "categories": [], "series": [], "reason": "等待轴距结构查询"},
     "motorPowerTrendChart": {"status": "pending", "kind": "percent_stack", "categories": [], "series": [], "reason": "等待功率结构查询"},
-    "sizePowerHeatmapChart": {"status": "pending", "kind": "heatmap_variants", "variants": [], "reason": "等待轴距与功率交叉查询"},
+    "sizePowerHeatmapChart": {"status": "pending", "kind": "heatmap_variants", "scope": {"energy_type": "纯电", "excluded_vehicle_types": ["皮卡"], "required_fields": ["轴距", "电机总功率"], "grain": "款型", "measure": "款型数"}, "default_year": null, "variants": [], "reason": "等待连续六年纯电款型的固定轴距段 × 固定功率段交叉查询"},
     "bevVoltageTrendChart": {"status": "pending", "kind": "percent_stack", "categories": [], "series": [], "reason": "等待纯电年度平台查询"},
     "bevVoltagePriceChart": {"status": "pending", "kind": "percent_stack", "categories": [], "series": [], "reason": "等待纯电价格带查询"},
     "nevVoltageTrendChart": {"status": "pending", "kind": "percent_stack", "categories": [], "series": [], "reason": "等待全新能源年度平台查询"},
     "nevVoltagePriceChart": {"status": "pending", "kind": "percent_stack", "categories": [], "series": [], "reason": "等待全新能源价格带查询"},
     "l2TrendChart": {"status": "pending", "kind": "line", "categories": [], "series": [], "reason": "等待 L2 趋势查询"},
-    "l2PriceBandChart": {"status": "pending", "kind": "line", "categories": [], "series": [], "reason": "等待 L2 价格带查询"},
+    "l2PriceBandChart": {"status": "pending", "kind": "line", "categories": [], "series": [], "reason": "等待连续六年的 L2+ 分价格带配备率与行业均值趋势"},
     "l2PriceBoxplotChart": {"status": "pending", "kind": "boxplot", "categories": [], "series": [], "reason": "等待 L2 指导价查询"},
     "highAdasTrendChart": {"status": "pending", "kind": "line", "categories": [], "series": [], "reason": "等待高阶智驾查询"},
     "hudRateChart": {"status": "pending", "kind": "line", "categories": [], "series": [], "reason": "等待 HUD 查询"},
@@ -616,9 +628,7 @@
     "fridgeRateChart": {"status": "pending", "kind": "line", "categories": [], "series": [], "reason": "等待车载冰箱查询"},
     "rearScreenRateChart": {"status": "pending", "kind": "line", "categories": [], "series": [], "reason": "等待后排屏查询"},
     "zeroGravityRateChart": {"status": "pending", "kind": "line", "categories": [], "series": [], "reason": "等待零重力座椅查询"},
-    "rearMassageRateChart": {"status": "pending", "kind": "line", "categories": [], "series": [], "reason": "等待后排按摩座椅查询"},
-    "coreConfigTrendChart": {"status": "pending", "kind": "combo_variants", "variants": [], "reason": "等待核心配置趋势查询"},
-    "coreConfigHeatmapChart": {"status": "pending", "kind": "heatmap_variants", "variants": [], "reason": "等待核心配置热力查询"}
+    "rearMassageRateChart": {"status": "pending", "kind": "line", "categories": [], "series": [], "reason": "等待后排按摩座椅查询"}
   },
   "evidence": {},
   "quality": {"status": "template", "plan_tasks": 0, "completed_tasks": 0, "missing_tasks": [], "warnings": []}

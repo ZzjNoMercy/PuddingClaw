@@ -379,22 +379,20 @@ def test_run_scoped_grant_still_changes_permission_manifest_without_run_id(
         lambda _session_id, _run_id: {"config_snapshot": {}},
     )
     monkeypatch.setattr(
-        "graph.middlewares.toolset.session_manager.list_permission_grants",
-        lambda _session_id: [
-            {
-                "type": "external_path",
-                "scope": "run",
-                "target_kind": "directory",
-                "target": "/approved",
-                "capabilities": ["read"],
-                "metadata": {"run_id": "run-with-grant"},
-                "bindings": {},
-            }
-        ],
-    )
-    monkeypatch.setattr(
-        "graph.middlewares.toolset.PermissionBindingPolicy.equivalent",
-        lambda **_kwargs: True,
+        "graph.middlewares.toolset.session_manager.permission_grants_snapshot",
+        lambda _session_id: (
+            [
+                {
+                    "type": "external_directory_read",
+                    "scope": "run",
+                    "target_kind": "exact_directory",
+                    "target": "/approved",
+                    "capabilities": ["read", "recursive", "external_path"],
+                    "metadata": {"run_id": "run-with-grant"},
+                }
+            ],
+            1,
+        ),
     )
     middleware = ToolsetMiddleware(skills_dir=tmp_path, toolsets_by_skill={})
 

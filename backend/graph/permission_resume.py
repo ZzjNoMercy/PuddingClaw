@@ -10,10 +10,13 @@ import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from graph.permission_policy import PermissionBindingPolicy
 from observability import emit_harness_metric
+
+if TYPE_CHECKING:
+    from harness.shell_access import ShellAccessPlan
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +193,101 @@ class PermissionResumeRegistry:
             session_id=session_id,
             type=request["type"],
             target=str(path),
+        )
+        return dict(request)
+
+    def create_shell_access_request(
+        self,
+        *,
+        session_id: str,
+        query_id: str,
+        run_id: str,
+        tool_call_id: str,
+        command: str,
+        plan: ShellAccessPlan,
+        grant_bindings: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Create one atomic shell-plane request for all command directories."""
+
+        if not plan.required:
+            raise ValueError("Shell access request requires at least one directory")
+        specs = [
+            {
+                "target": spec.target,
+                "access": spec.access,
+                "delete": spec.delete,
+                "capabilities": spec.capabilities,
+            }
+            for spec in plan.grant_specs
+        ]
+        semantic_payload = {
+            "authority_plane": "shell",
+            "session_id": session_id,
+            "run_id": run_id,
+            "specs": specs,
+            "grant_bindings": dict(grant_bindings),
+        }
+        semantic_key = "sha256:" + hashlib.sha256(
+            json.dumps(
+                semantic_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        replay_key = "\0".join(
+            [session_id, query_id, run_id, tool_call_id, semantic_key]
+        )
+        request_id = (
+            "perm-req-shell-"
+            + hashlib.sha256(replay_key.encode("utf-8")).hexdigest()[:16]
+        )
+        existing = self._requests.get(request_id)
+        if existing is not None and existing.get("status") == "pending":
+            emit_harness_metric(
+                logger,
+                "permission_reuse_count",
+                session_id=session_id,
+                scope="pending_request",
+            )
+            return dict(existing)
+        if existing is not None:
+            request_id = f"{request_id}-{uuid.uuid4().hex[:6]}"
+        capabilities = sorted(
+            {
+                capability
+                for spec in plan.grant_specs
+                for capability in spec.capabilities
+            }
+        )
+        request = {
+            "id": request_id,
+            "type": "shell_directory_access",
+            "authority_plane": "shell",
+            "session_id": session_id,
+            "query_id": query_id,
+            "run_id": run_id,
+            "tool_call_id": tool_call_id,
+            "command": command,
+            "path": plan.directories[0],
+            "paths": list(plan.directories),
+            "grant_specs": specs,
+            "target_kind": "exact_directory_set",
+            "capabilities": capabilities,
+            "grant_bindings": dict(grant_bindings),
+            "semantic_key": semantic_key,
+            "status": "pending",
+            "created_at": time.time(),
+            "options": ["exact_directory_run", "exact_directory_session"],
+        }
+        self._requests[request_id] = request
+        self._pending[request_id] = asyncio.get_running_loop().create_future()
+        emit_harness_metric(
+            logger,
+            "permission_prompt_count",
+            session_id=session_id,
+            type=request["type"],
+            target=" | ".join(plan.directories),
         )
         return dict(request)
 

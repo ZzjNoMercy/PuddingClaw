@@ -2774,6 +2774,38 @@ def test_multiple_database_revision_interrupts_resume_by_interrupt_id(tmp_path):
     }
 
 
+def test_sse_normalizes_nested_datetime_payload() -> None:
+    from datetime import datetime, timezone
+
+    from graph.deepagents_manager import DeepAgentsAgentManager
+
+    event = DeepAgentsAgentManager._sse(
+        "database_sql_revision_required",
+        {
+            "request": {
+                "semantic_assets": {
+                    "matched": [
+                        {
+                            "indexed_at": datetime(
+                                2026,
+                                7,
+                                29,
+                                13,
+                                42,
+                                tzinfo=timezone.utc,
+                            )
+                        }
+                    ]
+                }
+            }
+        },
+    )
+
+    assert json.loads(event["data"])["request"]["semantic_assets"]["matched"][0][
+        "indexed_at"
+    ] == "2026-07-29T13:42:00+00:00"
+
+
 def test_parallel_permissions_in_separate_stream_items_are_collected_before_resume(tmp_path):
     """Parallel nodes may emit one interrupt per stream item, not one combined tuple."""
 

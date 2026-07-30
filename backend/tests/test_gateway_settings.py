@@ -1211,8 +1211,7 @@ def test_agent_user_content_preserves_spaced_external_html_target(tmp_path):
     assert str(external_file) in content
     assert (
         "直接对原始绝对路径使用 "
-        "read_file/inspect_file_version/copy_file/replace_file/"
-        "materialize_source_ref/patch_file"
+        "read_file/write_file/materialize_source_ref/patch_file"
     ) in content
     assert "HostFileBroker 原子落到正式路径" in content
     assert "不要创建 /workspace 或 /scratch 影子副本" in content

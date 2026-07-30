@@ -11,6 +11,7 @@ from langchain_core.messages import AIMessage
 from langgraph.runtime import Runtime
 from langgraph.types import interrupt
 
+from graph.effective_grants import EffectiveGrantSet
 from graph.permission_policy import RunPermissionContext
 from graph.permission_resume import permission_resume_registry
 from graph.session_manager import session_manager
@@ -94,29 +95,25 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
     ) -> bool:
         """Honor one exact-directory Grant for its normalized descendants."""
 
-        for grant in session_manager.list_permission_grants(session_id):
-            if grant.get("type") != f"external_directory_{access}":
-                continue
-            if required_capability and required_capability not in (
-                grant.get("capabilities") or []
-            ):
-                continue
-            target = grant.get("target")
-            if not isinstance(target, str) or not target:
-                continue
-            root = Path(target).expanduser().resolve()
-            try:
-                requested.relative_to(root)
-            except ValueError:
-                continue
-            if session_manager.has_external_directory_permission(
-                session_id,
-                root,
-                access=access,
-                run_id=run_id,
-            ):
-                return True
-        return False
+        run = session_manager.get_run_state(session_id, run_id)
+        if not isinstance(run, dict):
+            return False
+        current_bindings = RunPermissionContext.from_config_snapshot(run.get("config_snapshot")).grant_bindings()
+        grants, grants_revision = session_manager.permission_grants_snapshot(session_id)
+        effective = EffectiveGrantSet.resolve(
+            grants,
+            run_id=run_id,
+            current_bindings=current_bindings,
+            current_shell_bindings=RunPermissionContext.from_config_snapshot(
+                run.get("config_snapshot")
+            ).shell_grant_bindings(),
+            permission_revision=grants_revision,
+        )
+        return effective.allows_directory(
+            requested,
+            access=access,
+            required_capabilities=((required_capability,) if required_capability else ()),
+        )
 
     @staticmethod
     def _directory_change_preview(session_id: str, args: dict[str, Any]) -> dict[str, str]:

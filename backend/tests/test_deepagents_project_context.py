@@ -117,8 +117,8 @@ def test_default_tool_guides_use_virtual_filesystem_for_semantic_assets() -> Non
     assert "convert it to the equivalent `/workspace/<relative-path>`" in prompt
     assert "transparently routed through the HostFileBroker" in prompt
     assert "do not call deprecated Stage/lease tools for a new Run" in prompt
-    assert "use `inspect_file_version` followed by `patch_file`" in prompt
-    assert "offline, read-only `docker run --rm`" in prompt
+    assert "`patch_file` with unique replacement anchors" in prompt
+    assert "The default runner is the kernel sandbox" in prompt
     assert "stage_external_artifact" not in prompt
     assert "stage_external_directory" not in prompt
 

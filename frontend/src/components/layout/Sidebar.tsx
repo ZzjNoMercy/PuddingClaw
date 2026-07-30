@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useRef, useCallback, useMemo } from "react";
+import { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo } from "react";
 import { createPortal } from "react-dom";
 import Link from "next/link";
 import { useRouter, usePathname } from "next/navigation";
@@ -35,6 +35,7 @@ import { openProject } from "@/lib/api";
 import { useProjectFolderPicker } from "@/components/projects/useProjectFolderPicker";
 
 const PROJECT_EXPANSION_STORAGE_KEY = "puddingclaw_sidebar_project_expansion";
+const useBrowserLayoutEffect = typeof window === "undefined" ? useEffect : useLayoutEffect;
 
 export default function Sidebar() {
   const {
@@ -51,6 +52,7 @@ export default function Sidebar() {
     currentProjectId,
     setCurrentProjectId,
     projects,
+    projectsLoaded,
     registerProject,
     updateProject,
     removeProject,
@@ -65,7 +67,7 @@ export default function Sidebar() {
   const [projectExpansionRestored, setProjectExpansionRestored] = useState(false);
   const hasSavedProjectExpansionRef = useRef(false);
 
-  useEffect(() => {
+  useBrowserLayoutEffect(() => {
     try {
       const raw = localStorage.getItem(PROJECT_EXPANSION_STORAGE_KEY);
       if (raw) {
@@ -122,21 +124,26 @@ export default function Sidebar() {
     return grouped;
   }, [sortedSessions, isAgentSession]);
 
-  useEffect(() => {
-    if (!projectExpansionRestored || projects.length === 0) return;
-    const activeProjectId = sessionsLoaded
-      ? sessions.find((session) => session.id === sessionId)?.project_id
+  // Reveal the active session's project synchronously during render (React's
+  // "adjusting state during render" pattern): the expansion must commit in
+  // the same frame as the session restore. An effect would run one paint too
+  // late and show a "collapsed but active project row" intermediate frame.
+  const activeProjectId = sessionsLoaded
+    ? sessions.find((session) => session.id === sessionId)?.project_id ?? null
+    : null;
+  const projectIdToReveal =
+    projectExpansionRestored && projects.length > 0
+      ? activeProjectId || (!hasSavedProjectExpansionRef.current ? projects[0]?.project_id ?? null : null)
       : null;
-    const projectIdToReveal = activeProjectId
-      || (!hasSavedProjectExpansionRef.current ? projects[0]?.project_id : null);
-    if (!projectIdToReveal) return;
-    setExpandedProjects((current) => {
-      if (current.has(projectIdToReveal)) return current;
-      const next = new Set(current);
+  const [lastRevealedProjectId, setLastRevealedProjectId] = useState<string | null>(null);
+  if (projectIdToReveal !== lastRevealedProjectId) {
+    setLastRevealedProjectId(projectIdToReveal);
+    if (projectIdToReveal && !expandedProjects.has(projectIdToReveal)) {
+      const next = new Set(expandedProjects);
       next.add(projectIdToReveal);
-      return next;
-    });
-  }, [projectExpansionRestored, projects, sessionId, sessions, sessionsLoaded]);
+      setExpandedProjects(next);
+    }
+  }
   const conversationSessions = useMemo(() => {
     if (runtimeMode === "agent") {
       return sortedSessions.filter((session) => isAgentSession(session) && !session.project_id);
@@ -290,7 +297,11 @@ export default function Sidebar() {
         <div className="mx-4 my-1.5 h-px bg-black/[0.04]" />
 
         {/* Projects */}
-        {runtimeReady && runtimeMode === "agent" && (
+        {/* Gated on sessionsLoaded + projectsLoaded: the initial restore
+            commits the sessions list, the selected session and the project
+            expansion in one frame, so project rows must not paint bare (no
+            children, no highlight, no transient "暂无项目") before that. */}
+        {runtimeReady && runtimeMode === "agent" && sessionsLoaded && projectsLoaded && (
           <div className="px-1.5 pb-2">
             <div className="flex items-center justify-between px-3 pt-2 pb-1">
               <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-widest">
@@ -313,7 +324,11 @@ export default function Sidebar() {
                   const projectCollapsed = !expandedProjects.has(project.project_id);
                   const visibleChildSessions = sessionsExpanded ? childSessions : childSessions.slice(0, 5);
                   const containsSelectedSession = childSessions.some((session) => session.id === sessionId);
-                  const projectContextSelected = sessionId === "default" && currentProjectId === project.project_id;
+                  // Gate on sessionsLoaded: before the initial restore decision
+                  // completes, sessionId is the placeholder "default" and the
+                  // project must not flash as selected (the saved session will
+                  // highlight itself a moment later).
+                  const projectContextSelected = sessionsLoaded && sessionId === "default" && currentProjectId === project.project_id;
                   return (
                     <div key={project.project_id} className="relative">
                       <ProjectItem

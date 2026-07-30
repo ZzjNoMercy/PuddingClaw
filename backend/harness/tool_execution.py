@@ -8,10 +8,12 @@ before both Docker and restricted-host execution.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
 import json
 import re
 import shlex
+import stat
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -24,11 +26,17 @@ from langchain.agents.middleware.types import ToolCallRequest, hook_config
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.types import Command, interrupt
 
+from graph.effective_grants import EffectiveGrantSet, SelectedGrantSet
 from graph.permission_policy import RunPermissionContext
 from graph.permission_resume import permission_resume_registry
 from graph.session_manager import session_manager
 from graph.skill_plan_resume import skill_plan_resume_registry
+from graph.virtual_paths import PathAuthority, classify_path_authority
+from harness.execution_context import AuthorizedExecution, bind_authorized_execution
+from harness.execution_permits import ExecutionPermit
 from harness.permission_reviewer import PermissionReviewer
+from harness.sandbox_profiles import SandboxGrantProfile
+from harness.shell_access import ShellAccessPlan
 from runtime_identity.adapters import (
     ManagedCliRegistry,
     UnsupportedManagedCliCommand,
@@ -59,6 +67,48 @@ class ShellCapabilities:
     workspace_write: bool = False
     package_install: bool = False
     destructive: bool = False
+
+
+@dataclass(frozen=True)
+class FilesystemIntent:
+    """One statically proven external filesystem effect."""
+
+    path: str
+    access: str
+
+
+@dataclass(frozen=True)
+class ExecutionRequirements:
+    """Immutable command requirements shared by policy and runner routing."""
+
+    capabilities: ShellCapabilities
+    filesystem_intents: tuple[FilesystemIntent, ...] = ()
+    shell_access_required: bool = False
+    opaque: bool = False
+    opaque_reason: str = ""
+    execution_command: str = ""
+    external_path_candidates: tuple[str, ...] = ()
+
+    @property
+    def digest(self) -> str:
+        payload = {
+            "capabilities": {
+                "network": self.capabilities.network,
+                "workspace_write": self.capabilities.workspace_write,
+                "package_install": self.capabilities.package_install,
+                "destructive": self.capabilities.destructive,
+            },
+            "filesystem_intents": [
+                {"path": intent.path, "access": intent.access} for intent in self.filesystem_intents
+            ],
+            "shell_access_required": self.shell_access_required,
+            "opaque": self.opaque,
+            "opaque_reason": self.opaque_reason,
+            "execution_command": self.execution_command,
+            "external_path_candidates": list(self.external_path_candidates),
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -322,6 +372,245 @@ class ShellPolicyAnalyzer:
         """Return whether an already-authorized command needs network access."""
 
         return cls.capabilities(command).network
+
+    @classmethod
+    def requirements(
+        cls,
+        command: str,
+        *,
+        workspace_path: str | Path,
+    ) -> ExecutionRequirements:
+        """Return a fail-closed, runner-neutral execution description.
+
+        Safe filesystem segments joined by ``&&`` are authorized atomically.
+        Their path operands are canonicalized once here so the Grant Profile,
+        macOS Seatbelt command and Docker bind command all describe the same
+        host objects. Unsupported shell grammar remains opaque.
+        """
+
+        capabilities = cls.capabilities(command, workspace_path=workspace_path)
+        try:
+            segments, operators, has_redirect = cls._requirements_structure(command)
+        except ValueError:
+            return ExecutionRequirements(
+                capabilities=capabilities,
+                opaque=True,
+                opaque_reason="shell_parse_failed",
+            )
+        external_candidates = cls._external_path_candidates(
+            segments,
+            workspace_path=workspace_path,
+        )
+        if has_redirect:
+            return ExecutionRequirements(
+                capabilities=capabilities,
+                opaque=True,
+                opaque_reason="shell_redirection",
+                external_path_candidates=external_candidates,
+            )
+        if any(operator != "&&" for operator in operators):
+            return ExecutionRequirements(
+                capabilities=capabilities,
+                opaque=True,
+                opaque_reason="unsupported_shell_operator",
+                external_path_candidates=external_candidates,
+            )
+        if _SHELL_META_PATTERN.search(command):
+            return ExecutionRequirements(
+                capabilities=capabilities,
+                opaque=True,
+                opaque_reason="expanding_shell",
+                external_path_candidates=external_candidates,
+            )
+
+        external: list[FilesystemIntent] = []
+        normalized_segments: list[str] = []
+        for raw_segment in segments:
+            tokens = cls._unwrap(raw_segment)
+            if not tokens:
+                return ExecutionRequirements(
+                    capabilities=capabilities,
+                    opaque=True,
+                    opaque_reason="empty_after_unwrap",
+                    external_path_candidates=external_candidates,
+                )
+            if tokens != raw_segment:
+                return ExecutionRequirements(
+                    capabilities=capabilities,
+                    opaque=True,
+                    opaque_reason="unsupported_command_wrapper",
+                    external_path_candidates=external_candidates,
+                )
+            parsed = cls._supported_filesystem_segment(tokens)
+            if isinstance(parsed, str):
+                return ExecutionRequirements(
+                    capabilities=capabilities,
+                    opaque=True,
+                    opaque_reason=parsed,
+                    external_path_candidates=external_candidates,
+                )
+            operand_accesses, operand_indexes = parsed
+            normalized_tokens = list(tokens)
+            for (raw_path, access), operand_index in zip(
+                operand_accesses,
+                operand_indexes,
+                strict=True,
+            ):
+                classified = classify_path_authority(
+                    raw_path,
+                    workspace_root=workspace_path,
+                )
+                if classified.authority is PathAuthority.ESCAPE:
+                    return ExecutionRequirements(
+                        capabilities=capabilities,
+                        opaque=True,
+                        opaque_reason="path_escape",
+                        external_path_candidates=external_candidates,
+                    )
+                if classified.authority is not PathAuthority.EXTERNAL:
+                    continue
+                canonical = classified.canonical_host_path
+                if canonical is None:
+                    return ExecutionRequirements(
+                        capabilities=capabilities,
+                        opaque=True,
+                        opaque_reason="external_path_not_canonical",
+                        external_path_candidates=external_candidates,
+                    )
+                canonical_text = str(canonical)
+                normalized_tokens[operand_index] = canonical_text
+                external.append(FilesystemIntent(path=canonical_text, access=access))
+            normalized_segments.append(shlex.join(normalized_tokens))
+        return ExecutionRequirements(
+            capabilities=capabilities,
+            filesystem_intents=tuple(external),
+            shell_access_required=bool(external),
+            execution_command=" && ".join(normalized_segments),
+        )
+
+    @classmethod
+    def _external_path_candidates(
+        cls,
+        segments: list[list[str]],
+        *,
+        workspace_path: str | Path,
+    ) -> tuple[str, ...]:
+        candidates: list[str] = []
+        for segment in segments:
+            for token in segment:
+                for raw_path in cls._absolute_path_fragments(token):
+                    classified = classify_path_authority(
+                        raw_path,
+                        workspace_root=workspace_path,
+                    )
+                    if (
+                        classified.authority is PathAuthority.EXTERNAL
+                        and classified.canonical_host_path is not None
+                    ):
+                        candidates.append(str(classified.canonical_host_path))
+        return tuple(dict.fromkeys(candidates))
+
+    @staticmethod
+    def _supported_filesystem_segment(
+        tokens: list[str],
+    ) -> tuple[list[tuple[str, str]], list[int]] | str:
+        """Parse only path operands whose authority can be proven exactly."""
+
+        executable = Path(tokens[0]).name.lower()
+        short_options = {
+            "cp": frozenset("Rrapfnv"),
+            "mv": frozenset("fnv"),
+            "mkdir": frozenset("pv"),
+            "ls": frozenset("laAhCFRStux1dnpq"),
+        }
+        long_options = {
+            "cp": frozenset({"--archive", "--recursive", "--preserve", "--force", "--no-clobber", "--verbose"}),
+            "mv": frozenset({"--force", "--no-clobber", "--verbose"}),
+            "mkdir": frozenset({"--parents", "--verbose"}),
+            "ls": frozenset({"--all", "--almost-all", "--long", "--classify", "--directory", "--inode", "--human-readable", "--reverse", "--recursive"}),
+        }
+        if executable not in short_options:
+            return "unsupported_command_grammar"
+        operands: list[tuple[int, str]] = []
+        options_done = False
+        for index, token in enumerate(tokens[1:], start=1):
+            if not options_done and token == "--":
+                options_done = True
+                continue
+            if not options_done and token.startswith("--"):
+                option = token.split("=", 1)[0]
+                if option not in long_options[executable] or "=" in token:
+                    return "unsupported_command_option"
+                continue
+            if not options_done and token.startswith("-") and token != "-":
+                if not token[1:] or not set(token[1:]).issubset(short_options[executable]):
+                    return "unsupported_command_option"
+                continue
+            operands.append((index, token))
+        if executable in {"cp", "mv"} and len(operands) < 2:
+            return "invalid_operand_count"
+        if executable in {"mkdir", "ls"} and not operands:
+            # ``ls`` without a path is a workspace-only command and still has
+            # a complete description; only mkdir requires a target.
+            if executable == "mkdir":
+                return "invalid_operand_count"
+            return ([], [])
+
+        accesses: list[tuple[str, str]] = []
+        indexes: list[int] = []
+        if executable == "cp":
+            for index, source in operands[:-1]:
+                accesses.append((source, "read"))
+                indexes.append(index)
+            accesses.append((operands[-1][1], "write"))
+            indexes.append(operands[-1][0])
+        elif executable == "mv":
+            for index, source in operands[:-1]:
+                accesses.extend(((source, "read"), (source, "delete")))
+                indexes.extend((index, index))
+            accesses.append((operands[-1][1], "write"))
+            indexes.append(operands[-1][0])
+        elif executable == "mkdir":
+            for index, target in operands:
+                accesses.append((target, "write"))
+                indexes.append(index)
+        else:
+            for index, target in operands:
+                accesses.append((target, "read"))
+                indexes.append(index)
+        return accesses, indexes
+
+    @staticmethod
+    def _requirements_structure(
+        command: str,
+    ) -> tuple[list[list[str]], list[str], bool]:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;<>")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+        segments: list[list[str]] = []
+        operators: list[str] = []
+        current: list[str] = []
+        has_redirect = False
+        for token in tokens:
+            if token in {"&&", "||", ";", "|", "&"}:
+                if not current:
+                    raise ValueError("dangling shell operator")
+                segments.append(current)
+                current = []
+                operators.append(token)
+                continue
+            if token and set(token).issubset({">", "<"}):
+                has_redirect = True
+            current.append(token)
+        if not current:
+            if operators:
+                raise ValueError("dangling shell operator")
+        else:
+            segments.append(current)
+        if operators and len(operators) != len(segments) - 1:
+            raise ValueError("invalid shell structure")
+        return segments, operators, has_redirect
 
     @classmethod
     def parse_segments(cls, command: str) -> list[list[str]]:
@@ -1313,7 +1602,11 @@ class ToolExecutionPipeline(AgentMiddleware):
         self.workspace_backend = workspace_backend
         self.managed_cli_registry = ManagedCliRegistry()
         self.managed_cli_service = managed_cli_service
-        if self.managed_cli_service is None and workspace_backend is not None and backend_mode == "docker":
+        if (
+            self.managed_cli_service is None
+            and workspace_backend is not None
+            and backend_mode in {"docker", "adaptive"}
+        ):
             try:
                 from runtime_identity.service import ManagedCliService
 
@@ -1327,6 +1620,468 @@ class ToolExecutionPipeline(AgentMiddleware):
                 "permissions": {"approval_mode": "strict"},
                 "execution": {"backend_mode": backend_mode},
             }
+        )
+
+    def _require_external_shell_authority(
+        self,
+        request: ToolCallRequest,
+    ) -> ToolMessage | None:
+        """Interrupt once for the atomic directory set required by ``execute``."""
+
+        if str(request.tool_call.get("name") or "") != "execute":
+            return None
+        context = self._context(request)
+        workspace_path = str(context.get("workspace_path") or "")
+        command = self._command(request)
+        if not workspace_path or not command:
+            return None
+        requirements = ShellPolicyAnalyzer.requirements(
+            command,
+            workspace_path=workspace_path,
+        )
+        if requirements.opaque:
+            if not requirements.external_path_candidates:
+                return None
+            return ToolMessage(
+                content=(
+                    "External shell access was denied before execution because the command "
+                    "could not be mapped to an exact directory set "
+                    f"({requirements.opaque_reason}). Split it into supported cp/mv/mkdir/ls "
+                    "segments joined with &&, without redirects or expansion."
+                ),
+                name="execute",
+                tool_call_id=str(request.tool_call.get("id") or ""),
+                status="error",
+            )
+        if not requirements.filesystem_intents:
+            return None
+        session_id = str(context.get("session_id") or "")
+        query_id = str(context.get("query_id") or "")
+        run_id = str(context.get("run_id") or "")
+        if not session_id or not run_id:
+            return ToolMessage(
+                content="External shell access requires an active Harness Run.",
+                name="execute",
+                tool_call_id=str(request.tool_call.get("id") or ""),
+                status="error",
+            )
+        grants, revision = session_manager.permission_grants_snapshot(session_id)
+        effective = EffectiveGrantSet.resolve(
+            grants,
+            run_id=run_id,
+            current_bindings=self.permission_context.grant_bindings(),
+            current_shell_bindings=self.permission_context.shell_grant_bindings(),
+            permission_revision=revision,
+        )
+        try:
+            SelectedGrantSet.select(effective, requirements)
+            session_manager.transition_run_status(
+                session_id,
+                run_id,
+                "running",
+                expected_statuses={"running", "waiting_hitl"},
+            )
+            return None
+        except PermissionError:
+            pass
+        try:
+            plan = ShellAccessPlan.compile(requirements, effective)
+        except ValueError as exc:
+            return ToolMessage(
+                content=f"External shell access was denied: {exc}",
+                name="execute",
+                tool_call_id=str(request.tool_call.get("id") or ""),
+                status="error",
+            )
+        permission_request = permission_resume_registry.create_shell_access_request(
+            session_id=session_id,
+            query_id=query_id,
+            run_id=run_id,
+            tool_call_id=str(request.tool_call.get("id") or ""),
+            command=command,
+            plan=plan,
+            grant_bindings=self.permission_context.shell_grant_bindings(),
+        )
+        session_manager.transition_run_status(
+            session_id,
+            run_id,
+            "waiting_hitl",
+            expected_statuses={"running", "waiting_hitl"},
+        )
+        resume_value = interrupt(
+            {
+                "type": "permission_request",
+                "request": permission_request,
+                "decisions": [{"type": "approve"}, {"type": "reject"}],
+            }
+        )
+        # LangGraph resumes at the exact interrupt call site; it does not
+        # replay this middleware from the top. Trust only newly persisted
+        # authority, never the client-provided resume payload by itself.
+        resumed_grants, resumed_revision = session_manager.permission_grants_snapshot(
+            session_id
+        )
+        resumed_effective = EffectiveGrantSet.resolve(
+            resumed_grants,
+            run_id=run_id,
+            current_bindings=self.permission_context.grant_bindings(),
+            current_shell_bindings=self.permission_context.shell_grant_bindings(),
+            permission_revision=resumed_revision,
+        )
+        try:
+            SelectedGrantSet.select(resumed_effective, requirements)
+        except PermissionError:
+            decision = (
+                str(resume_value.get("type") or "")
+                if isinstance(resume_value, dict)
+                else ""
+            )
+            detail = "rejected" if decision == "reject" else "not persisted"
+            return ToolMessage(
+                content=f"External shell authority was {detail} after resume.",
+                name="execute",
+                tool_call_id=str(request.tool_call.get("id") or ""),
+                status="error",
+            )
+        session_manager.transition_run_status(
+            session_id,
+            run_id,
+            "running",
+            expected_statuses={"running", "waiting_hitl"},
+        )
+        return None
+
+    def _compile_kernel_execution(
+        self,
+        request: ToolCallRequest,
+    ) -> AuthorizedExecution | None:
+        if (
+            str(request.tool_call.get("name") or "") != "execute"
+            or self.backend_mode not in {"kernel", "adaptive", "docker"}
+            or self.workspace_backend is None
+        ):
+            return None
+        context = self._context(request)
+        workspace = Path(str(context.get("workspace_path") or "")).expanduser().resolve()
+        scratch_value = getattr(self.workspace_backend, "scratch_path", None)
+        if not workspace.is_dir() or scratch_value is None:
+            raise RuntimeError("Sandbox execution roots are unavailable")
+        scratch = Path(scratch_value).expanduser().resolve()
+        command = self._command(request)
+        requirements = ShellPolicyAnalyzer.requirements(command, workspace_path=workspace)
+        session_id = str(context.get("session_id") or "")
+        run_id = str(context.get("run_id") or "")
+        grants, revision = (
+            session_manager.permission_grants_snapshot(session_id)
+            if session_id
+            else ([], 0)
+        )
+        effective = EffectiveGrantSet.resolve(
+            grants,
+            run_id=run_id,
+            current_bindings=self.permission_context.grant_bindings(),
+            current_shell_bindings=self.permission_context.shell_grant_bindings(),
+            permission_revision=revision,
+        )
+        selected = (
+            SelectedGrantSet.select(effective, requirements)
+            if requirements.filesystem_intents
+            else SelectedGrantSet(
+                grant_ids=(),
+                read_roots=(),
+                write_roots=(),
+                delete_roots=(),
+                permission_revision=revision,
+            )
+        )
+        selected_runner = (
+            "docker"
+            if self.backend_mode == "docker"
+            or self.backend_mode == "adaptive"
+            and (
+                requirements.capabilities.network
+                or requirements.capabilities.package_install
+                or "/opt/puddingclaw/bin/validate-html-report-e2e.mjs" in command
+            )
+            else "kernel_macos_seatbelt"
+        )
+        profile = SandboxGrantProfile.build(
+            workspace_root=workspace,
+            scratch_root=scratch,
+            external_read_roots=selected.read_roots,
+            external_write_roots=selected.write_roots,
+            external_delete_roots=selected.delete_roots,
+            network_allowed=(
+                selected_runner == "docker"
+                and requirements.capabilities.network
+            ),
+        )
+        tool_call_id = str(request.tool_call.get("id") or "")
+        permit = ExecutionPermit.issue(
+            tool_call_id=tool_call_id,
+            command=command,
+            requirements=requirements,
+            permission_revision=revision,
+            profile_digest=profile.digest,
+            selected_runner=selected_runner,
+        )
+
+        def current_revision() -> int:
+            if not session_id:
+                return 0
+            _current_grants, current = session_manager.permission_grants_snapshot(
+                session_id
+            )
+            return current
+
+        return AuthorizedExecution(
+            permit=permit,
+            command=command,
+            requirements=requirements,
+            profile=profile,
+            current_permission_revision=current_revision,
+        )
+
+    def _granted_external_shell_fast_path(
+        self,
+        request: ToolCallRequest,
+        result: ToolPolicyResult,
+    ) -> ToolPolicyResult | None:
+        """Allow only non-overwriting cp/mv and mkdir after explicit grants."""
+
+        if result.decision != PolicyDecision.ASK:
+            return None
+        context = self._context(request)
+        session_id = str(context.get("session_id") or "")
+        run_id = str(context.get("run_id") or "")
+        workspace_path = str(context.get("workspace_path") or "")
+        if not session_id or not run_id or not workspace_path:
+            return None
+        command = self._command(request)
+        requirements = ShellPolicyAnalyzer.requirements(
+            command,
+            workspace_path=workspace_path,
+        )
+        if requirements.opaque or not requirements.filesystem_intents:
+            return None
+        try:
+            segments = ShellPolicyAnalyzer.parse_segments(command)
+            tokens = ShellPolicyAnalyzer.unwrap_command(segments[0])
+        except (ValueError, IndexError):
+            return None
+        executable = Path(tokens[0]).name.lower() if tokens else ""
+        if executable not in {"cp", "mv", "mkdir"}:
+            return None
+        write_targets = [
+            Path(intent.path)
+            for intent in requirements.filesystem_intents
+            if intent.access == "write"
+        ]
+        if not write_targets or any(path.exists() for path in write_targets):
+            return None
+        grants, revision = session_manager.permission_grants_snapshot(session_id)
+        effective = EffectiveGrantSet.resolve(
+            grants,
+            run_id=run_id,
+            current_bindings=self.permission_context.grant_bindings(),
+            current_shell_bindings=self.permission_context.shell_grant_bindings(),
+            permission_revision=revision,
+        )
+        try:
+            SelectedGrantSet.select(effective, requirements)
+        except (PermissionError, ValueError):
+            return None
+        return ToolPolicyResult(
+            PolicyDecision.ALLOW,
+            f"authorized_external_shell:{executable}:non_overwrite",
+            "managed_write",
+        )
+
+    @staticmethod
+    def _shell_host_path(raw_path: str, authorized: AuthorizedExecution) -> Path | None:
+        """Resolve one already-classified shell operand to its host location.
+
+        This is evidence bookkeeping, not a second authorization path.  The
+        command can only reach these bytes through the permit-bound Grant
+        Profile compiled above.
+        """
+
+        normalized = str(raw_path or "").replace("\\", "/")
+        if normalized == "/scratch" or normalized.startswith("/scratch/"):
+            relative = normalized.removeprefix("/scratch").lstrip("/")
+            candidate = (authorized.profile.scratch_root / relative).resolve(strict=False)
+            try:
+                candidate.relative_to(authorized.profile.scratch_root)
+            except ValueError:
+                return None
+            return candidate
+        classified = classify_path_authority(
+            normalized,
+            workspace_root=authorized.profile.workspace_root,
+        )
+        if classified.authority in {PathAuthority.ESCAPE, PathAuthority.MANAGED}:
+            return None
+        return classified.canonical_host_path
+
+    @classmethod
+    def _shell_mutation_paths(
+        cls,
+        authorized: AuthorizedExecution,
+    ) -> tuple[tuple[str, str, Path], ...]:
+        """Return statically proven effects for the narrow cp/mv/mkdir grammar."""
+
+        if authorized.requirements.opaque:
+            return ()
+        try:
+            segments = ShellPolicyAnalyzer.parse_segments(authorized.execution_command)
+        except ValueError:
+            return ()
+        effects: list[tuple[str, str, Path]] = []
+        for raw_segment in segments:
+            tokens = ShellPolicyAnalyzer.unwrap_command(raw_segment)
+            if not tokens:
+                return ()
+            operation = Path(tokens[0]).name.lower()
+            parsed = ShellPolicyAnalyzer._supported_filesystem_segment(tokens)
+            if isinstance(parsed, str):
+                return ()
+            _accesses, operand_indexes = parsed
+            unique_indexes = tuple(dict.fromkeys(operand_indexes))
+            operands = [tokens[index] for index in unique_indexes]
+            if operation in {"cp", "mv"} and len(operands) >= 2:
+                sources = [cls._shell_host_path(item, authorized) for item in operands[:-1]]
+                destination = cls._shell_host_path(operands[-1], authorized)
+                if destination is None or any(source is None for source in sources):
+                    return ()
+                concrete_sources = [source for source in sources if source is not None]
+                destination_is_directory = destination.is_dir()
+                for source in concrete_sources:
+                    target = destination / source.name if destination_is_directory else destination
+                    effects.append((operation, "write", target.resolve(strict=False)))
+                    if operation == "mv":
+                        effects.append((operation, "delete", source.resolve(strict=False)))
+            elif operation == "mkdir" and operands:
+                for operand in operands:
+                    target = cls._shell_host_path(operand, authorized)
+                    if target is not None:
+                        effects.append((operation, "write", target.resolve(strict=False)))
+        return tuple(dict.fromkeys(effects))
+
+    @staticmethod
+    def _path_snapshot(path: Path) -> dict[str, Any]:
+        try:
+            metadata = path.lstat()
+        except OSError:
+            return {"exists": False}
+        if stat.S_ISREG(metadata.st_mode):
+            kind = "file"
+        elif stat.S_ISDIR(metadata.st_mode):
+            kind = "directory"
+        elif stat.S_ISLNK(metadata.st_mode):
+            kind = "symlink"
+        else:
+            kind = "other"
+        snapshot: dict[str, Any] = {
+            "exists": True,
+            "kind": kind,
+            "size_bytes": metadata.st_size,
+            "mtime_ns": metadata.st_mtime_ns,
+        }
+        if kind == "file":
+            hasher = hashlib.sha256()
+            try:
+                with path.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        hasher.update(chunk)
+            except OSError:
+                return {**snapshot, "content_sha256": None}
+            snapshot["content_sha256"] = f"sha256:{hasher.hexdigest()}"
+        return snapshot
+
+    @classmethod
+    def _shell_mutation_before(
+        cls,
+        authorized: AuthorizedExecution,
+    ) -> tuple[tuple[str, str, Path, dict[str, Any]], ...]:
+        return tuple(
+            (operation, access, path, cls._path_snapshot(path))
+            for operation, access, path in cls._shell_mutation_paths(authorized)
+        )
+
+    @classmethod
+    def _attach_shell_mutation_evidence(
+        cls,
+        result: ToolMessage | Command[Any],
+        *,
+        authorized: AuthorizedExecution,
+        before: tuple[tuple[str, str, Path, dict[str, Any]], ...],
+    ) -> ToolMessage | Command[Any]:
+        """Attach server-observed postconditions without changing model text."""
+
+        if not isinstance(result, ToolMessage) or not before:
+            return result
+        mutations: list[dict[str, Any]] = []
+        for operation, access, path, previous in before:
+            current = cls._path_snapshot(path)
+            if current == previous:
+                continue
+            mutations.append(
+                {
+                    "kind": "shell_mutation_observed",
+                    "receipt_version": 1,
+                    "tool_call_id": authorized.permit.tool_call_id,
+                    "operation": operation,
+                    "access": access,
+                    "target_path": str(path),
+                    "before": previous,
+                    "after": current,
+                    "atomic": False,
+                    "command_digest": authorized.permit.command_digest,
+                    "requirements_digest": authorized.permit.requirements_digest,
+                    "permission_revision": authorized.permit.permission_revision,
+                    "profile_digest": authorized.permit.profile_digest,
+                    "selected_runner": authorized.permit.selected_runner,
+                }
+            )
+        if not mutations:
+            return result
+        artifact = getattr(result, "artifact", None)
+        payload = dict(artifact) if isinstance(artifact, dict) else {}
+        payload["puddingclaw_shell_mutations"] = mutations
+        return result.model_copy(update={"artifact": payload})
+
+    async def _invoke_handler_with_execution_permit(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+    ) -> ToolMessage | Command[Any]:
+        authorized = self._compile_kernel_execution(request)
+        if authorized is None:
+            return await handler(request)
+        before = self._shell_mutation_before(authorized)
+        with bind_authorized_execution(authorized):
+            result = await handler(request)
+        return self._attach_shell_mutation_evidence(
+            result,
+            authorized=authorized,
+            before=before,
+        )
+
+    def _invoke_sync_handler_with_execution_permit(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
+    ) -> ToolMessage | Command[Any]:
+        authorized = self._compile_kernel_execution(request)
+        if authorized is None:
+            return handler(request)
+        before = self._shell_mutation_before(authorized)
+        with bind_authorized_execution(authorized):
+            result = handler(request)
+        return self._attach_shell_mutation_evidence(
+            result,
+            authorized=authorized,
+            before=before,
         )
 
     @staticmethod
@@ -1704,7 +2459,7 @@ class ToolExecutionPipeline(AgentMiddleware):
                 artifact=artifact,
             )
         if managed_add is None:
-            return await handler(request)
+            return await self._invoke_handler_with_execution_permit(request, handler)
         if self.base_dir is None:
             return ToolMessage(
                 content=json.dumps(
@@ -1848,6 +2603,9 @@ class ToolExecutionPipeline(AgentMiddleware):
                     request,
                     f"Managed CLI planning failed: {type(exc).__name__}: {exc}",
                 )
+        shell_authority_result = self._require_external_shell_authority(request)
+        if shell_authority_result is not None:
+            return shell_authority_result
         result = (
             self._managed_cli_preflight(managed_cli) if managed_cli is not None else await self._apreflight(request)
         )
@@ -1999,6 +2757,9 @@ class ToolExecutionPipeline(AgentMiddleware):
                     request,
                     f"Managed CLI planning failed: {type(exc).__name__}: {exc}",
                 )
+        shell_authority_result = self._require_external_shell_authority(request)
+        if shell_authority_result is not None:
+            return shell_authority_result
         result = self._managed_cli_preflight(managed_cli) if managed_cli is not None else self._preflight(request)
         if result.decision == PolicyDecision.ALLOW:
             delta_denial = self._delta_repair_denial(request)
@@ -2014,7 +2775,7 @@ class ToolExecutionPipeline(AgentMiddleware):
                     tool_call_id=str(request.tool_call.get("id") or ""),
                     status="success" if managed.exit_code == 0 else "error",
                 )
-            return handler(request)
+            return self._invoke_sync_handler_with_execution_permit(request, handler)
         return self._denied_message(request, result)
 
     def _delta_repair_denial(self, request: ToolCallRequest) -> ToolMessage | None:
@@ -2257,7 +3018,7 @@ class ToolExecutionPipeline(AgentMiddleware):
                 "managed_skill_write",
             )
         if tool_name == "install_packages":
-            if self.permission_context.backend_mode != "docker":
+            if self.permission_context.backend_mode not in {"docker", "adaptive"}:
                 return ToolPolicyResult(
                     PolicyDecision.DENY,
                     "package_install_requires_docker",
@@ -2269,7 +3030,10 @@ class ToolExecutionPipeline(AgentMiddleware):
                 "package_install",
             )
         if tool_name == "execute_external_directory":
-            if self.permission_context.backend_mode != "docker" or self.backend_mode != "docker":
+            if (
+                self.permission_context.backend_mode not in {"docker", "adaptive"}
+                or self.backend_mode not in {"docker", "adaptive"}
+            ):
                 return ToolPolicyResult(
                     PolicyDecision.DENY,
                     "external_directory_command_requires_docker",
@@ -2338,6 +3102,12 @@ class ToolExecutionPipeline(AgentMiddleware):
         )
         command = self._command(request)
         result = analyzer.analyze(command)
+        external_shell_result = self._granted_external_shell_fast_path(
+            request,
+            result,
+        )
+        if external_shell_result is not None:
+            return external_shell_result
         effects = analyzer.capabilities(
             command,
             workspace_path=str(context.get("workspace_path") or "."),
@@ -2418,8 +3188,8 @@ class ToolExecutionPipeline(AgentMiddleware):
         if (
             self.reviewer is None
             or not self.permission_context.smart
-            or self.permission_context.backend_mode != "docker"
-            or self.backend_mode != "docker"
+            or self.permission_context.backend_mode not in {"docker", "adaptive", "kernel"}
+            or self.backend_mode not in {"docker", "adaptive", "kernel"}
             or result.decision != PolicyDecision.ASK
             or str(request.tool_call.get("name") or "") != "execute"
         ):
@@ -2501,8 +3271,8 @@ class ToolExecutionPipeline(AgentMiddleware):
 
         if (
             not self.permission_context.smart
-            or self.permission_context.backend_mode != "docker"
-            or self.backend_mode != "docker"
+            or self.permission_context.backend_mode not in {"docker", "adaptive", "kernel"}
+            or self.backend_mode not in {"docker", "adaptive", "kernel"}
             or result.decision != PolicyDecision.ASK
         ):
             return None
@@ -3006,7 +3776,10 @@ class ToolExecutionPipeline(AgentMiddleware):
                 "label": f"本 Session 允许读取 {host}",
             }
         if tool_name == "install_packages":
-            if not self.permission_context.smart or self.permission_context.backend_mode != "docker":
+            if (
+                not self.permission_context.smart
+                or self.permission_context.backend_mode not in {"docker", "adaptive"}
+            ):
                 return None
             return {
                 "target_kind": "capability",

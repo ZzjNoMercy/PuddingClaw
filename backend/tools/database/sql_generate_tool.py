@@ -27,9 +27,16 @@ from .spans import emit_database_span
 
 _SEMANTIC_CONTRACT_PREVIEW_CHARS = 700
 _TECHNICAL_SQL_REVISION_PATTERN = re.compile(
-    r"(?:\bSQL\b|\bEXISTS\b|\bJOIN\b|\bCTE\b|\bFILTER\b|\bILIKE\b|"
+    # ``\bSQL\b`` does not match Chinese-adjacent text such as ``SQL执行失败``
+    # because Python treats both sides as Unicode word characters.  ASCII-only
+    # lookarounds preserve the intended token boundary for mixed-language
+    # database errors.
+    r"(?:(?<![A-Za-z0-9_])(?:SQL|VALUES)(?![A-Za-z0-9_])|"
+    r"\bEXISTS\b|\bJOIN\b|\bCTE\b|\bFILTER\b|\bILIKE\b|"
     r"\bGROUP\s+BY\b|\bDISTINCT\b|\bquery\b|超时|慢查询|性能|执行计划|"
-    r"相关子查询|子查询|语法|括号|表别名|重写查询)",
+    r"\bcolumn\b.{0,80}\bdoes\s+not\s+exist\b|\bunknown\s+column\b|"
+    r"\bundefined\s+column\b|相关子查询|子查询|语法|括号|表别名|列别名|"
+    r"(?:字段名|列名).{0,24}(?:不存在|不匹配|冲突|错误)|重写查询)",
     re.IGNORECASE,
 )
 _BUSINESS_SEMANTIC_CHANGE_PATTERN = re.compile(

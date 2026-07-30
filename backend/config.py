@@ -303,6 +303,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "max_rounds": 8,
         },
         "terminal": {
+            "sandbox_mode": "auto",
             "docker_enabled": False,
             "external_directory_writable_enabled": False,
             "on_unavailable": "fallback",
@@ -355,6 +356,13 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "todo_path": "workspace/TODO.md",
             "triggers": ["帮我", "待办", "记得", "提醒", "任务", "需要做"],
         },
+    },
+    # A dedicated, initialized PUDDINGCLAW_GBRAIN_HOME is the capability
+    # boundary. When it is ready, Agent runtimes automatically attach only the
+    # hard-allowlisted gbrain query tools; an incomplete runtime fails closed.
+    "mcp": {
+        "enabled": [],
+        "auto_enable_gbrain": True,
     },
 }
 
@@ -1686,6 +1694,10 @@ def _normalize_harness_update(value: Any) -> dict[str, Any]:
     if terminal is not None:
         if not isinstance(terminal, dict):
             raise ValueError("harness.terminal must be an object")
+        if terminal.get("sandbox_mode", "auto") not in {"auto", "kernel", "docker"}:
+            raise ValueError(
+                "harness.terminal.sandbox_mode must be auto, kernel, or docker"
+            )
         if terminal.get("on_unavailable", "fallback") not in {"fallback", "deny"}:
             raise ValueError(
                 "harness.terminal.on_unavailable must be fallback or deny"

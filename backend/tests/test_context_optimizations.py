@@ -1139,3 +1139,49 @@ class TestTokensAPI:
         assert result["total_tokens"] == 6800
         assert result["compaction_trigger"] == 160000
         assert result["percentage"] == 4.2
+
+    @pytest.mark.asyncio
+    async def test_unpersisted_agent_placeholder_uses_agent_trigger(self, tmp_path):
+        from api.tokens import get_session_token_count
+        from graph.session_manager import session_manager
+
+        session_manager.initialize(tmp_path)
+        with (
+            patch("api.tokens.build_system_prompt", return_value="sys"),
+            patch("api.tokens._count_tokens", return_value=11),
+            patch(
+                "api.tokens.get_deepagents_summarization_config",
+                return_value={"trigger_tokens": 272000},
+            ),
+        ):
+            result = await get_session_token_count(
+                "default",
+                runtime_mode="agent",
+            )
+
+        assert result["total_tokens"] == 11
+        assert result["compaction_trigger"] == 272000
+
+    @pytest.mark.asyncio
+    async def test_persisted_chat_ignores_agent_runtime_hint(self, tmp_path):
+        from api.tokens import get_session_token_count
+        from graph.session_manager import session_manager
+
+        session_manager.initialize(tmp_path)
+        sid = "persisted-chat-token-test"
+        session_manager.create_session(sid, metadata={"runtime_mode": "chat"})
+        with (
+            patch("api.tokens.build_system_prompt", return_value="sys"),
+            patch("api.tokens._count_tokens", return_value=1),
+            patch("api.tokens.get_compaction_trigger_tokens", return_value=500000),
+            patch(
+                "api.tokens.get_deepagents_summarization_config",
+                return_value={"trigger_tokens": 272000},
+            ),
+        ):
+            result = await get_session_token_count(
+                sid,
+                runtime_mode="agent",
+            )
+
+        assert result["compaction_trigger"] == 500000

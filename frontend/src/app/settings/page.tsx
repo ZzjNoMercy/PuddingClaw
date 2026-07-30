@@ -94,7 +94,7 @@ const HARNESS_SECTIONS: HarnessSection[] = [
   { id: "subagent", label: "SubAgent", description: "子代理注册与状态", icon: Bot },
   { id: "context", label: "上下文工程", description: "摘要与工具上下文压缩", icon: Brain },
   { id: "completion", label: "Goal 与验收", description: "Goal Run Rubric 与执行预算", icon: Target },
-  { id: "sandbox", label: "终端与沙箱", description: "Docker 后端与受控降级", icon: Box },
+  { id: "sandbox", label: "终端与沙箱", description: "内核优先与按需 Docker", icon: Box },
   { id: "runtime", label: "运行保护", description: "运行保护与权限策略", icon: ShieldCheck },
 ];
 
@@ -367,7 +367,17 @@ function positiveIntOrNull(value: string): number | null {
 }
 
 export default function SettingsPage() {
-  const { sidebarOpen, toggleSidebar, thinkingMode, setThinkingMode, currentProjectId, projects } = useApp();
+  const {
+    sidebarOpen,
+    toggleSidebar,
+    thinkingMode,
+    setThinkingMode,
+    currentProjectId,
+    projects,
+    sessionId,
+    setSessionId,
+    setWorkspaceView,
+  } = useApp();
   const [mounted, setMounted] = useState(false);
   const [selectedSubagentIndex, setSelectedSubagentIndex] = useState<number | null>(null);
   const [configModalOpen, setConfigModalOpen] = useState(false);
@@ -379,6 +389,16 @@ export default function SettingsPage() {
       setCategory(categoryParam as SettingsCategory);
     }
   }, []);
+  const handleReturnToApp = useCallback(() => {
+    let targetSessionId = sessionId;
+    try {
+      targetSessionId = sessionStorage.getItem("puddingclaw_session_id") || sessionId;
+    } catch {
+      // The in-memory Session remains the fallback when storage is unavailable.
+    }
+    setWorkspaceView("chat");
+    if (targetSessionId !== sessionId) setSessionId(targetSessionId);
+  }, [sessionId, setSessionId, setWorkspaceView]);
   const [category, setCategory] = useState<SettingsCategory>(() => {
     if (typeof window === "undefined") return "ai";
     const saved = localStorage.getItem(SETTINGS_CATEGORY_KEY);
@@ -538,8 +558,7 @@ export default function SettingsPage() {
   }>>([]);
   const [goalsEnabled, setGoalsEnabled] = useState(true);
   const [goalMaxRounds, setGoalMaxRounds] = useState("8");
-  const [dockerEnabled, setDockerEnabled] = useState(false);
-  const [dockerOnUnavailable, setDockerOnUnavailable] = useState<"fallback" | "deny">("fallback");
+  const [sandboxMode, setSandboxMode] = useState<"auto" | "kernel" | "docker">("auto");
   const [dockerConnection, setDockerConnection] = useState("");
   const [dockerContext, setDockerContext] = useState("");
   const [dockerUseCustomImage, setDockerUseCustomImage] = useState(false);
@@ -703,8 +722,11 @@ export default function SettingsPage() {
         setGoalsEnabled(s.harness?.goals?.enabled ?? true);
         setGoalMaxRounds(String(s.harness?.goals?.max_rounds ?? 8));
         const terminal = s.harness?.terminal;
-        setDockerEnabled(terminal?.docker_enabled ?? false);
-        setDockerOnUnavailable(terminal?.on_unavailable === "deny" ? "deny" : "fallback");
+        setSandboxMode(
+          terminal?.sandbox_mode === "auto" || terminal?.sandbox_mode === "kernel" || terminal?.sandbox_mode === "docker"
+            ? terminal.sandbox_mode
+            : terminal?.docker_enabled ? "docker" : "kernel"
+        );
         setDockerConnection(terminal?.docker?.connection || "");
         setDockerContext(terminal?.docker?.context || "");
         const configuredDockerImage = terminal?.docker?.image || MANAGED_DOCKER_IMAGE;
@@ -1143,8 +1165,9 @@ export default function SettingsPage() {
             max_rounds: positiveIntOrNull(goalMaxRounds) ?? 8,
           },
           terminal: {
-            docker_enabled: dockerEnabled,
-            on_unavailable: dockerOnUnavailable,
+            sandbox_mode: sandboxMode,
+            docker_enabled: sandboxMode === "docker",
+            on_unavailable: "deny",
             default_timeout_seconds: 120,
             docker: {
               connection: dockerConnection,
@@ -1182,7 +1205,7 @@ export default function SettingsPage() {
     } finally {
       setSaving(false);
     }
-  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaQueryTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmConcurrency, knowledgeRootDir, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, toolContextEnabled, immediateToolCompactionEnabled, singleToolTriggerTokens, backgroundMinResultTokens, keepRecentToolResults, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, rubricMaxStagnantRepairs, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, dockerEnabled, dockerOnUnavailable, dockerConnection, dockerContext, dockerUseCustomImage, dockerImage, dockerCpuLimit, dockerMemoryLimitMb, dockerPidsLimit, dockerNetworkEnabled, dockerDependencySetupEnabled, subagentItems, showToast]);
+  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaQueryTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmConcurrency, knowledgeRootDir, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, toolContextEnabled, immediateToolCompactionEnabled, singleToolTriggerTokens, backgroundMinResultTokens, keepRecentToolResults, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, rubricMaxStagnantRepairs, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, sandboxMode, dockerConnection, dockerContext, dockerUseCustomImage, dockerImage, dockerCpuLimit, dockerMemoryLimitMb, dockerPidsLimit, dockerNetworkEnabled, dockerDependencySetupEnabled, subagentItems, showToast]);
 
   const handleDatabaseModeChange = useCallback((mode: "bundled" | "external") => {
     setDatabaseMode(mode);
@@ -1540,6 +1563,7 @@ export default function SettingsPage() {
             <div className="flex-1 min-h-0 overflow-y-auto p-3">
               <Link
                 href="/"
+                onClick={handleReturnToApp}
                 className="flex items-center gap-2.5 px-3 py-2.5 mb-3 text-[13px] font-medium text-gray-700 bg-white/55 hover:bg-white/80 rounded-xl transition-all group"
               >
                 <ArrowLeft className="w-4 h-4 text-gray-500 group-hover:text-gray-700 transition-colors" />
@@ -1751,13 +1775,9 @@ export default function SettingsPage() {
                       管理请求经过哪里、使用哪个模型，以及每一层的访问凭证。
                     </p>
                   </div>
-                  <div className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[10px] font-medium ${
-                    capabilities?.ai_gateway.available
-                      ? "bg-emerald-50 text-emerald-700"
-                      : "bg-amber-50 text-amber-700"
-                  }`}>
+                  <div className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-2.5 py-1 text-[10px] font-medium text-emerald-700">
                     <span className="h-1.5 w-1.5 rounded-full bg-current" />
-                    {capabilities?.ai_gateway.available ? "Gateway 模式" : "Provider 直连"}
+                    内部网关
                   </div>
                 </div>
 
@@ -1765,10 +1785,10 @@ export default function SettingsPage() {
                   <RouteNode title="PuddingClaw" detail="ModelClient · 统一入口" status="运行中" tone="green" />
                   <Route className="mx-auto h-4 w-4 text-gray-300" />
                   <RouteNode
-                    title="Higress Gateway"
-                    detail={capabilities?.ai_gateway.available ? (gatewayBaseUrl || "http://higress:8080/v1") : "未探测到，失败时回退 Provider 直连"}
-                    status={capabilities?.ai_gateway.available ? "已接入" : "未接入"}
-                    tone={capabilities?.ai_gateway.available ? "green" : "amber"}
+                    title="内部网关"
+                    detail="Provider Registry · 统一模型路由"
+                    status="已启用"
+                    tone="green"
                   />
                   <Route className="mx-auto h-4 w-4 text-gray-300" />
                   <RouteNode title={gatewayModel} detail="网关模型" status="主模型" tone="blue" />
@@ -1782,7 +1802,7 @@ export default function SettingsPage() {
                       </div>
                       <div>
                         <h2 className="text-[14px] font-semibold text-gray-800">AI Gateway</h2>
-                        <p className="mt-0.5 text-[11px] text-gray-500">Higress · OpenAI-compatible endpoint</p>
+                        <p className="mt-0.5 text-[11px] text-gray-500">内部网关 · Provider Registry</p>
                         {gatewayEnvironmentOverride && (
                           <p className="mt-1 text-[10px] font-medium text-amber-600">当前值由环境变量覆盖，页面保存不会改变运行时覆盖值</p>
                         )}
@@ -1813,7 +1833,7 @@ export default function SettingsPage() {
                     </FormField>
                     <div className="flex items-center justify-between gap-4 rounded-xl border border-black/[0.06] bg-white/55 px-3 py-2.5">
                       <p className="text-[10px] leading-relaxed text-gray-500">
-                        Higress 只负责代理、Token 统计与模型切换；模型访问始终使用对应 Provider Key。
+                        内部网关负责统一路由、Token 统计与模型切换；模型访问始终使用对应 Provider Key。
                       </p>
                       <button onClick={handleTestGateway} disabled={gatewayTesting} className="flex shrink-0 items-center gap-1.5 rounded-lg bg-[#002fa7]/10 px-3 py-2 text-[11px] font-medium text-[#002fa7] transition-colors hover:bg-[#002fa7]/15 disabled:opacity-50">
                         {gatewayTesting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Zap className="h-3.5 w-3.5" />}
@@ -2060,7 +2080,7 @@ export default function SettingsPage() {
               <SettingsCard title="Fallback 直连配置" icon={Bot} color="#6b7280">
                 <div className="rounded-xl border border-amber-100/80 bg-amber-50/50 px-3.5 py-3 mb-4">
                   <p className="text-[11px] leading-relaxed text-amber-700">
-                    <strong>说明：</strong>Higress 可用时，LLM / Embedding 请求会优先经过网关路由；以下配置仅在网关探测失败或 fallback 时生效。
+                    <strong>说明：</strong>LLM / Embedding 请求统一经过内部网关路由；以下配置仅作为旧配置兼容保留。
                   </p>
                 </div>
 
@@ -3112,20 +3132,35 @@ export default function SettingsPage() {
                     <SettingsCard title="终端与沙箱" icon={Box} color="#002fa7">
                       <div className="space-y-4">
                         <div className="rounded-xl border border-black/[0.06] bg-white/55 px-3.5 py-3">
-                          <div className="flex items-center justify-between gap-4">
-                            <div>
-                              <p className="text-[13px] font-semibold text-gray-900">Docker 项目沙箱</p>
-                              <p className="mt-1 text-[11px] leading-relaxed text-gray-500">
-                                每个项目复用一个容器，项目目录挂载到 /workspace。Docker 只提供隔离，命令仍经过权限管线。
-                              </p>
+                          <div>
+                            <p className="text-[13px] font-semibold text-gray-900">Shell 沙箱模式</p>
+                            <p className="mt-1 text-[11px] leading-relaxed text-gray-500">
+                              Grant Profile 与权限卡保持一致；这里只决定由哪个隔离执行层承载命令。
+                            </p>
+                            <div className="mt-3 grid gap-2 lg:grid-cols-3">
+                              {([
+                                ["auto", "自动选择（推荐）", "普通命令使用轻量内核沙箱，需要 Docker 能力时按需升级。"],
+                                [
+                                  "kernel",
+                                  "仅内核沙箱",
+                                  "完全不启动 Docker；shell 联网、包安装及浏览器命令会被拒绝，fetch_url 等受控网络工具不受影响。",
+                                ],
+                                ["docker", "强制 Docker", "所有 shell 命令使用项目容器，隔离更重但运行环境最稳定。"],
+                              ] as const).map(([value, label, description]) => (
+                                <button
+                                  key={value}
+                                  type="button"
+                                  onClick={() => setSandboxMode(value)}
+                                  className={`rounded-xl border px-3 py-3 text-left transition ${sandboxMode === value ? "border-[#002fa7] bg-blue-50/70 ring-1 ring-[#002fa7]/20" : "border-black/[0.07] bg-white hover:bg-slate-50"}`}
+                                >
+                                  <span className="block text-[12px] font-semibold text-slate-900">{label}</span>
+                                  <span className="mt-1 block text-[10px] leading-4 text-slate-500">{description}</span>
+                                </button>
+                              ))}
                             </div>
-                            <SwitchButton
-                              checked={dockerEnabled}
-                              onChange={setDockerEnabled}
-                              ariaLabel="启用 Docker 项目沙箱"
-                            />
                           </div>
 
+                          <fieldset disabled={sandboxMode === "kernel"} className={sandboxMode === "kernel" ? "hidden" : ""}>
                           <div className="mt-4 grid gap-3 sm:grid-cols-2">
                             <FormField label="Docker connection / DOCKER_HOST">
                               <input value={dockerConnection} onChange={(event) => setDockerConnection(event.target.value)} className="form-input" placeholder="留空使用本机默认" />
@@ -3138,12 +3173,6 @@ export default function SettingsPage() {
                                 <p className="text-[12px] font-semibold text-slate-800">PuddingClaw 托管镜像</p>
                                 <p className="mt-0.5 text-[10px] text-slate-500">Python 3.12 + Node.js 22</p>
                               </div>
-                            </FormField>
-                            <FormField label="Docker 不可用时">
-                              <select value={dockerOnUnavailable} onChange={(event) => setDockerOnUnavailable(event.target.value === "deny" ? "deny" : "fallback")} className="form-select">
-                                <option value="fallback">降级到受控 Host Terminal</option>
-                                <option value="deny">拒绝命令执行</option>
-                              </select>
                             </FormField>
                             <FormField label="CPU 核数">
                               <select value={dockerCpuLimit} onChange={(event) => setDockerCpuLimit(event.target.value)} className="form-select">
@@ -3235,9 +3264,15 @@ export default function SettingsPage() {
                               </span>
                             )}
                           </div>
+                          </fieldset>
+                          {sandboxMode === "kernel" ? (
+                            <p className="mt-3 rounded-xl bg-sky-50 px-3 py-2 text-[11px] leading-5 text-sky-800">
+                              当前模式不会探测、创建或启动 Docker。命令由内核沙箱直接约束 workspace、scratch 和已授权目录。
+                            </p>
+                          ) : null}
                         </div>
                         <p className="rounded-xl bg-amber-50 px-3 py-2 text-[11px] leading-5 text-amber-800">
-                          未启用或不可用时，Restricted Host 只是 best-effort 降级，不会在 UI/Trace 中宣称为真沙箱。sudo、Docker 控制和宿主 workspace 外路径始终硬拒绝。
+                          自动模式优先使用内核沙箱，普通 Run 不触发 Docker CLI。内核与 Docker 都不可用时会 fail-closed，不再降级到无内核边界的 Host Terminal。
                         </p>
                       </div>
                     </SettingsCard>

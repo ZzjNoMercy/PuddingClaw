@@ -137,6 +137,7 @@ export default function ChatInput() {
     getInputDraft,
     setInputDraft,
     runtimeMode,
+    runtimeReady,
     setRuntimeMode,
     currentProjectId,
     setCurrentProjectId,
@@ -231,10 +232,14 @@ export default function ChatInput() {
   // system prompt + messages + tool outputs (or the recorded runtime peak).
   const refreshContextUsage = useCallback(() => {
     if (!sessionId) return;
+    // The placeholder Session gets its runtime mode from localStorage after
+    // hydration.  Waiting for that restore prevents a one-frame request with
+    // the default Chat mode before an Agent workbench is known to be Agent.
+    if (sessionId === "default" && !runtimeReady) return;
     const requestedSessionId = sessionId;
     const requestId = contextUsageRequestRef.current + 1;
     contextUsageRequestRef.current = requestId;
-    getSessionTokenCount(requestedSessionId)
+    getSessionTokenCount(requestedSessionId, runtimeMode)
       .then((data) => {
         // Initial page restoration briefly mounts with the default session.
         // Its slower response must never overwrite the token meter after the
@@ -256,7 +261,7 @@ export default function ChatInput() {
         });
       })
       .catch(() => {});
-  }, [sessionId, setContextUsage]);
+  }, [runtimeMode, runtimeReady, sessionId, setContextUsage]);
 
   useEffect(() => {
     refreshContextUsage();

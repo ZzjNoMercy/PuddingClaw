@@ -26,7 +26,8 @@ from langgraph.config import get_stream_writer
 from langgraph.types import Command
 from typing_extensions import TypedDict
 
-from graph.permission_policy import PermissionBindingPolicy, RunPermissionContext
+from graph.effective_grants import EffectiveGrantSet
+from graph.permission_policy import RunPermissionContext
 from graph.session_manager import session_manager
 from graph.trace_collector import get_current_trace_collector
 from harness.models import (
@@ -1344,40 +1345,24 @@ class ToolsetMiddleware(AgentMiddleware):
                         "reason": "arguments_require_realtime_tool_gate_evaluation",
                     }
                 )
-        grants = session_manager.list_permission_grants(session_id) if session_id else []
         current_bindings = RunPermissionContext.from_config_snapshot(
             config_snapshot if isinstance(config_snapshot, dict) else {}
         ).grant_bindings()
-        for grant in grants:
-            scope = str(grant.get("scope") or "session")
-            metadata = grant.get("metadata")
-            grant_run_id = str(metadata.get("run_id") or "") if isinstance(metadata, dict) else ""
-            if scope in {"once", "run"} and grant_run_id != run_id:
-                continue
-            bindings = grant.get("bindings")
-            if not isinstance(bindings, dict):
-                # Legacy grants without a policy/workspace binding are audit
-                # history, not current authority. The runtime Gate likewise
-                # refuses to reuse them across a Run boundary.
-                continue
-            if not PermissionBindingPolicy.equivalent(
-                grant_type=str(grant.get("type") or ""),
-                scope=scope,
-                target_kind=str(grant.get("target_kind") or ""),
-                target=str(grant.get("target") or ""),
-                left=bindings,
-                right=current_bindings,
-            ):
-                continue
-            allowed.append(
-                {
-                    "grant_type": str(grant.get("type") or ""),
-                    "scope": str(grant.get("scope") or ""),
-                    "target_kind": str(grant.get("target_kind") or ""),
-                    "target": str(grant.get("target") or ""),
-                    "capabilities": sorted(str(item) for item in grant.get("capabilities") or []),
-                }
-            )
+        grants, grants_revision = (
+            session_manager.permission_grants_snapshot(session_id)
+            if session_id
+            else ([], 0)
+        )
+        effective_grants = EffectiveGrantSet.resolve(
+            grants,
+            run_id=run_id,
+            current_bindings=current_bindings,
+            current_shell_bindings=RunPermissionContext.from_config_snapshot(
+                config_snapshot if isinstance(config_snapshot, dict) else {}
+            ).shell_grant_bindings(),
+            permission_revision=grants_revision,
+        )
+        allowed.extend(effective_grants.manifest_entries())
         allowed = sorted(
             allowed,
             key=lambda item: json.dumps(

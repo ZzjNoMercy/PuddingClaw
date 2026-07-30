@@ -365,6 +365,7 @@ interface AppState {
   setSessionId: (id: string) => void;
   sessions: SessionMeta[];
   sessionsLoaded: boolean;
+  projectsLoaded: boolean;
   loadSessions: () => void;
   createSession: () => Promise<string | null>;
   triggerSkillCreator: () => void;
@@ -948,7 +949,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   // ── UI state (reflects current session) ──
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [sessionHistoryLoading, setSessionHistoryLoading] = useState(false);
+  // Starts true: on a fresh provider mount the restore effect below still has
+  // to decide which session to show (saved id or latest). Until that decision
+  // resolves, ChatPanel must show the loading state instead of flashing the
+  // empty "default" workbench (which carries the localStorage-restored project
+  // chip) before jumping to the target session's history.
+  const [sessionHistoryLoading, setSessionHistoryLoading] = useState(true);
   const [todos, setTodos] = useState<TodoItem[]>([]);
   const [trace, setTrace] = useState<AgentTrace | null>(null);
   const [traceHistory, setTraceHistory] = useState<Record<string, AgentTrace>>({});
@@ -1012,6 +1018,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [goalRuns, setGoalRuns] = useState<HarnessRun[]>([]);
   const [verificationReport, setVerificationReport] = useState<RubricEvaluationReport | null>(null);
   const [projects, setProjects] = useState<ProjectMeta[]>([]);
+  const [projectsLoaded, setProjectsLoaded] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [inspectorFile, setInspectorFileRaw] = useState<string | null>(null);
   const [inspectorOpen, setInspectorOpen] = useState(false);
@@ -1600,7 +1607,46 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   // ── Session management ─────────────────────────────
 
+  // Tracks whether the initial session-restore decision has been made. The
+  // decision runs inside loadSessions (same commit as the list) — see below.
+  const restoredSessionRef = useRef(false);
+
   const loadSessions = useCallback(() => {
+    // Initial restore decision (runs once per provider mount). It must be
+    // issued in the same React batch as `setSessions`/`setSessionsLoaded` so
+    // the list, the selected session and the loaded flag commit in a single
+    // frame. Done via an effect instead, the "sessionsLoaded but sessionId
+    // still 'default'" window paints an intermediate frame (empty default
+    // workbench, sidebar project row flashing selected).
+    const finishInitialRestore = (list: SessionMeta[]) => {
+      if (restoredSessionRef.current) return;
+      restoredSessionRef.current = true;
+      let target: string | null = null;
+      try {
+        const saved = sessionStorage.getItem("puddingclaw_session_id");
+        if (saved && saved !== "default" && list.some((s) => s.id === saved)) {
+          target = saved;
+        }
+      } catch {
+        // ignore storage errors
+      }
+      if (!target) {
+        const latest = [...list].sort((a, b) => b.updated_at - a.updated_at)[0];
+        if (latest && latest.id !== sessionIdRef.current) target = latest.id;
+      }
+      if (target) {
+        // setSessionId is declared below; the closure captures the binding,
+        // which is initialized by the time loadSessions is ever invoked, and
+        // its logic reads only refs/stable setters, so the first-render
+        // closure is safe to call.
+        setSessionId(target);
+      } else if (sessionIdRef.current === "default") {
+        // Staying on the "default" workbench — end the initial loading gate
+        // (sessionHistoryLoading starts true). If another setSessionId call
+        // is already in flight it owns the loading state instead.
+        setSessionHistoryLoading(false);
+      }
+    };
     apiListSessions()
       .then((list) => {
         sessionsRef.current = list;
@@ -1620,15 +1666,21 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           }
         }
         setSessions(list);
+        finishInitialRestore(list);
+        setSessionsLoaded(true);
       })
-      .catch(() => {})
-      .finally(() => setSessionsLoaded(true));
+      .catch(() => {
+        finishInitialRestore(sessionsRef.current);
+        setSessionsLoaded(true);
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- setSessionId is declared below and stable in practice (refs + stable setters only)
   }, []);
 
   const loadProjects = useCallback(() => {
     apiListProjects()
       .then((list) => setProjects(list))
-      .catch(() => setProjects([]));
+      .catch(() => setProjects([]))
+      .finally(() => setProjectsLoaded(true));
   }, []);
 
   const registerProject = useCallback(async (path: string) => {
@@ -1919,35 +1971,21 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       .catch(() => {});
   }, [workspaceView, sessionId, updateSessionTodos]);
 
-  // On mount/refresh, restore the last viewed session from storage.
-  const restoredSessionRef = useRef(false);
+  // The initial restore decision is made synchronously inside loadSessions so
+  // it commits in the same frame as the sessions list. This effect only
+  // handles later sessions-list changes: if the current session vanished
+  // (e.g. deleted elsewhere), fall back to the latest — but never auto-switch
+  // away from the placeholder "default" session, since the user may have
+  // clicked "New Chat" and expects to start a fresh conversation.
   useEffect(() => {
-    if (sessions.length === 0) return;
-
-    const isInitialRestore = !restoredSessionRef.current;
-    if (isInitialRestore) {
-      restoredSessionRef.current = true;
-      try {
-        const saved = sessionStorage.getItem("puddingclaw_session_id");
-        if (saved && saved !== "default" && sessions.some((s) => s.id === saved)) {
-          setSessionId(saved);
-          return;
-        }
-      } catch {
-        // ignore storage errors
-      }
-    }
-
-    // Fallback: don't auto-switch away from the placeholder "default" session;
-    // the user may have clicked "New Chat" and expects to start a fresh conversation.
-    if (!isInitialRestore && sessionIdRef.current === "default") return;
-    // If the current session already exists in the loaded list, keep it.
+    if (!sessionsLoaded || !restoredSessionRef.current) return;
+    if (sessionIdRef.current === "default") return;
     if (sessions.some((s) => s.id === sessionIdRef.current)) return;
     const latest = [...sessions].sort((a, b) => b.updated_at - a.updated_at)[0];
     if (latest && latest.id !== sessionIdRef.current) {
       setSessionId(latest.id);
     }
-  }, [sessions, setSessionId]);
+  }, [sessions, sessionsLoaded, setSessionId]);
 
   const createSession = useCallback(async (): Promise<string | null> => {
     const originSessionId = sessionIdRef.current;
@@ -4131,6 +4169,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setSessionId,
         sessions,
         sessionsLoaded,
+        projectsLoaded,
         loadSessions,
         createSession,
         triggerSkillCreator,

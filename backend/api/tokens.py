@@ -1,7 +1,7 @@
 """GET/POST /api/tokens — Token counting for sessions and files."""
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import tiktoken
 from fastapi import APIRouter, HTTPException
@@ -46,7 +46,10 @@ def _count_tokens(text: str) -> int:
 
 
 @router.get("/tokens/session/{session_id}")
-async def get_session_token_count(session_id: str) -> dict[str, Any]:
+async def get_session_token_count(
+    session_id: str,
+    runtime_mode: Literal["chat", "agent"] | None = None,
+) -> dict[str, Any]:
     """Count tokens in a session: system prompt + all messages.
 
     若存在 context_usage_peak 且大于静态统计，则优先使用峰值，
@@ -68,7 +71,19 @@ async def get_session_token_count(session_id: str) -> dict[str, Any]:
     message_tokens += tool_output_tokens
 
     metadata = session_manager.get_metadata(session_id)
-    is_agent = metadata.get("runtime_mode") == "agent"
+    # The new-conversation workbench uses the non-persisted ``default``
+    # placeholder until the first message creates its real Session.  There is
+    # therefore no authoritative runtime_mode to read yet.  Let the caller
+    # describe that placeholder, while always trusting persisted Session
+    # metadata once it exists.  Without this distinction an Agent workbench
+    # briefly reports the legacy Chat compaction limit (500K), then jumps to
+    # the DeepAgents summarization limit after the first query.
+    effective_runtime_mode = (
+        metadata.get("runtime_mode")
+        if session_manager.session_exists(session_id)
+        else runtime_mode or metadata.get("runtime_mode")
+    )
+    is_agent = effective_runtime_mode == "agent"
     if is_agent:
         # Agent keeps the complete transcript for the UI, but DeepAgents may
         # send a much smaller summarized context to the model. Never replace

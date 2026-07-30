@@ -146,9 +146,9 @@ def build_patch_tools(backend: Any) -> list[StructuredTool]:
 
     def patch_file(
         file_path: str,
-        expected_sha256: str,
         replacements: list[ReplacementHunk],
         runtime: ToolRuntime[Any, Any],
+        expected_sha256: str | None = None,
     ) -> ToolMessage:
         original, error = read_all(backend, file_path)
         if error is not None or original is None:
@@ -159,7 +159,7 @@ def build_patch_tools(backend: Any) -> list[StructuredTool]:
                 status="error",
             )
         current_version = digest(original)
-        rebased = expected_sha256 != current_version
+        rebased = expected_sha256 is not None and expected_sha256 != current_version
         updated, applied, failures = render_replacements(original, replacements)
         if updated is None:
             return ToolMessage(
@@ -367,9 +367,9 @@ def build_patch_tools(backend: Any) -> list[StructuredTool]:
         StructuredTool.from_function(
             name="patch_file",
             description=(
-                "Apply one atomic, optimistic patch against expected_sha256. "
-                "If the source changed, mechanically rebase once only when every hunk "
-                "still matches uniquely and without overlap."
+                "Apply one atomic unique-anchor patch. expected_sha256 is optional; "
+                "when supplied, a changed source is mechanically rebased once only if "
+                "every hunk still matches uniquely and without overlap."
             ),
             func=patch_file,
             args_schema=PatchFileInput,

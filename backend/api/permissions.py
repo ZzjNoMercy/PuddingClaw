@@ -8,7 +8,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from graph.permission_policy import RunPermissionContext
+from graph.permission_policy import RunPermissionContext, ShellDirectoryGrantSpec
 from graph.permission_resume import permission_resume_registry
 from graph.session_manager import session_manager
 
@@ -30,6 +30,11 @@ class PermissionDenyRequest(BaseModel):
 class ToolActionGrantRequest(BaseModel):
     permission_request_id: str
     scope: str = Field(pattern="^(once|session)$")
+
+
+class ShellDirectoryGrantRequest(BaseModel):
+    permission_request_id: str
+    scope: Literal["run", "session"] = "run"
 
 
 class ApprovalModeUpdateRequest(BaseModel):
@@ -288,6 +293,92 @@ async def deny_permission_request(
     return {
         "session_id": session_id,
         "permission_request_id": req.permission_request_id,
+        "resumed": True,
+    }
+
+
+@router.post("/sessions/{session_id}/permissions/shell-directories")
+async def grant_shell_directory_permission(
+    session_id: str,
+    req: ShellDirectoryGrantRequest,
+) -> dict[str, Any]:
+    """Atomically grant the exact directory set requested by one shell command."""
+
+    pending = permission_resume_registry.get(req.permission_request_id)
+    if pending is None:
+        raise HTTPException(status_code=404, detail="permission request not found")
+    if pending.get("session_id") != session_id:
+        raise HTTPException(
+            status_code=400,
+            detail="permission request belongs to another session",
+        )
+    if pending.get("status") != "pending":
+        raise HTTPException(
+            status_code=409,
+            detail="permission request is no longer pending",
+        )
+    if (
+        pending.get("type") != "shell_directory_access"
+        or pending.get("authority_plane") != "shell"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="permission request is not a shell directory action",
+        )
+    raw_specs = pending.get("grant_specs")
+    bindings = pending.get("grant_bindings")
+    run_id = str(pending.get("run_id") or "")
+    if not isinstance(raw_specs, list) or not isinstance(bindings, dict) or not run_id:
+        raise HTTPException(status_code=409, detail="shell permission request is incomplete")
+    try:
+        specs = [
+            ShellDirectoryGrantSpec(
+                target=str(item["target"]),
+                access=str(item["access"]),
+                delete=bool(item.get("delete", False)),
+            )
+            for item in raw_specs
+            if isinstance(item, dict)
+        ]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail="shell permission request is invalid") from exc
+    if len(specs) != len(raw_specs):
+        raise HTTPException(status_code=409, detail="shell permission request is invalid")
+    active_before, _revision = session_manager.permission_grants_snapshot(session_id)
+    existing_ids = {str(grant.get("id") or "") for grant in active_before}
+    try:
+        grants = session_manager.add_shell_directory_grants_atomic(
+            session_id,
+            grant_specs=specs,
+            scope=req.scope,
+            run_id=run_id,
+            bindings=dict(bindings),
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Session not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    resumed = permission_resume_registry.resolve(
+        req.permission_request_id,
+        {"type": "approve", "grant_ids": [grant["id"] for grant in grants]},
+    )
+    if not resumed:
+        for grant in grants:
+            grant_id = str(grant.get("id") or "")
+            if grant_id and grant_id not in existing_ids:
+                session_manager.revoke_permission_grant(session_id, grant_id)
+        raise HTTPException(
+            status_code=409,
+            detail="permission request was resolved concurrently",
+        )
+    primary = next(
+        (grant for grant in grants if grant.get("type") == "external_directory_write"),
+        grants[0],
+    )
+    return {
+        "session_id": session_id,
+        "grant": primary,
+        "grants": grants,
         "resumed": True,
     }
 

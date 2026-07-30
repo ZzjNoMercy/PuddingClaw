@@ -574,6 +574,52 @@ def _result_evidence_refs(
                     **analytics_lineage,
                 }
             )
+        if tool_name in {"execute", "terminal"}:
+            message_artifact = getattr(message, "artifact", None)
+            mutations = (
+                message_artifact.get("puddingclaw_shell_mutations")
+                if isinstance(message_artifact, dict)
+                else None
+            )
+            command = str(args.get("command") or args.get("cmd") or "")
+            expected_command_digest = "sha256:" + hashlib.sha256(command.encode("utf-8")).hexdigest()
+            for mutation in mutations if isinstance(mutations, list) else []:
+                if (
+                    not isinstance(mutation, dict)
+                    or mutation.get("kind") != "shell_mutation_observed"
+                    or str(mutation.get("tool_call_id") or "") != tool_call_id
+                    or str(mutation.get("command_digest") or "") != expected_command_digest
+                ):
+                    continue
+                target_path = str(mutation.get("target_path") or "")
+                access = str(mutation.get("access") or "")
+                before = mutation.get("before") if isinstance(mutation.get("before"), dict) else {}
+                after = mutation.get("after") if isinstance(mutation.get("after"), dict) else {}
+                target = Path(target_path)
+                postcondition_valid = False
+                if access == "delete":
+                    postcondition_valid = bool(before.get("exists")) and not target.exists() and not after.get("exists")
+                elif after.get("kind") == "directory":
+                    postcondition_valid = target.is_dir()
+                elif after.get("kind") == "file" and after.get("content_sha256"):
+                    identity = _file_identity(target)
+                    postcondition_valid = identity is not None and identity[0] == after.get("content_sha256")
+                if not postcondition_valid:
+                    continue
+                refs.append(dict(mutation))
+                if access != "write" or after.get("kind") != "file":
+                    continue
+                artifact = _artifact_reference_for_write(
+                    raw_path=target_path,
+                    tool_call_id=tool_call_id,
+                    output_digest=f"sha256:{digest}",
+                    session_id=session_id,
+                    run_id=run_id,
+                    query_id=query_id,
+                    workspace_path=workspace_path,
+                )
+                if artifact.authorized and artifact.content_sha256 == after.get("content_sha256"):
+                    refs.append({"kind": "artifact_write", **artifact.model_dump(mode="json")})
         if tool_name == "publish_attachment":
             message_artifact = getattr(message, "artifact", None)
             resolved = resolve_published_attachment(
@@ -1434,6 +1480,18 @@ def build_verification_activations(
     # bytes written by HostFileBroker.
     if has_external_mutation_receipt and "artifact" not in packs:
         packs.append("artifact")
+    written_refs = [
+        ref
+        for ref in result_refs
+        if isinstance(ref, dict) and ref.get("kind") == "artifact_write" and ref.get("path")
+    ]
+    if written_refs and "artifact" not in packs:
+        packs.append("artifact")
+    if (
+        any(Path(str(ref.get("path") or "")).suffix.lower() in _CODE_EXTENSIONS for ref in written_refs)
+        and "code" not in packs
+    ):
+        packs.append("code")
     if tool_name == "commit_external_directory" and succeeded:
         written = [ref for ref in result_refs if ref.get("kind") == "artifact_write" and ref.get("path")]
         packs = ["artifact"] if written else []
@@ -1458,7 +1516,7 @@ def build_verification_activations(
         elif pack == "web_research":
             material = any(item.get("kind") == "source" for item in result_refs)
         elif pack == "artifact":
-            material = tool_name in _WRITE_TOOLS and any(item.get("kind") == "artifact_write" for item in result_refs)
+            material = any(item.get("kind") == "artifact_write" for item in result_refs)
         elif pack == "code":
             if tool_name in _WRITE_TOOLS:
                 material = any(

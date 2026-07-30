@@ -185,6 +185,7 @@ export interface HarnessSettings {
     max_rounds?: number;
   };
   terminal?: {
+    sandbox_mode?: "auto" | "kernel" | "docker";
     docker_enabled?: boolean;
     on_unavailable?: "fallback" | "deny";
     default_timeout_seconds?: number;
@@ -501,7 +502,7 @@ export interface CapabilityStatus {
 
 export interface Capabilities {
   database: CapabilityStatus;
-  ai_gateway: CapabilityStatus;
+  docker: CapabilityStatus;
   milvus: CapabilityStatus;
   mineru: CapabilityStatus;
 }

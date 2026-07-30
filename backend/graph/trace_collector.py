@@ -15,6 +15,8 @@ import uuid
 from contextvars import ContextVar
 from typing import Any
 
+from utils.json_serialization import to_json_compatible
+
 _current_trace_collector: ContextVar[TraceCollector | None] = ContextVar(
     "current_trace_collector",
     default=None,
@@ -67,16 +69,7 @@ class TraceSpan:
 
     @staticmethod
     def _serialize(value: Any) -> Any:
-        if value is None:
-            return None
-        if isinstance(value, (str, int, float, bool)):
-            return value
-        if isinstance(value, (list, dict, tuple)):
-            return value
-        try:
-            return str(value)
-        except Exception:
-            return None
+        return to_json_compatible(value)
 
 
 TraceEventCallback = Any  # Callable[[str, dict[str, Any]], None]
@@ -775,23 +768,28 @@ class TraceCollector:
 
     @staticmethod
     def _tool_schema_contract(tool: Any) -> dict[str, Any]:
-        serialized = TraceSpan._serialize(tool)
-        if isinstance(serialized, dict):
-            function = serialized.get("function") if isinstance(serialized.get("function"), dict) else {}
-            name = serialized.get("name") or function.get("name") or getattr(tool, "name", None)
+        if isinstance(tool, dict):
+            function = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+            name = tool.get("name") or function.get("name")
             description = (
-                serialized.get("description") or function.get("description") or getattr(tool, "description", None)
+                tool.get("description") or function.get("description")
             )
             schema = (
-                serialized.get("parameters")
+                tool.get("parameters")
                 or function.get("parameters")
-                or serialized.get("args_schema")
-                or serialized.get("schema")
+                or tool.get("args_schema")
+                or tool.get("schema")
             )
         else:
             name = getattr(tool, "name", None) or getattr(tool, "__name__", None) or type(tool).__name__
             description = getattr(tool, "description", None) or getattr(tool, "__doc__", None)
             schema = getattr(tool, "args_schema", None)
+            model_json_schema = getattr(schema, "model_json_schema", None)
+            if callable(model_json_schema):
+                try:
+                    schema = model_json_schema()
+                except Exception:
+                    schema = getattr(tool, "args", {}) or {}
         schema_value = TraceSpan._serialize(schema)
         return {
             "name": str(name or "tool"),

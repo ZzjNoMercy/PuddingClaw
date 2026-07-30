@@ -23,6 +23,21 @@ def _runtime(call_id: str = "call-1", **context):
     return SimpleNamespace(tool_call_id=call_id, context=context)
 
 
+def test_compact_model_surface_hides_broker_orchestration_tools(tmp_path) -> None:
+    middleware = VersionedPatchMiddleware(
+        FilesystemBackend(root_dir=tmp_path, virtual_mode=True),
+        compact_model_surface=True,
+    )
+
+    assert [tool.name for tool in middleware.tools] == [
+        "patch_file",
+        "materialize_source_ref",
+        "delete_file",
+        "validate_html_report",
+        "validate_artifact_contract",
+    ]
+
+
 def test_committed_external_artifact_supersedes_older_staged_lease(tmp_path) -> None:
     manager = SessionManager()
     state = tmp_path / "state"
@@ -116,6 +131,28 @@ def test_versioned_patch_rebases_once_and_reports_structured_conflicts(tmp_path)
     )
     assert applied.status == "success"
     assert path.read_text(encoding="utf-8") == "E\nD\n"
+
+
+def test_patch_file_without_base_sha_uses_current_unique_anchor(tmp_path) -> None:
+    path = tmp_path / "report.txt"
+    path.write_text("before\n", encoding="utf-8")
+    middleware = VersionedPatchMiddleware(
+        FilesystemBackend(root_dir=tmp_path, virtual_mode=True)
+    )
+    patch_tool = next(tool for tool in middleware.tools if tool.name == "patch_file")
+
+    result = patch_tool.func(
+        file_path="/report.txt",
+        replacements=[ReplacementHunk(old_string="before", new_string="after")],
+        runtime=_runtime("call-no-base-sha"),
+    )
+
+    assert result.status == "success"
+    payload = json.loads(result.content)
+    assert payload["previous_sha256"] == _digest("before\n")
+    assert payload["rebased"] is False
+    assert payload["rebased_from_sha256"] is None
+    assert path.read_text(encoding="utf-8") == "after\n"
 
 
 def test_replace_file_tool_replaces_workspace_file_without_broker_permission(tmp_path):

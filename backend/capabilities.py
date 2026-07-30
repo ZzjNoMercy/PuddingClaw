@@ -1,7 +1,7 @@
 """可选基础设施能力探测。
 
-在 core/full 混合部署下，backend 启动时异步检测 PostgreSQL、Milvus、MinerU 是否可用。
-``ai_gateway`` 仅保留为兼容状态字段，恒为 retired；业务请求不再依赖它。
+在 core/full 混合部署下，backend 启动时异步检测 PostgreSQL、Docker、Milvus、MinerU 是否可用。
+模型请求由内部网关统一路由，不属于外部基础设施健康探测。
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import httpx
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from config import get_database_config, get_knowledge_mineru_config
+from config import get_database_config, get_knowledge_mineru_config, load_config
 
 logger = logging.getLogger(__name__)
 
@@ -44,14 +44,14 @@ class CapabilityStatus:
 @dataclass
 class Capabilities:
     database: CapabilityStatus
-    ai_gateway: CapabilityStatus
+    docker: CapabilityStatus
     milvus: CapabilityStatus
     mineru: CapabilityStatus
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "database": self.database.to_dict(),
-            "ai_gateway": self.ai_gateway.to_dict(),
+            "docker": self.docker.to_dict(),
             "milvus": self.milvus.to_dict(),
             "mineru": self.mineru.to_dict(),
         }
@@ -96,6 +96,30 @@ async def _check_milvus(url: str | None) -> CapabilityStatus:
         return CapabilityStatus(available=True)
     except Exception as exc:  # noqa: BLE001
         return CapabilityStatus(available=False, reason=f"{type(exc).__name__}: {exc}")
+
+
+def _docker_config() -> dict[str, Any]:
+    config = load_config()
+    docker = config.get("harness", {}).get("terminal", {}).get("docker", {})
+    return dict(docker) if isinstance(docker, dict) else {}
+
+
+def _check_docker_sync() -> CapabilityStatus:
+    """复用沙箱设置页的 Docker daemon 探测，不创建容器。"""
+    try:
+        from harness.workspace_backends import ProjectSandboxManager
+
+        available, detail = ProjectSandboxManager(_docker_config()).probe()
+        return CapabilityStatus(
+            available=available,
+            reason=None if available else (detail or "Docker daemon unavailable"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return CapabilityStatus(available=False, reason=f"{type(exc).__name__}: {exc}")
+
+
+async def _check_docker() -> CapabilityStatus:
+    return await asyncio.to_thread(_check_docker_sync)
 
 
 def _resolve_postgres_url(explicit_url: str | None = None) -> str:
@@ -166,15 +190,16 @@ async def detect_capabilities(
 
     results = await asyncio.gather(
         _check_postgres(postgres_target),
+        _check_docker(),
         _check_milvus(milvus_target),
         _check_http_get(mineru_target, "/health"),
     )
 
     caps = Capabilities(
         database=results[0],
-        ai_gateway=CapabilityStatus(available=False, reason="Retired: use direct Provider endpoints"),
-        milvus=results[1],
-        mineru=results[2],
+        docker=results[1],
+        milvus=results[2],
+        mineru=results[3],
     )
 
     _CAPABILITIES_CACHE = caps
@@ -250,7 +275,7 @@ def _detect_capabilities_sync_fallback(
 
     caps = Capabilities(
         database=_check_postgres_sync(postgres_target),
-        ai_gateway=CapabilityStatus(available=False, reason="Retired: use direct Provider endpoints"),
+        docker=_check_docker_sync(),
         milvus=_check_milvus_sync(milvus_target),
         mineru=_check_http_get_sync(mineru_target, "/health"),
     )

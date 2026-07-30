@@ -57,6 +57,35 @@ def test_session_external_file_permission_grants(tmp_path):
     assert session_manager.has_external_file_read_permission("permission-session", external_file)
 
 
+def test_permission_grant_revision_changes_on_add_and_revoke(tmp_path):
+    from graph.session_manager import session_manager
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("permission-revision-session")
+    target = tmp_path / "outside" / "note.txt"
+    target.parent.mkdir()
+    target.write_text("hello", encoding="utf-8")
+
+    initial_grants, initial_revision = session_manager.permission_grants_snapshot("permission-revision-session")
+    grant = session_manager.add_permission_grant(
+        "permission-revision-session",
+        grant_type="external_file_read",
+        target_kind="exact_file",
+        target=str(target.resolve()),
+        capabilities=["read", "external_path"],
+    )
+    added_grants, added_revision = session_manager.permission_grants_snapshot("permission-revision-session")
+    session_manager.revoke_permission_grant("permission-revision-session", grant["id"])
+    revoked_grants, revoked_revision = session_manager.permission_grants_snapshot("permission-revision-session")
+
+    assert initial_grants == []
+    assert initial_revision == 0
+    assert [item["id"] for item in added_grants] == [grant["id"]]
+    assert added_revision == 1
+    assert revoked_grants == []
+    assert revoked_revision == 2
+
+
 def test_session_external_file_write_grant_is_exact_file_only(tmp_path):
     from graph.session_manager import session_manager
 
@@ -239,15 +268,9 @@ def test_permissioned_backend_never_mutates_managed_resources(tmp_path):
 
     assert virtual_write.error == "Managed resource is read-only: /skills/new.md"
     assert virtual_edit.error == "Managed resource is read-only: /skills/SKILL.md"
-    assert workspace_alias_edit.error == (
-        "Managed resource is read-only: /workspace/backend/skills/SKILL.md"
-    )
-    assert relative_write.error == (
-        "Managed resource is read-only: backend/skills/relative.md"
-    )
-    assert relative_edit.error == (
-        "Managed resource is read-only: backend/skills/SKILL.md"
-    )
+    assert workspace_alias_edit.error == ("Managed resource is read-only: /workspace/backend/skills/SKILL.md")
+    assert relative_write.error == ("Managed resource is read-only: backend/skills/relative.md")
+    assert relative_edit.error == ("Managed resource is read-only: backend/skills/SKILL.md")
     assert absolute_edit.error
     assert not (skills / "new.md").exists()
     assert not (skills / "relative.md").exists()

@@ -4,12 +4,12 @@ import { useEffect, useState, useCallback } from "react";
 import {
   Activity,
   AlertCircle,
+  Box,
   CheckCircle2,
   ChevronDown,
   Database,
   FileText,
   Loader2,
-  Network,
   XCircle,
 } from "lucide-react";
 import { getCapabilities, type Capabilities, type CapabilityStatus } from "@/lib/settingsApi";
@@ -40,15 +40,15 @@ const SERVICE_META: Record<
       { label: "降级策略", value: "不可用时，知识库管理降级，聊天能力保持可用" },
     ],
   },
-  ai_gateway: {
-    label: "AI Gateway (Higress)",
-    description: "统一模型路由、计量与限流",
-    icon: Network,
-    color: "#002fa7",
+  docker: {
+    label: "Docker 本地沙箱",
+    description: "项目级隔离运行、依赖安装与浏览器验证",
+    icon: Box,
+    color: "#2563eb",
     details: [
-      { label: "功能", value: "LLM 请求代理 / Token 计量 / 限流" },
-      { label: "检测地址", value: "http://localhost:8080/health" },
-      { label: "降级策略", value: "不可用时，LLM / Embedding 直连 Provider" },
+      { label: "功能", value: "隔离命令执行 / 项目依赖安装 / 浏览器验证" },
+      { label: "检测对象", value: "本机 Docker daemon（当前配置的 context）" },
+      { label: "降级策略", value: "不可用时，自动模式回退到内核沙箱" },
     ],
   },
   milvus: {
@@ -226,7 +226,7 @@ export default function CapabilitiesStatus({ refreshIntervalMs = 30000, onChange
   const [lastChecked, setLastChecked] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Record<keyof Capabilities, boolean>>({
     database: false,
-    ai_gateway: false,
+    docker: false,
     milvus: false,
     mineru: false,
   });
@@ -310,7 +310,7 @@ export default function CapabilitiesStatus({ refreshIntervalMs = 30000, onChange
         ))}
       </div>
       <p className="text-[11px] text-gray-500 leading-relaxed px-1">
-        PostgreSQL 是知识库功能的核心基础设施；Higress、Milvus、MinerU 可按能力逐步启用。Unavailable 的服务会按各自策略降级。
+        PostgreSQL 是知识库功能的核心基础设施；Docker 用于本地隔离运行，Milvus、MinerU 可按能力逐步启用。模型请求统一通过内部网关路由，不参与外部服务健康检测。
       </p>
     </div>
   );

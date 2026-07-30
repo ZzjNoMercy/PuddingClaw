@@ -460,6 +460,13 @@ export default function KnowledgePage() {
           </div>
           <div className="flex items-center gap-2">
             <Link
+              href="/knowledge/schema"
+              className="inline-flex h-10 items-center gap-2 rounded-full border border-[#002fa7]/10 bg-white px-4 text-sm font-medium text-[#002fa7] shadow-sm transition hover:bg-[#002fa7]/[0.04]"
+            >
+              <Database className="h-4 w-4" />
+              Schema Studio
+            </Link>
+            <Link
               href="/settings?category=knowledge"
               className="inline-flex h-10 items-center gap-2 rounded-full bg-[#002fa7]/10 px-4 text-sm font-medium text-[#002fa7] transition hover:bg-[#002fa7]/15"
             >

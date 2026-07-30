@@ -63,6 +63,35 @@ BUSINESS_TOOLSETS: dict[str, frozenset[str]] = {
         "update_skill",
     }),
     "knowledge_analysis": frozenset({"llamaindex_knowledge_query", "pandas_knowledge_query"}),
+    "llm_wiki": frozenset(
+        {
+            "llm_wiki_context",
+            "llm_wiki_publish",
+            "llm_wiki_lint",
+            "llm_wiki_query",
+            "llm_wiki_compile",
+        }
+    ),
+    "gbrain_query": frozenset(
+        {
+            "gbrain_get_page",
+            "gbrain_list_pages",
+            "gbrain_search",
+            "gbrain_query",
+            "gbrain_get_links",
+            "gbrain_get_backlinks",
+            "gbrain_traverse_graph",
+            "gbrain_get_timeline",
+            "gbrain_get_stats",
+            "gbrain_get_health",
+            "gbrain_resolve_slugs",
+            "gbrain_get_chunks",
+            "gbrain_get_active_schema_pack",
+            "gbrain_schema_stats",
+            "gbrain_schema_graph",
+            "gbrain_schema_explain_type",
+        }
+    ),
     "database_analysis": frozenset({
         "database_schema_inspect",
         "database_sql_generate",
@@ -245,6 +274,27 @@ TOOL_CONTROL_DESCRIPTORS: dict[str, ToolControlDescriptor] = {
     # Read-only business analysis.
     "llamaindex_knowledge_query": _READ_ONLY,
     "pandas_knowledge_query": _READ_ONLY,
+    "llm_wiki_context": _READ_ONLY,
+    "llm_wiki_lint": _READ_ONLY,
+    "llm_wiki_query": _READ_ONLY,
+    "llm_wiki_compile": _INTERNAL_MUTATION,
+    "llm_wiki_publish": _INTERNAL_MUTATION,
+    "gbrain_get_page": _READ_ONLY,
+    "gbrain_list_pages": _READ_ONLY,
+    "gbrain_search": _READ_ONLY,
+    "gbrain_query": _READ_ONLY,
+    "gbrain_get_links": _READ_ONLY,
+    "gbrain_get_backlinks": _READ_ONLY,
+    "gbrain_traverse_graph": _READ_ONLY,
+    "gbrain_get_timeline": _READ_ONLY,
+    "gbrain_get_stats": _READ_ONLY,
+    "gbrain_get_health": _READ_ONLY,
+    "gbrain_resolve_slugs": _READ_ONLY,
+    "gbrain_get_chunks": _READ_ONLY,
+    "gbrain_get_active_schema_pack": _READ_ONLY,
+    "gbrain_schema_stats": _READ_ONLY,
+    "gbrain_schema_graph": _READ_ONLY,
+    "gbrain_schema_explain_type": _READ_ONLY,
     "database_schema_inspect": _READ_ONLY,
     # These tools may be business-read-only, but they create durable
     # generations, validation receipts, and query-result artifacts.  Model

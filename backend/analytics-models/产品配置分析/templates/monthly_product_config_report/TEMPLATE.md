@@ -2,7 +2,7 @@
 formatter: analytics-template
 id: monthly_product_config_report
 name: 月度产品配置分析报告模板
-version: "1.0.0"
+version: "1.1.0"
 semantic_scope:
   enum_filters:
     dimension:energy_type:
@@ -129,6 +129,25 @@ table.competitor_updates
   固定企业与顺序：比亚迪集团、长安集团、奇瑞集团、长城汽车、吉利汽车
   同比：本年累计更新次数减上年同期累计更新次数
   周期：本年截至数据截止日的平均更新周期，不要求与上年同期对齐
+
+chart.sizePowerHeatmapChart
+  固定对象：纯电款型，排除皮卡，轴距和电机总功率均非空
+  固定年份：以 report_year 结尾的连续 6 年，每年一个变体，默认显示 report_year
+  固定坐标：横轴为 11 个电机功率段，纵轴为 10 个轴距段
+  固定度量：完整款型键去重后的款型数，不得改成占比
+
+chart.l2PriceBandChart
+  固定横轴：以 report_year 结尾的连续 6 年
+  固定系列：10-15 万、15-20 万、20-30 万、30 万以上、行业均值
+  固定图形：五条年度折线；不得改成单年度价格带柱图或柱线组合
+
+core_configuration
+  固定配置项：空气悬架、激光雷达、HUD
+  固定统计维度：款型、车系
+  固定热力图维度：价格段、轴距段、级别
+  默认组合：空气悬架 / 款型 / 价格段
+  固定年份：以 report_year 结尾的连续 6 年
+  输出路径：顶层 core_configuration；不得分别生成两个通用 chart spec
 ```
 
 ### S2：查询与计算
@@ -157,7 +176,7 @@ table.competitor_updates
 
 ```json
 {
-  "schema_version": "2.0",
+  "schema_version": "2.1",
   "report": {
     "title": "YYYY年MM月产品配置分析报告",
     "report_date": null,
@@ -170,7 +189,7 @@ table.competitor_updates
     "tables": {},
     "methodology": []
   },
-  "controls": {},
+  "core_configuration": {},
   "charts": {},
   "evidence": {},
   "quality": {
@@ -186,7 +205,7 @@ table.competitor_updates
 约束：
 
 - `report` 负责文本、KPI、章节和表格。
-- `controls` 负责核心配置和热力图切片的下拉选项。
+- 核心配置三个下拉框由 HTML 与渲染器固定，不从 Payload 生成；`core_configuration` 只保存 v3 结构的数据。
 - `charts` 以 DOM id 为键，只保存渲染所需的 `kind`、`categories`、`series`/`variants` 和 `query_ids`。
 - `evidence` 以 `query_id` 为键保存证据与口径。
 - `quality.completed_tasks` 必须等于 `quality.plan_tasks`；否则只能输出草稿。
@@ -304,6 +323,109 @@ charts.<DOM id> = {
 }
 ```
 
+`sizePowerHeatmapChart` 不是通用切片热力图，必须与 `designs/product-configuration-analysis/产品配置分析_2026_v3.html` 保持一致，并使用以下专用契约：
+
+```json
+{
+  "status": "ready",
+  "kind": "heatmap_variants",
+  "scope": {
+    "energy_type": "纯电",
+    "excluded_vehicle_types": ["皮卡"],
+    "required_fields": ["轴距", "电机总功率"],
+    "grain": "款型",
+    "measure": "款型数"
+  },
+  "default_year": "YYYY",
+  "variants": [
+    {
+      "label": "YYYY",
+      "kind": "heatmap",
+      "name": "款型数",
+      "filters": {"year": "YYYY"},
+      "x_categories": ["0-50", "50-100", "100-150", "150-200", "200-250", "250-300", "300-350", "350-400", "400-450", "450-500", "500kW以上"],
+      "y_categories": ["2600以下", "2600-2650", "2650-2700", "2700-2750", "2750-2800", "2800-2850", "2850-2900", "2900-2950", "2950-3000", "3000以上"],
+      "values": [[0, 0, 0]]
+    }
+  ],
+  "query_ids": ["<query_id>"]
+}
+```
+
+专用约束：
+
+- `variants` 恰好为以 `report_year` 结尾的连续 6 年，按年份升序排列；页面年份选择器默认选中最后一年。
+- `default_year` 必须等于 `report_year`，`scope` 必须逐项保持上述固定值，不得改成“全新能源”、车系口径或占比口径。
+- 横轴只能是上述 11 个电机总功率段，单位为 kW；纵轴只能是上述 10 个轴距段，单位为 mm，轴向不得互换。
+- 每个年度变体必须提供完整 `10 × 11 = 110` 个单元格；查询中不存在的组合显式补 0，不得省略坐标。
+- 单元格值只能是非负整数款型数，按完整款型键去重；不得使用车系数、车型数、占比或配置率。
+- 筛选固定为纯电、排除皮卡、轴距非空、电机总功率非空。年份切换只重绘该热力图，不得触发全页刷新或其他图表重绘。
+
+#### L2+ 分价格带配备率年度趋势专用契约
+
+`l2PriceBandChart` 必须复用 v3 的年度趋势结构，横轴是年份，不是价格带。Payload 固定为：
+
+```json
+{
+  "status": "ready",
+  "kind": "line",
+  "categories": ["YYYY-5", "YYYY-4", "YYYY-3", "YYYY-2", "YYYY-1", "YYYY"],
+  "series": [
+    {"name": "10-15 万", "type": "line", "data": [0, 0, 0, 0, 0, 0]},
+    {"name": "15-20 万", "type": "line", "data": [0, 0, 0, 0, 0, 0]},
+    {"name": "20-30 万", "type": "line", "data": [0, 0, 0, 0, 0, 0]},
+    {"name": "30 万以上", "type": "line", "data": [0, 0, 0, 0, 0, 0]},
+    {"name": "行业均值", "type": "line", "data": [0, 0, 0, 0, 0, 0]}
+  ],
+  "query_ids": ["<query_id>"]
+}
+```
+
+- 五条系列名称、顺序和 `type: "line"` 固定；不得增加 `5万以下`、`5-10万元`、`40-50万元` 等横截面分组。
+- `categories` 必须是以 `report_year` 结尾的连续 6 年，每条 `data` 与年份一一对应且数值在 `[0,100]`。
+- 页面固定使用 0–100% 纵轴；禁止把价格带放在横轴，禁止输出柱形或单年度价格带对比。
+
+#### 核心配置率查询 v3 直连契约
+
+核心配置部分不再接收通用 `charts.coreConfigTrendChart` / `charts.coreConfigHeatmapChart` spec，也不从 Payload 生成下拉选项。模板已直接固化 v3 的 DOM、下拉项、默认值、ECharts option 和联动函数；Agent 只能填充顶层 `core_configuration` 数据对象：
+
+```json
+{
+  "status": "ready",
+  "kind": "v3_core_configuration",
+  "years": ["YYYY-5", "YYYY-4", "YYYY-3", "YYYY-2", "YYYY-1", "YYYY"],
+  "dimensions": {
+    "price": {"label": "价格段", "bands": ["10万以下", "10-15万", "15-20万", "20-30万", "30-50万", "50万以上"]},
+    "wheelbase": {"label": "轴距段", "bands": ["2600以下", "2600-2700", "2700-2800", "2800-2900", "2900-3000", "3000以上"]},
+    "level": {"label": "级别", "bands": ["A0级", "A级", "B级", "C级", "D级", "MPV"]}
+  },
+  "configurations": {
+    "airSuspension": {
+      "label": "空气悬架",
+      "trim": {"counts": [0, 0, 0, 0, 0, 0], "rates": [0, 0, 0, 0, 0, 0]},
+      "series": {"counts": [0, 0, 0, 0, 0, 0], "rates": [0, 0, 0, 0, 0, 0]},
+      "heatmaps": {
+        "trim": {"price": [[0,0,0,0,0,0]], "wheelbase": [[0,0,0,0,0,0]], "level": [[0,0,0,0,0,0]]},
+        "series": {"price": [[0,0,0,0,0,0]], "wheelbase": [[0,0,0,0,0,0]], "level": [[0,0,0,0,0,0]]}
+      }
+    },
+    "lidar": {"label": "激光雷达", "trim": {}, "series": {}, "heatmaps": {"trim": {}, "series": {}}},
+    "hud": {"label": "HUD抬头显示", "trim": {}, "series": {}, "heatmaps": {"trim": {}, "series": {}}}
+  },
+  "query_ids": ["<query_id>"]
+}
+```
+
+上例中的每个 `heatmaps.<grain>.<dimension>` 必须扩展为完整 `6 行分组 × 6 列年份` 矩阵，不得只保留示意的一行。固定规则：
+
+- 页面控件只能是空气悬架/激光雷达/HUD、款型/车系、价格段/轴距段/级别；渲染器会覆盖任何外部控件内容并恢复默认 `空气悬架 / 款型 / 价格段`。
+- `configurations` 必须恰好包含 `airSuspension`、`lidar`、`hud`；每项同时包含 `trim` 和 `series` 的 6 年 `counts`、`rates`，以及两种口径下三类完整热力矩阵。
+- 趋势图由渲染器固定转换为“搭载数柱形 + 配置率折线”；热力图固定为“横轴年份、纵轴分组、单元格配置率”。Agent 不得提交图形类型、轴向、标题或 ECharts option。
+- 款型口径：搭载数为配置项已搭载的唯一完整款型键数量；配置率分母为同年或同年分组内全部唯一完整款型键数量。
+- 车系口径：搭载数为至少一个款型搭载该配置的唯一车系数量；配置率分母为同年或同年分组内全部唯一车系数量。同一车系在同一分组中只计一次。
+- `counts` 为非负整数，`rates` 和热力矩阵数值在 `[0,100]`；查询没有组合时显式补 0。
+- 任一控件变化时只调用本模块两张 ECharts 实例的 `setOption` 等价更新，不重新渲染其他章节或刷新页面。
+
 查询成功但无行时使用：
 
 ```text
@@ -348,7 +470,8 @@ charts.<DOM id> = {
 | `report.features.adas[]` | 智驾 KPI 卡片，不含芯片平台或雷达供应商份额 |
 | `report.features.cockpit[]` | HUD、屏幕和舒适配置 KPI 卡片，不含车机芯片披露率/型号份额 |
 | `report.tables.*` | `status/columns/rows/reason/query_ids` |
-| `charts.<DOM id>` | `status/kind/categories/series/query_ids`；交互图使用 `variants` |
+| `charts.<DOM id>` | `status/kind/categories/series/query_ids`；尺寸×功率年份切换使用 `variants` |
+| `core_configuration` | v3 核心配置嵌套数据；由固定渲染器同时驱动趋势图与热力图，不是通用 chart spec |
 | `report.methodology[]` | `code/title/description`，覆盖数据源、截止日、范围、颗粒度、分子分母和缺失处理 |
 
 ## 必需章节
@@ -375,7 +498,7 @@ charts.<DOM id> = {
 - 款型和车系口径不得混用；同图展示时必须在系列名标注。
 - 少于 3 个有效时间点时不画趋势线，改用单期条形图或数据卡片。
 - 箱线图必须从款型级价格样本计算 `[下须, Q1, median, Q3, 上须]`，上下须使用 1.5×IQR 范围内最远实际观测值，离群价格单独展示。
-- 热力图单元格只使用唯一款型数或占比中的一种。
+- `sizePowerHeatmapChart` 单元格固定使用唯一款型数；其他热力图只能在唯一款型数或占比中选择一种并明确标注。
 - 多系列图例首次点击只显示该系列，再次点击恢复全部系列，不得触发其他图表重绘。
 
 ### 20 个图表
@@ -385,13 +508,13 @@ charts.<DOM id> = {
 | `renewalChart` | 堆叠柱 + 双折线 | 连续 6 年；传统/新能源更新次数；传统/新能源平均周期；当前年更新次数为截至报告月的年累值 |
 | `wheelbaseTrendChart` | 100% 堆叠柱 | 年份、轴距段、款型占比 |
 | `motorPowerTrendChart` | 100% 堆叠柱 | 年份、功率段、款型占比 |
-| `sizePowerHeatmapChart` | 热力图 | 轴距段 × 功率段 × 款型数/占比 |
+| `sizePowerHeatmapChart` | 年份切换热力图 | 连续 6 年；纯电、排皮卡、轴距/功率非空；固定 10 个轴距段 × 11 个功率段 × 唯一款型数；默认最新年 |
 | `bevVoltageTrendChart` | 堆叠柱/折线 | 纯电、年份、电压平台、款型数/占比 |
 | `bevVoltagePriceChart` | 堆叠柱/折线 | 纯电、价格带、电压平台、款型数/占比 |
 | `nevVoltageTrendChart` | 堆叠柱/折线 | 全新能源、年份、电压平台、款型数/占比 |
 | `nevVoltagePriceChart` | 堆叠柱/折线 | 全新能源、价格带、电压平台、款型数/占比 |
 | `l2TrendChart` | 双折线 | 年份、车系覆盖率、款型配备率 |
-| `l2PriceBandChart` | 柱线图 | 价格带、款型配备率、行业均值 |
+| `l2PriceBandChart` | 五折线年度趋势 | 连续 6 年；10-15 万、15-20 万、20-30 万、30 万以上与行业均值 |
 | `l2PriceBoxplotChart` | 箱线图 | 年份、指导价五数概括 |
 | `highAdasTrendChart` | 双折线 | 年份、车系覆盖率、款型配备率 |
 | `hudRateChart` | 折线图 | 年份、HUD 配备率 |
@@ -400,8 +523,8 @@ charts.<DOM id> = {
 | `rearScreenRateChart` | 折线图 | 年份、后排多媒体屏配备率 |
 | `zeroGravityRateChart` | 折线图 | 年份、零重力座椅配备率 |
 | `rearMassageRateChart` | 折线图 | 年份、后排按摩座椅配备率 |
-| `coreConfigTrendChart` | 柱线图 | 配置项、年份、款型/车系数量、配置率 |
-| `coreConfigHeatmapChart` | 热力图 | 配置项、统计口径、年份、价格段/轴距段/级别、配置率 |
+| `coreConfigTrendChart` | v3 固定柱线图 | 输入来自 `core_configuration` 的配置项、年份、款型/车系数量与配置率 |
+| `coreConfigHeatmapChart` | v3 固定热力图 | 输入来自 `core_configuration` 的统计口径、年份、价格段/轴距段/级别配置率矩阵 |
 
 核心配置率查询的款型配备率与车系覆盖率必须使用独立计算的分子、分母和热力图矩阵。切换下拉框只更新本模块的两张图。
 
@@ -438,6 +561,9 @@ cockpitChipShareChart
 - 100% 堆叠图逐列合计满足误差规则。
 - 示例状态和真实报告状态不可混用。
 - `renewalChart` 恰好包含四条固定系列，柱形使用同一 `updates` 堆叠组，最新年份等于 `report.scope.period` 的年份。
+- `sizePowerHeatmapChart` 恰好包含连续 6 个年度变体，默认最新年，且每年为固定轴向的完整 10×11 非负整数款型数矩阵。
+- `l2PriceBandChart` 恰好包含连续 6 年和五条固定折线，不允许柱形或单年度价格带横截面。
+- `core_configuration` 使用 v3 嵌套结构；恰好 3 个配置项 × 2 种口径 × 3 类完整 6×6 热力矩阵，不接收通用图表变体。
 - `competitor_updates` 只含固定四列，`as_of_period === report.scope.period`，恰好包含固定五家企业且顺序正确，并且没有“年份”列。
 
 ### Gate 4 — 页面验收
@@ -448,6 +574,7 @@ cockpitChipShareChart
 - ECharts 实例数量正确，控制台无 JavaScript 错误。
 - 页面不存在示例值标记或未解析的 `{{variable}}`。
 - 新车迭代页面与设计基准一致：左侧为传统/新能源堆叠柱和双周期折线，右侧为“品牌集团/更新/同比/周期”四列表格。
+- 核心配置率查询默认展示空气悬架 / 款型 / 价格段；三类控件联动只更新本模块两张图，标题和统计口径同步变化。
 - 前台不显示 `query_id` 或 `QUERY REQUIRED`；查询证据只保存在 Payload 的 `query_ids` 与 `evidence`。
 
 ## 交付检查
@@ -466,5 +593,8 @@ cockpitChipShareChart
 - [ ] 价格、尺寸、功率和电压单位明确。
 - [ ] 时间序列连续性、缺失值和异常值已说明。
 - [ ] 已先识别目标报告月份；当前年更新次数为年初至数据截止日累计。
+- [ ] 尺寸 × 功率热力图只统计纯电款型，使用固定分箱、完整 10×11 矩阵和最新年份默认视图。
+- [ ] L2+ 价格带图横轴为连续 6 年，包含四个固定价格带与行业均值五条折线。
+- [ ] 核心配置查询固定为 3 个配置项、2 种统计口径和 3 种热力维度；`core_configuration` 的趋势数组与 18 个 6×6 矩阵完整。
 - [ ] 竞企表仅展示目标年份，固定为比亚迪集团、长安集团、奇瑞集团、长城汽车、吉利汽车，次数同比为本年累计减上年同期累计。
 - [ ] 平均周期允许当前年内区间与历史完整自然年直接并列。
