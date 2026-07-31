@@ -182,13 +182,24 @@ def _sha256_bytes(value: bytes) -> str:
 
 
 def _sha256_file(path: Path) -> str:
-    return _sha256_bytes(path.read_bytes())
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _atomic_write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     temporary.write_text(content, encoding="utf-8", newline="\n")
+    os.replace(temporary, path)
+
+
+def _atomic_write_bytes(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    temporary.write_bytes(content)
     os.replace(temporary, path)
 
 
@@ -333,8 +344,34 @@ class LlmWikiService:
     ) -> dict[str, Any]:
         """Materialize an immutable normalized raw snapshot and manifest row."""
 
+        normalized_content = content if content.endswith("\n") else f"{content}\n"
+        return self.snapshot_raw_bytes(
+            source_id=source_id,
+            asset_id=asset_id,
+            title=title,
+            content=normalized_content.encode("utf-8"),
+            source_path=source_path,
+        )
+
+    def snapshot_raw_bytes(
+        self,
+        *,
+        source_id: str,
+        asset_id: str,
+        title: str,
+        content: bytes,
+        source_path: str | None = None,
+    ) -> dict[str, Any]:
+        """Copy an immutable UTF-8 Markdown snapshot byte-for-byte into raw/."""
+
+        try:
+            decoded = content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise LlmWikiError("raw Markdown must be UTF-8 encoded") from exc
+        if not decoded.strip():
+            raise LlmWikiError("raw content must not be empty")
         with _file_lock(self.raw_lock_path):
-            return self._snapshot_raw_unlocked(
+            return self._snapshot_raw_bytes_unlocked(
                 source_id=source_id,
                 asset_id=asset_id,
                 title=title,
@@ -342,30 +379,49 @@ class LlmWikiService:
                 source_path=source_path,
             )
 
-    def _snapshot_raw_unlocked(
+    def snapshot_raw_file(
         self,
         *,
         source_id: str,
         asset_id: str,
         title: str,
-        content: str,
+        path: Path,
         source_path: str | None = None,
     ) -> dict[str, Any]:
+        """Copy a finalized Markdown file into raw/ without changing its bytes."""
 
+        resolved = path.resolve()
+        if resolved.suffix.lower() not in {".md", ".markdown"}:
+            raise LlmWikiError("only Markdown files can be copied into LLM Wiki Raw")
+        if not resolved.is_file():
+            raise LlmWikiError(f"Markdown source file not found: {resolved}")
+        return self.snapshot_raw_bytes(
+            source_id=source_id,
+            asset_id=asset_id,
+            title=title,
+            content=resolved.read_bytes(),
+            source_path=source_path or str(resolved),
+        )
+
+    def _snapshot_raw_bytes_unlocked(
+        self,
+        *,
+        source_id: str,
+        asset_id: str,
+        title: str,
+        content: bytes,
+        source_path: str | None = None,
+    ) -> dict[str, Any]:
         bundle = self._require_initialized()
-        if not content.strip():
-            raise LlmWikiError("raw content must not be empty")
         source = _identity_segment(source_id, label="source_id")
         asset = _identity_segment(asset_id, label="asset_id")
-        normalized_content = content if content.endswith("\n") else f"{content}\n"
-        encoded = normalized_content.encode("utf-8")
-        digest = _sha256_bytes(encoded)
+        digest = _sha256_bytes(content)
         relative = Path(source) / f"{asset}-{digest[:12]}.md"
         target = self.raw_dir / relative
-        if target.exists() and target.read_bytes() != encoded:
+        if target.exists() and target.read_bytes() != content:
             raise LlmWikiError(f"immutable raw snapshot collision: {relative}")
         if not target.exists():
-            _atomic_write(target, normalized_content)
+            _atomic_write_bytes(target, content)
 
         existing = self._manifest_records()
         for record in existing:
@@ -378,13 +434,37 @@ class LlmWikiService:
             "source_path": source_path,
             "snapshot_path": relative.as_posix(),
             "sha256": digest,
-            "size_bytes": len(encoded),
+            "size_bytes": len(content),
             "bundle_hash": bundle["bundle_hash"],
             "created_at": datetime.now(UTC).isoformat(),
         }
         lines = [json.dumps(item, ensure_ascii=False, sort_keys=True) for item in [*existing, record]]
         _atomic_write(self.raw_manifest_path, "\n".join(lines) + "\n")
         return record
+
+    def raw_status_for_source(self, *, source_path: str, content_sha256: str = "") -> dict[str, Any]:
+        """Return whether the current source bytes already have an immutable Raw snapshot."""
+
+        matching = [
+            record
+            for record in self._manifest_records()
+            if str(record.get("source_path") or "") == source_path
+        ]
+        current = next(
+            (
+                record
+                for record in reversed(matching)
+                if content_sha256 and str(record.get("sha256") or "") == content_sha256
+            ),
+            None,
+        )
+        latest = matching[-1] if matching else None
+        return {
+            "available": current is not None,
+            "snapshot": current,
+            "latest_snapshot": latest,
+            "changed_since_snapshot": bool(latest and current is None),
+        }
 
     def _resolve_raw_record(self, record: dict[str, Any]) -> tuple[str, Path, str]:
         relative = str(record.get("snapshot_path") or "")
@@ -395,6 +475,33 @@ class LlmWikiService:
         except ValueError as exc:
             raise LlmWikiError(f"raw manifest path escapes raw/: {relative}") from exc
         return relative, path, expected
+
+    def freeze_ingest_inputs(self, raw_paths: list[str]) -> dict[str, Any]:
+        """Validate immutable Raw metadata for a queued job without loading document bodies."""
+
+        bundle = self._require_initialized()
+        selected_paths = list(dict.fromkeys(str(path).strip() for path in raw_paths if str(path).strip()))
+        records_by_path = {
+            str(record.get("snapshot_path") or ""): record
+            for record in self._manifest_records()
+        }
+        missing = [path for path in selected_paths if path not in records_by_path]
+        if missing:
+            raise LlmWikiError(f"raw snapshots are not in the immutable manifest: {', '.join(missing)}")
+        selected: list[dict[str, Any]] = []
+        for path in selected_paths:
+            record = records_by_path[path]
+            _relative, source, expected = self._resolve_raw_record(record)
+            if not source.is_file():
+                raise LlmWikiError(f"raw snapshot is missing: {path}")
+            actual = _sha256_file(source)
+            if actual != expected:
+                raise LlmWikiError(f"raw snapshot hash drift: {path}")
+            selected.append(record)
+        return {
+            "schema_bundle": bundle,
+            "raw_manifest": selected,
+        }
 
     def _raw_hashes(self) -> dict[str, str]:
         hashes: dict[str, str] = {}

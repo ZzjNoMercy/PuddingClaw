@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from analytics.nl2sql.training import VannaTrainingError, import_table_entities
@@ -174,6 +176,9 @@ def job_to_list_dict(job: KnowledgeImportJob) -> dict[str, Any]:
         "compiler_runtime",
         "published_pages",
         "lint_ok",
+        "wiki_stage_complete",
+        "import_gbrain",
+        "gbrain_import_ok",
     ):
         if key in metadata:
             slim_metadata[key] = metadata[key]
@@ -282,6 +287,7 @@ async def create_llm_wiki_ingest_job(
     base_dir: Path,
     raw_paths: list[str],
     knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+    import_gbrain: bool = False,
 ) -> KnowledgeImportJob:
     """Queue one immutable, Schema-bound LLM Wiki compilation."""
 
@@ -295,7 +301,7 @@ async def create_llm_wiki_ingest_job(
         raise KnowledgeServiceError("请至少选择一个待编译的 Raw 快照。")
 
     wiki = get_llm_wiki_service(base_dir)
-    context = wiki.operation_context("ingest", raw_paths=selected_paths)
+    context = await asyncio.to_thread(wiki.freeze_ingest_inputs, selected_paths)
     manifest = context.get("raw_manifest") if isinstance(context.get("raw_manifest"), list) else []
     if len(manifest) != len(selected_paths):
         raise KnowledgeServiceError("部分 Raw 快照不在当前不可变清单中，请刷新后重试。")
@@ -306,20 +312,38 @@ async def create_llm_wiki_ingest_job(
     file_size = sum(int(item.get("size_bytes") or 0) for item in ordered_manifest)
     raw_hashes = {path: str(manifest_by_path[path].get("sha256") or "") for path in selected_paths}
     compiler = get_llm_wiki_compiler_agent_config()
+    job_fingerprint = hashlib.sha256(
+        json.dumps(
+            {
+                "raw_hashes": sorted((path, raw_hashes[path]) for path in selected_paths),
+                "bundle_hash": str(bundle.get("bundle_hash") or ""),
+                "compiler_model_id": str(compiler.get("model_id") or ""),
+                "import_gbrain": bool(import_gbrain),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    deterministic_job_id = f"job-wiki-{job_fingerprint[:40]}"
+    existing = await session.get(KnowledgeImportJob, deterministic_job_id)
+    if existing is not None:
+        return existing
 
     job = KnowledgeImportJob(
-        id=new_id("job"),
+        id=deterministic_job_id,
         knowledge_base_id=knowledge_base_id,
         status="queued",
         file_name=f"{len(selected_paths)} 个 Raw 快照",
         file_type="llm_wiki",
         file_size=file_size,
         source_path="llm-wiki://raw",
-        source_sha256=hashlib.sha256(
-            "\n".join(f"{path}:{raw_hashes[path]}" for path in selected_paths).encode("utf-8")
-        ).hexdigest(),
-        title=f"LLM Wiki 编译（{len(selected_paths)} 个 Raw）",
-        publish_targets=["llm_wiki", "gbrain"],
+        source_sha256=job_fingerprint,
+        title=(
+            f"LLM Wiki 编译并导入 GBrain（{len(selected_paths)} 个 Raw）"
+            if import_gbrain
+            else f"LLM Wiki 编译（{len(selected_paths)} 个 Raw）"
+        ),
+        publish_targets=["llm_wiki", *(["gbrain"] if import_gbrain else [])],
         current_step="queued",
         progress=0,
         job_metadata={
@@ -333,6 +357,7 @@ async def create_llm_wiki_ingest_job(
             "compiler_model": str(compiler.get("model") or ""),
             "compiler_provider": str(compiler.get("provider") or ""),
             "compiler_runtime": "llm_wiki_compiler_agent",
+            "import_gbrain": bool(import_gbrain),
             "deepagents_backend": "/knowledge/brain/wiki/",
         },
     )
@@ -341,7 +366,11 @@ async def create_llm_wiki_ingest_job(
         KnowledgeImportEvent(
             job_id=job.id,
             level="info",
-            message=f"LLM Wiki 编译任务已加入队列，共 {len(selected_paths)} 个 Raw 快照",
+            message=(
+                f"LLM Wiki 编译并导入 GBrain 任务已加入队列，共 {len(selected_paths)} 个 Raw 快照"
+                if import_gbrain
+                else f"LLM Wiki 编译任务已加入队列，共 {len(selected_paths)} 个 Raw 快照"
+            ),
             event_metadata={
                 "raw_paths": selected_paths,
                 "compiler_model_id": str(compiler.get("model_id") or ""),
@@ -349,7 +378,14 @@ async def create_llm_wiki_ingest_job(
             },
         )
     )
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        existing = await session.get(KnowledgeImportJob, deterministic_job_id)
+        if existing is not None:
+            return existing
+        raise
     await session.refresh(job)
     return job
 
@@ -622,6 +658,7 @@ async def claim_next_job(session: AsyncSession) -> KnowledgeImportJob | None:
         .where(KnowledgeImportJob.status == "queued")
         .order_by(KnowledgeImportJob.created_at.asc())
         .limit(1)
+        .with_for_update(skip_locked=True)
     )
     result = await session.execute(stmt)
     job = result.scalar_one_or_none()
@@ -870,6 +907,43 @@ async def process_import_job(session: AsyncSession, *, base_dir: Path, job: Know
             knowledge_base_id=job.knowledge_base_id,
             publish_targets=job.publish_targets,
         )
+        if "llm_wiki_raw" in (job.publish_targets or []):
+            from knowledge.llm_wiki import LlmWikiError, get_llm_wiki_service
+
+            await update_job_progress(
+                session,
+                job,
+                step="snapshotting_raw",
+                progress=75,
+                message="复制最终 Markdown 到 LLM Wiki Raw",
+            )
+            try:
+                raw_snapshot = await asyncio.to_thread(
+                    get_llm_wiki_service(base_dir).snapshot_raw_file,
+                    source_id="knowledge-upload",
+                    asset_id=document.id,
+                    title=document.title,
+                    path=Path(document.storage_path),
+                    source_path=document.virtual_path,
+                )
+            except (LlmWikiError, OSError) as exc:
+                raw_error = f"创建 LLM Wiki Raw 失败：{exc}"
+                job.publish_targets = [target for target in (job.publish_targets or []) if target != "llm_wiki_raw"]
+                document.publish_targets = [
+                    target for target in (document.publish_targets or []) if target != "llm_wiki_raw"
+                ]
+                ingest = {**(ingest or {}), "llm_wiki_raw": {"ok": False, "error": raw_error}}
+                session.add(
+                    KnowledgeImportEvent(
+                        job_id=job.id,
+                        level="warning",
+                        message=f"{raw_error}；知识库原文件已正常导入。",
+                    )
+                )
+            else:
+                if "llm_wiki_raw" not in (document.publish_targets or []):
+                    document.publish_targets = [*(document.publish_targets or []), "llm_wiki_raw"]
+                ingest = {**(ingest or {}), "llm_wiki_raw": {"ok": True, **raw_snapshot}}
     elif suffix in GENERIC_UPLOAD_SUFFIXES:
         document, ingest = await service.ingest_generic_upload(
             session,

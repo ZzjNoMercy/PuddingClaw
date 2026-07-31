@@ -100,6 +100,11 @@ const HARNESS_SECTIONS: HarnessSection[] = [
   { id: "runtime", label: "运行保护", description: "运行保护与权限策略", icon: ShieldCheck },
 ];
 
+const DATABASE_QA_SECTIONS: HarnessSection[] = [
+  { id: "preview", label: "结果预览", description: "直传、摘要与读取体量", icon: Database },
+  { id: "storage", label: "持久化存储", description: "落盘、保留与导出", icon: FileText },
+];
+
 const CATEGORIES: { key: SettingsCategory; label: string; icon: React.ElementType; color: string }[] = [
   { key: "ai", label: "模型服务", icon: Network, color: "#002fa7" },
   { key: "project", label: "项目上下文", icon: FileText, color: "#002fa7" },
@@ -517,6 +522,7 @@ export default function SettingsPage() {
   const [dbQaFullRowsHardRowCap, setDbQaFullRowsHardRowCap] = useState("200");
   const [dbQaFullRowsHardColumnCap, setDbQaFullRowsHardColumnCap] = useState("20");
   const [dbQaMaxCellCharsForLlm, setDbQaMaxCellCharsForLlm] = useState("500");
+  const [dbQaResultMaterializationRowCap, setDbQaResultMaterializationRowCap] = useState("5000");
   const [dbQaQueryTimeoutSeconds, setDbQaQueryTimeoutSeconds] = useState("30");
   const [dbQaResultStoreEnabled, setDbQaResultStoreEnabled] = useState(true);
   const [dbQaResultStoreTtlHours, setDbQaResultStoreTtlHours] = useState("168");
@@ -609,6 +615,7 @@ export default function SettingsPage() {
   // Harness left-right anchor layout
   const [harnessFilter, setHarnessFilter] = useState("");
   const [activeHarnessSection, setActiveHarnessSection] = useState("subagent");
+  const [activeDatabaseQaSection, setActiveDatabaseQaSection] = useState("preview");
 
   // SubAgent / Harness
   const [subagentItems, setSubagentItems] = useState<SubAgentItem[]>([]);
@@ -692,6 +699,7 @@ export default function SettingsPage() {
         setDbQaFullRowsHardRowCap(String(databaseQa?.full_rows_hard_row_cap ?? 200));
         setDbQaFullRowsHardColumnCap(String(databaseQa?.full_rows_hard_column_cap ?? 20));
         setDbQaMaxCellCharsForLlm(String(databaseQa?.max_cell_chars_for_llm ?? 500));
+        setDbQaResultMaterializationRowCap(String(databaseQa?.result_materialization_row_cap ?? 5000));
         setDbQaQueryTimeoutSeconds(String(Math.max(1, Math.round((databaseQa?.query_timeout_ms ?? 30000) / 1000))));
         setDbQaResultStoreEnabled(databaseQa?.result_store_enabled ?? true);
         setDbQaResultStoreTtlHours(String(databaseQa?.result_store_ttl_hours ?? 168));
@@ -887,6 +895,9 @@ export default function SettingsPage() {
     try {
       await bindProviderModel(binding, modelId);
       await refreshProviders();
+      window.dispatchEvent(new CustomEvent("puddingclaw:provider-bindings-changed", {
+        detail: { binding, modelId },
+      }));
       showToast("success", "默认模型已更新");
     } catch (err) {
       showToast("error", err instanceof Error ? err.message : "更新默认模型失败");
@@ -1151,6 +1162,7 @@ export default function SettingsPage() {
             full_rows_hard_row_cap: positiveIntOrNull(dbQaFullRowsHardRowCap) ?? 200,
             full_rows_hard_column_cap: positiveIntOrNull(dbQaFullRowsHardColumnCap) ?? 20,
             max_cell_chars_for_llm: positiveIntOrNull(dbQaMaxCellCharsForLlm) ?? 500,
+            result_materialization_row_cap: positiveIntOrNull(dbQaResultMaterializationRowCap) ?? 5000,
             query_timeout_ms: (positiveIntOrNull(dbQaQueryTimeoutSeconds) ?? 30) * 1000,
             result_store_enabled: dbQaResultStoreEnabled,
             result_store_ttl_hours: positiveIntOrNull(dbQaResultStoreTtlHours) ?? 168,
@@ -1271,7 +1283,7 @@ export default function SettingsPage() {
     } finally {
       setSaving(false);
     }
-  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaQueryTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmConcurrency, knowledgeRootDir, wikiCompilerModelId, wikiGbrainEmbeddingModelId, wikiGbrainThinkModelId, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, toolContextEnabled, immediateToolCompactionEnabled, singleToolTriggerTokens, backgroundMinResultTokens, keepRecentToolResults, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, rubricMaxStagnantRepairs, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, sandboxMode, dockerConnection, dockerContext, dockerUseCustomImage, dockerImage, dockerCpuLimit, dockerMemoryLimitMb, dockerPidsLimit, dockerNetworkEnabled, dockerDependencySetupEnabled, subagentItems, showToast]);
+  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaResultMaterializationRowCap, dbQaQueryTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmConcurrency, knowledgeRootDir, wikiCompilerModelId, wikiGbrainEmbeddingModelId, wikiGbrainThinkModelId, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, toolContextEnabled, immediateToolCompactionEnabled, singleToolTriggerTokens, backgroundMinResultTokens, keepRecentToolResults, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, rubricMaxStagnantRepairs, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, sandboxMode, dockerConnection, dockerContext, dockerUseCustomImage, dockerImage, dockerCpuLimit, dockerMemoryLimitMb, dockerPidsLimit, dockerNetworkEnabled, dockerDependencySetupEnabled, subagentItems, showToast]);
 
   const handleDatabaseModeChange = useCallback((mode: "bundled" | "external") => {
     setDatabaseMode(mode);
@@ -1755,7 +1767,7 @@ export default function SettingsPage() {
         <main className="workspace-content-frame flex min-w-0 flex-1 flex-col overflow-hidden">
           <div className="flex-1 overflow-y-auto px-8 pb-8 pt-6">
             <div className={`${
-              category === "ai" ? "max-w-none" : category === "databaseQa" ? "max-w-4xl" : category === "harness" || category === "project" ? "max-w-6xl" : "max-w-2xl"
+              category === "ai" ? "max-w-none" : category === "databaseQa" || category === "harness" || category === "project" ? "max-w-6xl" : "max-w-2xl"
             } mx-auto space-y-6`}>
             {category === "ai" && (
               <section className="provider-light min-h-[calc(100vh-96px)] overflow-hidden rounded-2xl border border-slate-200 bg-white text-slate-900 shadow-xl shadow-slate-200/50" data-screen-label="模型服务">
@@ -1976,7 +1988,7 @@ export default function SettingsPage() {
                       打开 Console
                     </a>
                   </div>
-                  <div className="grid grid-cols-2 gap-4">
+                  <div className="grid gap-4 md:grid-cols-2">
                     <FormField label="Gateway 覆盖地址（可选）">
                       <input value={gatewayBaseUrl} onChange={(e) => setGatewayBaseUrl(e.target.value)} className="form-input" placeholder="留空则自动探测 http://higress:8080/v1" />
                     </FormField>
@@ -2143,93 +2155,276 @@ export default function SettingsPage() {
             )}
 
             {category === "databaseQa" && (
-              <div className="space-y-5">
-                <div className="flex items-center justify-between gap-4">
+              <div className="flex flex-col gap-5 lg:flex-row">
+                <aside className="flex w-full flex-col gap-4 lg:sticky lg:top-6 lg:w-56 lg:self-start lg:shrink-0">
                   <div>
-                    <h1 className="text-[22px] font-semibold tracking-tight text-gray-900">智能问数</h1>
-                    <p className="mt-1 text-[12px] text-gray-500">
-                      控制数据库问数的上下文预算、结果持久化、分页和 Trace 可观测性。
+                    <h1 className="text-[18px] font-semibold text-gray-900">智能问数</h1>
+                    <p className="mt-1 text-[11px] text-gray-500">结果上下文与完整数据</p>
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    {DATABASE_QA_SECTIONS.map((section) => {
+                      const Icon = section.icon;
+                      const active = activeDatabaseQaSection === section.id;
+                      return (
+                        <button
+                          key={section.id}
+                          type="button"
+                          onClick={() => setActiveDatabaseQaSection(section.id)}
+                          className={`flex w-full items-start gap-3 rounded-xl px-3 py-2.5 text-left transition-all ${
+                            active
+                              ? "bg-[#002fa7]/[0.07] text-[#002fa7]"
+                              : "text-gray-600 hover:bg-black/[0.035] hover:text-gray-900"
+                          }`}
+                        >
+                          <Icon className="mt-0.5 h-4 w-4 shrink-0" />
+                          <div className="min-w-0">
+                            <p className="text-[12px] font-semibold">{section.label}</p>
+                            <p className="text-[10px] opacity-70">{section.description}</p>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </aside>
+
+                <div className="min-w-0 flex-1 space-y-5">
+                  <div className="flex min-h-12 items-center justify-between gap-4">
+                    <div>
+                      <h2 className="text-[18px] font-semibold text-gray-900">
+                        {activeDatabaseQaSection === "preview" ? "结果预览" : "持久化存储"}
+                      </h2>
+                      <p className="mt-1 text-[11px] text-gray-500">
+                        {activeDatabaseQaSection === "preview"
+                          ? "控制查询结果如何进入模型，以及单次读取体量。"
+                          : "控制完整结果是否落盘、保留多久，以及如何分页与导出。"}
+                      </p>
+                    </div>
+                    <button
+                      onClick={handleSave}
+                      disabled={saving}
+                      className="flex shrink-0 items-center gap-2 rounded-xl bg-[#002fa7] px-4 py-2.5 text-[12px] font-medium text-white shadow-sm transition-all hover:bg-[#002fa7]/90 disabled:opacity-50"
+                    >
+                      {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                      保存设置
+                    </button>
+                  </div>
+
+                {activeDatabaseQaSection === "preview" && (
+                  <>
+                <div className="overflow-hidden rounded-2xl border border-[#002fa7]/10 bg-[#002fa7]/[0.025]">
+                  <div className="border-b border-[#002fa7]/10 px-5 py-3.5">
+                    <p className="text-[12px] font-semibold text-gray-800">一条查询结果的处理顺序</p>
+                    <p className="mt-1 text-[10px] leading-4 text-gray-500">
+                      这些设置不会改变 SQL 的业务口径，只决定结果以什么体量进入模型和是否保留完整副本。
                     </p>
                   </div>
-                  <button
-                    onClick={handleSave}
-                    disabled={saving}
-                    className="flex items-center gap-2 rounded-xl bg-[#002fa7] px-4 py-2.5 text-[12px] font-medium text-white shadow-sm transition-all hover:bg-[#002fa7]/90 disabled:opacity-50"
-                  >
-                    {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-                    保存设置
-                  </button>
+                  <div className="grid gap-px bg-[#002fa7]/10 md:grid-cols-4">
+                    {[
+                      ["1", "执行 SQL", `最长 ${dbQaQueryTimeoutSeconds || "30"} 秒`],
+                      ["2", "尝试完整直传", `行 ≤ ${dbQaFullRowsHardRowCap || "200"} · 列 ≤ ${dbQaFullRowsHardColumnCap || "20"}`],
+                      ["3", "超限则发送预览", `预览 ≤ ${dbQaPreviewRowsTokenBudget || "3000"} Token`],
+                      ["4", "保留完整结果", `物化 ≤ ${dbQaResultMaterializationRowCap || "5000"} 行`],
+                    ].map(([step, label, detail]) => (
+                      <div key={step} className="bg-white/90 px-4 py-3.5">
+                        <div className="flex items-center gap-2">
+                          <span className="flex h-5 w-5 items-center justify-center rounded-full bg-[#002fa7] text-[9px] font-semibold text-white">
+                            {step}
+                          </span>
+                          <span className="text-[11px] font-semibold text-gray-700">{label}</span>
+                        </div>
+                        <p className="mt-1.5 pl-7 text-[10px] leading-4 text-gray-400">{detail}</p>
+                      </div>
+                    ))}
+                  </div>
                 </div>
-                <SettingsCard title="模型上下文预算" icon={Database} color="#002fa7">
-                  <div className="grid grid-cols-2 gap-4">
-                    <FormField label="完整明细 Token 预算">
-                      <input value={dbQaFullRowsTokenBudget} onChange={(e) => setDbQaFullRowsTokenBudget(e.target.value)} className="form-input" inputMode="numeric" />
-                    </FormField>
-                    <FormField label="预览明细 Token 预算">
-                      <input value={dbQaPreviewRowsTokenBudget} onChange={(e) => setDbQaPreviewRowsTokenBudget(e.target.value)} className="form-input" inputMode="numeric" />
-                    </FormField>
-                    <FormField label="Profile Token 预算">
-                      <input value={dbQaProfileTokenBudget} onChange={(e) => setDbQaProfileTokenBudget(e.target.value)} className="form-input" inputMode="numeric" />
-                    </FormField>
-                    <FormField label="单元格最大字符数">
-                      <input value={dbQaMaxCellCharsForLlm} onChange={(e) => setDbQaMaxCellCharsForLlm(e.target.value)} className="form-input" inputMode="numeric" />
-                    </FormField>
-                  </div>
-                  <p className="mt-3 text-[11px] leading-relaxed text-gray-500">
-                    预算越大，明细问题越可能直接完整回答；同时会增加模型上下文占用和延迟。
-                  </p>
-                </SettingsCard>
 
-                <SettingsCard title="完整明细保护" icon={ShieldCheck} color="#0f172a">
-                  <div className="grid grid-cols-2 gap-4">
-                    <FormField label="完整明细最大行数">
-                      <input value={dbQaFullRowsHardRowCap} onChange={(e) => setDbQaFullRowsHardRowCap(e.target.value)} className="form-input" inputMode="numeric" />
-                    </FormField>
-                    <FormField label="完整明细最大列数">
-                      <input value={dbQaFullRowsHardColumnCap} onChange={(e) => setDbQaFullRowsHardColumnCap(e.target.value)} className="form-input" inputMode="numeric" />
-                    </FormField>
-                    <FormField label="SQL 执行超时（秒）">
-                      <input value={dbQaQueryTimeoutSeconds} onChange={(e) => setDbQaQueryTimeoutSeconds(e.target.value)} className="form-input" inputMode="numeric" />
-                    </FormField>
+                <SettingsCard title="完整结果直传条件" icon={ShieldCheck} color="#0f172a">
+                  <div className="rounded-xl bg-blue-50/60 px-3.5 py-3 text-[10px] leading-4 text-blue-700">
+                    完整结果只有在<strong>行数、列数和估算 Token 三项同时达标</strong>时才会直接发送给模型。
+                    这些条件不限制 SQL 实际返回多少行，也不决定完整结果能否落盘。
                   </div>
-                </SettingsCard>
-
-                <SettingsCard title="持久化与分页" icon={FileText} color="#10b981">
-                  <div className="grid grid-cols-2 gap-4">
-                    <FormField label="默认分页大小">
-                      <input value={dbQaDefaultPageSize} onChange={(e) => setDbQaDefaultPageSize(e.target.value)} className="form-input" inputMode="numeric" />
-                    </FormField>
-                    <FormField label="最大分页大小">
-                      <input value={dbQaMaxPageSize} onChange={(e) => setDbQaMaxPageSize(e.target.value)} className="form-input" inputMode="numeric" />
-                    </FormField>
-                    <FormField label="结果保留时间（小时）">
-                      <input value={dbQaResultStoreTtlHours} onChange={(e) => setDbQaResultStoreTtlHours(e.target.value)} className="form-input" inputMode="numeric" />
-                    </FormField>
-                    <div className="grid gap-2">
-                      <ToggleRow
-                        label="持久化结果集"
-                        description="关闭后，大明细不会落盘，也不会生成 result_id、分页读取和导出入口。"
-                        checked={dbQaResultStoreEnabled}
-                        onChange={setDbQaResultStoreEnabled}
-                      />
-                      <ToggleRow
-                        label="生成 Profile"
-                        description="为截断明细生成分布摘要，帮助模型避免从预览行误判。"
-                        checked={dbQaProfileEnabled}
-                        onChange={setDbQaProfileEnabled}
-                      />
-                      <ToggleRow
-                        label="允许导出"
-                        description="控制查询结果页的 CSV 导出按钮和后端导出 API。"
-                        checked={dbQaExportEnabled}
-                        onChange={setDbQaExportEnabled}
+                  <div className="flex flex-wrap items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3.5 py-3 text-[10px] text-slate-600">
+                    <span className="font-semibold text-slate-800">完整直传 =</span>
+                    <span className="rounded-full bg-white px-2 py-1 shadow-sm">行数 ≤ {dbQaFullRowsHardRowCap || "200"}</span>
+                    <span className="font-semibold text-slate-400">AND</span>
+                    <span className="rounded-full bg-white px-2 py-1 shadow-sm">列数 ≤ {dbQaFullRowsHardColumnCap || "20"}</span>
+                    <span className="font-semibold text-slate-400">AND</span>
+                    <span className="rounded-full bg-white px-2 py-1 shadow-sm">结果 ≤ {dbQaFullRowsTokenBudget || "10000"} Token</span>
+                  </div>
+                  <div className="grid gap-4 md:grid-cols-3">
+                    <DatabaseQaParameterField
+                      label="最大行数"
+                      description="完整结果超过该行数时改发预览；不是 SQL 查询或落盘上限。"
+                      unit="行"
+                      value={dbQaFullRowsHardRowCap}
+                      onChange={setDbQaFullRowsHardRowCap}
+                    />
+                    <DatabaseQaParameterField
+                      label="最大列数"
+                      description="宽表超过该列数时改发预览，避免一次占满模型上下文。"
+                      unit="列"
+                      value={dbQaFullRowsHardColumnCap}
+                      onChange={setDbQaFullRowsHardColumnCap}
+                    />
+                    <DatabaseQaParameterField
+                      label="最大内容体量"
+                      description="完整结果经过单元格截短后的近似 Token 上限。"
+                      unit="Token"
+                      value={dbQaFullRowsTokenBudget}
+                      onChange={setDbQaFullRowsTokenBudget}
+                    />
+                  </div>
+                  <div className="border-t border-slate-100 pt-4">
+                    <div className="grid gap-4 md:grid-cols-2">
+                      <DatabaseQaParameterField
+                        label="SQL 执行超时"
+                        description="只计算数据库执行时间，不包含 SQL 生成、模型思考和后续文件写入。"
+                        unit="秒"
+                        value={dbQaQueryTimeoutSeconds}
+                        onChange={setDbQaQueryTimeoutSeconds}
                       />
                     </div>
                   </div>
-                  <p className="mt-3 text-[11px] leading-relaxed text-gray-500">
-                    超出上下文预算的明细会落盘到 backend/data/database-query-results，并通过 Trace 暴露 result_id、过期时间和分页动作。
-                  </p>
                 </SettingsCard>
+
+                <SettingsCard title="预览与摘要内容" icon={Database} color="#002fa7">
+                  <div className="rounded-xl bg-blue-50/60 px-3.5 py-3 text-[10px] leading-4 text-blue-700">
+                    完整结果无法直传时，模型收到的是<strong>预览行 + Profile 摘要</strong>。
+                    以下 Token 是本次数据库 Tool Result 的近似预算，不是模型的 272k 总上下文窗口。
+                  </div>
+                  <div className="grid gap-4 md:grid-cols-2">
+                    <DatabaseQaParameterField
+                      label="预览内容上限"
+                      description="完整结果无法直传时，逐步减少预览行，直到预览内容落入该预算。"
+                      unit="Token"
+                      value={dbQaPreviewRowsTokenBudget}
+                      onChange={setDbQaPreviewRowsTokenBudget}
+                    />
+                    <div className={`rounded-xl border px-3.5 py-3 ${dbQaProfileEnabled ? "border-blue-100 bg-blue-50/35" : "border-amber-100 bg-amber-50/40"}`}>
+                      <div className="mb-3 flex items-start justify-between gap-3">
+                        <div>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <p className="text-[11px] font-semibold text-gray-700">生成 Profile 摘要</p>
+                            <span className="rounded-full bg-white px-2 py-0.5 text-[9px] font-medium text-[#002fa7] shadow-sm">
+                              默认开启
+                            </span>
+                          </div>
+                          <p className="mt-1 text-[10px] leading-4 text-gray-400">
+                            进入预览模式时，补充分布、日期范围和数值范围，避免模型只依据预览行判断。
+                          </p>
+                        </div>
+                        <SwitchButton
+                          checked={dbQaProfileEnabled}
+                          onChange={setDbQaProfileEnabled}
+                          ariaLabel="生成 Profile 摘要"
+                        />
+                      </div>
+                      <DatabaseQaParameterField
+                        label="摘要内容上限"
+                        description={dbQaProfileEnabled
+                          ? "限制 Profile 进入模型的近似体量；不影响完整结果文件。"
+                          : "已关闭：模型在结果超限时只会收到预览行。"}
+                        unit="Token"
+                        value={dbQaProfileTokenBudget}
+                        onChange={setDbQaProfileTokenBudget}
+                        disabled={!dbQaProfileEnabled}
+                      />
+                    </div>
+                    <DatabaseQaParameterField
+                      label="单个文本值最大长度"
+                      description="完整直传和预览都会应用：单个文本超过该长度时，模型只看到前 N 个字符和省略号；数字不截断，落盘仍保存原值。"
+                      unit="字符"
+                      value={dbQaMaxCellCharsForLlm}
+                      onChange={setDbQaMaxCellCharsForLlm}
+                    />
+                  </div>
+                </SettingsCard>
+                  </>
+                )}
+
+                {activeDatabaseQaSection === "storage" && (
+                <SettingsCard title="持久化存储" icon={FileText} color="#10b981">
+                  <ToggleRow
+                    label="持久化结果集"
+                    description="为超出直传条件的完整结果生成 result_id 和 JSONL；关闭后不落盘，也不提供后续分页与导出。"
+                    checked={dbQaResultStoreEnabled}
+                    onChange={setDbQaResultStoreEnabled}
+                  />
+                  <div className={`grid gap-4 rounded-xl border p-3.5 transition-opacity md:grid-cols-2 ${
+                    dbQaResultStoreEnabled
+                      ? "border-emerald-100 bg-emerald-50/20"
+                      : "border-slate-100 bg-slate-50/60 opacity-50"
+                  }`}>
+                    <DatabaseQaParameterField
+                      label="单个结果集最大行数"
+                      description="开启持久化后，只有完整结果不超过该行数才会生成 result_id 并落盘。"
+                      unit="行"
+                      value={dbQaResultMaterializationRowCap}
+                      onChange={setDbQaResultMaterializationRowCap}
+                      disabled={!dbQaResultStoreEnabled}
+                    />
+                    <DatabaseQaParameterField
+                      label="结果保留时间"
+                      description="仅适用于已持久化的结果；到期后 JSONL、分页与导出入口会被清理。"
+                      unit="小时"
+                      value={dbQaResultStoreTtlHours}
+                      onChange={setDbQaResultStoreTtlHours}
+                      disabled={!dbQaResultStoreEnabled}
+                    />
+                    <div className="md:col-span-2">
+                      <ToggleRow
+                        label="允许导出"
+                        description="控制已持久化结果页的 CSV 导出按钮和后端导出 API。"
+                        checked={dbQaExportEnabled}
+                        onChange={setDbQaExportEnabled}
+                        disabled={!dbQaResultStoreEnabled}
+                      />
+                    </div>
+                  </div>
+                  <div className={`rounded-xl px-3.5 py-3 text-[10px] leading-4 ${
+                    dbQaResultStoreEnabled
+                      ? "bg-emerald-50/70 text-emerald-700"
+                      : "bg-slate-50 text-slate-500"
+                  }`}>
+                    {dbQaResultStoreEnabled ? (
+                      <>
+                        落盘条件：结果未完整直传，且完整结果行数不超过
+                        <strong> {dbQaResultMaterializationRowCap || "5000"} 行</strong>。成功后 Trace
+                        会显示以 <code>qr_</code> 开头的 result_id、文件路径和过期时间。
+                      </>
+                    ) : (
+                      "持久化已关闭：查询仍会返回模型预览和 Profile，但不会生成 result_id 或结果文件。"
+                    )}
+                  </div>
+                  <div className={`border-t pt-4 ${dbQaResultStoreEnabled ? "border-emerald-100" : "border-slate-100 opacity-50"}`}>
+                    <div className="mb-3">
+                      <p className="text-[12px] font-semibold text-gray-800">分页读取</p>
+                      <p className="mt-1 text-[10px] leading-4 text-gray-500">
+                        控制模型或结果页每次从已持久化文件中读取多少行。
+                      </p>
+                    </div>
+                    <div className="grid gap-4 md:grid-cols-2">
+                      <DatabaseQaParameterField
+                        label="默认每页行数"
+                        description="未指定 page_size 时使用。"
+                        unit="行"
+                        value={dbQaDefaultPageSize}
+                        onChange={setDbQaDefaultPageSize}
+                        disabled={!dbQaResultStoreEnabled}
+                      />
+                      <DatabaseQaParameterField
+                        label="单页最大行数"
+                        description="限制单次分页请求体量，不会提高持久化行数上限。"
+                        unit="行"
+                        value={dbQaMaxPageSize}
+                        onChange={setDbQaMaxPageSize}
+                        disabled={!dbQaResultStoreEnabled}
+                      />
+                    </div>
+                  </div>
+                </SettingsCard>
+                )}
+                </div>
               </div>
             )}
 
@@ -2673,111 +2868,6 @@ export default function SettingsPage() {
                   ) : null}
                 </SettingsCard>
 
-                <div id="gbrain-database" className="scroll-mt-6">
-                  <SettingsCard title="GBrain 数据库" icon={Database} color="#0f766e">
-                    <div className="rounded-xl border border-teal-100 bg-teal-50/50 px-3.5 py-3">
-                      <p className="text-[11px] leading-relaxed text-teal-700">
-                        GBrain 使用独立 PostgreSQL 数据库保存 Wiki 页面、关系和向量，不与 PuddingClaw 主数据库混用。这里负责数据库连接与初始化，Studio 只执行预检和入库。
-                      </p>
-                    </div>
-
-                    <div className="flex flex-wrap items-center gap-2 text-[11px]">
-                      <span className={`rounded-full px-2.5 py-1 font-medium ${gbrainWorkspace?.gbrain.postgres_configured ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-700"}`}>
-                        PostgreSQL {gbrainWorkspace?.gbrain.postgres_configured ? "已配置" : "未配置"}
-                      </span>
-                      <span className={`rounded-full px-2.5 py-1 font-medium ${gbrainWorkspace?.gbrain.cli_installed ? "bg-emerald-50 text-emerald-700" : "bg-red-50 text-red-700"}`}>
-                        CLI {gbrainWorkspace?.gbrain.cli_installed ? "已安装" : "未安装"}
-                      </span>
-                      <span className={`rounded-full px-2.5 py-1 font-medium ${gbrainWorkspace?.gbrain.models.configured ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-700"}`}>
-                        模型 {gbrainWorkspace?.gbrain.models.configured ? "已配置" : "未配置"}
-                      </span>
-                    </div>
-
-                    <div className="grid gap-4 md:grid-cols-2">
-                      <FormField label="模式">
-                        <select value="external" disabled className="form-select disabled:cursor-not-allowed disabled:bg-gray-50 disabled:text-gray-500">
-                          <option value="external">本机 PostgreSQL</option>
-                        </select>
-                      </FormField>
-                      <FormField label="本机端口">
-                        <input
-                          type="number"
-                          min="1"
-                          max="65535"
-                          value={gbrainDatabasePort}
-                          onChange={(event) => setGbrainDatabasePort(event.target.value)}
-                          className="form-input"
-                          placeholder="5432"
-                        />
-                      </FormField>
-                      <FormField label="数据库名">
-                        <input
-                          value={gbrainDatabaseName}
-                          onChange={(event) => setGbrainDatabaseName(event.target.value)}
-                          className="form-input"
-                          placeholder="llm_wiki"
-                        />
-                      </FormField>
-                      <FormField label="用户名">
-                        <input
-                          value={gbrainDatabaseUsername}
-                          onChange={(event) => setGbrainDatabaseUsername(event.target.value)}
-                          className="form-input"
-                          placeholder="pet"
-                        />
-                      </FormField>
-                      <FormField label="密码">
-                        <input
-                          type="password"
-                          value={gbrainDatabasePassword}
-                          onChange={(event) => setGbrainDatabasePassword(event.target.value)}
-                          className="form-input"
-                          placeholder={gbrainWorkspace?.gbrain.postgres_configured ? "重新配置时输入数据库密码" : "数据库密码（本机免密可留空）"}
-                          autoComplete="new-password"
-                        />
-                      </FormField>
-                    </div>
-
-                    <div className="flex flex-wrap items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => void handleTestGbrainDatabase()}
-                        disabled={gbrainDatabaseTesting || gbrainInitializing || !gbrainDatabaseName.trim() || !gbrainDatabaseUsername.trim()}
-                        className="inline-flex items-center gap-1.5 rounded-lg bg-gray-950 px-3 py-2 text-[11px] font-medium text-white hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
-                      >
-                        {gbrainDatabaseTesting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Zap className="h-3.5 w-3.5" />}
-                        测试连接
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => void handleInitializeGbrain()}
-                        disabled={gbrainDatabaseTesting || gbrainInitializing || !gbrainDatabaseName.trim() || !gbrainDatabaseUsername.trim() || !gbrainWorkspace?.gbrain.cli_installed || !gbrainWorkspace?.gbrain.models.configured}
-                        className="inline-flex items-center gap-1.5 rounded-lg bg-[#002fa7] px-3 py-2 text-[11px] font-medium text-white hover:bg-[#001f7a] disabled:cursor-not-allowed disabled:opacity-40"
-                      >
-                        {gbrainInitializing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Database className="h-3.5 w-3.5" />}
-                        {gbrainWorkspace?.gbrain.postgres_configured ? "重新连接并初始化" : "连接并初始化"}
-                      </button>
-                      {gbrainWorkspace?.gbrain.postgres?.configured ? (
-                        <span className="text-[11px] text-gray-400">
-                          当前：{gbrainWorkspace.gbrain.postgres.username}@{gbrainWorkspace.gbrain.postgres.host}:{gbrainWorkspace.gbrain.postgres.port}/{gbrainWorkspace.gbrain.postgres.database}
-                        </span>
-                      ) : null}
-                    </div>
-
-                    {!gbrainWorkspace?.gbrain.models.configured ? (
-                      <p className="rounded-xl border border-amber-100 bg-amber-50/60 px-3.5 py-3 text-[11px] leading-relaxed text-amber-700">
-                        连接并初始化前，请先在下方选择 GBrain 的 Embedding 与 Think 模型并保存设置。
-                      </p>
-                    ) : null}
-
-                    {gbrainDatabaseTestResult ? (
-                      <div className={`rounded-xl border px-3.5 py-3 text-[11px] ${gbrainDatabaseTestResult.ok ? "border-emerald-100 bg-emerald-50 text-emerald-700" : "border-red-100 bg-red-50 text-red-700"}`}>
-                        {gbrainDatabaseTestResult.msg}
-                      </div>
-                    ) : null}
-                  </SettingsCard>
-                </div>
-
                 <SettingsCard title="本地知识库目录" icon={FolderOpen} color="#002fa7">
                   <div className="rounded-xl border border-blue-100 bg-blue-50/50 px-3.5 py-3">
                     <p className="text-[11px] leading-relaxed text-blue-700">
@@ -2850,12 +2940,27 @@ export default function SettingsPage() {
                   </button>
                 </SettingsCard>
 
-                <SettingsCard title="GBrain 检索与推理" icon={Brain} color="#0f766e">
-                  <div className="rounded-xl border border-teal-100 bg-teal-50/50 px-3.5 py-3">
-                    <p className="text-[11px] leading-relaxed text-teal-700">
-                      Embedding 用于 Wiki 入库与语义检索，Think 模型用于多跳综合回答。模型、接口和密钥均复用「模型服务」，不会写进知识库。
-                    </p>
-                  </div>
+                <div id="gbrain-database" className="scroll-mt-6">
+                  <SettingsCard title="GBrain" icon={Brain} color="#0f766e">
+                    <div className="rounded-xl border border-teal-100 bg-teal-50/50 px-3.5 py-3">
+                      <p className="text-[11px] leading-relaxed text-teal-700">
+                        统一配置 GBrain 的检索模型、Think 模型与独立 PostgreSQL。模型接口和密钥复用「模型服务」；数据库保存 Wiki 页面、关系与向量，不与 PuddingClaw 主数据库混用。
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 text-[11px]">
+                      <span className={`rounded-full px-2.5 py-1 font-medium ${gbrainWorkspace?.gbrain.postgres_configured ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-700"}`}>
+                        PostgreSQL {gbrainWorkspace?.gbrain.postgres_configured ? "已配置" : "未配置"}
+                      </span>
+                      <span className={`rounded-full px-2.5 py-1 font-medium ${gbrainWorkspace?.gbrain.cli_installed ? "bg-emerald-50 text-emerald-700" : "bg-red-50 text-red-700"}`}>
+                        CLI {gbrainWorkspace?.gbrain.cli_installed ? "已安装" : "未安装"}
+                      </span>
+                      <span className={`rounded-full px-2.5 py-1 font-medium ${gbrainWorkspace?.gbrain.models.configured ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-700"}`}>
+                        模型 {gbrainWorkspace?.gbrain.models.configured ? "已配置" : "未配置"}
+                      </span>
+                    </div>
+                    <div className="border-t border-black/[0.06] pt-4">
+                      <p className="mb-3 text-[12px] font-semibold text-gray-800">检索与推理模型</p>
+                    </div>
                   <FormField label="Embedding 模型">
                     <ModelBindingSelect
                       value={wikiGbrainEmbeddingModelId}
@@ -2902,7 +3007,99 @@ export default function SettingsPage() {
                     管理模型与密钥
                     <ExternalLink className="h-3.5 w-3.5" />
                   </button>
-                </SettingsCard>
+
+                    <div className="border-t border-black/[0.06] pt-4">
+                      <div className="mb-3">
+                        <p className="text-[12px] font-semibold text-gray-800">PostgreSQL 数据库</p>
+                        <p className="mt-1 text-[11px] leading-relaxed text-gray-500">
+                          复用本机 PostgreSQL 服务，但为 GBrain 使用独立 database。Studio 只执行预检和入库，不再维护数据库连接。
+                        </p>
+                      </div>
+                      <div className="grid gap-4 md:grid-cols-2">
+                        <FormField label="模式">
+                          <select value="external" disabled className="form-select disabled:cursor-not-allowed disabled:bg-gray-50 disabled:text-gray-500">
+                            <option value="external">本机 PostgreSQL</option>
+                          </select>
+                        </FormField>
+                        <FormField label="本机端口">
+                          <input
+                            type="number"
+                            min="1"
+                            max="65535"
+                            value={gbrainDatabasePort}
+                            onChange={(event) => setGbrainDatabasePort(event.target.value)}
+                            className="form-input"
+                            placeholder="5432"
+                          />
+                        </FormField>
+                        <FormField label="数据库名">
+                          <input
+                            value={gbrainDatabaseName}
+                            onChange={(event) => setGbrainDatabaseName(event.target.value)}
+                            className="form-input"
+                            placeholder="llm_wiki"
+                          />
+                        </FormField>
+                        <FormField label="用户名">
+                          <input
+                            value={gbrainDatabaseUsername}
+                            onChange={(event) => setGbrainDatabaseUsername(event.target.value)}
+                            className="form-input"
+                            placeholder="pet"
+                          />
+                        </FormField>
+                        <FormField label="密码">
+                          <input
+                            type="password"
+                            value={gbrainDatabasePassword}
+                            onChange={(event) => setGbrainDatabasePassword(event.target.value)}
+                            className="form-input"
+                            placeholder={gbrainWorkspace?.gbrain.postgres_configured ? "重新配置时输入数据库密码" : "数据库密码（本机免密可留空）"}
+                            autoComplete="new-password"
+                          />
+                        </FormField>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => void handleTestGbrainDatabase()}
+                        disabled={gbrainDatabaseTesting || gbrainInitializing || !gbrainDatabaseName.trim() || !gbrainDatabaseUsername.trim()}
+                        className="inline-flex items-center gap-1.5 rounded-lg bg-gray-950 px-3 py-2 text-[11px] font-medium text-white hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {gbrainDatabaseTesting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Zap className="h-3.5 w-3.5" />}
+                        测试连接
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void handleInitializeGbrain()}
+                        disabled={gbrainDatabaseTesting || gbrainInitializing || !gbrainDatabaseName.trim() || !gbrainDatabaseUsername.trim() || !gbrainWorkspace?.gbrain.cli_installed || !gbrainWorkspace?.gbrain.models.configured}
+                        className="inline-flex items-center gap-1.5 rounded-lg bg-[#002fa7] px-3 py-2 text-[11px] font-medium text-white hover:bg-[#001f7a] disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        {gbrainInitializing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Database className="h-3.5 w-3.5" />}
+                        {gbrainWorkspace?.gbrain.postgres_configured ? "重新连接并初始化" : "连接并初始化"}
+                      </button>
+                      {gbrainWorkspace?.gbrain.postgres?.configured ? (
+                        <span className="text-[11px] text-gray-400">
+                          当前：{gbrainWorkspace.gbrain.postgres.username}@{gbrainWorkspace.gbrain.postgres.host}:{gbrainWorkspace.gbrain.postgres.port}/{gbrainWorkspace.gbrain.postgres.database}
+                        </span>
+                      ) : null}
+                    </div>
+
+                    {!gbrainWorkspace?.gbrain.models.configured ? (
+                      <p className="rounded-xl border border-amber-100 bg-amber-50/60 px-3.5 py-3 text-[11px] leading-relaxed text-amber-700">
+                        连接并初始化前，请先选择上方的 Embedding 与 Think 模型并保存设置。
+                      </p>
+                    ) : null}
+
+                    {gbrainDatabaseTestResult ? (
+                      <div className={`rounded-xl border px-3.5 py-3 text-[11px] ${gbrainDatabaseTestResult.ok ? "border-emerald-100 bg-emerald-50 text-emerald-700" : "border-red-100 bg-red-50 text-red-700"}`}>
+                        {gbrainDatabaseTestResult.msg}
+                      </div>
+                    ) : null}
+                  </SettingsCard>
+                </div>
 
                 <SettingsCard title="多模态 Embedding" icon={Database} color="#002fa7">
                   <div className="rounded-xl border border-slate-200 bg-slate-50 px-3.5 py-3">
@@ -3799,7 +3996,7 @@ export default function SettingsPage() {
             )}
 
             {/* Save Button */}
-            {category !== "ai" && <div className="flex justify-end pt-2 pb-8">
+            {category !== "ai" && category !== "databaseQa" && <div className="flex justify-end pt-2 pb-8">
               <button
                 onClick={handleSave}
                 disabled={saving}
@@ -4305,19 +4502,23 @@ function ToggleRow({
   description,
   checked,
   onChange,
+  disabled = false,
 }: {
   label: string;
   description?: string;
   checked: boolean;
   onChange: (checked: boolean) => void;
+  disabled?: boolean;
 }) {
   return (
-    <div className="flex items-center justify-between gap-3 rounded-lg border border-black/[0.06] bg-white/60 px-3 py-2">
+    <div className={`flex items-center justify-between gap-3 rounded-lg border border-black/[0.06] bg-white/60 px-3 py-2 ${
+      disabled ? "opacity-50" : ""
+    }`}>
       <span className="min-w-0">
         <span className="block text-[11px] font-medium text-gray-600">{label}</span>
         {description ? <span className="mt-0.5 block text-[10px] leading-4 text-gray-400">{description}</span> : null}
       </span>
-      <SwitchButton checked={checked} onChange={onChange} ariaLabel={label} />
+      <SwitchButton checked={checked} onChange={onChange} ariaLabel={label} disabled={disabled} />
     </div>
   );
 }
@@ -4351,6 +4552,43 @@ function FormField({ label, children }: { label: string; children: React.ReactNo
     <div>
       <label className="block text-[11px] font-medium text-gray-500 mb-1.5">{label}</label>
       {children}
+    </div>
+  );
+}
+
+function DatabaseQaParameterField({
+  label,
+  description,
+  unit,
+  value,
+  onChange,
+  disabled = false,
+}: {
+  label: string;
+  description: string;
+  unit: string;
+  value: string;
+  onChange: (value: string) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <div className={disabled ? "opacity-50" : ""}>
+      <label className="mb-1.5 block text-[11px] font-medium text-gray-600">{label}</label>
+      <div className="relative">
+        <input
+          type="number"
+          min="1"
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          disabled={disabled}
+          className="form-input settings-number-input pr-16 disabled:cursor-not-allowed disabled:bg-gray-50"
+          inputMode="numeric"
+        />
+        <span className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-[10px] font-medium text-gray-400">
+          {unit}
+        </span>
+      </div>
+      <p className="mt-1.5 text-[10px] leading-4 text-gray-400">{description}</p>
     </div>
   );
 }

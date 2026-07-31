@@ -120,6 +120,11 @@ def test_tavily_skill_uses_native_controlled_tool() -> None:
 def test_every_registered_agent_custom_tool_has_an_explicit_policy() -> None:
     assert agent_custom_tool_names() == business_tool_names() | DEFAULT_CUSTOM_TOOL_NAMES
     assert {
+        "llm_wiki_create_raw",
+        "llm_wiki_start_ingest",
+    }.issubset(BUSINESS_TOOLSETS["llm_wiki"])
+    assert "llm_wiki_publish" not in BUSINESS_TOOLSETS["llm_wiki"]
+    assert {
         "prepare_skill_install",
         "install_skill",
         "prepare_skill_update",

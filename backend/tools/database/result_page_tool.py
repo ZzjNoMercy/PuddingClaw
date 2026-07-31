@@ -20,7 +20,9 @@ class DatabaseQueryResultPageTool(BaseTool):
     description: str = (
         "Fetch a page from a persisted database query result_id. "
         "Use this after database_knowledge_query or database_sql_execute returns preview-only detail rows "
-        "and the user asks for row-level details."
+        "and explicitly returns a qr_* result_id. Do not use sql-gen-* generation IDs. If no result_id was "
+        "returned because the complete result exceeded the configured materialization row cap, narrow/aggregate "
+        "the query or raise the cap and rerun it; paging cannot recover a result that was never persisted."
     )
     args_schema: type[BaseModel] = DatabaseQueryResultPageInput
     risk_level: str = "safe"
@@ -51,7 +53,11 @@ class DatabaseQueryResultPageTool(BaseTool):
                     session_id=str(context.get("session_id") or ""),
                 )
         except QueryResultStoreError as exc:
-            return f"🧮 查询结果分页读取失败：{exc}"
+            return (
+                f"🧮 查询结果分页读取失败：{exc}\n"
+                "- 不要重试同一个 result_id；请重新执行数据库查询并使用新返回的 qr_* result_id。\n"
+                "- 如果原查询超过持久化行数上限，请缩小/聚合查询，或提高上限后再执行。"
+            )
         except Exception as exc:
             return f"🧮 查询结果分页读取失败：{type(exc).__name__}: {exc}"
 

@@ -26,7 +26,10 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { useApp } from "@/lib/store";
-import { isSessionSubmitting } from "@/lib/sessionConcurrency";
+import {
+  isSessionSubmitting,
+  rebindSessionScopedLock,
+} from "@/lib/sessionConcurrency";
 import { useProjectFolderPicker } from "@/components/projects/useProjectFolderPicker";
 import ConfirmDialog from "@/components/ui/ConfirmDialog";
 import {
@@ -226,8 +229,8 @@ export default function ChatInput() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, text]);
 
-  // Fetch token count on mount, when session changes, and after a streaming
-  // response finishes (so newly loaded messages are reflected immediately).
+  // Fetch token count on mount, when the Session changes, during a long
+  // streaming Run as an SSE recovery path, and again after the Run finishes.
   // Keep the same full-context definition as the live context_usage events:
   // system prompt + messages + tool outputs (or the recorded runtime peak).
   const refreshContextUsage = useCallback(() => {
@@ -273,6 +276,16 @@ export default function ChatInput() {
       refreshContextUsage();
     }
   }, [isStreaming, messages.length, refreshContextUsage]);
+
+  useEffect(() => {
+    if (!isStreaming) return;
+    // Live SSE is the fast path. This low-frequency refresh is the recovery
+    // path when a provider/runtime drops custom middleware events while a
+    // long-running Agent continues through multiple model/tool rounds.
+    refreshContextUsage();
+    const timer = window.setInterval(refreshContextUsage, 4000);
+    return () => window.clearInterval(timer);
+  }, [isStreaming, refreshContextUsage]);
 
   // Slash command state
   const [showSlashMenu, setShowSlashMenu] = useState(false);
@@ -324,27 +337,35 @@ export default function ChatInput() {
         .map((model) => ({ provider, model }))
     );
   }, [providerRegistry]);
+  const defaultConversationModel = useMemo(() => {
+    const defaultModelId = providerRegistry?.bindings.agent;
+    return conversationModels.find(({ model }) => model.id === defaultModelId)
+      || conversationModels[0]
+      || null;
+  }, [conversationModels, providerRegistry]);
   const selectedConversationModel = useMemo(
-    () => conversationModels.find(({ model }) => model.id === llmModelId) || null,
-    [conversationModels, llmModelId],
+    () => conversationModels.find(({ model }) => model.id === llmModelId)
+      || defaultConversationModel,
+    [conversationModels, defaultConversationModel, llmModelId],
   );
   const selectedThinkingProfile = selectedConversationModel?.model.thinking_profile;
+  const effectiveThinkingLevel = thinkingLevel
+    ?? selectedThinkingProfile?.default_level
+    ?? null;
 
   useEffect(() => {
     if (runtimeMode !== "agent") return;
-    getProviders()
-      .then((registry) => setProviderRegistry(registry))
-      .catch(() => setProviderRegistry(null));
+    const refreshProviderRegistry = () => {
+      getProviders()
+        .then((registry) => setProviderRegistry(registry))
+        .catch(() => setProviderRegistry(null));
+    };
+    refreshProviderRegistry();
+    window.addEventListener("puddingclaw:provider-bindings-changed", refreshProviderRegistry);
+    return () => {
+      window.removeEventListener("puddingclaw:provider-bindings-changed", refreshProviderRegistry);
+    };
   }, [runtimeMode]);
-
-  useEffect(() => {
-    if (!providerRegistry || llmModelId) return;
-    const defaultModelId = providerRegistry.bindings.agent;
-    const fallback = conversationModels[0]?.model;
-    const model = conversationModels.find((item) => item.model.id === defaultModelId)?.model || fallback;
-    if (!model) return;
-    setLlmSelection(model.id, model.thinking_profile?.default_level ?? null);
-  }, [conversationModels, llmModelId, providerRegistry, setLlmSelection]);
 
   useEffect(() => {
     if (runtimeMode !== "agent") return;
@@ -408,6 +429,7 @@ export default function ChatInput() {
       new Set(submittedSkillHintRecords.map((hint) => hint.name)),
     );
     const submittedSessionId = sessionId;
+    let trackedSubmissionSessionId = submittedSessionId;
     submitInFlightSessionsRef.current.add(submittedSessionId);
     setSubmittingSessionIds((current) => new Set(current).add(submittedSessionId));
     setInputError(null);
@@ -421,6 +443,21 @@ export default function ChatInput() {
     try {
       const accepted = await sendMessage(submittedText.trim(), submittedAttachments, {
         skillHints: submittedSkillHints,
+        onSessionResolved: (resolvedSessionId) => {
+          if (trackedSubmissionSessionId === resolvedSessionId) return;
+          const previousSessionId = trackedSubmissionSessionId;
+          trackedSubmissionSessionId = resolvedSessionId;
+          submitInFlightSessionsRef.current = rebindSessionScopedLock(
+            submitInFlightSessionsRef.current,
+            previousSessionId,
+            resolvedSessionId,
+          );
+          setSubmittingSessionIds((current) => rebindSessionScopedLock(
+            current,
+            previousSessionId,
+            resolvedSessionId,
+          ));
+        },
       });
       if (!accepted && currentSessionIdRef.current === submittedSessionId) {
         setText((current) => current || submittedText);
@@ -436,10 +473,10 @@ export default function ChatInput() {
         setInputError(error instanceof Error ? error.message : "消息发送失败，已恢复输入内容。");
       }
     } finally {
-      submitInFlightSessionsRef.current.delete(submittedSessionId);
+      submitInFlightSessionsRef.current.delete(trackedSubmissionSessionId);
       setSubmittingSessionIds((current) => {
         const next = new Set(current);
-        next.delete(submittedSessionId);
+        next.delete(trackedSubmissionSessionId);
         return next;
       });
     }
@@ -1041,8 +1078,8 @@ export default function ChatInput() {
                   >
                     <Brain className="h-3.5 w-3.5 shrink-0" />
                     <span>
-                      {selectedThinkingProfile?.strength_control === "levels" && thinkingLevel
-                        ? thinkingLevelLabels[thinkingLevel]
+                      {selectedThinkingProfile?.strength_control === "levels" && effectiveThinkingLevel
+                        ? thinkingLevelLabels[effectiveThinkingLevel]
                         : selectedThinkingProfile?.disabled_label || "默认"}
                     </span>
                   </button>
@@ -1052,11 +1089,12 @@ export default function ChatInput() {
                   <div role="menu" className="absolute bottom-full right-0 z-50 mb-2 w-[min(26rem,calc(100vw-2rem))] overflow-hidden rounded-2xl border border-black/[0.10] bg-white p-2 shadow-2xl shadow-slate-900/15 animate-fade-in-scale">
                     <div className="px-3 pb-2 pt-1">
                       <p className="text-[12px] font-semibold text-gray-800">对话模型</p>
-                      <p className="mt-0.5 text-[11px] text-gray-400">仅影响当前对话；发送时会冻结本次 Run 的选择。</p>
+                      <p className="mt-0.5 text-[11px] text-gray-400">未手动选择时跟随设置中的默认模型；发送时冻结本次 Run 的选择。</p>
                     </div>
                     <div className="max-h-52 overflow-y-auto py-1">
                       {conversationModels.map(({ provider, model }) => {
-                        const selected = model.id === llmModelId;
+                        const selected = model.id === selectedConversationModel?.model.id;
+                        const inheritedDefault = selected && !llmModelId;
                         return (
                           <button
                             key={model.id}
@@ -1073,6 +1111,11 @@ export default function ChatInput() {
                               <span className="block truncate text-[13px] font-medium">{model.name}</span>
                               <span className="block truncate text-[11px] text-gray-400">{provider.name}</span>
                             </span>
+                            {inheritedDefault && (
+                              <span className="rounded-full bg-[#002fa7]/[0.08] px-2 py-0.5 text-[9px] font-semibold text-[#002fa7]">
+                                默认
+                              </span>
+                            )}
                             {selected && <Check className="h-4 w-4 shrink-0" />}
                           </button>
                         );
@@ -1099,7 +1142,7 @@ export default function ChatInput() {
                                   key={level}
                                   type="button"
                                   onClick={() => setLlmSelection(selectedConversationModel.model.id, level)}
-                                  className={`rounded-lg px-3 py-1.5 text-[11px] font-medium transition ${thinkingLevel === level ? "bg-white text-[#002fa7] shadow-sm" : "text-gray-500 hover:text-gray-800"}`}
+                                  className={`rounded-lg px-3 py-1.5 text-[11px] font-medium transition ${effectiveThinkingLevel === level ? "bg-white text-[#002fa7] shadow-sm" : "text-gray-500 hover:text-gray-800"}`}
                                 >
                                   {thinkingLevelLabels[level]}
                                 </button>

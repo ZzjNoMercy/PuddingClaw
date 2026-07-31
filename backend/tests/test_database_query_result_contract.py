@@ -28,12 +28,14 @@ from analytics.nl2sql.sql_runner import (
     _compact_rows,
     _estimate_tokens,
     _profile_from_rows,
+    _trim_profile_to_token_budget,
     extract_sql,
     validate_readonly_sql,
 )
 from analytics.semantic_assets.resolver import format_semantic_assets_for_prompt
 from graph.database_sql_revision_resume import database_sql_revision_resume_registry
 from knowledge.models import AnalyticsQueryResult, Base, utcnow
+from tools.database.formatting import format_actions
 from tools.database.result_source_tool import DatabaseQueryResultSourceTool
 from tools.database.sql_execute_tool import DatabaseSqlExecuteTool
 from tools.database_knowledge_tool import _format_query_error
@@ -69,6 +71,78 @@ def test_product_configuration_model_declares_default_pickup_exclusion() -> None
     assert "默认分析中国狭义乘用车" in prompt
     assert "必须排除车型级别为 `皮卡`" in prompt
     assert "type_name = '级别'" in prompt
+
+
+@pytest.mark.asyncio
+async def test_result_source_rejects_generation_id_with_actionable_guidance() -> None:
+    result = await DatabaseQueryResultSourceTool(
+        session_id="source-adapter-session"
+    )._arun(
+        result_id="sql-gen-not-a-result",
+        runtime=SimpleNamespace(
+            context={"session_id": "source-adapter-session"}
+        ),
+    )
+
+    payload = json.loads(result)
+    assert payload["status"] == "error"
+    assert payload["error_code"] == "invalid_result_id_format"
+    assert payload["retry_same_result_id"] is False
+    assert "qr_*" in payload["error"]
+    assert "generation_id" in payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_result_store_row_cap_failure_is_actionable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        result_store_module,
+        "get_database_qa_config",
+        lambda: {
+            "result_store_enabled": True,
+            "result_materialization_row_cap": 5000,
+        },
+    )
+    execution = SqlExecutionResult(
+        columns=["id"],
+        rows=[{"id": 1}],
+        row_count=5905,
+        limited=True,
+        total_row_count=5905,
+        preview_count=1,
+        omitted_count=5904,
+        is_complete=False,
+        materialized_rows=[{"id": 1}],
+        materialized_all=False,
+    )
+
+    persisted = await result_store_module.attach_persisted_query_result(
+        SimpleNamespace(),
+        execution,
+        question="大明细",
+        sql="SELECT id FROM vehicle_params",
+    )
+
+    assert persisted is False
+    assert execution.result_id is None
+    assert execution.actions == [
+        {
+            "type": "fetch_page",
+            "available": False,
+            "reason": "result_exceeds_materialization_row_cap",
+            "row_count": 5905,
+            "materialization_row_cap": 5000,
+            "next_action": (
+                "narrow_or_aggregate_the_query_or_raise_"
+                "result_materialization_row_cap_then_rerun_database_query"
+            ),
+        }
+    ]
+    guidance = "\n".join(format_actions(execution.actions))
+    assert "超过持久化上限 5000 行" in guidance
+    assert "未生成 result_id" in guidance
+    assert "重新执行数据库查询" in guidance
 
 
 def test_semantic_resolution_uses_strict_match_then_generalizes_on_real_miss() -> None:
@@ -214,9 +288,14 @@ async def test_grounded_sql_keeps_long_l2_question_raw_for_vanna_retrieval() -> 
         stage_timings=timings,
     )
 
-    retrieval_calls = [value for name, value in calls if name != "refine"]
-    assert retrieval_calls
-    assert all(value == question for value in retrieval_calls)
+    retrieval_calls = [
+        value for name, value in calls
+        if name in {"ddl", "documentation", "sql_examples", "generate_sql"}
+    ]
+    assert retrieval_calls and all(value == question for value in retrieval_calls)
+    # A second, typed entity lookup is intentionally scoped to the unsupported
+    # EAV literal. It discovers candidates but never changes business intent.
+    assert ("entities", "自动驾驶级别") in calls
     assert references["entities"]["groups"][0]["items"][0]["name"] == "驾驶辅助级别"
     assert "type_name = '驾驶辅助级别'" in sql
     assert "type_name = '自动驾驶级别'" not in sql
@@ -312,6 +391,23 @@ def test_profile_fixture_keeps_omitted_tengshi_group_visible() -> None:
     assert profile["group_counts"]["品牌"] == {"比亚迪": 20, "腾势": 2}
     assert profile["date_ranges"]["上市日期"] == {"min": "2026-06-01", "max": "2026-06-23"}
     assert profile["numeric_ranges"]["价格"] == {"min": 10.0, "max": 34.98}
+
+
+def test_profile_token_budget_trims_distribution_evidence() -> None:
+    profile = {
+        "group_counts": {
+            "品牌": {f"品牌{i}": 100 - i for i in range(30)},
+        },
+        "date_ranges": {
+            "上市日期": {"min": "2021-01-01", "max": "2026-12-31"},
+        },
+    }
+
+    trimmed = _trim_profile_to_token_budget(profile, token_budget=60)
+
+    assert _estimate_tokens(trimmed) <= 60
+    assert trimmed["group_counts"]["品牌"]["品牌0"] == 100
+    assert len(trimmed["group_counts"]["品牌"]) < 30
 
 
 def test_budget_fixture_marks_preview_only_with_omitted_count() -> None:

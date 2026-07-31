@@ -4,7 +4,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
@@ -66,6 +66,20 @@ async def list_sessions():
     """List all sessions with title and metadata."""
     sessions = await run_in_threadpool(session_manager.list_sessions)
     return {"sessions": sessions}
+
+
+@router.get("/sessions/search")
+async def search_sessions(
+    q: str = Query(min_length=1, max_length=200),
+    limit: int = Query(default=50, ge=1, le=100),
+):
+    """Search session titles and visible conversation content."""
+    results = await run_in_threadpool(
+        session_manager.search_sessions,
+        q,
+        limit=limit,
+    )
+    return {"results": results}
 
 
 @router.post("/sessions")

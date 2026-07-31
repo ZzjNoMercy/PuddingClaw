@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 from typing import Any
 
 from sqlalchemy import exc as sa_exc
@@ -293,6 +294,48 @@ def _compact_rows(rows: list[dict[str, Any]], columns: list[str], *, max_cell_ch
     ]
 
 
+def _trim_profile_to_token_budget(
+    profile: dict[str, Any],
+    *,
+    token_budget: int,
+) -> dict[str, Any]:
+    """Keep Profile evidence within its configured model-context budget."""
+
+    budget = max(1, int(token_budget))
+    if _estimate_tokens(profile) <= budget:
+        return profile
+
+    trimmed: dict[str, Any] = {}
+
+    # Distribution evidence is the main defense against treating preview rows
+    # as the full population, so retain its highest-frequency values first.
+    group_counts = profile.get("group_counts")
+    if isinstance(group_counts, dict):
+        for column, raw_counts in group_counts.items():
+            if not isinstance(raw_counts, dict):
+                continue
+            for value, count in raw_counts.items():
+                candidate = deepcopy(trimmed)
+                candidate.setdefault("group_counts", {}).setdefault(column, {})[
+                    value
+                ] = count
+                if _estimate_tokens(candidate) > budget:
+                    break
+                trimmed = candidate
+
+    for section in ("date_ranges", "numeric_ranges"):
+        values = profile.get(section)
+        if not isinstance(values, dict):
+            continue
+        for column, range_info in values.items():
+            candidate = deepcopy(trimmed)
+            candidate.setdefault(section, {})[column] = range_info
+            if _estimate_tokens(candidate) <= budget:
+                trimmed = candidate
+
+    return trimmed
+
+
 def _is_statement_timeout(exc: BaseException) -> bool:
     text_value = str(exc).lower()
     return "statement timeout" in text_value or "querycancelederror" in text_value or "query canceled" in text_value
@@ -386,13 +429,25 @@ async def run_readonly_sql(
     """Execute validated SQL and return a completeness-aware result contract."""
 
     config = get_database_qa_config()
-    safe_limit = max(1, min(int(limit or config.get("default_page_size") or 100), int(config.get("max_page_size") or 500)))
-    max_cell_chars = int(config.get("max_cell_chars_for_llm") or 500)
     full_row_cap = int(config.get("full_rows_hard_row_cap") or 200)
+    requested_page_limit = max(
+        1,
+        min(
+            int(limit or config.get("default_page_size") or 100),
+            int(config.get("max_page_size") or 500),
+        ),
+    )
+    materialize_limit = max(requested_page_limit, full_row_cap)
+    if config.get("result_store_enabled", True):
+        materialize_limit = max(
+            materialize_limit,
+            int(config.get("result_materialization_row_cap") or 5000),
+        )
+    safe_limit = min(requested_page_limit, materialize_limit)
+    max_cell_chars = int(config.get("max_cell_chars_for_llm") or 500)
     full_column_cap = int(config.get("full_rows_hard_column_cap") or 20)
     full_token_budget = int(config.get("full_rows_token_budget") or 10000)
     effective_timeout_ms = int(timeout_ms or config.get("query_timeout_ms") or 30000)
-    materialize_limit = max(5000, safe_limit, full_row_cap)
     clean_sql = validate_readonly_sql(sql, allowed_tables=allowed_tables)
     engine = create_async_engine(database_source_url(source), pool_pre_ping=True)
     try:
@@ -431,11 +486,17 @@ async def run_readonly_sql(
                         preview_tokens = _estimate_tokens({"columns": string_columns, "rows": preview_rows})
                     model_rows = preview_rows
                 profile: dict[str, Any] = {}
-                if config.get("profile_enabled", True):
+                if not can_include_full and config.get("profile_enabled", True):
                     if materialized_all:
                         profile = _profile_from_rows(rows, string_columns)
                     else:
                         profile = await _profile_with_sql(conn, clean_sql, string_columns)
+                    profile = _trim_profile_to_token_budget(
+                        profile,
+                        token_budget=int(
+                            config.get("profile_token_budget") or 3000
+                        ),
+                    )
                 omitted_count = max(0, total_row_count - len(model_rows))
                 limited = not can_include_full
                 return SqlExecutionResult(

@@ -2,15 +2,40 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import hashlib
+import hmac
+import secrets
 from pathlib import Path
 from typing import Any, Literal
 
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import SQLAlchemyError
 
+from db import get_sessionmaker
+from graph.attachment_store import attachment_store
 from graph.citations import encode_tool_result
+from knowledge.import_jobs import create_llm_wiki_ingest_job as enqueue_llm_wiki_ingest_job
+from knowledge.import_jobs import job_to_dict
 from knowledge.llm_wiki import LlmWikiError, LlmWikiService
+from knowledge.service import KnowledgeService, KnowledgeServiceError
+
+_INTAKE_SECRET = secrets.token_bytes(32)
+
+
+def _intake_id(*, session_id: str, query_id: str, raw_paths: list[str]) -> str:
+    payload = json.dumps(
+        {
+            "session_id": session_id,
+            "query_id": query_id,
+            "raw_paths": raw_paths,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hmac.new(_INTAKE_SECRET, payload, hashlib.sha256).hexdigest()
 
 
 class WikiContextInput(BaseModel):
@@ -43,6 +68,38 @@ class NoInput(BaseModel):
     pass
 
 
+class WikiCreateRawInput(BaseModel):
+    source: Literal["current_message", "attachments", "knowledge_file"] = Field(
+        description="Authoritative input to snapshot. The server resolves current message and attachments; do not copy their text into arguments."
+    )
+    title: str = Field(default="", max_length=200)
+    attachment_ids: list[str] = Field(
+        default_factory=list,
+        description="For attachments, selected current-turn Markdown attachment ids. Empty means every current Markdown attachment.",
+    )
+    virtual_path: str = Field(
+        default="",
+        description="For knowledge_file, the exact /knowledge/... Markdown path.",
+    )
+
+
+class WikiStartIngestInput(BaseModel):
+    raw_paths: list[str] = Field(min_length=1, description="Exact snapshot_path values returned by llm_wiki_create_raw.")
+    intake_id: str = Field(
+        min_length=64,
+        max_length=64,
+        description="Opaque current-turn intake id returned by llm_wiki_create_raw.",
+    )
+    import_gbrain: bool = Field(
+        default=False,
+        description=(
+            "Whether to continue importing the validated Wiki into gbrain after publish and Lint. "
+            "Keep false when the user only asks to compile or organize content as Wiki; set true only when the user "
+            "explicitly asks to enter/import/sync gbrain."
+        ),
+    )
+
+
 class _WikiTool(BaseTool):
     base_dir: Path
 
@@ -67,9 +124,14 @@ class LlmWikiContextTool(_WikiTool):
     )
     args_schema: type[BaseModel] = WikiContextInput
     risk_level: str = "safe"
+    allow_ingest: bool = Field(default=True, exclude=True, repr=False)
 
     def _run(self, operation: str, raw_paths: list[str] | None = None) -> str:
         try:
+            if operation == "ingest" and not self.allow_ingest:
+                raise LlmWikiError(
+                    "聊天 Agent 不直接读取 Ingest Raw；请使用 llm_wiki_create_raw 和 llm_wiki_start_ingest 投递后台任务"
+                )
             return self.encode(self.service.operation_context(operation, raw_paths=raw_paths or []))
         except (LlmWikiError, OSError) as exc:
             return self.error(exc)
@@ -177,6 +239,184 @@ class LlmWikiCompileTool(_WikiTool):
             return self.error(exc)
 
 
+class LlmWikiCreateRawTool(_WikiTool):
+    name: str = "llm_wiki_create_raw"
+    description: str = (
+        "Create immutable LLM Wiki Raw snapshots from the exact current chat message, current Markdown attachments, "
+        "or one existing /knowledge/ Markdown file. The server reads authoritative bytes; never paste document content "
+        "into tool arguments. After success, pass returned raw_paths to llm_wiki_start_ingest."
+    )
+    args_schema: type[BaseModel] = WikiCreateRawInput
+    risk_level: str = "moderate"
+    session_id: str = Field(default="", exclude=True, repr=False)
+    query_id: str = Field(default="", exclude=True, repr=False)
+    current_message: str = Field(default="", exclude=True, repr=False)
+    current_attachments: list[dict[str, Any]] = Field(default_factory=list, exclude=True, repr=False)
+
+    def _run(self, **kwargs: Any) -> str:
+        return self.error(RuntimeError("llm_wiki_create_raw must run asynchronously"))
+
+    async def _arun(
+        self,
+        source: str,
+        title: str = "",
+        attachment_ids: list[str] | None = None,
+        virtual_path: str = "",
+    ) -> str:
+        try:
+            records: list[dict[str, Any]] = []
+            clean_title = str(title or "").strip()
+            if source == "current_message":
+                content = self.current_message
+                if not content.strip():
+                    raise LlmWikiError("当前消息没有可写入 Raw 的文本内容")
+                asset_id = self.query_id or hashlib.sha256(content.encode("utf-8")).hexdigest()
+                records.append(
+                    await asyncio.to_thread(
+                        self.service.snapshot_raw,
+                        source_id=f"chat:{self.session_id or 'unknown'}",
+                        asset_id=asset_id,
+                        title=clean_title or "聊天文本",
+                        content=content,
+                        source_path=f"chat://{self.session_id or 'unknown'}/{asset_id}",
+                    )
+                )
+            elif source == "attachments":
+                allowed = {
+                    str(item.get("id") or "")
+                    for item in self.current_attachments
+                    if isinstance(item, dict) and str(item.get("id") or "")
+                }
+                requested = list(dict.fromkeys(str(item).strip() for item in attachment_ids or [] if str(item).strip()))
+                stored_by_id = {
+                    attachment_id: attachment_store.get(self.session_id, attachment_id)
+                    for attachment_id in sorted(allowed)
+                }
+                selected = requested or [
+                    attachment_id
+                    for attachment_id, item in stored_by_id.items()
+                    if item
+                    and (
+                        Path(str(item.get("path") or "")).suffix.lower() in {".md", ".markdown"}
+                        or str(item.get("mime_type") or "") in {"text/markdown", "text/x-markdown"}
+                    )
+                ]
+                if not selected:
+                    raise LlmWikiError("当前消息没有 Markdown 附件")
+                unauthorized = [item for item in selected if item not in allowed]
+                if unauthorized:
+                    raise LlmWikiError(f"附件不属于当前消息：{', '.join(unauthorized)}")
+                for attachment_id in selected:
+                    item = stored_by_id.get(attachment_id)
+                    if not item:
+                        raise LlmWikiError(f"附件不存在或不可读取：{attachment_id}")
+                    path = Path(str(item.get("path") or ""))
+                    name = str(item.get("name") or path.name or attachment_id)
+                    mime_type = str(item.get("mime_type") or "")
+                    if path.suffix.lower() not in {".md", ".markdown"} and mime_type not in {
+                        "text/markdown",
+                        "text/x-markdown",
+                    }:
+                        raise LlmWikiError(f"只有 Markdown 附件可以进入 Raw：{name}")
+                    records.append(
+                        await asyncio.to_thread(
+                            self.service.snapshot_raw_file,
+                            source_id=f"attachment:{self.session_id or 'unknown'}",
+                            asset_id=attachment_id,
+                            title=clean_title or Path(name).stem,
+                            path=path,
+                            source_path=f"attachment://{self.session_id}/{attachment_id}",
+                        )
+                    )
+            elif source == "knowledge_file":
+                knowledge = KnowledgeService(self.base_dir)
+                path = knowledge.resolve_raw_file(virtual_path=virtual_path)
+                canonical_virtual_path = (
+                    f"/knowledge/{path.relative_to(knowledge.knowledge_dir.resolve()).as_posix()}"
+                )
+                try:
+                    path.relative_to(self.service.root.resolve())
+                except ValueError:
+                    pass
+                else:
+                    raise LlmWikiError("LLM Wiki 工作目录中的文件不能再次加入 Raw")
+                records.append(
+                    await asyncio.to_thread(
+                        self.service.snapshot_raw_file,
+                        source_id="knowledge-file",
+                        asset_id=canonical_virtual_path,
+                        title=clean_title or path.stem,
+                        path=path,
+                        source_path=canonical_virtual_path,
+                    )
+                )
+            else:
+                raise LlmWikiError(f"不支持的 Raw 来源：{source}")
+            return self.encode(
+                {
+                    "ok": True,
+                    "raw_paths": [str(record["snapshot_path"]) for record in records],
+                    "snapshots": records,
+                    "intake_id": _intake_id(
+                        session_id=self.session_id,
+                        query_id=self.query_id,
+                        raw_paths=[str(record["snapshot_path"]) for record in records],
+                    ),
+                    "next_tool": "llm_wiki_start_ingest",
+                }
+            )
+        except (LlmWikiError, KnowledgeServiceError, OSError) as exc:
+            return self.error(exc)
+
+
+class LlmWikiStartIngestTool(_WikiTool):
+    name: str = "llm_wiki_start_ingest"
+    description: str = (
+        "Queue the existing durable LLM Wiki compiler pipeline for exact immutable raw_paths. Returns immediately with "
+        "a task id. By default the dedicated compiler Agent stops after context → publish → lint (Wiki only). Set "
+        "import_gbrain=true only when the user explicitly requests gbrain; that adds the validated gbrain PostgreSQL "
+        "import as a second stage."
+    )
+    args_schema: type[BaseModel] = WikiStartIngestInput
+    risk_level: str = "moderate"
+    session_id: str = Field(default="", exclude=True, repr=False)
+    query_id: str = Field(default="", exclude=True, repr=False)
+
+    def _run(self, **kwargs: Any) -> str:
+        return self.error(RuntimeError("llm_wiki_start_ingest must run asynchronously"))
+
+    async def _arun(self, raw_paths: list[str], intake_id: str, import_gbrain: bool = False) -> str:
+        try:
+            expected_intake_id = _intake_id(
+                session_id=self.session_id,
+                query_id=self.query_id,
+                raw_paths=raw_paths,
+            )
+            if not self.session_id or not self.query_id or not hmac.compare_digest(intake_id, expected_intake_id):
+                raise KnowledgeServiceError(
+                    "intake_id 不属于当前消息；请先调用 llm_wiki_create_raw，并原样传递其 raw_paths 与 intake_id"
+                )
+            sessionmaker = get_sessionmaker()
+            async with sessionmaker() as session:
+                job = await enqueue_llm_wiki_ingest_job(
+                    session,
+                    base_dir=self.base_dir,
+                    raw_paths=raw_paths,
+                    import_gbrain=import_gbrain,
+                )
+            return self.encode(
+                {
+                    "ok": True,
+                    "queued": job.status == "queued",
+                    "status": job.status,
+                    "job": job_to_dict(job),
+                    "task_center_path": "/knowledge/imports",
+                }
+            )
+        except (KnowledgeServiceError, LlmWikiError, OSError, SQLAlchemyError) as exc:
+            return self.error(exc)
+
+
 def create_llm_wiki_tools(base_dir: Path) -> list[BaseTool]:
     resolved = base_dir.resolve()
     return [
@@ -185,4 +425,6 @@ def create_llm_wiki_tools(base_dir: Path) -> list[BaseTool]:
         LlmWikiLintTool(base_dir=resolved),
         LlmWikiQueryTool(base_dir=resolved),
         LlmWikiCompileTool(base_dir=resolved),
+        LlmWikiCreateRawTool(base_dir=resolved),
+        LlmWikiStartIngestTool(base_dir=resolved),
     ]

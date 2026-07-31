@@ -434,6 +434,13 @@ export interface KnowledgeFilePreview {
   content: string;
   truncated: boolean;
   message?: string | null;
+  llm_wiki_raw?: {
+    available: boolean;
+    snapshot?: Record<string, unknown> | null;
+    latest_snapshot?: Record<string, unknown> | null;
+    changed_since_snapshot: boolean;
+    error?: string;
+  };
 }
 
 export interface KnowledgeStatus {
@@ -1446,6 +1453,21 @@ export async function previewKnowledgeFile(virtualPath: string): Promise<Knowled
   return payload.file;
 }
 
+export async function snapshotKnowledgeFileToLlmWikiRaw(
+  virtualPath: string
+): Promise<{ ok: boolean; raw: Record<string, unknown> }> {
+  const response = await fetch(`${API_BASE}/knowledge/file/llm-wiki-raw`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ virtual_path: virtualPath }),
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(apiErrorMessage(text, `加入 LLM Wiki Raw 失败：${response.status}`));
+  }
+  return JSON.parse(text) as { ok: boolean; raw: Record<string, unknown> };
+}
+
 export function rawKnowledgeFileUrl(virtualPath: string): string {
   if (!virtualPath) return "";
   if (virtualPath.startsWith("/api/knowledge/file/raw?")) return virtualPath;
@@ -1533,11 +1555,14 @@ export async function createKnowledgeImportJob(
   return payload.job;
 }
 
-export async function createLlmWikiIngestJob(rawPaths: string[]): Promise<KnowledgeImportJob> {
+export async function createLlmWikiIngestJob(
+  rawPaths: string[],
+  importGbrain = false
+): Promise<KnowledgeImportJob> {
   const response = await fetch(`${API_BASE}/knowledge/brain/wiki/ingest-jobs`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ raw_paths: rawPaths }),
+    body: JSON.stringify({ raw_paths: rawPaths, import_gbrain: importGbrain }),
   });
   if (!response.ok) {
     const text = await response.text().catch(() => "");
@@ -3456,6 +3481,35 @@ export async function listSessions(): Promise<
   if (!resp.ok) throw new Error(`Failed to list sessions: ${resp.status}`);
   const data = await resp.json();
   return data.sessions;
+}
+
+export interface SessionSearchResult {
+  id: string;
+  title: string;
+  updated_at: number;
+  runtime_mode?: "agent" | "chat";
+  project_id?: string | null;
+  project_path?: string | null;
+  snippet: string;
+  matched_in: "title" | "content";
+}
+
+/** Search session titles and visible conversation content. */
+export async function searchSessions(
+  query: string,
+  signal?: AbortSignal,
+): Promise<SessionSearchResult[]> {
+  const params = new URLSearchParams({
+    q: query.trim(),
+    limit: "50",
+  });
+  const resp = await fetch(`${API_BASE}/sessions/search?${params.toString()}`, {
+    cache: "no-store",
+    signal,
+  });
+  if (!resp.ok) throw new Error(`Failed to search sessions: ${resp.status}`);
+  const data = await resp.json() as { results?: SessionSearchResult[] };
+  return Array.isArray(data.results) ? data.results : [];
 }
 
 export interface ProjectMeta {

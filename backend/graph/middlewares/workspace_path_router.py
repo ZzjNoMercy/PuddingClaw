@@ -25,6 +25,7 @@ from graph.middlewares.external_directory import (
 from graph.session_manager import session_manager
 from graph.trace_collector import get_current_trace_collector
 from graph.virtual_paths import (
+    MANAGED_VIRTUAL_NAMESPACE_ROOTS,
     VIRTUAL_NAMESPACE_ROOTS,
     PathAuthority,
     classify_path_authority,
@@ -48,8 +49,21 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
         "read_resource": "resource",
     }
 
-    def __init__(self, backend: Any | None = None) -> None:
+    def __init__(
+        self,
+        backend: Any | None = None,
+        *,
+        managed_host_path_aliases: dict[str, str | Path] | None = None,
+    ) -> None:
         self.backend = backend
+        aliases = managed_host_path_aliases
+        if aliases is None and backend is not None:
+            aliases = getattr(backend, "managed_host_path_aliases", None)
+        self.managed_host_path_aliases = {
+            str(virtual_root).rstrip("/"): Path(host_root).expanduser().resolve()
+            for virtual_root, host_root in dict(aliases or {}).items()
+            if str(virtual_root).rstrip("/") in MANAGED_VIRTUAL_NAMESPACE_ROOTS
+        }
 
     @classmethod
     def _default_search_scope(
@@ -131,6 +145,41 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
         if classified.authority is PathAuthority.ESCAPE:
             return "escape", routed
         return "external", routed
+
+    def _managed_virtual_path(self, raw_path: str) -> tuple[str | None, bool]:
+        """Map a configured managed host path back to its model-visible mount.
+
+        CompositeBackend routes expose targets such as ``/knowledge``. Users,
+        file pickers, and persisted source metadata may still provide the
+        physical source path. Treat both spellings as the same read-only
+        authority without teaching the model host-specific directory layouts.
+        The boolean reports a lexical-in-root symlink escape so callers can
+        fail closed instead of silently treating it as an external file.
+        """
+
+        normalized = str(raw_path or "").strip()
+        if not normalized or not self.managed_host_path_aliases:
+            return None, False
+        requested = Path(normalized).expanduser()
+        if not requested.is_absolute():
+            return None, False
+        lexical = Path(requested.absolute())
+        canonical = requested.resolve(strict=False)
+        for virtual_root, host_root in self.managed_host_path_aliases.items():
+            lexical_inside = self._is_relative_to(lexical, host_root)
+            canonical_inside = self._is_relative_to(canonical, host_root)
+            if lexical_inside and not canonical_inside:
+                return None, True
+            if not canonical_inside:
+                continue
+            relative = canonical.relative_to(host_root).as_posix()
+            return (
+                virtual_root
+                if relative == "."
+                else f"{virtual_root}/{relative}",
+                False,
+            )
+        return None, False
 
     @staticmethod
     def _tool_message(
@@ -394,6 +443,22 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
                 tool_call={**request.tool_call, "args": args}
             )
         raw_path = str(args.get(path_arg) or "")
+        managed_virtual_path, managed_escape = self._managed_virtual_path(raw_path)
+        if managed_escape:
+            return "result", self._tool_message(
+                request,
+                (
+                    "❌ Path escapes its managed read-only authority through a symlink: "
+                    f"{raw_path!r}."
+                ),
+                name=tool_name,
+            )
+        if managed_virtual_path is not None:
+            args[path_arg] = managed_virtual_path
+            request = request.override(
+                tool_call={**request.tool_call, "args": args}
+            )
+            raw_path = managed_virtual_path
         kind, routed_path = self._classify_path(raw_path, workspace_path)
 
         if kind == "escape":
@@ -459,6 +524,30 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
                 return "result", self._tool_message(
                     request,
                     "❌ `/scratch/...` is a Docker/Backend virtual path. Use read_file, not read_resource.",
+                    name="read_resource",
+                )
+            return "backend_read", (request, routed_path, args)  # type: ignore[return-value]
+
+        # Managed filesystem mounts are regular Backend files. If the model
+        # chose read_resource only because the user supplied the physical host
+        # spelling, normalize the call to read_file semantics at the execution
+        # boundary. Images remain resources because they need the image marker
+        # consumed by the visual-analysis path.
+        if (
+            tool_name == "read_resource"
+            and kind == "virtual"
+            and any(
+                routed_path == root or routed_path.startswith(f"{root}/")
+                for root in MANAGED_VIRTUAL_NAMESPACE_ROOTS
+            )
+            and Path(routed_path).suffix.lower() not in {
+                ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"
+            }
+        ):
+            if self.backend is None:
+                return "result", self._tool_message(
+                    request,
+                    "❌ Managed filesystem path requires the Agent Backend read_file route.",
                     name="read_resource",
                 )
             return "backend_read", (request, routed_path, args)  # type: ignore[return-value]

@@ -4329,6 +4329,103 @@ class SessionManager:
             sessions.append(meta)  # 追加到结果
         return sessions  # 返回所有会话列表
 
+    @staticmethod
+    def _searchable_message_content(message: dict[str, Any]) -> str:
+        """Return only user-visible message text, excluding tool payloads."""
+
+        def collect(value: Any) -> list[str]:
+            if isinstance(value, str):
+                return [value]
+            if isinstance(value, list):
+                parts: list[str] = []
+                for item in value:
+                    parts.extend(collect(item))
+                return parts
+            if not isinstance(value, dict):
+                return []
+
+            # Multimodal message blocks commonly store visible copy in
+            # ``text`` or nest it under ``content``. Deliberately do not walk
+            # arbitrary keys: tool inputs/outputs are execution records, not
+            # conversation content.
+            text = value.get("text")
+            if isinstance(text, str):
+                return [text]
+            if "content" in value:
+                return collect(value.get("content"))
+            return []
+
+        content = " ".join(collect(message.get("content")))
+        return re.sub(r"\s+", " ", content).strip()
+
+    @staticmethod
+    def _search_snippet(text: str, query: str, *, max_length: int = 180) -> str:
+        normalized = re.sub(r"\s+", " ", text).strip()
+        if not normalized:
+            return ""
+
+        match = re.search(re.escape(query), normalized, flags=re.IGNORECASE)
+        if match is None:
+            return normalized if len(normalized) <= max_length else f"{normalized[:max_length].rstrip()}…"
+
+        start = max(0, match.start() - 58)
+        end = min(len(normalized), start + max_length)
+        if end - start < max_length:
+            start = max(0, end - max_length)
+        snippet = normalized[start:end].strip()
+        return f"{'…' if start > 0 else ''}{snippet}{'…' if end < len(normalized) else ''}"
+
+    def search_sessions(self, query: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        """Search session titles and visible conversation content."""
+
+        normalized_query = query.strip()
+        if not normalized_query:
+            return []
+
+        query_key = normalized_query.casefold()
+        matches: list[dict[str, Any]] = []
+        for meta in self.list_sessions():
+            title = str(meta.get("title") or meta["id"])
+            title_matches = query_key in title.casefold()
+            content_match = ""
+            preview = ""
+
+            for message in self.load_session(str(meta["id"])):
+                if not isinstance(message, dict):
+                    continue
+                if str(message.get("role") or "") not in {"user", "assistant"}:
+                    continue
+                text = self._searchable_message_content(message)
+                if not text:
+                    continue
+                if not preview:
+                    preview = text
+                if title_matches:
+                    break
+                if query_key in text.casefold():
+                    content_match = text
+                    break
+
+            if not title_matches and not content_match:
+                continue
+
+            result = dict(meta)
+            result["matched_in"] = "title" if title_matches else "content"
+            result["snippet"] = self._search_snippet(
+                content_match or preview,
+                normalized_query if content_match else "",
+            )
+            matches.append(result)
+
+        matches.sort(
+            key=lambda item: (
+                item.get("matched_in") == "title",
+                float(item.get("updated_at") or 0),
+            ),
+            reverse=True,
+        )
+        return matches[: max(1, min(limit, 100))]
+
     # ── 短期记忆压缩（核心机制）────────────────────────────────────────────────
 
     @_session_write_locked

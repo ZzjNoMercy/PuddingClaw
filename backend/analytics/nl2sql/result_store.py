@@ -239,11 +239,31 @@ async def attach_persisted_query_result(
         ]
         return True
 
+    materialization_row_cap = int(
+        config.get("result_materialization_row_cap") or 5000
+    )
+    if not config.get("result_store_enabled", True):
+        reason = "result_store_disabled"
+        next_action = "enable_result_store_then_rerun_database_query"
+    elif not execution.materialized_all:
+        reason = "result_exceeds_materialization_row_cap"
+        next_action = (
+            "narrow_or_aggregate_the_query_or_raise_"
+            "result_materialization_row_cap_then_rerun_database_query"
+        )
+    else:
+        reason = "result_not_persisted"
+        next_action = "rerun_database_query"
     execution.actions = [
         {
             "type": "fetch_page",
             "available": False,
-            "reason": "result_not_fully_materialized",
+            "reason": reason,
+            "row_count": int(
+                execution.total_row_count or execution.row_count or 0
+            ),
+            "materialization_row_cap": materialization_row_cap,
+            "next_action": next_action,
         }
     ]
     return False

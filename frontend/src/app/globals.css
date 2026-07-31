@@ -353,6 +353,16 @@ body {
 }
 .form-input::placeholder { color: #aaa; }
 
+.settings-number-input {
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+.settings-number-input::-webkit-inner-spin-button,
+.settings-number-input::-webkit-outer-spin-button {
+  margin: 0;
+  -webkit-appearance: none;
+}
+
 .form-select {
   width: 100%;
   padding: 7px 12px;

@@ -91,6 +91,13 @@ class DatabaseSqlGenerateInput(BaseModel):
             "agree/reject/modify HITL flow."
         ),
     )
+    schema_evidence_receipt_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional server-issued receipt returned by database_schema_inspect. "
+            "Use it for an evidence-backed physical EAV repair; never copy schema rows into revision text."
+        ),
+    )
     runtime: ToolRuntime
 
 
@@ -142,6 +149,8 @@ class DatabaseSqlExecuteInput(BaseModel):
 
 
 class DatabaseSchemaInspectInput(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     mode: str = Field(
         default="tables",
         description="One of: tables, columns, type_names, sample.",
@@ -150,6 +159,11 @@ class DatabaseSchemaInspectInput(BaseModel):
     table_name: str | None = Field(default=None, description="Table name for columns/type_names/sample modes.")
     search: str | None = Field(default=None, description="Optional fuzzy search text for type_names.")
     limit: int = Field(default=100, ge=1, le=1000, description="Maximum rows to return.")
+    parent_generation_id: str | None = Field(
+        default=None,
+        description="Optional SQL generation id whose physical mapping is being diagnosed.",
+    )
+    runtime: ToolRuntime
 
 
 class DatabaseQueryTraceInspectInput(BaseModel):
@@ -162,7 +176,11 @@ class DatabaseQueryResultPageInput(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     result_id: str = Field(
-        description="Persisted database query result id returned by database_knowledge_query or database_sql_execute."
+        description=(
+            "A persisted qr_* result_id explicitly returned by database_knowledge_query or "
+            "database_sql_execute. Do not pass a sql-gen-* generation_id. If execution returned "
+            "no result_id because the materialization row cap was exceeded, adjust/rerun the query first."
+        )
     )
     page: int = Field(default=1, ge=1, description="1-based page number.")
     page_size: int | None = Field(default=None, ge=1, le=5000, description="Optional page size.")
@@ -174,8 +192,9 @@ class DatabaseQueryResultSourceInput(BaseModel):
 
     result_id: str = Field(
         description=(
-            "Persisted database query result id returned by database_knowledge_query "
-            "or database_sql_execute."
+            "A persisted qr_* result_id explicitly returned by database_knowledge_query "
+            "or database_sql_execute. Do not pass a sql-gen-* generation_id or retry a missing/expired ID; "
+            "rerun the database query after narrowing/aggregating it or raising the materialization row cap."
         )
     )
     runtime: ToolRuntime

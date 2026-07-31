@@ -18,6 +18,7 @@ class DatabaseQueryRequest:
     model_id: str | None = None
     measure_ids: list[str] = field(default_factory=list)
     semantic_question: str | None = None
+    technical_evidence: dict[str, Any] = field(default_factory=dict)
     limit: int = 100
     allow_llm_to_see_data: bool = False
 

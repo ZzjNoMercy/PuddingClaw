@@ -26,9 +26,13 @@ class DatabaseSqlExecuteTool(BaseTool):
         "Use only after database_sql_generate. In Agent mode, generation_id is mandatory and its registered SQL is "
         "loaded server-side; omit the SQL argument. A validation_receipt_id from database_sql_validate is also mandatory "
         "and must match the generation SQL hash. Semantic changes must go through the natural-language revision HITL flow. "
-        "When the result is preview-only, the full materialized rows are persisted and returned with a result_id; "
-        "use database_query_result_page only to inspect rows, or database_query_result_source followed by "
-        "materialize_source_ref to place the complete result in a file/typed slot without model-context transfer."
+        "A preview-only result is persisted and returned with a qr_* result_id only when result storage is enabled "
+        "and the complete row count does not exceed the configured result_materialization_row_cap. The limit argument "
+        "controls model preview rows, not that persistence cap. If the output has no result_id because the row cap was "
+        "exceeded, do not call result-page/source tools or retry an old ID: narrow/aggregate the query, or raise the "
+        "configured cap, then execute the SQL again. When a result_id is returned, use database_query_result_page only "
+        "to inspect rows, or database_query_result_source followed by materialize_source_ref to place the complete "
+        "result in a file/typed slot without model-context transfer."
     )
     args_schema: type[BaseModel] = DatabaseSqlExecuteInput
     risk_level: str = "moderate"

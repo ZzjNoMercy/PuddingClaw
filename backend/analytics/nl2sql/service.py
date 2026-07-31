@@ -3,14 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import re
+import time
 from time import perf_counter
 from typing import Any
 
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from analytics.models.registry import get_analytics_model_registry
+from analytics.nl2sql.eav_evidence import (
+    bindings_from_semantic_trace,
+    bindings_prompt,
+    check_eav_evidence,
+    eav_concept_key,
+    eav_mapping_fingerprint,
+    extract_eav_type_names,
+    sql_business_fingerprint,
+)
 from analytics.nl2sql.guardrails import (
     GuardrailConflict,
     collect_applied_semantic_rules,
@@ -35,7 +48,7 @@ from analytics.semantic_runtime import (
     render_sql_semantic_context,
 )
 from config import get_vanna_config
-from knowledge.database_sources import get_database_source
+from knowledge.database_sources import database_source_url, get_database_source
 
 
 class DatabaseKnowledgeQueryError(RuntimeError):
@@ -50,6 +63,185 @@ logger = logging.getLogger(__name__)
 
 VANNA_REFERENCE_TOP_K = 5
 VANNA_ENTITY_TOP_K_PER_TYPE = 10
+_SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _vehicle_params_table(route: Any) -> str | None:
+    """Return a quoted, schema-preserving authorized EAV table name."""
+
+    for raw_name in route.table_names:
+        parts = [part.strip().strip('"') for part in str(raw_name).split(".") if part.strip()]
+        if not parts or parts[-1].lower() != "vehicle_params":
+            continue
+        scoped = parts[-2:]
+        if all(_SAFE_IDENTIFIER.fullmatch(part) for part in scoped):
+            return ".".join(f'"{part}"' for part in scoped)
+    return None
+
+
+def _prompt_entity_type_names(items: list[dict[str, Any]]) -> set[str]:
+    result: set[str] = set()
+    for item in items:
+        column = str(item.get("table_column") or "").strip().lower()
+        if not (column.endswith(".vehicle_params.type_name") or column == "vehicle_params.type_name"):
+            continue
+        name = str(item.get("canonical_name") or item.get("name") or "").strip()
+        if name:
+            result.add(name)
+    return result
+
+
+def _normalize_table_scope(value: str) -> str:
+    parts = [part.strip().strip('"').lower() for part in str(value or "").split(".") if part.strip()]
+    if len(parts) == 1:
+        return f"public.{parts[0]}"
+    return ".".join(parts[-2:])
+
+
+def _schema_receipt_payload_is_valid(
+    receipt: dict[str, Any],
+    *,
+    route: Any,
+    parent_sql: str,
+) -> bool:
+    evidence = receipt.get("evidence") if isinstance(receipt.get("evidence"), dict) else {}
+    digest = hashlib.sha256(
+        json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    parent_digest = f"sha256:{hashlib.sha256(parent_sql.encode()).hexdigest()}"
+    return bool(
+        receipt.get("id")
+        and float(receipt.get("expires_at") or 0) >= time.time()
+        and str(receipt.get("sha256") or "") == f"sha256:{digest}"
+        and str(evidence.get("mode") or "") == "type_names"
+        and str(evidence.get("database_source_id") or "") == route.database_source_id
+        and _normalize_table_scope(str(evidence.get("table_name") or ""))
+        in {_normalize_table_scope(item) for item in route.table_names}
+        and str(evidence.get("parent_sql_sha256") or "") == parent_digest
+        and bool(evidence.get("parent_type_names"))
+    )
+
+
+async def _inspect_live_eav_type_names(
+    *,
+    source: Any,
+    route: Any,
+    requested_names: set[str],
+) -> list[dict[str, Any]]:
+    """Targeted live catalog inspection for generated EAV literals.
+
+    The query is server-built from an authorized table.  Model text is passed
+    only as bound search parameters, so it cannot alter the SQL shape.
+    """
+
+    table_name = _vehicle_params_table(route)
+    if not table_name or not requested_names:
+        return []
+    names = sorted(requested_names)[:250]
+    exact_placeholders = [f":exact_{index}" for index, _ in enumerate(names)]
+    parameters: dict[str, Any] = {
+        f"exact_{index}": name for index, name in enumerate(names)
+    }
+    statement = text(
+        f"SELECT type_name, COUNT(*) AS count FROM {table_name} "
+        f"WHERE type_name IN ({', '.join(exact_placeholders)}) "
+        "GROUP BY type_name ORDER BY COUNT(*) DESC, type_name"
+    )
+    engine = create_async_engine(database_source_url(source), pool_pre_ping=True)
+    try:
+        async with engine.connect() as connection:
+            result = await connection.execute(statement, parameters)
+            return [dict(row) for row in result.mappings().all()]
+    finally:
+        await engine.dispose()
+
+
+def _discover_vanna_eav_candidates(vanna: Any, requested_names: set[str]) -> list[dict[str, Any]]:
+    """Ask Vanna for candidates, without treating similarity as truth."""
+
+    collector = getattr(vanna, "get_related_entities", None)
+    if not callable(collector):
+        return []
+    found: dict[tuple[str, str], dict[str, Any]] = {}
+    for name in sorted(requested_names)[:20]:
+        try:
+            items = collector(name, entity_types=["配置名称"], limit=30)
+        except Exception:  # pragma: no cover - external vector runtime
+            continue
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            column = str(item.get("table_column") or "").strip().lower()
+            if not (column.endswith(".vehicle_params.type_name") or column == "vehicle_params.type_name"):
+                continue
+            canonical = str(item.get("canonical_name") or item.get("name") or "").strip()
+            if canonical:
+                found[(canonical, column)] = dict(item)
+    return list(found.values())
+
+
+def _split_eav_name_unit(value: str) -> tuple[str, str]:
+    normalized = str(value or "").strip()
+    match = re.search(r"[\[（(]([^\]）)]+)[\]）)]\s*$", normalized)
+    unit = re.sub(r"\s+", "", match.group(1)).lower() if match else ""
+    base = normalized[: match.start()].strip() if match else normalized
+    return eav_concept_key(base), unit
+
+
+def _eav_alias_authorizes(requested: str, canonical: str, alias: str) -> bool:
+    requested_base, requested_unit = _split_eav_name_unit(requested)
+    alias_base, alias_unit = _split_eav_name_unit(alias)
+    _canonical_base, canonical_unit = _split_eav_name_unit(canonical)
+    if requested_base != alias_base:
+        return False
+    if not requested_unit:
+        return True
+    expected_unit = alias_unit or canonical_unit
+    return bool(expected_unit and requested_unit == expected_unit)
+
+
+def _entity_authorized_replacement_pairs(
+    requested_names: set[str],
+    entities: list[dict[str, Any]],
+) -> set[tuple[str, str]]:
+    """Return only explicit canonical/alias mappings supplied by Vanna."""
+
+    pairs: set[tuple[str, str]] = set()
+
+    for item in entities:
+        canonical = str(item.get("canonical_name") or item.get("name") or "").strip()
+        if not canonical:
+            continue
+        aliases = item.get("aliases")
+        if isinstance(aliases, str):
+            aliases = [aliases]
+        elif not isinstance(aliases, list):
+            aliases = []
+        for requested in requested_names:
+            if any(
+                _eav_alias_authorizes(requested, canonical, str(alias))
+                for alias in [canonical, *aliases]
+                if str(alias).strip()
+            ):
+                pairs.add((requested, canonical))
+    return pairs
+
+
+def _live_rows_as_entities(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "entity_type": "配置名称",
+            "canonical_name": str(row.get("type_name") or ""),
+            "aliases": [],
+            "table_column": "public.vehicle_params.type_name",
+            "description": "live database type_name catalog evidence",
+            "score": 1.0,
+            "evidence_source": "live_database",
+            "row_count": int(row.get("count") or 0),
+        }
+        for row in rows
+        if str(row.get("type_name") or "").strip()
+    ]
 
 
 def _compile_request_semantic_context(request: DatabaseQueryRequest) -> SemanticQueryContext:
@@ -614,6 +806,7 @@ async def _generate_grounded_sql(
     semantic_trace: dict[str, Any],
     vanna: Any,
     stage_timings: dict[str, float],
+    source: Any | None = None,
 ) -> tuple[str, dict[str, Any], str, dict[str, Any]]:
     """Generate one final SQL through a raw-evidence then semantic-refinement pipeline."""
 
@@ -656,6 +849,132 @@ async def _generate_grounded_sql(
         started = perf_counter()
         candidate_sql = extract_sql(await asyncio.to_thread(generate_candidate_blocking))
         record_stage("sql_candidate_generation_ms", started)
+        candidate_type_names = extract_eav_type_names(candidate_sql)
+        vanna_type_names = _prompt_entity_type_names(prompt_entities)
+        technical_evidence = (
+            request.technical_evidence if isinstance(request.technical_evidence, dict) else {}
+        )
+        parent_sql = str(technical_evidence.get("parent_sql") or "")
+        parent_type_names = extract_eav_type_names(parent_sql)
+        bindings = bindings_from_semantic_trace(semantic_trace, question=retrieval_question)
+        if technical_evidence and parent_sql:
+            # Technical regeneration starts from the registered parent, not a
+            # fresh LLM interpretation of the business question.
+            candidate_sql = parent_sql
+            candidate_type_names = parent_type_names
+        schema_receipt = (
+            technical_evidence.get("schema_receipt")
+            if isinstance(technical_evidence.get("schema_receipt"), dict)
+            else {}
+        )
+        receipt_evidence = (
+            schema_receipt.get("evidence")
+            if isinstance(schema_receipt.get("evidence"), dict)
+            else {}
+        )
+        if technical_evidence.get("kind") == "schema_evidence" and not _schema_receipt_payload_is_valid(
+            schema_receipt,
+            route=route,
+            parent_sql=str(technical_evidence.get("parent_sql") or ""),
+        ):
+            raise DatabaseKnowledgeQueryError(
+                "schema receipt 已过期、被篡改，或与父 SQL/数据源/完整表范围不一致。",
+                sql=candidate_sql,
+            )
+        receipt_candidate_names = {
+            str(item.get("type_name") or "").strip()
+            for item in receipt_evidence.get("rows", [])
+            if isinstance(item, dict) and str(item.get("type_name") or "").strip()
+        }
+        discovery_started = perf_counter()
+        targeted_entities = await asyncio.to_thread(
+            _discover_vanna_eav_candidates,
+            vanna,
+            candidate_type_names | parent_type_names,
+        )
+        record_stage("eav_candidate_discovery_ms", discovery_started)
+        known_entity_names = _prompt_entity_type_names(prompt_entities)
+        prompt_entities.extend(
+            item
+            for item in targeted_entities
+            if str(item.get("canonical_name") or "") not in known_entity_names
+        )
+        discovered_type_names = _prompt_entity_type_names(targeted_entities)
+        vanna_repair_pairs = _entity_authorized_replacement_pairs(
+            candidate_type_names | parent_type_names,
+            [*prompt_entities, *targeted_entities],
+        )
+        semantic_repair_pairs = {
+            (original, physical)
+            for original in candidate_type_names | parent_type_names
+            for binding in bindings
+            for physical in binding.type_names
+            if original == physical
+            or any(
+                _eav_alias_authorizes(original, physical, alias)
+                for alias in binding.aliases
+            )
+        }
+        authorized_repair_pairs = vanna_repair_pairs | semantic_repair_pairs
+        authorized_physical_names = {
+            physical for _original, physical in authorized_repair_pairs
+        } | {name for binding in bindings for name in binding.type_names}
+        lookup_type_names = (
+            candidate_type_names
+            | discovered_type_names
+            | receipt_candidate_names
+            | authorized_physical_names
+        )
+        live_rows: list[dict[str, Any]] = []
+        if source is not None and _vehicle_params_table(route) and lookup_type_names:
+            inspection_started = perf_counter()
+            live_rows = await _inspect_live_eav_type_names(
+                source=source,
+                route=route,
+                requested_names=lookup_type_names,
+            )
+            record_stage("eav_live_inspection_ms", inspection_started)
+            live_entities = _live_rows_as_entities(live_rows)
+            known_entity_names = _prompt_entity_type_names(prompt_entities)
+            prompt_entities.extend(
+                item
+                for item in live_entities
+                if str(item.get("canonical_name") or "") in authorized_physical_names
+                and str(item.get("canonical_name") or "") not in known_entity_names
+            )
+        live_type_names = {
+            str(row.get("type_name") or "") for row in live_rows if row.get("type_name")
+        }
+        # Direct unit tests may exercise the generator without a live source.
+        # Production callers always pass ``source`` and therefore use the live
+        # catalog as physical truth rather than the Vanna snapshot.
+        evidence_type_names = live_type_names if source is not None else vanna_type_names
+        def receipt_name_is_relevant(name: str) -> bool:
+            return any((parent, name) in authorized_repair_pairs for parent in parent_type_names)
+
+        authorized_receipt_names = {
+            name
+            for name in receipt_candidate_names & live_type_names
+            if receipt_name_is_relevant(name)
+        }
+        if technical_evidence.get("kind") == "schema_evidence" and not authorized_receipt_names:
+            raise DatabaseKnowledgeQueryError(
+                "schema receipt 未提供与父 SQL 问题相关且经实时库精确复核的 EAV 配置名，已禁止自动修复。",
+                sql=candidate_sql,
+            )
+        trusted_receipt_evidence = {
+            **{key: value for key, value in receipt_evidence.items() if key != "rows"},
+            "rows": [
+                row
+                for row in live_rows
+                if str(row.get("type_name") or "") in authorized_receipt_names
+            ],
+        }
+        candidate_check = check_eav_evidence(
+            candidate_sql,
+            live_type_names=evidence_type_names,
+            bindings=bindings,
+        )
         started = perf_counter()
         sql = await asyncio.to_thread(
             _refine_sql_blocking,
@@ -668,11 +987,128 @@ async def _generate_grounded_sql(
             prompt_entities=prompt_entities,
         )
         record_stage("sql_semantic_refinement_ms", started)
+        baseline_sql = sql
+        baseline_type_names = extract_eav_type_names(baseline_sql)
+        missing_inspection_names = baseline_type_names - live_type_names
+        if source is not None and _vehicle_params_table(route) and missing_inspection_names:
+            discovery_started = perf_counter()
+            extra_entities = await asyncio.to_thread(
+                _discover_vanna_eav_candidates,
+                vanna,
+                missing_inspection_names,
+            )
+            record_stage("eav_candidate_discovery_ms", discovery_started)
+            extra_candidate_names = _prompt_entity_type_names(extra_entities)
+            extra_pairs = _entity_authorized_replacement_pairs(
+                missing_inspection_names,
+                extra_entities,
+            )
+            authorized_repair_pairs.update(extra_pairs)
+            authorized_physical_names.update(physical for _old, physical in extra_pairs)
+            inspection_started = perf_counter()
+            extra_rows = await _inspect_live_eav_type_names(
+                source=source,
+                route=route,
+                requested_names=missing_inspection_names | extra_candidate_names,
+            )
+            stage_timings["eav_live_inspection_ms"] = round(
+                stage_timings.get("eav_live_inspection_ms", 0.0)
+                + (perf_counter() - inspection_started) * 1000,
+                2,
+            )
+            by_name = {
+                str(row.get("type_name") or ""): row for row in [*live_rows, *extra_rows]
+                if str(row.get("type_name") or "")
+            }
+            live_rows = list(by_name.values())
+            known_entity_names = _prompt_entity_type_names(prompt_entities)
+            prompt_entities.extend(
+                item for item in [*extra_entities, *_live_rows_as_entities(extra_rows)]
+                if str(item.get("canonical_name") or "") in authorized_physical_names
+                and str(item.get("canonical_name") or "") not in known_entity_names
+            )
+            live_type_names = set(by_name)
+            evidence_type_names = live_type_names
+        baseline_check = check_eav_evidence(
+            baseline_sql,
+            live_type_names=evidence_type_names,
+            bindings=bindings,
+        )
+        repair_groups = sorted(
+            pair
+            for pair in authorized_repair_pairs
+            if pair[0] != pair[1] and pair[1] in live_type_names
+        )
+        evidence_correction = ""
+        if baseline_type_names and not baseline_check.passed:
+            evidence_correction = (
+                "上一版语义校正 SQL 未通过 EAV 物理证据预检。保持业务问题、指标、筛选、时间范围、"
+                "聚合粒度、去重键和授权表完全不变，只能依据下列服务器证据修复 type_name 映射。\n"
+                f"不受实时数据库支持的 type_name：{sorted(baseline_check.unsupported)}\n"
+                "实时数据库候选（仅证明存在，不证明语义等价）：\n"
+                + json.dumps(live_rows, ensure_ascii=False, indent=2)
+                + "\n显式 EAV 等价与合并契约（只有这里声明的多字段才允许合并）：\n"
+                + bindings_prompt(bindings)
+            )
+        if technical_evidence:
+            typed_correction = (
+                "服务器已登记一项 SQL 技术修复。原始业务问题和语义契约不可改变。"
+                "修复只能处理 SQL 实现或下列 schema receipt 中的 EAV 物理映射；"
+                "不得改变指标、分子分母、筛选、时间范围、粒度、去重键或授权表。\n"
+                + json.dumps(
+                    {
+                        "kind": technical_evidence.get("kind"),
+                        "observed_problem_category": technical_evidence.get(
+                            "observed_problem_category"
+                        ),
+                        "schema_evidence": trusted_receipt_evidence,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            evidence_correction = "\n\n".join(
+                item for item in (evidence_correction, typed_correction) if item
+            )
+        if evidence_correction:
+            repair_started = perf_counter()
+            sql = await asyncio.to_thread(
+                _refine_sql_blocking,
+                vanna,
+                question=retrieval_question,
+                candidate_sql=baseline_sql,
+                route=route,
+                semantic_context=semantic_context,
+                references=references,
+                prompt_entities=prompt_entities,
+                correction_instruction=evidence_correction,
+            )
+            record_stage("eav_evidence_repair_ms", repair_started)
+            requires_exact_mapping_invariant = (
+                technical_evidence.get("kind") == "schema_evidence"
+                or not baseline_check.passed
+            )
+            if requires_exact_mapping_invariant and eav_mapping_fingerprint(
+                baseline_sql,
+                bindings=bindings,
+                replacement_groups=repair_groups,
+            ) != eav_mapping_fingerprint(
+                sql,
+                bindings=bindings,
+                replacement_groups=repair_groups,
+            ):
+                raise DatabaseKnowledgeQueryError(
+                    "EAV 技术修复改变了 type_name 映射之外的 SQL 结构，已禁止执行。",
+                    sql=sql,
+                )
         stage_timings["sql_generation_ms"] = round(
             stage_timings.get("sql_candidate_generation_ms", 0.0)
-            + stage_timings.get("sql_semantic_refinement_ms", 0.0),
+            + stage_timings.get("sql_semantic_refinement_ms", 0.0)
+            + stage_timings.get("eav_evidence_repair_ms", 0.0),
             2,
         )
+    except DatabaseKnowledgeQueryError:
+        raise
     except Exception as exc:
         llm_context = _vanna_llm_context(vanna)
         raise DatabaseKnowledgeQueryError(
@@ -691,7 +1127,58 @@ async def _generate_grounded_sql(
         "semantic_refinement_applied": True,
         "guardrail_rewrites": 0,
         "technical_repairs": 0,
+        "eav_evidence": {
+            "candidate_type_names": sorted(candidate_type_names),
+            "vanna_type_names": sorted(vanna_type_names),
+            "live_type_names": sorted(live_type_names),
+            "live_inspection_count": len(live_rows),
+            "bindings": [item.concept for item in bindings],
+        },
     }
+
+    if candidate_type_names or extract_eav_type_names(sql):
+        final_check = check_eav_evidence(
+            sql,
+            live_type_names=evidence_type_names,
+            bindings=bindings,
+        )
+        if not final_check.passed:
+            details = []
+            if final_check.unsupported:
+                details.append("无实时数据库证据：" + ", ".join(sorted(final_check.unsupported)))
+            if final_check.incomplete_bindings:
+                details.extend(
+                    f"概念 {item.concept} 必须完整使用：{', '.join(item.type_names)}"
+                    for item in final_check.incomplete_bindings
+                )
+            if final_check.invalid_binding_resolutions:
+                details.extend(
+                    f"概念 {item.concept} 必须按 {item.value_resolution} 合并，不能求和或任意择值"
+                    for item in final_check.invalid_binding_resolutions
+                )
+            if final_check.unprovable_predicates:
+                details.append(
+                    "存在无法静态证明的 type_name 谓词："
+                    + ", ".join(final_check.unprovable_predicates)
+                )
+            raise DatabaseKnowledgeQueryError(
+                "EAV 物理证据校验失败，已禁止执行：" + "；".join(details),
+                sql=sql,
+            )
+        generation_trace["eav_evidence"].update(
+            {
+                "final_type_names": sorted(final_check.used_type_names),
+                "unsupported": sorted(final_check.unsupported),
+                "complete": final_check.passed,
+                "automatic_repair": bool(evidence_correction or not candidate_check.passed),
+            }
+        )
+        references["eav_live_inspection"] = {
+            "source": "live_database" if source is not None else "vanna_test_fallback",
+            "rows": live_rows,
+            "candidate_type_names": sorted(candidate_type_names),
+            "final_type_names": sorted(final_check.used_type_names),
+        }
 
     guardrail_conflicts = _detect_sql_guardrail_conflicts(
         sql,
@@ -808,6 +1295,98 @@ async def _generate_grounded_sql(
         )
         guardrail_note = f"{guardrail_note}；{repair_note}" if guardrail_note else repair_note
 
+    # True terminal guardrail: every LLM rewrite above (semantic correction,
+    # deterministic guardrail regeneration and syntax repair) can change SQL.
+    # Re-check physical EAV facts and resolution policy only after all of them.
+    terminal_type_names = extract_eav_type_names(sql)
+    terminal_missing = terminal_type_names - live_type_names
+    if source is not None and _vehicle_params_table(route) and terminal_missing:
+        inspection_started = perf_counter()
+        terminal_rows = await _inspect_live_eav_type_names(
+            source=source,
+            route=route,
+            requested_names=terminal_missing,
+        )
+        record_stage("eav_live_inspection_ms", inspection_started)
+        by_name = {
+            str(row.get("type_name") or ""): row
+            for row in [*live_rows, *terminal_rows]
+            if str(row.get("type_name") or "")
+        }
+        live_rows = list(by_name.values())
+        live_type_names = set(by_name)
+        evidence_type_names = live_type_names
+    terminal_check = check_eav_evidence(
+        sql,
+        live_type_names=evidence_type_names,
+        bindings=bindings,
+    )
+    unauthorized_terminal_names = terminal_check.used_type_names - authorized_physical_names
+    if unauthorized_terminal_names:
+        raise DatabaseKnowledgeQueryError(
+            "最终 SQL 使用了未获 Vanna canonical/alias 或显式语义绑定授权的 EAV 配置名："
+            + ", ".join(sorted(unauthorized_terminal_names)),
+            sql=sql,
+        )
+    if not terminal_check.passed:
+        details: list[str] = []
+        if terminal_check.unsupported:
+            details.append("无实时数据库精确证据：" + ", ".join(sorted(terminal_check.unsupported)))
+        details.extend(
+            f"概念 {item.concept} 缺少必需物理字段：{', '.join(item.type_names)}"
+            for item in terminal_check.incomplete_bindings
+        )
+        details.extend(
+            f"概念 {item.concept} 未按 {item.value_resolution} 解析"
+            for item in terminal_check.invalid_binding_resolutions
+        )
+        if terminal_check.unprovable_predicates:
+            details.append(
+                "动态/变形 type_name 谓词不可证明："
+                + ", ".join(terminal_check.unprovable_predicates)
+            )
+        raise DatabaseKnowledgeQueryError(
+            "最终 SQL 的 EAV 证据护栏失败，已禁止执行：" + "；".join(details),
+            sql=sql,
+        )
+    if technical_evidence.get("kind") == "schema_evidence":
+        parent_sql = str(technical_evidence.get("parent_sql") or "")
+        if not parent_sql or eav_mapping_fingerprint(
+            parent_sql,
+            bindings=bindings,
+            replacement_groups=repair_groups,
+        ) != eav_mapping_fingerprint(
+            sql,
+            bindings=bindings,
+            replacement_groups=repair_groups,
+        ):
+            raise DatabaseKnowledgeQueryError(
+                "schema receipt 技术修复改变了被授权 EAV 映射之外的 SQL 结构，已禁止执行。",
+                sql=sql,
+            )
+    elif technical_evidence.get("kind") == "observed_sql_failure":
+        parent_sql = str(technical_evidence.get("parent_sql") or "")
+        if not parent_sql or sql_business_fingerprint(parent_sql) != sql_business_fingerprint(sql):
+            raise DatabaseKnowledgeQueryError(
+                "自动 SQL 技术修复改变了父 SQL 的指标、筛选、粒度、去重或排序不变量，已禁止执行。",
+                sql=sql,
+            )
+    generation_trace["eav_evidence"].update(
+        {
+            "final_type_names": sorted(terminal_check.used_type_names),
+            "live_type_names": sorted(live_type_names),
+            "live_inspection_count": len(live_rows),
+            "unsupported": sorted(terminal_check.unsupported),
+            "complete": terminal_check.passed,
+        }
+    )
+    references["eav_live_inspection"] = {
+        "source": "live_database" if source is not None else "vanna_test_fallback",
+        "rows": live_rows,
+        "candidate_type_names": sorted(candidate_type_names),
+        "final_type_names": sorted(terminal_check.used_type_names),
+    }
+
     generation_trace["final_sql"] = sql
     generation_trace["applied_rules"] = collect_applied_semantic_rules(sql, semantic_trace)
     return sql, references, guardrail_note, generation_trace
@@ -866,6 +1445,7 @@ async def query_database_knowledge(
             semantic_trace=semantic_trace,
             vanna=vanna,
             stage_timings=stage_timings,
+            source=source,
         )
         logger.info(
             "[nl2sql-service] sql_generated source=%s tables=%s sql=%s",
@@ -977,6 +1557,7 @@ async def generate_database_sql(
 
         stage_started = perf_counter()
         vanna = build_vanna_client_from_app_config()
+        source = await get_database_source(session, route.database_source_id)
         record_stage("setup_ms", stage_started)
 
         sql, references, guardrail_note, generation = await _generate_grounded_sql(
@@ -986,6 +1567,7 @@ async def generate_database_sql(
             semantic_trace=semantic_trace,
             vanna=vanna,
             stage_timings=stage_timings,
+            source=source,
         )
 
         logger.info(

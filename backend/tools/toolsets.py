@@ -66,10 +66,11 @@ BUSINESS_TOOLSETS: dict[str, frozenset[str]] = {
     "llm_wiki": frozenset(
         {
             "llm_wiki_context",
-            "llm_wiki_publish",
             "llm_wiki_lint",
             "llm_wiki_query",
             "llm_wiki_compile",
+            "llm_wiki_create_raw",
+            "llm_wiki_start_ingest",
         }
     ),
     "gbrain_query": frozenset(
@@ -280,6 +281,8 @@ TOOL_CONTROL_DESCRIPTORS: dict[str, ToolControlDescriptor] = {
     "llm_wiki_query": _READ_ONLY,
     "llm_wiki_compile": _INTERNAL_MUTATION,
     "llm_wiki_publish": _INTERNAL_MUTATION,
+    "llm_wiki_create_raw": _INTERNAL_MUTATION,
+    "llm_wiki_start_ingest": _INTERNAL_MUTATION,
     "gbrain_get_page": _READ_ONLY,
     "gbrain_list_pages": _READ_ONLY,
     "gbrain_search": _READ_ONLY,

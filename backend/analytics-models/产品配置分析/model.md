@@ -3,14 +3,14 @@ formatter: analytics-model
 id: "产品配置分析"
 name: "产品配置分析"
 type: analysis_model
-version: "0.3.5"
+version: "0.3.6"
 description: "汽车行业已上市车型的配置分析，当用户询问单一车型的配置、多车型的配置对比以及行业的配置率发展趋势等场景使用。"
 tags: ["汽车产品配置","配置率","行业趋势报告","ECharts"]
 data_assets:
   tables: ["dbs_77982e981bac4a6fa8.vehicle_params","dbs_77982e981bac4a6fa8.vehicle_model_base"]
 semantic_assets:
   measures: ["measure:charging_c_rate","measure:config_rate","measure:launch_update_count","measure:launch_cycle"]
-  dimensions: ["dimension:launch_time","dimension:price_band","dimension:wheelbase","dimension:motor_power","dimension:brand","dimension:energy_type","dimension:vehicle_level","dimension:vehicle_series"]
+  dimensions: ["dimension:launch_time","dimension:price_band","dimension:wheelbase","dimension:motor_power","dimension:battery_energy","dimension:cltc_range","dimension:brand","dimension:energy_type","dimension:vehicle_level","dimension:vehicle_series"]
   grains: ["grain:car_model","grain:series"]
 asset_relations: ["relation:车系配置关联"]
 guardrails: ["air_suspension_reference_type_value","config_rate_model_key_group","config_rate_no_exists_distinct","config_rate_use_model_base_denominator","launch_time_no_car_name_year","postgres_count_distinct_nullable_tuple_after_left_join"]

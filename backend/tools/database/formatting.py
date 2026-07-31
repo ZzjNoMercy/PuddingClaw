@@ -61,8 +61,23 @@ def format_actions(actions: list[dict[str, Any]]) -> list[str]:
                 f"，请调用 database_query_result_page(result_id, page, page_size)，"
                 f"默认 page_size={action.get('page_size')}"
             )
+        elif action.get("reason") == "result_exceeds_materialization_row_cap":
+            detail = (
+                f"，完整结果约 {action.get('row_count') or '未知'} 行，超过持久化上限 "
+                f"{action.get('materialization_row_cap') or '未知'} 行，因此本次未生成 result_id。"
+                "不要调用 database_query_result_page 或 database_query_result_source，"
+                "应缩小时间/实体范围、改为聚合查询，或提高“单个结果集最大行数”后重新执行数据库查询"
+            )
+        elif action.get("reason") == "result_store_disabled":
+            detail = (
+                "，持久化结果集已关闭，因此本次未生成 result_id。"
+                "如需分页或完整结果落盘，请开启持久化后重新执行数据库查询"
+            )
         elif action.get("reason"):
-            detail = f"，原因：{action.get('reason')}"
+            detail = (
+                f"，原因：{action.get('reason')}；本次没有可读取的 result_id，"
+                "不要反复读取旧 ID，应调整后重新执行数据库查询"
+            )
         lines.append(f"  - {action_type}: {available}{detail}")
     return lines
 

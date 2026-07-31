@@ -16,6 +16,7 @@ from analytics.nl2sql.service import DatabaseKnowledgeQueryError, generate_datab
 from analytics.nl2sql.table_router import summarize_table_route
 from analytics.semantic_runtime import normalize_selected_semantic_asset_ids
 from db import get_sessionmaker
+from graph.database_schema_evidence import database_schema_evidence_registry
 from graph.database_sql_revision_resume import (
     RegisteredDatabaseSqlGeneration,
     database_sql_revision_resume_registry,
@@ -201,71 +202,6 @@ def _agent_added_physical_guidance(
     return findings
 
 
-def _agent_added_enum_caliber(
-    *,
-    question: str,
-    selected_asset_ids: list[str],
-    trusted_text: str,
-    authorized_terms_by_asset: dict[str, set[str]] | None = None,
-    strict: bool = False,
-) -> list[str]:
-    """Enum literals the Agent added to the question beyond the user's scope.
-
-    Chinese enum values (柴油, 汽油+48V轻混系统, ...) never match the
-    physical-identifier patterns above, so caliber injection through the
-    question channel needs its own vocabulary check. The vocabulary is driven
-    by the selected assets' declarations — nothing is hardcoded per dimension.
-    Values the user actually wrote are legitimate business overrides and pass.
-    """
-
-    if not trusted_text or not selected_asset_ids:
-        return []
-    try:
-        from analytics.semantic_assets.registry import get_semantic_asset_registry
-
-        registry = get_semantic_asset_registry()
-    except Exception as exc:
-        if strict:
-            raise RuntimeError("semantic asset registry unavailable") from exc
-        return []
-    vocabulary: dict[str, set[str]] = {}
-    for asset_id in selected_asset_ids:
-        try:
-            detail = registry.get_asset(str(asset_id))
-        except Exception as exc:
-            if strict:
-                raise RuntimeError(f"governed semantic asset unavailable: {asset_id}") from exc
-            continue
-        frontmatter = detail.get("frontmatter") if isinstance(detail, dict) else None
-        if not isinstance(frontmatter, dict):
-            continue
-        asset_vocabulary: set[str] = set()
-        for value in frontmatter.get("enum_universe") or []:
-            value = str(value).strip()
-            if value:
-                asset_vocabulary.add(value)
-        classifications = frontmatter.get("classifications")
-        if isinstance(classifications, dict):
-            for label, values in classifications.items():
-                label = str(label).strip()
-                if label:
-                    asset_vocabulary.add(label)
-                for value in values or []:
-                    value = str(value).strip()
-                    if value:
-                        asset_vocabulary.add(value)
-        vocabulary[str(asset_id)] = asset_vocabulary
-    authorized = authorized_terms_by_asset or {}
-    return sorted(
-        term
-        for asset_id, terms in vocabulary.items()
-        for term in terms
-        if term in question
-        and term not in trusted_text
-        and term not in authorized.get(asset_id, set())
-    )
-
-
 def _trusted_template_enum_terms(runtime: ToolRuntime | None) -> dict[str, set[str]]:
     """Load enum authorization from the template guide selected by the Agent.
 
@@ -313,6 +249,19 @@ def _is_technical_sql_revision(instruction: str) -> bool:
         and _TECHNICAL_SQL_REVISION_PATTERN.search(normalized)
         and not _BUSINESS_SEMANTIC_CHANGE_PATTERN.search(normalized)
     )
+
+
+def _technical_problem_category(instruction: str) -> str:
+    """Convert untrusted prose into a closed technical-error vocabulary."""
+
+    normalized = " ".join(str(instruction or "").split())
+    if re.search(r"超时|慢查询|性能|执行计划", normalized, re.IGNORECASE):
+        return "performance_or_timeout"
+    if re.search(r"语法|括号|表别名|列别名|syntax", normalized, re.IGNORECASE):
+        return "sql_syntax_or_alias"
+    if re.search(r"字段名|列名|does\s+not\s+exist|unknown\s+column|undefined\s+column", normalized, re.IGNORECASE):
+        return "physical_column_mismatch"
+    return "observed_sql_execution_failure"
 
 
 def _format_semantic_contract(semantic_assets: dict[str, object]) -> list[str]:
@@ -448,7 +397,8 @@ class DatabaseSqlGenerateTool(BaseTool):
         "matched Measure/Reference. To propose a business-semantic change, call this tool with parent_generation_id and "
         "a natural-language revision_instruction; the user then chooses agree, reject, or modify. For SQL timeout, "
         "syntax, validation, or performance failures, report the observed problem through revision_instruction without "
-        "prescribing fields, tables, entities, JOIN/CTE shape, or replacement SQL."
+        "prescribing fields, tables, entities, JOIN/CTE shape, or replacement SQL. Evidence-backed physical EAV "
+        "repairs must carry the schema_evidence_receipt_id returned by database_schema_inspect and do not require HITL."
     )
     args_schema: type[BaseModel] = DatabaseSqlGenerateInput
     risk_level: str = "moderate"
@@ -469,6 +419,7 @@ class DatabaseSqlGenerateTool(BaseTool):
         selected_semantic_asset_ids: list[str] | None = None,
         parent_generation_id: str | None = None,
         revision_instruction: str | None = None,
+        schema_evidence_receipt_id: str | None = None,
         tool_call_id: str = "",
         runtime: ToolRuntime | None = None,
     ) -> str:
@@ -508,36 +459,14 @@ class DatabaseSqlGenerateTool(BaseTool):
                     "🧮 SQL 生成失败：当前模板的语义范围引用了模型未授权资产："
                     + ", ".join(unauthorized_scope_assets)
                 )
-            try:
-                enum_caliber = _agent_added_enum_caliber(
-                    question=question,
-                    # The Agent must not bypass enum governance by omitting an
-                    # asset from selected_semantic_asset_ids. In model mode the
-                    # server-owned allowlist is the vocabulary authority.
-                    selected_asset_ids=sorted(allowed_asset_ids) if state_model_id else selected_asset_ids,
-                    trusted_text=_trusted_user_scope_text(runtime),
-                    authorized_terms_by_asset=template_terms,
-                    strict=bool(state_model_id),
-                )
-            except RuntimeError as exc:
-                return f"🧮 SQL 生成失败：当前分析模型的可信枚举范围不可用：{exc}"
-            injected = physical_guidance + [
-                term for term in enum_caliber if term not in physical_guidance
-            ]
-            if injected:
+            if physical_guidance:
                 return (
-                    "🧮 SQL 生成失败：检测到 Agent 在业务子任务中新增了用户未指定的物理实现或口径枚举："
-                    + ", ".join(injected[:12])
+                    "🧮 SQL 生成失败：检测到 Agent 在业务子任务中新增了用户未指定的物理实现："
+                    + ", ".join(physical_guidance[:12])
                     + "。Goal 模式允许拆解指标、维度、粒度、筛选和时间范围，但表、字段、"
                     "EAV 配置项/枚举、实体映射及 SQL 写法必须由 SQL 生成器根据数据库证据与语义资产决定。"
                     "请删除这些实现提示，仅保留业务问题后重新调用。"
                 )
-        elif revision_instruction and _is_prescriptive_sql_revision(revision_instruction):
-            return (
-                "🧮 SQL 重新生成失败：revision_instruction 只能反馈已观察到的问题，"
-                "不能指导使用哪个字段、表、实体或 SQL 实现。请保留 parent_generation_id，"
-                "仅描述错误、超时、空结果、校验冲突或结果异常后重试。"
-            )
         request_payload = {
             "question": question,
             "semantic_question": question,
@@ -545,6 +474,7 @@ class DatabaseSqlGenerateTool(BaseTool):
             "table_names": requested_table_names,
             "model_id": effective_model_id,
             "measure_ids": selected_asset_ids,
+            "technical_evidence": {},
         }
         parent: RegisteredDatabaseSqlGeneration | None = None
         disposition = "generated"
@@ -569,15 +499,59 @@ class DatabaseSqlGenerateTool(BaseTool):
             semantic_question = str(
                 request_payload.get("semantic_question") or original_question
             )
-            if _is_technical_sql_revision(proposed):
-                applied_instruction = proposed
-                request_payload["question"] = (
-                    f"原始业务问题（业务语义不可改变）：\n{original_question}\n\n"
-                    f"上一版 SQL：\n{parent.result.sql}\n\n"
-                    f"SQL 技术修复反馈（只允许改变实现与性能，不得改变指标、分母、粒度、筛选或时间范围）：\n"
-                    f"{proposed}"
+            runtime_context = getattr(runtime, "context", None)
+            context = runtime_context if isinstance(runtime_context, dict) else {}
+            schema_receipt = None
+            if schema_evidence_receipt_id:
+                schema_receipt = database_schema_evidence_registry.get(
+                    schema_evidence_receipt_id,
+                    session_id=self.session_id,
+                    query_id=self.query_id,
+                    run_id=str(context.get("run_id") or ""),
+                    goal_id=str(context.get("goal_id") or ""),
+                    goal_revision=context.get("goal_revision"),
+                    parent_generation_id=parent.id,
+                    database_source_id=str(parent.result.source.get("id") or ""),
+                    allowed_tables=list(parent.result.route.table_names),
+                    parent_sql_sha256=parent.sql_sha256,
                 )
+                if schema_receipt is None:
+                    return (
+                        "🧮 SQL 技术修复失败：schema_evidence_receipt_id 无效、已过期，"
+                        "或与当前 Session/Run/父 generation/数据源/表范围不匹配。"
+                    )
+            contains_business_change = bool(_BUSINESS_SEMANTIC_CHANGE_PATTERN.search(proposed))
+            evidence_backed_technical = bool(schema_receipt and not contains_business_change)
+            if (
+                _is_prescriptive_sql_revision(proposed)
+                and not evidence_backed_technical
+                and not contains_business_change
+            ):
+                return (
+                    "🧮 SQL 重新生成失败：revision_instruction 只能反馈已观察到的问题，"
+                    "不能指导使用哪个字段、表、实体或 SQL 实现。物理字段纠错必须携带同一作用域的 "
+                    "schema_evidence_receipt_id。"
+                )
+            if evidence_backed_technical or _is_technical_sql_revision(proposed):
+                applied_instruction = proposed
+                # Keep Vanna retrieval anchored to the original business
+                # question. Technical evidence travels in a separate typed
+                # channel so it cannot redefine the retrieval intent.
+                request_payload["question"] = original_question
                 request_payload["semantic_question"] = semantic_question
+                request_payload["database_source_id"] = parent.result.route.database_source_id
+                request_payload["table_names"] = list(parent.result.route.table_names)
+                request_payload["technical_evidence"] = {
+                    "kind": "schema_evidence" if schema_receipt else "observed_sql_failure",
+                    "observed_problem_category": (
+                        "schema_physical_mapping_mismatch"
+                        if schema_receipt
+                        else _technical_problem_category(proposed)
+                    ),
+                    "parent_generation_id": parent.id,
+                    "parent_sql": parent.result.sql,
+                    "schema_receipt": schema_receipt,
+                }
                 disposition = "technical_repair"
             else:
                 revision_request = database_sql_revision_resume_registry.create_revision_request(
@@ -619,6 +593,7 @@ class DatabaseSqlGenerateTool(BaseTool):
             model_id=request_payload.get("model_id"),
             measure_ids=list(request_payload.get("measure_ids") or []),
             semantic_question=request_payload.get("semantic_question"),
+            technical_evidence=dict(request_payload.get("technical_evidence") or {}),
         )
         try:
             sessionmaker = get_sessionmaker()

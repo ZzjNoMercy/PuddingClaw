@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -313,6 +315,95 @@ def test_external_write_request_contains_change_preview(tmp_path):
         )
         is None
     )
+
+
+def test_permission_middleware_treats_configured_knowledge_file_as_managed_read(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from langchain_core.messages import AIMessage
+
+    import graph.permission_middleware as permission_middleware_module
+    from graph.permission_middleware import ExternalFilePermissionMiddleware
+    from graph.session_manager import session_manager
+
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    knowledge_file = knowledge_root / "imported" / "note.md"
+    knowledge_file.parent.mkdir()
+    knowledge_file.write_text("managed knowledge", encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    session_manager.initialize(state_dir)
+    session_manager.create_session("managed-knowledge-session")
+    monkeypatch.setenv("PUDDINGCLAW_KNOWLEDGE_DIR", str(knowledge_root))
+
+    def unexpected_interrupt(_payload):
+        raise AssertionError("configured knowledge reads must not request HITL permission")
+
+    monkeypatch.setattr(permission_middleware_module, "interrupt", unexpected_interrupt)
+    state = {
+        "messages": [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {"file_path": str(knowledge_file)},
+                        "id": "call-managed-knowledge-read",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
+    }
+    runtime = SimpleNamespace(
+        context={
+            "session_id": "managed-knowledge-session",
+            "query_id": "query-managed-knowledge",
+            "run_id": "run-managed-knowledge",
+            "workspace_path": str(workspace),
+        }
+    )
+
+    assert ExternalFilePermissionMiddleware().after_model(state, runtime) is None
+
+
+def test_configured_knowledge_exception_is_read_only_and_symlink_safe(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from graph.permission_middleware import ExternalFilePermissionMiddleware
+
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    knowledge_file = knowledge_root / "note.md"
+    knowledge_file.write_text("managed knowledge", encoding="utf-8")
+    outside_file = tmp_path / "outside.md"
+    outside_file.write_text("outside", encoding="utf-8")
+    link = knowledge_root / "outside-link.md"
+    link.symlink_to(outside_file)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("PUDDINGCLAW_KNOWLEDGE_DIR", str(knowledge_root))
+
+    assert (
+        ExternalFilePermissionMiddleware._external_read_path(
+            str(knowledge_file),
+            str(workspace),
+        )
+        is None
+    )
+    assert ExternalFilePermissionMiddleware._external_write_path(
+        str(knowledge_file),
+        str(workspace),
+    ) == knowledge_file.resolve()
+    assert ExternalFilePermissionMiddleware._external_read_path(
+        str(link),
+        str(workspace),
+    ) == outside_file.resolve()
 
 
 def test_external_delete_request_is_a_separate_capability(tmp_path):

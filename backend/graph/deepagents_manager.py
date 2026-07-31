@@ -2677,6 +2677,14 @@ class DeepAgentsAgentManager:
         backend.execution_scratch_host_path = str(scratch_scope_dir.resolve())
         backend.execution_scratch_goal_id = goal_id
         backend.execution_scratch_goal_revision = goal_revision
+        backend.managed_host_path_aliases = {
+            "/knowledge": str(knowledge_dir.resolve()),
+            "/semantic-assets": str(semantic_assets_dir.resolve()),
+            "/sql-guardrails": str(sql_guardrails_dir.resolve()),
+            "/analytics-models": str(analytics_models_dir.resolve()),
+            "/skills": str(skills_dir.resolve()),
+            "/large_tool_results": str(large_tool_results_dir.resolve()),
+        }
         backend.external_directory_writable_enabled = bool(
             terminal_config.get("external_directory_writable_enabled", False)
         )
@@ -2865,6 +2873,8 @@ class DeepAgentsAgentManager:
         session_id: str = "",
         query_id: str = "",
         run_id: str = "",
+        current_message: str = "",
+        current_attachments: list[dict[str, Any]] | None = None,
         goal_id: str = "",
         goal_revision: int | None = None,
         execution_backend: Any | None = None,
@@ -2944,6 +2954,7 @@ class DeepAgentsAgentManager:
                 "database_sql_generate",
                 "database_sql_validate",
                 "database_sql_execute",
+                "database_schema_inspect",
                 "database_query_result_source",
             }:
                 database_updates = {"session_id": session_id, "query_id": query_id}
@@ -2951,6 +2962,33 @@ class DeepAgentsAgentManager:
                     tool = tool.model_copy(update=database_updates)
                 except Exception:
                     for key, value in database_updates.items():
+                        setattr(tool, key, value)
+            elif getattr(tool, "name", "") == "llm_wiki_create_raw":
+                wiki_intake_updates = {
+                    "session_id": session_id,
+                    "query_id": query_id,
+                    "current_message": current_message,
+                    "current_attachments": list(current_attachments or []),
+                }
+                try:
+                    tool = tool.model_copy(update=wiki_intake_updates)
+                except Exception:
+                    for key, value in wiki_intake_updates.items():
+                        setattr(tool, key, value)
+            elif getattr(tool, "name", "") == "llm_wiki_context":
+                try:
+                    tool = tool.model_copy(update={"allow_ingest": False})
+                except Exception:
+                    setattr(tool, "allow_ingest", False)
+            elif getattr(tool, "name", "") == "llm_wiki_start_ingest":
+                wiki_job_updates = {
+                    "session_id": session_id,
+                    "query_id": query_id,
+                }
+                try:
+                    tool = tool.model_copy(update=wiki_job_updates)
+                except Exception:
+                    for key, value in wiki_job_updates.items():
                         setattr(tool, key, value)
             elif getattr(tool, "name", "") in {
                 "prepare_skill_install",
@@ -6613,6 +6651,8 @@ class DeepAgentsAgentManager:
                 session_id=session_id,
                 query_id=query_id,
                 run_id=run_record.run_id,
+                current_message=message,
+                current_attachments=attachments,
                 goal_id=str(run_record.goal_id or ""),
                 goal_revision=run_record.goal_revision,
                 execution_backend=getattr(
@@ -6880,6 +6920,9 @@ class DeepAgentsAgentManager:
             last_snapshot_at = 0.0
             last_snapshot_signature = ""
             last_context_usage = -1
+            last_persisted_context_usage = session_manager.get_agent_context_usage(session_id)
+            received_context_usage_event = False
+            last_fallback_context_usage = -1
             persisted_agent_context_fingerprint = _agent_context_fingerprint(saved_agent_context)
             # A natural stop without a declaration is still allowed to publish
             # this Run's progress response. The final transaction—not stream
@@ -7562,6 +7605,17 @@ class DeepAgentsAgentManager:
                             observed_usage = payload.get("used_tokens")
                             if isinstance(observed_usage, int):
                                 last_context_usage = observed_usage
+                                received_context_usage_event = True
+                                if observed_usage != last_persisted_context_usage:
+                                    try:
+                                        session_manager.update_agent_context_usage(session_id, observed_usage)
+                                        last_persisted_context_usage = observed_usage
+                                    except Exception:
+                                        logger.warning(
+                                            "Failed to persist streamed Agent context usage for session=%s",
+                                            session_id,
+                                            exc_info=True,
+                                        )
                         if event_type == "rubric_evaluation_start":
                             yield self._sse(
                                 "verification_started",
@@ -7618,12 +7672,12 @@ class DeepAgentsAgentManager:
                         system_prompt,
                         agent_tools,
                     )
-                    if last_context_usage >= 0:
+                    if received_context_usage_event and last_context_usage >= 0:
                         current_context_usage = last_context_usage
                     summary_event = payload.get("_summarization_event")
                     compact_context_active = using_saved_agent_context or isinstance(summary_event, dict)
-                    if compact_context_active:
-                        try:
+                    try:
+                        if compact_context_active:
                             serialized_context = _serialize_protocol_closed_agent_context(effective_messages)
                             if serialized_context is None:
                                 # A model value is emitted before the tools node.
@@ -7645,12 +7699,49 @@ class DeepAgentsAgentManager:
                                         run_id=run_record.run_id,
                                     )
                                     persisted_agent_context_fingerprint = context_fingerprint
-                        except Exception:
-                            logger.warning(
-                                "Failed to persist protocol-closed Agent context for session=%s",
+                                elif current_context_usage != last_persisted_context_usage:
+                                    session_manager.update_agent_context_usage(
+                                        session_id,
+                                        current_context_usage,
+                                    )
+                        elif current_context_usage != last_persisted_context_usage:
+                            # A normal, uncompacted Run must expose its effective
+                            # context while it is still running. Previously this
+                            # value was only persisted for summarized contexts or
+                            # at terminal completion, leaving the UI at
+                            # ``pending measurement`` throughout long tool Runs.
+                            session_manager.update_agent_context_usage(
                                 session_id,
-                                exc_info=True,
+                                current_context_usage,
                             )
+                        last_persisted_context_usage = current_context_usage
+                    except Exception:
+                        logger.warning(
+                            "Failed to persist Agent context usage for session=%s",
+                            session_id,
+                            exc_info=True,
+                        )
+                    if (
+                        not received_context_usage_event
+                        and current_context_usage != last_fallback_context_usage
+                    ):
+                        # ToolProtocolIntegrityMiddleware normally publishes an
+                        # exact model-boundary event. Graph values are a reliable
+                        # fallback for providers/runtimes that do not propagate
+                        # custom middleware events.
+                        yield self._sse(
+                            "context_usage",
+                            {
+                                "used_tokens": current_context_usage,
+                                "total_tokens": context_trigger_tokens,
+                                "percentage": round(
+                                    current_context_usage / max(1, context_trigger_tokens) * 100,
+                                    1,
+                                ),
+                                "source": "graph_values_fallback",
+                            },
+                        )
+                        last_fallback_context_usage = current_context_usage
                     # HarnessTodoMiddleware has already committed the patch to
                     # Session JSON before returning success. Graph values are a
                     # projection only: they may notify the frontend, but must

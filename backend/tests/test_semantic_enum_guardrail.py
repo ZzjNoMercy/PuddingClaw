@@ -140,6 +140,25 @@ def test_eav_literals_from_other_domains_do_not_false_positive():
     assert conflict is None
 
 
+def test_eav_type_name_containing_energy_enum_text_does_not_false_positive():
+    sql = (
+        "SELECT type_value FROM vehicle_params "
+        "WHERE type_name = 'CLTC纯电续航[km]'"
+    )
+    conflict = _detect_semantic_enum_consistency(sql, _RULE, semantic_trace=_TRACE_ENERGY)
+    assert conflict is None
+
+
+def test_energy_eav_value_is_checked_only_when_pinned_to_energy_type():
+    sql = (
+        "SELECT * FROM vehicle_params "
+        "WHERE type_name = '能源类型' AND type_value = '未登记能源'"
+    )
+    conflict = _detect_semantic_enum_consistency(sql, _RULE, semantic_trace=_TRACE_ENERGY)
+    assert conflict is not None
+    assert "未登记能源" in conflict.message
+
+
 def test_question_driven_plain_where_bypass_is_closed():
     # No CASE labels at all; the question text names 传统能源 while the SQL
     # sneaks diesel into a plain WHERE — this was the S1 bypass.
@@ -346,80 +365,6 @@ def test_named_classification_materialized_as_filter_passes():
         question="2021年到2026年，每年传统能源有多少次上市更新事件？",
     )
     assert conflict is None
-
-
-# ---------------------------------------------------------------------------
-# P2a: question-channel enum caliber injection (question vs trusted user text)
-# ---------------------------------------------------------------------------
-
-
-def test_enum_caliber_injection_beyond_user_scope_detected():
-    from tools.database.sql_generate_tool import _agent_added_enum_caliber
-
-    findings = _agent_added_enum_caliber(
-        question=(
-            "每年传统能源和新能源各有多少次上市更新事件？"
-            "传统能源包括汽油、汽油+48V轻混系统、油电混合、汽油电驱、汽油+24V轻混系统、"
-            "柴油、柴油+48V轻混系统；新能源包括纯电、插电混合、增程式纯电动。"
-        ),
-        selected_asset_ids=["dimension:energy_type"],
-        trusted_text="2021年到2026年，每年传统能源和新能源各有多少次上市更新事件？排除皮卡。",
-    )
-    assert "柴油" in findings
-    assert "柴油+48V轻混系统" in findings
-    assert "汽油" in findings
-
-
-def test_enum_caliber_user_stated_values_pass():
-    from tools.database.sql_generate_tool import _agent_added_enum_caliber
-
-    findings = _agent_added_enum_caliber(
-        question="传统能源（含柴油）的上市更新次数？",
-        selected_asset_ids=["dimension:energy_type"],
-        trusted_text="传统能源（含柴油）的上市更新次数？",
-    )
-    assert findings == []
-
-
-def test_enum_caliber_classification_label_is_governed():
-    from tools.database.sql_generate_tool import _agent_added_enum_caliber
-
-    findings = _agent_added_enum_caliber(
-        question="仅统计新能源车型",
-        selected_asset_ids=["dimension:energy_type"],
-        trusted_text="刷新产品配置报告",
-    )
-
-    assert "新能源" in findings
-
-
-def test_enum_caliber_allows_only_server_routed_template_terms():
-    from tools.database.sql_generate_tool import _agent_added_enum_caliber
-
-    findings = _agent_added_enum_caliber(
-        question="分别统计纯电、新能源、柴油和传统能源车型",
-        selected_asset_ids=["dimension:energy_type"],
-        trusted_text="刷新月报",
-        authorized_terms_by_asset={
-            "dimension:energy_type": {"纯电", "新能源"},
-        },
-    )
-
-    assert "纯电" not in findings
-    assert "新能源" not in findings
-    assert "柴油" in findings
-    assert "传统能源" in findings
-
-
-def test_enum_caliber_without_trusted_text_escapes():
-    from tools.database.sql_generate_tool import _agent_added_enum_caliber
-
-    findings = _agent_added_enum_caliber(
-        question="传统能源包括柴油的上市更新次数？",
-        selected_asset_ids=["dimension:energy_type"],
-        trusted_text="",
-    )
-    assert findings == []
 
 
 # ---------------------------------------------------------------------------

@@ -444,7 +444,7 @@ function WikiWorkflowPanel({
         <div className="flex flex-wrap items-start gap-3">
           <div className="min-w-0 flex-1">
             <h2 className="text-base font-semibold text-gray-950">LLM Wiki 编译工作台</h2>
-            <p className="mt-1 text-xs leading-5 text-gray-500">选择不可变 Raw 快照，交给 Agent 按 AGENTS.md 编译 Wiki，再通过 gbrain 预检并导入 PostgreSQL。</p>
+            <p className="mt-1 text-xs leading-5 text-gray-500">选择不可变 Raw 快照，交给 Agent 按 AGENTS.md 编译并发布 Wiki；如需进入 gbrain，再单独执行预检与 PostgreSQL 入库。</p>
           </div>
           <div className="rounded-xl bg-white/80 px-3 py-2 text-right shadow-sm ring-1 ring-black/[0.04]">
             <p className="text-[10px] text-gray-400">Schema {status.schema_version}</p>

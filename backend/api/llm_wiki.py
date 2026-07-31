@@ -61,6 +61,10 @@ class GbrainInitializePayload(StrictPayload):
 class WikiIngestJobPayload(StrictPayload):
     raw_paths: list[str] = Field(min_length=1, max_length=200)
     knowledge_base_id: str = Field(default=DEFAULT_KNOWLEDGE_BASE_ID, min_length=1, max_length=64)
+    import_gbrain: bool = Field(
+        default=False,
+        description="Only continue into gbrain when explicitly requested; ordinary compilation stops at Wiki.",
+    )
 
 
 def _service():
@@ -102,6 +106,7 @@ async def create_ingest_job(
             base_dir=BASE_DIR,
             raw_paths=payload.raw_paths,
             knowledge_base_id=payload.knowledge_base_id,
+            import_gbrain=payload.import_gbrain,
         )
         return {"job": job_to_dict(job)}
     except (LlmWikiError, KnowledgeServiceError, OSError) as exc:

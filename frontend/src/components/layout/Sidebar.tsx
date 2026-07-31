@@ -32,8 +32,9 @@ import {
   ListChecks,
 } from "lucide-react";
 import { useApp } from "@/lib/store";
-import { openProject } from "@/lib/api";
+import { openProject, type SessionSearchResult } from "@/lib/api";
 import { useProjectFolderPicker } from "@/components/projects/useProjectFolderPicker";
+import SessionSearchDialog from "./SessionSearchDialog";
 
 const PROJECT_EXPANSION_STORAGE_KEY = "puddingclaw_sidebar_project_expansion";
 const useBrowserLayoutEffect = typeof window === "undefined" ? useEffect : useLayoutEffect;
@@ -66,7 +67,19 @@ export default function Sidebar() {
   const [expandedProjectSessions, setExpandedProjectSessions] = useState<Set<string>>(() => new Set());
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(() => new Set());
   const [projectExpansionRestored, setProjectExpansionRestored] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
   const hasSavedProjectExpansionRef = useRef(false);
+
+  useEffect(() => {
+    const handleSearchShortcut = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setSearchOpen(true);
+      }
+    };
+    document.addEventListener("keydown", handleSearchShortcut);
+    return () => document.removeEventListener("keydown", handleSearchShortcut);
+  }, []);
 
   useBrowserLayoutEffect(() => {
     try {
@@ -173,6 +186,28 @@ export default function Sidebar() {
     await openProjectFolderPicker();
   }, [openProjectFolderPicker]);
 
+  const projectNames = useMemo(
+    () => new Map(projects.map((project) => [project.project_id, project.name])),
+    [projects],
+  );
+
+  const handleSearchResultSelect = useCallback((session: SessionSearchResult) => {
+    const nextMode = session.runtime_mode === "agent" ? "agent" : "chat";
+    setRuntimeMode(nextMode);
+    setCurrentProjectId(nextMode === "agent" ? session.project_id || null : null);
+    setSessionId(session.id);
+    setWorkspaceView("chat");
+    setSearchOpen(false);
+    if (pathname !== "/") router.push("/");
+  }, [
+    pathname,
+    router,
+    setCurrentProjectId,
+    setRuntimeMode,
+    setSessionId,
+    setWorkspaceView,
+  ]);
+
   const toggleProjectSessions = useCallback((projectId: string) => {
     setExpandedProjectSessions((current) => {
       const next = new Set(current);
@@ -257,7 +292,12 @@ export default function Sidebar() {
           <Plus className="w-4 h-4" />
           新对话
         </button>
-        <SidebarLink icon={Search} label="搜索" muted />
+        <SidebarLink
+          icon={Search}
+          label="搜索"
+          muted
+          onClick={() => setSearchOpen(true)}
+        />
         <Link
           href="/knowledge"
           className={`w-full flex items-center gap-2 px-3 py-2 text-[13px] rounded-xl transition-all ${
@@ -494,6 +534,12 @@ export default function Sidebar() {
 
     </aside>
     {projectFolderDialog}
+    <SessionSearchDialog
+      open={searchOpen}
+      projectNames={projectNames}
+      onClose={() => setSearchOpen(false)}
+      onSelect={handleSearchResultSelect}
+    />
     </>
   );
 }
@@ -771,10 +817,12 @@ function SidebarLink({
   icon: Icon,
   label,
   muted = false,
+  onClick,
 }: {
   icon: React.ElementType;
   label: string;
   muted?: boolean;
+  onClick?: () => void;
 }) {
   return (
     <button
@@ -784,6 +832,7 @@ function SidebarLink({
           : "text-gray-600 hover:text-gray-900 hover:bg-white/50"
       }`}
       type="button"
+      onClick={onClick}
     >
       <Icon className="w-4 h-4" />
       {label}

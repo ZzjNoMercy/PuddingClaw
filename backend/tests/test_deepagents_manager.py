@@ -2630,6 +2630,10 @@ def test_checkpoint_thread_survives_hitl_wait_and_is_deleted_after_resume(tmp_pa
 
     assert any(event["event"] == "permission_required" for event in events)
     assert any(event["event"] == "permission_resolved" for event in events)
+    context_usage_events = [event for event in events if event["event"] == "context_usage"]
+    assert context_usage_events
+    assert json.loads(context_usage_events[0]["data"])["used_tokens"] > 0
+    assert session_manager.get_agent_context_usage("hitl-lifecycle-session") > 0
     assert any(event["event"] == "done" for event in events)
     assert isinstance(fake_agent.inputs[-1], Command)
     assert len(deleted) == 1
@@ -4641,7 +4645,13 @@ def test_deepagents_manager_uses_backend_execute_instead_of_custom_terminal(tmp_
     runtime = DeepAgentsAgentManager()
     runtime.initialize(Path(__file__).resolve().parent.parent)
 
-    tools = runtime._build_tools(workspace)  # noqa: SLF001 - intentional contract test
+    tools = runtime._build_tools(  # noqa: SLF001 - intentional contract test
+        workspace,
+        session_id="session-1",
+        query_id="query-1",
+        current_message="# pasted markdown",
+        current_attachments=[{"id": "attachment-1", "name": "source.md"}],
+    )
     by_name = {tool.name: tool for tool in tools}
 
     assert "terminal" not in by_name
@@ -4659,6 +4669,14 @@ def test_deepagents_manager_uses_backend_execute_instead_of_custom_terminal(tmp_
     assert "read_file" not in by_name
     assert "write_file" not in by_name
     assert "execute_skill" not in by_name
+    assert "llm_wiki_publish" not in by_name
+    assert by_name["llm_wiki_context"].allow_ingest is False
+    assert by_name["llm_wiki_create_raw"].session_id == "session-1"
+    assert by_name["llm_wiki_create_raw"].query_id == "query-1"
+    assert by_name["llm_wiki_create_raw"].current_message == "# pasted markdown"
+    assert by_name["llm_wiki_create_raw"].current_attachments == [{"id": "attachment-1", "name": "source.md"}]
+    assert by_name["llm_wiki_start_ingest"].session_id == "session-1"
+    assert by_name["llm_wiki_start_ingest"].query_id == "query-1"
 
 
 def test_memory_dir_and_memory_md_creation(tmp_path):

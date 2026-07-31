@@ -91,6 +91,7 @@ export interface DatabaseQaSettings {
   full_rows_hard_row_cap: number;
   full_rows_hard_column_cap: number;
   max_cell_chars_for_llm: number;
+  result_materialization_row_cap: number;
   query_timeout_ms: number;
   result_store_enabled: boolean;
   result_store_ttl_hours: number;

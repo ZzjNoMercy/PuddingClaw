@@ -56,6 +56,81 @@ def test_absolute_workspace_path_is_rewritten_before_read_file(tmp_path):
     assert captured["args"]["file_path"] == "/workspace/reports/dashboard.html"
 
 
+def test_absolute_managed_knowledge_path_is_rewritten_before_read_file(tmp_path):
+    from graph.middlewares.workspace_path_router import WorkspacePathRouterMiddleware
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    knowledge = tmp_path / "knowledge"
+    target = knowledge / "imported" / "note.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("managed note", encoding="utf-8")
+    captured = {}
+
+    def handler(request):
+        captured.update(request.tool_call)
+        return ToolMessage(
+            content="managed note",
+            name="read_file",
+            tool_call_id="call-1",
+            status="success",
+        )
+
+    result = WorkspacePathRouterMiddleware(
+        managed_host_path_aliases={"/knowledge": knowledge},
+    ).wrap_tool_call(
+        _request("read_file", {"file_path": str(target)}, workspace),
+        handler,
+    )
+
+    assert result.status == "success"
+    assert captured["name"] == "read_file"
+    assert captured["args"]["file_path"] == "/knowledge/imported/note.md"
+
+
+def test_read_resource_for_managed_text_uses_backend_read_file_route(tmp_path):
+    from graph.middlewares.workspace_path_router import WorkspacePathRouterMiddleware
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    knowledge = tmp_path / "knowledge"
+    target = knowledge / "imported" / "note.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("managed note", encoding="utf-8")
+    captured = {}
+
+    class Backend:
+        managed_host_path_aliases = {"/knowledge": knowledge}
+
+        def read(self, path, *, offset, limit):
+            captured.update({"path": path, "offset": offset, "limit": limit})
+            return SimpleNamespace(
+                error=None,
+                file_data={"encoding": "utf-8", "content": "managed note"},
+            )
+
+    def unexpected_handler(_request):
+        raise AssertionError("managed text must bypass read_resource")
+
+    result = WorkspacePathRouterMiddleware(Backend()).wrap_tool_call(
+        _request(
+            "read_resource",
+            {"resource": str(target), "offset": 3, "limit": 20},
+            workspace,
+        ),
+        unexpected_handler,
+    )
+
+    assert result.status == "success"
+    assert result.name == "read_file"
+    assert result.content == "managed note"
+    assert captured == {
+        "path": "/knowledge/imported/note.md",
+        "offset": 3,
+        "limit": 20,
+    }
+
+
 def test_absolute_workspace_path_is_rewritten_before_ls(tmp_path):
     from graph.middlewares.workspace_path_router import WorkspacePathRouterMiddleware
 

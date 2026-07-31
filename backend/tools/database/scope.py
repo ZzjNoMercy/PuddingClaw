@@ -52,6 +52,15 @@ def normalize_table_name_for_match(table_name: str) -> str:
     return str(table_name or "").strip().strip('"').split(".")[-1].lower()
 
 
+def normalize_table_scope(table_name: str) -> str:
+    """Normalize a table without erasing its authorization schema."""
+
+    parts = [part.strip().strip('"').lower() for part in str(table_name or "").split(".") if part.strip()]
+    if len(parts) == 1:
+        return f"public.{parts[0]}"
+    return ".".join(parts[-2:])
+
+
 def table_in_scope(table_name: str, allowed_tables: list[str]) -> bool:
-    target = normalize_table_name_for_match(table_name)
-    return any(normalize_table_name_for_match(item) == target for item in allowed_tables)
+    target = normalize_table_scope(table_name)
+    return any(normalize_table_scope(item) == target for item in allowed_tables)

@@ -12,6 +12,7 @@ from langgraph.runtime import Runtime
 from langgraph.types import interrupt
 
 from graph.effective_grants import EffectiveGrantSet
+from graph.managed_paths import is_managed_resource_path
 from graph.permission_policy import RunPermissionContext
 from graph.permission_resume import permission_resume_registry
 from graph.session_manager import session_manager
@@ -35,8 +36,20 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
     @classmethod
     def _external_read_path(cls, raw_path: str, workspace_path: str) -> Path | None:
         """Return a host path only when external read authority is required."""
+        requested = cls._external_write_path(raw_path, workspace_path)
+        if requested is None:
+            return None
 
-        return cls._external_write_path(raw_path, workspace_path)
+        # The configured knowledge root and attachment store are
+        # PuddingClaw-managed read-only resources. Their physical host paths
+        # may live outside the active workspace, but reading them must have the
+        # same authority as their virtual `/knowledge` / attachment aliases.
+        # Keep this exception read-only: writes continue through
+        # `_external_write_path` and therefore still require explicit consent.
+        base_dir = Path(__file__).resolve().parent.parent
+        if is_managed_resource_path(requested, base_dir):
+            return None
+        return requested
 
     @staticmethod
     def _change_preview(tool_name: str, args: dict[str, Any]) -> dict[str, str]:
@@ -463,6 +476,19 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                     )
                     else "read"
                 )
+                if (
+                    access == "read"
+                    and tool_name in {"grep", "glob", "ls"}
+                    and is_managed_resource_path(
+                        requested,
+                        Path(__file__).resolve().parent.parent,
+                    )
+                ):
+                    # Absolute aliases of the configured knowledge directory
+                    # are as trusted for read-only discovery as `/knowledge`.
+                    # Execution/staging tools intentionally remain permission
+                    # gated even when their source happens to be managed.
+                    continue
                 deletion_required = False
                 if tool_name == "commit_external_directory":
                     lease = session_manager.get_external_directory_lease(

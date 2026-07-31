@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Type
 
+from langchain.tools import ToolRuntime
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from analytics.nl2sql.eav_evidence import extract_eav_type_names
 from analytics.nl2sql.sql_runner import run_readonly_sql
+from graph.database_schema_evidence import database_schema_evidence_registry
+from graph.database_sql_revision_resume import database_sql_revision_resume_registry
 from knowledge.database_sources import database_source_url
 
 from .formatting import markdown_table
@@ -23,10 +26,14 @@ class DatabaseSchemaInspectTool(BaseTool):
     name: str = "database_schema_inspect"
     description: str = (
         "Inspect configured database metadata without Vanna: list selected tables, columns, EAV type_name values, "
-        "or sample rows. Use for schema/debug questions, not for answering business metrics directly."
+        "or sample rows. type_names mode returns a server-owned schema_evidence_receipt_id; when diagnosing an "
+        "existing SQL generation, pass parent_generation_id and use the receipt for an automatic physical repair. "
+        "Use for schema/debug questions, not for answering business metrics directly."
     )
-    args_schema: Type[BaseModel] = DatabaseSchemaInspectInput
+    args_schema: type[BaseModel] = DatabaseSchemaInspectInput
     risk_level: str = "safe"
+    session_id: str = ""
+    query_id: str = ""
 
     class Config:
         arbitrary_types_allowed = True
@@ -38,6 +45,8 @@ class DatabaseSchemaInspectTool(BaseTool):
         table_name: str | None = None,
         search: str | None = None,
         limit: int = 100,
+        parent_generation_id: str | None = None,
+        runtime: ToolRuntime | None = None,
     ) -> str:
         try:
             source, public_source, allowed_tables = await resolve_database_source_scope(database_source_id, [])
@@ -101,18 +110,24 @@ class DatabaseSchemaInspectTool(BaseTool):
             try:
                 async with engine.connect() as conn:
                     table_only = normalize_table_name_for_match(table_name)
+                    table_parts = [
+                        part.strip().strip('"')
+                        for part in str(table_name).split(".")
+                        if part.strip()
+                    ]
+                    table_schema = table_parts[-2] if len(table_parts) >= 2 else "public"
                     if normalized_mode == "columns":
                         result = await conn.execute(
                             text(
                                 """
                                 SELECT column_name, data_type, is_nullable
                                 FROM information_schema.columns
-                                WHERE table_schema = 'public'
+                                WHERE table_schema = :table_schema
                                   AND table_name = :table_name
                                 ORDER BY ordinal_position
                                 """
                             ),
-                            {"table_name": table_only},
+                            {"table_schema": table_schema, "table_name": table_only},
                         )
                         rows = [dict(row) for row in result.mappings().all()]
                         emit_database_span(
@@ -152,6 +167,45 @@ class DatabaseSchemaInspectTool(BaseTool):
                             {"search_text": str(search or ""), "limit_value": max(1, min(int(limit or 100), 1000))},
                         )
                         rows = [dict(row) for row in result.mappings().all()]
+                        runtime_context = getattr(runtime, "context", None)
+                        context = runtime_context if isinstance(runtime_context, dict) else {}
+                        receipt = None
+                        if parent_generation_id:
+                            parent = database_sql_revision_resume_registry.get_generation(
+                                parent_generation_id,
+                                session_id=self.session_id,
+                                run_id=str(context.get("run_id") or ""),
+                                goal_id=str(context.get("goal_id") or ""),
+                                goal_revision=context.get("goal_revision"),
+                            )
+                            if parent is None:
+                                raise RuntimeError(
+                                    "parent_generation_id 不存在或不属于当前 Session/Run/Goal。"
+                                )
+                            if str(parent.query_id or "") != str(self.query_id or ""):
+                                raise RuntimeError("父 generation 与本次 schema 检查不属于同一 Query。")
+                            if str(parent.result.source.get("id") or "") != str(public_source.get("id") or ""):
+                                raise RuntimeError("父 generation 与本次 schema 检查不属于同一数据源。")
+                            if not table_in_scope(table_name, list(parent.result.route.table_names)):
+                                raise RuntimeError("父 generation 未授权本次检查的表。")
+                            parent_type_names = sorted(extract_eav_type_names(parent.result.sql))
+                            if not parent_type_names:
+                                raise RuntimeError("父 SQL 没有可诊断的 vehicle_params.type_name 字面量。")
+                            receipt = database_schema_evidence_registry.register(
+                                session_id=self.session_id,
+                                query_id=self.query_id,
+                                run_id=str(context.get("run_id") or ""),
+                                goal_id=str(context.get("goal_id") or ""),
+                                goal_revision=context.get("goal_revision"),
+                                parent_generation_id=str(parent_generation_id),
+                                database_source_id=str(public_source.get("id") or ""),
+                                table_name=str(table_name),
+                                mode=normalized_mode,
+                                search=str(search or ""),
+                                rows=rows,
+                                parent_sql_sha256=parent.sql_sha256,
+                                parent_type_names=parent_type_names,
+                            )
                         emit_database_span(
                             "schema_inspect",
                             {
@@ -165,12 +219,21 @@ class DatabaseSchemaInspectTool(BaseTool):
                             },
                             metadata={"database_source_id": public_source.get("id")},
                         )
+                        receipt_lines = (
+                            [
+                                f"- schema_evidence_receipt_id：{receipt['id']}",
+                                f"- evidence_sha256：{receipt['sha256']}",
+                            ]
+                            if receipt
+                            else ["- schema_evidence_receipt_id：未签发（诊断修复时需传 parent_generation_id）"]
+                        )
                         return "\n".join(
                             [
                                 "🧮 EAV type_name 枚举",
                                 f"- 数据源：{public_source.get('name')} ({public_source.get('id')})",
                                 f"- 表：{table_name}",
                                 f"- 搜索：{search or '<empty>'}",
+                                *receipt_lines,
                                 "",
                                 *markdown_table(rows, ["type_name", "count"], max_rows=len(rows) or 20),
                             ]
@@ -188,6 +251,7 @@ class DatabaseSchemaInspectTool(BaseTool):
         table_name: str | None = None,
         search: str | None = None,
         limit: int = 100,
+        parent_generation_id: str | None = None,
     ) -> str:
         try:
             asyncio.get_running_loop()
@@ -199,6 +263,7 @@ class DatabaseSchemaInspectTool(BaseTool):
                     table_name=table_name,
                     search=search,
                     limit=limit,
+                    parent_generation_id=parent_generation_id,
                 )
             )
         return "🧮 数据库结构检查失败：当前运行环境不支持同步调用，请使用异步工具调用。"

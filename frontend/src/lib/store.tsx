@@ -67,7 +67,11 @@ import {
   settleRunningVerificationActivities,
   verificationFailureActivity,
 } from "./verificationActivity";
-import { mergeRunningSessionIds } from "./sessionConcurrency";
+import {
+  mergeRunningSessionIds,
+  releaseOrphanedPlaceholderLock,
+  rebindSessionScopedLock,
+} from "./sessionConcurrency";
 import {
   getSettings as apiGetSettings,
   updateSettings as apiUpdateSettings,
@@ -310,6 +314,7 @@ export interface SendMessageOptions {
   goalControlAction?: "start";
   hiddenUserMessage?: boolean;
   skillHints?: string[];
+  onSessionResolved?: (sessionId: string) => void;
 }
 
 interface AppState {
@@ -1150,6 +1155,34 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [runActivityStatus, setRunActivityStatus] =
     useState<RunActivityStatus | null>(null);
   const toolContextPollingJobsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    const handleProviderBindingChange = (event: Event) => {
+      const detail = (event as CustomEvent<{ binding?: string }>).detail;
+      if (detail?.binding !== "agent") return;
+
+      // The unsent placeholder conversation inherits the global Agent binding.
+      // Never turn that inherited default into a durable per-session override.
+      llmSelectionsMapRef.current.default = {
+        modelId: null,
+        thinkingLevel: null,
+      };
+      if (sessionIdRef.current === "default") {
+        setLlmModelIdRaw(null);
+        setThinkingLevelRaw(null);
+      }
+    };
+    window.addEventListener(
+      "puddingclaw:provider-bindings-changed",
+      handleProviderBindingChange,
+    );
+    return () => {
+      window.removeEventListener(
+        "puddingclaw:provider-bindings-changed",
+        handleProviderBindingChange,
+      );
+    };
+  }, []);
 
   const [activeSourceId, setActiveSourceId] = useState<string | null>(null);
   const [activeAttachmentPreview, setActiveAttachmentPreview] =
@@ -2307,6 +2340,22 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     ): Promise<boolean> => {
       // Guard: only check if CURRENT session is streaming (other sessions can be)
       const originSendSessionId = sessionIdRef.current;
+      let reservationSessionId = originSendSessionId;
+      if (originSendSessionId === "default") {
+        // Fast Refresh or a frontend deployment can leave an older in-flight
+        // closure holding the placeholder reservation after its actual stream
+        // has already moved to a durable session id. Reclaim only a provably
+        // orphaned placeholder; a live create/stream still keeps double-submit
+        // protection.
+        sendReservationsRef.current = releaseOrphanedPlaceholderLock(
+          sendReservationsRef.current,
+          originSendSessionId,
+          {
+            creationPending: createSessionPromisesRef.current.has(originSendSessionId),
+            streaming: streamingSessionsRef.current.has(originSendSessionId),
+          },
+        );
+      }
       if (
         (!text.trim() && attachments.length === 0) ||
         streamingSessionsRef.current.has(originSendSessionId) ||
@@ -2346,6 +2395,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         if (!createdSessionId) return false;
         sendSessionId = createdSessionId;
       }
+
+      if (reservationSessionId !== sendSessionId) {
+        sendReservationsRef.current = rebindSessionScopedLock(
+          sendReservationsRef.current,
+          reservationSessionId,
+          sendSessionId,
+        );
+        reservationSessionId = sendSessionId;
+      }
+      options.onSessionResolved?.(sendSessionId);
 
       // Capture the sessionId at send time (stable for entire SSE lifecycle)
 
@@ -2762,12 +2821,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               total_tokens: number;
               percentage: number;
             };
-            setContextUsage({
-              used: usage.used_tokens,
-              total: usage.total_tokens,
-              percentage: usage.percentage,
-              measured: true,
-            });
+            // Streams continue in the background when the user switches
+            // conversations. Never let one Session overwrite another
+            // Session's composer meter.
+            if (sessionIdRef.current === sendSessionId) {
+              setContextUsage({
+                used: usage.used_tokens,
+                total: usage.total_tokens,
+                percentage: usage.percentage,
+                measured: true,
+              });
+            }
             continue;
           }
 
@@ -4100,7 +4164,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }
         return true;
       } finally {
-        sendReservationsRef.current.delete(originSendSessionId);
+        sendReservationsRef.current.delete(reservationSessionId);
       }
     },
     [

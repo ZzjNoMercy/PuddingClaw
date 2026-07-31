@@ -8,6 +8,7 @@ import mimetypes
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -52,6 +53,7 @@ from knowledge.import_jobs import (
 )
 from knowledge.indexer import reset_multimodal_collections
 from knowledge.paths import get_knowledge_originals_dir, get_knowledge_root
+from knowledge.llm_wiki import LlmWikiError, get_llm_wiki_service
 from knowledge.models import new_id
 from knowledge.models import KnowledgeDocument
 from knowledge.service import DEFAULT_KNOWLEDGE_BASE_ID, KnowledgeService, KnowledgeServiceError, _slugify, document_to_dict
@@ -61,6 +63,14 @@ from tools.search_knowledge_tool import LlamaIndexKnowledgeQueryTool
 router = APIRouter(prefix="/knowledge", tags=["knowledge"])
 BASE_DIR = Path(__file__).resolve().parent.parent
 logger = logging.getLogger(__name__)
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class ImportLocalMarkdownRequest(BaseModel):
@@ -80,6 +90,10 @@ class MarkdownGrepRequest(BaseModel):
 class KnowledgeSearchRequest(BaseModel):
     query: str = Field(min_length=1, description="Semantic query for the LlamaIndex knowledge index.")
     top_k: int | None = Field(default=None, ge=1, le=20, description="Final number of hits returned to the Agent/LLM.")
+
+
+class KnowledgeFileRawRequest(BaseModel):
+    virtual_path: str = Field(description="A Markdown file under /knowledge/ to copy into immutable LLM Wiki Raw.")
 
 
 class KnowledgeTableQueryRequest(BaseModel):
@@ -628,8 +642,55 @@ async def get_knowledge_directory_tree(max_depth: int = 5, limit: int = 500):
 async def preview_knowledge_file(virtual_path: str):
     service = KnowledgeService(BASE_DIR)
     try:
-        return {"file": service.preview_file(virtual_path=virtual_path)}
+        payload = await run_in_threadpool(service.preview_file, virtual_path=virtual_path)
+        if Path(payload["storage_path"]).suffix.lower() in {".md", ".markdown"}:
+            source_path = str(payload["virtual_path"])
+            digest = await run_in_threadpool(_sha256_path, Path(payload["storage_path"]))
+            try:
+                payload["llm_wiki_raw"] = await run_in_threadpool(
+                    get_llm_wiki_service(BASE_DIR).raw_status_for_source,
+                    source_path=source_path,
+                    content_sha256=digest,
+                )
+            except (LlmWikiError, OSError) as exc:
+                payload["llm_wiki_raw"] = {
+                    "available": False,
+                    "snapshot": None,
+                    "latest_snapshot": None,
+                    "changed_since_snapshot": False,
+                    "error": str(exc),
+                }
+        return {"file": payload}
     except KnowledgeServiceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/file/llm-wiki-raw")
+async def snapshot_knowledge_file_to_llm_wiki_raw(request: KnowledgeFileRawRequest):
+    service = KnowledgeService(BASE_DIR)
+    try:
+        path = service.resolve_raw_file(virtual_path=request.virtual_path)
+        if path.suffix.lower() not in {".md", ".markdown"}:
+            raise KnowledgeServiceError("只有 Markdown 文件可以加入 LLM Wiki Raw。")
+        canonical_virtual_path = f"/knowledge/{path.relative_to(service.knowledge_dir.resolve()).as_posix()}"
+
+        wiki = get_llm_wiki_service(BASE_DIR)
+        try:
+            path.relative_to(wiki.root.resolve())
+        except ValueError:
+            pass
+        else:
+            raise KnowledgeServiceError("LLM Wiki 工作目录中的文件不能再次加入 Raw。")
+        record = await run_in_threadpool(
+            wiki.snapshot_raw_file,
+            source_id="knowledge-file",
+            asset_id=canonical_virtual_path,
+            title=path.stem,
+            path=path,
+            source_path=canonical_virtual_path,
+        )
+        return {"ok": True, "raw": record}
+    except (KnowledgeServiceError, LlmWikiError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 

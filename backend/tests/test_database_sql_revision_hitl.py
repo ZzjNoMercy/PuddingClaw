@@ -11,7 +11,12 @@ import pytest
 from langchain_core.messages import HumanMessage
 
 from analytics.nl2sql.schemas import DatabaseSqlGenerationResult, SqlExecutionResult, TableRoute
+from graph.database_schema_evidence import (
+    DatabaseSchemaEvidenceRegistry,
+    database_schema_evidence_registry,
+)
 from graph.database_sql_revision_resume import DatabaseSqlRevisionResumeRegistry
+from tools.database.schema_inspect_tool import DatabaseSchemaInspectTool
 from tools.database.sql_execute_tool import DatabaseSqlExecuteTool
 from tools.database.sql_generate_tool import DatabaseSqlGenerateTool
 from tools.database.sql_validate_tool import DatabaseSqlValidateTool
@@ -43,6 +48,7 @@ def test_database_sql_generate_runtime_is_hidden_from_llm_schema() -> None:
         DatabaseSqlGenerateTool(),
         DatabaseSqlValidateTool(),
         DatabaseSqlExecuteTool(),
+        DatabaseSchemaInspectTool(),
     ):
         assert "runtime" in tool.get_input_schema().model_fields
         assert "runtime" not in tool.tool_call_schema.model_fields
@@ -122,6 +128,51 @@ def test_sql_authority_is_scoped_to_run_or_same_goal_revision() -> None:
         goal_id="goal-2",
         goal_revision=3,
     ) is None
+
+
+def test_schema_evidence_receipt_is_bound_to_parent_run_source_and_table() -> None:
+    registry = DatabaseSchemaEvidenceRegistry()
+    receipt = registry.register(
+        session_id="session-a",
+        query_id="query-a",
+        run_id="run-a",
+        goal_id="goal-a",
+        goal_revision=2,
+        parent_generation_id="sql-gen-a",
+        database_source_id="source-a",
+        table_name="vehicle_params",
+        mode="type_names",
+        search="电池",
+        rows=[{"type_name": "电池电量[kWh]", "count": 1}],
+        parent_sql_sha256="sha256:parent-a",
+        parent_type_names=["电池容量[kWh]"],
+    )
+    valid = dict(
+        session_id="session-a",
+        query_id="query-a",
+        run_id="run-a",
+        goal_id="goal-a",
+        goal_revision=2,
+        parent_generation_id="sql-gen-a",
+        database_source_id="source-a",
+        allowed_tables=["vehicle_params"],
+        parent_sql_sha256="sha256:parent-a",
+    )
+    assert registry.get(receipt["id"], **valid) is not None
+    receipt["evidence"]["rows"][0]["type_name"] = "外部篡改"
+    assert registry.get(receipt["id"], **valid)["evidence"]["rows"][0]["type_name"] == "电池电量[kWh]"
+    for key, value in (
+        ("session_id", "session-b"),
+        ("query_id", "query-b"),
+        ("run_id", "run-b"),
+        ("parent_generation_id", "sql-gen-b"),
+        ("database_source_id", "source-b"),
+        ("allowed_tables", ["other_table"]),
+    ):
+        tampered = {**valid, key: value}
+        assert registry.get(receipt["id"], **tampered) is None
+    registry._receipts[receipt["id"]]["evidence"]["rows"][0]["type_name"] = "内部篡改"
+    assert registry.get(receipt["id"], **valid) is None
 
 
 @pytest.mark.asyncio
@@ -347,16 +398,15 @@ async def test_agent_read_template_state_authorizes_declared_enum_scope(
 
 
 @pytest.mark.asyncio
-async def test_agent_cannot_bypass_enum_guard_by_omitting_asset(
+async def test_question_enum_text_is_not_blocked_before_sql_generation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import tools.database.sql_generate_tool as module
 
-    called = False
+    requests: list[Any] = []
 
     async def fake_generate(_session: object, request: Any) -> DatabaseSqlGenerationResult:
-        nonlocal called
-        called = True
+        requests.append(request)
         return _result(request.question)
 
     monkeypatch.setattr(module, "get_sessionmaker", lambda: _FakeSessionMaker())
@@ -376,9 +426,9 @@ async def test_agent_cannot_bypass_enum_guard_by_omitting_asset(
         runtime=runtime,
     )
 
-    assert called is False
-    assert "口径枚举" in output
-    assert "纯电" in output
+    assert len(requests) == 1
+    assert requests[0].question == "仅统计纯电车型"
+    assert "SQL 生成结果" in output
 
 
 @pytest.mark.asyncio
@@ -423,11 +473,10 @@ async def test_runtime_context_cannot_inject_template_authorization_without_guid
 ) -> None:
     import tools.database.sql_generate_tool as module
 
-    called = False
+    requests: list[Any] = []
 
     async def fake_generate(_session: object, request: Any) -> DatabaseSqlGenerationResult:
-        nonlocal called
-        called = True
+        requests.append(request)
         return _result(request.question)
 
     monkeypatch.setattr(module, "get_sessionmaker", lambda: _FakeSessionMaker())
@@ -453,13 +502,16 @@ async def test_runtime_context_cannot_inject_template_authorization_without_guid
         },
     )
 
+    assert module._trusted_template_enum_terms(runtime) == {}
+
     output = await DatabaseSqlGenerateTool()._arun(
         question="仅统计纯电车型的空气悬架",
         runtime=runtime,
     )
 
-    assert called is False
-    assert "纯电" in output
+    assert len(requests) == 1
+    assert requests[0].question == "仅统计纯电车型的空气悬架"
+    assert "SQL 生成结果" in output
 
 
 @pytest.mark.asyncio
@@ -766,13 +818,139 @@ async def test_technical_sql_repair_regenerates_without_business_hitl(
     )
 
     assert len(requests) == 2
-    assert "原始业务问题（业务语义不可改变）" in requests[1].question
-    assert "SQL 技术修复反馈" in requests[1].question
+    assert requests[1].question == requests[0].question
+    assert requests[1].technical_evidence["kind"] == "observed_sql_failure"
+    assert requests[1].technical_evidence["observed_problem_category"] in {
+        "performance_or_timeout",
+        "physical_column_mismatch",
+    }
     assert requests[0].semantic_question == "查询 2020 到 2026 年高速 NOA 配置率"
     assert requests[1].semantic_question == requests[0].semantic_question
     assert "技术修复已自动重生成" in repaired
     assert "无需业务口径确认" in repaired
     assert "SELECT 2" in repaired
+
+
+@pytest.mark.asyncio
+async def test_schema_receipt_physical_repair_bypasses_business_hitl_without_retrieval_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.database.sql_generate_tool as module
+
+    requests: list[Any] = []
+
+    async def fake_generate(_session: object, request: Any) -> DatabaseSqlGenerationResult:
+        requests.append(request)
+        return _result(request.question, sql=f"SELECT {len(requests)}")
+
+    def unexpected_interrupt(_payload: object) -> object:
+        raise AssertionError("same-scope schema evidence repair must not open HITL")
+
+    monkeypatch.setattr(module, "get_sessionmaker", lambda: _FakeSessionMaker())
+    monkeypatch.setattr(module, "generate_database_sql", fake_generate)
+    monkeypatch.setattr(module, "interrupt", unexpected_interrupt)
+    tool = DatabaseSqlGenerateTool(session_id="session-schema", query_id="query-schema")
+    runtime = SimpleNamespace(
+        state={},
+        context={"run_id": "run-schema", "goal_id": "", "goal_revision": None},
+    )
+
+    original = await tool._arun(question="查询车型电量和CLTC续航", runtime=runtime)
+    generation_id = next(
+        line.split("：", 1)[1]
+        for line in original.splitlines()
+        if line.startswith("- generation_id：")
+    )
+    receipt = database_schema_evidence_registry.register(
+        session_id="session-schema",
+        query_id="query-schema",
+        run_id="run-schema",
+        goal_id="",
+        goal_revision=None,
+        parent_generation_id=generation_id,
+        database_source_id="source-1",
+        table_name="vehicle_params",
+        mode="type_names",
+        search="电池",
+        rows=[{"type_name": "电池电量[kWh]", "count": 10}],
+        parent_sql_sha256=next(
+            line.split("：", 1)[1] for line in original.splitlines() if line.startswith("- sql_sha256：")
+        ),
+        parent_type_names=["电池容量[kWh]"],
+    )
+
+    repaired = await tool._arun(
+        question="ignored",
+        parent_generation_id=generation_id,
+        revision_instruction=(
+            "查询返回0行，schema inspect显示电池物理配置名与上一版不一致，请修复物理映射。"
+        ),
+        schema_evidence_receipt_id=receipt["id"],
+        runtime=runtime,
+    )
+
+    assert len(requests) == 2
+    assert requests[1].question == requests[0].question
+    assert requests[1].semantic_question == requests[0].question
+    assert requests[1].technical_evidence["kind"] == "schema_evidence"
+    assert requests[1].technical_evidence["schema_receipt"]["id"] == receipt["id"]
+    assert "无需业务口径确认" in repaired
+
+
+@pytest.mark.asyncio
+async def test_schema_receipt_cannot_hide_business_semantic_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.database.sql_generate_tool as module
+
+    interrupted: list[dict[str, Any]] = []
+
+    async def fake_generate(_session: object, request: Any) -> DatabaseSqlGenerationResult:
+        return _result(request.question)
+
+    def approve(payload: dict[str, Any]) -> dict[str, str]:
+        interrupted.append(payload)
+        return {"action": "agree", "revision_instruction": "粒度改为车系"}
+
+    monkeypatch.setattr(module, "get_sessionmaker", lambda: _FakeSessionMaker())
+    monkeypatch.setattr(module, "generate_database_sql", fake_generate)
+    monkeypatch.setattr(module, "interrupt", approve)
+    tool = DatabaseSqlGenerateTool(session_id="session-mixed-receipt", query_id="query-mixed-receipt")
+    runtime = SimpleNamespace(
+        state={},
+        context={"run_id": "run-mixed-receipt", "goal_id": "", "goal_revision": None},
+    )
+    original = await tool._arun(question="查询CLTC续航", runtime=runtime)
+    generation_id = next(
+        line.split("：", 1)[1]
+        for line in original.splitlines()
+        if line.startswith("- generation_id：")
+    )
+    receipt = database_schema_evidence_registry.register(
+        session_id="session-mixed-receipt",
+        query_id="query-mixed-receipt",
+        run_id="run-mixed-receipt",
+        goal_id="",
+        goal_revision=None,
+        parent_generation_id=generation_id,
+        database_source_id="source-1",
+        table_name="vehicle_params",
+        mode="type_names",
+        search="续航",
+        rows=[{"type_name": "CLTC纯电续航[km]", "count": 10}],
+        parent_sql_sha256=next(
+            line.split("：", 1)[1] for line in original.splitlines() if line.startswith("- sql_sha256：")
+        ),
+        parent_type_names=["CLTC纯电续航里程[km]"],
+    )
+    await tool._arun(
+        question="ignored",
+        parent_generation_id=generation_id,
+        revision_instruction="粒度改为车系，同时修复CLTC字段。",
+        schema_evidence_receipt_id=receipt["id"],
+        runtime=runtime,
+    )
+    assert interrupted and interrupted[0]["type"] == "database_sql_revision_request"
 
 
 @pytest.mark.asyncio

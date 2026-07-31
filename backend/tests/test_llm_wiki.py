@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import shutil
 from copy import deepcopy
@@ -16,11 +17,23 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from api.llm_wiki import router
 from graph.citations import parse_tool_result
 from knowledge.brain_schema import BrainSchemaError, BrainSchemaService
-from knowledge.import_jobs import LLM_WIKI_INGEST_KIND, create_llm_wiki_ingest_job, job_to_list_dict
+from knowledge.import_jobs import (
+    LLM_WIKI_INGEST_KIND,
+    create_import_job,
+    create_llm_wiki_ingest_job,
+    job_to_list_dict,
+    process_import_job,
+)
 from knowledge.llm_wiki import LlmWikiError, LlmWikiService
-from knowledge.llm_wiki_compiler_agent import LlmWikiCompilerAgent
+from knowledge.llm_wiki_compiler_agent import COMPILER_SYSTEM_PROMPT, LlmWikiCompilerAgent
+from knowledge.llm_wiki_job_runner import BACKGROUND_INGEST_GROUNDING_RULES, process_llm_wiki_ingest_job
 from knowledge.models import Base
-from tools.llm_wiki_tools import LlmWikiQueryTool
+from tools.llm_wiki_tools import (
+    LlmWikiCreateRawTool,
+    LlmWikiQueryTool,
+    LlmWikiStartIngestTool,
+    WikiStartIngestInput,
+)
 
 
 @pytest.fixture()
@@ -82,6 +95,363 @@ def test_raw_snapshot_is_immutable_and_context_is_bounded(wiki_env: LlmWikiServi
     assert wiki_env.operation_context("ingest")["raw_files"] == {}
 
 
+def test_markdown_file_snapshot_preserves_final_bytes_and_detects_changes(
+    wiki_env: LlmWikiService,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "uploaded.md"
+    original = "# 原始 Markdown\n\n没有强制补换行"
+    source.write_bytes(original.encode("utf-8"))
+    record = wiki_env.snapshot_raw_file(
+        source_id="knowledge-upload",
+        asset_id="doc-final",
+        title="最终文件",
+        path=source,
+        source_path="/knowledge/imported/uploaded.md",
+    )
+    assert (wiki_env.raw_dir / record["snapshot_path"]).read_bytes() == original.encode("utf-8")
+    status = wiki_env.raw_status_for_source(
+        source_path="/knowledge/imported/uploaded.md",
+        content_sha256=record["sha256"],
+    )
+    assert status["available"] is True
+    assert status["changed_since_snapshot"] is False
+
+    source.write_text(f"{original}\n\n已修改", encoding="utf-8")
+    changed_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    changed_status = wiki_env.raw_status_for_source(
+        source_path="/knowledge/imported/uploaded.md",
+        content_sha256=changed_hash,
+    )
+    assert changed_status["available"] is False
+    assert changed_status["changed_since_snapshot"] is True
+
+
+def test_main_agent_raw_tool_uses_bound_current_message_without_content_argument(
+    wiki_env: LlmWikiService,
+) -> None:
+    tool = LlmWikiCreateRawTool(
+        base_dir=wiki_env.base_dir,
+        session_id="session-one",
+        query_id="query-one",
+        current_message="# 粘贴内容\n\n请把这段内容整理成 Wiki。",
+        current_attachments=[],
+    )
+
+    result = asyncio.run(tool._arun(source="current_message", title="聊天材料"))
+    payload = json.loads(result)
+    assert payload["ok"] is True
+    assert payload["next_tool"] == "llm_wiki_start_ingest"
+    assert len(payload["intake_id"]) == 64
+    assert len(payload["raw_paths"]) == 1
+    snapshot = wiki_env.raw_dir / payload["raw_paths"][0]
+    assert snapshot.read_text(encoding="utf-8") == "# 粘贴内容\n\n请把这段内容整理成 Wiki。\n"
+
+
+def test_main_agent_ingest_tool_rejects_raw_paths_without_current_intake(
+    wiki_env: LlmWikiService,
+) -> None:
+    tool = LlmWikiStartIngestTool(
+        base_dir=wiki_env.base_dir,
+        session_id="session-one",
+        query_id="query-one",
+    )
+    result = asyncio.run(
+        tool._arun(
+            raw_paths=["historical/source.md"],
+            intake_id="0" * 64,
+        )
+    )
+    payload = json.loads(result)
+    assert payload["ok"] is False
+    assert "当前消息" in payload["error"]
+
+
+def test_main_agent_ingest_defaults_to_wiki_only() -> None:
+    payload = WikiStartIngestInput.model_validate(
+        {
+            "raw_paths": ["chat-session/source.md"],
+            "intake_id": "0" * 64,
+        }
+    )
+    assert payload.import_gbrain is False
+
+
+def test_empty_attachment_selection_snapshots_only_current_markdown_attachments(
+    wiki_env: LlmWikiService,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    markdown = tmp_path / "source.md"
+    image = tmp_path / "image.png"
+    markdown.write_text("# Markdown attachment\n", encoding="utf-8")
+    image.write_bytes(b"\x89PNG")
+    stored = {
+        "md": {"id": "md", "name": "source.md", "path": str(markdown), "mime_type": "text/markdown"},
+        "image": {"id": "image", "name": "image.png", "path": str(image), "mime_type": "image/png"},
+    }
+    monkeypatch.setattr(
+        "tools.llm_wiki_tools.attachment_store.get",
+        lambda _session_id, attachment_id: stored.get(attachment_id),
+    )
+    tool = LlmWikiCreateRawTool(
+        base_dir=wiki_env.base_dir,
+        session_id="session-one",
+        query_id="query-one",
+        current_attachments=[{"id": "md"}, {"id": "image"}],
+    )
+    payload = json.loads(asyncio.run(tool._arun(source="attachments")))
+    assert payload["ok"] is True
+    assert len(payload["raw_paths"]) == 1
+    assert payload["snapshots"][0]["asset_id"] == "md"
+
+
+def test_knowledge_file_raw_tool_canonicalizes_virtual_path(
+    wiki_env: LlmWikiService,
+) -> None:
+    imported = wiki_env.root.parent / "imported"
+    imported.mkdir(parents=True, exist_ok=True)
+    source = imported / "canonical.md"
+    source.write_text("# Canonical\n", encoding="utf-8")
+    tool = LlmWikiCreateRawTool(
+        base_dir=wiki_env.base_dir,
+        session_id="session-one",
+        query_id="query-one",
+    )
+    payload = json.loads(
+        asyncio.run(
+            tool._arun(
+                source="knowledge_file",
+                virtual_path="/knowledge/imported/folder/../canonical.md",
+            )
+        )
+    )
+    assert payload["ok"] is True
+    assert payload["snapshots"][0]["source_path"] == "/knowledge/imported/canonical.md"
+    assert payload["snapshots"][0]["asset_id"] == "/knowledge/imported/canonical.md"
+
+
+def test_markdown_import_job_copies_final_imported_file_to_raw_once(
+    wiki_env: LlmWikiService,
+    tmp_path: Path,
+) -> None:
+    content = "# 上传文件\n\n服务端只能读取最终 imported 文件"
+    task_source = tmp_path / "task" / "source" / "upload.md"
+    task_source.parent.mkdir(parents=True)
+    task_source.write_bytes(content.encode("utf-8"))
+
+    async def run() -> None:
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'upload-jobs.db'}")
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with factory() as session:
+            job = await create_import_job(
+                session,
+                base_dir=wiki_env.base_dir,
+                filename="upload.md",
+                source_path=task_source,
+                file_size=len(content.encode("utf-8")),
+                source_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                publish_targets=["local_markdown", "llm_wiki_raw"],
+            )
+            result = await process_import_job(session, base_dir=wiki_env.base_dir, job=job)
+            imported_path = Path(result.job_metadata["document_virtual_path"].replace("/knowledge/", "", 1))
+            imported_path = wiki_env.root.parent / imported_path
+            raw = result.job_metadata["ingestion"]["llm_wiki_raw"]
+            assert Path(result.source_path) == task_source
+            assert imported_path.read_bytes() == content.encode("utf-8")
+            assert (wiki_env.raw_dir / raw["snapshot_path"]).read_bytes() == imported_path.read_bytes()
+        await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_raw_addon_failure_does_not_fail_original_markdown_import(
+    wiki_env: LlmWikiService,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    content = "# 原上传链路\n"
+    task_source = tmp_path / "failed-raw-task" / "source" / "upload.md"
+    task_source.parent.mkdir(parents=True)
+    task_source.write_bytes(content.encode("utf-8"))
+
+    class BrokenWiki:
+        def snapshot_raw_file(self, **_kwargs):
+            raise LlmWikiError("Schema 尚未初始化")
+
+    monkeypatch.setattr("knowledge.llm_wiki.get_llm_wiki_service", lambda _base: BrokenWiki())
+
+    async def run() -> None:
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'failed-raw-jobs.db'}")
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with factory() as session:
+            job = await create_import_job(
+                session,
+                base_dir=wiki_env.base_dir,
+                filename="upload.md",
+                source_path=task_source,
+                file_size=len(content.encode("utf-8")),
+                source_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                publish_targets=["local_markdown", "llm_wiki_raw"],
+            )
+            result = await process_import_job(session, base_dir=wiki_env.base_dir, job=job)
+            assert result.status == "succeeded"
+            assert result.document_id
+            assert "llm_wiki_raw" not in result.publish_targets
+            assert result.job_metadata["ingestion"]["llm_wiki_raw"]["ok"] is False
+        await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_llm_wiki_retry_resumes_at_gbrain_without_rerunning_compiler(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_path = "chat-session/source.md"
+    raw_hash = "b" * 64
+    bundle_hash = "a" * 64
+    compile_calls: list[bool] = []
+
+    class FakeWiki:
+        def freeze_ingest_inputs(self, raw_paths: list[str]):
+            return {
+                "schema_bundle": {"bundle_hash": bundle_hash},
+                "raw_manifest": [{"snapshot_path": raw_path, "sha256": raw_hash}],
+            }
+
+        def compile_gbrain(self, *, import_pages: bool):
+            compile_calls.append(import_pages)
+            return {"ok": True, "phase": "import"}
+
+    class FakeSession:
+        def __init__(self):
+            self.events: list[object] = []
+
+        def add(self, value):
+            self.events.append(value)
+
+        async def commit(self):
+            return None
+
+        async def refresh(self, _value):
+            return None
+
+    class ForbiddenCompiler:
+        def __init__(self, **_kwargs):
+            raise AssertionError("checkpoint retry must not rebuild the Wiki")
+
+    monkeypatch.setattr("knowledge.llm_wiki_job_runner.get_llm_wiki_service", lambda _base: FakeWiki())
+    monkeypatch.setattr("knowledge.llm_wiki_job_runner.LlmWikiCompilerAgent", ForbiddenCompiler)
+    job = SimpleNamespace(
+        id="job-retry",
+        status="running",
+        current_step="starting",
+        progress=5,
+        finished_at=None,
+        error_message=None,
+        job_metadata={
+            "raw_paths": [raw_path],
+            "raw_hashes": {raw_path: raw_hash},
+            "bundle_hash": bundle_hash,
+            "compiler_model_id": "compiler",
+            "wiki_stage_complete": True,
+            "import_gbrain": True,
+            "published_pages": ["concepts/example"],
+            "publish_result": {"published_pages": ["concepts/example"]},
+            "lint_result": {"ok": True},
+            "run_outcome": {"outcome": "completed"},
+        },
+    )
+    session = FakeSession()
+    result = asyncio.run(
+        process_llm_wiki_ingest_job(
+            session,  # type: ignore[arg-type]
+            base_dir=tmp_path,
+            job=job,  # type: ignore[arg-type]
+        )
+    )
+    assert result.status == "succeeded"
+    assert result.job_metadata["gbrain_import_ok"] is True
+    assert compile_calls == [True]
+
+
+def test_wiki_only_checkpoint_does_not_import_or_report_gbrain_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_path = "chat-session/wiki-only.md"
+    raw_hash = "c" * 64
+    bundle_hash = "d" * 64
+
+    class FakeWiki:
+        def freeze_ingest_inputs(self, raw_paths: list[str]):
+            return {
+                "schema_bundle": {"bundle_hash": bundle_hash},
+                "raw_manifest": [{"snapshot_path": raw_path, "sha256": raw_hash}],
+            }
+
+        def compile_gbrain(self, *, import_pages: bool):
+            raise AssertionError(f"Wiki-only task must not import gbrain: {import_pages}")
+
+    class FakeSession:
+        def __init__(self):
+            self.events: list[object] = []
+
+        def add(self, value):
+            self.events.append(value)
+
+        async def commit(self):
+            return None
+
+        async def refresh(self, _value):
+            return None
+
+    class ForbiddenCompiler:
+        def __init__(self, **_kwargs):
+            raise AssertionError("checkpoint retry must not rebuild the Wiki")
+
+    monkeypatch.setattr("knowledge.llm_wiki_job_runner.get_llm_wiki_service", lambda _base: FakeWiki())
+    monkeypatch.setattr("knowledge.llm_wiki_job_runner.LlmWikiCompilerAgent", ForbiddenCompiler)
+    job = SimpleNamespace(
+        id="job-wiki-only",
+        status="running",
+        current_step="starting",
+        progress=5,
+        finished_at=None,
+        error_message=None,
+        job_metadata={
+            "raw_paths": [raw_path],
+            "raw_hashes": {raw_path: raw_hash},
+            "bundle_hash": bundle_hash,
+            "compiler_model_id": "compiler",
+            "wiki_stage_complete": True,
+            "import_gbrain": False,
+            "published_pages": ["concepts/example"],
+            "publish_result": {"published_pages": ["concepts/example"]},
+            "lint_result": {"ok": True},
+            "run_outcome": {"outcome": "completed"},
+        },
+    )
+    session = FakeSession()
+    result = asyncio.run(
+        process_llm_wiki_ingest_job(
+            session,  # type: ignore[arg-type]
+            base_dir=tmp_path,
+            job=job,  # type: ignore[arg-type]
+        )
+    )
+    assert result.status == "succeeded"
+    assert result.job_metadata["gbrain_import_ok"] is None
+    final_event = session.events[-1]
+    assert final_event.event_metadata["gbrain_import_ok"] is None
+    assert "gbrain" not in final_event.message.lower()
+
+
 def test_llm_wiki_ingest_job_freezes_raw_schema_and_compiler_model(
     wiki_env: LlmWikiService,
     tmp_path: Path,
@@ -122,12 +492,38 @@ def test_llm_wiki_ingest_job_freezes_raw_schema_and_compiler_model(
             assert payload["metadata"]["compiler_model_id"] == "provider:endpoint:wiki-model"
             assert payload["metadata"]["compiler_model"] == "wiki-model"
             assert payload["metadata"]["compiler_runtime"] == "llm_wiki_compiler_agent"
+            assert payload["metadata"]["import_gbrain"] is False
+            assert payload["publish_targets"] == ["llm_wiki"]
+            assert "GBrain" not in payload["title"]
+            duplicate = await create_llm_wiki_ingest_job(
+                session,
+                base_dir=Path(__file__).resolve().parent.parent,
+                raw_paths=[raw["snapshot_path"]],
+            )
+            assert duplicate.id == job.id
+            gbrain_job = await create_llm_wiki_ingest_job(
+                session,
+                base_dir=Path(__file__).resolve().parent.parent,
+                raw_paths=[raw["snapshot_path"]],
+                import_gbrain=True,
+            )
+            gbrain_payload = job_to_list_dict(gbrain_job)
+            assert gbrain_job.id != job.id
+            assert gbrain_payload["metadata"]["import_gbrain"] is True
+            assert gbrain_payload["publish_targets"] == ["llm_wiki", "gbrain"]
+            assert "GBrain" in gbrain_payload["title"]
         await engine.dispose()
 
     asyncio.run(run())
 
 
 def test_dedicated_compiler_agent_runs_only_required_tools_in_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert "source_refs、文件路径、URL 和引用字段不是已授权内容" in COMPILER_SYSTEM_PROMPT
+    assert "index_md 只用于解析已有 slug，不是事实证据" in COMPILER_SYSTEM_PROMPT
+    assert "不得为了避免孤立页面而强行互链" in COMPILER_SYSTEM_PROMPT
+    assert "严格保留专有名词与主客体" in COMPILER_SYSTEM_PROMPT
+    assert "先规划 Raw 明确支持的实体、主题、页面类型和关系" in BACKGROUND_INGEST_GROUNDING_RULES
+    assert "Index 只用于解析 slug，不是事实证据" in BACKGROUND_INGEST_GROUNDING_RULES
     messages = [HumanMessage(content="compile")]
 
     def ai_call(name: str, call_id: str, args: dict[str, object]) -> AIMessage:
