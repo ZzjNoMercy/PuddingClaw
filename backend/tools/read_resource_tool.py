@@ -21,10 +21,11 @@ class ReadResourceInput(BaseModel):
     resource: str = Field(
         description=(
             "Resource to read. Pass either an attachment id like att_11d3cfb4dc67 for uploaded/pasted "
-            "attachments, a /knowledge/... virtual path, or the exact non-workspace path the user provided. "
+            "attachments or the exact non-workspace host path the user provided. "
             "This includes POSIX absolute paths, Windows absolute paths, and home-relative paths. "
             "HTTP(S) URLs are web resources and must be passed to fetch_url, not read_resource. "
-            "Do not pass /workspace or /scratch virtual paths here."
+            "Do not pass managed virtual paths such as /workspace, /scratch, /knowledge, /skills, "
+            "/semantic-assets, /analytics-models, or /sql-guardrails here; use read_file for them."
         )
     )
     offset: int = Field(default=0, ge=0, description="Zero-based line offset for text files")
@@ -35,9 +36,9 @@ class ReadResourceTool(BaseTool):
     name: str = "read_resource"
     description: str = (
         "Read a PuddingClaw resource from a single entry point. Use this for uploaded/pasted attachment refs "
-        "(`att_xxx`), `/knowledge/...` virtual paths, and user-provided paths outside the `/workspace/` virtual namespace. "
-        "Never pass `/scratch/...` here: staged scratch artifacts belong to the Backend/Docker namespace and "
-        "must be read with read_file."
+        "(`att_xxx`) and user-provided host paths outside the managed virtual namespaces. "
+        "Use read_file for `/workspace`, `/scratch`, `/knowledge`, `/skills`, `/semantic-assets`, "
+        "`/analytics-models`, `/sql-guardrails`, and `/large_tool_results`."
     )
     args_schema: type[BaseModel] = ReadResourceInput
     risk_level: str = "moderate"

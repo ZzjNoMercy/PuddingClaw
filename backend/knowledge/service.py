@@ -73,6 +73,22 @@ class KnowledgeServiceError(ValueError):
     pass
 
 
+def _ensure_directory_readable(path: Path) -> None:
+    """Fail loudly when an existing knowledge root cannot be enumerated.
+
+    ``Path.rglob`` may silently yield no entries when macOS denies access to a
+    protected directory.  Treating that case as an empty knowledge base makes
+    the UI incorrectly claim that the user's files disappeared.
+    """
+
+    try:
+        next(path.iterdir(), None)
+    except OSError as exc:
+        raise KnowledgeServiceError(
+            f"无法读取知识库目录，请检查该目录的访问权限：{path}"
+        ) from exc
+
+
 def _slugify(value: str) -> str:
     name = Path(value or "").name.strip()
     if not name:
@@ -591,6 +607,7 @@ class KnowledgeService:
 
         if not self.knowledge_dir.exists():
             return []
+        _ensure_directory_readable(self.knowledge_dir)
 
         max_items = max(1, min(limit, 1000))
         files: list[dict[str, Any]] = []
@@ -702,6 +719,8 @@ class KnowledgeService:
                 "child_count": 0,
                 "truncated": False,
             }
+
+        _ensure_directory_readable(root)
 
         tree = visit(root, 0)
         if tree is None:

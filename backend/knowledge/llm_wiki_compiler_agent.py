@@ -27,6 +27,8 @@ COMPILER_SYSTEM_PROMPT = """你是 PuddingClaw 内置的 LLM Wiki Compiler Agent
 - 只能使用 context 授权的 Raw；不得臆造来源或使用模型既有知识补充事实。
 - publish 的 raw_paths 必须与任务给出的完整列表逐项一致。
 - sources 必须逐字复制 context 的 snapshot_path，不得添加 raw/ 前缀。
+- frontmatter 的 schema_version 只能填写 context.schema_bundle.brain_schema.document.bundle_version 的值，
+  例如 0.4.0；不得填写 puddingclaw-wiki@0.4.0 这类 schema_id@version 组合值。
 - page slug 相对于 wiki/ 根目录，例如 frameworks/langgraph；不得写成 wiki/frameworks/langgraph。
 - wikilink 必须使用 [[<type-directory>/<slug>]] 完整路径；不得再次添加 wiki/。
 - Raw frontmatter 中的 id/type/subtype/related 只是来源线索，不是目标页面分类或关系结论；根据正文主题与活动 Schema 重新判断。
@@ -39,7 +41,8 @@ COMPILER_SYSTEM_PROMPT = """你是 PuddingClaw 内置的 LLM Wiki Compiler Agent
 - 若有证据的关系指向尚不存在的长期实体，且 Raw 已提供足够稳定事实，则在同一次 publish 中创建对应实体页面；否则保留文本并报告知识缺口。
 - publish 前执行一次忠实度自检：逐项对照 Raw 核验事实归属、实体关系和专有名词，然后再提交页面。
 - 页面必须可读、可追溯，并满足所有 frontmatter 与 Schema 约束。
-- 不得跳过、调换或重复上述三个步骤；工具失败时不要用其他方式绕过。
+- 不得跳过或调换上述三个步骤。publish 返回 published=false 时，根据返回的 Lint 错误修正完整页面并重试 publish；
+  只有 published=true 后才调用 lint，不得用其他方式绕过。
 - 完成 Lint 后用一句简短中文总结结果，不要向用户提问。
 """
 
@@ -113,6 +116,8 @@ class LlmWikiCompilerAgent:
         final_text = ""
         expected_tool_index = 0
         active_tool_call_id = ""
+        publish_attempts = 0
+        last_publish_failure: dict[str, Any] | None = None
 
         async for state in agent.astream(
             {"messages": [{"role": "user", "content": prompt}]},
@@ -157,6 +162,8 @@ class LlmWikiCompilerAgent:
                                 raise RuntimeError("llm_wiki_context 必须使用任务锁定的完整 raw_paths")
                             if name == "llm_wiki_publish" and args.get("raw_paths") != raw_paths:
                                 raise RuntimeError("llm_wiki_publish 必须提交任务锁定的完整 raw_paths")
+                            if name == "llm_wiki_publish":
+                                publish_attempts += 1
                             active_tool_call_id = call_id
                             await _emit(
                                 on_tool_event,
@@ -175,6 +182,13 @@ class LlmWikiCompilerAgent:
                     result = _decode_tool_output(message.content)
                     if getattr(message, "status", None) == "error" or result.get("ok") is False:
                         raise RuntimeError(str(result.get("error") or message.content or f"{name} 执行失败"))
+                    if name == "llm_wiki_publish" and result.get("published") is not True:
+                        last_publish_failure = result
+                        await _emit(on_tool_event, "end", name, result)
+                        active_tool_call_id = ""
+                        if publish_attempts >= 3:
+                            raise RuntimeError(_publish_failure_message(result))
+                        continue
                     called[name] = result
                     await _emit(on_tool_event, "end", name, result)
                     expected_tool_index += 1
@@ -182,5 +196,21 @@ class LlmWikiCompilerAgent:
 
         missing = [name for name in REQUIRED_TOOL_NAMES if name not in called]
         if missing:
+            if "llm_wiki_publish" in missing and last_publish_failure is not None:
+                raise RuntimeError(_publish_failure_message(last_publish_failure))
             raise RuntimeError(f"Wiki Compiler Agent 未完成必要步骤：{', '.join(missing)}")
         return {"called": called, "final_text": final_text, "outcome": "completed"}
+
+
+def _publish_failure_message(result: dict[str, Any]) -> str:
+    lint = result.get("lint") if isinstance(result.get("lint"), dict) else {}
+    findings = lint.get("errors") if isinstance(lint.get("errors"), list) else []
+    details = []
+    for finding in findings[:8]:
+        if not isinstance(finding, dict):
+            continue
+        path = str(finding.get("path") or "Wiki")
+        message = str(finding.get("message") or finding.get("code") or "校验失败")
+        details.append(f"{path}: {message}")
+    suffix = "；".join(details) if details else "确定性发布器未接受候选页面"
+    return f"Wiki 发布校验失败：{suffix}"

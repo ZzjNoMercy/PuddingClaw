@@ -86,7 +86,7 @@ async def process_llm_wiki_ingest_job(
                 [
                     "执行一次完整的 LLM Wiki Ingest。这是任务中心创建的后台编译任务，不要请求用户交互。",
                     BACKGROUND_INGEST_GROUNDING_RULES,
-                    "完成后调用 llm_wiki_publish 提交完整页面；页面 slug 和 wikilink 都相对于 wiki/ 根目录，必须使用 concepts/<slug> 等 [[<type-directory>/<slug>]] 完整路径，不得再次添加 wiki/。frontmatter 的 sources 必须逐字复制 context 返回的 snapshot_path，不得添加 raw/ 前缀。确保 frontmatter、index 和 append-only log 均通过校验；最后必须调用 llm_wiki_lint 报告结果。不要使用通用文件工具写 raw/、wiki/、index.md 或 log.md。",
+                    "完成后调用 llm_wiki_publish 提交完整页面；页面 slug 和 wikilink 都相对于 wiki/ 根目录，必须使用 concepts/<slug> 等 [[<type-directory>/<slug>]] 完整路径，不得再次添加 wiki/。frontmatter 的 sources 必须逐字复制 context 返回的 snapshot_path，不得添加 raw/ 前缀；schema_version 只能填写 context.schema_bundle.brain_schema.document.bundle_version（例如 0.4.0），不得填写 schema_id@version。确保 frontmatter、index 和 append-only log 均通过校验；publish 返回 published=false 时须按 Lint 错误修正后重试，只有 published=true 后才调用 llm_wiki_lint。不要使用通用文件工具写 raw/、wiki/、index.md 或 log.md。",
                     f"compiler_model: {metadata.get('compiler_model') or compiler_model_id or 'agent-default'}",
                     f"raw_paths: {json.dumps(raw_paths, ensure_ascii=False)}",
                 ]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from types import SimpleNamespace
 
@@ -131,6 +132,63 @@ def test_read_resource_for_managed_text_uses_backend_read_file_route(tmp_path):
     }
 
 
+def test_managed_read_eperm_is_not_reported_as_session_permission_gap(tmp_path):
+    from graph.middlewares.workspace_path_router import WorkspacePathRouterMiddleware
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    knowledge = tmp_path / "knowledge"
+    knowledge.mkdir()
+
+    class Backend:
+        managed_host_path_aliases = {"/knowledge": knowledge}
+
+        def read(self, _path, *, offset, limit):
+            del offset, limit
+            return SimpleNamespace(
+                error="[Errno 1] Operation not permitted: '/managed/note.md'",
+                file_data=None,
+            )
+
+    result = WorkspacePathRouterMiddleware(Backend()).wrap_tool_call(
+        _request(
+            "read_resource",
+            {"resource": "/knowledge/imported/note.md"},
+            workspace,
+        ),
+        lambda _request: (_ for _ in ()).throw(AssertionError("managed read must use backend")),
+    )
+
+    assert result.status == "error"
+    assert "managed_resource_unavailable" in str(result.content)
+    assert "not a Session external-file permission gap" in str(result.content)
+    assert "Do not retry with the physical host path" in str(result.content)
+
+
+def test_managed_ls_eperm_is_normalized_before_model_sees_it(tmp_path):
+    from graph.middlewares.workspace_path_router import WorkspacePathRouterMiddleware
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    def handler(request):
+        return ToolMessage(
+            content="Error: Listing aborted: [Errno 1] Operation not permitted",
+            name="ls",
+            tool_call_id=request.tool_call["id"],
+            status="error",
+        )
+
+    result = WorkspacePathRouterMiddleware().wrap_tool_call(
+        _request("ls", {"path": "/knowledge/"}, workspace),
+        handler,
+    )
+
+    assert result.status == "error"
+    assert "managed_resource_unavailable" in str(result.content)
+    assert "do not request HITL authorization" in str(result.content)
+
+
 def test_absolute_workspace_path_is_rewritten_before_ls(tmp_path):
     from graph.middlewares.workspace_path_router import WorkspacePathRouterMiddleware
 
@@ -198,6 +256,61 @@ def test_glob_without_path_searches_workspace_once_and_returns_canonical_path(tm
 
     assert result.content == "['/workspace/reports/dashboard.html']"
     assert backend.read("/workspace/reports/dashboard.html").error is None
+
+
+def test_mounted_backends_bypass_host_broker_for_builtin_file_tools(tmp_path):
+    from deepagents.backends import FilesystemBackend
+
+    from graph.permissioned_filesystem_backend import PermissionedCompositeBackend
+
+    workspace = tmp_path / "workspace"
+    knowledge = tmp_path / "knowledge"
+    workspace.mkdir()
+    knowledge.mkdir()
+    (workspace / "draft.md").write_text("before needle", encoding="utf-8")
+    (knowledge / "note.md").write_text("managed needle", encoding="utf-8")
+    workspace_backend = FilesystemBackend(root_dir=workspace, virtual_mode=True)
+    backend = PermissionedCompositeBackend(
+        default=workspace_backend,
+        routes={
+            "/workspace/": workspace_backend,
+            "/knowledge/": FilesystemBackend(root_dir=knowledge, virtual_mode=True),
+        },
+        session_id="mounted-session",
+        workspace_root=workspace,
+        managed_readonly_roots=(knowledge,),
+    )
+
+    class UnexpectedHostBroker:
+        def __getattr__(self, name):
+            raise AssertionError(f"mounted path must not call HostFileBroker.{name}")
+
+    backend.host_file_broker = UnexpectedHostBroker()
+
+    assert backend.read("/knowledge/note.md").error is None
+    assert backend.ls("/knowledge").error is None
+    assert backend.glob("*.md", path="/knowledge").error is None
+    assert backend.grep("needle", path="/knowledge", glob="*.md").error is None
+
+    assert backend.write("/workspace/new.md", "created").error is None
+    assert backend.edit("/workspace/draft.md", "before", "after").error is None
+    assert (workspace / "new.md").read_text(encoding="utf-8") == "created"
+    assert (workspace / "draft.md").read_text(encoding="utf-8") == "after needle"
+
+    assert "read-only" in backend.write("/knowledge/new.md", "blocked").error.lower()
+    assert "read-only" in backend.edit("/knowledge/note.md", "managed", "changed").error.lower()
+
+    async def verify_async_routes():
+        assert (await backend.aread("/knowledge/note.md")).error is None
+        assert (await backend.als("/knowledge")).error is None
+        assert (await backend.aglob("*.md", path="/knowledge")).error is None
+        assert (await backend.agrep("needle", path="/knowledge", glob="*.md")).error is None
+        assert (await backend.awrite("/workspace/async.md", "async-created")).error is None
+        assert (await backend.aedit("/workspace/draft.md", "after", "final")).error is None
+
+    asyncio.run(verify_async_routes())
+    assert (workspace / "async.md").read_text(encoding="utf-8") == "async-created"
+    assert (workspace / "draft.md").read_text(encoding="utf-8") == "final needle"
 
 
 def test_grep_without_path_defaults_to_workspace(tmp_path):

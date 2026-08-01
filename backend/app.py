@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+from builtins import BaseExceptionGroup
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -12,6 +13,57 @@ from fastapi.middleware.cors import CORSMiddleware
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
+
+
+def _exception_leaf_summary(exc: BaseException) -> str:
+    """Expose useful TaskGroup leaf errors without dumping tracebacks."""
+
+    if isinstance(exc, BaseExceptionGroup):
+        parts = [_exception_leaf_summary(item) for item in exc.exceptions]
+        return "; ".join(dict.fromkeys(part for part in parts if part))
+    detail = " ".join(str(exc).split())
+    return f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+
+
+async def _warm_mcp_discovery() -> None:
+    """Prime MCP metadata while keeping startup failures non-fatal."""
+
+    enabled_mcp: list[str] = []
+    try:
+        import config
+        from mcp_clients import load_filtered_mcp_tools
+        from mcp_clients.servers import effective_mcp_server_names
+
+        mcp_config = config.load_config().get("mcp", {})
+        enabled_mcp = effective_mcp_server_names(
+            mcp_config.get("enabled", []),
+            auto_enable_gbrain=bool(mcp_config.get("auto_enable_gbrain", False)),
+        )
+        if not enabled_mcp:
+            return
+        tools = await load_filtered_mcp_tools(enabled_mcp)
+        print(f"🔌 MCP discovery warmed: {len(tools)} filtered tools")
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        # Discovery failures are never cached; the first MCP-dependent Agent
+        # request retries on demand.  Spell this out because upstream stdio
+        # servers may print setup instructions that do not describe the
+        # durable PuddingClaw runtime accurately.
+        cause = _exception_leaf_summary(exc)
+        print(
+            "⚠️ MCP discovery warm-up did not complete; backend startup will continue "
+            f"and first use will retry. Cause: {cause}"
+        )
+        if "gbrain" in enabled_mcp:
+            from mcp_clients.servers import gbrain_runtime_status
+
+            status = gbrain_runtime_status()
+            if status.get("ready"):
+                print(
+                    "ℹ️ Dedicated GBrain configuration and Schema Pack are present. "
+                    "This is only an MCP metadata warm-up failure; do not run `gbrain init`."
+                )
 
 
 @asynccontextmanager
@@ -33,31 +85,6 @@ async def lifespan(app: FastAPI):
     from projects.registry import project_registry
     from tools.skills_scanner import scan_skills
 
-    async def warm_mcp_discovery() -> None:
-        """Prime MCP discovery before the backend announces readiness."""
-
-        try:
-            import config
-            from mcp_clients import load_filtered_mcp_tools
-            from mcp_clients.servers import effective_mcp_server_names
-
-            mcp_config = config.load_config().get("mcp", {})
-            enabled_mcp = effective_mcp_server_names(
-                mcp_config.get("enabled", []),
-                auto_enable_gbrain=bool(mcp_config.get("auto_enable_gbrain", False)),
-            )
-            if not enabled_mcp:
-                return
-            tools = await load_filtered_mcp_tools(enabled_mcp)
-            print(f"🔌 MCP discovery warmed: {len(tools)} filtered tools")
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            # A failed warm-up must not make backend startup fail. Agent
-            # construction will retry discovery on demand because failures
-            # are never cached.
-            print(f"⚠️ MCP discovery warm-up failed; will retry on demand: {exc}")
-
     scan_skills(BASE_DIR)
     semantic_assets = get_semantic_asset_registry(BASE_DIR).refresh()
     print(f"🧭 Semantic assets loaded: {semantic_assets.get('count', 0)}")
@@ -65,16 +92,18 @@ async def lifespan(app: FastAPI):
     attachment_store.initialize(BASE_DIR)
     # SQL Evidence catalog backfill needs the durable Session owner index.
     session_manager.initialize(BASE_DIR)
-    # Start stdio MCP discovery before database/vector clients can create gRPC
-    # worker threads. Awaiting it here makes readiness truthful: the first
-    # Agent request can reuse the cached tool metadata immediately.
-    await warm_mcp_discovery()
     db_ready = await init_database()
     if db_ready:
         print("🗄️ Knowledge catalog database ready")
         query_result_cleanup_manager.start()
     else:
         print("⚠️ Knowledge catalog database unavailable; knowledge management API will report degraded status")
+    # Confirm database startup before spawning database-backed stdio MCP
+    # servers. Keep discovery ahead of capability detection because Milvus can
+    # create gRPC worker threads and forking after that emits unsafe-fork
+    # warnings. Awaiting discovery here also keeps first-use latency out of the
+    # first Agent request whenever warm-up succeeds.
+    await _warm_mcp_discovery()
     caps = await capabilities.detect_capabilities(force=True)
     print(f"🔌 Capabilities: {caps.to_dict()}")
     try:

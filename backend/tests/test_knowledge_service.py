@@ -13,7 +13,7 @@ from knowledge.import_jobs import clear_import_jobs, create_import_job, delete_i
 from knowledge.indexer import _build_multimodal_nodes
 from knowledge.mineru_client import MinerUClient, MinerUParseResult
 from knowledge.paths import get_knowledge_root
-from knowledge.service import KnowledgeService, _slugify
+from knowledge.service import KnowledgeService, KnowledgeServiceError, _slugify
 from tools.search_knowledge_tool import LlamaIndexKnowledgeQueryTool
 
 
@@ -460,3 +460,22 @@ def test_knowledge_root_can_be_configured_by_user_directory(tmp_path: Path, monk
     assert service.knowledge_dir == custom_root.resolve()
     assert service.imported_dir == custom_root.resolve() / "imported"
     assert service.originals_dir == custom_root.resolve() / "originals"
+
+
+def test_directory_listing_reports_unreadable_root(tmp_path: Path, monkeypatch):
+    knowledge_dir = tmp_path / "knowledge"
+    knowledge_dir.mkdir()
+    service = KnowledgeService(tmp_path)
+    original_iterdir = Path.iterdir
+
+    def denied_iterdir(path: Path):
+        if path == knowledge_dir:
+            raise PermissionError("permission denied")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", denied_iterdir)
+
+    with pytest.raises(KnowledgeServiceError, match="无法读取知识库目录"):
+        service.list_directory_files()
+    with pytest.raises(KnowledgeServiceError, match="无法读取知识库目录"):
+        service.list_directory_tree()

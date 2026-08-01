@@ -40,6 +40,12 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
     """Normalize workspace paths and reroute external reads before execution."""
 
     _SEARCH_TOOLS = frozenset({"glob", "grep"})
+    _MANAGED_OS_PERMISSION_MARKERS = (
+        "operation not permitted",
+        "permission denied",
+        "errno 1",
+        "errno 13",
+    )
 
     _PATH_ARGS = {
         "read_file": "file_path",
@@ -194,6 +200,57 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
             tool_call_id=str(request.tool_call.get("id") or ""),
             name=name,
             status="error" if is_error else "success",
+        )
+
+    @classmethod
+    def _managed_access_error(cls, virtual_path: str, error: str) -> str:
+        """Explain an OS-denied managed mount without opening the HITL path.
+
+        ``/knowledge`` and the other managed namespaces are application
+        capabilities, not arbitrary external files.  A macOS/Linux sandbox can
+        still deny the backend process itself.  Calling that a Session grant
+        problem makes the model retry the physical host spelling and produces
+        a bogus authorization drawer that cannot repair the process sandbox.
+        """
+
+        return (
+            "❌ managed_resource_unavailable: the backend process cannot read the configured "
+            f"managed path {virtual_path!r}; the operating system denied access. "
+            "This is not a Session external-file permission gap. Do not retry with the "
+            "physical host path or read_resource, and do not request HITL authorization. "
+            "Use the dedicated knowledge/Wiki tool when the workflow provides one; otherwise "
+            "report that the configured knowledge root must be readable by the backend process. "
+            f"Underlying error: {error}"
+        )
+
+    @classmethod
+    def _normalize_managed_execute_result(
+        cls,
+        request: ToolCallRequest,
+        result: ToolMessage | Command[Any],
+    ) -> ToolMessage | Command[Any]:
+        """Turn raw EPERM/EACCES from managed mounts into a stable contract."""
+
+        if not isinstance(result, ToolMessage):
+            return result
+        tool_name = str(request.tool_call.get("name") or "")
+        path_arg = cls._PATH_ARGS.get(tool_name)
+        args = dict(request.tool_call.get("args") or {})
+        virtual_path = str(args.get(path_arg) or "") if path_arg else ""
+        if not any(
+            virtual_path == root or virtual_path.startswith(f"{root}/")
+            for root in MANAGED_VIRTUAL_NAMESPACE_ROOTS
+        ):
+            return result
+        content = str(result.content or "")
+        lowered = content.lower()
+        if not any(marker in lowered for marker in cls._MANAGED_OS_PERMISSION_MARKERS):
+            return result
+        return result.model_copy(
+            update={
+                "content": cls._managed_access_error(virtual_path, content),
+                "status": "error",
+            }
         )
 
     def _authorized_directory_root(
@@ -621,7 +678,8 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
     ) -> ToolMessage | Command[Any]:
         action, routed = self._route_request(request)
         if action == "execute":
-            return handler(routed)  # type: ignore[arg-type]
+            result = handler(routed)  # type: ignore[arg-type]
+            return self._normalize_managed_execute_result(routed, result)  # type: ignore[arg-type]
         if action == "result":
             return routed  # type: ignore[return-value]
         if action == "backend_read":
@@ -632,7 +690,11 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
                 limit=int(args.get("limit") or 2000),
             )
             if result.error:
-                content = f"❌ Error reading staged artifact: {result.error}"
+                lowered = str(result.error).lower()
+                if any(marker in lowered for marker in self._MANAGED_OS_PERMISSION_MARKERS):
+                    content = self._managed_access_error(routed_path, str(result.error))
+                else:
+                    content = f"❌ Error reading staged artifact: {result.error}"
             else:
                 data = result.file_data or {}
                 if data.get("encoding") != "utf-8":
@@ -653,7 +715,8 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
         # sizeable; keep deterministic routing off the async model event loop.
         action, routed = await asyncio.to_thread(self._route_request, request)
         if action == "execute":
-            return await handler(routed)  # type: ignore[arg-type]
+            result = await handler(routed)  # type: ignore[arg-type]
+            return self._normalize_managed_execute_result(routed, result)  # type: ignore[arg-type]
         if action == "result":
             return routed  # type: ignore[return-value]
         if action == "backend_read":
@@ -664,7 +727,11 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
                 limit=int(args.get("limit") or 2000),
             )
             if result.error:
-                content = f"❌ Error reading staged artifact: {result.error}"
+                lowered = str(result.error).lower()
+                if any(marker in lowered for marker in self._MANAGED_OS_PERMISSION_MARKERS):
+                    content = self._managed_access_error(routed_path, str(result.error))
+                else:
+                    content = f"❌ Error reading staged artifact: {result.error}"
             else:
                 data = result.file_data or {}
                 if data.get("encoding") != "utf-8":

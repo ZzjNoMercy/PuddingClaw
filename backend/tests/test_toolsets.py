@@ -122,6 +122,7 @@ def test_every_registered_agent_custom_tool_has_an_explicit_policy() -> None:
     assert {
         "llm_wiki_create_raw",
         "llm_wiki_start_ingest",
+        "llm_wiki_retire_pages",
     }.issubset(BUSINESS_TOOLSETS["llm_wiki"])
     assert "llm_wiki_publish" not in BUSINESS_TOOLSETS["llm_wiki"]
     assert {

@@ -37,6 +37,24 @@ only when the queued task explicitly requests that second stage.
 Do not write `raw/`, `wiki/`, `index.md`, or `log.md` through generic filesystem
 tools.
 
+For an explicitly identified duplicate or obsolete published page, call
+`llm_wiki_retire_pages` directly with the exact obsolete slug and an existing
+replacement slug. This is a deterministic maintenance operation: it does not
+queue the Compiler Agent or consume a compiler-model call. Do not infer a
+retirement merely from similar titles; the user must explicitly authorize the
+obsolete-to-replacement mapping. Do not read raw source files, list `/knowledge`,
+or inspect the Wiki before this call: the tool atomically verifies that both the
+obsolete page and replacement page satisfy the requested mapping. Keep
+`sync_gbrain=false` unless the user also asks to remove the obsolete page from
+gbrain. When enabled, gbrain performs a recoverable soft delete.
+Treat the tool result as authoritative. `ok=true` with either `retired=true` or
+`already_retired=true` completes the request; report the returned Lint and do
+not call any generic filesystem tool to verify it.
+If the retirement tool fails, report its exact error and stop. Do not use
+generic filesystem tools to inspect `/knowledge` or the physical knowledge
+root afterward: those tools intentionally have a different sandbox boundary
+and their denial is not evidence that the dedicated Wiki service is unreadable.
+
 For Query, prefer the allowlisted gbrain MCP tools when available. Otherwise
 use `llm_wiki_query`. Cite Wiki slugs and their `sources`; report a knowledge
 gap instead of reading raw files.

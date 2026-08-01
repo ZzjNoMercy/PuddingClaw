@@ -31,6 +31,7 @@ from knowledge.models import Base
 from tools.llm_wiki_tools import (
     LlmWikiCreateRawTool,
     LlmWikiQueryTool,
+    LlmWikiRetirePagesTool,
     LlmWikiStartIngestTool,
     WikiStartIngestInput,
 )
@@ -517,7 +518,9 @@ def test_llm_wiki_ingest_job_freezes_raw_schema_and_compiler_model(
     asyncio.run(run())
 
 
-def test_dedicated_compiler_agent_runs_only_required_tools_in_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_dedicated_compiler_agent_runs_only_required_tools_in_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     assert "source_refs、文件路径、URL 和引用字段不是已授权内容" in COMPILER_SYSTEM_PROMPT
     assert "index_md 只用于解析已有 slug，不是事实证据" in COMPILER_SYSTEM_PROMPT
     assert "不得为了避免孤立页面而强行互链" in COMPILER_SYSTEM_PROMPT
@@ -535,9 +538,17 @@ def test_dedicated_compiler_agent_runs_only_required_tools_in_order(tmp_path: Pa
     states = []
     for message in (
         ai_call("llm_wiki_context", "context-1", {"operation": "ingest", "raw_paths": ["one.md"]}),
-        ToolMessage(content=json.dumps({"schema_bundle": {"bundle_hash": "a" * 64}}), name="llm_wiki_context", tool_call_id="context-1"),
+        ToolMessage(
+            content=json.dumps({"schema_bundle": {"bundle_hash": "a" * 64}}),
+            name="llm_wiki_context",
+            tool_call_id="context-1",
+        ),
         ai_call("llm_wiki_publish", "publish-1", {"pages": [], "raw_paths": ["one.md"]}),
-        ToolMessage(content=json.dumps({"ok": True, "published_pages": ["frameworks/one"]}), name="llm_wiki_publish", tool_call_id="publish-1"),
+        ToolMessage(
+            content=json.dumps({"published": True, "pages": ["frameworks/one"]}),
+            name="llm_wiki_publish",
+            tool_call_id="publish-1",
+        ),
         ai_call("llm_wiki_lint", "lint-1", {}),
         ToolMessage(content=json.dumps({"ok": True, "errors": []}), name="llm_wiki_lint", tool_call_id="lint-1"),
         AIMessage(content="编译完成。"),
@@ -581,6 +592,65 @@ def test_dedicated_compiler_agent_runs_only_required_tools_in_order(tmp_path: Pa
         "runtime": "llm_wiki_compiler_agent",
         "job_id": "job-1",
     }
+
+
+def test_dedicated_compiler_agent_retries_rejected_publish(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    messages = [HumanMessage(content="compile")]
+
+    def ai_call(name: str, call_id: str, args: dict[str, object]) -> AIMessage:
+        return AIMessage(content="", tool_calls=[{"name": name, "args": args, "id": call_id, "type": "tool_call"}])
+
+    failed = {
+        "published": False,
+        "lint": {
+            "ok": False,
+            "errors": [
+                {"code": "schema_drift", "path": "wiki/frameworks/one.md", "message": "expected schema_version '0.4.0'"}
+            ],
+        },
+    }
+    states = []
+    for message in (
+        ai_call("llm_wiki_context", "context-1", {"operation": "ingest", "raw_paths": ["one.md"]}),
+        ToolMessage(
+            content=json.dumps({"schema_bundle": {"bundle_hash": "a" * 64}}),
+            name="llm_wiki_context",
+            tool_call_id="context-1",
+        ),
+        ai_call("llm_wiki_publish", "publish-1", {"pages": [], "raw_paths": ["one.md"]}),
+        ToolMessage(content=json.dumps(failed), name="llm_wiki_publish", tool_call_id="publish-1"),
+        ai_call("llm_wiki_publish", "publish-2", {"pages": [], "raw_paths": ["one.md"]}),
+        ToolMessage(
+            content=json.dumps({"published": True, "pages": ["frameworks/one"]}),
+            name="llm_wiki_publish",
+            tool_call_id="publish-2",
+        ),
+        ai_call("llm_wiki_lint", "lint-1", {}),
+        ToolMessage(content=json.dumps({"ok": True, "errors": []}), name="llm_wiki_lint", tool_call_id="lint-1"),
+    ):
+        messages = [*messages, message]
+        states.append({"messages": messages})
+
+    class FakeAgent:
+        async def astream(self, *_args, **_kwargs):
+            for state in states:
+                yield state
+
+    compiler = LlmWikiCompilerAgent(base_dir=tmp_path)
+    monkeypatch.setattr(compiler, "_build", lambda: FakeAgent())
+    events: list[tuple[str, str]] = []
+    result = asyncio.run(
+        compiler.run(
+            "compile",
+            job_id="job-retry",
+            raw_paths=["one.md"],
+            on_tool_event=lambda phase, name, _payload: events.append((phase, name)),
+        )
+    )
+
+    assert result["called"]["llm_wiki_publish"]["published"] is True
+    assert events.count(("start", "llm_wiki_publish")) == 2
+    assert events.count(("end", "llm_wiki_publish")) == 2
 
 
 def test_initialize_dedicated_gbrain_runtime_uses_existing_postgres(
@@ -825,6 +895,35 @@ def test_publish_normalizes_legacy_raw_prefix_to_manifest_snapshot_path(wiki_env
     assert result["lint"]["ok"] is True
 
 
+def test_publish_normalizes_schema_identity_to_bundle_version(wiki_env: LlmWikiService) -> None:
+    raw = wiki_env.snapshot_raw(
+        source_id="existing-kb",
+        asset_id="schema-identity",
+        title="Schema identity",
+        content="# Source\n\nEvidence.\n",
+    )
+    bundle = wiki_env.schema.bundle()
+    document = bundle["brain_schema"]["document"]
+    page = _page("Schema Identity", "concept", raw["snapshot_path"], "concepts/schema-identity")
+    page = page.replace(
+        "schema_version: 0.1.0",
+        f"schema_version: {document['schema_id']}@{document['bundle_version']}",
+    )
+
+    result = wiki_env.publish(
+        pages=[{"slug": "concepts/schema-identity", "content": page}],
+        expected_bundle_hash=bundle["bundle_hash"],
+        summary="Normalize schema identity",
+        model="test:model",
+        raw_paths=[raw["snapshot_path"]],
+    )
+
+    assert result["published"] is True
+    published = (wiki_env.wiki_dir / "concepts" / "schema-identity.md").read_text(encoding="utf-8")
+    assert f"schema_version: {document['bundle_version']}" in published
+    assert f"{document['schema_id']}@{document['bundle_version']}" not in published
+
+
 def test_publish_preserves_type_directories_for_gbrain(wiki_env: LlmWikiService) -> None:
     raw = wiki_env.snapshot_raw(
         source_id="existing-kb",
@@ -869,6 +968,215 @@ def test_publish_preserves_type_directories_for_gbrain(wiki_env: LlmWikiService)
     source_dir = wiki_env._gbrain_source_dir()
     assert source_dir is not None
     assert (source_dir / "papers" / "compiled-rag.md").is_file()
+
+
+def test_retire_pages_rewrites_links_rebuilds_index_and_is_idempotent(wiki_env: LlmWikiService) -> None:
+    raw = wiki_env.snapshot_raw(
+        source_id="existing-kb",
+        asset_id="retirement-source",
+        title="Retirement Source",
+        content="# Retirement Source\n\nEvidence.\n",
+    )
+    bundle = wiki_env.schema.bundle()
+    published = wiki_env.publish(
+        pages=[
+            {
+                "slug": "concepts/duplicate-practice",
+                "content": _page(
+                    "Duplicate Practice",
+                    "concept",
+                    raw["snapshot_path"],
+                    "practices/canonical-practice",
+                ),
+            },
+            {
+                "slug": "practices/canonical-practice",
+                "content": _page(
+                    "Canonical Practice",
+                    "engineering_practice",
+                    raw["snapshot_path"],
+                    "practices/canonical-practice",
+                ),
+            },
+            {
+                "slug": "systems/example",
+                "content": _page(
+                    "Example System",
+                    "system",
+                    raw["snapshot_path"],
+                    "concepts/duplicate-practice",
+                ).replace(
+                    "[[concepts/duplicate-practice]]",
+                    "[[concepts/duplicate-practice|旧实践]]",
+                ),
+            },
+        ],
+        expected_bundle_hash=bundle["bundle_hash"],
+        summary="Publish duplicate",
+        model="test:model",
+        raw_paths=[raw["snapshot_path"]],
+    )
+    assert published["published"] is True
+
+    result = wiki_env.retire_pages(
+        retirements=[
+            {
+                "slug": "concepts/duplicate-practice",
+                "replacement": "practices/canonical-practice",
+            }
+        ],
+        summary="Remove duplicate classification",
+    )
+
+    assert result["retired"] is True
+    assert result["already_retired"] is False
+    assert not (wiki_env.wiki_dir / "concepts" / "duplicate-practice.md").exists()
+    assert (wiki_env.wiki_dir / "practices" / "canonical-practice.md").is_file()
+    consumer = (wiki_env.wiki_dir / "systems" / "example.md").read_text(encoding="utf-8")
+    assert "[[practices/canonical-practice|旧实践]]" in consumer
+    assert "[[concepts/duplicate-practice" not in consumer
+    index = (wiki_env.wiki_dir / "index.md").read_text(encoding="utf-8")
+    assert "[[concepts/duplicate-practice" not in index
+    assert "[[practices/canonical-practice|Canonical Practice]]" in index
+    log = (wiki_env.wiki_dir / "log.md").read_text(encoding="utf-8")
+    assert "## [" in log and "] retire | Remove duplicate classification" in log
+    assert "[[concepts/duplicate-practice]] -> [[practices/canonical-practice]]" in log
+    archived = wiki_env.root / result["archive_dir"] / "concepts" / "duplicate-practice.md"
+    assert archived.is_file()
+    assert result["lint"]["ok"] is True
+
+    raw_status = {item["snapshot_path"]: item for item in wiki_env.workspace_status()["raw"]}
+    assert raw_status[raw["snapshot_path"]]["compiled_pages"] == [
+        "practices/canonical-practice",
+        "systems/example",
+    ]
+
+    repeated = wiki_env.retire_pages(
+        retirements=[
+            {
+                "slug": "concepts/duplicate-practice",
+                "replacement": "practices/canonical-practice",
+            }
+        ],
+        summary="Repeat safely",
+    )
+    assert repeated["retired"] is False
+    assert repeated["already_retired"] is True
+    assert repeated["job_id"] == result["job_id"]
+
+
+def test_retire_pages_rejects_missing_replacement_without_mutation(wiki_env: LlmWikiService) -> None:
+    raw = wiki_env.snapshot_raw(
+        source_id="existing-kb",
+        asset_id="retirement-invalid",
+        title="Retirement Invalid",
+        content="# Retirement Invalid\n",
+    )
+    bundle = wiki_env.schema.bundle()
+    published = wiki_env.publish(
+        pages=[
+            {
+                "slug": "concepts/keep-me",
+                "content": _page("Keep Me", "concept", raw["snapshot_path"], "concepts/keep-me"),
+            }
+        ],
+        expected_bundle_hash=bundle["bundle_hash"],
+        summary="Publish retained page",
+        model="test:model",
+        raw_paths=[raw["snapshot_path"]],
+    )
+    assert published["published"] is True
+    before_index = (wiki_env.wiki_dir / "index.md").read_text(encoding="utf-8")
+    before_log = (wiki_env.wiki_dir / "log.md").read_text(encoding="utf-8")
+
+    with pytest.raises(LlmWikiError, match="replacement Wiki pages do not exist"):
+        wiki_env.retire_pages(
+            retirements=[{"slug": "concepts/keep-me", "replacement": "concepts/missing"}],
+            summary="Must fail",
+        )
+
+    assert (wiki_env.wiki_dir / "concepts" / "keep-me.md").is_file()
+    assert (wiki_env.wiki_dir / "index.md").read_text(encoding="utf-8") == before_index
+    assert (wiki_env.wiki_dir / "log.md").read_text(encoding="utf-8") == before_log
+
+
+def test_retire_pages_tool_optionally_soft_deletes_gbrain(
+    wiki_env: LlmWikiService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = wiki_env.snapshot_raw(
+        source_id="existing-kb",
+        asset_id="retirement-tool",
+        title="Retirement Tool",
+        content="# Retirement Tool\n",
+    )
+    bundle = wiki_env.schema.bundle()
+    assert (
+        wiki_env.publish(
+            pages=[
+                {
+                    "slug": "concepts/tool-old",
+                    "content": _page("Tool Old", "concept", raw["snapshot_path"], "concepts/tool-new"),
+                },
+                {
+                    "slug": "concepts/tool-new",
+                    "content": _page("Tool New", "concept", raw["snapshot_path"], "concepts/tool-new"),
+                },
+            ],
+            expected_bundle_hash=bundle["bundle_hash"],
+            summary="Publish tool pages",
+            model="test:model",
+            raw_paths=[raw["snapshot_path"]],
+        )["published"]
+        is True
+    )
+    calls: list[list[str]] = []
+
+    def fake_retire_gbrain(_service: LlmWikiService, slugs: list[str]) -> dict[str, object]:
+        calls.append(slugs)
+        return {"ok": True, "soft_deleted": slugs}
+
+    monkeypatch.setattr(LlmWikiService, "retire_gbrain_pages", fake_retire_gbrain)
+    payload = json.loads(
+        LlmWikiRetirePagesTool(base_dir=wiki_env.base_dir)._run(
+            retirements=[{"slug": "concepts/tool-old", "replacement": "concepts/tool-new"}],
+            summary="Tool retirement",
+            sync_gbrain=True,
+        )
+    )
+
+    assert payload["ok"] is True
+    assert payload["wiki"]["retired"] is True
+    assert payload["gbrain"]["soft_deleted"] == ["concepts/tool-old"]
+    assert calls == [["concepts/tool-old"]]
+
+
+def test_retire_gbrain_pages_syncs_current_wiki_before_soft_delete(
+    wiki_env: LlmWikiService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[object] = []
+
+    def fake_compile(*, import_pages: bool) -> dict[str, object]:
+        order.append(("import", import_pages))
+        return {"ok": True, "phase": "import"}
+
+    def fake_run(command: list[str], *, environment: dict[str, str], timeout: int = 60) -> dict[str, object]:
+        order.append(("run", command, environment, timeout))
+        return {"ok": True, "command": command, "exit_code": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(wiki_env, "_compile_gbrain_unlocked", fake_compile)
+    monkeypatch.setattr("knowledge.llm_wiki.resolve_gbrain_binary", lambda: "/fake/gbrain")
+    monkeypatch.setattr(wiki_env, "_production_gbrain_env", lambda **_kwargs: ({"ENV": "test"}, Path("/runtime")))
+    monkeypatch.setattr("knowledge.llm_wiki.gbrain_subprocess_environment", lambda _binary, env: env)
+    monkeypatch.setattr(wiki_env, "_run", fake_run)
+
+    result = wiki_env.retire_gbrain_pages(["concepts/old"])
+
+    assert result["ok"] is True
+    assert result["soft_deleted"] == ["concepts/old"]
+    assert order[0] == ("import", True)
+    assert order[1][0:2] == ("run", ["/fake/gbrain", "delete", "concepts/old"])
 
 
 def test_invalid_candidate_is_not_published(wiki_env: LlmWikiService) -> None:
@@ -1167,18 +1475,21 @@ def test_compatible_schema_upgrade_migrates_the_whole_wiki(wiki_env: LlmWikiServ
 def test_destructive_schema_upgrade_fails_before_activation(wiki_env: LlmWikiService) -> None:
     raw = wiki_env.snapshot_raw(source_id="kb", asset_id="destructive", title="Destructive", content="# D\n")
     bundle = wiki_env.schema.bundle()
-    assert wiki_env.publish(
-        pages=[
-            {
-                "slug": "systems/system-page",
-                "content": _page("System", "system", raw["snapshot_path"], "systems/system-page"),
-            }
-        ],
-        expected_bundle_hash=bundle["bundle_hash"],
-        summary="system page",
-        model="test:model",
-        raw_paths=[raw["snapshot_path"]],
-    )["published"] is True
+    assert (
+        wiki_env.publish(
+            pages=[
+                {
+                    "slug": "systems/system-page",
+                    "content": _page("System", "system", raw["snapshot_path"], "systems/system-page"),
+                }
+            ],
+            expected_bundle_hash=bundle["bundle_hash"],
+            summary="system page",
+            model="test:model",
+            raw_paths=[raw["snapshot_path"]],
+        )["published"]
+        is True
+    )
 
     manifest = deepcopy(bundle["custom"]["manifest"])
     manifest["version"] = "0.2.0"
@@ -1190,9 +1501,7 @@ def test_destructive_schema_upgrade_fails_before_activation(wiki_env: LlmWikiSer
             expected_bundle_hash=bundle["bundle_hash"],
         )
     assert wiki_env.schema.bundle()["bundle_hash"] == bundle["bundle_hash"]
-    assert "schema_version: 0.1.0" in (wiki_env.wiki_dir / "systems" / "system-page.md").read_text(
-        encoding="utf-8"
-    )
+    assert "schema_version: 0.1.0" in (wiki_env.wiki_dir / "systems" / "system-page.md").read_text(encoding="utf-8")
 
 
 def test_llm_wiki_api_vertical_slice(wiki_env: LlmWikiService) -> None:

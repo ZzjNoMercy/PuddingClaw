@@ -41,10 +41,9 @@ TYPED_SLUG_PATTERN = rf"{SLUG_SEGMENT_PATTERN}(?:/{SLUG_SEGMENT_PATTERN})+"
 SLUG_RE = re.compile(rf"^{SLUG_PATTERN}$")
 WIKILINK_TARGET_RE = re.compile(rf"^(?P<slug>{TYPED_SLUG_PATTERN})$")
 WIKILINK_RE = re.compile(rf"\[\[({TYPED_SLUG_PATTERN})(?:\|[^\]]+)?\]\]")
+WIKILINK_WITH_LABEL_RE = re.compile(rf"\[\[(?P<slug>{TYPED_SLUG_PATTERN})(?P<label>\|[^\]]+)?\]\]")
 ANY_WIKILINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]")
-LEGACY_WORKSPACE_WIKILINK_RE = re.compile(
-    rf"\[\[wiki/(?P<slug>{TYPED_SLUG_PATTERN})(?P<label>\|[^\]]+)?\]\]"
-)
+LEGACY_WORKSPACE_WIKILINK_RE = re.compile(rf"\[\[wiki/(?P<slug>{TYPED_SLUG_PATTERN})(?P<label>\|[^\]]+)?\]\]")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 WORD_RE = re.compile(r"[\w\u4e00-\u9fff-]+", re.UNICODE)
 SPECIAL_WIKI_FILES = frozenset({"index.md", "log.md"})
@@ -140,11 +139,7 @@ async def _read_gbrain_import_status(database_url: str, *, limit: int = 10) -> d
                 "source_type": str(row["source_type"] or ""),
                 "pages_updated": [str(item) for item in pages_updated],
                 "summary": str(row["summary"] or ""),
-                "created_at": (
-                    created_at.isoformat()
-                    if isinstance(created_at, datetime)
-                    else str(created_at or "")
-                ),
+                "created_at": (created_at.isoformat() if isinstance(created_at, datetime) else str(created_at or "")),
             }
         )
     return {
@@ -163,9 +158,7 @@ def _wiki_page_paths(directory: Path) -> list[Path]:
     """Return Wiki pages recursively, excluding only root generated files."""
 
     return sorted(
-        path
-        for path in directory.rglob("*.md")
-        if path.relative_to(directory).as_posix() not in SPECIAL_WIKI_FILES
+        path for path in directory.rglob("*.md") if path.relative_to(directory).as_posix() not in SPECIAL_WIKI_FILES
     )
 
 
@@ -269,6 +262,15 @@ def _render_frontmatter(metadata: dict[str, Any], body: str) -> str:
 def _rewrite_legacy_workspace_wikilinks(content: str) -> str:
     return LEGACY_WORKSPACE_WIKILINK_RE.sub(
         lambda match: f"[[{match.group('slug')}{match.group('label') or ''}]]",
+        content,
+    )
+
+
+def _rewrite_wikilink_targets(content: str, replacements: dict[str, str]) -> str:
+    """Rewrite exact Wiki targets while preserving optional display labels."""
+
+    return WIKILINK_WITH_LABEL_RE.sub(
+        lambda match: f"[[{replacements.get(match.group('slug'), match.group('slug'))}{match.group('label') or ''}]]",
         content,
     )
 
@@ -446,9 +448,7 @@ class LlmWikiService:
         """Return whether the current source bytes already have an immutable Raw snapshot."""
 
         matching = [
-            record
-            for record in self._manifest_records()
-            if str(record.get("source_path") or "") == source_path
+            record for record in self._manifest_records() if str(record.get("source_path") or "") == source_path
         ]
         current = next(
             (
@@ -481,10 +481,7 @@ class LlmWikiService:
 
         bundle = self._require_initialized()
         selected_paths = list(dict.fromkeys(str(path).strip() for path in raw_paths if str(path).strip()))
-        records_by_path = {
-            str(record.get("snapshot_path") or ""): record
-            for record in self._manifest_records()
-        }
+        records_by_path = {str(record.get("snapshot_path") or ""): record for record in self._manifest_records()}
         missing = [path for path in selected_paths if path not in records_by_path]
         if missing:
             raise LlmWikiError(f"raw snapshots are not in the immutable manifest: {', '.join(missing)}")
@@ -528,6 +525,7 @@ class LlmWikiService:
         jobs_dir = self.root / ".puddingclaw" / "jobs"
         if not jobs_dir.is_dir():
             return compiled
+        receipts: list[dict[str, Any]] = []
         for path in sorted(jobs_dir.glob("wiki-*.json")):
             try:
                 receipt = json.loads(path.read_text(encoding="utf-8"))
@@ -535,11 +533,19 @@ class LlmWikiService:
                 continue
             if receipt.get("status") != "published" or receipt.get("bundle_hash") != bundle_hash:
                 continue
+            receipts.append(receipt)
+        receipts.sort(key=lambda item: (str(item.get("published_at") or ""), str(item.get("job_id") or "")))
+        for receipt in receipts:
+            retired_pages = receipt.get("retired_pages")
+            if isinstance(retired_pages, dict):
+                retired_slugs = {str(slug) for slug in retired_pages}
+                for entry in compiled.values():
+                    entry["pages"].difference_update(retired_slugs)
             consumed = receipt.get("consumed_raw_by_page")
             raw_hashes = receipt.get("raw_hashes")
             if not isinstance(consumed, dict) or not isinstance(raw_hashes, dict):
                 continue
-            job_id = str(receipt.get("job_id") or path.stem)
+            job_id = str(receipt.get("job_id") or "unknown")
             published_at = str(receipt.get("published_at") or "")
             for page_slug, raw_paths in consumed.items():
                 if not isinstance(raw_paths, list):
@@ -555,7 +561,7 @@ class LlmWikiService:
                     entry["pages"].add(str(page_slug))
                     entry["job_ids"].add(job_id)
                     entry["compiled_at"] = max(str(entry["compiled_at"]), published_at)
-        return compiled
+        return {path: entry for path, entry in compiled.items() if entry["pages"]}
 
     def workspace_status(self) -> dict[str, Any]:
         """Return the small, user-facing state needed by the LLM Wiki workbench."""
@@ -569,9 +575,7 @@ class LlmWikiService:
             digest = raw_hashes.get(snapshot_path, "missing")
             compiled = compiled_receipts.get(snapshot_path)
             is_compiled = bool(
-                digest == record.get("sha256")
-                and compiled
-                and compiled.get("sha256") == record.get("sha256")
+                digest == record.get("sha256") and compiled and compiled.get("sha256") == record.get("sha256")
             )
             raw_records.append(
                 {
@@ -606,9 +610,7 @@ class LlmWikiService:
                     }
                 )
             except LlmWikiError as exc:
-                wiki_pages.append(
-                    {"slug": slug, "title": slug, "type": "unknown", "valid": False, "error": str(exc)}
-                )
+                wiki_pages.append({"slug": slug, "title": slug, "type": "unknown", "valid": False, "error": str(exc)})
 
         try:
             gbrain_ai = resolve_gbrain_ai_runtime()
@@ -919,6 +921,8 @@ class LlmWikiService:
             raise LlmWikiError(f"raw paths are not in the immutable manifest: {', '.join(unknown_raw)}")
         selected_records = [item for item in manifest_records if str(item.get("snapshot_path")) in raw_paths]
         authorized_sources = {str(record.get("snapshot_path") or "") for record in selected_records}
+        bundle_version = str(bundle["brain_schema"]["document"]["bundle_version"])
+        schema_identity = f"{bundle['brain_schema']['document']['schema_id']}@{bundle_version}"
         consumed_by_page: dict[str, list[str]] = {}
         prepared_pages: list[dict[str, str]] = []
         for item in pages:
@@ -948,9 +952,16 @@ class LlmWikiService:
             if not consumed:
                 raise LlmWikiError(f"wiki/{slug}.md: must cite at least one raw selected for this Ingest")
             consumed_by_page[slug] = consumed
+            normalized_metadata = False
+            if str(metadata.get("schema_version") or "") == schema_identity:
+                metadata = dict(metadata)
+                metadata["schema_version"] = bundle_version
+                normalized_metadata = True
             if canonical_sources != [str(source) for source in sources]:
                 metadata = dict(metadata)
                 metadata["sources"] = canonical_sources
+                normalized_metadata = True
+            if normalized_metadata:
                 content = _render_frontmatter(metadata, body)
             prepared_pages.append({"slug": slug, "content": content})
         pages = prepared_pages
@@ -983,8 +994,7 @@ class LlmWikiService:
             changed.append(slug)
 
         candidate_pages = {
-            _wiki_slug(staging, path): path.read_text(encoding="utf-8")
-            for path in _wiki_page_paths(staging)
+            _wiki_slug(staging, path): path.read_text(encoding="utf-8") for path in _wiki_page_paths(staging)
         }
         (staging / "index.md").write_text(self._build_index(candidate_pages), encoding="utf-8")
         prior_log = (self.wiki_dir / "log.md").read_text(encoding="utf-8")
@@ -1035,6 +1045,199 @@ class LlmWikiService:
             json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         )
         return {"published": True, **receipt}
+
+    def retire_pages(
+        self,
+        *,
+        retirements: list[dict[str, str]],
+        summary: str,
+    ) -> dict[str, Any]:
+        """Retire obsolete Wiki pages in favor of existing replacements."""
+
+        with _file_lock(self.brain_write_lock_path), _file_lock(self.publish_lock_path):
+            bundle = self._require_initialized()
+            replacements: dict[str, str] = {}
+            for item in retirements:
+                slug = str(item.get("slug") or "").strip()
+                replacement = str(item.get("replacement") or "").strip()
+                if not SLUG_RE.fullmatch(slug) or slug in {"index", "log"}:
+                    raise LlmWikiError(f"invalid retired Wiki slug: {slug!r}")
+                if not SLUG_RE.fullmatch(replacement) or replacement in {"index", "log"}:
+                    raise LlmWikiError(f"invalid replacement Wiki slug: {replacement!r}")
+                if slug == replacement:
+                    raise LlmWikiError(f"retired Wiki slug must differ from its replacement: {slug}")
+                if slug in replacements:
+                    raise LlmWikiError(f"duplicate retired Wiki slug: {slug}")
+                replacements[slug] = replacement
+            if not replacements:
+                raise LlmWikiError("retire_pages requires at least one retirement")
+            if set(replacements) & set(replacements.values()):
+                raise LlmWikiError("a replacement cannot also be retired in the same operation")
+
+            original_pages = {
+                _wiki_slug(self.wiki_dir, path): path.read_text(encoding="utf-8")
+                for path in _wiki_page_paths(self.wiki_dir)
+            }
+            missing = sorted(set(replacements) - set(original_pages))
+            missing_replacements = sorted(set(replacements.values()) - set(original_pages))
+            if missing:
+                prior = self._matching_retirement_receipt(bundle_hash=bundle["bundle_hash"], replacements=replacements)
+                if len(missing) == len(replacements) and not missing_replacements and prior is not None:
+                    report = self._lint_directory(self.wiki_dir)
+                    if not report["ok"]:
+                        raise LlmWikiError("retirement receipt exists but the current Wiki does not pass Lint")
+                    return {"retired": False, "already_retired": True, **prior, "lint": report}
+                raise LlmWikiError(f"retired Wiki pages do not exist: {', '.join(missing)}")
+            if missing_replacements:
+                raise LlmWikiError(f"replacement Wiki pages do not exist: {', '.join(missing_replacements)}")
+
+            desired_pages: dict[str, str] = {}
+            links_updated_in: list[str] = []
+            for slug, content in original_pages.items():
+                if slug in replacements:
+                    continue
+                rewritten = _rewrite_wikilink_targets(content, replacements)
+                desired_pages[slug] = rewritten
+                if rewritten != content:
+                    links_updated_in.append(slug)
+
+            job_id = f"wiki-retire-{uuid.uuid4().hex[:16]}"
+            staging = self.root / ".puddingclaw" / "staging" / job_id / "wiki"
+            staging.mkdir(parents=True, exist_ok=False)
+            for slug, content in desired_pages.items():
+                destination = staging / f"{slug}.md"
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(content if content.endswith("\n") else f"{content}\n", encoding="utf-8")
+            candidate_index = self._build_index(desired_pages)
+            (staging / "index.md").write_text(candidate_index, encoding="utf-8")
+
+            prior_index = (self.wiki_dir / "index.md").read_text(encoding="utf-8")
+            prior_log = (self.wiki_dir / "log.md").read_text(encoding="utf-8")
+            today = datetime.now(UTC).date().isoformat()
+            safe_summary = _single_line(summary, fallback="Retire obsolete Wiki pages")
+            retirement_lines = ", ".join(
+                f"[[{slug}]] -> [[{replacement}]]" for slug, replacement in sorted(replacements.items())
+            )
+            log_entry = (
+                f"\n## [{today}] retire | {safe_summary}\n\n"
+                f"- job_id: {job_id}\n"
+                f"- schema: {bundle['brain_schema']['document']['schema_id']}@{bundle['brain_schema']['document']['bundle_version']}\n"
+                f"- bundle_hash: {bundle['bundle_hash']}\n"
+                f"- retired: {retirement_lines}\n"
+                f"- links_updated_in: {', '.join(f'[[{slug}]]' for slug in sorted(links_updated_in)) or 'none'}\n"
+            )
+            separator = "" if prior_log.endswith("\n") else "\n"
+            candidate_log = prior_log + separator + log_entry.lstrip("\n")
+            if not candidate_log.startswith(prior_log):
+                raise LlmWikiError("retirement log does not preserve the append-only prefix")
+            (staging / "log.md").write_text(candidate_log, encoding="utf-8")
+
+            report = self._lint_directory(staging)
+            if not report["ok"]:
+                raise LlmWikiError(
+                    "Wiki page retirement failed validation: "
+                    + "; ".join(f"{item['path']}: {item['message']}" for item in report["errors"][:8])
+                )
+
+            archive_dir = self.root / ".puddingclaw" / "retired" / job_id / "wiki"
+            for slug in replacements:
+                destination = archive_dir / f"{slug}.md"
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(original_pages[slug], encoding="utf-8")
+
+            published_at = datetime.now(UTC).isoformat()
+            receipt = {
+                "job_id": job_id,
+                "status": "published",
+                "operation": "page-retirement",
+                "bundle_hash": bundle["bundle_hash"],
+                "schema_id": bundle["brain_schema"]["document"]["schema_id"],
+                "schema_version": bundle["brain_schema"]["document"]["bundle_version"],
+                "raw_hashes": self._raw_hashes(),
+                "retired_pages": dict(sorted(replacements.items())),
+                "updated_pages": sorted(links_updated_in),
+                "archive_dir": str(archive_dir.relative_to(self.root)),
+                "published_at": published_at,
+                "retired_at": published_at,
+                "lint": report,
+            }
+            receipt_path = self.root / ".puddingclaw" / "jobs" / f"{job_id}.json"
+            try:
+                for slug, content in desired_pages.items():
+                    if content != original_pages[slug]:
+                        _atomic_write(
+                            self.wiki_dir / f"{slug}.md",
+                            content if content.endswith("\n") else f"{content}\n",
+                        )
+                _atomic_write(self.wiki_dir / "index.md", candidate_index)
+                _atomic_write(self.wiki_dir / "log.md", candidate_log)
+                for slug in replacements:
+                    path = self.wiki_dir / f"{slug}.md"
+                    path.unlink()
+                    self._prune_empty_wiki_parents(path.parent)
+                _atomic_write(receipt_path, json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+            except Exception:
+                for slug, content in original_pages.items():
+                    _atomic_write(self.wiki_dir / f"{slug}.md", content)
+                _atomic_write(self.wiki_dir / "index.md", prior_index)
+                _atomic_write(self.wiki_dir / "log.md", prior_log)
+                if receipt_path.is_file():
+                    receipt_path.unlink()
+                raise
+            return {"retired": True, "already_retired": False, **receipt}
+
+    def _matching_retirement_receipt(
+        self,
+        *,
+        bundle_hash: str,
+        replacements: dict[str, str],
+    ) -> dict[str, Any] | None:
+        matches: list[dict[str, Any]] = []
+        for path in (self.root / ".puddingclaw" / "jobs").glob("wiki-retire-*.json"):
+            try:
+                receipt = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if (
+                receipt.get("status") == "published"
+                and receipt.get("bundle_hash") == bundle_hash
+                and receipt.get("retired_pages") == dict(sorted(replacements.items()))
+            ):
+                matches.append(receipt)
+        return max(matches, key=lambda item: str(item.get("published_at") or ""), default=None)
+
+    def _prune_empty_wiki_parents(self, parent: Path) -> None:
+        while parent != self.wiki_dir:
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
+
+    def retire_gbrain_pages(self, slugs: list[str]) -> dict[str, Any]:
+        """Sync rewritten Wiki pages, then soft-delete retired gbrain slugs."""
+
+        normalized = list(dict.fromkeys(str(slug or "").strip() for slug in slugs))
+        if not normalized or any(not SLUG_RE.fullmatch(slug) for slug in normalized):
+            raise LlmWikiError("retire_gbrain_pages requires valid Wiki slugs")
+        with _file_lock(self.brain_write_lock_path):
+            synced = self._compile_gbrain_unlocked(import_pages=True)
+            if not synced.get("ok"):
+                return {"ok": False, "phase": "sync_current_wiki", "wiki_import": synced, "soft_deleted": []}
+            bundle = self._require_initialized()
+            binary = resolve_gbrain_binary()
+            if not binary:
+                raise LlmWikiError("gbrain CLI is not installed")
+            environment, runtime_home = self._production_gbrain_env(bundle_hash=bundle["bundle_hash"])
+            environment = gbrain_subprocess_environment(binary, environment)
+            results = [self._run([binary, "delete", slug], environment=environment) for slug in normalized]
+            return {
+                "ok": all(item["ok"] for item in results),
+                "runtime_home": str(runtime_home),
+                "wiki_import": synced,
+                "soft_deleted": normalized,
+                "results": results,
+            }
 
     def migrate_legacy_wiki_prefixes(self) -> dict[str, Any]:
         """Remove a duplicated workspace ``wiki/`` segment from pages and links."""
@@ -1380,6 +1583,14 @@ class LlmWikiService:
 
     def compile_gbrain(self, *, import_pages: bool = False) -> dict[str, Any]:
         """Validate with real gbrain and optionally import into configured PostgreSQL brain."""
+
+        if import_pages:
+            with _file_lock(self.brain_write_lock_path):
+                return self._compile_gbrain_unlocked(import_pages=True)
+        return self._compile_gbrain_unlocked(import_pages=False)
+
+    def _compile_gbrain_unlocked(self, *, import_pages: bool = False) -> dict[str, Any]:
+        """Implementation shared by ordinary imports and locked maintenance operations."""
 
         bundle = self._require_initialized()
         binary = resolve_gbrain_binary()

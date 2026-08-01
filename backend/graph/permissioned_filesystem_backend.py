@@ -1555,6 +1555,24 @@ class PermissionedCompositeBackend(CompositeBackend):
             PathAuthority.MANAGED,
         }
 
+    def _mounted_backend_path(self, file_path: str | None) -> bool:
+        """Return whether an explicit CompositeBackend route owns ``file_path``.
+
+        Mounted paths are application capabilities, not external host paths.
+        Built-in filesystem tools must dispatch them directly to the owning
+        backend instead of consulting host-file Grants or the execution
+        sandbox.  Access mode is still enforced separately: managed mounts
+        remain read-only while workspace and scratch routes are writable.
+        """
+
+        normalized = str(file_path or "").strip().replace("\\", "/")
+        if not normalized:
+            return False
+        return any(
+            normalized == prefix.rstrip("/") or normalized.startswith(prefix)
+            for prefix in self.routes
+        )
+
     def _approved_external_target(self, file_path: str) -> tuple[FilesystemBackend, str, str] | None:
         if not self.session_id:
             return None
@@ -1593,6 +1611,8 @@ class PermissionedCompositeBackend(CompositeBackend):
     def write(self, file_path: str, content: str):
         if self._managed_readonly(file_path):
             return WriteResult(error=f"Managed resource is read-only: {file_path}")
+        if self._mounted_backend_path(file_path):
+            return super().write(file_path, content)
         if self.host_file_broker is not None:
             broker_result = self.host_file_broker.write(file_path, content)
             if broker_result is not None:
@@ -1609,6 +1629,8 @@ class PermissionedCompositeBackend(CompositeBackend):
         return self._restore_external_path(result, resolved)
 
     def read(self, file_path: str, offset: int = 0, limit: int = 2000):
+        if self._mounted_backend_path(file_path):
+            return super().read(file_path, offset=offset, limit=limit)
         if self.host_file_broker is not None:
             broker_result = self.host_file_broker.read(
                 file_path,
@@ -1628,6 +1650,8 @@ class PermissionedCompositeBackend(CompositeBackend):
         return backend.read(backend_path, offset=offset, limit=limit)
 
     async def aread(self, file_path: str, offset: int = 0, limit: int = 2000):
+        if self._mounted_backend_path(file_path):
+            return await super().aread(file_path, offset=offset, limit=limit)
         if self.host_file_broker is not None:
             broker_result = await asyncio.to_thread(
                 self.host_file_broker.read,
@@ -1650,6 +1674,8 @@ class PermissionedCompositeBackend(CompositeBackend):
     async def awrite(self, file_path: str, content: str):
         if self._managed_readonly(file_path):
             return WriteResult(error=f"Managed resource is read-only: {file_path}")
+        if self._mounted_backend_path(file_path):
+            return await super().awrite(file_path, content)
         if self.host_file_broker is not None:
             broker_result = await asyncio.to_thread(
                 self.host_file_broker.write,
@@ -1678,6 +1704,8 @@ class PermissionedCompositeBackend(CompositeBackend):
     ):
         if self._managed_readonly(file_path):
             return EditResult(error=f"Managed resource is read-only: {file_path}")
+        if self._mounted_backend_path(file_path):
+            return super().edit(file_path, old_string, new_string, replace_all=replace_all)
         if self.host_file_broker is not None:
             broker_result = self.host_file_broker.edit(
                 file_path,
@@ -1707,6 +1735,8 @@ class PermissionedCompositeBackend(CompositeBackend):
     ):
         if self._managed_readonly(file_path):
             return EditResult(error=f"Managed resource is read-only: {file_path}")
+        if self._mounted_backend_path(file_path):
+            return await super().aedit(file_path, old_string, new_string, replace_all=replace_all)
         if self.host_file_broker is not None:
             broker_result = await asyncio.to_thread(
                 self.host_file_broker.edit,
@@ -1729,6 +1759,8 @@ class PermissionedCompositeBackend(CompositeBackend):
         return self._restore_external_path(result, resolved)
 
     def ls(self, path: str):
+        if self._mounted_backend_path(path):
+            return super().ls(path)
         if self.host_file_broker is not None:
             result = self.host_file_broker.ls(path)
             if result is not None:
@@ -1738,6 +1770,8 @@ class PermissionedCompositeBackend(CompositeBackend):
         return super().ls(path)
 
     async def als(self, path: str):
+        if self._mounted_backend_path(path):
+            return await super().als(path)
         if self.host_file_broker is not None:
             result = await asyncio.to_thread(self.host_file_broker.ls, path)
             if result is not None:
@@ -1747,6 +1781,8 @@ class PermissionedCompositeBackend(CompositeBackend):
         return await super().als(path)
 
     def glob(self, pattern: str, path: str | None = None):
+        if self._mounted_backend_path(path):
+            return super().glob(pattern, path=path)
         if self.host_file_broker is not None:
             result = self.host_file_broker.glob(pattern, path=path)
             if result is not None:
@@ -1756,6 +1792,8 @@ class PermissionedCompositeBackend(CompositeBackend):
         return super().glob(pattern, path=path)
 
     async def aglob(self, pattern: str, path: str | None = None):
+        if self._mounted_backend_path(path):
+            return await super().aglob(pattern, path=path)
         if self.host_file_broker is not None:
             result = await asyncio.to_thread(
                 self.host_file_broker.glob,
@@ -1769,6 +1807,8 @@ class PermissionedCompositeBackend(CompositeBackend):
         return await super().aglob(pattern, path=path)
 
     def grep(self, pattern: str, path: str | None = None, glob: str | None = None):
+        if self._mounted_backend_path(path):
+            return super().grep(pattern, path=path, glob=glob)
         if self.host_file_broker is not None:
             result = self.host_file_broker.grep(pattern, path=path, glob=glob)
             if result is not None:
@@ -1778,6 +1818,8 @@ class PermissionedCompositeBackend(CompositeBackend):
         return super().grep(pattern, path=path, glob=glob)
 
     async def agrep(self, pattern: str, path: str | None = None, glob: str | None = None):
+        if self._mounted_backend_path(path):
+            return await super().agrep(pattern, path=path, glob=glob)
         if self.host_file_broker is not None:
             result = await asyncio.to_thread(
                 self.host_file_broker.grep,

@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import hashlib
 import hmac
+import json
 import secrets
 from pathlib import Path
 from typing import Any, Literal
@@ -97,6 +97,24 @@ class WikiStartIngestInput(BaseModel):
             "Keep false when the user only asks to compile or organize content as Wiki; set true only when the user "
             "explicitly asks to enter/import/sync gbrain."
         ),
+    )
+
+
+class WikiPageRetirement(BaseModel):
+    slug: str = Field(description="Exact obsolete Wiki slug relative to the wiki/ root.")
+    replacement: str = Field(description="Exact existing replacement Wiki slug relative to the wiki/ root.")
+
+
+class WikiRetirePagesInput(BaseModel):
+    retirements: list[WikiPageRetirement] = Field(
+        min_length=1,
+        max_length=20,
+        description="Explicit obsolete-to-replacement page mappings authorized by the user.",
+    )
+    summary: str = Field(default="退役重复或过期 Wiki 页面", min_length=1, max_length=500)
+    sync_gbrain: bool = Field(
+        default=False,
+        description="Also soft-delete the obsolete slugs from configured gbrain. Enable only when the user explicitly requests it.",
     )
 
 
@@ -417,6 +435,60 @@ class LlmWikiStartIngestTool(_WikiTool):
             return self.error(exc)
 
 
+class LlmWikiRetirePagesTool(_WikiTool):
+    name: str = "llm_wiki_retire_pages"
+    description: str = (
+        "Deterministically retire explicitly identified obsolete LLM Wiki pages in favor of existing replacement pages. "
+        "It rewrites inbound Wiki links, rebuilds index.md, appends log.md, archives retired Markdown, writes an audit "
+        "receipt, and runs Lint atomically. This tool does not invoke an LLM. Use only after the user has explicitly "
+        "identified the obsolete and replacement slugs. Set sync_gbrain=true only when the user also asks to remove the "
+        "obsolete pages from gbrain; gbrain deletion is soft and recoverable for 72 hours. Treat an ok=true result, "
+        "including already_retired=true, as authoritative and do not verify it with generic filesystem tools."
+    )
+    args_schema: type[BaseModel] = WikiRetirePagesInput
+    risk_level: str = "moderate"
+
+    def _run(
+        self,
+        retirements: list[WikiPageRetirement | dict[str, Any]],
+        summary: str = "退役重复或过期 Wiki 页面",
+        sync_gbrain: bool = False,
+    ) -> str:
+        normalized = [
+            item.model_dump() if isinstance(item, WikiPageRetirement) else dict(item)
+            for item in retirements
+        ]
+        try:
+            wiki_result = self.service.retire_pages(retirements=normalized, summary=summary)
+        except (LlmWikiError, OSError) as exc:
+            return self.error(exc)
+        gbrain_result: dict[str, Any] | None = None
+        if sync_gbrain:
+            try:
+                gbrain_result = self.service.retire_gbrain_pages([str(item["slug"]) for item in normalized])
+            except (LlmWikiError, OSError) as exc:
+                return self.encode(
+                    {
+                        "ok": False,
+                        "error": f"Wiki 页面已退役，但 gbrain 同步失败：{exc}",
+                        "wiki": wiki_result,
+                        "gbrain": None,
+                        "retry_safe": True,
+                    }
+                )
+            if not gbrain_result.get("ok"):
+                return self.encode(
+                    {
+                        "ok": False,
+                        "error": "Wiki 页面已退役，但 gbrain 软删除未全部成功",
+                        "wiki": wiki_result,
+                        "gbrain": gbrain_result,
+                        "retry_safe": True,
+                    }
+                )
+        return self.encode({"ok": True, "wiki": wiki_result, "gbrain": gbrain_result})
+
+
 def create_llm_wiki_tools(base_dir: Path) -> list[BaseTool]:
     resolved = base_dir.resolve()
     return [
@@ -427,4 +499,5 @@ def create_llm_wiki_tools(base_dir: Path) -> list[BaseTool]:
         LlmWikiCompileTool(base_dir=resolved),
         LlmWikiCreateRawTool(base_dir=resolved),
         LlmWikiStartIngestTool(base_dir=resolved),
+        LlmWikiRetirePagesTool(base_dir=resolved),
     ]

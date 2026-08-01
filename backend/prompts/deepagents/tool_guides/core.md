@@ -76,7 +76,7 @@ a known directory. Use `glob` only when the exact file path or name is unknown
 and pattern discovery is necessary; keep the search scope narrow and stop once
 the required path is known.
 
-Use the built-in `read_file`, `glob`, and `grep` for paths exposed by the DeepAgents virtual filesystem. Supported namespaces include:
+Use the built-in `read_file`, `ls`, `glob`, and `grep` for paths exposed by the DeepAgents virtual filesystem. Backend-mounted paths dispatch directly to their owning filesystem backend and never require an external-file Grant, `read_resource`, or a terminal sandbox. If a user supplies the physical host spelling of a managed mount, the runtime canonicalizes it back to the corresponding virtual path before dispatch. Supported namespaces include:
 
 - `/workspace/`
 - `/skills/`
@@ -85,6 +85,9 @@ Use the built-in `read_file`, `glob`, and `grep` for paths exposed by the DeepAg
 - `/sql-guardrails/`
 - `/knowledge/`
 - `/large_tool_results/`
+- `/scratch/`
+
+Writes follow the mount's declared access mode: `/workspace/` and `/scratch/` are writable through the built-in write/edit tools; managed mounts such as `/knowledge/`, `/skills/`, and the schema/asset namespaces are read-only. Do not treat a managed read-only result as an external authorization gap, and do not bypass it with shell commands. Knowledge mutations that have a dedicated Tool contract must use that Tool.
 
 When `glob` or `grep` omits `path` (or supplies the composite root `/`), the
 search is scoped to `/workspace/` and returns only canonical
@@ -118,7 +121,7 @@ For user-provided resources outside all virtual namespaces, use the ordinary fil
 
 An `http://` or `https://` value is always a web resource, even when its path ends in `.md`, `.json`, or another file-like suffix. Read it with `fetch_url`; never reinterpret the URL as a host path or pass it to `read_resource`/file tools.
 
-`/scratch/...` is always a Backend virtual path. Read it with `read_file`, patch it with `patch_file`, and execute against it only through the controlled terminal. Do not create numbered garbage copies. Never pass `/scratch/...` to `read_resource`; `read_resource` is for attachment refs, managed knowledge, and host-side exact files.
+`/scratch/...` is always a Backend virtual path. Read it with `read_file`, patch it with `patch_file`, and execute against it only through the controlled terminal. Do not create numbered garbage copies. Never pass `/scratch/...` to `read_resource`; `read_resource` is for attachment refs and host-side exact files.
 
 When the user explicitly supplies an external directory, use ordinary file tools for reads and `execute` with standard `cp`, `mv`, or `mkdir` for directory operations. The first such command requests one atomic shell-directory Grant Profile containing only the source/destination roots and required read/write/delete capabilities; after approval, replay the original command unchanged. The default runner is the kernel sandbox. Docker is selected only by forced mode or a capability that requires it, and is started lazily. Exact-file Grants remain Broker-only and never widen into shell directory access. HTML browser validation still uses `validate_html_report`, which resolves its own runtime capability from the frozen contract.
 

@@ -4670,6 +4670,7 @@ def test_deepagents_manager_uses_backend_execute_instead_of_custom_terminal(tmp_
     assert "write_file" not in by_name
     assert "execute_skill" not in by_name
     assert "llm_wiki_publish" not in by_name
+    assert "llm_wiki_retire_pages" in by_name
     assert by_name["llm_wiki_context"].allow_ingest is False
     assert by_name["llm_wiki_create_raw"].session_id == "session-1"
     assert by_name["llm_wiki_create_raw"].query_id == "query-1"
