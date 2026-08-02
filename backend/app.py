@@ -25,8 +25,17 @@ def _exception_leaf_summary(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
 
 
-async def _warm_mcp_discovery() -> None:
-    """Prime MCP metadata while keeping startup failures non-fatal."""
+async def _warm_mcp_discovery(
+    *,
+    max_attempts: int = 2,
+    retry_delay_seconds: float = 0.25,
+) -> None:
+    """Prime MCP metadata while keeping startup failures non-fatal.
+
+    A stdio MCP server can close its first cold-start handshake while its
+    runtime is still settling.  Retry that transient once before surfacing a
+    warning; discovery failures are not cached, so the retry is a clean spawn.
+    """
 
     enabled_mcp: list[str] = []
     try:
@@ -41,8 +50,23 @@ async def _warm_mcp_discovery() -> None:
         )
         if not enabled_mcp:
             return
-        tools = await load_filtered_mcp_tools(enabled_mcp)
-        print(f"🔌 MCP discovery warmed: {len(tools)} filtered tools")
+        attempts = max(1, max_attempts)
+        for attempt in range(1, attempts + 1):
+            try:
+                tools = await load_filtered_mcp_tools(enabled_mcp)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if attempt >= attempts:
+                    raise
+                await asyncio.sleep(max(0.0, retry_delay_seconds))
+            else:
+                retry_note = " after one cold-start retry" if attempt > 1 else ""
+                print(
+                    f"🔌 MCP discovery warmed{retry_note}: "
+                    f"{len(tools)} filtered tools"
+                )
+                return
     except asyncio.CancelledError:
         raise
     except Exception as exc:

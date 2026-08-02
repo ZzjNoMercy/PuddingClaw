@@ -28,9 +28,10 @@ def build_deepagents_system_prompt(base_dir: Path, workspace_path: Path) -> str:
     project_context, _source, _is_project_local = read_project_context(workspace_path, base_dir)
     core_tool_guides = _read_prompt_component(prompt_dir / "tool_guides" / "core.md")
 
-    parts = [
-        agents,
-        project_context.strip(),
-        core_tool_guides,
-    ]
+    parts = []
+    stable_core = "\n\n".join(part for part in (agents, core_tool_guides) if part)
+    if stable_core:
+        parts.append(f"## Stable Core\n\n{stable_core}")
+    if project_context.strip():
+        parts.append(f"## Project Context\n\n{project_context.strip()}")
     return "\n\n".join(part for part in parts if part)

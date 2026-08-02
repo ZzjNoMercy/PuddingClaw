@@ -15,6 +15,8 @@ import uuid
 from contextvars import ContextVar
 from typing import Any
 
+import config
+from graph.prompt_cache import build_part_fingerprints, compare_part_inputs, digest
 from utils.json_serialization import to_json_compatible
 
 _current_trace_collector: ContextVar[TraceCollector | None] = ContextVar(
@@ -120,6 +122,7 @@ class TraceCollector:
         self._tool_span_by_call_id: dict[str, TraceSpan] = {}
         self._model_input_count = 0
         self._last_model_input_summary: dict[str, Any] | None = None
+        self._last_model_input_snapshot: dict[str, Any] | None = None
         self._skill_effect_recorded = False
         self._memory_effect_recorded = False
         self._subagent_effect_recorded = False
@@ -254,11 +257,45 @@ class TraceCollector:
             for item in preview
             if str(item.get("role", "")).lower() in {"system", "systemmessage"}
         )
-        fingerprints = {
+        legacy_fingerprints = {
             "messages_hash": self._stable_hash(preview),
             "system_prompt_hash": self._stable_hash(system_prompt_text),
             "tool_schema_hash": self._stable_hash(tool_schema_items),
         }
+        prompt_cache_config = config.load_config().get("harness", {}).get("prompt_cache", {})
+        diagnostics_enabled = bool(prompt_cache_config.get("trace_part_diagnostics", True))
+        fingerprints = dict(legacy_fingerprints)
+        continuity: dict[str, Any] | None = None
+        if diagnostics_enabled:
+            fingerprints.update(
+                build_part_fingerprints(
+                    system_prompt=system_prompt_text,
+                    tool_schemas=tool_schema_items,
+                    message_previews=preview,
+                )
+            )
+            fingerprints["cache_cohort_id"] = self._stable_hash(
+                {
+                    "model": (model_params or {}).get("model"),
+                    "provider": (model_params or {}).get("provider"),
+                    "binding": (model_params or {}).get("binding"),
+                    "tool_full_schema_hash": fingerprints.get("tool_full_schema_hash"),
+                    "toolset_protocol_version": "prompt-cache-tools-v1",
+                }
+            )
+        snapshot = {"messages_preview": preview, "fingerprints": fingerprints}
+        if diagnostics_enabled:
+            continuity = (
+                compare_part_inputs(self._last_model_input_snapshot, snapshot)
+                if self._last_model_input_snapshot is not None
+                else {
+                    "first_diff_part": "none",
+                    "first_diff_path": "",
+                    "common_prefix_messages": 0,
+                    "common_prefix_tokens_estimated": 0,
+                }
+            )
+            self._last_model_input_snapshot = snapshot
         assembly = self._model_input_assembly(
             preview=preview,
             tool_schema_items=tool_schema_items,
@@ -276,6 +313,8 @@ class TraceCollector:
             "fingerprints": fingerprints,
             "assembly": assembly,
         }
+        if continuity is not None:
+            contract["cache_diagnostics"] = continuity
         model_call_index = self._model_input_count
         self._model_input_count += 1
         span_metadata = {
@@ -295,6 +334,8 @@ class TraceCollector:
                 ],
             },
         }
+        if continuity is not None:
+            span_metadata["cache_diagnostics"] = continuity
         if metadata:
             span_metadata.update(metadata)
 
@@ -602,6 +643,11 @@ class TraceCollector:
             "agent_memory_present": agent_memory_present,
             "matched_sources": matched_sources,
             "source_count": len(matched_sources),
+            "memory_hash": digest(
+                system_text[system_text.find("<agent_memory>") : system_text.find("</agent_memory>") + len("</agent_memory>")]
+                if agent_memory_present
+                else ""
+            ),
         }
         memory_diff = {
             "memory_contents_loaded": agent_memory_present or bool(matched_sources),
@@ -620,6 +666,7 @@ class TraceCollector:
                 "system_prompt_checked": True,
                 "memory_sources": matched_sources,
                 "state_field": "memory_contents",
+                "memory_hash": memory_after["memory_hash"],
             },
         )
         self.add_middleware_effect(
@@ -639,6 +686,7 @@ class TraceCollector:
                 "memory_sources": matched_sources,
                 "request_field": "system_message",
                 "state_field": "memory_contents",
+                "memory_hash": memory_after["memory_hash"],
             },
         )
         self._memory_effect_recorded = True
@@ -1450,6 +1498,8 @@ class TraceCollector:
         if isinstance(message, dict):
             additional_kwargs = message.get("additional_kwargs", additional_kwargs)
         additional_kwargs = additional_kwargs if isinstance(additional_kwargs, dict) else {}
+        is_prompt_control = bool(additional_kwargs.get("puddingclaw_prompt_control"))
+        rendered_content = "[PuddingClaw internal control omitted]" if is_prompt_control else content_text
         raw_tool_calls = additional_kwargs.get("tool_calls")
         parsed_preview = TraceCollector._message_tool_calls(tool_calls)
         invalid_preview = TraceCollector._message_tool_calls(invalid_tool_calls)
@@ -1461,7 +1511,7 @@ class TraceCollector:
         tool_call_id = getattr(message, "tool_call_id", None)
         if isinstance(message, dict):
             tool_call_id = message.get("tool_call_id", tool_call_id)
-        return {
+        preview: dict[str, Any] = {
             "role": str(role),
             "name": name,
             "chars": len(content_text),
@@ -1475,9 +1525,16 @@ class TraceCollector:
             "provider_tool_call_count": len(provider_preview),
             "provider_tool_call_ids": [item.get("id") for item in provider_preview],
             "tool_call_id": str(tool_call_id or "") or None,
-            "content": content_text,
-            "preview": content_text[:600],
+            "content": rendered_content,
+            "preview": rendered_content[:600],
+            "puddingclaw_prompt_control": is_prompt_control,
         }
+        if is_prompt_control:
+            preview["content_hash"] = digest(content_text)
+            sections = additional_kwargs.get("puddingclaw_control_sections")
+            if isinstance(sections, dict):
+                preview["control_sections"] = sorted(str(key) for key in sections)
+        return preview
 
     @staticmethod
     def _message_tool_calls(tool_calls: Any) -> list[dict[str, Any]]:

@@ -104,3 +104,51 @@ def test_docker_executes_authorized_external_mv_with_delete(tmp_path: Path) -> N
     assert result.exit_code == 0, result.output
     assert not source.exists()
     assert target.read_bytes() == b"docker-mv-e2e\n"
+
+
+def test_docker_executes_authorized_external_python_script_read_only(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    external = tmp_path / "external"
+    for path in (workspace, scratch, external):
+        path.mkdir()
+    script = external / "run_once.py"
+    sibling = external / "must-not-write.txt"
+    script.write_text(
+        "from pathlib import Path\n"
+        "try:\n"
+        "    Path(__file__).with_name('must-not-write.txt').write_text('bad')\n"
+        "except OSError:\n"
+        "    print('EXTERNAL_READ_ONLY_OK')\n"
+        "print('PYTHON_EXTERNAL_EXEC_OK')\n",
+        encoding="utf-8",
+    )
+    command = f"python3 {script}"
+    requirements = ShellPolicyAnalyzer.requirements(command, workspace_path=workspace)
+    profile = SandboxGrantProfile.build(
+        workspace_root=workspace,
+        scratch_root=scratch,
+        external_read_roots=[external],
+    )
+    manager = ProjectSandboxManager(
+        {
+            "image": DEFAULT_SANDBOX_IMAGE,
+            "cpu_limit": "2",
+            "memory_limit_mb": 1024,
+            "pids_limit": 128,
+            "network_enabled": False,
+        }
+    )
+
+    result = manager.run_ephemeral_grant_profile_command(
+        workspace,
+        command=requirements.execution_command,
+        profile=profile,
+        timeout=60,
+        max_output_bytes=100_000,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "EXTERNAL_READ_ONLY_OK" in result.output
+    assert "PYTHON_EXTERNAL_EXEC_OK" in result.output
+    assert not sibling.exists()

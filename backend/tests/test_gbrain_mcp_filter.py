@@ -42,6 +42,7 @@ def test_gbrain_server_requires_ready_dedicated_home(monkeypatch, tmp_path) -> N
         lambda base: ({**base, "DASHSCOPE_API_KEY": "test"}, runtime),
     )
     config = build_mcp_servers_config(["gbrain"])["gbrain"]
+    assert config["cwd"] == str(tmp_path.resolve())
     assert config["transport"] == "stdio"
     assert config["env"]["GBRAIN_HOME"] == str(tmp_path)
     assert config["env"]["GBRAIN_SCHEMA_PACK"] == "puddingclaw-wiki"

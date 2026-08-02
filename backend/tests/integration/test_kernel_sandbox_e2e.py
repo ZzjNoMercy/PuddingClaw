@@ -15,10 +15,11 @@ from langchain_core.messages import ToolMessage
 from graph.permission_policy import RunPermissionContext, ShellDirectoryGrantSpec
 from graph.session_manager import session_manager
 from harness.coordinators import HarnessRunCoordinator
+from harness.execution_context import bind_authorized_execution
 from harness.kernel_sandbox import MacOSSeatbeltRunner
 from harness.models import RunStatus
 from harness.sandbox_profiles import SandboxGrantProfile
-from harness.tool_execution import ToolExecutionPipeline
+from harness.tool_execution import ShellPolicyAnalyzer, ToolExecutionPipeline
 from harness.workspace_backends import KernelWorkspaceBackend
 
 pytestmark = pytest.mark.skipif(
@@ -95,6 +96,86 @@ def test_seatbelt_runs_standard_host_toolchains_without_docker(tmp_path: Path) -
     assert result.exit_code == 0
     assert "Python" in result.output
     assert "git version" in result.output
+
+
+def test_seatbelt_executes_authorized_external_python_script_read_only(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    external = tmp_path / "external"
+    for path in (workspace, scratch, external):
+        path.mkdir()
+    script = external / "run_once.py"
+    sibling = external / "must-not-write.txt"
+    script.write_text(
+        "from pathlib import Path\n"
+        "try:\n"
+        "    Path(__file__).with_name('must-not-write.txt').write_text('bad')\n"
+        "except OSError:\n"
+        "    print('EXTERNAL_READ_ONLY_OK')\n"
+        "print('PYTHON_EXTERNAL_EXEC_OK')\n",
+        encoding="utf-8",
+    )
+    command = f"python3 {script}"
+    requirements = ShellPolicyAnalyzer.requirements(command, workspace_path=workspace)
+    profile = SandboxGrantProfile.build(
+        workspace_root=workspace,
+        scratch_root=scratch,
+        external_read_roots=[external],
+    )
+
+    result = MacOSSeatbeltRunner(profile).execute(requirements.execution_command)
+
+    assert result.exit_code == 0, result.output
+    assert "EXTERNAL_READ_ONLY_OK" in result.output
+    assert "PYTHON_EXTERNAL_EXEC_OK" in result.output
+    assert not sibling.exists()
+
+
+def test_kernel_execute_runs_platform_skill_from_virtual_namespace(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from harness import workspace_backends
+
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    skills = tmp_path / "skills"
+    for path in (workspace, scratch, skills):
+        path.mkdir()
+    script_dir = skills / "get-date" / "scripts"
+    script_dir.mkdir(parents=True)
+    (script_dir / "get_datetime.py").write_text(
+        "print('managed-skill-ok')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(workspace_backends, "_macos_seatbelt_available", lambda: True)
+    backend = KernelWorkspaceBackend(
+        root_dir=workspace,
+        scratch_path=scratch,
+        managed_readonly_path_aliases=(("/skills", skills.resolve()),),
+    )
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute"},
+        backend_mode="kernel",
+        workspace_backend=backend,
+    )
+    command = "python3 /skills/get-date/scripts/get_datetime.py"
+    request = ToolCallRequest(
+        tool_call={"id": "call-kernel-skill", "name": "execute", "args": {"command": command}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(workspace)}),
+    )
+    authorized = pipeline._compile_kernel_execution(request)
+
+    assert authorized is not None
+    with bind_authorized_execution(authorized):
+        result = backend.execute(command)
+
+    assert result.exit_code == 0
+    assert result.output.strip() == "managed-skill-ok"
 
 
 def test_seatbelt_timeout_kills_background_process_group(tmp_path: Path) -> None:

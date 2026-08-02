@@ -10,6 +10,8 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ModelRequest, ModelResponse, ToolCallRequest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
+import config
+from graph.prompt_cache import append_control_message
 from graph.session_manager import session_manager
 from harness.models import RunTaskProfile
 
@@ -232,6 +234,18 @@ class SkillIntentRouterMiddleware(AgentMiddleware):
             else ""
         )
         routing_prompt = " ".join(item for item in (invocation_notice, missing_notice, load_notice) if item)
+        if bool(
+            config.load_config().get("harness", {}).get("prompt_cache", {}).get("tail_routing_message", False)
+        ):
+            # Keep the user's HumanMessage byte-for-byte intact.  The control
+            # tail is request-scoped and is removed before Session persistence.
+            return request.override(
+                messages=append_control_message(
+                    messages,
+                    section="skill_routing",
+                    content=f"{routing_prompt}\n\n规范化任务文本（仅供路由参考）：{content}",
+                )
+            )
         messages[index] = original.model_copy(update={"content": f"{content}\n\n{_MARKER} {routing_prompt}"})
         return request.override(messages=messages)
 

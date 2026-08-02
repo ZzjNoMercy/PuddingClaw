@@ -289,6 +289,15 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         },
     },
     "harness": {
+        # Prompt-cache rollout controls. Diagnostics are safe to enable first;
+        # the behavioral switches remain independently reversible.
+        "prompt_cache": {
+            "trace_part_diagnostics": True,
+            "ordered_system_sections": False,
+            "tail_routing_message": False,
+            "deterministic_session_projection": False,
+            "stable_tool_schema": False,
+        },
         "model_call_limit": {
             "enabled": True,
             "run_limit": 50,

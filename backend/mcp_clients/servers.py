@@ -188,6 +188,11 @@ def build_mcp_servers_config(enabled_names: list[str] | None = None) -> dict[str
         registry.pop("gbrain", None)
     elif "gbrain" in registry:
         registry["gbrain"]["command"] = str(gbrain_status["binary"])
+        # GBrain normally honors GBRAIN_HOME, but an explicit working
+        # directory also prevents cold-start discovery from falling back to a
+        # user's personal/default brain when PuddingClaw is launched from a
+        # reloader or package runner with a different cwd.
+        registry["gbrain"]["cwd"] = gbrain_home
         environment = {
             "GBRAIN_HOME": gbrain_home,
             "GBRAIN_SCHEMA_PACK": "puddingclaw-wiki",

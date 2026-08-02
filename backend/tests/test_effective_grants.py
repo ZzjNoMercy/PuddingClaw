@@ -335,3 +335,116 @@ def test_selected_grants_require_delete_capability_for_mv(tmp_path: Path) -> Non
 
     with pytest.raises(PermissionError, match="delete"):
         SelectedGrantSet.select(effective, requirements)
+
+
+def test_all_shell_authority_projects_every_active_directory_grant(
+    tmp_path: Path,
+) -> None:
+    read_only = tmp_path / "scripts"
+    writable = tmp_path / "output"
+    for root in (read_only, writable):
+        root.mkdir()
+    grants = [
+        {
+            "id": "scripts-read",
+            "type": "external_directory_read",
+            "scope": "run",
+            "target_kind": "exact_directory",
+            "target": str(read_only),
+            "capabilities": ["read", "recursive", "external_path", "shell_access"],
+            "binding_schema_version": 3,
+            "bindings": _shell_bindings(),
+            "metadata": {"run_id": "run-one"},
+        },
+        {
+            "id": "output-read",
+            "type": "external_directory_read",
+            "scope": "run",
+            "target_kind": "exact_directory",
+            "target": str(writable),
+            "capabilities": ["read", "recursive", "external_path", "shell_access"],
+            "binding_schema_version": 3,
+            "bindings": _shell_bindings(),
+            "metadata": {"run_id": "run-one"},
+        },
+        {
+            "id": "output-write",
+            "type": "external_directory_write",
+            "scope": "run",
+            "target_kind": "exact_directory",
+            "target": str(writable),
+            "capabilities": [
+                "write",
+                "delete",
+                "recursive",
+                "external_path",
+                "shell_access",
+            ],
+            "binding_schema_version": 3,
+            "bindings": _shell_bindings(),
+            "metadata": {"run_id": "run-one"},
+        },
+    ]
+    effective = EffectiveGrantSet.resolve(
+        grants,
+        run_id="run-one",
+        current_bindings=_bindings(),
+        current_shell_bindings=_shell_bindings(),
+        permission_revision=11,
+    )
+
+    selected = SelectedGrantSet.all_shell_authority(effective)
+
+    assert selected.read_roots == (writable, read_only)
+    assert selected.write_roots == (writable,)
+    assert selected.delete_roots == (writable,)
+    assert selected.grant_ids == (
+        "output-read",
+        "output-write",
+        "scripts-read",
+    )
+    assert selected.permission_revision == 11
+
+
+def test_all_shell_authority_never_promotes_unpaired_or_broker_grants(
+    tmp_path: Path,
+) -> None:
+    unpaired = tmp_path / "unpaired"
+    broker_only = tmp_path / "broker-only"
+    for root in (unpaired, broker_only):
+        root.mkdir()
+    grants = [
+        {
+            "id": "unpaired-write",
+            "type": "external_directory_write",
+            "scope": "run",
+            "target_kind": "exact_directory",
+            "target": str(unpaired),
+            "capabilities": ["write", "recursive", "external_path", "shell_access"],
+            "binding_schema_version": 3,
+            "bindings": _shell_bindings(),
+            "metadata": {"run_id": "run-one"},
+        },
+        {
+            "id": "broker-read",
+            "type": "external_directory_read",
+            "scope": "run",
+            "target_kind": "exact_directory",
+            "target": str(broker_only),
+            "capabilities": ["read", "recursive", "external_path"],
+            "metadata": {"run_id": "run-one"},
+        },
+    ]
+    effective = EffectiveGrantSet.resolve(
+        grants,
+        run_id="run-one",
+        current_bindings=_bindings(),
+        current_shell_bindings=_shell_bindings(),
+    )
+
+    selected = SelectedGrantSet.all_shell_authority(effective)
+
+    assert selected.grant_ids == ()
+    assert selected.read_roots == ()
+    assert selected.write_roots == ()
+    assert selected.delete_roots == ()

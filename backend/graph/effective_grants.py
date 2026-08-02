@@ -345,3 +345,58 @@ class SelectedGrantSet:
             delete_roots=tuple(sorted(delete_roots, key=str)),
             permission_revision=effective.permission_revision,
         )
+
+    @classmethod
+    def all_shell_authority(cls, effective: EffectiveGrantSet) -> SelectedGrantSet:
+        """Project every active shell-directory Grant into one sandbox profile.
+
+        A ``shell_access`` directory Grant authorizes general shell processes,
+        not one parser-recognized command family.  Keeping the projection tied
+        to statically inferred operands made the parser an accidental command
+        whitelist: Python, shell scripts, sed and ordinary tools could not use
+        authority the user had already granted.  The OS sandbox remains the
+        enforcement boundary; this method never invents a root or capability.
+        """
+
+        selected_ids: set[str] = set()
+        read_roots: set[Path] = set()
+        write_roots: set[Path] = set()
+        delete_roots: set[Path] = set()
+        for grant in effective.grants:
+            if (
+                grant.target_kind != "exact_directory"
+                or "shell_access" not in grant.capabilities
+            ):
+                continue
+            root = Path(grant.target).expanduser()
+            if (
+                not root.is_absolute()
+                or root.is_symlink()
+                or not root.is_dir()
+                or root.resolve() != root
+            ):
+                continue
+            if grant.grant_type == "external_directory_read" and "read" in grant.capabilities:
+                selected_ids.add(grant.grant_id)
+                read_roots.add(root)
+                continue
+            if grant.grant_type != "external_directory_write" or "write" not in grant.capabilities:
+                continue
+            read_matches = effective._matching_shell_grants(root, access="read")
+            if not read_matches:
+                # General writable mounts are also readable.  An unpaired
+                # Broker-style write Grant must never become shell authority.
+                continue
+            read_grant, read_root = read_matches[0]
+            selected_ids.update((grant.grant_id, read_grant.grant_id))
+            read_roots.add(read_root)
+            write_roots.add(root)
+            if "delete" in grant.capabilities:
+                delete_roots.add(root)
+        return cls(
+            grant_ids=tuple(sorted(selected_ids)),
+            read_roots=tuple(sorted(read_roots, key=str)),
+            write_roots=tuple(sorted(write_roots, key=str)),
+            delete_roots=tuple(sorted(delete_roots, key=str)),
+            permission_revision=effective.permission_revision,
+        )

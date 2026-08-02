@@ -26,8 +26,10 @@ from langgraph.config import get_stream_writer
 from langgraph.types import Command
 from typing_extensions import TypedDict
 
+import config
 from graph.effective_grants import EffectiveGrantSet
 from graph.permission_policy import RunPermissionContext
+from graph.prompt_cache import append_control_message
 from graph.session_manager import session_manager
 from graph.trace_collector import get_current_trace_collector
 from harness.models import (
@@ -81,6 +83,23 @@ _GOAL_INSPECTION_ALLOWED_TOOLS = frozenset(
 )
 _CAPABILITY_RECOMMENDATION_MARKER = "[系统 Capability 建议]"
 logger = logging.getLogger(__name__)
+
+# The order is semantic rather than discovery-order.  The explicit prefix
+# keeps the long-lived native/harness schemas in front of Skill/MCP schemas;
+# the remaining names sort lexicographically for deterministic extension.
+_STABLE_TOOL_ORDER = (
+    "ls",
+    "read_file",
+    "glob",
+    "grep",
+    "write_file",
+    "execute",
+    "task",
+    "update_todos",
+    "update_goal",
+    "request_user_input",
+    "read_evidence",
+)
 
 _ARGUMENT_DEPENDENT_PERMISSION_TOOLS = frozenset(
     {
@@ -853,13 +872,50 @@ class ToolsetMiddleware(AgentMiddleware):
         )
         legacy_enabled = self._legacy_external_lease_tools_enabled(request)
         inspection = str(context.get("run_kind") or "") == "goal_inspection"
-        return [
+        visible = [
             tool
             for tool in request.tools
             if self._tool_name(tool) in allowed
             and (not inspection or self._inspection_tool_allowed(self._tool_name(tool)))
             and (legacy_enabled or self._tool_name(tool) not in _LEGACY_EXTERNAL_LEASE_TOOLS)
         ]
+        stable_schema = bool(
+            config.load_config().get("harness", {}).get("prompt_cache", {}).get("stable_tool_schema", False)
+        )
+        if stable_schema:
+            # The schema cohort is a bounded superset of the tools already
+            # mounted for this Agent.  It never invents tools and never bypasses
+            # the per-call Skill/permission gate below.
+            mounted_names = {self._tool_name(tool) for tool in request.tools}
+            installed_skill_tools = {
+                tool_name
+                for skill_id, toolsets in self.toolsets_by_skill.items()
+                if self._refresh_installed_skill(skill_id)
+                for tool_name in tools_for_toolsets(set(toolsets))
+            }
+            stable_names = allowed | (mounted_names & installed_skill_tools)
+            visible = [
+                tool
+                for tool in request.tools
+                if self._tool_name(tool) in stable_names
+                and (not inspection or self._inspection_tool_allowed(self._tool_name(tool)))
+                and (legacy_enabled or self._tool_name(tool) not in _LEGACY_EXTERNAL_LEASE_TOOLS)
+            ]
+        if stable_schema:
+            return self._sort_visible_tools(visible, dynamic_names=installed_skill_tools)
+        return visible
+
+    @classmethod
+    def _sort_visible_tools(cls, tools: list[Any], *, dynamic_names: set[str]) -> list[Any]:
+        order = {name: index for index, name in enumerate(_STABLE_TOOL_ORDER)}
+        return sorted(
+            tools,
+            key=lambda tool: (
+                1 if cls._tool_name(tool) in dynamic_names else 0,
+                order.get(cls._tool_name(tool), len(order)),
+                cls._tool_name(tool),
+            ),
+        )
 
     @staticmethod
     def _inspection_tool_allowed(tool_name: str) -> bool:
@@ -1015,7 +1071,15 @@ class ToolsetMiddleware(AgentMiddleware):
         enabled_toolsets = sorted(
             {toolset for skill_id in active for toolset in self.toolsets_by_skill.get(skill_id, ())}
         )
-        allowed = sorted(self._tool_name(tool) for tool in visible_tools if self._tool_name(tool))
+        allowed_names = self._allowed_tool_names(
+            request.state,
+            policy_epoch=self._context_policy_epoch(str(context.get("session_id") or "")),
+        )
+        allowed = sorted(
+            self._tool_name(tool)
+            for tool in visible_tools
+            if self._tool_name(tool) in allowed_names
+        )
         mounted = sorted({self._tool_name(tool) for tool in request.tools if self._tool_name(tool)})
         unavailable: list[dict[str, Any]] = []
         for name in mounted:
@@ -1174,10 +1238,11 @@ class ToolsetMiddleware(AgentMiddleware):
         sections: list[str] = []
         seen: set[str] = set()
         currently_loaded = set(self._loaded_skill_ids(list(request.messages or [])))
-        for raw in self._valid_activations(
+        activations = self._valid_activations(
             list(request.state.get("skill_activations") or []),
             policy_epoch=policy_epoch,
-        ):
+        )
+        for raw in sorted(activations, key=lambda item: (str(item.get("skill_id") or ""), str(item.get("activation_id") or ""))):
             activation = SkillActivation.model_validate(raw)
             cache_bound = activation.source_tool_call_id.startswith("skill-cache:")
             inherited = bool(run_id and activation.run_id != run_id)
@@ -1242,24 +1307,35 @@ class ToolsetMiddleware(AgentMiddleware):
             get_stream_writer()({"type": "permission_manifest", **permission_audit_payload})
         except (KeyError, RuntimeError):
             pass
-        section = (
+        capability_section = (
             "## Current Capability Manifest (authoritative)\n\n"
-            "Only tools listed below are callable in this model turn. Soft routing hints do not grant tools. "
+            "The allowed list describes tools callable in this model turn. A stable schema cohort may also carry "
+            "inactive tool definitions for cache stability; schemas do not grant access and the server-side Tool "
+            "Gate remains authoritative. Soft routing hints do not grant tools. "
             "`skill_not_activated` is a recoverable capability dependency, not proof that the system lacks the "
             "capability: inspect its `activation_skill_ids`, read the relevant authoritative "
             "`/skills/<skill-id>/SKILL.md`, and continue the task. Do not ask the user to provide data merely "
             "because a required tool is waiting for Skill activation.\n\n"
             f"```json\n{json.dumps(model_payload, ensure_ascii=False, sort_keys=True)}\n```"
         )
-        section += (
+        permission_section = (
             "\n\n## Current Permission Manifest (authoritative)\n\n"
             "This describes authorization for the current Run only. Historical grants and Evidence "
             "do not grant permission; the Tool Gate makes the final per-call decision.\n\n"
             f"```json\n{json.dumps(permission_model_payload, ensure_ascii=False, sort_keys=True)}\n```"
         )
         cached_skill_instructions = self._cached_skill_instruction_section(request)
-        if cached_skill_instructions:
-            section += f"\n\n{cached_skill_instructions}"
+        ordered_sections = bool(
+            config.load_config().get("harness", {}).get("prompt_cache", {}).get("ordered_system_sections", False)
+        )
+        if ordered_sections:
+            section = "\n\n".join(
+                item for item in (cached_skill_instructions, capability_section, permission_section) if item
+            )
+        else:
+            section = capability_section + permission_section
+            if cached_skill_instructions:
+                section += f"\n\n{cached_skill_instructions}"
         updated = request.override(
             tools=visible_tools,
             system_message=append_to_system_message(request.system_message, section),
@@ -1297,6 +1373,16 @@ class ToolsetMiddleware(AgentMiddleware):
             )
             for item in missing
         )
+        if bool(
+            config.load_config().get("harness", {}).get("prompt_cache", {}).get("tail_routing_message", False)
+        ):
+            return request.override(
+                messages=append_control_message(
+                    messages,
+                    section="capability_recommendation",
+                    content=instructions,
+                )
+            )
         messages[index] = original.model_copy(
             update={"content": (f"{original.content}\n\n{_CAPABILITY_RECOMMENDATION_MARKER} {instructions}")}
         )
@@ -1322,10 +1408,20 @@ class ToolsetMiddleware(AgentMiddleware):
         approval_mode = str(permissions.get("approval_mode") or "strict")
         if approval_mode not in {"strict", "smart"}:
             approval_mode = "strict"
+        active_tool_names = self._allowed_tool_names(
+            request.state,
+            policy_epoch=self._context_policy_epoch(session_id),
+        )
         allowed: list[dict[str, Any]] = []
         hitl_required: list[dict[str, Any]] = []
         for tool in visible_tools:
             name = self._tool_name(tool)
+            # A stable schema cohort can include inactive Skill tools. They
+            # are schema-only in this turn and must not appear as executable
+            # permission entries; the capability manifest already explains
+            # their activation dependency.
+            if name not in active_tool_names:
+                continue
             descriptor = tool_control_descriptor(name)
             if name in _ARGUMENT_DEPENDENT_PERMISSION_TOOLS:
                 hitl_required.append(

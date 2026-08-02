@@ -120,6 +120,7 @@ from graph.permission_middleware import ExternalFilePermissionMiddleware
 from graph.permission_policy import RunPermissionContext
 from graph.permission_resume import permission_resume_registry
 from graph.permissioned_filesystem_backend import PermissionedCompositeBackend
+from graph.prompt_cache import CONTROL_SOURCE, is_prompt_control_message
 from graph.session_manager import session_manager
 from graph.skill_plan_resume import skill_plan_resume_registry
 from graph.tool_result_adapter import tool_result_adapter
@@ -248,6 +249,7 @@ _INTERNAL_CONTROL_SOURCES = frozenset(
         "puddingclaw_completion_gate",
         "puddingclaw_goal_continuation",
         GOAL_COMPLETION_REMINDER_SOURCE,
+        CONTROL_SOURCE,
     }
 )
 
@@ -277,6 +279,8 @@ def _message_metadata(message: Any) -> tuple[str, str, dict[str, Any]]:
 
 
 def _is_internal_control_message(message: Any) -> bool:
+    if is_prompt_control_message(message):
+        return True
     role, name, extra = _message_metadata(message)
     if role not in {"human", "user"}:
         return False
@@ -2774,6 +2778,23 @@ class DeepAgentsAgentManager:
                 workspace_backend=getattr(workspace_backend, "execution_backend", workspace_backend),
             ),
         ]
+        prompt_cache_cfg = config.load_config().get("harness", {}).get("prompt_cache", {})
+        if bool(prompt_cache_cfg.get("ordered_system_sections", False)):
+            # Memory is versioned context, not stable core.  Put it after the
+            # project/semantic sections so a memory edit invalidates only its
+            # suffix.  The list order is also reflected in runtime inventory.
+            memory_index = next(
+                (index for index, item in enumerate(middlewares) if isinstance(item, MemoryMiddleware)),
+                None,
+            )
+            semantic_index = next(
+                (index for index, item in enumerate(middlewares) if isinstance(item, SemanticAssetsMiddleware)),
+                None,
+            )
+            if memory_index is not None and semantic_index is not None and memory_index < semantic_index:
+                memory = middlewares.pop(memory_index)
+                semantic_index -= 1
+                middlewares.insert(semantic_index + 1, memory)
         tool_context_cfg = ToolContextConfig.from_mapping(config.get_deepagents_tool_context_config())
         if tool_context_cfg.enabled:
             middlewares.append(ToolContextCompactionMiddleware(tool_context_cfg))
@@ -3286,6 +3307,7 @@ class DeepAgentsAgentManager:
             "subagents": self._subagent_inventory(),
             "package_versions": self._package_versions(),
             "checkpointer": checkpointer or {},
+            "prompt_cache": config.load_config().get("harness", {}).get("prompt_cache", {}),
         }
         if execution_backend is not None:
             inventory["execution"] = {
@@ -4178,10 +4200,12 @@ class DeepAgentsAgentManager:
                     )
                 )
             )
-        detailed_tool_calls: set[int] = set()
+        detailed_tool_calls: set[tuple[int, int]] = set()
         remaining_tool_budget = _HISTORICAL_TOOL_INLINE_BUDGET_CHARS
-        for history_item in reversed(history):
-            for historical_call in reversed(history_item.get("tool_calls") or []):
+        for history_index in range(len(history) - 1, -1, -1):
+            history_item = history[history_index]
+            for call_index in range(len(history_item.get("tool_calls") or []) - 1, -1, -1):
+                historical_call = (history_item.get("tool_calls") or [])[call_index]
                 if not isinstance(historical_call, dict):
                     continue
                 raw_value = str(historical_call.get("raw_output", historical_call.get("output", "")) or "")
@@ -4193,27 +4217,29 @@ class DeepAgentsAgentManager:
                     else min(len(raw_value), 4_000 if len(raw_value) > 16_000 else len(raw_value))
                 )
                 if projected_cost <= remaining_tool_budget:
-                    detailed_tool_calls.add(id(historical_call))
+                    detailed_tool_calls.add((history_index, call_index))
                     remaining_tool_budget -= projected_cost
 
         detailed_text_messages: set[int] = set()
         remaining_text_budget = _HISTORICAL_MESSAGE_INLINE_BUDGET_CHARS
-        for history_item in reversed(history):
+        for history_index in range(len(history) - 1, -1, -1):
+            history_item = history[history_index]
             if history_item.get("tool_calls"):
                 continue
             historical_content = str(history_item.get("content") or "")
             projected_cost = min(len(historical_content), 8_000)
             if projected_cost <= remaining_text_budget:
-                detailed_text_messages.add(id(history_item))
+                detailed_text_messages.add(history_index)
                 remaining_text_budget -= projected_cost
 
         remaining_args_budget = _HISTORICAL_TOOL_ARGS_BUDGET_CHARS
+        used_protocol_ids: set[str] = set()
         for message_index, item in enumerate(history):
             role = item.get("role")
             content = item.get("content")
             if role not in {"user", "assistant", "system"} or content is None:
                 continue
-            if not item.get("tool_calls") and id(item) not in detailed_text_messages:
+            if not item.get("tool_calls") and message_index not in detailed_text_messages:
                 raw_content = str(content)
                 content = f"[Historical message minimal projection]\n{raw_content[:240]}" + (
                     f"\n... [omitted {len(raw_content) - 240} chars]" if len(raw_content) > 240 else ""
@@ -4251,11 +4277,15 @@ class DeepAgentsAgentManager:
                                 str(item.get("query_id") or ""),
                                 str(tc.get("source_run_id") or ""),
                                 persisted_tc_id,
-                                str(message_index),
-                                str(index),
                             )
                         )
                         tc_id = f"historical_{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:24]}"
+                    collision = 1
+                    base_tc_id = tc_id
+                    while tc_id in used_protocol_ids:
+                        collision += 1
+                        tc_id = f"{base_tc_id}_{collision}"
+                    used_protocol_ids.add(tc_id)
                     tool_name = tc.get("tool") or tc.get("name") or "unknown_tool"
                     normalized_tool_calls.append((tc, tool_name, tc_id))
 
@@ -4319,7 +4349,7 @@ class DeepAgentsAgentManager:
                             f"Historical preview/profile:\n{stored_output}"
                         )
                         model_sources = list(tc.get("sources", []) or [])
-                    elif bool(tc.get("historical")) and id(tc) not in detailed_tool_calls:
+                    elif bool(tc.get("historical")) and (message_index, index) not in detailed_tool_calls:
                         raw_text = str(stored_raw_output)
                         model_output = (
                             "[Historical Evidence minimal projection]\n"
@@ -4347,6 +4377,17 @@ class DeepAgentsAgentManager:
                                 f"{raw_text[:2800]}\n\n... [projection omitted {len(raw_text) - 4000} chars] ...\n\n"
                                 f"{raw_text[-1200:]}"
                             )
+                        model_sources = list(tc.get("sources", []) or [])
+                    elif (
+                        isinstance(tc.get("context_compaction"), dict)
+                        and tc["context_compaction"].get("status") == "ready"
+                        and tc["context_compaction"].get("source_hash") == tc.get("source_hash")
+                        and tc.get("context_output")
+                    ):
+                        # A ready post-hoc Tool Context projection is the one
+                        # durable choice for model history, independent of the
+                        # current Run's remaining token budget.
+                        model_output = str(tc.get("context_output"))
                         model_sources = list(tc.get("sources", []) or [])
                     elif tc.get("summary_source") in {"single_tool_overflow", "tool_result_clear"}:
                         model_output = str(stored_output or stored_raw_output)
@@ -6798,20 +6839,20 @@ class DeepAgentsAgentManager:
             system_prompt = build_deepagents_system_prompt(self._base_dir, workspace_path)
             dependency_prompt = dependency_plan_prompt(getattr(agent_backend, "execution_dependency_plan", None))
             if dependency_prompt:
-                system_prompt += f"\n\n{dependency_prompt}"
+                system_prompt += f"\n\n## Current Run Delta\n\n{dependency_prompt}"
             if analytics_model_prompt:
-                system_prompt += analytics_model_prompt
-            system_prompt += _run_artifact_continuity_prompt(run_record)
+                system_prompt += f"\n\n## Versioned Analytics / Semantics\n{analytics_model_prompt}"
+            system_prompt += f"\n\n## Current Run Delta\n{_run_artifact_continuity_prompt(run_record)}"
             if run_record.executes_goal:
                 system_prompt += (
-                    "\n\n## Goal 完成协议\n"
+                    "\n\n## Current Run Delta\n\n## Goal 完成协议\n"
                     "Goal 不会因自然停止而完成。完成前请从原始 Goal 和用户明确要求推导全部必需结果，"
                     "核对真实状态，并执行与改动风险相称且实际需要的检查；只能报告实际执行过的检查。"
                     "只有全部必需项完成且没有已知遗留工作时，才调用 update_goal(completed=true)。"
                     "调用成功后只生成最终回复；若还要调用任何工具或修改产物，必须先继续工作并在最后重新提交完成声明。"
                 )
             if run_record.run_kind == RunKind.GOAL_INSPECTION:
-                system_prompt += self._goal_inspection_prompt(
+                system_prompt += "\n\n## Current Run Delta\n" + self._goal_inspection_prompt(
                     session_id=session_id,
                     run=run_record,
                     todos=persisted_todos,
@@ -8956,6 +8997,35 @@ class DeepAgentsAgentManager:
                     query_id,
                     exc_info=True,
                 )
+
+def build_model_messages(
+    session_json: dict[str, Any] | list[dict[str, Any]],
+    current_query: str,
+    *,
+    attachments: list[dict[str, Any]] | None = None,
+    session_id: str | None = None,
+    workspace_path: str | Path | None = None,
+    query_id: str | None = None,
+) -> list[Any]:
+    """Pure model-message projection from the durable Session fact.
+
+    This public wrapper makes the cache contract explicit: callers provide the
+    same Session JSON and query and receive the same protocol-valid messages;
+    it never reads a checkpoint, generates a new persisted record, or mutates
+    the supplied object.
+    """
+
+    history = session_json.get("messages", []) if isinstance(session_json, dict) else session_json
+    if not isinstance(history, list):
+        history = []
+    return DeepAgentsAgentManager._build_messages(
+        history,
+        current_query,
+        attachments,
+        session_id=session_id,
+        workspace_path=workspace_path,
+        query_id=query_id,
+    )
 
 
 deepagents_agent_manager = DeepAgentsAgentManager()

@@ -143,6 +143,13 @@
     }
   },
   "harness": {
+    "prompt_cache": {
+      "trace_part_diagnostics": true,
+      "ordered_system_sections": false,
+      "tail_routing_message": false,
+      "deterministic_session_projection": false,
+      "stable_tool_schema": false
+    },
     "model_call_limit": {
       "enabled": true,
       "run_limit": 50,

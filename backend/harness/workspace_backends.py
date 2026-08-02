@@ -37,6 +37,75 @@ _LARK_CONFIG_URL = re.compile(
 )
 
 
+def _managed_readonly_path_aliases(
+    docker_config: dict[str, Any],
+) -> tuple[tuple[str, Path], ...]:
+    """Return trusted virtual roots that exist in every execution runner.
+
+    Docker receives these as read-only mounts.  Host runners need the same
+    contract expressed as virtual-to-host aliases instead.
+    """
+
+    aliases: list[tuple[str, Path]] = []
+    for item in docker_config.get("_managed_readonly_mounts") or []:
+        if not isinstance(item, dict):
+            continue
+        virtual_root = str(item.get("target") or "").rstrip("/")
+        # Managed shell resources are intentionally allow-listed.  Other
+        # CompositeBackend namespaces remain file-tool-only.
+        if virtual_root != "/skills":
+            continue
+        source = Path(str(item.get("source") or "")).expanduser()
+        if source.is_symlink() or not source.is_dir():
+            continue
+        canonical = source.resolve()
+        if canonical != source:
+            continue
+        aliases.append((virtual_root, canonical))
+    return tuple(dict.fromkeys(aliases))
+
+
+def _rewrite_managed_virtual_paths(
+    command: str,
+    aliases: tuple[tuple[str, Path], ...],
+) -> str:
+    """Map platform-owned virtual roots without touching partial path names."""
+
+    def quote_state(text: str, position: int) -> str | None:
+        state: str | None = None
+        escaped = False
+        for character in text[:position]:
+            if escaped:
+                escaped = False
+            elif character == "\\" and state != "'":
+                escaped = True
+            elif character in {"'", '"'}:
+                if state == character:
+                    state = None
+                elif state is None:
+                    state = character
+        return state
+
+    mapped = command
+    for virtual_root, host_root in sorted(aliases, key=lambda item: len(item[0]), reverse=True):
+        host_text = str(host_root)
+
+        def replacement(match: re.Match[str]) -> str:
+            state = quote_state(mapped, match.start())
+            if state == "'":
+                return host_text.replace("'", "'\"'\"'")
+            if state == '"':
+                return re.sub(r'([\\"$`])', r"\\\1", host_text)
+            return shlex.quote(host_text)
+
+        mapped = re.sub(
+            rf"(?<![A-Za-z0-9_./-]){re.escape(virtual_root)}(?=(?:/|\s|$|[\"']))",
+            replacement,
+            mapped,
+        )
+    return mapped
+
+
 def _macos_seatbelt_available() -> bool:
     if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").is_file():
         return False
@@ -196,12 +265,17 @@ class RestrictedHostWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         scratch_path: Path | None = None,
         timeout: int = 120,
         max_output_bytes: int = 100_000,
+        managed_readonly_path_aliases: tuple[tuple[str, Path], ...] = (),
     ) -> None:
         super().__init__(root_dir=root_dir, virtual_mode=True)
         self.workspace_path = root_dir.expanduser().resolve()
         self.scratch_path = scratch_path.expanduser().resolve() if scratch_path is not None else None
         self._default_timeout = timeout
         self._max_output_bytes = max_output_bytes
+        self.managed_readonly_path_aliases = tuple(managed_readonly_path_aliases)
+        self.managed_readonly_host_roots = tuple(
+            host_root for _virtual_root, host_root in self.managed_readonly_path_aliases
+        )
         workspace_digest = hashlib.sha256(str(self.workspace_path).encode("utf-8")).hexdigest()[:16]
         self._id = f"restricted-host:{workspace_digest}"
         runtime_dir = self.workspace_path / ".puddingclaw" / "runtime"
@@ -248,6 +322,10 @@ class RestrictedHostWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
                 shlex.quote(str(self.scratch_path)),
                 command,
             )
+        command = _rewrite_managed_virtual_paths(
+            command,
+            self.managed_readonly_path_aliases,
+        )
         effective_timeout = timeout if timeout is not None else self._default_timeout
         if not isinstance(effective_timeout, int) or effective_timeout <= 0:
             raise ValueError("timeout must be a positive integer")
@@ -305,6 +383,7 @@ class KernelWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         root_dir: Path,
         scratch_path: Path,
         timeout: int = 120,
+        managed_readonly_path_aliases: tuple[tuple[str, Path], ...] = (),
     ) -> None:
         super().__init__(root_dir=root_dir, virtual_mode=True)
         self.workspace_path = root_dir.expanduser().resolve()
@@ -314,6 +393,10 @@ class KernelWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         if not _macos_seatbelt_available():
             raise RuntimeError("No supported kernel sandbox is available on this host")
         self._default_timeout = timeout
+        self.managed_readonly_path_aliases = tuple(managed_readonly_path_aliases)
+        self.managed_readonly_host_roots = tuple(
+            host_root for _virtual_root, host_root in self.managed_readonly_path_aliases
+        )
         workspace_digest = hashlib.sha256(
             str(self.workspace_path).encode("utf-8")
         ).hexdigest()[:16]
@@ -356,8 +439,12 @@ class KernelWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
                 output="Error: Kernel execution permit became invalid before process spawn.",
                 exit_code=126,
             )
-        return runner.execute(
+        execution_command = _rewrite_managed_virtual_paths(
             authorized.execution_command,
+            self.managed_readonly_path_aliases,
+        )
+        return runner.execute(
+            execution_command,
             timeout=timeout or self._default_timeout,
             spawn_guard=lambda: authorized.valid_at_spawn(
                 command=command,
@@ -2664,14 +2751,20 @@ class AdaptiveWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         scratch_path: Path,
         docker_config: dict[str, Any],
         timeout: int = 120,
+        managed_readonly_path_aliases: tuple[tuple[str, Path], ...] = (),
     ) -> None:
         super().__init__(root_dir=root_dir, virtual_mode=True)
         self.workspace_path = root_dir.expanduser().resolve()
         self.scratch_path = scratch_path.expanduser().resolve()
+        self.managed_readonly_path_aliases = tuple(managed_readonly_path_aliases)
+        self.managed_readonly_host_roots = tuple(
+            host_root for _virtual_root, host_root in self.managed_readonly_path_aliases
+        )
         self.kernel = KernelWorkspaceBackend(
             root_dir=self.workspace_path,
             scratch_path=self.scratch_path,
             timeout=timeout,
+            managed_readonly_path_aliases=self.managed_readonly_path_aliases,
         )
         self._docker_config = dict(docker_config)
         self._default_timeout = timeout
@@ -2792,6 +2885,7 @@ def build_workspace_execution_backend(
         else bool(terminal_config.get("docker_enabled", False))
     )
     docker_config = dict(terminal_config.get("docker") or {})
+    managed_readonly_aliases = _managed_readonly_path_aliases(docker_config)
     scratch_host_path_raw = str(terminal_config.get("_scratch_host_path") or "").strip()
     scratch_host_path = Path(scratch_host_path_raw) if scratch_host_path_raw else None
     if sandbox_mode in {"auto", "kernel"}:
@@ -2804,6 +2898,7 @@ def build_workspace_execution_backend(
                     scratch_path=scratch_host_path,
                     docker_config=docker_config,
                     timeout=timeout,
+                    managed_readonly_path_aliases=managed_readonly_aliases,
                 )
                 return WorkspaceBackendSelection(
                     backend=adaptive,
@@ -2814,6 +2909,7 @@ def build_workspace_execution_backend(
                     root_dir=workspace_path,
                     scratch_path=scratch_host_path,
                     timeout=timeout,
+                    managed_readonly_path_aliases=managed_readonly_aliases,
                 ),
                 mode="kernel",
             )
@@ -2853,6 +2949,7 @@ def build_workspace_execution_backend(
                 root_dir=workspace_path,
                 scratch_path=scratch_host_path,
                 timeout=timeout,
+                managed_readonly_path_aliases=managed_readonly_aliases,
             ),
             mode="restricted_host",
             fallback_reason=reason,
@@ -2862,6 +2959,7 @@ def build_workspace_execution_backend(
             root_dir=workspace_path,
             scratch_path=scratch_host_path,
             timeout=timeout,
+            managed_readonly_path_aliases=managed_readonly_aliases,
         ),
         mode="restricted_host",
     )

@@ -862,7 +862,6 @@ class SessionManager:
         validated_goal: GoalRecord | None = None
         if goal is not None:
             validated_goal = GoalRecord.model_validate(goal)
-            decision = validated_goal.latest_goal_decision
             if (
                 validated_goal.session_id != session_id
                 or validated_goal.goal_id != validated_run.goal_id
@@ -999,7 +998,6 @@ class SessionManager:
 
         from harness.models import (
             GoalCompletionRequest,
-            GoalCompletionRequestStatus,
             GoalRecord,
             GoalStatus,
             RunRecord,
@@ -3982,11 +3980,24 @@ class SessionManager:
             )
         return {
             key: str(fingerprints.get(key) or "")
-            for key in (
+            for key in fingerprints
+            if key
+            in {
                 "system_prompt_hash",
+                "system_stable_hash",
+                "system_project_hash",
+                "system_versioned_hash",
+                "system_memory_hash",
+                "system_active_runtime_hash",
+                "system_volatile_tail_hash",
                 "tool_schema_hash",
+                "tool_stable_prefix_hash",
+                "tool_full_schema_hash",
                 "messages_hash",
-            )
+                "messages_history_hash",
+                "messages_volatile_tail_hash",
+                "cache_cohort_id",
+            }
         }
 
     @staticmethod
@@ -4034,21 +4045,46 @@ class SessionManager:
                 break
             prefix_count += 1
         prefix_ratio = round(prefix_count / len(previous_messages), 6) if previous_messages else 1.0
+        first_diff_part = "none"
+        first_diff_path = ""
+        for part, paths in (
+            (
+                "system",
+                (
+                    "system_stable_hash",
+                    "system_project_hash",
+                    "system_versioned_hash",
+                    "system_memory_hash",
+                    "system_active_runtime_hash",
+                    "system_volatile_tail_hash",
+                    "system_prompt_hash",
+                ),
+            ),
+            ("tools", ("tool_stable_prefix_hash", "tool_full_schema_hash", "tool_schema_hash")),
+            ("messages", ("messages_history_hash", "messages_volatile_tail_hash", "messages_hash")),
+        ):
+            for path in paths:
+                if previous_fingerprints.get(path) != current_fingerprints.get(path):
+                    first_diff_part = part
+                    first_diff_path = path
+                    break
+            if first_diff_part != "none":
+                break
         system_match = bool(
-            previous_fingerprints["system_prompt_hash"]
-            and previous_fingerprints["system_prompt_hash"] == current_fingerprints["system_prompt_hash"]
+            previous_fingerprints.get("system_prompt_hash")
+            and previous_fingerprints.get("system_prompt_hash") == current_fingerprints.get("system_prompt_hash")
         )
         tool_schema_match = bool(
-            previous_fingerprints["tool_schema_hash"]
-            and previous_fingerprints["tool_schema_hash"] == current_fingerprints["tool_schema_hash"]
+            previous_fingerprints.get("tool_schema_hash")
+            and previous_fingerprints.get("tool_schema_hash") == current_fingerprints.get("tool_schema_hash")
         )
-        return {
+        continuity = {
             "previous_query_id": previous_query_id,
             "system_prompt_hash_match": system_match,
             "tool_schema_hash_match": tool_schema_match,
             "messages_hash_match": bool(
-                previous_fingerprints["messages_hash"]
-                and previous_fingerprints["messages_hash"] == current_fingerprints["messages_hash"]
+                previous_fingerprints.get("messages_hash")
+                and previous_fingerprints.get("messages_hash") == current_fingerprints.get("messages_hash")
             ),
             "previous_message_count": len(previous_messages),
             "current_message_count": len(current_messages),
@@ -4059,6 +4095,47 @@ class SessionManager:
                 system_match and tool_schema_match and prefix_count == len(previous_messages)
             ),
         }
+        partition_keys = {
+            "system_stable_hash",
+            "system_versioned_hash",
+            "system_project_hash",
+            "system_memory_hash",
+            "system_active_runtime_hash",
+            "system_volatile_tail_hash",
+            "tool_stable_prefix_hash",
+            "tool_full_schema_hash",
+            "messages_history_hash",
+            "messages_volatile_tail_hash",
+            "cache_cohort_id",
+        }
+        if partition_keys & (set(previous_fingerprints) | set(current_fingerprints)):
+            continuity.update(
+                {
+                    "cache_cohort_id_match": bool(
+                        previous_fingerprints.get("cache_cohort_id")
+                        and previous_fingerprints.get("cache_cohort_id")
+                        == current_fingerprints.get("cache_cohort_id")
+                    ),
+                    "first_diff_part": first_diff_part,
+                    "first_diff_path": first_diff_path,
+                    "system_stable_hash_match": bool(
+                        previous_fingerprints.get("system_stable_hash")
+                        and previous_fingerprints.get("system_stable_hash")
+                        == current_fingerprints.get("system_stable_hash")
+                    ),
+                    "tool_stable_prefix_hash_match": bool(
+                        previous_fingerprints.get("tool_stable_prefix_hash")
+                        and previous_fingerprints.get("tool_stable_prefix_hash")
+                        == current_fingerprints.get("tool_stable_prefix_hash")
+                    ),
+                    "messages_history_hash_match": bool(
+                        previous_fingerprints.get("messages_history_hash")
+                        and previous_fingerprints.get("messages_history_hash")
+                        == current_fingerprints.get("messages_history_hash")
+                    ),
+                }
+            )
+        return continuity
 
     @_session_write_locked
     def update_trace(
@@ -7904,6 +7981,13 @@ class SessionManager:
             }:
                 current_run_id = str(latest_run_id)
 
+        import config
+
+        deterministic_projection = bool(
+            config.load_config().get("harness", {}).get("prompt_cache", {}).get(
+                "deterministic_session_projection", False
+            )
+        )
         merged: list[dict[str, Any]] = []  # 合并后的结果列表
 
         # A display/archive projection already contains the original logical
@@ -7962,6 +8046,8 @@ class SessionManager:
                     entry["query_id"] = str(msg.get("query_id") or "")
             prev_has_tool_calls = bool(merged[-1].get("_had_tool_calls")) if merged else False
             if (
+                not deterministic_projection
+                and
                 merged  # 列表非空
                 and merged[-1]["role"] == "assistant"  # 上一条是 assistant
                 and msg["role"] == "assistant"  # 当前也是 assistant

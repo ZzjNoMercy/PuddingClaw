@@ -517,6 +517,46 @@ class ShellPolicyAnalyzer:
         """Parse only path operands whose authority can be proven exactly."""
 
         executable = Path(tokens[0]).name.lower()
+        script_interpreters = {
+            "python",
+            "python3",
+            "node",
+            "ruby",
+            "perl",
+            "php",
+            "sh",
+            "bash",
+            "zsh",
+        }
+        if executable in script_interpreters:
+            # Script entry points have one statically provable host dependency:
+            # the interpreter must read the script. Arguments remain ordinary
+            # argv; any additional authorized directory access is constrained
+            # by the active SandboxGrantProfile rather than inferred here.
+            inline_flags = {"-c", "-e", "--eval", "-m"}
+            args = tokens[1:]
+            if not args or any(
+                arg in inline_flags or any(arg.startswith(f"{flag}=") for flag in inline_flags if flag.startswith("--"))
+                for arg in args
+            ):
+                return "unsupported_command_grammar"
+            script_index = next(
+                (index for index, arg in enumerate(tokens[1:], start=1) if not arg.startswith("-")),
+                None,
+            )
+            if script_index is None or tokens[script_index] == "-":
+                return "unsupported_command_grammar"
+            # We can prove that the interpreter reads its entry script, but an
+            # additional absolute path may be an input, output, socket, or some
+            # application-specific target.  Leave that form opaque so the
+            # authority preflight derives a conservative directory prompt for
+            # every external path instead of silently omitting one.
+            if any(
+                Path(arg).expanduser().is_absolute()
+                for arg in tokens[script_index + 1 :]
+            ):
+                return "unsupported_command_grammar"
+            return ([(tokens[script_index], "read")], [script_index])
         short_options = {
             "cp": frozenset("Rrapfnv"),
             "mv": frozenset("fnv"),
@@ -1622,6 +1662,36 @@ class ToolExecutionPipeline(AgentMiddleware):
             }
         )
 
+    @staticmethod
+    def _external_authority_requirements(
+        requirements: ExecutionRequirements,
+    ) -> ExecutionRequirements:
+        """Turn opaque path candidates into a conservative permission request.
+
+        This description is used only to ask for missing directory authority;
+        it is never substituted for the original opaque execution permit.
+        Parsers improve the requested access level, while the OS sandbox still
+        enforces the Grant Profile for commands the parser does not understand.
+        """
+
+        if not requirements.opaque:
+            return requirements
+        if requirements.capabilities.destructive:
+            access = "delete"
+        elif requirements.capabilities.workspace_write:
+            access = "write"
+        else:
+            access = "read"
+        return ExecutionRequirements(
+            capabilities=requirements.capabilities,
+            filesystem_intents=tuple(
+                FilesystemIntent(path=path, access=access)
+                for path in requirements.external_path_candidates
+            ),
+            shell_access_required=bool(requirements.external_path_candidates),
+            external_path_candidates=requirements.external_path_candidates,
+        )
+
     def _require_external_shell_authority(
         self,
         request: ToolCallRequest,
@@ -1639,21 +1709,8 @@ class ToolExecutionPipeline(AgentMiddleware):
             command,
             workspace_path=workspace_path,
         )
-        if requirements.opaque:
-            if not requirements.external_path_candidates:
-                return None
-            return ToolMessage(
-                content=(
-                    "External shell access was denied before execution because the command "
-                    "could not be mapped to an exact directory set "
-                    f"({requirements.opaque_reason}). Split it into supported cp/mv/mkdir/ls "
-                    "segments joined with &&, without redirects or expansion."
-                ),
-                name="execute",
-                tool_call_id=str(request.tool_call.get("id") or ""),
-                status="error",
-            )
-        if not requirements.filesystem_intents:
+        authority_requirements = self._external_authority_requirements(requirements)
+        if not authority_requirements.filesystem_intents:
             return None
         session_id = str(context.get("session_id") or "")
         query_id = str(context.get("query_id") or "")
@@ -1674,7 +1731,7 @@ class ToolExecutionPipeline(AgentMiddleware):
             permission_revision=revision,
         )
         try:
-            SelectedGrantSet.select(effective, requirements)
+            SelectedGrantSet.select(effective, authority_requirements)
             session_manager.transition_run_status(
                 session_id,
                 run_id,
@@ -1685,7 +1742,7 @@ class ToolExecutionPipeline(AgentMiddleware):
         except PermissionError:
             pass
         try:
-            plan = ShellAccessPlan.compile(requirements, effective)
+            plan = ShellAccessPlan.compile(authority_requirements, effective)
         except ValueError as exc:
             return ToolMessage(
                 content=f"External shell access was denied: {exc}",
@@ -1729,7 +1786,7 @@ class ToolExecutionPipeline(AgentMiddleware):
             permission_revision=resumed_revision,
         )
         try:
-            SelectedGrantSet.select(resumed_effective, requirements)
+            SelectedGrantSet.select(resumed_effective, authority_requirements)
         except PermissionError:
             decision = (
                 str(resume_value.get("type") or "")
@@ -1783,17 +1840,12 @@ class ToolExecutionPipeline(AgentMiddleware):
             current_shell_bindings=self.permission_context.shell_grant_bindings(),
             permission_revision=revision,
         )
-        selected = (
-            SelectedGrantSet.select(effective, requirements)
-            if requirements.filesystem_intents
-            else SelectedGrantSet(
-                grant_ids=(),
-                read_roots=(),
-                write_roots=(),
-                delete_roots=(),
-                permission_revision=revision,
-            )
-        )
+        authority_requirements = self._external_authority_requirements(requirements)
+        if authority_requirements.filesystem_intents:
+            # Re-check at permit compilation so a revoked or changed Grant
+            # cannot ride the earlier middleware decision.
+            SelectedGrantSet.select(effective, authority_requirements)
+        selected = SelectedGrantSet.all_shell_authority(effective)
         selected_runner = (
             "docker"
             if self.backend_mode == "docker"
@@ -1805,10 +1857,15 @@ class ToolExecutionPipeline(AgentMiddleware):
             )
             else "kernel_macos_seatbelt"
         )
+        managed_readonly_roots = (
+            tuple(getattr(self.workspace_backend, "managed_readonly_host_roots", ()) or ())
+            if selected_runner == "kernel_macos_seatbelt"
+            else ()
+        )
         profile = SandboxGrantProfile.build(
             workspace_root=workspace,
             scratch_root=scratch,
-            external_read_roots=selected.read_roots,
+            external_read_roots=(*selected.read_roots, *managed_readonly_roots),
             external_write_roots=selected.write_roots,
             external_delete_roots=selected.delete_roots,
             network_allowed=(
@@ -3118,7 +3175,14 @@ class ToolExecutionPipeline(AgentMiddleware):
                 "network_access:embedded_command",
                 "network",
             )
-        smart_result = self._smart_docker_workspace_result(
+        smart_network_result = self._smart_network_result(
+            command=command,
+            result=result,
+            effects=effects,
+        )
+        if smart_network_result is not None:
+            return smart_network_result
+        smart_result = self._smart_sandbox_result(
             command=command,
             result=result,
             effects=effects,
@@ -3253,14 +3317,14 @@ class ToolExecutionPipeline(AgentMiddleware):
             return command
         return f"{command}\n\n# Inspected local shell script: {script.name}\n{content[:12000]}"
 
-    def _smart_docker_workspace_result(
+    def _smart_sandbox_result(
         self,
         *,
         command: str,
         result: ToolPolicyResult,
         effects: ShellCapabilities,
     ) -> ToolPolicyResult | None:
-        """Auto-approve ordinary project work inside the real Docker sandbox.
+        """Auto-approve ordinary work inside an enforced Kernel/Docker profile.
 
         Smart mode is intended to remove approval noise for computation,
         validation, and normal project writes.  The deterministic analyzer has
@@ -3282,12 +3346,11 @@ class ToolExecutionPipeline(AgentMiddleware):
             "managed_workspace_write:find:"
         ):
             return None
-        # Unknown/opaque entry points are the Grok-style gray zone.  They go
-        # through the reviewer instead of being silently treated as ordinary
-        # Docker work.  Unreadable shell files are not reviewable because the
-        # reviewer would see only the innocent-looking ``bash file`` wrapper.
-        if result.reason.startswith(("arbitrary_shell:", "unreadable_shell_script:")):
-            return None
+        script_entrypoint = self._script_entrypoint(command)
+        # Unknown native programs remain a reviewer gray zone. Script entry
+        # points are ordinary sandboxed computation: their effects are bounded
+        # by the same profile as inline Python/Node and do not need a separate
+        # executable-name allowlist.
         if result.reason.startswith(
             (
                 "unknown_command:",
@@ -3296,7 +3359,7 @@ class ToolExecutionPipeline(AgentMiddleware):
                 "node_command",
                 "python_tool:",
             )
-        ):
+        ) and script_entrypoint is None:
             return None
         if result.reason.startswith("managed_git_write:"):
             if not self._smart_git_write_allowed(command, result.reason):
@@ -3316,9 +3379,136 @@ class ToolExecutionPipeline(AgentMiddleware):
 
         return ToolPolicyResult(
             PolicyDecision.ALLOW,
-            "smart_docker_workspace_write" if effects.workspace_write else "smart_docker_workspace_execute",
+            "smart_sandbox_workspace_write" if effects.workspace_write else "smart_sandbox_execute",
             "managed_write" if effects.workspace_write else "low",
         )
+
+    def _smart_network_result(
+        self,
+        *,
+        command: str,
+        result: ToolPolicyResult,
+        effects: ShellCapabilities,
+    ) -> ToolPolicyResult | None:
+        """Allow a narrow public HTTPS read without turning on raw-network trust."""
+
+        if (
+            not self.permission_context.smart
+            or self.permission_context.backend_mode not in {"docker", "adaptive"}
+            or self.backend_mode not in {"docker", "adaptive"}
+            or not effects.network
+            or effects.package_install
+            or effects.destructive
+            or result.decision is PolicyDecision.DENY
+            or not self._smart_public_curl_read(command)
+        ):
+            return None
+        return ToolPolicyResult(
+            PolicyDecision.ALLOW,
+            "smart_controlled_network:curl_public_https_read",
+            "network",
+        )
+
+    @staticmethod
+    def _script_entrypoint(command: str) -> str | None:
+        try:
+            segments = ShellPolicyAnalyzer.parse_segments(command)
+        except ValueError:
+            return None
+        if len(segments) != 1:
+            return None
+        tokens = ShellPolicyAnalyzer.unwrap_command(segments[0])
+        if not tokens:
+            return None
+        executable = Path(tokens[0]).name.lower()
+        if executable in {"python", "python3", "node", "ruby", "perl", "php", "sh", "bash", "zsh"}:
+            return executable
+        if Path(tokens[0]).suffix.lower() in {".py", ".js", ".mjs", ".cjs", ".rb", ".pl", ".php", ".sh", ".zsh"}:
+            return executable
+        return None
+
+    @classmethod
+    def _smart_public_curl_read(cls, command: str) -> bool:
+        if any(marker in command for marker in ("$", "`", "\n", "\r", ">", "<", "|", ";", "&")):
+            return False
+        try:
+            segments = ShellPolicyAnalyzer.parse_segments(command)
+        except ValueError:
+            return False
+        if len(segments) != 1:
+            return False
+        tokens = ShellPolicyAnalyzer.unwrap_command(segments[0])
+        if not tokens or Path(tokens[0]).name.lower() != "curl":
+            return False
+        lowered = [item.lower() for item in tokens[1:]]
+        forbidden_flags = {
+            "-d", "--data", "--data-ascii", "--data-binary", "--data-raw",
+            "--data-urlencode", "-f", "--form", "--form-string", "-t",
+            "--upload-file", "--json", "-u", "--user", "-h", "--header",
+            "-b", "--cookie", "-c", "--cookie-jar", "-k", "--config",
+            "--netrc", "--netrc-file", "--cert", "--key", "-l", "--location",
+            "--location-trusted", "--proxy", "-x", "--resolve", "--connect-to",
+        }
+        if any(
+            item in forbidden_flags
+            or any(item.startswith(f"{flag}=") for flag in forbidden_flags if flag.startswith("--"))
+            or item.startswith("@")
+            for item in lowered
+        ):
+            return False
+        for index, item in enumerate(lowered):
+            if item in {"-x", "--request"}:
+                if index + 1 >= len(lowered) or lowered[index + 1].upper() not in {"GET", "HEAD"}:
+                    return False
+            if item.startswith("--request=") and item.partition("=")[2].upper() not in {"GET", "HEAD"}:
+                return False
+        urls = [item for item in tokens[1:] if item.lower().startswith(("http://", "https://"))]
+        if not urls:
+            return False
+        intent = ShellPolicyAnalyzer.network_intent(command)
+        if not intent.target_known or intent.remote_effect != "read" or len(intent.origins) != len(urls):
+            return False
+        return all(cls._public_https_url(url) for url in urls)
+
+    @staticmethod
+    def _public_https_url(raw_url: str) -> bool:
+        try:
+            parsed = urlsplit(raw_url)
+            port = parsed.port
+        except ValueError:
+            return False
+        if parsed.scheme.lower() != "https" or not parsed.hostname or parsed.username or parsed.password:
+            return False
+        hostname = parsed.hostname.rstrip(".").lower()
+        if hostname == "localhost" or hostname.endswith(
+            (
+                ".localhost",
+                ".local",
+                ".internal",
+                ".home",
+                ".lan",
+                ".home.arpa",
+                ".test",
+                ".example",
+                ".invalid",
+                ".onion",
+            )
+        ):
+            return False
+        try:
+            literal = ipaddress.ip_address(hostname)
+        except ValueError:
+            literal = None
+        if literal is not None:
+            if getattr(literal, "ipv4_mapped", None) is not None:
+                literal = literal.ipv4_mapped
+            if not literal.is_global:
+                return False
+        elif "." not in hostname:
+            # Single-label names commonly resolve only through a local search
+            # domain and are not a statically identifiable public target.
+            return False
+        return port in {None, 443}
 
     @staticmethod
     def _smart_git_write_allowed(command: str, reason: str) -> bool:

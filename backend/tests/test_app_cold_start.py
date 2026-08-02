@@ -67,6 +67,44 @@ def test_mcp_warmup_flattens_taskgroup_and_disambiguates_ready_gbrain(
     assert "unhandled errors in a TaskGroup" not in output
 
 
+def test_mcp_warmup_retries_one_transient_stdio_failure(
+    monkeypatch,
+    capsys,
+) -> None:
+    import config
+    import mcp_clients
+    from mcp_clients import servers
+
+    monkeypatch.setattr(
+        config,
+        "load_config",
+        lambda: {"mcp": {"enabled": [], "auto_enable_gbrain": True}},
+    )
+    monkeypatch.setattr(
+        servers,
+        "effective_mcp_server_names",
+        lambda *_args, **_kwargs: ["gbrain"],
+    )
+    calls = 0
+
+    async def transient_discovery(_enabled):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("connection closed")
+        return [object()] * 17
+
+    monkeypatch.setattr(mcp_clients, "load_filtered_mcp_tools", transient_discovery)
+
+    asyncio.run(app._warm_mcp_discovery(retry_delay_seconds=0))
+
+    output = capsys.readouterr().out
+    assert calls == 2
+    assert "MCP discovery warmed after one cold-start retry: 17 filtered tools" in output
+    assert "warm-up did not complete" not in output
+    assert "gbrain init" not in output
+
+
 def test_lifespan_warms_mcp_after_database_and_before_capabilities() -> None:
     source = inspect.getsource(app.lifespan)
 
