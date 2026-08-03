@@ -834,6 +834,47 @@ def test_historical_skill_reads_do_not_activate_tools(tmp_path) -> None:
     assert "database_sql_execute" not in middleware._allowed_tool_names(update)
 
 
+def test_execute_cannot_use_skill_entrypoint_before_current_skill_activation(tmp_path) -> None:
+    _install_test_skill(tmp_path, "aihot", set())
+    middleware = ToolsetMiddleware(
+        skills_dir=tmp_path,
+        toolsets_by_skill={"aihot": set()},
+    )
+    executed: list[str] = []
+    request = ToolCallRequest(
+        tool_call={
+            "name": "execute",
+            "args": {
+                "command": "python3 /skills/aihot/scripts/aihot_query.py --user-query latest",
+            },
+            "id": "call-stale-entrypoint",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={"messages": [], "active_skill_ids": [], "skill_activations": []},
+        runtime=SimpleNamespace(context={"run_id": "run-new"}),
+    )
+
+    result = middleware.wrap_tool_call(
+        request,
+        lambda _request: executed.append("executed") or ToolMessage(
+            content="unexpected",
+            tool_call_id="call-stale-entrypoint",
+            name="execute",
+        ),
+    )
+
+    assert isinstance(result, ToolMessage)
+    assert result.status == "error"
+    assert "read the current authoritative" in str(result.content).lower()
+    assert result.additional_kwargs["puddingclaw_control_plane"] == {
+        "type": "skill_context_required",
+        "skill_id": "aihot",
+        "original_tool_executed": False,
+    }
+    assert executed == []
+
+
 def test_session_cached_skill_does_not_activate_a_new_run(
     tmp_path,
     monkeypatch,

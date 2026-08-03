@@ -97,6 +97,24 @@ def test_selected_analytics_model_is_context_not_task_intent(
         assert expected_pack in profile.initial_packs
 
 
+def test_ai_insights_deterministically_routes_installed_aihot_skill() -> None:
+    profile = TaskProfileClassifier.classify(
+        message="整理最新的 AI 热点新闻",
+        skill_catalog=[
+            {
+                "skill_id": "aihot",
+                "name": "aihot",
+                "description": "Query current AI news.",
+            }
+        ],
+    )
+
+    assert profile.primary_intent == "ai_insights"
+    assert [item.skill_id for item in profile.skill_candidates] == ["aihot"]
+    assert profile.execution_route == "skill_first"
+    assert "deterministic_skill_route:ai_insights->aihot" in profile.reasons
+
+
 class _TaskClassifierModel:
     def __init__(self, content: str | None = None, error: Exception | None = None):
         self.content = content

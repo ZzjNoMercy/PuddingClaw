@@ -3639,6 +3639,41 @@ def test_historical_context_uses_total_budget_and_unique_protocol_ids() -> None:
     assert any("minimal projection" in str(message.content) for message in tool_messages)
 
 
+def test_historical_skill_read_omits_mutable_instructions_from_model_context() -> None:
+    from graph.deepagents_manager import DeepAgentsAgentManager
+
+    history = [
+        {
+            "role": "assistant",
+            "content": "old skill read",
+            "query_id": "query-old-skill",
+            "tool_calls": [
+                {
+                    "tool": "read_file",
+                    "id": "call-old-skill",
+                    "input": {"file_path": "/skills/aihot/SKILL.md"},
+                    "output": "Always run python3 /skills/aihot/scripts/aihot_query.py",
+                    "raw_output": "Always run python3 /skills/aihot/scripts/aihot_query.py",
+                    "historical": True,
+                    "evidence_id": "evidence-old-skill",
+                    "status": "success",
+                }
+            ],
+        }
+    ]
+
+    messages = DeepAgentsAgentManager._build_messages(
+        history,
+        "整理最新 AI 新闻",
+        session_id="skill-version-session",
+    )
+    tool_message = next(message for message in messages if isinstance(message, ToolMessage))
+
+    assert "Historical Skill instructions omitted" in str(tool_message.content)
+    assert "/skills/aihot/SKILL.md" in str(tool_message.content)
+    assert "aihot_query.py" not in str(tool_message.content)
+
+
 def test_historical_context_budget_covers_tool_args_and_many_short_messages() -> None:
     from langchain_core.messages import messages_to_dict
 

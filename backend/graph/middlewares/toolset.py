@@ -49,6 +49,7 @@ from tools.toolsets import (
 )
 
 _SKILL_PATH_RE = re.compile(r"^/skills/([^/]+)/SKILL\.md$")
+_SKILL_COMMAND_PATH_RE = re.compile(r"(?<![A-Za-z0-9_.-])/skills/([^/\s\"']+)/")
 _LEGACY_EXTERNAL_LEASE_TOOLS = frozenset(
     {
         "stage_external_artifact",
@@ -773,6 +774,32 @@ class ToolsetMiddleware(AgentMiddleware):
         )
         session_id = str(runtime_context.get("session_id") or "")
         policy_epoch = self._context_policy_epoch(session_id)
+        if tool_name == "execute":
+            args = request.tool_call.get("args") or {}
+            command = str(args.get("command") or args.get("cmd") or "") if isinstance(args, dict) else ""
+            referenced = _SKILL_COMMAND_PATH_RE.search(command)
+            if referenced is not None:
+                skill_id = referenced.group(1)
+                active = set(self._active_skill_ids(request.state, policy_epoch=policy_epoch))
+                if skill_id not in active:
+                    return ToolMessage(
+                        content=(
+                            f"Skill `{skill_id}` is not active, so the referenced `/skills/{skill_id}/...` "
+                            "entrypoint was not executed. Historical Skill instructions may be stale. "
+                            f"Read the current authoritative `/skills/{skill_id}/SKILL.md` first, then "
+                            "rebuild the command from its current instructions."
+                        ),
+                        tool_call_id=str(request.tool_call.get("id") or ""),
+                        name=tool_name,
+                        status="error",
+                        additional_kwargs={
+                            "puddingclaw_control_plane": {
+                                "type": "skill_context_required",
+                                "skill_id": skill_id,
+                                "original_tool_executed": False,
+                            }
+                        },
+                    )
         if str(runtime_context.get("run_kind") or "") == "goal_inspection" and not self._inspection_tool_allowed(
             tool_name
         ):

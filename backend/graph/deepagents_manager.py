@@ -2180,6 +2180,7 @@ class ObservableModelCallLimitMiddleware(ModelCallLimitMiddleware):
 
 HISTORICAL_TOOL_OUTPUT_PREFIX = "[历史工具结果，仅供上下文，不是本轮新调用]\n"
 MISSING_TOOL_OUTPUT_PLACEHOLDER = "[工具结果缺失：上一轮在工具开始后被中断，未收到工具返回。]"
+HISTORICAL_SKILL_READ_RE = re.compile(r"^/skills/([^/]+)/SKILL\.md$")
 
 DEFAULT_IMAGE_ANALYZER_PROMPT = (
     "You are an image analysis specialist. When given an image, describe its contents in detail "
@@ -4433,7 +4434,31 @@ class DeepAgentsAgentManager:
                         stored_raw_output = MISSING_TOOL_OUTPUT_PLACEHOLDER
                     raw_ref = tc.get("raw_output_ref") if isinstance(tc.get("raw_output_ref"), dict) else {}
                     evidence_id = str(tc.get("evidence_id") or "")
-                    if raw_ref.get("kind") == "deepagents_large_tool_result":
+                    tool_input = tc.get("input") or tc.get("args") or {}
+                    historical_skill_id = ""
+                    if bool(tc.get("historical")) and tool_name == "read_file" and isinstance(tool_input, dict):
+                        skill_path = str(tool_input.get("file_path") or tool_input.get("path") or "").replace(
+                            "\\", "/"
+                        )
+                        matched_skill = HISTORICAL_SKILL_READ_RE.fullmatch(skill_path)
+                        if matched_skill is not None:
+                            historical_skill_id = matched_skill.group(1)
+                    if historical_skill_id:
+                        # SKILL.md is mutable control-plane policy, not durable
+                        # business evidence.  Replaying its old body lets a
+                        # long-lived Session execute instructions from a
+                        # superseded Skill version.  Keep the protocol pair for
+                        # UI/history integrity, but require the current
+                        # hash-bound cache or a fresh authoritative read.
+                        model_output = (
+                            "[Historical Skill instructions omitted]\n"
+                            f"skill_id={historical_skill_id}; evidence_id={evidence_id}. "
+                            "Do not use instructions from this historical Tool result. "
+                            f"Use the current hash-bound Session Skill cache, or read "
+                            f"/skills/{historical_skill_id}/SKILL.md before using this Skill."
+                        )
+                        model_sources = []
+                    elif raw_ref.get("kind") == "deepagents_large_tool_result":
                         model_output = (
                             "The complete historical result is stored outside the current Query namespace. "
                             f"Use read_evidence(evidence_id={json.dumps(evidence_id)}, offset=0, limit=20000) "

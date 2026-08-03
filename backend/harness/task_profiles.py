@@ -62,6 +62,11 @@ INTENT_REGISTRY: dict[str, dict[str, Any]] = {
             r"(?:openai|anthropic|google\s*(?:ai|deepmind)|deepmind|meta\s*ai|mistral).{0,12}(?:最近|发布|动态|新闻|更新)",
         ],
         "packs": ["core", "web_research"],
+        # This is a deterministic product route, not an LLM guess.  It lets a
+        # hash-valid Session Skill cache be reused on a later AI-news Query;
+        # when the cache is missing or stale, SkillIntentRouter still requires
+        # a fresh authoritative SKILL.md read before execution.
+        "skill_ids": ["aihot"],
     },
     "semantic_dimension": {
         "keywords": ["构建维度", "刷新维度", "车系维度", "crosswalk", "实体匹配", "规范实体"],
@@ -393,13 +398,38 @@ class TaskProfileClassifier:
             if not explicit_web:
                 intents.remove("web_research")
 
+        installed_skill_ids = {
+            str(item.get("skill_id") or item.get("name") or "").strip()
+            for item in (skill_catalog or [])
+            if str(item.get("skill_id") or item.get("name") or "").strip()
+        }
+        deterministic_skill_candidates = [
+            SkillCandidate(
+                skill_id=skill_id,
+                confidence=1.0,
+                evidence=f"确定性任务意图 {intent_id}",
+                explicit=False,
+            )
+            for intent_id in intents
+            for skill_id in INTENT_REGISTRY[intent_id].get("skill_ids", [])
+            if skill_id in installed_skill_ids
+        ]
         profile = cls.profile_from_dimensions(
             work_natures=[item for item in intents if item != "artifact"],
             delivery_forms=["artifact"] if "artifact" in intents else [],
             verification_intents=intents,
+            skill_candidates=deterministic_skill_candidates,
             analytics_model_id=analytics_model_id,
             classifier="deterministic_fallback",
-            reasons=[f"fallback:intent:{intent_id}" for intent_id in intents],
+            reasons=[
+                *(f"fallback:intent:{intent_id}" for intent_id in intents),
+                *(
+                    f"deterministic_skill_route:{intent_id}->{skill_id}"
+                    for intent_id in intents
+                    for skill_id in INTENT_REGISTRY[intent_id].get("skill_ids", [])
+                    if skill_id in installed_skill_ids
+                ),
+            ],
         )
         return cls.with_explicit_skill_requests(
             profile,
