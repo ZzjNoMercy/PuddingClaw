@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import re
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 
 STRUCTURED_TOOL_RESULT_KEY = "puddingclaw_tool_result"
@@ -17,6 +20,28 @@ _FOOTNOTE_DEFINITION_RE = re.compile(
 )
 _UNSUPPORTED_FOOTNOTE_REFERENCE_RE = re.compile(
     r"\[\^(?!src_[A-Za-z0-9_-]+\])[^\]\n]+\]"
+)
+_GENERATED_CITATIONS_RE = re.compile(
+    r"\n*<!-- puddingclaw-citations:start -->.*?"
+    r"<!-- puddingclaw-citations:end -->\n*",
+    re.DOTALL,
+)
+_GENERATED_CITATION_MAP_RE = re.compile(
+    r"<!-- puddingclaw-citation-map: (\{.*?\}) -->"
+)
+_NUMERIC_FOOTNOTE_DEFINITION_RE = re.compile(
+    r"^[ \t]*\[\^(\d+)\]:[ \t]*(.*?)[ \t]*$",
+    re.MULTILINE,
+)
+_GENERATED_HTML_CITATIONS_RE = re.compile(
+    r"\s*<!-- puddingclaw-citations:start -->.*?"
+    r"<!-- puddingclaw-citations:end -->\s*",
+    re.DOTALL,
+)
+_GENERATED_HTML_MARKER_RE = re.compile(
+    r'<sup\s+class="citation"\s+data-source-id="(src_[A-Za-z0-9_-]+)"[^>]*>'
+    r'.*?</sup>',
+    re.DOTALL,
 )
 
 
@@ -216,3 +241,217 @@ def resolve_message_citations(
         if source["source_id"] in cited_ids and source["source_id"] not in current_ids
     ]
     return dedupe_sources(current + reused), citations
+
+
+def _source_link_target(source: dict[str, Any]) -> str:
+    """Return a portable web URL or an exact local ``file://`` target."""
+
+    uri = _clean_text(source.get("uri"))
+    if urlsplit(uri).scheme in {"http", "https"}:
+        return uri
+
+    metadata = source.get("metadata") if isinstance(source.get("metadata"), dict) else {}
+    local_candidates = []
+    if str(source.get("source_type") or "") == "knowledge_image":
+        local_candidates.append(metadata.get("linked_markdown"))
+    local_candidates.extend((metadata.get("file_path"), metadata.get("linked_markdown")))
+    if uri.startswith("/") and not uri.startswith(("/knowledge/", "/workspace/", "/scratch/")):
+        local_candidates.append(uri)
+    for candidate in local_candidates:
+        raw = _clean_text(candidate)
+        if not raw:
+            continue
+        try:
+            return Path(raw).expanduser().resolve(strict=False).as_uri()
+        except (OSError, ValueError):
+            continue
+
+    # Keep non-HTTP schemes such as wiki:// or database:// usable when the
+    # source does not have a host-file counterpart.
+    if urlsplit(uri).scheme:
+        return uri
+    return ""
+
+
+def _source_locator(source: dict[str, Any]) -> str:
+    metadata = source.get("metadata") if isinstance(source.get("metadata"), dict) else {}
+    parts: list[str] = []
+    if source.get("page") not in (None, ""):
+        parts.append(f"第 {source['page']} 页")
+    heading = _clean_text(metadata.get("chunk_title") or metadata.get("header_path"))
+    if heading and heading != "/":
+        parts.append(f"章节：{heading.strip('/')}")
+    chunk_id = _clean_text(source.get("chunk_id"))
+    if chunk_id and chunk_id not in {"tavily-result", "web-result"}:
+        parts.append(f"片段：{chunk_id}")
+    return "；".join(parts)
+
+
+def _markdown_label(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+
+
+def _markdown_source_definition(source: dict[str, Any], source_id: str) -> str:
+    title = _markdown_label(_clean_text(source.get("title")) or source_id)
+    target = _source_link_target(source)
+    label = f"[{title}](<{target.replace('>', '%3E')}>)" if target else title
+    locator = _source_locator(source)
+    return f"{label}{f' — {locator}' if locator else ''}"
+
+
+def materialize_artifact_citations(
+    content: str,
+    sources: list[dict[str, Any]],
+    *,
+    file_path: str,
+) -> tuple[str, dict[str, Any]]:
+    """Make ``src_*`` markers self-contained in Markdown or HTML artifacts.
+
+    Chat keeps structured source objects for interactive citation cards. Files
+    cannot depend on that UI state, so this function derives stable footnote
+    definitions (Markdown) or numbered anchors (HTML) from the same source
+    records at the write boundary. The generated block is tagged and replaced
+    idempotently on later writes or patches.
+    """
+
+    suffix = Path(str(file_path or "")).suffix.lower()
+    if suffix not in {".md", ".markdown", ".html", ".htm"}:
+        return content, {"materialized": 0, "unresolved_source_ids": []}
+
+    source_map = {
+        str(source.get("source_id") or ""): source
+        for source in dedupe_sources(sources)
+        if str(source.get("source_id") or "")
+    }
+    previous_markdown_map: dict[str, str] = {}
+    if suffix in {".html", ".htm"}:
+        cleaned = _GENERATED_HTML_CITATIONS_RE.sub("", str(content or ""))
+        cleaned = _GENERATED_HTML_MARKER_RE.sub(lambda match: f"[^{match.group(1)}]", cleaned)
+    else:
+        raw_content = str(content or "")
+        generated_block = _GENERATED_CITATIONS_RE.search(raw_content)
+        if generated_block:
+            map_match = _GENERATED_CITATION_MAP_RE.search(generated_block.group(0))
+            if map_match:
+                try:
+                    parsed_map = json.loads(map_match.group(1))
+                    if isinstance(parsed_map, dict):
+                        previous_markdown_map = {
+                            str(index): str(source_id)
+                            for index, source_id in parsed_map.items()
+                            if str(index).isdigit() and _CITATION_MARKER_RE.fullmatch(f"[^{source_id}]")
+                        }
+                except json.JSONDecodeError:
+                    previous_markdown_map = {}
+        if previous_markdown_map:
+            # Migrate the short-lived comment-map format without leaving any
+            # machine metadata visible in Markdown renderers that escape HTML.
+            cleaned = _GENERATED_CITATIONS_RE.sub("\n", raw_content)
+            for index, source_id in previous_markdown_map.items():
+                cleaned = re.sub(
+                    rf"\[\^{re.escape(index)}\]",
+                    f"[^{source_id}]",
+                    cleaned,
+                )
+        else:
+            cleaned = raw_content
+    ordered_ids = list(dict.fromkeys(match.group(1) for match in _CITATION_MARKER_RE.finditer(cleaned)))
+    if not ordered_ids:
+        return cleaned, {"materialized": 0, "unresolved_source_ids": []}
+
+    unresolved = [source_id for source_id in ordered_ids if source_id not in source_map]
+    if suffix in {".md", ".markdown"}:
+        existing_definitions = {
+            int(match.group(1)): match.group(2).strip()
+            for match in _NUMERIC_FOOTNOTE_DEFINITION_RE.finditer(cleaned)
+        }
+        definition_indexes = {
+            definition: index for index, definition in existing_definitions.items()
+        }
+        next_index = max(existing_definitions, default=0) + 1
+        indexes: dict[str, int] = {}
+        new_definitions: list[tuple[int, str]] = []
+        for source_id in ordered_ids:
+            source = source_map.get(source_id)
+            definition = (
+                _markdown_source_definition(source, source_id)
+                if source is not None
+                else f"⚠️ 未解析来源 `{source_id}`"
+            )
+            index = definition_indexes.get(definition)
+            if index is None:
+                index = next_index
+                next_index += 1
+                definition_indexes[definition] = index
+                new_definitions.append((index, definition))
+            indexes[source_id] = index
+        rendered_body = _CITATION_MARKER_RE.sub(
+            lambda match: f"[^{indexes[match.group(1)]}]",
+            cleaned,
+        )
+        if new_definitions:
+            rendered_body = (
+                rendered_body.rstrip()
+                + "\n\n"
+                + "\n".join(
+                    f"[^{index}]: {definition}"
+                    for index, definition in new_definitions
+                )
+                + "\n"
+            )
+        return rendered_body, {
+            "materialized": len(ordered_ids) - len(unresolved),
+            "unresolved_source_ids": unresolved,
+        }
+
+    indexes = {source_id: index for index, source_id in enumerate(ordered_ids, start=1)}
+    occurrence_counts: dict[str, int] = {}
+
+    def replace_marker(match: re.Match[str]) -> str:
+        source_id = match.group(1)
+        occurrence_counts[source_id] = occurrence_counts.get(source_id, 0) + 1
+        index = indexes[source_id]
+        return (
+            f'<sup class="citation" data-source-id="{html.escape(source_id)}" '
+            f'id="cite-ref-{html.escape(source_id)}-{occurrence_counts[source_id]}">'
+            f'<a href="#cite-source-{html.escape(source_id)}" aria-label="引用 {index}">[{index}]</a>'
+            "</sup>"
+        )
+
+    rendered = _CITATION_MARKER_RE.sub(replace_marker, cleaned)
+    items: list[str] = []
+    for source_id in ordered_ids:
+        source = source_map.get(source_id)
+        index = indexes[source_id]
+        if source is None:
+            description = f"⚠️ 未解析来源 {html.escape(source_id)}"
+        else:
+            title = html.escape(_clean_text(source.get("title")) or source_id)
+            target = _source_link_target(source)
+            description = (
+                f'<a href="{html.escape(target, quote=True)}">{title}</a>' if target else title
+            )
+            locator = _source_locator(source)
+            if locator:
+                description += f" — {html.escape(locator)}"
+        items.append(
+            f'<li id="cite-source-{html.escape(source_id)}" value="{index}">{description} '
+            f'<a href="#cite-ref-{html.escape(source_id)}-1" aria-label="返回正文">↩</a></li>'
+        )
+    block = (
+        '<!-- puddingclaw-citations:start -->\n'
+        '<section class="citation-references" aria-label="引用">\n'
+        '<h2>引用</h2>\n<ol>\n'
+        + "\n".join(items)
+        + "\n</ol>\n</section>\n"
+        '<!-- puddingclaw-citations:end -->'
+    )
+    body_close = re.search(r"</body\s*>", rendered, re.IGNORECASE)
+    if body_close:
+        rendered = rendered[:body_close.start()] + block + "\n" + rendered[body_close.start():]
+    else:
+        rendered = rendered.rstrip() + "\n" + block + "\n"
+    return rendered, {
+        "materialized": len(ordered_ids) - len(unresolved),
+        "unresolved_source_ids": unresolved,
+    }

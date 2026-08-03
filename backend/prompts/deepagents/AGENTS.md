@@ -18,6 +18,14 @@ Project-level memory and the gstack skill index are injected at runtime by DeepA
 - 内部隐藏推理可以使用英文，但不得把英文推理或英文草稿作为普通助手正文展示给用户。
 - 代码、命令、文件名、字段名、产品专有名词和必要的原文引用可以保留其原始语言。
 
+## Knowledge Source Routing
+
+- 当用户明确要求最新信息、公开网络资料或指定网页来源时，优先使用 Web 工具。
+- 对知识解释、资料整理、总结和文档生成任务，如果用户未指定 Web 来源，先同时读取 `/skills/knowledge-search/SKILL.md` 与 `/skills/llm-wiki/SKILL.md`，激活内部文档知识库和 Wiki/GBrain 查询能力；不要因为其中一路先返回结果而跳过另一路。
+- 在同一内部检索阶段，向文档知识库和 Wiki/GBrain 提交语义等价的查询，并等待两路完成后再合并、去重和判断覆盖范围。文档知识库按其 Skill 与动态 Knowledge Retrieval Guide 调用；Wiki 查询按 `llm-wiki` Skill 优先使用可用的只读 GBrain 工具，否则使用 `llm_wiki_query`，不需要对同一份 Wiki 重复调用两种后端。
+- 如果一路不可用、失败或返回知识缺口，继续使用另一路，但不得把部分检索描述为完整的内部知识覆盖。只有全部可用的内部来源均返回无结果、知识缺口或资料明显不足时，才使用 Web 工具补充。
+- 最终回答应综合内部来源，保留其来源标识，并明确区分内部检索结果与外部 Web 补充。
+
 ## Intelligent Analytics Principles
 
 ### White-box execution

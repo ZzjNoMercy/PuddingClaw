@@ -513,12 +513,16 @@ class LlmWikiService:
                     hashes[relative] = f"mismatch:{expected}:{actual}"
         return hashes
 
-    def _compiled_raw_receipts(self, *, bundle_hash: str) -> dict[str, dict[str, Any]]:
-        """Project successful publish receipts into current-Bundle Raw coverage.
+    def _compiled_raw_receipts(self) -> dict[str, dict[str, Any]]:
+        """Project successful publish receipts into immutable Raw coverage.
 
         A selected Raw is not necessarily consumed, so the receipt's
-        ``consumed_raw_by_page`` map is the authority. Corrupt, failed, stale-
-        Bundle, or hash-mismatched receipts never hide a Raw from the queue.
+        ``consumed_raw_by_page`` map is the authority. Compilation survives a
+        compatible Schema migration because that migration validates and
+        rewrites the published Wiki rather than changing the immutable Raw.
+        Only a new Raw hash requires recompilation. Retired pages are removed
+        from ``compiled_pages``, while their source Raw remains processed and
+        therefore does not re-enter the pending queue.
         """
 
         compiled: dict[str, dict[str, Any]] = {}
@@ -531,7 +535,7 @@ class LlmWikiService:
                 receipt = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
-            if receipt.get("status") != "published" or receipt.get("bundle_hash") != bundle_hash:
+            if receipt.get("status") != "published":
                 continue
             receipts.append(receipt)
         receipts.sort(key=lambda item: (str(item.get("published_at") or ""), str(item.get("job_id") or "")))
@@ -561,14 +565,17 @@ class LlmWikiService:
                     entry["pages"].add(str(page_slug))
                     entry["job_ids"].add(job_id)
                     entry["compiled_at"] = max(str(entry["compiled_at"]), published_at)
-        return {path: entry for path, entry in compiled.items() if entry["pages"]}
+        active_pages = {_wiki_slug(self.wiki_dir, path) for path in _wiki_page_paths(self.wiki_dir)}
+        for entry in compiled.values():
+            entry["pages"].intersection_update(active_pages)
+        return compiled
 
     def workspace_status(self) -> dict[str, Any]:
         """Return the small, user-facing state needed by the LLM Wiki workbench."""
 
         bundle = self._require_initialized()
         raw_hashes = self._raw_hashes()
-        compiled_receipts = self._compiled_raw_receipts(bundle_hash=bundle["bundle_hash"])
+        compiled_receipts = self._compiled_raw_receipts()
         raw_records: list[dict[str, Any]] = []
         for record in self._manifest_records():
             snapshot_path = str(record.get("snapshot_path") or "")

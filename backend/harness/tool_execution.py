@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import ipaddress
 import json
+import logging
 import re
 import shlex
 import stat
@@ -27,6 +28,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.types import Command, interrupt
 
 from graph.effective_grants import EffectiveGrantSet, SelectedGrantSet
+from graph.citations import dedupe_sources, materialize_artifact_citations
 from graph.permission_policy import RunPermissionContext
 from graph.permission_resume import permission_resume_registry
 from graph.session_manager import session_manager
@@ -42,6 +44,8 @@ from runtime_identity.adapters import (
     UnsupportedManagedCliCommand,
 )
 from tools.toolsets import tool_control_descriptor
+
+logger = logging.getLogger(__name__)
 
 
 class PolicyDecision(StrEnum):
@@ -2516,6 +2520,7 @@ class ToolExecutionPipeline(AgentMiddleware):
                 artifact=artifact,
             )
         if managed_add is None:
+            request = self._materialize_cited_write_request(request)
             return await self._invoke_handler_with_execution_permit(request, handler)
         if self.base_dir is None:
             return ToolMessage(
@@ -2583,6 +2588,47 @@ class ToolExecutionPipeline(AgentMiddleware):
             tool_call_id=str(request.tool_call.get("id") or ""),
             status=status,
         )
+
+    def _materialize_cited_write_request(self, request: ToolCallRequest) -> ToolCallRequest:
+        """Make full Markdown/HTML writes independent from the chat renderer."""
+
+        tool_name = str(request.tool_call.get("name") or "")
+        if tool_name not in {"write_file", "replace_file"}:
+            return request
+        args = request.tool_call.get("args")
+        if not isinstance(args, dict):
+            return request
+        file_path = str(args.get("file_path") or "")
+        content = args.get("content")
+        if not isinstance(content, str) or Path(file_path).suffix.lower() not in {
+            ".md", ".markdown", ".html", ".htm",
+        }:
+            return request
+        session_id = str(self._context(request).get("session_id") or "")
+        if not session_id:
+            return request
+        sources = dedupe_sources([
+            source
+            for message in session_manager.load_session(session_id)
+            for source in message.get("sources", []) or []
+            if isinstance(source, dict)
+        ])
+        rendered, report = materialize_artifact_citations(
+            content,
+            sources,
+            file_path=file_path,
+        )
+        if rendered == content:
+            return request
+        if report.get("unresolved_source_ids"):
+            logger.warning(
+                "Artifact citation materialization has unresolved sources: session=%s file=%s ids=%s",
+                session_id,
+                file_path,
+                report["unresolved_source_ids"],
+            )
+        updated_args = {**args, "content": rendered}
+        return request.override(tool_call={**request.tool_call, "args": updated_args})
 
     @classmethod
     def _managed_npx_rejection(cls, request: ToolCallRequest) -> ToolMessage:

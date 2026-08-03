@@ -30,6 +30,7 @@ import {
   Pin,
   Loader2,
   ListChecks,
+  FlaskConical,
 } from "lucide-react";
 import { useApp } from "@/lib/store";
 import { openProject, type SessionSearchResult } from "@/lib/api";
@@ -330,6 +331,17 @@ export default function Sidebar() {
         >
           <Puzzle className="w-4 h-4" />
           扩展
+        </Link>
+        <Link
+          href="/evaluation/datasets"
+          className={`w-full flex items-center gap-2 px-3 py-2 text-[13px] rounded-xl transition-all ${
+            pathname.startsWith("/evaluation")
+              ? "bg-[#002fa7] text-white font-medium shadow-sm shadow-[#002fa7]/20"
+              : "text-gray-600 hover:text-gray-900 hover:bg-white/50"
+          }`}
+        >
+          <FlaskConical className="w-4 h-4" />
+          评估
         </Link>
         <SidebarLink icon={Workflow} label="定时任务" muted />
         <Link

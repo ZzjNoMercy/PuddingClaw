@@ -28,6 +28,7 @@ from analytics.nl2sql.sql_runner import (
     _compact_rows,
     _estimate_tokens,
     _profile_from_rows,
+    _referenced_tables,
     _trim_profile_to_token_budget,
     extract_sql,
     validate_readonly_sql,
@@ -75,13 +76,9 @@ def test_product_configuration_model_declares_default_pickup_exclusion() -> None
 
 @pytest.mark.asyncio
 async def test_result_source_rejects_generation_id_with_actionable_guidance() -> None:
-    result = await DatabaseQueryResultSourceTool(
-        session_id="source-adapter-session"
-    )._arun(
+    result = await DatabaseQueryResultSourceTool(session_id="source-adapter-session")._arun(
         result_id="sql-gen-not-a-result",
-        runtime=SimpleNamespace(
-            context={"session_id": "source-adapter-session"}
-        ),
+        runtime=SimpleNamespace(context={"session_id": "source-adapter-session"}),
     )
 
     payload = json.loads(result)
@@ -134,8 +131,7 @@ async def test_result_store_row_cap_failure_is_actionable(
             "row_count": 5905,
             "materialization_row_cap": 5000,
             "next_action": (
-                "narrow_or_aggregate_the_query_or_raise_"
-                "result_materialization_row_cap_then_rerun_database_query"
+                "narrow_or_aggregate_the_query_or_raise_result_materialization_row_cap_then_rerun_database_query"
             ),
         }
     ]
@@ -260,7 +256,7 @@ async def test_grounded_sql_keeps_long_l2_question_raw_for_vanna_retrieval() -> 
         @staticmethod
         def submit_prompt(prompt: list[dict[str, str]], **_kwargs: Any) -> str:
             calls.append(("refine", prompt[1]["content"]))
-            assert "canonical_name\": \"驾驶辅助级别" in prompt[1]["content"]
+            assert 'canonical_name": "驾驶辅助级别' in prompt[1]["content"]
             assert "语义资产中的自然语言概念“自动驾驶级别”" in prompt[1]["content"]
             assert "数据库实体证据在物理名称或存储值上冲突时" in prompt[0]["content"]
             return "SELECT COUNT(*) FROM vehicle_params WHERE type_name = '驾驶辅助级别'"
@@ -289,8 +285,7 @@ async def test_grounded_sql_keeps_long_l2_question_raw_for_vanna_retrieval() -> 
     )
 
     retrieval_calls = [
-        value for name, value in calls
-        if name in {"ddl", "documentation", "sql_examples", "generate_sql"}
+        value for name, value in calls if name in {"ddl", "documentation", "sql_examples", "generate_sql"}
     ]
     assert retrieval_calls and all(value == question for value in retrieval_calls)
     # A second, typed entity lookup is intentionally scoped to the unsupported
@@ -378,8 +373,7 @@ async def test_legacy_database_tool_forwards_strict_result_owner_context(
 
 def test_profile_fixture_keeps_omitted_tengshi_group_visible() -> None:
     rows = [
-        {"车型名称": f"比亚迪车型{i}", "品牌": "比亚迪", "上市日期": "2026-06-01", "价格": "10.00"}
-        for i in range(20)
+        {"车型名称": f"比亚迪车型{i}", "品牌": "比亚迪", "上市日期": "2026-06-01", "价格": "10.00"} for i in range(20)
     ] + [
         {"车型名称": "腾势车型1", "品牌": "腾势", "上市日期": "2026-06-23", "价格": "31.98"},
         {"车型名称": "腾势车型2", "品牌": "腾势", "上市日期": "2026-06-23", "价格": "34.98"},
@@ -412,8 +406,7 @@ def test_profile_token_budget_trims_distribution_evidence() -> None:
 
 def test_budget_fixture_marks_preview_only_with_omitted_count() -> None:
     rows = [
-        {"车型名称": f"比亚迪车型{i}", "品牌": "比亚迪", "上市日期": "2026-06-01", "价格": "10.00"}
-        for i in range(20)
+        {"车型名称": f"比亚迪车型{i}", "品牌": "比亚迪", "上市日期": "2026-06-01", "价格": "10.00"} for i in range(20)
     ] + [
         {"车型名称": "腾势车型1", "品牌": "腾势", "上市日期": "2026-06-23", "价格": "31.98"},
         {"车型名称": "腾势车型2", "品牌": "腾势", "上市日期": "2026-06-23", "价格": "34.98"},
@@ -473,6 +466,104 @@ def test_validate_readonly_sql_does_not_treat_extract_from_to_date_as_table() ->
     clean_sql = validate_readonly_sql(sql, allowed_tables=["vehicle_params"])
 
     assert "to_date" in clean_sql
+
+
+def test_validate_readonly_sql_does_not_treat_is_not_distinct_from_column_as_table() -> None:
+    sql = """WITH model_latest AS (
+      SELECT MAX(launch_date) AS latest_launch_date_by_model
+      FROM vehicle_model_base
+    ),
+    config_latest AS (
+      SELECT MAX(launch_date) AS latest_launch_date_by_config
+      FROM vehicle_params
+    )
+    SELECT ml.latest_launch_date_by_model IS NOT DISTINCT FROM cl.latest_launch_date_by_config
+    FROM model_latest ml
+    CROSS JOIN config_latest cl"""
+
+    clean_sql = validate_readonly_sql(
+        sql,
+        allowed_tables=["vehicle_model_base", "vehicle_params"],
+    )
+
+    assert "IS NOT DISTINCT FROM" in clean_sql
+    assert _referenced_tables(sql) == {"vehicle_model_base", "vehicle_params"}
+
+
+def test_validate_readonly_sql_does_not_treat_is_distinct_from_column_as_table() -> None:
+    sql = "SELECT left_row.value IS DISTINCT FROM right_row.value FROM vehicle_params left_row JOIN vehicle_model_base right_row ON TRUE"
+
+    assert (
+        validate_readonly_sql(
+            sql,
+            allowed_tables=["vehicle_params", "vehicle_model_base"],
+        )
+        == sql
+    )
+
+
+def test_validate_readonly_sql_preserves_schema_qualified_table_scope() -> None:
+    sql = 'SELECT vp.car_name FROM "public"."vehicle_params" vp'
+
+    assert _referenced_tables(sql) == {"public.vehicle_params"}
+    assert validate_readonly_sql(sql, allowed_tables=["public.vehicle_params"]) == sql
+
+
+def test_validate_readonly_sql_rejects_unauthorized_table_inside_cte() -> None:
+    sql = """WITH hidden AS (
+      SELECT * FROM private.secret_models
+    )
+    SELECT * FROM hidden"""
+
+    with pytest.raises(SqlRunnerError, match="private.secret_models"):
+        validate_readonly_sql(sql, allowed_tables=["vehicle_params"])
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM dblink('connection', 'SELECT * FROM secret') AS t(id int)",
+        "SELECT * FROM generate_series(1, 3) AS n",
+        "SELECT * FROM unnest(ARRAY[1, 2]) AS n",
+    ],
+)
+def test_validate_readonly_sql_fails_closed_for_table_functions(sql: str) -> None:
+    with pytest.raises(SqlRunnerError, match=r"未授权的(?:表函数|关系或系统读取函数)"):
+        validate_readonly_sql(sql, allowed_tables=["vehicle_params"])
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT query_to_xml('SELECT * FROM private.secret', true, false, '')",
+        "SELECT table_to_xml('private.secret'::regclass, true, false, '')",
+        "SELECT pg_read_file('/etc/passwd')",
+    ],
+)
+def test_validate_readonly_sql_fails_closed_for_dynamic_relation_readers(sql: str) -> None:
+    with pytest.raises(SqlRunnerError, match="未授权的关系或系统读取函数"):
+        validate_readonly_sql(sql, allowed_tables=["vehicle_params"])
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT secret_reader()",
+        "SELECT public.secret_reader()",
+        "SELECT public.jsonb_agg(car_name) FROM vehicle_params",
+        "SELECT convert_from(lo_get(1234), 'UTF8')",
+        "SELECT loread(1234, 4096)",
+    ],
+)
+def test_validate_readonly_sql_rejects_unregistered_scalar_relation_readers(sql: str) -> None:
+    with pytest.raises(SqlRunnerError, match="未授权的"):
+        validate_readonly_sql(sql, allowed_tables=["vehicle_params"])
+
+
+def test_validate_readonly_sql_allows_explicit_safe_postgres_aggregate_exception() -> None:
+    sql = "SELECT jsonb_agg(car_name) FROM vehicle_params"
+
+    assert validate_readonly_sql(sql, allowed_tables=["vehicle_params"]) == sql
 
 
 def test_validate_readonly_sql_recognizes_commented_chained_ctes() -> None:
@@ -675,9 +766,7 @@ async def test_persisted_execution_reads_all_206_rows_across_pages(
         assert page_2["has_next"] is True
         assert len(page_3["rows"]) == 6
         assert page_3["has_next"] is False
-        assert [row["row_number"] for row in page_1["rows"] + page_2["rows"] + page_3["rows"]] == list(
-            range(206)
-        )
+        assert [row["row_number"] for row in page_1["rows"] + page_2["rows"] + page_3["rows"]] == list(range(206))
         artifact = result_store_module.RESULT_DIR / f"{execution.result_id}.jsonl"
         artifact.write_text('{"row_number":999}\n', encoding="utf-8")
         async with sessionmaker() as session:
@@ -720,10 +809,7 @@ async def test_database_result_adapts_to_generic_source_reference_without_rows(
         state.mkdir()
         session_manager.initialize(state)
         session_manager.create_session("source-adapter-session")
-        rows = [
-            {"year": 2021 + index % 6, "config": f"配置-{index}"}
-            for index in range(337)
-        ]
+        rows = [{"year": 2021 + index % 6, "config": f"配置-{index}"} for index in range(337)]
         execution = SqlExecutionResult(
             columns=["year", "config"],
             rows=rows[:20],
@@ -749,9 +835,7 @@ async def test_database_result_adapts_to_generic_source_reference_without_rows(
                 producer_receipt_ids=["sql-validation-receipt"],
             )
 
-        result = await DatabaseQueryResultSourceTool(
-            session_id="source-adapter-session"
-        )._arun(
+        result = await DatabaseQueryResultSourceTool(session_id="source-adapter-session")._arun(
             result_id=str(execution.result_id),
             runtime=SimpleNamespace(
                 context={
@@ -843,9 +927,7 @@ async def test_backfill_query_result_catalog_recovers_legacy_owner(
             assert record.tool_call_id == "call-legacy-owner"
 
         catalog = json.loads(
-            (result_store_module.RESULT_DIR / ".catalog" / "qr-legacy-owner.json").read_text(
-                encoding="utf-8"
-            )
+            (result_store_module.RESULT_DIR / ".catalog" / "qr-legacy-owner.json").read_text(encoding="utf-8")
         )
         assert catalog["session_id"] == "legacy-result-session"
         assert catalog["tool_call_id"] == "call-legacy-owner"
@@ -855,9 +937,7 @@ async def test_backfill_query_result_catalog_recovers_legacy_owner(
         async with sessionmaker() as session:
             assert await result_store_module.backfill_query_result_catalogs(session) == 0
         catalog_after_restart = json.loads(
-            (result_store_module.RESULT_DIR / ".catalog" / "qr-legacy-owner.json").read_text(
-                encoding="utf-8"
-            )
+            (result_store_module.RESULT_DIR / ".catalog" / "qr-legacy-owner.json").read_text(encoding="utf-8")
         )
         assert catalog_after_restart["artifact_sha256"] == immutable_hash
     finally:
@@ -1032,9 +1112,7 @@ async def test_persist_registers_creating_owner_before_publishing_final_files(
 
             async def tracked_commit() -> None:
                 await original_commit()
-                result = await session.execute(
-                    select(AnalyticsQueryResult)
-                )
+                result = await session.execute(select(AnalyticsQueryResult))
                 record = result.scalars().first()
                 if record is not None:
                     committed_states.append(

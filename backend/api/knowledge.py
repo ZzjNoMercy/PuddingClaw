@@ -30,33 +30,39 @@ from knowledge.database_sources import (
     KnowledgeDatabaseSourceError,
     delete_database_source,
     get_database_source,
-    list_database_table_columns,
     list_database_sources,
+    list_database_table_columns,
     list_database_tables,
     test_database_source,
     upsert_database_source,
 )
 from knowledge.import_jobs import (
+    clear_import_jobs,
+    create_document_vector_publish_job,
     create_import_job,
     create_vanna_entity_import_job,
     create_vector_publish_job,
-    clear_import_jobs,
     delete_import_job,
     event_to_dict,
     get_import_job,
     job_to_dict,
     job_to_list_dict,
-    list_related_import_events,
     list_import_jobs,
+    list_related_import_events,
     retry_import_job,
     task_source_path,
 )
 from knowledge.indexer import reset_multimodal_collections
-from knowledge.paths import get_knowledge_originals_dir, get_knowledge_root
 from knowledge.llm_wiki import LlmWikiError, get_llm_wiki_service
-from knowledge.models import new_id
-from knowledge.models import KnowledgeDocument
-from knowledge.service import DEFAULT_KNOWLEDGE_BASE_ID, KnowledgeService, KnowledgeServiceError, _slugify, document_to_dict
+from knowledge.models import KnowledgeDocument, new_id
+from knowledge.paths import get_knowledge_originals_dir, get_knowledge_root
+from knowledge.service import (
+    DEFAULT_KNOWLEDGE_BASE_ID,
+    KnowledgeService,
+    KnowledgeServiceError,
+    _slugify,
+    document_to_dict,
+)
 from tools.pandas_knowledge_tool import PandasKnowledgeQueryTool
 from tools.search_knowledge_tool import LlamaIndexKnowledgeQueryTool
 
@@ -578,6 +584,28 @@ async def publish_import_job_vector(
     try:
         vector_job = await create_vector_publish_job(session, base_dir=BASE_DIR, source_job=job)
         return {"job": job_to_dict(vector_job), "queued": True, "source_job_id": job.id}
+    except KnowledgeServiceError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        await session.rollback()
+        raise HTTPException(status_code=503, detail=f"Failed to create vector import job: {exc}") from exc
+
+
+@router.post("/documents/{document_id}/publish-vector")
+async def publish_document_vector(
+    document_id: str,
+    session: AsyncSession = Depends(get_db_session),
+):
+    document = await session.get(KnowledgeDocument, document_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail=f"Knowledge document not found: {document_id}")
+    if document.source_type != "pdf_mineru":
+        raise HTTPException(status_code=400, detail="当前入口只用于重建已导入 PDF 的向量索引。")
+
+    try:
+        vector_job = await create_document_vector_publish_job(session, base_dir=BASE_DIR, document=document)
+        return {"job": job_to_dict(vector_job), "queued": vector_job.status == "queued"}
     except KnowledgeServiceError as exc:
         await session.rollback()
         raise HTTPException(status_code=400, detail=str(exc)) from exc

@@ -264,7 +264,7 @@ export default function KnowledgeImportJobsPage() {
 
         <main className="workspace-content-frame flex min-w-0 flex-1 flex-col overflow-hidden">
           <div className="flex-1 overflow-y-auto">
-            <div className="mx-auto flex w-full max-w-6xl flex-col gap-5 px-5 py-6">
+            <div className="workspace-page-container flex flex-col gap-5">
               <div className="flex items-center justify-between gap-4">
                 <div>
                   <h1 className="text-2xl font-semibold tracking-tight text-gray-950">任务中心</h1>

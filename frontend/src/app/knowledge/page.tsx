@@ -28,16 +28,19 @@ import {
   getKnowledgeStatus,
   listKnowledgeDatabaseSourceTables,
   listKnowledgeDatabaseSources,
+  listKnowledgeDocuments,
   listKnowledgeImportJobs,
   listKnowledgeFiles,
   listTableAssets,
   previewKnowledgeFile,
+  publishKnowledgeDocumentVector,
   snapshotKnowledgeFileToLlmWikiRaw,
   createKnowledgeImportJob,
   saveKnowledgeDatabaseSource,
   testKnowledgeDatabaseSource,
   type KnowledgeDatabaseSource,
   type KnowledgeDirectoryFile,
+  type KnowledgeDocument,
   type KnowledgeFilePreview,
   type KnowledgeImportJob,
   type KnowledgeStatus,
@@ -139,12 +142,13 @@ function KnowledgeFileTree({
       <button
         type="button"
         onClick={() => onPreview(node)}
-        className={`group flex w-full items-center gap-2 rounded-xl px-2 py-1.5 text-left text-[12px] transition ${
+        className={`group flex w-full items-center gap-1.5 rounded-xl px-2 py-1.5 text-left text-[12px] transition ${
           selected ? "bg-[#002fa7]/10 text-[#002fa7]" : "text-gray-700 hover:bg-[#002fa7]/[0.05]"
         }`}
         style={{ paddingLeft: `${Math.min(depth, 5) * 10 + 8}px` }}
         title={node.storage_path}
       >
+        <span aria-hidden="true" className="h-3.5 w-3.5 shrink-0" />
         <FileText className="h-3.5 w-3.5 shrink-0 text-[#002fa7]/75" />
         <span className="min-w-0 flex-1 truncate">{node.name}</span>
         {typeof node.size_bytes === "number" ? (
@@ -208,6 +212,7 @@ export default function KnowledgePage() {
   } = useApp();
   const [status, setStatus] = useState<KnowledgeStatus | null>(null);
   const [directoryFiles, setDirectoryFiles] = useState<KnowledgeDirectoryFile[]>([]);
+  const [documents, setDocuments] = useState<KnowledgeDocument[]>([]);
   const [importJobs, setImportJobs] = useState<KnowledgeImportJob[]>([]);
   const [tableAssets, setTableAssets] = useState<TableAsset[]>([]);
   const [databaseSources, setDatabaseSources] = useState<KnowledgeDatabaseSource[]>([]);
@@ -224,6 +229,7 @@ export default function KnowledgePage() {
   const [loading, setLoading] = useState(true);
   const [uploadingDocument, setUploadingDocument] = useState(false);
   const [snapshottingRaw, setSnapshottingRaw] = useState(false);
+  const [rebuildingDocumentId, setRebuildingDocumentId] = useState<string | null>(null);
   const [jobPage, setJobPage] = useState(1);
   const [databaseModalOpen, setDatabaseModalOpen] = useState(false);
   const [databaseDraft, setDatabaseDraft] = useState<KnowledgeDatabaseSource>(() => emptyDatabaseSource());
@@ -265,16 +271,18 @@ export default function KnowledgePage() {
     try {
       const nextStatus = await getKnowledgeStatus();
       setStatus(nextStatus);
-      const [nextFiles, nextTree, nextTables, nextDatabaseSources] = await Promise.all([
+      const [nextFiles, nextTree, nextTables, nextDatabaseSources, nextDocuments] = await Promise.all([
         listKnowledgeFiles(),
         getKnowledgeFileTree(),
         listTableAssets(false),
         listKnowledgeDatabaseSources(),
+        listKnowledgeDocuments(),
       ]);
       setDirectoryFiles(nextFiles);
       setFileTree(nextTree);
       setTableAssets(nextTables);
       setDatabaseSources(nextDatabaseSources);
+      setDocuments(nextDocuments);
       const nextJobs = await listKnowledgeImportJobs();
       setImportJobs(nextJobs);
     } catch (error) {
@@ -297,6 +305,17 @@ export default function KnowledgePage() {
   }, [importJobs, refresh]);
 
   const jobPageCount = Math.max(1, Math.ceil(importJobs.length / HOME_JOB_PAGE_SIZE));
+  const previewDocument = previewFile
+    ? documents.find((document) => document.virtual_path === previewFile.virtual_path) ?? null
+    : null;
+  const activePreviewVectorJob = previewDocument
+    ? importJobs.find(
+        (job) =>
+          isVectorPublishJob(job) &&
+          job.document_id === previewDocument.id &&
+          (job.status === "queued" || job.status === "running")
+      )
+    : null;
   const pagedImportJobs = useMemo(
     () => importJobs.slice((jobPage - 1) * HOME_JOB_PAGE_SIZE, jobPage * HOME_JOB_PAGE_SIZE),
     [importJobs, jobPage]
@@ -392,6 +411,25 @@ export default function KnowledgePage() {
       setSnapshottingRaw(false);
     }
   }, [previewFile]);
+
+  const rebuildPreviewVectorIndex = useCallback(async () => {
+    if (!previewDocument) return;
+    setRebuildingDocumentId(previewDocument.id);
+    setToast(null);
+    try {
+      const result = await publishKnowledgeDocumentVector(previewDocument.id);
+      await refresh();
+      setToast({
+        type: "success",
+        message: result.queued ? `已加入索引重建队列：${previewDocument.title}` : "该文档正在重建索引。",
+      });
+      setJobPage(1);
+    } catch (error) {
+      setToast({ type: "error", message: errorMessage(error) });
+    } finally {
+      setRebuildingDocumentId(null);
+    }
+  }, [previewDocument, refresh]);
 
   const openDatabaseSourceModal = useCallback((source?: KnowledgeDatabaseSource) => {
     setDatabaseDraft(source ? { ...source, password: "" } : emptyDatabaseSource());
@@ -492,7 +530,7 @@ export default function KnowledgePage() {
 
         <main className="workspace-content-frame flex min-w-0 flex-1 flex-col overflow-hidden">
           <div className="flex-1 overflow-y-auto">
-            <div className="mx-auto flex w-full max-w-6xl flex-col gap-5 px-5 py-6">
+            <div className="workspace-page-container flex flex-col gap-5">
         <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
           <div className="min-w-0">
             <h1 className="text-2xl font-semibold tracking-tight text-gray-950">知识库</h1>
@@ -708,7 +746,7 @@ export default function KnowledgePage() {
 
             {previewFile || previewLoading ? (
               <div className="mt-8 flex flex-1 flex-col overflow-hidden rounded-[28px] bg-black/[0.018]">
-                <div className="flex items-center justify-between gap-3 border-b border-black/[0.05] px-5 py-4">
+                <div className="flex flex-col gap-3 border-b border-black/[0.05] px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
                   <div className="min-w-0">
                     <p className="truncate text-base font-semibold text-gray-950">
                       {previewLoading ? "正在打开文件..." : previewFile?.name}
@@ -719,7 +757,23 @@ export default function KnowledgePage() {
                       </p>
                     ) : null}
                   </div>
-                  <div className="flex shrink-0 items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2 sm:shrink-0 sm:justify-end">
+                    {previewDocument?.source_type === "pdf_mineru" ? (
+                      <button
+                        type="button"
+                        onClick={rebuildPreviewVectorIndex}
+                        disabled={rebuildingDocumentId === previewDocument.id || Boolean(activePreviewVectorJob)}
+                        title="仅重建该 PDF 的文本、BM25 与图片向量索引"
+                        className="inline-flex h-9 items-center gap-2 rounded-full border border-[#002fa7]/15 bg-white px-4 text-xs font-semibold text-[#002fa7] transition hover:bg-[#002fa7]/[0.04] disabled:cursor-wait disabled:opacity-60"
+                      >
+                        {rebuildingDocumentId === previewDocument.id || activePreviewVectorJob ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Database className="h-3.5 w-3.5" />
+                        )}
+                        {activePreviewVectorJob ? "索引重建中" : "重建向量索引"}
+                      </button>
+                    ) : null}
                     {previewFile && [".md", ".markdown"].some((suffix) => previewFile.name.toLowerCase().endsWith(suffix)) ? (
                       <button
                         type="button"
@@ -742,9 +796,11 @@ export default function KnowledgePage() {
                         setPreviewLoading(false);
                         setPreviewFile(null);
                       }}
-                      className="rounded-full px-3 py-2 text-xs font-medium text-gray-500 transition hover:bg-white hover:text-gray-900"
+                      title="关闭文件详情"
+                      aria-label="关闭文件详情"
+                      className="flex h-9 w-9 items-center justify-center rounded-full text-gray-500 transition hover:bg-white hover:text-gray-900"
                     >
-                      关闭
+                      <X className="h-4 w-4" />
                     </button>
                   </div>
                 </div>

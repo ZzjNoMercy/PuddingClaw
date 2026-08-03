@@ -44,6 +44,7 @@ from langchain.agents.middleware.types import (
     ModelRequest,
     ModelResponse,
     PrivateStateAttr,
+    ToolCallRequest,
     hook_config,
 )
 from langchain_core.language_models import BaseChatModel
@@ -154,7 +155,10 @@ from harness.models import (
 )
 from harness.permission_reviewer import ModelPermissionReviewer, PermissionReviewer
 from harness.rubric_compiler import RunRubricCompiler
-from harness.task_profiles import SemanticTaskProfileClassifier, TaskProfileClassifier
+from harness.task_profiles import (
+    SemanticRubricProfileClassifier,
+    TaskProfileClassifier,
+)
 from harness.tool_execution import ToolExecutionPipeline
 from harness.verification_activations import (
     VerificationActivationMiddleware,
@@ -179,7 +183,7 @@ from utils.json_serialization import to_json_compatible
 
 logger = logging.getLogger(__name__)
 
-_TASK_ROUTER_TIMEOUT_SECONDS = 15.0
+_RUBRIC_PROFILE_TIMEOUT_SECONDS = 15.0
 _GOAL_TURN_ROUTER_TIMEOUT_SECONDS = 8.0
 _VERIFICATION_CRITERION_LABELS = {
     "artifact_delivery": "产物交付",
@@ -191,6 +195,23 @@ _VERIFICATION_CRITERION_LABELS = {
     "time_scope": "数据时间范围",
     "analysis_traceability": "分析证据可追溯",
 }
+
+
+def _should_classify_rubric_profile(
+    *,
+    completion_policy: str,
+    goal_mode: bool,
+    goal_id: str | None,
+    run_kind: RunKind | str,
+) -> bool:
+    """Only a brand-new experimental Rubric Goal needs semantic acceptance classification."""
+
+    return (
+        completion_policy == GoalCompletionPolicy.RUBRIC.value
+        and goal_mode
+        and goal_id is None
+        and RunKind(run_kind) == RunKind.GOAL_EXECUTION
+    )
 
 
 def _verification_gap_detail(payload: dict[str, Any]) -> str:
@@ -212,18 +233,6 @@ def _verification_gap_detail(payload: dict[str, Any]) -> str:
         if len(issues) == 3:
             break
     return "待处理：" + "；".join(issues) if issues else ""
-
-
-_TRIVIAL_TASK_ROUTER_RE = re.compile(
-    r"^\s*(?:你好|您好|嗨|哈喽|hello|hi|hey|谢谢|多谢|好的|好|ok|okay|在吗|早上好|下午好|晚上好)[!！。,.，?？\s]*$",
-    re.IGNORECASE,
-)
-
-
-def _should_start_semantic_task_router(message: str) -> bool:
-    """Skip provider work that cannot add routing value for trivial chat."""
-
-    return _TRIVIAL_TASK_ROUTER_RE.fullmatch(str(message or "")) is None
 
 
 _TASK_PROFILE_CONTINUATION_RE = re.compile(
@@ -1004,6 +1013,57 @@ class RunScopeMiddleware(AgentMiddleware):
 
     async def abefore_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:
         return self._update(state, runtime) or None
+
+
+class EvaluationToolBoundaryMiddleware(AgentMiddleware):
+    """Opt-in boundary for DeepAgents built-ins during isolated evaluation."""
+
+    def __init__(self, allowed_tools: set[str]) -> None:
+        self.allowed_tools = frozenset(allowed_tools)
+
+    @staticmethod
+    def _tool_name(tool: Any) -> str:
+        if isinstance(tool, dict):
+            function = tool.get("function")
+            if isinstance(function, dict) and function.get("name"):
+                return str(function["name"])
+            return str(tool.get("name") or "")
+        return str(getattr(tool, "name", "") or "")
+
+    def _filter_request(self, request: ModelRequest) -> ModelRequest:
+        return request.override(
+            tools=[tool for tool in request.tools if self._tool_name(tool) in self.allowed_tools]
+        )
+
+    def wrap_model_call(self, request: ModelRequest, handler: Callable[[ModelRequest], ModelResponse]) -> Any:
+        return handler(self._filter_request(request))
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> Any:
+        return await handler(self._filter_request(request))
+
+    def wrap_tool_call(self, request: ToolCallRequest, handler: Callable[..., Any]) -> Any:
+        name = str(request.tool_call.get("name") or "")
+        if name not in self.allowed_tools:
+            return ToolMessage(
+                content=f"Tool '{name}' is disabled by the evaluation capability profile.",
+                tool_call_id=str(request.tool_call.get("id") or "evaluation-denied"),
+                status="error",
+            )
+        return handler(request)
+
+    async def awrap_tool_call(self, request: ToolCallRequest, handler: Callable[..., Awaitable[Any]]) -> Any:
+        name = str(request.tool_call.get("name") or "")
+        if name not in self.allowed_tools:
+            return ToolMessage(
+                content=f"Tool '{name}' is disabled by the evaluation capability profile.",
+                tool_call_id=str(request.tool_call.get("id") or "evaluation-denied"),
+                status="error",
+            )
+        return await handler(request)
 
 
 class PuddingClawRubricMiddleware(RubricMiddleware):
@@ -2545,7 +2605,12 @@ class DeepAgentsAgentManager:
         """Return the on-disk directory that holds runtime project memory."""
 
         assert self._base_dir is not None
-        memory_root = self._base_dir / "data" / "deepagents-memory"
+        evaluation_root = os.getenv("PUDDINGCLAW_EVALUATION_RUNTIME_ROOT")
+        memory_root = (
+            Path(evaluation_root).resolve() / "memory"
+            if evaluation_root
+            else self._base_dir / "data" / "deepagents-memory"
+        )
         if project_id:
             return memory_root / "projects" / project_id
         return memory_root / "global"
@@ -2580,11 +2645,20 @@ class DeepAgentsAgentManager:
         goal_revision: int | None = None,
     ):
         assert self._base_dir is not None
-        skills_dir = self._base_dir / "skills"
-        semantic_assets_dir = self._base_dir / "semantic-assets"
-        sql_guardrails_dir = self._base_dir / "sql-guardrails"
-        analytics_models_dir = self._base_dir / "analytics-models"
-        knowledge_dir = get_knowledge_root(self._base_dir)
+        evaluation_root_raw = os.getenv("PUDDINGCLAW_EVALUATION_RUNTIME_ROOT")
+        reference_root = Path(evaluation_root_raw).resolve() / "reference" if evaluation_root_raw else None
+        skills_dir = reference_root / "skills" if reference_root else self._base_dir / "skills"
+        semantic_assets_dir = (
+            reference_root / "semantic-assets" if reference_root else self._base_dir / "semantic-assets"
+        )
+        sql_guardrails_dir = (
+            reference_root / "sql-guardrails" if reference_root else self._base_dir / "sql-guardrails"
+        )
+        analytics_models_dir = (
+            reference_root / "analytics-models" if reference_root else self._base_dir / "analytics-models"
+        )
+        knowledge_dir = reference_root / "knowledge" if reference_root else get_knowledge_root(self._base_dir)
+        skills_dir.mkdir(parents=True, exist_ok=True)
         knowledge_dir.mkdir(parents=True, exist_ok=True)
         semantic_assets_dir.mkdir(parents=True, exist_ok=True)
         sql_guardrails_dir.mkdir(parents=True, exist_ok=True)
@@ -2602,7 +2676,12 @@ class DeepAgentsAgentManager:
         safe_query = re.sub(r"[^A-Za-z0-9_-]+", "_", query_id or "unscoped-query")
         safe_goal = re.sub(r"[^A-Za-z0-9_-]+", "_", goal_id)
         scratch_scope = f"goal-{safe_goal}-r{int(goal_revision or 1)}" if safe_goal else safe_query
-        scratch_project_root = self._base_dir / "data" / "harness-scratch" / "projects" / workspace_digest
+        scratch_root = (
+            Path(evaluation_root_raw).resolve() / "scratch"
+            if evaluation_root_raw
+            else self._base_dir / "data" / "harness-scratch"
+        )
+        scratch_project_root = scratch_root / "projects" / workspace_digest
         scratch_relative = f"{safe_session}/{scratch_scope}"
         scratch_scope_dir = scratch_project_root / safe_session / scratch_scope
         scratch_scope_dir.mkdir(parents=True, exist_ok=True)
@@ -2705,6 +2784,8 @@ class DeepAgentsAgentManager:
         permission_context: RunPermissionContext | None = None,
         workspace_backend: Any | None = None,
         permission_reviewer: PermissionReviewer | None = None,
+        evaluation_builtin_tool_allowlist: set[str] | None = None,
+        rubric_config: dict[str, Any] | None = None,
     ) -> list[Any]:
         """Build user-provided DeepAgents middlewares.
 
@@ -2744,6 +2825,11 @@ class DeepAgentsAgentManager:
 
         toolset_mapping = skill_toolsets or discover_skill_toolsets(self._base_dir / "skills")
         middlewares: list[Any] = [
+            *(
+                [EvaluationToolBoundaryMiddleware(evaluation_builtin_tool_allowlist)]
+                if evaluation_builtin_tool_allowlist is not None
+                else []
+            ),
             MemoryMiddleware(backend=memory_backend, sources=sources),
             RunScopeMiddleware(),
             AnalysisTemplateMiddleware(base_dir=self._base_dir),
@@ -2798,8 +2884,8 @@ class DeepAgentsAgentManager:
         tool_context_cfg = ToolContextConfig.from_mapping(config.get_deepagents_tool_context_config())
         if tool_context_cfg.enabled:
             middlewares.append(ToolContextCompactionMiddleware(tool_context_cfg))
-        rubric_cfg = config.load_config().get("harness", {}).get("completion", {}).get("rubric", {})
-        if rubric_cfg.get("enabled", True) and rubric_model is not None:
+        if rubric_config is not None and rubric_model is not None:
+            rubric_cfg = rubric_config
             max_iterations = rubric_cfg.get("max_iterations", 2)
             if not isinstance(max_iterations, int) or isinstance(max_iterations, bool) or not 1 <= max_iterations <= 20:
                 max_iterations = 2
@@ -3805,87 +3891,80 @@ class DeepAgentsAgentManager:
             explicit_skill_hints=explicit_skill_hints,
         )
 
-    async def _classify_task_profile(
+    async def _classify_rubric_profile(
         self,
         *,
         objective: str,
         analytics_model_id: str | None,
         model_override: str | None,
-        skill_catalog: list[dict[str, Any]],
-        explicit_skill_hints: list[str] | None = None,
-        independent_skill_review: bool = False,
     ) -> RunTaskProfile:
-        """Run the semantic Router as a bounded soft enhancement."""
+        """Build acceptance-only semantics before a new Rubric Goal exists."""
 
-        router_model = ModelClientChatModel(
-            role="task_classifier",
+        classifier_model = ModelClientChatModel(
+            role="rubric_classifier",
             temperature=0,
             streaming=False,
             thinking_enabled=False,
             model_override=model_override or None,
         )
-        primary = SemanticTaskProfileClassifier.classify(
-            message=objective,
-            analytics_model_id=analytics_model_id,
-            model=router_model,
-            skill_catalog=skill_catalog,
-            explicit_skill_hints=explicit_skill_hints,
-        )
-        if not independent_skill_review:
-            return await asyncio.wait_for(
-                primary,
-                timeout=_TASK_ROUTER_TIMEOUT_SECONDS,
-            )
-        skeptic_model = ModelClientChatModel(
-            role="task_classifier",
-            temperature=0,
-            streaming=False,
-            thinking_enabled=False,
-            model_override=model_override or None,
-        )
-        primary_task = asyncio.create_task(primary)
-        skeptic_task = asyncio.create_task(
-            SemanticTaskProfileClassifier.classify_as_skill_skeptic(
+        return await asyncio.wait_for(
+            SemanticRubricProfileClassifier.classify(
                 message=objective,
                 analytics_model_id=analytics_model_id,
-                model=skeptic_model,
-                skill_catalog=skill_catalog,
-                explicit_skill_hints=explicit_skill_hints,
-            )
+                model=classifier_model,
+            ),
+            timeout=_RUBRIC_PROFILE_TIMEOUT_SECONDS,
         )
-        router_tasks = (primary_task, skeptic_task)
+
+    async def _resolve_rubric_task_profile(
+        self,
+        *,
+        baseline: RunTaskProfile,
+        objective: str,
+        analytics_model_id: str | None,
+        model_override: str | None,
+    ) -> tuple[RunTaskProfile, dict[str, Any]]:
+        """Return one frozen acceptance profile with deterministic fallback."""
+
+        started_at = time.monotonic()
+        status = "completed"
+        error: str | None = None
+        applied = False
+        resolved = baseline
         try:
-            done, _ = await asyncio.wait(
-                router_tasks,
-                timeout=_TASK_ROUTER_TIMEOUT_SECONDS,
+            semantic = await self._classify_rubric_profile(
+                objective=objective,
+                analytics_model_id=analytics_model_id,
+                model_override=model_override,
             )
-        finally:
-            unfinished = [task for task in router_tasks if not task.done()]
-            for task in unfinished:
-                task.cancel()
-            if unfinished:
-                await asyncio.gather(*unfinished, return_exceptions=True)
-        completed: list[RunTaskProfile] = []
-        for task in (primary_task, skeptic_task):
-            if task not in done or task.cancelled():
-                continue
-            try:
-                completed.append(task.result())
-            except Exception:
-                logger.warning(
-                    "One independent Task Router branch failed; using the other branch",
-                    exc_info=True,
-                )
-        if not completed:
-            raise TimeoutError("All independent Task Router branches timed out or failed")
-        merged = completed[0]
-        for enhancement in completed[1:]:
-            merged = TaskProfileClassifier.merge_semantic_enhancement(
-                merged,
-                enhancement,
+            resolved = TaskProfileClassifier.merge_rubric_profile(
+                baseline,
+                semantic,
                 analytics_model_id=analytics_model_id,
             )
-        return merged
+            applied = resolved != baseline
+        except TimeoutError:
+            status = "timed_out"
+            error = "rubric_profile_timeout"
+            logger.warning(
+                "Rubric profile classifier timed out after %.1fs; using deterministic acceptance profile",
+                _RUBRIC_PROFILE_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            status = "failed"
+            error = str(exc)
+            logger.warning(
+                "Rubric profile classifier failed; using deterministic acceptance profile: %s",
+                exc,
+                exc_info=True,
+            )
+        return resolved, {
+            "status": status,
+            "applied": applied,
+            "duration_ms": round((time.monotonic() - started_at) * 1000, 2),
+            "error": error,
+            "task_profile": resolved.model_dump(mode="json"),
+        }
 
     async def _classify_goal_turn(
         self,
@@ -3908,7 +3987,7 @@ class DeepAgentsAgentManager:
             goal=goal,
         )
         router_model = ModelClientChatModel(
-            role="task_classifier",
+            role="goal_turn_classifier",
             temperature=0,
             streaming=False,
             thinking_enabled=False,
@@ -4059,6 +4138,28 @@ class DeepAgentsAgentManager:
             profile.reasons.append("reused_for_continuation")
         profile.classifier = "session_continuation"
         return profile
+
+    @staticmethod
+    def _frozen_goal_rubric_config(
+        *,
+        session_id: str,
+        goal: dict[str, Any],
+        fallback: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Load the creation-time Rubric settings from the Goal's first Run."""
+
+        for run_id in goal.get("run_ids") or []:
+            run = session_manager.get_run_state(session_id, str(run_id))
+            snapshot = run.get("config_snapshot") if isinstance(run, dict) else None
+            completion = snapshot.get("completion") if isinstance(snapshot, dict) else None
+            rubric = completion.get("rubric") if isinstance(completion, dict) else None
+            if isinstance(rubric, dict):
+                frozen = dict(rubric)
+                frozen["enabled"] = True
+                return frozen
+        frozen = dict(fallback)
+        frozen["enabled"] = True
+        return frozen
 
     def _analytics_model_context(
         self,
@@ -5160,7 +5261,7 @@ class DeepAgentsAgentManager:
         if not os.environ.get("LANGSMITH_API_KEY"):
             return None
         try:
-            from langchain.callbacks.tracers import LangChainTracer
+            from langchain_core.tracers.langchain import LangChainTracer
 
             return [LangChainTracer()]
         except Exception:
@@ -5744,6 +5845,10 @@ class DeepAgentsAgentManager:
         goal_id: str | None = None,
         context_goal_id: str | None = None,
         goal_control_action: str | None = None,
+        callbacks_override: list[Any] | None = None,
+        evaluation_tool_allowlist: set[str] | None = None,
+        disable_mcp: bool = False,
+        evaluation_builtin_tool_allowlist: set[str] | None = None,
     ) -> AsyncGenerator[dict[str, str], None]:
         """Stream one user request and autonomously advance recoverable Goal Runs."""
 
@@ -5763,6 +5868,7 @@ class DeepAgentsAgentManager:
         context_goal_revision: int | None = None
         turn_decision: GoalTurnDecision | None = None
         run_kind = RunKind.STANDALONE
+        precomputed_rubric_profile_result: dict[str, Any] | None = None
         if isinstance(existing_goal, dict):
             if goal_control_action == "start":
                 if str(existing_goal.get("status") or "") != GoalStatus.ACTIVE.value:
@@ -5867,12 +5973,74 @@ class DeepAgentsAgentManager:
                 yield self._sse("done", {"content": content, "session_id": session_id})
                 return
             if turn_decision.intent == GoalTurnIntent.REVISE_GOAL:
+                revised_objective = str(turn_decision.revised_objective or "")
+                revised_profile: RunTaskProfile | None = None
+                if str(existing_goal.get("completion_policy") or "") == GoalCompletionPolicy.RUBRIC.value:
+                    live_rubric = (
+                        config.load_config()
+                        .get("harness", {})
+                        .get("completion", {})
+                        .get("rubric", {})
+                    )
+                    frozen_rubric = self._frozen_goal_rubric_config(
+                        session_id=session_id,
+                        goal=existing_goal,
+                        fallback=(live_rubric if isinstance(live_rubric, dict) else {}),
+                    )
+                    revision_model_name = str(frozen_rubric.get("model") or "").strip()
+                    if not revision_model_name:
+                        revision_model_name = str(
+                            config.get_fallback_llm_config(
+                                thinking_enabled_override=False,
+                            ).get("model")
+                            or ""
+                        ).strip()
+                    baseline = self._build_preflight_task_profile(
+                        objective=revised_objective,
+                        analytics_model_id=analytics_model_id,
+                        skill_catalog=discover_skill_catalog(self._base_dir / "skills"),
+                        explicit_skill_hints=skill_hints,
+                    )
+                    yield self._sse(
+                        "rubric_profile_started",
+                        {
+                            "session_id": session_id,
+                            "goal_id": str(existing_goal.get("goal_id") or ""),
+                            "goal_revision": int(existing_goal.get("objective_revision") or 1) + 1,
+                            "label": "Rubric 验收正在为修订后的 Goal 生成任务画像",
+                            "blocking": True,
+                            "timeout_seconds": _RUBRIC_PROFILE_TIMEOUT_SECONDS,
+                        },
+                    )
+                    revised_profile, precomputed_rubric_profile_result = (
+                        await self._resolve_rubric_task_profile(
+                            baseline=baseline,
+                            objective=revised_objective,
+                            analytics_model_id=analytics_model_id,
+                            model_override=revision_model_name or None,
+                        )
+                    )
+                    yield self._sse(
+                        "rubric_profile_completed",
+                        {
+                            "session_id": session_id,
+                            "goal_id": str(existing_goal.get("goal_id") or ""),
+                            "goal_revision": int(existing_goal.get("objective_revision") or 1) + 1,
+                            "label": "修订后的 Rubric 验收画像已冻结",
+                            "status": precomputed_rubric_profile_result["status"],
+                            "applied": bool(precomputed_rubric_profile_result["applied"]),
+                            "blocking": True,
+                            "duration_ms": precomputed_rubric_profile_result["duration_ms"],
+                            "verification_intents": list(revised_profile.verification_intents),
+                        },
+                    )
                 revised = await asyncio.to_thread(
                     self._run_coordinator.goals.update_objective,
                     session_id,
                     str(existing_goal.get("goal_id") or ""),
-                    objective=str(turn_decision.revised_objective or ""),
+                    objective=revised_objective,
                     expected_revision=int(existing_goal.get("objective_revision") or 1),
+                    task_profile=revised_profile,
                 )
                 existing_goal = revised.model_dump(mode="json")
                 current_objective = revised.objective
@@ -5936,6 +6104,11 @@ class DeepAgentsAgentManager:
                 context_goal_id=run_context_goal_id,
                 context_goal_revision=context_goal_revision,
                 goal_turn_decision=turn_decision,
+                callbacks_override=callbacks_override,
+                evaluation_tool_allowlist=evaluation_tool_allowlist,
+                disable_mcp=disable_mcp,
+                evaluation_builtin_tool_allowlist=evaluation_builtin_tool_allowlist,
+                precomputed_rubric_profile_result=precomputed_rubric_profile_result,
             ):
                 event_name = event.get("event")
                 payload = self._parse_sse_payload(event)
@@ -5954,6 +6127,9 @@ class DeepAgentsAgentManager:
                         goal_payload = candidate
                 yield event
 
+            # A revision-level Rubric profile is recorded on exactly the first
+            # Run of that objective revision, never on automatic repair Runs.
+            precomputed_rubric_profile_result = None
             if goal_payload.get("goal_id"):
                 # A pause/cancel can race with the small boundary between Runs.
                 # Re-read session JSON, the cross-Run authority, before advancing.
@@ -6083,6 +6259,11 @@ class DeepAgentsAgentManager:
         context_goal_id: str | None = None,
         context_goal_revision: int | None = None,
         goal_turn_decision: GoalTurnDecision | None = None,
+        callbacks_override: list[Any] | None = None,
+        evaluation_tool_allowlist: set[str] | None = None,
+        disable_mcp: bool = False,
+        evaluation_builtin_tool_allowlist: set[str] | None = None,
+        precomputed_rubric_profile_result: dict[str, Any] | None = None,
     ) -> AsyncGenerator[dict[str, str], None]:
         """Stream exactly one Harness Run; the public method owns Goal looping."""
 
@@ -6104,11 +6285,8 @@ class DeepAgentsAgentManager:
         user_message_persisted = user_message_already_persisted
         title_task: asyncio.Task[str | None] | None = None
         title_event_emitted = False
-        task_router_task: asyncio.Task[dict[str, Any]] | None = None
-        task_router_event_emitted = False
-        task_router_trace_recorded = False
-        task_router_cancel_reason: str | None = None
-        router_skipped_trivial = False
+        rubric_profile_result: dict[str, Any] | None = precomputed_rubric_profile_result
+        rubric_profile_trace_recorded = False
         checkpoint_thread_id = f"{session_id}:{query_id}"
         try:
             effective_llm = config.get_fallback_llm_config(
@@ -6171,6 +6349,7 @@ class DeepAgentsAgentManager:
             harness_config = config.load_config().get("harness", {})
             goals_config = harness_config.get("goals", {})
             rubric_config = harness_config.get("completion", {}).get("rubric", {})
+            effective_rubric_config = dict(rubric_config)
             completion_policy = "rubric" if rubric_config.get("enabled", False) else "standard"
             # Policy is frozen when a Goal is created; a later settings change
             # applies to new Goals without changing an active Goal mid-run.
@@ -6178,7 +6357,16 @@ class DeepAgentsAgentManager:
                 persisted_goal = session_manager.get_goal_state(session_id, goal_id)
                 if isinstance(persisted_goal, dict):
                     completion_policy = str(persisted_goal.get("completion_policy") or "standard")
-            rubric_model_name = str(rubric_config.get("model") or "").strip()
+                    if completion_policy == GoalCompletionPolicy.RUBRIC.value:
+                        # Freeze the operational Rubric settings with the Goal,
+                        # not merely its label. The first bound Run owns the
+                        # creation-time snapshot used by every continuation.
+                        effective_rubric_config = self._frozen_goal_rubric_config(
+                            session_id=session_id,
+                            goal=persisted_goal,
+                            fallback=effective_rubric_config,
+                        )
+            rubric_model_name = str(effective_rubric_config.get("model") or "").strip()
             if not rubric_model_name:
                 rubric_model_name = str(
                     config.get_fallback_llm_config(
@@ -6238,6 +6426,57 @@ class DeepAgentsAgentManager:
                         "label": "指定的 Skill 尚未安装，Agent 将引导安装或选择通用执行",
                     },
                 )
+
+            # Rubric is an experimental completion policy. Its semantic
+            # classifier exists only to compile the acceptance contract of a
+            # new Goal. Standard Runs, standalone Runs, and continuations of
+            # an existing Goal must not pay for or be changed by this model
+            # call. The resulting profile is merged before start_run so the
+            # Goal contract is deterministic and frozen before execution.
+            should_classify_rubric = _should_classify_rubric_profile(
+                completion_policy=completion_policy,
+                goal_mode=goal_mode,
+                goal_id=goal_id,
+                run_kind=run_kind,
+            )
+            if should_classify_rubric:
+                yield self._sse(
+                    "rubric_profile_started",
+                    {
+                        "session_id": session_id,
+                        "query_id": query_id,
+                        "label": "Rubric 验收正在生成任务画像",
+                        "blocking": True,
+                        "timeout_seconds": _RUBRIC_PROFILE_TIMEOUT_SECONDS,
+                    },
+                )
+                task_profile, rubric_profile_result = await self._resolve_rubric_task_profile(
+                    baseline=task_profile,
+                    objective=run_objective or message,
+                    analytics_model_id=analytics_model_id,
+                    model_override=rubric_model_name or None,
+                )
+                rubric_status = str(rubric_profile_result["status"])
+                rubric_applied = bool(rubric_profile_result["applied"])
+                yield self._sse(
+                    "rubric_profile_completed",
+                    {
+                        "session_id": session_id,
+                        "query_id": query_id,
+                        "label": (
+                            "Rubric 验收画像已冻结"
+                            if rubric_status == "completed"
+                            else "Rubric 画像生成超时，已冻结确定性验收画像"
+                            if rubric_status == "timed_out"
+                            else "Rubric 画像生成失败，已冻结确定性验收画像"
+                        ),
+                        "status": rubric_status,
+                        "applied": rubric_applied,
+                        "blocking": True,
+                        "duration_ms": rubric_profile_result["duration_ms"],
+                        "verification_intents": list(task_profile.verification_intents),
+                    },
+                )
             run_record, goal_record = self._run_coordinator.start_run(
                 session_id=session_id,
                 query_id=query_id,
@@ -6247,16 +6486,22 @@ class DeepAgentsAgentManager:
                 project_id=project_id,
                 analytics_model_id=analytics_model_id,
                 config_snapshot={
-                    "completion": harness_config.get("completion", {}),
+                    "completion": {
+                        **dict(harness_config.get("completion", {})),
+                        "rubric": dict(effective_rubric_config),
+                    },
                     "goals": goals_config,
                     "model_call_limit": harness_config.get("model_call_limit", {}),
                 },
-                verification_enabled=rubric_config.get("enabled", True),
+                # Existing Goals freeze their completion policy. A later UI
+                # setting change must not silently disable the verifier for a
+                # Rubric Goal continuation or upgrade a Standard Goal.
+                verification_enabled=(completion_policy == GoalCompletionPolicy.RUBRIC.value),
                 completion_policy=completion_policy,
                 goal_max_rounds=goal_max_rounds,
                 custom_rubric_rules=(
-                    list(rubric_config.get("custom_rules") or [])
-                    if rubric_config.get("custom_rules_enabled", False)
+                    list(effective_rubric_config.get("custom_rules") or [])
+                    if effective_rubric_config.get("custom_rules_enabled", False)
                     else []
                 ),
                 task_profile=task_profile,
@@ -6268,234 +6513,48 @@ class DeepAgentsAgentManager:
                 goal_turn_classifier=(goal_turn_decision.classifier if goal_turn_decision else None),
             )
 
-            async def route_task_in_background() -> dict[str, Any]:
-                started_at = time.monotonic()
-                try:
-                    router_kwargs: dict[str, Any] = {
-                        "objective": run_record.objective,
-                        "analytics_model_id": analytics_model_id,
-                        "model_override": rubric_model_name or None,
-                        "skill_catalog": skill_catalog,
-                    }
-                    if skill_hints is not None:
-                        router_kwargs["explicit_skill_hints"] = skill_hints
-                    router_kwargs["independent_skill_review"] = bool(explicit_skills)
-                    semantic_profile = await self._classify_task_profile(**router_kwargs)
-                    saved_run, applied = await asyncio.to_thread(
-                        session_manager.enhance_run_task_profile,
-                        session_id,
-                        run_record.run_id,
-                        semantic_profile.model_dump(mode="json"),
-                    )
-                    saved_profile = saved_run.get("task_profile")
-                    return {
-                        "status": "completed",
-                        "applied": applied,
-                        "duration_ms": round((time.monotonic() - started_at) * 1000, 2),
-                        "task_profile": (saved_profile if isinstance(saved_profile, dict) else {}),
-                    }
-                except TimeoutError:
-                    logger.warning(
-                        "Task Router timed out after %.1fs for session=%s run=%s; "
-                        "continuing with deterministic baseline",
-                        _TASK_ROUTER_TIMEOUT_SECONDS,
-                        session_id,
-                        run_record.run_id,
-                    )
-                    return {
-                        "status": "timed_out",
-                        "applied": False,
-                        "duration_ms": round((time.monotonic() - started_at) * 1000, 2),
-                        "task_profile": run_record.task_profile.model_dump(mode="json"),
-                    }
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    logger.warning(
-                        "Task Router failed for session=%s run=%s: %s; continuing with deterministic baseline",
-                        session_id,
-                        run_record.run_id,
-                        exc,
-                        exc_info=True,
-                    )
-                    return {
-                        "status": "failed",
-                        "applied": False,
-                        "duration_ms": round((time.monotonic() - started_at) * 1000, 2),
-                        "error": str(exc),
-                        "task_profile": run_record.task_profile.model_dump(mode="json"),
-                    }
-
-            router_skipped_trivial = reused_task_profile is None and not _should_start_semantic_task_router(
-                run_record.objective
-            )
-            if reused_task_profile is None and not router_skipped_trivial:
-                task_router_task = asyncio.create_task(route_task_in_background())
-                # Give a cache-fast Router one scheduling turn. Slow provider
-                # work remains cancellable before the user-visible model call.
-                await asyncio.sleep(0)
-
-            def task_router_completion_event() -> dict[str, str] | None:
-                if task_router_task is None or not task_router_task.done():
-                    return None
-                if task_router_task.cancelled():
-                    result: dict[str, Any] = {
-                        "status": "cancelled",
-                        "applied": False,
-                        "task_profile": run_record.task_profile.model_dump(mode="json"),
-                    }
-                else:
-                    try:
-                        result = task_router_task.result()
-                    except Exception as exc:
-                        result = {
-                            "status": "failed",
-                            "applied": False,
-                            "error": str(exc),
-                            "task_profile": run_record.task_profile.model_dump(mode="json"),
-                        }
-                profile_payload = result.get("task_profile")
-                profile = profile_payload if isinstance(profile_payload, dict) else {}
-                candidates = [
-                    str(item.get("skill_id") or "")
-                    for item in profile.get("skill_candidates") or []
-                    if isinstance(item, dict) and str(item.get("skill_id") or "")
-                ]
-                status = str(result.get("status") or "failed")
-                label = (
-                    "任务理解与 Skill 候选已补充"
-                    if status == "completed" and result.get("applied")
-                    else "任务路由无需补充，继续使用当前任务画像"
-                    if status == "completed"
-                    else "任务路由超时，已使用确定性任务画像继续执行"
-                    if status == "timed_out"
-                    else "任务路由不可用，已使用确定性任务画像继续执行"
-                )
-                return self._sse(
-                    "task_routing_completed",
-                    {
-                        "session_id": session_id,
-                        "query_id": query_id,
-                        "run_id": run_record.run_id,
-                        "label": label,
-                        "status": status,
-                        "applied": bool(result.get("applied")),
-                        "blocking": bool(explicit_skills),
-                        "duration_ms": result.get("duration_ms"),
-                        "execution_route": profile.get("execution_route", "native"),
-                        "skill_candidates": candidates,
-                    },
-                )
-
-            def record_task_router_trace(
-                collector: TraceCollector,
-                *,
-                settle_pending: bool = False,
-            ) -> None:
-                nonlocal task_router_trace_recorded
-                if task_router_trace_recorded or task_router_task is None:
+            def record_rubric_profile_trace(collector: TraceCollector) -> None:
+                nonlocal rubric_profile_trace_recorded
+                if rubric_profile_trace_recorded or rubric_profile_result is None:
                     return
-                if not task_router_task.done():
-                    if not settle_pending:
-                        return
-                    task_router_task.cancel()
-                    result: dict[str, Any] = {
-                        "status": "cancelled",
-                        "applied": False,
-                        "error": "run_finished_before_router",
-                    }
-                elif task_router_task.cancelled():
-                    result: dict[str, Any] = {
-                        "status": "cancelled",
-                        "applied": False,
-                        "error": task_router_cancel_reason,
-                    }
-                else:
-                    try:
-                        result = task_router_task.result()
-                    except Exception as exc:
-                        result = {
-                            "status": "failed",
-                            "applied": False,
-                            "error": str(exc),
-                        }
                 collector.add_custom_span(
-                    "task_router",
+                    "rubric_profile_classifier",
                     {
-                        "status": result.get("status"),
-                        "applied": bool(result.get("applied")),
-                        "duration_ms": result.get("duration_ms"),
-                        "timeout_seconds": _TASK_ROUTER_TIMEOUT_SECONDS,
-                        "error": result.get("error"),
+                        "status": rubric_profile_result.get("status"),
+                        "applied": bool(rubric_profile_result.get("applied")),
+                        "duration_ms": rubric_profile_result.get("duration_ms"),
+                        "timeout_seconds": _RUBRIC_PROFILE_TIMEOUT_SECONDS,
+                        "error": rubric_profile_result.get("error"),
                     },
                     metadata={
-                        "role": "task_classifier",
-                        "blocking": bool(explicit_skills),
+                        "role": "rubric_classifier",
+                        "blocking": True,
                         "fallback": "deterministic_task_profile",
                         "harness": {
-                            "mechanism": "task_routing",
-                            "pillars": [
-                                {"name": "context_engineering", "role": "primary"},
-                                {"name": "architectural_constraints", "role": "supporting"},
-                            ],
+                            "mechanism": "rubric_profile_compilation",
+                            "experimental": True,
                         },
                     },
                 )
-                task_router_trace_recorded = True
+                rubric_profile_trace_recorded = True
 
-            yield self._sse(
-                "task_routing_started",
-                {
-                    "session_id": session_id,
-                    "query_id": query_id,
-                    "run_id": run_record.run_id,
-                    "label": (
-                        "已复用上一轮任务理解"
-                        if reused_task_profile is not None
-                        else "普通对话无需语义路由"
-                        if router_skipped_trivial
-                        else "Agent 正在确认显式 Skill 并补充复合任务所需 Skill"
-                        if explicit_skills
-                        else "Agent 正在后台理解任务并匹配 Skill"
-                    ),
-                    "blocking": bool(explicit_skills),
-                    "timeout_seconds": _TASK_ROUTER_TIMEOUT_SECONDS,
-                },
+            # Start the Run trace immediately after durable Run creation so a
+            # later backend/tool/middleware/agent-construction failure cannot
+            # erase the already completed RubricProfile classification.
+            pending_trace_events: list[dict[str, str]] = []
+
+            def _trace_emit(event: str, payload: dict[str, Any]) -> None:
+                pending_trace_events.append(self._sse(event, payload))
+
+            trace_collector = TraceCollector(
+                session_id=session_id,
+                query_id=query_id,
+                emit_callback=_trace_emit,
+                runtime_inventory={},
             )
-            if reused_task_profile is not None:
-                task_router_event_emitted = True
-                yield self._sse(
-                    "task_routing_completed",
-                    {
-                        "session_id": session_id,
-                        "query_id": query_id,
-                        "run_id": run_record.run_id,
-                        "label": "已复用上一轮任务理解，无需重新路由",
-                        "status": "reused",
-                        "applied": True,
-                        "blocking": False,
-                        "duration_ms": 0,
-                        "execution_route": reused_task_profile.execution_route,
-                        "skill_candidates": TaskProfileClassifier.skill_ids(reused_task_profile),
-                    },
-                )
-            elif router_skipped_trivial:
-                task_router_event_emitted = True
-                yield self._sse(
-                    "task_routing_completed",
-                    {
-                        "session_id": session_id,
-                        "query_id": query_id,
-                        "run_id": run_record.run_id,
-                        "label": "普通对话已直接交给 Agent",
-                        "status": "not_required",
-                        "applied": False,
-                        "blocking": False,
-                        "duration_ms": 0,
-                        "execution_route": "native",
-                        "skill_candidates": [],
-                    },
-                )
+            trace_collector.__enter__()
+            trace_context_active = True
+            record_rubric_profile_trace(trace_collector)
             if goal_record is not None:
                 current_task = asyncio.current_task()
                 if current_task is not None:
@@ -6702,6 +6761,12 @@ class DeepAgentsAgentManager:
                     None,
                 ),
             )
+            if evaluation_tool_allowlist is not None:
+                agent_tools = [
+                    tool
+                    for tool in agent_tools
+                    if str(getattr(tool, "name", "")) in evaluation_tool_allowlist
+                ]
             mcp_config = config.load_config().get("mcp", {})
             from mcp_clients.servers import effective_mcp_server_names
 
@@ -6709,7 +6774,7 @@ class DeepAgentsAgentManager:
                 mcp_config.get("enabled", []),
                 auto_enable_gbrain=bool(mcp_config.get("auto_enable_gbrain", False)),
             )
-            if enabled_mcp:
+            if enabled_mcp and not disable_mcp:
                 try:
                     from mcp_clients import load_filtered_mcp_tools
 
@@ -6747,6 +6812,12 @@ class DeepAgentsAgentManager:
                 permission_context=permission_context,
                 workspace_backend=agent_backend,
                 permission_reviewer=permission_reviewer,
+                evaluation_builtin_tool_allowlist=evaluation_builtin_tool_allowlist,
+                rubric_config=(
+                    effective_rubric_config
+                    if run_record.requires_goal_verification
+                    else None
+                ),
             )
             main_summarization = _build_deepagents_summarization(model, agent_backend)
             if main_summarization is not None:
@@ -6768,6 +6839,7 @@ class DeepAgentsAgentManager:
                 checkpointer=self._checkpointer_info,
                 execution_backend=agent_backend,
             )
+            trace_collector.runtime_inventory = runtime_inventory
             analytics_model_prompt, analytics_model_payload = self._analytics_model_context(
                 analytics_model_id,
                 query=run_record.objective,
@@ -6784,6 +6856,11 @@ class DeepAgentsAgentManager:
 
             def build_subagent_middlewares() -> list[Any]:
                 middlewares: list[Any] = [
+                    *(
+                        [EvaluationToolBoundaryMiddleware(evaluation_builtin_tool_allowlist)]
+                        if evaluation_builtin_tool_allowlist is not None
+                        else []
+                    ),
                     SubagentProgressMiddleware(),
                     RunScopeMiddleware(),
                     AnalysisTemplateMiddleware(base_dir=self._base_dir),
@@ -6869,15 +6946,6 @@ class DeepAgentsAgentManager:
                 state_schema=PuddingClawAgentState,
             )
             logger.info("DeepAgents agent built successfully for session=%s", session_id)
-            # A slash hint must improve routing without becoming its only
-            # source. For an explicit hint, wait for the already bounded
-            # semantic Router before the first Agent decision so compound
-            # requirements (for example design + database analysis) are both
-            # visible. Requests without an explicit hint remain non-blocking.
-            if explicit_skills and task_router_task is not None and not task_router_task.done():
-                await task_router_task
-            if explicit_skills and task_router_task is not None and task_router_task.done():
-                self._run_coordinator._refresh_runtime_fields(run_record)
             self._run_coordinator.transition(run_record, RunStatus.RUNNING)
             yield self._sse(
                 "run_status_changed",
@@ -6907,27 +6975,6 @@ class DeepAgentsAgentManager:
             emitted_tool_ends: set[str] = set()
             pending_tool_starts = {}
             turn_sources = []
-            # Buffer trace events emitted synchronously by TraceCollector so they
-            # can be yielded asynchronously through the SSE stream.
-            pending_trace_events: list[dict[str, str]] = []
-            trace_collector: TraceCollector | None = None
-
-            def _trace_emit(event: str, payload: dict[str, Any]) -> None:
-                pending_trace_events.append(self._sse(event, payload))
-                # The live trace already reaches the UI over SSE. Persisting a
-                # growing snapshot for every span used to rewrite tens of MB on
-                # the event loop and stall unrelated session reads. Completed,
-                # cancelled and failed traces are persisted once below.
-
-            trace_collector = TraceCollector(
-                session_id=session_id,
-                query_id=query_id,
-                emit_callback=_trace_emit,
-                runtime_inventory=runtime_inventory,
-            )
-            trace_collector.__enter__()
-            trace_context_active = True
-            record_task_router_trace(trace_collector)
             active_llm_span: str | None = None
             model_call_index = 0
             active_graph_node: str | None = None
@@ -7044,16 +7091,9 @@ class DeepAgentsAgentManager:
                     "user_id": user_id,
                 }
             }
-            langsmith_callbacks = self._langsmith_callbacks()
-            if langsmith_callbacks:
-                agent_config["callbacks"] = langsmith_callbacks
-
-            if task_router_task is not None and task_router_task.done() and not task_router_event_emitted:
-                self._run_coordinator._refresh_runtime_fields(run_record)
-                router_event = task_router_completion_event()
-                if router_event is not None:
-                    task_router_event_emitted = True
-                    yield router_event
+            callbacks = callbacks_override if callbacks_override is not None else self._langsmith_callbacks()
+            if callbacks:
+                agent_config["callbacks"] = callbacks
 
             initial_state: dict[str, Any] = {
                 "messages": messages,
@@ -7098,13 +7138,6 @@ class DeepAgentsAgentManager:
                 },
                 trace_collector=trace_collector,
             ):
-                if task_router_task is not None and task_router_task.done() and not task_router_event_emitted:
-                    self._run_coordinator._refresh_runtime_fields(run_record)
-                    record_task_router_trace(trace_collector)
-                    router_event = task_router_completion_event()
-                    if router_event is not None:
-                        task_router_event_emitted = True
-                        yield router_event
                 if title_task is not None and title_task.done() and not title_event_emitted:
                     refined_title = title_task.result()
                     title_event_emitted = True
@@ -7823,14 +7856,6 @@ class DeepAgentsAgentManager:
                             },
                         )
 
-            if task_router_task is not None and task_router_task.done() and not task_router_event_emitted:
-                self._run_coordinator._refresh_runtime_fields(run_record)
-                record_task_router_trace(trace_collector)
-                router_event = task_router_completion_event()
-                if router_event is not None:
-                    task_router_event_emitted = True
-                    yield router_event
-
             # Close any still-running LLM span at the end of the stream.
             if active_llm_span is not None:
                 trace_collector.finish_llm_span(output=emitted_text)
@@ -8233,7 +8258,7 @@ class DeepAgentsAgentManager:
             # turns such as "你好" as two model calls.
             trace: dict[str, Any] | None = None
             try:
-                record_task_router_trace(trace_collector, settle_pending=True)
+                record_rubric_profile_trace(trace_collector)
                 trace = trace_collector.finish(
                     status=run_record.outcome.value if run_record.outcome else "completed"
                 )
@@ -8513,7 +8538,7 @@ class DeepAgentsAgentManager:
                 logger.debug("Failed to reject pending permission requests for session=%s", session_id, exc_info=True)
             try:
                 if trace_collector is not None:
-                    record_task_router_trace(trace_collector, settle_pending=True)
+                    record_rubric_profile_trace(trace_collector)
                     trace = trace_collector.finish(status="cancelled", error="client_cancelled")
                     await asyncio.to_thread(
                         session_manager.update_trace,
@@ -8695,7 +8720,7 @@ class DeepAgentsAgentManager:
                     )
                     run_messages_persisted = True
                     if trace_collector is not None:
-                        record_task_router_trace(trace_collector, settle_pending=True)
+                        record_rubric_profile_trace(trace_collector)
                         trace = trace_collector.finish(
                             status=RunOutcome.BUDGET_EXCEEDED.value,
                             error=detail,
@@ -8849,7 +8874,7 @@ class DeepAgentsAgentManager:
                     # user to reproduce it repeatedly or scrape a terminal.
                     trace_collector.root.metadata["error_type"] = type(exc).__name__
                     trace_collector.root.metadata["error_traceback"] = error_traceback[-20000:]
-                    record_task_router_trace(trace_collector, settle_pending=True)
+                    record_rubric_profile_trace(trace_collector)
                     trace = trace_collector.finish(status="error", error=error_msg)
                     await asyncio.to_thread(
                         session_manager.update_trace,
@@ -8875,19 +8900,6 @@ class DeepAgentsAgentManager:
                         "Failed to reject terminal user-input requests for session=%s run=%s",
                         session_id,
                         run_record.run_id,
-                        exc_info=True,
-                    )
-            if task_router_task is not None and not task_router_task.done():
-                task_router_task.cancel()
-                try:
-                    await task_router_task
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    logger.debug(
-                        "Task router cleanup failed for session=%s query=%s",
-                        session_id,
-                        query_id,
                         exc_info=True,
                     )
             if goal_record is not None:

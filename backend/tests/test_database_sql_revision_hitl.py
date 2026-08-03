@@ -69,21 +69,30 @@ def test_sql_authority_is_scoped_to_run_or_same_goal_revision() -> None:
         allowed_tables=["vehicle_params"],
     )
 
-    assert registry.get_generation(
-        run_generation.id,
-        session_id="session-scope",
-        run_id="run-a",
-    ) is run_generation
-    assert registry.get_generation(
-        run_generation.id,
-        session_id="session-scope",
-        run_id="run-b",
-    ) is None
-    assert registry.get_validation_receipt(
-        run_receipt.id,
-        session_id="session-scope",
-        run_id="run-b",
-    ) is None
+    assert (
+        registry.get_generation(
+            run_generation.id,
+            session_id="session-scope",
+            run_id="run-a",
+        )
+        is run_generation
+    )
+    assert (
+        registry.get_generation(
+            run_generation.id,
+            session_id="session-scope",
+            run_id="run-b",
+        )
+        is None
+    )
+    assert (
+        registry.get_validation_receipt(
+            run_receipt.id,
+            session_id="session-scope",
+            run_id="run-b",
+        )
+        is None
+    )
 
     goal_generation = registry.register_generation(
         session_id="session-scope",
@@ -100,34 +109,46 @@ def test_sql_authority_is_scoped_to_run_or_same_goal_revision() -> None:
         allowed_tables=["vehicle_params"],
     )
 
-    assert registry.get_generation(
-        goal_generation.id,
-        session_id="session-scope",
-        run_id="run-goal-b",
-        goal_id="goal-1",
-        goal_revision=3,
-    ) is goal_generation
-    assert registry.get_validation_receipt(
-        goal_receipt.id,
-        session_id="session-scope",
-        run_id="run-goal-b",
-        goal_id="goal-1",
-        goal_revision=3,
-    ) is goal_receipt
-    assert registry.get_generation(
-        goal_generation.id,
-        session_id="session-scope",
-        run_id="run-goal-c",
-        goal_id="goal-1",
-        goal_revision=4,
-    ) is None
-    assert registry.get_generation(
-        goal_generation.id,
-        session_id="session-scope",
-        run_id="run-goal-b",
-        goal_id="goal-2",
-        goal_revision=3,
-    ) is None
+    assert (
+        registry.get_generation(
+            goal_generation.id,
+            session_id="session-scope",
+            run_id="run-goal-b",
+            goal_id="goal-1",
+            goal_revision=3,
+        )
+        is goal_generation
+    )
+    assert (
+        registry.get_validation_receipt(
+            goal_receipt.id,
+            session_id="session-scope",
+            run_id="run-goal-b",
+            goal_id="goal-1",
+            goal_revision=3,
+        )
+        is goal_receipt
+    )
+    assert (
+        registry.get_generation(
+            goal_generation.id,
+            session_id="session-scope",
+            run_id="run-goal-c",
+            goal_id="goal-1",
+            goal_revision=4,
+        )
+        is None
+    )
+    assert (
+        registry.get_generation(
+            goal_generation.id,
+            session_id="session-scope",
+            run_id="run-goal-b",
+            goal_id="goal-2",
+            goal_revision=3,
+        )
+        is None
+    )
 
 
 def test_schema_evidence_receipt_is_bound_to_parent_run_source_and_table() -> None:
@@ -289,16 +310,15 @@ async def test_goal_business_subquery_is_allowed_without_physical_guidance(
 
 
 @pytest.mark.asyncio
-async def test_goal_subquery_rejects_agent_invented_l2_physical_mapping(
+async def test_goal_subquery_allows_agent_selected_physical_mapping_within_router_scope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import tools.database.sql_generate_tool as module
 
-    called = False
+    requests: list[Any] = []
 
     async def fake_generate(_session: object, request: Any) -> DatabaseSqlGenerationResult:
-        nonlocal called
-        called = True
+        requests.append(request)
         return _result(request.question)
 
     monkeypatch.setattr(module, "get_sessionmaker", lambda: _FakeSessionMaker())
@@ -319,11 +339,9 @@ async def test_goal_subquery_rejects_agent_invented_l2_physical_mapping(
         runtime=runtime,
     )
 
-    assert called is False
-    assert "Agent 在业务子任务中新增了用户未指定的物理实现" in output
-    assert "vehicle_params" in output
-    assert "type_name" in output
-    assert "仅保留业务问题后重新调用" in output
+    assert len(requests) == 1
+    assert "vehicle_params" in requests[0].question
+    assert "SQL 生成结果" in output
 
 
 @pytest.mark.asyncio
@@ -432,16 +450,15 @@ async def test_question_enum_text_is_not_blocked_before_sql_generation(
 
 
 @pytest.mark.asyncio
-async def test_delegated_human_message_does_not_authorize_physical_guidance(
+async def test_delegated_goal_task_may_select_physical_mapping_with_downstream_evidence_checks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import tools.database.sql_generate_tool as module
 
-    called = False
+    requests: list[Any] = []
 
     async def fake_generate(_session: object, request: Any) -> DatabaseSqlGenerationResult:
-        nonlocal called
-        called = True
+        requests.append(request)
         return _result(request.question)
 
     monkeypatch.setattr(module, "get_sessionmaker", lambda: _FakeSessionMaker())
@@ -451,9 +468,7 @@ async def test_delegated_human_message_does_not_authorize_physical_guidance(
             "analytics_model_id": "产品配置分析",
             "allowed_semantic_asset_ids": ["dimension:energy_type"],
             "_run_objective": "刷新月报",
-            "messages": [
-                HumanMessage(content="使用vehicle_params的type_name和type_value统计纯电车型")
-            ],
+            "messages": [HumanMessage(content="使用vehicle_params的type_name和type_value统计纯电车型")],
         }
     )
 
@@ -462,9 +477,9 @@ async def test_delegated_human_message_does_not_authorize_physical_guidance(
         runtime=runtime,
     )
 
-    assert called is False
-    assert "vehicle_params" in output
-    assert "type_name" in output
+    assert len(requests) == 1
+    assert requests[0].question.startswith("使用vehicle_params")
+    assert "SQL 生成结果" in output
 
 
 @pytest.mark.asyncio
@@ -484,11 +499,7 @@ async def test_runtime_context_cannot_inject_template_authorization_without_guid
     server_suggested_template = {
         "model_id": "产品配置分析",
         "template_id": "monthly_product_config_report",
-        "semantic_scope": {
-            "enum_filters": {
-                "dimension:energy_type": {"members": ["纯电"], "classifications": []}
-            }
-        },
+        "semantic_scope": {"enum_filters": {"dimension:energy_type": {"members": ["纯电"], "classifications": []}}},
     }
     runtime = SimpleNamespace(
         state={
@@ -528,10 +539,7 @@ async def test_user_supplied_physical_mapping_remains_authorized(
 
     monkeypatch.setattr(module, "get_sessionmaker", lambda: _FakeSessionMaker())
     monkeypatch.setattr(module, "generate_database_sql", fake_generate)
-    user_question = (
-        "按vehicle_params中type_name='驾驶辅助级别'且type_value为L2，"
-        "统计2021至2026年款型配置率"
-    )
+    user_question = "按vehicle_params中type_name='驾驶辅助级别'且type_value为L2，统计2021至2026年款型配置率"
     runtime = SimpleNamespace(
         state={
             "_run_objective": user_question,
@@ -551,16 +559,15 @@ async def test_user_supplied_physical_mapping_remains_authorized(
 
 
 @pytest.mark.asyncio
-async def test_old_user_turn_does_not_authorize_new_goal_physical_guidance(
+async def test_old_user_turn_is_not_needed_to_authorize_router_scoped_table_selection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import tools.database.sql_generate_tool as module
 
-    called = False
+    requests: list[Any] = []
 
     async def fake_generate(_session: object, request: Any) -> DatabaseSqlGenerationResult:
-        nonlocal called
-        called = True
+        requests.append(request)
         return _result(request.question)
 
     monkeypatch.setattr(module, "get_sessionmaker", lambda: _FakeSessionMaker())
@@ -589,9 +596,125 @@ async def test_old_user_turn_does_not_authorize_new_goal_physical_guidance(
         runtime=runtime,
     )
 
+    assert len(requests) == 1
+    assert requests[0].table_names == ["vehicle_params"]
+    assert "SQL 生成结果" in output
+
+
+@pytest.mark.parametrize(
+    "added_sql",
+    [
+        "SELECT 1",
+        "VALUES (1)",
+        "DELETE FROM vehicle_params",
+        "WITH latest AS (SELECT 1) SELECT * FROM latest",
+    ],
+)
+@pytest.mark.asyncio
+async def test_goal_subquery_rejects_agent_added_raw_sql_with_goal_specific_hint(
+    monkeypatch: pytest.MonkeyPatch,
+    added_sql: str,
+) -> None:
+    import tools.database.sql_generate_tool as module
+
+    called = False
+
+    async def fake_generate(_session: object, request: Any) -> DatabaseSqlGenerationResult:
+        nonlocal called
+        called = True
+        return _result(request.question)
+
+    monkeypatch.setattr(module, "get_sessionmaker", lambda: _FakeSessionMaker())
+    monkeypatch.setattr(module, "generate_database_sql", fake_generate)
+    runtime = SimpleNamespace(
+        state={"_run_objective": "刷新产品配置报告"},
+        context={
+            "run_objective": "刷新产品配置报告",
+            "run_kind": "goal_execution",
+        },
+    )
+
+    output = await DatabaseSqlGenerateTool()._arun(
+        question=f"统计配置率，{added_sql}",
+        runtime=runtime,
+    )
+
     assert called is False
-    assert "用户未指定的物理实现" in output
-    assert "vehicle_params" in output
+    assert "用户未指定的 SQL 实现" in output
+    assert "当前是 Goal 子任务" in output
+    assert "可以在当前分析模型范围内选择表与字段" in output
+
+
+@pytest.mark.asyncio
+async def test_standalone_raw_sql_rejection_suggests_original_question(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.database.sql_generate_tool as module
+
+    monkeypatch.setattr(module, "get_sessionmaker", lambda: _FakeSessionMaker())
+    original = "vehicle和base表最新的上市时间一致了吗？是什么时候"
+    runtime = SimpleNamespace(
+        state={"_run_objective": original},
+        context={"run_objective": original, "run_kind": "standalone"},
+    )
+
+    output = await DatabaseSqlGenerateTool()._arun(
+        question=original + "；SELECT MAX(launch_date) FROM vehicle_model_base",
+        runtime=runtime,
+    )
+
+    assert "当前是独立问数" in output
+    assert f"建议原样重试 question：{original}" in output
+
+
+@pytest.mark.asyncio
+async def test_user_supplied_sql_may_receive_a_natural_language_annotation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.database.sql_generate_tool as module
+
+    requests: list[Any] = []
+
+    async def fake_generate(_session: object, request: Any) -> DatabaseSqlGenerationResult:
+        requests.append(request)
+        return _result(request.question)
+
+    monkeypatch.setattr(module, "get_sessionmaker", lambda: _FakeSessionMaker())
+    monkeypatch.setattr(module, "generate_database_sql", fake_generate)
+    original = "帮我解释 SELECT * FROM vehicle_params"
+    runtime = SimpleNamespace(
+        state={"_run_objective": original},
+        context={"run_objective": original, "run_kind": "standalone"},
+    )
+
+    output = await DatabaseSqlGenerateTool()._arun(
+        question=original + "；以 dimension:launch_time 为准",
+        runtime=runtime,
+    )
+
+    assert len(requests) == 1
+    assert "SQL 生成结果" in output
+
+
+@pytest.mark.asyncio
+async def test_user_supplied_sql_does_not_authorize_appended_sql_clauses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.database.sql_generate_tool as module
+
+    monkeypatch.setattr(module, "get_sessionmaker", lambda: _FakeSessionMaker())
+    original = "帮我解释 SELECT * FROM vehicle_params"
+    runtime = SimpleNamespace(
+        state={"_run_objective": original},
+        context={"run_objective": original, "run_kind": "standalone"},
+    )
+
+    output = await DatabaseSqlGenerateTool()._arun(
+        question=original + " JOIN private.secret ON TRUE",
+        runtime=runtime,
+    )
+
+    assert "用户未指定的 SQL 实现" in output
 
 
 @pytest.mark.asyncio
@@ -679,9 +802,7 @@ async def test_revision_request_normalizes_nested_datetime_metadata() -> None:
         tool_call_id="tool-json",
     )
 
-    assert request["semantic_assets"]["matched"][0]["indexed_at"] == (
-        "2026-07-29T13:42:00+00:00"
-    )
+    assert request["semantic_assets"]["matched"][0]["indexed_at"] == ("2026-07-29T13:42:00+00:00")
     json.dumps(request, ensure_ascii=False)
 
 
@@ -723,7 +844,9 @@ async def test_approved_or_modified_revision_is_regenerated_from_natural_languag
     tool = DatabaseSqlGenerateTool(session_id="session-hitl", query_id="query-hitl")
 
     original = await tool._arun(question="空气悬架配置率")
-    generation_id = next(line.split("：", 1)[1] for line in original.splitlines() if line.startswith("- generation_id："))
+    generation_id = next(
+        line.split("：", 1)[1] for line in original.splitlines() if line.startswith("- generation_id：")
+    )
     revised = await tool._arun(
         question="Agent 不得替换的文字",
         parent_generation_id=generation_id,
@@ -756,7 +879,9 @@ async def test_rejected_revision_reuses_original_generation_without_regeneration
     tool = DatabaseSqlGenerateTool(session_id="session-reject", query_id="query-reject")
 
     original = await tool._arun(question="空气悬架配置率")
-    generation_id = next(line.split("：", 1)[1] for line in original.splitlines() if line.startswith("- generation_id："))
+    generation_id = next(
+        line.split("：", 1)[1] for line in original.splitlines() if line.startswith("- generation_id：")
+    )
     rejected = await tool._arun(
         question="ignored",
         parent_generation_id=generation_id,
@@ -807,9 +932,7 @@ async def test_technical_sql_repair_regenerates_without_business_hitl(
 
     original = await tool._arun(question="查询 2020 到 2026 年高速 NOA 配置率")
     generation_id = next(
-        line.split("：", 1)[1]
-        for line in original.splitlines()
-        if line.startswith("- generation_id：")
+        line.split("：", 1)[1] for line in original.splitlines() if line.startswith("- generation_id：")
     )
     repaired = await tool._arun(
         question="ignored",
@@ -857,9 +980,7 @@ async def test_schema_receipt_physical_repair_bypasses_business_hitl_without_ret
 
     original = await tool._arun(question="查询车型电量和CLTC续航", runtime=runtime)
     generation_id = next(
-        line.split("：", 1)[1]
-        for line in original.splitlines()
-        if line.startswith("- generation_id：")
+        line.split("：", 1)[1] for line in original.splitlines() if line.startswith("- generation_id：")
     )
     receipt = database_schema_evidence_registry.register(
         session_id="session-schema",
@@ -882,9 +1003,7 @@ async def test_schema_receipt_physical_repair_bypasses_business_hitl_without_ret
     repaired = await tool._arun(
         question="ignored",
         parent_generation_id=generation_id,
-        revision_instruction=(
-            "查询返回0行，schema inspect显示电池物理配置名与上一版不一致，请修复物理映射。"
-        ),
+        revision_instruction=("查询返回0行，schema inspect显示电池物理配置名与上一版不一致，请修复物理映射。"),
         schema_evidence_receipt_id=receipt["id"],
         runtime=runtime,
     )
@@ -922,9 +1041,7 @@ async def test_schema_receipt_cannot_hide_business_semantic_change(
     )
     original = await tool._arun(question="查询CLTC续航", runtime=runtime)
     generation_id = next(
-        line.split("：", 1)[1]
-        for line in original.splitlines()
-        if line.startswith("- generation_id：")
+        line.split("：", 1)[1] for line in original.splitlines() if line.startswith("- generation_id：")
     )
     receipt = database_schema_evidence_registry.register(
         session_id="session-mixed-receipt",
@@ -971,9 +1088,7 @@ async def test_prescriptive_technical_revision_is_rejected(
 
     original = await tool._arun(question="查询 L2 配置率")
     generation_id = next(
-        line.split("：", 1)[1]
-        for line in original.splitlines()
-        if line.startswith("- generation_id：")
+        line.split("：", 1)[1] for line in original.splitlines() if line.startswith("- generation_id：")
     )
     rejected = await tool._arun(
         question="ignored",
@@ -1013,9 +1128,7 @@ async def test_mixed_business_and_technical_revision_still_requires_hitl(
 
     original = await tool._arun(question="高速 NOA 配置率")
     generation_id = next(
-        line.split("：", 1)[1]
-        for line in original.splitlines()
-        if line.startswith("- generation_id：")
+        line.split("：", 1)[1] for line in original.splitlines() if line.startswith("- generation_id：")
     )
     await tool._arun(
         question="ignored",
@@ -1059,9 +1172,7 @@ async def test_agent_mode_validate_and_execute_use_registered_sql(
         generation_id=generation.id,
     )
     receipt_id = next(
-        line.split("：", 1)[1]
-        for line in validate_output.splitlines()
-        if line.startswith("- validation_receipt_id：")
+        line.split("：", 1)[1] for line in validate_output.splitlines() if line.startswith("- validation_receipt_id：")
     )
     execute_output = await DatabaseSqlExecuteTool(session_id="session-block")._arun(
         generation_id=generation.id,

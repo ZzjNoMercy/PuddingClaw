@@ -327,6 +327,7 @@ def test_build_middlewares_includes_model_call_limit(tmp_path, monkeypatch):
     middlewares = manager._build_middlewares(
         project_id=None,
         rubric_model=SimpleNamespace(),
+        rubric_config={"enabled": True, "max_stagnant_repairs": 4},
     )
     middleware_names = [item.__class__.__name__ for item in middlewares]
     assert middleware_names.index("ToolGuideMiddleware") == middleware_names.index("ToolsetMiddleware") + 1
@@ -1600,9 +1601,11 @@ def test_standard_goal_budget_exhaustion_keeps_progress_visible(tmp_path, monkey
     assert (
         event_names.index("task_preflight_started")
         < event_names.index("task_preflight_completed")
-        < event_names.index("task_routing_started")
         < event_names.index("run_started")
     )
+    assert "task_routing_started" not in event_names
+    assert "task_routing_completed" not in event_names
+    assert "rubric_profile_started" not in event_names
     assert "token" in event_names
     assert "final_response" not in event_names
     assert "run_limit_reached" in event_names
@@ -1615,19 +1618,209 @@ def test_standard_goal_budget_exhaustion_keeps_progress_visible(tmp_path, monkey
     )
 
 
-def test_slow_task_router_never_blocks_run_or_main_agent_start(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("completion_policy", "goal_mode", "goal_id", "run_kind", "expected"),
+    [
+        ("standard", True, None, "goal_execution", False),
+        ("rubric", False, None, "standalone", False),
+        ("rubric", True, "goal-existing", "goal_execution", False),
+        ("rubric", True, None, "goal_execution", True),
+    ],
+)
+def test_rubric_profile_classifier_boundary(
+    completion_policy,
+    goal_mode,
+    goal_id,
+    run_kind,
+    expected,
+):
+    from graph.deepagents_manager import _should_classify_rubric_profile
+
+    assert _should_classify_rubric_profile(
+        completion_policy=completion_policy,
+        goal_mode=goal_mode,
+        goal_id=goal_id,
+        run_kind=run_kind,
+    ) is expected
+
+
+def test_existing_rubric_goal_stays_rubric_after_global_setting_is_disabled(tmp_path, monkeypatch):
+    from graph import deepagents_manager as manager_module
+    from graph.session_manager import session_manager
+    from harness.coordinators import HarnessRunCoordinator
+    from harness.models import GoalCompletionPolicy, RunStatus
+    from projects.registry import project_registry
+
+    session_manager.initialize(tmp_path)
+    project_registry.initialize(tmp_path)
+    session_manager.create_session("frozen-rubric-policy-session")
+    coordinator = HarnessRunCoordinator(session_manager)
+    first_run, goal = coordinator.start_run(
+        session_id="frozen-rubric-policy-session",
+        query_id="query-create-rubric-goal",
+        objective="生成并验收分析报告",
+        goal_mode=True,
+        completion_policy=GoalCompletionPolicy.RUBRIC,
+        verification_enabled=True,
+    )
+    assert goal is not None
+    coordinator.transition(first_run, RunStatus.RUNNING)
+    _completed_run, goal, _report = coordinator.complete_from_final_state(first_run, goal, {})
+    assert goal is not None
+
+    async def forbidden_classifier(_self, **_kwargs):
+        raise AssertionError("an existing Rubric Goal must reuse its frozen contract")
+
+    captured_middlewares = []
+
+    class FakeDeepAgent:
+        async def astream(self, *_args, **_kwargs):
+            yield ("values", {"messages": [AIMessage(content="继续执行。")], "todos": []})
+
+    async def no_title(_session_id: str):
+        return None
+
+    monkeypatch.setattr(
+        manager_module.DeepAgentsAgentManager,
+        "_classify_rubric_profile",
+        forbidden_classifier,
+    )
+
+    def fake_create_deep_agent(**kwargs):
+        captured_middlewares.extend(kwargs.get("middleware") or [])
+        return FakeDeepAgent()
+
+    monkeypatch.setattr(manager_module, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(manager_module, "_generate_title", no_title)
+    runtime = manager_module.DeepAgentsAgentManager()
+    runtime.initialize(Path(tmp_path))
+
+    async def collect():
+        return [
+            event
+            async for event in runtime.astream(
+                message="继续",
+                session_id="frozen-rubric-policy-session",
+                user_id="test-user",
+                goal_mode=True,
+                goal_id=goal.goal_id,
+            )
+        ]
+
+    events = asyncio.run(collect())
+    started = json.loads(next(event["data"] for event in events if event["event"] == "run_started"))
+    continued_run = started["run"]
+
+    assert continued_run["verification_enabled"] is True
+    assert continued_run["verification_mode"] == "rubric"
+    assert continued_run["verification_contract"] is not None
+    assert any(
+        isinstance(item, manager_module.PuddingClawRubricMiddleware)
+        for item in captured_middlewares
+    )
+    assert all(event["event"] != "rubric_profile_started" for event in events)
+
+
+def test_rubric_goal_revision_reclassifies_once_before_freezing_new_contract(tmp_path, monkeypatch):
+    from graph import deepagents_manager as manager_module
+    from graph.session_manager import session_manager
+    from harness.coordinators import HarnessRunCoordinator
+    from harness.goal_turn_router import GoalTurnDecision
+    from harness.models import GoalCompletionPolicy, GoalTurnIntent, RunStatus
+    from harness.task_profiles import TaskProfileClassifier
+    from projects.registry import project_registry
+
+    session_manager.initialize(tmp_path)
+    project_registry.initialize(tmp_path)
+    session_manager.create_session("rubric-revision-profile-session")
+    coordinator = HarnessRunCoordinator(session_manager)
+    first_run, goal = coordinator.start_run(
+        session_id="rubric-revision-profile-session",
+        query_id="query-create-rubric-revision-goal",
+        objective="生成分析报告",
+        goal_mode=True,
+        completion_policy=GoalCompletionPolicy.RUBRIC,
+        verification_enabled=True,
+    )
+    assert goal is not None
+    coordinator.transition(first_run, RunStatus.RUNNING)
+    _completed_run, goal, _report = coordinator.complete_from_final_state(first_run, goal, {})
+    assert goal is not None
+
+    async def revise_goal_turn(_self, **_kwargs):
+        return GoalTurnDecision(
+            intent=GoalTurnIntent.REVISE_GOAL,
+            target_goal_id=goal.goal_id,
+            revised_objective="重算销量并更新分析报告",
+            confidence=1.0,
+            reason="test_revision",
+            classifier="test",
+        )
+
+    classifier_calls = 0
+
+    async def revised_rubric_profile(_self, **_kwargs):
+        nonlocal classifier_calls
+        classifier_calls += 1
+        return TaskProfileClassifier.profile_from_dimensions(
+            work_natures=["重算销量并更新分析报告"],
+            delivery_forms=["artifact"],
+            verification_intents=["database_analysis", "artifact"],
+            classifier="llm_rubric",
+        )
+
+    class FakeDeepAgent:
+        async def astream(self, *_args, **_kwargs):
+            yield ("values", {"messages": [AIMessage(content="按新目标继续。")], "todos": []})
+
+    async def no_title(_session_id: str):
+        return None
+
+    monkeypatch.setattr(manager_module.DeepAgentsAgentManager, "_classify_goal_turn", revise_goal_turn)
+    monkeypatch.setattr(
+        manager_module.DeepAgentsAgentManager,
+        "_classify_rubric_profile",
+        revised_rubric_profile,
+    )
+    monkeypatch.setattr(manager_module, "create_deep_agent", lambda **_kwargs: FakeDeepAgent())
+    monkeypatch.setattr(manager_module, "_generate_title", no_title)
+    runtime = manager_module.DeepAgentsAgentManager()
+    runtime.initialize(Path(tmp_path))
+
+    async def collect():
+        return [
+            event
+            async for event in runtime.astream(
+                message="把目标改成重算销量并更新分析报告",
+                session_id="rubric-revision-profile-session",
+                user_id="test-user",
+                goal_mode=True,
+                goal_id=goal.goal_id,
+            )
+        ]
+
+    events = asyncio.run(collect())
+    revised_goal = session_manager.get_goal_state("rubric-revision-profile-session", goal.goal_id)
+
+    assert classifier_calls == 1
+    assert revised_goal is not None
+    assert revised_goal["objective_revision"] == 2
+    assert {"analytics", "artifact"} <= set(revised_goal["goal_contract"]["verification_packs"])
+    assert sum(event["event"] == "rubric_profile_started" for event in events) == 1
+    assert sum(event["event"] == "rubric_profile_completed" for event in events) == 1
+
+
+def test_standard_mode_never_calls_rubric_profile_classifier(tmp_path, monkeypatch):
     from graph import deepagents_manager as manager_module
     from graph.session_manager import session_manager
     from projects.registry import project_registry
 
     session_manager.initialize(tmp_path)
     project_registry.initialize(tmp_path)
-    session_manager.create_session("nonblocking-router-session")
-    router_started = asyncio.Event()
+    session_manager.create_session("standard-no-rubric-profile-session")
 
-    async def blocked_router(_self, **_kwargs):
-        router_started.set()
-        await asyncio.Event().wait()
+    async def forbidden_classifier(_self, **_kwargs):
+        raise AssertionError("standard mode must not call the Rubric classifier")
 
     class FakeDeepAgent:
         async def astream(self, *_args, **_kwargs):
@@ -1639,8 +1832,8 @@ def test_slow_task_router_never_blocks_run_or_main_agent_start(tmp_path, monkeyp
 
     monkeypatch.setattr(
         manager_module.DeepAgentsAgentManager,
-        "_classify_task_profile",
-        blocked_router,
+        "_classify_rubric_profile",
+        forbidden_classifier,
     )
     monkeypatch.setattr(
         manager_module,
@@ -1656,29 +1849,26 @@ def test_slow_task_router_never_blocks_run_or_main_agent_start(tmp_path, monkeyp
             event
             async for event in runtime.astream(
                 message="分析并刷新产品报告",
-                session_id="nonblocking-router-session",
+                session_id="standard-no-rubric-profile-session",
                 user_id="test-user",
             )
         ]
 
     events = asyncio.run(collect())
     event_names = [event["event"] for event in events]
-    trace = session_manager.get_trace("nonblocking-router-session")
+    trace = session_manager.get_trace("standard-no-rubric-profile-session")
 
-    assert router_started.is_set()
-    assert event_names.index("task_routing_started") < event_names.index("run_started")
-    assert "task_routing_completed" not in event_names
+    assert "rubric_profile_started" not in event_names
+    assert "rubric_profile_completed" not in event_names
+    assert "task_routing_started" not in event_names
     assert "done" in event_names
     assert trace is not None
-    router_span = next(span for span in trace["spans"] if span["name"] == "task_router")
-    assert router_span["output"]["status"] == "cancelled"
-    assert router_span["output"]["error"] == "run_finished_before_router"
+    assert all(span["name"] != "rubric_profile_classifier" for span in trace["spans"])
 
 
-def test_explicit_skill_hint_waits_for_complementary_semantic_candidates(tmp_path, monkeypatch):
+def test_explicit_skill_hint_is_deterministic_and_does_not_start_a_router(tmp_path, monkeypatch):
     from graph import deepagents_manager as manager_module
     from graph.session_manager import session_manager
-    from harness.task_profiles import TaskProfileClassifier
     from projects.registry import project_registry
 
     session_manager.initialize(tmp_path)
@@ -1698,21 +1888,8 @@ def test_explicit_skill_hint_waits_for_complementary_semantic_candidates(tmp_pat
     )
     captured: dict[str, object] = {}
 
-    async def semantic_router(_self, **_kwargs):
-        await asyncio.sleep(0.01)
-        return TaskProfileClassifier.profile_from_dimensions(
-            work_natures=["查询数据库销量"],
-            delivery_forms=["artifact"],
-            verification_intents=["database_analysis", "artifact"],
-            skill_candidates=[
-                {
-                    "skill_id": "database-analysis",
-                    "confidence": 0.94,
-                    "evidence": "查询数据库销量",
-                }
-            ],
-            classifier="llm_semantic",
-        )
+    async def forbidden_classifier(_self, **_kwargs):
+        raise AssertionError("explicit Skill hints must not start a semantic router")
 
     class FakeDeepAgent:
         async def astream(self, graph_input, **_kwargs):
@@ -1724,8 +1901,8 @@ def test_explicit_skill_hint_waits_for_complementary_semantic_candidates(tmp_pat
 
     monkeypatch.setattr(
         manager_module.DeepAgentsAgentManager,
-        "_classify_task_profile",
-        semantic_router,
+        "_classify_rubric_profile",
+        forbidden_classifier,
     )
     monkeypatch.setattr(manager_module, "create_deep_agent", lambda **_kwargs: FakeDeepAgent())
     monkeypatch.setattr(manager_module, "_generate_title", no_title)
@@ -1747,34 +1924,51 @@ def test_explicit_skill_hint_waits_for_complementary_semantic_candidates(tmp_pat
         item["skill_id"]
         for item in captured["task_profile"]["skill_candidates"]  # type: ignore[index]
     }
-    assert candidates == {"baoyu-design", "database-analysis"}
-    routing = json.loads(next(event["data"] for event in events if event["event"] == "task_routing_completed"))
-    assert routing["blocking"] is True
+    assert candidates == {"baoyu-design"}
+    assert all(event["event"] != "task_routing_started" for event in events)
+    assert all(event["event"] != "rubric_profile_started" for event in events)
 
 
-def test_trivial_chat_skips_semantic_router_provider_call(tmp_path, monkeypatch):
+def test_new_rubric_goal_freezes_semantic_profile_before_run_start(tmp_path, monkeypatch):
+    import copy
+
     from graph import deepagents_manager as manager_module
     from graph.session_manager import session_manager
+    from harness.task_profiles import TaskProfileClassifier
     from projects.registry import project_registry
 
     session_manager.initialize(tmp_path)
     project_registry.initialize(tmp_path)
-    session_manager.create_session("trivial-router-session")
+    session_manager.create_session("rubric-profile-session")
+    runtime_config = copy.deepcopy(manager_module.config.load_config())
+    runtime_config.setdefault("harness", {}).setdefault("completion", {}).setdefault("rubric", {})[
+        "enabled"
+    ] = True
+    monkeypatch.setattr(manager_module.config, "load_config", lambda: runtime_config)
 
-    async def forbidden_router(_self, **_kwargs):
-        raise AssertionError("trivial chat must not call the semantic router")
+    classifier_called = False
+
+    async def semantic_rubric_profile(_self, **_kwargs):
+        nonlocal classifier_called
+        classifier_called = True
+        return TaskProfileClassifier.profile_from_dimensions(
+            work_natures=["重算销量并刷新报告"],
+            delivery_forms=["artifact"],
+            verification_intents=["database_analysis", "artifact"],
+            classifier="llm_rubric",
+        )
 
     class FakeDeepAgent:
         async def astream(self, *_args, **_kwargs):
-            yield ("values", {"messages": [AIMessage(content="你好。")]})
+            yield ("values", {"messages": [AIMessage(content="已执行。")], "todos": []})
 
     async def no_title(_session_id: str):
         return None
 
     monkeypatch.setattr(
         manager_module.DeepAgentsAgentManager,
-        "_classify_task_profile",
-        forbidden_router,
+        "_classify_rubric_profile",
+        semantic_rubric_profile,
     )
     monkeypatch.setattr(manager_module, "create_deep_agent", lambda **_kwargs: FakeDeepAgent())
     monkeypatch.setattr(manager_module, "_generate_title", no_title)
@@ -1785,31 +1979,47 @@ def test_trivial_chat_skips_semantic_router_provider_call(tmp_path, monkeypatch)
         return [
             event
             async for event in runtime.astream(
-                message="你好",
-                session_id="trivial-router-session",
+                message="查询销量并刷新分析报告",
+                session_id="rubric-profile-session",
                 user_id="test-user",
+                goal_mode=True,
             )
         ]
 
     events = asyncio.run(collect())
-    completion = next(json.loads(event["data"]) for event in events if event["event"] == "task_routing_completed")
-    trace = session_manager.get_trace("trivial-router-session")
+    event_names = [event["event"] for event in events]
+    started = json.loads(next(event["data"] for event in events if event["event"] == "run_started"))
+    run = started["run"]
+    trace = session_manager.get_trace("rubric-profile-session")
 
-    assert completion["status"] == "not_required"
+    assert classifier_called is True
+    assert event_names.index("rubric_profile_started") < event_names.index("run_started")
+    assert event_names.index("rubric_profile_completed") < event_names.index("run_started")
+    assert {"analytics", "artifact"} <= set(run["verification_contract"]["verification_packs"])
+    assert run["task_profile"]["skill_candidates"] == []
     assert trace is not None
-    assert all(span["name"] != "task_router" for span in trace["spans"])
+    classifier_span = next(span for span in trace["spans"] if span["name"] == "rubric_profile_classifier")
+    assert classifier_span["output"]["status"] == "completed"
+    assert classifier_span["metadata"]["role"] == "rubric_classifier"
 
 
-def test_task_router_timeout_is_persisted_in_trace(tmp_path, monkeypatch):
+def test_rubric_profile_timeout_freezes_deterministic_fallback(tmp_path, monkeypatch):
+    import copy
+
     from graph import deepagents_manager as manager_module
     from graph.session_manager import session_manager
     from projects.registry import project_registry
 
     session_manager.initialize(tmp_path)
     project_registry.initialize(tmp_path)
-    session_manager.create_session("router-timeout-trace-session")
+    session_manager.create_session("rubric-timeout-trace-session")
+    runtime_config = copy.deepcopy(manager_module.config.load_config())
+    runtime_config.setdefault("harness", {}).setdefault("completion", {}).setdefault("rubric", {})[
+        "enabled"
+    ] = True
+    monkeypatch.setattr(manager_module.config, "load_config", lambda: runtime_config)
 
-    async def timed_out_router(_self, **_kwargs):
+    async def timed_out_classifier(_self, **_kwargs):
         raise TimeoutError
 
     class FakeDeepAgent:
@@ -1822,8 +2032,8 @@ def test_task_router_timeout_is_persisted_in_trace(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         manager_module.DeepAgentsAgentManager,
-        "_classify_task_profile",
-        timed_out_router,
+        "_classify_rubric_profile",
+        timed_out_classifier,
     )
     monkeypatch.setattr(
         manager_module,
@@ -1839,24 +2049,86 @@ def test_task_router_timeout_is_persisted_in_trace(tmp_path, monkeypatch):
             event
             async for event in runtime.astream(
                 message="分析并刷新产品报告",
-                session_id="router-timeout-trace-session",
+                session_id="rubric-timeout-trace-session",
                 user_id="test-user",
+                goal_mode=True,
             )
         ]
 
     events = asyncio.run(collect())
-    completion = next(json.loads(event["data"]) for event in events if event["event"] == "task_routing_completed")
-    trace = session_manager.get_trace("router-timeout-trace-session")
+    completion = next(
+        json.loads(event["data"])
+        for event in events
+        if event["event"] == "rubric_profile_completed"
+    )
+    trace = session_manager.get_trace("rubric-timeout-trace-session")
 
     assert completion["status"] == "timed_out"
-    assert completion["blocking"] is False
+    assert completion["blocking"] is True
     assert trace is not None
-    router_span = next(span for span in trace["spans"] if span["name"] == "task_router")
-    assert router_span["type"] == "custom"
-    assert router_span["output"]["status"] == "timed_out"
-    assert router_span["output"]["applied"] is False
-    assert router_span["metadata"]["role"] == "task_classifier"
-    assert router_span["metadata"]["blocking"] is False
+    classifier_span = next(span for span in trace["spans"] if span["name"] == "rubric_profile_classifier")
+    assert classifier_span["type"] == "custom"
+    assert classifier_span["output"]["status"] == "timed_out"
+    assert classifier_span["output"]["applied"] is False
+    assert classifier_span["metadata"]["role"] == "rubric_classifier"
+    assert classifier_span["metadata"]["blocking"] is True
+
+
+def test_rubric_profile_trace_survives_agent_construction_failure(tmp_path, monkeypatch):
+    import copy
+
+    from graph import deepagents_manager as manager_module
+    from graph.session_manager import session_manager
+    from harness.task_profiles import TaskProfileClassifier
+    from projects.registry import project_registry
+
+    session_manager.initialize(tmp_path)
+    project_registry.initialize(tmp_path)
+    session_manager.create_session("rubric-construction-failure-session")
+    runtime_config = copy.deepcopy(manager_module.config.load_config())
+    runtime_config.setdefault("harness", {}).setdefault("completion", {}).setdefault("rubric", {})[
+        "enabled"
+    ] = True
+    monkeypatch.setattr(manager_module.config, "load_config", lambda: runtime_config)
+
+    async def rubric_profile(_self, **_kwargs):
+        return TaskProfileClassifier.profile_from_dimensions(
+            work_natures=["生成报告"],
+            delivery_forms=["artifact"],
+            verification_intents=["artifact"],
+            classifier="llm_rubric",
+        )
+
+    async def no_title(_session_id: str):
+        return None
+
+    monkeypatch.setattr(manager_module.DeepAgentsAgentManager, "_classify_rubric_profile", rubric_profile)
+    monkeypatch.setattr(
+        manager_module,
+        "create_deep_agent",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("agent construction failed")),
+    )
+    monkeypatch.setattr(manager_module, "_generate_title", no_title)
+    runtime = manager_module.DeepAgentsAgentManager()
+    runtime.initialize(Path(tmp_path))
+
+    async def collect():
+        return [
+            event
+            async for event in runtime.astream(
+                message="生成报告",
+                session_id="rubric-construction-failure-session",
+                user_id="test-user",
+                goal_mode=True,
+            )
+        ]
+
+    events = asyncio.run(collect())
+    trace = session_manager.get_trace("rubric-construction-failure-session")
+
+    assert any(event["event"] == "error" for event in events)
+    assert trace is not None
+    assert any(span["name"] == "rubric_profile_classifier" for span in trace["spans"])
 
 
 @pytest.mark.parametrize(

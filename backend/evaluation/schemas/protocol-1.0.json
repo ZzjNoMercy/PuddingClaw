@@ -1,0 +1,3172 @@
+{
+  "protocol_version": "1.0",
+  "schemas": {
+    "AgentRunEnvelope": {
+      "$defs": {
+        "EvalError": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "title": "Code",
+              "type": "string"
+            },
+            "details": {
+              "additionalProperties": true,
+              "title": "Details",
+              "type": "object"
+            },
+            "message": {
+              "title": "Message",
+              "type": "string"
+            },
+            "retryable": {
+              "default": false,
+              "title": "Retryable",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "title": "EvalError",
+          "type": "object"
+        },
+        "EvalInput": {
+          "additionalProperties": false,
+          "properties": {
+            "message": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Message"
+            },
+            "turns": {
+              "items": {
+                "$ref": "#/$defs/EvalTurn"
+              },
+              "title": "Turns",
+              "type": "array"
+            }
+          },
+          "title": "EvalInput",
+          "type": "object"
+        },
+        "EvalTurn": {
+          "additionalProperties": false,
+          "properties": {
+            "content": {
+              "minLength": 1,
+              "title": "Content",
+              "type": "string"
+            },
+            "name": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Name"
+            },
+            "role": {
+              "enum": [
+                "system",
+                "user",
+                "assistant",
+                "tool"
+              ],
+              "title": "Role",
+              "type": "string"
+            }
+          },
+          "required": [
+            "role",
+            "content"
+          ],
+          "title": "EvalTurn",
+          "type": "object"
+        },
+        "RunTiming": {
+          "additionalProperties": false,
+          "properties": {
+            "latency_ms": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Latency Ms"
+            },
+            "time_to_first_token_ms": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Time To First Token Ms"
+            }
+          },
+          "title": "RunTiming",
+          "type": "object"
+        },
+        "TokenUsage": {
+          "additionalProperties": false,
+          "properties": {
+            "estimated_cost_usd": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Estimated Cost Usd"
+            },
+            "input_tokens": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Input Tokens"
+            },
+            "output_tokens": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Output Tokens"
+            },
+            "total_tokens": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Total Tokens"
+            }
+          },
+          "title": "TokenUsage",
+          "type": "object"
+        },
+        "ToolCallEvidence": {
+          "additionalProperties": false,
+          "properties": {
+            "arguments": {
+              "additionalProperties": true,
+              "title": "Arguments",
+              "type": "object"
+            },
+            "name": {
+              "title": "Name",
+              "type": "string"
+            },
+            "output_summary": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Output Summary"
+            },
+            "sequence": {
+              "minimum": 0,
+              "title": "Sequence",
+              "type": "integer"
+            },
+            "succeeded": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Succeeded"
+            }
+          },
+          "required": [
+            "name",
+            "sequence"
+          ],
+          "title": "ToolCallEvidence",
+          "type": "object"
+        },
+        "TraceReference": {
+          "additionalProperties": false,
+          "properties": {
+            "provider": {
+              "enum": [
+                "langsmith",
+                "puddingclaw_trace"
+              ],
+              "title": "Provider",
+              "type": "string"
+            },
+            "trace_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Trace Id"
+            },
+            "url": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Url"
+            }
+          },
+          "required": [
+            "provider"
+          ],
+          "title": "TraceReference",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "artifacts": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Artifacts",
+          "type": "array"
+        },
+        "candidate_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Candidate Id"
+        },
+        "case_id": {
+          "title": "Case Id",
+          "type": "string"
+        },
+        "citations": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Citations",
+          "type": "array"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EvalError"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "eval_run_id": {
+          "title": "Eval Run Id",
+          "type": "string"
+        },
+        "experiment_id": {
+          "title": "Experiment Id",
+          "type": "string"
+        },
+        "finished_at": {
+          "format": "date-time",
+          "title": "Finished At",
+          "type": "string"
+        },
+        "input": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EvalInput"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "title": "Metadata",
+          "type": "object"
+        },
+        "outcome": {
+          "default": "completed",
+          "enum": [
+            "completed",
+            "failed",
+            "cancelled",
+            "interrupted"
+          ],
+          "title": "Outcome",
+          "type": "string"
+        },
+        "protocol_version": {
+          "const": "1.0",
+          "default": "1.0",
+          "title": "Protocol Version",
+          "type": "string"
+        },
+        "repetition": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Repetition",
+          "type": "integer"
+        },
+        "response": {
+          "default": "",
+          "title": "Response",
+          "type": "string"
+        },
+        "run_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Run Id"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        },
+        "started_at": {
+          "format": "date-time",
+          "title": "Started At",
+          "type": "string"
+        },
+        "state": {
+          "additionalProperties": true,
+          "title": "State",
+          "type": "object"
+        },
+        "state_after": {
+          "additionalProperties": true,
+          "title": "State After",
+          "type": "object"
+        },
+        "state_before": {
+          "additionalProperties": true,
+          "title": "State Before",
+          "type": "object"
+        },
+        "state_diff": {
+          "additionalProperties": true,
+          "title": "State Diff",
+          "type": "object"
+        },
+        "structured_output": {
+          "default": null,
+          "title": "Structured Output"
+        },
+        "timing": {
+          "$ref": "#/$defs/RunTiming"
+        },
+        "tool_calls": {
+          "items": {
+            "$ref": "#/$defs/ToolCallEvidence"
+          },
+          "title": "Tool Calls",
+          "type": "array"
+        },
+        "trace_refs": {
+          "items": {
+            "$ref": "#/$defs/TraceReference"
+          },
+          "title": "Trace Refs",
+          "type": "array"
+        },
+        "usage": {
+          "$ref": "#/$defs/TokenUsage"
+        }
+      },
+      "required": [
+        "case_id",
+        "experiment_id",
+        "session_id"
+      ],
+      "title": "AgentRunEnvelope",
+      "type": "object"
+    },
+    "DatasetBundle": {
+      "$defs": {
+        "Criticality": {
+          "enum": [
+            "normal",
+            "high",
+            "critical"
+          ],
+          "title": "Criticality",
+          "type": "string"
+        },
+        "DataClassification": {
+          "enum": [
+            "public",
+            "internal",
+            "sensitive",
+            "restricted"
+          ],
+          "title": "DataClassification",
+          "type": "string"
+        },
+        "DatasetStatus": {
+          "enum": [
+            "draft",
+            "published",
+            "archived"
+          ],
+          "title": "DatasetStatus",
+          "type": "string"
+        },
+        "EvalCase": {
+          "additionalProperties": false,
+          "properties": {
+            "case_id": {
+              "title": "Case Id",
+              "type": "string"
+            },
+            "created_at": {
+              "format": "date-time",
+              "title": "Created At",
+              "type": "string"
+            },
+            "criticality": {
+              "$ref": "#/$defs/Criticality",
+              "default": "normal"
+            },
+            "data_classification": {
+              "$ref": "#/$defs/DataClassification",
+              "default": "internal"
+            },
+            "description": {
+              "default": "",
+              "title": "Description",
+              "type": "string"
+            },
+            "dimensions": {
+              "items": {
+                "$ref": "#/$defs/EvaluationDimension"
+              },
+              "title": "Dimensions",
+              "type": "array"
+            },
+            "enabled": {
+              "default": true,
+              "title": "Enabled",
+              "type": "boolean"
+            },
+            "evaluator_bindings": {
+              "items": {
+                "$ref": "#/$defs/EvaluatorBinding"
+              },
+              "title": "Evaluator Bindings",
+              "type": "array"
+            },
+            "expectations": {
+              "$ref": "#/$defs/EvalExpectations"
+            },
+            "input": {
+              "$ref": "#/$defs/EvalInput"
+            },
+            "metadata": {
+              "additionalProperties": true,
+              "title": "Metadata",
+              "type": "object"
+            },
+            "name": {
+              "maxLength": 200,
+              "minLength": 1,
+              "title": "Name",
+              "type": "string"
+            },
+            "protocol_version": {
+              "const": "1.0",
+              "default": "1.0",
+              "title": "Protocol Version",
+              "type": "string"
+            },
+            "repetitions": {
+              "default": 1,
+              "maximum": 20,
+              "minimum": 1,
+              "title": "Repetitions",
+              "type": "integer"
+            },
+            "resolved_evaluator_bindings": {
+              "items": {
+                "$ref": "#/$defs/ResolvedEvaluatorBinding"
+              },
+              "title": "Resolved Evaluator Bindings",
+              "type": "array"
+            },
+            "revision_id": {
+              "title": "Revision Id",
+              "type": "string"
+            },
+            "setup": {
+              "$ref": "#/$defs/EvalSetup"
+            },
+            "tags": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Tags",
+              "type": "array"
+            },
+            "updated_at": {
+              "format": "date-time",
+              "title": "Updated At",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "input"
+          ],
+          "title": "EvalCase",
+          "type": "object"
+        },
+        "EvalDataset": {
+          "additionalProperties": false,
+          "properties": {
+            "cases": {
+              "items": {
+                "$ref": "#/$defs/EvalCase"
+              },
+              "title": "Cases",
+              "type": "array"
+            },
+            "created_at": {
+              "format": "date-time",
+              "title": "Created At",
+              "type": "string"
+            },
+            "current_version": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Current Version",
+              "type": "integer"
+            },
+            "current_version_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Current Version Id"
+            },
+            "dataset_id": {
+              "title": "Dataset Id",
+              "type": "string"
+            },
+            "default_profile": {
+              "default": "general_agent@1",
+              "title": "Default Profile",
+              "type": "string"
+            },
+            "description": {
+              "default": "",
+              "title": "Description",
+              "type": "string"
+            },
+            "metadata": {
+              "additionalProperties": true,
+              "title": "Metadata",
+              "type": "object"
+            },
+            "name": {
+              "maxLength": 200,
+              "minLength": 1,
+              "title": "Name",
+              "type": "string"
+            },
+            "protocol_version": {
+              "const": "1.0",
+              "default": "1.0",
+              "title": "Protocol Version",
+              "type": "string"
+            },
+            "revision": {
+              "default": 1,
+              "minimum": 1,
+              "title": "Revision",
+              "type": "integer"
+            },
+            "status": {
+              "$ref": "#/$defs/DatasetStatus",
+              "default": "draft"
+            },
+            "tags": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Tags",
+              "type": "array"
+            },
+            "updated_at": {
+              "format": "date-time",
+              "title": "Updated At",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "title": "EvalDataset",
+          "type": "object"
+        },
+        "EvalExpectations": {
+          "additionalProperties": false,
+          "properties": {
+            "contains_all": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Contains All",
+              "type": "array"
+            },
+            "contains_any": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Contains Any",
+              "type": "array"
+            },
+            "exact_output": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Exact Output"
+            },
+            "excludes": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Excludes",
+              "type": "array"
+            },
+            "expected_state": {
+              "additionalProperties": true,
+              "title": "Expected State",
+              "type": "object"
+            },
+            "forbidden_actions": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Forbidden Actions",
+              "type": "array"
+            },
+            "forbidden_tools": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Forbidden Tools",
+              "type": "array"
+            },
+            "max_tool_calls": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Max Tool Calls"
+            },
+            "reference_answer": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Reference Answer"
+            },
+            "required_steps": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Required Steps",
+              "type": "array"
+            },
+            "required_tools": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Required Tools",
+              "type": "array"
+            },
+            "rubric": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Rubric"
+            },
+            "tool_order": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Tool Order",
+              "type": "array"
+            }
+          },
+          "title": "EvalExpectations",
+          "type": "object"
+        },
+        "EvalInput": {
+          "additionalProperties": false,
+          "properties": {
+            "message": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Message"
+            },
+            "turns": {
+              "items": {
+                "$ref": "#/$defs/EvalTurn"
+              },
+              "title": "Turns",
+              "type": "array"
+            }
+          },
+          "title": "EvalInput",
+          "type": "object"
+        },
+        "EvalSetup": {
+          "additionalProperties": false,
+          "properties": {
+            "allow_network": {
+              "default": false,
+              "title": "Allow Network",
+              "type": "boolean"
+            },
+            "allow_side_effects": {
+              "default": false,
+              "title": "Allow Side Effects",
+              "type": "boolean"
+            },
+            "clock": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Clock"
+            },
+            "fixtures": {
+              "items": {
+                "$ref": "#/$defs/FixtureReference"
+              },
+              "title": "Fixtures",
+              "type": "array"
+            },
+            "reproducible": {
+              "default": true,
+              "title": "Reproducible",
+              "type": "boolean"
+            },
+            "resource_group": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Resource Group"
+            },
+            "timezone": {
+              "default": "UTC",
+              "title": "Timezone",
+              "type": "string"
+            }
+          },
+          "title": "EvalSetup",
+          "type": "object"
+        },
+        "EvalTurn": {
+          "additionalProperties": false,
+          "properties": {
+            "content": {
+              "minLength": 1,
+              "title": "Content",
+              "type": "string"
+            },
+            "name": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Name"
+            },
+            "role": {
+              "enum": [
+                "system",
+                "user",
+                "assistant",
+                "tool"
+              ],
+              "title": "Role",
+              "type": "string"
+            }
+          },
+          "required": [
+            "role",
+            "content"
+          ],
+          "title": "EvalTurn",
+          "type": "object"
+        },
+        "EvaluationDimension": {
+          "enum": [
+            "task_completion",
+            "tool_use",
+            "trajectory",
+            "grounding",
+            "multi_turn",
+            "safety",
+            "robustness"
+          ],
+          "title": "EvaluationDimension",
+          "type": "string"
+        },
+        "EvaluatorBinding": {
+          "additionalProperties": false,
+          "properties": {
+            "config": {
+              "additionalProperties": true,
+              "title": "Config",
+              "type": "object"
+            },
+            "evaluator_id": {
+              "title": "Evaluator Id",
+              "type": "string"
+            },
+            "required": {
+              "default": false,
+              "title": "Required",
+              "type": "boolean"
+            },
+            "version": {
+              "default": "1",
+              "title": "Version",
+              "type": "string"
+            }
+          },
+          "required": [
+            "evaluator_id"
+          ],
+          "title": "EvaluatorBinding",
+          "type": "object"
+        },
+        "FixtureReference": {
+          "additionalProperties": false,
+          "properties": {
+            "checksum": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Checksum"
+            },
+            "fixture_id": {
+              "title": "Fixture Id",
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "file",
+                "directory",
+                "database",
+                "connector",
+                "inline"
+              ],
+              "title": "Kind",
+              "type": "string"
+            },
+            "payload": {
+              "anyOf": [
+                {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Payload"
+            },
+            "read_only": {
+              "default": true,
+              "title": "Read Only",
+              "type": "boolean"
+            },
+            "reset_strategy": {
+              "default": "recreate",
+              "enum": [
+                "recreate",
+                "rollback",
+                "restore_snapshot",
+                "none"
+              ],
+              "title": "Reset Strategy",
+              "type": "string"
+            },
+            "resource_lock": {
+              "default": "read",
+              "enum": [
+                "read",
+                "write",
+                "exclusive"
+              ],
+              "title": "Resource Lock",
+              "type": "string"
+            },
+            "source": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Source"
+            },
+            "target": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Target"
+            }
+          },
+          "required": [
+            "fixture_id",
+            "kind"
+          ],
+          "title": "FixtureReference",
+          "type": "object"
+        },
+        "ResolvedEvaluatorBinding": {
+          "additionalProperties": false,
+          "properties": {
+            "code_hash": {
+              "title": "Code Hash",
+              "type": "string"
+            },
+            "config": {
+              "additionalProperties": true,
+              "title": "Config",
+              "type": "object"
+            },
+            "evaluator_id": {
+              "title": "Evaluator Id",
+              "type": "string"
+            },
+            "required": {
+              "default": false,
+              "title": "Required",
+              "type": "boolean"
+            },
+            "version": {
+              "default": "1",
+              "title": "Version",
+              "type": "string"
+            }
+          },
+          "required": [
+            "evaluator_id",
+            "code_hash"
+          ],
+          "title": "ResolvedEvaluatorBinding",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "checksum": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Checksum"
+        },
+        "dataset": {
+          "$ref": "#/$defs/EvalDataset"
+        },
+        "exported_at": {
+          "format": "date-time",
+          "title": "Exported At",
+          "type": "string"
+        },
+        "protocol_version": {
+          "const": "1.0",
+          "default": "1.0",
+          "title": "Protocol Version",
+          "type": "string"
+        },
+        "version_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Version Id"
+        }
+      },
+      "required": [
+        "dataset"
+      ],
+      "title": "DatasetBundle",
+      "type": "object"
+    },
+    "EvalCase": {
+      "$defs": {
+        "Criticality": {
+          "enum": [
+            "normal",
+            "high",
+            "critical"
+          ],
+          "title": "Criticality",
+          "type": "string"
+        },
+        "DataClassification": {
+          "enum": [
+            "public",
+            "internal",
+            "sensitive",
+            "restricted"
+          ],
+          "title": "DataClassification",
+          "type": "string"
+        },
+        "EvalExpectations": {
+          "additionalProperties": false,
+          "properties": {
+            "contains_all": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Contains All",
+              "type": "array"
+            },
+            "contains_any": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Contains Any",
+              "type": "array"
+            },
+            "exact_output": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Exact Output"
+            },
+            "excludes": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Excludes",
+              "type": "array"
+            },
+            "expected_state": {
+              "additionalProperties": true,
+              "title": "Expected State",
+              "type": "object"
+            },
+            "forbidden_actions": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Forbidden Actions",
+              "type": "array"
+            },
+            "forbidden_tools": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Forbidden Tools",
+              "type": "array"
+            },
+            "max_tool_calls": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Max Tool Calls"
+            },
+            "reference_answer": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Reference Answer"
+            },
+            "required_steps": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Required Steps",
+              "type": "array"
+            },
+            "required_tools": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Required Tools",
+              "type": "array"
+            },
+            "rubric": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Rubric"
+            },
+            "tool_order": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Tool Order",
+              "type": "array"
+            }
+          },
+          "title": "EvalExpectations",
+          "type": "object"
+        },
+        "EvalInput": {
+          "additionalProperties": false,
+          "properties": {
+            "message": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Message"
+            },
+            "turns": {
+              "items": {
+                "$ref": "#/$defs/EvalTurn"
+              },
+              "title": "Turns",
+              "type": "array"
+            }
+          },
+          "title": "EvalInput",
+          "type": "object"
+        },
+        "EvalSetup": {
+          "additionalProperties": false,
+          "properties": {
+            "allow_network": {
+              "default": false,
+              "title": "Allow Network",
+              "type": "boolean"
+            },
+            "allow_side_effects": {
+              "default": false,
+              "title": "Allow Side Effects",
+              "type": "boolean"
+            },
+            "clock": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Clock"
+            },
+            "fixtures": {
+              "items": {
+                "$ref": "#/$defs/FixtureReference"
+              },
+              "title": "Fixtures",
+              "type": "array"
+            },
+            "reproducible": {
+              "default": true,
+              "title": "Reproducible",
+              "type": "boolean"
+            },
+            "resource_group": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Resource Group"
+            },
+            "timezone": {
+              "default": "UTC",
+              "title": "Timezone",
+              "type": "string"
+            }
+          },
+          "title": "EvalSetup",
+          "type": "object"
+        },
+        "EvalTurn": {
+          "additionalProperties": false,
+          "properties": {
+            "content": {
+              "minLength": 1,
+              "title": "Content",
+              "type": "string"
+            },
+            "name": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Name"
+            },
+            "role": {
+              "enum": [
+                "system",
+                "user",
+                "assistant",
+                "tool"
+              ],
+              "title": "Role",
+              "type": "string"
+            }
+          },
+          "required": [
+            "role",
+            "content"
+          ],
+          "title": "EvalTurn",
+          "type": "object"
+        },
+        "EvaluationDimension": {
+          "enum": [
+            "task_completion",
+            "tool_use",
+            "trajectory",
+            "grounding",
+            "multi_turn",
+            "safety",
+            "robustness"
+          ],
+          "title": "EvaluationDimension",
+          "type": "string"
+        },
+        "EvaluatorBinding": {
+          "additionalProperties": false,
+          "properties": {
+            "config": {
+              "additionalProperties": true,
+              "title": "Config",
+              "type": "object"
+            },
+            "evaluator_id": {
+              "title": "Evaluator Id",
+              "type": "string"
+            },
+            "required": {
+              "default": false,
+              "title": "Required",
+              "type": "boolean"
+            },
+            "version": {
+              "default": "1",
+              "title": "Version",
+              "type": "string"
+            }
+          },
+          "required": [
+            "evaluator_id"
+          ],
+          "title": "EvaluatorBinding",
+          "type": "object"
+        },
+        "FixtureReference": {
+          "additionalProperties": false,
+          "properties": {
+            "checksum": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Checksum"
+            },
+            "fixture_id": {
+              "title": "Fixture Id",
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "file",
+                "directory",
+                "database",
+                "connector",
+                "inline"
+              ],
+              "title": "Kind",
+              "type": "string"
+            },
+            "payload": {
+              "anyOf": [
+                {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Payload"
+            },
+            "read_only": {
+              "default": true,
+              "title": "Read Only",
+              "type": "boolean"
+            },
+            "reset_strategy": {
+              "default": "recreate",
+              "enum": [
+                "recreate",
+                "rollback",
+                "restore_snapshot",
+                "none"
+              ],
+              "title": "Reset Strategy",
+              "type": "string"
+            },
+            "resource_lock": {
+              "default": "read",
+              "enum": [
+                "read",
+                "write",
+                "exclusive"
+              ],
+              "title": "Resource Lock",
+              "type": "string"
+            },
+            "source": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Source"
+            },
+            "target": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Target"
+            }
+          },
+          "required": [
+            "fixture_id",
+            "kind"
+          ],
+          "title": "FixtureReference",
+          "type": "object"
+        },
+        "ResolvedEvaluatorBinding": {
+          "additionalProperties": false,
+          "properties": {
+            "code_hash": {
+              "title": "Code Hash",
+              "type": "string"
+            },
+            "config": {
+              "additionalProperties": true,
+              "title": "Config",
+              "type": "object"
+            },
+            "evaluator_id": {
+              "title": "Evaluator Id",
+              "type": "string"
+            },
+            "required": {
+              "default": false,
+              "title": "Required",
+              "type": "boolean"
+            },
+            "version": {
+              "default": "1",
+              "title": "Version",
+              "type": "string"
+            }
+          },
+          "required": [
+            "evaluator_id",
+            "code_hash"
+          ],
+          "title": "ResolvedEvaluatorBinding",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "case_id": {
+          "title": "Case Id",
+          "type": "string"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "criticality": {
+          "$ref": "#/$defs/Criticality",
+          "default": "normal"
+        },
+        "data_classification": {
+          "$ref": "#/$defs/DataClassification",
+          "default": "internal"
+        },
+        "description": {
+          "default": "",
+          "title": "Description",
+          "type": "string"
+        },
+        "dimensions": {
+          "items": {
+            "$ref": "#/$defs/EvaluationDimension"
+          },
+          "title": "Dimensions",
+          "type": "array"
+        },
+        "enabled": {
+          "default": true,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "evaluator_bindings": {
+          "items": {
+            "$ref": "#/$defs/EvaluatorBinding"
+          },
+          "title": "Evaluator Bindings",
+          "type": "array"
+        },
+        "expectations": {
+          "$ref": "#/$defs/EvalExpectations"
+        },
+        "input": {
+          "$ref": "#/$defs/EvalInput"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "title": "Metadata",
+          "type": "object"
+        },
+        "name": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "protocol_version": {
+          "const": "1.0",
+          "default": "1.0",
+          "title": "Protocol Version",
+          "type": "string"
+        },
+        "repetitions": {
+          "default": 1,
+          "maximum": 20,
+          "minimum": 1,
+          "title": "Repetitions",
+          "type": "integer"
+        },
+        "resolved_evaluator_bindings": {
+          "items": {
+            "$ref": "#/$defs/ResolvedEvaluatorBinding"
+          },
+          "title": "Resolved Evaluator Bindings",
+          "type": "array"
+        },
+        "revision_id": {
+          "title": "Revision Id",
+          "type": "string"
+        },
+        "setup": {
+          "$ref": "#/$defs/EvalSetup"
+        },
+        "tags": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Tags",
+          "type": "array"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "title": "Updated At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "input"
+      ],
+      "title": "EvalCase",
+      "type": "object"
+    },
+    "EvalDataset": {
+      "$defs": {
+        "Criticality": {
+          "enum": [
+            "normal",
+            "high",
+            "critical"
+          ],
+          "title": "Criticality",
+          "type": "string"
+        },
+        "DataClassification": {
+          "enum": [
+            "public",
+            "internal",
+            "sensitive",
+            "restricted"
+          ],
+          "title": "DataClassification",
+          "type": "string"
+        },
+        "DatasetStatus": {
+          "enum": [
+            "draft",
+            "published",
+            "archived"
+          ],
+          "title": "DatasetStatus",
+          "type": "string"
+        },
+        "EvalCase": {
+          "additionalProperties": false,
+          "properties": {
+            "case_id": {
+              "title": "Case Id",
+              "type": "string"
+            },
+            "created_at": {
+              "format": "date-time",
+              "title": "Created At",
+              "type": "string"
+            },
+            "criticality": {
+              "$ref": "#/$defs/Criticality",
+              "default": "normal"
+            },
+            "data_classification": {
+              "$ref": "#/$defs/DataClassification",
+              "default": "internal"
+            },
+            "description": {
+              "default": "",
+              "title": "Description",
+              "type": "string"
+            },
+            "dimensions": {
+              "items": {
+                "$ref": "#/$defs/EvaluationDimension"
+              },
+              "title": "Dimensions",
+              "type": "array"
+            },
+            "enabled": {
+              "default": true,
+              "title": "Enabled",
+              "type": "boolean"
+            },
+            "evaluator_bindings": {
+              "items": {
+                "$ref": "#/$defs/EvaluatorBinding"
+              },
+              "title": "Evaluator Bindings",
+              "type": "array"
+            },
+            "expectations": {
+              "$ref": "#/$defs/EvalExpectations"
+            },
+            "input": {
+              "$ref": "#/$defs/EvalInput"
+            },
+            "metadata": {
+              "additionalProperties": true,
+              "title": "Metadata",
+              "type": "object"
+            },
+            "name": {
+              "maxLength": 200,
+              "minLength": 1,
+              "title": "Name",
+              "type": "string"
+            },
+            "protocol_version": {
+              "const": "1.0",
+              "default": "1.0",
+              "title": "Protocol Version",
+              "type": "string"
+            },
+            "repetitions": {
+              "default": 1,
+              "maximum": 20,
+              "minimum": 1,
+              "title": "Repetitions",
+              "type": "integer"
+            },
+            "resolved_evaluator_bindings": {
+              "items": {
+                "$ref": "#/$defs/ResolvedEvaluatorBinding"
+              },
+              "title": "Resolved Evaluator Bindings",
+              "type": "array"
+            },
+            "revision_id": {
+              "title": "Revision Id",
+              "type": "string"
+            },
+            "setup": {
+              "$ref": "#/$defs/EvalSetup"
+            },
+            "tags": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Tags",
+              "type": "array"
+            },
+            "updated_at": {
+              "format": "date-time",
+              "title": "Updated At",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "input"
+          ],
+          "title": "EvalCase",
+          "type": "object"
+        },
+        "EvalExpectations": {
+          "additionalProperties": false,
+          "properties": {
+            "contains_all": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Contains All",
+              "type": "array"
+            },
+            "contains_any": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Contains Any",
+              "type": "array"
+            },
+            "exact_output": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Exact Output"
+            },
+            "excludes": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Excludes",
+              "type": "array"
+            },
+            "expected_state": {
+              "additionalProperties": true,
+              "title": "Expected State",
+              "type": "object"
+            },
+            "forbidden_actions": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Forbidden Actions",
+              "type": "array"
+            },
+            "forbidden_tools": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Forbidden Tools",
+              "type": "array"
+            },
+            "max_tool_calls": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Max Tool Calls"
+            },
+            "reference_answer": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Reference Answer"
+            },
+            "required_steps": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Required Steps",
+              "type": "array"
+            },
+            "required_tools": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Required Tools",
+              "type": "array"
+            },
+            "rubric": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Rubric"
+            },
+            "tool_order": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Tool Order",
+              "type": "array"
+            }
+          },
+          "title": "EvalExpectations",
+          "type": "object"
+        },
+        "EvalInput": {
+          "additionalProperties": false,
+          "properties": {
+            "message": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Message"
+            },
+            "turns": {
+              "items": {
+                "$ref": "#/$defs/EvalTurn"
+              },
+              "title": "Turns",
+              "type": "array"
+            }
+          },
+          "title": "EvalInput",
+          "type": "object"
+        },
+        "EvalSetup": {
+          "additionalProperties": false,
+          "properties": {
+            "allow_network": {
+              "default": false,
+              "title": "Allow Network",
+              "type": "boolean"
+            },
+            "allow_side_effects": {
+              "default": false,
+              "title": "Allow Side Effects",
+              "type": "boolean"
+            },
+            "clock": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Clock"
+            },
+            "fixtures": {
+              "items": {
+                "$ref": "#/$defs/FixtureReference"
+              },
+              "title": "Fixtures",
+              "type": "array"
+            },
+            "reproducible": {
+              "default": true,
+              "title": "Reproducible",
+              "type": "boolean"
+            },
+            "resource_group": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Resource Group"
+            },
+            "timezone": {
+              "default": "UTC",
+              "title": "Timezone",
+              "type": "string"
+            }
+          },
+          "title": "EvalSetup",
+          "type": "object"
+        },
+        "EvalTurn": {
+          "additionalProperties": false,
+          "properties": {
+            "content": {
+              "minLength": 1,
+              "title": "Content",
+              "type": "string"
+            },
+            "name": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Name"
+            },
+            "role": {
+              "enum": [
+                "system",
+                "user",
+                "assistant",
+                "tool"
+              ],
+              "title": "Role",
+              "type": "string"
+            }
+          },
+          "required": [
+            "role",
+            "content"
+          ],
+          "title": "EvalTurn",
+          "type": "object"
+        },
+        "EvaluationDimension": {
+          "enum": [
+            "task_completion",
+            "tool_use",
+            "trajectory",
+            "grounding",
+            "multi_turn",
+            "safety",
+            "robustness"
+          ],
+          "title": "EvaluationDimension",
+          "type": "string"
+        },
+        "EvaluatorBinding": {
+          "additionalProperties": false,
+          "properties": {
+            "config": {
+              "additionalProperties": true,
+              "title": "Config",
+              "type": "object"
+            },
+            "evaluator_id": {
+              "title": "Evaluator Id",
+              "type": "string"
+            },
+            "required": {
+              "default": false,
+              "title": "Required",
+              "type": "boolean"
+            },
+            "version": {
+              "default": "1",
+              "title": "Version",
+              "type": "string"
+            }
+          },
+          "required": [
+            "evaluator_id"
+          ],
+          "title": "EvaluatorBinding",
+          "type": "object"
+        },
+        "FixtureReference": {
+          "additionalProperties": false,
+          "properties": {
+            "checksum": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Checksum"
+            },
+            "fixture_id": {
+              "title": "Fixture Id",
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "file",
+                "directory",
+                "database",
+                "connector",
+                "inline"
+              ],
+              "title": "Kind",
+              "type": "string"
+            },
+            "payload": {
+              "anyOf": [
+                {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Payload"
+            },
+            "read_only": {
+              "default": true,
+              "title": "Read Only",
+              "type": "boolean"
+            },
+            "reset_strategy": {
+              "default": "recreate",
+              "enum": [
+                "recreate",
+                "rollback",
+                "restore_snapshot",
+                "none"
+              ],
+              "title": "Reset Strategy",
+              "type": "string"
+            },
+            "resource_lock": {
+              "default": "read",
+              "enum": [
+                "read",
+                "write",
+                "exclusive"
+              ],
+              "title": "Resource Lock",
+              "type": "string"
+            },
+            "source": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Source"
+            },
+            "target": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Target"
+            }
+          },
+          "required": [
+            "fixture_id",
+            "kind"
+          ],
+          "title": "FixtureReference",
+          "type": "object"
+        },
+        "ResolvedEvaluatorBinding": {
+          "additionalProperties": false,
+          "properties": {
+            "code_hash": {
+              "title": "Code Hash",
+              "type": "string"
+            },
+            "config": {
+              "additionalProperties": true,
+              "title": "Config",
+              "type": "object"
+            },
+            "evaluator_id": {
+              "title": "Evaluator Id",
+              "type": "string"
+            },
+            "required": {
+              "default": false,
+              "title": "Required",
+              "type": "boolean"
+            },
+            "version": {
+              "default": "1",
+              "title": "Version",
+              "type": "string"
+            }
+          },
+          "required": [
+            "evaluator_id",
+            "code_hash"
+          ],
+          "title": "ResolvedEvaluatorBinding",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "cases": {
+          "items": {
+            "$ref": "#/$defs/EvalCase"
+          },
+          "title": "Cases",
+          "type": "array"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "current_version": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Current Version",
+          "type": "integer"
+        },
+        "current_version_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Current Version Id"
+        },
+        "dataset_id": {
+          "title": "Dataset Id",
+          "type": "string"
+        },
+        "default_profile": {
+          "default": "general_agent@1",
+          "title": "Default Profile",
+          "type": "string"
+        },
+        "description": {
+          "default": "",
+          "title": "Description",
+          "type": "string"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "title": "Metadata",
+          "type": "object"
+        },
+        "name": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "protocol_version": {
+          "const": "1.0",
+          "default": "1.0",
+          "title": "Protocol Version",
+          "type": "string"
+        },
+        "revision": {
+          "default": 1,
+          "minimum": 1,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "status": {
+          "$ref": "#/$defs/DatasetStatus",
+          "default": "draft"
+        },
+        "tags": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Tags",
+          "type": "array"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "title": "Updated At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "EvalDataset",
+      "type": "object"
+    },
+    "EvalExperiment": {
+      "$defs": {
+        "EvalError": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "title": "Code",
+              "type": "string"
+            },
+            "details": {
+              "additionalProperties": true,
+              "title": "Details",
+              "type": "object"
+            },
+            "message": {
+              "title": "Message",
+              "type": "string"
+            },
+            "retryable": {
+              "default": false,
+              "title": "Retryable",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "title": "EvalError",
+          "type": "object"
+        },
+        "ExecutionPolicy": {
+          "additionalProperties": false,
+          "properties": {
+            "max_concurrency": {
+              "default": 1,
+              "maximum": 16,
+              "minimum": 1,
+              "title": "Max Concurrency",
+              "type": "integer"
+            },
+            "preserve_workspaces": {
+              "default": false,
+              "title": "Preserve Workspaces",
+              "type": "boolean"
+            },
+            "repetitions": {
+              "default": 1,
+              "maximum": 20,
+              "minimum": 1,
+              "title": "Repetitions",
+              "type": "integer"
+            },
+            "timeout_seconds": {
+              "default": 300,
+              "maximum": 3600,
+              "minimum": 1,
+              "title": "Timeout Seconds",
+              "type": "integer"
+            }
+          },
+          "title": "ExecutionPolicy",
+          "type": "object"
+        },
+        "ExperimentCandidate": {
+          "additionalProperties": false,
+          "properties": {
+            "analytics_model_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Analytics Model Id"
+            },
+            "candidate_id": {
+              "title": "Candidate Id",
+              "type": "string"
+            },
+            "config": {
+              "additionalProperties": true,
+              "title": "Config",
+              "type": "object"
+            },
+            "fingerprint": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Fingerprint"
+            },
+            "fingerprint_status": {
+              "default": "partial",
+              "enum": [
+                "partial",
+                "complete"
+              ],
+              "title": "Fingerprint Status",
+              "type": "string"
+            },
+            "llm_model_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Llm Model Id"
+            },
+            "name": {
+              "maxLength": 200,
+              "minLength": 1,
+              "title": "Name",
+              "type": "string"
+            },
+            "project_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Project Id"
+            },
+            "protocol_version": {
+              "const": "1.0",
+              "default": "1.0",
+              "title": "Protocol Version",
+              "type": "string"
+            },
+            "target": {
+              "const": "puddingclaw_agent",
+              "default": "puddingclaw_agent",
+              "title": "Target",
+              "type": "string"
+            },
+            "thinking_level": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "low",
+                    "high",
+                    "max"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Thinking Level"
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "title": "ExperimentCandidate",
+          "type": "object"
+        },
+        "ExperimentStatus": {
+          "enum": [
+            "queued",
+            "syncing",
+            "running",
+            "completed",
+            "failed",
+            "cancel_requested",
+            "cancelled"
+          ],
+          "title": "ExperimentStatus",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "backend": {
+          "const": "langsmith",
+          "default": "langsmith",
+          "title": "Backend",
+          "type": "string"
+        },
+        "candidate": {
+          "$ref": "#/$defs/ExperimentCandidate"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "dataset_content_hash": {
+          "title": "Dataset Content Hash",
+          "type": "string"
+        },
+        "dataset_id": {
+          "title": "Dataset Id",
+          "type": "string"
+        },
+        "dataset_version": {
+          "minimum": 1,
+          "title": "Dataset Version",
+          "type": "integer"
+        },
+        "dataset_version_id": {
+          "title": "Dataset Version Id",
+          "type": "string"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EvalError"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "execution": {
+          "$ref": "#/$defs/ExecutionPolicy"
+        },
+        "experiment_id": {
+          "title": "Experiment Id",
+          "type": "string"
+        },
+        "finished_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Finished At"
+        },
+        "name": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "profile_id": {
+          "default": "general_agent@1",
+          "title": "Profile Id",
+          "type": "string"
+        },
+        "protocol_version": {
+          "const": "1.0",
+          "default": "1.0",
+          "title": "Protocol Version",
+          "type": "string"
+        },
+        "remote_experiment_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Remote Experiment Id"
+        },
+        "remote_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Remote Url"
+        },
+        "started_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Started At"
+        },
+        "status": {
+          "$ref": "#/$defs/ExperimentStatus",
+          "default": "queued"
+        },
+        "summary": {
+          "additionalProperties": true,
+          "title": "Summary",
+          "type": "object"
+        },
+        "verdict": {
+          "default": "pending",
+          "enum": [
+            "pending",
+            "pass",
+            "fail",
+            "indeterminate"
+          ],
+          "title": "Verdict",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "dataset_id",
+        "dataset_version",
+        "dataset_version_id",
+        "dataset_content_hash",
+        "candidate"
+      ],
+      "title": "EvalExperiment",
+      "type": "object"
+    },
+    "EvaluationResult": {
+      "$defs": {
+        "EvaluationDimension": {
+          "enum": [
+            "task_completion",
+            "tool_use",
+            "trajectory",
+            "grounding",
+            "multi_turn",
+            "safety",
+            "robustness"
+          ],
+          "title": "EvaluationDimension",
+          "type": "string"
+        },
+        "EvaluationOutcome": {
+          "enum": [
+            "pass",
+            "fail",
+            "not_applicable",
+            "not_evaluated",
+            "error"
+          ],
+          "title": "EvaluationOutcome",
+          "type": "string"
+        },
+        "EvidenceReference": {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "title": "Kind",
+              "type": "string"
+            },
+            "locator": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Locator"
+            },
+            "metadata": {
+              "additionalProperties": true,
+              "title": "Metadata",
+              "type": "object"
+            },
+            "summary": {
+              "default": "",
+              "title": "Summary",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "title": "EvidenceReference",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "dimension": {
+          "$ref": "#/$defs/EvaluationDimension"
+        },
+        "error_type": {
+          "anyOf": [
+            {
+              "enum": [
+                "agent_error",
+                "evaluator_error",
+                "evidence_missing"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Error Type"
+        },
+        "evaluator_id": {
+          "title": "Evaluator Id",
+          "type": "string"
+        },
+        "evaluator_version": {
+          "title": "Evaluator Version",
+          "type": "string"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/EvidenceReference"
+          },
+          "title": "Evidence",
+          "type": "array"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "title": "Metadata",
+          "type": "object"
+        },
+        "outcome": {
+          "$ref": "#/$defs/EvaluationOutcome"
+        },
+        "passed": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Passed"
+        },
+        "protocol_version": {
+          "const": "1.0",
+          "default": "1.0",
+          "title": "Protocol Version",
+          "type": "string"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        },
+        "score": {
+          "anyOf": [
+            {
+              "maximum": 1,
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Score"
+        }
+      },
+      "required": [
+        "evaluator_id",
+        "evaluator_version",
+        "dimension",
+        "outcome",
+        "reason"
+      ],
+      "title": "EvaluationResult",
+      "type": "object"
+    },
+    "ExperimentCandidate": {
+      "additionalProperties": false,
+      "properties": {
+        "analytics_model_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Analytics Model Id"
+        },
+        "candidate_id": {
+          "title": "Candidate Id",
+          "type": "string"
+        },
+        "config": {
+          "additionalProperties": true,
+          "title": "Config",
+          "type": "object"
+        },
+        "fingerprint": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Fingerprint"
+        },
+        "fingerprint_status": {
+          "default": "partial",
+          "enum": [
+            "partial",
+            "complete"
+          ],
+          "title": "Fingerprint Status",
+          "type": "string"
+        },
+        "llm_model_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Llm Model Id"
+        },
+        "name": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "project_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Project Id"
+        },
+        "protocol_version": {
+          "const": "1.0",
+          "default": "1.0",
+          "title": "Protocol Version",
+          "type": "string"
+        },
+        "target": {
+          "const": "puddingclaw_agent",
+          "default": "puddingclaw_agent",
+          "title": "Target",
+          "type": "string"
+        },
+        "thinking_level": {
+          "anyOf": [
+            {
+              "enum": [
+                "low",
+                "high",
+                "max"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Thinking Level"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "ExperimentCandidate",
+      "type": "object"
+    },
+    "TraceEvidence": {
+      "$defs": {
+        "EvidenceReference": {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "title": "Kind",
+              "type": "string"
+            },
+            "locator": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Locator"
+            },
+            "metadata": {
+              "additionalProperties": true,
+              "title": "Metadata",
+              "type": "object"
+            },
+            "summary": {
+              "default": "",
+              "title": "Summary",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "title": "EvidenceReference",
+          "type": "object"
+        },
+        "ToolCallEvidence": {
+          "additionalProperties": false,
+          "properties": {
+            "arguments": {
+              "additionalProperties": true,
+              "title": "Arguments",
+              "type": "object"
+            },
+            "name": {
+              "title": "Name",
+              "type": "string"
+            },
+            "output_summary": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Output Summary"
+            },
+            "sequence": {
+              "minimum": 0,
+              "title": "Sequence",
+              "type": "integer"
+            },
+            "succeeded": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Succeeded"
+            }
+          },
+          "required": [
+            "name",
+            "sequence"
+          ],
+          "title": "ToolCallEvidence",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "artifacts": {
+          "items": {
+            "$ref": "#/$defs/EvidenceReference"
+          },
+          "title": "Artifacts",
+          "type": "array"
+        },
+        "available_kinds": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Available Kinds",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "errors": {
+          "items": {
+            "$ref": "#/$defs/EvidenceReference"
+          },
+          "title": "Errors",
+          "type": "array"
+        },
+        "grounding": {
+          "items": {
+            "$ref": "#/$defs/EvidenceReference"
+          },
+          "title": "Grounding",
+          "type": "array"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "title": "Metadata",
+          "type": "object"
+        },
+        "model_inputs": {
+          "items": {
+            "$ref": "#/$defs/EvidenceReference"
+          },
+          "title": "Model Inputs",
+          "type": "array"
+        },
+        "permissions": {
+          "items": {
+            "$ref": "#/$defs/EvidenceReference"
+          },
+          "title": "Permissions",
+          "type": "array"
+        },
+        "protocol_version": {
+          "const": "1.0",
+          "default": "1.0",
+          "title": "Protocol Version",
+          "type": "string"
+        },
+        "provider": {
+          "default": "envelope",
+          "enum": [
+            "envelope",
+            "langsmith",
+            "puddingclaw_trace"
+          ],
+          "title": "Provider",
+          "type": "string"
+        },
+        "retrieval": {
+          "items": {
+            "$ref": "#/$defs/EvidenceReference"
+          },
+          "title": "Retrieval",
+          "type": "array"
+        },
+        "run_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Run Id"
+        },
+        "safety": {
+          "items": {
+            "$ref": "#/$defs/EvidenceReference"
+          },
+          "title": "Safety",
+          "type": "array"
+        },
+        "state_changes": {
+          "items": {
+            "$ref": "#/$defs/EvidenceReference"
+          },
+          "title": "State Changes",
+          "type": "array"
+        },
+        "tool_calls": {
+          "items": {
+            "$ref": "#/$defs/ToolCallEvidence"
+          },
+          "title": "Tool Calls",
+          "type": "array"
+        },
+        "trace_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Trace Url"
+        },
+        "trajectory": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Trajectory",
+          "type": "array"
+        }
+      },
+      "title": "TraceEvidence",
+      "type": "object"
+    }
+  }
+}

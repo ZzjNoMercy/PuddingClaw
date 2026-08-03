@@ -12,6 +12,7 @@ from graph.session_manager import SessionManager
 from harness.coordinators import CompletionVerificationCoordinator, HarnessRunCoordinator
 from harness.deterministic_checks import evaluate_deterministic_criteria
 from harness.models import (
+    GoalCompletionPolicy,
     RunOutcome,
     RunRecord,
     RunStatus,
@@ -20,7 +21,11 @@ from harness.models import (
     VerificationStatus,
 )
 from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
-from harness.task_profiles import SemanticTaskProfileClassifier, TaskProfileClassifier
+from harness.task_profiles import (
+    SemanticRubricProfileClassifier,
+    SemanticTaskProfileClassifier,
+    TaskProfileClassifier,
+)
 from harness.verification_activations import (
     VerificationActivationMiddleware,
     build_verification_activations,
@@ -103,6 +108,110 @@ class _TaskClassifierModel:
         if self.error is not None:
             raise self.error
         return AIMessage(content=self.content or "")
+
+
+@pytest.mark.asyncio
+async def test_rubric_classifier_has_no_skill_or_execution_routing_authority():
+    model = _TaskClassifierModel(
+        json.dumps(
+            {
+                "work_natures": ["重算销量并刷新报告"],
+                "delivery_forms": ["artifact"],
+                "verification_intents": ["database_analysis", "artifact"],
+                "evidence": {
+                    "database_analysis": ["重算销量"],
+                    "artifact": ["刷新报告"],
+                },
+            },
+            ensure_ascii=False,
+        )
+    )
+
+    profile = await SemanticRubricProfileClassifier.classify(
+        message="重算销量并刷新报告",
+        analytics_model_id="产品配置分析",
+        model=model,
+    )
+
+    assert profile.classifier == "llm_rubric"
+    assert profile.skill_candidates == []
+    assert profile.execution_route == "native"
+    system_prompt = str(model.received_messages[0][0].content)
+    assert "不选择 Skill" in system_prompt
+    assert "installed_skill_catalog" not in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_rubric_classifier_surfaces_provider_failure_to_orchestrator():
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        await SemanticRubricProfileClassifier.classify(
+            message="刷新报告",
+            analytics_model_id=None,
+            model=_TaskClassifierModel(error=RuntimeError("provider unavailable")),
+        )
+
+
+@pytest.mark.asyncio
+async def test_rubric_classifier_rejects_intents_without_user_evidence_spans():
+    profile = await SemanticRubricProfileClassifier.classify(
+        message="你好",
+        analytics_model_id=None,
+        model=_TaskClassifierModel(
+            json.dumps(
+                {
+                    "work_natures": ["查询数据库并生成报告"],
+                    "delivery_forms": ["artifact"],
+                    "verification_intents": ["database_analysis", "artifact"],
+                    "evidence": {
+                        "database_analysis": ["查询数据库"],
+                        "artifact": ["生成报告"],
+                    },
+                },
+                ensure_ascii=False,
+            )
+        ),
+    )
+
+    assert profile.verification_intents == []
+    assert profile.delivery_forms == []
+    assert profile.initial_packs == []
+    assert "rubric_rejected_missing_evidence:database_analysis" in profile.reasons
+    assert "rubric_rejected_missing_evidence:artifact" in profile.reasons
+
+
+def test_rubric_profile_merge_cannot_change_skill_or_execution_route():
+    baseline = TaskProfileClassifier.classify(
+        message="/baoyu-design 刷新报告",
+        skill_catalog=[{"skill_id": "baoyu-design", "name": "baoyu-design"}],
+    )
+    hostile = TaskProfileClassifier.profile_from_dimensions(
+        work_natures=["重算销量"],
+        delivery_forms=["artifact"],
+        verification_intents=["database_analysis", "artifact"],
+        skill_candidates=[
+            {"skill_id": "database-analysis", "confidence": 1.0, "evidence": "hostile"}
+        ],
+        missing_explicit_skill_ids=["missing-skill"],
+        classifier="llm_rubric",
+    )
+
+    merged = TaskProfileClassifier.merge_rubric_profile(
+        baseline,
+        hostile,
+        analytics_model_id=None,
+    )
+
+    assert [item.skill_id for item in merged.skill_candidates] == ["baoyu-design"]
+    assert merged.missing_explicit_skill_ids == []
+    assert merged.execution_route == baseline.execution_route == "skill_first"
+    assert merged.native_fallback is baseline.native_fallback is True
+    assert {"database_analysis", "artifact"} <= set(merged.verification_intents)
+    with pytest.raises(ValueError, match="merge_rubric_profile"):
+        TaskProfileClassifier.merge_semantic_enhancement(
+            baseline,
+            hostile,
+            analytics_model_id=None,
+        )
 
 
 @pytest.mark.asyncio
@@ -473,75 +582,33 @@ def test_semantic_router_enhancement_only_adds_to_deterministic_baseline():
     assert merged.classifier == "llm_semantic"
 
 
-def test_async_router_can_enhance_preparing_run_but_not_running_contract(tmp_path):
+def test_rubric_contract_is_compiled_from_prestart_profile_and_persisted(tmp_path):
     sessions = SessionManager()
     sessions.initialize(tmp_path)
-    sessions.create_session("router-enhancement-session")
+    sessions.create_session("rubric-prestart-profile-session")
     coordinator = HarnessRunCoordinator(sessions)
-    baseline = TaskProfileClassifier.classify(message="更新报告")
-    run, _ = coordinator.start_run(
-        session_id="router-enhancement-session",
-        query_id="query-router-enhancement",
-        objective="更新报告并重算配置指标",
-        goal_mode=False,
-        task_profile=baseline,
-    )
-    semantic = TaskProfileClassifier.profile_from_dimensions(
+    profile = TaskProfileClassifier.profile_from_dimensions(
         work_natures=["重算配置指标"],
         delivery_forms=["artifact"],
-        verification_intents=["database_analysis"],
-        classifier="llm_semantic",
+        verification_intents=["database_analysis", "artifact"],
+        classifier="llm_rubric",
+    )
+    run, goal = coordinator.start_run(
+        session_id="rubric-prestart-profile-session",
+        query_id="query-rubric-prestart-profile",
+        objective="更新报告并重算配置指标",
+        goal_mode=True,
+        completion_policy=GoalCompletionPolicy.RUBRIC,
+        task_profile=profile,
     )
 
-    saved, applied = sessions.enhance_run_task_profile(
-        run.session_id,
-        run.run_id,
-        semantic.model_dump(mode="json"),
-    )
-
-    assert applied is True
-    assert {"artifact", "analytics"} <= set(saved["verification_contract"]["verification_packs"])
-
-    persisted_run = sessions.get_run_state(run.session_id, run.run_id)
-    assert persisted_run is not None
-    live_run = RunRecord.model_validate(persisted_run)
-    coordinator.transition(live_run, RunStatus.RUNNING)
-    later = TaskProfileClassifier.profile_from_dimensions(
-        work_natures=["联网研究"],
-        delivery_forms=["answer"],
-        verification_intents=["web_research"],
-        classifier="llm_semantic",
-    )
-    unchanged, applied_late = sessions.enhance_run_task_profile(
-        live_run.session_id,
-        live_run.run_id,
-        later.model_dump(mode="json"),
-    )
-
-    assert applied_late is False
-    assert "web_research" not in unchanged["verification_contract"]["verification_packs"]
-
-    late_skill = TaskProfileClassifier.profile_from_dimensions(
-        work_natures=["联网研究"],
-        delivery_forms=["answer"],
-        verification_intents=["web_research"],
-        skill_candidates=[
-            {
-                "skill_id": "web-research",
-                "confidence": 0.9,
-                "evidence": "联网研究",
-            }
-        ],
-        classifier="llm_semantic",
-    )
-    advisory, advisory_applied = sessions.enhance_run_task_profile(
-        live_run.session_id,
-        live_run.run_id,
-        late_skill.model_dump(mode="json"),
-    )
-    assert advisory_applied is True
-    assert [item["skill_id"] for item in advisory["task_profile"]["skill_candidates"]] == ["web-research"]
-    assert "web_research" not in advisory["verification_contract"]["verification_packs"]
+    assert goal is not None
+    assert run.verification_contract is not None
+    assert {"artifact", "analytics"} <= set(run.verification_contract.verification_packs)
+    assert goal.goal_contract == run.declared_verification_contract
+    persisted = sessions.get_run_state(run.session_id, run.run_id)
+    assert persisted is not None
+    assert persisted["task_profile"]["classifier"] == "llm_rubric"
 
 
 def test_run_coordinator_accepts_semantic_task_profile(tmp_path):

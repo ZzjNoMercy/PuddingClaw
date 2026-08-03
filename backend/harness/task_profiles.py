@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -214,6 +215,38 @@ _DELIVERY_FORM_TO_INTENT: dict[str, str | None] = {
 _WORK_NATURE_IDS = tuple(intent_id for intent_id in INTENT_REGISTRY if intent_id not in {"artifact"})
 _SAFETY_FLOOR_INTENTS = {"artifact", "code"}
 _SKILL_CONFIDENCE_THRESHOLD = 0.65
+
+_RUBRIC_PROFILE_PROMPT = """你是 Rubric 验收画像分类器，只为当前用户请求选择验收标准，不执行任务、不选择 Skill、不决定执行路线。
+
+把验收画像拆成三个彼此独立的部分：
+1. work_natures：用用户语言概括工作性质，可多选，不受固定枚举限制。
+2. delivery_forms：answer, artifact, external_action，可多选。
+3. verification_intents：只用于选择验收标准，可从以下值多选：{verification_intents}
+
+约束：
+- database_analysis：需要查询、重算、核对或分析数据库/业务指标，即使用户没有说“数据库”。
+- table_analysis：主要对 Excel/CSV/表格文件做计算分析。
+- artifact：要求创建、修改、刷新或交付文件、报告、页面、图表等产物。
+- answer：只需在对话中解释、总结或回答。
+- external_action：需要向工作区外的系统发布、发送或修改外部状态。
+- 选择了分析模型只表示该模型是可用上下文，绝不能单独作为 database_analysis 的证据。
+- 同一请求可以同时是 database_analysis + artifact；不要为了选一个而丢掉另一个。
+- 只根据当前请求中明确表达或可直接推导的目标分类，不根据历史会话猜测。
+- 不得输出 Skill、工具、Agent、执行路线或物理实现建议。
+
+只返回一个 JSON 对象，不要 Markdown：
+{{
+  "work_natures": ["重算业务指标并刷新分析报告"],
+  "delivery_forms": ["artifact"],
+  "verification_intents": ["database_analysis", "artifact"],
+  "evidence": {{
+    "database_analysis": ["重算所有年份数据"],
+    "artifact": ["刷新产品配置分析报告"]
+  }}
+}}
+
+没有匹配项时对应数组返回空数组。evidence 必须是用户原文中的短语，不能写解释。
+"""
 
 _SEMANTIC_CLASSIFIER_PROMPT = """你是任务路由分类器，只判断当前用户请求，不执行任务。
 
@@ -600,6 +633,9 @@ class TaskProfileClassifier:
         explicit user choice that was available when the Run started.
         """
 
+        if enhancement.classifier == "llm_rubric":
+            raise ValueError("Rubric profiles must use merge_rubric_profile()")
+
         candidates: dict[str, SkillCandidate] = {
             item.skill_id: item.model_copy(deep=True) for item in baseline.skill_candidates
         }
@@ -647,9 +683,193 @@ class TaskProfileClassifier:
             missing_explicit_skill_ids=missing,
             analytics_model_id=analytics_model_id,
             evidence=evidence,
-            classifier=("llm_semantic" if enhancement.classifier == "llm_semantic" else baseline.classifier),
+            classifier=(
+                enhancement.classifier
+                if enhancement.classifier == "llm_semantic"
+                else baseline.classifier
+            ),
             reasons=list(dict.fromkeys([*baseline.reasons, *enhancement.reasons])),
         )
+
+    @classmethod
+    def merge_rubric_profile(
+        cls,
+        baseline: RunTaskProfile,
+        rubric_profile: RunTaskProfile,
+        *,
+        analytics_model_id: str | None,
+    ) -> RunTaskProfile:
+        """Merge acceptance semantics without granting execution authority.
+
+        A Rubric classifier may add verification dimensions and evidence only.
+        Skill candidates, missing Skill state, execution route, and native
+        fallback remain exactly as established by deterministic preflight and
+        later authoritative SKILL.md reads.
+        """
+
+        evidence = {
+            key: list(dict.fromkeys(values))
+            for key, values in {
+                **baseline.classification_evidence,
+                **{
+                    key: [
+                        *baseline.classification_evidence.get(key, []),
+                        *values,
+                    ]
+                    for key, values in rubric_profile.classification_evidence.items()
+                },
+            }.items()
+        }
+        merged = cls.profile_from_dimensions(
+            work_natures=list(dict.fromkeys([*baseline.work_natures, *rubric_profile.work_natures])),
+            delivery_forms=list(dict.fromkeys([*baseline.delivery_forms, *rubric_profile.delivery_forms])),
+            verification_intents=list(
+                dict.fromkeys(
+                    [
+                        *baseline.verification_intents,
+                        *rubric_profile.verification_intents,
+                    ]
+                )
+            ),
+            skill_candidates=[item.model_copy(deep=True) for item in baseline.skill_candidates],
+            missing_explicit_skill_ids=list(baseline.missing_explicit_skill_ids),
+            analytics_model_id=analytics_model_id,
+            evidence=evidence,
+            classifier=(
+                rubric_profile.classifier
+                if rubric_profile.classifier == "llm_rubric"
+                else baseline.classifier
+            ),
+            reasons=list(dict.fromkeys([*baseline.reasons, *rubric_profile.reasons])),
+        )
+        # profile_from_dimensions derives these fields from Skill data. Keep
+        # the baseline values verbatim as a hard authority boundary.
+        merged.execution_route = baseline.execution_route
+        merged.native_fallback = baseline.native_fallback
+        return merged
+
+
+class SemanticRubricProfileClassifier:
+    """Classify only the acceptance semantics of a new experimental Rubric Goal.
+
+    This classifier deliberately has no Skill catalog and no execution-route
+    output. Skill choice belongs to the main Agent; the returned profile is
+    compiled into a Goal contract before execution starts and is then frozen.
+    """
+
+    @classmethod
+    async def classify(
+        cls,
+        *,
+        message: str,
+        analytics_model_id: str | None,
+        model: Any,
+    ) -> RunTaskProfile:
+        response = await model.ainvoke(
+            [
+                SystemMessage(
+                    content=_RUBRIC_PROFILE_PROMPT.format(
+                        verification_intents=", ".join(INTENT_REGISTRY),
+                    )
+                ),
+                HumanMessage(
+                    content=(
+                        f"当前请求：\n<request>\n{message}\n</request>\n\n"
+                        f"已选择分析模型：{analytics_model_id or '<none>'}"
+                    )
+                ),
+            ]
+        )
+        payload = cls._parse_payload(getattr(response, "content", response))
+
+        work_natures = [
+            str(item).strip()
+            for item in payload["work_natures"]
+            if str(item).strip()
+        ]
+        requested_delivery_forms = [
+            str(item).strip()
+            for item in payload["delivery_forms"]
+            if str(item).strip() in _DELIVERY_FORM_TO_INTENT
+        ]
+        requested_intents = [
+            str(item).strip()
+            for item in payload["verification_intents"]
+            if str(item).strip() in INTENT_REGISTRY
+        ]
+        raw_evidence = payload.get("evidence")
+        candidate_evidence = raw_evidence if isinstance(raw_evidence, dict) else {}
+        normalized_message = cls._normalize_evidence(message)
+        evidence: dict[str, list[str]] = {}
+        rejected_intents: list[str] = []
+        verification_intents: list[str] = []
+        for intent_id in requested_intents:
+            raw_snippets = candidate_evidence.get(intent_id)
+            valid_snippets = [
+                str(snippet).strip()
+                for snippet in raw_snippets
+                if str(snippet).strip()
+                and cls._normalize_evidence(str(snippet)) in normalized_message
+            ] if isinstance(raw_snippets, list) else []
+            if not valid_snippets:
+                rejected_intents.append(intent_id)
+                continue
+            verification_intents.append(intent_id)
+            evidence[intent_id] = list(dict.fromkeys(valid_snippets))
+        delivery_forms = [
+            item
+            for item in requested_delivery_forms
+            if item != "artifact" or "artifact" in verification_intents
+        ]
+        reasons = [
+            f"rubric_llm:{intent_id}:{snippet}"
+            for intent_id, snippets in evidence.items()
+            if isinstance(snippets, list)
+            for snippet in snippets
+            if intent_id in verification_intents and str(snippet).strip()
+        ]
+        reasons.extend(f"rubric_rejected_missing_evidence:{intent_id}" for intent_id in rejected_intents)
+        return TaskProfileClassifier.profile_from_dimensions(
+            work_natures=work_natures,
+            delivery_forms=delivery_forms,
+            verification_intents=verification_intents,
+            analytics_model_id=analytics_model_id,
+            evidence=evidence,
+            classifier="llm_rubric",
+            reasons=reasons,
+        )
+
+    @staticmethod
+    def _normalize_evidence(value: str) -> str:
+        normalized = unicodedata.normalize("NFKC", str(value or ""))
+        return re.sub(r"\s+", "", normalized).lower()
+
+    @staticmethod
+    def _parse_payload(content: Any) -> dict[str, Any]:
+        if isinstance(content, list):
+            content = "".join(
+                str(block.get("text") or block.get("content") or "")
+                for block in content
+                if isinstance(block, dict)
+            )
+        text = str(content or "").strip()
+        fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+        if fenced:
+            text = fenced.group(1)
+        else:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start >= 0 and end > start:
+                text = text[start : end + 1]
+        payload = json.loads(text)
+        if not isinstance(payload, dict):
+            raise ValueError("Rubric classifier response must be a JSON object.")
+        if any(
+            not isinstance(payload.get(key), list)
+            for key in ("work_natures", "delivery_forms", "verification_intents")
+        ):
+            raise ValueError("Rubric classifier response is missing dimension arrays.")
+        return payload
 
 
 class SemanticTaskProfileClassifier:
@@ -928,6 +1148,7 @@ class SemanticTaskProfileClassifier:
 
 __all__ = [
     "INTENT_REGISTRY",
+    "SemanticRubricProfileClassifier",
     "SemanticTaskProfileClassifier",
     "TaskProfileClassifier",
 ]

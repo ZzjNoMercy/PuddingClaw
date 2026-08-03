@@ -7,7 +7,7 @@ import stat
 import httpx
 import pytest
 
-from provider_registry import ProviderRegistry
+from provider_registry import DASHSCOPE_NATIVE_MODEL_CATALOG, ProviderRegistry
 
 
 def _legacy_config() -> dict:
@@ -173,9 +173,10 @@ def test_dashscope_native_discovery_merges_official_and_remote_models(tmp_path, 
         def __exit__(self, *_args):
             return None
 
-        def get(self, url, headers):
+        def get(self, url, headers, timeout):
             captured["url"] = url
             captured["headers"] = headers
+            captured["request_timeout"] = timeout
             return FakeResponse()
 
     monkeypatch.setattr(httpx, "Client", FakeClient)
@@ -190,7 +191,38 @@ def test_dashscope_native_discovery_merges_official_and_remote_models(tmp_path, 
     assert "qwen3-235b" not in names
     assert str(captured["url"]).startswith("https://dashscope.aliyuncs.com/api/v1/deployments/models?")
     assert captured["headers"] == {"Authorization": "Bearer dashscope-text-secret"}
-    assert captured["client_kwargs"] == {"timeout": 15.0}
+    assert captured["client_kwargs"] == {"timeout": 3.0}
+    assert 0 < float(captured["request_timeout"]) <= 3.0
+
+
+def test_dashscope_native_discovery_falls_back_and_caches_on_timeout(tmp_path, monkeypatch):
+    registry = ProviderRegistry(tmp_path)
+    registry.ensure_migrated(_legacy_config())
+    calls = 0
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get(self, _url, headers=None, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise httpx.ReadTimeout("slow deployment catalog")
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+
+    first = registry.discover_models("dashscope", "dashscope-native-mm")
+    second = registry.discover_models("dashscope", "dashscope-native-mm")
+
+    assert {model["name"] for model in first} == set(DASHSCOPE_NATIVE_MODEL_CATALOG)
+    assert second == first
+    assert calls == 1
 
 
 def test_provider_update_persists_api_key_and_reports_masked_status(tmp_path):

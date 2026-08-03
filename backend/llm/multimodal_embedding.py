@@ -6,9 +6,9 @@ import asyncio
 import base64
 import mimetypes
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import httpx
 from llama_index.core.embeddings import MultiModalEmbedding
@@ -41,7 +41,7 @@ class DashScopeMultiModalEmbedding(MultiModalEmbedding):
         self,
         *,
         api_key: str | None = None,
-        model_name: str = "qwen2.5-vl-embedding",
+        model_name: str = "qwen3-vl-embedding",
         dimension: int = 1024,
         base_url: str = "",
         route_path: str = "/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding",
@@ -85,28 +85,29 @@ class DashScopeMultiModalEmbedding(MultiModalEmbedding):
         if callback:
             callback(modality, done, self._progress_totals.get(modality, 0))
 
-    def _request_concurrency(self, total: int) -> int:
+    def _provider_batch_size(self, total: int, *, modality: str) -> int:
         value = max(1, int(getattr(self, "embed_batch_size", 1) or 1))
-        return max(1, min(value, total))
+        if self.model_name == "qwen3-vl-embedding":
+            provider_limit = 10 if modality == "image" else 20
+            return max(1, min(value, provider_limit, total))
+        return 1
 
-    def _call_items_concurrently(self, input_items: list[dict[str, str]], *, modality: str) -> list[list[float]]:
+    def _call_items_in_batches(self, input_items: list[dict[str, str]], *, modality: str) -> list[list[float]]:
         if not input_items:
             return []
-        results: list[list[float] | None] = [None] * len(input_items)
-        max_workers = self._request_concurrency(len(input_items))
-        if max_workers == 1:
-            for index, item in enumerate(input_items):
-                results[index] = self._call_api([item])[0]
-                self._notify_progress(modality, 1)
-            return [embedding for embedding in results if embedding is not None]
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(self._call_api, [item]): index for index, item in enumerate(input_items)}
-            for future in as_completed(futures):
-                index = futures[future]
-                results[index] = future.result()[0]
-                self._notify_progress(modality, 1)
-        return [embedding for embedding in results if embedding is not None]
+        results: list[list[float]] = []
+        batch_size = self._provider_batch_size(len(input_items), modality=modality)
+        for start in range(0, len(input_items), batch_size):
+            batch = input_items[start : start + batch_size]
+            embeddings = self._call_api(batch)
+            if len(embeddings) != len(batch):
+                raise RuntimeError(
+                    "Multimodal embedding response count does not match the request: "
+                    f"expected {len(batch)}, got {len(embeddings)}"
+                )
+            results.extend(embeddings)
+            self._notify_progress(modality, len(batch))
+        return results
 
     def _call_api(self, input_data: list[dict[str, str]]) -> list[list[float]]:
         # Use a per-request client rather than DashScope's module globals.
@@ -121,14 +122,35 @@ class DashScopeMultiModalEmbedding(MultiModalEmbedding):
         headers = {"Content-Type": "application/json"}
         headers["Authorization"] = f"Bearer {self._api_key}"
         with httpx.Client(timeout=120.0) as client:
-            response = client.post(url, headers=headers, json={"model": self.model_name, "input": input_data})
-            response.raise_for_status()
+            response = client.post(
+                url,
+                headers=headers,
+                json={
+                    "model": self.model_name,
+                    "input": {"contents": input_data},
+                    "parameters": {
+                        "dimension": self._dimension,
+                        **({"enable_fusion": False} if self.model_name == "qwen3-vl-embedding" else {}),
+                    },
+                },
+            )
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                detail = response.text.strip()[:2000]
+                raise RuntimeError(
+                    f"DashScope multimodal embedding returned HTTP {response.status_code}: {detail}"
+                ) from exc
             payload = response.json()
         output = payload.get("output", {}) if isinstance(payload, dict) else {}
         embeddings = output.get("embeddings", [])
         if not embeddings:
             raise RuntimeError(f"Multimodal embedding HTTP endpoint returned no embeddings: {payload}")
-        return [list(item["embedding"]) for item in embeddings]
+        ordered = sorted(
+            enumerate(embeddings),
+            key=lambda indexed: int(indexed[1].get("index", indexed[0])),
+        )
+        return [list(item["embedding"]) for _, item in ordered]
 
     @staticmethod
     def _image_payload_for_http(img_file_path: ImageType) -> str:
@@ -147,19 +169,14 @@ class DashScopeMultiModalEmbedding(MultiModalEmbedding):
             abs_path = Path(str(img_file_path)).expanduser().resolve()
             image = self._image_payload_for_http(abs_path)
             input_items.append({"image": image})
-        # DashScope multimodal embedding rejects repeated input types in one
-        # request, e.g. [{"image": ...}, {"image": ...}]. Keep the LlamaIndex
-        # batch interface, but fan out provider calls with bounded concurrency.
-        return self._call_items_concurrently(input_items, modality="image")
+        return self._call_items_in_batches(input_items, modality="image")
 
     def _get_text_embedding(self, text: str) -> list[float]:
         embedding = self._get_text_embeddings([text])[0]
         return embedding
 
     def _get_text_embeddings(self, texts: list[str]) -> list[list[float]]:
-        # DashScope multimodal embedding allows only one "text" input per
-        # request. LlamaIndex may still pass us batches; fan them out here.
-        return self._call_items_concurrently([{"text": text} for text in texts], modality="text")
+        return self._call_items_in_batches([{"text": text} for text in texts], modality="text")
 
     def _get_query_embedding(self, query: str) -> list[float]:
         return self._call_api([{"text": query}])[0]
@@ -185,7 +202,7 @@ def get_multimodal_embedding_model() -> DashScopeMultiModalEmbedding:
     if cfg.get("protocol") != "dashscope_multimodal_embedding":
         raise ValueError(f"Multimodal embedding requires a DashScope native endpoint, got {cfg.get('protocol')}")
     return DashScopeMultiModalEmbedding(
-        model_name=cfg.get("model", "qwen2.5-vl-embedding"),
+        model_name=cfg.get("model", "qwen3-vl-embedding"),
         dimension=int(cfg.get("dimension", 1024)),
         embed_batch_size=int(cfg.get("batch_size", 10)),
         api_key=cfg.get("api_key", ""),

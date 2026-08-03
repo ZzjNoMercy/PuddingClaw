@@ -563,7 +563,7 @@ export default function SettingsPage() {
     const timer = window.setTimeout(() => setGbrainDatabaseTestResult(null), 3000);
     return () => window.clearTimeout(timer);
   }, [gbrainDatabaseTestResult]);
-  const [mmConcurrency, setMmConcurrency] = useState("10");
+  const [mmBatchSize, setMmBatchSize] = useState("10");
   const [kbIndexEnabled, setKbIndexEnabled] = useState(true);
   const [kbVectorStore, setKbVectorStore] = useState("milvus");
   const [kbMilvusUri, setKbMilvusUri] = useState("http://localhost:19530");
@@ -676,7 +676,7 @@ export default function SettingsPage() {
         setEmbProvider(validEmbProvider);
         setEmbModel(s.fallback_embedding.model);
         setEmbDimension(String(s.fallback_embedding.dimension || 1024));
-        setEmbBatchSize(String(s.fallback_embedding.batch_size || 20));
+        setEmbBatchSize(String(s.fallback_embedding.batch_size || 10));
         setEmbBaseUrl(
           EMBEDDING_PROVIDERS.find((p) => p.value === validEmbProvider)?.baseUrl ?? s.fallback_embedding.base_url
         );
@@ -740,7 +740,7 @@ export default function SettingsPage() {
             }
           })
           .catch(() => {});
-        setMmConcurrency(String(s.multimodal_embedding?.batch_size || 10));
+        setMmBatchSize(String(s.multimodal_embedding?.batch_size || 10));
         setKbIndexEnabled(s.knowledge?.multimodal_index?.enabled ?? true);
         setKbVectorStore(s.knowledge?.multimodal_index?.vector_store || "milvus");
         setKbMilvusUri(s.knowledge?.multimodal_index?.milvus_uri || "http://localhost:19530");
@@ -1129,7 +1129,7 @@ export default function SettingsPage() {
           provider: embProvider,
           model: embModel,
           dimension: Number.parseInt(embDimension, 10) || 1024,
-          batch_size: Number.parseInt(embBatchSize, 10) || 20,
+          batch_size: Number.parseInt(embBatchSize, 10) || 10,
           base_url: embBaseUrl,
           ...(embApiKey ? { api_key: embApiKey } : {}),
         },
@@ -1182,7 +1182,7 @@ export default function SettingsPage() {
           url: "",
         },
         multimodal_embedding: {
-          batch_size: Number.parseInt(mmConcurrency, 10) || 10,
+          batch_size: Number.parseInt(mmBatchSize, 10) || 10,
         },
         knowledge: {
           root_dir: knowledgeRootDir,
@@ -1283,7 +1283,7 @@ export default function SettingsPage() {
     } finally {
       setSaving(false);
     }
-  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaResultMaterializationRowCap, dbQaQueryTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmConcurrency, knowledgeRootDir, wikiCompilerModelId, wikiGbrainEmbeddingModelId, wikiGbrainThinkModelId, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, toolContextEnabled, immediateToolCompactionEnabled, singleToolTriggerTokens, backgroundMinResultTokens, keepRecentToolResults, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, rubricMaxStagnantRepairs, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, sandboxMode, dockerConnection, dockerContext, dockerUseCustomImage, dockerImage, dockerCpuLimit, dockerMemoryLimitMb, dockerPidsLimit, dockerNetworkEnabled, dockerDependencySetupEnabled, subagentItems, showToast]);
+  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaResultMaterializationRowCap, dbQaQueryTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmBatchSize, knowledgeRootDir, wikiCompilerModelId, wikiGbrainEmbeddingModelId, wikiGbrainThinkModelId, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, toolContextEnabled, immediateToolCompactionEnabled, singleToolTriggerTokens, backgroundMinResultTokens, keepRecentToolResults, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, rubricMaxStagnantRepairs, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, sandboxMode, dockerConnection, dockerContext, dockerUseCustomImage, dockerImage, dockerCpuLimit, dockerMemoryLimitMb, dockerPidsLimit, dockerNetworkEnabled, dockerDependencySetupEnabled, subagentItems, showToast]);
 
   const handleDatabaseModeChange = useCallback((mode: "bundled" | "external") => {
     setDatabaseMode(mode);
@@ -2574,10 +2574,10 @@ export default function SettingsPage() {
                       value={embBatchSize}
                       onChange={(e) => setEmbBatchSize(e.target.value)}
                       className="form-input"
-                      placeholder="20"
+                    placeholder="10"
                     />
                     <p className="mt-1 text-[10px] text-gray-400">
-                      DashScope 文本向量建议不超过 20。
+                      text-embedding-v3/v4 单次最多处理 10 条文本。
                     </p>
                   </FormField>
                 </div>
@@ -3127,10 +3127,10 @@ export default function SettingsPage() {
                     </div>
                   </div>
                   <div className="max-w-sm">
-                    <FormField label="索引并发数">
-                      <input value={mmConcurrency} onChange={(e) => setMmConcurrency(e.target.value)} className="form-input" placeholder="10" />
+                    <FormField label="多模态批量数">
+                      <input value={mmBatchSize} onChange={(e) => setMmBatchSize(e.target.value)} className="form-input" placeholder="10" />
                       <p className="mt-1 text-[11px] leading-relaxed text-gray-400">
-                        控制知识库建索引时同时发起的单条向量化请求数。
+                        qwen3-vl-embedding 单次最多处理 20 条文本或 10 张图片。
                       </p>
                     </FormField>
                   </div>

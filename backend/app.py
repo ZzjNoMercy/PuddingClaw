@@ -99,6 +99,7 @@ async def lifespan(app: FastAPI):
     from analytics.nl2sql.result_cleanup import query_result_cleanup_manager
     from analytics.semantic_assets import get_semantic_asset_registry
     from db import init_database
+    from evaluation.worker_manager import evaluation_worker_manager
     from graph.agent import agent_manager
     from graph.attachment_store import attachment_store
     from graph.deepagents_manager import deepagents_agent_manager
@@ -162,9 +163,11 @@ async def lifespan(app: FastAPI):
         print("ℹ️ RAG mode disabled, skipping memory index build")
 
     print("✅ PuddingClaw backend ready")
+    await evaluation_worker_manager.start_pending()
     try:
         yield
     finally:
+        await evaluation_worker_manager.stop()
         await query_result_cleanup_manager.stop()
         await semantic_dimension_build_worker_manager.stop()
         await knowledge_import_worker_manager.stop()
@@ -197,6 +200,7 @@ from api.tokens import router as tokens_router
 from api.compress import router as compress_router
 from api.config_api import router as config_router
 from api.eval_api import router as eval_router
+from api.evaluation import router as evaluation_router
 from api.skills_api import router as skills_api_router
 from api.stats_api import router as stats_router
 from api.mcp import router as mcp_router
@@ -224,6 +228,7 @@ app.include_router(tokens_router, prefix="/api")
 app.include_router(compress_router, prefix="/api")
 app.include_router(config_router, prefix="/api")
 app.include_router(eval_router, prefix="/api")
+app.include_router(evaluation_router, prefix="/api")
 app.include_router(stats_router, prefix="/api")
 app.include_router(mcp_router, prefix="/api")
 app.include_router(capabilities_router, prefix="/api")

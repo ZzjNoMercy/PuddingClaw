@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import tempfile
 import time
@@ -22,6 +23,8 @@ from llm.thinking_mapping import thinking_profile
 
 REGISTRY_VERSION = 1
 DEFAULT_NATIVE_MM_PATH = "/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding"
+DASHSCOPE_NATIVE_DISCOVERY_TIMEOUT_SECONDS = 3.0
+DASHSCOPE_NATIVE_DISCOVERY_CACHE_TTL_SECONDS = 300.0
 DASHSCOPE_NATIVE_MODEL_CATALOG = (
     "qwen3-vl-embedding",
     "qwen2.5-vl-embedding",
@@ -46,6 +49,8 @@ DEFAULT_MODEL_CATEGORY = {
     "multimodal_embedding": "multimodal_embedding",
     "rerank": "rerank",
 }
+
+logger = logging.getLogger(__name__)
 
 
 def user_data_dir() -> Path:
@@ -138,6 +143,14 @@ class LocalCredentialStore:
         item = self._payload().get("credentials", {}).get(reference.removeprefix("local-file://"), {})
         return str(item.get("value") or "") if isinstance(item, dict) else ""
 
+    def delete(self, ref: str) -> None:
+        key = ref.removeprefix("local-file://")
+        payload = self._payload()
+        credentials = payload.setdefault("credentials", {})
+        if key in credentials:
+            del credentials[key]
+            _atomic_json_write(self.path, payload, mode=0o600)
+
     def display(self, reference: str) -> str:
         return _mask(self.get(reference))
 
@@ -166,6 +179,9 @@ class ProviderRegistry:
         self.root = root or user_data_dir()
         self.path = self.root / "providers.json"
         self.credentials = LocalCredentialStore(self.root)
+        self._dashscope_native_discovery_cache: dict[
+            tuple[str, str, int], tuple[float, list[dict[str, Any]]]
+        ] = {}
 
     def _payload(self) -> dict[str, Any]:
         payload = _read_json(self.path, _default_registry())
@@ -176,6 +192,9 @@ class ProviderRegistry:
 
     def _save(self, payload: dict[str, Any]) -> None:
         _atomic_json_write(self.path, payload, mode=0o600)
+        # Endpoint URLs and credentials may have changed. Never serve discovery
+        # results cached against registry state that has just been replaced.
+        self._dashscope_native_discovery_cache.clear()
 
     @staticmethod
     def _backfill_bindings(payload: dict[str, Any]) -> bool:
@@ -342,8 +361,8 @@ class ProviderRegistry:
             self._endpoint(active_llm_provider, active_llm_endpoint)["base_url"] = str(llm.get("base_url") or self._endpoint(active_llm_provider, active_llm_endpoint)["base_url"])
             self._set_endpoint_credential(active_llm_provider, active_llm_endpoint, llm_ref)
         llm_id = add_model(active_llm_provider, active_llm_endpoint, str(llm.get("model") or "deepseek-chat"), "llm", categories=["llm"], temperature=llm.get("temperature", 0.7), max_tokens=llm.get("max_tokens", 4096), context_window=llm.get("context_window", 1000000), thinking=llm.get("thinking", {}))
-        text_id = add_model(dashscope, "dashscope-compatible", str(embedding.get("model") or "text-embedding-v4"), "text_embedding", categories=["text_embedding"], dimension=int(embedding.get("dimension") or 1024), batch_size=int(embedding.get("batch_size") or 20))
-        mm_id = add_model(dashscope, "dashscope-native-mm", str(multimodal.get("model") or "qwen2.5-vl-embedding"), "multimodal_embedding", categories=["multimodal_embedding"], dimension=int(multimodal.get("dimension") or 1024), concurrency=int(multimodal.get("batch_size") or 10), route_path=str(multimodal.get("route_path") or DEFAULT_NATIVE_MM_PATH))
+        text_id = add_model(dashscope, "dashscope-compatible", str(embedding.get("model") or "text-embedding-v4"), "text_embedding", categories=["text_embedding"], dimension=int(embedding.get("dimension") or 1024), batch_size=int(embedding.get("batch_size") or 10))
+        mm_id = add_model(dashscope, "dashscope-native-mm", str(multimodal.get("model") or "qwen3-vl-embedding"), "multimodal_embedding", categories=["multimodal_embedding"], dimension=int(multimodal.get("dimension") or 1024), batch_size=int(multimodal.get("batch_size") or 10), route_path=str(multimodal.get("route_path") or DEFAULT_NATIVE_MM_PATH))
         rerank_id = add_model(dashscope, "dashscope-native-mm", str(rerank.get("model") or "qwen3-vl-rerank"), "rerank", categories=["rerank"], top_n=int(rerank.get("top_n") or 5), candidate_top_k=int(rerank.get("candidate_top_k") or 20), route_path="/api/v1/services/rerank/text-rerank/text-rerank")
         bindings = payload["bindings"]
         bindings.setdefault("agent", llm_id)
@@ -541,7 +560,23 @@ class ProviderRegistry:
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
         if protocol == "dashscope_multimodal_embedding":
-            return self._discover_dashscope_native_models(endpoint, headers)
+            credential_ref = str(endpoint.get("credential_ref") or "")
+            cache_key = (
+                str(endpoint.get("base_url") or "").strip().rstrip("/"),
+                credential_ref,
+                self.credentials.updated_at(credential_ref),
+            )
+            now = time.monotonic()
+            cached = self._dashscope_native_discovery_cache.get(cache_key)
+            if cached and cached[0] > now:
+                return copy.deepcopy(cached[1])
+
+            models = self._discover_dashscope_native_models(endpoint, headers)
+            self._dashscope_native_discovery_cache[cache_key] = (
+                now + DASHSCOPE_NATIVE_DISCOVERY_CACHE_TTL_SECONDS,
+                copy.deepcopy(models),
+            )
+            return models
         if protocol not in {"deepseek", "openai_compatible"}:
             raise ValueError("This endpoint has no supported model-list API.")
 
@@ -560,7 +595,7 @@ class ProviderRegistry:
         closest remote catalog, but it does not contain every serverless native
         model.  Merge compatible entries from that catalog with the small
         official native inference catalog so models such as
-        ``qwen2.5-vl-embedding`` remain selectable.
+        ``qwen3-vl-embedding`` remain selectable.
         """
         base_url = str(endpoint.get("base_url") or "").strip().rstrip("/")
         if not base_url:
@@ -575,37 +610,59 @@ class ProviderRegistry:
             for name in DASHSCOPE_NATIVE_MODEL_CATALOG
         }
 
+        # Without a credential the deployment catalog cannot add anything to
+        # the built-in native catalog. Returning immediately also keeps initial
+        # provider setup responsive.
+        if not headers:
+            return list(discovered.values())
+
         page_no = 1
         page_size = 100
-        with httpx.Client(timeout=15.0) as client:
-            while page_no <= 20:
-                separator = "&" if "?" in catalog_url else "?"
-                response = client.get(
-                    f"{catalog_url}{separator}page_no={page_no}&page_size={page_size}&version=v1.0&model_source=base",
-                    headers=headers,
-                )
-                response.raise_for_status()
-                body = response.json()
-                output = body.get("output", body) if isinstance(body, dict) else {}
-                raw_models = output.get("models", []) if isinstance(output, dict) else []
-                if not isinstance(raw_models, list):
-                    raw_models = []
-
-                for item in raw_models:
-                    if not isinstance(item, dict):
-                        continue
-                    name = str(item.get("model_name") or item.get("name") or item.get("id") or "").strip()
-                    lowered = name.lower()
-                    is_native_embedding = "embedding" in lowered and any(
-                        marker in lowered for marker in ("vl", "vision", "image", "video", "multimodal")
+        started_at = time.monotonic()
+        deadline = started_at + DASHSCOPE_NATIVE_DISCOVERY_TIMEOUT_SECONDS
+        try:
+            with httpx.Client(timeout=DASHSCOPE_NATIVE_DISCOVERY_TIMEOUT_SECONDS) as client:
+                while page_no <= 20:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    separator = "&" if "?" in catalog_url else "?"
+                    response = client.get(
+                        f"{catalog_url}{separator}page_no={page_no}&page_size={page_size}&version=v1.0&model_source=base",
+                        headers=headers,
+                        timeout=remaining,
                     )
-                    if name and (is_native_embedding or "rerank" in lowered):
-                        discovered.setdefault(name, {"id": name, "name": name, "owned_by": "dashscope"})
+                    response.raise_for_status()
+                    body = response.json()
+                    output = body.get("output", body) if isinstance(body, dict) else {}
+                    raw_models = output.get("models", []) if isinstance(output, dict) else []
+                    if not isinstance(raw_models, list):
+                        raw_models = []
 
-                total = int(output.get("total") or 0) if isinstance(output, dict) else 0
-                if not raw_models or len(raw_models) < page_size or (total and page_no * page_size >= total):
-                    break
-                page_no += 1
+                    for item in raw_models:
+                        if not isinstance(item, dict):
+                            continue
+                        name = str(item.get("model_name") or item.get("name") or item.get("id") or "").strip()
+                        lowered = name.lower()
+                        is_native_embedding = "embedding" in lowered and any(
+                            marker in lowered for marker in ("vl", "vision", "image", "video", "multimodal")
+                        )
+                        if name and (is_native_embedding or "rerank" in lowered):
+                            discovered.setdefault(name, {"id": name, "name": name, "owned_by": "dashscope"})
+
+                    total = int(output.get("total") or 0) if isinstance(output, dict) else 0
+                    if not raw_models or len(raw_models) < page_size or (total and page_no * page_size >= total):
+                        break
+                    page_no += 1
+        except httpx.TransportError as exc:
+            # The remote deployment catalog is optional enrichment. Keep the
+            # picker usable when DashScope is slow or temporarily unreachable.
+            logger.warning(
+                "DashScope native model discovery timed out or failed after %.0fms; using %d built-in/partial models: %s",
+                (time.monotonic() - started_at) * 1000,
+                len(discovered),
+                exc,
+            )
 
         return list(discovered.values())
 

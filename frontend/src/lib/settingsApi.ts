@@ -128,7 +128,9 @@ export interface KnowledgeSettings {
     vector_store: string;
     milvus_uri: string;
     text_collection: string;
+    legacy_text_collection?: string;
     image_collection: string;
+    bm25_enabled?: boolean;
     overwrite?: boolean;
   };
 }

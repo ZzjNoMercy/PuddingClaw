@@ -4,6 +4,7 @@ import dynamic from "next/dynamic";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -364,7 +365,7 @@ function AgentsPreviewModal({
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [onClose]);
 
-  return (
+  const dialog = (
     <div
       className="fixed inset-0 z-[170] flex items-center justify-center bg-slate-950/35 px-4 py-6 backdrop-blur-sm"
       onMouseDown={(event) => {
@@ -397,6 +398,8 @@ function AgentsPreviewModal({
       </section>
     </div>
   );
+
+  return typeof document === "undefined" ? null : createPortal(dialog, document.body);
 }
 
 function WikiWorkflowPanel({
@@ -523,14 +526,20 @@ function WikiWorkflowPanel({
             <p className="text-sm font-semibold text-gray-900">3. Wiki 发布结果</p>
             <p className="mt-1 text-[11px] text-gray-400">{status.wiki.length} 个页面 · index {status.files.index ? "就绪" : "缺失"} · log {status.files.log ? "就绪" : "缺失"}</p>
           </div>
-          <button type="button" disabled={working} onClick={onLint} className="h-8 rounded-xl border border-black/[0.07] px-3 text-[11px] font-medium text-gray-600 hover:text-[#002fa7] disabled:opacity-40">
-            {busy === "lint" ? "检查中…" : "运行 Lint"}
+          <button
+            type="button"
+            disabled={working}
+            onClick={onLint}
+            title="检查页面格式、Schema 类型、Raw 来源、Wiki 链接、目录和索引是否完整"
+            className="h-8 rounded-xl border border-black/[0.07] px-3 text-[11px] font-medium text-gray-600 hover:text-[#002fa7] disabled:opacity-40"
+          >
+            {busy === "lint" ? "检查中…" : "检查完整性"}
           </button>
         </div>
         {result?.kind === "lint" ? (
           <div className={`border-t px-4 py-3 text-xs ${result.value.ok ? "border-emerald-500/10 bg-emerald-50/70 text-emerald-800" : "border-red-500/10 bg-red-50/70 text-red-700"}`}>
-            <p className="font-semibold">{result.value.ok ? "Lint 通过" : "Lint 未通过"}</p>
-            <p className="mt-1">{result.value.counts.pages} 个页面，{result.value.counts.errors} 个错误，{result.value.counts.warnings} 个警告。</p>
+            <p className="font-semibold">{result.value.ok ? "检查通过" : "发现需要处理的问题"}</p>
+            <p className="mt-1">{result.value.counts.pages} 个页面，{result.value.counts.errors} 个问题，{result.value.counts.warnings} 个提醒。</p>
             {result.value.errors.slice(0, 5).map((item) => <p key={`${item.code}-${item.path}`} className="mt-1 font-mono text-[10px]">{item.path}: {item.message}</p>)}
           </div>
         ) : null}
@@ -1429,7 +1438,7 @@ export default function BrainSchemaPage() {
                     {tab === "resolved" ? (
                       <div>
                         <h2 className="text-sm font-semibold text-gray-900">解析后的有效 Schema</h2>
-                        <p className="mt-1 text-xs leading-5 text-gray-500">按 gbrain 的继承、覆盖和借用语义合并，编译和 Lint 使用这一视图。</p>
+                        <p className="mt-1 text-xs leading-5 text-gray-500">按 gbrain 的继承、覆盖和借用语义合并，编译和完整性检查使用这一视图。</p>
                         <div className="mt-4 grid gap-3 sm:grid-cols-2">
                           <div className="rounded-2xl border border-black/[0.06] bg-white p-4"><p className="text-2xl font-semibold text-gray-900">{preview?.resolved.manifest.page_types.length ?? bundle.resolved.manifest.page_types.length}</p><p className="mt-1 text-xs text-gray-400">Page Types</p></div>
                           <div className="rounded-2xl border border-black/[0.06] bg-white p-4"><p className="text-2xl font-semibold text-gray-900">{preview?.resolved.manifest.link_types.length ?? bundle.resolved.manifest.link_types.length}</p><p className="mt-1 text-xs text-gray-400">Link Types</p></div>

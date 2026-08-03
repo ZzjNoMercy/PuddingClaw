@@ -440,8 +440,9 @@ export default function SkillsPage() {
         )}
 
         <main className="workspace-content-frame flex min-w-0 flex-1 flex-col overflow-hidden">
+      <div className="workspace-page-width flex h-full min-h-0 flex-col overflow-hidden">
       <nav className="shrink-0 bg-white/60" aria-label="扩展类型">
-        <div className="flex w-full items-center gap-1.5 px-5 py-2">
+        <div className="flex w-full items-center gap-1.5 px-5 py-6">
           <button
             type="button"
             aria-current={extensionView === "skills" ? "page" : undefined}
@@ -753,6 +754,7 @@ export default function SkillsPage() {
         )}
       </div>
       )}
+      </div>
         </main>
       </div>
 

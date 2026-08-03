@@ -47,6 +47,7 @@ class TableRoute:
     confidence: float
     reason: str
     prompt_context: str
+    alias_resolutions: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass(slots=True)

@@ -8,6 +8,7 @@ from langchain.tools import ToolRuntime
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import StructuredTool
 
+from graph.citations import dedupe_sources, materialize_artifact_citations
 from tools.filesystem.inspect import digest, read_all
 from tools.filesystem.schemas import (
     FilePatchSpec,
@@ -16,6 +17,35 @@ from tools.filesystem.schemas import (
     ReplaceFileInput,
     ReplacementHunk,
 )
+
+
+def _materialize_cited_content(
+    file_path: str,
+    content: str,
+    runtime: ToolRuntime[Any, Any],
+) -> str:
+    """Refresh self-contained citation definitions after a file mutation."""
+
+    if Path(file_path).suffix.lower() not in {".md", ".markdown", ".html", ".htm"}:
+        return content
+    context = runtime.context if isinstance(runtime.context, dict) else {}
+    session_id = str(context.get("session_id") or "")
+    if not session_id:
+        return content
+    from graph.session_manager import session_manager
+
+    sources = dedupe_sources([
+        source
+        for message in session_manager.load_session(session_id)
+        for source in message.get("sources", []) or []
+        if isinstance(source, dict)
+    ])
+    rendered, _report = materialize_artifact_citations(
+        content,
+        sources,
+        file_path=file_path,
+    )
+    return rendered
 
 
 def _canonical_artifact_path(backend: Any, target_path: str) -> str | None:
@@ -179,6 +209,7 @@ def build_patch_tools(backend: Any) -> list[StructuredTool]:
                 tool_call_id=runtime.tool_call_id,
                 status="error",
             )
+        updated = _materialize_cited_content(file_path, updated, runtime)
         result = backend.edit(file_path, original, updated, replace_all=False)
         if result.error:
             return ToolMessage(
@@ -268,6 +299,7 @@ def build_patch_tools(backend: Any) -> list[StructuredTool]:
                 tool_call_id=runtime.tool_call_id,
                 status="error",
             )
+        content = _materialize_cited_content(file_path, content, runtime)
         result = replace(
             file_path,
             content.encode("utf-8"),
@@ -338,6 +370,7 @@ def build_patch_tools(backend: Any) -> list[StructuredTool]:
                     hunk.new_string,
                     -1 if hunk.replace_all else 1,
                 )
+            updated = _materialize_cited_content(spec.file_path, updated, runtime)
             changes.append(
                 {
                     "file_path": spec.file_path,

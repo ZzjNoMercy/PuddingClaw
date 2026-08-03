@@ -6,9 +6,13 @@ import re
 from copy import deepcopy
 from typing import Any
 
+import sqlglot
 from sqlalchemy import exc as sa_exc
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
+from sqlglot import exp
+from sqlglot.errors import ParseError
+from sqlglot.optimizer.scope import Scope, build_scope
 
 from analytics.nl2sql.schemas import SqlExecutionResult
 from config import get_database_qa_config
@@ -30,20 +34,44 @@ _DANGEROUS_RE = re.compile(
     r"\b(insert|update|delete|drop|alter|truncate|create|grant|revoke|copy|call|execute|merge|vacuum|analyze|refresh|set|reset)\b",
     re.IGNORECASE,
 )
-_TABLE_REF_RE = re.compile(
-    r"\b(?:from|join)\s+((?:\"[^\"]+\"|[a-zA-Z_][\w]*)(?:\.(?:\"[^\"]+\"|[a-zA-Z_][\w]*))?)",
-    re.IGNORECASE,
-)
-_CTE_NAME_RE = re.compile(
-    r"(?:\bwith|,)\s+((?:\"[^\"]+\"|[a-zA-Z_][\w]*))\s+as\s*\(",
-    re.IGNORECASE,
-)
 _SCALAR_SUBQUERY_LIST_RE = re.compile(
     r"\)\s+as\s+(?:\"[^\"]+\"|[a-zA-Z_][\w]*)\s*,\s*\(\s*select\b",
     re.IGNORECASE | re.DOTALL,
 )
-_FUNCTION_FROM_KEYWORDS = {"extract", "substring", "trim"}
-
+_FORBIDDEN_FUNCTION_NAMES = {
+    "cursor_to_xml",
+    "database_to_xml",
+    "database_to_xml_and_xmlschema",
+    "database_to_xmlschema",
+    "lo_export",
+    "lo_get",
+    "lo_import",
+    "loread",
+    "query_to_xml",
+    "schema_to_xml",
+    "schema_to_xml_and_xmlschema",
+    "schema_to_xmlschema",
+    "table_to_xml",
+    "table_to_xml_and_xmlschema",
+    "table_to_xmlschema",
+}
+_FORBIDDEN_FUNCTION_PREFIXES = ("dblink", "pg_ls_", "pg_read_")
+_ALLOWED_ANONYMOUS_FUNCTION_NAMES = {
+    # sqlglot does not model these PostgreSQL built-ins with a dedicated
+    # expression class. Unknown scalar functions fail closed because a
+    # SECURITY DEFINER function can read relations absent from the query AST.
+    "json_agg",
+    "json_build_array",
+    "json_build_object",
+    "json_object_agg",
+    "jsonb_agg",
+    "jsonb_build_array",
+    "jsonb_build_object",
+    "jsonb_object_agg",
+    "make_date",
+    "make_interval",
+    "width_bucket",
+}
 _DIMENSION_HINTS = ("品牌", "brand", "车系", "serial", "车型", "name", "分类", "category", "类型", "type")
 _DATE_HINTS = ("日期", "时间", "date", "time", "created_at", "updated_at")
 _NUMERIC_HINTS = ("价格", "金额", "销量", "数量", "price", "amount", "count", "qty", "num")
@@ -201,46 +229,59 @@ def _table_aliases(table_name: str) -> set[str]:
 
 
 def _referenced_tables(sql: str) -> set[str]:
-    tables: set[str] = set()
-    parse_sql = _strip_sql_comments(sql)
-    for match in _TABLE_REF_RE.finditer(parse_sql):
-        if _is_function_argument_from(parse_sql, match.start()):
-            continue
-        ref = match.group(1).strip()
-        if ref.startswith("("):
-            continue
-        tables.add(_normalize_identifier(ref))
-    return tables
+    """Return physical PostgreSQL tables referenced by a read-only query.
 
-
-def _is_function_argument_from(sql: str, from_index: int) -> bool:
-    """Return true for PostgreSQL function syntax like ``EXTRACT(YEAR FROM x)``.
-
-    The table-scope validator intentionally uses a small parser instead of a
-    full SQL AST. PostgreSQL also uses the word FROM inside function arguments,
-    so a plain ``FROM <identifier>`` regex would otherwise treat ``to_date`` in
-    ``EXTRACT(YEAR FROM to_date(...))`` as an unauthorized table.
+    Table scope is an authorization boundary, so derive it from SQL structure
+    rather than keyword-shaped text. A regex cannot distinguish a real FROM
+    clause from PostgreSQL expressions such as ``IS NOT DISTINCT FROM`` or
+    ``EXTRACT(... FROM ...)``. Scope sources do make that distinction: CTEs
+    and subqueries resolve to nested scopes, while physical relations remain
+    ``Table`` expressions.
     """
 
-    last_open = sql.rfind("(", 0, from_index)
-    if last_open < 0:
-        return False
-    last_close = sql.rfind(")", 0, from_index)
-    if last_close > last_open:
-        return False
-    before_open = sql[:last_open].rstrip()
-    function_match = re.search(r'(?:"([^"]+)"|([a-zA-Z_][\w]*))\s*$', before_open)
-    if not function_match:
-        return False
-    function_name = (function_match.group(1) or function_match.group(2) or "").lower()
-    return function_name in _FUNCTION_FROM_KEYWORDS
-
-
-def _cte_names(sql: str) -> set[str]:
     parse_sql = _strip_sql_comments(sql)
-    if not parse_sql.lstrip().lower().startswith("with"):
-        return set()
-    return {_normalize_identifier(match.group(1)) for match in _CTE_NAME_RE.finditer(parse_sql)}
+    try:
+        tree = sqlglot.parse_one(parse_sql, dialect="postgres")
+        root_scope = build_scope(tree)
+    except ParseError as exc:
+        raise SqlRunnerError(f"SQL 解析失败：{exc}", sql=sql) from exc
+    if root_scope is None:
+        raise SqlRunnerError("SQL 解析失败：无法建立查询作用域。", sql=sql)
+
+    for function in tree.find_all(exp.Func):
+        name = (
+            str(function.name or "") if isinstance(function, exp.Anonymous) else str(function.sql_name() or "")
+        ).lower()
+        if isinstance(function.parent, exp.Dot):
+            qualifier = function.parent.this
+            schema_name = qualifier.name.lower() if isinstance(qualifier, exp.Identifier) else ""
+            if schema_name != "pg_catalog":
+                raise SqlRunnerError(f"SQL 包含未授权的 schema 限定函数：{name}", sql=sql)
+        if name in _FORBIDDEN_FUNCTION_NAMES or name.startswith(_FORBIDDEN_FUNCTION_PREFIXES):
+            raise SqlRunnerError(f"SQL 包含未授权的关系或系统读取函数：{name}", sql=sql)
+        if isinstance(function, exp.Anonymous) and name not in _ALLOWED_ANONYMOUS_FUNCTION_NAMES:
+            raise SqlRunnerError(f"SQL 包含未授权的自定义或未登记函数：{name}", sql=sql)
+
+    tables: set[str] = set()
+    for scope in root_scope.traverse():
+        for source in scope.sources.values():
+            if isinstance(source, Scope) and isinstance(source.expression, exp.UDTF):
+                raise SqlRunnerError(
+                    f"SQL FROM/JOIN 包含未授权的表函数：{source.expression.sql(dialect='postgres')}",
+                    sql=sql,
+                )
+            if not isinstance(source, exp.Table):
+                continue
+            if not isinstance(source.this, exp.Identifier):
+                raise SqlRunnerError(
+                    f"SQL FROM/JOIN 包含未授权的表函数：{source.this.sql(dialect='postgres')}",
+                    sql=sql,
+                )
+            parts = [source.catalog, source.db, source.name]
+            normalized = _normalize_identifier(".".join(part for part in parts if part))
+            if normalized:
+                tables.add(normalized)
+    return tables
 
 
 def validate_readonly_sql(sql: str, *, allowed_tables: list[str]) -> str:
@@ -266,9 +307,8 @@ def validate_readonly_sql(sql: str, *, allowed_tables: list[str]) -> str:
     for table_name in allowed_tables:
         allowed_aliases |= _table_aliases(table_name)
 
-    cte_names = _cte_names(clean_sql)
     referenced = _referenced_tables(clean_sql)
-    blocked = sorted(ref for ref in referenced if ref not in allowed_aliases and ref not in cte_names)
+    blocked = sorted(ref for ref in referenced if ref not in allowed_aliases)
     if blocked:
         raise SqlRunnerError(f"SQL 引用了未授权数据表：{', '.join(blocked)}", sql=clean_sql)
     return clean_sql
@@ -288,10 +328,7 @@ def _compact_cell(value: Any, *, max_chars: int) -> Any:
 
 
 def _compact_rows(rows: list[dict[str, Any]], columns: list[str], *, max_cell_chars: int) -> list[dict[str, Any]]:
-    return [
-        {column: _compact_cell(row.get(column), max_chars=max_cell_chars) for column in columns}
-        for row in rows
-    ]
+    return [{column: _compact_cell(row.get(column), max_chars=max_cell_chars) for column in columns} for row in rows]
 
 
 def _trim_profile_to_token_budget(
@@ -316,9 +353,7 @@ def _trim_profile_to_token_budget(
                 continue
             for value, count in raw_counts.items():
                 candidate = deepcopy(trimmed)
-                candidate.setdefault("group_counts", {}).setdefault(column, {})[
-                    value
-                ] = count
+                candidate.setdefault("group_counts", {}).setdefault(column, {})[value] = count
                 if _estimate_tokens(candidate) > budget:
                     break
                 trimmed = candidate
@@ -354,7 +389,9 @@ def _profile_from_rows(rows: list[dict[str, Any]], columns: list[str]) -> dict[s
                 key = str(value)
                 counts[key] = counts.get(key, 0) + 1
             if 0 < len(counts) <= 100:
-                profile["group_counts"][column] = dict(sorted(counts.items(), key=lambda item: item[1], reverse=True)[:100])
+                profile["group_counts"][column] = dict(
+                    sorted(counts.items(), key=lambda item: item[1], reverse=True)[:100]
+                )
         if any(hint in column or hint in lower for hint in _DATE_HINTS):
             as_text = [str(value) for value in values]
             profile["date_ranges"][column] = {"min": min(as_text), "max": max(as_text)}
@@ -453,6 +490,7 @@ async def run_readonly_sql(
     try:
         async with engine.connect() as conn:
             async with conn.begin():
+                await conn.execute(text("SET TRANSACTION READ ONLY"))
                 await conn.execute(text(f"SET LOCAL statement_timeout = '{effective_timeout_ms}ms'"))
                 result = await conn.execute(
                     text(f"SELECT * FROM ({clean_sql}) AS puddingclaw_result LIMIT :limit_value"),
@@ -468,7 +506,9 @@ async def run_readonly_sql(
                 if materialized_all:
                     total_row_count = len(rows)
                 else:
-                    count_result = await conn.execute(text(f"SELECT COUNT(*) AS count FROM ({clean_sql}) AS puddingclaw_count"))
+                    count_result = await conn.execute(
+                        text(f"SELECT COUNT(*) AS count FROM ({clean_sql}) AS puddingclaw_count")
+                    )
                     total_row_count = int(count_result.scalar_one() or 0)
                 can_include_full = (
                     materialized_all
@@ -493,9 +533,7 @@ async def run_readonly_sql(
                         profile = await _profile_with_sql(conn, clean_sql, string_columns)
                     profile = _trim_profile_to_token_budget(
                         profile,
-                        token_budget=int(
-                            config.get("profile_token_budget") or 3000
-                        ),
+                        token_budget=int(config.get("profile_token_budget") or 3000),
                     )
                 omitted_count = max(0, total_row_count - len(model_rows))
                 limited = not can_include_full

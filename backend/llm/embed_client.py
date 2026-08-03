@@ -7,9 +7,11 @@
 from __future__ import annotations
 
 import logging
+
 from llama_index.embeddings.openai import OpenAIEmbedding
 
 from config import get_fallback_embedding_config
+from llm.embedding_limits import clamp_embedding_batch_size
 
 logger = logging.getLogger(__name__)
 
@@ -25,12 +27,7 @@ def get_embedding_model() -> OpenAIEmbedding:
         raise ValueError(f"Text embedding requires an OpenAI-compatible endpoint, got {cfg.get('protocol')}")
     api_base = cfg.get("api_base", "https://api.openai.com/v1")
     model = cfg.get("model", "text-embedding-3-small")
-    embed_batch_size = int(cfg.get("batch_size", 100))
-    if str(model).startswith("text-embedding-v") and "dashscope" in str(api_base).lower():
-        # DashScope text-embedding-v* OpenAI-compatible endpoint rejects
-        # input.contents batches larger than 20. Keep the UI/config flexible,
-        # but never send an invalid provider batch at runtime.
-        embed_batch_size = min(embed_batch_size, 20)
+    embed_batch_size = clamp_embedding_batch_size(model, int(cfg.get("batch_size", 10)))
 
     api_key = cfg.get("api_key", "")
     if not api_key:

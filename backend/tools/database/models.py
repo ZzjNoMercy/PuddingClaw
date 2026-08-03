@@ -42,16 +42,21 @@ class DatabaseSqlGenerateInput(BaseModel):
 
     question: str = Field(
         description=(
-            "Business-level question used only to generate SQL. For a Goal, decompose the Goal into a focused "
-            "sub-question containing only the metric/subject, dimensions, grain, filters, time range, and desired "
-            "output. Do not add physical tables, columns, EAV names/values, entity mappings, JOIN/CTE choices, or "
-            "other SQL implementation details unless the user explicitly supplied them."
+            "Business question used to generate SQL. For a standalone request, preserve the user's intent and shorthand. "
+            "For a Goal, decompose it into a focused sub-question without changing its business semantics. The Agent may "
+            "select tables and columns only from the active analytics model's declared data assets, but must not embed an "
+            "Agent-written SELECT/JOIN/CTE implementation. EAV values and entity mappings remain subject to semantic "
+            "and schema evidence checks."
         )
     )
     database_source_id: str | None = Field(default=None, description="Optional configured database source id.")
     table_names: list[str] = Field(
         default_factory=list,
-        description="Optional allowed table names. Explicit table names win over router-selected tables.",
+        description=(
+            "Optional physical table names or full <database_source_id>.<table_name> data-asset references selected by "
+            "the Agent from the active analytics model. The router intersects them with both model-declared tables and "
+            "the database source allowlist; explicit names never broaden authorization."
+        ),
     )
     model_id: str | None = Field(
         default=None,
@@ -201,7 +206,11 @@ class DatabaseQueryResultSourceInput(BaseModel):
 
 
 class SemanticEntityLookupInput(BaseModel):
-    dimension_id: str = Field(description="Entity-lookup dimension id, for example 'vehicle_series' or 'dimension:vehicle_series'.")
+    dimension_id: str = Field(
+        description="Entity-lookup dimension id, for example 'vehicle_series' or 'dimension:vehicle_series'."
+    )
     source_ref: str = Field(description="Source asset reference declared by the active Crosswalk binding.")
     keys: list[dict[str, str]] = Field(description="One or more source key objects using the binding field names.")
-    include_non_joinable: bool = Field(default=False, description="Include candidate and unmatched mappings for diagnosis only.")
+    include_non_joinable: bool = Field(
+        default=False, description="Include candidate and unmatched mappings for diagnosis only."
+    )

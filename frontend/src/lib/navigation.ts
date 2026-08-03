@@ -36,6 +36,11 @@ export const NAV_ITEMS: NavItem[] = [
     ],
   },
   {
+    label: "评估",
+    href: "/evaluation/datasets",
+    icon: "FlaskConical",
+  },
+  {
     label: "设置",
     href: "/settings",
     icon: "Settings",
@@ -49,5 +54,7 @@ export const ROUTE_TITLES: Record<string, string> = {
   "/skills": "扩展管理",
   "/skills/compare": "版本对比",
   "/skills/review": "评估审核",
+  "/evaluation/datasets": "评测集",
+  "/evaluation/experiments": "Experiments",
   "/settings": "系统设置",
 };

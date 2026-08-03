@@ -3273,35 +3273,12 @@ function SpanDetail({ span, allSpans = [], onClose }: { span: TraceSpan; allSpan
 }
 
 function ToolSpanDetail({ span, allSpans = [] }: { span: TraceSpan; allSpans?: TraceSpan[] }) {
-  const ragSpans = allSpans.filter((item) => item.parent_id === span.id && item.type === "rag");
+  const ragSpans = traceDescendantsOf(span.id, allSpans, "rag");
   const databaseSpans = traceDescendantsOf(span.id, allSpans, "database");
-  const ragStages = ragStageCounts(ragSpans);
   return (
     <div className="space-y-2">
       {databaseSpans.length > 0 && <DatabaseTraceSummary spans={databaseSpans} />}
-      {ragSpans.length > 0 && (
-        <div className="rounded-lg border border-emerald-100 bg-emerald-50/50 p-3">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div>
-              <p className="text-[11px] font-bold text-emerald-800">RAG 细节已折叠</p>
-              <p className="mt-0.5 text-[10px] text-emerald-700/70">
-                主流程只展示 tool output 和后续 model input；检索内部步骤保留在原始 trace 数据里。
-              </p>
-            </div>
-            <span className="rounded-full bg-white px-2 py-0.5 text-[10px] font-semibold text-emerald-700 shadow-sm">
-              {ragSpans.length} steps
-            </span>
-          </div>
-          <div className="mt-2 flex flex-wrap gap-1.5">
-            {ragStages.map((item) => (
-              <span key={item.stage} className="rounded-md border border-emerald-100 bg-white px-2 py-1 text-[10px] font-medium text-emerald-700">
-                {item.stage}
-                {item.count > 1 ? ` ×${item.count}` : ""}
-              </span>
-            ))}
-          </div>
-        </div>
-      )}
+      {ragSpans.length > 0 && <RagTraceSummary spans={ragSpans} />}
       <div className="grid gap-2 lg:grid-cols-2">
         <DetailBlock title="Tool Input / Arguments" value={span.input} />
         <DetailBlock title="Tool Output / Result" value={span.output} />
@@ -3331,6 +3308,199 @@ function traceDescendantsOf(parentId: string, allSpans: TraceSpan[], type?: stri
     stack.push(...(byParent.get(span.id) || []));
   }
   return result.sort((a, b) => spanEventOrder(a) - spanEventOrder(b));
+}
+
+type RagCandidateSummary = {
+  rank?: number;
+  title?: string;
+  section?: string;
+  preview?: string;
+  chunk_id?: string;
+  retrieval_channel?: string;
+  score?: number;
+  raw_score?: number;
+  normalized_score?: number;
+  rerank_score?: number;
+};
+
+function RagTraceSummary({ spans }: { spans: TraceSpan[] }) {
+  const ordered = [...spans].sort((a, b) => spanEventOrder(a) - spanEventOrder(b));
+  const byStage = new Map(ordered.map((span) => [ragStage(span), span]));
+  const query = objectFromUnknown(byStage.get("query")?.output);
+  const channels = [
+    { stage: "retrieve.text_vector", label: "Text vector" },
+    { stage: "retrieve.bm25", label: "BM25" },
+    { stage: "retrieve.image_vector", label: "Image vector" },
+  ].map(({ stage, label }) => {
+    const payload = objectFromUnknown(byStage.get(stage)?.output);
+    return {
+      stage,
+      label,
+      count: numericTraceValue(payload.candidate_count),
+      enabled: payload.enabled !== false,
+      error: typeof payload.error === "string" ? payload.error : "",
+      candidates: ragCandidates(payload.top_candidates),
+    };
+  });
+  const textFusion = objectFromUnknown(byStage.get("fusion.text_hybrid")?.output);
+  const multimodalFusion = objectFromUnknown(byStage.get("fusion.multimodal")?.output);
+  const rerank = objectFromUnknown(byStage.get("rerank")?.output);
+  const selected = objectFromUnknown(byStage.get("select")?.output);
+
+  return (
+    <div className="overflow-hidden rounded-lg border border-emerald-100 bg-white">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-emerald-100 bg-emerald-50/60 px-3 py-2.5">
+        <div>
+          <p className="text-[11px] font-bold text-emerald-900">RAG 检索诊断</p>
+          <p className="mt-0.5 text-[10px] text-emerald-800/70">
+            {String(query.vector_store || "retrieval")} · top {String(query.top_k ?? "-")} · candidate top {String(query.candidate_top_k ?? "-")}
+          </p>
+        </div>
+        <span className="rounded border border-emerald-100 bg-white px-2 py-0.5 text-[10px] font-semibold text-emerald-700">
+          {spans.length} spans
+        </span>
+      </div>
+
+      <div className="grid gap-px bg-slate-100 sm:grid-cols-3">
+        {channels.map((channel) => (
+          <div key={channel.stage} className="bg-white px-3 py-2.5">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[10px] font-semibold text-slate-600">{channel.label}</span>
+              <span className={`text-[15px] font-bold ${channel.error ? "text-red-600" : "text-slate-900"}`}>
+                {channel.enabled ? channel.count ?? 0 : "off"}
+              </span>
+            </div>
+            {channel.error && <p className="mt-1 line-clamp-2 text-[9px] text-red-600">{channel.error}</p>}
+          </div>
+        ))}
+      </div>
+
+      <div className="border-t border-slate-100 px-3 py-2.5">
+        <p className="mb-2 text-[10px] font-semibold text-slate-500">融合与选择</p>
+        <div className="flex flex-wrap gap-x-4 gap-y-1.5 text-[10px] text-slate-600">
+          <RagFusionLabel label="文本混合" payload={textFusion} />
+          <RagFusionLabel label="多模态混合" payload={multimodalFusion} />
+          {Object.keys(rerank).length > 0 && (
+            <span>
+              Rerank <strong className="font-semibold text-slate-900">{String(rerank.candidate_count ?? 0)} → {String(rerank.returned_count ?? 0)}</strong>
+            </span>
+          )}
+          {Object.keys(selected).length > 0 && (
+            <span>
+              最终 <strong className="font-semibold text-slate-900">{String(selected.selected_count ?? 0)}</strong>
+              <span className="text-slate-400">（文本 {String(selected.chunks_count ?? 0)} / 图片 {String(selected.image_hits_count ?? 0)}）</span>
+            </span>
+          )}
+        </div>
+      </div>
+
+      <div className="border-t border-slate-100 px-3 py-2.5">
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <p className="text-[10px] font-semibold text-slate-500">各路候选池</p>
+          <p className="text-[9px] text-slate-400">Trace 保存全部候选与内容预览</p>
+        </div>
+        <div className="grid gap-3 xl:grid-cols-3">
+          {channels.map((channel) => (
+            <RagCandidatePool key={`${channel.stage}-candidates`} channel={channel} />
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RagCandidatePool({
+  channel,
+}: {
+  channel: {
+    label: string;
+    count: number | null;
+    candidates: RagCandidateSummary[];
+  };
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const visibleCandidates = expanded ? channel.candidates : channel.candidates.slice(0, 5);
+  const canExpand = channel.candidates.length > 5;
+  return (
+    <div className="min-w-0">
+      <div className="mb-1 flex items-center justify-between text-[10px]">
+        <span className="font-semibold text-slate-700">{channel.label}</span>
+        <span className="tabular-nums text-slate-400">{channel.candidates.length}/{channel.count ?? 0}</span>
+      </div>
+      {visibleCandidates.length > 0 ? (
+        <ol className="divide-y divide-slate-100 border-y border-slate-100">
+          {visibleCandidates.map((candidate, index) => (
+            <li key={`${candidate.chunk_id || candidate.title || "candidate"}-${index}`} className="flex min-w-0 items-start gap-2 py-2 text-[10px]">
+              <span className="mt-0.5 w-4 shrink-0 text-right tabular-nums text-slate-400">{candidate.rank ?? index + 1}</span>
+              <span className="min-w-0 flex-1">
+                <span className="flex min-w-0 items-center gap-1.5">
+                  <span className="min-w-0 flex-1 truncate font-medium text-slate-700" title={candidate.section || candidate.title || candidate.chunk_id || ""}>
+                    {candidate.section || candidate.title || candidate.chunk_id || "未命名候选"}
+                  </span>
+                  {candidate.chunk_id && <span className="shrink-0 text-[9px] text-slate-400">{candidate.chunk_id}</span>}
+                </span>
+                {candidate.preview && (
+                  <span className="mt-0.5 line-clamp-2 block leading-4 text-slate-500" title={candidate.preview}>
+                    {candidate.preview}
+                  </span>
+                )}
+              </span>
+              <span className="mt-0.5 shrink-0 tabular-nums text-slate-500">{ragCandidateScore(candidate)}</span>
+            </li>
+          ))}
+        </ol>
+      ) : (
+        <p className="border-y border-slate-100 py-2 text-[10px] text-slate-400">无候选</p>
+      )}
+      {canExpand && (
+        <button
+          type="button"
+          onClick={() => setExpanded((value) => !value)}
+          className="mt-1 flex items-center gap-1 text-[10px] font-medium text-emerald-700 hover:text-emerald-900"
+        >
+          {expanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+          {expanded ? "收起" : `查看全部 ${channel.candidates.length} 条`}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function RagFusionLabel({ label, payload }: { label: string; payload: Record<string, unknown> }) {
+  const weights = objectFromUnknown(payload.weights);
+  if (Object.keys(weights).length === 0) return null;
+  const summary = Object.entries(weights)
+    .map(([key, value]) => `${key} ${formatRagWeight(value)}`)
+    .join(" / ");
+  return (
+    <span>
+      {label} <strong className="font-semibold text-slate-900">{summary}</strong>
+    </span>
+  );
+}
+
+function ragStage(span: TraceSpan): string {
+  return typeof span.metadata?.rag_stage === "string"
+    ? span.metadata.rag_stage
+    : span.name.replace(/^rag\./, "");
+}
+
+function ragCandidates(value: unknown): RagCandidateSummary[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is RagCandidateSummary => Boolean(item && typeof item === "object"));
+}
+
+function numericTraceValue(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function formatRagWeight(value: unknown): string {
+  return typeof value === "number" && Number.isFinite(value) ? `${Math.round(value * 100)}%` : "-";
+}
+
+function ragCandidateScore(candidate: RagCandidateSummary): string {
+  const value = candidate.rerank_score ?? candidate.score ?? candidate.raw_score ?? candidate.normalized_score;
+  return typeof value === "number" && Number.isFinite(value) ? value.toFixed(3) : "-";
 }
 
 function DatabaseTraceSummary({ spans }: { spans: TraceSpan[] }) {
@@ -3584,16 +3754,6 @@ function formatTraceSummaryValue(value: unknown): string {
 function objectFromUnknown(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   return value as Record<string, unknown>;
-}
-
-function ragStageCounts(spans: TraceSpan[]): Array<{ stage: string; count: number }> {
-  const counts = new Map<string, number>();
-  spans.forEach((span) => {
-    const rawStage = typeof span.metadata?.rag_stage === "string" ? span.metadata.rag_stage : span.name.replace(/^rag\./, "");
-    const group = rawStage.split(".", 1)[0] || rawStage || "rag";
-    counts.set(group, (counts.get(group) || 0) + 1);
-  });
-  return Array.from(counts.entries()).map(([stage, count]) => ({ stage, count }));
 }
 
 function ModelInputDetail({ span, allSpans = [] }: { span: TraceSpan; allSpans?: TraceSpan[] }) {

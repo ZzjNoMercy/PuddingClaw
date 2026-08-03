@@ -144,13 +144,28 @@ def _semantic_table_boost(question: str, table_name: str, columns: list[str]) ->
     return score, reasons
 
 
-def _match_requested_tables(requested: list[str], available: list[str]) -> list[str]:
+def _match_requested_tables(
+    requested: list[str],
+    available: list[str],
+    *,
+    configured_aliases: dict[str, str] | None = None,
+    scope_label: str = "当前数据源的已选表",
+) -> list[str]:
     if not requested:
         return []
     alias_to_available: dict[str, str] = {}
     for table in available:
         for alias in _table_aliases(table):
             alias_to_available[alias.lower()] = table
+    available_by_normalized = {_normalize_table_name(table).lower(): table for table in available}
+    for alias, target in (configured_aliases or {}).items():
+        available_table = available_by_normalized.get(_normalize_table_name(target).lower())
+        if available_table:
+            alias_key = str(alias).strip().lower()
+            existing = alias_to_available.get(alias_key)
+            if existing and _normalize_table_name(existing).lower() != _normalize_table_name(available_table).lower():
+                raise TableRouterError(f"分析模型表别名与真实数据表标识冲突：{alias}")
+            alias_to_available[alias_key] = available_table
     matched: list[str] = []
     missing: list[str] = []
     for raw in requested:
@@ -161,8 +176,98 @@ def _match_requested_tables(requested: list[str], available: list[str]) -> list[
         else:
             missing.append(str(raw))
     if missing:
-        raise TableRouterError(f"以下数据表未在当前数据源的已选表中：{', '.join(missing)}")
+        raise TableRouterError(f"以下数据表未在{scope_label}中：{', '.join(missing)}")
     return matched
+
+
+def _model_table_aliases_by_source(model_id: str | None) -> dict[str, dict[str, str]]:
+    """Return explicit, model-owned user aliases for declared database tables."""
+
+    clean_model_id = str(model_id or "").strip()
+    if not clean_model_id:
+        return {}
+    try:
+        model = get_analytics_model_registry().get_model(clean_model_id)
+    except AnalyticsModelError as exc:
+        raise TableRouterError(str(exc)) from exc
+
+    data_assets = (model.get("frontmatter") or {}).get("data_assets") or {}
+    table_refs = [str(item or "").strip() for item in data_assets.get("tables") or []]
+    declared = {ref for ref in table_refs if ref and not ref.startswith("table_asset:") and "." in ref}
+    raw_aliases = data_assets.get("table_aliases") or {}
+    if not isinstance(raw_aliases, dict):
+        raise TableRouterError("分析模型 data_assets.table_aliases 必须是映射。")
+
+    grouped: dict[str, dict[str, str]] = {}
+    for raw_ref, raw_values in raw_aliases.items():
+        ref = str(raw_ref or "").strip()
+        if ref not in declared:
+            raise TableRouterError(f"分析模型表别名引用了未声明的数据表：{ref}")
+        if not isinstance(raw_values, list):
+            raise TableRouterError(f"分析模型表别名必须是列表：{ref}")
+        source_id, table_name = ref.split(".", 1)
+        aliases = grouped.setdefault(source_id, {})
+        for raw_alias in raw_values:
+            alias = str(raw_alias or "").strip().lower()
+            if not alias:
+                continue
+            existing = aliases.get(alias)
+            if existing and existing != table_name:
+                raise TableRouterError(f"分析模型表别名存在冲突：{alias} 同时指向 {existing} 和 {table_name}")
+            aliases[alias] = table_name
+    return grouped
+
+
+def _contains_explicit_alias(question: str, alias: str) -> bool:
+    """Match a configured alias without treating it as fuzzy model inference."""
+
+    value = str(alias or "").strip().lower()
+    if not value:
+        return False
+    if re.fullmatch(r"[a-z0-9_\-]+", value):
+        return bool(
+            re.search(
+                rf"(?<![a-z0-9_\-]){re.escape(value)}(?![a-z0-9_\-])",
+                question.lower(),
+            )
+        )
+    return value in question.lower()
+
+
+def _resolve_question_table_aliases(
+    question: str,
+    configured_aliases: dict[str, str],
+    *,
+    model_id: str,
+) -> list[dict[str, str]]:
+    resolutions: list[dict[str, str]] = []
+    for alias, table in configured_aliases.items():
+        if _contains_explicit_alias(question, alias):
+            resolutions.append(
+                {
+                    "alias": alias,
+                    "table": table,
+                    "source": f"analytics_model:{model_id}",
+                }
+            )
+    return resolutions
+
+
+def _ambiguous_requested_aliases(
+    question: str,
+    requested_tables: list[str],
+    aliases_by_source: dict[str, dict[str, str]],
+) -> dict[str, list[str]]:
+    """Find source-backed aliases that cannot identify one physical relation."""
+
+    requested = {str(item or "").strip().lower() for item in requested_tables if str(item or "").strip()}
+    targets_by_alias: dict[str, set[str]] = {}
+    for source_id, aliases in aliases_by_source.items():
+        for alias, table in aliases.items():
+            if alias not in requested and not _contains_explicit_alias(question, alias):
+                continue
+            targets_by_alias.setdefault(alias, set()).add(f"{source_id}.{table}")
+    return {alias: sorted(targets) for alias, targets in targets_by_alias.items() if len(targets) > 1}
 
 
 def _model_database_tables_by_source(model_id: str | None) -> dict[str, list[str]]:
@@ -181,7 +286,7 @@ def _model_database_tables_by_source(model_id: str | None) -> dict[str, list[str
     except AnalyticsModelError as exc:
         raise TableRouterError(str(exc)) from exc
 
-    table_refs = (((model.get("frontmatter") or {}).get("data_assets") or {}).get("tables") or [])
+    table_refs = ((model.get("frontmatter") or {}).get("data_assets") or {}).get("tables") or []
     grouped: dict[str, list[str]] = {}
     for raw_ref in table_refs:
         ref = str(raw_ref or "").strip()
@@ -195,7 +300,9 @@ def _model_database_tables_by_source(model_id: str | None) -> dict[str, list[str
     return grouped
 
 
-async def _load_columns(source: KnowledgeDatabaseSource | dict[str, Any], table_names: list[str]) -> dict[str, list[str]]:
+async def _load_columns(
+    source: KnowledgeDatabaseSource | dict[str, Any], table_names: list[str]
+) -> dict[str, list[str]]:
     if not table_names:
         return {}
 
@@ -276,6 +383,10 @@ def _build_prompt_context(route: TableRoute) -> str:
         lines.append(f"  - {candidate.name}")
         if column_preview:
             lines.append(f"    字段：{column_preview}")
+    if route.alias_resolutions:
+        lines.append("- 用户表简称解析（来自已选分析模型）：")
+        for item in route.alias_resolutions:
+            lines.append(f"  - {item['alias']} -> {item['table']} ({item['source']})")
     return "\n".join(lines)
 
 
@@ -309,6 +420,7 @@ def summarize_table_route(route: TableRoute) -> dict[str, Any]:
         "available_tables_count": len(route.available_tables),
         "confidence": round(route.confidence, 3),
         "reason": route.reason,
+        "alias_resolutions": route.alias_resolutions,
         "candidates": candidates,
     }
 
@@ -341,6 +453,18 @@ async def route_database_tables(session: AsyncSession, request: DatabaseQueryReq
 
     source_records = await list_database_sources(session)
     model_tables_by_source = _model_database_tables_by_source(request.model_id)
+    model_aliases_by_source = _model_table_aliases_by_source(request.model_id)
+    if not request.database_source_id:
+        ambiguous_aliases = _ambiguous_requested_aliases(
+            question,
+            request.table_names,
+            model_aliases_by_source,
+        )
+        if ambiguous_aliases:
+            details = "；".join(
+                f"{alias} -> {', '.join(targets)}" for alias, targets in sorted(ambiguous_aliases.items())
+            )
+            raise TableRouterError(f"表别名跨数据源存在歧义，请指定数据库源：{details}")
     if request.database_source_id:
         source_ids = [request.database_source_id]
     elif model_tables_by_source:
@@ -360,26 +484,90 @@ async def route_database_tables(session: AsyncSession, request: DatabaseQueryReq
                 route_errors.append(f"{source_id}: 未选择可问数数据表")
                 continue
 
-            model_table_names = model_tables_by_source.get(source_id, []) if not request.table_names else []
-            table_names = _match_requested_tables(request.table_names or model_table_names, selected_tables)
-            if not table_names and len(selected_tables) == 1:
-                table_names = selected_tables[:1]
+            declared_model_tables = model_tables_by_source.get(source_id, [])
+            if request.model_id:
+                declared_normalized = {_normalize_table_name(table).lower() for table in declared_model_tables}
+                routable_tables = [
+                    table for table in selected_tables if _normalize_table_name(table).lower() in declared_normalized
+                ]
+                if not routable_tables:
+                    raise TableRouterError(f"当前分析模型未在数据源 {source_id} 声明可用数据表")
+            else:
+                routable_tables = selected_tables
 
-            columns_by_table = await _load_columns(source, selected_tables)
-            candidates = [
-                _score_table(question, table, columns_by_table.get(table, []))
-                for table in selected_tables
-            ]
+            configured_aliases = model_aliases_by_source.get(source_id, {})
+            model_reference_aliases = {f"{source_id}.{table}".lower(): table for table in declared_model_tables}
+            for alias, target in configured_aliases.items():
+                reference_target = model_reference_aliases.get(alias)
+                if (
+                    reference_target
+                    and _normalize_table_name(reference_target).lower() != _normalize_table_name(target).lower()
+                ):
+                    raise TableRouterError(f"分析模型表别名与数据资产引用冲突：{alias}")
+            selection_aliases = {**configured_aliases, **model_reference_aliases}
+            alias_resolutions = _resolve_question_table_aliases(
+                question,
+                configured_aliases,
+                model_id=str(request.model_id or ""),
+            )
+            for raw_name in request.table_names:
+                alias = str(raw_name or "").strip().lower()
+                table = configured_aliases.get(alias)
+                if table and not any(item["alias"] == alias for item in alias_resolutions):
+                    alias_resolutions.append(
+                        {
+                            "alias": alias,
+                            "table": table,
+                            "source": f"analytics_model:{request.model_id}",
+                        }
+                    )
+                model_ref_table = model_reference_aliases.get(alias)
+                if model_ref_table and not any(item["alias"] == alias for item in alias_resolutions):
+                    alias_resolutions.append(
+                        {
+                            "alias": alias,
+                            "table": model_ref_table,
+                            "source": f"analytics_model:{request.model_id}:data_asset_ref",
+                        }
+                    )
+            model_table_names = routable_tables if request.model_id and not request.table_names else []
+            table_names = _match_requested_tables(
+                request.table_names or model_table_names,
+                routable_tables,
+                configured_aliases=selection_aliases,
+                scope_label=("当前分析模型的数据资产范围" if request.model_id else "当前数据源的已选表"),
+            )
+            if request.table_names and alias_resolutions:
+                selected_normalized = {_normalize_table_name(table).lower() for table in table_names}
+                conflicting_aliases = [
+                    item
+                    for item in alias_resolutions
+                    if _normalize_table_name(item["table"]).lower() not in selected_normalized
+                ]
+                if conflicting_aliases:
+                    details = ", ".join(f"{item['alias']}->{item['table']}" for item in conflicting_aliases)
+                    raise TableRouterError(f"问题中的表别名与显式 table_names 冲突：{details}")
+            if not table_names and len(routable_tables) == 1:
+                table_names = routable_tables[:1]
+
+            columns_by_table = await _load_columns(source, routable_tables)
+            candidates = [_score_table(question, table, columns_by_table.get(table, [])) for table in routable_tables]
+            for resolution in alias_resolutions:
+                for candidate in candidates:
+                    if _normalize_table_name(candidate.name) == _normalize_table_name(resolution["table"]):
+                        candidate.score += 24.0
+                        candidate.reasons.append(f"分析模型表别名命中：{resolution['alias']}→{resolution['table']}")
             candidates.sort(key=lambda item: item.score, reverse=True)
 
             if not table_names:
+                alias_tables = list(dict.fromkeys(item["table"] for item in alias_resolutions))
                 positive = [item.name for item in candidates if item.score > 0]
-                table_names = positive[:3] or [candidates[0].name]
+                table_names = alias_tables or positive[:3] or [candidates[0].name]
 
             selected_candidates = [item for item in candidates if item.name in set(table_names)]
             top_score = max((item.score for item in selected_candidates), default=0.0)
             confidence = 1.0 if request.table_names or model_table_names else min(0.95, 0.45 + top_score / 20)
-            if len(selected_tables) == 1:
+            if len(routable_tables) == 1:
                 confidence = max(confidence, 0.8)
 
             source_name = str(_source_value(source, "name", source_id) or source_id)
@@ -390,19 +578,20 @@ async def route_database_tables(session: AsyncSession, request: DatabaseQueryReq
                 database=database,
                 dialect="PostgreSQL",
                 table_names=table_names,
-                available_tables=selected_tables,
+                available_tables=routable_tables,
                 candidates=_route_candidates_for_prompt(candidates, table_names),
                 confidence=confidence,
                 reason=(
-                    "调用方显式指定表"
+                    ("调用方显式指定表（分析模型别名已解析）" if alias_resolutions else "调用方显式指定表")
                     if request.table_names
                     else (
                         "分析模型声明的数据资产"
                         if model_table_names
-                        else ("单表数据源" if len(selected_tables) == 1 else "按问题与已选表/字段轻量匹配")
+                        else ("单表模型范围" if len(routable_tables) == 1 else "按问题与模型表/字段轻量匹配")
                     )
                 ),
                 prompt_context="",
+                alias_resolutions=alias_resolutions,
             )
             route.prompt_context = _build_prompt_context(route)
 
@@ -416,9 +605,7 @@ async def route_database_tables(session: AsyncSession, request: DatabaseQueryReq
         raise TableRouterError(f"无法确定可问数的数据表：{detail}")
 
     if best_route.confidence < 0.55 and not request.table_names:
-        raise TableRouterError(
-            "无法可靠判断要查询哪张数据库表。请在问数工作台选择数据表，或在问题里明确表/业务对象。"
-        )
+        raise TableRouterError("无法可靠判断要查询哪张数据库表。请在问数工作台选择数据表，或在问题里明确表/业务对象。")
 
     summary = summarize_table_route(best_route)
     logger.info(

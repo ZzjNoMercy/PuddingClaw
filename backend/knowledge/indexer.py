@@ -8,9 +8,10 @@ import posixpath
 import re
 import shutil
 import uuid
-from datetime import datetime
+from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from config import get_knowledge_multimodal_index_config
 from knowledge.paths import get_knowledge_root
@@ -45,7 +46,7 @@ def _write_multimodal_manifest(
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     knowledge_dir = get_knowledge_root(base_dir)
     payload = {
-        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
         "knowledge_dir": str(knowledge_dir),
         "markdown_count": len(markdown_files),
         "image_count": len(image_files),
@@ -64,6 +65,54 @@ def refresh_local_knowledge_index(base_dir: Path, progress_callback: VectorProgr
     """Backward-compatible wrapper for the multimodal-aware publisher."""
 
     return refresh_multimodal_knowledge_index(base_dir, progress_callback=progress_callback)
+
+
+def refresh_document_knowledge_index(
+    base_dir: Path,
+    document_path: Path,
+    progress_callback: VectorProgressCallback | None = None,
+) -> dict[str, Any]:
+    """Update one Markdown document and its linked images in Milvus."""
+
+    knowledge_dir = get_knowledge_root(base_dir).resolve()
+    markdown_path = document_path.resolve()
+    if knowledge_dir not in markdown_path.parents:
+        return {"refreshed": False, "reason": "document is outside the knowledge directory"}
+    if not markdown_path.is_file() or markdown_path.suffix.lower() not in {".md", ".markdown"}:
+        return {"refreshed": False, "reason": "document Markdown does not exist"}
+
+    index_config = get_knowledge_multimodal_index_config()
+    if not index_config.get("enabled") or str(index_config.get("vector_store") or "local").lower() != "milvus":
+        return {"refreshed": False, "reason": "single-document rebuild requires the Milvus multimodal index"}
+
+    all_images = _collect_image_files(knowledge_dir)
+    image_files = [Path(path) for path in _linked_images_for_markdown(markdown_path, all_images)]
+    virtual_path = f"/knowledge/{markdown_path.relative_to(knowledge_dir).as_posix()}"
+    result = _try_build_multimodal_index(
+        base_dir=base_dir,
+        knowledge_dir=knowledge_dir,
+        markdown_files=[markdown_path],
+        image_files=image_files,
+        index_config=index_config,
+        progress_callback=progress_callback,
+        replace_document_virtual_path=virtual_path,
+    )
+    if not result.get("enabled"):
+        return {
+            "refreshed": False,
+            "mode": "llamaindex_multimodal_document",
+            "document_virtual_path": virtual_path,
+            "multimodal": result,
+            "error": result.get("error") or result.get("reason") or "document index failed",
+        }
+    return {
+        "refreshed": True,
+        "mode": "llamaindex_multimodal_document",
+        "document_virtual_path": virtual_path,
+        "document_count": result.get("document_count", 1 + len(image_files)),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "multimodal": result,
+    }
 
 
 def refresh_multimodal_knowledge_index(base_dir: Path, progress_callback: VectorProgressCallback | None = None) -> dict[str, Any]:
@@ -122,6 +171,7 @@ def refresh_multimodal_knowledge_index(base_dir: Path, progress_callback: Vector
 
     try:
         from llama_index.core import SimpleDirectoryReader, VectorStoreIndex
+
         from llm.embed_client import get_embedding_model
 
         documents = SimpleDirectoryReader(str(knowledge_dir), recursive=True).load_data()
@@ -172,11 +222,13 @@ def _try_build_multimodal_index(
     image_files: list[Path],
     index_config: dict[str, Any],
     progress_callback: VectorProgressCallback | None = None,
+    replace_document_virtual_path: str | None = None,
 ) -> dict[str, Any]:
     multimodal_storage_dir = base_dir / "storage" / "knowledge_multimodal_index"
     try:
         from llama_index.core import Settings, StorageContext
         from llama_index.core.indices.multi_modal import MultiModalVectorStoreIndex
+
         from llm.embed_client import get_embedding_model
         from llm.multimodal_embedding import get_multimodal_embedding_model
 
@@ -234,7 +286,9 @@ def _try_build_multimodal_index(
         if vector_store == "milvus":
             storage_context, milvus_extra = _build_milvus_storage_context(index_config)
             extra.update(milvus_extra)
+            existing_node_ids = _document_node_ids(storage_context, replace_document_virtual_path)
         else:
+            existing_node_ids = {}
             if multimodal_storage_dir.exists():
                 shutil.rmtree(multimodal_storage_dir)
             multimodal_storage_dir.mkdir(parents=True, exist_ok=True)
@@ -258,6 +312,8 @@ def _try_build_multimodal_index(
             show_progress=False,
             image_vector_store_key="image",
         )
+        if replace_document_virtual_path:
+            _delete_stale_document_nodes(storage_context, existing_node_ids, nodes)
         if vector_store != "milvus":
             index.storage_context.persist(persist_dir=str(multimodal_storage_dir))
         if progress_callback:
@@ -278,6 +334,7 @@ def _try_build_multimodal_index(
             "image_count": len(node_manifest["images"]),
             "markdown_count": len(markdown_files),
             "parser": "MarkdownNodeParser",
+            "scope": "document" if replace_document_virtual_path else "knowledge_base",
             "chunks": node_manifest["chunks"],
             "images": node_manifest["images"],
             "text_embed_model": getattr(text_embed_model, "model_name", None) or getattr(text_embed_model, "model", None),
@@ -569,16 +626,23 @@ def _linked_images_for_markdown(markdown_path: Path, image_files: list[Path]) ->
         text = markdown_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return []
-    linked: list[str] = []
-    for image_path in image_files:
-        if image_path.name in text or str(image_path) in text:
-            linked.append(str(image_path))
-    if not linked:
-        assets_dir = markdown_path.parents[2] / "assets" if len(markdown_path.parents) >= 3 else None
-        for image_path in image_files:
-            if assets_dir and assets_dir in image_path.parents:
-                linked.append(str(image_path))
-    return linked[:20]
+    directly_linked = [
+        image_path
+        for image_path in image_files
+        if image_path.name in text or str(image_path) in text
+    ]
+    if not directly_linked:
+        return []
+
+    # MinerU keeps every image extracted from one PDF in a dedicated directory,
+    # while its Markdown may omit decorative or low-confidence images. Once a
+    # document links that directory, rebuild the complete PDF image set.
+    linked_directories = {image_path.parent.resolve() for image_path in directly_linked}
+    return [
+        str(image_path)
+        for image_path in image_files
+        if image_path.parent.resolve() in linked_directories
+    ]
 
 
 def _nearest_markdown(image_path: Path, markdown_files: list[Path]) -> str | None:
@@ -591,6 +655,7 @@ def _nearest_markdown(image_path: Path, markdown_files: list[Path]) -> str | Non
 def _build_milvus_storage_context(index_config: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
     from llama_index.core import StorageContext
     from llama_index.vector_stores.milvus import MilvusVectorStore
+    from llama_index.vector_stores.milvus.utils import BM25BuiltInFunction
 
     uri = index_config.get("milvus_uri", "http://localhost:19530")
     from config import get_fallback_embedding_config, get_multimodal_embedding_config
@@ -599,6 +664,18 @@ def _build_milvus_storage_context(index_config: dict[str, Any]) -> tuple[Any, di
     image_dim = int(get_multimodal_embedding_config().get("dimension", 1024))
     text_collection = index_config.get("text_collection", "puddingclaw_knowledge_text")
     image_collection = index_config.get("image_collection", "puddingclaw_knowledge_image")
+    bm25_enabled = bool(index_config.get("bm25_enabled", True))
+    sparse_embedding_function = None
+    if bm25_enabled:
+        sparse_embedding_function = BM25BuiltInFunction(
+            input_field_names="text",
+            output_field_names="sparse_embedding",
+            function_name="puddingclaw_knowledge_bm25",
+            analyzer_params={
+                "tokenizer": "jieba",
+                "filter": ["lowercase"],
+            },
+        )
 
     text_store = MilvusVectorStore(
         uri=uri,
@@ -607,7 +684,9 @@ def _build_milvus_storage_context(index_config: dict[str, Any]) -> tuple[Any, di
         overwrite=False,
         upsert_mode=True,
         text_key="text",
-        enable_sparse=False,
+        enable_sparse=bm25_enabled,
+        sparse_embedding_field="sparse_embedding",
+        sparse_embedding_function=sparse_embedding_function,
     )
     image_store = MilvusVectorStore(
         uri=uri,
@@ -627,6 +706,9 @@ def _build_milvus_storage_context(index_config: dict[str, Any]) -> tuple[Any, di
         "image_collection": image_collection,
         "text_dimension": text_dim,
         "image_dimension": image_dim,
+        "bm25_enabled": bm25_enabled,
+        "bm25_analyzer": "jieba",
+        "sparse_embedding_field": "sparse_embedding" if bm25_enabled else None,
         "overwrite": False,
         "upsert": True,
     }
@@ -642,6 +724,59 @@ def _delete_misrouted_image_rows_from_text_store(text_store: Any) -> None:
         )
     except Exception as exc:  # noqa: BLE001
         logger.debug("Skip cleaning misrouted image rows from text collection: %s", exc)
+
+
+def _document_node_ids(storage_context: Any, virtual_path: str | None) -> dict[str, set[str]]:
+    if not virtual_path:
+        return {}
+    filters = {
+        "text": f"virtual_path == {json.dumps(virtual_path, ensure_ascii=False)}",
+        "image": f"linked_markdown_virtual_path == {json.dumps(virtual_path, ensure_ascii=False)}",
+    }
+    result: dict[str, set[str]] = {}
+    for store_key, filter_expression in filters.items():
+        store = storage_context.vector_stores.get("default" if store_key == "text" else store_key)
+        if store is None:
+            continue
+        try:
+            rows = store.client.query(
+                collection_name=store.collection_name,
+                filter=filter_expression,
+                output_fields=["id"],
+                limit=16_384,
+            )
+            result[store_key] = {str(row["id"]) for row in rows if row.get("id")}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Unable to inspect existing %s nodes for %s: %s", store_key, virtual_path, exc)
+    return result
+
+
+def _delete_stale_document_nodes(
+    storage_context: Any,
+    existing_node_ids: dict[str, set[str]],
+    nodes: list[Any],
+) -> None:
+    current_ids: dict[str, set[str]] = {"text": set(), "image": set()}
+    for node in nodes:
+        modality = str((node.metadata or {}).get("modality") or "text")
+        current_ids["image" if modality == "image" else "text"].add(str(node.node_id))
+
+    for store_key, old_ids in existing_node_ids.items():
+        stale_ids = sorted(old_ids - current_ids.get(store_key, set()))
+        store = storage_context.vector_stores.get("default" if store_key == "text" else store_key)
+        if store is None:
+            continue
+        for offset in range(0, len(stale_ids), 100):
+            batch = stale_ids[offset : offset + 100]
+            if not batch:
+                continue
+            try:
+                store.client.delete(
+                    collection_name=store.collection_name,
+                    filter=f"id in {json.dumps(batch)}",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Unable to delete stale %s nodes: %s", store_key, exc)
 
 
 def reset_multimodal_collections(index_config: dict[str, Any] | None = None) -> dict[str, Any]:

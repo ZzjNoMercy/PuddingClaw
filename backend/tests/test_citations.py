@@ -142,6 +142,112 @@ def test_resolve_message_citations_reuses_only_cited_session_sources():
     assert [citation["source_id"] for citation in citations] == ["src_current", "src_reused"]
 
 
+def test_materialize_markdown_citations_links_web_and_local_sources(tmp_path):
+    from graph.citations import materialize_artifact_citations
+
+    local_markdown = tmp_path / "知识 资料.md"
+    local_markdown.write_text("# 来源", encoding="utf-8")
+    sources = [
+        {
+            "source_id": "src_web",
+            "title": "网页来源",
+            "uri": "https://example.com/article",
+            "source_type": "web",
+        },
+        {
+            "source_id": "src_local",
+            "title": "本地知识",
+            "uri": "/knowledge/imported/source.md",
+            "source_type": "knowledge_base",
+            "chunk_id": "text-3",
+            "metadata": {
+                "file_path": str(local_markdown),
+                "chunk_title": "关键章节",
+            },
+        },
+    ]
+
+    rendered, report = materialize_artifact_citations(
+        "网页结论[^src_web]，本地结论[^src_local]。",
+        sources,
+        file_path="/workspace/report.md",
+    )
+    rerendered, second_report = materialize_artifact_citations(
+        rendered,
+        sources,
+        file_path="/workspace/report.md",
+    )
+
+    assert "网页结论[^1]，本地结论[^2]" in rendered
+    assert "[^1]: [网页来源](<https://example.com/article>)" in rendered
+    assert f"[^2]: [本地知识](<{local_markdown.resolve().as_uri()}>)" in rendered
+    assert "章节：关键章节；片段：text-3" in rendered
+    assert "puddingclaw-citation" not in rendered
+    assert "src_web" not in rendered
+    assert "src_local" not in rendered
+    assert rerendered == rendered
+    assert report == {"materialized": 2, "unresolved_source_ids": []}
+    assert second_report == {"materialized": 0, "unresolved_source_ids": []}
+
+
+def test_materialize_markdown_citations_reuses_existing_definition_number():
+    from graph.citations import materialize_artifact_citations
+
+    source = {
+        "source_id": "src_web",
+        "title": "网页来源",
+        "uri": "https://example.com/article",
+        "source_type": "web",
+    }
+    content = (
+        "已有结论[^7]。新增结论[^src_web]。\n\n"
+        "[^7]: [网页来源](<https://example.com/article>)\n"
+    )
+
+    rendered, report = materialize_artifact_citations(
+        content,
+        [source],
+        file_path="/workspace/report.md",
+    )
+
+    assert "已有结论[^7]。新增结论[^7]。" in rendered
+    assert rendered.count("[^7]:") == 1
+    assert "src_web" not in rendered
+    assert report == {"materialized": 1, "unresolved_source_ids": []}
+
+
+def test_materialize_html_citations_uses_numbered_anchors():
+    from graph.citations import materialize_artifact_citations
+
+    rendered, report = materialize_artifact_citations(
+        "<html><body><p>结论[^src_web]，再次引用[^src_web]。</p></body></html>",
+        [{
+            "source_id": "src_web",
+            "title": "网页来源",
+            "uri": "https://example.com/article",
+            "source_type": "web",
+        }],
+        file_path="/workspace/report.html",
+    )
+
+    assert rendered.count('href="#cite-source-src_web"') == 2
+    assert '<li id="cite-source-src_web" value="1">' in rendered
+    assert '<a href="https://example.com/article">网页来源</a>' in rendered
+    assert rendered.index("citation-references") < rendered.index("</body>")
+    assert report == {"materialized": 1, "unresolved_source_ids": []}
+    rerendered, _ = materialize_artifact_citations(
+        rendered,
+        [{
+            "source_id": "src_web",
+            "title": "网页来源",
+            "uri": "https://example.com/article",
+            "source_type": "web",
+        }],
+        file_path="/workspace/report.html",
+    )
+    assert rerendered == rendered
+
+
 def test_session_message_persists_sources_and_citations(tmp_path):
     from graph.session_manager import SessionManager
 

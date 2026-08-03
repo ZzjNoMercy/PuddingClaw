@@ -3102,30 +3102,20 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             continue;
           }
 
-          if (event.event === "task_routing_started") {
+          if (event.event === "rubric_profile_started") {
+            updateSessionRunActivity(sendSessionId, {
+              phase: "running",
+              label: "Rubric 验收正在生成任务画像",
+              detail: "实验性模式会在执行前冻结本次 Goal 的验收契约",
+            });
             continue;
           }
 
-          if (event.event === "task_routing_completed") {
-            // The semantic Router is a non-blocking soft enhancement. Its
-            // timeout/fallback is diagnostic Trace data, not a user-actionable
-            // chat state, so never flash it over the main Agent activity.
-            if (event.data.blocking === false) {
-              continue;
-            }
-            const route = String(event.data.execution_route || "").trim();
-            const skills = Array.isArray(event.data.skill_candidates)
-              ? event.data.skill_candidates.map(String).filter(Boolean)
-              : [];
-            const detail = skills.length > 0
-              ? `Skill 优先：${skills.join("、")}`
-              : route === "native"
-                ? "使用通用 Agent 执行"
-                : "执行路线已确定";
+          if (event.event === "rubric_profile_completed") {
             updateSessionRunActivity(sendSessionId, {
               phase: "running",
-              label: "Agent 正在处理",
-              detail: `${String(event.data.label || "任务识别与执行路线已确定")} · ${detail}`,
+              label: String(event.data.label || "Rubric 验收画像已冻结"),
+              detail: "Agent 即将按冻结后的验收契约开始执行",
             });
             continue;
           }

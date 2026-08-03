@@ -1,14 +1,17 @@
 """LlamaIndex knowledge query tools."""
 
 import json
+import logging
 from pathlib import Path
-from typing import Any, Type, Optional
+from typing import Any
 
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
 
 from config import get_knowledge_multimodal_index_config, get_rag_config, get_rag_hybrid_config
 from knowledge.paths import get_knowledge_root
+
+logger = logging.getLogger(__name__)
 
 
 class LlamaIndexKnowledgeInput(BaseModel):
@@ -23,127 +26,43 @@ class LlamaIndexKnowledgeQueryTool(BaseTool):
         "Do not switch to glob/grep on your own after this tool returns results; only use glob/grep under "
         "/knowledge/ when the user explicitly asks for exact file-name or raw Markdown text lookup."
     )
-    args_schema: Type[BaseModel] = LlamaIndexKnowledgeInput
+    args_schema: type[BaseModel] = LlamaIndexKnowledgeInput
     risk_level: str = "safe"
     base_dir: str = ""
-    _index: Optional[object] = None
-    _index_error: Optional[str] = None
-    _knowledge_signature: Optional[str] = None
+    _index: object | None = None
+    _index_error: str | None = None
 
     class Config:
         arbitrary_types_allowed = True
 
-    def _compute_knowledge_signature(self) -> str:
-        """Return a cheap signature for local knowledge files.
+    def _load_local_index(self):
+        """Load a previously published local index without mutating it."""
+        if self._index is not None:
+            return self._index
 
-        The tool instance is cached by the tools registry. Without this check,
-        Markdown files imported through the knowledge API would not be visible
-        until the backend process restarts.
-        """
-
-        knowledge_dir = get_knowledge_root(Path(self.base_dir))
-        if not knowledge_dir.exists():
-            return ""
-
-        parts: list[str] = []
-        for path in sorted(knowledge_dir.rglob("*")):
-            if not path.is_file() or path.name.startswith("."):
-                continue
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
-            rel = path.relative_to(knowledge_dir)
-            parts.append(f"{rel}:{stat.st_mtime_ns}:{stat.st_size}")
-        return "|".join(parts)
-
-    def _build_index(self, *, force_rebuild: bool = False):
-        """Build or load LlamaIndex index from knowledge/ directory."""
-        knowledge_dir = get_knowledge_root(Path(self.base_dir))
         storage_dir = Path(self.base_dir) / "storage" / "knowledge_index"
-
-        if not knowledge_dir.exists() or not any(knowledge_dir.iterdir()):
-            self._index_error = None
+        if not storage_dir.exists() or not any(storage_dir.iterdir()):
+            self._index_error = "No manually published local knowledge index is available"
             return None
 
         try:
-            from llama_index.core import (
-                SimpleDirectoryReader,
-                StorageContext,
-                VectorStoreIndex,
-                load_index_from_storage,
-            )
+            from llama_index.core import StorageContext, load_index_from_storage
+
             from llm.embed_client import get_embedding_model
 
-            embed_model = get_embedding_model()
-
-            # Try loading persisted index unless the local knowledge signature
-            # changed. When files change, the persisted index is stale and must
-            # be rebuilt from the Markdown artifacts.
-            if not force_rebuild and storage_dir.exists() and any(storage_dir.iterdir()):
-                try:
-                    storage_context = StorageContext.from_defaults(
-                        persist_dir=str(storage_dir)
-                    )
-                    return load_index_from_storage(storage_context, embed_model=embed_model)
-                except Exception:
-                    pass
-
-            # Build fresh index
-            documents = SimpleDirectoryReader(
-                str(knowledge_dir), recursive=True
-            ).load_data()
-
-            if not documents:
-                self._index_error = None
-                return None
-
-            index = VectorStoreIndex.from_documents(documents, embed_model=embed_model)
-            storage_dir.mkdir(parents=True, exist_ok=True)
-            index.storage_context.persist(persist_dir=str(storage_dir))
+            storage_context = StorageContext.from_defaults(persist_dir=str(storage_dir))
+            index = load_index_from_storage(storage_context, embed_model=get_embedding_model())
             self._index_error = None
+            self._index = index
             return index
-
         except ImportError as e:
             self._index_error = f"LlamaIndex not fully installed: {e}"
-            print(f"⚠️ {self._index_error}")
+            logger.warning(self._index_error)
             return None
         except Exception as e:
-            self._index_error = f"Index build error: {e}"
-            print(f"⚠️ {self._index_error}")
+            self._index_error = f"Local index load error: {e}"
+            logger.warning(self._index_error)
             return None
-
-    def _ensure_local_index(self):
-        signature = self._compute_knowledge_signature()
-        if self._index is None or signature != self._knowledge_signature:
-            self._index = self._build_index(force_rebuild=signature != self._knowledge_signature)
-            self._knowledge_signature = signature
-        return self._index
-
-    def _build_bm25_nodes(self) -> list[Any]:
-        knowledge_dir = get_knowledge_root(Path(self.base_dir))
-        if not knowledge_dir.exists():
-            return []
-        try:
-            from llama_index.core.schema import TextNode
-            from knowledge.indexer import IMAGE_SUFFIXES, _build_multimodal_nodes
-        except ImportError:
-            return []
-
-        markdown_files = sorted(
-            path
-            for path in knowledge_dir.rglob("*")
-            if path.is_file() and path.suffix.lower() in {".md", ".markdown"}
-        )
-        image_files = sorted(
-            path
-            for path in knowledge_dir.rglob("*")
-            if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
-        )
-        if not markdown_files:
-            return []
-        nodes, _manifest = _build_multimodal_nodes(knowledge_dir, markdown_files, image_files)
-        return [node for node in nodes if isinstance(node, TextNode) and getattr(node, "text", "")]
 
     @staticmethod
     def _node_content(node: Any) -> str:
@@ -197,76 +116,6 @@ class LlamaIndexKnowledgeQueryTool(BaseTool):
             if isinstance(source, dict):
                 source["score"] = float(item.get("rrf_score") or 0.0)
         return fused
-
-    def _bm25_candidates(self, query: str, *, top_k: int) -> list[dict[str, Any]]:
-        """Return BM25 candidates for the semantic LlamaIndex tool.
-
-        This is intentionally scoped to llamaindex_knowledge_query. The exact
-        file-level Markdown flow still lives in the separate glob/grep tools.
-        """
-
-        if top_k <= 0:
-            return []
-        try:
-            from graph.citations import normalize_source
-            from llama_index.retrievers.bm25 import BM25Retriever
-        except ImportError:
-            return []
-
-        bm25_nodes = self._build_bm25_nodes()
-        if not bm25_nodes:
-            return []
-
-        try:
-            bm25_retriever = BM25Retriever.from_defaults(
-                nodes=bm25_nodes,
-                similarity_top_k=top_k,
-                skip_stemming=True,
-            )
-            nodes = bm25_retriever.retrieve(query)
-        except Exception:
-            return []
-
-        candidates: list[dict[str, Any]] = []
-        for rank, item in enumerate(nodes, start=1):
-            node = getattr(item, "node", item)
-            metadata = self._node_metadata(node)
-            quote = self._node_content(node)
-            file_name = metadata.get("file_name") or metadata.get("filename")
-            file_path = metadata.get("file_path") or metadata.get("source") or ""
-            document_id = getattr(node, "ref_doc_id", None) or metadata.get("document_id") or file_path
-            chunk_id = getattr(node, "node_id", None) or metadata.get("chunk_id") or f"bm25-{rank}"
-            score = getattr(item, "score", None)
-            title = file_name or (Path(file_path).name if file_path else f"关键词命中 {rank}")
-            source = normalize_source({
-                "title": title,
-                "uri": file_path,
-                "document_id": document_id,
-                "chunk_id": chunk_id,
-                "source_type": "knowledge_bm25",
-                "quote": quote,
-                "score": score,
-                "metadata": {
-                    "modality": "text",
-                    "retrieval_channel": "bm25",
-                    **{
-                        key: value for key, value in metadata.items()
-                        if key not in {"file_path"} and isinstance(value, (str, int, float, bool, type(None)))
-                    },
-                },
-            })
-            candidates.append({
-                "modality": "text",
-                "title": title,
-                "quote": quote,
-                "score": score,
-                "source": source,
-                "rerank_document": quote,
-                "image_hit": None,
-                "retrieval_channel": "bm25",
-                "retrieval_rank": rank,
-            })
-        return candidates
 
     @staticmethod
     def _entity_payload(result: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -442,15 +291,17 @@ class LlamaIndexKnowledgeQueryTool(BaseTool):
         cls,
         candidates: list[dict[str, Any]],
         *,
-        limit: int = 5,
+        include_preview: bool = False,
     ) -> list[dict[str, Any]]:
         summary: list[dict[str, Any]] = []
-        for rank, candidate in enumerate(candidates[:limit], start=1):
+        for rank, candidate in enumerate(candidates, start=1):
             source = candidate.get("source") if isinstance(candidate.get("source"), dict) else {}
             image_hit = candidate.get("image_hit") if isinstance(candidate.get("image_hit"), dict) else None
-            summary.append({
+            source_metadata = source.get("metadata") if isinstance(source.get("metadata"), dict) else {}
+            item = {
                 "rank": rank,
                 "title": candidate.get("title"),
+                "section": source_metadata.get("chunk_title") or source_metadata.get("header_path"),
                 "modality": candidate.get("modality"),
                 "retrieval_channel": candidate.get("retrieval_channel"),
                 "retrieval_rank": candidate.get("retrieval_rank"),
@@ -463,7 +314,23 @@ class LlamaIndexKnowledgeQueryTool(BaseTool):
                 "chunk_id": source.get("chunk_id"),
                 "uri": source.get("uri"),
                 "image_path": image_hit.get("file_path") if image_hit else None,
-            })
+            }
+            if include_preview:
+                image_context = (
+                    image_hit.get("context")
+                    if image_hit and isinstance(image_hit.get("context"), dict)
+                    else {}
+                )
+                preview_value = (
+                    image_context.get("snippet")
+                    or image_context.get("caption")
+                    or image_context.get("heading")
+                    or candidate.get("quote")
+                    or ""
+                )
+                preview = " ".join(str(preview_value).split())
+                item["preview"] = preview
+            summary.append(item)
         return summary
 
     @staticmethod
@@ -481,21 +348,40 @@ class LlamaIndexKnowledgeQueryTool(BaseTool):
         if not config.get("enabled") or str(config.get("vector_store") or "").lower() != "milvus":
             return None
 
+        from pymilvus import MilvusClient
+
         from config import get_rag_rerank_config
         from graph.citations import normalize_source
         from llm.embed_client import get_embedding_model
         from llm.multimodal_embedding import get_multimodal_embedding_model
-        from pymilvus import MilvusClient
 
         knowledge_dir = get_knowledge_root(Path(self.base_dir))
+        hybrid_config = get_rag_hybrid_config()
+        bm25_requested = bool(config.get("bm25_enabled", True) and hybrid_config.get("enabled"))
         text_embed_model = get_embedding_model()
         image_embed_model = get_multimodal_embedding_model()
-        text_query_embedding = text_embed_model.get_query_embedding(query)
-        image_query_embedding = image_embed_model.get_query_embedding(query)
+        embedding_errors: dict[str, str] = {}
+        retrieval_errors: dict[str, str] = {}
+        text_query_embedding = None
+        image_query_embedding = None
+        try:
+            text_query_embedding = text_embed_model.get_query_embedding(query)
+        except Exception as exc:  # noqa: BLE001
+            embedding_errors["text"] = f"{type(exc).__name__}: {exc}"
+            logger.warning("Text query embedding failed: %s", exc)
+        try:
+            image_query_embedding = image_embed_model.get_query_embedding(query)
+        except Exception as exc:  # noqa: BLE001
+            embedding_errors["image"] = f"{type(exc).__name__}: {exc}"
+            logger.warning("Image query embedding failed; continuing with text retrieval: %s", exc)
+
+        if text_query_embedding is None and image_query_embedding is None and not bm25_requested:
+            raise RuntimeError(f"All query embedding channels failed: {embedding_errors}")
+
         client = MilvusClient(uri=config.get("milvus_uri", "http://localhost:19530"), timeout=10.0)
-        hybrid_config = get_rag_hybrid_config()
         rerank_config = get_rag_rerank_config()
         search_limit = max(top_k, int(hybrid_config.get("candidate_top_k") or top_k))
+        text_collection = str(config.get("text_collection") or "puddingclaw_knowledge_text")
         self._emit_rag_span(
             "query",
             {
@@ -506,7 +392,7 @@ class LlamaIndexKnowledgeQueryTool(BaseTool):
                 "rerank_enabled": bool(rerank_config.get("enabled")),
                 "vector_store": "milvus",
                 "collections": {
-                    "text": config.get("text_collection", "puddingclaw_knowledge_text"),
+                    "text": text_collection,
                     "image": config.get("image_collection", "puddingclaw_knowledge_image"),
                 },
             },
@@ -517,27 +403,66 @@ class LlamaIndexKnowledgeQueryTool(BaseTool):
             {
                 "text_query_embedding": self._embedding_summary(text_query_embedding),
                 "image_query_embedding": self._embedding_summary(image_query_embedding),
+                "errors": embedding_errors,
                 "raw_vector_recorded": False,
             },
         )
 
-        collections = [
-            ("text", "text_vector", config.get("text_collection", "puddingclaw_knowledge_text"), text_query_embedding),
-            ("image", "image_vector", config.get("image_collection", "puddingclaw_knowledge_image"), image_query_embedding),
-        ]
+        search_routes: list[dict[str, Any]] = []
+        if text_query_embedding is not None:
+            search_routes.append({
+                "modality": "text",
+                "channel": "text_vector",
+                "collection": text_collection,
+                "data": [text_query_embedding],
+                "anns_field": "embedding",
+            })
+        if bm25_requested:
+            search_routes.append({
+                "modality": "text",
+                "channel": "bm25",
+                "collection": text_collection,
+                "data": [query],
+                "anns_field": "sparse_embedding",
+                "search_params": {"params": {"drop_ratio_search": 0.2}},
+            })
+        if image_query_embedding is not None:
+            search_routes.append({
+                "modality": "image",
+                "channel": "image_vector",
+                "collection": config.get("image_collection", "puddingclaw_knowledge_image"),
+                "data": [image_query_embedding],
+                "anns_field": "embedding",
+            })
         text_vector_candidates: list[dict[str, Any]] = []
         image_candidates: list[dict[str, Any]] = []
         bm25_candidates: list[dict[str, Any]] = []
 
-        for modality, retrieval_channel, collection, query_embedding in collections:
+        for route in search_routes:
+            modality = str(route["modality"])
+            retrieval_channel = str(route["channel"])
+            collection = str(route["collection"] or "")
             if not collection or not client.has_collection(collection):
                 continue
-            results = client.search(
-                collection_name=collection,
-                data=[query_embedding],
-                limit=search_limit,
-                output_fields=["*"],
-            )
+            search_kwargs = {
+                "collection_name": collection,
+                "data": route["data"],
+                "anns_field": route["anns_field"],
+                "limit": search_limit,
+                "output_fields": ["text", "_node_content", "_node_type", "doc_id"],
+            }
+            if route.get("search_params"):
+                search_kwargs["search_params"] = route["search_params"]
+            try:
+                results = client.search(**search_kwargs)
+            except Exception as exc:  # noqa: BLE001
+                retrieval_errors[retrieval_channel] = f"{type(exc).__name__}: {exc}"
+                logger.warning(
+                    "Milvus %s retrieval failed; continuing with remaining channels: %s",
+                    retrieval_channel,
+                    exc,
+                )
+                continue
             for index, result in enumerate(results[0] if results else []):
                 payload, entity = self._entity_payload(result)
                 metadata = dict(payload.get("metadata") or {})
@@ -610,6 +535,8 @@ class LlamaIndexKnowledgeQueryTool(BaseTool):
                 }
                 if modality == "image":
                     image_candidates.append(candidate)
+                elif retrieval_channel == "bm25":
+                    bm25_candidates.append(candidate)
                 else:
                     text_vector_candidates.append(candidate)
 
@@ -618,39 +545,40 @@ class LlamaIndexKnowledgeQueryTool(BaseTool):
             {
                 "channel": "text_vector",
                 "candidate_count": len(text_vector_candidates),
-                "top_candidates": self._rag_candidate_summary(text_vector_candidates),
+                "top_candidates": self._rag_candidate_summary(text_vector_candidates, include_preview=True),
             },
             metadata={"rag_channel": "text_vector", "candidate_count": len(text_vector_candidates)},
+        )
+        self._emit_rag_span(
+            "retrieve.bm25",
+            {
+                "channel": "bm25",
+                "enabled": bm25_requested,
+                "candidate_count": len(bm25_candidates),
+                "error": retrieval_errors.get("bm25"),
+                "top_candidates": self._rag_candidate_summary(bm25_candidates, include_preview=True),
+            },
+            metadata={"rag_channel": "bm25", "candidate_count": len(bm25_candidates)},
         )
         self._emit_rag_span(
             "retrieve.image_vector",
             {
                 "channel": "image_vector",
                 "candidate_count": len(image_candidates),
-                "top_candidates": self._rag_candidate_summary(image_candidates),
+                "top_candidates": self._rag_candidate_summary(image_candidates, include_preview=True),
             },
             metadata={"rag_channel": "image_vector", "candidate_count": len(image_candidates)},
         )
 
         text_candidates = text_vector_candidates
-        if hybrid_config.get("enabled"):
-            bm25_candidates = self._bm25_candidates(query, top_k=search_limit)
-            self._emit_rag_span(
-                "retrieve.bm25",
-                {
-                    "channel": "bm25",
-                    "candidate_count": len(bm25_candidates),
-                    "top_candidates": self._rag_candidate_summary(bm25_candidates),
-                },
-                metadata={"rag_channel": "bm25", "candidate_count": len(bm25_candidates)},
-            )
+        if text_vector_candidates and bm25_candidates:
             text_candidates = self._apply_rrf(
-                text_vector_candidates + bm25_candidates,
+                [*text_vector_candidates, *bm25_candidates],
                 weights={
                     "text_vector": float(hybrid_config.get("text_vector_weight") or 0.45),
                     "bm25": float(hybrid_config.get("bm25_weight") or 0.2),
                 },
-            )[:search_limit]
+            )
             self._emit_rag_span(
                 "fusion.text_hybrid",
                 {
@@ -668,6 +596,8 @@ class LlamaIndexKnowledgeQueryTool(BaseTool):
                 },
                 metadata={"rag_stage_kind": "fusion", "candidate_count": len(text_candidates)},
             )
+        elif bm25_candidates:
+            text_candidates = bm25_candidates
 
         image_weight = float(hybrid_config.get("image_vector_weight") or 0.35)
         text_group_weight = max(0.0, 1.0 - image_weight)
@@ -680,7 +610,7 @@ class LlamaIndexKnowledgeQueryTool(BaseTool):
         ]
 
         candidates = grouped_candidates
-        if len(grouped_candidates) > 1:
+        if text_candidates and image_candidates:
             candidates = self._apply_rrf(
                 grouped_candidates,
                 weights={
@@ -705,22 +635,6 @@ class LlamaIndexKnowledgeQueryTool(BaseTool):
                 },
                 metadata={"rag_stage_kind": "fusion", "candidate_count": len(candidates)},
             )
-
-        if not candidates:
-            self._emit_rag_span(
-                "select",
-                {
-                    "selected_count": 0,
-                    "reason": "no candidates",
-                    "candidate_counts": {
-                        "text_vector": len(text_vector_candidates),
-                        "bm25": len(bm25_candidates),
-                        "image_vector": len(image_candidates),
-                    },
-                },
-                metadata={"selected_count": 0},
-            )
-            return None
 
         from llm.rerank_client import rerank_documents
 
@@ -784,6 +698,7 @@ class LlamaIndexKnowledgeQueryTool(BaseTool):
                 "bm25_weight": float(hybrid_config.get("bm25_weight") or 0.2),
                 "image_vector_weight": float(hybrid_config.get("image_vector_weight") or 0.35),
                 "text_group_weight": max(0.0, 1.0 - float(hybrid_config.get("image_vector_weight") or 0.35)),
+                "bm25_enabled": bm25_requested,
                 "rerank_enabled": bool(rerank_config.get("enabled")),
                 "rerank_top_n": top_k,
                 "rerank_candidate_top_k": int(rerank_config.get("candidate_top_k") or search_limit),
@@ -795,6 +710,8 @@ class LlamaIndexKnowledgeQueryTool(BaseTool):
                 "selected": len(selected),
                 "hybrid_enabled": bool(hybrid_config.get("enabled")),
                 "rerank_enabled": bool(rerank_config.get("enabled")),
+                "text_collection": text_collection,
+                "errors": retrieval_errors,
             },
             "hits": [
                 self._candidate_payload(candidate, rank=index + 1)
@@ -864,7 +781,7 @@ class LlamaIndexKnowledgeQueryTool(BaseTool):
                   "请只使用 subagent_type 和 description 字段，不要使用 prompt 字段。\n"
                 + json.dumps(task_suggestions[:2], ensure_ascii=False, indent=2)
             )
-        result = "\n\n".join(sections)
+        result = "\n\n".join(sections) if sections else "未找到相关内容。"
         truncated = False
         if len(result) > 6000:
             result = result[:6000] + "\n...[truncated]"
@@ -912,23 +829,28 @@ class LlamaIndexKnowledgeQueryTool(BaseTool):
     def _run(self, query: str) -> str:
         rag_config = get_rag_config()
         top_k = int(rag_config.get("top_k") or 3)
-        try:
-            multimodal_result = self._query_milvus_multimodal(query, top_k=top_k)
-            if multimodal_result:
-                return multimodal_result
-        except Exception as exc:
-            print(f"⚠️ Multimodal Milvus query failed, falling back to text index: {exc}")
+        index_config = get_knowledge_multimodal_index_config()
+        uses_milvus = bool(index_config.get("enabled")) and str(
+            index_config.get("vector_store") or ""
+        ).lower() == "milvus"
 
-        signature = self._compute_knowledge_signature()
-        if self._index is None or signature != self._knowledge_signature:
-            self._index = self._build_index(force_rebuild=signature != self._knowledge_signature)
-            self._knowledge_signature = signature
+        if uses_milvus:
+            try:
+                result = self._query_milvus_multimodal(query, top_k=top_k)
+                return result or "未找到相关内容。"
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Milvus knowledge query failed")
+                return (
+                    "❌ Milvus knowledge query failed without modifying the index: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+        self._index = self._load_local_index()
 
         if self._index is None:
-            kb_dir = get_knowledge_root(Path(self.base_dir))
             if self._index_error:
-                return f"📭 Knowledge base index failed to build: {self._index_error}"
-            return f"📭 Knowledge base is empty. Add Markdown documents to /knowledge/ (physical path: {kb_dir}/) to enable search."
+                return f"📭 Knowledge base index is unavailable: {self._index_error}. Rebuild it manually."
+            return "📭 Knowledge base index is unavailable. Rebuild it manually."
 
         try:
             from graph.citations import encode_tool_result, normalize_source
@@ -1002,7 +924,7 @@ class LlamaIndexKnowledgeQueryTool(BaseTool):
                     "query": query,
                     "top_k": top_k,
                     "candidate_count": len(retrieved_nodes),
-                    "top_candidates": self._rag_candidate_summary(fallback_candidates),
+                    "top_candidates": self._rag_candidate_summary(fallback_candidates, include_preview=True),
                 },
                 metadata={"rag_channel": "text_index", "candidate_count": len(retrieved_nodes)},
             )

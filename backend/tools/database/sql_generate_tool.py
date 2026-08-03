@@ -46,30 +46,14 @@ _BUSINESS_SEMANTIC_CHANGE_PATTERN = re.compile(
     r".{0,24}(?:指标|范围|筛选|时间|年份|能源|品牌|价格|车型|车系|款型|皮卡|分母|分子|粒度|维度))",
     re.IGNORECASE,
 )
-_PHYSICAL_IDENTIFIER_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9_]*\.[A-Za-z][A-Za-z0-9_]*(?![A-Za-z0-9_])"
-    r"|(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+(?![A-Za-z0-9_])"
-)
-_ASSET_ID_REFERENCE_PATTERN = re.compile(
-    r"\b(?:dimension|measure|grain|relation):[A-Za-z0-9_\-]+"
-)
-_SQL_IMPLEMENTATION_PATTERN = re.compile(
-    r"\b(?:SELECT|FROM|JOIN|WHERE|CTE|EXISTS|DISTINCT|GROUP\s+BY|"
-    r"ORDER\s+BY|COUNT|FILTER|LIKE|ILIKE)\b",
+_ASSET_ID_REFERENCE_PATTERN = re.compile(r"\b(?:dimension|measure|grain|relation):[A-Za-z0-9_\-]+")
+_SQL_STATEMENT_START_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_])(?:WITH|SELECT|VALUES|INSERT|UPDATE|DELETE|MERGE|CREATE|DROP|ALTER)\b",
     re.IGNORECASE,
 )
-_PHYSICAL_DIRECTIVE_MARKERS = (
-    "判断依据",
-    "物理字段",
-    "物理表",
-    "字段名",
-    "列名",
-    "表名",
-)
-_PHYSICAL_CHOICE_DIRECTIVE_PATTERN = re.compile(
-    r"(?:使用|采用|改用|指定|选择|匹配|读取|关联|映射到|取自)"
-    r".{0,40}(?:字段|列|表|配置项|实体)"
-    r"|(?:字段|列|表|配置项|实体).{0,40}(?:使用|采用|指定|选择|匹配|映射)",
+_SQL_APPEND_IMPLEMENTATION_PATTERN = re.compile(
+    r"\b(?:SELECT|FROM|JOIN|WHERE|GROUP\s+BY|HAVING|ORDER\s+BY|LIMIT|OFFSET|"
+    r"UNION|INTERSECT|EXCEPT|AND|OR|RETURNING|INTO)\b",
     re.IGNORECASE,
 )
 _PRESCRIPTIVE_REVISION_PATTERN = re.compile(
@@ -90,9 +74,7 @@ def _message_text(message: object) -> str:
             content = message["data"].get("content", "")
     if isinstance(content, list):
         return "".join(
-            str(block.get("text") or block.get("content") or "")
-            if isinstance(block, dict)
-            else str(block)
+            str(block.get("text") or block.get("content") or "") if isinstance(block, dict) else str(block)
             for block in content
         )
     return str(content or "")
@@ -161,45 +143,81 @@ def _trusted_user_scope_text(runtime: ToolRuntime | None) -> str:
     return "\n".join(dict.fromkeys(parts))
 
 
-def _agent_added_physical_guidance(
+def _agent_added_sql_implementation(
     *,
     question: str,
-    table_names: list[str],
     runtime: ToolRuntime | None,
 ) -> list[str]:
-    """Find physical implementation choices absent from trusted user scope."""
+    """Find raw SQL implementation syntax absent from trusted user scope.
+
+    Choosing authorized tables and columns is normal NL2SQL implementation
+    work. The table router, semantic evidence checks, and read-only SQL scope
+    validator own those boundaries. This lightweight check only keeps an Agent
+    from smuggling an invented SQL program into the business-question channel.
+    """
 
     trusted_text = _trusted_user_scope_text(runtime)
     if not trusted_text:
         # Non-Agent callers and older tests do not expose message provenance.
         return []
-    # Asset-id references (dimension:energy_type) are legitimate vocabulary of
-    # the semantic channel — strip them so an id containing a column-shaped
-    # name is not misread as a bare physical hint. A bare `energy_type`
-    # elsewhere in the question is still flagged. (The SQL-level guardrail
-    # remains the deterministic backstop; this check is heuristic.)
     scanned = _ASSET_ID_REFERENCE_PATTERN.sub(" ", question)
     trusted_lower = trusted_text.lower()
     findings: list[str] = []
-    for token in _PHYSICAL_IDENTIFIER_PATTERN.findall(scanned):
-        if token.lower() not in trusted_lower and token not in findings:
+    for match in _SQL_STATEMENT_START_PATTERN.finditer(scanned):
+        statement = scanned[match.start() :].strip()
+        if statement.lower() in trusted_lower:
+            continue
+        trusted_prefix_authorized = False
+        for trusted_match in _SQL_STATEMENT_START_PATTERN.finditer(trusted_text):
+            if trusted_match.group(0).lower() != match.group(0).lower():
+                continue
+            trusted_line_end = trusted_text.find("\n", trusted_match.start())
+            if trusted_line_end < 0:
+                trusted_line_end = len(trusted_text)
+            trusted_statement = trusted_text[trusted_match.start() : trusted_line_end].strip()
+            if not trusted_statement or not statement.lower().startswith(trusted_statement.lower()):
+                continue
+            annotation = statement[len(trusted_statement) :]
+            if not _SQL_APPEND_IMPLEMENTATION_PATTERN.search(annotation):
+                trusted_prefix_authorized = True
+                break
+        if trusted_prefix_authorized:
+            continue
+        token = match.group(0).upper()
+        if token not in findings:
             findings.append(token)
-    for match in _SQL_IMPLEMENTATION_PATTERN.finditer(scanned):
-        token = " ".join(match.group(0).upper().split())
-        if token.lower() not in trusted_lower and token not in findings:
-            findings.append(token)
-    for marker in _PHYSICAL_DIRECTIVE_MARKERS:
-        if marker in scanned and marker not in trusted_text and marker not in findings:
-            findings.append(marker)
-    for match in _PHYSICAL_CHOICE_DIRECTIVE_PATTERN.finditer(scanned):
-        directive = " ".join(match.group(0).split())
-        if directive not in trusted_text and directive not in findings:
-            findings.append(directive)
-    for table_name in table_names:
-        normalized = str(table_name or "").strip()
-        if normalized and normalized.lower() not in trusted_lower and normalized not in findings:
-            findings.append(normalized)
     return findings
+
+
+def _run_kind(runtime: ToolRuntime | None) -> str:
+    context = getattr(runtime, "context", None)
+    if isinstance(context, dict):
+        value = str(context.get("run_kind") or "").strip()
+        if value:
+            return value
+    return "standalone"
+
+
+def _format_untrusted_sql_error(findings: list[str], runtime: ToolRuntime | None) -> str:
+    run_kind = _run_kind(runtime)
+    if run_kind == "goal_execution":
+        guidance = (
+            "当前是 Goal 子任务：可以拆解业务指标、维度、粒度、筛选和时间范围，也可以在当前分析模型范围内"
+            "选择表与字段；但不要在 question 中新增用户未要求的 SQL 写法。请保留业务子问题后重试。"
+        )
+    else:
+        original = _trusted_user_scope_text(runtime).strip()
+        retry = f" 建议原样重试 question：{original[:500]}" if original else ""
+        guidance = (
+            f"当前是独立问数：Agent 可以在当前分析模型范围内选择表与字段，"
+            f"但不要把自行编写的 SQL 语法塞入 question。{retry}"
+        )
+    return (
+        "🧮 SQL 生成失败：检测到 Agent 在业务问题中新增了用户未指定的 SQL 实现："
+        + ", ".join(findings[:12])
+        + "。"
+        + guidance
+    )
 
 
 def _trusted_template_enum_terms(runtime: ToolRuntime | None) -> dict[str, set[str]]:
@@ -283,9 +301,7 @@ def _format_semantic_contract(semantic_assets: dict[str, object]) -> list[str]:
     ]
     context_id = str(semantic_assets.get("semantic_context_id") or "").strip()
     semantic_hash = str(
-        semantic_assets.get("semantic_hash")
-        or semantic_assets.get("semantic_context_hash")
-        or ""
+        semantic_assets.get("semantic_hash") or semantic_assets.get("semantic_context_hash") or ""
     ).strip()
     if context_id:
         lines.append(f"  - semantic_context_id: {context_id}")
@@ -321,11 +337,11 @@ def _format_generation(
     disposition: str = "generated",
 ) -> str:
     result = generation.result
-    matched_assets = result.semantic_assets.get("matched") if isinstance(result.semantic_assets.get("matched"), list) else []
+    matched_assets = (
+        result.semantic_assets.get("matched") if isinstance(result.semantic_assets.get("matched"), list) else []
+    )
     asset_names = [
-        f"{item.get('id') or item.get('name')}({item.get('type')})"
-        for item in matched_assets
-        if isinstance(item, dict)
+        f"{item.get('id') or item.get('name')}({item.get('type')})" for item in matched_assets if isinstance(item, dict)
     ]
     title = "🧮 SQL 生成结果（未执行）"
     if disposition == "rejected_revision":
@@ -343,6 +359,11 @@ def _format_generation(
         f"- 路由：{result.route.reason}，confidence={result.route.confidence:.2f}",
         f"- 语义资产：{', '.join(asset_names) if asset_names else '未命中（已进入模型泛化模式）'}",
     ]
+    if result.route.alias_resolutions:
+        aliases = ", ".join(
+            f"{item['alias']}→{item['table']}（{item['source']}）" for item in result.route.alias_resolutions
+        )
+        lines.append(f"- 表简称解析：{aliases}")
     if disposition == "rejected_revision":
         lines.extend(
             [
@@ -388,9 +409,11 @@ class DatabaseSqlGenerateTool(BaseTool):
     description: str = (
         "Generate PostgreSQL SQL from a business-level database question without executing it. "
         "Use this as the first step for database analysis when the Agent needs to inspect, validate, "
-        "or execute SQL. For a Goal, the Agent may decompose the Goal into a focused business sub-question, but it "
-        "must not add physical tables, columns, EAV names/values, entities, or SQL implementation choices that the "
-        "user did not specify. It uses that business question for Vanna evidence/candidate retrieval, then applies semantic "
+        "or execute SQL. The Agent may select physical tables or columns only from the active analytics model's declared "
+        "data assets; the database source allowlist remains an additional boundary. For a standalone request, "
+        "preserve the user's business intent and shorthand. For a Goal, the Agent may decompose it into a focused business "
+        "sub-question without changing its business semantics. Do not embed Agent-written SELECT/JOIN/CTE implementation "
+        "in question. It uses that question for Vanna evidence/candidate retrieval, then applies semantic "
         "assets in a separate final refinement pass before SQL guardrails. Database entity evidence is authoritative "
         "for physical table/column/EAV values. It returns SQL plus its authoritative semantic contract. Do not "
         "manually rewrite semantics from a "
@@ -428,17 +451,13 @@ class DatabaseSqlGenerateTool(BaseTool):
             state_model_id = str(runtime.state.get("analytics_model_id") or "").strip()
         effective_model_id = state_model_id or model_id
         requested_table_names = list(table_names or [])
-        selected_asset_ids = list(
-            dict.fromkeys(selected_semantic_asset_ids or semantic_asset_ids or measure_ids or [])
-        )
+        selected_asset_ids = list(dict.fromkeys(selected_semantic_asset_ids or semantic_asset_ids or measure_ids or []))
         allowed_asset_ids: set[str] = set()
         if state_model_id and runtime is not None and isinstance(runtime.state, dict):
             if "allowed_semantic_asset_ids" not in runtime.state:
                 return "🧮 SQL 生成失败：当前分析模型的可信语义资产范围不可用，请重新开始本轮任务。"
             allowed_asset_ids = {
-                str(item).strip()
-                for item in runtime.state.get("allowed_semantic_asset_ids") or []
-                if str(item).strip()
+                str(item).strip() for item in runtime.state.get("allowed_semantic_asset_ids") or [] if str(item).strip()
             }
             selected_asset_ids, normalization_error = normalize_selected_semantic_asset_ids(
                 selected_asset_ids,
@@ -447,26 +466,18 @@ class DatabaseSqlGenerateTool(BaseTool):
             if normalization_error:
                 return "🧮 SQL 生成失败：" + normalization_error
         if not parent_generation_id:
-            physical_guidance = _agent_added_physical_guidance(
+            sql_implementation = _agent_added_sql_implementation(
                 question=question,
-                table_names=requested_table_names,
                 runtime=runtime,
             )
             template_terms = _trusted_template_enum_terms(runtime)
             unauthorized_scope_assets = sorted(set(template_terms) - allowed_asset_ids)
             if state_model_id and unauthorized_scope_assets:
-                return (
-                    "🧮 SQL 生成失败：当前模板的语义范围引用了模型未授权资产："
-                    + ", ".join(unauthorized_scope_assets)
+                return "🧮 SQL 生成失败：当前模板的语义范围引用了模型未授权资产：" + ", ".join(
+                    unauthorized_scope_assets
                 )
-            if physical_guidance:
-                return (
-                    "🧮 SQL 生成失败：检测到 Agent 在业务子任务中新增了用户未指定的物理实现："
-                    + ", ".join(physical_guidance[:12])
-                    + "。Goal 模式允许拆解指标、维度、粒度、筛选和时间范围，但表、字段、"
-                    "EAV 配置项/枚举、实体映射及 SQL 写法必须由 SQL 生成器根据数据库证据与语义资产决定。"
-                    "请删除这些实现提示，仅保留业务问题后重新调用。"
-                )
+            if sql_implementation:
+                return _format_untrusted_sql_error(sql_implementation, runtime)
         request_payload = {
             "question": question,
             "semantic_question": question,
@@ -496,9 +507,7 @@ class DatabaseSqlGenerateTool(BaseTool):
                 return "🧮 SQL 重新生成失败：必须提供自然语言 revision_instruction，不能提供 SQL。"
             request_payload = dict(parent.request)
             original_question = str(request_payload.get("question") or parent.result.question)
-            semantic_question = str(
-                request_payload.get("semantic_question") or original_question
-            )
+            semantic_question = str(request_payload.get("semantic_question") or original_question)
             runtime_context = getattr(runtime, "context", None)
             context = runtime_context if isinstance(runtime_context, dict) else {}
             schema_receipt = None
@@ -544,9 +553,7 @@ class DatabaseSqlGenerateTool(BaseTool):
                 request_payload["technical_evidence"] = {
                     "kind": "schema_evidence" if schema_receipt else "observed_sql_failure",
                     "observed_problem_category": (
-                        "schema_physical_mapping_mismatch"
-                        if schema_receipt
-                        else _technical_problem_category(proposed)
+                        "schema_physical_mapping_mismatch" if schema_receipt else _technical_problem_category(proposed)
                     ),
                     "parent_generation_id": parent.id,
                     "parent_sql": parent.result.sql,
@@ -577,8 +584,7 @@ class DatabaseSqlGenerateTool(BaseTool):
                 if not applied_instruction:
                     return "🧮 SQL 重新生成失败：审批结果缺少自然语言修改说明。"
                 approved_question = (
-                    f"原始问题：\n{original_question}\n\n"
-                    f"用户确认的本次口径补充：\n{applied_instruction}"
+                    f"原始问题：\n{original_question}\n\n用户确认的本次口径补充：\n{applied_instruction}"
                 )
                 request_payload["question"] = approved_question
                 request_payload["semantic_question"] = approved_question
@@ -624,9 +630,7 @@ class DatabaseSqlGenerateTool(BaseTool):
             },
         )
         generation_request = (
-            dict(parent.request)
-            if parent is not None and disposition == "technical_repair"
-            else dict(request_payload)
+            dict(parent.request) if parent is not None and disposition == "technical_repair" else dict(request_payload)
         )
         raw_runtime_context = getattr(runtime, "context", None)
         runtime_context = raw_runtime_context if isinstance(raw_runtime_context, dict) else {}

@@ -47,6 +47,51 @@ def _is_ignored_model_file(path: Path) -> bool:
     )
 
 
+def _normalize_table_aliases(data_assets: dict[str, Any]) -> dict[str, list[str]]:
+    """Validate and normalize model-owned aliases without broadening table scope."""
+
+    table_refs = [str(item or "").strip() for item in data_assets.get("tables") or [] if str(item or "").strip()]
+    declared_database_refs = {ref for ref in table_refs if not ref.startswith("table_asset:") and "." in ref}
+    raw_aliases = data_assets.get("table_aliases") or {}
+    if not isinstance(raw_aliases, dict):
+        raise AnalyticsModelError("data_assets.table_aliases must be a mapping")
+
+    physical_identifiers: dict[str, dict[str, str]] = {}
+    for ref in declared_database_refs:
+        source_id, table_name = ref.split(".", 1)
+        clean_table = table_name.strip().strip('"').lower()
+        source_identifiers = physical_identifiers.setdefault(source_id, {})
+        for identifier in {clean_table, clean_table.split(".")[-1]}:
+            source_identifiers[identifier] = table_name
+
+    aliases_by_source: dict[str, dict[str, str]] = {}
+    normalized: dict[str, list[str]] = {}
+    for raw_ref, raw_values in raw_aliases.items():
+        ref = str(raw_ref or "").strip()
+        if ref not in declared_database_refs:
+            raise AnalyticsModelError(f"table alias references undeclared database table: {ref}")
+        if not isinstance(raw_values, list):
+            raise AnalyticsModelError(f"table aliases must be a list: {ref}")
+        source_id, table_name = ref.split(".", 1)
+        source_aliases = aliases_by_source.setdefault(source_id, {})
+        values: list[str] = []
+        for raw_alias in raw_values:
+            alias = str(raw_alias or "").strip().lower()
+            if not alias or alias in values:
+                continue
+            physical_target = physical_identifiers.get(source_id, {}).get(alias)
+            if physical_target and physical_target != table_name:
+                raise AnalyticsModelError(f"table alias conflicts with physical table identifier: {alias}")
+            existing = source_aliases.get(alias)
+            if existing and existing != table_name:
+                raise AnalyticsModelError(f"table alias maps to multiple tables in one source: {alias}")
+            source_aliases[alias] = table_name
+            values.append(alias)
+        if values:
+            normalized[ref] = values
+    return normalized
+
+
 @dataclass(frozen=True)
 class AnalyticsModel:
     id: str
@@ -108,13 +153,7 @@ def canonical_model_resource_path(raw_path: object, *, root: str) -> str:
     value = str(raw_path or "").strip()
     if not value:
         raise AnalyticsModelError(f"{root} resource path is required")
-    if (
-        "\x00" in value
-        or "\\" in value
-        or value.startswith("/")
-        or "://" in value
-        or re.match(r"^[A-Za-z]:/", value)
-    ):
+    if "\x00" in value or "\\" in value or value.startswith("/") or "://" in value or re.match(r"^[A-Za-z]:/", value):
         raise AnalyticsModelError(f"Invalid {root} resource path: {value}")
     while value.startswith("./"):
         value = value[2:]
@@ -282,7 +321,7 @@ class AnalyticsModelRegistry:
         relation_context: list[dict[str, Any]] = []
         semantic_asset_context: list[dict[str, Any]] = []
         binding_assets_by_dimension: dict[str, list[str]] = {}
-        semantic_assets_meta = ((model.get("frontmatter") or {}).get("semantic_assets") or {})
+        semantic_assets_meta = (model.get("frontmatter") or {}).get("semantic_assets") or {}
         if isinstance(semantic_assets_meta, dict):
             from analytics.semantic_assets import get_semantic_asset_registry
 
@@ -348,7 +387,10 @@ class AnalyticsModelRegistry:
         data_asset_context: list[dict[str, Any]] = []
         logical_dataset_context: list[dict[str, Any]] = []
         missing_data_assets: list[str] = []
-        table_refs = [str(item).strip() for item in ((model.get("frontmatter") or {}).get("data_assets") or {}).get("tables") or []]
+        table_refs = [
+            str(item).strip()
+            for item in ((model.get("frontmatter") or {}).get("data_assets") or {}).get("tables") or []
+        ]
         for table_ref in table_refs:
             if not table_ref.startswith("table_asset:"):
                 database_source_id, separator, table_name = table_ref.partition(".")
@@ -384,22 +426,21 @@ class AnalyticsModelRegistry:
                     "statistics": definition.get("statistics"),
                     "routing": definition.get("routing"),
                     "sources": [
-                        {"asset_id": source.get("asset_id"), "name": source.get("name"), "sheet_name": source.get("sheet_name")}
+                        {
+                            "asset_id": source.get("asset_id"),
+                            "name": source.get("name"),
+                            "sheet_name": source.get("sheet_name"),
+                        }
                         for source in definition.get("sources") or []
                         if isinstance(source, dict)
                     ],
                 }
                 logical_dataset_context.append(logical_summary)
-                data_asset_context.append(
-                    {"ref": table_ref, "asset_type": "logical_dataset", **logical_summary}
-                )
+                data_asset_context.append({"ref": table_ref, "asset_type": "logical_dataset", **logical_summary})
                 continue
 
             profile_path = (
-                get_knowledge_root(self.base_dir)
-                / ".puddingclaw"
-                / "table_profiles"
-                / f"{asset_id}.profile.json"
+                get_knowledge_root(self.base_dir) / ".puddingclaw" / "table_profiles" / f"{asset_id}.profile.json"
             )
             try:
                 profile = json.loads(profile_path.read_text(encoding="utf-8"))
@@ -423,8 +464,7 @@ class AnalyticsModelRegistry:
             month_fields = [
                 str(item.get("name"))
                 for item in columns
-                if str(item.get("name") or "").isdigit()
-                and 1 <= int(str(item.get("name"))) <= 12
+                if str(item.get("name") or "").isdigit() and 1 <= int(str(item.get("name"))) <= 12
             ]
             data_asset_context.append(
                 {
@@ -437,10 +477,7 @@ class AnalyticsModelRegistry:
                     "sheet_name": profile.get("sheet_name"),
                     "schema": {
                         "fields": [str(item.get("name") or "") for item in columns],
-                        "field_types": {
-                            str(item.get("name") or ""): str(item.get("dtype") or "")
-                            for item in columns
-                        },
+                        "field_types": {str(item.get("name") or ""): str(item.get("dtype") or "") for item in columns},
                     },
                     "coverage": {
                         "years": year_values,
@@ -477,9 +514,7 @@ class AnalyticsModelRegistry:
                 }
 
         semantic_by_id = {
-            str(item.get("id") or ""): item
-            for item in semantic_asset_context
-            if str(item.get("id") or "")
+            str(item.get("id") or ""): item for item in semantic_asset_context if str(item.get("id") or "")
         }
         resolved_templates: dict[str, dict[str, Any]] = {}
         raw_templates = model.get("templates") if isinstance(model.get("templates"), dict) else {}
@@ -593,9 +628,7 @@ class AnalyticsModelRegistry:
                     )
                     members = [str(value).strip() for value in raw_filter.get("members") or [] if str(value).strip()]
                     labels = [
-                        str(value).strip()
-                        for value in raw_filter.get("classifications") or []
-                        if str(value).strip()
+                        str(value).strip() for value in raw_filter.get("classifications") or [] if str(value).strip()
                     ]
                     unknown_members = sorted(set(members) - enum_universe)
                     unknown_labels = sorted(set(labels) - {str(key) for key in classifications})
@@ -799,7 +832,10 @@ class AnalyticsModelRegistry:
             "version": version,
             "description": description,
             "tags": tags,
-            "data_assets": {"tables": data_assets.get("tables") or []},
+            "data_assets": {
+                "tables": data_assets.get("tables") or [],
+                "table_aliases": _normalize_table_aliases(data_assets),
+            },
             "semantic_assets": {
                 "measures": semantic_assets.get("measures") or [],
                 "dimensions": semantic_assets.get("dimensions") or [],
@@ -836,6 +872,7 @@ class AnalyticsModelRegistry:
         semantic_assets: dict[str, Any],
         asset_relations: list[str],
     ) -> None:
+        _normalize_table_aliases(data_assets)
         tables = {str(item).strip() for item in data_assets.get("tables") or [] if str(item).strip()}
         dimensions = {str(item).strip() for item in semantic_assets.get("dimensions") or [] if str(item).strip()}
         if len(tables) <= 1:

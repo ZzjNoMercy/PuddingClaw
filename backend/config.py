@@ -57,15 +57,13 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "api_key": "",
         "dimension": 1024,
-        "batch_size": 20,
+        "batch_size": 10,
     },
     "multimodal_embedding": {
         "provider": "dashscope",
-        "model": "qwen2.5-vl-embedding",
+        "model": "qwen3-vl-embedding",
         "dimension": 1024,
-        # DashScope multimodal embedding does not accept multiple same-type
-        # inputs in one request. Keep the legacy key name for config
-        # compatibility, but use it as provider request concurrency.
+        # qwen3-vl-embedding accepts up to 20 independent content elements.
         "batch_size": 10,
         # qwen-vl embedding uses DashScope native API, not OpenAI-compatible /v1/embeddings.
         # Leave base_url empty for direct DashScope SDK mode. If a Higress native passthrough
@@ -148,6 +146,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "milvus_uri": "http://localhost:19530",
             "text_collection": "puddingclaw_knowledge_text",
             "image_collection": "puddingclaw_knowledge_image",
+            "bm25_enabled": True,
         },
     },
     "vanna": {
@@ -177,7 +176,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "model": "text-embedding-v4",
             "base_url": "",
             "api_key": "",
-            "batch_size": 20,
+            "batch_size": 10,
         },
         "milvus": {
             # Keep Vanna NL2SQL collections separate from document RAG
@@ -976,18 +975,20 @@ def get_fallback_embedding_config() -> dict[str, Any]:
     注意：api_base 是 OpenAIEmbedding 的参数名，与 config.json 中的 base_url 做了映射。
     """
     config = load_config()
+    from llm.embedding_limits import clamp_embedding_batch_size
     from provider_registry import get_provider_registry
 
     resolved = get_provider_registry().resolve_binding("text_embedding", legacy_config=config)
+    model = str(resolved.get("name") or "text-embedding-v4")
     return {
         "provider": resolved.get("provider_id", "dashscope"),
-        "model": resolved.get("name", "text-embedding-v4"),
+        "model": model,
         "api_key": resolved.get("api_key", ""),
         "api_base": resolved.get("base_url", "https://api.openai.com/v1"),
         "protocol": resolved.get("protocol", "openai_compatible"),
         "model_id": resolved.get("id", ""),
         "dimension": int(resolved.get("dimension", 1024)),
-        "batch_size": max(1, int(resolved.get("batch_size", 20))),
+        "batch_size": clamp_embedding_batch_size(model, int(resolved.get("batch_size", 10))),
     }
 
 
@@ -1005,9 +1006,12 @@ def get_multimodal_embedding_config() -> dict[str, Any]:
     runtime = config.get("multimodal_embedding", {})
     return {
         "provider": resolved.get("provider_id", "dashscope"),
-        "model": resolved.get("name", "qwen2.5-vl-embedding"),
+        "model": resolved.get("name", "qwen3-vl-embedding"),
         "dimension": int(resolved.get("dimension", 1024)),
-        "batch_size": max(1, int(runtime.get("batch_size", resolved.get("concurrency", 10)))),
+        "batch_size": max(
+            1,
+            int(runtime.get("batch_size", resolved.get("batch_size", resolved.get("concurrency", 10)))),
+        ),
         "api_key": resolved.get("api_key", ""),
         "base_url": resolved.get("base_url", "https://dashscope.aliyuncs.com"),
         "route_path": resolved.get("route_path", "/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding"),
@@ -1053,6 +1057,7 @@ def get_knowledge_multimodal_index_config() -> dict[str, Any]:
             os.getenv("PUDDINGCLAW_MILVUS_IMAGE_COLLECTION")
             or index.get("image_collection", "puddingclaw_knowledge_image")
         ),
+        "bm25_enabled": bool(index.get("bm25_enabled", True)),
         "overwrite": False,
     }
 
@@ -1340,6 +1345,7 @@ def _normalize_subagent_config(raw: dict[str, Any]) -> dict[str, Any]:
 def get_settings_for_display() -> dict[str, Any]:
     """Get settings with masked API keys for frontend display."""
     import os
+
     from provider_registry import get_provider_registry
 
     config = load_config()
@@ -1675,7 +1681,14 @@ def update_settings(updates: dict[str, Any]) -> None:
             existing = config["knowledge"].get("multimodal_index", {})
             if not isinstance(existing, dict):
                 existing = {}
-            for key in ("enabled", "vector_store", "milvus_uri", "text_collection", "image_collection"):
+            for key in (
+                "enabled",
+                "vector_store",
+                "milvus_uri",
+                "text_collection",
+                "image_collection",
+                "bm25_enabled",
+            ):
                 if key in mm_index_update:
                     existing[key] = mm_index_update[key]
             existing["overwrite"] = False

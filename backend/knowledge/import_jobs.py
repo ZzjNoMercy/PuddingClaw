@@ -15,8 +15,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from analytics.nl2sql.training import VannaTrainingError, import_table_entities
-from knowledge.indexer import refresh_local_knowledge_index
-from knowledge.models import KnowledgeDatabaseSource, KnowledgeDocument, KnowledgeImportEvent, KnowledgeImportJob, new_id
+from knowledge.indexer import refresh_document_knowledge_index
+from knowledge.models import (
+    KnowledgeDatabaseSource,
+    KnowledgeDocument,
+    KnowledgeImportEvent,
+    KnowledgeImportJob,
+    new_id,
+)
 from knowledge.paths import get_knowledge_root
 from knowledge.service import (
     DEFAULT_KNOWLEDGE_BASE_ID,
@@ -454,6 +460,57 @@ async def create_vector_publish_job(
             event_metadata={"vector_job_id": job.id},
         )
     )
+    await session.commit()
+    await session.refresh(job)
+    return job
+
+
+async def create_document_vector_publish_job(
+    session: AsyncSession,
+    *,
+    base_dir: Path,
+    document: KnowledgeDocument,
+) -> KnowledgeImportJob:
+    service = KnowledgeService(base_dir)
+    await service.ensure_default_knowledge_base(session)
+
+    active_stmt = (
+        select(KnowledgeImportJob)
+        .where(
+            KnowledgeImportJob.file_type == "vector",
+            KnowledgeImportJob.document_id == document.id,
+            KnowledgeImportJob.status.in_(("queued", "running")),
+        )
+        .order_by(KnowledgeImportJob.created_at.desc())
+        .limit(1)
+    )
+    active_result = await session.execute(active_stmt)
+    active_job = active_result.scalar_one_or_none()
+    if active_job is not None:
+        return active_job
+
+    job = KnowledgeImportJob(
+        id=new_id("job"),
+        knowledge_base_id=document.knowledge_base_id,
+        status="queued",
+        file_name=Path(document.storage_path).name,
+        file_type="vector",
+        file_size=document.size_bytes,
+        source_path=document.storage_path,
+        source_sha256=document.content_sha256 or "",
+        title=f"重建索引：{document.title}",
+        publish_targets=["vector"],
+        current_step="queued",
+        progress=0,
+        document_id=document.id,
+        job_metadata={
+            "kind": VECTOR_PUBLISH_KIND,
+            "document_virtual_path": document.virtual_path,
+            "deepagents_backend": "/knowledge/",
+        },
+    )
+    session.add(job)
+    session.add(KnowledgeImportEvent(job_id=job.id, level="info", message="文档向量重建任务已加入队列"))
     await session.commit()
     await session.refresh(job)
     return job
@@ -1063,7 +1120,12 @@ async def process_vector_publish_job(session: AsyncSession, *, base_dir: Path, j
         except Exception:
             logger.exception("[knowledge-vector] failed to persist progress job_id=%s", job.id)
 
-    result = await asyncio.to_thread(refresh_local_knowledge_index, base_dir, _progress_callback)
+    result = await asyncio.to_thread(
+        refresh_document_knowledge_index,
+        base_dir,
+        Path(document.storage_path),
+        _progress_callback,
+    )
     if not result.get("refreshed"):
         reason = result.get("error") or result.get("reason") or "向量导入未完成，请检查设置或服务状态。"
         raise KnowledgeServiceError(str(reason))

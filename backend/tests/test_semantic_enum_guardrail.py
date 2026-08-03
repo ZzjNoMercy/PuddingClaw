@@ -65,9 +65,7 @@ WHERE vehicle_level IS DISTINCT FROM '皮卡'
 
 
 def test_diesel_in_explicit_enum_is_rejected_with_diff():
-    conflict = _detect_semantic_enum_consistency(
-        _DIESEL_CASE_SQL, _RULE, semantic_trace=_TRACE_ENERGY
-    )
+    conflict = _detect_semantic_enum_consistency(_DIESEL_CASE_SQL, _RULE, semantic_trace=_TRACE_ENERGY)
     assert conflict is not None
     assert "柴油" in conflict.message
     assert "传统能源" in conflict.message
@@ -99,10 +97,7 @@ def test_fuzzy_like_forbidden_pattern_is_rejected():
 
 
 def test_fuzzy_like_eav_pinned_is_rejected():
-    sql = (
-        "SELECT * FROM vehicle_params "
-        "WHERE type_name = '能源类型' AND type_value LIKE '%纯电%'"
-    )
+    sql = "SELECT * FROM vehicle_params WHERE type_name = '能源类型' AND type_value LIKE '%纯电%'"
     conflict = _detect_semantic_enum_consistency(sql, _RULE, semantic_trace=_TRACE_ENERGY)
     assert conflict is not None
     assert "禁止模式" in conflict.message
@@ -141,19 +136,13 @@ def test_eav_literals_from_other_domains_do_not_false_positive():
 
 
 def test_eav_type_name_containing_energy_enum_text_does_not_false_positive():
-    sql = (
-        "SELECT type_value FROM vehicle_params "
-        "WHERE type_name = 'CLTC纯电续航[km]'"
-    )
+    sql = "SELECT type_value FROM vehicle_params WHERE type_name = 'CLTC纯电续航[km]'"
     conflict = _detect_semantic_enum_consistency(sql, _RULE, semantic_trace=_TRACE_ENERGY)
     assert conflict is None
 
 
 def test_energy_eav_value_is_checked_only_when_pinned_to_energy_type():
-    sql = (
-        "SELECT * FROM vehicle_params "
-        "WHERE type_name = '能源类型' AND type_value = '未登记能源'"
-    )
+    sql = "SELECT * FROM vehicle_params WHERE type_name = '能源类型' AND type_value = '未登记能源'"
     conflict = _detect_semantic_enum_consistency(sql, _RULE, semantic_trace=_TRACE_ENERGY)
     assert conflict is not None
     assert "未登记能源" in conflict.message
@@ -184,10 +173,7 @@ def test_subset_narrowing_is_legitimate():
 
 
 def test_unrelated_label_column_is_not_judged():
-    sql = (
-        "SELECT CASE WHEN serial_name = '轩逸' THEN '传统能源' ELSE '新能源' END AS grp "
-        "FROM vehicle_model_base"
-    )
+    sql = "SELECT CASE WHEN serial_name = '轩逸' THEN '传统能源' ELSE '新能源' END AS grp FROM vehicle_model_base"
     conflict = _detect_semantic_enum_consistency(sql, _RULE, semantic_trace=_TRACE_ENERGY)
     assert conflict is None
 
@@ -378,23 +364,21 @@ def test_asset_id_reference_is_not_flagged_as_physical_identifier(monkeypatch):
     monkeypatch.setattr(
         gen_tool, "_trusted_user_scope_text", lambda runtime: "每年传统能源和新能源各有多少次上市更新事件？"
     )
-    findings = gen_tool._agent_added_physical_guidance(
+    findings = gen_tool._agent_added_sql_implementation(
         question="传统能源和新能源的分类以语义资产 dimension:energy_type 的定义为准。",
-        table_names=[],
         runtime=None,
     )
     assert findings == []
 
 
-def test_bare_column_name_is_still_flagged(monkeypatch):
+def test_bare_column_name_is_left_to_router_and_semantic_evidence(monkeypatch):
     import tools.database.sql_generate_tool as gen_tool
 
     monkeypatch.setattr(
         gen_tool, "_trusted_user_scope_text", lambda runtime: "每年传统能源和新能源各有多少次上市更新事件？"
     )
-    findings = gen_tool._agent_added_physical_guidance(
+    findings = gen_tool._agent_added_sql_implementation(
         question="按 energy_type 分组统计传统能源和新能源。",
-        table_names=[],
         runtime=None,
     )
-    assert "energy_type" in findings
+    assert findings == []

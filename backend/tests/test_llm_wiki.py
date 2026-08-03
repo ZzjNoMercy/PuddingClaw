@@ -1065,6 +1065,63 @@ def test_retire_pages_rewrites_links_rebuilds_index_and_is_idempotent(wiki_env: 
     assert repeated["job_id"] == result["job_id"]
 
 
+def test_retired_page_source_raw_does_not_reenter_pending_queue(wiki_env: LlmWikiService) -> None:
+    obsolete_raw = wiki_env.snapshot_raw(
+        source_id="existing-kb",
+        asset_id="obsolete-source",
+        title="Obsolete Source",
+        content="# Obsolete Source\n",
+    )
+    replacement_raw = wiki_env.snapshot_raw(
+        source_id="existing-kb",
+        asset_id="replacement-source",
+        title="Replacement Source",
+        content="# Replacement Source\n",
+    )
+    bundle = wiki_env.schema.bundle()
+    assert wiki_env.publish(
+        pages=[
+            {
+                "slug": "concepts/obsolete",
+                "content": _page(
+                    "Obsolete",
+                    "concept",
+                    obsolete_raw["snapshot_path"],
+                    "practices/replacement",
+                ),
+            },
+            {
+                "slug": "practices/replacement",
+                "content": _page(
+                    "Replacement",
+                    "engineering_practice",
+                    replacement_raw["snapshot_path"],
+                    "practices/replacement",
+                ),
+            },
+        ],
+        expected_bundle_hash=bundle["bundle_hash"],
+        summary="Publish replacement pair",
+        model="test:model",
+        raw_paths=[obsolete_raw["snapshot_path"], replacement_raw["snapshot_path"]],
+    )["published"]
+
+    wiki_env.retire_pages(
+        retirements=[
+            {
+                "slug": "concepts/obsolete",
+                "replacement": "practices/replacement",
+            }
+        ],
+        summary="Retire obsolete output",
+    )
+
+    raw_status = {item["snapshot_path"]: item for item in wiki_env.workspace_status()["raw"]}
+    assert raw_status[obsolete_raw["snapshot_path"]]["compiled"] is True
+    assert raw_status[obsolete_raw["snapshot_path"]]["compiled_pages"] == []
+    assert raw_status[replacement_raw["snapshot_path"]]["compiled"] is True
+
+
 def test_retire_pages_rejects_missing_replacement_without_mutation(wiki_env: LlmWikiService) -> None:
     raw = wiki_env.snapshot_raw(
         source_id="existing-kb",
@@ -1469,7 +1526,7 @@ def test_compatible_schema_upgrade_migrates_the_whole_wiki(wiki_env: LlmWikiServ
     assert "schema_version: 0.2.0" in (wiki_env.wiki_dir / "systems" / "two.md").read_text(encoding="utf-8")
     assert "schema-migrate" in (wiki_env.wiki_dir / "log.md").read_text(encoding="utf-8")
     assert wiki_env.lint()["ok"] is True
-    assert wiki_env.workspace_status()["raw"][0]["compiled"] is False
+    assert wiki_env.workspace_status()["raw"][0]["compiled"] is True
 
 
 def test_destructive_schema_upgrade_fails_before_activation(wiki_env: LlmWikiService) -> None:

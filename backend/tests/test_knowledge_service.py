@@ -1,6 +1,7 @@
 import asyncio
-from pathlib import Path
 import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -8,12 +9,25 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config
-from knowledge.models import Base
-from knowledge.import_jobs import clear_import_jobs, create_import_job, delete_import_job, job_to_dict, process_import_job, task_source_path
-from knowledge.indexer import _build_multimodal_nodes
+import knowledge.import_jobs as import_jobs_module
+import knowledge.indexer as indexer_module
+import tools.search_knowledge_tool as search_knowledge_module
+from knowledge.import_jobs import (
+    clear_import_jobs,
+    create_document_vector_publish_job,
+    create_import_job,
+    delete_import_job,
+    job_to_dict,
+    process_import_job,
+    process_vector_publish_job,
+    task_source_path,
+)
+from knowledge.indexer import _build_milvus_storage_context, _build_multimodal_nodes
 from knowledge.mineru_client import MinerUClient, MinerUParseResult
+from knowledge.models import Base
 from knowledge.paths import get_knowledge_root
 from knowledge.service import KnowledgeService, KnowledgeServiceError, _slugify
+from llm.multimodal_embedding import DashScopeMultiModalEmbedding
 from tools.search_knowledge_tool import LlamaIndexKnowledgeQueryTool
 
 
@@ -132,6 +146,125 @@ def test_import_job_processes_markdown_upload(tmp_path: Path):
     asyncio.run(run())
 
 
+def test_document_vector_job_deduplicates_and_rebuilds_only_its_document(tmp_path: Path, monkeypatch):
+    async def run() -> None:
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+
+        backend_dir = tmp_path / "backend"
+        service = KnowledgeService(backend_dir)
+        async with sessionmaker() as session:
+            document, _ = await service.ingest_markdown_upload(
+                session,
+                filename="report.md",
+                content=b"# Report\n\nselected document\n",
+                title="Report",
+                publish_targets=["local_markdown"],
+            )
+            job = await create_document_vector_publish_job(
+                session,
+                base_dir=backend_dir,
+                document=document,
+            )
+            duplicate = await create_document_vector_publish_job(
+                session,
+                base_dir=backend_dir,
+                document=document,
+            )
+            assert duplicate.id == job.id
+
+            captured: dict[str, Path] = {}
+
+            def fake_refresh(base_dir: Path, document_path: Path, progress_callback=None):
+                captured["base_dir"] = base_dir
+                captured["document_path"] = document_path
+                if progress_callback:
+                    progress_callback({"stage": "done", "text_total": 1, "image_total": 0})
+                return {
+                    "refreshed": True,
+                    "generated_at": "2026-08-03T00:00:00Z",
+                    "document_virtual_path": document.virtual_path,
+                }
+
+            monkeypatch.setattr(import_jobs_module, "refresh_document_knowledge_index", fake_refresh)
+            processed = await process_vector_publish_job(session, base_dir=backend_dir, job=job)
+
+        assert processed.status == "succeeded"
+        assert captured["base_dir"] == backend_dir
+        assert captured["document_path"] == Path(document.storage_path)
+
+    asyncio.run(run())
+
+
+def test_refresh_document_index_selects_complete_linked_pdf_image_directory(tmp_path: Path, monkeypatch):
+    backend_dir = tmp_path / "backend"
+    knowledge_dir = tmp_path / "knowledge"
+    markdown_path = knowledge_dir / "imported" / "20260803" / "report.md"
+    linked_image = knowledge_dir / "assets" / "report" / "figure.png"
+    unrelated_image = knowledge_dir / "assets" / "other" / "other.png"
+    markdown_path.parent.mkdir(parents=True)
+    linked_image.parent.mkdir(parents=True)
+    unrelated_image.parent.mkdir(parents=True)
+    markdown_path.write_text("# Report\n\n![](../../../assets/report/figure.png)\n", encoding="utf-8")
+    linked_image.write_bytes(b"linked")
+    sibling_images = [linked_image.parent / f"unreferenced-{index:02d}.png" for index in range(25)]
+    for image_path in sibling_images:
+        image_path.write_bytes(b"sibling")
+    unrelated_image.write_bytes(b"unrelated")
+
+    monkeypatch.setattr(indexer_module, "get_knowledge_root", lambda _base_dir: knowledge_dir)
+    monkeypatch.setattr(
+        indexer_module,
+        "get_knowledge_multimodal_index_config",
+        lambda: {"enabled": True, "vector_store": "milvus"},
+    )
+    captured: dict[str, object] = {}
+
+    def fake_build(**kwargs):
+        captured.update(kwargs)
+        return {"enabled": True, "document_count": 2}
+
+    monkeypatch.setattr(indexer_module, "_try_build_multimodal_index", fake_build)
+
+    result = indexer_module.refresh_document_knowledge_index(backend_dir, markdown_path)
+
+    assert result["refreshed"] is True
+    assert captured["markdown_files"] == [markdown_path]
+    assert captured["image_files"] == sorted([linked_image, *sibling_images])
+    assert captured["replace_document_virtual_path"] == "/knowledge/imported/20260803/report.md"
+
+
+def test_document_rebuild_deletes_only_stale_milvus_nodes():
+    class FakeClient:
+        def __init__(self, rows: list[dict[str, str]]):
+            self.rows = rows
+            self.deletes: list[str] = []
+
+        def query(self, **_kwargs):
+            return self.rows
+
+        def delete(self, *, filter: str, **_kwargs):
+            self.deletes.append(filter)
+
+    class FakeStore:
+        def __init__(self, rows: list[dict[str, str]]):
+            self.collection_name = "collection"
+            self.client = FakeClient(rows)
+
+    text_store = FakeStore([{"id": "text-current"}, {"id": "text-stale"}])
+    image_store = FakeStore([{"id": "image-stale"}])
+    storage_context = SimpleNamespace(vector_stores={"default": text_store, "image": image_store})
+    existing = indexer_module._document_node_ids(storage_context, "/knowledge/imported/report.md")
+    nodes = [SimpleNamespace(node_id="text-current", metadata={"modality": "text"})]
+
+    indexer_module._delete_stale_document_nodes(storage_context, existing, nodes)
+
+    assert text_store.client.deletes == ['id in ["text-stale"]']
+    assert image_store.client.deletes == ['id in ["image-stale"]']
+
+
 def test_import_local_markdown_copies_into_deepagents_knowledge_backend(tmp_path: Path):
     async def run() -> None:
         engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
@@ -156,20 +289,488 @@ def test_import_local_markdown_copies_into_deepagents_knowledge_backend(tmp_path
     asyncio.run(run())
 
 
-def test_search_knowledge_tool_signature_changes_when_markdown_is_imported(tmp_path: Path):
-    knowledge_dir = tmp_path / "knowledge"
-    knowledge_dir.mkdir()
-    (knowledge_dir / "a.md").write_text("first", encoding="utf-8")
-
+def test_search_knowledge_tool_has_no_query_time_index_builder(tmp_path: Path):
     tool = LlamaIndexKnowledgeQueryTool(base_dir=str(tmp_path))
-    before = tool._compute_knowledge_signature()
 
-    imported_dir = knowledge_dir / "imported" / "20260702"
-    imported_dir.mkdir(parents=True)
-    (imported_dir / "b.md").write_text("second", encoding="utf-8")
+    assert not hasattr(tool, "_build_index")
+    assert not hasattr(tool, "_compute_knowledge_signature")
 
-    after = tool._compute_knowledge_signature()
-    assert before != after
+
+def test_rag_trace_candidate_summary_includes_complete_content_preview():
+    text_candidate = {
+        "title": "whitepaper.md",
+        "quote": "AI native applications combine models, agents, retrieval, memory, and tools. " * 4,
+        "modality": "text",
+        "retrieval_channel": "text_vector",
+        "retrieval_rank": 1,
+        "source": {
+            "chunk_id": "text-1",
+            "metadata": {"chunk_title": "Core architecture"},
+        },
+    }
+    image_candidate = {
+        "title": "architecture.png",
+        "quote": "image path only",
+        "modality": "image",
+        "retrieval_channel": "image_vector",
+        "retrieval_rank": 1,
+        "source": {"chunk_id": "image-1", "metadata": {}},
+        "image_hit": {"context": {"snippet": "Architecture diagram with model, agent, RAG, and tools."}},
+    }
+
+    summaries = LlamaIndexKnowledgeQueryTool._rag_candidate_summary(
+        [text_candidate, image_candidate],
+        include_preview=True,
+    )
+
+    assert summaries[0]["section"] == "Core architecture"
+    assert summaries[0]["preview"].startswith("AI native applications")
+    assert summaries[0]["preview"] == (
+        "AI native applications combine models, agents, retrieval, memory, and tools. " * 4
+    ).strip()
+    assert summaries[1]["preview"] == "Architecture diagram with model, agent, RAG, and tools."
+    compact = LlamaIndexKnowledgeQueryTool._rag_candidate_summary([text_candidate])
+    assert "preview" not in compact[0]
+
+
+def test_knowledge_milvus_defaults_to_stable_collection_names():
+    index_config = config.get_knowledge_multimodal_index_config()
+
+    assert index_config["text_collection"] == "puddingclaw_knowledge_text"
+    assert index_config["image_collection"] == "puddingclaw_knowledge_image"
+    assert "legacy_text_collection" not in index_config
+    assert index_config["bm25_enabled"] is True
+
+
+def test_milvus_text_store_enables_builtin_bm25_with_chinese_analyzer(monkeypatch):
+    stores: list[dict] = []
+    functions: list[dict] = []
+
+    class FakeMilvusVectorStore:
+        def __init__(self, **kwargs):
+            stores.append(kwargs)
+            self.collection_name = kwargs["collection_name"]
+            self.client = SimpleNamespace(delete=lambda **_kwargs: None)
+
+    class FakeBM25BuiltInFunction:
+        def __init__(self, **kwargs):
+            functions.append(kwargs)
+
+    class FakeStorageContext:
+        def __init__(self, vector_store):
+            self.vector_stores = {"default": vector_store}
+
+    monkeypatch.setattr("llama_index.vector_stores.milvus.MilvusVectorStore", FakeMilvusVectorStore)
+    monkeypatch.setattr(
+        "llama_index.vector_stores.milvus.utils.BM25BuiltInFunction",
+        FakeBM25BuiltInFunction,
+    )
+    monkeypatch.setattr(
+        "llama_index.core.StorageContext.from_defaults",
+        lambda **kwargs: FakeStorageContext(kwargs["vector_store"]),
+    )
+    monkeypatch.setattr(config, "get_fallback_embedding_config", lambda: {"dimension": 1024})
+    monkeypatch.setattr(config, "get_multimodal_embedding_config", lambda: {"dimension": 1024})
+
+    _storage_context, details = _build_milvus_storage_context({
+        "milvus_uri": "http://milvus.test:19530",
+        "text_collection": "puddingclaw_knowledge_text",
+        "image_collection": "puddingclaw_knowledge_image",
+        "bm25_enabled": True,
+    })
+
+    assert stores[0]["collection_name"] == "puddingclaw_knowledge_text"
+    assert stores[0]["enable_sparse"] is True
+    assert stores[0]["sparse_embedding_field"] == "sparse_embedding"
+    assert stores[1]["enable_sparse"] is False
+    assert functions == [{
+        "input_field_names": "text",
+        "output_field_names": "sparse_embedding",
+        "function_name": "puddingclaw_knowledge_bm25",
+        "analyzer_params": {
+            "tokenizer": "jieba",
+            "filter": ["lowercase"],
+        },
+    }]
+    assert details["bm25_enabled"] is True
+    assert details["bm25_analyzer"] == "jieba"
+
+
+def test_search_knowledge_tool_never_falls_back_from_milvus_to_local_index(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(
+        search_knowledge_module,
+        "get_knowledge_multimodal_index_config",
+        lambda: {"enabled": True, "vector_store": "milvus"},
+    )
+
+    def fail_milvus(_self, _query: str, *, top_k: int = 3):
+        raise RuntimeError("milvus unavailable")
+
+    def fail_if_local_index_is_loaded(_self):
+        raise AssertionError("Milvus query failure must not load or rebuild a local index")
+
+    monkeypatch.setattr(LlamaIndexKnowledgeQueryTool, "_query_milvus_multimodal", fail_milvus)
+    monkeypatch.setattr(LlamaIndexKnowledgeQueryTool, "_load_local_index", fail_if_local_index_is_loaded)
+
+    result = LlamaIndexKnowledgeQueryTool(base_dir=str(tmp_path))._run("AI 原生应用")
+
+    assert "Milvus knowledge query failed without modifying the index" in result
+
+
+def test_image_embedding_failure_keeps_text_milvus_retrieval(tmp_path: Path, monkeypatch):
+    class FakeTextEmbedding:
+        def get_query_embedding(self, _query: str):
+            return [0.1, 0.2]
+
+    class FailingImageEmbedding:
+        def get_query_embedding(self, _query: str):
+            raise RuntimeError("image endpoint rejected request")
+
+    class FakeMilvusClient:
+        searches: list[str] = []
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def has_collection(self, collection: str) -> bool:
+            return collection == "kb_text"
+
+        def search(self, *, collection_name: str, **_kwargs):
+            self.searches.append(collection_name)
+            return [[{
+                "id": "chunk-1",
+                "distance": 0.9,
+                "entity": {
+                    "text": "AI 原生应用需要模型、Agent、RAG 与评估体系。",
+                    "metadata": {
+                        "file_path": "/knowledge/imported/ai-native.md",
+                        "document_id": "doc-1",
+                        "chunk_id": "chunk-1",
+                    },
+                },
+            }]]
+
+    monkeypatch.setattr(
+        search_knowledge_module,
+        "get_knowledge_multimodal_index_config",
+        lambda: {
+            "enabled": True,
+            "vector_store": "milvus",
+            "milvus_uri": "http://milvus.test:19530",
+            "text_collection": "kb_text",
+            "image_collection": "kb_image",
+        },
+    )
+    monkeypatch.setattr(
+        search_knowledge_module,
+        "get_rag_hybrid_config",
+        lambda: {
+            "enabled": False,
+            "candidate_top_k": 3,
+            "image_vector_weight": 0.35,
+        },
+    )
+    monkeypatch.setattr(config, "get_rag_rerank_config", lambda: {"enabled": False})
+    monkeypatch.setattr("llm.embed_client.get_embedding_model", lambda: FakeTextEmbedding())
+    monkeypatch.setattr("llm.multimodal_embedding.get_multimodal_embedding_model", lambda: FailingImageEmbedding())
+    monkeypatch.setattr("pymilvus.MilvusClient", FakeMilvusClient)
+
+    payload = LlamaIndexKnowledgeQueryTool(base_dir=str(tmp_path))._query_milvus_multimodal_hits(
+        "AI 原生应用",
+        top_k=3,
+    )
+
+    assert payload is not None
+    assert payload["retrieval"]["text_vector"] == 1
+    assert payload["retrieval"]["image_vector"] == 0
+    assert payload["chunks"] == ["AI 原生应用需要模型、Agent、RAG 与评估体系。"]
+    assert FakeMilvusClient.searches == ["kb_text"]
+
+
+def test_milvus_bm25_retrieval_uses_raw_query_without_embedding(tmp_path: Path, monkeypatch):
+    class FailingEmbedding:
+        def get_query_embedding(self, _query: str):
+            raise RuntimeError("embedding unavailable")
+
+    class FakeMilvusClient:
+        searches: list[tuple[str, object]] = []
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def has_collection(self, collection: str) -> bool:
+            return collection == "puddingclaw_knowledge_text"
+
+        def search(self, *, anns_field: str, data: list, **_kwargs):
+            self.searches.append((anns_field, data[0]))
+            assert anns_field == "sparse_embedding"
+            return [[{
+                "id": "chunk-bm25",
+                "distance": 8.2,
+                "entity": {
+                    "text": "马赫 M100 智驾算法支持年度改款车型。",
+                    "metadata": {
+                        "file_path": "/knowledge/imported/l6.md",
+                        "document_id": "doc-l6",
+                        "chunk_id": "chunk-bm25",
+                    },
+                },
+            }]]
+
+    monkeypatch.setattr(
+        search_knowledge_module,
+        "get_knowledge_multimodal_index_config",
+        lambda: {
+            "enabled": True,
+            "vector_store": "milvus",
+            "milvus_uri": "http://milvus.test:19530",
+            "text_collection": "puddingclaw_knowledge_text",
+            "image_collection": "puddingclaw_knowledge_image",
+            "bm25_enabled": True,
+        },
+    )
+    monkeypatch.setattr(
+        search_knowledge_module,
+        "get_rag_hybrid_config",
+        lambda: {
+            "enabled": True,
+            "candidate_top_k": 5,
+            "text_vector_weight": 0.7,
+            "bm25_weight": 0.3,
+            "image_vector_weight": 0.4,
+        },
+    )
+    monkeypatch.setattr(config, "get_rag_rerank_config", lambda: {"enabled": False})
+    monkeypatch.setattr("llm.embed_client.get_embedding_model", lambda: FailingEmbedding())
+    monkeypatch.setattr("llm.multimodal_embedding.get_multimodal_embedding_model", lambda: FailingEmbedding())
+    monkeypatch.setattr("pymilvus.MilvusClient", FakeMilvusClient)
+
+    payload = LlamaIndexKnowledgeQueryTool(base_dir=str(tmp_path))._query_milvus_multimodal_hits(
+        "马赫 M100",
+        top_k=3,
+    )
+
+    assert payload is not None
+    assert FakeMilvusClient.searches == [("sparse_embedding", "马赫 M100")]
+    assert payload["retrieval"]["text_vector"] == 0
+    assert payload["retrieval"]["bm25"] == 1
+    assert payload["chunks"] == ["马赫 M100 智驾算法支持年度改款车型。"]
+
+
+def test_missing_configured_collection_does_not_fallback_to_another_collection(tmp_path: Path, monkeypatch):
+    class FakeEmbedding:
+        def get_query_embedding(self, _query: str):
+            return [0.1, 0.2]
+
+    class FailingImageEmbedding:
+        def get_query_embedding(self, _query: str):
+            raise RuntimeError("image unavailable")
+
+    class FakeMilvusClient:
+        fields: list[str] = []
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def has_collection(self, collection: str) -> bool:
+            return collection == "some_old_collection"
+
+        def search(self, *, anns_field: str, **_kwargs):
+            self.fields.append(anns_field)
+            return [[]]
+
+    monkeypatch.setattr(
+        search_knowledge_module,
+        "get_knowledge_multimodal_index_config",
+        lambda: {
+            "enabled": True,
+            "vector_store": "milvus",
+            "text_collection": "puddingclaw_knowledge_text",
+            "image_collection": "puddingclaw_knowledge_image",
+            "bm25_enabled": True,
+        },
+    )
+    monkeypatch.setattr(
+        search_knowledge_module,
+        "get_rag_hybrid_config",
+        lambda: {
+            "enabled": True,
+            "candidate_top_k": 3,
+            "text_vector_weight": 0.7,
+            "bm25_weight": 0.3,
+            "image_vector_weight": 0.4,
+        },
+    )
+    monkeypatch.setattr(config, "get_rag_rerank_config", lambda: {"enabled": False})
+    monkeypatch.setattr("llm.embed_client.get_embedding_model", lambda: FakeEmbedding())
+    monkeypatch.setattr("llm.multimodal_embedding.get_multimodal_embedding_model", lambda: FailingImageEmbedding())
+    monkeypatch.setattr("pymilvus.MilvusClient", FakeMilvusClient)
+
+    payload = LlamaIndexKnowledgeQueryTool(base_dir=str(tmp_path))._query_milvus_multimodal_hits(
+        "AI 原生应用",
+        top_k=3,
+    )
+
+    assert payload is not None
+    assert FakeMilvusClient.fields == []
+    assert payload["retrieval"]["text_collection"] == "puddingclaw_knowledge_text"
+    assert "legacy_text_fallback" not in payload["retrieval"]
+    assert payload["retrieval"]["bm25"] == 0
+
+
+def test_dashscope_multimodal_http_uses_contents_envelope(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"output": {"embeddings": [{"embedding": [0.1, 0.2]}]}}
+
+    class FakeHttpClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def post(self, url: str, *, headers: dict, json: dict):
+            captured.update({"url": url, "headers": headers, "json": json})
+            return FakeResponse()
+
+    monkeypatch.setattr("llm.multimodal_embedding.httpx.Client", FakeHttpClient)
+    model = DashScopeMultiModalEmbedding(
+        api_key="test-key",
+        model_name="qwen2.5-vl-embedding",
+        dimension=1024,
+        base_url="https://dashscope.example",
+    )
+
+    result = model._call_http_api([{"text": "AI 原生应用"}])
+
+    assert result == [[0.1, 0.2]]
+    assert captured["json"] == {
+        "model": "qwen2.5-vl-embedding",
+        "input": {"contents": [{"text": "AI 原生应用"}]},
+        "parameters": {"dimension": 1024},
+    }
+
+
+def test_qwen3_multimodal_http_requests_independent_vectors_and_restores_index_order(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "output": {
+                    "embeddings": [
+                        {"index": 1, "embedding": [0.3, 0.4]},
+                        {"index": 0, "embedding": [0.1, 0.2]},
+                    ]
+                }
+            }
+
+    class FakeHttpClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def post(self, url: str, *, headers: dict, json: dict):
+            captured.update({"url": url, "headers": headers, "json": json})
+            return FakeResponse()
+
+    monkeypatch.setattr("llm.multimodal_embedding.httpx.Client", FakeHttpClient)
+    model = DashScopeMultiModalEmbedding(
+        api_key="test-key",
+        model_name="qwen3-vl-embedding",
+        dimension=1024,
+        base_url="https://dashscope.example",
+    )
+
+    result = model._call_http_api([{"text": "first"}, {"text": "second"}])
+
+    assert result == [[0.1, 0.2], [0.3, 0.4]]
+    assert captured["json"] == {
+        "model": "qwen3-vl-embedding",
+        "input": {"contents": [{"text": "first"}, {"text": "second"}]},
+        "parameters": {"dimension": 1024, "enable_fusion": False},
+    }
+
+
+def test_qwen3_multimodal_batches_independent_inputs_up_to_configured_size(monkeypatch):
+    calls: list[list[dict[str, str]]] = []
+
+    def fake_call_api(_self, input_data: list[dict[str, str]]) -> list[list[float]]:
+        calls.append(input_data)
+        return [[float(index)] for index, _item in enumerate(input_data)]
+
+    monkeypatch.setattr(DashScopeMultiModalEmbedding, "_call_api", fake_call_api)
+    model = DashScopeMultiModalEmbedding(
+        api_key="test-key",
+        model_name="qwen3-vl-embedding",
+        dimension=1024,
+        embed_batch_size=10,
+        base_url="https://dashscope.example",
+    )
+
+    result = model._get_text_embeddings([f"chunk-{index}" for index in range(23)])
+
+    assert [len(batch) for batch in calls] == [10, 10, 3]
+    assert len(result) == 23
+
+
+def test_qwen3_multimodal_caps_image_batches_at_ten(monkeypatch):
+    calls: list[list[dict[str, str]]] = []
+
+    def fake_call_api(_self, input_data: list[dict[str, str]]) -> list[list[float]]:
+        calls.append(input_data)
+        return [[0.1] for _item in input_data]
+
+    monkeypatch.setattr(DashScopeMultiModalEmbedding, "_call_api", fake_call_api)
+    model = DashScopeMultiModalEmbedding(
+        api_key="test-key",
+        model_name="qwen3-vl-embedding",
+        dimension=1024,
+        embed_batch_size=20,
+        base_url="https://dashscope.example",
+    )
+
+    model._call_items_in_batches([{"image": f"image-{index}"} for index in range(23)], modality="image")
+
+    assert [len(batch) for batch in calls] == [10, 10, 3]
+
+
+def test_qwen25_multimodal_keeps_single_item_requests(monkeypatch):
+    calls: list[list[dict[str, str]]] = []
+
+    def fake_call_api(_self, input_data: list[dict[str, str]]) -> list[list[float]]:
+        calls.append(input_data)
+        return [[0.1] for _item in input_data]
+
+    monkeypatch.setattr(DashScopeMultiModalEmbedding, "_call_api", fake_call_api)
+    model = DashScopeMultiModalEmbedding(
+        api_key="test-key",
+        model_name="qwen2.5-vl-embedding",
+        dimension=1024,
+        embed_batch_size=10,
+        base_url="https://dashscope.example",
+    )
+
+    model._get_text_embeddings(["first", "second", "third"])
+
+    assert [len(batch) for batch in calls] == [1, 1, 1]
 
 
 def test_multimodal_index_builds_markdown_parser_nodes_with_image_context(tmp_path: Path):

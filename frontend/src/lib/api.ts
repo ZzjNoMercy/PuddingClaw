@@ -1658,6 +1658,20 @@ export async function publishKnowledgeImportJobVector(
   return response.json();
 }
 
+export async function publishKnowledgeDocumentVector(
+  documentId: string
+): Promise<{ job: KnowledgeImportJob; queued: boolean }> {
+  const response = await fetch(
+    `${API_BASE}/knowledge/documents/${encodeURIComponent(documentId)}/publish-vector`,
+    { method: "POST" }
+  );
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to rebuild document vector index: ${response.status}`));
+  }
+  return response.json();
+}
+
 export async function globKnowledgeMarkdown(pattern = "**/*.md"): Promise<KnowledgeMarkdownFile[]> {
   const params = new URLSearchParams({ pattern });
   const response = await fetch(`${API_BASE}/knowledge/markdown/glob?${params.toString()}`, { cache: "no-store" });

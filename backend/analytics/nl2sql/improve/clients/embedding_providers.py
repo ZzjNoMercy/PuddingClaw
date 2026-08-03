@@ -11,6 +11,8 @@ import requests
 import numpy as np
 from typing import List, Optional, Dict, Any
 
+from llm.embedding_limits import clamp_embedding_batch_size
+
 
 # ==================== 嵌入向量基类 ====================
 
@@ -259,7 +261,14 @@ class QwenEmbedding(EmbeddingBase):
             extra_headers: 额外请求头
             batch_size: 批量请求大小
         """
-        super().__init__(api_url, api_key, model_name, timeout, extra_headers, batch_size=batch_size)
+        super().__init__(
+            api_url,
+            api_key,
+            model_name,
+            timeout,
+            extra_headers,
+            batch_size=clamp_embedding_batch_size(model_name or "", batch_size),
+        )
 
     def _embed(self, texts: List[str]) -> np.ndarray:
         """调用 Qwen API 获取嵌入向量"""

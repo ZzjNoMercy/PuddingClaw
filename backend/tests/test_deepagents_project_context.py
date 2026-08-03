@@ -150,3 +150,16 @@ def test_default_agent_prompt_requires_chinese_user_visible_output() -> None:
     assert "所有对用户可见的输出必须使用中文" in prompt
     assert "工具调用前后的过渡语" in prompt
     assert "内部隐藏推理可以使用英文" in prompt
+
+
+def test_default_agent_prompt_routes_internal_knowledge_sources_together() -> None:
+    prompt = (Path(__file__).resolve().parent.parent / "prompts" / "deepagents" / "AGENTS.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "## Knowledge Source Routing" in prompt
+    assert "同时读取 `/skills/knowledge-search/SKILL.md` 与 `/skills/llm-wiki/SKILL.md`" in prompt
+    assert "不要因为其中一路先返回结果而跳过另一路" in prompt
+    assert "向文档知识库和 Wiki/GBrain 提交语义等价的查询" in prompt
+    assert "否则使用 `llm_wiki_query`" in prompt
+    assert "只有全部可用的内部来源均返回无结果、知识缺口或资料明显不足时" in prompt

@@ -1192,7 +1192,7 @@ export default function AnalyticsWorkbenchPage() {
 
         <main className="workspace-content-frame flex min-w-0 flex-1 flex-col overflow-hidden">
           <div className="flex-1 overflow-y-auto">
-            <div className="mx-auto flex w-full max-w-[1400px] flex-col gap-5 px-5 py-6">
+            <div className="workspace-page-container flex flex-col gap-5">
               <div className="flex items-center justify-between gap-4">
                 <div>
                   <h1 className="text-2xl font-semibold tracking-tight text-gray-950">智能问数</h1>
@@ -4837,8 +4837,8 @@ function DimensionDefinitionEditorModal({
   };
 
   return (
-    <div className="fixed inset-0 z-[140] flex items-center justify-center bg-black/40 px-4 py-6 backdrop-blur-sm">
-      <div className={`flex max-h-[90vh] w-[96vw] flex-col overflow-hidden rounded-[28px] bg-white shadow-2xl ring-1 ring-black/[0.08] ${tab === "matching" ? "max-w-[1720px]" : "max-w-5xl"}`}>
+    <div className="fixed inset-0 z-[140] flex items-start justify-center bg-black/40 px-4 py-[5vh] backdrop-blur-sm">
+      <div className="flex max-h-[90vh] w-[96vw] max-w-5xl flex-col overflow-hidden rounded-[28px] bg-white shadow-2xl ring-1 ring-black/[0.08]">
         <div className="flex items-start justify-between gap-4 border-b border-black/[0.06] px-6 py-5">
           <div>
             <h3 className="text-lg font-semibold text-gray-950">编辑维度</h3>

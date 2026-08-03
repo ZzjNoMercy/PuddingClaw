@@ -489,6 +489,7 @@ class GoalCoordinator:
         *,
         objective: str,
         expected_revision: int,
+        task_profile: RunTaskProfile | None = None,
     ) -> GoalRecord:
         """Create an auditable Goal revision and rebuild its acceptance contract."""
 
@@ -528,9 +529,13 @@ class GoalCoordinator:
             if isinstance(rubric, dict) and rubric.get("custom_rules_enabled", False)
             else []
         )
-        profile = TaskProfileClassifier.classify(
-            message=normalized,
-            analytics_model_id=(str(analytics_model_id) if analytics_model_id else None),
+        profile = (
+            task_profile.model_copy(deep=True)
+            if task_profile is not None
+            else TaskProfileClassifier.classify(
+                message=normalized,
+                analytics_model_id=(str(analytics_model_id) if analytics_model_id else None),
+            )
         )
         contract = CompletionVerificationCoordinator.compile_contract(
             user_message=normalized,

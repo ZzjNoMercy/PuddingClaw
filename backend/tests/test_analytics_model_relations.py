@@ -43,15 +43,12 @@ def _prepare_relations(tmp_path) -> tuple[str, str]:
 
 
 def test_template_paths_have_one_model_relative_canonical_form() -> None:
-    assert canonical_model_resource_path(
-        "monthly/index.html", root="templates"
-    ) == "templates/monthly/index.html"
-    assert canonical_model_resource_path(
-        "templates/monthly/index.html", root="templates"
-    ) == "templates/monthly/index.html"
-    assert canonical_model_resource_path(
-        "references/rules.md", root="references"
-    ) == "references/rules.md"
+    assert canonical_model_resource_path("monthly/index.html", root="templates") == "templates/monthly/index.html"
+    assert (
+        canonical_model_resource_path("templates/monthly/index.html", root="templates")
+        == "templates/monthly/index.html"
+    )
+    assert canonical_model_resource_path("references/rules.md", root="references") == "references/rules.md"
     for invalid in (
         "/tmp/report.html",
         "C:/tmp/report.html",
@@ -219,9 +216,7 @@ def test_model_import_keeps_javascript_template_bundle(tmp_path: Path) -> None:
 
     assert "monthly/templates/report/renderer.js" in result["imported"]
     detail = models.get_model("monthly")
-    assert "templates/report/renderer.js" in {
-        item["relative_path"] for item in detail["files"]
-    }
+    assert "templates/report/renderer.js" in {item["relative_path"] for item in detail["files"]}
 
 
 def test_model_requires_connected_selected_relation(tmp_path) -> None:
@@ -338,6 +333,58 @@ def test_model_normalizes_legacy_repeated_semantic_prefixes(tmp_path) -> None:
     )
 
     assert created["frontmatter"]["semantic_assets"]["dimensions"] == ["dimension:车系"]
+
+
+def test_model_create_round_trips_source_backed_table_aliases(tmp_path: Path) -> None:
+    models = AnalyticsModelRegistry(tmp_path)
+
+    created = models.create_model(
+        name="带表别名的模型",
+        data_assets={
+            "tables": ["dbs_source.vehicle_model_base"],
+            "table_aliases": {
+                "dbs_source.vehicle_model_base": ["base", "基础表", "BASE"],
+            },
+        },
+    )
+
+    assert created["frontmatter"]["data_assets"] == {
+        "tables": ["dbs_source.vehicle_model_base"],
+        "table_aliases": {
+            "dbs_source.vehicle_model_base": ["base", "基础表"],
+        },
+    }
+
+
+def test_model_rejects_alias_target_outside_declared_tables(tmp_path: Path) -> None:
+    models = AnalyticsModelRegistry(tmp_path)
+
+    with pytest.raises(AnalyticsModelError, match="undeclared database table"):
+        models.create_model(
+            name="越界表别名",
+            data_assets={
+                "tables": ["dbs_source.vehicle_model_base"],
+                "table_aliases": {"dbs_source.vehicle_params": ["vehicle"]},
+            },
+        )
+
+
+def test_model_rejects_alias_that_shadows_another_physical_table(tmp_path: Path) -> None:
+    models = AnalyticsModelRegistry(tmp_path)
+
+    with pytest.raises(AnalyticsModelError, match="conflicts with physical table identifier"):
+        models.create_model(
+            name="冲突表别名",
+            data_assets={
+                "tables": [
+                    "dbs_source.vehicle_params",
+                    "dbs_source.vehicle_model_base",
+                ],
+                "table_aliases": {
+                    "dbs_source.vehicle_model_base": ["vehicle_params"],
+                },
+            },
+        )
 
 
 def test_model_context_injects_selected_virtual_dataset_summary(tmp_path) -> None:
