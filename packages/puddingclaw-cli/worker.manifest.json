@@ -1,0 +1,26 @@
+{
+  "schemaVersion": "1",
+  "id": "puddingclaw",
+  "name": "PuddingClaw",
+  "description": "企业数据分析、NL2SQL、知识查询和指标归因 Worker",
+  "kind": "agent-worker",
+  "protocolVersion": "1",
+  "transport": {
+    "type": "cli",
+    "command": "puddingclaw",
+    "input": "stdin-json",
+    "output": "stdout-json"
+  },
+  "capabilities": ["data.query", "data.analysis", "data.nl2sql", "knowledge.query"],
+  "modelSelection": {
+    "type": "analytics_model",
+    "required": true,
+    "discoveryCommand": ["models", "list", "--json"]
+  },
+  "commands": {
+    "probe": ["doctor", "--json"],
+    "capabilities": ["capabilities", "--json"],
+    "models": ["models", "list", "--json"],
+    "run": ["run", "--input-json", "-", "--json"]
+  }
+}

@@ -283,6 +283,11 @@ class SessionManager:
             "analytics_model_id",
             "llm_model_id",
             "thinking_level",
+            "headless_enabled",
+            "worker_key_id",
+            "platform_id",
+            "worker_id",
+            "interaction_mode",
         ):
             if key in data:
                 meta[key] = data.get(key)
@@ -388,6 +393,11 @@ class SessionManager:
             "analytics_model_id",
             "llm_model_id",
             "thinking_level",
+            "headless_enabled",
+            "worker_key_id",
+            "platform_id",
+            "worker_id",
+            "interaction_mode",
         }
         forbidden = set(metadata) - allowed_keys
         if forbidden:

@@ -77,6 +77,7 @@ from graph.deepagents_prompt_builder import build_deepagents_system_prompt
 from graph.dimension_build_resume import dimension_build_resume_registry
 from graph.live_tool_output import project_live_tool_output
 from graph.logical_dataset_resume import logical_dataset_resume_registry
+from graph.headless_resolver import HeadlessInterruptResolver
 from graph.managed_paths import is_managed_resource_path
 from graph.middleware_trace_proxy import wrap_middlewares_for_trace
 from graph.middlewares.analysis_templates import AnalysisTemplateMiddleware
@@ -4862,31 +4863,40 @@ class DeepAgentsAgentManager:
                 "skill_plan_confirmation_request": "skill_plan_confirmation_resolved",
             }
             goal_id = str(context.get("goal_id") or "")
-            decision_tasks = [
-                asyncio.create_task(resume_registries[interrupted_type].wait(str(interrupted_request.get("id") or "")))
-                for interrupted_type, interrupted_request, _interrupt_id in pending_interrupts
-            ]
-            try:
-                while not all(task.done() for task in decision_tasks):
-                    await asyncio.wait(decision_tasks, timeout=0.25)
-                    if not goal_id:
-                        continue
-                    authoritative_goal = session_manager.get_goal_state(session_id, goal_id)
-                    if (
-                        not isinstance(authoritative_goal, dict)
-                        or str(authoritative_goal.get("status") or "") != "active"
-                        or bool(authoritative_goal.get("requested_status"))
-                        or str(authoritative_goal.get("current_run_id") or "") != run_id
-                        or int(authoritative_goal.get("objective_revision") or 1)
-                        != int(context.get("goal_revision") or 1)
-                    ):
-                        raise asyncio.CancelledError("Goal control changed while waiting for user input")
-                decisions = [task.result() for task in decision_tasks]
-            finally:
-                for task in decision_tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*decision_tasks, return_exceptions=True)
+            if str(context.get("interaction_mode") or "interactive") == "auto":
+                resolver = HeadlessInterruptResolver(context=context)
+                decisions = [
+                    resolver.resolve(interrupted_type, interrupted_request)
+                    for interrupted_type, interrupted_request, _interrupt_id in pending_interrupts
+                ]
+            else:
+                decision_tasks = [
+                    asyncio.create_task(
+                        resume_registries[interrupted_type].wait(str(interrupted_request.get("id") or ""))
+                    )
+                    for interrupted_type, interrupted_request, _interrupt_id in pending_interrupts
+                ]
+                try:
+                    while not all(task.done() for task in decision_tasks):
+                        await asyncio.wait(decision_tasks, timeout=0.25)
+                        if not goal_id:
+                            continue
+                        authoritative_goal = session_manager.get_goal_state(session_id, goal_id)
+                        if (
+                            not isinstance(authoritative_goal, dict)
+                            or str(authoritative_goal.get("status") or "") != "active"
+                            or bool(authoritative_goal.get("requested_status"))
+                            or str(authoritative_goal.get("current_run_id") or "") != run_id
+                            or int(authoritative_goal.get("objective_revision") or 1)
+                            != int(context.get("goal_revision") or 1)
+                        ):
+                            raise asyncio.CancelledError("Goal control changed while waiting for user input")
+                    decisions = [task.result() for task in decision_tasks]
+                finally:
+                    for task in decision_tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*decision_tasks, return_exceptions=True)
             if goal_id:
                 authoritative_goal = session_manager.get_goal_state(session_id, goal_id)
                 if (
@@ -5870,6 +5880,11 @@ class DeepAgentsAgentManager:
         goal_id: str | None = None,
         context_goal_id: str | None = None,
         goal_control_action: str | None = None,
+        interaction_mode: str = "interactive",
+        authority_profile: str = "workspace",
+        authority_directories: list[str] | None = None,
+        authority_network_origins: list[str] | None = None,
+        analytics_model_snapshot: dict[str, Any] | None = None,
         callbacks_override: list[Any] | None = None,
         evaluation_tool_allowlist: set[str] | None = None,
         disable_mcp: bool = False,
@@ -6129,6 +6144,11 @@ class DeepAgentsAgentManager:
                 context_goal_id=run_context_goal_id,
                 context_goal_revision=context_goal_revision,
                 goal_turn_decision=turn_decision,
+                interaction_mode=interaction_mode,
+                authority_profile=authority_profile,
+                authority_directories=authority_directories,
+                authority_network_origins=authority_network_origins,
+                analytics_model_snapshot=analytics_model_snapshot,
                 callbacks_override=callbacks_override,
                 evaluation_tool_allowlist=evaluation_tool_allowlist,
                 disable_mcp=disable_mcp,
@@ -6284,6 +6304,11 @@ class DeepAgentsAgentManager:
         context_goal_id: str | None = None,
         context_goal_revision: int | None = None,
         goal_turn_decision: GoalTurnDecision | None = None,
+        interaction_mode: str = "interactive",
+        authority_profile: str = "workspace",
+        authority_directories: list[str] | None = None,
+        authority_network_origins: list[str] | None = None,
+        analytics_model_snapshot: dict[str, Any] | None = None,
         callbacks_override: list[Any] | None = None,
         evaluation_tool_allowlist: set[str] | None = None,
         disable_mcp: bool = False,
@@ -6517,6 +6542,13 @@ class DeepAgentsAgentManager:
                     },
                     "goals": goals_config,
                     "model_call_limit": harness_config.get("model_call_limit", {}),
+                    "interaction": {
+                        "mode": interaction_mode,
+                        "authority_profile": authority_profile,
+                    },
+                    "worker": {
+                        "analytics_model": dict(analytics_model_snapshot or {}),
+                    },
                 },
                 # Existing Goals freeze their completion policy. A later UI
                 # setting change must not silently disable the verifier for a
@@ -7140,27 +7172,28 @@ class DeepAgentsAgentManager:
                     },
                 )
 
+            stream_context = {
+                "session_id": session_id,
+                "query_id": query_id,
+                "run_id": run_record.run_id,
+                "goal_id": run_record.goal_id or "",
+                "goal_revision": run_record.goal_revision,
+                "user_id": user_id,
+                "project_id": project_id,
+                "workspace_path": str(workspace_path),
+                "permission_policy": permission_context.grant_bindings(),
+                "interaction_mode": interaction_mode,
+                "authority_profile": authority_profile,
+                "authority_directories": list(authority_directories or []),
+                "authority_network_origins": list(authority_network_origins or []),
+                "run_objective": run_record.objective,
+            }
             async for item in self._astream_with_hitl_resume(
                 agent,
                 initial_state,
                 stream_mode=["messages", "updates", "custom", "values"],
                 config=agent_config,
-                context={
-                    "session_id": session_id,
-                    "query_id": query_id,
-                    "run_id": run_record.run_id,
-                    "goal_id": run_record.goal_id or "",
-                    "goal_revision": run_record.goal_revision,
-                    "user_id": user_id,
-                    "project_id": project_id,
-                    "workspace_path": str(workspace_path),
-                    "permission_policy": permission_context.grant_bindings(),
-                    # The main agent receives cross-Run history, but the grader
-                    # owns exactly one Run. The middleware copies this trusted
-                    # objective into private state and matches query_id against
-                    # the marker on the current HumanMessage.
-                    "run_objective": run_record.objective,
-                },
+                context=stream_context,
                 trace_collector=trace_collector,
             ):
                 if title_task is not None and title_task.done() and not title_event_emitted:
@@ -8068,11 +8101,25 @@ class DeepAgentsAgentManager:
                     "message": detail,
                 }
             else:
-                run_record, goal_record, verification_report = self._run_coordinator.complete_from_final_state(
-                    run_record,
-                    goal_record,
-                    verification_state,
-                )
+                if stream_context.get("_headless_needs_input") and run_record.status == RunStatus.RUNNING:
+                    run_record = self._run_coordinator.fail(
+                        run_record,
+                        outcome=RunOutcome.BLOCKED,
+                        error="headless_business_confirmation_required",
+                    )
+                    if goal_record is not None:
+                        self._run_coordinator.goals.release_run(
+                            goal_record,
+                            run=run_record,
+                            gap="该任务需要业务确认，Headless Worker 未代替用户作决定。",
+                        )
+                    verification_report = None
+                else:
+                    run_record, goal_record, verification_report = self._run_coordinator.complete_from_final_state(
+                        run_record,
+                        goal_record,
+                        verification_state,
+                    )
             completion_accepted = bool(
                 run_record.outcome == RunOutcome.COMPLETED
                 and (
@@ -8219,6 +8266,11 @@ class DeepAgentsAgentManager:
                     "outcome": run_record.outcome.value if run_record.outcome else None,
                     "budget_exhaustion_reason": run_record.budget_exhaustion_reason,
                     "model_call_count": run_record.model_call_count,
+                    "auto_resolved": list(stream_context.get("_headless_auto_resolved") or []),
+                    "interrupt_summary": dict(
+                        stream_context.get("_headless_interrupt_summary")
+                        or {"total": 0, "auto_approved": 0, "auto_rejected": 0, "by_type": {}}
+                    ),
                 },
             )
             if run_limit_payload is not None:
@@ -8555,6 +8607,11 @@ class DeepAgentsAgentManager:
                 )
                 if run_record is not None:
                     user_input_resume_registry.reject_run(
+                        session_id,
+                        run_record.run_id,
+                        "Agent stream was cancelled by the client.",
+                    )
+                    skill_plan_resume_registry.reject_run(
                         session_id,
                         run_record.run_id,
                         "Agent stream was cancelled by the client.",

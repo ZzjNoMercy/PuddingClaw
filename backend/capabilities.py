@@ -11,6 +11,7 @@ import logging
 import os
 import socket
 from dataclasses import dataclass
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
@@ -20,6 +21,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from config import get_database_config, get_knowledge_mineru_config, load_config
+from cli_runtime import current_cli_runtime_status
 from postgres_dependencies import PGVECTOR_STATUS_SQL, normalize_pgvector_status
 
 logger = logging.getLogger(__name__)
@@ -37,9 +39,13 @@ DEFAULT_POSTGRES_URL = ""
 class CapabilityStatus:
     available: bool
     reason: str | None = None
+    details: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"available": self.available, "reason": self.reason}
+        result: dict[str, Any] = {"available": self.available, "reason": self.reason}
+        if self.details:
+            result["details"] = self.details
+        return result
 
 
 @dataclass
@@ -49,15 +55,39 @@ class Capabilities:
     docker: CapabilityStatus
     milvus: CapabilityStatus
     mineru: CapabilityStatus
+    cli: CapabilityStatus | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "database": self.database.to_dict(),
             "pgvector": self.pgvector.to_dict(),
             "docker": self.docker.to_dict(),
             "milvus": self.milvus.to_dict(),
             "mineru": self.mineru.to_dict(),
         }
+        if self.cli is not None:
+            result["cli"] = self.cli.to_dict()
+        return result
+
+
+def _check_cli() -> CapabilityStatus:
+    status = current_cli_runtime_status(Path(__file__).resolve().parent)
+    installed = bool(status.get("installed"))
+    details = {
+        "安装状态": "已安装" if installed else "未安装",
+        "版本": str(status.get("version") or "未检测到"),
+        "Node.js": str((status.get("node") or {}).get("version") or "未检测到"),
+        "npm": str((status.get("npm") or {}).get("version") or "未检测到"),
+        "安装策略": str(status.get("install_policy") or "未配置"),
+    }
+    message = str(status.get("install_message") or "").strip()
+    if message:
+        details["检测说明"] = message
+    return CapabilityStatus(
+        available=installed,
+        reason=None if installed else (message or "PuddingClaw CLI 尚未安装"),
+        details=details,
+    )
 
 
 async def _check_http_get(url: str, path: str, timeout: float = 3.0) -> CapabilityStatus:
@@ -231,6 +261,7 @@ async def detect_capabilities(
         docker=results[2],
         milvus=results[3],
         mineru=results[4],
+        cli=_check_cli(),
     )
 
     _CAPABILITIES_CACHE = caps
@@ -313,6 +344,7 @@ def _detect_capabilities_sync_fallback(
         docker=_check_docker_sync(),
         milvus=_check_milvus_sync(milvus_target),
         mineru=_check_http_get_sync(mineru_target, "/health"),
+        cli=_check_cli(),
     )
     _CAPABILITIES_CACHE = caps
     _CAPABILITIES_CACHED_AT = datetime.now(timezone.utc)

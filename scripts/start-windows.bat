@@ -95,6 +95,12 @@ echo.
 echo   后端 API:  %BACKEND_URL%
 echo   前端界面:  http://127.0.0.1:%FRONTEND_PORT%
 echo   API 文档:  %BACKEND_URL%/docs
+where puddingclaw >nul 2>&1
+if errorlevel 1 (
+    echo   Worker CLI:  当前未安装；后端启动后将按 PUDDINGCLAW_CLI_INSTALL_POLICY 后台检测/安装
+) else (
+    echo   Worker CLI:  已安装
+)
 echo.
 echo ============================================
 echo   按 Ctrl+C 停止所有服务

@@ -1433,7 +1433,7 @@ class ToolsetMiddleware(AgentMiddleware):
             else {}
         )
         approval_mode = str(permissions.get("approval_mode") or "strict")
-        if approval_mode not in {"strict", "smart"}:
+        if approval_mode not in {"strict", "smart", "full_access"}:
             approval_mode = "strict"
         active_tool_names = self._allowed_tool_names(
             request.state,

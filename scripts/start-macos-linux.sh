@@ -111,6 +111,11 @@ echo "    数据库优先使用 Settings 中的配置；如需命令行强制覆
 echo "  模型服务:      Provider 直连（在 Settings > 模型服务 中配置）"
 echo "  Milvus:          ${MILVUS_SERVICE_URL}"
 echo "  MinerU API:      ${MINERU_API_URL}"
+if command -v puddingclaw >/dev/null 2>&1; then
+    echo "  Worker CLI:      已安装 ($(command -v puddingclaw))"
+else
+    echo "  Worker CLI:      当前未安装；后端启动后将按 PUDDINGCLAW_CLI_INSTALL_POLICY 后台检测/安装"
+fi
 echo ""
 echo -e "${YELLOW}[提示] 模型服务请在 Settings > 模型服务 中配置，运行时将直连已启用的 Provider${NC}"
 echo -e "${YELLOW}       如需使用 PostgreSQL / Milvus / MinerU，请确保对应服务已启动${NC}"

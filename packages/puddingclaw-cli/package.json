@@ -1,0 +1,14 @@
+{
+  "name": "@pudding/worker-puddingclaw",
+  "version": "0.1.0",
+  "description": "PuddingClaw Worker Plugin CLI",
+  "type": "module",
+  "bin": {
+    "puddingclaw": "dist/cli.js"
+  },
+  "files": ["dist", "src", "worker.manifest.json", "tsconfig.json"],
+  "engines": {"node": ">=20"},
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  }
+}

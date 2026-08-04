@@ -61,6 +61,11 @@ echo ""
 echo "  前端界面: ${FRONTEND_URL}"
 echo "  后端 API: ${BACKEND_URL}"
 echo "  API 文档: ${BACKEND_URL}/docs"
+if command -v puddingclaw >/dev/null 2>&1; then
+    echo "  Worker CLI: 已安装 ($(command -v puddingclaw))"
+else
+    echo "  Worker CLI: 未检测到宿主机命令；Docker 后端 CLI 状态请查看 backend 日志"
+fi
 echo ""
 echo "  常用命令："
 echo "    查看日志: $COMPOSE_CMD logs -f backend"

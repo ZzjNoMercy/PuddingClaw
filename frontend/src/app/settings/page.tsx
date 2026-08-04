@@ -68,6 +68,7 @@ import {
 } from "@/lib/api";
 import MemoryEditor from "@/components/settings/MemoryEditor";
 import CapabilitiesStatus from "@/components/settings/CapabilitiesStatus";
+import WorkerAccessKeysPanel from "@/components/settings/WorkerAccessKeysPanel";
 import Navbar from "@/components/layout/Navbar";
 import Link from "next/link";
 import deepseekLogo from "@lobehub/icons-static-svg/icons/deepseek-color.svg";
@@ -75,7 +76,7 @@ import bailianLogo from "@lobehub/icons-static-svg/icons/bailian-color.svg";
 import moonshotLogo from "@lobehub/icons-static-svg/icons/moonshot.svg";
 import siliconFlowLogo from "@lobehub/icons-static-svg/icons/siliconcloud-color.svg";
 
-type SettingsCategory = "ai" | "project" | "databaseQa" | "rag" | "knowledge" | "memory" | "harness" | "advanced" | "system";
+type SettingsCategory = "ai" | "project" | "databaseQa" | "rag" | "knowledge" | "memory" | "harness" | "worker" | "advanced" | "system";
 type SubAgentConfigMap = Record<string, Omit<SubAgentItem, "name">>;
 type PendingModelCategoryEdit = {
   providerId: string;
@@ -113,6 +114,7 @@ const CATEGORIES: { key: SettingsCategory; label: string; icon: React.ElementTyp
   { key: "knowledge", label: "知识库", icon: FolderOpen, color: "#002fa7" },
   { key: "memory", label: "记忆管理", icon: Brain, color: "#002fa7" },
   { key: "harness", label: "Harness 配置", icon: Bot, color: "#002fa7" },
+  { key: "worker", label: "Worker 接入", icon: KeyRound, color: "#002fa7" },
   { key: "advanced", label: "高级设置", icon: Sliders, color: "#6b7280" },
   { key: "system", label: "系统状态", icon: Activity, color: "#002fa7" },
 ];
@@ -3960,6 +3962,9 @@ export default function SettingsPage() {
                 </div>
               </div>
             )}
+            {/* Worker Access */}
+            {category === "worker" && <WorkerAccessKeysPanel />}
+
             {/* Memory Editor */}
             {category === "memory" && (
               <div className="h-[calc(100vh-140px)]">
@@ -3996,7 +4001,7 @@ export default function SettingsPage() {
             )}
 
             {/* Save Button */}
-            {category !== "ai" && category !== "databaseQa" && <div className="flex justify-end pt-2 pb-8">
+            {category !== "ai" && category !== "databaseQa" && category !== "worker" && category !== "system" && <div className="flex justify-end pt-2 pb-8">
               <button
                 onClick={handleSave}
                 disabled={saving}

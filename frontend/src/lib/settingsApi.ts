@@ -518,6 +518,7 @@ export async function testDatabaseConnection(params: {
 export interface CapabilityStatus {
   available: boolean;
   reason: string | null;
+  details?: Record<string, string>;
 }
 
 export interface Capabilities {
@@ -526,6 +527,7 @@ export interface Capabilities {
   docker: CapabilityStatus;
   milvus: CapabilityStatus;
   mineru: CapabilityStatus;
+  cli: CapabilityStatus;
 }
 
 export async function getCapabilities(): Promise<Capabilities> {

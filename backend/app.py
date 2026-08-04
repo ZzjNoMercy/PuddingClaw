@@ -91,6 +91,29 @@ async def _warm_mcp_discovery(
 
 
 @asynccontextmanager
+async def _install_cli_runtime_in_background() -> None:
+    """Install the optional CLI after the backend has become ready."""
+
+    from cli_runtime import ensure_cli_runtime
+
+    try:
+        status = await asyncio.to_thread(ensure_cli_runtime, BASE_DIR)
+        if status.get("installed"):
+            print(
+                f"🧩 Worker CLI ready: {status.get('command')} "
+                f"v{status.get('version')} ({status.get('path')})"
+            )
+        else:
+            print(
+                "⚠️ Worker CLI remains unavailable; backend is still usable. "
+                f"{status.get('install_message') or 'install it separately when needed.'}"
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        print(f"⚠️ Worker CLI background setup failed; backend will continue: {exc}")
+
+
 async def lifespan(app: FastAPI):
     """Startup: scan skills, initialize agent, build memory index."""
     import traceback
@@ -105,6 +128,8 @@ async def lifespan(app: FastAPI):
     from graph.deepagents_manager import deepagents_agent_manager
     from graph.memory_indexer import get_memory_indexer
     from graph.session_manager import session_manager
+    from cli_runtime import detect_cli_runtime
+    from worker_access import worker_access_store
     from knowledge.import_worker import knowledge_import_worker_manager
     from knowledge.semantic_dimension_worker import semantic_dimension_build_worker_manager
     from projects.registry import project_registry
@@ -117,6 +142,19 @@ async def lifespan(app: FastAPI):
     attachment_store.initialize(BASE_DIR)
     # SQL Evidence catalog backfill needs the durable Session owner index.
     session_manager.initialize(BASE_DIR)
+    worker_access_store.initialize(BASE_DIR)
+    cli_status = detect_cli_runtime(BASE_DIR)
+    if not cli_status.get("installed"):
+        print(
+            "ℹ️ Worker CLI not ready yet; backend startup will continue. "
+            f"Policy={cli_status.get('install_policy')}; "
+            "an optional background setup may install it."
+        )
+        if cli_status.get("install_policy") in {"auto", "prompt"}:
+            app.state.cli_runtime_install_task = asyncio.create_task(
+                _install_cli_runtime_in_background(),
+                name="puddingclaw-cli-runtime-setup",
+            )
     db_ready = await init_database()
     if db_ready:
         print("🗄️ Knowledge catalog database ready")
@@ -167,6 +205,10 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        cli_task = getattr(app.state, "cli_runtime_install_task", None)
+        if cli_task is not None and not cli_task.done():
+            cli_task.cancel()
+            await asyncio.gather(cli_task, return_exceptions=True)
         await evaluation_worker_manager.stop()
         await query_result_cleanup_manager.stop()
         await semantic_dimension_build_worker_manager.stop()
@@ -218,6 +260,8 @@ from api.user_input_requests import router as user_input_requests_router
 from api.connectors import router as connectors_router
 from api.brain_schema import router as brain_schema_router
 from api.llm_wiki import router as llm_wiki_router
+from api.headless import router as headless_router
+from api.headless import worker_access_router
 
 app.include_router(chat_router, prefix="/api")
 app.include_router(agent_router, prefix="/api")
@@ -245,6 +289,8 @@ app.include_router(user_input_requests_router, prefix="/api")
 app.include_router(connectors_router, prefix="/api")
 app.include_router(brain_schema_router, prefix="/api")
 app.include_router(llm_wiki_router, prefix="/api")
+app.include_router(headless_router, prefix="/api")
+app.include_router(worker_access_router, prefix="/api")
 
 
 @app.get("/")

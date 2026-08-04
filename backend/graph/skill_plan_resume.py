@@ -45,7 +45,10 @@ class SkillPlanResumeRegistry:
         if future is None:
             request = self._requests.get(request_id) or {}
             return dict(request.get("decision") or {"action": "cancel"})
-        return await future
+        try:
+            return await future
+        finally:
+            self._pending.pop(request_id, None)
 
     def record(self, *, session_id: str, plan_id: str, status: str) -> bool:
         for request_id, request in self._requests.items():
@@ -69,6 +72,45 @@ class SkillPlanResumeRegistry:
                     loop.call_soon_threadsafe(future.set_result, decision)
             return True
         return False
+
+    def cancel(self, request_id: str, message: str = "") -> dict[str, Any] | None:
+        """Cancel a pending plan request through the registry's own future."""
+
+        request = self._requests.get(request_id)
+        if request is None or request.get("status") != "pending":
+            return None
+        decision = {"action": "cancel"}
+        if message:
+            decision["reason"] = message
+        request["status"] = "resolved"
+        request["resolved_at"] = time.time()
+        request["decision"] = decision
+        future = self._pending.get(request_id)
+        if future is not None and not future.done():
+            future.set_result(decision)
+        return decision
+
+    def reject_session(self, session_id: str, message: str) -> int:
+        count = 0
+        for request_id, request in list(self._requests.items()):
+            if request.get("session_id") != session_id or request.get("status") != "pending":
+                continue
+            if self.cancel(request_id, message) is not None:
+                count += 1
+        return count
+
+    def reject_run(self, session_id: str, run_id: str, message: str) -> int:
+        count = 0
+        for request_id, request in list(self._requests.items()):
+            if (
+                request.get("session_id") != session_id
+                or str(request.get("run_id") or "") != run_id
+                or request.get("status") != "pending"
+            ):
+                continue
+            if self.cancel(request_id, message) is not None:
+                count += 1
+        return count
 
 
 skill_plan_resume_registry = SkillPlanResumeRegistry()

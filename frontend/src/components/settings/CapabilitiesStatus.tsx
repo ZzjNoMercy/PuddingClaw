@@ -10,6 +10,7 @@ import {
   Database,
   FileText,
   Loader2,
+  Terminal,
   XCircle,
 } from "lucide-react";
 import { getCapabilities, type Capabilities, type CapabilityStatus } from "@/lib/settingsApi";
@@ -84,6 +85,16 @@ const SERVICE_META: Record<
       { label: "降级策略", value: "不可用时，跳过版面解析，仅处理文本内容" },
     ],
   },
+  cli: {
+    label: "PuddingClaw CLI",
+    description: "本地终端调用 Headless API 的命令行客户端",
+    icon: Terminal,
+    color: "#002fa7",
+    details: [
+      { label: "用途", value: "puddingclaw run / doctor / models list" },
+      { label: "安装方式", value: "后端启动时按安装策略检测或后台安装" },
+    ],
+  },
 };
 
 function StatusBadge({ available }: { available: boolean }) {
@@ -156,7 +167,7 @@ function ServiceCard({
           >
             <div className="overflow-hidden">
               <div className="rounded-xl bg-black/[0.02] border border-black/[0.05] p-3 space-y-2">
-                {meta.details.map((d) => (
+                {[...meta.details, ...Object.entries(service.details || {}).map(([label, value]) => ({ label, value }))].map((d) => (
                   <div key={d.label} className="flex items-start gap-2">
                     <span className="text-[10px] font-medium text-gray-400 uppercase tracking-wide w-16 shrink-0 pt-0.5">
                       {d.label}
@@ -241,6 +252,7 @@ export default function CapabilitiesStatus({ refreshIntervalMs = 30000, onChange
     docker: false,
     milvus: false,
     mineru: false,
+    cli: false,
   });
 
   const fetchCapabilities = useCallback(async () => {

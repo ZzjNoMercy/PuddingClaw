@@ -15,6 +15,7 @@ class ApprovalMode(StrEnum):
 
     STRICT = "strict"
     SMART = "smart"
+    FULL_ACCESS = "full_access"
 
 
 DEFAULT_APPROVAL_MODE = ApprovalMode.STRICT
@@ -248,6 +249,12 @@ class RunPermissionContext:
     @property
     def smart(self) -> bool:
         return self.approval_mode == ApprovalMode.SMART
+
+    @property
+    def full_access(self) -> bool:
+        """Whether the caller requested the separately-scoped trusted mode."""
+
+        return self.approval_mode == ApprovalMode.FULL_ACCESS
 
     def grant_bindings(self) -> dict[str, Any]:
         return {

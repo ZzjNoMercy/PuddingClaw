@@ -341,7 +341,7 @@ class PermissionManifest(BaseModel):
 
     manifest_id: str
     run_id: str
-    approval_mode: Literal["strict", "smart"]
+    approval_mode: Literal["strict", "smart", "full_access"]
     allowed: list[dict[str, Any]] = Field(default_factory=list)
     hitl_required: list[dict[str, Any]] = Field(default_factory=list)
     blocked: list[dict[str, Any]] = Field(default_factory=list)
