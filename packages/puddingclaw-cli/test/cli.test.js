@@ -10,7 +10,7 @@ const cli = path.join(root, "dist", "cli.js");
 
 test("run maps model to analytics_model_id and keeps stdout JSON-only", async () => {
   const child = spawn(process.execPath, ["--import", path.join(root, "test", "mock-fetch.js"), cli, "run", "分析销售", "--model", "sales", "--json"], {
-    env: { ...process.env, PUDDING_PLATFORM_ID: "puddingteams", PUDDINGCLAW_URL: "http://127.0.0.1:8888", PUDDINGCLAW_TOKEN: "test-token", PUDDINGCLAW_PROJECTS_ROOT: "/tmp/puddingclaw-cli-test" },
+    env: { ...process.env, PUDDINGCLAW_URL: "http://127.0.0.1:8888", PUDDINGCLAW_TOKEN: "test-token", PUDDINGCLAW_PROJECTS_ROOT: "/tmp/puddingclaw-cli-test" },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let stdout = ""; let stderr = "";
@@ -18,12 +18,12 @@ test("run maps model to analytics_model_id and keeps stdout JSON-only", async ()
   child.stderr.on("data", (chunk) => { stderr += chunk; });
   const [result] = await once(child, "close");
   assert.equal(result, 0, stderr);
-  assert.deepEqual(JSON.parse(stdout), { schema_version: "1", status: "completed", outcome: "completed", reply: "ok", analytics_model_id: "sales" });
+  assert.deepEqual(JSON.parse(stdout), { schema_version: "1", status: "completed", outcome: "completed", reply: "ok", final_response: "final ok", analytics_model_id: "sales" });
 });
 
 test("stdin JSON preserves non-ASCII message and maps model", async () => {
   const child = spawn(process.execPath, ["--import", path.join(root, "test", "mock-fetch.js"), cli, "run", "--input-json", "-", "--json"], {
-    env: { ...process.env, PUDDING_PLATFORM_ID: "puddingteams", PUDDINGCLAW_URL: "http://127.0.0.1:8888", PUDDINGCLAW_TOKEN: "test-token", PUDDINGCLAW_PROJECTS_ROOT: "/tmp/puddingclaw-cli-test" },
+    env: { ...process.env, PUDDINGCLAW_URL: "http://127.0.0.1:8888", PUDDINGCLAW_TOKEN: "test-token", PUDDINGCLAW_PROJECTS_ROOT: "/tmp/puddingclaw-cli-test" },
     stdio: ["pipe", "pipe", "pipe"],
   });
   let stdout = ""; let stderr = "";
@@ -33,4 +33,17 @@ test("stdin JSON preserves non-ASCII message and maps model", async () => {
   const [result] = await once(child, "close");
   assert.equal(result, 0, stderr);
   assert.equal(JSON.parse(stdout).analytics_model_id, "sales");
+});
+
+test("human-readable run output prefers final_response over aggregate reply", async () => {
+  const child = spawn(process.execPath, ["--import", path.join(root, "test", "mock-fetch.js"), cli, "run", "分析销售", "--model", "sales"], {
+    env: { ...process.env, PUDDINGCLAW_URL: "http://127.0.0.1:8888", PUDDINGCLAW_TOKEN: "test-token", PUDDINGCLAW_PROJECTS_ROOT: "/tmp/puddingclaw-cli-test" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = ""; let stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const [result] = await once(child, "close");
+  assert.equal(result, 0, stderr);
+  assert.equal(stdout, "final ok\n");
 });

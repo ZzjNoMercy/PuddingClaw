@@ -12,9 +12,11 @@ frontend/out/
 backend/.env
 backend/config.json
 frontend/.env
+skills/**/.env
 !backend/.env.example
 !backend/config.json.example
 !frontend/.env.example
+!skills/**/.env.example
 
 # Runtime data
 backend/sessions/

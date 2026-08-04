@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 from db import get_sessionmaker
 from knowledge.import_jobs import (
     LLM_WIKI_INGEST_KIND,
+    READ_LATER_CAPTURE_KIND,
     VANNA_ENTITY_IMPORT_KIND,
     claim_next_job,
     job_kind,
@@ -91,11 +92,23 @@ class KnowledgeImportWorkerManager:
                     from knowledge.llm_wiki_job_runner import process_llm_wiki_ingest_job
 
                     await process_llm_wiki_ingest_job(session, base_dir=base_dir, job=job)
+                elif kind == READ_LATER_CAPTURE_KIND:
+                    from knowledge.read_later import process_read_later_capture_job
+
+                    await process_read_later_capture_job(session, base_dir=base_dir, job=job)
                 else:
                     await process_import_job(session, base_dir=base_dir, job=job)
                 logger.info("[knowledge-worker] completed job_id=%s", job.id)
             except Exception as exc:
                 logger.exception("[knowledge-worker] failed job_id=%s", job.id)
+                if kind == READ_LATER_CAPTURE_KIND:
+                    from knowledge.models import ReadLaterItem
+
+                    item_id = str((job.job_metadata or {}).get("read_later_item_id") or "")
+                    item = await session.get(ReadLaterItem, item_id) if item_id else None
+                    if item is not None:
+                        item.parse_status = "failed"
+                        item.error_message = str(exc)
                 await mark_job_failed(session, job, exc)
             return True
 

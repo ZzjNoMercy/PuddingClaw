@@ -32,6 +32,7 @@ import {
 import Navbar from "@/components/layout/Navbar";
 import ResizeHandle from "@/components/layout/ResizeHandle";
 import Sidebar from "@/components/layout/Sidebar";
+import WorkspacePageHeader from "@/components/layout/WorkspacePageHeader";
 import {
   databaseQueryResultExportCsvUrl,
   createAnalyticsModel,
@@ -1193,15 +1194,11 @@ export default function AnalyticsWorkbenchPage() {
         <main className="workspace-content-frame flex min-w-0 flex-1 flex-col overflow-hidden">
           <div className="flex-1 overflow-y-auto">
             <div className="workspace-page-container flex flex-col gap-5">
-              <div className="flex items-center justify-between gap-4">
-                <div>
-                  <h1 className="text-2xl font-semibold tracking-tight text-gray-950">智能问数</h1>
-                  <p className="mt-2 max-w-3xl text-sm leading-6 text-gray-500">
-                    管理 Excel / CSV / TSV、数据库源等数据资产，生成 Profile，并为分析模型、度量值和自然语言问数做好准备。
-                    文件上传仍统一在知识库入口完成。
-                  </p>
-                </div>
-                <div className="flex items-center gap-2">
+              <WorkspacePageHeader
+                eyebrow="DATA WORKSPACE"
+                title="智能问数"
+                description="从数据资产开始，沉淀 Profile、语义模型与业务口径，再交给 Agent 完成可靠问数。"
+                actions={
                   <Link
                     href="/knowledge"
                     className="inline-flex h-10 items-center gap-2 rounded-full bg-[#002fa7]/10 px-4 text-sm font-medium text-[#002fa7] transition hover:bg-[#002fa7]/15"
@@ -1209,8 +1206,8 @@ export default function AnalyticsWorkbenchPage() {
                     <Upload className="h-4 w-4" />
                     上传文件
                   </Link>
-                </div>
-              </div>
+                }
+              />
 
               {toast ? (
                 <div

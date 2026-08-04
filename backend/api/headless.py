@@ -7,7 +7,6 @@ import hashlib
 import ipaddress
 import json
 import os
-import re
 import threading
 import time
 import uuid
@@ -29,8 +28,8 @@ from worker_access import WORKER_SCOPES, WorkerAccessError, worker_access_store
 router = APIRouter(prefix="/headless", tags=["headless-worker"])
 worker_access_router = APIRouter(tags=["worker-access-keys"])
 BASE_DIR = Path(__file__).resolve().parent.parent
-_IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _idempotency_lock = threading.RLock()
+_WORKER_PROJECT_NAME = "puddingclaw"
 
 
 class HeadlessRunRequest(BaseModel):
@@ -81,26 +80,19 @@ def _model_binding(model_id: str) -> dict[str, Any]:
     }
 
 
-def _platform_id() -> str:
-    value = os.getenv("PUDDING_PLATFORM_ID", "puddingteams").strip()
-    if not _IDENTITY_RE.fullmatch(value) or value in {".", ".."}:
-        raise HTTPException(status_code=503, detail="PUDDING_PLATFORM_ID is invalid")
-    return value
-
-
-def _projects_root(platform_id: str) -> Path:
+def _projects_root() -> Path:
     configured = os.getenv("PUDDINGCLAW_PROJECTS_ROOT", "").strip()
-    return (Path(configured).expanduser() if configured else Path.home()).resolve() / platform_id
+    return (Path(configured).expanduser() if configured else Path.home()).resolve() / _WORKER_PROJECT_NAME
 
 
-def _ensure_worker_project(platform_id: str) -> tuple[str, Path]:
-    path = _projects_root(platform_id)
+def _ensure_worker_project() -> tuple[str, Path]:
+    path = _projects_root()
     try:
         path.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise HTTPException(status_code=503, detail="Worker projects root is unavailable") from exc
     try:
-        record = project_registry.register(str(path), name=platform_id)
+        record = project_registry.register(str(path), name=_WORKER_PROJECT_NAME)
     except (FileNotFoundError, NotADirectoryError, KeyError) as exc:
         raise HTTPException(status_code=503, detail="Worker project is unavailable") from exc
     return record.project_id, path
@@ -155,13 +147,12 @@ def _idempotency_key(request: HeadlessRunRequest, header: str | None) -> str:
     return str(header or request.request_id or "").strip()
 
 
-def _request_hash(request: HeadlessRunRequest, *, principal: dict[str, Any], platform_id: str) -> str:
+def _request_hash(request: HeadlessRunRequest, *, principal: dict[str, Any]) -> str:
     payload = {
         "message": request.message,
         "analytics_model_id": request.analytics_model_id,
         "session_id": request.session_id,
         "metadata": request.metadata,
-        "platform_id": platform_id,
         "key_id": principal.get("key_id"),
     }
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
@@ -233,11 +224,11 @@ async def _consume_run(
     request: HeadlessRunRequest,
     session_id: str,
     project_id: str,
-    platform_id: str,
     approval_mode: str,
     authority: dict[str, Any],
 ) -> dict[str, Any]:
     final_content = ""
+    final_response = ""
     outcome: dict[str, Any] = {}
     verification: dict[str, Any] = {"status": "not_required", "summary": ""}
     needs_input: dict[str, Any] | None = None
@@ -272,8 +263,11 @@ async def _consume_run(
                         "status": report.get("status") or "not_required",
                         "summary": report.get("explanation") or "",
                     }
+                elif name == "final_response":
+                    final_response = str(payload.get("final_response") or "")
                 elif name == "done":
                     final_content = str(payload.get("content") or "")
+                    final_response = str(payload.get("final_response") or final_response)
                 elif name.endswith("_required"):
                     needs_input = _needs_input(name, payload) or needs_input
     finally:
@@ -285,12 +279,12 @@ async def _consume_run(
         "run_id": outcome.get("run_id"),
         "session_id": session_id,
         "project_id": project_id,
-        "platform_id": platform_id,
         "analytics_model_id": request.analytics_model_id,
         "approval_mode": approval_mode,
         "status": status_value,
         "outcome": final_outcome,
         "reply": final_content,
+        "final_response": final_response,
         "verification": verification,
         "budget_exhaustion_reason": outcome.get("budget_exhaustion_reason"),
         "model_call_count": outcome.get("model_call_count", 0),
@@ -303,8 +297,7 @@ async def _consume_run(
 @router.get("/health")
 async def worker_health(authorization: str | None = Header(default=None)):
     principal = _principal_for_scope(authorization, "worker:health")
-    platform_id = _platform_id()
-    project_id, path = _ensure_worker_project(platform_id)
+    project_id, path = _ensure_worker_project()
     cli_status = current_cli_runtime_status(BASE_DIR)
     cli_status.pop("path", None)
     cli_status.pop("package_dir", None)
@@ -317,7 +310,6 @@ async def worker_health(authorization: str | None = Header(default=None)):
         "authenticated": True,
         "reachable": True,
         "server_version": "0.1.0",
-        "platform_id": platform_id,
         "project_id": project_id,
         "workspace_ready": path.is_dir(),
         "capabilities": ["data.query", "data.analysis", "data.nl2sql", "knowledge.query"],
@@ -344,7 +336,6 @@ async def create_headless_run(
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
     principal = _principal_for_scope(authorization, "worker:runs:create")
-    platform_id = _platform_id()
     models = _model_options(principal)
     selected = str(request.analytics_model_id or "").strip()
     if not selected or not any(str(item.get("id")) == selected for item in models):
@@ -360,7 +351,7 @@ async def create_headless_run(
         }
         return response
     key = _idempotency_key(request, idempotency_key)
-    previous = _reserve_idempotency(key, _request_hash(request, principal=principal, platform_id=platform_id))
+    previous = _reserve_idempotency(key, _request_hash(request, principal=principal))
     if previous is not None:
         if previous.get("status") == "completed" and isinstance(previous.get("response"), dict):
             return previous["response"]
@@ -382,7 +373,6 @@ async def create_headless_run(
                 "headless_enabled": True,
                 "worker_id": "puddingclaw",
                 "worker_key_id": principal.get("key_id"),
-                "platform_id": platform_id,
                 "interaction_mode": "auto",
                 "analytics_model_id": selected,
             },
@@ -399,13 +389,12 @@ async def create_headless_run(
         if active:
             raise HTTPException(status_code=409, detail="Session already has an active Run")
         approval_mode = str(metadata.get("approval_mode") or approval_mode)
-    project_id, _workspace_path = _ensure_worker_project(platform_id)
+    project_id, _workspace_path = _ensure_worker_project()
     try:
         response = await _consume_run(
             request=request,
             session_id=session_id,
             project_id=project_id,
-            platform_id=platform_id,
             approval_mode=approval_mode,
             authority={**authority, "profile": authority_profile if approval_mode == "full_access" else "smart"},
         )
@@ -413,7 +402,6 @@ async def create_headless_run(
         response = {
             "schema_version": "1",
             "session_id": session_id,
-            "platform_id": platform_id,
             "status": "failed",
             "outcome": "timeout",
             "needs_input": None,

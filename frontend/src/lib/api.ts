@@ -1572,6 +1572,102 @@ export async function createLlmWikiIngestJob(
   return payload.job;
 }
 
+export type ReadLaterItem = {
+  id: string;
+  original_url: string;
+  canonical_url: string;
+  title: string;
+  site_name: string;
+  author: string;
+  description: string;
+  image_url: string;
+  virtual_path: string;
+  content_sha256: string;
+  parse_status: "queued" | "processing" | "ready" | "link_only" | "failed";
+  reading_status: "unread" | "read" | "archived";
+  error_message: string;
+  tags: string[];
+  note: string;
+  document_id: string | null;
+  raw_snapshot_path: string;
+  wiki_job_id: string;
+  fetched_at: string | null;
+  read_at: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  content?: string;
+};
+
+export async function saveReadLaterUrl(input: {
+  url: string;
+  title?: string;
+  note?: string;
+  tags?: string[];
+}): Promise<{ item: ReadLaterItem; job: KnowledgeImportJob | null; deduplicated: boolean }> {
+  const response = await fetch(`${API_BASE}/read-later`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(apiErrorMessage(text, `收藏链接失败：${response.status}`));
+  return JSON.parse(text);
+}
+
+export async function listReadLaterItems(options: {
+  readingStatus?: string;
+  parseStatus?: string;
+  search?: string;
+} = {}): Promise<ReadLaterItem[]> {
+  const params = new URLSearchParams();
+  if (options.readingStatus) params.set("reading_status", options.readingStatus);
+  if (options.parseStatus) params.set("parse_status", options.parseStatus);
+  if (options.search) params.set("search", options.search);
+  const response = await fetch(`${API_BASE}/read-later?${params.toString()}`, { cache: "no-store" });
+  const text = await response.text();
+  if (!response.ok) throw new Error(apiErrorMessage(text, `读取稍后读失败：${response.status}`));
+  return (JSON.parse(text).items || []) as ReadLaterItem[];
+}
+
+export async function getReadLaterItem(itemId: string): Promise<ReadLaterItem> {
+  const response = await fetch(`${API_BASE}/read-later/${encodeURIComponent(itemId)}`, { cache: "no-store" });
+  const text = await response.text();
+  if (!response.ok) throw new Error(apiErrorMessage(text, `读取收藏正文失败：${response.status}`));
+  return JSON.parse(text).item as ReadLaterItem;
+}
+
+export async function updateReadLaterItem(
+  itemId: string,
+  patch: Partial<Pick<ReadLaterItem, "reading_status" | "title" | "note" | "tags">>
+): Promise<ReadLaterItem> {
+  const response = await fetch(`${API_BASE}/read-later/${encodeURIComponent(itemId)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(apiErrorMessage(text, `更新收藏失败：${response.status}`));
+  return JSON.parse(text).item as ReadLaterItem;
+}
+
+export async function retryReadLaterItem(itemId: string): Promise<{ item: ReadLaterItem; job: KnowledgeImportJob }> {
+  const response = await fetch(`${API_BASE}/read-later/${encodeURIComponent(itemId)}/retry`, { method: "POST" });
+  const text = await response.text();
+  if (!response.ok) throw new Error(apiErrorMessage(text, `重新解析失败：${response.status}`));
+  return JSON.parse(text);
+}
+
+export async function compileReadLaterItems(itemIds: string[], importGbrain = false): Promise<KnowledgeImportJob> {
+  const response = await fetch(`${API_BASE}/read-later/compile`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ item_ids: itemIds, import_gbrain: importGbrain }),
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(apiErrorMessage(text, `提交 Wiki 编译失败：${response.status}`));
+  return JSON.parse(text).job as KnowledgeImportJob;
+}
+
 export async function listKnowledgeImportJobs(limit = 20): Promise<KnowledgeImportJob[]> {
   const params = new URLSearchParams({ limit: String(limit) });
   const response = await fetchWithTimeout(

@@ -9,7 +9,6 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   AlertCircle,
-  ArrowLeft,
   Bot,
   BookOpen,
   Check,
@@ -35,6 +34,8 @@ import {
 
 import Navbar from "@/components/layout/Navbar";
 import ResizeHandle from "@/components/layout/ResizeHandle";
+import KnowledgeWorkspaceHeader from "@/components/knowledge/KnowledgeWorkspaceHeader";
+import KnowledgeWorkspaceNav from "@/components/knowledge/KnowledgeWorkspaceNav";
 import Sidebar from "@/components/layout/Sidebar";
 import {
   compileLlmWikiGbrain,
@@ -1107,45 +1108,46 @@ export default function BrainSchemaPage() {
         ) : null}
 
         <main className="workspace-content-frame flex min-w-0 flex-1 flex-col overflow-hidden">
-          <header className="flex min-h-[72px] shrink-0 items-center gap-4 border-b border-black/[0.055] bg-white/80 px-5 backdrop-blur-xl">
-            <Link href="/knowledge" className="rounded-xl p-2 text-gray-400 hover:bg-black/[0.04] hover:text-gray-700" title="返回知识库">
-              <ArrowLeft className="h-4 w-4" />
-            </Link>
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2">
-                <DatabaseZap className="h-5 w-5 text-[#002fa7]" />
-                <h1 className="truncate text-lg font-semibold text-gray-950">LLM WiKi Studio</h1>
-              </div>
-              <p className="mt-0.5 truncate text-xs text-gray-500">统一管理 Wiki 编译、知识 Schema 与 Agent 操作契约</p>
+          <header className="shrink-0 bg-white/80 backdrop-blur-xl">
+            <div className="workspace-page-container flex flex-col gap-5 !pb-0">
+              <KnowledgeWorkspaceHeader
+                section="wiki"
+                actions={
+                  <>
+                    {bundle ? (
+                      <div className="hidden text-right lg:block">
+                        <p className="font-mono text-[10px] text-gray-400">BUNDLE</p>
+                        <p className="font-mono text-[11px] text-gray-600">{bundle.bundle_hash.slice(0, 12)}</p>
+                      </div>
+                    ) : null}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (!dirty || window.confirm("刷新会丢弃未保存的 Schema 草稿，继续吗？")) void load();
+                      }}
+                      disabled={loading}
+                      className="inline-flex h-9 items-center gap-1.5 rounded-full border border-black/[0.07] bg-white px-3 text-xs font-medium text-gray-700 disabled:opacity-50"
+                    >
+                      <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} /> 刷新
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void save()}
+                      disabled={!dirty || versionNeedsBump || saving || validating || Boolean(validationError) || !preview}
+                      title={versionNeedsBump ? `Schema 内容变化必须将版本升级到高于 ${bundle?.custom.manifest.version}` : undefined}
+                      className="inline-flex h-9 items-center gap-1.5 rounded-full bg-[#002fa7] px-4 text-xs font-medium text-white shadow-sm disabled:cursor-not-allowed disabled:opacity-35"
+                    >
+                      {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+                      保存 Schema
+                    </button>
+                  </>
+                }
+              />
+              <KnowledgeWorkspaceNav />
             </div>
-            {bundle ? (
-              <div className="hidden text-right lg:block">
-                <p className="font-mono text-[10px] text-gray-400">BUNDLE</p>
-                <p className="font-mono text-[11px] text-gray-600">{bundle.bundle_hash.slice(0, 12)}</p>
-              </div>
-            ) : null}
-            <button
-              type="button"
-              onClick={() => {
-                if (!dirty || window.confirm("刷新会丢弃未保存的 Schema 草稿，继续吗？")) void load();
-              }}
-              disabled={loading}
-              className="inline-flex h-9 items-center gap-1.5 rounded-full border border-black/[0.07] bg-white px-3 text-xs font-medium text-gray-700 disabled:opacity-50"
-            >
-              <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} /> 刷新
-            </button>
-            <button
-              type="button"
-              onClick={() => void save()}
-              disabled={!dirty || versionNeedsBump || saving || validating || Boolean(validationError) || !preview}
-              title={versionNeedsBump ? `Schema 内容变化必须将版本升级到高于 ${bundle?.custom.manifest.version}` : undefined}
-              className="inline-flex h-9 items-center gap-1.5 rounded-full bg-[#002fa7] px-4 text-xs font-medium text-white shadow-sm disabled:cursor-not-allowed disabled:opacity-35"
-            >
-              {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
-              保存 Schema
-            </button>
           </header>
 
+          <div className="workspace-page-width flex min-h-0 flex-1 flex-col overflow-hidden">
           {loading ? (
             <div className="flex flex-1 items-center justify-center text-sm text-gray-400">
               <Loader2 className="mr-2 h-5 w-5 animate-spin" /> 正在读取 gbrain 官方 Schema…
@@ -1216,7 +1218,7 @@ export default function BrainSchemaPage() {
               ) : null}
 
               <div className="flex min-h-0 flex-1 gap-4 p-5">
-                <section className="flex min-w-0 flex-[1.3] flex-col overflow-hidden rounded-[24px] border border-black/[0.06] bg-white/65">
+                <section className="flex min-w-0 flex-[1.3] flex-col overflow-hidden rounded-2xl border border-black/[0.06] bg-white/65">
                   <nav className="flex shrink-0 items-center gap-1 border-b border-black/[0.055] bg-white/85 p-2">
                     {([
                       ["workflow", "编译工作台", Bot],
@@ -1456,7 +1458,7 @@ export default function BrainSchemaPage() {
                   </div>
                 </section>
 
-                {tab !== "workflow" && rawPreviewOpen ? <aside className="flex min-w-0 flex-1 flex-col overflow-hidden rounded-[24px] border border-black/[0.06] bg-white">
+                {tab !== "workflow" && rawPreviewOpen ? <aside className="flex min-w-0 flex-1 flex-col overflow-hidden rounded-2xl border border-black/[0.06] bg-white">
                   <div className="flex shrink-0 items-center gap-2 border-b border-black/[0.055] px-3 py-2">
                     <Code2 className="h-4 w-4 text-gray-400" />
                     <span className="mr-auto text-xs font-semibold text-gray-700">原始文件预览</span>
@@ -1506,6 +1508,7 @@ export default function BrainSchemaPage() {
               </div>
             </div>
           )}
+          </div>
         </main>
       </div>
       {pageTypeEditor && draft ? (

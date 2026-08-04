@@ -14,11 +14,14 @@ import {
   RefreshCw,
   RotateCcw,
   Trash2,
+  Link2,
 } from "lucide-react";
 
 import Navbar from "@/components/layout/Navbar";
 import Sidebar from "@/components/layout/Sidebar";
 import ResizeHandle from "@/components/layout/ResizeHandle";
+import KnowledgeWorkspaceHeader from "@/components/knowledge/KnowledgeWorkspaceHeader";
+import KnowledgeWorkspaceNav from "@/components/knowledge/KnowledgeWorkspaceNav";
 import { useApp } from "@/lib/store";
 import {
   clearKnowledgeImportJobs,
@@ -75,7 +78,7 @@ function JobIcon({ status }: { status: string }) {
   return <Clock3 className="h-5 w-5 text-gray-400" />;
 }
 
-type JobFilter = "all" | "wiki" | "file" | "vector" | "entity";
+type JobFilter = "all" | "wiki" | "read_later" | "file" | "vector" | "entity";
 const JOB_PAGE_SIZE = 10;
 
 function isVectorPublishJob(job: KnowledgeImportJob): boolean {
@@ -90,20 +93,27 @@ function isLlmWikiJob(job: KnowledgeImportJob): boolean {
   return job.metadata?.kind === "llm_wiki_ingest" || job.file_type === "llm_wiki";
 }
 
+function isReadLaterJob(job: KnowledgeImportJob): boolean {
+  return job.metadata?.kind === "read_later_capture" || job.file_type === "url";
+}
+
 function jobKindLabel(job: KnowledgeImportJob): string {
   if (isLlmWikiJob(job)) return "Wiki 编译";
+  if (isReadLaterJob(job)) return "稍后读解析";
   if (isVannaEntityJob(job)) return "实体导入";
   return isVectorPublishJob(job) ? "向量导入" : "文件导入";
 }
 
 function jobKindClass(job: KnowledgeImportJob): string {
   if (isLlmWikiJob(job)) return "bg-violet-50 text-violet-700";
+  if (isReadLaterJob(job)) return "bg-cyan-50 text-cyan-700";
   if (isVannaEntityJob(job)) return "bg-amber-50 text-amber-700";
   return isVectorPublishJob(job) ? "bg-[#002fa7]/10 text-[#002fa7]" : "bg-emerald-50 text-emerald-700";
 }
 
 function filterLabel(filter: JobFilter): string {
   if (filter === "wiki") return "Wiki 编译";
+  if (filter === "read_later") return "稍后读";
   if (filter === "file") return "文件导入";
   if (filter === "vector") return "向量导入";
   if (filter === "entity") return "实体导入";
@@ -219,12 +229,14 @@ export default function KnowledgeImportJobsPage() {
   const vectorJobCount = useMemo(() => jobs.filter(isVectorPublishJob).length, [jobs]);
   const entityJobCount = useMemo(() => jobs.filter(isVannaEntityJob).length, [jobs]);
   const wikiJobCount = useMemo(() => jobs.filter(isLlmWikiJob).length, [jobs]);
-  const fileJobCount = Math.max(0, jobs.length - vectorJobCount - entityJobCount - wikiJobCount);
+  const readLaterJobCount = useMemo(() => jobs.filter(isReadLaterJob).length, [jobs]);
+  const fileJobCount = Math.max(0, jobs.length - vectorJobCount - entityJobCount - wikiJobCount - readLaterJobCount);
   const visibleJobs = useMemo(() => {
     if (jobFilter === "wiki") return jobs.filter(isLlmWikiJob);
+    if (jobFilter === "read_later") return jobs.filter(isReadLaterJob);
     if (jobFilter === "vector") return jobs.filter(isVectorPublishJob);
     if (jobFilter === "entity") return jobs.filter(isVannaEntityJob);
-    if (jobFilter === "file") return jobs.filter((job) => !isVectorPublishJob(job) && !isVannaEntityJob(job) && !isLlmWikiJob(job));
+    if (jobFilter === "file") return jobs.filter((job) => !isVectorPublishJob(job) && !isVannaEntityJob(job) && !isLlmWikiJob(job) && !isReadLaterJob(job));
     return jobs;
   }, [jobFilter, jobs]);
   const jobPageCount = Math.max(1, Math.ceil(visibleJobs.length / JOB_PAGE_SIZE));
@@ -265,14 +277,10 @@ export default function KnowledgeImportJobsPage() {
         <main className="workspace-content-frame flex min-w-0 flex-1 flex-col overflow-hidden">
           <div className="flex-1 overflow-y-auto">
             <div className="workspace-page-container flex flex-col gap-5">
-              <div className="flex items-center justify-between gap-4">
-                <div>
-                  <h1 className="text-2xl font-semibold tracking-tight text-gray-950">任务中心</h1>
-                  <p className="mt-2 max-w-2xl text-sm leading-6 text-gray-500">
-                    统一查看 Wiki 编译、文件解析、向量与实体导入。离开页面后，后台仍会继续处理。
-                  </p>
-                </div>
-                <div className="flex shrink-0 items-center gap-2">
+              <KnowledgeWorkspaceHeader
+                section="tasks"
+                actions={
+                  <>
                   <button
                     type="button"
                     onClick={clearJobs}
@@ -291,8 +299,10 @@ export default function KnowledgeImportJobsPage() {
                     <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
                     刷新
                   </button>
-                </div>
-              </div>
+                  </>
+                }
+              />
+              <KnowledgeWorkspaceNav />
 
               {toast ? (
                 <div
@@ -316,11 +326,11 @@ export default function KnowledgeImportJobsPage() {
                   <div>
                     <h2 className="text-base font-semibold text-gray-950">任务队列</h2>
                     <p className="mt-1 text-xs text-gray-400">
-                      Wiki 编译 {wikiJobCount} 条 · 文件导入 {fileJobCount} 条 · 向量导入 {vectorJobCount} 条 · 实体导入 {entityJobCount} 条
+                      Wiki 编译 {wikiJobCount} 条 · 稍后读 {readLaterJobCount} 条 · 文件导入 {fileJobCount} 条 · 向量导入 {vectorJobCount} 条 · 实体导入 {entityJobCount} 条
                     </p>
                   </div>
                   <div className="inline-flex rounded-2xl bg-black/[0.035] p-1">
-                    {(["all", "wiki", "file", "vector", "entity"] as JobFilter[]).map((filter) => (
+                    {(["all", "wiki", "read_later", "file", "vector", "entity"] as JobFilter[]).map((filter) => (
                       <button
                         key={filter}
                         type="button"
@@ -345,7 +355,7 @@ export default function KnowledgeImportJobsPage() {
                         <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
                           <Link href={`/knowledge/imports/${job.id}`} className="flex min-w-0 flex-1 items-start gap-3">
                             <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-white text-[#002fa7] shadow-sm ring-1 ring-black/[0.04]">
-                              {isLlmWikiJob(job) ? <BookOpenCheck className="h-5 w-5 text-violet-600" /> : isVectorPublishJob(job) ? <Database className="h-5 w-5 text-[#002fa7]" /> : <JobIcon status={job.status} />}
+                              {isLlmWikiJob(job) ? <BookOpenCheck className="h-5 w-5 text-violet-600" /> : isReadLaterJob(job) ? <Link2 className="h-5 w-5 text-cyan-600" /> : isVectorPublishJob(job) ? <Database className="h-5 w-5 text-[#002fa7]" /> : <JobIcon status={job.status} />}
                             </div>
                             <div className="min-w-0 flex-1">
                               <div className="flex flex-wrap items-center gap-2">

@@ -34,6 +34,12 @@ function stripModelCallLimitNotice(content: string): string {
     .trimEnd();
 }
 
+const ScrollableMarkdownTable: Components["table"] = ({ node: _node, ...props }) => (
+  <div className="markdown-table-scroll">
+    <table {...props} />
+  </div>
+);
+
 /** Detect 401 / API key errors without matching arbitrary numbers like patent IDs. */
 function isAuthError(content: string): boolean {
   const lower = content.toLowerCase();
@@ -108,6 +114,7 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
       />
     ),
     img: SafeMarkdownImage,
+    table: ScrollableMarkdownTable,
   };
 
   return (
@@ -1488,6 +1495,7 @@ function SegmentBlock({
       />
     ),
     img: SafeMarkdownImage,
+    table: ScrollableMarkdownTable,
   };
 
   const hasTools = segment.timeline?.some((item) => item.type === "tool") ?? false;
@@ -1567,7 +1575,7 @@ function VerificationSummaryText({ text }: { text?: string }) {
     <div className="mt-5 text-slate-700">
       <ReactMarkdown
         remarkPlugins={markdownRemarkPlugins}
-        components={{ img: SafeMarkdownImage }}
+        components={{ img: SafeMarkdownImage, table: ScrollableMarkdownTable }}
         urlTransform={markdownUrlTransform}
       >
         {summary}

@@ -4107,6 +4107,7 @@ def test_deepagents_manager_emits_and_persists_tool_events(tmp_path, monkeypatch
     event_names = [event["event"] for event in events]
     tool_start = next(event for event in events if event["event"] == "tool_start")
     tool_end = next(event for event in events if event["event"] == "tool_end")
+    final_response = next(event for event in events if event["event"] == "final_response")
     done = next(event for event in events if event["event"] == "done")
     history = session_manager.load_session("agent-tool-session")
     assistant_with_tool = next(
@@ -4146,6 +4147,9 @@ def test_deepagents_manager_emits_and_persists_tool_events(tmp_path, monkeypatch
     assert assistant_with_tool["tool_calls"][0]["output"] == "README content"
     assert len(assistant_with_tool["tool_calls"]) == 1
     assert "raw_output" not in assistant_with_tool["tool_calls"][0]
+    assert json.loads(final_response["data"])["content"] == "我先读取 README，确认当前内容。\n\n已读取。"
+    assert json.loads(final_response["data"])["final_response"] == "已读取。"
+    assert json.loads(done["data"])["final_response"] == "已读取。"
     assert len(deleted) == 1
     assert deleted[0].startswith("agent-tool-session:query-")
 

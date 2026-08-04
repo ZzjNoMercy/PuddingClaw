@@ -40,6 +40,7 @@ JOB_TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
 VECTOR_PUBLISH_KIND = "vector_publish"
 VANNA_ENTITY_IMPORT_KIND = "vanna_entity_import"
 LLM_WIKI_INGEST_KIND = "llm_wiki_ingest"
+READ_LATER_CAPTURE_KIND = "read_later_capture"
 
 
 def job_kind(job: KnowledgeImportJob) -> str:
@@ -185,6 +186,8 @@ def job_to_list_dict(job: KnowledgeImportJob) -> dict[str, Any]:
         "wiki_stage_complete",
         "import_gbrain",
         "gbrain_import_ok",
+        "read_later_item_id",
+        "parse_status",
     ):
         if key in metadata:
             slim_metadata[key] = metadata[key]
@@ -734,6 +737,8 @@ async def claim_next_job(session: AsyncSession) -> KnowledgeImportJob | None:
         message = "开始导入实体"
     elif kind == LLM_WIKI_INGEST_KIND:
         message = "开始编译 LLM Wiki"
+    elif kind == READ_LATER_CAPTURE_KIND:
+        message = "开始解析稍后读链接"
     else:
         message = "开始导入"
     session.add(KnowledgeImportEvent(job_id=job.id, level="info", message=message))

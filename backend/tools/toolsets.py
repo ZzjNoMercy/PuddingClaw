@@ -49,6 +49,7 @@ UNCONDITIONAL_EXTENSION_TOOLSETS: dict[str, frozenset[str]] = {
     }),
     "web_research": frozenset({"tavily_search", "fetch_url"}),
     "package_management": frozenset({"install_packages"}),
+    "read_later_capture": frozenset({"read_later_save_url"}),
 }
 
 # PuddingClaw tools are opt-in business capabilities.  A name must occur in
@@ -267,6 +268,9 @@ TOOL_CONTROL_DESCRIPTORS: dict[str, ToolControlDescriptor] = {
     # Controlled network and runtime setup.
     "tavily_search": _CONTROLLED_NETWORK,
     "fetch_url": _CONTROLLED_NETWORK,
+    # The Tool only queues an idempotent internal bookmark mutation. The
+    # worker performs the separately sandboxed public-network fetch later.
+    "read_later_save_url": _INTERNAL_MUTATION,
     "install_packages": _PACKAGE_INSTALL,
     # Skill management.
     "inspect_skill": _READ_ONLY,

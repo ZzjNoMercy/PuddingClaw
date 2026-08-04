@@ -29,7 +29,6 @@ import {
   Archive,
   Pin,
   Loader2,
-  ListChecks,
   FlaskConical,
 } from "lucide-react";
 import { useApp } from "@/lib/store";
@@ -302,7 +301,7 @@ export default function Sidebar() {
         <Link
           href="/knowledge"
           className={`w-full flex items-center gap-2 px-3 py-2 text-[13px] rounded-xl transition-all ${
-            runtimeReady && pathname.startsWith("/knowledge") && !pathname.startsWith("/knowledge/imports")
+            runtimeReady && pathname.startsWith("/knowledge")
               ? "bg-[#002fa7] text-white font-medium shadow-sm shadow-[#002fa7]/20"
               : "text-gray-600 hover:text-gray-900 hover:bg-white/50"
           }`}
@@ -344,17 +343,6 @@ export default function Sidebar() {
           评估
         </Link>
         <SidebarLink icon={Workflow} label="定时任务" muted />
-        <Link
-          href="/knowledge/imports"
-          className={`w-full flex items-center gap-2 px-3 py-2 text-[13px] rounded-xl transition-all ${
-            runtimeReady && pathname.startsWith("/knowledge/imports")
-              ? "bg-[#002fa7] text-white font-medium shadow-sm shadow-[#002fa7]/20"
-              : "text-gray-600 hover:text-gray-900 hover:bg-white/50"
-          }`}
-        >
-          <ListChecks className="w-4 h-4" />
-          任务中心
-        </Link>
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto">

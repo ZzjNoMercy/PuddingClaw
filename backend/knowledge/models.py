@@ -61,6 +61,45 @@ class KnowledgeDocument(Base):
     knowledge_base: Mapped[KnowledgeBase] = relationship(back_populates="documents")
 
 
+class ReadLaterItem(Base):
+    """A durable URL bookmark whose extracted Markdown lives in /knowledge/."""
+
+    __tablename__ = "read_later_items"
+    __table_args__ = (
+        UniqueConstraint("knowledge_base_id", "canonical_url", name="uq_read_later_kb_canonical_url"),
+        Index("ix_read_later_kb_created", "knowledge_base_id", "created_at"),
+        Index("ix_read_later_kb_status", "knowledge_base_id", "reading_status", "parse_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: new_id("later"))
+    knowledge_base_id: Mapped[str] = mapped_column(String(64), ForeignKey("knowledge_bases.id"), nullable=False)
+    original_url: Mapped[str] = mapped_column(Text, nullable=False)
+    canonical_url: Mapped[str] = mapped_column(Text, nullable=False)
+    title: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    site_name: Mapped[str] = mapped_column(String(300), nullable=False, default="")
+    author: Mapped[str] = mapped_column(String(300), nullable=False, default="")
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    image_url: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    storage_path: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    virtual_path: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    parse_status: Mapped[str] = mapped_column(String(40), nullable=False, default="queued")
+    reading_status: Mapped[str] = mapped_column(String(40), nullable=False, default="unread")
+    error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    tags: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    note: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    document_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("knowledge_documents.id"), nullable=True)
+    raw_snapshot_path: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    wiki_job_id: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+    knowledge_base: Mapped[KnowledgeBase] = relationship()
+    document: Mapped[KnowledgeDocument | None] = relationship()
+
+
 class KnowledgeDatabaseSource(Base):
     __tablename__ = "knowledge_database_sources"
     __table_args__ = (

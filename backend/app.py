@@ -260,6 +260,7 @@ from api.user_input_requests import router as user_input_requests_router
 from api.connectors import router as connectors_router
 from api.brain_schema import router as brain_schema_router
 from api.llm_wiki import router as llm_wiki_router
+from api.read_later import router as read_later_router
 from api.headless import router as headless_router
 from api.headless import worker_access_router
 
@@ -289,6 +290,7 @@ app.include_router(user_input_requests_router, prefix="/api")
 app.include_router(connectors_router, prefix="/api")
 app.include_router(brain_schema_router, prefix="/api")
 app.include_router(llm_wiki_router, prefix="/api")
+app.include_router(read_later_router, prefix="/api")
 app.include_router(headless_router, prefix="/api")
 app.include_router(worker_access_router, prefix="/api")
 

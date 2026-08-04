@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
+import { usePathname } from "next/navigation";
 import {
   AlertCircle,
   ChevronDown,
@@ -22,6 +23,9 @@ import {
 import Navbar from "@/components/layout/Navbar";
 import Sidebar from "@/components/layout/Sidebar";
 import ResizeHandle from "@/components/layout/ResizeHandle";
+import KnowledgeOverview from "@/components/knowledge/KnowledgeOverview";
+import KnowledgeWorkspaceHeader from "@/components/knowledge/KnowledgeWorkspaceHeader";
+import KnowledgeWorkspaceNav from "@/components/knowledge/KnowledgeWorkspaceNav";
 import { useApp } from "@/lib/store";
 import {
   getKnowledgeFileTree,
@@ -204,6 +208,7 @@ function KnowledgeFileTree({
 }
 
 export default function KnowledgePage() {
+  const pathname = usePathname();
   const {
     sidebarOpen,
     toggleSidebar,
@@ -531,22 +536,20 @@ export default function KnowledgePage() {
         <main className="workspace-content-frame flex min-w-0 flex-1 flex-col overflow-hidden">
           <div className="flex-1 overflow-y-auto">
             <div className="workspace-page-container flex flex-col gap-5">
-        <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
-          <div className="min-w-0">
-            <h1 className="text-2xl font-semibold tracking-tight text-gray-950">知识库</h1>
-            <p className="mt-2 max-w-2xl text-sm leading-6 text-gray-500">
-              当前打通 PDF/MinerU 与 Markdown 双管道：PDF 解析成 md 后写入 <code className="rounded bg-black/[0.04] px-1.5 py-0.5">/knowledge/imported/</code>，
-              同时发布到本地知识库目录和多模态向量索引。
-            </p>
-          </div>
-          <div className="flex shrink-0 flex-wrap items-center gap-2 xl:max-w-[620px] xl:justify-end">
-            <Link
-              href="/knowledge/schema"
-              className="inline-flex h-9 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border border-[#002fa7]/10 bg-white px-3.5 text-xs font-semibold text-[#002fa7] shadow-sm transition hover:bg-[#002fa7]/[0.04]"
-            >
-              <Database className="h-4 w-4" />
-              LLM Wiki Studio
-            </Link>
+        {pathname === "/knowledge" ? (
+          <KnowledgeOverview
+            documentCount={documents.length}
+            fileCount={directoryFiles.length}
+            jobs={importJobs}
+            loading={loading}
+            onRefresh={refresh}
+          />
+        ) : (
+          <>
+        <KnowledgeWorkspaceHeader
+          section="library"
+          actions={
+            <>
             <Link
               href="/settings?category=knowledge"
               className="inline-flex h-9 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full bg-[#002fa7]/10 px-3.5 text-xs font-semibold text-[#002fa7] transition hover:bg-[#002fa7]/15"
@@ -563,8 +566,10 @@ export default function KnowledgePage() {
               <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
               刷新
             </button>
-          </div>
-        </div>
+            </>
+          }
+        />
+        <KnowledgeWorkspaceNav />
 
         {toast ? (
           <div
@@ -1194,6 +1199,9 @@ export default function KnowledgePage() {
             </div>
           </div>
         ) : null}
+
+          </>
+        )}
 
             </div>
           </div>

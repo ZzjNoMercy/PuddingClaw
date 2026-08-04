@@ -7,6 +7,7 @@ import { FlaskConical, Settings2, X } from "lucide-react";
 import Navbar from "@/components/layout/Navbar";
 import Sidebar from "@/components/layout/Sidebar";
 import ResizeHandle from "@/components/layout/ResizeHandle";
+import WorkspacePageHeader from "@/components/layout/WorkspacePageHeader";
 import { useApp } from "@/lib/store";
 import { getLangSmithSettings, saveLangSmithSettings, testLangSmithConnection, type LangSmithSettings } from "@/lib/evaluationApi";
 
@@ -41,18 +42,25 @@ export default function EvaluationLayout({ children }: { children: React.ReactNo
         <div className="workspace-sidebar-shell shrink-0 panel-transition overflow-hidden" style={{ width: sidebarOpen ? sidebarWidth : 0 }}><div style={{ width: sidebarWidth, minWidth: 200 }} className="flex h-full flex-col"><div className="h-11 shrink-0"/><div className="min-h-0 flex-1 overflow-hidden"><Sidebar /></div></div></div>
         {mounted && sidebarOpen && <ResizeHandle onResize={resize} direction="left" />}
         <main className="workspace-content-frame flex min-w-0 flex-1 flex-col overflow-hidden">
-            <header className="shrink-0 border-b border-black/[0.06]">
-              <div className="workspace-page-width flex items-center justify-between px-5 py-6">
-              <div className="flex items-center gap-5">
-                <div className="flex items-center gap-2 text-sm font-semibold text-gray-900"><FlaskConical className="h-4 w-4 text-[#002fa7]" />Agent 评估</div>
-                <nav className="flex gap-1 text-sm">
+            <header className="shrink-0 border-b border-black/[0.06] bg-white/60">
+              <div className="workspace-page-width px-5 pb-4 pt-6">
+                <WorkspacePageHeader
+                  eyebrow="EVALUATION WORKSPACE"
+                  title="评估"
+                  description="用版本化评测集和可追踪实验，持续验证 Agent 的质量、稳定性与回归表现。"
+                  actions={
+                    <button onClick={() => setDialog(true)} className="flex items-center gap-2 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs text-gray-600">
+                      <span className={`h-2 w-2 rounded-full ${settings?.enabled && settings.api_key_configured ? "bg-emerald-500" : "bg-gray-300"}`} />LangSmith<Settings2 className="h-3.5 w-3.5" />
+                    </button>
+                  }
+                />
+                <div className="mt-5 flex items-center gap-5">
+                  <div className="flex items-center gap-2 text-sm font-semibold text-gray-900"><FlaskConical className="h-4 w-4 text-[#002fa7]" />Agent 评估</div>
+                  <nav className="flex gap-1 text-sm">
                   <Link href="/evaluation/datasets" className={`rounded-lg px-3 py-1.5 ${pathname.startsWith("/evaluation/datasets") ? "bg-[#002fa7] text-white" : "text-gray-500 hover:bg-gray-100"}`}>Dataset</Link>
                   <Link href="/evaluation/experiments" className={`rounded-lg px-3 py-1.5 ${pathname.startsWith("/evaluation/experiments") ? "bg-[#002fa7] text-white" : "text-gray-500 hover:bg-gray-100"}`}>Experiments</Link>
-                </nav>
-              </div>
-              <button onClick={() => setDialog(true)} className="flex items-center gap-2 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs text-gray-600">
-                <span className={`h-2 w-2 rounded-full ${settings?.enabled && settings.api_key_configured ? "bg-emerald-500" : "bg-gray-300"}`} />LangSmith<Settings2 className="h-3.5 w-3.5" />
-              </button>
+                  </nav>
+                </div>
               </div>
             </header>
             <div className="min-h-0 flex-1 overflow-y-auto">{children}</div>

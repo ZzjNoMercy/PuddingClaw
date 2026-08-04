@@ -133,6 +133,7 @@ def test_every_registered_agent_custom_tool_has_an_explicit_policy() -> None:
         "inspect_skill",
     }.issubset(BUSINESS_TOOLSETS["skill_management"])
     assert "edit_file" not in UNCONDITIONAL_TOOL_NAMES
+    assert "read_later_save_url" in UNCONDITIONAL_TOOL_NAMES
     assert {
         "inspect_file_version",
         "patch_file",

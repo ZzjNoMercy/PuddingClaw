@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import os from "node:os";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
@@ -9,17 +10,9 @@ import { exitCodeForResponse, writeDiagnostic, writeJson } from "./output.js";
 const VERSION = "0.1.0";
 const CAPABILITIES = ["data.query", "data.analysis", "data.nl2sql", "knowledge.query"];
 
-function platformId() {
-  const value = String(process.env.PUDDING_PLATFORM_ID || "").trim();
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(value) || value === "." || value === "..") {
-    throw new WorkerClientError("PUDDING_PLATFORM_ID is missing or invalid", { code: "configuration_error" });
-  }
-  return value;
-}
-
 async function ensureWorkspace() {
   const root = String(process.env.PUDDINGCLAW_PROJECTS_ROOT || os.homedir());
-  const target = path.resolve(root, platformId());
+  const target = path.resolve(root, "puddingclaw");
   const rootResolved = path.resolve(root);
   if (target !== rootResolved && !target.startsWith(`${rootResolved}${path.sep}`)) {
     throw new WorkerClientError("platform workspace escapes projects root", { code: "configuration_error" });
@@ -43,8 +36,80 @@ function jsonMode(args) { return args.includes("--json"); }
 
 function emit(value, asJson) {
   if (asJson) writeJson(value);
+  else if (typeof value?.final_response === "string" && value.final_response) process.stdout.write(`${value.final_response}\n`);
   else if (typeof value?.reply === "string") process.stdout.write(`${value.reply}\n`);
   else writeJson(value);
+}
+
+function doctorLine(ok, label, value) {
+  const mark = ok === true ? "✓" : ok === false ? "✗" : "!";
+  return `  ${mark} ${label.padEnd(18)}${value}`;
+}
+
+function doctorDetail(label, value) {
+  if (value === undefined || value === null || value === "") return "";
+  return `      ${label.padEnd(22)}${value}`;
+}
+
+function localCliStatus() {
+  let npm = { available: false, path: null, version: null };
+  try {
+    const version = execFileSync("npm", ["--version"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    const command = process.platform === "win32" ? "where" : "which";
+    const npmPath = execFileSync(command, ["npm"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim().split(/\r?\n/)[0];
+    npm = { available: Boolean(version), path: npmPath || null, version: version || null };
+  } catch { /* npm is optional for an already installed CLI */ }
+  const nodeMajor = Number.parseInt(process.versions.node.split(".")[0], 10);
+  return {
+    command: "puddingclaw",
+    installed: true,
+    version: VERSION,
+    required_version: VERSION,
+    version_mismatch: false,
+    node: { available: true, path: process.execPath, version: process.versions.node, supported: nodeMajor >= 20 },
+    npm,
+    install_policy: process.env.PUDDINGCLAW_CLI_INSTALL_POLICY || "not reported",
+  };
+}
+
+function hostLabel() {
+  const platform = { darwin: "macos", win32: "windows", linux: "linux" }[process.platform] || process.platform;
+  const arch = { arm64: "aarch64", x64: "x86_64", arm: "arm", ia32: "x86" }[process.arch] || process.arch;
+  return `${platform}-${arch}`;
+}
+
+function formatDoctor(result) {
+  const cli = result.cli || {};
+  const node = cli.node || {};
+  const npm = cli.npm || {};
+  const backendReady = result.configured === true && result.authenticated === true && result.reachable === true;
+  const cliReady = cli.installed === true && cli.version_mismatch !== true;
+  const lines = [
+    `PuddingClaw Doctor v${result.cli_version || VERSION} · ${hostLabel()}`,
+    "",
+    "Worker API",
+    doctorLine(backendReady, "connection", backendReady ? "authenticated · reachable" : (result.error || "not ready")),
+    doctorDetail("server version", result.server_version),
+    doctorDetail("project", result.project_id),
+    doctorDetail("workspace", result.workspace_ready === true ? "ready" : result.workspace_ready === false ? "not ready" : undefined),
+    doctorDetail("worker key", result.worker_key_name ? `${result.worker_key_name} (${result.key_id || "unknown"})` : result.key_id),
+    doctorDetail("capabilities", Array.isArray(result.capabilities) ? result.capabilities.join(", ") : undefined),
+    "",
+    "Environment",
+    doctorLine(cliReady, "puddingclaw", cliReady ? `installed · ${cli.version || "unknown"}` : (cli.install_message || "not ready")),
+    doctorDetail("required version", cli.required_version),
+    doctorDetail("command", cli.command),
+    doctorDetail("node", node.available ? `${node.version || "available"} · ${node.path || "path unknown"}` : "not available"),
+    doctorDetail("npm", npm.available ? `${npm.version || "available"} · ${npm.path || "path unknown"}` : "not available"),
+    doctorDetail("install policy", cli.install_policy),
+  ];
+  if (cli.version_mismatch === true) lines.push(doctorDetail("version check", "mismatch"));
+  return `${lines.filter(Boolean).join("\n")}\n`;
+}
+
+function emitDoctor(value, asJson) {
+  if (asJson) writeJson(value);
+  else process.stdout.write(formatDoctor(value));
 }
 
 function parseFlags(args) {
@@ -115,11 +180,11 @@ async function doctor(args) {
     await ensureWorkspace();
     const client = new WorkerClient(config());
     const response = await client.request("/api/headless/health");
-    emit({ ...base, ...response, configured: true }, asJson);
+    emitDoctor({ ...base, ...response, configured: true }, asJson);
     return 0;
   } catch (error) {
-    const result = { ...base, configured: false, authenticated: error?.code === "auth_error" ? false : null, reachable: error?.code === "connection_error" ? false : null, error: error?.message || String(error) };
-    emit(result, asJson);
+    const result = { ...base, configured: false, authenticated: error?.code === "auth_error" ? false : null, reachable: error?.code === "connection_error" ? false : null, error: error?.message || String(error), cli: localCliStatus() };
+    emitDoctor(result, asJson);
     return error?.code === "timeout" ? 3 : 2;
   }
 }

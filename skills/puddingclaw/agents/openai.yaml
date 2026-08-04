@@ -1,0 +1,4 @@
+interface:
+  display_name: "PuddingClaw 数据分析"
+  short_description: "通过 PuddingClaw CLI 委派企业数据分析任务"
+  default_prompt: "Use $puddingclaw to answer my enterprise data question with the configured analytics model."

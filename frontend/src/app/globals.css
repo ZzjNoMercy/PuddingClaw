@@ -191,11 +191,19 @@ body {
   overflow-x: auto; margin: 0.5em 0; font-size: 0.87em;
   box-shadow: 0 2px 8px rgba(0,0,0,0.10);
 }
+.markdown-table-scroll {
+  max-width: 100%;
+  margin: 1.1em 0;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
 .markdown-content table {
-  width: 100%;
+  width: max-content;
+  min-width: 100%;
+  max-width: none;
   border-collapse: separate;
   border-spacing: 0;
-  margin: 1.1em 0;
+  margin: 0;
   overflow: hidden;
   border: 1px solid rgba(16,24,40,0.12);
   border-radius: 14px;
@@ -206,6 +214,9 @@ body {
   border-bottom: 1px solid rgba(16,24,40,0.10);
   padding: 0.72em 0.9em;
   text-align: left;
+  min-width: 8rem;
+  max-width: 24rem;
+  overflow-wrap: anywhere;
 }
 .markdown-content th:last-child,
 .markdown-content td:last-child { border-right: 0; }

@@ -7,6 +7,7 @@ import "@/lib/monaco-config";
 import Navbar from "@/components/layout/Navbar";
 import Sidebar from "@/components/layout/Sidebar";
 import ResizeHandle from "@/components/layout/ResizeHandle";
+import WorkspacePageHeader from "@/components/layout/WorkspacePageHeader";
 import FileTree from "@/components/skills/FileTree";
 import ConnectorCatalog from "@/components/extensions/ConnectorCatalog";
 import McpCatalog from "@/components/extensions/McpCatalog";
@@ -441,8 +442,15 @@ export default function SkillsPage() {
 
         <main className="workspace-content-frame flex min-w-0 flex-1 flex-col overflow-hidden">
       <div className="workspace-page-width flex h-full min-h-0 flex-col overflow-hidden">
+      <div className="shrink-0 px-5 pb-2 pt-6">
+        <WorkspacePageHeader
+          eyebrow="EXTENSION WORKSPACE"
+          title="扩展"
+          description="管理技能、连接器与 MCP 服务，为 Agent 按需装配可复用的外部能力。"
+        />
+      </div>
       <nav className="shrink-0 bg-white/60" aria-label="扩展类型">
-        <div className="flex w-full items-center gap-1.5 px-5 py-6">
+        <div className="flex w-full items-center gap-1.5 px-5 py-4">
           <button
             type="button"
             aria-current={extensionView === "skills" ? "page" : undefined}

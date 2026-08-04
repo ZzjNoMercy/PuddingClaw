@@ -7052,8 +7052,6 @@ class DeepAgentsAgentManager:
             chunk_count = 0
             emitted_reasoning = False
             accumulated_reasoning = ""
-            reasoning_log_chars = 0
-            REASONING_LOG_INTERVAL = 500
             # Track todo state across stream values for white-box persistence.
             previous_todos: list[dict[str, Any]] = list(persisted_todos)
             last_graph_todos: list[dict[str, Any]] = list(persisted_todos)
@@ -7314,21 +7312,6 @@ class DeepAgentsAgentManager:
                             trace_collector.add_reasoning_span(reasoning_text)
                             active_segment["reasoning_content"] += reasoning_text
                             self._append_reasoning_to_timeline(active_segment, reasoning_text)
-                            source = self._detect_reasoning_source(payload)
-                            prev_logged_chars = reasoning_log_chars
-                            reasoning_log_chars = len(accumulated_reasoning)
-                            if (
-                                reasoning_log_chars // REASONING_LOG_INTERVAL
-                                != prev_logged_chars // REASONING_LOG_INTERVAL
-                            ):
-                                logger.info(
-                                    "Emitting reasoning delta for session=%s (node=%s, source=%s, accumulated=%d): %s...",
-                                    session_id,
-                                    node,
-                                    source,
-                                    reasoning_log_chars,
-                                    accumulated_reasoning[-120:].replace("\n", " "),
-                                )
                             yield self._sse(
                                 "reasoning",
                                 {
@@ -7411,11 +7394,10 @@ class DeepAgentsAgentManager:
                                 )
                                 raw_output = adapted.answer_context
                                 sources = adapted.sources
-                                logger.info(
-                                    "Tool %s adapted sources: %d (output preview: %s)",
+                                logger.debug(
+                                    "Tool %s adapted sources: %d",
                                     tool_name,
                                     len(sources),
-                                    raw_output[:100].replace("\n", " "),
                                 )
                                 if sources:
                                     try:
@@ -7427,7 +7409,7 @@ class DeepAgentsAgentManager:
                                         pass
                                     turn_sources = dedupe_sources(turn_sources + sources)
                                     for source in sources:
-                                        logger.info(
+                                        logger.debug(
                                             "Emitting source_found event: source_id=%s",
                                             source.get("source_id"),
                                         )
@@ -8171,6 +8153,9 @@ class DeepAgentsAgentManager:
                 seg["content"] = sanitize_citation_markdown(
                     self._strip_model_call_limit_notice(str(seg.get("content") or ""))
                 )
+            final_response_content = sanitize_citation_markdown(
+                self._strip_model_call_limit_notice(str(final_content or ""))
+            )
             full_content = (
                 (final_content or "")
                 if defer_final_publication and completion_accepted
@@ -8464,6 +8449,7 @@ class DeepAgentsAgentManager:
                     "final_response",
                     {
                         "content": full_content,
+                        "final_response": final_response_content,
                         "session_id": session_id,
                         "query_id": query_id,
                         "run_id": run_record.run_id,
@@ -8475,6 +8461,7 @@ class DeepAgentsAgentManager:
                 "done",
                 {
                     "content": full_content if completion_accepted else "",
+                    "final_response": final_response_content if completion_accepted else "",
                     "verification_summary": verification_summary,
                     "session_id": session_id,
                     "project_id": project_id,
