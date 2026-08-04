@@ -96,6 +96,18 @@ def test_raw_snapshot_is_immutable_and_context_is_bounded(wiki_env: LlmWikiServi
     assert wiki_env.operation_context("ingest")["raw_files"] == {}
 
 
+def test_llm_wiki_skill_falls_back_to_markdown_after_irrelevant_gbrain_results() -> None:
+    skill = (Path(__file__).resolve().parent.parent / "skills" / "llm-wiki" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    normalized = " ".join(skill.split())
+
+    assert "published Markdown LLM Wiki as the complete source of truth" in normalized
+    assert "does not directly match the entity/topic asked by the user" in normalized
+    assert "call `llm_wiki_query` before" in normalized
+    assert "when gbrain already returns a direct, relevant answer" in normalized
+
+
 def test_markdown_file_snapshot_preserves_final_bytes_and_detects_changes(
     wiki_env: LlmWikiService,
     tmp_path: Path,
@@ -1279,6 +1291,83 @@ def test_wikilink_requires_the_gbrain_directory_prefix(wiki_env: LlmWikiService)
     )
     assert result["published"] is False
     assert "invalid_wikilink" in {item["code"] for item in result["lint"]["errors"]}
+
+
+def test_lint_requires_source_to_link_back_to_sourced_media(wiki_env: LlmWikiService) -> None:
+    raw = wiki_env.snapshot_raw(source_id="kb", asset_id="source-backlink", title="Article", content="# Article\n")
+    bundle = wiki_env.schema.bundle()
+    media = _page("Article", "media", raw["snapshot_path"], "sources/publisher").replace(
+        "参见 [[sources/publisher]]",
+        "本文章 sourced_from [[sources/publisher|Publisher]]",
+    )
+    source = _page("Publisher", "source", raw["snapshot_path"], "sources/publisher").replace(
+        "这是 Publisher 的稳定知识摘要，参见 [[sources/publisher]]。",
+        "## 已收录内容\n\n- Article（详见 media 页面）",
+    )
+
+    result = wiki_env.publish(
+        pages=[
+            {"slug": "media/article", "content": media},
+            {"slug": "sources/publisher", "content": source},
+        ],
+        expected_bundle_hash=bundle["bundle_hash"],
+        summary="missing source backlink",
+        model="test:model",
+        raw_paths=[raw["snapshot_path"]],
+    )
+
+    assert result["published"] is False
+    assert "missing_source_backlink" in {item["code"] for item in result["lint"]["errors"]}
+
+
+def test_lint_requires_collected_media_to_declare_sourced_from(wiki_env: LlmWikiService) -> None:
+    raw = wiki_env.snapshot_raw(source_id="kb", asset_id="media-source", title="Article", content="# Article\n")
+    bundle = wiki_env.schema.bundle()
+    media = _page("Article", "media", raw["snapshot_path"], "media/article")
+    source = _page("Publisher", "source", raw["snapshot_path"], "media/article").replace(
+        "这是 Publisher 的稳定知识摘要，参见 [[media/article]]。",
+        "## 已收录内容\n\n- [[media/article|Article]]",
+    )
+
+    result = wiki_env.publish(
+        pages=[
+            {"slug": "media/article", "content": media},
+            {"slug": "sources/publisher", "content": source},
+        ],
+        expected_bundle_hash=bundle["bundle_hash"],
+        summary="missing media source relation",
+        model="test:model",
+        raw_paths=[raw["snapshot_path"]],
+    )
+
+    assert result["published"] is False
+    assert "missing_media_source_relation" in {item["code"] for item in result["lint"]["errors"]}
+
+
+def test_lint_accepts_bidirectional_source_collection_links(wiki_env: LlmWikiService) -> None:
+    raw = wiki_env.snapshot_raw(source_id="kb", asset_id="source-pair", title="Article", content="# Article\n")
+    bundle = wiki_env.schema.bundle()
+    media = _page("Article", "media", raw["snapshot_path"], "sources/publisher").replace(
+        "参见 [[sources/publisher]]",
+        "本文章 sourced_from [[sources/publisher|Publisher]]",
+    )
+    source = _page("Publisher", "source", raw["snapshot_path"], "media/article").replace(
+        "这是 Publisher 的稳定知识摘要，参见 [[media/article]]。",
+        "## 已收录内容\n\n- [[media/article|Article]]",
+    )
+
+    result = wiki_env.publish(
+        pages=[
+            {"slug": "media/article", "content": media},
+            {"slug": "sources/publisher", "content": source},
+        ],
+        expected_bundle_hash=bundle["bundle_hash"],
+        summary="complete source pair",
+        model="test:model",
+        raw_paths=[raw["snapshot_path"]],
+    )
+
+    assert result["published"] is True
 
 
 def test_publish_rejects_a_duplicated_workspace_wiki_prefix(wiki_env: LlmWikiService) -> None:

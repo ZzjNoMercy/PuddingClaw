@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import fnmatch
+import hashlib
 import mimetypes
 import os
 import posixpath
@@ -1035,6 +1035,43 @@ class KnowledgeService:
             "markdown_path": str(target),
             "vector_index": vector_result,
         }
+
+    def replace_markdown_document_content(
+        self,
+        *,
+        document: KnowledgeDocument,
+        content: bytes,
+        title: str,
+        publish_targets: list[str],
+    ) -> KnowledgeDocument:
+        """Replace an owned Markdown document without allocating a new filename.
+
+        This is intentionally separate from upload ingestion: uploads are
+        immutable catalog additions, while sources such as Read Later refresh
+        the capture they already own.
+        """
+
+        if not content:
+            raise KnowledgeServiceError("Markdown content is empty.")
+        target = Path(document.storage_path).resolve()
+        knowledge_root = self.knowledge_dir.resolve()
+        if not target.is_relative_to(knowledge_root) or target.suffix.lower() not in MARKDOWN_SUFFIXES:
+            raise KnowledgeServiceError("The existing Markdown document is outside the knowledge directory.")
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        content_sha256 = hashlib.sha256(content).hexdigest()
+        document.title = title.strip() or document.title
+        document.content_sha256 = content_sha256
+        document.size_bytes = target.stat().st_size
+        document.status = "ready"
+        document.publish_targets = publish_targets
+        document.doc_metadata = {
+            **(document.doc_metadata or {}),
+            "markdown_sha256": _sha256(target),
+            "llamaindex_chunks": _build_llamaindex_chunk_metadata(self.knowledge_dir, target),
+        }
+        return document
 
     async def ingest_generic_upload(
         self,

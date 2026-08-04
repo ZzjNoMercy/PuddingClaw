@@ -5557,6 +5557,7 @@ class DeepAgentsAgentManager:
         error_notice: str | None = None,
         pending_tool_output: str = "Tool execution was interrupted because the user stopped the run.",
         suppress_terminal_content: bool = False,
+        query_created_at: float | None = None,
     ) -> None:
         """Save the visible partial run after client cancellation.
 
@@ -5583,6 +5584,7 @@ class DeepAgentsAgentManager:
                 "user",
                 self._display_message_with_attachments(user_message, attachments),
                 attachments=attachments,
+                created_at=query_created_at,
             )
         self._persist_assistant_snapshot(
             session_id=session_id,
@@ -5889,8 +5891,11 @@ class DeepAgentsAgentManager:
         evaluation_tool_allowlist: set[str] | None = None,
         disable_mcp: bool = False,
         evaluation_builtin_tool_allowlist: set[str] | None = None,
+        query_created_at: float | None = None,
     ) -> AsyncGenerator[dict[str, str], None]:
         """Stream one user request and autonomously advance recoverable Goal Runs."""
+
+        query_created_at = float(query_created_at) if query_created_at is not None else time.time()
 
         existing_goal = (
             session_manager.get_goal_state(session_id, context_goal_id)
@@ -5979,7 +5984,13 @@ class DeepAgentsAgentManager:
                     "cancel": "当前 Goal 已请求取消。",
                 }[action]
                 if not user_message_already_persisted:
-                    session_manager.save_message(session_id, "user", message, attachments=attachments)
+                    session_manager.save_message(
+                        session_id,
+                        "user",
+                        message,
+                        attachments=attachments,
+                        created_at=query_created_at,
+                    )
                 control_query_id = f"query-{uuid.uuid4().hex[:12]}"
                 self._persist_assistant_snapshot(
                     session_id=session_id,
@@ -5999,7 +6010,13 @@ class DeepAgentsAgentManager:
             if turn_decision.intent == GoalTurnIntent.CLARIFY:
                 content = "我不确定你是想查看当前 Goal 的进度，还是继续执行它。请明确说“总结进度”或“继续执行”。"
                 if not user_message_already_persisted:
-                    session_manager.save_message(session_id, "user", message, attachments=attachments)
+                    session_manager.save_message(
+                        session_id,
+                        "user",
+                        message,
+                        attachments=attachments,
+                        created_at=query_created_at,
+                    )
                 clarify_query_id = f"query-{uuid.uuid4().hex[:12]}"
                 self._persist_assistant_snapshot(
                     session_id=session_id,
@@ -6154,6 +6171,7 @@ class DeepAgentsAgentManager:
                 disable_mcp=disable_mcp,
                 evaluation_builtin_tool_allowlist=evaluation_builtin_tool_allowlist,
                 precomputed_rubric_profile_result=precomputed_rubric_profile_result,
+                query_created_at=query_created_at,
             ):
                 event_name = event.get("event")
                 payload = self._parse_sse_payload(event)
@@ -6314,9 +6332,11 @@ class DeepAgentsAgentManager:
         disable_mcp: bool = False,
         evaluation_builtin_tool_allowlist: set[str] | None = None,
         precomputed_rubric_profile_result: dict[str, Any] | None = None,
+        query_created_at: float | None = None,
     ) -> AsyncGenerator[dict[str, str], None]:
         """Stream exactly one Harness Run; the public method owns Goal looping."""
 
+        query_created_at = float(query_created_at) if query_created_at is not None else time.time()
         query_id = f"query-{uuid.uuid4().hex[:12]}"
         run_record: RunRecord | None = None
         goal_record: GoalRecord | None = None
@@ -6365,6 +6385,7 @@ class DeepAgentsAgentManager:
                     "user",
                     self._display_message_with_attachments(message, attachments),
                     attachments=attachments,
+                    created_at=query_created_at,
                 )
                 user_message_persisted = True
             if is_first_query:
@@ -6754,6 +6775,7 @@ class DeepAgentsAgentManager:
                     "user",
                     self._display_message_with_attachments(message, attachments),
                     attachments=attachments,
+                    created_at=query_created_at,
                 )
                 user_message_persisted = True
 
@@ -8557,6 +8579,7 @@ class DeepAgentsAgentManager:
                         interruption_notice="本轮已被用户停止，以上为中断前已完成的部分结果。",
                         pending_tool_output="Tool execution was interrupted because the user stopped the run.",
                         suppress_terminal_content=bool(run_record.requires_goal_verification),
+                        query_created_at=query_created_at,
                     )
             except Exception:
                 logger.warning("Failed to persist partial cancelled run for session=%s", session_id, exc_info=True)
@@ -8909,6 +8932,7 @@ class DeepAgentsAgentManager:
                         error_notice=error_notice,
                         pending_tool_output="Tool execution was interrupted because the agent run failed.",
                         suppress_terminal_content=bool(run_record.requires_goal_verification),
+                        query_created_at=query_created_at,
                     )
             except Exception:
                 logger.warning("Failed to persist partial failed run for session=%s", session_id, exc_info=True)

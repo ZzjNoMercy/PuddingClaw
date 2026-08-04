@@ -120,6 +120,7 @@ function parseFlags(args) {
     if (arg === "--json") { flags.json = true; continue; }
     if (arg === "--input-json") { flags.inputJson = args[++i]; continue; }
     if (arg === "--model") { flags.model = args[++i]; continue; }
+    if (arg === "--session") { flags.session = args[++i]; continue; }
     if (arg.startsWith("--")) throw new WorkerClientError(`unknown option: ${arg}`, { code: "argument_error" });
     positionals.push(arg);
   }
@@ -147,11 +148,16 @@ async function runCommand(args) {
   const input = await readInput(flags);
   const message = input?.message ?? (positionals.length ? positionals.join(" ") : "");
   const inputModel = input?.model ?? input?.analytics_model_id;
+  const inputSession = input?.session_id;
   if (!message || !String(message).trim()) throw new WorkerClientError("message is required", { code: "argument_error" });
   if (flags.model !== undefined && inputModel !== undefined && String(flags.model) !== String(inputModel)) {
     throw new WorkerClientError("--model conflicts with stdin model", { code: "argument_error" });
   }
+  if (flags.session !== undefined && inputSession !== undefined && String(flags.session) !== String(inputSession)) {
+    throw new WorkerClientError("--session conflicts with stdin session_id", { code: "argument_error" });
+  }
   const model = flags.model ?? inputModel;
+  const sessionId = flags.session ?? inputSession;
   await ensureWorkspace();
   const client = new WorkerClient(config());
   const controller = new AbortController();
@@ -161,7 +167,7 @@ async function runCommand(args) {
     const body = {
       message: String(message),
       analytics_model_id: model === undefined || model === null ? null : String(model),
-      ...(input?.session_id ? { session_id: String(input.session_id) } : {}),
+      ...(sessionId ? { session_id: String(sessionId) } : {}),
       ...(input?.metadata && typeof input.metadata === "object" ? { metadata: input.metadata } : {}),
       ...(input?.request_id ? { request_id: String(input.request_id) } : {}),
     };
@@ -205,7 +211,7 @@ async function main(argv) {
   if (command === "doctor") return doctor(rest);
   if (command === "models" && rest[0] === "list") return models(rest.slice(1));
   if (command === "run") return runCommand(rest);
-  throw new WorkerClientError("usage: puddingclaw run <message> [--model <analytics_model_id>] [--json]", { code: "argument_error" });
+  throw new WorkerClientError("usage: puddingclaw run <message> [--model <analytics_model_id>] [--session <session_id>] [--json]", { code: "argument_error" });
 }
 
 try {
@@ -214,9 +220,17 @@ try {
 } catch (error) {
   if (error?.code === "cancelled") process.exitCode = 130;
   else if (error?.code === "timeout") process.exitCode = 3;
+  else if (error?.code === "session_expired") process.exitCode = 1;
   else process.exitCode = 2;
   if (process.argv.includes("--json")) {
-    writeJson({ schema_version: "1", status: "error", error: error?.message || String(error) });
+    writeJson({
+      schema_version: "1",
+      status: "error",
+      ...(error?.code === "session_expired" ? { outcome: "session_expired" } : {}),
+      error_code: error?.code || "unknown_error",
+      ...(Number(error?.status) > 0 ? { http_status: Number(error.status) } : {}),
+      error: error?.message || String(error),
+    });
   } else {
     writeDiagnostic(error?.message || String(error));
   }

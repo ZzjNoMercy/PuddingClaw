@@ -525,6 +525,17 @@ class PermissionResumeRegistry:
                 rejected += 1
         return rejected
 
+    def has_pending_session(self, session_id: str) -> bool:
+        """Return whether a live permission decision still belongs to the Session."""
+
+        return any(
+            request.get("session_id") == session_id
+            and request.get("status") == "pending"
+            and request_id in self._pending
+            and not self._pending[request_id].done()
+            for request_id, request in self._requests.items()
+        )
+
     def get(self, request_id: str) -> dict[str, Any] | None:
         request = self._requests.get(request_id)
         return dict(request) if request else None

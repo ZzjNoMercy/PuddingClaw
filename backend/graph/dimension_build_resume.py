@@ -67,6 +67,17 @@ class DimensionBuildResumeRegistry:
                     count += 1
         return count
 
+    def has_pending_session(self, session_id: str) -> bool:
+        """Return whether a live dimension-rule decision belongs to the Session."""
+
+        return any(
+            request.get("session_id") == session_id
+            and request.get("status") == "pending"
+            and request_id in self._pending
+            and not self._pending[request_id].done()
+            for request_id, request in self._requests.items()
+        )
+
     def get(self, request_id: str) -> dict[str, Any] | None:
         item = self._requests.get(request_id)
         return dict(item) if item else None

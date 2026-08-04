@@ -26,6 +26,12 @@ globalThis.fetch = async (url, options) => {
     }), { status: 200, headers: { "content-type": "application/json" } });
   }
   const body = options?.body ? JSON.parse(options.body) : {};
+  if (body.session_id === "worker-session-expired") {
+    return new Response(JSON.stringify({ detail: "Headless Session expired after its configured inactivity TTL" }), {
+      status: 410,
+      headers: { "content-type": "application/json" },
+    });
+  }
   return new Response(JSON.stringify({
     schema_version: "1",
     status: "completed",
@@ -33,5 +39,6 @@ globalThis.fetch = async (url, options) => {
     reply: "ok",
     final_response: "final ok",
     analytics_model_id: body.analytics_model_id,
+    session_id: body.session_id,
   }), { status: 200, headers: { "content-type": "application/json" } });
 };

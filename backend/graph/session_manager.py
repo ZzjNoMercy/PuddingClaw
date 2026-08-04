@@ -558,7 +558,10 @@ class SessionManager:
             return []
 
         if isinstance(data.get("display_messages"), list):
-            return list(data.get("display_messages", []))
+            return self._project_message_timestamps(
+                data,
+                list(data.get("display_messages", [])),
+            )
 
         messages = list(data.get("messages", []))
 
@@ -578,7 +581,95 @@ class SessionManager:
                 archived_messages.extend(arc_messages)
             messages = archived_messages + messages
 
-        return messages
+        return self._project_message_timestamps(data, messages)
+
+    @staticmethod
+    def _valid_timestamp(value: Any) -> float | None:
+        try:
+            timestamp = float(value)
+        except (TypeError, ValueError):
+            return None
+        return timestamp if timestamp > 0 else None
+
+    @classmethod
+    def _query_created_at_by_id(cls, data: dict[str, Any]) -> dict[str, float]:
+        harness = data.get("harness")
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        if not isinstance(runs, dict):
+            return {}
+        result: dict[str, float] = {}
+        for run in runs.values():
+            if not isinstance(run, dict):
+                continue
+            query_id = str(run.get("query_id") or "")
+            timestamp = cls._valid_timestamp(run.get("created_at"))
+            if query_id and timestamp is not None:
+                result[query_id] = timestamp
+        return result
+
+    @classmethod
+    def _assistant_created_at_by_query_id(cls, data: dict[str, Any]) -> dict[str, float]:
+        harness = data.get("harness")
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        if not isinstance(runs, dict):
+            return {}
+        result: dict[str, float] = {}
+        for run in runs.values():
+            if not isinstance(run, dict):
+                continue
+            query_id = str(run.get("query_id") or "")
+            timestamp = (
+                cls._valid_timestamp(run.get("completed_at"))
+                or cls._valid_timestamp(run.get("updated_at"))
+                or cls._valid_timestamp(run.get("created_at"))
+            )
+            if query_id and timestamp is not None:
+                result[query_id] = timestamp
+        return result
+
+    @classmethod
+    def _project_message_timestamps(
+        cls,
+        data: dict[str, Any],
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Return display messages with stable event times, including legacy Sessions."""
+
+        session_created_at = cls._valid_timestamp(data.get("created_at")) or 0.0
+        query_created_at_by_id = cls._query_created_at_by_id(data)
+        assistant_created_at_by_query_id = cls._assistant_created_at_by_query_id(data)
+        projected: list[dict[str, Any]] = []
+        previous_timestamp = session_created_at
+        for index, raw_message in enumerate(messages):
+            if not isinstance(raw_message, dict):
+                continue
+            message = dict(raw_message)
+            timestamp = cls._valid_timestamp(message.get("created_at"))
+            query_id = str(message.get("query_id") or "")
+            if timestamp is None and query_id:
+                timestamp = (
+                    assistant_created_at_by_query_id.get(query_id)
+                    if message.get("role") == "assistant"
+                    else query_created_at_by_id.get(query_id)
+                )
+            if timestamp is None and message.get("role") == "user":
+                # Legacy user messages predate query_id persistence. Pair the
+                # turn with the next assistant message and use its Run start.
+                for candidate in messages[index + 1 :]:
+                    if not isinstance(candidate, dict):
+                        continue
+                    if candidate.get("role") == "user":
+                        break
+                    candidate_query_id = str(candidate.get("query_id") or "")
+                    if candidate_query_id:
+                        timestamp = query_created_at_by_id.get(candidate_query_id)
+                        if timestamp is not None:
+                            break
+            timestamp = timestamp or previous_timestamp or session_created_at
+            message["created_at"] = timestamp
+            previous_timestamp = timestamp
+            projected.append(message)
+        return projected
 
     @_session_write_locked
     def save_message(
@@ -598,6 +689,7 @@ class SessionManager:
         run_boundary_notice: dict[str, Any] | None = None,  # 跨 Run 续跑/停止说明
         attachments: list[dict[str, Any]] | None = None,  # Session-scoped stable attachment refs
         output_attachments: list[dict[str, Any]] | None = None,  # Assistant-published derived attachments
+        created_at: float | None = None,  # Query/message input time as Unix seconds
     ) -> None:
         """追加一条消息到会话历史"""
         data = self._read_file(session_id)  # 读取现有数据
@@ -618,6 +710,7 @@ class SessionManager:
             run_boundary_notice=run_boundary_notice,
             attachments=attachments,
             output_attachments=output_attachments,
+            created_at=created_at,
         )
         data["messages"].append(msg)  # 追加到消息列表末尾
         if isinstance(data.get("display_messages"), list):
@@ -644,10 +737,15 @@ class SessionManager:
         output_attachments: list[dict[str, Any]] | None = None,
         query_id: str | None = None,
         status: str | None = None,
+        created_at: float | None = None,
     ) -> dict[str, Any]:
         """Build the persisted message shape shared by append and upsert paths."""
 
-        msg: dict[str, Any] = {"role": role, "content": content}
+        msg: dict[str, Any] = {
+            "role": role,
+            "content": content,
+            "created_at": float(created_at) if created_at is not None else time.time(),
+        }
         if tool_calls:
             msg["tool_calls"] = tool_calls
         if reasoning_content:
@@ -798,6 +896,9 @@ class SessionManager:
                 and existing.get("query_id") == query_id
             ):
                 previous_context_signature = context_signature(existing)
+                existing_created_at = self._valid_timestamp(existing.get("created_at"))
+                if existing_created_at is not None:
+                    msg["created_at"] = existing_created_at
                 messages[index] = msg
                 replaced = True
                 break
@@ -986,6 +1087,9 @@ class SessionManager:
                     and existing.get("role") == "assistant"
                     and existing.get("query_id") == query_id
                 ):
+                    existing_created_at = self._valid_timestamp(existing.get("created_at"))
+                    if existing_created_at is not None:
+                        message["created_at"] = existing_created_at
                     collection[index] = dict(message)
                     break
             else:
@@ -4146,6 +4250,40 @@ class SessionManager:
     def update_title(self, session_id: str, title: str) -> None:
         """更新标题（rename_session 的别名，供 API 层调用）"""
         self.rename_session(session_id, title)
+
+    @_session_write_locked
+    def delete_session_if_idle_headless_before(
+        self,
+        session_id: str,
+        *,
+        cutoff: float,
+        terminal_run_statuses: set[str],
+    ) -> bool:
+        """Atomically delete one expired Headless Session if no Run is active."""
+
+        data = self._read_file(session_id)
+        if (
+            not data
+            or data.get("headless_enabled") is not True
+            or data.get("runtime_mode") != "headless_worker"
+        ):
+            return False
+        try:
+            updated_at = float(data.get("updated_at"))
+        except (TypeError, ValueError):
+            return False
+        if updated_at > cutoff:
+            return False
+        harness = data.get("harness")
+        runs = harness.get("runs") if isinstance(harness, dict) else {}
+        if any(
+            isinstance(run, dict)
+            and str(run.get("status") or "") not in terminal_run_statuses
+            for run in (runs.values() if isinstance(runs, dict) else ())
+        ):
+            return False
+        self.delete_session(session_id)
+        return True
 
     @_session_write_locked
     def delete_session(self, session_id: str) -> None:

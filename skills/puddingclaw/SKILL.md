@@ -76,6 +76,26 @@ Optional stdin fields:
 
 While the process is running, show a host-side state such as “PuddingClaw 正在处理”. The current CLI is intentionally non-streaming; do not parse partial stdout as progress.
 
+## Preserve task continuity
+
+Treat `session_id` as host-owned state for one logical task or conversation thread:
+
+1. For a new task, omit `session_id` and read it from the completed CLI JSON response.
+2. Store the returned `session_id` with the host's Task/Thread record, together with `session_expires_at` when present.
+3. For a follow-up, correction, or retry that requires prior context, send that same `session_id` in stdin JSON.
+4. For an unrelated task, start a fresh Session. Never derive a default Session from the Worker Key name or share one Session across tasks.
+5. Do not store `session_id` in `.env`; `.env` is only a credential fallback and Session identity changes per task.
+
+Headless Sessions expire after the Backend's inactivity TTL, which defaults to 24 hours and is refreshed whenever the Session is updated. If `session_expires_at` has passed, start a new Session and include the relevant prior context in the new message. If CLI JSON returns `outcome=session_expired` (`error_code=session_expired`, HTTP `410`), remove the stale mapping and do the same; never claim that the expired Session's hidden context was preserved.
+
+For direct human use, the equivalent continuation flag is:
+
+```text
+puddingclaw run "继续刚才的分析" --model <analytics model> --session <session_id> --json
+```
+
+Machine integrations should continue using stdin JSON rather than constructing a shell command.
+
 ## Interpret the result
 
 Parse stdout only after the process exits. It contains one JSON object.
@@ -83,8 +103,10 @@ Parse stdout only after the process exits. It contains one JSON object.
 - `status == "completed"`: present `final_response` as the Worker answer. Fall back to `reply` only for an older compatible Worker that omits `final_response`.
 - `reply`: aggregated visible content that may include intermediate assistant narration. Do not prefer it over `final_response`.
 - `needs_input != null`: show the question or approval request, collect the user's answer, and continue with the returned `session_id` according to the payload.
+- `outcome == "session_expired"`: remove the Task/Thread mapping and create a new Session with the relevant visible context restated in the message.
 - `status == "error"` or a nonzero exit: summarize the structured error without exposing configuration values.
 - Preserve `run_id` and `session_id` in host metadata for tracing and follow-up, not in the main user-facing answer unless useful.
+- Preserve `session_expires_at` with the mapping when returned; it is lifecycle metadata, not user content.
 
 Do not claim success solely because the process returned JSON; check `status` and `outcome`.
 

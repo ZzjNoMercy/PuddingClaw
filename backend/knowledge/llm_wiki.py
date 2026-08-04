@@ -43,10 +43,23 @@ WIKILINK_TARGET_RE = re.compile(rf"^(?P<slug>{TYPED_SLUG_PATTERN})$")
 WIKILINK_RE = re.compile(rf"\[\[({TYPED_SLUG_PATTERN})(?:\|[^\]]+)?\]\]")
 WIKILINK_WITH_LABEL_RE = re.compile(rf"\[\[(?P<slug>{TYPED_SLUG_PATTERN})(?P<label>\|[^\]]+)?\]\]")
 ANY_WIKILINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]")
+SOURCED_FROM_WIKILINK_RE = re.compile(
+    rf"\bsourced_from\b[^\n]*?\[\[(?P<slug>{TYPED_SLUG_PATTERN})(?:\|[^\]]+)?\]\]"
+)
 LEGACY_WORKSPACE_WIKILINK_RE = re.compile(rf"\[\[wiki/(?P<slug>{TYPED_SLUG_PATTERN})(?P<label>\|[^\]]+)?\]\]")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 WORD_RE = re.compile(r"[\w\u4e00-\u9fff-]+", re.UNICODE)
 SPECIAL_WIKI_FILES = frozenset({"index.md", "log.md"})
+
+
+def _markdown_level_two_section(body: str, title: str) -> str:
+    """Return one level-two Markdown section without interpreting prose as structure."""
+
+    match = re.search(
+        rf"(?ms)^##\s+{re.escape(title)}\s*$\n(?P<body>.*?)(?=^##\s+|\Z)",
+        body,
+    )
+    return match.group("body") if match else ""
 
 
 def _empty_gbrain_import_status(*, available: bool = False) -> dict[str, Any]:
@@ -754,6 +767,8 @@ class LlmWikiService:
         warnings: list[dict[str, str]] = []
         page_paths = _wiki_page_paths(directory)
         pages = {_wiki_slug(directory, path): path.read_text(encoding="utf-8") for path in page_paths}
+        page_types: dict[str, str] = {}
+        page_bodies: dict[str, str] = {}
         raw_names = {str(item.get("snapshot_path")) for item in self._manifest_records()}
 
         def finding(collection: list[dict[str, str]], code: str, path: str, message: str) -> None:
@@ -779,6 +794,8 @@ class LlmWikiService:
                 if field not in metadata or metadata[field] in (None, "", []):
                     finding(errors, "missing_frontmatter", path, f"required field is missing: {field}")
             page_type = str(metadata.get("type") or "")
+            page_types[slug] = page_type
+            page_bodies[slug] = body
             if page_type and page_type not in allowed_types:
                 finding(errors, "unknown_page_type", path, f"type {page_type!r} is not in the resolved Schema")
             elif page_type:
@@ -830,6 +847,65 @@ class LlmWikiService:
                     )
                 elif match.group("slug") not in pages:
                     finding(errors, "broken_wikilink", path, f"target does not exist: {target}")
+
+        sourced_from_by_media: dict[str, set[str]] = {}
+        for media_slug, body in page_bodies.items():
+            if page_types.get(media_slug) != "media":
+                continue
+            source_slugs = {match.group("slug") for match in SOURCED_FROM_WIKILINK_RE.finditer(body)}
+            sourced_from_by_media[media_slug] = source_slugs
+            for source_slug in sorted(source_slugs):
+                if source_slug not in pages:
+                    continue  # The ordinary broken_wikilink finding already reports this.
+                if page_types.get(source_slug) != "source":
+                    finding(
+                        errors,
+                        "invalid_sourced_from_target",
+                        f"wiki/{media_slug}.md",
+                        f"sourced_from target must be a source page: {source_slug}",
+                    )
+                    continue
+                source_links = set(WIKILINK_RE.findall(page_bodies.get(source_slug, "")))
+                if media_slug not in source_links:
+                    finding(
+                        errors,
+                        "missing_source_backlink",
+                        f"wiki/{source_slug}.md",
+                        f"source must link collected media page in 已收录内容: {media_slug}",
+                    )
+
+        for source_slug, body in page_bodies.items():
+            if page_types.get(source_slug) != "source":
+                continue
+            collected_section = _markdown_level_two_section(body, "已收录内容")
+            collected_media = WIKILINK_RE.findall(collected_section)
+            seen_media: set[str] = set()
+            for media_slug in collected_media:
+                if media_slug in seen_media:
+                    finding(
+                        errors,
+                        "duplicate_source_collection_link",
+                        f"wiki/{source_slug}.md",
+                        f"已收录内容 contains duplicate media link: {media_slug}",
+                    )
+                    continue
+                seen_media.add(media_slug)
+                if media_slug not in pages:
+                    continue  # The ordinary broken_wikilink finding already reports this.
+                if page_types.get(media_slug) != "media":
+                    finding(
+                        errors,
+                        "invalid_source_collection_target",
+                        f"wiki/{source_slug}.md",
+                        f"已收录内容 must link a media page: {media_slug}",
+                    )
+                elif source_slug not in sourced_from_by_media.get(media_slug, set()):
+                    finding(
+                        errors,
+                        "missing_media_source_relation",
+                        f"wiki/{media_slug}.md",
+                        f"media listed by {source_slug} must declare sourced_from [[{source_slug}]]",
+                    )
 
         index_path = directory / "index.md"
         if not index_path.is_file():

@@ -1650,6 +1650,17 @@ export async function updateReadLaterItem(
   return JSON.parse(text).item as ReadLaterItem;
 }
 
+export async function deleteReadLaterItem(itemId: string): Promise<{
+  ok: boolean;
+  deleted: Record<string, boolean>;
+  preserved: string[];
+}> {
+  const response = await fetch(`${API_BASE}/read-later/${encodeURIComponent(itemId)}`, { method: "DELETE" });
+  const text = await response.text();
+  if (!response.ok) throw new Error(apiErrorMessage(text, `删除收藏失败：${response.status}`));
+  return JSON.parse(text);
+}
+
 export async function retryReadLaterItem(itemId: string): Promise<{ item: ReadLaterItem; job: KnowledgeImportJob }> {
   const response = await fetch(`${API_BASE}/read-later/${encodeURIComponent(itemId)}/retry`, { method: "POST" });
   const text = await response.text();
@@ -4021,6 +4032,7 @@ export async function getSessionHistory(
   messages: Array<{
     role: string;
     content: string;
+    created_at?: number;
     query_id?: string;
     attachments?: AgentAttachment[];
     output_attachments?: AgentAttachment[];

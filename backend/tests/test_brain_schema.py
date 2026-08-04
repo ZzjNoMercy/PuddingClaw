@@ -62,6 +62,11 @@ def test_initialize_creates_schema_bundle_and_resolved_preview(schema_env: Brain
     assert "长期实体—稳定主题—关系" in agents
     assert "`source_refs`、文件路径、URL 和其他引用字段只表示来源线索" in agents
     assert "现有 `index.md` 只用于发现和解析已有页面 slug，不是事实证据" in agents
+    assert "具有稳定名称且会重复收录内容的发布渠道" in agents
+    assert "使用 `sourced_from` 将每个 `media` 页面链接到该来源" in agents
+    assert "`source` 页的“已收录内容”必须使用完整路径 wikilink" in agents
+    assert "禁止使用“详见 media 页面”等纯文本代替链接" in agents
+    assert "账号名或频道名本身不等于 `person`" in agents
     assert "不得为了避免孤立页面或满足“互链”而添加关系" in agents
     assert "暂时没有可信关系的页面可以保持孤立" in agents
     assert "严格保留专有名词及主客体" in agents

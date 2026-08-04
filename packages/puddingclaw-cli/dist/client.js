@@ -47,7 +47,11 @@ export class WorkerClient {
         const detail = typeof payload.detail === "string" ? payload.detail : `HTTP ${response.status}`;
         throw new WorkerClientError(safeMessage(detail), {
           status: response.status,
-          code: response.status === 401 || response.status === 403 ? "auth_error" : "http_error",
+          code: response.status === 410
+            ? "session_expired"
+            : response.status === 401 || response.status === 403
+              ? "auth_error"
+              : "http_error",
         });
       }
       return payload;

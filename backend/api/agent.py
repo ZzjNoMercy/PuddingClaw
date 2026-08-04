@@ -170,6 +170,7 @@ class AgentRequest(BaseModel):
 @router.post("/agent")
 async def agent(request: AgentRequest):
     request_started_at = time.perf_counter()
+    request_received_at = time.time()
     request_id = f"agentreq-{uuid.uuid4().hex[:12]}"
     logger.info(
         "[agent-latency] metric=request_received request_id=%s session=%s stream=%s "
@@ -247,6 +248,7 @@ async def agent(request: AgentRequest):
                     request.attachments,
                 ),
                 attachments=request.attachments,
+                created_at=request_received_at,
             )
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="Session not found") from exc
@@ -276,6 +278,7 @@ async def agent(request: AgentRequest):
             goal_id=request.goal_id,
             context_goal_id=request.context_goal_id,
             goal_control_action=request.goal_control_action,
+            query_created_at=request_received_at,
         )
         return EventSourceResponse(
             _instrument_agent_stream(
@@ -304,6 +307,7 @@ async def agent(request: AgentRequest):
         goal_id=request.goal_id,
         context_goal_id=request.context_goal_id,
         goal_control_action=request.goal_control_action,
+        query_created_at=request_received_at,
     )
     async for event in _instrument_agent_stream(
         stream,

@@ -22,6 +22,14 @@ from cli_runtime import current_cli_runtime_status
 from graph.deepagents_manager import deepagents_agent_manager
 from graph.headless_resolver import headless_authority_from_environment
 from graph.session_manager import session_manager
+from headless_session_lifecycle import (
+    TERMINAL_RUN_STATUSES,
+    cleanup_stale_headless_sessions,
+    headless_session_expires_at,
+    headless_session_has_pending_resume,
+    headless_session_ttl_seconds,
+    is_headless_session_expired,
+)
 from projects.registry import project_registry
 from worker_access import WORKER_SCOPES, WorkerAccessError, worker_access_store
 
@@ -30,6 +38,56 @@ worker_access_router = APIRouter(tags=["worker-access-keys"])
 BASE_DIR = Path(__file__).resolve().parent.parent
 _idempotency_lock = threading.RLock()
 _WORKER_PROJECT_NAME = "puddingclaw"
+_active_headless_sessions: set[str] = set()
+_active_headless_sessions_lock = threading.RLock()
+_headless_cleanup_lock = threading.Lock()
+_last_headless_cleanup_monotonic = 0.0
+
+
+def _claim_headless_session(session_id: str) -> bool:
+    with _active_headless_sessions_lock:
+        if session_id in _active_headless_sessions:
+            return False
+        _active_headless_sessions.add(session_id)
+        return True
+
+
+def _release_headless_session(session_id: str) -> None:
+    with _active_headless_sessions_lock:
+        _active_headless_sessions.discard(session_id)
+
+
+def _cleanup_interval_seconds() -> float:
+    raw = os.getenv("PUDDINGCLAW_HEADLESS_SESSION_CLEANUP_INTERVAL_S", "3600").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 3600.0
+
+
+def _maybe_cleanup_stale_headless_sessions(*, force: bool = False, now: float | None = None) -> list[str]:
+    """Run bounded opportunistic cleanup without racing a claimed request."""
+
+    global _last_headless_cleanup_monotonic
+    monotonic_now = time.monotonic()
+    with _headless_cleanup_lock:
+        interval = _cleanup_interval_seconds()
+        if not force and monotonic_now - _last_headless_cleanup_monotonic < interval:
+            return []
+        _last_headless_cleanup_monotonic = monotonic_now
+        with _active_headless_sessions_lock:
+            return cleanup_stale_headless_sessions(
+                now=now,
+                protected_session_ids=set(_active_headless_sessions),
+            )
+
+
+def _attach_session_lifecycle(response: dict[str, Any], session_id: str) -> dict[str, Any]:
+    ttl_seconds = headless_session_ttl_seconds()
+    metadata = session_manager.get_metadata(session_id)
+    response["session_ttl_seconds"] = int(ttl_seconds) if ttl_seconds is not None else None
+    response["session_expires_at"] = headless_session_expires_at(metadata, ttl_seconds)
+    return response
 
 
 class HeadlessRunRequest(BaseModel):
@@ -144,7 +202,12 @@ def _idempotency_path() -> Path:
 
 
 def _idempotency_key(request: HeadlessRunRequest, header: str | None) -> str:
-    return str(header or request.request_id or "").strip()
+    # FastAPI replaces ``Header`` defaults for real HTTP requests, but direct
+    # callers (including internal tests/adapters) receive the ``Header``
+    # descriptor itself when the argument is omitted.  Never persist that
+    # shared descriptor representation as an idempotency key.
+    resolved_header = header if isinstance(header, str) else None
+    return str(resolved_header or request.request_id or "").strip()
 
 
 def _request_hash(request: HeadlessRunRequest, *, principal: dict[str, Any]) -> str:
@@ -198,6 +261,28 @@ def _finish_idempotency(key: str, response: dict[str, Any]) -> None:
         temp.replace(path)
 
 
+def _abandon_idempotency(key: str, request_hash: str) -> None:
+    """Remove this request's unfinished reservation so a corrected retry can run."""
+
+    if not key:
+        return
+    path = _idempotency_path()
+    with _idempotency_lock:
+        try:
+            records = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        existing = records.get(key) if isinstance(records, dict) else None
+        if not isinstance(existing, dict):
+            return
+        if existing.get("status") != "running" or existing.get("request_hash") != request_hash:
+            return
+        records.pop(key, None)
+        temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        temp.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp.replace(path)
+
+
 def _needs_input(event_name: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     mapping = {
         "user_input_required": "user_input",
@@ -226,6 +311,7 @@ async def _consume_run(
     project_id: str,
     approval_mode: str,
     authority: dict[str, Any],
+    request_received_at: float,
 ) -> dict[str, Any]:
     final_content = ""
     final_response = ""
@@ -243,6 +329,7 @@ async def _consume_run(
         authority_profile=str(authority.get("profile") or "workspace"),
         authority_directories=list(authority.get("directories") or []),
         authority_network_origins=list(authority.get("network_origins") or []),
+        query_created_at=request_received_at,
     )
     try:
         timeout_s = max(1.0, float(os.getenv("PUDDINGCLAW_TIMEOUT_S", "600")))
@@ -297,6 +384,7 @@ async def _consume_run(
 @router.get("/health")
 async def worker_health(authorization: str | None = Header(default=None)):
     principal = _principal_for_scope(authorization, "worker:health")
+    _maybe_cleanup_stale_headless_sessions()
     project_id, path = _ensure_worker_project()
     cli_status = current_cli_runtime_status(BASE_DIR)
     cli_status.pop("path", None)
@@ -335,6 +423,7 @@ async def create_headless_run(
     authorization: str | None = Header(default=None),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
+    request_received_at = time.time()
     principal = _principal_for_scope(authorization, "worker:runs:create")
     models = _model_options(principal)
     selected = str(request.analytics_model_id or "").strip()
@@ -351,11 +440,13 @@ async def create_headless_run(
         }
         return response
     key = _idempotency_key(request, idempotency_key)
-    previous = _reserve_idempotency(key, _request_hash(request, principal=principal))
+    request_hash = _request_hash(request, principal=principal)
+    previous = _reserve_idempotency(key, request_hash)
     if previous is not None:
         if previous.get("status") == "completed" and isinstance(previous.get("response"), dict):
             return previous["response"]
         raise HTTPException(status_code=409, detail="An identical Worker Run is already in progress")
+    idempotency_finished = False
 
     requested_session_id = str(request.session_id or "").strip()
     session_id = requested_session_id or f"worker-session-{uuid.uuid4().hex[:16]}"
@@ -378,40 +469,73 @@ async def create_headless_run(
             },
             approval_mode=approval_mode,
         )
-    else:
-        if not session_manager.session_exists(session_id):
-            raise HTTPException(status_code=404, detail="Headless Session not found")
-        metadata = session_manager.get_metadata(session_id)
-        if not metadata.get("headless_enabled") or metadata.get("worker_key_id") != principal.get("key_id"):
-            raise HTTPException(status_code=403, detail="Session is not authorized for this Worker")
-        harness = session_manager.get_harness_state(session_id)
-        active = [item for item in (harness.get("runs") or {}).values() if isinstance(item, dict) and item.get("status") not in {"completed", "cancelled", "failed", "blocked", "budget_exceeded", "verification_failed"}]
-        if active:
-            raise HTTPException(status_code=409, detail="Session already has an active Run")
-        approval_mode = str(metadata.get("approval_mode") or approval_mode)
-    project_id, _workspace_path = _ensure_worker_project()
+    if not _claim_headless_session(session_id):
+        _abandon_idempotency(key, request_hash)
+        raise HTTPException(status_code=409, detail="Headless Session already has an active request")
     try:
-        response = await _consume_run(
-            request=request,
-            session_id=session_id,
-            project_id=project_id,
-            approval_mode=approval_mode,
-            authority={**authority, "profile": authority_profile if approval_mode == "full_access" else "smart"},
-        )
-    except asyncio.TimeoutError:
-        response = {
-            "schema_version": "1",
-            "session_id": session_id,
-            "status": "failed",
-            "outcome": "timeout",
-            "needs_input": None,
-        }
+        if requested_session_id:
+            if not session_manager.session_exists(session_id):
+                raise HTTPException(status_code=404, detail="Headless Session not found")
+            metadata = session_manager.get_metadata(session_id)
+            if not metadata.get("headless_enabled") or metadata.get("worker_key_id") != principal.get("key_id"):
+                raise HTTPException(status_code=403, detail="Session is not authorized for this Worker")
+            harness = session_manager.get_harness_state(session_id)
+            active = [
+                item
+                for item in (harness.get("runs") or {}).values()
+                if isinstance(item, dict) and item.get("status") not in TERMINAL_RUN_STATUSES
+            ]
+            if active or headless_session_has_pending_resume(session_id):
+                raise HTTPException(status_code=409, detail="Session already has an active Run or pending input")
+            ttl_seconds = headless_session_ttl_seconds()
+            if ttl_seconds is not None and is_headless_session_expired(
+                metadata,
+                now=request_received_at,
+                ttl_seconds=ttl_seconds,
+            ):
+                deleted = session_manager.delete_session_if_idle_headless_before(
+                    session_id,
+                    cutoff=request_received_at - ttl_seconds,
+                    terminal_run_statuses=TERMINAL_RUN_STATUSES,
+                )
+                if deleted:
+                    raise HTTPException(
+                        status_code=status.HTTP_410_GONE,
+                        detail="Headless Session expired after its configured inactivity TTL",
+                    )
+                raise HTTPException(status_code=409, detail="Headless Session changed while expiry was checked")
+            approval_mode = str(metadata.get("approval_mode") or approval_mode)
+
+        _maybe_cleanup_stale_headless_sessions(now=request_received_at)
+        project_id, _workspace_path = _ensure_worker_project()
+        try:
+            response = await _consume_run(
+                request=request,
+                session_id=session_id,
+                project_id=project_id,
+                approval_mode=approval_mode,
+                authority={**authority, "profile": authority_profile if approval_mode == "full_access" else "smart"},
+                request_received_at=request_received_at,
+            )
+        except asyncio.TimeoutError:
+            response = {
+                "schema_version": "1",
+                "session_id": session_id,
+                "status": "failed",
+                "outcome": "timeout",
+                "needs_input": None,
+            }
+        _attach_session_lifecycle(response, session_id)
         if key:
             _finish_idempotency(key, response)
-        return JSONResponse(status_code=status.HTTP_504_GATEWAY_TIMEOUT, content=response)
-    if key:
-        _finish_idempotency(key, response)
-    return response
+            idempotency_finished = True
+        if response.get("outcome") == "timeout":
+            return JSONResponse(status_code=status.HTTP_504_GATEWAY_TIMEOUT, content=response)
+        return response
+    finally:
+        if key and not idempotency_finished:
+            _abandon_idempotency(key, request_hash)
+        _release_headless_session(session_id)
 
 
 @router.post("/access-keys")

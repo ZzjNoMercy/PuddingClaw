@@ -510,7 +510,13 @@ async def _maybe_middle_trim_session(session_id: str) -> None:
         )
 
 
-async def event_generator(message: str, session_id: str, user_id: str = "default_user") -> AsyncGenerator[dict, None]:
+async def event_generator(
+    message: str,
+    session_id: str,
+    user_id: str = "default_user",
+    *,
+    query_created_at: float | None = None,
+) -> AsyncGenerator[dict, None]:
     """Generate SSE events from agent stream.
 
     Tracks multiple response segments — each time the agent finishes
@@ -523,6 +529,7 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
     2. Exception (API timeout, etc.) → saved in except block
     3. Client disconnect (GeneratorExit) → saved in finally block
     """
+    query_created_at = float(query_created_at) if query_created_at is not None else time.time()
     # 设置请求级 user_id，供 memory_tools 中的 @tool 函数读取
     from tools.memory_tools import current_user_id
     current_user_id.set(user_id)
@@ -823,7 +830,12 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
                     )
                     segments.append(current_segment)
 
-                session_manager.save_message(session_id, "user", message)
+                session_manager.save_message(
+                    session_id,
+                    "user",
+                    message,
+                    created_at=query_created_at,
+                )
                 for seg in segments:
                     seg = _ensure_tool_call_outputs(seg)
                     tc = seg["tool_calls"] if seg["tool_calls"] else None
@@ -944,7 +956,12 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
                     seg["content"] or seg["tool_calls"] for seg in segments
                 )
                 if has_content:
-                    session_manager.save_message(session_id, "user", message)
+                    session_manager.save_message(
+                        session_id,
+                        "user",
+                        message,
+                        created_at=query_created_at,
+                    )
                     for seg in segments:
                         seg = _ensure_tool_call_outputs(seg)
                         if seg["content"] or seg["tool_calls"]:
@@ -974,6 +991,7 @@ async def event_generator(message: str, session_id: str, user_id: str = "default
 
 @router.post("/chat")
 async def chat(request: ChatRequest):
+    request_received_at = time.time()
     try:
         session_manager.update_metadata(
             request.session_id,
@@ -989,10 +1007,20 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=404, detail="Session not found") from exc
     if request.stream:
         return EventSourceResponse(
-            event_generator(request.message, request.session_id, request.user_id)
+            event_generator(
+                request.message,
+                request.session_id,
+                request.user_id,
+                query_created_at=request_received_at,
+            )
         )
     # Non-streaming fallback — 同样需要设置请求级 user_id
     from tools.memory_tools import current_user_id
     current_user_id.set(request.user_id)
-    result = await agent_manager.ainvoke(request.message, request.session_id, request.user_id)
+    result = await agent_manager.ainvoke(
+        request.message,
+        request.session_id,
+        request.user_id,
+        query_created_at=request_received_at,
+    )
     return {"reply": result}

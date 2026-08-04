@@ -55,9 +55,14 @@ generic filesystem tools to inspect `/knowledge` or the physical knowledge
 root afterward: those tools intentionally have a different sandbox boundary
 and their denial is not evidence that the dedicated Wiki service is unreadable.
 
-For Query, prefer the allowlisted gbrain MCP tools when available. Otherwise
-use `llm_wiki_query`. Cite Wiki slugs and their `sources`; report a knowledge
-gap instead of reading raw files.
+For Query, treat the published Markdown LLM Wiki as the complete source of
+truth and gbrain as its structured acceleration/index layer. Prefer the
+allowlisted gbrain MCP tools first when available. If gbrain is unavailable,
+fails, returns no results, returns only stale results, or does not directly
+match the entity/topic asked by the user, call `llm_wiki_query` before
+reporting an internal knowledge gap or using Web. Do not call both backends
+when gbrain already returns a direct, relevant answer. Cite Wiki slugs and
+their `sources`; report a knowledge gap instead of reading raw files.
 
 For Lint, call `llm_wiki_lint`. Use `llm_wiki_compile` when the user asks to
 verify gbrain compatibility. Neither operation repairs files.

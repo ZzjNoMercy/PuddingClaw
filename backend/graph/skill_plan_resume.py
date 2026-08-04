@@ -99,6 +99,17 @@ class SkillPlanResumeRegistry:
                 count += 1
         return count
 
+    def has_pending_session(self, session_id: str) -> bool:
+        """Return whether a live Skill-plan decision belongs to the Session."""
+
+        return any(
+            request.get("session_id") == session_id
+            and request.get("status") == "pending"
+            and request_id in self._pending
+            and not self._pending[request_id].done()
+            for request_id, request in self._requests.items()
+        )
+
     def reject_run(self, session_id: str, run_id: str, message: str) -> int:
         count = 0
         for request_id, request in list(self._requests.items()):

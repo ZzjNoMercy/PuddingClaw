@@ -20,9 +20,31 @@ interface Props {
   showInterruptionNotice?: boolean;
 }
 
+const BEIJING_DATE_TIME_FORMATTER = new Intl.DateTimeFormat("en-CA", {
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  hourCycle: "h23",
+  timeZone: "Asia/Shanghai",
+});
+
+function beijingDateTimeParts(date: Date): Record<string, string> {
+  return Object.fromEntries(
+    BEIJING_DATE_TIME_FORMATTER.formatToParts(date).map(({ type, value }) => [type, value])
+  );
+}
+
 function formatTime(ts: number): string {
-  const d = new Date(ts);
-  return d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+  if (!Number.isFinite(ts) || ts <= 0) return "";
+  const value = beijingDateTimeParts(new Date(ts));
+  const today = beijingDateTimeParts(new Date());
+  const time = `${value.hour}:${value.minute}`;
+  const isToday = value.year === today.year
+    && value.month === today.month
+    && value.day === today.day;
+  return isToday ? time : `${value.year}/${value.month}/${value.day} ${time}`;
 }
 
 function stripModelCallLimitNotice(content: string): string {

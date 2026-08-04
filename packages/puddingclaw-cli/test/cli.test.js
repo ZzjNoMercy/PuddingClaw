@@ -35,6 +35,39 @@ test("stdin JSON preserves non-ASCII message and maps model", async () => {
   assert.equal(JSON.parse(stdout).analytics_model_id, "sales");
 });
 
+test("run accepts an explicit session for a continuous task", async () => {
+  const child = spawn(process.execPath, ["--import", path.join(root, "test", "mock-fetch.js"), cli, "run", "继续分析", "--model", "sales", "--session", "worker-session-existing", "--json"], {
+    env: { ...process.env, PUDDINGCLAW_URL: "http://127.0.0.1:8888", PUDDINGCLAW_TOKEN: "test-token", PUDDINGCLAW_PROJECTS_ROOT: "/tmp/puddingclaw-cli-test" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = ""; let stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const [result] = await once(child, "close");
+  assert.equal(result, 0, stderr);
+  assert.equal(JSON.parse(stdout).session_id, "worker-session-existing");
+});
+
+test("expired session is a structured recoverable outcome", async () => {
+  const child = spawn(process.execPath, ["--import", path.join(root, "test", "mock-fetch.js"), cli, "run", "继续分析", "--model", "sales", "--session", "worker-session-expired", "--json"], {
+    env: { ...process.env, PUDDINGCLAW_URL: "http://127.0.0.1:8888", PUDDINGCLAW_TOKEN: "test-token", PUDDINGCLAW_PROJECTS_ROOT: "/tmp/puddingclaw-cli-test" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = ""; let stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const [result] = await once(child, "close");
+  assert.equal(result, 1, stderr);
+  assert.deepEqual(JSON.parse(stdout), {
+    schema_version: "1",
+    status: "error",
+    outcome: "session_expired",
+    error_code: "session_expired",
+    http_status: 410,
+    error: "Headless Session expired after its configured inactivity TTL",
+  });
+});
+
 test("human-readable run output prefers final_response over aggregate reply", async () => {
   const child = spawn(process.execPath, ["--import", path.join(root, "test", "mock-fetch.js"), cli, "run", "分析销售", "--model", "sales"], {
     env: { ...process.env, PUDDINGCLAW_URL: "http://127.0.0.1:8888", PUDDINGCLAW_TOKEN: "test-token", PUDDINGCLAW_PROJECTS_ROOT: "/tmp/puddingclaw-cli-test" },

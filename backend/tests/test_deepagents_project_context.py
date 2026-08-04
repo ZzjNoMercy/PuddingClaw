@@ -161,5 +161,7 @@ def test_default_agent_prompt_routes_internal_knowledge_sources_together() -> No
     assert "同时读取 `/skills/knowledge-search/SKILL.md` 与 `/skills/llm-wiki/SKILL.md`" in prompt
     assert "不要因为其中一路先返回结果而跳过另一路" in prompt
     assert "向文档知识库和 Wiki/GBrain 提交语义等价的查询" in prompt
-    assert "否则使用 `llm_wiki_query`" in prompt
+    assert "发布后的 Markdown LLM Wiki 是完整知识源" in prompt
+    assert "结果没有直接命中用户所问实体/主题" in prompt
+    assert "必须继续调用 `llm_wiki_query`" in prompt
     assert "只有全部可用的内部来源均返回无结果、知识缺口或资料明显不足时" in prompt

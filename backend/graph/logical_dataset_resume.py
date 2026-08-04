@@ -102,5 +102,26 @@ class LogicalDatasetResumeRegistry:
             future.set_result(normalized)
         return normalized
 
+    def reject_session(self, session_id: str, message: str) -> int:
+        """Reject all live logical-dataset decisions for a cancelled Session."""
+
+        count = 0
+        for request_id, request in list(self._requests.items()):
+            if request.get("session_id") == session_id and request.get("status") == "pending":
+                if self.resolve(request_id, {"action": "cancel", "message": message}) is not None:
+                    count += 1
+        return count
+
+    def has_pending_session(self, session_id: str) -> bool:
+        """Return whether a live logical-dataset decision belongs to the Session."""
+
+        return any(
+            request.get("session_id") == session_id
+            and request.get("status") == "pending"
+            and request_id in self._pending
+            and not self._pending[request_id].done()
+            for request_id, request in self._requests.items()
+        )
+
 
 logical_dataset_resume_registry = LogicalDatasetResumeRegistry()

@@ -16,6 +16,7 @@ from knowledge.import_jobs import job_to_dict
 from knowledge.models import ReadLaterItem
 from knowledge.read_later import (
     create_read_later_item,
+    delete_read_later_item,
     list_read_later_items,
     promote_read_later_to_wiki,
     read_later_to_dict,
@@ -86,6 +87,7 @@ async def get_read_later_items(
 ):
     items = await list_read_later_items(
         session,
+        base_dir=BASE_DIR,
         knowledge_base_id=knowledge_base_id,
         reading_status=reading_status,
         parse_status=parse_status,
@@ -130,6 +132,22 @@ async def update_read_later_item(
     await session.commit()
     await session.refresh(item)
     return {"item": read_later_to_dict(item)}
+
+
+@router.delete("/{item_id}")
+async def delete_read_later(
+    item_id: str,
+    session: AsyncSession = Depends(get_db_session),
+):
+    item = await session.get(ReadLaterItem, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="稍后读记录不存在")
+    result = await delete_read_later_item(session, base_dir=BASE_DIR, item=item)
+    return {
+        "ok": True,
+        "deleted": result,
+        "preserved": ["raw_snapshot", "wiki_pages", "gbrain_data", "task_history"],
+    }
 
 
 @router.post("/{item_id}/retry")

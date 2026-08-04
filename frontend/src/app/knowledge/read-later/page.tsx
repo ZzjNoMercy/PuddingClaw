@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -20,6 +20,7 @@ import {
   RefreshCw,
   Search,
   Sparkles,
+  Trash2,
 } from "lucide-react";
 import Navbar from "@/components/layout/Navbar";
 import Sidebar from "@/components/layout/Sidebar";
@@ -29,8 +30,10 @@ import KnowledgeWorkspaceNav from "@/components/knowledge/KnowledgeWorkspaceNav"
 import { useApp } from "@/lib/store";
 import {
   compileReadLaterItems,
+  deleteReadLaterItem,
   getReadLaterItem,
   listReadLaterItems,
+  rawKnowledgeFileUrl,
   saveReadLaterUrl,
   retryReadLaterItem,
   updateReadLaterItem,
@@ -64,6 +67,27 @@ function relativeTime(value: string | null) {
   return `${Math.floor(minutes / 1440)} 天前`;
 }
 
+function ReadLaterCover({ src, title }: { src: string; title: string }) {
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => setFailed(false), [src]);
+
+  if (!src || failed) return null;
+  return (
+    <span className="h-20 w-20 shrink-0 overflow-hidden rounded-xl bg-black/[0.035] ring-1 ring-black/[0.05]">
+      {/* Local knowledge assets are served through the authenticated raw-file endpoint. */}
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        src={rawKnowledgeFileUrl(src)}
+        alt={`${title}封面`}
+        loading="lazy"
+        className="h-full w-full object-cover"
+        onError={() => setFailed(true)}
+      />
+    </span>
+  );
+}
+
 export default function ReadLaterPage() {
   const { sidebarOpen, toggleSidebar, sidebarWidth, setSidebarWidth } = useApp();
   const [mounted, setMounted] = useState(false);
@@ -79,29 +103,38 @@ export default function ReadLaterPage() {
   const [saving, setSaving] = useState(false);
   const [compiling, setCompiling] = useState(false);
   const [readerFullscreen, setReaderFullscreen] = useState(false);
+  const [deleteCandidate, setDeleteCandidate] = useState<ReadLaterItem | null>(null);
+  const [deleting, setDeleting] = useState(false);
   const [notice, setNotice] = useState<{ tone: "ok" | "error"; text: string } | null>(null);
+  const refreshVersion = useRef(0);
 
   const refresh = useCallback(async () => {
+    const version = ++refreshVersion.current;
     try {
-      const result = await listReadLaterItems();
+      const result = await listReadLaterItems({ search: query.trim() });
+      if (version !== refreshVersion.current) return;
       setItems(result);
-      setSelectedId((current) => current || result[0]?.id || "");
+      setSelectedId((current) => result.some((item) => item.id === current) ? current : result[0]?.id || "");
     } catch (error) {
+      if (version !== refreshVersion.current) return;
       setNotice({ tone: "error", text: error instanceof Error ? error.message : "读取稍后读失败" });
     } finally {
-      setLoading(false);
+      if (version === refreshVersion.current) setLoading(false);
     }
-  }, []);
+  }, [query]);
 
   useEffect(() => {
     setMounted(true);
   }, []);
 
   useEffect(() => {
-    void refresh();
-    const timer = window.setInterval(() => void refresh(), 4000);
-    return () => window.clearInterval(timer);
-  }, [refresh]);
+    const debounce = window.setTimeout(() => void refresh(), query.trim() ? 250 : 0);
+    const timer = query.trim() ? null : window.setInterval(() => void refresh(), 4000);
+    return () => {
+      window.clearTimeout(debounce);
+      if (timer !== null) window.clearInterval(timer);
+    };
+  }, [query, refresh]);
 
   useEffect(() => {
     if (!selectedId) {
@@ -143,9 +176,8 @@ export default function ReadLaterPage() {
     if (filter === "link_only" && (item.parse_status !== "link_only" || item.reading_status === "archived")) return false;
     if (filter !== "all" && filter !== "link_only" && item.reading_status !== filter) return false;
     if (filter === "all" && item.reading_status === "archived") return false;
-    const needle = query.trim().toLowerCase();
-    return !needle || `${item.title} ${item.original_url} ${item.site_name}`.toLowerCase().includes(needle);
-  }), [filter, items, query]);
+    return true;
+  }), [filter, items]);
 
   const selectedReady = Array.from(checked).filter((id) => items.find((item) => item.id === id)?.parse_status === "ready");
 
@@ -177,6 +209,30 @@ export default function ReadLaterPage() {
       await refresh();
     } catch (error) {
       setNotice({ tone: "error", text: error instanceof Error ? error.message : "重新解析失败" });
+    }
+  }
+
+  async function deleteBookmark() {
+    if (!deleteCandidate) return;
+    setDeleting(true);
+    try {
+      await deleteReadLaterItem(deleteCandidate.id);
+      const remaining = items.filter((item) => item.id !== deleteCandidate.id);
+      setItems(remaining);
+      setChecked((current) => {
+        const next = new Set(current);
+        next.delete(deleteCandidate.id);
+        return next;
+      });
+      setSelectedId(remaining[0]?.id || "");
+      setDetail(null);
+      setReaderFullscreen(false);
+      setDeleteCandidate(null);
+      setNotice({ tone: "ok", text: "收藏及本地正文副本已删除" });
+    } catch (error) {
+      setNotice({ tone: "error", text: error instanceof Error ? error.message : "删除失败" });
+    } finally {
+      setDeleting(false);
     }
   }
 
@@ -248,16 +304,13 @@ export default function ReadLaterPage() {
                 </button>
               ))}
             </nav>
-            <div className="mt-6 hidden rounded-2xl border border-[#002fa7]/10 bg-[#002fa7]/[0.035] p-3 text-xs leading-5 text-gray-600 lg:block">
-              解析正文不会调用 LLM。只有你主动编译时，正文才会复制到 Raw。
-            </div>
           </aside>
 
           <section className="border-b border-black/[0.06] lg:border-b-0 lg:border-r">
             <div className="flex h-16 items-center gap-2 border-b border-black/[0.06] px-4">
               <div className="flex min-w-0 flex-1 items-center gap-2 rounded-xl bg-black/[0.035] px-3">
                 <Search className="h-4 w-4 text-gray-400" />
-                <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索标题或来源" className="h-10 min-w-0 flex-1 bg-transparent text-sm outline-none" />
+                <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索标题、平台或正文" className="h-10 min-w-0 flex-1 bg-transparent text-sm outline-none" />
               </div>
               <button onClick={() => void refresh()} className="rounded-xl p-2.5 text-gray-400 hover:bg-black/[0.04] hover:text-gray-800"><RefreshCw className="h-4 w-4" /></button>
             </div>
@@ -284,13 +337,16 @@ export default function ReadLaterPage() {
                 <article key={item.id} onClick={() => setSelectedId(item.id)} className={`group mb-1 cursor-pointer rounded-2xl border p-3.5 transition ${selectedId === item.id ? "border-[#002fa7]/25 bg-[#002fa7]/[0.035]" : "border-transparent hover:bg-black/[0.025]"}`}>
                   <div className="flex gap-3">
                     <button onClick={(event) => { event.stopPropagation(); setChecked((current) => { const next = new Set(current); next.has(item.id) ? next.delete(item.id) : next.add(item.id); return next; }); }} className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border ${checked.has(item.id) ? "border-[#002fa7] bg-[#002fa7] text-white" : "border-gray-300 bg-white text-transparent"}`}><Check className="h-3.5 w-3.5" /></button>
-                    <div className="min-w-0 flex-1">
-                      <h2 className="line-clamp-2 text-sm font-semibold leading-5 text-gray-900">{item.title || hostname(item.original_url)}</h2>
-                      {item.description && <p className="mt-1 line-clamp-2 text-xs leading-5 text-gray-500">{item.description}</p>}
-                      <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[10px] text-gray-400">
-                        <span>{item.site_name || hostname(item.original_url)}</span><span>·</span><span>{relativeTime(item.created_at)}</span>
-                        <span className={`rounded-md px-1.5 py-0.5 ${item.parse_status === "ready" ? "bg-emerald-50 text-emerald-700" : item.parse_status === "link_only" ? "bg-amber-50 text-amber-700" : "bg-blue-50 text-blue-700"}`}>{parseLabels[item.parse_status] || item.parse_status}</span>
+                    <div className="flex min-w-0 flex-1 gap-3">
+                      <div className="min-w-0 flex-1">
+                        <h2 className="line-clamp-2 text-sm font-semibold leading-5 text-gray-900">{item.title || hostname(item.original_url)}</h2>
+                        {item.description && <p className="mt-1 line-clamp-2 text-xs leading-5 text-gray-500">{item.description}</p>}
+                        <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[10px] text-gray-400">
+                          <span>{item.site_name || hostname(item.original_url)}</span><span>·</span><span>{relativeTime(item.created_at)}</span>
+                          <span className={`rounded-md px-1.5 py-0.5 ${item.parse_status === "ready" ? "bg-emerald-50 text-emerald-700" : item.parse_status === "link_only" ? "bg-amber-50 text-amber-700" : "bg-blue-50 text-blue-700"}`}>{parseLabels[item.parse_status] || item.parse_status}</span>
+                        </div>
                       </div>
+                      <ReadLaterCover src={item.image_url} title={item.title || hostname(item.original_url)} />
                     </div>
                   </div>
                 </article>
@@ -313,6 +369,7 @@ export default function ReadLaterPage() {
                   <button onClick={() => void retryCapture(detail.id)} disabled={detail.parse_status === "queued" || detail.parse_status === "processing"} className="rounded-xl p-2 text-gray-500 hover:bg-black/[0.04] hover:text-[#002fa7] disabled:cursor-wait disabled:opacity-40" title="重新解析正文与图片"><RefreshCw className={`h-4 w-4 ${detail.parse_status === "queued" || detail.parse_status === "processing" ? "animate-spin" : ""}`} /></button>
                   <button onClick={() => void updateStatus(detail.id, detail.reading_status === "read" ? "unread" : "read")} className="rounded-xl p-2 text-gray-500 hover:bg-black/[0.04] hover:text-[#002fa7]" title={detail.reading_status === "read" ? "标为未读" : "标为已读"}><CheckCircle2 className="h-4 w-4" /></button>
                   <button onClick={() => void updateStatus(detail.id, "archived")} className="rounded-xl p-2 text-gray-500 hover:bg-black/[0.04] hover:text-[#002fa7]" title="归档"><Archive className="h-4 w-4" /></button>
+                  <button onClick={() => setDeleteCandidate(detail)} className="rounded-xl p-2 text-gray-400 hover:bg-red-50 hover:text-red-600" title="删除收藏"><Trash2 className="h-4 w-4" /></button>
                 </div>
                 <div className={readerFullscreen ? "h-[calc(100vh-64px)] overflow-y-auto px-6 py-10" : "max-h-[calc(100vh-255px)] overflow-y-auto px-6 py-8 xl:px-10"}>
                   <div className={readerFullscreen ? "mx-auto max-w-4xl" : ""}>
@@ -332,7 +389,7 @@ export default function ReadLaterPage() {
                               );
                             }
                             // eslint-disable-next-line @next/next/no-img-element
-                            return <img src={src} alt={alt || "文章图片"} loading="lazy" />;
+                            return <img src={rawKnowledgeFileUrl(src)} alt={alt || "文章图片"} loading="lazy" />;
                           },
                         }}
                       >
@@ -357,6 +414,28 @@ export default function ReadLaterPage() {
         </div>
         </main>
       </div>
+
+      {deleteCandidate ? (
+        <div className="fixed inset-0 z-[180] flex items-center justify-center bg-slate-950/25 p-4 backdrop-blur-[2px]" onMouseDown={(event) => { if (event.currentTarget === event.target && !deleting) setDeleteCandidate(null); }}>
+          <section role="alertdialog" aria-modal="true" aria-labelledby="delete-bookmark-title" className="w-full max-w-md overflow-hidden rounded-[26px] border border-white/70 bg-white shadow-2xl shadow-slate-900/20">
+            <div className="px-6 py-6">
+              <span className="flex h-11 w-11 items-center justify-center rounded-2xl bg-red-50 text-red-600"><Trash2 className="h-5 w-5" /></span>
+              <h2 id="delete-bookmark-title" className="mt-4 text-lg font-semibold text-gray-950">删除这条收藏？</h2>
+              <p className="mt-2 line-clamp-2 text-sm font-medium text-gray-700">{deleteCandidate.title || hostname(deleteCandidate.original_url)}</p>
+              <p className="mt-3 text-xs leading-5 text-gray-500">
+                将删除收藏记录、稍后读 Markdown 正文和本地图片。已经生成的 Raw、Wiki 页面、GBrain 数据和历史任务不会被删除。
+              </p>
+            </div>
+            <div className="flex justify-end gap-2 border-t border-black/[0.06] bg-black/[0.012] px-6 py-4">
+              <button type="button" onClick={() => setDeleteCandidate(null)} disabled={deleting} className="h-10 rounded-xl px-4 text-sm font-semibold text-gray-500 hover:bg-black/[0.04] disabled:opacity-40">取消</button>
+              <button type="button" onClick={() => void deleteBookmark()} disabled={deleting} className="inline-flex h-10 items-center gap-2 rounded-xl bg-red-600 px-5 text-sm font-semibold text-white shadow-sm hover:bg-red-700 disabled:cursor-wait disabled:opacity-50">
+                {deleting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+                确认删除
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
     </div>
   );
 }

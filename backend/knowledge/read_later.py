@@ -5,19 +5,20 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import html2text
 import yaml
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from knowledge.import_jobs import create_llm_wiki_ingest_job, update_job_progress
-from knowledge.models import KnowledgeImportEvent, KnowledgeImportJob, ReadLaterItem, new_id
+from knowledge.models import KnowledgeDocument, KnowledgeImportEvent, KnowledgeImportJob, ReadLaterItem, new_id
 from knowledge.service import DEFAULT_KNOWLEDGE_BASE_ID, KnowledgeService, KnowledgeServiceError
 from tools.fetch_url_tool import MAX_REDIRECTS, FetchURLTool, _validated_url
 
@@ -34,6 +35,40 @@ _IMAGE_MEDIA_EXTENSIONS = {
 _MARKDOWN_IMAGE_PATTERN = re.compile(
     r"!\[(?P<alt>[^\]]*)\]\((?P<url>[^)\s]+)(?P<suffix>\s+\"[^\"]*\")?\)"
 )
+_ARTICLE_ROOT_SELECTORS = (
+    "[itemprop='articleBody']",
+    "#article-body",
+    ".article-content",
+    ".article__body",
+    ".post-content",
+    ".entry-content",
+    "article",
+    "main",
+)
+_ARTICLE_NOISE_SELECTORS = (
+    "script",
+    "style",
+    "noscript",
+    "nav",
+    "footer",
+    "header",
+    "aside",
+    "form",
+    "dialog",
+    "[hidden]",
+    "[aria-hidden='true']",
+    ".advertisement",
+    ".adsbygoogle",
+    ".social-share",
+    ".share-buttons",
+    ".newsletter",
+    ".subscribe",
+    ".related-posts",
+    "#comments",
+    ".comments",
+)
+_LAZY_IMAGE_ATTRIBUTES = ("data-src", "data-original", "data-lazy-src", "data-actualsrc")
+_WECHAT_HEADING_PATTERN = re.compile(r"^(?:\d+[.、．]|[一二三四五六七八九十]+[、.．])\s*\S+")
 _TRACKING_PARAMS = {
     "fbclid", "gclid", "dclid", "msclkid", "mc_cid", "mc_eid", "igshid", "spm", "from",
 }
@@ -168,6 +203,37 @@ def _meta(soup: BeautifulSoup, *selectors: tuple[str, str]) -> str:
     return ""
 
 
+def _prepare_article_images(root: BeautifulSoup | Tag) -> None:
+    for image in root.select("img"):
+        lazy_source = next((str(image.get(attribute) or "").strip() for attribute in _LAZY_IMAGE_ATTRIBUTES if image.get(attribute)), "")
+        if lazy_source:
+            image["src"] = lazy_source
+        if not image.get("alt"):
+            caption = image.find_parent("figure")
+            caption_node = caption.find("figcaption") if caption else None
+            image["alt"] = caption_node.get_text(" ", strip=True) if caption_node else "文章图片"
+
+
+def _prepare_wechat_article(root: BeautifulSoup | Tag) -> None:
+    for node in root.select("[style*='display: none'], [style*='display:none']"):
+        node.decompose()
+    for block in root.find_all("section"):
+        text = block.get_text(" ", strip=True)
+        styled_heading = bool(
+            block.find("strong")
+            and (
+                _WECHAT_HEADING_PATTERN.match(text)
+                or text in {"写在最后", "结语", "总结"}
+                or any(
+                    re.search(r"font-size\s*:\s*(?:2[0-9]|[3-9][0-9])px", str(node.get("style") or ""), re.IGNORECASE)
+                    for node in block.find_all(style=True)
+                )
+            )
+            and len(text) <= 60
+        )
+        block.name = "h2" if styled_heading else "div"
+
+
 def _extract_markdown(html: str, url: str) -> tuple[dict[str, str], str]:
     soup = BeautifulSoup(html, "lxml")
     title = _meta(soup, ("property", "og:title"), ("name", "twitter:title"))
@@ -185,9 +251,27 @@ def _extract_markdown(html: str, url: str) -> tuple[dict[str, str], str]:
     }
     if metadata["image_url"]:
         metadata["image_url"] = urljoin(url, metadata["image_url"])
-    for tag in soup.select("script,style,noscript,nav,footer,header,aside,form,dialog"):
+    host = (urlsplit(url).hostname or "").lower()
+    is_wechat = host == "mp.weixin.qq.com" or host.endswith(".mp.weixin.qq.com")
+    if is_wechat:
+        root = soup.select_one("#js_content")
+        author_node = soup.select_one("#js_name, .rich_media_meta_nickname")
+        if not metadata["author"] and author_node:
+            metadata["author"] = author_node.get_text(" ", strip=True)
+        metadata["site_name"] = metadata["site_name"] or "微信公众平台"
+    else:
+        root = next((soup.select_one(selector) for selector in _ARTICLE_ROOT_SELECTORS if soup.select_one(selector)), None)
+    root = root or soup.body or soup
+    for tag in root.select(",".join(_ARTICLE_NOISE_SELECTORS)):
         tag.decompose()
-    root = soup.find("article") or soup.find("main") or soup.body or soup
+    _prepare_article_images(root)
+    if is_wechat:
+        _prepare_wechat_article(root)
+    else:
+        # html2text does not treat HTML5 section as a block and otherwise
+        # concatenates adjacent paragraphs into one unreadable line.
+        for section in root.find_all("section"):
+            section.name = "div"
     converter = html2text.HTML2Text()
     converter.ignore_links = False
     # Images are preserved here, then downloaded into the local knowledge
@@ -197,6 +281,9 @@ def _extract_markdown(html: str, url: str) -> tuple[dict[str, str], str]:
     converter.body_width = 0
     converter.baseurl = url
     markdown = converter.handle(str(root)).strip()
+    markdown = re.sub(r"^(#{1,6})\s+\*\*(.+)\*\*\s*$", r"\1 \2", markdown, flags=re.MULTILINE)
+    markdown = re.sub(r"^(#{1,6}\s+)(\d+)\\\.", r"\1\2.", markdown, flags=re.MULTILINE)
+    markdown = re.sub(r"[ \t]+\n", "\n", markdown)
     markdown = re.sub(r"\n{3,}", "\n\n", markdown)
     return metadata, markdown
 
@@ -347,15 +434,30 @@ async def process_read_later_capture_job(
             "author": metadata["author"],
         }
         markdown = f"---\n{yaml.safe_dump(frontmatter, allow_unicode=True, sort_keys=False).strip()}\n---\n\n{body}\n"
-        document, _ = await service.ingest_markdown_upload(
-            session,
-            filename=f"{frontmatter['title']}.md",
-            content=markdown.encode("utf-8"),
-            title=str(frontmatter["title"]),
-            knowledge_base_id=item.knowledge_base_id,
-            publish_targets=["local_markdown", "read_later"],
-            publish_vector_now=False,
+        markdown_bytes = markdown.encode("utf-8")
+        existing_document = await session.get(KnowledgeDocument, item.document_id) if item.document_id else None
+        owns_existing_document = bool(
+            existing_document
+            and existing_document.source_type == "read_later"
+            and str((existing_document.doc_metadata or {}).get("read_later_item_id") or "") == item.id
         )
+        if owns_existing_document and existing_document is not None:
+            document = service.replace_markdown_document_content(
+                document=existing_document,
+                content=markdown_bytes,
+                title=str(frontmatter["title"]),
+                publish_targets=["local_markdown", "read_later"],
+            )
+        else:
+            document, _ = await service.ingest_markdown_upload(
+                session,
+                filename=f"{frontmatter['title']}.md",
+                content=markdown_bytes,
+                title=str(frontmatter["title"]),
+                knowledge_base_id=item.knowledge_base_id,
+                publish_targets=["local_markdown", "read_later"],
+                publish_vector_now=False,
+            )
         document.source_type = "read_later"
         document.source_path = item.original_url
         document.doc_metadata = {
@@ -392,6 +494,7 @@ async def process_read_later_capture_job(
 async def list_read_later_items(
     session: AsyncSession,
     *,
+    base_dir: Path,
     knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
     reading_status: str = "all",
     parse_status: str = "all",
@@ -403,11 +506,116 @@ async def list_read_later_items(
         stmt = stmt.where(ReadLaterItem.reading_status == reading_status)
     if parse_status != "all":
         stmt = stmt.where(ReadLaterItem.parse_status == parse_status)
-    if search.strip():
-        needle = f"%{search.strip()}%"
-        stmt = stmt.where(or_(ReadLaterItem.title.ilike(needle), ReadLaterItem.original_url.ilike(needle)))
-    result = await session.execute(stmt.order_by(ReadLaterItem.created_at.desc()).limit(max(1, min(limit, 500))))
-    return list(result.scalars())
+    result_limit = max(1, min(limit, 500))
+    candidate_limit = 500 if search.strip() else result_limit
+    result = await session.execute(stmt.order_by(ReadLaterItem.created_at.desc()).limit(candidate_limit))
+    items = list(result.scalars())
+    needle = search.strip().casefold()
+    if not needle:
+        return items
+
+    knowledge_root = KnowledgeService(base_dir).knowledge_dir.resolve()
+
+    def matches(item: ReadLaterItem) -> bool:
+        metadata = " ".join(
+            [
+                item.title,
+                item.site_name,
+                item.author,
+                item.description,
+                item.original_url,
+                item.canonical_url,
+                item.note,
+                " ".join(item.tags or []),
+            ]
+        ).casefold()
+        if needle in metadata:
+            return True
+        if not item.storage_path:
+            return False
+        try:
+            path = Path(item.storage_path).resolve()
+            if not path.is_relative_to(knowledge_root) or not path.is_file():
+                return False
+            return needle in path.read_text(encoding="utf-8", errors="replace").casefold()
+        except OSError:
+            return False
+
+    return [item for item in items if matches(item)][:result_limit]
+
+
+async def delete_read_later_item(
+    session: AsyncSession,
+    *,
+    base_dir: Path,
+    item: ReadLaterItem,
+) -> dict[str, bool]:
+    """Delete one bookmark and only its owned local capture artifacts.
+
+    Raw snapshots, published Wiki pages, GBrain data and task history intentionally remain.
+    """
+
+    service = KnowledgeService(base_dir)
+    document = await session.get(KnowledgeDocument, item.document_id) if item.document_id else None
+    owns_document = bool(
+        document
+        and document.source_type == "read_later"
+        and str((document.doc_metadata or {}).get("read_later_item_id") or "") == item.id
+    )
+
+    job_conditions = [KnowledgeImportJob.source_path == item.canonical_url]
+    if item.document_id:
+        job_conditions.append(KnowledgeImportJob.document_id == item.document_id)
+    related_jobs = list(
+        (
+            await session.execute(
+                select(KnowledgeImportJob).where(or_(*job_conditions))
+            )
+        ).scalars()
+    )
+    for job in related_jobs:
+        if item.document_id and job.document_id == item.document_id:
+            job.document_id = None
+        if (
+            job.status in {"queued", "running"}
+            and str((job.job_metadata or {}).get("read_later_item_id") or "") == item.id
+        ):
+            job.status = "cancelled"
+            job.current_step = "cancelled"
+            job.finished_at = datetime.now(timezone.utc)
+
+    markdown_path = Path(document.storage_path).resolve() if owns_document and document else None
+    assets_dir = (service.knowledge_dir / "assets" / "read-later" / item.id).resolve()
+    knowledge_root = service.knowledge_dir.resolve()
+
+    await session.delete(item)
+    if owns_document and document is not None:
+        await session.delete(document)
+    await session.commit()
+
+    markdown_deleted = False
+    if markdown_path and markdown_path.is_relative_to(knowledge_root) and markdown_path.is_file():
+        try:
+            markdown_path.unlink()
+            markdown_deleted = True
+        except OSError:
+            # The database deletion is authoritative. A transient filesystem
+            # cleanup failure must not turn a completed delete into an API 500.
+            pass
+    assets_deleted = False
+    if assets_dir.is_relative_to(knowledge_root) and assets_dir.is_dir():
+        try:
+            shutil.rmtree(assets_dir)
+            assets_deleted = True
+        except OSError:
+            pass
+
+    return {
+        "record_deleted": True,
+        "document_deleted": bool(owns_document),
+        "markdown_deleted": markdown_deleted,
+        "assets_deleted": assets_deleted,
+    }
 
 
 async def retry_read_later_item(

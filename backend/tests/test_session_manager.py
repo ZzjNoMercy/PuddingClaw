@@ -1142,6 +1142,73 @@ def test_upsert_assistant_message_replaces_same_query_draft(tmp_path):
     assert assistant["error_notice"] == "模型连接中断"
 
 
+def test_message_timestamp_uses_explicit_query_input_time(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("timestamp-session")
+
+    session_manager.save_message(
+        "timestamp-session",
+        "user",
+        "查询输入",
+        created_at=1_785_824_745.5,
+    )
+
+    history = session_manager.load_session("timestamp-session")
+    assert history[0]["created_at"] == 1_785_824_745.5
+
+
+def test_assistant_draft_upsert_preserves_first_timestamp(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("assistant-timestamp-session")
+
+    session_manager.upsert_assistant_message(
+        "assistant-timestamp-session",
+        query_id="query-time",
+        content="处理中",
+        status="running",
+    )
+    first_timestamp = session_manager.load_session("assistant-timestamp-session")[0]["created_at"]
+    session_manager.upsert_assistant_message(
+        "assistant-timestamp-session",
+        query_id="query-time",
+        content="完成",
+        status="completed",
+    )
+
+    assert session_manager.load_session("assistant-timestamp-session")[0]["created_at"] == first_timestamp
+
+
+def test_legacy_turn_timestamp_is_projected_from_harness_run(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("legacy-timestamp-session")
+    path = session_manager._session_path("legacy-timestamp-session")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["messages"] = [
+        {"role": "user", "content": "旧查询"},
+        {
+            "role": "assistant",
+            "content": "旧回答",
+            "query_id": "query-legacy-time",
+        },
+    ]
+    data["harness"] = {
+        "runs": {
+            "run-legacy-time": {
+                "query_id": "query-legacy-time",
+                "created_at": 1_785_824_745.5,
+                "completed_at": 1_785_824_925.5,
+            }
+        }
+    }
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    history = session_manager.load_session("legacy-timestamp-session")
+    assert [message["created_at"] for message in history] == [
+        1_785_824_745.5,
+        1_785_824_925.5,
+    ]
+
+
 def test_reasoning_content_saved_for_plain_assistant(tmp_path):
     session_manager.initialize(tmp_path)
     session_manager.create_session("plain-session")
@@ -1387,7 +1454,12 @@ def test_conversation_history_does_not_read_trace_sidecar(tmp_path, monkeypatch)
 
     session_manager.initialize(tmp_path)
     session_manager.create_session("fast-history-session")
-    session_manager.save_message("fast-history-session", "user", "只读取消息")
+    session_manager.save_message(
+        "fast-history-session",
+        "user",
+        "只读取消息",
+        created_at=1234.5,
+    )
     session_manager.update_trace(
         "fast-history-session",
         {"trace_id": "trace-large", "query_id": "query-large", "spans": []},
@@ -1404,10 +1476,10 @@ def test_conversation_history_does_not_read_trace_sidecar(tmp_path, monkeypatch)
     monkeypatch.setattr(Path, "read_text", guarded_read_text)
 
     assert session_manager.load_session("fast-history-session") == [
-        {"role": "user", "content": "只读取消息"}
+        {"role": "user", "content": "只读取消息", "created_at": 1234.5}
     ]
     assert session_manager.get_raw_messages("fast-history-session")["messages"] == [
-        {"role": "user", "content": "只读取消息"}
+        {"role": "user", "content": "只读取消息", "created_at": 1234.5}
     ]
 
 

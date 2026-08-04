@@ -509,10 +509,17 @@ function stripPersistedModelCallLimitNotice(content: string): string {
     .trimEnd();
 }
 
+function persistedTimestampMilliseconds(value: number | undefined): number {
+  const timestamp = Number(value);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return 0;
+  return timestamp >= 1_000_000_000_000 ? timestamp : timestamp * 1000;
+}
+
 function parseHistoryMessages(
   backendMessages: Array<{
     role: string;
     content: string;
+    created_at?: number;
     query_id?: string;
     attachments?: AgentAttachment[];
     output_attachments?: AgentAttachment[];
@@ -566,7 +573,7 @@ function parseHistoryMessages(
         role: "user",
         content: userMessage.content,
         attachments: msg.attachments?.length ? msg.attachments : userMessage.attachments,
-        timestamp: Date.now() - (backendMessages.length - msgIndex) * 1000,
+        timestamp: persistedTimestampMilliseconds(msg.created_at),
       });
     } else if (msg.role === "assistant") {
       const toolCalls: ToolCall[] = (msg.tool_calls || []).map(
@@ -629,7 +636,7 @@ function parseHistoryMessages(
         // persisted audit record, but are intentionally not rendered as chat
         // messages; the Goal drawer owns the cross-Run timeline.
         runBoundaryNotice: undefined,
-        timestamp: Date.now() - (backendMessages.length - msgIndex) * 1000,
+        timestamp: persistedTimestampMilliseconds(msg.created_at),
       };
       const previous = loaded[loaded.length - 1];
       const restoredGoalId = segments?.find((segment) => segment.goalId)?.goalId;

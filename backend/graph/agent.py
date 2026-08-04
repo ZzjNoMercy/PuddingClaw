@@ -1074,7 +1074,15 @@ class AgentManager:
         async for event in self._run_agent_stream(agent, messages, system_prompt_tokens, user_id, session_id):
             yield event
 
-    async def ainvoke(self, message: str, session_id: str, user_id: str = "default_user") -> str:
+    async def ainvoke(
+        self,
+        message: str,
+        session_id: str,
+        user_id: str = "default_user",
+        *,
+        query_created_at: float | None = None,
+    ) -> str:
+        query_created_at = float(query_created_at) if query_created_at is not None else time.time()
         history = session_manager.load_session_for_agent(session_id)
         rag_context, mem0_context, _ = await self._retrieve_memory_context(message, user_id)
 
@@ -1134,7 +1142,12 @@ class AgentManager:
                                 response = _extract_stream_text(msg)
                                 if not response:
                                     continue
-                                session_manager.save_message(session_id, "user", message)
+                                session_manager.save_message(
+                                    session_id,
+                                    "user",
+                                    message,
+                                    created_at=query_created_at,
+                                )
                                 session_manager.save_message(session_id, "assistant", response)
                                 return response
                         return "No response generated."
@@ -1180,7 +1193,12 @@ class AgentManager:
                 response = _extract_stream_text(msg)
                 if not response:
                     continue
-                session_manager.save_message(session_id, "user", message)
+                session_manager.save_message(
+                    session_id,
+                    "user",
+                    message,
+                    created_at=query_created_at,
+                )
                 session_manager.save_message(session_id, "assistant", response)
                 return response
         return "No response generated."

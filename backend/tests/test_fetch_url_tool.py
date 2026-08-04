@@ -63,6 +63,8 @@ def test_fetch_url_returns_complete_html_markdown(monkeypatch) -> None:
         "169.254.169.254",
         "::1",
         "::ffff:127.0.0.1",
+        "64:ff9b::7f00:1",
+        "64:ff9b::a9fe:a9fe",
     ],
 )
 def test_dns_resolution_rejects_any_non_public_address(monkeypatch, address) -> None:
@@ -134,6 +136,8 @@ def test_redirect_is_revalidated_before_following(monkeypatch) -> None:
         "http://example.com:8080/",
         "https://example.com:8443/",
         "https://198.18.0.118/",
+        "https://[64:ff9b::7f00:1]/",
+        "https://[64:ff9b::a9fe:a9fe]/",
     ],
 )
 def test_unsafe_url_shapes_are_blocked_without_request(url) -> None:
