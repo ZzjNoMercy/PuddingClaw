@@ -427,7 +427,7 @@ export default function SkillsComparePage() {
                 versionA={versionA}
                 versionB={versionB}
                 onViewFull={() => {
-                  window.location.href = `/skills/review?skill=${encodeURIComponent(selectedSkill)}&vA=${encodeURIComponent(versionA)}&vB=${encodeURIComponent(versionB)}`;
+                  window.location.href = `/extension/skills/review?skill=${encodeURIComponent(selectedSkill)}&vA=${encodeURIComponent(versionA)}&vB=${encodeURIComponent(versionB)}`;
                 }}
               />
             </div>

@@ -886,7 +886,7 @@ function RuntimeMountPanel({ inventory }: { inventory: TraceRuntimeInventory }) 
               title: skill.name,
               subtitle: skill.description || skill.location || "",
               badge: skill.in_system_prompt ? "system prompt" : "skill",
-              href: `/skills?skill=${encodeURIComponent(skill.name)}`,
+              href: `/extension/skills?skill=${encodeURIComponent(skill.name)}`,
             }))}
           />
 

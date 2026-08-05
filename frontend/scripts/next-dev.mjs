@@ -22,8 +22,20 @@ if (!hasHost) args.push("-H", "0.0.0.0");
 if (!hasPort) args.push("-p", port);
 args.push(...forwarded);
 
-const command = process.platform === "win32" ? "npx.cmd" : "npx";
-const child = spawn(command, args, {
+const command = process.platform === "win32" ? "npx.cmd" : "/bin/bash";
+const commandArgs = process.platform === "win32"
+  ? args
+  : [
+      "-c",
+      // Raise a small inherited limit, but never lower a larger one. Lowering
+      // a 1M shell limit to 65K caused Watchpack to miss app routes and leave
+      // the dev server serving only its generated 404 page.
+      'current="$(ulimit -n 2>/dev/null || echo 0)"; target="${PUDDINGCLAW_MAX_OPEN_FILES:-122880}"; case "$current:$target" in *[!0-9:]*|:*) ;; *) if [ "$current" -lt "$target" ]; then ulimit -n "$target" 2>/dev/null || true; fi ;; esac; exec "$@"',
+      "puddingclaw-next-dev",
+      "npx",
+      ...args,
+    ];
+const child = spawn(command, commandArgs, {
   stdio: "inherit",
   env: {
     ...process.env,

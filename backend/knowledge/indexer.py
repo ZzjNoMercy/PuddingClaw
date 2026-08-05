@@ -226,7 +226,7 @@ def _try_build_multimodal_index(
 ) -> dict[str, Any]:
     multimodal_storage_dir = base_dir / "storage" / "knowledge_multimodal_index"
     try:
-        from llama_index.core import Settings, StorageContext
+        from llama_index.core import StorageContext
         from llama_index.core.indices.multi_modal import MultiModalVectorStoreIndex
 
         from llm.embed_client import get_embedding_model
@@ -277,9 +277,6 @@ def _try_build_multimodal_index(
                 })
 
             image_embed_model.set_progress_callback(_embedding_progress, text_total=0, image_total=image_total)
-        Settings.embed_model = text_embed_model
-        Settings.image_embed_model = image_embed_model
-
         vector_store = str(index_config.get("vector_store") or "local").strip().lower()
         storage_context: StorageContext
         extra: dict[str, Any] = {"vector_store": vector_store}

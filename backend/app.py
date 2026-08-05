@@ -121,6 +121,7 @@ async def lifespan(app: FastAPI):
     import capabilities
     from analytics.nl2sql.result_cleanup import query_result_cleanup_manager
     from analytics.semantic_assets import get_semantic_asset_registry
+    from cli_runtime import detect_cli_runtime
     from db import init_database
     from evaluation.worker_manager import evaluation_worker_manager
     from graph.agent import agent_manager
@@ -128,18 +129,19 @@ async def lifespan(app: FastAPI):
     from graph.deepagents_manager import deepagents_agent_manager
     from graph.memory_indexer import get_memory_indexer
     from graph.session_manager import session_manager
-    from cli_runtime import detect_cli_runtime
-    from worker_access import worker_access_store
     from knowledge.import_worker import knowledge_import_worker_manager
+    from knowledge.portal_search import knowledge_catalog_watcher
     from knowledge.semantic_dimension_worker import semantic_dimension_build_worker_manager
     from projects.registry import project_registry
     from tools.skills_scanner import scan_skills
+    from worker_access import worker_access_store
 
     scan_skills(BASE_DIR)
     semantic_assets = get_semantic_asset_registry(BASE_DIR).refresh()
     print(f"🧭 Semantic assets loaded: {semantic_assets.get('count', 0)}")
     project_registry.initialize(BASE_DIR)
     attachment_store.initialize(BASE_DIR)
+    knowledge_catalog_watcher.start(BASE_DIR)
     # SQL Evidence catalog backfill needs the durable Session owner index.
     session_manager.initialize(BASE_DIR)
     worker_access_store.initialize(BASE_DIR)
@@ -213,6 +215,7 @@ async def lifespan(app: FastAPI):
         await query_result_cleanup_manager.stop()
         await semantic_dimension_build_worker_manager.stop()
         await knowledge_import_worker_manager.stop()
+        await knowledge_catalog_watcher.stop()
 
 
 app = FastAPI(title="PuddingClaw", version="0.1.0", lifespan=lifespan)
@@ -234,35 +237,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from api.chat import router as chat_router
 from api.agent import router as agent_router
-from api.files import router as files_router
-from api.sessions import router as sessions_router
-from api.tokens import router as tokens_router
+from api.analytics import router as analytics_router
+from api.attachments import router as attachments_router
+from api.brain_schema import router as brain_schema_router
+from api.capabilities import router as capabilities_router
+from api.chat import router as chat_router
 from api.compress import router as compress_router
 from api.config_api import router as config_router
+from api.connectors import router as connectors_router
+from api.database_sql_revisions import router as database_sql_revisions_router
+from api.dimension_build_rules import router as dimension_build_rules_router
 from api.eval_api import router as eval_router
 from api.evaluation import router as evaluation_router
-from api.skills_api import router as skills_api_router
-from api.stats_api import router as stats_router
-from api.mcp import router as mcp_router
-from api.capabilities import router as capabilities_router
-from api.projects import router as projects_router
-from api.permissions import router as permissions_router
-from api.skill_plans import router as skill_plans_router
-from api.attachments import router as attachments_router
-from api.knowledge import router as knowledge_router
-from api.analytics import router as analytics_router
-from api.dimension_build_rules import router as dimension_build_rules_router
-from api.logical_dataset_rules import router as logical_dataset_rules_router
-from api.database_sql_revisions import router as database_sql_revisions_router
-from api.user_input_requests import router as user_input_requests_router
-from api.connectors import router as connectors_router
-from api.brain_schema import router as brain_schema_router
-from api.llm_wiki import router as llm_wiki_router
-from api.read_later import router as read_later_router
+from api.files import router as files_router
 from api.headless import router as headless_router
 from api.headless import worker_access_router
+from api.knowledge import router as knowledge_router
+from api.llm_wiki import router as llm_wiki_router
+from api.logical_dataset_rules import router as logical_dataset_rules_router
+from api.mcp import router as mcp_router
+from api.permissions import router as permissions_router
+from api.projects import router as projects_router
+from api.read_later import router as read_later_router
+from api.sessions import router as sessions_router
+from api.skill_plans import router as skill_plans_router
+from api.skills_api import router as skills_api_router
+from api.stats_api import router as stats_router
+from api.tokens import router as tokens_router
+from api.user_input_requests import router as user_input_requests_router
 
 app.include_router(chat_router, prefix="/api")
 app.include_router(agent_router, prefix="/api")

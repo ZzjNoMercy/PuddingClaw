@@ -207,6 +207,29 @@ def test_unloaded_business_tools_are_hidden_from_model_request(tmp_path) -> None
     assert [tool["name"] for tool in middleware._visible_tools(request)] == ["read_file", "execute"]
 
 
+def test_loaded_mcp_tools_are_default_visible_without_skill_activation(tmp_path) -> None:
+    middleware = ToolsetMiddleware(
+        skills_dir=tmp_path,
+        toolsets_by_skill={"database-analysis": {"database_analysis"}},
+        mcp_tool_names={"zhihuiya_patents_search"},
+    )
+    request = ModelRequest(
+        model=None,
+        messages=[],
+        tools=[
+            {"name": "read_file"},
+            {"name": "database_sql_generate"},
+            {"name": "zhihuiya_patents_search"},
+        ],
+        state={"messages": []},
+    )
+
+    assert [tool["name"] for tool in middleware._visible_tools(request)] == [
+        "read_file",
+        "zhihuiya_patents_search",
+    ]
+
+
 def test_capability_manifest_drives_prompt_and_visible_schema_from_same_state(tmp_path) -> None:
     _install_test_skill(tmp_path, "database-analysis", {"database_analysis"})
     middleware = ToolsetMiddleware(

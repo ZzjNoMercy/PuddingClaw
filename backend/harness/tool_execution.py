@@ -1632,6 +1632,7 @@ class ToolExecutionPipeline(AgentMiddleware):
         self,
         *,
         known_tools: set[str],
+        mcp_tool_names: set[str] | None = None,
         backend_mode: str,
         permission_context: RunPermissionContext | None = None,
         base_dir: Path | None = None,
@@ -1640,6 +1641,7 @@ class ToolExecutionPipeline(AgentMiddleware):
         managed_cli_service: Any | None = None,
     ) -> None:
         self.known_tools = set(known_tools) | set(self.BUILTIN_TOOLS)
+        self.mcp_tool_names = frozenset(str(name) for name in (mcp_tool_names or ()) if str(name))
         self.backend_mode = backend_mode
         self.base_dir = base_dir.expanduser().resolve() if base_dir is not None else None
         self.reviewer = reviewer
@@ -3038,6 +3040,16 @@ class ToolExecutionPipeline(AgentMiddleware):
             )
         control_descriptor = tool_control_descriptor(tool_name)
         if control_descriptor is None:
+            if tool_name in self.mcp_tool_names:
+                return ToolPolicyResult(
+                    PolicyDecision.ASK,
+                    "mcp_tool_requires_user_approval",
+                    "high",
+                    explanation=(
+                        "MCP 工具来自已启用的外部 MCP Server，但没有静态控制描述；"
+                        "首次执行需要用户确认。"
+                    ),
+                )
             return ToolPolicyResult(
                 PolicyDecision.DENY,
                 f"missing_tool_control_descriptor:{tool_name}",
@@ -3818,9 +3830,8 @@ class ToolExecutionPipeline(AgentMiddleware):
             explanation="受管飞书非删除操作默认联网并自动执行。",
         )
 
-    @classmethod
     def _required_capabilities(
-        cls,
+        self,
         request: ToolCallRequest,
         *,
         managed_cli: Any | None = None,
@@ -3839,21 +3850,23 @@ class ToolExecutionPipeline(AgentMiddleware):
                 capabilities.append("destructive_write")
             return list(dict.fromkeys(capabilities))
         tool_name = str(request.tool_call.get("name") or "")
-        if tool_name == "execute" and cls._managed_npx_skills_add(cls._command(request)) is not None:
+        if tool_name == "execute" and self._managed_npx_skills_add(self._command(request)) is not None:
             return ["execute", "temporary_network"]
         if tool_name == "install_packages":
             return ["execute", "package_install", "temporary_network"]
         if tool_name in {"prepare_skill_install", "prepare_skill_update"}:
             return ["execute", "temporary_network"]
-        if tool_name in cls.SKILL_COMMIT_TOOLS:
+        if tool_name in self.SKILL_COMMIT_TOOLS:
             return ["execute", "managed_skill_write"]
         if tool_name in {"fetch_url", "tavily_search"}:
             return ["execute", "network_access"]
+        if tool_name in self.mcp_tool_names:
+            return ["execute", "network_access"]
         capabilities = ["execute"]
         if tool_name in {"execute", "execute_external_directory"}:
-            context = cls._context(request)
+            context = self._context(request)
             effects = ShellPolicyAnalyzer.capabilities(
-                cls._command(request),
+                self._command(request),
                 workspace_path=(
                     "/external-workspace"
                     if tool_name == "execute_external_directory"

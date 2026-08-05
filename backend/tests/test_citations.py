@@ -695,3 +695,27 @@ def test_read_file_json_document_does_not_create_sources():
 
     assert adapted.adapter == "plain_text"
     assert adapted.sources == []
+
+
+def test_format_sources_for_model_omits_evidence_quotes_when_historical():
+    """Historical projections keep only source_id ↔ title continuity; the
+    evidence quote must stay out of the model payload (recoverable via
+    read_evidence) while in-run callers keep the full quote."""
+    from graph.citations import format_sources_for_model
+
+    sources = [{
+        "source_id": "src_abc123",
+        "title": "架构文档",
+        "page": 12,
+        "quote": "这段证据原文不应该出现在历史投影里。",
+    }]
+
+    full = format_sources_for_model("答案", sources)
+    assert "证据：这段证据原文不应该出现在历史投影里。" in full
+    assert "src_abc123: 架构文档，第 12 页" in full
+
+    slim = format_sources_for_model("答案", sources, include_evidence=False)
+    assert "src_abc123: 架构文档，第 12 页" in slim
+    assert "这段证据原文不应该出现在历史投影里。" not in slim
+    assert "read_evidence" in slim  # 省略是刻意的,且原文可恢复
+    assert "[^source_id]" in slim  # 引用协议说明保留

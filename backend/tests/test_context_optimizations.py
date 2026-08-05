@@ -1010,6 +1010,49 @@ class TestSessionManagerPersistence:
         assert agent_history[2]["content"] == "Final answer from the searched topic."
         assert "tool_calls" not in agent_history[2]
 
+    def test_load_session_for_agent_merges_compaction_committed_after_display_snapshot(self, tmp_path):
+        """Regression: middle trim snapshots display_messages, and the background
+        Tool Context commit only writes the raw messages store. The agent
+        projection must merge the ready context_output back by tool_call id."""
+        from graph.session_manager import SessionManager
+
+        mgr = SessionManager()
+        mgr.initialize(tmp_path)
+        sid = "test-session"
+        mgr.create_session(sid)
+        raw_output = "搜索结果正文" * 2000
+        mgr.save_message(sid, "user", "head")
+        mgr.save_message(
+            sid,
+            "assistant",
+            "search-answer",
+            tool_calls=[{"tool": "tavily_search", "id": "tc1", "args": {"q": "topic"}, "output": raw_output}],
+        )
+        mgr.save_message(sid, "user", "trim-user")
+        mgr.save_message(sid, "assistant", "trim-assistant")
+        mgr.save_message(sid, "user", "tail")
+
+        # Middle trim creates the display_messages snapshot; the compaction
+        # commit lands afterwards and only touches the raw messages store.
+        assert mgr.middle_trim_history(sid, "trimmed", 2, 4)
+        assert mgr.persist_immediate_tool_context(
+            sid,
+            tool_call_id="tc1",
+            source_output=raw_output,
+            context_output="压缩后的搜索结果摘要",
+            method="search_adapter",
+            policy_version="tool-context-v2-harness-control",
+        )
+
+        display_call = mgr.load_session(sid)[1]["tool_calls"][0]
+        assert "context_output" not in display_call  # 快照停留在提交前,证明合并是必要的
+
+        agent_call = mgr.load_session_for_agent(sid)[1]["tool_calls"][0]
+        assert agent_call["context_output"] == "压缩后的搜索结果摘要"
+        assert agent_call["context_compaction"]["status"] == "ready"
+        assert agent_call["context_compaction"]["method"] == "search_adapter"
+
+
     def test_load_session_for_agent_still_merges_plain_consecutive_assistant_text(self, tmp_path):
         from graph.session_manager import SessionManager
 
@@ -1130,6 +1173,9 @@ class TestTokensAPI:
             session_manager.create_session(sid, metadata={"runtime_mode": "agent"})
             session_manager.save_message(sid, "user", "x" * 10000)
             session_manager.update_context_usage_peak(sid, 205000)
+            session_manager.update_agent_context_usage(sid, 205000)
+            # A completed Summary pass must be allowed to lower the current
+            # effective context instead of preserving the pre-summary value.
             session_manager.update_agent_context_usage(sid, 6800)
 
             with patch("api.tokens.build_system_prompt", return_value="sys"):

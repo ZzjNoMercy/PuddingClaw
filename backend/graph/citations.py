@@ -175,20 +175,52 @@ def parse_tool_result(raw_output: str, tool_call_id: str = "") -> tuple[str, lis
     return _clean_text(payload.get("answer_context")), dedupe_sources(sources)
 
 
-def format_sources_for_model(answer_context: str, sources: list[dict[str, Any]]) -> str:
-    """Keep stable source ids visible to the model after extracting the envelope."""
+def format_sources_for_model(
+    answer_context: str,
+    sources: list[dict[str, Any]],
+    *,
+    include_evidence: bool = True,
+) -> str:
+    """Keep stable source ids visible to the model after extracting the envelope.
+
+    The catalog serves two distinct needs:
+
+    1. Identity continuity — the ``source_id`` ↔ title mapping lets the model
+       keep citing the same ids across turns. This is cheap and always needed.
+    2. Evidence text — the per-source quote lets the model verify what it is
+       citing *while composing* a new answer.
+
+    Historical projections only need the first: the reply that cited these
+    sources is already written and frozen, and the raw evidence remains
+    recoverable through read_evidence. Pass ``include_evidence=False`` on the
+    historical path so old search results are not re-billed at full price on
+    every new Run. In-run callers keep the default so citation accuracy is
+    preserved while the model is actually writing.
+    """
     if not sources:
         return answer_context
     catalog = []
     for source in sources:
         location = f"，第 {source['page']} 页" if source.get("page") not in (None, "") else ""
-        catalog.append(
-            f"- {source['source_id']}: {source['title']}{location}\n"
-            f"  证据：{source.get('quote') or '见工具返回内容'}"
+        if include_evidence:
+            catalog.append(
+                f"- {source['source_id']}: {source['title']}{location}\n"
+                f"  证据：{source.get('quote') or '见工具返回内容'}"
+            )
+        else:
+            catalog.append(f"- {source['source_id']}: {source['title']}{location}")
+    omitted_note = ""
+    if not include_evidence:
+        # Tell the model the omission is deliberate and recoverable, otherwise
+        # it may treat the missing quotes as lost data and re-run the search.
+        omitted_note = (
+            "\n(证据摘录已在历史投影中省略；原文保留在会话证据存储中，"
+            "可按需用 read_evidence 读取。)"
         )
     return (
         f"{answer_context}\n\n[可引用来源]\n"
         + "\n".join(catalog)
+        + omitted_note
         + "\n\n回答中使用某来源支持具体论述时，请在该论述后添加 [^source_id]，"
           "例如 [^src_abc123]。只能使用上方列出的 source_id。"
     )

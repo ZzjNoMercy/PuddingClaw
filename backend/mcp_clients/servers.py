@@ -4,6 +4,8 @@
 """
 
 import os
+import copy
+import re
 from pathlib import Path
 from typing import Any
 
@@ -81,16 +83,65 @@ _SERVER_DISPLAY_NAMES: dict[str, str] = {
 }
 
 
-def get_mcp_server_display_info(enabled_names: list[str]) -> list[dict[str, str]]:
+_CUSTOM_SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_SUPPORTED_TRANSPORTS = {"stdio", "sse", "streamable-http"}
+
+
+def _configured_servers() -> dict[str, Any]:
+    """Load user-defined servers without importing config at module load time."""
+
+    try:
+        from config import load_config
+
+        servers = load_config().get("mcp", {}).get("servers", {})
+    except Exception:
+        return {}
+    return servers if isinstance(servers, dict) else {}
+
+
+def _server_registry(custom_servers: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return the single MCP config registry, with legacy fallback entries."""
+
+    registry = copy.deepcopy(_REGISTRY)
+    for name, value in (custom_servers if custom_servers is not None else _configured_servers()).items():
+        if not isinstance(name, str) or not _CUSTOM_SERVER_NAME_RE.fullmatch(name):
+            continue
+        if not isinstance(value, dict) or value.get("transport") not in _SUPPORTED_TRANSPORTS:
+            continue
+        if value.get("transport") in {"sse", "streamable-http"} and not str(value.get("url") or "").strip():
+            continue
+        if value.get("transport") == "stdio" and not str(value.get("command") or "").strip():
+            continue
+        registry[name] = _resolve_environment_values(copy.deepcopy(value))
+    return registry
+
+
+def _resolve_environment_values(value: Any) -> Any:
+    """Resolve ${ENV_NAME} references in the single MCP config file."""
+
+    if isinstance(value, dict):
+        return {key: _resolve_environment_values(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_resolve_environment_values(item) for item in value]
+    if isinstance(value, str) and value.startswith("${") and value.endswith("}"):
+        return _get_env(value[2:-1])
+    return value
+
+
+def get_mcp_server_display_info(
+    enabled_names: list[str],
+    custom_servers: dict[str, Any] | None = None,
+) -> list[dict[str, str]]:
     """返回供前端展示的 MCP 服务器信息（不含敏感 headers）."""
     result = []
+    registry = _server_registry(custom_servers)
     for name in enabled_names:
-        cfg = _REGISTRY.get(name)
+        cfg = registry.get(name)
         if not cfg:
             continue
         result.append({
             "key": name,
-            "name": _SERVER_DISPLAY_NAMES.get(name, name),
+            "name": cfg.get("name") or _SERVER_DISPLAY_NAMES.get(name, name),
             "url": cfg.get("url", ""),
             "transport": cfg.get("transport", ""),
         })
@@ -171,7 +222,10 @@ def effective_mcp_server_names(
     return result
 
 
-def build_mcp_servers_config(enabled_names: list[str] | None = None) -> dict[str, Any]:
+def build_mcp_servers_config(
+    enabled_names: list[str] | None = None,
+    custom_servers: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """构建 MCP 服务器配置，供 MultiServerMCPClient 使用.
 
     Args:
@@ -180,8 +234,7 @@ def build_mcp_servers_config(enabled_names: list[str] | None = None) -> dict[str
     环境变量规范：
         MCP_API_KEY 或各服务特定 Key — API Key
     """
-    import copy
-    registry = copy.deepcopy(_REGISTRY)
+    registry = _server_registry(custom_servers)
     gbrain_status = gbrain_runtime_status()
     gbrain_home = str(gbrain_status["home"])
     if not gbrain_status["ready"]:
@@ -205,9 +258,16 @@ def build_mcp_servers_config(enabled_names: list[str] | None = None) -> dict[str
             registry.pop("gbrain", None)
 
     if enabled_names is not None:
-        return {k: v for k, v in registry.items() if k in enabled_names}
+        return {
+            k: {field: value for field, value in v.items() if field != "name"}
+            for k, v in registry.items()
+            if k in enabled_names
+        }
 
-    return registry
+    return {
+        k: {field: value for field, value in v.items() if field != "name"}
+        for k, v in registry.items()
+    }
 
 
 def allowed_mcp_tool_names(server_name: str) -> frozenset[str] | None:

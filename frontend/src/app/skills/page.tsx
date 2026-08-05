@@ -65,6 +65,8 @@ const MonacoEditor = dynamic(() => import("@monaco-editor/react"), {
 
 // ── Main Page ────────────────────────────────────────────
 export default function SkillsPage() {
+  const pathname = usePathname();
+  const router = useRouter();
   const {
     sidebarOpen,
     toggleSidebar,
@@ -73,7 +75,9 @@ export default function SkillsPage() {
     triggerSkillCreator,
     setPendingInput,
   } = useApp();
-  const [extensionView, setExtensionView] = useState<"connectors" | "skills" | "mcp">("skills");
+  const [extensionView, setExtensionView] = useState<"connectors" | "skills" | "mcp">(
+    pathname === "/extension/mcp" ? "mcp" : "skills"
+  );
   const [skills, setSkills] = useState<SkillInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedSkill, setSelectedSkill] = useState<string | null>(null);
@@ -95,8 +99,6 @@ export default function SkillsPage() {
   const [importing, setImporting] = useState(false);
   const [showRenameModal, setShowRenameModal] = useState(false);
   const [renamingSkill, setRenamingSkill] = useState<string | null>(null);
-  const pathname = usePathname();
-  const router = useRouter();
   const MIN_SIDEBAR = 200;
 
   const [mounted, setMounted] = useState(false);
@@ -104,6 +106,16 @@ export default function SkillsPage() {
     setMounted(true);
     setSkillFromQuery(new URLSearchParams(window.location.search).get("skill"));
   }, []);
+
+  useEffect(() => {
+    if (pathname === "/skills") {
+      router.replace(`/extension/skills${window.location.search}`);
+    } else if (pathname === "/extension/mcp") {
+      setExtensionView("mcp");
+    } else if (pathname === "/extension/skills") {
+      setExtensionView("skills");
+    }
+  }, [pathname, router]);
 
   const handleSidebarResize = useCallback(
     (delta: number) => {
@@ -134,8 +146,8 @@ export default function SkillsPage() {
   }, [showToast]);
 
   useEffect(() => {
-    loadSkills();
-  }, [loadSkills]);
+    if (extensionView === "skills") void loadSkills();
+  }, [extensionView, loadSkills]);
 
   // ── Load skill detail ────────────────────────────────
   const loadSkillDetail = useCallback(
@@ -371,12 +383,20 @@ export default function SkillsPage() {
       if (view === extensionView) return;
       if (isDirty && !window.confirm("当前文件有未保存的更改，确定要切换吗？")) return;
       setExtensionView(view);
+      if (view === "mcp") {
+        window.history.pushState(null, "", "/extension/mcp");
+        return;
+      }
+      if (view === "skills") {
+        window.history.pushState(null, "", "/extension/skills");
+        return;
+      }
     },
     [extensionView, isDirty]
   );
 
   // ── Loading state ────────────────────────────────────
-  if (loading) {
+  if (extensionView === "skills" && loading) {
     return (
       <div className="h-screen app-bg">
         <div className="fixed left-3 top-3 z-[80]">

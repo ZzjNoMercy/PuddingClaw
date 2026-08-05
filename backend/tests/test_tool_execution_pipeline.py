@@ -861,6 +861,23 @@ def test_registered_but_unclassified_tool_fails_closed(tmp_path):
     assert result.reason == "missing_tool_control_descriptor:new_mutating_tool"
 
 
+def test_loaded_mcp_tool_is_known_but_requires_conservative_approval(tmp_path):
+    request = ToolCallRequest(
+        tool_call={"id": "call-1", "name": "zhihuiya_patents_search", "args": {"query": "AI"}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+    result = ToolExecutionPipeline(
+        known_tools={"zhihuiya_patents_search"},
+        mcp_tool_names={"zhihuiya_patents_search"},
+        backend_mode="restricted_host",
+    )._preflight(request)
+
+    assert result.decision == PolicyDecision.ASK
+    assert result.reason == "mcp_tool_requires_user_approval"
+
+
 def test_internal_database_result_source_uses_its_control_descriptor(tmp_path):
     request = ToolCallRequest(
         tool_call={

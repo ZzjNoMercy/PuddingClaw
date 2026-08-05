@@ -321,9 +321,9 @@ export default function Sidebar() {
           智能问数
         </Link>
         <Link
-          href="/skills"
+          href="/extension/skills"
           className={`w-full flex items-center gap-2 px-3 py-2 text-[13px] rounded-xl transition-all ${
-            runtimeReady && pathname.startsWith("/skills")
+            runtimeReady && pathname.startsWith("/extension")
               ? "bg-[#002fa7] text-white font-medium shadow-sm shadow-[#002fa7]/20"
               : "text-gray-600 hover:text-gray-900 hover:bg-white/50"
           }`}

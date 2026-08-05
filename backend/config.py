@@ -148,6 +148,18 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "image_collection": "puddingclaw_knowledge_image",
             "bm25_enabled": True,
         },
+        "search": {
+            "enabled": True,
+            "directories": [
+                {"id": "assets", "path": "assets", "enabled": True, "recursive": True, "content_types": ["image"], "referenced_images_only": True},
+                {"id": "imported", "path": "imported", "enabled": True, "recursive": True, "content_types": ["markdown", "pdf", "document"]},
+                {"id": "originals", "path": "originals", "enabled": True, "recursive": True, "content_types": ["pdf", "document", "image"]},
+                {"id": "llm-wiki", "path": "llm-wiki/wiki", "enabled": True, "recursive": True, "content_types": ["markdown"]},
+                {"id": "source-code-updates", "path": "source-code-updates", "enabled": True, "recursive": True, "content_types": ["markdown"]},
+            ],
+            "sources": {"read_later": {"enabled": True}},
+            "exclude": ["**/.DS_Store", "**/.git/**", "**/.puddingclaw/**", "llm-wiki/raw/**", "llm-wiki/wiki/index.md", "llm-wiki/wiki/log.md"],
+        },
     },
     "vanna": {
         # Global NL2SQL runtime for the analytics workbench. Training data is
@@ -383,6 +395,23 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "mcp": {
         "enabled": [],
         "auto_enable_gbrain": True,
+        # Every MCP server is described in this one config section. Secret
+        # values use environment references and are resolved at runtime.
+        "servers": {
+            "zhihuiya_patents": {
+                "name": "智慧芽专利检索",
+                "transport": "streamable-http",
+                "url": "https://connect.zhihuiya.com/1458a4/mcp",
+                "headers": {"Authorization": "${ZHIHUIYA_MCP_API_KEY}"},
+                "timeout": 60,
+            },
+            "gbrain": {
+                "name": "gbrain",
+                "transport": "stdio",
+                "command": "gbrain",
+                "args": ["serve"],
+            },
+        },
     },
 }
 
@@ -1419,6 +1448,7 @@ def get_settings_for_display() -> dict[str, Any]:
                 **config.get("knowledge", {}).get("multimodal_index", {}),
                 **effective_knowledge_index,
             },
+            "search": config.get("knowledge", {}).get("search", {}),
         },
         "database": {
             **config.get("database", {}),
@@ -1614,6 +1644,18 @@ def update_settings(updates: dict[str, Any]) -> None:
             config["knowledge"] = {}
         if isinstance(knowledge_update, dict) and "root_dir" in knowledge_update:
             config["knowledge"]["root_dir"] = str(knowledge_update.get("root_dir") or "").strip()
+
+        if isinstance(knowledge_update, dict) and "search" in knowledge_update:
+            search_update = knowledge_update.get("search")
+            if not isinstance(search_update, dict):
+                raise ValueError("knowledge.search 必须是对象")
+            existing_search = config["knowledge"].get("search", {})
+            if not isinstance(existing_search, dict):
+                existing_search = {}
+            for key in ("enabled", "directories", "sources", "exclude"):
+                if key in search_update:
+                    existing_search[key] = search_update[key]
+            config["knowledge"]["search"] = existing_search
         if isinstance(knowledge_update, dict) and "llm_wiki" in knowledge_update:
             llm_wiki_update = knowledge_update.get("llm_wiki")
             existing_llm_wiki = config["knowledge"].get("llm_wiki", {})

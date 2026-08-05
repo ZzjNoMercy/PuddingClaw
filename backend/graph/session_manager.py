@@ -4265,7 +4265,6 @@ class SessionManager:
         if (
             not data
             or data.get("headless_enabled") is not True
-            or data.get("runtime_mode") != "headless_worker"
         ):
             return False
         try:
@@ -5867,6 +5866,22 @@ class SessionManager:
             return 0
         return int(data.get("agent_context_usage", 0) or 0)
 
+    @staticmethod
+    def _run_agent_context_record(data: dict[str, Any]) -> dict[str, Any] | None:
+        """Read the current Run snapshot, including the legacy flat shape."""
+
+        record = data.get("run_agent_context")
+        if isinstance(record, dict) and isinstance(record.get("messages"), list):
+            return record
+        legacy_messages = data.get("agent_context_messages")
+        if not isinstance(legacy_messages, list):
+            return None
+        return {
+            "run_id": data.get("agent_context_run_id"),
+            "messages": legacy_messages,
+            "updated_at": data.get("updated_at"),
+        }
+
     def get_effective_agent_context_usage(
         self,
         session_id: str,
@@ -5905,7 +5920,8 @@ class SessionManager:
                 return usage
 
             delta = 0
-            messages = data.get("agent_context_messages")
+            run_context = self._run_agent_context_record(data)
+            messages = run_context.get("messages") if run_context else None
             if not isinstance(messages, list):
                 return usage
             for message in messages:
@@ -5934,12 +5950,17 @@ class SessionManager:
         *,
         run_id: str | None = None,
     ) -> None:
-        """Persist DeepAgents' compact model context separately from UI history."""
+        """Persist the current Run's model execution snapshot."""
         data = self._read_file(session_id)
         if not data:
             return
-        data["agent_context_messages"] = messages
-        data["agent_context_run_id"] = run_id
+        data["run_agent_context"] = {
+            "run_id": run_id,
+            "messages": messages,
+            "updated_at": time.time(),
+        }
+        data.pop("agent_context_messages", None)
+        data.pop("agent_context_run_id", None)
         self._write_file(session_id, data)
 
     def get_agent_context_messages(
@@ -5948,16 +5969,72 @@ class SessionManager:
         *,
         run_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Load the compact model context saved by a previous Agent turn."""
+        """Load a model execution snapshot only for its source Run."""
         data = self._read_file(session_id)
         if not data:
             return []
-        if run_id is not None and data.get("agent_context_run_id") != run_id:
+        record = self._run_agent_context_record(data)
+        if record is None:
             return []
-        messages = data.get("agent_context_messages")
+        if run_id is not None and record.get("run_id") != run_id:
+            return []
+        messages = record.get("messages")
         if not isinstance(messages, list):
             return []
         return [item for item in messages if isinstance(item, dict)]
+
+    @_session_write_locked
+    def update_session_summary_projection(
+        self,
+        session_id: str,
+        *,
+        summary_text: str,
+        recent_messages: list[dict[str, Any]],
+        transcript_boundary: dict[str, Any],
+        source_run_id: str,
+        history_ref: str = "",
+        tokens_after: int = 0,
+    ) -> None:
+        """Persist the completed DeepAgents Summary projection across Runs."""
+
+        normalized_summary = str(summary_text or "").strip()
+        source_query_id = str(transcript_boundary.get("source_query_id") or "")
+        if not normalized_summary or not source_query_id:
+            raise ValueError("Session summary projection requires summary_text and source_query_id")
+        data = self._read_file(session_id)
+        if not data:
+            return
+        data["session_summary_projection"] = {
+            "schema_version": 1,
+            "status": "completed",
+            "summary_text": normalized_summary,
+            "recent_messages": [item for item in recent_messages if isinstance(item, dict)],
+            "transcript_boundary": {
+                "source_query_id": source_query_id,
+                "message_count": max(0, int(transcript_boundary.get("message_count") or 0)),
+            },
+            "source_run_id": str(source_run_id or ""),
+            "history_ref": str(history_ref or ""),
+            "tokens_after": max(0, int(tokens_after or 0)),
+            "created_at": time.time(),
+        }
+        self._write_file(session_id, data)
+
+    def get_session_summary_projection(self, session_id: str) -> dict[str, Any] | None:
+        """Return the latest completed cross-Run Summary projection."""
+
+        data = self._read_file(session_id)
+        projection = data.get("session_summary_projection") if data else None
+        if not isinstance(projection, dict) or projection.get("status") != "completed":
+            return None
+        if not str(projection.get("summary_text") or "").strip():
+            return None
+        if not isinstance(projection.get("recent_messages"), list):
+            return None
+        boundary = projection.get("transcript_boundary")
+        if not isinstance(boundary, dict) or not str(boundary.get("source_query_id") or ""):
+            return None
+        return deepcopy(projection)
 
     @_session_write_locked
     def register_delivered_artifact(
@@ -6901,14 +6978,19 @@ class SessionManager:
         messages: list[dict[str, Any]] | None = None,
         run_id: str | None = None,
     ) -> None:
-        """Atomically persist Agent usage and, when compacted, its model context."""
+        """Atomically persist Agent usage and an optional same-Run snapshot."""
         data = self._read_file(session_id)
         if not data:
             return
         data["agent_context_usage"] = max(0, int(used_tokens))
         if messages is not None:
-            data["agent_context_messages"] = messages
-            data["agent_context_run_id"] = run_id
+            data["run_agent_context"] = {
+                "run_id": run_id,
+                "messages": messages,
+                "updated_at": time.time(),
+            }
+            data.pop("agent_context_messages", None)
+            data.pop("agent_context_run_id", None)
         self._write_file(session_id, data)
 
     # ── Host-file mutation receipts ──────────────────────────────────────────
@@ -8013,6 +8095,22 @@ class SessionManager:
                 self._write_file(session_id, data)
         messages = logical.get("messages", []) if logical else []  # active + archive
 
+        # ``complete_tool_context_compaction`` commits ready context outputs to
+        # the raw ``messages`` store only. A middle-trimmed Session returns a
+        # ``display_messages`` snapshot from ``load_session`` that predates the
+        # commit, so merge the authoritative compaction fields back by tool_call
+        # id or the deterministic projection can never select them.
+        context_compaction_by_call_id: dict[str, dict[str, Any]] = {}
+        for _, _, _, stored_call in self._iter_persisted_tool_calls(data or {}):
+            stored_call_id = str(stored_call.get("id") or "")
+            stored_context_output = stored_call.get("context_output")
+            stored_context_metadata = stored_call.get("context_compaction")
+            if stored_call_id and stored_context_output and isinstance(stored_context_metadata, dict):
+                context_compaction_by_call_id[stored_call_id] = {
+                    "context_output": str(stored_context_output),
+                    "context_compaction": deepcopy(stored_context_metadata),
+                }
+
         if current_run_id is None and data:
             harness = data.get("harness")
             runs = harness.get("runs") if isinstance(harness, dict) else None
@@ -8071,6 +8169,8 @@ class SessionManager:
 
         for msg in messages:  # 遍历所有消息
             entry: dict[str, Any] = {"role": msg["role"], "content": msg["content"]}
+            if msg.get("query_id"):
+                entry["query_id"] = str(msg["query_id"])
             # Attachments are durable session-scoped references, not transient
             # request payloads. Keep their structured metadata in the agent
             # history so a later Run (for example after a reload or "continue")
@@ -8085,12 +8185,15 @@ class SessionManager:
                     if not isinstance(raw_call, dict):
                         continue
                     call = deepcopy(raw_call)
+                    stored_context = context_compaction_by_call_id.get(str(call.get("id") or ""))
+                    if stored_context:
+                        call["context_output"] = stored_context["context_output"]
+                        call["context_compaction"] = stored_context["context_compaction"]
                     source_run_id = str(call.get("source_run_id") or "")
                     call["historical"] = bool(not current_run_id or source_run_id != current_run_id)
                     calls.append(call)
                 if calls:
                     entry["tool_calls"] = calls
-                    entry["query_id"] = str(msg.get("query_id") or "")
             prev_has_tool_calls = bool(merged[-1].get("_had_tool_calls")) if merged else False
             if (
                 not deterministic_projection
@@ -8102,6 +8205,8 @@ class SessionManager:
                 and not msg_has_tool_calls  # 当前消息无 tool_calls 才合并
             ):
                 merged[-1]["content"] += "\n" + msg["content"]  # 合并为一条（避免连续 assistant）
+                if msg.get("query_id"):
+                    merged[-1]["query_id"] = str(msg["query_id"])
             else:
                 entry["_had_tool_calls"] = msg_has_tool_calls  # 内部标记，用于下一轮合并判断
                 merged.append(entry)
@@ -8130,6 +8235,11 @@ class SessionManager:
             del data["compressed_context"]
         if "middle_trim_context" in data:
             del data["middle_trim_context"]
+        data.pop("run_agent_context", None)
+        data.pop("agent_context_messages", None)
+        data.pop("agent_context_run_id", None)
+        data.pop("session_summary_projection", None)
+        data.pop("agent_context_usage", None)
         if "harness" in data:
             del data["harness"]
         self._write_file(session_id, data)  # 写回磁盘

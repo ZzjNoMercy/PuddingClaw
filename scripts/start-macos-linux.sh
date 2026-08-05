@@ -7,6 +7,20 @@
 
 set -e
 
+# macOS GUI terminals and launchd jobs may inherit a very small soft maxfiles
+# limit. Only raise the limit when needed: never replace a larger inherited
+# value with our fallback, otherwise Watchpack can regress into partial route
+# discovery and serve only the 404 page.
+TARGET_MAX_OPEN_FILES="${PUDDINGCLAW_MAX_OPEN_FILES:-122880}"
+CURRENT_MAX_OPEN_FILES="$(ulimit -n 2>/dev/null || echo 0)"
+if [[ "$CURRENT_MAX_OPEN_FILES" =~ ^[0-9]+$ ]] &&
+   [[ "$TARGET_MAX_OPEN_FILES" =~ ^[0-9]+$ ]] &&
+   (( CURRENT_MAX_OPEN_FILES < TARGET_MAX_OPEN_FILES )); then
+    if ! ulimit -n "$TARGET_MAX_OPEN_FILES" 2>/dev/null; then
+        echo "[警告] 无法将文件描述符上限从 $CURRENT_MAX_OPEN_FILES 提升到 $TARGET_MAX_OPEN_FILES，将沿用 $(ulimit -n)"
+    fi
+fi
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -185,10 +199,6 @@ fi
 echo ""
 echo -e "${BLUE}[信息] 启动前端服务...${NC}"
 cd frontend
-if [ -d ".next" ]; then
-    echo -e "${YELLOW}[信息] 清理前端 dev 缓存 .next，避免旧 chunks 造成 404...${NC}"
-    rm -rf .next
-fi
-npx next dev -H 0.0.0.0 --port "$FRONTEND_PORT"
+npm run dev -- -H 0.0.0.0 --port "$FRONTEND_PORT"
 
 cleanup

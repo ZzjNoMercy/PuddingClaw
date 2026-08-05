@@ -119,7 +119,6 @@ function parseFlags(args) {
     const arg = args[i];
     if (arg === "--json") { flags.json = true; continue; }
     if (arg === "--input-json") { flags.inputJson = args[++i]; continue; }
-    if (arg === "--model") { flags.model = args[++i]; continue; }
     if (arg === "--session") { flags.session = args[++i]; continue; }
     if (arg.startsWith("--")) throw new WorkerClientError(`unknown option: ${arg}`, { code: "argument_error" });
     positionals.push(arg);
@@ -147,16 +146,14 @@ async function runCommand(args) {
   const { positionals, flags } = parseFlags(args);
   const input = await readInput(flags);
   const message = input?.message ?? (positionals.length ? positionals.join(" ") : "");
-  const inputModel = input?.model ?? input?.analytics_model_id;
   const inputSession = input?.session_id;
   if (!message || !String(message).trim()) throw new WorkerClientError("message is required", { code: "argument_error" });
-  if (flags.model !== undefined && inputModel !== undefined && String(flags.model) !== String(inputModel)) {
-    throw new WorkerClientError("--model conflicts with stdin model", { code: "argument_error" });
+  if (input?.model !== undefined || input?.analytics_model_id !== undefined) {
+    throw new WorkerClientError("model input is not supported; PuddingClaw routes the question on the backend", { code: "argument_error" });
   }
   if (flags.session !== undefined && inputSession !== undefined && String(flags.session) !== String(inputSession)) {
     throw new WorkerClientError("--session conflicts with stdin session_id", { code: "argument_error" });
   }
-  const model = flags.model ?? inputModel;
   const sessionId = flags.session ?? inputSession;
   await ensureWorkspace();
   const client = new WorkerClient(config());
@@ -166,7 +163,6 @@ async function runCommand(args) {
   try {
     const body = {
       message: String(message),
-      analytics_model_id: model === undefined || model === null ? null : String(model),
       ...(sessionId ? { session_id: String(sessionId) } : {}),
       ...(input?.metadata && typeof input.metadata === "object" ? { metadata: input.metadata } : {}),
       ...(input?.request_id ? { request_id: String(input.request_id) } : {}),
@@ -207,11 +203,11 @@ async function models(args) {
 async function main(argv) {
   const [command, ...rest] = argv;
   if (command === "version") { emit({ schema_version: "1", cli_version: VERSION, protocol_version: "1", agent_id: "puddingclaw" }, jsonMode(rest)); return 0; }
-  if (command === "capabilities") { emit({ schema_version: "1", agent_id: "puddingclaw", protocol_version: "1", capabilities: CAPABILITIES, analytics_model_selection: { type: "analytics_model", required: true, discovery_command: ["models", "list", "--json"] } }, jsonMode(rest)); return 0; }
+  if (command === "capabilities") { emit({ schema_version: "1", agent_id: "puddingclaw", protocol_version: "1", capabilities: CAPABILITIES, analytics_model_routing: { strategy: "backend", input: "message", discovery_command: ["models", "list", "--json"], ambiguity_outcome: "analytics_model_clarification_required" } }, jsonMode(rest)); return 0; }
   if (command === "doctor") return doctor(rest);
   if (command === "models" && rest[0] === "list") return models(rest.slice(1));
   if (command === "run") return runCommand(rest);
-  throw new WorkerClientError("usage: puddingclaw run <message> [--model <analytics_model_id>] [--session <session_id>] [--json]", { code: "argument_error" });
+  throw new WorkerClientError("usage: puddingclaw run <message> [--session <session_id>] [--json]", { code: "argument_error" });
 }
 
 try {

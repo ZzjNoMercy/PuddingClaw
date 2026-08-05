@@ -5,7 +5,7 @@ description: Use the local PuddingClaw Worker CLI for enterprise data questions,
 
 # PuddingClaw Worker
 
-Delegate enterprise-data work to the local `puddingclaw` Node CLI. The CLI is a Worker boundary, not an LLM command: its `--model` value is a PuddingClaw **analytics model** discovered from the connected PuddingClaw instance.
+Delegate enterprise-data work to the local `puddingclaw` Node CLI. Keep the CLI thin: send the user's question and task lifecycle metadata only. PuddingClaw Backend chooses an allowed **analytics model** from the question; this is a business capability boundary, not an LLM provider model.
 
 ## Host contract
 
@@ -47,7 +47,7 @@ The launcher parses only `PUDDINGCLAW_TOKEN`, injects it into the child-process 
 
 Never put a Worker Access Key in argv, prompt text, stdout, logs, summaries, or error messages. Never echo it back.
 
-## Select an analytics model
+## Inspect available capabilities
 
 Run:
 
@@ -57,7 +57,7 @@ puddingclaw models list --json
 
 When using the Skill-local `.env`, replace `puddingclaw` with `node <skill-dir>/scripts/run.mjs` in this and subsequent command shapes.
 
-Use only an identifier returned by this command. If the host has not already bound a model, show the available analytics models to the user and ask which one to use. Do not call it an LLM model and do not substitute a provider model name.
+This command is informational. Do not select a model, pass a model identifier, or ask the user to configure an LLM model. The Backend filters analytics models by Worker Access Key and routes the question before starting a new Session.
 
 ## Run a task
 
@@ -65,7 +65,7 @@ Invoke exactly this command shape:
 
 ```text
 argv:  ["puddingclaw", "run", "--input-json", "-", "--json"]
-stdin: {"message":"...","model":"<analytics model>"}
+stdin: {"message":"..."}
 ```
 
 Optional stdin fields:
@@ -91,7 +91,7 @@ Headless Sessions expire after the Backend's inactivity TTL, which defaults to 2
 For direct human use, the equivalent continuation flag is:
 
 ```text
-puddingclaw run "继续刚才的分析" --model <analytics model> --session <session_id> --json
+puddingclaw run "继续刚才的分析" --session <session_id> --json
 ```
 
 Machine integrations should continue using stdin JSON rather than constructing a shell command.
@@ -101,7 +101,10 @@ Machine integrations should continue using stdin JSON rather than constructing a
 Parse stdout only after the process exits. It contains one JSON object.
 
 - `status == "completed"`: present `final_response` as the Worker answer. Fall back to `reply` only for an older compatible Worker that omits `final_response`.
+- `analytics_model_id` and `analytics_model_match`: Backend-selected audit output. Preserve them for tracing; never feed them back as CLI input.
 - `reply`: aggregated visible content that may include intermediate assistant narration. Do not prefer it over `final_response`.
+- `outcome == "analytics_model_clarification_required"`: ask the user to clarify the actual business object, metric, time range, or analysis scenario, then submit the clarified question as a new request. Do not ask the user for a model ID and do not start a Session until the Backend finds one unique match.
+- `outcome == "analytics_model_unavailable"`: explain that the Worker Key has no usable model or its Session-bound model is no longer allowed; ask the user to contact the PuddingClaw administrator. Do not silently switch a continuous Session to another model.
 - `needs_input != null`: show the question or approval request, collect the user's answer, and continue with the returned `session_id` according to the payload.
 - `outcome == "session_expired"`: remove the Task/Thread mapping and create a new Session with the relevant visible context restated in the message.
 - `status == "error"` or a nonzero exit: summarize the structured error without exposing configuration values.

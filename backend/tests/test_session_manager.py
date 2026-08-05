@@ -1112,6 +1112,82 @@ def test_compact_agent_context_is_scoped_to_source_run(tmp_path):
     ) == []
 
 
+def test_agent_context_usage_update_does_not_rebind_run_snapshot(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("agent-context-rebind")
+    payload = [{"type": "ai", "data": {"content": "old run", "tool_calls": []}}]
+    session_manager.update_agent_context_state(
+        "agent-context-rebind",
+        used_tokens=100,
+        messages=payload,
+        run_id="run-old",
+    )
+
+    session_manager.update_agent_context_state(
+        "agent-context-rebind",
+        used_tokens=120,
+        messages=None,
+        run_id="run-new",
+    )
+
+    assert session_manager.get_agent_context_messages(
+        "agent-context-rebind",
+        run_id="run-old",
+    ) == payload
+    assert session_manager.get_agent_context_messages(
+        "agent-context-rebind",
+        run_id="run-new",
+    ) == []
+
+
+def test_session_summary_projection_is_readable_across_runs(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("summary-projection")
+    recent = [{"type": "human", "data": {"content": "recent", "additional_kwargs": {}}}]
+
+    session_manager.update_session_summary_projection(
+        "summary-projection",
+        summary_text="## Objective\n- continue",
+        recent_messages=recent,
+        transcript_boundary={"source_query_id": "query-old", "message_count": 4},
+        source_run_id="run-old",
+        history_ref="/conversation_history/old.md",
+        tokens_after=1200,
+    )
+
+    projection = session_manager.get_session_summary_projection("summary-projection")
+    assert projection is not None
+    assert projection["summary_text"] == "## Objective\n- continue"
+    assert projection["source_run_id"] == "run-old"
+    assert projection["transcript_boundary"] == {
+        "source_query_id": "query-old",
+        "message_count": 4,
+    }
+    assert projection["recent_messages"] == recent
+
+
+def test_clear_messages_removes_run_snapshot_and_session_summary_projection(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("clear-summary-state")
+    session_manager.update_agent_context_messages(
+        "clear-summary-state",
+        [{"type": "human", "data": {"content": "run"}}],
+        run_id="run-1",
+    )
+    session_manager.update_session_summary_projection(
+        "clear-summary-state",
+        summary_text="summary",
+        recent_messages=[],
+        transcript_boundary={"source_query_id": "query-1", "message_count": 2},
+        source_run_id="run-1",
+    )
+
+    session_manager.clear_messages("clear-summary-state")
+
+    assert session_manager.get_agent_context_messages("clear-summary-state") == []
+    assert session_manager.get_session_summary_projection("clear-summary-state") is None
+
+
 def test_upsert_assistant_message_replaces_same_query_draft(tmp_path):
     session_manager.initialize(tmp_path)
     session_manager.create_session("draft-session")

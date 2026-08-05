@@ -192,7 +192,7 @@ export default function InspectorPanel() {
               activeSkills={activeSkills}
               onSelect={setInspectorFile}
               selectedPath={inspectorFile}
-              onNavigateToConfig={() => router.push("/skills")}
+              onNavigateToConfig={() => router.push("/extension/skills")}
             />
           ) : (
             <McpServerList servers={mcpServers} />

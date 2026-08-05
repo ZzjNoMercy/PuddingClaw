@@ -13,11 +13,12 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from analytics.models import get_analytics_model_registry
+from analytics.models.router import AnalyticsModelRoute, AnalyticsModelRouter
 from cli_runtime import current_cli_runtime_status
 from graph.deepagents_manager import deepagents_agent_manager
 from graph.headless_resolver import headless_authority_from_environment
@@ -30,8 +31,9 @@ from headless_session_lifecycle import (
     headless_session_ttl_seconds,
     is_headless_session_expired,
 )
+from llm.model_client import ModelClientChatModel
 from projects.registry import project_registry
-from worker_access import WORKER_SCOPES, WorkerAccessError, worker_access_store
+from worker_access import WorkerAccessError, worker_access_store
 
 router = APIRouter(prefix="/headless", tags=["headless-worker"])
 worker_access_router = APIRouter(tags=["worker-access-keys"])
@@ -91,8 +93,9 @@ def _attach_session_lifecycle(response: dict[str, Any], session_id: str) -> dict
 
 
 class HeadlessRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     message: str = Field(min_length=1, max_length=100_000)
-    analytics_model_id: str | None = Field(default=None, max_length=200)
     session_id: str | None = Field(default=None, max_length=200)
     metadata: dict[str, Any] = Field(default_factory=dict)
     request_id: str | None = Field(default=None, max_length=200)
@@ -126,6 +129,87 @@ def _model_options(principal: dict[str, Any]) -> list[dict[str, Any]]:
     if allowed:
         models = [item for item in models if str(item.get("id")) in allowed]
     return models
+
+
+def _model_routing_candidates(principal: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return only allowed models, enriched with bounded routing guidance."""
+
+    registry = get_analytics_model_registry(BASE_DIR)
+    candidates: list[dict[str, Any]] = []
+    for option in _model_options(principal):
+        candidate = dict(option)
+        try:
+            detail = registry.get_model(str(option.get("id") or ""))
+            candidate["applicability"] = str(detail.get("body") or "")[:4_000]
+        except Exception:
+            # Registry summaries still provide a useful fail-closed candidate.
+            candidate["applicability"] = ""
+        candidates.append(candidate)
+    return candidates
+
+
+async def _route_analytics_model(message: str, principal: dict[str, Any]) -> AnalyticsModelRoute:
+    """Resolve one allowed Analytics Model without giving the CLI selection authority."""
+
+    candidates = _model_routing_candidates(principal)
+    deterministic = AnalyticsModelRouter.deterministic(message, candidates)
+    if deterministic is not None:
+        return deterministic
+    try:
+        model = ModelClientChatModel(
+            role="analytics_model_router",
+            temperature=0,
+            streaming=False,
+            thinking_enabled=False,
+        )
+        timeout_s = max(
+            1.0,
+            float(os.getenv("PUDDINGCLAW_ANALYTICS_MODEL_ROUTER_TIMEOUT_S", "15")),
+        )
+        return await asyncio.wait_for(
+            AnalyticsModelRouter.route(
+                message=message,
+                candidates=candidates,
+                model=model,
+            ),
+            timeout=timeout_s,
+        )
+    except TimeoutError:
+        return AnalyticsModelRoute("ambiguous", None, 0.0, "fallback", "classifier_timeout")
+    except Exception as exc:
+        return AnalyticsModelRoute(
+            "ambiguous",
+            None,
+            0.0,
+            "fallback",
+            f"classifier_error:{type(exc).__name__}",
+        )
+
+
+def _model_routing_needs_input(
+    route: AnalyticsModelRoute,
+    models: list[dict[str, Any]],
+) -> dict[str, Any]:
+    unavailable = route.status == "unmatched" and (
+        not models or route.reason == "bound_model_no_longer_allowed"
+    )
+    if route.reason == "bound_model_no_longer_allowed":
+        prompt = "该连续任务绑定的分析模型已不可用，请联系管理员恢复权限或创建一个新任务。"
+    elif unavailable:
+        prompt = "当前 Worker Key 没有可用的分析模型，请联系管理员配置模型权限。"
+    else:
+        prompt = "无法根据当前问题唯一匹配分析模型，请补充要分析的业务对象、指标或场景。"
+    return {
+        "schema_version": "1",
+        "status": "needs_input",
+        "outcome": "analytics_model_unavailable" if unavailable else "analytics_model_clarification_required",
+        "analytics_model_match": route.to_dict(),
+        "needs_input": {
+            "type": "analytics_model_unavailable" if unavailable else "analytics_model_clarification",
+            "prompt": prompt,
+            "options": models,
+        },
+    }
 
 
 def _model_binding(model_id: str) -> dict[str, Any]:
@@ -213,7 +297,6 @@ def _idempotency_key(request: HeadlessRunRequest, header: str | None) -> str:
 def _request_hash(request: HeadlessRunRequest, *, principal: dict[str, Any]) -> str:
     payload = {
         "message": request.message,
-        "analytics_model_id": request.analytics_model_id,
         "session_id": request.session_id,
         "metadata": request.metadata,
         "key_id": principal.get("key_id"),
@@ -312,6 +395,8 @@ async def _consume_run(
     approval_mode: str,
     authority: dict[str, Any],
     request_received_at: float,
+    analytics_model_id: str,
+    analytics_model_match: dict[str, Any],
 ) -> dict[str, Any]:
     final_content = ""
     final_response = ""
@@ -322,8 +407,8 @@ async def _consume_run(
         message=request.message,
         session_id=session_id,
         project_id=project_id,
-        analytics_model_id=request.analytics_model_id,
-        analytics_model_snapshot=_model_binding(str(request.analytics_model_id)),
+        analytics_model_id=analytics_model_id,
+        analytics_model_snapshot=_model_binding(analytics_model_id),
         user_id="worker",
         interaction_mode="auto",
         authority_profile=str(authority.get("profile") or "workspace"),
@@ -366,7 +451,8 @@ async def _consume_run(
         "run_id": outcome.get("run_id"),
         "session_id": session_id,
         "project_id": project_id,
-        "analytics_model_id": request.analytics_model_id,
+        "analytics_model_id": analytics_model_id,
+        "analytics_model_match": analytics_model_match,
         "approval_mode": approval_mode,
         "status": status_value,
         "outcome": final_outcome,
@@ -412,7 +498,8 @@ async def worker_models(authorization: str | None = Header(default=None)):
     return {
         "schema_version": "1",
         "model_type": "analytics_model",
-        "required": True,
+        "required": False,
+        "selection": "backend_auto",
         "models": _model_options(principal),
     }
 
@@ -426,19 +513,6 @@ async def create_headless_run(
     request_received_at = time.time()
     principal = _principal_for_scope(authorization, "worker:runs:create")
     models = _model_options(principal)
-    selected = str(request.analytics_model_id or "").strip()
-    if not selected or not any(str(item.get("id")) == selected for item in models):
-        response = {
-            "schema_version": "1",
-            "status": "needs_input",
-            "outcome": "model_selection_required",
-            "needs_input": {
-                "type": "analytics_model_selection",
-                "prompt": "请选择 PuddingClaw 分析模型",
-                "options": models,
-            },
-        }
-        return response
     key = _idempotency_key(request, idempotency_key)
     request_hash = _request_hash(request, principal=principal)
     previous = _reserve_idempotency(key, request_hash)
@@ -450,25 +524,14 @@ async def create_headless_run(
 
     requested_session_id = str(request.session_id or "").strip()
     session_id = requested_session_id or f"worker-session-{uuid.uuid4().hex[:16]}"
+    selected = ""
+    model_route: AnalyticsModelRoute | None = None
     authority = headless_authority_from_environment()
     configured_mode = os.getenv("PUDDINGCLAW_HEADLESS_APPROVAL_MODE", "smart").strip().lower()
     if configured_mode not in {"smart", "full_access"}:
         configured_mode = "smart"
     authority_profile = str(principal.get("authority_profile") or "smart").strip().lower()
     approval_mode = "full_access" if configured_mode == "full_access" and authority_profile != "smart" else "smart"
-    if not requested_session_id:
-        session_manager.create_session(
-            session_id,
-            metadata={
-                "runtime_mode": "headless_worker",
-                "headless_enabled": True,
-                "worker_id": "puddingclaw",
-                "worker_key_id": principal.get("key_id"),
-                "interaction_mode": "auto",
-                "analytics_model_id": selected,
-            },
-            approval_mode=approval_mode,
-        )
     if not _claim_headless_session(session_id):
         _abandon_idempotency(key, request_hash)
         raise HTTPException(status_code=409, detail="Headless Session already has an active request")
@@ -505,9 +568,68 @@ async def create_headless_run(
                     )
                 raise HTTPException(status_code=409, detail="Headless Session changed while expiry was checked")
             approval_mode = str(metadata.get("approval_mode") or approval_mode)
+            selected = str(metadata.get("analytics_model_id") or "").strip()
+            allowed_ids = {str(item.get("id") or "") for item in models}
+            if selected and selected not in allowed_ids:
+                model_route = AnalyticsModelRoute(
+                    "unmatched",
+                    None,
+                    1.0,
+                    "session_bound",
+                    "bound_model_no_longer_allowed",
+                )
+                response = _model_routing_needs_input(model_route, models)
+                response["session_id"] = session_id
+                _attach_session_lifecycle(response, session_id)
+                if key:
+                    _finish_idempotency(key, response)
+                    idempotency_finished = True
+                return response
+            if selected:
+                model_route = AnalyticsModelRoute(
+                    "matched",
+                    selected,
+                    1.0,
+                    "session_bound",
+                    "continuous_session_model",
+                )
+            else:
+                model_route = await _route_analytics_model(request.message, principal)
+                selected = str(model_route.selected_id or "")
+                if model_route.status != "matched" or not selected:
+                    response = _model_routing_needs_input(model_route, models)
+                    response["session_id"] = session_id
+                    _attach_session_lifecycle(response, session_id)
+                    if key:
+                        _finish_idempotency(key, response)
+                        idempotency_finished = True
+                    return response
+                session_manager.update_metadata(session_id, {"analytics_model_id": selected})
+        else:
+            model_route = await _route_analytics_model(request.message, principal)
+            selected = str(model_route.selected_id or "")
+            if model_route.status != "matched" or not selected:
+                response = _model_routing_needs_input(model_route, models)
+                if key:
+                    _finish_idempotency(key, response)
+                    idempotency_finished = True
+                return response
+            session_manager.create_session(
+                session_id,
+                metadata={
+                    "runtime_mode": "headless_worker",
+                    "headless_enabled": True,
+                    "worker_id": "puddingclaw",
+                    "worker_key_id": principal.get("key_id"),
+                    "interaction_mode": "auto",
+                    "analytics_model_id": selected,
+                },
+                approval_mode=approval_mode,
+            )
 
         _maybe_cleanup_stale_headless_sessions(now=request_received_at)
         project_id, _workspace_path = _ensure_worker_project()
+        assert model_route is not None
         try:
             response = await _consume_run(
                 request=request,
@@ -516,11 +638,15 @@ async def create_headless_run(
                 approval_mode=approval_mode,
                 authority={**authority, "profile": authority_profile if approval_mode == "full_access" else "smart"},
                 request_received_at=request_received_at,
+                analytics_model_id=selected,
+                analytics_model_match=model_route.to_dict(),
             )
         except asyncio.TimeoutError:
             response = {
                 "schema_version": "1",
                 "session_id": session_id,
+                "analytics_model_id": selected,
+                "analytics_model_match": model_route.to_dict(),
                 "status": "failed",
                 "outcome": "timeout",
                 "needs_input": None,

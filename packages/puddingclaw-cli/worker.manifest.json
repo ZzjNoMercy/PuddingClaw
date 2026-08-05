@@ -12,10 +12,11 @@
     "output": "stdout-json"
   },
   "capabilities": ["data.query", "data.analysis", "data.nl2sql", "knowledge.query"],
-  "modelSelection": {
-    "type": "analytics_model",
-    "required": true,
-    "discoveryCommand": ["models", "list", "--json"]
+  "modelRouting": {
+    "strategy": "backend",
+    "input": "message",
+    "discoveryCommand": ["models", "list", "--json"],
+    "ambiguityOutcome": "analytics_model_clarification_required"
   },
   "commands": {
     "probe": ["doctor", "--json"],

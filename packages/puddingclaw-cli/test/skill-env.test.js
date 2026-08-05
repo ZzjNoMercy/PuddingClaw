@@ -71,7 +71,7 @@ await import(${JSON.stringify(pathToFileURL(realCli).href)});
 `);
     await chmod(cliShim, 0o700);
 
-    const child = spawn(process.execPath, [launcher, "run", "验证 Skill", "--model", "sales", "--json"], {
+    const child = spawn(process.execPath, [launcher, "run", "验证 Skill", "--json"], {
       env: {
         ...process.env,
         PUDDINGCLAW_TOKEN: "",
@@ -89,7 +89,7 @@ await import(${JSON.stringify(pathToFileURL(realCli).href)});
     const payload = JSON.parse(stdout);
     assert.equal(payload.status, "completed");
     assert.equal(payload.final_response, "final ok");
-    assert.equal(payload.analytics_model_id, "sales");
+    assert.equal(payload.analytics_model_id, "auto-analysis");
     assert.doesNotMatch(stdout + stderr, /test-token/);
   } finally {
     await rm(temp, { recursive: true, force: true });

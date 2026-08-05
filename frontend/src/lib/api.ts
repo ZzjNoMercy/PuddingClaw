@@ -759,6 +759,15 @@ export interface KnowledgeSearchHit {
   modality: "text" | "image" | string;
   title: string;
   quote: string;
+  id?: string;
+  result_type?: string;
+  uri?: string;
+  display_path?: string;
+  snippet?: string;
+  highlights?: string[];
+  matched_by?: string[];
+  source_group?: { original?: string | null; imported?: string | null; wiki?: string | null; versions?: string[] };
+  preview?: { kind?: string; heading?: string | null; line_number?: number | null };
   score?: number | null;
   raw_score?: number | null;
   normalized_score?: number | null;
@@ -781,6 +790,9 @@ export interface KnowledgeSearchResult {
   query: string;
   top_k: number;
   candidate_top_k: number;
+  total?: number;
+  took_ms?: number;
+  facets?: Record<string, Record<string, number>>;
   fusion?: {
     text_vector_weight?: number;
     bm25_weight?: number;
@@ -1818,6 +1830,84 @@ export async function searchKnowledge(query: string, topK?: number): Promise<Kno
     throw new Error(apiErrorMessage(text, `Failed to search knowledge: ${response.status}`));
   }
   return response.json();
+}
+
+export type KnowledgeSearchCategory = "all" | "wiki" | "article" | "image" | "file";
+
+export interface KnowledgeSearchDirectory {
+  id: string;
+  path: string;
+  enabled: boolean;
+  recursive: boolean;
+  content_types: string[];
+  referenced_images_only?: boolean;
+  status?: string;
+  indexed_documents?: number;
+  indexed_images?: number;
+}
+
+export interface KnowledgeSearchConfig {
+  enabled: boolean;
+  directories: KnowledgeSearchDirectory[];
+  sources: { read_later?: { enabled: boolean } };
+  exclude: string[];
+}
+
+export interface KnowledgeSearchIndexStatus {
+  enabled: boolean;
+  status: string;
+  generated_at?: string | null;
+  counts: { records: number; documents: number; images: number };
+  directories: KnowledgeSearchDirectory[];
+}
+
+export async function searchKnowledgePortal(input: {
+  query: string;
+  category?: KnowledgeSearchCategory;
+  offset?: number;
+  limit?: number;
+  directory_ids?: string[];
+}): Promise<KnowledgeSearchResult> {
+  const response = await fetch(`${API_BASE}/knowledge/search`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(apiErrorMessage(text, `搜索知识库失败：${response.status}`));
+  return JSON.parse(text) as KnowledgeSearchResult;
+}
+
+export async function getKnowledgeSearchConfig(): Promise<KnowledgeSearchConfig> {
+  const response = await fetch(`${API_BASE}/knowledge/search/config`, { cache: "no-store" });
+  const text = await response.text();
+  if (!response.ok) throw new Error(apiErrorMessage(text, `读取搜索配置失败：${response.status}`));
+  return (JSON.parse(text) as { config: KnowledgeSearchConfig }).config;
+}
+
+export async function updateKnowledgeSearchConfig(config: KnowledgeSearchConfig): Promise<KnowledgeSearchConfig> {
+  const response = await fetch(`${API_BASE}/knowledge/search/config`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(config),
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(apiErrorMessage(text, `保存搜索配置失败：${response.status}`));
+  return (JSON.parse(text) as { config: KnowledgeSearchConfig }).config;
+}
+
+export async function getKnowledgeSearchIndexStatus(): Promise<KnowledgeSearchIndexStatus> {
+  const response = await fetch(`${API_BASE}/knowledge/search/index-status`, { cache: "no-store" });
+  const text = await response.text();
+  if (!response.ok) throw new Error(apiErrorMessage(text, `读取关键词目录状态失败：${response.status}`));
+  return JSON.parse(text) as KnowledgeSearchIndexStatus;
+}
+
+export async function refreshKnowledgeSearchIndex(rebuild = false): Promise<KnowledgeSearchIndexStatus> {
+  const response = await fetch(`${API_BASE}/knowledge/search/${rebuild ? "index-rebuild" : "index-refresh"}`, { method: "POST" });
+  const text = await response.text();
+  if (!response.ok) throw new Error(apiErrorMessage(text, `更新关键词目录失败：${response.status}`));
+  return JSON.parse(text) as KnowledgeSearchIndexStatus;
 }
 
 export async function listTableAssets(includeProfile = false): Promise<TableAsset[]> {
@@ -4087,6 +4177,46 @@ export async function listMcpServers(): Promise<
   return data.servers;
 }
 
+export interface McpServerConfig {
+  name?: string;
+  transport: "stdio" | "sse" | "streamable-http";
+  url?: string;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  headers?: Record<string, string>;
+  timeout?: number;
+}
+
+export interface McpConfig {
+  enabled: string[];
+  auto_enable_gbrain: boolean;
+  servers: Record<string, McpServerConfig>;
+}
+
+export interface McpConfigPayload {
+  path: string;
+  config: McpConfig;
+}
+
+export async function getMcpConfig(): Promise<McpConfigPayload> {
+  const resp = await fetch(`${API_BASE}/mcp/config`, { cache: "no-store" });
+  if (!resp.ok) throw new Error(`Failed to load MCP config: ${resp.status}`);
+  return resp.json() as Promise<McpConfigPayload>;
+}
+
+export async function updateMcpConfig(config: McpConfig): Promise<McpConfigPayload> {
+  const resp = await fetch(`${API_BASE}/mcp/config`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ config }),
+  });
+  const data = await resp.json().catch(() => null) as { detail?: string } | null;
+  if (!resp.ok) throw new Error(data?.detail || `Failed to save MCP config: ${resp.status}`);
+  mcpStatusProbeInFlight = null;
+  return data as McpConfigPayload;
+}
+
 export interface McpServerStatus {
   key: string;
   name: string;
@@ -4120,12 +4250,24 @@ export interface McpServersStatus {
   };
 }
 
+let mcpStatusProbeInFlight: Promise<McpServersStatus> | null = null;
+
 export async function getMcpServersStatus(probe = true): Promise<McpServersStatus> {
-  const resp = await fetch(`${API_BASE}/mcp/servers?probe=${probe ? "true" : "false"}`, {
-    cache: "no-store",
-  });
-  if (!resp.ok) throw new Error(`Failed to inspect MCP servers: ${resp.status}`);
-  return resp.json() as Promise<McpServersStatus>;
+  if (probe && mcpStatusProbeInFlight) return mcpStatusProbeInFlight;
+  const request = (async () => {
+    const resp = await fetch(`${API_BASE}/mcp/servers?probe=${probe ? "true" : "false"}`, {
+      cache: "no-store",
+    });
+    if (!resp.ok) throw new Error(`Failed to inspect MCP servers: ${resp.status}`);
+    return resp.json() as Promise<McpServersStatus>;
+  })();
+  if (!probe) return request;
+  mcpStatusProbeInFlight = request;
+  try {
+    return await request;
+  } finally {
+    if (mcpStatusProbeInFlight === request) mcpStatusProbeInFlight = null;
+  }
 }
 
 /**

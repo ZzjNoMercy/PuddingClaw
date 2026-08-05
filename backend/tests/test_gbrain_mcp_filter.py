@@ -19,7 +19,9 @@ from tools.toolsets import tools_for_toolsets
 
 
 def test_default_config_auto_enables_only_ready_gbrain_runtime() -> None:
-    assert _DEFAULT_CONFIG["mcp"] == {"enabled": [], "auto_enable_gbrain": True}
+    assert _DEFAULT_CONFIG["mcp"]["enabled"] == []
+    assert _DEFAULT_CONFIG["mcp"]["auto_enable_gbrain"] is True
+    assert set(_DEFAULT_CONFIG["mcp"]["servers"]) == {"zhihuiya_patents", "gbrain"}
 
 
 def test_gbrain_server_requires_ready_dedicated_home(monkeypatch, tmp_path) -> None:
@@ -119,6 +121,7 @@ def test_mcp_catalog_reports_filtered_tools_after_live_probe(monkeypatch) -> Non
     app = FastAPI()
     app.include_router(router)
     payload = TestClient(app).get("/mcp/servers?probe=true").json()
-    assert payload["catalog"][0]["status"] == "loaded"
-    assert payload["catalog"][0]["auto_enabled"] is True
-    assert payload["catalog"][0]["tools"] == ["gbrain_query", "gbrain_think"]
+    gbrain = next(item for item in payload["catalog"] if item["key"] == "gbrain")
+    assert gbrain["status"] == "loaded"
+    assert gbrain["auto_enabled"] is True
+    assert gbrain["tools"] == ["gbrain_query", "gbrain_think"]

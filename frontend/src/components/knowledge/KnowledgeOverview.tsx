@@ -16,6 +16,7 @@ import {
   ListChecks,
   Loader2,
   RefreshCw,
+  Search,
   Settings,
   Sparkles,
   X,
@@ -49,6 +50,8 @@ function isActive(job: KnowledgeImportJob) {
 export default function KnowledgeOverview({ documentCount, fileCount, jobs, loading, onRefresh }: Props) {
   const router = useRouter();
   const uploadInputRef = useRef<HTMLInputElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const [searchQuery, setSearchQuery] = useState("");
   const [readLater, setReadLater] = useState<ReadLaterItem[]>([]);
   const [dialog, setDialog] = useState<"read-later" | "compile" | null>(null);
   const [url, setUrl] = useState("");
@@ -62,6 +65,22 @@ export default function KnowledgeOverview({ documentCount, fileCount, jobs, load
   useEffect(() => {
     void listReadLaterItems().then(setReadLater).catch(() => setReadLater([]));
   }, []);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        searchInputRef.current?.focus();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  function submitSearch() {
+    const query = searchQuery.trim();
+    if (query) router.push(`/knowledge/search?q=${encodeURIComponent(query)}`);
+  }
 
   useEffect(() => {
     if (!notice) return;
@@ -218,6 +237,32 @@ export default function KnowledgeOverview({ documentCount, fileCount, jobs, load
 
       <KnowledgeWorkspaceNav />
 
+      <section className="rounded-[28px] border border-[#002fa7]/10 bg-gradient-to-br from-[#002fa7]/[0.07] via-white to-cyan-50/60 p-5 shadow-sm sm:p-7">
+        <div className="mx-auto max-w-4xl">
+          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#002fa7]/70">LOCAL KNOWLEDGE SEARCH</p>
+          <h2 className="mt-2 text-xl font-semibold tracking-tight text-gray-950 sm:text-2xl">从你的知识库找到答案所需的原文</h2>
+          <form
+            className="mt-5 flex items-center gap-2 rounded-2xl border border-black/[0.09] bg-white p-1.5 shadow-lg shadow-[#002fa7]/[0.06] focus-within:border-[#002fa7]/35 focus-within:ring-4 focus-within:ring-[#002fa7]/[0.08]"
+            onSubmit={(event) => { event.preventDefault(); submitSearch(); }}
+          >
+            <Search className="ml-3 h-5 w-5 shrink-0 text-[#002fa7]" />
+            <input
+              ref={searchInputRef}
+              value={searchQuery}
+              onChange={(event) => setSearchQuery(event.target.value)}
+              placeholder="搜索文章、Wiki、文件和图片……"
+              className="h-12 min-w-0 flex-1 bg-transparent px-2 text-sm text-gray-900 outline-none placeholder:text-gray-400"
+              aria-label="搜索知识库"
+            />
+            <button type="submit" disabled={!searchQuery.trim()} className="h-11 rounded-xl bg-[#002fa7] px-5 text-xs font-semibold text-white transition hover:bg-[#00227d] disabled:cursor-not-allowed disabled:opacity-40">搜索</button>
+          </form>
+          <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-gray-500">
+            <span>Wiki · 文章 · 图片 · 文件</span>
+            <Link href="/knowledge/settings/search" className="font-semibold text-[#002fa7] hover:underline">配置搜索范围</Link>
+          </div>
+        </div>
+      </section>
+
       <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
         {workspaces.map((item) => {
           const Icon = item.icon;
@@ -241,7 +286,7 @@ export default function KnowledgeOverview({ documentCount, fileCount, jobs, load
         })}
       </section>
 
-      <section className="grid items-start gap-5 xl:grid-cols-[1.3fr_0.7fr]">
+      <section className="grid items-start gap-4 xl:grid-cols-2">
         <div className="rounded-2xl border border-black/[0.06] bg-white p-5 shadow-sm">
           <div className="flex items-center justify-between gap-3">
             <div>
@@ -249,7 +294,7 @@ export default function KnowledgeOverview({ documentCount, fileCount, jobs, load
               <p className="mt-1 text-xs text-gray-400">从当前意图直接进入下一步。</p>
             </div>
           </div>
-          <div className="mt-4 grid gap-3 sm:grid-cols-3">
+          <div className="mt-3 grid gap-2.5 sm:grid-cols-3">
             <input
               ref={uploadInputRef}
               type="file"
@@ -261,19 +306,19 @@ export default function KnowledgeOverview({ documentCount, fileCount, jobs, load
               type="button"
               onClick={() => uploadInputRef.current?.click()}
               disabled={Boolean(busy)}
-              className="group flex min-h-[76px] items-center gap-3 rounded-xl border border-[#002fa7]/15 bg-[#002fa7]/[0.035] px-3.5 py-3 text-left transition hover:border-[#002fa7]/30 hover:bg-[#002fa7]/[0.07] disabled:cursor-wait disabled:opacity-60"
+              className="group flex min-h-[68px] items-center gap-2.5 rounded-xl border border-[#002fa7]/15 bg-[#002fa7]/[0.035] px-3 py-2.5 text-left transition hover:border-[#002fa7]/30 hover:bg-[#002fa7]/[0.07] disabled:cursor-wait disabled:opacity-60"
             >
-              <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-blue-50 text-[#002fa7]">
+              <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-blue-50 text-[#002fa7]">
                 {busy === "upload" ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileUp className="h-4 w-4" />}
               </span>
               <span className="min-w-0 flex-1"><strong className="block text-sm text-gray-900">上传资料</strong><span className="mt-0.5 block truncate text-[10px] text-gray-400">PDF / Markdown / 表格</span></span>
             </button>
-            <button type="button" onClick={openReadLater} disabled={Boolean(busy)} className="group flex min-h-[76px] items-center gap-3 rounded-xl border border-black/[0.06] bg-black/[0.018] px-3.5 py-3 text-left transition hover:border-cyan-500/20 hover:bg-cyan-50/60 disabled:opacity-60">
-              <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-cyan-50 text-cyan-700"><BookOpenCheck className="h-4 w-4" /></span>
+            <button type="button" onClick={openReadLater} disabled={Boolean(busy)} className="group flex min-h-[68px] items-center gap-2.5 rounded-xl border border-black/[0.06] bg-black/[0.018] px-3 py-2.5 text-left transition hover:border-cyan-500/20 hover:bg-cyan-50/60 disabled:opacity-60">
+              <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-cyan-50 text-cyan-700"><BookOpenCheck className="h-4 w-4" /></span>
               <span className="min-w-0 flex-1"><strong className="block text-sm text-gray-900">收藏链接</strong><span className="mt-0.5 block truncate text-[10px] text-gray-400">自动抓取并整理正文</span></span>
             </button>
-            <button type="button" onClick={() => void openCompile()} disabled={Boolean(busy)} className="group flex min-h-[76px] items-center gap-3 rounded-xl border border-black/[0.06] bg-black/[0.018] px-3.5 py-3 text-left transition hover:border-violet-500/20 hover:bg-violet-50/60 disabled:opacity-60">
-              <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-violet-50 text-violet-700"><Sparkles className="h-4 w-4" /></span>
+            <button type="button" onClick={() => void openCompile()} disabled={Boolean(busy)} className="group flex min-h-[68px] items-center gap-2.5 rounded-xl border border-black/[0.06] bg-black/[0.018] px-3 py-2.5 text-left transition hover:border-violet-500/20 hover:bg-violet-50/60 disabled:opacity-60">
+              <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-violet-50 text-violet-700"><Sparkles className="h-4 w-4" /></span>
               <span className="min-w-0 flex-1"><strong className="block text-sm text-gray-900">编译 Wiki</strong><span className="mt-0.5 block truncate text-[10px] text-gray-400">选择 Raw 并提交后台</span></span>
             </button>
           </div>

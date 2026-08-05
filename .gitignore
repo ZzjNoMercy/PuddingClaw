@@ -6,6 +6,7 @@ frontend/node_modules/
 electron/node_modules/
 frontend/.next/
 frontend/.next-build/
+frontend/.next-dev-*/
 frontend/out/
 
 # Environment & secrets
@@ -56,6 +57,7 @@ backend/.pytest_cache/
 *~
 
 # Local dev tooling
+.codex-tmp/
 .playwright-cli/
 iterm2_workspace.iterm2arrangement
 

@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 from deepagents.middleware.memory import MemoryMiddleware
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage, message_to_dict
 
 
 def _rubric_runtime(tmp_path: Path, *, objective: str = "完成任务"):
@@ -101,6 +101,88 @@ def test_effective_agent_messages_uses_summary_and_preserved_tail():
         "old-3",
         "old-4",
     ]
+
+
+def test_summary_prompt_uses_anchored_work_state_schema():
+    from graph.deepagents_manager import PUDDINGCLAW_SUMMARY_PROMPT
+
+    assert "Create or update the anchored summary" in PUDDINGCLAW_SUMMARY_PROMPT
+    assert "## Objective" in PUDDINGCLAW_SUMMARY_PROMPT
+    assert "### Completed" in PUDDINGCLAW_SUMMARY_PROMPT
+    assert "### Active" in PUDDINGCLAW_SUMMARY_PROMPT
+    assert "### Blocked" in PUDDINGCLAW_SUMMARY_PROMPT
+    assert "## Next Move" in PUDDINGCLAW_SUMMARY_PROMPT
+    assert "{messages}" in PUDDINGCLAW_SUMMARY_PROMPT
+
+
+def test_session_summary_projection_refreshes_harness_envelope(monkeypatch):
+    from graph import deepagents_manager as manager_module
+
+    old_envelope = '<HARNESS_ENVELOPE authoritative="true">old</HARNESS_ENVELOPE>'
+    new_envelope = '\n<HARNESS_ENVELOPE authoritative="true">new</HARNESS_ENVELOPE>'
+    monkeypatch.setattr(manager_module, "_harness_summary_envelope", lambda _session_id: new_envelope)
+
+    summary_message = manager_module._summary_message(
+        f"## Objective\n- continue\n{old_envelope}",
+        history_path="/conversation_history/thread.md",
+        session_id="session-1",
+    )
+    parts = manager_module._summary_projection_parts(
+        [summary_message, HumanMessage(content="recent")]
+    )
+
+    assert parts is not None
+    summary, recent, history_ref = parts
+    assert old_envelope not in summary
+    assert new_envelope in summary_message.content
+    assert summary_message.content.count("<HARNESS_ENVELOPE") == 1
+    assert summary == "## Objective\n- continue"
+    assert [message.content for message in recent] == ["recent"]
+    assert history_ref == "/conversation_history/thread.md"
+
+
+def test_restore_session_summary_projection_is_cross_run_and_protocol_closed(monkeypatch):
+    from graph import deepagents_manager as manager_module
+
+    monkeypatch.setattr(
+        manager_module,
+        "_harness_summary_envelope",
+        lambda session_id: f"\n<HARNESS_ENVELOPE>{session_id}:current</HARNESS_ENVELOPE>",
+    )
+    projection = {
+        "summary_text": "## Objective\n- continue",
+        "recent_messages": [message_to_dict(HumanMessage(content="recent fact"))],
+        "history_ref": "/conversation_history/old-run.md",
+        "source_run_id": "run-old",
+    }
+
+    restored = manager_module._restore_session_summary_projection(
+        projection,
+        session_id="session-1",
+    )
+
+    assert restored is not None
+    assert "session-1:current" in restored[0].content
+    assert [message.content for message in restored[1:]] == ["recent fact"]
+
+
+def test_history_after_summary_boundary_requires_matching_terminal_query():
+    from graph.deepagents_manager import _history_after_summary_boundary
+
+    history = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "done", "query_id": "query-old"},
+        {"role": "user", "content": "new"},
+    ]
+
+    assert _history_after_summary_boundary(
+        history,
+        {"transcript_boundary": {"source_query_id": "query-old"}},
+    ) == [{"role": "user", "content": "new"}]
+    assert _history_after_summary_boundary(
+        history,
+        {"transcript_boundary": {"source_query_id": "missing"}},
+    ) is None
 
 
 def test_legacy_segment_verification_projection_is_removed():
@@ -4554,6 +4636,86 @@ def test_deepagents_manager_generates_title_when_user_was_pre_persisted(tmp_path
     assert len(model_human_messages) == 1
     assert model_human_messages[0].content == "重建车系维度校验"
     assert session_manager.get_raw_messages(session_id)["title"] == "车系维度校验"
+
+
+def test_deepagents_manager_restores_session_summary_projection_across_runs(tmp_path, monkeypatch):
+    from graph import deepagents_manager as manager_module
+    from graph.session_manager import session_manager
+    from projects.registry import project_registry
+
+    session_manager.initialize(tmp_path)
+    project_registry.initialize(tmp_path)
+    session_id = "agent-summary-projection-session"
+    session_manager.create_session(session_id)
+    session_manager.save_message(session_id, "user", "旧问题")
+    session_manager.upsert_assistant_message(
+        session_id,
+        query_id="query-old",
+        content="旧回答已完成",
+        status="completed",
+    )
+    session_manager.update_session_summary_projection(
+        session_id,
+        summary_text="## Objective\n- 延续旧会话",
+        recent_messages=[],
+        transcript_boundary={"source_query_id": "query-old", "message_count": 2},
+        source_run_id="run-old",
+        history_ref="/conversation_history/old.md",
+    )
+    monkeypatch.setattr(
+        manager_module,
+        "_harness_summary_envelope",
+        lambda current_session_id: (
+            f'\n<HARNESS_ENVELOPE authoritative="true">{current_session_id}:current</HARNESS_ENVELOPE>'
+        ),
+    )
+
+    class FakeDeepAgent:
+        initial_state = None
+
+        async def astream(self, graph_input, **_kwargs):
+            self.initial_state = graph_input
+            yield ("messages", (AIMessageChunk(content="新回答。"), {"langgraph_node": "model"}))
+            yield (
+                "values",
+                {"messages": [*graph_input["messages"], AIMessage(content="新回答。")]},
+            )
+
+    fake_agent = FakeDeepAgent()
+    monkeypatch.setattr(manager_module, "create_deep_agent", lambda **_kwargs: fake_agent)
+
+    async def no_title(_session_id: str):
+        return None
+
+    monkeypatch.setattr(manager_module, "_generate_title", no_title)
+    runtime = manager_module.DeepAgentsAgentManager()
+    runtime.initialize(Path(tmp_path))
+
+    async def collect():
+        return [
+            event
+            async for event in runtime.astream(
+                message="新问题",
+                session_id=session_id,
+                project_id=None,
+                user_id="test-user",
+            )
+        ]
+
+    asyncio.run(collect())
+
+    assert fake_agent.initial_state is not None
+    model_messages = fake_agent.initial_state["messages"]
+    assert model_messages[0].additional_kwargs["lc_source"] == "summarization"
+    assert "## Objective\n- 延续旧会话" in model_messages[0].content
+    assert f"{session_id}:current" in model_messages[0].content
+    assert "旧问题" not in "\n".join(str(message.content) for message in model_messages)
+    assert model_messages[-1].content == "新问题"
+
+    projection = session_manager.get_session_summary_projection(session_id)
+    assert projection is not None
+    assert projection["source_run_id"] != "run-old"
+    assert projection["transcript_boundary"]["source_query_id"] != "query-old"
 
 
 def test_deepagents_manager_separates_reasoning_from_final_answer(tmp_path, monkeypatch):

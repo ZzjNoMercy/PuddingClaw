@@ -56,6 +56,12 @@ from knowledge.indexer import reset_multimodal_collections
 from knowledge.llm_wiki import LlmWikiError, get_llm_wiki_service
 from knowledge.models import KnowledgeDocument, new_id
 from knowledge.paths import get_knowledge_originals_dir, get_knowledge_root
+from knowledge.portal_search import (
+    KnowledgePortalSearchService,
+    PortalSearchConfigError,
+    get_search_config,
+    save_search_config,
+)
 from knowledge.service import (
     DEFAULT_KNOWLEDGE_BASE_ID,
     KnowledgeService,
@@ -64,7 +70,6 @@ from knowledge.service import (
     document_to_dict,
 )
 from tools.pandas_knowledge_tool import PandasKnowledgeQueryTool
-from tools.search_knowledge_tool import LlamaIndexKnowledgeQueryTool
 
 router = APIRouter(prefix="/knowledge", tags=["knowledge"])
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -94,8 +99,24 @@ class MarkdownGrepRequest(BaseModel):
 
 
 class KnowledgeSearchRequest(BaseModel):
-    query: str = Field(min_length=1, description="Semantic query for the LlamaIndex knowledge index.")
-    top_k: int | None = Field(default=None, ge=1, le=20, description="Final number of hits returned to the Agent/LLM.")
+    query: str = Field(min_length=1, description="Hybrid semantic query for the local knowledge portal.")
+    top_k: int | None = Field(default=None, ge=1, le=20, description="Final number of portal search results.")
+    category: str = Field(default="all")
+    directory_ids: list[str] = Field(default_factory=list)
+    page_types: list[str] = Field(default_factory=list)
+    platforms: list[str] = Field(default_factory=list)
+    file_types: list[str] = Field(default_factory=list)
+    date_from: str | None = None
+    date_to: str | None = None
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=20, ge=1, le=100)
+
+
+class KnowledgeSearchConfigRequest(BaseModel):
+    enabled: bool = True
+    directories: list[dict[str, object]] | None = None
+    sources: dict[str, object] | None = None
+    exclude: list[str] | None = None
 
 
 class KnowledgeFileRawRequest(BaseModel):
@@ -779,12 +800,77 @@ async def grep_markdown_files(request: MarkdownGrepRequest):
 
 @router.post("/search")
 async def search_knowledge(request: KnowledgeSearchRequest):
+    """Search the knowledge portal without entering the Agent runtime."""
+    service = KnowledgePortalSearchService(BASE_DIR)
     try:
-        tool = LlamaIndexKnowledgeQueryTool(base_dir=str(BASE_DIR))
-        return tool.query_structured(request.query, top_k=request.top_k)
+        return await run_in_threadpool(
+            service.search,
+            request.query,
+            category=request.category,
+            directory_ids=request.directory_ids,
+            page_types=request.page_types,
+            platforms=request.platforms,
+            file_types=request.file_types,
+            offset=request.offset,
+            limit=request.top_k or request.limit,
+        )
+    except PortalSearchConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("[knowledge-search] failed query=%s", request.query)
         raise HTTPException(status_code=503, detail=f"Knowledge search failed: {exc}") from exc
+
+
+@router.get("/search/config")
+async def get_knowledge_search_config():
+    return {"config": get_search_config()}
+
+
+@router.put("/search/config")
+async def put_knowledge_search_config(request: KnowledgeSearchConfigRequest):
+    try:
+        payload = {key: value for key, value in request.model_dump().items() if value is not None}
+        return {"config": save_search_config(payload)}
+    except PortalSearchConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/search/index-status")
+async def get_knowledge_search_index_status():
+    try:
+        return KnowledgePortalSearchService(BASE_DIR).status()
+    except PortalSearchConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/search/index-refresh")
+async def refresh_knowledge_search_index():
+    try:
+        return await run_in_threadpool(KnowledgePortalSearchService(BASE_DIR).refresh)
+    except PortalSearchConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("[knowledge-search] refresh failed")
+        raise HTTPException(status_code=503, detail=f"Knowledge search index refresh failed: {exc}") from exc
+
+
+@router.post("/search/index-rebuild")
+async def rebuild_knowledge_search_index():
+    try:
+        return await run_in_threadpool(KnowledgePortalSearchService(BASE_DIR).refresh, rebuild=True)
+    except PortalSearchConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("[knowledge-search] rebuild failed")
+        raise HTTPException(status_code=503, detail=f"Knowledge search index rebuild failed: {exc}") from exc
+
+
+@router.get("/search/suggestions")
+async def knowledge_search_suggestions(q: str = "", limit: int = 8):
+    try:
+        return {"suggestions": KnowledgePortalSearchService(BASE_DIR).suggestions(q, limit=limit)}
+    except PortalSearchConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/tables/query")

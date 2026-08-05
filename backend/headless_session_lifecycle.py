@@ -80,7 +80,10 @@ def is_headless_session_expired(
 ) -> bool:
     """Return true only for an explicitly Headless Session past its TTL."""
 
-    if metadata.get("headless_enabled") is not True or metadata.get("runtime_mode") != "headless_worker":
+    # ``runtime_mode`` describes the active runtime and is intentionally
+    # changed to ``agent`` when DeepAgents starts. ``headless_enabled`` is the
+    # durable ownership marker stamped only by the Headless Worker API.
+    if metadata.get("headless_enabled") is not True:
         return False
     effective_ttl = headless_session_ttl_seconds() if ttl_seconds is None else ttl_seconds
     expires_at = headless_session_expires_at(metadata, effective_ttl)

@@ -157,10 +157,20 @@ class ToolsetMiddleware(AgentMiddleware):
 
     state_schema = ToolsetState
 
-    def __init__(self, *, skills_dir: Path, toolsets_by_skill: dict[str, set[str]]) -> None:
+    def __init__(
+        self,
+        *,
+        skills_dir: Path,
+        toolsets_by_skill: dict[str, set[str]],
+        mcp_tool_names: set[str] | None = None,
+    ) -> None:
         super().__init__()
         self.skills_dir = skills_dir.resolve()
         self.toolsets_by_skill = {key: frozenset(value) for key, value in toolsets_by_skill.items()}
+        # MCP tools are runtime capabilities discovered from enabled MCP
+        # servers. They are not Skill capabilities and do not wait for a
+        # Skill activation before becoming visible to the Agent.
+        self.mcp_tool_names = frozenset(str(name) for name in (mcp_tool_names or ()) if str(name))
         self._observed_recommendations: set[tuple[str, str]] = set()
         self._observed_activations: set[tuple[str, str]] = set()
         for item in discover_skill_catalog(self.skills_dir):
@@ -674,7 +684,11 @@ class ToolsetMiddleware(AgentMiddleware):
             policy_epoch=policy_epoch,
         ):
             enabled_toolsets.update(self.toolsets_by_skill.get(skill_id, ()))
-        return set(UNCONDITIONAL_TOOL_NAMES) | set(tools_for_toolsets(enabled_toolsets))
+        return (
+            set(UNCONDITIONAL_TOOL_NAMES)
+            | set(tools_for_toolsets(enabled_toolsets))
+            | set(self.mcp_tool_names)
+        )
 
     def _activate_cached_tool_provider(
         self,
@@ -929,7 +943,10 @@ class ToolsetMiddleware(AgentMiddleware):
                 and (legacy_enabled or self._tool_name(tool) not in _LEGACY_EXTERNAL_LEASE_TOOLS)
             ]
         if stable_schema:
-            return self._sort_visible_tools(visible, dynamic_names=installed_skill_tools)
+            return self._sort_visible_tools(
+                visible,
+                dynamic_names=installed_skill_tools | set(self.mcp_tool_names),
+            )
         return visible
 
     @classmethod
@@ -1456,6 +1473,14 @@ class ToolsetMiddleware(AgentMiddleware):
                         "tool": name,
                         "approval_scope": "argument_dependent",
                         "reason": "workspace_paths_are_allowed_but_external_paths_require_realtime_gate",
+                    }
+                )
+            elif name in self.mcp_tool_names and descriptor is None:
+                hitl_required.append(
+                    {
+                        "tool": name,
+                        "approval_scope": "mcp_tool",
+                        "reason": "mcp_tool_requires_realtime_gate",
                     }
                 )
             elif descriptor is None or descriptor.approval_scope == "none":

@@ -3,12 +3,17 @@ import { ChevronRight } from "lucide-react";
 
 import WorkspacePageHeader from "@/components/layout/WorkspacePageHeader";
 
-type Section = "overview" | "library" | "readLater" | "wiki" | "tasks";
+type Section = "overview" | "search" | "library" | "readLater" | "wiki" | "tasks";
 
 const sectionCopy: Record<Section, { eyebrow: string; label?: string; description: string }> = {
   overview: {
     eyebrow: "KNOWLEDGE WORKSPACE",
     description: "从资料与链接开始，按需要沉淀为 Wiki，再交给检索和 Agent 使用。",
+  },
+  search: {
+    eyebrow: "KNOWLEDGE SEARCH",
+    label: "搜索",
+    description: "在本地知识库中查找文章、Wiki、文件和图片。",
   },
   library: {
     eyebrow: "LIBRARY WORKSPACE",

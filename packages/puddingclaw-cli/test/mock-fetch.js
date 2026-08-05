@@ -38,7 +38,8 @@ globalThis.fetch = async (url, options) => {
     outcome: "completed",
     reply: "ok",
     final_response: "final ok",
-    analytics_model_id: body.analytics_model_id,
+    analytics_model_id: "auto-analysis",
+    analytics_model_match: { status: "matched", selected_id: "auto-analysis", strategy: "semantic" },
     session_id: body.session_id,
   }), { status: 200, headers: { "content-type": "application/json" } });
 };
