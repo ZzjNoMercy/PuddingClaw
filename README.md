@@ -209,48 +209,95 @@ analysis-project/
 
 知识库现已提供 Schema Studio：可查看 gbrain 内置 Schema、选择父 pack、结构化编辑完整官方 manifest，并预览 custom/parent/resolved YAML。当前还缺少可视化 diff、官方 YAML CST 导入/注释保留、Ingest / Query / Lint 运维页、raw/Wiki drift 看板、Embedding 绑定与托管式重建入口。
 
-## 快速开始
+## 部署与快速开始
 
-### 环境要求
+### 选择运行方式
 
-- Python 3.11 或 3.12
-- [uv](https://docs.astral.sh/uv/)
-- Node.js 18+
-- Docker（启动内置 PostgreSQL / Milvus 时需要）
-- PostgreSQL 16 + pgvector（本机 PostgreSQL 模式；Bundled Docker 镜像已内置 pgvector）
-- gbrain CLI（Schema 官方校验、Wiki 编译和筛选 MCP 查询需要）
+| 方式 | 适用场景 | 包含内容 |
+| --- | --- | --- |
+| **本机应用 + Docker 基础设施（推荐）** | macOS / Linux / WSL2 单机使用和开发 | 前后端在宿主机运行；Docker 运行 PostgreSQL 和 Milvus；MinerU 按需启动 |
+| **Docker Core** | 服务器、演示环境或希望统一容器管理 | Compose 运行 PostgreSQL、backend 和 frontend；不自动包含 Milvus / MinerU |
+| **手动开发** | 需要单独调试前端或后端 | 手动安装 Python / Node 依赖并分别启动 |
 
-MinerU、Milvus 和 Docker Agent Sandbox 都是按能力启用的增强组件。知识库 Catalog 和任务管理依赖 PostgreSQL；不使用图文向量检索时可以关闭 Milvus 索引，继续使用本地文件检索。
+Milvus、MinerU、gbrain 和 Docker Agent Sandbox 都是按能力启用的增强组件。知识库 Catalog 和任务管理依赖 PostgreSQL；不使用图文向量检索时，可以不启动 Milvus，本地文件和精确检索仍可使用。
 
-### macOS / Linux（推荐）
+### 方式 A：本机应用 + Docker 基础设施（推荐）
 
-先启动本地基础设施。脚本会检测 5432 端口：已有本机 PostgreSQL 时保留它，根据实际 PostgreSQL 主版本自动安装锁定的 pgvector，并在目标数据库中创建或升级 `vector` 扩展；否则启动已内置 pgvector 的 PuddingClaw PostgreSQL；同时启动 Milvus。
+#### 1. 准备环境
 
-如果选择完全本机安装，macOS 只需先安装数据库：`brew install postgresql@16`。`scripts/start-local-infra.sh` 默认锁定 pgvector `0.8.6`，并在 Homebrew Bottle 不包含当前 PostgreSQL 主版本时自动进行源码编译。独立的 gbrain 库可通过 `PUDDINGCLAW_PGVECTOR_DATABASE=llm_wiki` 指定；升级版本时设置 `PUDDINGCLAW_PGVECTOR_VERSION` 和对应的 `PUDDINGCLAW_PGVECTOR_SHA256`。`pgvector` 是 PostgreSQL 服务端依赖，不属于 `uv` 管理的 Python 依赖。
+- Git、Python 3.11 或 3.12、[uv](https://docs.astral.sh/uv/)、Node.js 18+
+- Docker Desktop 或 Docker Engine，并安装 Compose v2（`docker compose version`）
+- 默认端口空闲：`3000`、`8888`、`5432`、`19530`、`9091`；MinerU 还会使用 `8002`
+- 只有启用 LLM Wiki / gbrain 时才需要 gbrain CLI
 
 ```bash
+git clone https://github.com/ZzjNoMercy/PuddingClaw.git
+cd PuddingClaw
 chmod +x scripts/start-local-infra.sh scripts/start-macos-linux.sh
+```
+
+#### 2. 启动 PostgreSQL 和 Milvus
+
+```bash
 ./scripts/start-local-infra.sh
 ```
 
-再启动后端与前端：
+脚本会自动写入 `backend/config.json`，并根据 `5432` 端口选择 PostgreSQL：
+
+- `detect`（默认）：保留已有本机 PostgreSQL，否则启动 bundled PostgreSQL。
+- `bundled`：强制使用 Docker PostgreSQL。
+- `external`：明确使用现有 PostgreSQL，Compose 只启动 Milvus。
+
+```bash
+# 强制使用 bundled PostgreSQL
+PUDDINGCLAW_POSTGRES_MODE=bundled ./scripts/start-local-infra.sh
+
+# 使用已有 PostgreSQL
+PUDDINGCLAW_POSTGRES_MODE=external \
+LOCAL_POSTGRES_USER=my_user \
+LOCAL_POSTGRES_DB=puddingclaw \
+LOCAL_POSTGRES_PASSWORD=my_password \
+./scripts/start-local-infra.sh
+```
+
+本机 PostgreSQL 必须提供 pgvector。脚本默认锁定 pgvector `0.8.6`；macOS Homebrew PostgreSQL 缺少对应版本时，脚本会校验 SHA-256 后编译安装。
+
+#### 3. 启动 backend 和 frontend
 
 ```bash
 ./scripts/start-macos-linux.sh
 ```
 
-默认地址：
+首次启动会自动执行 `uv sync`、安装前端依赖，并在缺少时从 `backend/.env.example` 创建 `backend/.env`。按 `Ctrl+C` 会停止前后端，不会删除基础设施数据。
 
-- 前端：http://127.0.0.1:3000
-- 后端 API：http://127.0.0.1:8888
-- OpenAPI：http://127.0.0.1:8888/docs
+如需修改应用端口：
+
+```bash
+BACKEND_PORT=9000 FRONTEND_PORT=4000 ./scripts/start-macos-linux.sh
+```
+
+#### 4. 验证部署
+
+```bash
+docker compose -f docker-compose.infra.yml ps
+curl http://127.0.0.1:8888/api/capabilities
+```
+
+- 前端：<http://127.0.0.1:3000>
+- 后端 API：<http://127.0.0.1:8888>
+- OpenAPI：<http://127.0.0.1:8888/docs>
 - PostgreSQL：`127.0.0.1:5432`
-- Milvus：`localhost:19530`
-- MinerU API：`localhost:8002`
+- Milvus：`127.0.0.1:19530`
 
-首次进入应用后，在“设置 → 模型服务”登记 Provider 和模型。模型配置不再要求以 `DEEPSEEK_API_KEY` / `OPENAI_API_KEY` 作为唯一入口。
+#### 5. 完成首次配置
 
-### 可选：启动 MinerU
+1. 在“设置 → 模型服务”登记 Provider，为对话、视觉、Embedding 和 Rerank 绑定模型。
+2. 在“设置 → 知识库”确认 Catalog Database 连接，并选择长期知识目录。
+3. 在“系统状态”确认 PostgreSQL / Milvus 健康；未启用的可选能力应显示为降级，而不是伪装成可用。
+
+Provider 密钥推荐在设置页管理。`backend/.env` 和 `backend/config.json` 均可包含密钥、数据库密码或本机路径，已被 Git 忽略，不应手动提交。
+
+#### 6. 可选：启动 MinerU
 
 复杂 PDF、扫描件、中文 OCR 和图文分离建议使用 MinerU：
 
@@ -260,40 +307,90 @@ python scripts/setup-mineru.py --foreground
 
 如果只处理 Markdown、表格或数据库，可以不启动 MinerU。
 
-### 手动开发
+### 方式 B：Docker Core
 
-后端：
+Docker Core 适合将 Web 前端、API 和 PostgreSQL 统一交给 Compose 管理。它不包含 Milvus 和 MinerU；需要图文向量检索时，应另行部署并在设置页绑定。
+
+#### 1. 创建本地配置
 
 ```bash
-cd backend
-uv sync --group dev
-uv run python -m uvicorn app:app --reload --host 0.0.0.0 --port 8888
+cp backend/.env.example backend/.env
+cp backend/config.json.example backend/config.json
 ```
 
-前端：
+修改 `backend/.env` 里的 `POSTGRES_PASSWORD`，生产或可被其他设备访问的环境不得使用默认密码。默认连接串直接使用该密码，因此建议使用字母、数字、`_` / `-` / `.` 组成的强密码；如果包含 URL 保留字符，请额外设置经百分号编码的 `PUDDINGCLAW_DATABASE_URL`。
+
+#### 2. 构建并启动
 
 ```bash
+docker compose --env-file backend/.env up --build -d
+docker compose --env-file backend/.env ps
+```
+
+Compose 会把 backend 数据库连接强制指向容器内的 `postgres:5432`，避免误用 `config.json` 中的宿主机地址。首次启动可通过以下命令观察健康检查：
+
+```bash
+docker compose --env-file backend/.env logs -f backend frontend
+curl http://127.0.0.1:8888/api/capabilities
+```
+
+#### 3. 远程部署检查
+
+- 用 Nginx、Caddy 或等价网关终止 TLS，对外只暴露 Web 入口。
+- 将 `CORS_ORIGINS` 设为真实前端域名，不要使用通配来源。
+- 通过主机防火墙限制 PostgreSQL `5432`、Milvus `19530` 和 backend `8888`；这些端口不应直接暴露到公网。
+- 保留 `backend/.env` 和 `backend/config.json` 的宿主机备份，但不要将它们提交到 Git。
+
+#### 4. 停止
+
+```bash
+docker compose --env-file backend/.env down
+```
+
+`down` 会停止容器，但保留 `postgres_data` 命名卷和宿主机挂载的知识、会话与配置。不要在没有备份时执行 `docker compose down -v`。
+
+### 方式 C：手动开发
+
+先确保 PostgreSQL 已配置；需要向量检索时再启动 Milvus。
+
+```bash
+# 后端
+cd backend
+uv sync --all-extras --group dev --group deepagents-test
+uv run python -m uvicorn app:app --reload --host 0.0.0.0 --port 8888
+
+# 新终端：前端
 cd frontend
 npm install
-npm run dev -- --host 0.0.0.0 --port 3000
+npm run dev -- --port 3000
 ```
 
-自定义端口：
+### 升级、停止与数据保护
+
+#### 升级源码部署
 
 ```bash
-BACKEND_PORT=9000 FRONTEND_PORT=4000 ./scripts/start-macos-linux.sh
+git pull --ff-only
 ```
 
-### Docker 全栈
+- 推荐方式：重新运行 `./scripts/start-local-infra.sh`，然后运行 `./scripts/start-macos-linux.sh`。如果 `frontend/package-lock.json` 变化，先在 `frontend/` 执行 `npm install`。
+- Docker Core：重新执行 `docker compose --env-file backend/.env up --build -d`。
 
-仓库仍保留全栈 Compose，可用于容器化启动核心服务：
+#### 停止基础设施
 
 ```bash
-cp backend/.env.example backend/.env  # 首次启动时执行；Provider 仍可进入应用后配置
-docker compose up --build -d
+docker compose -f docker-compose.infra.yml stop
+# 需要移除容器和网络时：
+docker compose -f docker-compose.infra.yml down
 ```
 
-当前本地开发更推荐“`docker-compose.infra.yml` 启动基础设施 + 启动脚本运行 frontend/backend”，便于热更新和使用本机知识目录。
+`docker-compose.infra.yml` 使用 `data/postgres/` 和 `data/milvus/` 持久化数据；Docker Core 的 PostgreSQL 使用 `postgres_data` 命名卷。业务可迁移资产主要位于用户选择的知识目录、`backend/semantic-assets/`、`backend/analytics-models/`、`backend/sql-guardrails/` 和分析项目导出包。升级或迁移前应同时备份：
+
+- PostgreSQL（使用 `pg_dump`，不要直接复制正在运行的数据目录）；
+- 用户知识目录和分析项目导出包；
+- `backend/config.json`、`backend/.env` 以及需要保留的 `backend/sessions/`。
+
+Milvus 和 gbrain 索引应能从原始知识、Schema 和 Wiki 重建，不应成为唯一事实源。
 
 ## 项目结构
 

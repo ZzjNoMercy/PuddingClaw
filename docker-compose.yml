@@ -51,7 +51,10 @@ services:
       - BACKEND_HOST=0.0.0.0
       - BACKEND_PORT=9100
       - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
-      - DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://puddingclaw:puddingclaw@postgres:5432/puddingclaw}
+      # Deployment override recognized by backend/config.py. Generic DATABASE_URL
+      # is intentionally ignored so inherited shell variables cannot silently
+      # disagree with Settings.
+      - PUDDINGCLAW_DATABASE_URL=${PUDDINGCLAW_DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-puddingclaw}:${POSTGRES_PASSWORD:-puddingclaw}@postgres:5432/${POSTGRES_DB:-puddingclaw}}
       # 其他环境变量在 backend/.env 中配置（如 MINERU_URL）
     volumes:
       # 持久化会话、workspace、memory、日志到宿主机
