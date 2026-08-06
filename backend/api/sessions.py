@@ -38,12 +38,14 @@ class SessionAnalyticsModelRequest(BaseModel):
 class SessionLlmSelectionRequest(BaseModel):
     llm_model_id: str
     thinking_level: Literal["low", "high", "max"] | None = None
+    credential_name: str | None = None
 
 
 class SessionCreateRequest(BaseModel):
     analytics_model_id: str | None = None
     llm_model_id: str | None = None
     thinking_level: Literal["low", "high", "max"] | None = None
+    credential_name: str | None = None
     approval_mode: Literal["strict", "smart"] = "strict"
     runtime_mode: Literal["chat", "agent"] = "chat"
     project_id: str | None = None
@@ -99,9 +101,11 @@ async def create_session(req: SessionCreateRequest | None = None):
             effective_llm = get_fallback_llm_config(
                 model_id_override=payload.llm_model_id,
                 thinking_level=payload.thinking_level,
+                credential_name=payload.credential_name,
             )
             metadata["llm_model_id"] = effective_llm.get("model_id")
             metadata["thinking_level"] = effective_llm.get("thinking_level")
+            metadata["credential_name"] = effective_llm.get("credential_name")
         if payload.project_id:
             metadata["project_id"] = payload.project_id
         meta = session_manager.create_session(
@@ -151,12 +155,14 @@ async def update_session_llm_selection(
         effective = get_fallback_llm_config(
             model_id_override=req.llm_model_id,
             thinking_level=req.thinking_level,
+            credential_name=req.credential_name,
         )
         return session_manager.update_metadata(
             session_id,
             {
                 "llm_model_id": effective.get("model_id"),
                 "thinking_level": effective.get("thinking_level"),
+                "credential_name": effective.get("credential_name"),
             },
         )
     except FileNotFoundError as exc:

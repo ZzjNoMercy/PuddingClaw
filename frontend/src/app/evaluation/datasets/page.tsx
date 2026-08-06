@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
-import { Archive, CloudUpload, Download, Loader2, Plus, RefreshCw, Upload } from "lucide-react";
+import { Archive, CloudUpload, Download, FileDown, Loader2, Plus, RefreshCw, Upload } from "lucide-react";
 import { archiveEvaluationDataset, createEvaluationDataset, evaluationDatasetExportUrl, importEvaluationDataset, listEvaluationDatasets, publishEvaluationDataset, reopenEvaluationDataset, syncEvaluationDataset, type EvalDataset } from "@/lib/evaluationApi";
 import { datasetActions } from "@/lib/evaluationState";
 
@@ -14,11 +14,24 @@ export default function DatasetsPage() {
   const [error, setError] = useState("");
   const load = useCallback(async () => { try { setItems((await listEvaluationDatasets()).items); setError(""); } catch (e) { setError(e instanceof Error ? e.message : "加载失败"); } finally { setLoading(false); } }, []);
   useEffect(() => { load(); }, [load]);
+  const downloadCsvTemplate = () => {
+    const csv = [
+      "question,answer,case_type,expected_tool,name,criticality",
+      '"请只回答项目名称","PuddingClaw","smoke","","项目名称回答","normal"',
+      '"读取 report.md 并总结","第一点|第二点|第三点","tool-use","read_file","文件总结","high"',
+    ].join("\n");
+    const url = URL.createObjectURL(new Blob([`\uFEFF${csv}\n`], { type: "text/csv;charset=utf-8" }));
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = "puddingclaw-evaluation-template.csv";
+    anchor.click();
+    URL.revokeObjectURL(url);
+  };
   const create = async () => { if (!name.trim()) return; setBusy("create"); try { await createEvaluationDataset({ name: name.trim() }); setName(""); await load(); } catch (e) { setError(e instanceof Error ? e.message : "创建失败"); } finally { setBusy(null); } };
   const act = async (key: string, task: () => Promise<unknown>) => { setBusy(key); try { await task(); await load(); } catch (e) { setError(e instanceof Error ? e.message : "操作失败"); } finally { setBusy(null); } };
   return <div className="workspace-page-container">
     <div className="mb-6 flex items-end justify-between"><div><h1 className="text-xl font-semibold text-gray-900">评测集</h1><p className="mt-1 text-sm text-gray-500">本地 Dataset 是权威源；LangSmith 是可选投影。</p></div><button onClick={load} className="rounded-lg border bg-white p-2"><RefreshCw className="h-4 w-4" /></button></div>
-    <div className="mb-5 flex gap-2 rounded-xl border bg-white p-3"><input value={name} onChange={(e) => setName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && create()} placeholder="新 Dataset 名称" className="min-w-0 flex-1 rounded-lg border px-3 py-2 text-sm"/><label className="flex cursor-pointer items-center gap-2 rounded-lg border px-4 text-sm"><Upload className="h-4 w-4"/>导入<input type="file" accept=".json,.bundle,.jsonl,.csv" className="hidden" onChange={async(e)=>{const file=e.target.files?.[0];if(!file)return;const format=file.name.endsWith(".csv")?"csv":file.name.endsWith(".jsonl")?"jsonl":"bundle";setBusy("import");try{await importEvaluationDataset(await file.text(),format);await load();}catch(error){setError(error instanceof Error?error.message:"导入失败");}finally{setBusy(null);e.target.value="";}}}/></label><button onClick={create} disabled={busy === "create"} className="flex items-center gap-2 rounded-lg bg-[#002fa7] px-4 text-sm text-white"><Plus className="h-4 w-4"/>新建</button></div>
+    <div className="mb-5 rounded-xl border bg-white p-3"><div className="flex gap-2"><input value={name} onChange={(e) => setName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && create()} placeholder="新 Dataset 名称" className="min-w-0 flex-1 rounded-lg border px-3 py-2 text-sm"/><button onClick={downloadCsvTemplate} className="flex items-center gap-2 rounded-lg border px-3 text-sm" title="下载可批量填写的最简 CSV"><FileDown className="h-4 w-4"/>CSV 模板</button><label className="flex cursor-pointer items-center gap-2 rounded-lg border px-4 text-sm"><Upload className="h-4 w-4"/>批量导入<input type="file" accept=".json,.bundle,.jsonl,.csv" className="hidden" onChange={async(e)=>{const file=e.target.files?.[0];if(!file)return;const format=file.name.endsWith(".csv")?"csv":file.name.endsWith(".jsonl")?"jsonl":"bundle";setBusy("import");try{await importEvaluationDataset(await file.text(),format);await load();}catch(error){setError(error instanceof Error?error.message:"导入失败");}finally{setBusy(null);e.target.value="";}}}/></label><button onClick={create} disabled={busy === "create"} className="flex items-center gap-2 rounded-lg bg-[#002fa7] px-4 text-sm text-white"><Plus className="h-4 w-4"/>新建</button></div><p className="mt-2 text-xs text-gray-400">批量建 Case：下载 CSV 模板，每行只需填写 question 和 answer；ID、版本、默认安全配置等字段由系统自动补齐。</p></div>
     {error && <div className="mb-4 rounded-lg bg-red-50 p-3 text-sm text-red-700">{error}</div>}
     {loading ? <div className="flex justify-center p-12"><Loader2 className="animate-spin"/></div> : <div className="overflow-hidden rounded-xl border bg-white">
       <div className="grid grid-cols-[minmax(0,1fr)_100px_100px_110px_280px] border-b bg-gray-50 px-4 py-2 text-xs text-gray-500"><span>名称</span><span>版本</span><span>状态</span><span>Cases</span><span>操作</span></div>

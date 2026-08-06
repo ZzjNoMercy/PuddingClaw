@@ -347,6 +347,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "docker": {
                 "connection": "",
                 "context": "",
+                "probe_timeout_seconds": 5,
                 "image": "puddingclaw/sandbox:python3.12-node22-chromium-v4",
                 "cpu_limit": "2",
                 "memory_limit_mb": 2048,
@@ -822,6 +823,7 @@ def get_fallback_llm_config(
     binding: str = "agent",
     model_id_override: str | None = None,
     thinking_level: str | None = None,
+    credential_name: str | None = None,
 ) -> dict[str, Any]:
     """Resolve one LLM workload binding from the local Provider Registry.
 
@@ -834,9 +836,17 @@ def get_fallback_llm_config(
 
     registry = get_provider_registry()
     resolved = (
-        registry.resolve_model(model_id_override, legacy_config=config)
+        registry.resolve_model(
+            model_id_override,
+            legacy_config=config,
+            credential_name=credential_name,
+        )
         if model_id_override
-        else registry.resolve_binding(binding, legacy_config=config)
+        else registry.resolve_binding(
+            binding,
+            legacy_config=config,
+            credential_name=credential_name,
+        )
     )
     if model_id_override or thinking_level is not None:
         from llm.thinking_mapping import map_thinking_request
@@ -852,6 +862,7 @@ def get_fallback_llm_config(
             "base_url": resolved.get("base_url", "https://api.deepseek.com"),
             "protocol": resolved.get("protocol", "deepseek"),
             "model_id": resolved.get("id", ""),
+            "credential_name": resolved.get("credential_name", "default"),
             "temperature": float(resolved.get("temperature", 0.7)),
             "max_tokens": int(resolved.get("max_tokens", 4096)),
             "context_window": int(resolved.get("context_window", 1000000)),
@@ -872,6 +883,7 @@ def get_fallback_llm_config(
         "base_url": resolved.get("base_url", "https://api.deepseek.com"),
         "protocol": resolved.get("protocol", "deepseek"),
         "model_id": resolved.get("id", ""),
+        "credential_name": resolved.get("credential_name", "default"),
         "temperature": float(resolved.get("temperature", 0.7)),
         "max_tokens": int(resolved.get("max_tokens", 4096)),
         "context_window": int(resolved.get("context_window", 1000000)),
@@ -1960,6 +1972,7 @@ def _normalize_harness_update(value: Any) -> dict[str, Any]:
                 raise ValueError("harness.terminal.docker must be an object")
             docker["lifecycle"] = "project"
             for key, minimum, maximum in (
+                ("probe_timeout_seconds", 1, 30),
                 ("memory_limit_mb", 128, 131072),
                 ("pids_limit", 16, 4096),
                 ("idle_stop_minutes", 1, 10080),

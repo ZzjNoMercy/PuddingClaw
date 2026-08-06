@@ -268,6 +268,7 @@ export interface SessionMeta {
   analytics_model_id?: string | null;
   llm_model_id?: string | null;
   thinking_level?: "low" | "high" | "max" | null;
+  credential_name?: string | null;
   approval_mode?: ApprovalMode;
   policy_epoch?: number;
   policy_version?: string;
@@ -330,9 +331,11 @@ interface AppState {
   setAnalyticsModelId: (id: string | null) => void;
   llmModelId: string | null;
   thinkingLevel: "low" | "high" | "max" | null;
+  credentialName: string | null;
   setLlmSelection: (
     modelId: string,
     thinkingLevel: "low" | "high" | "max" | null,
+    credentialName?: string | null,
   ) => void;
   projects: ProjectMeta[];
   loadProjects: () => void;
@@ -944,6 +947,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const llmSelectionsMapRef = useRef<Record<string, {
     modelId: string | null;
     thinkingLevel: "low" | "high" | "max" | null;
+    credentialName: string | null;
   }>>({});
   const llmSelectionSaveChainsRef = useRef<Record<string, Promise<void>>>({});
   const approvalModesMapRef = useRef<Record<string, ApprovalMode>>({ default: "strict" });
@@ -1024,6 +1028,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [analyticsModelId, setAnalyticsModelIdRaw] = useState<string | null>(null);
   const [llmModelId, setLlmModelIdRaw] = useState<string | null>(null);
   const [thinkingLevel, setThinkingLevelRaw] = useState<"low" | "high" | "max" | null>(null);
+  const [credentialName, setCredentialNameRaw] = useState<string | null>(null);
   const [goalModeEnabled, setGoalModeEnabledRaw] = useState(false);
   const [approvalMode, setApprovalModeRaw] = useState<ApprovalMode>("strict");
   const [approvalModeSaving, setApprovalModeSaving] = useState(false);
@@ -1175,10 +1180,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       llmSelectionsMapRef.current.default = {
         modelId: null,
         thinkingLevel: null,
+        credentialName: null,
       };
       if (sessionIdRef.current === "default") {
         setLlmModelIdRaw(null);
         setThinkingLevelRaw(null);
+        setCredentialNameRaw(null);
       }
     };
     window.addEventListener(
@@ -1229,14 +1236,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const setLlmSelection = useCallback((
     modelId: string,
     nextThinkingLevel: "low" | "high" | "max" | null,
+    nextCredentialName: string | null = null,
   ) => {
     const sid = sessionIdRef.current;
     llmSelectionsMapRef.current[sid] = {
       modelId,
       thinkingLevel: nextThinkingLevel,
+      credentialName: nextCredentialName,
     };
     setLlmModelIdRaw(modelId);
     setThinkingLevelRaw(nextThinkingLevel);
+    setCredentialNameRaw(nextCredentialName);
 
     if (sid === "default") return;
     setSessions((current) => current.map((session) =>
@@ -1245,13 +1255,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             ...session,
             llm_model_id: modelId,
             thinking_level: nextThinkingLevel,
+            credential_name: nextCredentialName,
           }
         : session
     ));
     const previousSave = llmSelectionSaveChainsRef.current[sid] || Promise.resolve();
     const nextSave = previousSave
       .catch(() => undefined)
-      .then(() => apiUpdateSessionLlmSelection(sid, modelId, nextThinkingLevel))
+      .then(() => apiUpdateSessionLlmSelection(sid, modelId, nextThinkingLevel, nextCredentialName))
       .then(() => undefined)
       .catch(() => {
         // The next Agent request validates and persists the same frozen values.
@@ -1702,6 +1713,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             llmSelectionsMapRef.current[session.id] = {
               modelId: session.llm_model_id ?? null,
               thinkingLevel: session.thinking_level ?? null,
+              credentialName: session.credential_name ?? null,
             };
           }
           approvalModesMapRef.current[session.id] = session.approval_mode || "strict";
@@ -1812,6 +1824,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setAnalyticsModelIdRaw(analyticsModelIdsMapRef.current.default ?? null);
         setLlmModelIdRaw(llmSelectionsMapRef.current.default?.modelId ?? null);
         setThinkingLevelRaw(llmSelectionsMapRef.current.default?.thinkingLevel ?? null);
+        setCredentialNameRaw(llmSelectionsMapRef.current.default?.credentialName ?? null);
         setGoalModeEnabledRaw(nextRunGoalModeMapRef.current.default ?? false);
         setApprovalModeRaw(approvalModesMapRef.current.default || "strict");
         setApprovalModeSaving(approvalModeSavingSessionsRef.current.has("default"));
@@ -1824,6 +1837,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setAnalyticsModelIdRaw(analyticsModelIdsMapRef.current[id] ?? null);
         setLlmModelIdRaw(llmSelectionsMapRef.current[id]?.modelId ?? null);
         setThinkingLevelRaw(llmSelectionsMapRef.current[id]?.thinkingLevel ?? null);
+        setCredentialNameRaw(llmSelectionsMapRef.current[id]?.credentialName ?? null);
         setApprovalModeRaw(approvalModesMapRef.current[id] || "strict");
         setApprovalModeSaving(approvalModeSavingSessionsRef.current.has(id));
         setApprovalModeError(approvalModeErrorsMapRef.current[id] ?? null);
@@ -2059,6 +2073,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       llmSelection: llmSelectionsMapRef.current[originSessionId] || {
         modelId: null,
         thinkingLevel: null,
+        credentialName: null,
       },
       approvalMode: (approvalModesMapRef.current[originSessionId] || "strict") as ApprovalMode,
       goalModeEnabled: nextRunGoalModeMapRef.current[originSessionId] ?? false,
@@ -2071,6 +2086,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           analytics_model_id: snapshot.analyticsModelId,
           llm_model_id: snapshot.llmSelection.modelId,
           thinking_level: snapshot.llmSelection.thinkingLevel,
+          credential_name: snapshot.llmSelection.credentialName,
           approval_mode: snapshot.approvalMode,
           runtime_mode: snapshot.runtimeMode,
           project_id: snapshot.projectId,
@@ -2091,6 +2107,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               analytics_model_id: snapshot.analyticsModelId,
               llm_model_id: snapshot.llmSelection.modelId,
               thinking_level: snapshot.llmSelection.thinkingLevel,
+              credential_name: snapshot.llmSelection.credentialName,
               approval_mode: meta.approval_mode,
               policy_epoch: meta.policy_epoch,
               policy_version: meta.policy_version,
@@ -2109,7 +2126,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         }
         if (originSessionId === "default") {
           analyticsModelIdsMapRef.current.default = null;
-          llmSelectionsMapRef.current.default = { modelId: null, thinkingLevel: null };
+          llmSelectionsMapRef.current.default = { modelId: null, thinkingLevel: null, credentialName: null };
           approvalModesMapRef.current.default = "strict";
           approvalPolicyEpochsMapRef.current.default = 1;
           nextRunGoalModeMapRef.current.default = false;
@@ -2439,6 +2456,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         llmSelection: llmSelectionsMapRef.current[sendSessionId] || {
           modelId: llmModelId,
           thinkingLevel,
+          credentialName,
         },
         requestedGoalMode:
           options.goalControlAction === "start"
@@ -2720,6 +2738,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               options.skillHints,
               runOptions.llmSelection.modelId,
               runOptions.llmSelection.thinkingLevel,
+              runOptions.llmSelection.credentialName,
             )
           : streamChat(processedText, sendSessionId, controller.signal, userId);
 
@@ -4256,6 +4275,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       analyticsModelId,
       llmModelId,
       thinkingLevel,
+      credentialName,
       goalModeEnabled,
       activeGoal,
       updateSessionRunActivity,
@@ -4283,6 +4303,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setAnalyticsModelId,
         llmModelId,
         thinkingLevel,
+        credentialName,
         setLlmSelection,
         projects,
         loadProjects,

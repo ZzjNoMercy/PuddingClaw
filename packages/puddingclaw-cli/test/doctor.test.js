@@ -18,7 +18,7 @@ test("doctor renders a human-readable diagnostic by default", async () => {
   child.stderr.on("data", (chunk) => { stderr += chunk; });
   const [result] = await once(child, "close");
   assert.equal(result, 0, stderr);
-  assert.match(stdout, /PuddingClaw Doctor v0\.1\.0 · (macos-aarch64|macos-x86_64|windows-|linux-)/);
+  assert.match(stdout, /PuddingClaw Doctor v0\.2\.0 · (macos-aarch64|macos-x86_64|windows-|linux-)/);
   assert.match(stdout, /Worker API/);
   assert.match(stdout, /authenticated · reachable/);
   assert.match(stdout, /worker key.*wak_test/);

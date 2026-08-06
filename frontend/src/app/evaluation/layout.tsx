@@ -32,7 +32,7 @@ export default function EvaluationLayout({ children }: { children: React.ReactNo
     catch (error) { setMessage(error instanceof Error ? error.message : "保存失败"); }
   };
   const test = async () => {
-    try { await persistSettings(); await testLangSmithConnection(); setMessage("保存并连接成功"); }
+    try { const saved = await persistSettings(); await testLangSmithConnection(); setMessage(saved.enabled ? "连接成功，自动投影已启用" : "连接成功；API Key 有效，自动投影当前未启用"); }
     catch (error) { setMessage(error instanceof Error ? error.message : "连接失败"); }
   };
   return (
@@ -69,16 +69,17 @@ export default function EvaluationLayout({ children }: { children: React.ReactNo
       {dialog && settings && <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/25 p-4">
         <div className="w-full max-w-lg rounded-2xl bg-white p-5 shadow-xl">
           <div className="mb-4 flex items-center justify-between"><h2 className="font-semibold">LangSmith 评估后端</h2><button onClick={() => setDialog(false)}><X className="h-4 w-4" /></button></div>
-          <label className="mb-3 flex items-center gap-2 text-sm"><input type="checkbox" checked={settings.enabled} onChange={(event) => setSettings({ ...settings, enabled: event.target.checked })} />启用 LangSmith 投影</label>
+          <label className="mb-1 flex items-center gap-2 text-sm"><input type="checkbox" checked={settings.enabled} onChange={(event) => setSettings({ ...settings, enabled: event.target.checked })} />评测完成后自动投影到 LangSmith</label>
+          <p className="mb-3 text-xs text-gray-400">关闭自动投影时仍然可以保存 API Key 和测试连接。</p>
           <label className="mb-3 block text-xs text-gray-500">Endpoint<input value={settings.endpoint} onChange={(event) => setSettings({ ...settings, endpoint: event.target.value })} className="mt-1 w-full rounded-lg border px-3 py-2 text-sm text-gray-800" /></label>
           <label className="mb-3 block text-xs text-gray-500">Project<input value={settings.project} onChange={(event) => setSettings({ ...settings, project: event.target.value })} className="mt-1 w-full rounded-lg border px-3 py-2 text-sm text-gray-800" /></label>
           <div className="mb-3 grid grid-cols-2 gap-3">
             <label className="block text-xs text-gray-500">单次请求超时（秒）<input type="number" min={1} max={120} value={settings.request_timeout_seconds} onChange={(event) => setSettings({ ...settings, request_timeout_seconds: Number(event.target.value) })} className="mt-1 w-full rounded-lg border px-3 py-2 text-sm text-gray-800" /></label>
             <label className="block text-xs text-gray-500">最大重试次数<input type="number" min={0} max={5} value={settings.max_retries} onChange={(event) => setSettings({ ...settings, max_retries: Number(event.target.value) })} className="mt-1 w-full rounded-lg border px-3 py-2 text-sm text-gray-800" /></label>
           </div>
-          <label className="mb-3 block text-xs text-gray-500">API Key ({settings.api_key_masked || "未配置"})<input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="留空表示保持不变" className="mt-1 w-full rounded-lg border px-3 py-2 text-sm text-gray-800" /></label>
+          <label className="mb-3 block text-xs text-gray-500">API Key（{settings.api_key_configured ? `已保存 ${settings.api_key_masked || ""}` : "未配置"}）<input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="留空表示保持已保存的 Key" className="mt-1 w-full rounded-lg border px-3 py-2 text-sm text-gray-800" /></label>
           {message && <p className="mb-3 text-xs text-gray-600">{message}</p>}
-          <div className="flex justify-end gap-2"><button onClick={test} className="rounded-lg border px-3 py-2 text-sm">测试连接</button><button onClick={save} className="rounded-lg bg-[#002fa7] px-3 py-2 text-sm text-white">保存</button></div>
+          <div className="flex justify-end gap-2"><button onClick={test} className="rounded-lg border px-3 py-2 text-sm">保存并测试连接</button><button onClick={save} className="rounded-lg bg-[#002fa7] px-3 py-2 text-sm text-white">仅保存</button></div>
         </div>
       </div>}
     </div>

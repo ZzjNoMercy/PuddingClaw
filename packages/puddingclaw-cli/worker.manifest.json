@@ -22,6 +22,16 @@
     "probe": ["doctor", "--json"],
     "capabilities": ["capabilities", "--json"],
     "models": ["models", "list", "--json"],
-    "run": ["run", "--input-json", "-", "--json"]
-  }
+    "run": ["run", "--input-json", "-", "--json"],
+    "respond": ["respond", "<run_id>", "--input-json", "-", "--json"],
+    "cancel": ["cancel", "<run_id>", "--json"]
+  },
+  "operations": {
+    "run": true,
+    "continue": true,
+    "respond": true,
+    "cancel": true
+  },
+  "interactionKinds": ["permission_request"],
+  "progress": "jsonl"
 }

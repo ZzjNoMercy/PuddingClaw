@@ -92,7 +92,7 @@ export interface EvalExperiment {
   dataset_content_hash: string;
   profile_id: string;
   status: ExperimentStatus;
-  candidate: { name: string; llm_model_id?: string | null; fingerprint?: string | null; fingerprint_status: "partial" | "complete" };
+  candidate: { name: string; llm_model_id?: string | null; credential_name?: string | null; fingerprint?: string | null; fingerprint_status: "partial" | "complete" };
   execution: { repetitions: number; max_concurrency: number; timeout_seconds: number; preserve_workspaces: boolean };
   summary: Record<string, unknown>;
   error?: { code: string; message: string } | null;

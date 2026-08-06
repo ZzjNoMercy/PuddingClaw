@@ -314,6 +314,24 @@ def test_provider_connection_check_is_separate_from_model_discovery(monkeypatch)
     }
 
 
+def test_provider_credential_reveal_requires_explicit_endpoint(monkeypatch):
+    def fake_reveal(self, provider_id, credential_name, *, legacy_config):
+        assert provider_id == "deepseek"
+        assert credential_name == "evaluation"
+        assert isinstance(legacy_config, dict)
+        return "evaluation-secret"
+
+    monkeypatch.setattr(provider_registry.ProviderRegistry, "reveal_credential", fake_reveal)
+
+    response = TestClient(app).post(
+        "/api/providers/deepseek/credentials/evaluation/reveal"
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"name": "evaluation", "value": "evaluation-secret"}
+    assert response.headers["cache-control"] == "no-store"
+
+
 def test_multimodal_embedding_settings_are_separate_from_openai_embedding(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     config_path.write_text(

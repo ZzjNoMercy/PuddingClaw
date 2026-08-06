@@ -251,6 +251,7 @@ class ModelClient:
         model_override: str | None = None,
         model_id_override: str | None = None,
         thinking_level: str | None = None,
+        credential_name: str | None = None,
         binding: str = "agent",
     ) -> None:
         self.role = role
@@ -259,6 +260,7 @@ class ModelClient:
         self.model_override = str(model_override or "").strip() or None
         self.model_id_override = str(model_id_override or "").strip() or None
         self.thinking_level = str(thinking_level or "").strip() or None
+        self.credential_name = str(credential_name or "").strip() or None
         resolution_kwargs: dict[str, Any] = {
             "thinking_enabled_override": thinking_enabled,
             "binding": binding,
@@ -267,6 +269,8 @@ class ModelClient:
             resolution_kwargs["model_id_override"] = self.model_id_override
         if self.thinking_level is not None:
             resolution_kwargs["thinking_level"] = self.thinking_level
+        if self.credential_name is not None:
+            resolution_kwargs["credential_name"] = self.credential_name
         self.cfg = get_fallback_llm_config(**resolution_kwargs)
         if self.model_override is not None:
             self.cfg["model"] = self.model_override
@@ -708,6 +712,7 @@ class ModelClientChatModel(BaseChatModel):
         model_override: str | None = None,
         model_id_override: str | None = None,
         thinking_level: str | None = None,
+        credential_name: str | None = None,
         binding: str = "agent",
     ) -> None:
         # BaseChatModel otherwise may route ``ainvoke`` through ``_astream``
@@ -727,6 +732,7 @@ class ModelClientChatModel(BaseChatModel):
             model_override=model_override,
             model_id_override=model_id_override,
             thinking_level=thinking_level,
+            credential_name=credential_name,
             binding=binding,
         )
 

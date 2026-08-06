@@ -108,10 +108,16 @@ def _rewrite_managed_virtual_paths(
 
 def _macos_seatbelt_available() -> bool:
     if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").is_file():
+        logger.warning("Kernel sandbox unavailable: macOS sandbox-exec is not present")
         return False
     from harness.kernel_sandbox import MacOSSeatbeltRunner
 
-    available, _reason = MacOSSeatbeltRunner.probe()
+    available, reason = MacOSSeatbeltRunner.probe()
+    if not available:
+        logger.warning(
+            "Kernel sandbox probe failed; will retry after the short failure TTL: %s",
+            reason,
+        )
     return available
 
 
@@ -768,8 +774,16 @@ class ProjectSandboxManager:
         return image_id
 
     def probe(self) -> tuple[bool, str]:
+        raw_timeout = self.config.get("probe_timeout_seconds", 5)
         try:
-            result = self._run(["version", "--format", "{{.Server.Version}}"])
+            timeout = max(1, min(int(raw_timeout), 30))
+        except (TypeError, ValueError):
+            timeout = 5
+        try:
+            result = self._run(
+                ["version", "--format", "{{.Server.Version}}"],
+                timeout=timeout,
+            )
         except Exception as exc:  # noqa: BLE001
             return False, f"{type(exc).__name__}: {exc}"
         if result.returncode != 0:
@@ -2733,6 +2747,7 @@ class AdaptiveWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
     """Kernel-first backend with a Docker delegate constructed only on use."""
 
     mode = "adaptive"
+    runtime_contract = RUNTIME_CONTRACT
     _MANAGED_DOCKER_METHODS = frozenset(
         {
             "install_managed_node_cli",
@@ -2852,7 +2867,15 @@ class AdaptiveWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
 
     def __getattr__(self, name: str) -> Any:
         if name in self._MANAGED_DOCKER_METHODS:
-            return getattr(self._docker_backend(), name)
+            # Attribute discovery must remain side-effect free.  In
+            # particular ManagedCliService probes this surface with hasattr()
+            # during construction; eagerly resolving the Docker backend here
+            # would make every Agent Run depend on Docker availability before
+            # a managed command is actually executed.
+            def lazy_managed_method(*args: Any, **kwargs: Any) -> Any:
+                return getattr(self._docker_backend(), name)(*args, **kwargs)
+
+            return lazy_managed_method
         raise AttributeError(name)
 
 
@@ -2919,6 +2942,10 @@ def build_workspace_execution_backend(
             # Auto only touches Docker when the default kernel boundary is
             # genuinely unavailable. Capability-based lazy upgrades are
             # handled by the execution router, not during Run construction.
+            logger.warning(
+                "Kernel sandbox unavailable; evaluating Docker fallback: %s",
+                exc,
+            )
             docker_enabled = True
             kernel_fallback_reason = str(exc)
     else:

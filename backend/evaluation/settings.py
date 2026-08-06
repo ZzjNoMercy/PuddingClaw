@@ -62,21 +62,26 @@ class EvaluationSettingsStore:
         from provider_registry import LocalCredentialStore
 
         credential_store = LocalCredentialStore()
+        explicit_key_reference = "api_key_ref" in payload
         reference = str(payload.pop("api_key_ref", "") or f"local-file://{self._CREDENTIAL_ID}")
         legacy_key = str(payload.pop("api_key", "") or "")
         if legacy_key:
             reference = credential_store.put(self._CREDENTIAL_ID, legacy_key)
+            explicit_key_reference = True
         stored_key = credential_store.get(reference)
         if stored_key:
             payload["api_key"] = stored_key
         env_key = os.getenv("LANGSMITH_API_KEY")
         env_endpoint = os.getenv("LANGSMITH_ENDPOINT")
         env_project = os.getenv("LANGSMITH_PROJECT")
-        if env_key:
+        # Evaluation UI settings are an explicit, isolated provider profile.
+        # Environment variables are bootstrap fallbacks only; otherwise an old
+        # process-level key silently overrides a key the user just saved.
+        if env_key and not explicit_key_reference:
             payload["api_key"] = env_key
-        if env_endpoint:
+        if env_endpoint and not payload.get("endpoint"):
             payload["endpoint"] = env_endpoint
-        if env_project:
+        if env_project and not payload.get("project"):
             payload["project"] = env_project
         return LangSmithSettings.model_validate(payload)
 

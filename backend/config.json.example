@@ -181,6 +181,7 @@
       "docker": {
         "connection": "",
         "context": "",
+        "probe_timeout_seconds": 5,
         "image": "puddingclaw/sandbox:python3.12-node22-v2",
         "cpu_limit": "2",
         "memory_limit_mb": 2048,

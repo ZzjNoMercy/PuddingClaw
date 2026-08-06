@@ -12,6 +12,7 @@ import copy
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -21,7 +22,9 @@ import httpx
 
 from llm.thinking_mapping import thinking_profile
 
-REGISTRY_VERSION = 1
+REGISTRY_VERSION = 2
+DEFAULT_CREDENTIAL_NAME = "default"
+CREDENTIAL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 DEFAULT_NATIVE_MM_PATH = "/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding"
 DASHSCOPE_NATIVE_DISCOVERY_TIMEOUT_SECONDS = 3.0
 DASHSCOPE_NATIVE_DISCOVERY_CACHE_TTL_SECONDS = 300.0
@@ -163,10 +166,10 @@ class LocalCredentialStore:
 
 def _provider_presets() -> list[dict[str, Any]]:
     return [
-        {"id": "deepseek", "name": "DeepSeek", "enabled": True, "website": "https://platform.deepseek.com", "endpoints": [{"id": "deepseek-openai", "protocol": "deepseek", "base_url": "https://api.deepseek.com", "credential_ref": "", "capabilities": ["llm"]}], "models": []},
-        {"id": "dashscope", "name": "阿里云百炼", "enabled": True, "website": "https://bailian.console.aliyun.com", "credential_scope": "provider", "endpoints": [{"id": "dashscope-compatible", "protocol": "openai_compatible", "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "credential_ref": "", "capabilities": ["llm", "text_embedding"]}, {"id": "dashscope-native-mm", "protocol": "dashscope_multimodal_embedding", "base_url": "https://dashscope.aliyuncs.com", "route_path": DEFAULT_NATIVE_MM_PATH, "credential_ref": "", "capabilities": ["multimodal_embedding", "rerank"]}], "models": []},
-        {"id": "kimi", "name": "Kimi", "enabled": False, "website": "https://platform.moonshot.cn", "endpoints": [{"id": "kimi-openai", "protocol": "openai_compatible", "base_url": "https://api.moonshot.cn/v1", "credential_ref": "", "capabilities": ["llm"]}], "models": []},
-        {"id": "siliconflow", "name": "硅基流动", "enabled": False, "website": "https://siliconflow.cn", "endpoints": [{"id": "siliconflow-openai", "protocol": "openai_compatible", "base_url": "https://api.siliconflow.cn/v1", "credential_ref": "", "capabilities": ["llm", "text_embedding"]}], "models": []},
+        {"id": "deepseek", "name": "DeepSeek", "enabled": True, "website": "https://platform.deepseek.com", "credentials": {}, "endpoints": [{"id": "deepseek-openai", "protocol": "deepseek", "base_url": "https://api.deepseek.com", "credential_ref": "", "capabilities": ["llm"]}], "models": []},
+        {"id": "dashscope", "name": "阿里云百炼", "enabled": True, "website": "https://bailian.console.aliyun.com", "credential_scope": "provider", "credentials": {}, "endpoints": [{"id": "dashscope-compatible", "protocol": "openai_compatible", "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "credential_ref": "", "capabilities": ["llm", "text_embedding"]}, {"id": "dashscope-native-mm", "protocol": "dashscope_multimodal_embedding", "base_url": "https://dashscope.aliyuncs.com", "route_path": DEFAULT_NATIVE_MM_PATH, "credential_ref": "", "capabilities": ["multimodal_embedding", "rerank"]}], "models": []},
+        {"id": "kimi", "name": "Kimi", "enabled": False, "website": "https://platform.moonshot.cn", "credentials": {}, "endpoints": [{"id": "kimi-openai", "protocol": "openai_compatible", "base_url": "https://api.moonshot.cn/v1", "credential_ref": "", "capabilities": ["llm"]}], "models": []},
+        {"id": "siliconflow", "name": "硅基流动", "enabled": False, "website": "https://siliconflow.cn", "credentials": {}, "endpoints": [{"id": "siliconflow-openai", "protocol": "openai_compatible", "base_url": "https://api.siliconflow.cn/v1", "credential_ref": "", "capabilities": ["llm", "text_embedding"]}], "models": []},
     ]
 
 
@@ -191,6 +194,7 @@ class ProviderRegistry:
         return payload
 
     def _save(self, payload: dict[str, Any]) -> None:
+        payload["version"] = REGISTRY_VERSION
         _atomic_json_write(self.path, payload, mode=0o600)
         # Endpoint URLs and credentials may have changed. Never serve discovery
         # results cached against registry state that has just been replaced.
@@ -288,11 +292,69 @@ class ProviderRegistry:
                 return int(explicit_local), int(compatible_endpoint), self.credentials.updated_at(reference)
 
             selected_reference = max(pool, key=priority)[1]
+            credentials = provider.get("credentials")
+            if isinstance(credentials, dict) and credentials.get(DEFAULT_CREDENTIAL_NAME) != selected_reference:
+                credentials[DEFAULT_CREDENTIAL_NAME] = selected_reference
+                changed = True
             for endpoint in provider.get("endpoints", []):
                 if endpoint.get("credential_ref") != selected_reference:
                     endpoint["credential_ref"] = selected_reference
                     changed = True
         return changed
+
+    @staticmethod
+    def _normalize_credential_name(value: Any) -> str:
+        name = str(value or "").strip()
+        if not CREDENTIAL_NAME_PATTERN.fullmatch(name):
+            raise ValueError(
+                "Credential name must be 1-64 characters using letters, numbers, '.', '_' or '-'"
+            )
+        return name
+
+    @staticmethod
+    def _backfill_provider_credentials(payload: dict[str, Any]) -> bool:
+        """Promote the former endpoint credential to provider key `default`."""
+        changed = False
+        for provider in payload.get("providers", []):
+            credentials = provider.get("credentials")
+            if not isinstance(credentials, dict):
+                credentials = {}
+                provider["credentials"] = credentials
+                changed = True
+            if DEFAULT_CREDENTIAL_NAME not in credentials:
+                reference = next(
+                    (
+                        str(endpoint.get("credential_ref") or "")
+                        for endpoint in provider.get("endpoints", [])
+                        if endpoint.get("credential_ref")
+                    ),
+                    "",
+                )
+                if reference:
+                    credentials[DEFAULT_CREDENTIAL_NAME] = reference
+                    changed = True
+            default_reference = str(credentials.get(DEFAULT_CREDENTIAL_NAME) or "")
+            if default_reference:
+                for endpoint in provider.get("endpoints", []):
+                    if endpoint.get("credential_ref") != default_reference:
+                        endpoint["credential_ref"] = default_reference
+                        changed = True
+        return changed
+
+    def _credential_reference(
+        self,
+        provider: dict[str, Any],
+        endpoint: dict[str, Any],
+        credential_name: str | None = None,
+    ) -> tuple[str, str]:
+        name = self._normalize_credential_name(credential_name or DEFAULT_CREDENTIAL_NAME)
+        credentials = provider.get("credentials")
+        reference = str(credentials.get(name) or "") if isinstance(credentials, dict) else ""
+        if not reference and name == DEFAULT_CREDENTIAL_NAME:
+            reference = str(endpoint.get("credential_ref") or "")
+        if credential_name and not reference:
+            raise ValueError(f"本地未保存 {provider['name']} 的 API Key：{name}")
+        return name, reference
 
     def ensure_migrated(self, legacy_config: dict[str, Any]) -> None:
         """Import effective legacy direct/Higress values once without deleting sources."""
@@ -300,6 +362,7 @@ class ProviderRegistry:
         bindings_backfilled = self._backfill_bindings(payload)
         categories_backfilled = self._backfill_model_categories(payload)
         shared_credentials_backfilled = self._normalize_shared_provider_credentials(payload)
+        provider_credentials_backfilled = self._backfill_provider_credentials(payload)
         migration_complete = payload.get("migration", {}).get("state") == "complete"
         legacy_secret_present = any(
             isinstance(item, dict) and bool(item.get("api_key"))
@@ -313,7 +376,7 @@ class ProviderRegistry:
             )
         )
         if migration_complete and not legacy_secret_present:
-            if bindings_backfilled or categories_backfilled or shared_credentials_backfilled:
+            if bindings_backfilled or categories_backfilled or shared_credentials_backfilled or provider_credentials_backfilled:
                 self._save(payload)
             return
         deepseek = self._provider(payload, "deepseek")
@@ -374,9 +437,16 @@ class ProviderRegistry:
         bindings.setdefault("vanna_embedding", text_id)
         payload["migration"] = {"state": "complete", "completed_at": int(time.time()), "sources": ["config.json", "environment references", "higress data (read-only import)"], "legacy_gateway": {"ai_gateway": legacy_config.get("ai_gateway", {}), "gateway_llm": legacy_config.get("gateway_llm", {})}}
         self._normalize_shared_provider_credentials(payload)
+        self._backfill_provider_credentials(payload)
         self._save(payload)
 
-    def resolve_binding(self, binding: str, *, legacy_config: dict[str, Any]) -> dict[str, Any]:
+    def resolve_binding(
+        self,
+        binding: str,
+        *,
+        legacy_config: dict[str, Any],
+        credential_name: str | None = None,
+    ) -> dict[str, Any]:
         self.ensure_migrated(legacy_config)
         payload = self._payload()
         model_id = payload["bindings"].get(binding)
@@ -388,7 +458,21 @@ class ProviderRegistry:
                     endpoint = self._endpoint(provider, str(model["endpoint_id"]))
                     if model.get("capability") not in endpoint.get("capabilities", []):
                         raise ValueError(f"Model {model_id} is incompatible with endpoint {endpoint['id']}")
-                    return self._resolved_model(provider, endpoint, model, binding=binding)
+                    if credential_name:
+                        selected_name, reference = self._credential_reference(
+                            provider, endpoint, credential_name
+                        )
+                        if not self.credentials.get(reference):
+                            raise ValueError(
+                                f"本地未保存 {provider['name']} 的 API Key：{selected_name}"
+                            )
+                    return self._resolved_model(
+                        provider,
+                        endpoint,
+                        model,
+                        binding=binding,
+                        credential_name=credential_name,
+                    )
         raise ValueError(f"Bound model not found: {model_id}")
 
     def resolve_model(
@@ -397,6 +481,7 @@ class ProviderRegistry:
         *,
         legacy_config: dict[str, Any],
         expected_capability: str = "llm",
+        credential_name: str | None = None,
     ) -> dict[str, Any]:
         """Resolve an explicit registered model without switching providers."""
 
@@ -413,9 +498,15 @@ class ProviderRegistry:
                     )
                 if model.get("capability") not in endpoint.get("capabilities", []):
                     raise ValueError(f"Model {model_id} is incompatible with endpoint {endpoint['id']}")
-                if not self.credentials.get(str(endpoint.get("credential_ref") or "")):
-                    raise ValueError(f"Provider {provider['name']} has no configured credential")
-                return self._resolved_model(provider, endpoint, model)
+                selected_name, reference = self._credential_reference(provider, endpoint, credential_name)
+                if not self.credentials.get(reference):
+                    raise ValueError(f"本地未保存 {provider['name']} 的 API Key：{selected_name}")
+                return self._resolved_model(
+                    provider,
+                    endpoint,
+                    model,
+                    credential_name=selected_name,
+                )
         raise ValueError(f"Unknown model: {model_id}")
 
     def _resolved_model(
@@ -425,7 +516,9 @@ class ProviderRegistry:
         model: dict[str, Any],
         *,
         binding: str = "",
+        credential_name: str | None = None,
     ) -> dict[str, Any]:
+        selected_name, reference = self._credential_reference(provider, endpoint, credential_name)
         return {
             "binding": binding,
             "provider_id": provider["id"],
@@ -434,8 +527,9 @@ class ProviderRegistry:
             "protocol": endpoint["protocol"],
             "base_url": endpoint["base_url"],
             "route_path": model.get("route_path") or endpoint.get("route_path") or "",
-            "credential_ref": endpoint.get("credential_ref", ""),
-            "api_key": self.credentials.get(str(endpoint.get("credential_ref") or "")),
+            "credential_ref": reference,
+            "credential_name": selected_name,
+            "api_key": self.credentials.get(reference),
             "thinking_profile": thinking_profile(
                 provider_id=str(provider.get("id") or ""),
                 model_name=str(model.get("name") or ""),
@@ -449,8 +543,23 @@ class ProviderRegistry:
         payload = self._payload()
         result = copy.deepcopy(payload)
         for provider in result["providers"]:
+            raw_credentials = provider.pop("credentials", {})
+            provider["default_credential_name"] = DEFAULT_CREDENTIAL_NAME
+            provider["api_keys"] = []
+            names = set(raw_credentials) if isinstance(raw_credentials, dict) else set()
+            names.add(DEFAULT_CREDENTIAL_NAME)
+            for name in sorted(names, key=lambda item: (item != DEFAULT_CREDENTIAL_NAME, item.lower())):
+                reference = str(raw_credentials.get(name) or "") if isinstance(raw_credentials, dict) else ""
+                provider["api_keys"].append({
+                    "name": name,
+                    "is_default": name == DEFAULT_CREDENTIAL_NAME,
+                    "credential_configured": bool(self.credentials.get(reference)),
+                    "api_key_masked": self.credentials.display(reference),
+                    "credential_source": "environment" if reference.startswith("env://") else "local_file" if reference else "",
+                })
             for endpoint in provider.get("endpoints", []):
-                reference = str(endpoint.pop("credential_ref", ""))
+                reference = str(raw_credentials.get(DEFAULT_CREDENTIAL_NAME) or endpoint.pop("credential_ref", ""))
+                endpoint.pop("credential_ref", None)
                 endpoint["credential_configured"] = bool(self.credentials.get(reference))
                 endpoint["api_key_masked"] = self.credentials.display(reference)
                 endpoint["credential_source"] = "environment" if reference.startswith("env://") else "local_file" if reference else ""
@@ -461,6 +570,30 @@ class ProviderRegistry:
                     endpoint_id=str(model.get("endpoint_id") or ""),
                 )
         return result
+
+    def reveal_credential(
+        self,
+        provider_id: str,
+        credential_name: str,
+        *,
+        legacy_config: dict[str, Any],
+    ) -> str:
+        """Return one secret only for an explicit local reveal action."""
+        self.ensure_migrated(legacy_config)
+        payload = self._payload()
+        provider = self._provider(payload, provider_id)
+        endpoints = provider.get("endpoints", [])
+        if not endpoints:
+            raise ValueError(f"Provider {provider['name']} has no endpoint")
+        name, reference = self._credential_reference(
+            provider,
+            endpoints[0],
+            credential_name,
+        )
+        value = self.credentials.get(reference)
+        if not value:
+            raise ValueError(f"本地未保存 {provider['name']} 的 API Key：{name}")
+        return value
 
     def update_provider(
         self,
@@ -490,12 +623,40 @@ class ProviderRegistry:
                 if key in update_endpoint:
                     endpoint[key] = str(update_endpoint[key]).strip()
             if update_endpoint.get("api_key"):
-                if provider.get("credential_scope") == "provider":
-                    reference = self.credentials.put(f"{provider_id}-shared", str(update_endpoint["api_key"]))
-                    for provider_endpoint in provider.get("endpoints", []):
-                        provider_endpoint["credential_ref"] = reference
-                else:
-                    endpoint["credential_ref"] = self.credentials.put(f"{provider_id}-{endpoint['id']}", str(update_endpoint["api_key"]))
+                ref_name = (
+                    f"{provider_id}-shared"
+                    if provider.get("credential_scope") == "provider"
+                    else f"{provider_id}-{endpoint['id']}"
+                )
+                reference = self.credentials.put(ref_name, str(update_endpoint["api_key"]))
+                provider.setdefault("credentials", {})[DEFAULT_CREDENTIAL_NAME] = reference
+                for provider_endpoint in provider.get("endpoints", []):
+                    provider_endpoint["credential_ref"] = reference
+        credential_updates = update.get("credentials", [])
+        if not isinstance(credential_updates, list):
+            raise ValueError("credentials must be a list")
+        credentials = provider.setdefault("credentials", {})
+        normalized_updates: list[tuple[str, str]] = []
+        for credential in credential_updates:
+            if not isinstance(credential, dict):
+                continue
+            name = self._normalize_credential_name(credential.get("name"))
+            value = str(credential.get("value") or "").strip()
+            if not value:
+                raise ValueError(f"Credential {name} value is required")
+            normalized_updates.append((name, value))
+        if (
+            normalized_updates
+            and not credentials.get(DEFAULT_CREDENTIAL_NAME)
+            and all(name != DEFAULT_CREDENTIAL_NAME for name, _ in normalized_updates)
+        ):
+            raise ValueError("Configure the default credential before adding named credentials")
+        for name, value in normalized_updates:
+            reference = self.credentials.put(f"{provider_id}-credential-{name}", value)
+            credentials[name] = reference
+            if name == DEFAULT_CREDENTIAL_NAME:
+                for provider_endpoint in provider.get("endpoints", []):
+                    provider_endpoint["credential_ref"] = reference
         self._save(payload)
         return self.display(legacy_config={})
 
@@ -673,6 +834,7 @@ class ProviderRegistry:
         *,
         base_url: str = "",
         api_key: str = "",
+        credential_name: str | None = None,
     ) -> dict[str, Any]:
         """Validate a Provider endpoint without returning or registering models.
 
@@ -690,7 +852,13 @@ class ProviderRegistry:
         target_base_url = (base_url or str(endpoint.get("base_url") or "")).strip().rstrip("/")
         if not target_base_url:
             raise ValueError("Endpoint base URL is required")
-        resolved_key = api_key or self.credentials.get(str(endpoint.get("credential_ref") or ""))
+        if api_key:
+            # A name is only a local alias. While adding a new key there is no
+            # saved alias yet, so test the explicitly entered value directly.
+            resolved_key = api_key
+        else:
+            _, credential_ref = self._credential_reference(provider, endpoint, credential_name)
+            resolved_key = self.credentials.get(credential_ref)
         headers = {"Authorization": f"Bearer {resolved_key}"} if resolved_key else {}
 
         with httpx.Client(timeout=10.0, trust_env=False) as client:

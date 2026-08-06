@@ -3491,6 +3491,7 @@ export async function* streamAgent(
   skillHints?: string[],
   llmModelId?: string | null,
   thinkingLevel?: "low" | "high" | "max" | null,
+  credentialName?: string | null,
 ): AsyncGenerator<SSEEvent> {
   const response = await fetch(`${API_BASE}/agent`, {
     method: "POST",
@@ -3505,6 +3506,7 @@ export async function* streamAgent(
       skill_hints: skillHints ?? null,
       llm_model_id: llmModelId || null,
       thinking_level: thinkingLevel || null,
+      credential_name: credentialName || null,
       goal_mode: goalMode,
       goal_id: goalMode ? goalId || null : null,
       context_goal_id: contextGoalId || null,
@@ -3683,6 +3685,7 @@ export async function listSessions(): Promise<
     analytics_model_id?: string | null;
     llm_model_id?: string | null;
     thinking_level?: "low" | "high" | "max" | null;
+    credential_name?: string | null;
     approval_mode?: ApprovalMode;
     policy_epoch?: number;
     policy_version?: string;
@@ -3924,6 +3927,7 @@ export interface CreateSessionOptions {
   analytics_model_id?: string | null;
   llm_model_id?: string | null;
   thinking_level?: "low" | "high" | "max" | null;
+  credential_name?: string | null;
   approval_mode?: ApprovalMode;
   runtime_mode?: "agent" | "chat";
   project_id?: string | null;
@@ -3946,6 +3950,7 @@ export async function createSession(options: CreateSessionOptions = {}): Promise
   analytics_model_id?: string | null;
   llm_model_id?: string | null;
   thinking_level?: "low" | "high" | "max" | null;
+  credential_name?: string | null;
   approval_mode: ApprovalMode;
   policy_epoch: number;
   policy_version: string;
@@ -3963,10 +3968,12 @@ export async function updateSessionLlmSelection(
   sessionId: string,
   llmModelId: string,
   thinkingLevel: "low" | "high" | "max" | null,
+  credentialName: string | null = null,
 ): Promise<{
   id: string;
   llm_model_id?: string | null;
   thinking_level?: "low" | "high" | "max" | null;
+  credential_name?: string | null;
 }> {
   const resp = await fetch(
     `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/llm-selection`,
@@ -3976,6 +3983,7 @@ export async function updateSessionLlmSelection(
       body: JSON.stringify({
         llm_model_id: llmModelId,
         thinking_level: thinkingLevel,
+        credential_name: credentialName,
       }),
     },
   );

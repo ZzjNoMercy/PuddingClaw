@@ -2434,6 +2434,18 @@
               "title": "Config",
               "type": "object"
             },
+            "credential_name": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Credential Name"
+            },
             "fingerprint": {
               "anyOf": [
                 {
@@ -2863,6 +2875,18 @@
           "additionalProperties": true,
           "title": "Config",
           "type": "object"
+        },
+        "credential_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Credential Name"
         },
         "fingerprint": {
           "anyOf": [

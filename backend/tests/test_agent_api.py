@@ -53,22 +53,26 @@ def test_agent_request_model_selection_overrides_persisted_session_selection(mon
         metadata={
             "llm_model_id": "deepseek:deepseek:deepseek-v4-pro:llm",
             "thinking_level": "high",
+            "credential_name": "default",
         },
     )
 
-    def fake_llm_config(*, model_id_override=None, thinking_level=None, **_kwargs):
+    def fake_llm_config(*, model_id_override=None, thinking_level=None, credential_name=None, **_kwargs):
         assert model_id_override == "kimi:kimi-openai:kimi-k3:llm"
         assert thinking_level == "max"
+        assert credential_name == "evaluation"
         return {
             "model_id": model_id_override,
             "provider": "kimi",
             "model": "kimi-k3",
             "thinking_level": thinking_level,
+            "credential_name": credential_name,
         }
 
     async def fake_astream(**kwargs):
         assert kwargs["llm_model_id"] == "kimi:kimi-openai:kimi-k3:llm"
         assert kwargs["thinking_level"] == "max"
+        assert kwargs["credential_name"] == "evaluation"
         yield {"event": "done", "data": "{}"}
 
     monkeypatch.setattr(agent_api, "get_fallback_llm_config", fake_llm_config)
@@ -83,6 +87,7 @@ def test_agent_request_model_selection_overrides_persisted_session_selection(mon
             "session_id": "agent-model-request-priority",
             "llm_model_id": "kimi:kimi-openai:kimi-k3:llm",
             "thinking_level": "max",
+            "credential_name": "evaluation",
             "stream": True,
         },
     )
@@ -91,6 +96,7 @@ def test_agent_request_model_selection_overrides_persisted_session_selection(mon
     metadata = session_manager.get_metadata("agent-model-request-priority")
     assert metadata["llm_model_id"] == "kimi:kimi-openai:kimi-k3:llm"
     assert metadata["thinking_level"] == "max"
+    assert metadata["credential_name"] == "evaluation"
 
 
 def test_agent_uses_persisted_conversation_model_when_request_omits_selection(

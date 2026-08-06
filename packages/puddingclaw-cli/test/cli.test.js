@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -134,4 +136,70 @@ test("stdin JSON rejects model selection fields", async () => {
   const [result] = await once(child, "close");
   assert.equal(result, 2);
   assert.match(JSON.parse(stdout).error, /model input is not supported/);
+});
+
+test("respond sends the opaque continuation and request id without TTY interaction", async () => {
+  const child = spawn(process.execPath, ["--import", path.join(root, "test", "mock-fetch.js"), cli, "respond", "run-respond", "--input-json", "-", "--json"], {
+    env: { ...process.env, PUDDINGCLAW_URL: "http://127.0.0.1:8888", PUDDINGCLAW_TOKEN: "test-token" },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let stdout = ""; let stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  child.stdin.end(JSON.stringify({
+    continuation_token: "continuation-token-long-enough",
+    request_id: "response-from-teams",
+    decisions: [{ request_id: "perm-1", decision: "approve", scope: "once" }],
+  }));
+  const [result] = await once(child, "close");
+  assert.equal(result, 0, stderr);
+  assert.equal(JSON.parse(stdout).final_response, "responded");
+});
+
+test("capabilities expose the four lifecycle operations and interaction kind", async () => {
+  const child = spawn(process.execPath, [cli, "capabilities", "--json"], { stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  const [result] = await once(child, "close");
+  assert.equal(result, 0);
+  const response = JSON.parse(stdout);
+  assert.deepEqual(response.operations, { run: true, continue: true, respond: true, cancel: true });
+  assert.deepEqual(response.interaction_kinds, ["permission_request"]);
+});
+
+test("run --jsonl forwards progress events and ends with one result event", async () => {
+  const child = spawn(process.execPath, ["--import", path.join(root, "test", "mock-fetch.js"), cli, "run", "流式任务", "--jsonl"], {
+    env: { ...process.env, PUDDINGCLAW_URL: "http://127.0.0.1:8888", PUDDINGCLAW_TOKEN: "test-token" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = ""; let stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const [result] = await once(child, "close");
+  assert.equal(result, 0, stderr);
+  const events = stdout.trim().split("\n").map((line) => JSON.parse(line));
+  assert.deepEqual(events.map((item) => item.event), ["run_started", "progress", "result"]);
+  assert.equal(events.at(-1).data.final_response, "stream done");
+});
+
+test("run --export copies only backend-declared artifacts", async () => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "puddingclaw-cli-export-"));
+  const exportDir = path.join(rootDir, "handoff");
+  await mkdir(path.join(rootDir, "puddingclaw"), { recursive: true });
+  await writeFile(path.join(rootDir, "puddingclaw", "report.csv"), "a,b\n");
+  try {
+    const child = spawn(process.execPath, ["--import", path.join(root, "test", "mock-fetch.js"), cli, "run", "导出测试", "--export", exportDir, "--json"], {
+      env: { ...process.env, PUDDINGCLAW_URL: "http://127.0.0.1:8888", PUDDINGCLAW_TOKEN: "test-token", PUDDINGCLAW_PROJECTS_ROOT: rootDir },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = ""; let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const [result] = await once(child, "close");
+    assert.equal(result, 0, stderr);
+    assert.equal(await readFile(path.join(exportDir, "report.csv"), "utf8"), "a,b\n");
+    assert.equal(JSON.parse(stdout).export.exported[0].exported_path, "report.csv");
+  } finally {
+    await rm(rootDir, { recursive: true, force: true });
+  }
 });

@@ -140,6 +140,45 @@ def test_endpoint_connectivity_probe_discards_model_list(tmp_path, monkeypatch):
     assert captured["client_kwargs"] == {"timeout": 10.0, "trust_env": False}
 
 
+def test_endpoint_probe_accepts_unsaved_local_alias_with_explicit_key(tmp_path, monkeypatch):
+    registry = ProviderRegistry(tmp_path)
+    registry.ensure_migrated(_legacy_config())
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get(self, _url, headers):
+            captured["headers"] = headers
+            return FakeResponse()
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+
+    registry.test_endpoint(
+        "deepseek",
+        "deepseek-openai",
+        api_key="unsaved-evaluation-secret",
+        credential_name="evaluate",
+    )
+
+    assert captured["headers"] == {
+        "Authorization": "Bearer unsaved-evaluation-secret"
+    }
+
+
 def test_dashscope_native_discovery_merges_official_and_remote_models(tmp_path, monkeypatch):
     registry = ProviderRegistry(tmp_path)
     registry.ensure_migrated(_legacy_config())
@@ -250,6 +289,55 @@ def test_provider_update_persists_api_key_and_reports_masked_status(tmp_path):
     reloaded = ProviderRegistry(tmp_path)
     reloaded_endpoint = reloaded._payload()["providers"][0]["endpoints"][0]
     assert reloaded.credentials.get(reloaded_endpoint["credential_ref"]) == "saved-provider-secret"
+
+
+def test_provider_supports_named_credentials_with_default_fallback(tmp_path):
+    registry = ProviderRegistry(tmp_path)
+    registry.ensure_migrated(_legacy_config())
+    model_id = registry._payload()["bindings"]["agent"]
+
+    displayed = registry.update_provider(
+        "deepseek",
+        {
+            "credentials": [
+                {"name": "default", "value": "primary-secret"},
+                {"name": "evaluation", "value": "evaluation-secret"},
+            ]
+        },
+        legacy_config={},
+    )
+
+    provider = next(item for item in displayed["providers"] if item["id"] == "deepseek")
+    assert [item["name"] for item in provider["api_keys"]] == ["default", "evaluation"]
+    assert all(item["credential_configured"] for item in provider["api_keys"])
+    assert "primary-secret" not in json.dumps(displayed)
+    assert "evaluation-secret" not in json.dumps(displayed)
+    assert registry.resolve_model(model_id, legacy_config={})["api_key"] == "primary-secret"
+    evaluated = registry.resolve_model(
+        model_id,
+        legacy_config={},
+        credential_name="evaluation",
+    )
+    assert evaluated["api_key"] == "evaluation-secret"
+    assert evaluated["credential_name"] == "evaluation"
+    assert registry.reveal_credential(
+        "deepseek",
+        "evaluation",
+        legacy_config={},
+    ) == "evaluation-secret"
+
+
+def test_unknown_named_credential_is_rejected(tmp_path):
+    registry = ProviderRegistry(tmp_path)
+    registry.ensure_migrated(_legacy_config())
+    model_id = registry._payload()["bindings"]["agent"]
+
+    with pytest.raises(ValueError, match="本地未保存 DeepSeek 的 API Key：missing"):
+        registry.resolve_model(
+            model_id,
+            legacy_config={},
+            credential_name="missing",
+        )
 
 
 def test_dashscope_endpoints_share_one_provider_credential(tmp_path):

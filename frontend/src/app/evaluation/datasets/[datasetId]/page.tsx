@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useParams } from "next/navigation";
-import { CheckCircle2, Loader2, Plus, Save, Trash2 } from "lucide-react";
+import { CheckCircle2, Copy, Loader2, Plus, Save, Trash2 } from "lucide-react";
 import {
   addEvaluationCase,
   deleteEvaluationCase,
@@ -26,6 +26,20 @@ function newCase(): EvalCase {
     expectations: { contains_all: [], contains_any: [], excludes: [], required_tools: [], forbidden_tools: [], tool_order: [], required_steps: [], forbidden_actions: [], expected_state: {} },
     evaluator_bindings: [], resolved_evaluator_bindings: [], criticality: "normal",
     data_classification: "internal", tags: [], metadata: {}, created_at: now, updated_at: now,
+  };
+}
+
+function copyCase(source: EvalCase): EvalCase {
+  const now = new Date().toISOString();
+  const id = crypto.randomUUID().replaceAll("-", "");
+  return {
+    ...structuredClone(source),
+    case_id: `case_${id}`,
+    revision_id: `rev_${id}`,
+    name: `${source.name} - 副本`,
+    resolved_evaluator_bindings: [],
+    created_at: now,
+    updated_at: now,
   };
 }
 
@@ -113,13 +127,13 @@ export default function DatasetDetailPage() {
 
   return <div className="grid min-h-full grid-cols-[280px_minmax(0,1fr)]">
     <aside className="border-r bg-gray-50/70 p-4"><div className="mb-3"><h1 className="font-semibold">{dataset.name}</h1><p className="text-xs text-gray-500">{dataset.status} · v{dataset.current_version} · revision {dataset.revision}</p></div>
-      {editable && <button disabled={busy} onClick={() => choose(newCase())} className="mb-3 flex w-full items-center justify-center gap-2 rounded-lg border bg-white py-2 text-sm"><Plus className="h-4 w-4" />新增 Case</button>}
+      {editable && <div className="mb-3 grid grid-cols-2 gap-2"><button disabled={busy} onClick={() => choose(newCase())} className="flex items-center justify-center gap-1 rounded-lg border bg-white py-2 text-xs"><Plus className="h-3.5 w-3.5" />新增空白</button><button disabled={busy || !selected} onClick={() => selected && choose(copyCase(selected))} className="flex items-center justify-center gap-1 rounded-lg border bg-white py-2 text-xs disabled:opacity-40"><Copy className="h-3.5 w-3.5" />复制当前</button></div>}
       <div className="space-y-1">{dataset.cases.map((item) => <button key={item.case_id} onClick={() => choose(item)} className={`w-full rounded-lg px-3 py-2 text-left text-sm ${selected?.case_id === item.case_id ? "bg-[#002fa7] text-white" : "hover:bg-white"}`}><div className="truncate">{item.name}</div><div className="truncate text-[11px] opacity-60">{item.criticality} · {item.data_classification}</div></button>)}</div>
     </aside>
     <section className="p-6">{error && <div className="mb-4 rounded-lg bg-red-50 p-3 text-sm text-red-700">{error}</div>}
       <div className="mb-5 flex justify-between"><div><h2 className="text-lg font-semibold">{selected?.name || "选择一个 Case"}{dirty && <span className="ml-2 text-xs text-amber-600">未保存</span>}</h2><p className="text-xs text-gray-500">Phase 1 使用隔离 Workspace Core 能力集；已发布版本只读。</p></div><div className="flex gap-2"><button disabled={busy} onClick={precheck} className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50">预检查</button>{editable && dataset.cases.length > 0 && <button disabled={busy} onClick={publish} className="rounded-lg bg-emerald-600 px-3 py-2 text-sm text-white disabled:opacity-50">发布版本</button>}</div></div>
       {validation && <div className={`mb-5 rounded-xl border p-4 ${validation.valid ? "border-emerald-200 bg-emerald-50" : "border-red-200 bg-red-50"}`}><div className="flex items-center gap-2 text-sm font-medium"><CheckCircle2 className="h-4 w-4" />{validation.valid ? "可以发布" : "需要修正"}</div>{validation.issues.map((issue, index) => <p key={index} className="mt-1 text-xs">{issue.severity}: {issue.message}</p>)}</div>}
-      {selected && <div className="grid max-w-4xl grid-cols-2 gap-4 rounded-xl border bg-white p-5">
+      {selected && <><div className="mb-3 max-w-4xl rounded-lg bg-blue-50 px-4 py-3 text-xs text-blue-800">最少只需要填写“名称、输入、回答必须包含”三项；其余字段可以保持默认。相似用例可“复制当前”，大量用例建议在 Dataset 列表下载 CSV 模板后批量导入。</div><div className="grid max-w-4xl grid-cols-2 gap-4 rounded-xl border bg-white p-5">
         <label className="text-xs text-gray-500">名称<input disabled={!editable} value={selected.name} onChange={(e) => change({...selected, name: e.target.value})} className="mt-1 w-full rounded-lg border px-3 py-2 text-sm text-gray-900 disabled:bg-gray-50" /></label>
         <label className="text-xs text-gray-500">等级<select disabled={!editable} value={selected.criticality} onChange={(e) => change({...selected, criticality: e.target.value as EvalCase["criticality"]})} className="mt-1 w-full rounded-lg border px-3 py-2 text-sm text-gray-900"><option value="normal">normal</option><option value="high">high</option><option value="critical">critical</option></select></label>
         <div className="col-span-2"><div className="mb-2 flex items-center justify-between"><span className="text-xs text-gray-500">输入</span><select disabled={!editable} value={selected.input.turns.length ? "multi" : "single"} onChange={(e) => change({...selected, input: e.target.value === "multi" ? {message: null, turns: [{role: "user", content: selected.input.message || ""}]} : {message: selected.input.turns.find((turn) => turn.role === "user")?.content || "", turns: []}})} className="rounded-md border px-2 py-1 text-xs"><option value="single">单轮</option><option value="multi">多轮</option></select></div>
@@ -131,7 +145,7 @@ export default function DatasetDetailPage() {
         <label className="text-xs text-gray-500">固定时间（协议预留；Phase 1 发布会拒绝）<input disabled={!editable} type="text" placeholder="2026-08-03T09:00:00+08:00" value={selected.setup.clock || ""} onChange={(e) => change({...selected, setup: {...selected.setup, clock: e.target.value || null}})} className="mt-1 w-full rounded-lg border px-3 py-2 text-sm text-gray-900" /></label>
         <label className="text-xs text-gray-500">数据分级<select disabled={!editable} value={selected.data_classification} onChange={(e) => change({...selected, data_classification: e.target.value as EvalCase["data_classification"]})} className="mt-1 w-full rounded-lg border px-3 py-2 text-sm text-gray-900"><option>public</option><option>internal</option><option>sensitive</option><option>restricted</option></select></label>
         {editable && <div className="col-span-2 flex justify-between border-t pt-4"><button disabled={busy} onClick={remove} className="flex items-center gap-2 text-sm text-red-600 disabled:opacity-50"><Trash2 className="h-4 w-4" />删除</button><button disabled={busy || (!selected.input.message?.trim() && !selected.input.turns.some((turn) => turn.role === "user" && turn.content.trim()))} onClick={save} className="flex items-center gap-2 rounded-lg bg-[#002fa7] px-4 py-2 text-sm text-white disabled:opacity-40">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}保存 Case</button></div>}
-      </div>}
+      </div></>}
     </section>
   </div>;
 }

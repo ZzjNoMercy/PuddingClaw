@@ -14,8 +14,9 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from collections.abc import Callable
-from functools import lru_cache
 from pathlib import Path
 
 from deepagents.backends.protocol import ExecuteResponse
@@ -42,6 +43,9 @@ class MacOSSeatbeltRunner:
 
     mode = "kernel_macos_seatbelt"
     executable = Path("/usr/bin/sandbox-exec")
+    _PROBE_FAILURE_TTL_SECONDS = 5.0
+    _probe_cache: tuple[float, tuple[bool, str]] | None = None
+    _probe_lock = threading.Lock()
     _SYSTEM_READ_ROOTS = (
         Path("/System"),
         Path("/usr"),
@@ -67,9 +71,37 @@ class MacOSSeatbeltRunner:
         self.tmp.mkdir(parents=True, exist_ok=True)
 
     @classmethod
-    @lru_cache(maxsize=1)
     def probe(cls) -> tuple[bool, str]:
-        """Run one real allow/deny probe, cached for the Backend process."""
+        """Run a real allow/deny probe without pinning transient failures.
+
+        Successful enforcement is stable for the lifetime of the Backend
+        process and can be cached indefinitely.  A failed startup probe may be
+        caused by a short-lived host condition, so retain it only briefly and
+        retry on a later Run instead of silently disabling the kernel backend
+        until Uvicorn is restarted.
+        """
+
+        now = time.monotonic()
+        cached = cls._probe_cache
+        if cached is not None:
+            cached_at, result = cached
+            if result[0] or now - cached_at < cls._PROBE_FAILURE_TTL_SECONDS:
+                return result
+
+        with cls._probe_lock:
+            now = time.monotonic()
+            cached = cls._probe_cache
+            if cached is not None:
+                cached_at, result = cached
+                if result[0] or now - cached_at < cls._PROBE_FAILURE_TTL_SECONDS:
+                    return result
+            result = cls._probe_once()
+            cls._probe_cache = (now, result)
+            return result
+
+    @classmethod
+    def _probe_once(cls) -> tuple[bool, str]:
+        """Perform one uncached Seatbelt enforcement probe."""
 
         if sys.platform != "darwin" or not cls.executable.is_file():
             return False, "macOS sandbox-exec is unavailable"

@@ -54,6 +54,7 @@ class CandidateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     llm_model_id: str | None = None
     thinking_level: Literal["low", "high", "max"] | None = None
+    credential_name: str | None = None
     project_id: str | None = None
     analytics_model_id: str | None = None
     tool_allowlist: list[str] = Field(default_factory=list)
@@ -114,14 +115,18 @@ def resolve_candidate(base_dir: Path, request: CandidateRequest) -> ExperimentCa
 
     git_sha = _git(base_dir, "rev-parse", "HEAD")
     dirty = _git(base_dir, "status", "--porcelain")
-    effective_llm = config.get_fallback_llm_config(
-        model_id_override=request.llm_model_id,
-        thinking_level=request.thinking_level,
-    )
+    resolution_kwargs: dict[str, Any] = {
+        "model_id_override": request.llm_model_id,
+        "thinking_level": request.thinking_level,
+    }
+    if request.credential_name:
+        resolution_kwargs["credential_name"] = request.credential_name
+    effective_llm = config.get_fallback_llm_config(**resolution_kwargs)
     effective_llm = _without_secrets(effective_llm)
     snapshots: dict[str, Any] = {
         "llm_model_id": request.llm_model_id,
         "thinking_level": request.thinking_level,
+        "credential_name": request.credential_name,
         "analytics_model_id": request.analytics_model_id,
         "project_id": request.project_id,
         "effective_llm": effective_llm,
@@ -142,6 +147,7 @@ def resolve_candidate(base_dir: Path, request: CandidateRequest) -> ExperimentCa
         name=request.name,
         llm_model_id=request.llm_model_id,
         thinking_level=request.thinking_level,
+        credential_name=request.credential_name,
         project_id=request.project_id,
         analytics_model_id=request.analytics_model_id,
         config=snapshots,
@@ -156,14 +162,18 @@ def verify_candidate_snapshot(base_dir: Path, candidate: ExperimentCandidate) ->
     import config
 
     expected = candidate.config
-    effective_llm = config.get_fallback_llm_config(
-        model_id_override=candidate.llm_model_id,
-        thinking_level=candidate.thinking_level,
-    )
+    resolution_kwargs: dict[str, Any] = {
+        "model_id_override": candidate.llm_model_id,
+        "thinking_level": candidate.thinking_level,
+    }
+    if candidate.credential_name:
+        resolution_kwargs["credential_name"] = candidate.credential_name
+    effective_llm = config.get_fallback_llm_config(**resolution_kwargs)
     effective_llm = _without_secrets(effective_llm)
     current = {
         "llm_model_id": candidate.llm_model_id,
         "thinking_level": candidate.thinking_level,
+        "credential_name": candidate.credential_name,
         "analytics_model_id": candidate.analytics_model_id,
         "project_id": candidate.project_id,
         "effective_llm": effective_llm,

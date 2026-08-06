@@ -225,6 +225,7 @@ class ExperimentCandidate(ProtocolModel):
     target: Literal["puddingclaw_agent"] = "puddingclaw_agent"
     llm_model_id: str | None = None
     thinking_level: Literal["low", "high", "max"] | None = None
+    credential_name: str | None = None
     project_id: str | None = None
     analytics_model_id: str | None = None
     config: dict[str, Any] = Field(default_factory=dict)

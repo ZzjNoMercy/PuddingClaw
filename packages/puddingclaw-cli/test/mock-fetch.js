@@ -3,7 +3,7 @@ globalThis.fetch = async (url, options) => {
     return new Response(JSON.stringify({
       schema_version: "1",
       agent_id: "puddingclaw",
-      cli_version: "0.1.0",
+      cli_version: "0.2.0",
       protocol_version: "1",
       configured: true,
       authenticated: true,
@@ -16,8 +16,8 @@ globalThis.fetch = async (url, options) => {
       cli: {
         command: "puddingclaw",
         installed: true,
-        version: "0.1.0",
-        required_version: "0.1.0",
+        version: "0.2.0",
+        required_version: "0.2.0",
         version_mismatch: false,
         node: { available: true, path: "/opt/homebrew/bin/node", version: "26.5.0" },
         npm: { available: true, path: "/opt/homebrew/bin/npm", version: "11.17.0" },
@@ -26,6 +26,35 @@ globalThis.fetch = async (url, options) => {
     }), { status: 200, headers: { "content-type": "application/json" } });
   }
   const body = options?.body ? JSON.parse(options.body) : {};
+  if (String(url).includes("/api/headless/runs?stream=true")) {
+    const events = [
+      { event: "run_started", data: { run_id: "run-stream", session_id: "worker-session-stream" } },
+      { event: "progress", data: { message: "正在处理" } },
+      { event: "result", data: { schema_version: "1", run_id: "run-stream", status: "completed", outcome: "completed", final_response: "stream done", artifacts: [] } },
+    ];
+    return new Response(`${events.map((item) => JSON.stringify(item)).join("\n")}\n`, { status: 200, headers: { "content-type": "application/x-ndjson" } });
+  }
+  if (String(url).includes("/api/headless/runs/run-respond/resume")) {
+    return new Response(JSON.stringify({
+      schema_version: "1",
+      run_id: "run-respond",
+      session_id: "worker-session-respond",
+      status: "completed",
+      outcome: "completed",
+      reply: "responded",
+      final_response: "responded",
+      artifacts: [],
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  }
+  if (String(url).includes("/api/headless/runs/run-cancel/cancel")) {
+    return new Response(JSON.stringify({
+      schema_version: "1",
+      run_id: "run-cancel",
+      status: "cancelled",
+      outcome: "cancelled",
+      artifacts: [],
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  }
   if (String(url).includes("/api/headless/runs/run-approval/resume")) {
     return new Response(JSON.stringify({
       schema_version: "1",
@@ -66,6 +95,7 @@ globalThis.fetch = async (url, options) => {
     outcome: "completed",
     reply: "ok",
     final_response: "final ok",
+    ...(body.message === "导出测试" ? { artifacts: [{ name: "report.csv", path: "report.csv", kind: "data", size: 4, origin: "push" }] } : {}),
     analytics_model_id: "auto-analysis",
     analytics_model_match: { status: "matched", selected_id: "auto-analysis", strategy: "semantic" },
     session_id: body.session_id,

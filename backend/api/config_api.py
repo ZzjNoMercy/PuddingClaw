@@ -2,10 +2,11 @@
 
 import asyncio
 import re
-from typing import Any, Optional
+from typing import Any
 
 import httpx
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
@@ -46,27 +47,28 @@ async def set_rag_mode_endpoint(request: RagModeRequest):
 
 
 class SettingsUpdateRequest(BaseModel):
-    thinking_mode: Optional[bool] = None
-    ai_gateway: Optional[dict[str, Any]] = None
-    gateway_llm: Optional[dict[str, Any]] = None
-    fallback_llm: Optional[dict[str, Any]] = None
-    fallback_embedding: Optional[dict[str, Any]] = None
-    multimodal_embedding: Optional[dict[str, Any]] = None
-    rag: Optional[dict[str, Any]] = None
-    vanna: Optional[dict[str, Any]] = None
-    analytics: Optional[dict[str, Any]] = None
-    database: Optional[dict[str, Any]] = None
-    knowledge: Optional[dict[str, Any]] = None
-    compression: Optional[dict[str, Any]] = None
-    harness: Optional[dict[str, Any]] = None
-    subagents: Optional[dict[str, Any]] = None
-    subagent: Optional[dict[str, Any]] = None
+    thinking_mode: bool | None = None
+    ai_gateway: dict[str, Any] | None = None
+    gateway_llm: dict[str, Any] | None = None
+    fallback_llm: dict[str, Any] | None = None
+    fallback_embedding: dict[str, Any] | None = None
+    multimodal_embedding: dict[str, Any] | None = None
+    rag: dict[str, Any] | None = None
+    vanna: dict[str, Any] | None = None
+    analytics: dict[str, Any] | None = None
+    database: dict[str, Any] | None = None
+    knowledge: dict[str, Any] | None = None
+    compression: dict[str, Any] | None = None
+    harness: dict[str, Any] | None = None
+    subagents: dict[str, Any] | None = None
+    subagent: dict[str, Any] | None = None
 
 
 class ProviderUpdateRequest(BaseModel):
-    name: Optional[str] = None
-    enabled: Optional[bool] = None
+    name: str | None = None
+    enabled: bool | None = None
     endpoints: list[dict[str, Any]] = []
+    credentials: list[dict[str, Any]] = []
 
 
 class ProviderBindingRequest(BaseModel):
@@ -77,15 +79,16 @@ class ProviderModelRequest(BaseModel):
     endpoint_id: str
     capability: str
     name: str
-    categories: Optional[list[str]] = None
-    dimension: Optional[int] = None
-    batch_size: Optional[int] = None
-    concurrency: Optional[int] = None
+    categories: list[str] | None = None
+    dimension: int | None = None
+    batch_size: int | None = None
+    concurrency: int | None = None
 
 
 class ProviderConnectionTestRequest(BaseModel):
     base_url: str = ""
     api_key: str = ""
+    credential_name: str | None = None
 
 
 @router.get("/settings")
@@ -116,6 +119,23 @@ async def put_settings(request: SettingsUpdateRequest):
 async def get_providers():
     """Provider/endpoint/model metadata only; credentials are always masked."""
     return get_provider_registry().display(legacy_config=load_config())
+
+
+@router.post("/providers/{provider_id}/credentials/{credential_name}/reveal")
+async def reveal_provider_credential(provider_id: str, credential_name: str):
+    """Reveal one credential only after an explicit user action."""
+    try:
+        value = get_provider_registry().reveal_credential(
+            provider_id,
+            credential_name,
+            legacy_config=load_config(),
+        )
+        return JSONResponse(
+            {"name": credential_name, "value": value},
+            headers={"Cache-Control": "no-store"},
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.patch("/providers/{provider_id}")
@@ -171,12 +191,17 @@ async def test_provider_connection(
 
     started_at = time.time()
     try:
+        probe_kwargs: dict[str, Any] = {
+            "base_url": request.base_url,
+            "api_key": request.api_key,
+        }
+        if request.credential_name:
+            probe_kwargs["credential_name"] = request.credential_name
         result = await run_in_threadpool(
             get_provider_registry().test_endpoint,
             provider_id,
             endpoint_id,
-            base_url=request.base_url,
-            api_key=request.api_key,
+            **probe_kwargs,
         )
         return {
             "success": True,

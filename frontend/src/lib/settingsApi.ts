@@ -304,6 +304,14 @@ export interface ProviderEndpoint {
   credential_source: "" | "environment" | "local_file";
 }
 
+export interface ProviderApiKey {
+  name: string;
+  is_default: boolean;
+  credential_configured: boolean;
+  api_key_masked: string;
+  credential_source: "" | "environment" | "local_file";
+}
+
 export interface ProviderModel {
   id: string;
   name: string;
@@ -322,6 +330,8 @@ export interface ProviderService {
   enabled: boolean;
   website?: string;
   credential_scope?: "provider" | "endpoint";
+  default_credential_name: string;
+  api_keys: ProviderApiKey[];
   endpoints: ProviderEndpoint[];
   models: ProviderModel[];
 }
@@ -357,10 +367,23 @@ export async function getProviders(): Promise<ProviderRegistry> {
   return resp.json();
 }
 
+export async function revealProviderCredential(providerId: string, credentialName: string): Promise<string> {
+  const resp = await fetch(
+    `${API_BASE}/providers/${encodeURIComponent(providerId)}/credentials/${encodeURIComponent(credentialName)}/reveal`,
+    { method: "POST", cache: "no-store" },
+  );
+  if (!resp.ok) {
+    const data = await resp.json().catch(() => ({}));
+    throw new Error(data.detail || `Failed to reveal provider credential: ${resp.status}`);
+  }
+  return (await resp.json()).value;
+}
+
 export async function updateProvider(providerId: string, update: {
   name?: string;
   enabled?: boolean;
   endpoints?: Array<{ id: string; base_url?: string; route_path?: string; api_key?: string }>;
+  credentials?: Array<{ name: string; value: string }>;
 }): Promise<ProviderRegistry> {
   const resp = await fetch(`${API_BASE}/providers/${providerId}`, {
     method: "PATCH",
@@ -405,7 +428,7 @@ export interface ProviderConnectionTestResult {
 export async function testProviderConnection(
   providerId: string,
   endpointId: string,
-  params: { base_url?: string; api_key?: string },
+  params: { base_url?: string; api_key?: string; credential_name?: string },
 ): Promise<ProviderConnectionTestResult> {
   const resp = await fetch(`${API_BASE}/providers/${providerId}/endpoints/${endpointId}/test-connection`, {
     method: "POST",

@@ -6154,6 +6154,7 @@ class DeepAgentsAgentManager:
         analytics_model_id: str | None = None,
         llm_model_id: str | None = None,
         thinking_level: str | None = None,
+        credential_name: str | None = None,
         user_id: str = "default_user",
         attachments: list[dict[str, Any]] | None = None,
         skill_hints: list[str] | None = None,
@@ -6429,6 +6430,7 @@ class DeepAgentsAgentManager:
                 analytics_model_id=analytics_model_id,
                 llm_model_id=llm_model_id,
                 thinking_level=thinking_level,
+                credential_name=credential_name,
                 user_id=user_id,
                 attachments=[] if internal_continuation else attachments,
                 skill_hints=[] if internal_continuation else skill_hints,
@@ -6590,6 +6592,7 @@ class DeepAgentsAgentManager:
         analytics_model_id: str | None = None,
         llm_model_id: str | None = None,
         thinking_level: str | None = None,
+        credential_name: str | None = None,
         user_id: str = "default_user",
         attachments: list[dict[str, Any]] | None = None,
         skill_hints: list[str] | None = None,
@@ -6642,6 +6645,7 @@ class DeepAgentsAgentManager:
             effective_llm = config.get_fallback_llm_config(
                 model_id_override=llm_model_id,
                 thinking_level=thinking_level,
+                credential_name=credential_name,
             )
             thinking_enabled = bool(effective_llm.get("thinking_enabled", False))
             logger.info(
@@ -7153,6 +7157,7 @@ class DeepAgentsAgentManager:
                 streaming=True,
                 model_id_override=llm_model_id,
                 thinking_level=thinking_level,
+                credential_name=credential_name,
             )
             rubric_model = ModelClientChatModel(
                 role="rubric",

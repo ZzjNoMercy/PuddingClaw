@@ -350,10 +350,15 @@ async def update_langsmith_settings(body: LangSmithSettingsRequest) -> dict[str,
 @router.post("/settings/langsmith/test")
 async def test_langsmith_settings() -> dict[str, Any]:
     settings = get_evaluation_settings_store().load()
-    if not settings.enabled or not settings.api_key:
-        raise HTTPException(status_code=409, detail="LangSmith evaluation backend is disabled or not configured")
+    # Connection testing and automatic projection are separate concerns. A
+    # disabled backend may still be tested safely before the user enables it.
+    if not settings.api_key:
+        raise HTTPException(status_code=409, detail="LangSmith API Key is not configured")
     try:
-        return await run_in_threadpool(LangSmithDatasetAdapter(get_evaluation_repository(), settings).test_connection)
+        result = await run_in_threadpool(
+            LangSmithDatasetAdapter(get_evaluation_repository(), settings).test_connection
+        )
+        return {**result, "projection_enabled": settings.enabled}
     except Exception as exc:
         raise HTTPException(
             status_code=502,

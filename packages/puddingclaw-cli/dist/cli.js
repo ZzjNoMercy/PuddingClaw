@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import os from "node:os";
+import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -8,7 +9,7 @@ import { createInterface } from "node:readline/promises";
 import { WorkerClient, WorkerClientError } from "./client.js";
 import { exitCodeForResponse, writeDiagnostic, writeJson } from "./output.js";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 const CAPABILITIES = ["data.query", "data.analysis", "data.nl2sql", "knowledge.query"];
 
 async function ensureWorkspace() {
@@ -122,10 +123,58 @@ function parseFlags(args) {
     if (arg === "--json") { flags.json = true; continue; }
     if (arg === "--input-json") { flags.inputJson = args[++i]; continue; }
     if (arg === "--session") { flags.session = args[++i]; continue; }
+    if (arg === "--export") { flags.exportDir = args[++i]; continue; }
+    if (arg === "--jsonl") { flags.jsonl = true; continue; }
     if (arg.startsWith("--")) throw new WorkerClientError(`unknown option: ${arg}`, { code: "argument_error" });
     positionals.push(arg);
   }
   return { positionals, flags };
+}
+
+function validateExportDir(value) {
+  if (value === undefined) return undefined;
+  const clean = String(value || "").trim();
+  if (!clean || clean === "." || clean === "..") {
+    throw new WorkerClientError("--export requires a directory", { code: "argument_error" });
+  }
+  return path.resolve(clean);
+}
+
+async function exportArtifacts(response, exportDir) {
+  const target = validateExportDir(exportDir);
+  if (!target) return response;
+  const artifacts = Array.isArray(response?.artifacts) ? response.artifacts : [];
+  const projectRoot = path.resolve(String(process.env.PUDDINGCLAW_PROJECTS_ROOT || os.homedir()), "puddingclaw");
+  await fs.mkdir(target, { recursive: true, mode: 0o700 });
+  const exported = [];
+  const skipped = [];
+  for (const item of artifacts) {
+    const relative = String(item?.path || "").replaceAll("\\", "/").replace(/^\/+/, "");
+    if (!relative || relative.split("/").includes("..")) {
+      skipped.push({ name: item?.name || "artifact", reason: "invalid_relative_path" });
+      continue;
+    }
+    const source = path.resolve(projectRoot, relative);
+    if (source !== projectRoot && !source.startsWith(`${projectRoot}${path.sep}`)) {
+      skipped.push({ name: item?.name || relative, reason: "outside_worker_workspace" });
+      continue;
+    }
+    try {
+      const stat = await fs.stat(source);
+      if (!stat.isFile()) throw new Error("not a file");
+      const destination = path.resolve(target, relative);
+      if (destination !== target && !destination.startsWith(`${target}${path.sep}`)) {
+        skipped.push({ name: item?.name || relative, reason: "invalid_destination" });
+        continue;
+      }
+      await fs.mkdir(path.dirname(destination), { recursive: true, mode: 0o700 });
+      await fs.copyFile(source, destination);
+      exported.push({ ...item, exported_path: path.relative(target, destination) });
+    } catch (error) {
+      skipped.push({ name: item?.name || relative, reason: error?.code === "ENOENT" ? "source_missing" : "copy_failed" });
+    }
+  }
+  return { ...response, export: { directory: target, exported, skipped } };
 }
 
 async function readInput(flags) {
@@ -211,7 +260,11 @@ async function resumeWithCliApproval(client, response, { asJson, signal }) {
     }
     current = await client.request(`/api/headless/runs/${encodeURIComponent(runId)}/resume`, {
       method: "POST",
-      body: { continuation_token: token, decisions },
+      body: {
+        continuation_token: token,
+        decisions,
+        request_id: `puddingclaw-cli-response-${randomUUID()}`,
+      },
       signal,
     });
   }
@@ -243,16 +296,74 @@ async function runCommand(args) {
       ...(input?.metadata && typeof input.metadata === "object" ? { metadata: input.metadata } : {}),
       ...(input?.request_id ? { request_id: String(input.request_id) } : {}),
     };
-    let response = await client.request("/api/headless/runs", {
+    let response;
+    if (flags.jsonl) {
+      response = await client.streamJsonl("/api/headless/runs?stream=true", {
+        method: "POST",
+        body,
+        signal: controller.signal,
+        onEvent: async (event) => {
+          if (event?.event !== "result") writeJson(event);
+        },
+      });
+      response = await exportArtifacts(response, flags.exportDir);
+      writeJson({ event: "result", data: response });
+      return exitCodeForResponse(response);
+    }
+    response = await client.request("/api/headless/runs", {
       method: "POST", body, signal: controller.signal,
     });
     response = await resumeWithCliApproval(client, response, {
-      asJson: Boolean(flags.json),
+      asJson: Boolean(flags.json || flags.jsonl),
       signal: controller.signal,
     });
-    emit(response, Boolean(flags.json));
+    response = await exportArtifacts(response, flags.exportDir);
+    emit(response, Boolean(flags.json || flags.jsonl));
     return exitCodeForResponse(response);
   } finally { process.removeListener("SIGINT", onSignal); }
+}
+
+async function respondCommand(args) {
+  const { positionals, flags } = parseFlags(args);
+  if (positionals.length !== 1) throw new WorkerClientError("run_id is required", { code: "argument_error" });
+  const input = await readInput(flags);
+  const runId = String(positionals[0] || "").trim();
+  if (!runId) throw new WorkerClientError("run_id is required", { code: "argument_error" });
+  if (!input || typeof input.continuation_token !== "string" || input.continuation_token.length < 20) {
+    throw new WorkerClientError("continuation_token is required", { code: "protocol_error" });
+  }
+  if (!Array.isArray(input.decisions) || input.decisions.length === 0) {
+    throw new WorkerClientError("decisions must be a non-empty array", { code: "protocol_error" });
+  }
+  for (const decision of input.decisions) {
+    if (!decision || typeof decision !== "object" || typeof decision.request_id !== "string"
+      || !["approve", "reject"].includes(String(decision.decision))
+      || !["once", "session"].includes(String(decision.scope || "once"))) {
+      throw new WorkerClientError("decisions must contain request_id, decision and scope", { code: "protocol_error" });
+    }
+  }
+  const client = new WorkerClient(config());
+  const body = {
+    continuation_token: input.continuation_token,
+    decisions: input.decisions,
+    ...(input.request_id ? { request_id: String(input.request_id) } : {}),
+  };
+  let response = await client.request(`/api/headless/runs/${encodeURIComponent(runId)}/resume`, {
+    method: "POST", body,
+  });
+  response = await exportArtifacts(response, flags.exportDir);
+  emit(response, Boolean(flags.json || flags.jsonl));
+  return exitCodeForResponse(response);
+}
+
+async function cancelCommand(args) {
+  const { positionals, flags } = parseFlags(args);
+  if (positionals.length !== 1) throw new WorkerClientError("run_id is required", { code: "argument_error" });
+  const runId = String(positionals[0] || "").trim();
+  if (!runId) throw new WorkerClientError("run_id is required", { code: "argument_error" });
+  const response = await new WorkerClient(config()).request(`/api/headless/runs/${encodeURIComponent(runId)}/cancel`, { method: "POST" });
+  emit(response, Boolean(flags.json || flags.jsonl));
+  return exitCodeForResponse(response);
 }
 
 async function doctor(args) {
@@ -283,11 +394,13 @@ async function models(args) {
 async function main(argv) {
   const [command, ...rest] = argv;
   if (command === "version") { emit({ schema_version: "1", cli_version: VERSION, protocol_version: "1", agent_id: "puddingclaw" }, jsonMode(rest)); return 0; }
-  if (command === "capabilities") { emit({ schema_version: "1", agent_id: "puddingclaw", protocol_version: "1", capabilities: CAPABILITIES, analytics_model_routing: { strategy: "backend", input: "message", discovery_command: ["models", "list", "--json"], ambiguity_outcome: "analytics_model_clarification_required" } }, jsonMode(rest)); return 0; }
+  if (command === "capabilities") { emit({ schema_version: "1", agent_id: "puddingclaw", protocol_version: "1", capabilities: CAPABILITIES, operations: { run: true, continue: true, respond: true, cancel: true }, interaction_kinds: ["permission_request"], progress: "jsonl", transport: "cli", analytics_model_routing: { strategy: "backend", input: "message", discovery_command: ["models", "list", "--json"], ambiguity_outcome: "analytics_model_clarification_required" } }, jsonMode(rest)); return 0; }
   if (command === "doctor") return doctor(rest);
   if (command === "models" && rest[0] === "list") return models(rest.slice(1));
   if (command === "run") return runCommand(rest);
-  throw new WorkerClientError("usage: puddingclaw run <message> [--session <session_id>] [--json]", { code: "argument_error" });
+  if (command === "respond") return respondCommand(rest);
+  if (command === "cancel") return cancelCommand(rest);
+  throw new WorkerClientError("usage: puddingclaw run <message> [--session <session_id>] [--export <dir>] [--json] | respond <run_id> --input-json - --json | cancel <run_id> --json", { code: "argument_error" });
 }
 
 try {
@@ -296,13 +409,16 @@ try {
 } catch (error) {
   if (error?.code === "cancelled") process.exitCode = 130;
   else if (error?.code === "timeout") process.exitCode = 3;
-  else if (error?.code === "session_expired") process.exitCode = 1;
+  else if (["session_expired", "interaction_expired", "interaction_conflict", "run_expired"].includes(error?.code)) process.exitCode = 1;
   else process.exitCode = 2;
   if (process.argv.includes("--json")) {
     writeJson({
       schema_version: "1",
       status: "error",
       ...(error?.code === "session_expired" ? { outcome: "session_expired" } : {}),
+      ...(error?.code === "interaction_expired" ? { outcome: "interaction_expired" } : {}),
+      ...(error?.code === "interaction_conflict" ? { outcome: "interaction_conflict" } : {}),
+      ...(error?.code === "run_expired" ? { outcome: "run_expired" } : {}),
       error_code: error?.code || "unknown_error",
       ...(Number(error?.status) > 0 ? { http_status: Number(error.status) } : {}),
       error: error?.message || String(error),

@@ -20,6 +20,7 @@ from api.headless import (
     _consume_run,
     _ensure_worker_project,
     _resolve_external_permission,
+    cancel_headless_run,
     create_headless_run,
     list_worker_access_logs,
     resume_headless_run,
@@ -576,6 +577,7 @@ async def test_headless_permission_pauses_and_resume_continues_same_run(tmp_path
         "run-same",
         HeadlessResumeRequest(
             continuation_token=paused["continuation_token"],
+            request_id="response-same",
             decisions=[
                 HeadlessResumeDecision(
                     request_id=permission["id"],
@@ -598,6 +600,7 @@ async def test_headless_permission_pauses_and_resume_continues_same_run(tmp_path
         "run-same",
         HeadlessResumeRequest(
             continuation_token=paused["continuation_token"],
+            request_id="response-same",
             decisions=[
                 HeadlessResumeDecision(
                     request_id=permission["id"],
@@ -610,6 +613,59 @@ async def test_headless_permission_pauses_and_resume_continues_same_run(tmp_path
     )
     assert retried["status"] == "completed"
     assert retried["run_id"] == "run-same"
+
+    with pytest.raises(HTTPException) as conflict:
+        await resume_headless_run(
+            "run-same",
+            HeadlessResumeRequest(
+                continuation_token=paused["continuation_token"],
+                request_id="response-same",
+                decisions=[
+                    HeadlessResumeDecision(
+                        request_id=permission["id"],
+                        decision="approve",
+                        scope="once",
+                    )
+                ],
+            ),
+            authorization="Bearer test",
+        )
+    assert conflict.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_headless_cancel_ends_run_but_keeps_session_handle(monkeypatch):
+    class FakeExecution:
+        run_id = "run-cancel"
+        session_id = "worker-session-cancel"
+        worker_key_id = "key-cancel"
+        done = False
+
+        async def cancel(self):
+            self.done = True
+
+        def response(self):
+            return {
+                "run_id": self.run_id,
+                "session_id": self.session_id,
+                "status": "cancelled",
+                "outcome": "cancelled",
+            }
+
+    execution = FakeExecution()
+    monkeypatch.setattr(headless_api, "_headless_executions", {execution.session_id: execution})
+    monkeypatch.setattr(
+        headless_api,
+        "_principal_for_scope",
+        lambda _authorization, _scope: {"key_id": execution.worker_key_id},
+    )
+    monkeypatch.setattr(headless_api, "_claim_headless_session", lambda _session_id: True)
+    monkeypatch.setattr(headless_api, "_release_headless_session", lambda _session_id: None)
+    monkeypatch.setattr(headless_api, "_attach_session_lifecycle", lambda response, _session_id: response)
+
+    response = await cancel_headless_run("run-cancel", authorization="Bearer test")
+    assert response["status"] == "cancelled"
+    assert execution.done is True
 
 
 @pytest.mark.asyncio

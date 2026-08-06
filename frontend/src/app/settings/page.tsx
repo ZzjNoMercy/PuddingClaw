@@ -44,6 +44,7 @@ import {
   getCapabilities,
   probeHarnessDocker,
   getProviders,
+  revealProviderCredential,
   updateProvider,
   bindProviderModel,
   discoverProviderModels,
@@ -168,10 +169,6 @@ const PROTOCOL_LABELS: Record<string, string> = {
 
 function protocolLabel(protocol: string): string {
   return PROTOCOL_LABELS[protocol] || "自定义接口";
-}
-
-function providerCredentialStateKey(provider: ProviderService, endpointId: string): string {
-  return provider.credential_scope === "provider" ? provider.id : `${provider.id}:${endpointId}`;
 }
 
 const MODEL_CATEGORY_OPTIONS: Array<{ id: ProviderModelCategory; label: string; description: string; capability: ProviderCapability }> = [
@@ -444,6 +441,9 @@ export default function SettingsPage() {
   const [providerBusy, setProviderBusy] = useState<string | null>(null);
   const [providerUrls, setProviderUrls] = useState<Record<string, string>>({});
   const [providerKeys, setProviderKeys] = useState<Record<string, string>>({});
+  const [providerRevealedKeys, setProviderRevealedKeys] = useState<Record<string, boolean>>({});
+  const [providerCredentialNames, setProviderCredentialNames] = useState<Record<string, string>>({});
+  const [providerAddingCredentialId, setProviderAddingCredentialId] = useState<string | null>(null);
   const [discoveredProviderModels, setDiscoveredProviderModels] = useState<Record<string, string[]>>({});
   const [providerConnectionResults, setProviderConnectionResults] = useState<Record<string, { ok: boolean; message: string }>>({});
   const providerConnectionResultTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
@@ -871,43 +871,98 @@ export default function SettingsPage() {
     }
   }, [providerRegistry, selectedEndpointId, selectedProviderId]);
 
-  const handleProviderSave = useCallback(async (provider: ProviderService, endpointId: string, baseUrl: string | undefined, apiKey: string) => {
+  const handleProviderSave = useCallback(async (provider: ProviderService, endpointId: string, baseUrl: string | undefined, apiKey: string, credentialName = "default") => {
     const keyToSave = apiKey.trim();
+    const keyName = credentialName.trim();
     if (baseUrl === undefined && !keyToSave) {
       showToast("error", "请输入要保存的 API 密钥");
+      return;
+    }
+    if (baseUrl === undefined && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(keyName)) {
+      showToast("error", "Key 名称仅支持字母、数字、点、下划线和短横线");
       return;
     }
     setProviderBusy(`${provider.id}:${endpointId}`);
     try {
       const fresh = await updateProvider(provider.id, {
         enabled: provider.enabled,
-        endpoints: [{ id: endpointId, ...(baseUrl !== undefined ? { base_url: baseUrl } : {}), ...(keyToSave ? { api_key: keyToSave } : {}) }],
+        endpoints: [{ id: endpointId, ...(baseUrl !== undefined ? { base_url: baseUrl } : {}) }],
+        ...(keyToSave ? { credentials: [{ name: keyName, value: keyToSave }] } : {}),
       });
-      const savedEndpoint = fresh.providers
+      const savedCredential = fresh.providers
         .find((item) => item.id === provider.id)
-        ?.endpoints.find((item) => item.id === endpointId);
+        ?.api_keys.find((item) => item.name === keyName);
       const savedMaskMatches = keyToSave.length <= 8
-        || savedEndpoint?.api_key_masked.endsWith(keyToSave.slice(-4));
+        || savedCredential?.api_key_masked.endsWith(keyToSave.slice(-4));
       if (keyToSave && (
-        !savedEndpoint?.credential_configured
-        || savedEndpoint.credential_source !== "local_file"
+        !savedCredential?.credential_configured
+        || savedCredential.credential_source !== "local_file"
         || !savedMaskMatches
       )) {
         throw new Error("新密钥未写入本地凭证存储，保存已被判定为失败");
       }
       setProviderRegistry(fresh);
+      if (keyToSave) {
+        setProviderCredentialNames((current) => ({ ...current, [provider.id]: keyName }));
+        setProviderAddingCredentialId(null);
+      }
       setProviderKeys((current) => {
         const next = { ...current };
-        delete next[providerCredentialStateKey(provider, endpointId)];
+        delete next[`${provider.id}:${keyName}`];
+        delete next[`${provider.id}:__new__`];
         return next;
       });
-      showToast("success", keyToSave ? `${provider.name} 密钥已保存至本地用户目录` : `${provider.name} API 地址已保存`);
+      setProviderRevealedKeys((current) => {
+        const next = { ...current };
+        delete next[`${provider.id}:${keyName}`];
+        return next;
+      });
+      showToast("success", keyToSave ? `${provider.name} · ${keyName} 已保存` : `${provider.name} API 地址已保存`);
     } catch (err) {
       showToast("error", err instanceof Error ? err.message : "保存 Provider 失败");
     } finally {
       setProviderBusy(null);
     }
   }, [showToast]);
+
+  const handleProviderKeyVisibility = useCallback(async (
+    provider: ProviderService,
+    credentialName: string,
+    credentialConfigured: boolean,
+  ) => {
+    const key = `${provider.id}:${credentialName}`;
+    if (showProviderKey) {
+      setShowProviderKey(false);
+      if (providerRevealedKeys[key]) {
+        setProviderKeys((current) => {
+          const next = { ...current };
+          delete next[key];
+          return next;
+        });
+        setProviderRevealedKeys((current) => {
+          const next = { ...current };
+          delete next[key];
+          return next;
+        });
+      }
+      return;
+    }
+    if (providerKeys[key] || !credentialConfigured) {
+      setShowProviderKey(true);
+      return;
+    }
+    setProviderBusy(`${key}:reveal`);
+    try {
+      const value = await revealProviderCredential(provider.id, credentialName);
+      setProviderKeys((current) => ({ ...current, [key]: value }));
+      setProviderRevealedKeys((current) => ({ ...current, [key]: true }));
+      setShowProviderKey(true);
+    } catch (err) {
+      showToast("error", err instanceof Error ? err.message : "读取 Provider 密钥失败");
+    } finally {
+      setProviderBusy(null);
+    }
+  }, [providerKeys, providerRevealedKeys, showProviderKey, showToast]);
 
   const handleBindProvider = useCallback(async (binding: string, modelId: string) => {
     try {
@@ -975,7 +1030,8 @@ export default function SettingsPage() {
     try {
       const result = await testProviderConnection(provider.id, endpointId, {
         base_url: providerUrls[key] || "",
-        api_key: providerKeyInputRef.current?.value.trim() || providerKeys[providerCredentialStateKey(provider, endpointId)] || "",
+        api_key: providerKeyInputRef.current?.value.trim() || providerKeys[`${provider.id}:${providerCredentialNames[provider.id] || "default"}`] || "",
+        credential_name: providerCredentialNames[provider.id] || "default",
       });
       const message = `连接成功 · HTTP ${result.status_code} · ${result.latency_ms}ms`;
       showProviderConnectionResult(key, { ok: true, message });
@@ -985,7 +1041,7 @@ export default function SettingsPage() {
     } finally {
       setProviderBusy(null);
     }
-  }, [providerKeys, providerUrls, showProviderConnectionResult]);
+  }, [providerCredentialNames, providerKeys, providerUrls, showProviderConnectionResult]);
 
   useEffect(() => () => {
     Object.values(providerConnectionResultTimers.current).forEach((timer) => clearTimeout(timer));
@@ -1687,12 +1743,23 @@ export default function SettingsPage() {
   const activeProvider = providerRegistry?.providers.find((provider) => provider.id === selectedProviderId) || null;
   const activeEndpoint = activeProvider?.endpoints.find((endpoint) => endpoint.id === selectedEndpointId) || activeProvider?.endpoints[0] || null;
   const activeEndpointKey = activeProvider && activeEndpoint ? `${activeProvider.id}:${activeEndpoint.id}` : "";
-  const activeProviderCredentialKey = activeProvider && activeEndpoint ? providerCredentialStateKey(activeProvider, activeEndpoint.id) : "";
+  const isAddingProviderCredential = Boolean(activeProvider && providerAddingCredentialId === activeProvider.id);
+  const activeProviderCredentialName = activeProvider
+    ? isAddingProviderCredential
+      ? providerCredentialNames[activeProvider.id] ?? ""
+      : providerCredentialNames[activeProvider.id] || "default"
+    : "default";
+  const activeProviderCredentialKey = activeProvider
+    ? isAddingProviderCredential
+      ? `${activeProvider.id}:__new__`
+      : `${activeProvider.id}:${activeProviderCredentialName}`
+    : "";
+  const activeProviderCredential = activeProvider?.api_keys.find((item) => item.name === activeProviderCredentialName);
   const filteredProviders = (providerRegistry?.providers || []).filter((provider) => {
     const query = providerSearch.trim().toLowerCase();
     const searchable = `${provider.name} ${provider.id}`.toLowerCase();
     const matchesSearch = !query || searchable.includes(query);
-    const matchesStatus = !onlyConfiguredProviders || provider.endpoints.some((endpoint) => endpoint.credential_configured);
+    const matchesStatus = !onlyConfiguredProviders || provider.api_keys.some((item) => item.credential_configured);
     return matchesSearch && matchesStatus;
   });
   const allProviderModels = providerRegistry?.providers.flatMap((provider) => provider.models.map((model) => ({ ...model, provider }))) || [];
@@ -1860,7 +1927,7 @@ export default function SettingsPage() {
                       <div className="space-y-1">
                         {filteredProviders.map((provider) => {
                           const selected = selectedProviderId === provider.id;
-                          const configured = provider.endpoints.some((endpoint) => endpoint.credential_configured);
+                          const configured = provider.api_keys.some((item) => item.credential_configured);
                           const hasDefaultModel = providerHasDefaultModel(provider);
                           return <button type="button" key={provider.id} onClick={() => setSelectedProviderId(provider.id)} className={`group flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left transition-all ${selected ? "bg-white/[0.1] text-white shadow-sm ring-1 ring-white/[0.12]" : "text-white/65 hover:bg-white/[0.055] hover:text-white"}`}>
                             <ProviderLogo provider={provider} />
@@ -1920,12 +1987,25 @@ export default function SettingsPage() {
 
                         <div className="mx-auto max-w-5xl px-6 py-7 sm:px-10">
                           <section className="border-b border-white/[0.1] pb-7">
-                            <div className="mb-3 flex items-center justify-between gap-4"><label className="text-[15px] font-semibold text-white">API 密钥</label><span className="text-[10px] text-white/35">{activeEndpoint.credential_source === "environment" ? "由环境变量提供" : activeEndpoint.credential_configured ? "已保存在本地用户目录" : "尚未配置"}</span></div>
+                            <div className="mb-3 flex items-center justify-between gap-4"><label className="text-[15px] font-semibold text-white">API 密钥</label><span className="text-[10px] text-white/35">按名称保存多个 Key；未选择时使用 default</span></div>
+                            <div className="mb-3 flex flex-wrap gap-2">
+                              {activeProvider.api_keys.map((credential) => (
+                                <button key={credential.name} type="button" onClick={() => { setProviderAddingCredentialId(null); setProviderCredentialNames((current) => ({ ...current, [activeProvider.id]: credential.name })); setShowProviderKey(false); }} className={`rounded-lg px-3 py-1.5 text-[11px] font-medium transition ${!isAddingProviderCredential && activeProviderCredentialName === credential.name ? "bg-[#727eff] text-white" : "bg-white/[0.07] text-white/55 hover:bg-white/[0.11] hover:text-white"}`}>
+                                  {credential.name}{credential.is_default ? " · 默认" : ""}{credential.credential_configured ? " ✓" : ""}
+                                </button>
+                              ))}
+                              {isAddingProviderCredential ? (
+                                <button type="button" onClick={() => { setProviderAddingCredentialId(null); setProviderCredentialNames((current) => ({ ...current, [activeProvider.id]: "default" })); setProviderKeys((current) => { const next = { ...current }; delete next[`${activeProvider.id}:__new__`]; return next; }); setShowProviderKey(false); }} className="inline-flex items-center gap-1.5 rounded-lg bg-rose-400/10 px-3 py-1.5 text-[11px] font-medium text-rose-300 transition hover:bg-rose-400/15"><X className="h-3.5 w-3.5" />取消新增</button>
+                              ) : (
+                                <button type="button" onClick={() => { setProviderAddingCredentialId(activeProvider.id); setProviderCredentialNames((current) => ({ ...current, [activeProvider.id]: "" })); setProviderKeys((current) => { const next = { ...current }; delete next[`${activeProvider.id}:__new__`]; return next; }); setShowProviderKey(false); }} className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-slate-100 px-3 py-1.5 text-[11px] font-medium text-slate-600 outline-none transition hover:border-slate-300 hover:bg-slate-200 hover:text-slate-800"><Plus className="h-3.5 w-3.5" />添加 Key</button>
+                              )}
+                            </div>
                             <div className="flex overflow-hidden rounded-xl border border-white/[0.13] bg-[#1a1a1a] transition-colors focus-within:border-[#8d9cff]">
-                              <input ref={providerKeyInputRef} type={showProviderKey ? "text" : "password"} name={`provider-api-key-${activeProvider.id}`} autoComplete="new-password" data-1p-ignore="true" data-lpignore="true" spellCheck={false} value={providerKeys[activeProviderCredentialKey] || ""} onChange={(event) => setProviderKeys((current) => ({ ...current, [activeProviderCredentialKey]: event.target.value }))} placeholder={activeEndpoint.api_key_masked || "输入 API 密钥"} className="min-w-0 flex-1 bg-transparent px-4 py-3 text-[14px] text-white outline-none placeholder:text-white/25" aria-label={`${activeProvider.name} API Key`} />
-                              <button type="button" onClick={() => setShowProviderKey((value) => !value)} className="px-3 text-white/45 transition hover:bg-white/[0.07] hover:text-white" title={showProviderKey ? "隐藏密钥" : "显示密钥"}>{showProviderKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}</button>
+                              <input value={activeProviderCredentialName} readOnly={!isAddingProviderCredential} onChange={(event) => setProviderCredentialNames((current) => ({ ...current, [activeProvider.id]: event.target.value }))} className={`w-36 border-r border-white/[0.13] px-4 py-3 font-mono text-[13px] text-white outline-none placeholder:text-white/25 ${isAddingProviderCredential ? "bg-transparent" : "cursor-default bg-white/[0.025] text-white/55"}`} placeholder="Key 名称" aria-label={`${activeProvider.name} Key 名称`} />
+                              <input ref={providerKeyInputRef} type={showProviderKey ? "text" : "password"} name={`provider-api-key-${activeProvider.id}`} autoComplete="new-password" data-1p-ignore="true" data-lpignore="true" spellCheck={false} value={providerKeys[activeProviderCredentialKey] || ""} onChange={(event) => { setProviderKeys((current) => ({ ...current, [activeProviderCredentialKey]: event.target.value })); setProviderRevealedKeys((current) => { const next = { ...current }; delete next[activeProviderCredentialKey]; return next; }); }} placeholder={activeProviderCredential?.api_key_masked || "输入 API 密钥"} className="min-w-0 flex-1 bg-transparent px-4 py-3 text-[14px] text-white outline-none placeholder:text-white/25" aria-label={`${activeProvider.name} API Key`} />
+                              <button type="button" disabled={providerBusy === `${activeProviderCredentialKey}:reveal`} onClick={() => handleProviderKeyVisibility(activeProvider, activeProviderCredentialName, Boolean(activeProviderCredential?.credential_configured))} className="px-3 text-white/45 transition hover:bg-white/[0.07] hover:text-white disabled:opacity-45" title={showProviderKey ? "隐藏密钥" : "显示密钥"}>{providerBusy === `${activeProviderCredentialKey}:reveal` ? <Loader2 className="h-4 w-4 animate-spin" /> : showProviderKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}</button>
                               {activeEndpoint.protocol !== "dashscope_multimodal_embedding" && <button type="button" disabled={providerBusy === `${activeEndpointKey}:test`} onClick={() => handleTestProviderConnection(activeProvider, activeEndpoint.id)} className="border-l border-white/[0.13] px-4 text-[12px] font-semibold text-white transition hover:bg-white/[0.07] disabled:opacity-45">{providerBusy === `${activeEndpointKey}:test` ? "检测中…" : "检测"}</button>}
-                              <button type="button" disabled={providerBusy === activeEndpointKey} onClick={() => handleProviderSave(activeProvider, activeEndpoint.id, undefined, providerKeyInputRef.current?.value || providerKeys[activeProviderCredentialKey] || "")} className="provider-primary-action border-l border-white/[0.13] px-4 text-[12px] font-semibold transition disabled:opacity-45">{providerBusy === activeEndpointKey ? "保存中…" : "保存"}</button>
+                              <button type="button" disabled={providerBusy === activeEndpointKey} onClick={() => handleProviderSave(activeProvider, activeEndpoint.id, undefined, providerKeyInputRef.current?.value || providerKeys[activeProviderCredentialKey] || "", activeProviderCredentialName)} className="provider-primary-action border-l border-white/[0.13] px-4 text-[12px] font-semibold transition disabled:opacity-45">{providerBusy === activeEndpointKey ? "保存中…" : "保存"}</button>
                             </div>
                             {providerConnectionResults[activeEndpointKey] && <p className={`mt-2 text-[11px] ${providerConnectionResults[activeEndpointKey].ok ? "text-emerald-600" : "text-rose-600"}`}>{providerConnectionResults[activeEndpointKey].message}</p>}
                             {activeProvider.website && <a href={activeProvider.website} target="_blank" rel="noreferrer" className="mt-3 inline-flex items-center gap-1.5 text-[11px] text-[#8d9cff] transition hover:text-[#b1b8ff]"><KeyRound className="h-3.5 w-3.5" /> 前往 {activeProvider.name} 获取密钥</a>}

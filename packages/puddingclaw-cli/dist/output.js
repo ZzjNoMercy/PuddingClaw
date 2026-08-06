@@ -7,5 +7,6 @@ export function writeDiagnostic(message) {
 }
 
 export function exitCodeForResponse(response) {
-  return response?.outcome === "completed" || response?.status === "completed" ? 0 : 1;
+  return response?.outcome === "completed" || response?.status === "completed"
+    || response?.outcome === "cancelled" || response?.status === "cancelled" ? 0 : 1;
 }

@@ -15,12 +15,12 @@ import shutil
 import subprocess
 import sys
 import threading
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, Callable, Sequence
-
+from typing import Any
 
 CLI_COMMAND = "puddingclaw"
-CLI_VERSION = "0.1.0"
+CLI_VERSION = "0.2.0"
 MIN_NODE_MAJOR = 20
 INSTALL_POLICIES = frozenset({"auto", "prompt", "never"})
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]

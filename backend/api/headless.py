@@ -19,7 +19,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from analytics.models import get_analytics_model_registry
@@ -54,6 +54,7 @@ _last_headless_cleanup_monotonic = 0.0
 _BEIJING_TIMEZONE = ZoneInfo("Asia/Shanghai")
 _headless_executions: dict[str, _HeadlessExecution] = {}
 _headless_executions_lock = threading.RLock()
+_HEADLESS_EXECUTION_RETENTION_SECONDS = 3600.0
 
 
 def _claim_headless_session(session_id: str) -> bool:
@@ -67,6 +68,18 @@ def _claim_headless_session(session_id: str) -> bool:
 def _release_headless_session(session_id: str) -> None:
     with _active_headless_sessions_lock:
         _active_headless_sessions.discard(session_id)
+
+
+def _prune_headless_executions() -> None:
+    cutoff = time.time() - _HEADLESS_EXECUTION_RETENTION_SECONDS
+    with _headless_executions_lock:
+        stale = [
+            session_id
+            for session_id, execution in _headless_executions.items()
+            if execution.done and float(getattr(execution, "done_at", 0.0) or 0.0) <= cutoff
+        ]
+        for session_id in stale:
+            _headless_executions.pop(session_id, None)
 
 
 def _cleanup_interval_seconds() -> float:
@@ -131,6 +144,46 @@ class HeadlessResumeRequest(BaseModel):
 
     continuation_token: str = Field(min_length=20, max_length=500)
     decisions: list[HeadlessResumeDecision] = Field(min_length=1, max_length=50)
+    request_id: str | None = Field(default=None, max_length=200)
+
+
+def _headless_artifacts(session_id: str, project_id: str) -> list[dict[str, Any]]:
+    """Expose only durable, workspace-relative artifacts for CLI export."""
+
+    try:
+        workspace = project_registry.resolve(project_id)
+        registered = session_manager.list_delivered_artifacts(
+            session_id,
+            verify_freshness=True,
+            include_inactive=False,
+        )
+    except Exception:
+        return []
+    artifacts: list[dict[str, Any]] = []
+    for item in registered:
+        target = Path(str(item.get("target_path") or "")).expanduser().resolve()
+        try:
+            relative = target.relative_to(workspace).as_posix()
+        except ValueError:
+            # A PuddingClaw CLI caller can only safely export files in the
+            # worker project; never leak or guess a server-side absolute path.
+            continue
+        if not target.is_file():
+            continue
+        try:
+            size = target.stat().st_size
+        except OSError:
+            size = None
+        artifacts.append(
+            {
+                "name": target.name,
+                "path": relative,
+                "kind": "report",
+                "size": size,
+                "origin": "push",
+            }
+        )
+    return artifacts
 
 
 class _HeadlessExecution:
@@ -170,6 +223,10 @@ class _HeadlessExecution:
         self.terminal_needs_input: dict[str, Any] | None = None
         self.revision = 0
         self.done = False
+        self.cancelled = False
+        self.done_at = 0.0
+        self.resume_results: dict[str, tuple[str, dict[str, Any]]] = {}
+        self.events: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
         self.error: BaseException | None = None
         self.updated = asyncio.Condition()
         self.task: asyncio.Task[None] | None = None
@@ -192,6 +249,7 @@ class _HeadlessExecution:
                     payload = {}
                 if not isinstance(payload, dict):
                     payload = {}
+                self.events.put_nowait({"event": name, "data": payload})
                 self.run_id = str(payload.get("run_id") or self.run_id)
                 self.query_id = str(payload.get("query_id") or self.query_id)
                 if name == "run_outcome":
@@ -225,7 +283,10 @@ class _HeadlessExecution:
                         self.pending_inputs.pop(request_id, None)
                         self._persist_pending_state("resumed")
         except BaseException as exc:
-            self.error = exc
+            if isinstance(exc, asyncio.CancelledError):
+                self.cancelled = True
+            else:
+                self.error = exc
         finally:
             try:
                 await self.stream.aclose()
@@ -233,6 +294,8 @@ class _HeadlessExecution:
                 pass
             self.stream = None
             self.done = True
+            self.done_at = time.time()
+            self.events.put_nowait(None)
             self._persist_pending_state("completed" if self.error is None else "failed")
             await self._signal()
 
@@ -292,6 +355,18 @@ class _HeadlessExecution:
         if self.pending_inputs and not self.done:
             await asyncio.sleep(0.02)
 
+    async def cancel(self) -> None:
+        if self.done:
+            return
+        task = self.task
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.cancelled = True
+        self.done = True
+        self.done_at = time.time()
+        await self._signal()
+
     def response(self) -> dict[str, Any]:
         if self.pending_inputs and not self.done:
             requests = list(self.pending_inputs.values())
@@ -316,8 +391,26 @@ class _HeadlessExecution:
             }
         if self.error is not None:
             raise self.error
+        if self.cancelled:
+            return {
+                "schema_version": "1",
+                "run_id": self.run_id or None,
+                "session_id": self.session_id,
+                "project_id": self.project_id,
+                "analytics_model_id": self.analytics_model_id,
+                "analytics_model_match": self.analytics_model_match,
+                "approval_mode": self.approval_mode,
+                "status": "cancelled",
+                "outcome": "cancelled",
+                "reply": self.final_content,
+                "final_response": self.final_response,
+                "verification": self.verification,
+                "needs_input": None,
+                "artifacts": _headless_artifacts(self.session_id, self.project_id),
+            }
         final_outcome = str(self.outcome.get("outcome") or "failed")
         status_value = str(self.outcome.get("status") or final_outcome)
+        artifacts = _headless_artifacts(self.session_id, self.project_id)
         return {
             "schema_version": "1",
             "run_id": self.outcome.get("run_id") or self.run_id or None,
@@ -337,6 +430,7 @@ class _HeadlessExecution:
             "interrupt_summary": self.outcome.get("interrupt_summary")
             or {"total": 0, "auto_approved": 0, "auto_rejected": 0, "by_type": {}},
             "needs_input": self.terminal_needs_input,
+            "artifacts": artifacts,
         }
 
 
@@ -537,6 +631,14 @@ def _request_hash(request: HeadlessRunRequest, *, principal: dict[str, Any]) -> 
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
 
 
+def _resume_request_hash(request: HeadlessResumeRequest) -> str:
+    payload = {
+        "continuation_token": request.continuation_token,
+        "decisions": [item.model_dump(mode="json") for item in request.decisions],
+    }
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+
 def _reserve_idempotency(key: str, request_hash: str) -> dict[str, Any] | None:
     if not key:
         return None
@@ -679,11 +781,36 @@ async def _consume_run(
         analytics_model_match=analytics_model_match,
         worker_key_id=worker_key_id,
     )
+    _prune_headless_executions()
     with _headless_executions_lock:
         _headless_executions[session_id] = execution
     execution.start()
-    await execution.wait_for_boundary()
+    try:
+        await execution.wait_for_boundary()
+    except BaseException:
+        await execution.cancel()
+        raise
     return execution.response()
+
+
+async def _stream_headless_execution(
+    execution: _HeadlessExecution,
+    initial_response: dict[str, Any],
+):
+    """Yield live Agent events, then one canonical result event."""
+
+    if execution.pending_inputs and not execution.done:
+        yield {"event": "result", "data": initial_response}
+        return
+    while True:
+        item = await execution.events.get()
+        if item is None:
+            break
+        yield item
+        if execution.pending_inputs and not execution.done:
+            yield {"event": "result", "data": execution.response()}
+            return
+    yield {"event": "result", "data": execution.response()}
 
 
 async def _resolve_external_permission(
@@ -776,7 +903,7 @@ async def worker_health(authorization: str | None = Header(default=None)):
     return {
         "schema_version": "1",
         "agent_id": "puddingclaw",
-        "cli_version": "0.1.0",
+        "cli_version": "0.2.0",
         "protocol_version": "1",
         "configured": True,
         "authenticated": True,
@@ -785,6 +912,9 @@ async def worker_health(authorization: str | None = Header(default=None)):
         "project_id": project_id,
         "workspace_ready": path.is_dir(),
         "capabilities": ["data.query", "data.analysis", "data.nl2sql", "knowledge.query"],
+        "operations": {"run": True, "continue": True, "respond": True, "cancel": True},
+        "interaction_kinds": ["permission_request"],
+        "progress": "jsonl",
         "key_id": principal.get("key_id"),
         "cli": cli_status,
     }
@@ -807,6 +937,7 @@ async def create_headless_run(
     request: HeadlessRunRequest,
     authorization: str | None = Header(default=None),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    stream: bool = Query(default=False),
 ):
     request_received_at = time.time()
     principal = _principal_for_scope(authorization, "worker:runs:create")
@@ -829,6 +960,7 @@ async def create_headless_run(
             return previous["response"]
         raise HTTPException(status_code=409, detail="An identical Worker Run is already in progress")
     idempotency_finished = False
+    streaming_lifecycle = False
 
     requested_session_id = str(request.session_id or "").strip()
     session_id = requested_session_id or f"worker-session-{uuid.uuid4().hex[:16]}"
@@ -967,6 +1099,35 @@ async def create_headless_run(
                 "needs_input": None,
             }
         _attach_session_lifecycle(response, session_id)
+        if stream is True and response.get("run_id"):
+            with _headless_executions_lock:
+                execution = next(
+                    (
+                        item
+                        for item in _headless_executions.values()
+                        if item.run_id == str(response.get("run_id"))
+                    ),
+                    None,
+                )
+            if execution is not None:
+                streaming_lifecycle = True
+
+                async def event_stream():
+                    nonlocal idempotency_finished
+                    terminal_response = response
+                    try:
+                        async for item in _stream_headless_execution(execution, response):
+                            if item.get("event") == "result" and isinstance(item.get("data"), dict):
+                                terminal_response = item["data"]
+                            yield f"{json.dumps(item, ensure_ascii=False)}\n"
+                        if key:
+                            _finish_idempotency(key, terminal_response)
+                            idempotency_finished = True
+                    finally:
+                        if execution.done:
+                            _release_headless_session(session_id)
+
+                return StreamingResponse(event_stream(), media_type="application/x-ndjson")
         if key:
             _finish_idempotency(key, response)
             idempotency_finished = True
@@ -974,9 +1135,10 @@ async def create_headless_run(
             return JSONResponse(status_code=status.HTTP_504_GATEWAY_TIMEOUT, content=response)
         return response
     finally:
-        if key and not idempotency_finished:
+        if key and not idempotency_finished and not streaming_lifecycle:
             _abandon_idempotency(key, request_hash)
-        _release_headless_session(session_id)
+        if not streaming_lifecycle:
+            _release_headless_session(session_id)
 
 
 @router.post("/runs/{run_id}/resume")
@@ -1006,6 +1168,15 @@ async def resume_headless_run(
         raise HTTPException(status_code=403, detail="Run is not authorized for this Worker")
     if not hmac.compare_digest(execution.token, request.continuation_token):
         raise HTTPException(status_code=403, detail="Headless continuation token is invalid")
+    request_id = str(request.request_id or "").strip()
+    request_hash = _resume_request_hash(request)
+    if request_id:
+        cached = execution.resume_results.get(request_id)
+        if cached is not None:
+            cached_hash, cached_response = cached
+            if not hmac.compare_digest(cached_hash, request_hash):
+                raise HTTPException(status_code=409, detail="request_id was already used with another response")
+            return cached_response
     if execution.done:
         response = execution.response()
         _attach_session_lifecycle(response, execution.session_id)
@@ -1042,6 +1213,8 @@ async def resume_headless_run(
         await execution.wait_for_boundary(after_revision=previous_revision)
         response = execution.response()
         _attach_session_lifecycle(response, execution.session_id)
+        if request_id:
+            execution.resume_results[request_id] = (request_hash, response)
         return response
     except asyncio.TimeoutError:
         response = {
@@ -1053,7 +1226,40 @@ async def resume_headless_run(
             "needs_input": None,
         }
         _attach_session_lifecycle(response, execution.session_id)
+        if request_id:
+            execution.resume_results[request_id] = (request_hash, response)
         return JSONResponse(status_code=status.HTTP_504_GATEWAY_TIMEOUT, content=response)
+    finally:
+        _release_headless_session(execution.session_id)
+
+
+@router.post("/runs/{run_id}/cancel")
+async def cancel_headless_run(
+    run_id: str,
+    authorization: str | None = Header(default=None),
+):
+    """Cancel a live Headless Run while retaining its Session."""
+
+    principal = _principal_for_scope(authorization, "worker:runs:cancel")
+    with _headless_executions_lock:
+        execution = next(
+            (item for item in _headless_executions.values() if item.run_id == run_id),
+            None,
+        )
+    if execution is None:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Headless Run is no longer active",
+        )
+    if execution.worker_key_id != str(principal.get("key_id") or ""):
+        raise HTTPException(status_code=403, detail="Run is not authorized for this Worker")
+    if not _claim_headless_session(execution.session_id):
+        raise HTTPException(status_code=409, detail="Headless Session already has an active request")
+    try:
+        await execution.cancel()
+        response = execution.response()
+        _attach_session_lifecycle(response, execution.session_id)
+        return response
     finally:
         _release_headless_session(execution.session_id)
 

@@ -137,6 +137,7 @@ class AgentRequest(BaseModel):
     analytics_model_id: str | None = None
     llm_model_id: str | None = None
     thinking_level: Literal["low", "high", "max"] | None = None
+    credential_name: str | None = None
     attachments: list[dict] = Field(default_factory=list)
     skill_hints: list[str] | None = Field(default=None, max_length=8)
     goal_mode: bool = False
@@ -288,14 +289,18 @@ async def agent(request: AgentRequest):
     session_selection = session_manager.get_metadata(request.session_id)
     persisted_model_id = str(session_selection.get("llm_model_id") or "").strip() or None
     persisted_thinking_level = str(session_selection.get("thinking_level") or "").strip() or None
+    persisted_credential_name = str(session_selection.get("credential_name") or "").strip() or None
     if persisted_thinking_level not in {"low", "high", "max"}:
         persisted_thinking_level = None
 
     requested_model_id = str(request.llm_model_id or "").strip() or None
     selected_model_id = requested_model_id or persisted_model_id
     selected_thinking_level = request.thinking_level
+    selected_credential_name = request.credential_name
     if selected_thinking_level is None and requested_model_id is None:
         selected_thinking_level = persisted_thinking_level
+    if selected_credential_name is None and requested_model_id is None:
+        selected_credential_name = persisted_credential_name
 
     # Validate the complete Provider route and its normalized thinking level
     # before an SSE response is opened.  This also prevents a model name from
@@ -304,28 +309,31 @@ async def agent(request: AgentRequest):
         effective_llm = get_fallback_llm_config(
             model_id_override=selected_model_id,
             thinking_level=selected_thinking_level,
+            credential_name=selected_credential_name,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    selection_explicit = bool(selected_model_id or selected_thinking_level)
+    selection_explicit = bool(selected_model_id or selected_thinking_level or selected_credential_name)
     runtime_model_id = str(effective_llm.get("model_id") or "") if selection_explicit else None
     runtime_thinking_level = effective_llm.get("thinking_level") if selection_explicit else None
+    runtime_credential_name = effective_llm.get("credential_name") if selection_explicit else None
     selection_source = (
         "request"
-        if requested_model_id or request.thinking_level is not None
+        if requested_model_id or request.thinking_level is not None or request.credential_name is not None
         else "session"
-        if persisted_model_id or persisted_thinking_level
+        if persisted_model_id or persisted_thinking_level or persisted_credential_name
         else "default"
     )
     logger.info(
-        "[agent-model] session=%s source=%s route=%s provider=%s model=%s thinking_level=%s",
+        "[agent-model] session=%s source=%s route=%s provider=%s model=%s thinking_level=%s credential_name=%s",
         request.session_id,
         selection_source,
         runtime_model_id or effective_llm.get("model_id") or "<default>",
         effective_llm.get("provider") or "<unknown>",
         effective_llm.get("model") or "<unknown>",
         runtime_thinking_level or "<none>",
+        runtime_credential_name or "default",
     )
     persisted_user_message = False
     session_metadata = {"runtime_mode": "agent"}
@@ -334,6 +342,7 @@ async def agent(request: AgentRequest):
             {
                 "llm_model_id": runtime_model_id,
                 "thinking_level": runtime_thinking_level,
+                "credential_name": runtime_credential_name,
             }
         )
     if request.goal_control_action is None:
@@ -371,6 +380,7 @@ async def agent(request: AgentRequest):
             analytics_model_id=request.analytics_model_id,
             llm_model_id=runtime_model_id,
             thinking_level=runtime_thinking_level,
+            credential_name=runtime_credential_name,
             user_id=request.user_id,
             attachments=request.attachments,
             skill_hints=request.skill_hints,
@@ -400,6 +410,7 @@ async def agent(request: AgentRequest):
         analytics_model_id=request.analytics_model_id,
         llm_model_id=runtime_model_id,
         thinking_level=runtime_thinking_level,
+        credential_name=runtime_credential_name,
         user_id=request.user_id,
         attachments=request.attachments,
         skill_hints=request.skill_hints,

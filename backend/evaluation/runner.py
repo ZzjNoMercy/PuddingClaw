@@ -276,6 +276,7 @@ class EvaluationRunner:
                         analytics_model_id=experiment.candidate.analytics_model_id,
                         llm_model_id=experiment.candidate.llm_model_id,
                         thinking_level=experiment.candidate.thinking_level,
+                        credential_name=experiment.candidate.credential_name,
                         user_id="evaluation_worker",
                         callbacks_override=callbacks,
                         evaluation_tool_allowlist=set(experiment.candidate.config.get("tool_allowlist") or []),

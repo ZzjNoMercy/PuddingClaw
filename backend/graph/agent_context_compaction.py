@@ -111,6 +111,7 @@ class AgentContextCompactionService:
         focus: str,
         model_id: str | None,
         thinking_level: str | None,
+        credential_name: str | None = None,
     ) -> tuple[str, str, list[Any], list[Any]]:
         cfg = config.get_deepagents_summarization_config()
         configured_model_id = str(cfg.get("model_id") or "").strip()
@@ -124,6 +125,7 @@ class AgentContextCompactionService:
             # a configured Flash model must not inherit a Session's Pro/high
             # selection through the thinking override.
             thinking_level=None,
+            **({"credential_name": credential_name} if credential_name and not configured_model_id else {}),
         )
         middleware = PuddingClawSummarizationMiddleware(
             model=model,
@@ -252,6 +254,7 @@ class AgentContextCompactionService:
                     focus=focus,
                     model_id=str(metadata.get("llm_model_id") or "") or None,
                     thinking_level=str(metadata.get("thinking_level") or "") or None,
+                    credential_name=str(metadata.get("credential_name") or "") or None,
                 )
             except AgentContextCompactionError:
                 raise

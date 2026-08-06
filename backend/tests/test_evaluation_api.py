@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 import api.evaluation as evaluation_api
 from evaluation.contracts import EvalCase, EvalExpectations, EvalInput
 from evaluation.repository import EvaluationRepository
+from evaluation.settings import LangSmithSettings
 
 
 def test_dataset_api_lifecycle_and_revision_conflict(tmp_path: Path, monkeypatch):
@@ -49,3 +50,36 @@ def test_dataset_api_lifecycle_and_revision_conflict(tmp_path: Path, monkeypatch
     )
     assert published.status_code == 200
     assert published.json()["dataset"]["current_version"] == 1
+
+
+def test_langsmith_connection_can_be_tested_before_projection_is_enabled(
+    tmp_path: Path, monkeypatch
+):
+    repository = EvaluationRepository(tmp_path / "evaluation.db")
+
+    class Store:
+        def load(self):
+            return LangSmithSettings(enabled=False, api_key="lsv2_test")
+
+    class Adapter:
+        def __init__(self, repository, settings):
+            assert settings.enabled is False
+            assert settings.api_key
+
+        def test_connection(self):
+            return {"ok": True, "dataset_access": True}
+
+    monkeypatch.setattr(evaluation_api, "get_evaluation_repository", lambda: repository)
+    monkeypatch.setattr(evaluation_api, "get_evaluation_settings_store", lambda: Store())
+    monkeypatch.setattr(evaluation_api, "LangSmithDatasetAdapter", Adapter)
+    app = FastAPI()
+    app.include_router(evaluation_api.router, prefix="/api")
+
+    response = TestClient(app).post("/api/evaluation/settings/langsmith/test")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": True,
+        "dataset_access": True,
+        "projection_enabled": False,
+    }

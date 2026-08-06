@@ -149,6 +149,7 @@ export default function ChatInput() {
     registerProject,
     llmModelId,
     thinkingLevel,
+    credentialName,
     setLlmSelection,
     analyticsModelId,
     setAnalyticsModelId,
@@ -343,7 +344,8 @@ export default function ChatInput() {
           const endpoint = provider.endpoints.find((item) => item.id === model.endpoint_id);
           return model.capability === "llm"
             && model.categories?.includes("llm")
-            && Boolean(endpoint?.credential_configured);
+            && Boolean(endpoint)
+            && provider.api_keys.some((credential) => credential.credential_configured);
         })
         .map((model) => ({ provider, model }))
     );
@@ -363,6 +365,11 @@ export default function ChatInput() {
   const effectiveThinkingLevel = thinkingLevel
     ?? selectedThinkingProfile?.default_level
     ?? null;
+  const selectedProviderCredentials = useMemo(
+    () => selectedConversationModel?.provider.api_keys.filter((item) => item.credential_configured) || [],
+    [selectedConversationModel],
+  );
+  const effectiveCredentialName = credentialName || "default";
 
   useEffect(() => {
     if (runtimeMode !== "agent") return;
@@ -1145,10 +1152,12 @@ export default function ChatInput() {
                     onClick={() => togglePopover("llm")}
                     aria-expanded={openPopover === "llm"}
                     className="flex h-full max-w-[15rem] items-center gap-1.5 px-3 text-[12px] text-gray-700 transition hover:bg-white/80 hover:text-gray-950"
-                    title={selectedConversationModel ? `${selectedConversationModel.provider.name} · ${selectedConversationModel.model.name}` : "选择对话模型"}
+                    title={selectedConversationModel ? `${selectedConversationModel.provider.name} · ${selectedConversationModel.model.name} · ${effectiveCredentialName}` : "选择对话模型"}
                   >
                     <span className="truncate">
-                      {selectedConversationModel?.model.name || "选择模型"}
+                      {selectedConversationModel
+                        ? `${selectedConversationModel.model.name}${credentialName && credentialName !== "default" ? ` · ${credentialName}` : ""}`
+                        : "选择模型"}
                     </span>
                     <ChevronDown className="h-3.5 w-3.5 shrink-0" />
                   </button>
@@ -1188,6 +1197,7 @@ export default function ChatInput() {
                             onClick={() => setLlmSelection(
                               model.id,
                               model.thinking_profile?.default_level ?? null,
+                              provider.id === selectedConversationModel?.provider.id ? credentialName : null,
                             )}
                             className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left transition ${selected ? "bg-[#002fa7]/[0.07] text-[#002fa7]" : "text-gray-700 hover:bg-black/[0.04]"}`}
                           >
@@ -1225,7 +1235,7 @@ export default function ChatInput() {
                                 <button
                                   key={level}
                                   type="button"
-                                  onClick={() => setLlmSelection(selectedConversationModel.model.id, level)}
+                                  onClick={() => setLlmSelection(selectedConversationModel.model.id, level, credentialName)}
                                   className={`rounded-lg px-3 py-1.5 text-[11px] font-medium transition ${effectiveThinkingLevel === level ? "bg-white text-[#002fa7] shadow-sm" : "text-gray-500 hover:text-gray-800"}`}
                                 >
                                   {thinkingLevelLabels[level]}
@@ -1237,6 +1247,28 @@ export default function ChatInput() {
                               {selectedThinkingProfile?.disabled_label || "默认"}
                             </span>
                           )}
+                        </div>
+                      </div>
+                    )}
+                    {selectedConversationModel && selectedProviderCredentials.length > 1 && (
+                      <div className="border-t border-black/[0.06] px-3 pb-2 pt-3">
+                        <p className="text-[12px] font-semibold text-gray-800">API Key</p>
+                        <p className="mt-0.5 text-[11px] text-gray-400">仅当前 Provider 有多个 Key 时显示；未选择使用 default。</p>
+                        <div className="mt-2 flex flex-wrap gap-2">
+                          {selectedProviderCredentials.map((credential) => (
+                            <button
+                              key={credential.name}
+                              type="button"
+                              onClick={() => setLlmSelection(
+                                selectedConversationModel.model.id,
+                                thinkingLevel,
+                                credential.is_default ? null : credential.name,
+                              )}
+                              className={`rounded-lg px-3 py-1.5 text-[11px] font-medium transition ${effectiveCredentialName === credential.name ? "bg-[#002fa7] text-white" : "bg-slate-100 text-gray-600 hover:text-gray-900"}`}
+                            >
+                              {credential.name}{credential.is_default ? " · 默认" : ""}
+                            </button>
+                          ))}
                         </div>
                       </div>
                     )}
