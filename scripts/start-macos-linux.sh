@@ -182,18 +182,23 @@ cd ..
 
 echo -e "${BLUE}[信息] 等待后端启动...${NC}"
 BACKEND_READY=false
-for i in $(seq 1 30); do
+BACKEND_STARTUP_TIMEOUT_SECONDS="${BACKEND_STARTUP_TIMEOUT_SECONDS:-90}"
+for i in $(seq 1 "$BACKEND_STARTUP_TIMEOUT_SECONDS"); do
     if curl -s "http://127.0.0.1:${BACKEND_PORT}/api/capabilities" >/dev/null 2>&1; then
         BACKEND_READY=true
         echo -e "${GREEN}[成功] 后端服务已就绪${NC}"
         break
     fi
-    echo -e "${BLUE}[信息] 等待后端就绪... ${i}/30${NC}"
+    if ! kill -0 "$BACKEND_PID" 2>/dev/null; then
+        echo -e "${RED}[错误] 后端进程已提前退出，请检查上方错误日志${NC}"
+        exit 1
+    fi
+    echo -e "${BLUE}[信息] 等待后端就绪... ${i}/${BACKEND_STARTUP_TIMEOUT_SECONDS}${NC}"
     sleep 1
 done
 
 if [ "$BACKEND_READY" = false ]; then
-    echo -e "${YELLOW}[警告] 后端服务未在 30 秒内就绪，继续启动前端...${NC}"
+    echo -e "${YELLOW}[警告] 后端服务未在 ${BACKEND_STARTUP_TIMEOUT_SECONDS} 秒内就绪，继续启动前端...${NC}"
 fi
 
 echo ""

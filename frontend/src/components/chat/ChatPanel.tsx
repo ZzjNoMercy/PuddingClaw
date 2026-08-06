@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useApp, type SourceRecord } from "@/lib/store";
 import { shouldShowInlineBudgetRequest } from "@/lib/goalControls";
 import ChatMessage from "./ChatMessage";
@@ -23,6 +23,43 @@ export default function ChatPanel() {
   const previousSessionIdRef = useRef(sessionId);
   const previousHistoryLoadingRef = useRef(sessionHistoryLoading);
   const hasMountedRef = useRef(false);
+  const isContextCompaction = Boolean(
+    maintenanceStatus && [
+      "manual_compaction",
+      "manual_compaction_done",
+      "global_summarization",
+      "global_summarization_done",
+    ].includes(maintenanceStatus.phase),
+  );
+  const [maintenanceClock, setMaintenanceClock] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!isContextCompaction || !maintenanceStatus?.startedAt) return;
+    setMaintenanceClock(Date.now());
+    if (maintenanceStatus.phase.endsWith("_done")) return;
+    const timer = window.setInterval(() => setMaintenanceClock(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [isContextCompaction, maintenanceStatus?.phase, maintenanceStatus?.startedAt]);
+
+  const maintenanceElapsedSeconds = maintenanceStatus?.startedAt
+    ? Math.max(0, Math.floor((maintenanceClock - maintenanceStatus.startedAt) / 1000))
+    : null;
+  const maintenanceElapsedLabel = maintenanceElapsedSeconds == null
+    ? ""
+    : maintenanceElapsedSeconds < 60
+      ? `已耗时 ${maintenanceElapsedSeconds} 秒`
+      : `已耗时 ${Math.floor(maintenanceElapsedSeconds / 60)} 分 ${maintenanceElapsedSeconds % 60} 秒`;
+  const contextTokenLabel = (
+    maintenanceStatus?.usedTokensBefore != null && maintenanceStatus?.triggerTokens != null
+  )
+    ? `${Math.round(maintenanceStatus.usedTokensBefore / 1000)}k / ${Math.round(maintenanceStatus.triggerTokens / 1000)}k`
+    : "";
+  const compactionDetail = isContextCompaction
+    ? [
+        maintenanceStatus?.phase.endsWith("_done") ? "" : contextTokenLabel,
+        maintenanceElapsedLabel,
+      ].filter(Boolean).join(" · ")
+    : "";
 
   useEffect(() => {
     const initialHistoryRender = !hasMountedRef.current;
@@ -121,18 +158,14 @@ export default function ChatPanel() {
               )}
               <span className="shrink-0 font-medium text-slate-800">
                 {maintenanceStatus
-                  ? maintenanceStatus.phase === "global_summarization"
-                    ? "正在进行全局上下文压缩"
+                  ? isContextCompaction && !maintenanceStatus.phase.endsWith("_done")
+                    ? "正在压缩上下文"
                     : maintenanceStatus.message
                   : runActivityStatus?.label || "Agent 正在处理"}
               </span>
-              {(runActivityStatus?.detail || maintenanceStatus?.phase === "global_summarization") ? (
+              {(runActivityStatus?.detail || compactionDetail) ? (
                 <span className="truncate text-slate-400">
-                  {runActivityStatus?.detail || (
-                    maintenanceStatus?.usedTokensBefore != null && maintenanceStatus?.triggerTokens != null
-                      ? `${Math.round(maintenanceStatus.usedTokensBefore / 1000)}k / ${Math.round(maintenanceStatus.triggerTokens / 1000)}k`
-                      : maintenanceStatus?.message
-                  )}
+                  {runActivityStatus?.detail || compactionDetail}
                 </span>
               ) : null}
             </div>

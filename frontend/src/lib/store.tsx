@@ -23,7 +23,7 @@ import {
   getSessionTraces as apiGetSessionTraces,
   getSessionHistory as apiGetSessionHistory,
   getCurrentSessionTodos as apiGetCurrentSessionTodos,
-  compressSession as apiCompressSession,
+  compactAgentSession as apiCompactAgentSession,
   clearSession as apiClearSession,
   getRagMode as apiGetRagMode,
   setRagMode as apiSetRagMode,
@@ -59,6 +59,7 @@ import {
   HarnessRun,
   RubricEvaluationReport,
   ApprovalMode,
+  AgentCompactResult,
 } from "./api";
 import { getSubagentActivityIdentity } from "./subagentActivity";
 import { goalRemainsVisible } from "./goalControls";
@@ -289,6 +290,7 @@ export interface ContextMaintenanceStatus {
   message: string;
   usedTokensBefore?: number;
   triggerTokens?: number;
+  startedAt?: number;
 }
 
 export interface RunActivityStatus {
@@ -445,7 +447,7 @@ interface AppState {
 
   // Compression
   isCompressing: boolean;
-  compressCurrentSession: () => Promise<void>;
+  compactCurrentAgentSession: (focus?: string) => Promise<AgentCompactResult>;
 
   // Clear
   clearCurrentSession: () => Promise<void>;
@@ -1961,6 +1963,25 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               updateSessionGraph(id, data.graph || null);
             }
             const loaded = data.messages?.length ? parseHistoryMessages(data.messages) : [];
+            const externalPending = data.headless_pending_input;
+            const externalRequests = externalPending?.status === "pending"
+              && Array.isArray(externalPending.requests)
+              ? externalPending.requests.filter((request) => request?.id)
+              : [];
+            if (externalRequests.length > 0) {
+              let target = [...loaded].reverse().find((message) => message.role === "assistant");
+              if (!target) {
+                target = {
+                  id: `headless-pending-${externalPending?.run_id || id}`,
+                  queryId: externalPending?.query_id || undefined,
+                  role: "assistant",
+                  content: "",
+                  timestamp: Number(externalPending?.updated_at || Date.now() / 1000) * 1000,
+                };
+                loaded.push(target);
+              }
+              target.permissionRequests = externalRequests;
+            }
             messagesMapRef.current[id] = loaded;
             // Only update UI if still viewing this session
             if (sessionIdRef.current === id) {
@@ -2166,29 +2187,56 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   // ── Compression ──────────────────────────────────────
 
-  const compressCurrentSession = useCallback(async () => {
-    if (isCompressing || streamingSessions.has(sessionId)) return;
+  const compactCurrentAgentSession = useCallback(async (focus = "") => {
+    if (runtimeMode !== "agent") {
+      throw new Error("/compact 只适用于 Agent Session。");
+    }
+    if (!sessionId || sessionId === "default") {
+      throw new Error("当前还没有可压缩的已完成 Agent Session。");
+    }
+    if (isCompressing || streamingSessions.has(sessionId)) {
+      throw new Error("当前 Session 正在运行或维护，请完成后再执行 /compact。");
+    }
     setIsCompressing(true);
+    const compactionStartedAt = Date.now();
+    setMaintenanceStatus({
+      phase: "manual_compaction",
+      message: "正在压缩上下文…",
+      usedTokensBefore: contextUsage.used,
+      triggerTokens: contextUsage.total,
+      startedAt: compactionStartedAt,
+    });
     try {
-      await apiCompressSession(sessionId);
-      loadRawMessages();
-      const data = await apiGetSessionHistory(sessionId);
-      if (data.messages && data.messages.length > 0) {
-        const loaded = parseHistoryMessages(data.messages);
-        messagesMapRef.current[sessionId] = loaded;
-        if (sessionIdRef.current === sessionId) {
-          setMessages(loaded);
-        }
-      } else {
-        messagesMapRef.current[sessionId] = [];
-        if (sessionIdRef.current === sessionId) {
-          setMessages([]);
-        }
+      const result = await apiCompactAgentSession(sessionId, focus.trim());
+      if (sessionIdRef.current === sessionId) {
+        const total = contextUsage.total;
+        setContextUsage({
+          used: result.tokens_after,
+          total,
+          percentage: total > 0 ? Math.min(100, result.tokens_after / total * 100) : 0,
+          measured: true,
+        });
+        setMaintenanceStatus({
+          phase: "manual_compaction_done",
+          message: `Agent 上下文已压缩：${result.tokens_before.toLocaleString()} → ${result.tokens_after.toLocaleString()} tokens（减少 ${result.reduction_percentage}%）。`,
+          startedAt: compactionStartedAt,
+        });
+        window.setTimeout(() => {
+          if (sessionIdRef.current === sessionId) {
+            setMaintenanceStatus((current) =>
+              current?.phase === "manual_compaction_done" ? null : current,
+            );
+          }
+        }, 5000);
       }
+      return result;
+    } catch (error) {
+      if (sessionIdRef.current === sessionId) setMaintenanceStatus(null);
+      throw error;
     } finally {
       setIsCompressing(false);
     }
-  }, [isCompressing, sessionId, loadRawMessages]);
+  }, [contextUsage.total, contextUsage.used, isCompressing, runtimeMode, sessionId, streamingSessions]);
 
   // ── RAG mode ────────────────────────────────────────
 
@@ -2851,6 +2899,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               used_tokens_before?: number;
               trigger_tokens?: number;
             };
+            const isSummarizationPhase = [
+              "global_summarization",
+              "deepagents_summarization",
+            ].includes(payload.phase || "");
             if (payload.status === "start") {
               if (
                 payload.phase === "global_summarization" &&
@@ -2867,18 +2919,27 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                   measured: true,
                 });
               }
-              setMaintenanceStatus({
-                phase: payload.phase || "context",
-                message: payload.message || "正在维护上下文...",
-                usedTokensBefore: payload.used_tokens_before,
-                triggerTokens: payload.trigger_tokens,
-              });
+              setMaintenanceStatus((current) => ({
+                phase: isSummarizationPhase
+                  ? "global_summarization"
+                  : payload.phase || "context",
+                message: isSummarizationPhase
+                  ? "正在压缩上下文…"
+                  : payload.message || "正在维护上下文...",
+                usedTokensBefore: payload.used_tokens_before ?? current?.usedTokensBefore,
+                triggerTokens: payload.trigger_tokens ?? current?.triggerTokens,
+                startedAt: isSummarizationPhase
+                  ? current?.phase === "global_summarization"
+                    ? current.startedAt
+                    : Date.now()
+                  : undefined,
+              }));
               updateSessionRunActivity(sendSessionId, {
                 phase: "running",
-                label: payload.phase === "global_summarization"
-                  ? "正在进行全局上下文压缩"
+                label: isSummarizationPhase
+                  ? "正在压缩上下文"
                   : "正在优化工具上下文",
-                detail: payload.message,
+                detail: isSummarizationPhase ? undefined : payload.message,
               });
               const jobId = String(event.data.job_id || "");
               const maintenanceSessionId = String(event.data.session_id || sendSessionId);
@@ -2943,6 +3004,25 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                   }
                 })();
               }
+            } else if (
+              payload.status === "done" &&
+              ["global_summarization_done", "deepagents_summarization"].includes(
+                payload.phase || "",
+              )
+            ) {
+              setMaintenanceStatus((current) => ({
+                phase: "global_summarization_done",
+                message: payload.message || "上下文压缩完成，Harness 状态已保留。",
+                startedAt: current?.startedAt,
+              }));
+              updateSessionRunActivity(sendSessionId, null);
+              window.setTimeout(() => {
+                if (sessionIdRef.current === sendSessionId) {
+                  setMaintenanceStatus((current) =>
+                    current?.phase === "global_summarization_done" ? null : current,
+                  );
+                }
+              }, 3000);
             } else {
               setMaintenanceStatus(null);
               refreshActivityAfterTool();
@@ -4279,7 +4359,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         inspectorWidth,
         setInspectorWidth,
         isCompressing,
-        compressCurrentSession,
+        compactCurrentAgentSession,
         clearCurrentSession,
         ragMode,
         toggleRagMode,

@@ -2,19 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 import time
 import uuid
 from collections.abc import AsyncIterator
-from typing import Any, Literal
+from typing import Any, Literal, NoReturn
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, model_validator
 from sse_starlette.sse import EventSourceResponse
 
 from config import get_fallback_llm_config
+from graph.agent_context_compaction import (
+    AgentContextCompactionError,
+    agent_context_compaction_service,
+)
 from graph.deepagents_manager import deepagents_agent_manager
 from graph.session_manager import session_manager
 
@@ -23,6 +28,7 @@ logger = logging.getLogger(__name__)
 # Agent TTFT is an operational metric. Keep it visible even when the process
 # root logger intentionally filters ordinary application INFO messages.
 logger.setLevel(logging.INFO)
+_agent_compaction_tasks: dict[str, asyncio.Task[None]] = {}
 
 
 def _parse_event_payload(event: dict[str, str]) -> dict[str, Any]:
@@ -167,6 +173,99 @@ class AgentRequest(BaseModel):
         return self
 
 
+class AgentCompactRequest(BaseModel):
+    """Optional user emphasis for an Agent-only manual compaction."""
+
+    focus: str = Field(default="", max_length=1000)
+
+
+def _raise_compaction_http_error(exc: AgentContextCompactionError) -> NoReturn:
+    raise HTTPException(
+        status_code=exc.status_code,
+        detail={"code": exc.code, "message": str(exc)},
+    ) from exc
+
+
+async def _run_agent_compaction(
+    session_id: str,
+    *,
+    operation_id: str,
+    focus: str,
+    claim: dict[str, Any],
+) -> None:
+    try:
+        await agent_context_compaction_service.compact(
+            session_id,
+            focus=focus,
+            operation_id=operation_id,
+            claim=claim,
+        )
+    except AgentContextCompactionError as exc:
+        logger.warning(
+            "Agent context compaction ended with status=%s session=%s operation=%s error=%s",
+            exc.code,
+            session_id,
+            operation_id,
+            exc,
+        )
+    except Exception:
+        logger.exception(
+            "Unexpected Agent context compaction failure session=%s operation=%s",
+            session_id,
+            operation_id,
+        )
+    finally:
+        _agent_compaction_tasks.pop(operation_id, None)
+
+
+@router.post("/agent/sessions/{session_id}/compact", status_code=202)
+async def compact_agent_session(
+    session_id: str,
+    request: AgentCompactRequest,
+) -> dict[str, Any]:
+    """Claim background compaction and return before any Provider call."""
+
+    try:
+        operation_id, claim = agent_context_compaction_service.begin(
+            session_id,
+            focus=request.focus,
+        )
+    except AgentContextCompactionError as exc:
+        _raise_compaction_http_error(exc)
+    try:
+        task = asyncio.create_task(
+            _run_agent_compaction(
+                session_id,
+                operation_id=operation_id,
+                focus=request.focus,
+                claim=claim,
+            ),
+            name=f"agent-context-{operation_id}",
+        )
+    except Exception as exc:
+        session_manager.fail_agent_context_compaction(
+            session_id,
+            operation_id=operation_id,
+            error=f"Failed to launch compaction task: {type(exc).__name__}: {exc}",
+        )
+        raise HTTPException(status_code=500, detail="Failed to launch compaction task") from exc
+    _agent_compaction_tasks[operation_id] = task
+    return agent_context_compaction_service.result_payload(session_id, claim)
+
+
+@router.get("/agent/sessions/{session_id}/compact/{operation_id}")
+async def agent_compaction_status(session_id: str, operation_id: str) -> dict[str, Any]:
+    """Poll durable compaction state after the short start request returns."""
+
+    try:
+        return agent_context_compaction_service.status(
+            session_id,
+            operation_id=operation_id,
+        )
+    except AgentContextCompactionError as exc:
+        _raise_compaction_http_error(exc)
+
+
 @router.post("/agent")
 async def agent(request: AgentRequest):
     request_started_at = time.perf_counter()
@@ -237,7 +336,7 @@ async def agent(request: AgentRequest):
                 "thinking_level": runtime_thinking_level,
             }
         )
-    if request.stream and request.goal_control_action is None:
+    if request.goal_control_action is None:
         try:
             session_manager.update_metadata(request.session_id, session_metadata)
             session_manager.save_message(
@@ -252,6 +351,8 @@ async def agent(request: AgentRequest):
             )
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="Session not found") from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         persisted_user_message = True
     elif request.goal_control_action is not None:
         # Product controls are audited by the Run/Goal ledger. They are not
@@ -302,7 +403,7 @@ async def agent(request: AgentRequest):
         user_id=request.user_id,
         attachments=request.attachments,
         skill_hints=request.skill_hints,
-        user_message_already_persisted=request.goal_control_action is not None,
+        user_message_already_persisted=persisted_user_message,
         goal_mode=request.goal_mode,
         goal_id=request.goal_id,
         context_goal_id=request.context_goal_id,

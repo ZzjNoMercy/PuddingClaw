@@ -503,6 +503,13 @@ class ShellPolicyAnalyzer:
         for segment in segments:
             for token in segment:
                 for raw_path in cls._absolute_path_fragments(token):
+                    # File-descriptor sinks such as ``2>/dev/null`` do not
+                    # expose host data or grant access to a host directory.
+                    # Treating them as external paths makes an otherwise
+                    # sandboxed Python/Node script request directory HITL
+                    # before SMART-mode execution policy can approve it.
+                    if raw_path in _NON_MATERIAL_REDIRECT_SINKS:
+                        continue
                     classified = classify_path_authority(
                         raw_path,
                         workspace_root=workspace_path,

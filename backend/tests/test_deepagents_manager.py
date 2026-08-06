@@ -2887,6 +2887,108 @@ def test_permission_resume_helper_continues_after_decision(tmp_path):
     assert isinstance(agent.inputs[-1], Command)
 
 
+def test_external_headless_mode_waits_for_permission_but_fail_closes_business_hitl(tmp_path):
+    """External consumers approve permissions; business HITL remains unattended."""
+
+    import asyncio
+
+    from langgraph.types import Command, Interrupt
+
+    from graph.database_sql_revision_resume import database_sql_revision_resume_registry
+    from graph.deepagents_manager import DeepAgentsAgentManager
+    from graph.permission_resume import permission_resume_registry
+    from graph.trace_collector import TraceCollector
+
+    permission = {
+        "id": "external-permission",
+        "type": "network_access",
+        "session_id": "external-session",
+        "query_id": "external-query",
+        "tool_call_id": "call-permission",
+    }
+    revision = {
+        "id": "external-sql-revision",
+        "type": "database_sql_revision",
+        "session_id": "external-session",
+        "query_id": "external-query",
+        "tool_call_id": "call-revision",
+    }
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self.inputs = []
+
+        async def astream(self, graph_input, **_kwargs):
+            self.inputs.append(graph_input)
+            if len(self.inputs) == 1:
+                yield {
+                    "__interrupt__": (
+                        Interrupt(
+                            value={"type": "permission_request", "request": permission},
+                            id="external-permission-interrupt",
+                        ),
+                        Interrupt(
+                            value={"type": "database_sql_revision_request", "request": revision},
+                            id="external-revision-interrupt",
+                        ),
+                    )
+                }
+                return
+            yield ("messages", ("resumed", {"langgraph_node": "model"}))
+
+    runtime = DeepAgentsAgentManager()
+    runtime.initialize(tmp_path)
+    agent = FakeAgent()
+
+    async def run():
+        permission_resume_registry._pending[permission["id"]] = (
+            asyncio.get_running_loop().create_future()
+        )
+        permission_resume_registry._requests[permission["id"]] = {
+            **permission,
+            "status": "pending",
+        }
+        database_sql_revision_resume_registry._pending[revision["id"]] = (
+            asyncio.get_running_loop().create_future()
+        )
+        database_sql_revision_resume_registry._requests[revision["id"]] = {
+            **revision,
+            "status": "pending",
+        }
+        with TraceCollector(session_id="external-session", query_id="external-query") as trace:
+            events = []
+            async for item in runtime._astream_with_hitl_resume(
+                agent,
+                {"messages": []},
+                stream_mode=["messages", "updates", "custom", "values"],
+                config={"configurable": {"thread_id": "external-session"}},
+                context={
+                    "session_id": "external-session",
+                    "query_id": "external-query",
+                    "interaction_mode": "external",
+                },
+                trace_collector=trace,
+            ):
+                events.append(item)
+                if isinstance(item, dict) and item.get("event") == "permission_required":
+                    permission_resume_registry.resolve(permission["id"], {"type": "approve"})
+            return events
+
+    events = asyncio.run(run())
+
+    assert [event.get("event") for event in events if isinstance(event, dict)] == [
+        "permission_required",
+        "database_sql_revision_required",
+        "permission_resolved",
+        "database_sql_revision_resolved",
+    ]
+    assert isinstance(agent.inputs[-1], Command)
+    assert agent.inputs[-1].resume == {
+        "external-permission-interrupt": {"decisions": [{"type": "approve"}]},
+        "external-revision-interrupt": {"action": "reject"},
+    }
+
+
 def test_checkpoint_thread_survives_hitl_wait_and_is_deleted_after_resume(tmp_path, monkeypatch):
     """The active HITL thread must live through the pause, then be released at Run end."""
 
@@ -4872,6 +4974,46 @@ def test_deepagents_summarization_uses_agent_only_configured_policy(monkeypatch)
     assert middleware._lc_helper.trigger == ("tokens", 500000)
     assert middleware._lc_helper.keep == ("messages", 20)
     assert middleware._lc_helper.trim_tokens_to_summarize == 400000
+
+
+def test_deepagents_summarization_uses_dedicated_non_thinking_model(monkeypatch):
+    from deepagents.backends import StateBackend
+
+    from graph import deepagents_manager as manager_module
+    from llm.model_client import ModelClientChatModel
+
+    fallback_model = ModelClientChatModel()
+    captured: dict[str, object] = {}
+
+    def build_summary_model(**kwargs):
+        captured.update(kwargs)
+        return fallback_model
+
+    monkeypatch.setattr(
+        manager_module.config,
+        "get_deepagents_summarization_config",
+        lambda: {
+            "enabled": True,
+            "model_id": "deepseek:deepseek-openai:deepseek-v4-flash:llm",
+            "trigger_tokens": 160000,
+            "keep_messages": 20,
+            "summary_input_tokens": 800000,
+        },
+    )
+    monkeypatch.setattr(manager_module, "ModelClientChatModel", build_summary_model)
+
+    middleware = manager_module._build_deepagents_summarization(
+        fallback_model,
+        StateBackend(),
+    )
+
+    assert middleware is not None
+    assert captured == {
+        "role": "summary",
+        "streaming": False,
+        "thinking_enabled": False,
+        "model_id_override": "deepseek:deepseek-openai:deepseek-v4-flash:llm",
+    }
 
 
 def test_deepagents_manager_extracts_reasoning_from_thinking_blocks(tmp_path, monkeypatch):

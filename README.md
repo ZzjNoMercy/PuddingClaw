@@ -419,6 +419,8 @@ PuddingClaw/
 
 ## 架构与数据边界
 
+发布和集成前建议先阅读 [Session 与上下文架构](docs/session-and-context-architecture.md)。它说明 Session JSON、AgentState、Model Input 与 Trace 的边界，以及 Goal、Run、Todo、权限、Skill、Evidence、Artifact、Prompt Cache 和 compact 的权威关系。
+
 | 层 | 当前职责 |
 | --- | --- |
 | Next.js / Electron | 对话、知识库、智能问数、设置、Trace 与桌面集成 |

@@ -342,6 +342,9 @@ async def get_session_history(session_id: str):
         result["todo_ledger_revision"] = data["todo_ledger_revision"]
     if "graph" in data:
         result["graph"] = data["graph"]
+    pending_input = data.get("headless_pending_input")
+    if isinstance(pending_input, dict):
+        result["headless_pending_input"] = pending_input
     return result
 
 

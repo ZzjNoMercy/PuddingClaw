@@ -96,16 +96,18 @@ def test_raw_snapshot_is_immutable_and_context_is_bounded(wiki_env: LlmWikiServi
     assert wiki_env.operation_context("ingest")["raw_files"] == {}
 
 
-def test_llm_wiki_skill_falls_back_to_markdown_after_irrelevant_gbrain_results() -> None:
+def test_llm_wiki_skill_uses_markdown_first_and_gbrain_conditionally() -> None:
     skill = (Path(__file__).resolve().parent.parent / "skills" / "llm-wiki" / "SKILL.md").read_text(
         encoding="utf-8"
     )
     normalized = " ".join(skill.split())
 
     assert "published Markdown LLM Wiki as the complete source of truth" in normalized
-    assert "does not directly match the entity/topic asked by the user" in normalized
-    assert "call `llm_wiki_query` before" in normalized
-    assert "when gbrain already returns a direct, relevant answer" in normalized
+    assert '`llm_wiki_context(operation="query")`' in normalized
+    assert "always call `llm_wiki_query`" in normalized
+    assert "Do not query gbrain by default" in normalized
+    assert "entity relations, graph traversal, or structured filtering" in normalized
+    assert "never replaces or skips the Markdown Wiki query" in normalized
 
 
 def test_markdown_file_snapshot_preserves_final_bytes_and_detects_changes(

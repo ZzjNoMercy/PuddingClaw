@@ -153,6 +153,7 @@ export interface CompressionSettings {
   deepagents?: {
     summarization?: {
       enabled?: boolean;
+      model_id?: string;
       trigger_tokens?: number;
       keep_messages?: number;
     };
@@ -167,6 +168,13 @@ export interface CompressionSettings {
 }
 
 export interface HarnessSettings {
+  prompt_cache?: {
+    trace_part_diagnostics?: boolean;
+    ordered_system_sections?: boolean;
+    tail_routing_message?: boolean;
+    deterministic_session_projection?: boolean;
+    stable_tool_schema?: boolean;
+  };
   model_call_limit: {
     enabled: boolean;
     run_limit: number | null;

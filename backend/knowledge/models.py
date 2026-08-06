@@ -181,6 +181,22 @@ class AnalyticsQueryResult(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class WorkerAccessLog(Base):
+    """Audit record for an authenticated Headless Worker Run request."""
+
+    __tablename__ = "worker_access_logs"
+    __table_args__ = (
+        Index("ix_worker_access_logs_created", "created_at"),
+        Index("ix_worker_access_logs_key_name", "key_name"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: new_id("wal"))
+    key_id: Mapped[str] = mapped_column(String(120), nullable=False)
+    key_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    query: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
 class KnowledgeImportJob(Base):
     __tablename__ = "knowledge_import_jobs"
     __table_args__ = (

@@ -1,5 +1,16 @@
-"""GET/POST /api/tokens — Token counting for sessions and files."""
+"""GET/POST /api/tokens — Token counting for sessions and files.
 
+Token counting must never make backend startup depend on the network.  The
+``cl100k_base`` vocabulary is loaded only when its verified tiktoken cache file
+already exists; otherwise the API uses a local approximation.
+"""
+
+import hashlib
+import logging
+import os
+import tempfile
+import threading
+from math import ceil
 from pathlib import Path
 from typing import Any, Literal
 
@@ -17,32 +28,84 @@ from graph.prompt_builder import build_system_prompt
 from graph.session_manager import session_manager
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Cache the encoder instance with a fallback for offline / slow networks.
-try:
-    _encoder = tiktoken.get_encoding("cl100k_base")
-except Exception as _tiktoken_exc:  # pragma: no cover - offline fallback
-    import warnings
+_CL100K_BLOB_URL = (
+    "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken"
+)
+_CL100K_SHA256 = "223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7"
+_CL100K_CACHE_KEY = hashlib.sha1(_CL100K_BLOB_URL.encode()).hexdigest()
+_encoder: Any | None = None
+_encoder_lock = threading.Lock()
+_fallback_logged = False
 
-    warnings.warn(
-        f"Failed to load tiktoken cl100k_base ({_tiktoken_exc}); "
-        "using rough character-based token estimate."
-    )
 
-    class _FallbackEncoder:
-        """Rough token estimator when tiktoken encodings cannot be downloaded."""
+def _tiktoken_cache_path() -> Path | None:
+    """Return the cache path used internally by tiktoken, if caching is enabled."""
+    if "TIKTOKEN_CACHE_DIR" in os.environ:
+        cache_dir = os.environ["TIKTOKEN_CACHE_DIR"]
+    elif "DATA_GYM_CACHE_DIR" in os.environ:
+        cache_dir = os.environ["DATA_GYM_CACHE_DIR"]
+    else:
+        cache_dir = str(Path(tempfile.gettempdir()) / "data-gym-cache")
+    if not cache_dir:
+        return None
+    return Path(cache_dir) / _CL100K_CACHE_KEY
 
-        def encode(self, text: str) -> list[int]:
-            return [0] * max(1, len(text) // 4)
 
-    _encoder = _FallbackEncoder()
+def _has_verified_tiktoken_cache() -> bool:
+    """Check the local vocabulary before calling tiktoken's network-capable loader."""
+    cache_path = _tiktoken_cache_path()
+    if cache_path is None or not cache_path.is_file():
+        return False
+    try:
+        return hashlib.sha256(cache_path.read_bytes()).hexdigest() == _CL100K_SHA256
+    except OSError:
+        return False
+
+
+def _get_cached_encoder() -> Any | None:
+    """Load cl100k_base only from a verified local cache; never download it here."""
+    global _encoder, _fallback_logged
+    if _encoder is not None:
+        return _encoder
+    if not _has_verified_tiktoken_cache():
+        if not _fallback_logged:
+            logger.warning(
+                "cl100k_base cache is unavailable; using local token estimate "
+                "without blocking backend startup"
+            )
+            _fallback_logged = True
+        return None
+    with _encoder_lock:
+        if _encoder is None:
+            try:
+                # The verified cache guarantees this call will not fetch the BPE
+                # vocabulary over the network.
+                _encoder = tiktoken.get_encoding("cl100k_base")
+            except Exception:
+                logger.exception("Failed to load verified cl100k_base cache")
+                return None
+    return _encoder
+
+
+def _estimate_tokens(text: str) -> int:
+    """Reasonable offline estimate for mixed Latin and CJK content."""
+    if not text:
+        return 0
+    ascii_count = sum(1 for char in text if ord(char) < 128)
+    non_ascii_count = len(text) - ascii_count
+    return max(1, ceil(ascii_count / 4 + non_ascii_count * 1.2))
 
 
 def _count_tokens(text: str) -> int:
-    """Count tokens using cl100k_base encoding (or a rough fallback)."""
-    return len(_encoder.encode(text))
+    """Count tokens from the local cl100k cache or use an offline estimate."""
+    encoder = _get_cached_encoder()
+    if encoder is None:
+        return _estimate_tokens(text)
+    return len(encoder.encode(text))
 
 
 @router.get("/tokens/session/{session_id}")

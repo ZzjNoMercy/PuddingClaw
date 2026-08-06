@@ -68,6 +68,7 @@ class TestContextEngineeringConfig:
         agent_summary = _DEFAULT_CONFIG["compression"]["deepagents"]["summarization"]
         chat_middleware = _DEFAULT_CONFIG["compression"]["middleware"]
 
+        assert agent_summary["model_id"] == ""
         assert agent_summary["trigger_tokens"] == 160000
         assert "summary_input_tokens" not in agent_summary
         assert agent_summary["keep_messages"] == 20
@@ -86,6 +87,7 @@ class TestContextEngineeringConfig:
                     "compression": {
                         "deepagents": {
                             "summarization": {
+                                "model_id": "provider:endpoint:flash:llm",
                                 "trigger_tokens": 120000,
                                 "summary_input_tokens": 1,
                             }
@@ -100,13 +102,26 @@ class TestContextEngineeringConfig:
         runtime = config.get_deepagents_summarization_config()
         displayed = config.get_settings_for_display()
         assert runtime["trigger_tokens"] == 120000
+        assert runtime["model_id"] == "provider:endpoint:flash:llm"
         assert runtime["summary_input_tokens"] == 400000
         assert "summary_input_tokens" not in displayed["compression"]["deepagents"]["summarization"]
 
         config.update_settings(
-            {"compression": {"deepagents": {"summarization": {"trigger_tokens": 130000}}}}
+            {
+                "compression": {
+                    "deepagents": {
+                        "summarization": {
+                            "model_id": "provider:endpoint:flash-2:llm",
+                            "trigger_tokens": 130000,
+                        }
+                    }
+                }
+            }
         )
         saved = json.loads(config_path.read_text(encoding="utf-8"))
+        assert saved["compression"]["deepagents"]["summarization"]["model_id"] == (
+            "provider:endpoint:flash-2:llm"
+        )
         assert saved["compression"]["deepagents"]["summarization"]["trigger_tokens"] == 130000
         assert "summary_input_tokens" not in saved["compression"]["deepagents"]["summarization"]
 

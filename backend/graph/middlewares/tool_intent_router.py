@@ -114,11 +114,16 @@ _DEFAULT_INTENT_REGISTRY: dict[str, dict[str, Any]] = {
             "白皮书", "报告", "图片", "架构图", "检索", "查找", "查询",
             "rag", "knowledge",
         ],
-        "preferred_tools": ["llamaindex_knowledge_query"],
+        "preferred_tools": ["llm_wiki_query"],
         "tool_categories": ["knowledge"],
         "routing_prompt": (
-            "用户意图为本地知识库 RAG 检索。PDF、Markdown、图文混排和图片命中优先使用 "
-            "llamaindex_knowledge_query。不要用 pandas_knowledge_query 处理 PDF/Markdown。"
+            "用户意图为本地知识查询。先读取 /skills/llm-wiki/SKILL.md，并按其 Query 协议调用 "
+            "llm_wiki_context(operation='query') 和 llm_wiki_query。不要默认并行调用 "
+            "llamaindex_knowledge_query；仅在 Wiki 无直接命中或覆盖不足、用户要求原始证据或具体 "
+            "PDF/Markdown/图片/图表、可能涉及尚未编译的新资料，或明确要求全面检索时，才读取 "
+            "/skills/knowledge-search/SKILL.md 并用 llamaindex_knowledge_query 补充。GBrain 只用于有价值的"
+            "实体关系、图谱遍历或结构化筛选，不得替代 Markdown Wiki。不要用 pandas_knowledge_query "
+            "处理 PDF/Markdown。"
         ),
     },
     "web_search": {

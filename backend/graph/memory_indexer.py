@@ -96,6 +96,28 @@ class MemoryIndexer:
             print(f"⚠️ Memory index build error: {e}")               # 打印错误
             self._index = None                                       # 索引置空
 
+    def initialize_index(self) -> None:
+        """Load an unchanged persisted index; rebuild only when it is stale.
+
+        Startup previously called :meth:`rebuild_index` unconditionally,
+        which made every backend restart call the remote Embedding API even
+        when ``MEMORY.md`` had not changed.  The stored content hash is the
+        authority for deciding whether the persisted index can be reused.
+        """
+        current_hash = self._get_file_hash()
+        if not current_hash:
+            self._index = None
+            print("⚠️ memory/MEMORY.md not found or empty, skipping index build")
+            return
+
+        if current_hash == self._get_stored_hash():
+            persisted_index = self._load_index()
+            if persisted_index is not None:
+                print("✅ Memory index loaded from persisted storage")
+                return
+
+        self.rebuild_index()
+
     # ── 索引加载 ─────────────────────────────────────────────────────────────────
 
     def _load_index(self) -> Any:

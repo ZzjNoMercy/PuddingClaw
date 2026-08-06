@@ -4,16 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import ipaddress
 import json
+import logging
 import os
+import secrets
 import threading
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Header, HTTPException, Request, status
+from fastapi import APIRouter, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -22,6 +27,7 @@ from analytics.models.router import AnalyticsModelRoute, AnalyticsModelRouter
 from cli_runtime import current_cli_runtime_status
 from graph.deepagents_manager import deepagents_agent_manager
 from graph.headless_resolver import headless_authority_from_environment
+from graph.permission_resume import permission_resume_registry
 from graph.session_manager import session_manager
 from headless_session_lifecycle import (
     TERMINAL_RUN_STATUSES,
@@ -33,8 +39,9 @@ from headless_session_lifecycle import (
 )
 from llm.model_client import ModelClientChatModel
 from projects.registry import project_registry
-from worker_access import WorkerAccessError, worker_access_store
+from worker_access import WorkerAccessError, worker_access_log_store, worker_access_store
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/headless", tags=["headless-worker"])
 worker_access_router = APIRouter(tags=["worker-access-keys"])
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -44,6 +51,9 @@ _active_headless_sessions: set[str] = set()
 _active_headless_sessions_lock = threading.RLock()
 _headless_cleanup_lock = threading.Lock()
 _last_headless_cleanup_monotonic = 0.0
+_BEIJING_TIMEZONE = ZoneInfo("Asia/Shanghai")
+_headless_executions: dict[str, _HeadlessExecution] = {}
+_headless_executions_lock = threading.RLock()
 
 
 def _claim_headless_session(session_id: str) -> bool:
@@ -105,6 +115,229 @@ class HeadlessRunRequest(BaseModel):
         if not self.message.strip():
             raise ValueError("message must not be empty")
         return self
+
+
+class HeadlessResumeDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str = Field(min_length=1, max_length=200)
+    decision: str = Field(pattern="^(approve|reject)$")
+    scope: str = Field(default="once", pattern="^(once|session)$")
+    message: str | None = Field(default=None, max_length=2_000)
+
+
+class HeadlessResumeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    continuation_token: str = Field(min_length=20, max_length=500)
+    decisions: list[HeadlessResumeDecision] = Field(min_length=1, max_length=50)
+
+
+class _HeadlessExecution:
+    """One live Headless stream suspended on the normal HITL registries.
+
+    The Agent task, LangGraph checkpoint thread and Run remain the same while
+    the synchronous HTTP caller is released.  The consumer later resolves the
+    pending request and waits for the next externally observable boundary.
+    """
+
+    def __init__(
+        self,
+        *,
+        stream: Any,
+        session_id: str,
+        project_id: str,
+        approval_mode: str,
+        analytics_model_id: str,
+        analytics_model_match: dict[str, Any],
+        worker_key_id: str,
+    ) -> None:
+        self.stream = stream
+        self.session_id = session_id
+        self.project_id = project_id
+        self.approval_mode = approval_mode
+        self.analytics_model_id = analytics_model_id
+        self.analytics_model_match = dict(analytics_model_match)
+        self.worker_key_id = worker_key_id
+        self.token = secrets.token_urlsafe(32)
+        self.run_id = ""
+        self.query_id = ""
+        self.final_content = ""
+        self.final_response = ""
+        self.outcome: dict[str, Any] = {}
+        self.verification: dict[str, Any] = {"status": "not_required", "summary": ""}
+        self.pending_inputs: dict[str, dict[str, Any]] = {}
+        self.terminal_needs_input: dict[str, Any] | None = None
+        self.revision = 0
+        self.done = False
+        self.error: BaseException | None = None
+        self.updated = asyncio.Condition()
+        self.task: asyncio.Task[None] | None = None
+
+    def start(self) -> None:
+        self.task = asyncio.create_task(self._consume())
+
+    async def _signal(self) -> None:
+        async with self.updated:
+            self.revision += 1
+            self.updated.notify_all()
+
+    async def _consume(self) -> None:
+        try:
+            async for event in self.stream:
+                name = str(event.get("event") or "")
+                try:
+                    payload = json.loads(event.get("data") or "{}")
+                except (TypeError, ValueError):
+                    payload = {}
+                if not isinstance(payload, dict):
+                    payload = {}
+                self.run_id = str(payload.get("run_id") or self.run_id)
+                self.query_id = str(payload.get("query_id") or self.query_id)
+                if name == "run_outcome":
+                    self.outcome = payload
+                elif name == "verification_report":
+                    report = payload.get("report") if isinstance(payload.get("report"), dict) else {}
+                    self.verification = {
+                        "status": report.get("status") or "not_required",
+                        "summary": report.get("explanation") or "",
+                    }
+                elif name == "final_response":
+                    self.final_response = str(payload.get("final_response") or "")
+                elif name == "done":
+                    self.final_content = str(payload.get("content") or "")
+                    self.final_response = str(payload.get("final_response") or self.final_response)
+                elif name == "permission_required":
+                    pending = _needs_input(name, payload)
+                    if pending is not None and pending.get("request_id"):
+                        self.pending_inputs[str(pending["request_id"])] = pending
+                        self._persist_pending_state("pending")
+                        await self._signal()
+                elif name.endswith("_required"):
+                    # External Headless continuation is deliberately limited
+                    # to permissions. The graph auto-resolves other business
+                    # HITL fail-closed, but retain its structured explanation
+                    # on the eventual terminal response.
+                    self.terminal_needs_input = _needs_input(name, payload) or self.terminal_needs_input
+                elif name.endswith("_resolved"):
+                    request_id = str(payload.get("request_id") or "")
+                    if request_id:
+                        self.pending_inputs.pop(request_id, None)
+                        self._persist_pending_state("resumed")
+        except BaseException as exc:
+            self.error = exc
+        finally:
+            try:
+                await self.stream.aclose()
+            except Exception:
+                pass
+            self.stream = None
+            self.done = True
+            self._persist_pending_state("completed" if self.error is None else "failed")
+            await self._signal()
+
+    def _persist_pending_state(self, status_value: str) -> None:
+        payload = {
+            "status": status_value,
+            "run_id": self.run_id or None,
+            "query_id": self.query_id or None,
+            "request_ids": list(self.pending_inputs),
+            "requests": [
+                {
+                    **{
+                        "id": request.get("request_id"),
+                        "type": request.get("permission_type") or "permission",
+                        "session_id": self.session_id,
+                        "query_id": self.query_id or None,
+                        "status": "pending",
+                        "approval_source": "headless_consumer",
+                    },
+                    **{
+                        key: request.get(key)
+                        for key in (
+                            "tool_name",
+                            "command",
+                            "path",
+                            "paths",
+                            "risk",
+                            "reason",
+                            "options",
+                        )
+                        if request.get(key) is not None
+                    },
+                }
+                for request in self.pending_inputs.values()
+            ],
+            "updated_at": time.time(),
+        }
+        try:
+            session_manager.update_metadata(self.session_id, {"headless_pending_input": payload})
+        except Exception:
+            logger.debug(
+                "Failed to persist Headless pending-input state for session=%s",
+                self.session_id,
+                exc_info=True,
+            )
+
+    async def wait_for_boundary(self, *, after_revision: int = -1) -> None:
+        timeout_s = max(1.0, float(os.getenv("PUDDINGCLAW_TIMEOUT_S", "600")))
+        async with asyncio.timeout(timeout_s):
+            async with self.updated:
+                await self.updated.wait_for(
+                    lambda: self.revision > after_revision and (self.done or bool(self.pending_inputs))
+                )
+        # Parallel nodes can emit several interrupts in adjacent loop turns.
+        # Let the stream collector gather the complete pause set before the
+        # synchronous caller renders approval choices.
+        if self.pending_inputs and not self.done:
+            await asyncio.sleep(0.02)
+
+    def response(self) -> dict[str, Any]:
+        if self.pending_inputs and not self.done:
+            requests = list(self.pending_inputs.values())
+            first = dict(requests[0])
+            if len(requests) > 1:
+                first["requests"] = requests
+            return {
+                "schema_version": "1",
+                "run_id": self.run_id or None,
+                "session_id": self.session_id,
+                "project_id": self.project_id,
+                "analytics_model_id": self.analytics_model_id,
+                "analytics_model_match": self.analytics_model_match,
+                "approval_mode": self.approval_mode,
+                "status": "needs_input",
+                "outcome": "waiting_hitl",
+                "reply": self.final_content,
+                "final_response": self.final_response,
+                "verification": self.verification,
+                "needs_input": first,
+                "continuation_token": self.token,
+            }
+        if self.error is not None:
+            raise self.error
+        final_outcome = str(self.outcome.get("outcome") or "failed")
+        status_value = str(self.outcome.get("status") or final_outcome)
+        return {
+            "schema_version": "1",
+            "run_id": self.outcome.get("run_id") or self.run_id or None,
+            "session_id": self.session_id,
+            "project_id": self.project_id,
+            "analytics_model_id": self.analytics_model_id,
+            "analytics_model_match": self.analytics_model_match,
+            "approval_mode": self.approval_mode,
+            "status": status_value,
+            "outcome": final_outcome,
+            "reply": self.final_content,
+            "final_response": self.final_response,
+            "verification": self.verification,
+            "budget_exhaustion_reason": self.outcome.get("budget_exhaustion_reason"),
+            "model_call_count": self.outcome.get("model_call_count", 0),
+            "auto_resolved": self.outcome.get("auto_resolved") or [],
+            "interrupt_summary": self.outcome.get("interrupt_summary")
+            or {"total": 0, "auto_approved": 0, "auto_rejected": 0, "by_type": {}},
+            "needs_input": self.terminal_needs_input,
+        }
 
 
 class WorkerAccessKeyCreateRequest(BaseModel):
@@ -368,6 +601,7 @@ def _abandon_idempotency(key: str, request_hash: str) -> None:
 
 def _needs_input(event_name: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     mapping = {
+        "permission_required": "permission_request",
         "user_input_required": "user_input",
         "database_sql_revision_required": "database_sql_revision",
         "dimension_build_rule_required": "dimension_build_rule",
@@ -382,6 +616,26 @@ def _needs_input(event_name: str, payload: dict[str, Any]) -> dict[str, Any] | N
         "request_id": payload.get("id"),
         "prompt": "该任务需要人工确认，Worker 未自动伪造业务决定。",
     }
+    if input_type == "permission_request":
+        request_type = str(payload.get("type") or "permission")
+        tool_name = str(payload.get("tool_name") or "")
+        command = str(payload.get("command") or "")
+        path = str(payload.get("path") or "")
+        target = tool_name or path or request_type
+        result.update(
+            {
+                "permission_type": request_type,
+                "prompt": f"Agent 请求授权：{target}",
+                "tool_name": tool_name or None,
+                "command": command or None,
+                "path": path or None,
+                "paths": payload.get("paths") or [],
+                "risk": payload.get("risk"),
+                "reason": payload.get("reason"),
+                "options": payload.get("options") or ["once"],
+                "request": payload,
+            }
+        )
     if input_type == "user_input":
         result["questions"] = payload.get("questions") or []
     return result
@@ -397,74 +651,118 @@ async def _consume_run(
     request_received_at: float,
     analytics_model_id: str,
     analytics_model_match: dict[str, Any],
+    worker_key_id: str = "",
 ) -> dict[str, Any]:
-    final_content = ""
-    final_response = ""
-    outcome: dict[str, Any] = {}
-    verification: dict[str, Any] = {"status": "not_required", "summary": ""}
-    needs_input: dict[str, Any] | None = None
     stream = deepagents_agent_manager.astream(
         message=request.message,
         session_id=session_id,
         project_id=project_id,
-        analytics_model_id=analytics_model_id,
-        analytics_model_snapshot=_model_binding(analytics_model_id),
+        analytics_model_id=analytics_model_id or None,
+        analytics_model_snapshot=_model_binding(analytics_model_id) if analytics_model_id else None,
         user_id="worker",
-        interaction_mode="auto",
+        # Headless is externally interactive: unlike ``auto`` it must never
+        # fabricate or reject a user's approval decision.  The background
+        # consumer keeps the original graph invocation alive while the HTTP
+        # caller is released with a structured ``needs_input`` response.
+        interaction_mode="external",
         authority_profile=str(authority.get("profile") or "workspace"),
         authority_directories=list(authority.get("directories") or []),
         authority_network_origins=list(authority.get("network_origins") or []),
         query_created_at=request_received_at,
     )
-    try:
-        timeout_s = max(1.0, float(os.getenv("PUDDINGCLAW_TIMEOUT_S", "600")))
-        async with asyncio.timeout(timeout_s):
-            async for event in stream:
-                name = str(event.get("event") or "")
-                try:
-                    payload = json.loads(event.get("data") or "{}")
-                except (TypeError, ValueError):
-                    payload = {}
-                if not isinstance(payload, dict):
-                    payload = {}
-                if name == "run_outcome":
-                    outcome = payload
-                elif name == "verification_report":
-                    report = payload.get("report") if isinstance(payload.get("report"), dict) else {}
-                    verification = {
-                        "status": report.get("status") or "not_required",
-                        "summary": report.get("explanation") or "",
-                    }
-                elif name == "final_response":
-                    final_response = str(payload.get("final_response") or "")
-                elif name == "done":
-                    final_content = str(payload.get("content") or "")
-                    final_response = str(payload.get("final_response") or final_response)
-                elif name.endswith("_required"):
-                    needs_input = _needs_input(name, payload) or needs_input
-    finally:
-        await stream.aclose()
-    final_outcome = str(outcome.get("outcome") or "failed")
-    status_value = str(outcome.get("status") or final_outcome)
-    return {
-        "schema_version": "1",
-        "run_id": outcome.get("run_id"),
-        "session_id": session_id,
-        "project_id": project_id,
-        "analytics_model_id": analytics_model_id,
-        "analytics_model_match": analytics_model_match,
-        "approval_mode": approval_mode,
-        "status": status_value,
-        "outcome": final_outcome,
-        "reply": final_content,
-        "final_response": final_response,
-        "verification": verification,
-        "budget_exhaustion_reason": outcome.get("budget_exhaustion_reason"),
-        "model_call_count": outcome.get("model_call_count", 0),
-        "auto_resolved": outcome.get("auto_resolved") or [],
-        "interrupt_summary": outcome.get("interrupt_summary") or {"total": 0, "auto_approved": 0, "auto_rejected": 0, "by_type": {}},
-        "needs_input": needs_input,
-    }
+    execution = _HeadlessExecution(
+        stream=stream,
+        session_id=session_id,
+        project_id=project_id,
+        approval_mode=approval_mode,
+        analytics_model_id=analytics_model_id,
+        analytics_model_match=analytics_model_match,
+        worker_key_id=worker_key_id,
+    )
+    with _headless_executions_lock:
+        _headless_executions[session_id] = execution
+    execution.start()
+    await execution.wait_for_boundary()
+    return execution.response()
+
+
+async def _resolve_external_permission(
+    *,
+    session_id: str,
+    decision: HeadlessResumeDecision,
+) -> None:
+    """Apply one consumer decision through the canonical permission service."""
+
+    # Import lazily so the normal interactive permission router and Headless
+    # transport share one grant implementation without creating an API import
+    # cycle at application startup.
+    from api.permissions import (
+        ExternalFileGrantRequest,
+        PermissionDenyRequest,
+        ShellDirectoryGrantRequest,
+        ToolActionGrantRequest,
+        deny_permission_request,
+        grant_external_file_permission,
+        grant_shell_directory_permission,
+        grant_tool_action_permission,
+    )
+
+    pending = permission_resume_registry.get(decision.request_id)
+    if pending is None:
+        raise HTTPException(status_code=404, detail="Permission request not found")
+    if str(pending.get("session_id") or "") != session_id:
+        raise HTTPException(status_code=400, detail="Permission request belongs to another Session")
+    if str(pending.get("status") or "") != "pending":
+        raise HTTPException(status_code=409, detail="Permission request is no longer pending")
+    if decision.decision == "reject":
+        await deny_permission_request(
+            session_id,
+            PermissionDenyRequest(
+                permission_request_id=decision.request_id,
+                message=decision.message or "User denied permission from the Headless CLI.",
+            ),
+        )
+        return
+
+    request_type = str(pending.get("type") or "")
+    if request_type == "tool_action":
+        options = {str(item) for item in pending.get("options") or []}
+        scope = "session" if decision.scope == "session" and "session" in options else "once"
+        await grant_tool_action_permission(
+            session_id,
+            ToolActionGrantRequest(
+                permission_request_id=decision.request_id,
+                scope=scope,
+            ),
+        )
+        return
+    if request_type == "shell_directory_access":
+        await grant_shell_directory_permission(
+            session_id,
+            ShellDirectoryGrantRequest(
+                permission_request_id=decision.request_id,
+                scope="session" if decision.scope == "session" else "run",
+            ),
+        )
+        return
+    if request_type.startswith("external_file_") or request_type.startswith("external_directory_"):
+        is_directory = request_type.startswith("external_directory_")
+        if not is_directory and decision.scope != "session":
+            raise HTTPException(
+                status_code=422,
+                detail="External file permissions require Session scope",
+            )
+        await grant_external_file_permission(
+            session_id,
+            ExternalFileGrantRequest(
+                target_kind="exact_directory" if is_directory else "exact_file",
+                path=str(pending.get("path") or ""),
+                permission_request_id=decision.request_id,
+                scope=("session" if decision.scope == "session" else "run") if is_directory else None,
+            ),
+        )
+        return
+    raise HTTPException(status_code=422, detail=f"Unsupported permission request type: {request_type}")
 
 
 @router.get("/health")
@@ -512,6 +810,16 @@ async def create_headless_run(
 ):
     request_received_at = time.time()
     principal = _principal_for_scope(authorization, "worker:runs:create")
+    try:
+        await worker_access_log_store.record(
+            key_id=str(principal.get("key_id") or "unknown-worker-key"),
+            key_name=str(principal.get("name") or principal.get("key_id") or "Unknown Worker Key"),
+            query=request.message,
+            created_at=request_received_at,
+        )
+    except Exception as exc:
+        # Audit persistence must not make an otherwise valid Worker unavailable.
+        logger.warning("Failed to persist Worker access log: %s", type(exc).__name__)
     models = _model_options(principal)
     key = _idempotency_key(request, idempotency_key)
     request_hash = _request_hash(request, principal=principal)
@@ -595,25 +903,31 @@ async def create_headless_run(
                 )
             else:
                 model_route = await _route_analytics_model(request.message, principal)
+                if model_route.status == "general":
+                    selected = ""
+                else:
+                    selected = str(model_route.selected_id or "")
+                    if model_route.status != "matched" or not selected:
+                        response = _model_routing_needs_input(model_route, models)
+                        response["session_id"] = session_id
+                        _attach_session_lifecycle(response, session_id)
+                        if key:
+                            _finish_idempotency(key, response)
+                            idempotency_finished = True
+                        return response
+                    session_manager.update_metadata(session_id, {"analytics_model_id": selected})
+        else:
+            model_route = await _route_analytics_model(request.message, principal)
+            if model_route.status == "general":
+                selected = ""
+            else:
                 selected = str(model_route.selected_id or "")
                 if model_route.status != "matched" or not selected:
                     response = _model_routing_needs_input(model_route, models)
-                    response["session_id"] = session_id
-                    _attach_session_lifecycle(response, session_id)
                     if key:
                         _finish_idempotency(key, response)
                         idempotency_finished = True
                     return response
-                session_manager.update_metadata(session_id, {"analytics_model_id": selected})
-        else:
-            model_route = await _route_analytics_model(request.message, principal)
-            selected = str(model_route.selected_id or "")
-            if model_route.status != "matched" or not selected:
-                response = _model_routing_needs_input(model_route, models)
-                if key:
-                    _finish_idempotency(key, response)
-                    idempotency_finished = True
-                return response
             session_manager.create_session(
                 session_id,
                 metadata={
@@ -621,7 +935,7 @@ async def create_headless_run(
                     "headless_enabled": True,
                     "worker_id": "puddingclaw",
                     "worker_key_id": principal.get("key_id"),
-                    "interaction_mode": "auto",
+                    "interaction_mode": "external",
                     "analytics_model_id": selected,
                 },
                 approval_mode=approval_mode,
@@ -640,6 +954,7 @@ async def create_headless_run(
                 request_received_at=request_received_at,
                 analytics_model_id=selected,
                 analytics_model_match=model_route.to_dict(),
+                worker_key_id=str(principal.get("key_id") or ""),
             )
         except asyncio.TimeoutError:
             response = {
@@ -664,6 +979,85 @@ async def create_headless_run(
         _release_headless_session(session_id)
 
 
+@router.post("/runs/{run_id}/resume")
+async def resume_headless_run(
+    run_id: str,
+    request: HeadlessResumeRequest,
+    authorization: str | None = Header(default=None),
+):
+    """Resolve external approval and continue the exact suspended Run."""
+
+    principal = _principal_for_scope(authorization, "worker:runs:create")
+    with _headless_executions_lock:
+        execution = next(
+            (
+                item
+                for item in _headless_executions.values()
+                if item.run_id == run_id
+            ),
+            None,
+        )
+    if execution is None:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Headless continuation is no longer active; start a new Run",
+        )
+    if execution.worker_key_id != str(principal.get("key_id") or ""):
+        raise HTTPException(status_code=403, detail="Run is not authorized for this Worker")
+    if not hmac.compare_digest(execution.token, request.continuation_token):
+        raise HTTPException(status_code=403, detail="Headless continuation token is invalid")
+    if execution.done:
+        response = execution.response()
+        _attach_session_lifecycle(response, execution.session_id)
+        return response
+    pending_ids = set(execution.pending_inputs)
+    decision_ids = {item.request_id for item in request.decisions}
+    if not pending_ids:
+        raise HTTPException(status_code=409, detail="Run is not waiting for external input")
+    if decision_ids != pending_ids:
+        raise HTTPException(
+            status_code=409,
+            detail="Decisions must resolve the complete current interrupt set",
+        )
+    unsupported = [
+        request_id
+        for request_id in pending_ids
+        if execution.pending_inputs[request_id].get("type") != "permission_request"
+    ]
+    if unsupported:
+        raise HTTPException(
+            status_code=422,
+            detail="This CLI version can only resume permission requests",
+        )
+
+    if not _claim_headless_session(execution.session_id):
+        raise HTTPException(status_code=409, detail="Headless Session already has an active resume request")
+    try:
+        previous_revision = execution.revision
+        for decision in request.decisions:
+            await _resolve_external_permission(
+                session_id=execution.session_id,
+                decision=decision,
+            )
+        await execution.wait_for_boundary(after_revision=previous_revision)
+        response = execution.response()
+        _attach_session_lifecycle(response, execution.session_id)
+        return response
+    except asyncio.TimeoutError:
+        response = {
+            "schema_version": "1",
+            "run_id": execution.run_id or run_id,
+            "session_id": execution.session_id,
+            "status": "failed",
+            "outcome": "timeout",
+            "needs_input": None,
+        }
+        _attach_session_lifecycle(response, execution.session_id)
+        return JSONResponse(status_code=status.HTTP_504_GATEWAY_TIMEOUT, content=response)
+    finally:
+        _release_headless_session(execution.session_id)
+
+
 @router.post("/access-keys")
 async def create_worker_access_key(request: Request, payload: WorkerAccessKeyCreateRequest):
     _admin(request)
@@ -678,6 +1072,40 @@ async def create_worker_access_key(request: Request, payload: WorkerAccessKeyCre
 async def list_worker_access_keys(request: Request):
     _admin(request)
     return {"keys": worker_access_store.list_public()}
+
+
+@worker_access_router.get("/worker-access-logs")
+async def list_worker_access_logs(
+    request: Request,
+    page: int = Query(default=1, ge=1),
+    key_name: str | None = Query(default=None, max_length=120),
+    query_keyword: str | None = Query(default=None, alias="query", max_length=200),
+    start_at: float | None = Query(default=None, ge=0),
+    end_at: float | None = Query(default=None, ge=0),
+):
+    _admin(request)
+    if start_at is not None and end_at is not None and start_at > end_at:
+        raise HTTPException(status_code=422, detail="start_at must not be later than end_at")
+    result = await worker_access_log_store.list(
+        page=page,
+        page_size=10,
+        key_name=key_name,
+        query=query_keyword,
+        start_at=start_at,
+        end_at=end_at,
+    )
+    result["items"] = [
+        {
+            **item,
+            "created_at_beijing": datetime.fromtimestamp(
+                float(item["created_at"]),
+                tz=_BEIJING_TIMEZONE,
+            ).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        for item in result["items"]
+    ]
+    result["timezone"] = "Asia/Shanghai"
+    return result
 
 
 @router.post("/access-keys/{key_id}/rotate")

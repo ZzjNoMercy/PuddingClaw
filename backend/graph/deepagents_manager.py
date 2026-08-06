@@ -982,7 +982,7 @@ class PuddingClawSummarizationMiddleware(DeepAgentsSummarizationMiddleware):
                     "type": "context_maintenance",
                     "status": "start",
                     "phase": "global_summarization",
-                    "message": "正在执行全局上下文压缩，并保留 Goal、Todo、产物与验收缺口…",
+                    "message": "正在压缩上下文…",
                     **(_SUMMARIZATION_USAGE_CONTEXT.get() or {}),
                 }
             )
@@ -1011,7 +1011,7 @@ class PuddingClawSummarizationMiddleware(DeepAgentsSummarizationMiddleware):
                     "type": "context_maintenance",
                     "status": "start",
                     "phase": "global_summarization",
-                    "message": "正在执行全局上下文压缩，并保留 Goal、Todo、产物与验收缺口…",
+                    "message": "正在压缩上下文…",
                     **(_SUMMARIZATION_USAGE_CONTEXT.get() or {}),
                 }
             )
@@ -1078,8 +1078,19 @@ def _build_deepagents_summarization(model: BaseChatModel, backend: Any) -> Puddi
     cfg = config.get_deepagents_summarization_config()
     if not cfg.get("enabled", True):
         return None
+    summary_model_id = str(cfg.get("model_id") or "").strip()
+    summary_model = model
+    if summary_model_id:
+        # Summarization is a bounded transformation workload. It should not
+        # inherit an expensive per-Session Agent override or reasoning mode.
+        summary_model = ModelClientChatModel(
+            role="summary",
+            streaming=False,
+            thinking_enabled=False,
+            model_id_override=summary_model_id,
+        )
     return PuddingClawSummarizationMiddleware(
-        model=model,
+        model=summary_model,
         backend=backend,
         trigger=("tokens", max(1, int(cfg.get("trigger_tokens", 160000)))),
         keep=("messages", max(1, int(cfg.get("keep_messages", 20)))),
@@ -4486,14 +4497,17 @@ class DeepAgentsAgentManager:
         session_id: str | None = None,
         workspace_path: str | Path | None = None,
         query_id: str | None = None,
+        history_message_limit: int | None = _HISTORICAL_MAX_MESSAGE_COUNT,
+        append_current_message: bool = True,
     ) -> list[Any]:
         messages: list[Any] = []
-        omitted_history_count = max(
-            0,
-            len(history) - _HISTORICAL_MAX_MESSAGE_COUNT,
+        omitted_history_count = (
+            max(0, len(history) - history_message_limit)
+            if history_message_limit is not None
+            else 0
         )
         if omitted_history_count:
-            history = history[-_HISTORICAL_MAX_MESSAGE_COUNT:]
+            history = history[-history_message_limit:]
             messages.append(
                 SystemMessage(
                     content=(
@@ -4768,17 +4782,18 @@ class DeepAgentsAgentManager:
             elif role == "assistant":
                 messages.append(AIMessage(content=content))
 
-        messages.append(
-            HumanMessage(
-                content=cls._build_user_content(
-                    message,
-                    attachments,
-                    session_id=session_id,
-                    workspace_path=workspace_path,
-                ),
-                additional_kwargs=({"puddingclaw_query_id": query_id} if query_id else {}),
+        if append_current_message:
+            messages.append(
+                HumanMessage(
+                    content=cls._build_user_content(
+                        message,
+                        attachments,
+                        session_id=session_id,
+                        workspace_path=workspace_path,
+                    ),
+                    additional_kwargs=({"puddingclaw_query_id": query_id} if query_id else {}),
+                )
             )
-        )
         return messages
 
     @staticmethod
@@ -5070,11 +5085,69 @@ class DeepAgentsAgentManager:
                 "skill_plan_confirmation_request": "skill_plan_confirmation_resolved",
             }
             goal_id = str(context.get("goal_id") or "")
-            if str(context.get("interaction_mode") or "interactive") == "auto":
+            interaction_mode = str(context.get("interaction_mode") or "interactive")
+            if interaction_mode == "auto":
                 resolver = HeadlessInterruptResolver(context=context)
                 decisions = [
                     resolver.resolve(interrupted_type, interrupted_request)
                     for interrupted_type, interrupted_request, _interrupt_id in pending_interrupts
+                ]
+            elif interaction_mode == "external":
+                # Headless consumers can explicitly approve permissions through
+                # the Resume API. Business confirmations remain unattended and
+                # therefore keep the existing deterministic fail-closed policy.
+                resolver = HeadlessInterruptResolver(context=context)
+                decisions: list[dict[str, Any] | None] = []
+                decision_tasks: list[tuple[int, asyncio.Task[Any]]] = []
+                for interrupted_type, interrupted_request, _interrupt_id in pending_interrupts:
+                    if interrupted_type == "permission_request":
+                        index = len(decisions)
+                        decisions.append(None)
+                        decision_tasks.append(
+                            (
+                                index,
+                                asyncio.create_task(
+                                    permission_resume_registry.wait(
+                                        str(interrupted_request.get("id") or "")
+                                    )
+                                ),
+                            )
+                        )
+                    else:
+                        decisions.append(resolver.resolve(interrupted_type, interrupted_request))
+                try:
+                    while not all(task.done() for _, task in decision_tasks):
+                        await asyncio.wait(
+                            [task for _, task in decision_tasks],
+                            timeout=0.25,
+                        )
+                        if not goal_id:
+                            continue
+                        authoritative_goal = session_manager.get_goal_state(session_id, goal_id)
+                        if (
+                            not isinstance(authoritative_goal, dict)
+                            or str(authoritative_goal.get("status") or "") != "active"
+                            or bool(authoritative_goal.get("requested_status"))
+                            or str(authoritative_goal.get("current_run_id") or "") != run_id
+                            or int(authoritative_goal.get("objective_revision") or 1)
+                            != int(context.get("goal_revision") or 1)
+                        ):
+                            raise asyncio.CancelledError(
+                                "Goal control changed while waiting for user input"
+                            )
+                    for index, task in decision_tasks:
+                        decisions[index] = task.result()
+                finally:
+                    for _, task in decision_tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(
+                        *(task for _, task in decision_tasks),
+                        return_exceptions=True,
+                    )
+                decisions = [
+                    decision if isinstance(decision, dict) else {"type": "reject"}
+                    for decision in decisions
                 ]
             else:
                 decision_tasks = [

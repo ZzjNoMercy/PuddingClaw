@@ -65,6 +65,24 @@ class SessionManager:
     # so the complete read-modify-write transaction remains serialized.
     _shared_session_locks: dict[str, threading.RLock] = {}
     _shared_session_locks_guard = threading.Lock()
+    _AGENT_CONTEXT_COMPACTION_TTL_SECONDS = 15 * 60
+
+    @classmethod
+    def _agent_context_compaction_is_active(
+        cls,
+        record: Any,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        if not isinstance(record, dict) or record.get("status") != "running":
+            return False
+        started_at = float(record.get("started_at") or 0)
+        return started_at > 0 and (now if now is not None else time.time()) - started_at < cls._AGENT_CONTEXT_COMPACTION_TTL_SECONDS
+
+    @staticmethod
+    def _agent_context_transcript_fingerprint(transcript: list[Any]) -> str:
+        payload = json.dumps(transcript, ensure_ascii=False, sort_keys=True, default=str)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def __init__(self) -> None:
         self._base_dir: Path | None = None
@@ -288,6 +306,7 @@ class SessionManager:
             "platform_id",
             "worker_id",
             "interaction_mode",
+            "headless_pending_input",
         ):
             if key in data:
                 meta[key] = data.get(key)
@@ -398,6 +417,7 @@ class SessionManager:
             "platform_id",
             "worker_id",
             "interaction_mode",
+            "headless_pending_input",
         }
         forbidden = set(metadata) - allowed_keys
         if forbidden:
@@ -695,6 +715,15 @@ class SessionManager:
         data = self._read_file(session_id)  # 读取现有数据
         if not data:
             raise FileNotFoundError(f"Session {session_id} not found")
+        compaction = data.get("agent_context_compaction")
+        if role == "user" and self._agent_context_compaction_is_active(compaction):
+            raise RuntimeError(
+                f"Session {session_id} is compacting Agent context; retry after maintenance completes"
+            )
+        if role == "user" and isinstance(compaction, dict) and compaction.get("status") == "running":
+            compaction["status"] = "expired"
+            compaction["completed_at"] = time.time()
+            compaction["error"] = "maintenance claim expired before user message"
         msg = self._build_message_payload(
             role,
             content,
@@ -3443,6 +3472,15 @@ class SessionManager:
         data = self._read_file(session_id)
         if not data:
             raise FileNotFoundError(f"Session {session_id} not found")
+        compaction = data.get("agent_context_compaction")
+        if self._agent_context_compaction_is_active(compaction):
+            raise ValueError(
+                f"Session {session_id} is compacting Agent context; retry after maintenance completes"
+            )
+        if isinstance(compaction, dict) and compaction.get("status") == "running":
+            compaction["status"] = "expired"
+            compaction["completed_at"] = time.time()
+            compaction["error"] = "maintenance claim expired before Run start"
         harness = data.setdefault("harness", {})
         runs = harness.setdefault("runs", {})
         if run_id in runs:
@@ -6020,6 +6058,245 @@ class SessionManager:
         }
         self._write_file(session_id, data)
 
+    @_session_write_locked
+    def begin_agent_context_compaction(
+        self,
+        session_id: str,
+        *,
+        operation_id: str,
+        focus: str = "",
+    ) -> dict[str, Any]:
+        """Claim one idle Agent Session for manual context compaction."""
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        if str(data.get("runtime_mode") or "") != "agent":
+            raise ValueError("Manual /compact is available only for Agent sessions")
+
+        harness = data.get("harness")
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        terminal_statuses = {
+            "completed",
+            "cancelled",
+            "failed",
+            "blocked",
+            "budget_exceeded",
+            "verification_failed",
+        }
+        active_run = next(
+            (
+                run
+                for run in (runs.values() if isinstance(runs, dict) else ())
+                if isinstance(run, dict) and str(run.get("status") or "") not in terminal_statuses
+            ),
+            None,
+        )
+        if active_run is not None:
+            raise RuntimeError(
+                f"Session {session_id} has active Run {active_run.get('run_id')}; compact at a safe boundary"
+            )
+
+        tool_context_job = data.get("tool_context_job")
+        if isinstance(tool_context_job, dict) and str(tool_context_job.get("status") or "") in {
+            "queued",
+            "running",
+        }:
+            raise RuntimeError("Tool context maintenance is still running; retry /compact when it finishes")
+
+        now = time.time()
+        previous = data.get("agent_context_compaction")
+        if self._agent_context_compaction_is_active(previous, now=now):
+            raise RuntimeError("Agent context compaction is already running for this Session")
+        if isinstance(previous, dict) and previous.get("status") == "running":
+            previous["status"] = "expired"
+            previous["completed_at"] = now
+            previous["error"] = "maintenance claim expired"
+
+        messages = data.get("messages")
+        transcript = messages if isinstance(messages, list) else []
+        last_message = next(
+            (item for item in reversed(transcript) if isinstance(item, dict) and item.get("role") != "system"),
+            None,
+        )
+        if (
+            not isinstance(last_message, dict)
+            or last_message.get("role") != "assistant"
+            or last_message.get("status") != "completed"
+        ):
+            raise ValueError("Manual /compact requires a completed Assistant turn")
+        source_query_id = str(last_message.get("query_id") or "")
+        if not source_query_id:
+            raise ValueError("The latest Assistant turn has no stable query boundary")
+        latest_run_id = str(harness.get("latest_run_id") or "") if isinstance(harness, dict) else ""
+
+        claim = {
+            "operation_id": str(operation_id),
+            "status": "running",
+            "trigger": "manual",
+            "focus": str(focus or ""),
+            "source_query_id": source_query_id,
+            "source_run_id": latest_run_id,
+            "message_count": len(transcript),
+            "transcript_sha256": self._agent_context_transcript_fingerprint(transcript),
+            "started_at": now,
+        }
+        data["agent_context_compaction"] = claim
+        self._write_file(session_id, data)
+        return deepcopy(claim)
+
+    @_session_write_locked
+    def complete_agent_context_compaction(
+        self,
+        session_id: str,
+        *,
+        operation_id: str,
+        summary_text: str,
+        recent_messages: list[dict[str, Any]],
+        effective_messages: list[dict[str, Any]],
+        tokens_before: int,
+        tokens_after: int,
+        summarized_message_count: int,
+        kept_recent_message_count: int,
+        summary_model: str = "",
+    ) -> dict[str, Any]:
+        """Commit a manual compact projection only if its transcript claim is unchanged."""
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        claim = data.get("agent_context_compaction")
+        if (
+            not isinstance(claim, dict)
+            or claim.get("status") != "running"
+            or str(claim.get("operation_id") or "") != str(operation_id)
+        ):
+            raise RuntimeError("Agent context compaction claim is no longer active")
+
+        messages = data.get("messages")
+        transcript = messages if isinstance(messages, list) else []
+        last_message = next(
+            (item for item in reversed(transcript) if isinstance(item, dict) and item.get("role") != "system"),
+            None,
+        )
+        if (
+            len(transcript) != int(claim.get("message_count") or 0)
+            or not isinstance(last_message, dict)
+            or last_message.get("role") != "assistant"
+            or last_message.get("status") != "completed"
+            or str(last_message.get("query_id") or "") != str(claim.get("source_query_id") or "")
+            or self._agent_context_transcript_fingerprint(transcript)
+            != str(claim.get("transcript_sha256") or "")
+        ):
+            raise RuntimeError("Session transcript changed while /compact was running; projection was not committed")
+
+        normalized_summary = str(summary_text or "").strip()
+        if not normalized_summary:
+            raise ValueError("Agent context summary is empty")
+        now = time.time()
+        projection = {
+            "schema_version": 2,
+            "status": "completed",
+            "summary_text": normalized_summary,
+            "recent_messages": [item for item in recent_messages if isinstance(item, dict)],
+            "transcript_boundary": {
+                "source_query_id": str(claim.get("source_query_id") or ""),
+                "message_count": len(transcript),
+            },
+            "source_run_id": str(claim.get("source_run_id") or ""),
+            "history_ref": "",
+            "trigger": "manual",
+            "focus": str(claim.get("focus") or ""),
+            "tokens_before": max(0, int(tokens_before)),
+            "tokens_after": max(0, int(tokens_after)),
+            "created_at": now,
+        }
+        data["session_summary_projection"] = projection
+        data["run_agent_context"] = {
+            "run_id": str(claim.get("source_run_id") or ""),
+            "messages": [item for item in effective_messages if isinstance(item, dict)],
+            "updated_at": now,
+        }
+        data["agent_context_usage"] = max(0, int(tokens_after))
+        completed = {
+            **claim,
+            "status": "completed",
+            "tokens_before": max(0, int(tokens_before)),
+            "tokens_after": max(0, int(tokens_after)),
+            "summarized_message_count": max(0, int(summarized_message_count)),
+            "kept_recent_message_count": max(0, int(kept_recent_message_count)),
+            "summary_model": str(summary_model or ""),
+            "completed_at": now,
+        }
+        data["agent_context_compaction"] = completed
+        history = data.setdefault("agent_context_compactions", [])
+        if isinstance(history, list):
+            history.append(deepcopy(completed))
+            del history[:-20]
+        self._write_file(session_id, data)
+        return deepcopy(completed)
+
+    @_session_write_locked
+    def fail_agent_context_compaction(
+        self,
+        session_id: str,
+        *,
+        operation_id: str,
+        error: str,
+    ) -> None:
+        """Release a matching compaction claim without changing the last good projection."""
+
+        data = self._read_file(session_id)
+        claim = data.get("agent_context_compaction") if data else None
+        if (
+            not isinstance(claim, dict)
+            or claim.get("status") != "running"
+            or str(claim.get("operation_id") or "") != str(operation_id)
+        ):
+            return
+        claim["status"] = "failed"
+        claim["error"] = str(error or "Agent context compaction failed")[:1000]
+        claim["completed_at"] = time.time()
+        self._write_file(session_id, data)
+
+    @_session_write_locked
+    def get_agent_context_compaction_status(
+        self,
+        session_id: str,
+        *,
+        operation_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return one persisted manual compaction operation, expiring stale claims."""
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        record = data.get("agent_context_compaction")
+        if not isinstance(record, dict):
+            return None
+        if operation_id and str(record.get("operation_id") or "") != str(operation_id):
+            history = data.get("agent_context_compactions")
+            record = next(
+                (
+                    item
+                    for item in reversed(history if isinstance(history, list) else [])
+                    if isinstance(item, dict)
+                    and str(item.get("operation_id") or "") == str(operation_id)
+                ),
+                None,
+            )
+            if not isinstance(record, dict):
+                return None
+        if self._agent_context_compaction_is_active(record):
+            return deepcopy(record)
+        if record.get("status") == "running":
+            record["status"] = "expired"
+            record["error"] = "Agent context compaction exceeded its maintenance lease"
+            record["completed_at"] = time.time()
+            if data.get("agent_context_compaction") is record:
+                self._write_file(session_id, data)
+        return deepcopy(record)
+
     def get_session_summary_projection(self, session_id: str) -> dict[str, Any] | None:
         """Return the latest completed cross-Run Summary projection."""
 
@@ -8239,6 +8516,8 @@ class SessionManager:
         data.pop("agent_context_messages", None)
         data.pop("agent_context_run_id", None)
         data.pop("session_summary_projection", None)
+        data.pop("agent_context_compaction", None)
+        data.pop("agent_context_compactions", None)
         data.pop("agent_context_usage", None)
         if "harness" in data:
             del data["harness"]

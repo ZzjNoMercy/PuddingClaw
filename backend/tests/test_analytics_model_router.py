@@ -71,3 +71,26 @@ async def test_low_confidence_or_unknown_candidate_never_guesses():
     )
     assert low.status == "ambiguous" and low.selected_id is None
     assert unknown.status == "ambiguous" and unknown.selected_id is None
+
+
+@pytest.mark.asyncio
+async def test_general_scope_passes_through_without_a_model():
+    route = await AnalyticsModelRouter.route(
+        message="今天宁波慈溪天气如何",
+        candidates=MODELS,
+        model=FakeModel({"selected_id": None, "confidence": 0.9, "scope": "general", "reason": "weather_question"}),
+    )
+    assert route.status == "general"
+    assert route.selected_id is None
+    assert route.strategy == "semantic"
+
+
+@pytest.mark.asyncio
+async def test_payload_without_scope_stays_ambiguous():
+    route = await AnalyticsModelRouter.route(
+        message="分析一下",
+        candidates=MODELS,
+        model=FakeModel({"selected_id": None, "confidence": 0.4, "reason": "legacy_no_scope"}),
+    )
+    assert route.status == "ambiguous"
+    assert route.selected_id is None

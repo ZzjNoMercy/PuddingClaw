@@ -26,6 +26,34 @@ globalThis.fetch = async (url, options) => {
     }), { status: 200, headers: { "content-type": "application/json" } });
   }
   const body = options?.body ? JSON.parse(options.body) : {};
+  if (String(url).includes("/api/headless/runs/run-approval/resume")) {
+    return new Response(JSON.stringify({
+      schema_version: "1",
+      run_id: "run-approval",
+      session_id: "worker-session-approval",
+      status: "completed",
+      outcome: "completed",
+      reply: "approved",
+      final_response: "approved",
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  }
+  if (body.message === "需要授权") {
+    return new Response(JSON.stringify({
+      schema_version: "1",
+      run_id: "run-approval",
+      session_id: "worker-session-approval",
+      status: "needs_input",
+      outcome: "waiting_hitl",
+      continuation_token: "continuation-token-long-enough",
+      needs_input: {
+        type: "permission_request",
+        request_id: "perm-req-test",
+        tool_name: "execute",
+        command: "python3 /skills/test/run.py",
+        options: ["once", "session"],
+      },
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  }
   if (body.session_id === "worker-session-expired") {
     return new Response(JSON.stringify({ detail: "Headless Session expired after its configured inactivity TTL" }), {
       status: 410,

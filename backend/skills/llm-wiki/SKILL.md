@@ -56,13 +56,14 @@ root afterward: those tools intentionally have a different sandbox boundary
 and their denial is not evidence that the dedicated Wiki service is unreadable.
 
 For Query, treat the published Markdown LLM Wiki as the complete source of
-truth and gbrain as its structured acceleration/index layer. Prefer the
-allowlisted gbrain MCP tools first when available. If gbrain is unavailable,
-fails, returns no results, returns only stale results, or does not directly
-match the entity/topic asked by the user, call `llm_wiki_query` before
-reporting an internal knowledge gap or using Web. Do not call both backends
-when gbrain already returns a direct, relevant answer. Cite Wiki slugs and
-their `sources`; report a knowledge gap instead of reading raw files.
+truth and gbrain only as its structured acceleration/index layer. First call
+`llm_wiki_context(operation="query")`, then always call `llm_wiki_query` with
+the user's retrieval intent before deciding whether another knowledge path is
+needed. Do not query gbrain by default. Use allowlisted gbrain MCP tools only
+when entity relations, graph traversal, or structured filtering can materially
+improve the answer. A gbrain hit never replaces or skips the Markdown Wiki
+query; merge and deduplicate it as supplementary structure. Cite Wiki slugs
+and their `sources`; report a knowledge gap instead of reading raw files.
 
 For Lint, call `llm_wiki_lint`. Use `llm_wiki_compile` when the user asks to
 verify gbrain compatibility. Neither operation repairs files.

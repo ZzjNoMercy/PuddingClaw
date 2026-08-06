@@ -61,8 +61,10 @@ backend/.pytest_cache/
 .playwright-cli/
 iterm2_workspace.iterm2arrangement
 
-# Private design notes and project documentation
-/docs/
+# Private design notes and project documentation. Keep the public Session
+# contract publishable while leaving other local planning documents ignored.
+/docs/*
+!/docs/session-and-context-architecture.md
 
 # Logs
 *.log

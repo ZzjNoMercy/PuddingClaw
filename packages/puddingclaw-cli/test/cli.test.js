@@ -48,6 +48,36 @@ test("run accepts an explicit session for a continuous task", async () => {
   assert.equal(JSON.parse(stdout).session_id, "worker-session-existing");
 });
 
+test("JSON mode returns external approval without making a decision", async () => {
+  const child = spawn(process.execPath, ["--import", path.join(root, "test", "mock-fetch.js"), cli, "run", "需要授权", "--json"], {
+    env: { ...process.env, PUDDINGCLAW_URL: "http://127.0.0.1:8888", PUDDINGCLAW_TOKEN: "test-token", PUDDINGCLAW_PROJECTS_ROOT: "/tmp/puddingclaw-cli-test" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = ""; let stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const [result] = await once(child, "close");
+  assert.equal(result, 1, stderr);
+  const response = JSON.parse(stdout);
+  assert.equal(response.status, "needs_input");
+  assert.equal(response.outcome, "waiting_hitl");
+  assert.equal(response.needs_input.request_id, "perm-req-test");
+  assert.equal(response.continuation_token, "continuation-token-long-enough");
+});
+
+test("non-TTY human mode preserves structured approval instead of printing a blank reply", async () => {
+  const child = spawn(process.execPath, ["--import", path.join(root, "test", "mock-fetch.js"), cli, "run", "需要授权"], {
+    env: { ...process.env, PUDDINGCLAW_URL: "http://127.0.0.1:8888", PUDDINGCLAW_TOKEN: "test-token", PUDDINGCLAW_PROJECTS_ROOT: "/tmp/puddingclaw-cli-test" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = ""; let stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const [result] = await once(child, "close");
+  assert.equal(result, 1, stderr);
+  assert.equal(JSON.parse(stdout).status, "needs_input");
+});
+
 test("expired session is a structured recoverable outcome", async () => {
   const child = spawn(process.execPath, ["--import", path.join(root, "test", "mock-fetch.js"), cli, "run", "继续分析", "--session", "worker-session-expired", "--json"], {
     env: { ...process.env, PUDDINGCLAW_URL: "http://127.0.0.1:8888", PUDDINGCLAW_TOKEN: "test-token", PUDDINGCLAW_PROJECTS_ROOT: "/tmp/puddingclaw-cli-test" },

@@ -91,9 +91,13 @@ def test_data_analysis_wins_over_knowledge_rag() -> None:
     assert "database_sql_generate" in decision["preferred_tools"]
 
 
-def test_document_knowledge_request_still_routes_to_llamaindex() -> None:
+def test_document_knowledge_request_routes_to_llm_wiki_first() -> None:
     decision = ToolIntentRouterMiddleware()._classify_intent("从知识库总结 AI 架构白皮书")
 
     assert decision["matched"] is True
     assert decision["intents"] == ["knowledge_rag"]
-    assert decision["preferred_tools"] == ["llamaindex_knowledge_query"]
+    assert decision["preferred_tools"] == ["llm_wiki_query"]
+    assert "先读取 /skills/llm-wiki/SKILL.md" in decision["routing_prompt"]
+    assert "不要默认并行调用 llamaindex_knowledge_query" in decision["routing_prompt"]
+    assert "Wiki 无直接命中或覆盖不足" in decision["routing_prompt"]
+    assert "GBrain 只用于有价值的实体关系" in decision["routing_prompt"]

@@ -128,6 +128,7 @@ export default function ChatInput() {
     stopStreaming,
     isStreaming,
     isCompressing,
+    compactCurrentAgentSession,
     sessionHistoryLoading,
     sessionId,
     setSessionId,
@@ -303,13 +304,23 @@ export default function ChatInput() {
     listSkills().then(setSkills).catch(() => {});
   }, []);
 
-  // Single source of truth for filtered skills (fixes I-1: dedup filter logic)
-  const filteredSkills = useMemo(
-    () => skills.filter((s) =>
-      s.name.toLowerCase().includes(slashQuery) ||
-      s.description.toLowerCase().includes(slashQuery)
+  // Built-in lifecycle commands and installed Skills share one slash picker,
+  // but only Skill rows become backend skill_hints.
+  const filteredSlashItems = useMemo(
+    () => [
+      ...(runtimeMode === "agent"
+        ? [{
+            name: "compact",
+            description: "压缩 Agent 模型上下文；不删除聊天、Goal、Todo、Artifact 或 Evidence",
+            kind: "command" as const,
+          }]
+        : []),
+      ...skills.map((skill) => ({ ...skill, kind: "skill" as const })),
+    ].filter((item) =>
+      item.name.toLowerCase().includes(slashQuery) ||
+      item.description.toLowerCase().includes(slashQuery)
     ),
-    [skills, slashQuery]
+    [runtimeMode, skills, slashQuery]
   );
 
   // Ref to let global Escape handler know if slash menu is open (fixes I-2)
@@ -414,6 +425,53 @@ export default function ChatInput() {
     }
   }, [text]);
 
+  const executeCompactCommand = useCallback(async (
+    submittedText: string,
+    focus: string,
+  ) => {
+    if (runtimeMode !== "agent") {
+      setInputError("/compact 只适用于 Agent Session。");
+      return;
+    }
+    if (attachments.length > 0) {
+      setInputError("/compact 不接受附件；请先移除附件再执行。");
+      return;
+    }
+    const submittedSessionId = sessionId;
+    if (submitInFlightSessionsRef.current.has(submittedSessionId)) return;
+    submitInFlightSessionsRef.current.add(submittedSessionId);
+    setSubmittingSessionIds((current) => new Set(current).add(submittedSessionId));
+    // Treat a local lifecycle command like a sent message: clear it as soon as
+    // the request is accepted, then restore it only if compaction fails.
+    setText("");
+    selectedSkillHintsBySessionRef.current.delete(submittedSessionId);
+    if (textareaRef.current) textareaRef.current.style.height = "auto";
+    setInputError(null);
+    setOpenPopover(null);
+    setShowSlashMenu(false);
+    try {
+      await compactCurrentAgentSession(focus);
+      if (currentSessionIdRef.current === submittedSessionId) {
+        setText("");
+        setPendingInput(null);
+        selectedSkillHintsBySessionRef.current.delete(submittedSessionId);
+        if (textareaRef.current) textareaRef.current.style.height = "auto";
+      }
+    } catch (error) {
+      if (currentSessionIdRef.current === submittedSessionId) {
+        setText((current) => current || submittedText);
+        setInputError(error instanceof Error ? error.message : "Agent 上下文压缩失败。");
+      }
+    } finally {
+      submitInFlightSessionsRef.current.delete(submittedSessionId);
+      setSubmittingSessionIds((current) => {
+        const next = new Set(current);
+        next.delete(submittedSessionId);
+        return next;
+      });
+    }
+  }, [attachments.length, compactCurrentAgentSession, runtimeMode, sessionId, setPendingInput]);
+
   const handleSubmit = useCallback(async () => {
     if (
       (!text.trim() && attachments.length === 0) ||
@@ -421,6 +479,11 @@ export default function ChatInput() {
       submitInFlightSessionsRef.current.has(sessionId)
     ) return;
     const submittedText = text;
+    const compactMatch = submittedText.trim().match(/^\/compact(?:\s+([\s\S]*))?$/i);
+    if (compactMatch) {
+      await executeCompactCommand(submittedText.trim(), compactMatch[1] || "");
+      return;
+    }
     const submittedAttachments = attachments;
     const submittedSkillHintRecords = (
       selectedSkillHintsBySessionRef.current.get(sessionId) || []
@@ -480,7 +543,15 @@ export default function ChatInput() {
         return next;
       });
     }
-  }, [text, attachments, disabled, sendMessage, setPendingInput, sessionId]);
+  }, [
+    attachments,
+    disabled,
+    executeCompactCommand,
+    sendMessage,
+    sessionId,
+    setPendingInput,
+    text,
+  ]);
 
   const handleAttachmentFiles = useCallback(async (files: FileList | File[] | null, source: "upload" | "paste" = "upload") => {
     if (!files || files.length === 0) return;
@@ -536,7 +607,11 @@ export default function ChatInput() {
     await openProjectFolderPicker();
   }, [openProjectFolderPicker]);
 
-  const handleSlashSelect = useCallback((skillName: string) => {
+  const handleSlashSelect = useCallback((item: {
+    name: string;
+    kind: "command" | "skill";
+  }) => {
+    const skillName = item.name;
     // Use textarea DOM value as source of truth to avoid stale closure (fixes I-1)
     const currentText = textareaRef.current?.value ?? "";
     const startPos = slashStartPosRef.current;
@@ -564,10 +639,15 @@ export default function ChatInput() {
       setText(`/${skillName} `);
     }
     setShowSlashMenu(false);
-    selectedSkillHintsBySessionRef.current.set(sessionId, [
-      ...adjustedHints.filter((hint) => hint.name !== skillName),
-      { name: skillName, start: insertedStart, end: insertedStart + skillName.length + 1 },
-    ]);
+    selectedSkillHintsBySessionRef.current.set(
+      sessionId,
+      item.kind === "skill"
+        ? [
+            ...adjustedHints.filter((hint) => hint.name !== skillName),
+            { name: skillName, start: insertedStart, end: insertedStart + skillName.length + 1 },
+          ]
+        : adjustedHints,
+    );
     slashStartPosRef.current = -1;
     textareaRef.current?.focus();
   }, [sessionId]);
@@ -605,14 +685,18 @@ export default function ChatInput() {
       }
       if (e.key === "ArrowDown") {
         e.preventDefault();
-        setSelectedMenuIndex((prev) => Math.min(prev + 1, Math.max(0, filteredSkills.length - 1)));
+        setSelectedMenuIndex((prev) => Math.min(prev + 1, Math.max(0, filteredSlashItems.length - 1)));
         return;
       }
       if (e.key === "Enter") {
         e.preventDefault();
-        if (filteredSkills.length > 0) {
-          const idx = Math.min(selectedMenuIndex, filteredSkills.length - 1);
-          handleSlashSelect(filteredSkills[idx].name);
+        if (filteredSlashItems.length > 0) {
+          const idx = Math.min(selectedMenuIndex, filteredSlashItems.length - 1);
+          const item = filteredSlashItems[idx];
+          handleSlashSelect(item);
+          if (item.kind === "command" && item.name === "compact" && !disabled) {
+            void executeCompactCommand("/compact", "");
+          }
         }
         return;
       }
@@ -641,7 +725,7 @@ export default function ChatInput() {
       <div className="glass-input relative mx-auto flex w-full max-w-[900px] flex-col gap-2 rounded-3xl px-3 py-3 transition-shadow hover:shadow-lg sm:px-4">
         <SlashCommandMenu
           visible={showSlashMenu}
-          filteredSkills={filteredSkills}
+          filteredItems={filteredSlashItems}
           selectedIndex={selectedMenuIndex}
           onSelect={handleSlashSelect}
           onClose={() => setShowSlashMenu(false)}

@@ -1,8 +1,10 @@
 """Deterministic, fail-closed resolution for unattended Worker Runs.
 
 The interactive Agent path intentionally waits on the same registries.  This
-module is the only place where ``interaction_mode=auto`` may turn a pending
-interrupt into a decision.  It never invents business confirmation payloads.
+module is the only place where unattended ``auto``/``external`` modes may turn
+a pending interrupt into a decision. ``external`` leaves permission decisions
+to the consumer and uses this resolver only for fail-closed business HITL. It
+never invents business confirmation payloads.
 """
 
 from __future__ import annotations

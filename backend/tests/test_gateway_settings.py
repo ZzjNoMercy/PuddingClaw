@@ -900,6 +900,42 @@ def test_settings_api_persists_harness_model_call_limit(tmp_path, monkeypatch):
     assert displayed["harness"]["model_call_limit"]["thread_limit"] == 100
 
 
+def test_settings_api_persists_harness_prompt_cache_controls(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
+
+    prompt_cache = {
+        "trace_part_diagnostics": True,
+        "ordered_system_sections": True,
+        "tail_routing_message": True,
+        "deterministic_session_projection": True,
+        "stable_tool_schema": False,
+    }
+    client = TestClient(app)
+    response = client.put("/api/settings", json={"harness": {"prompt_cache": prompt_cache}})
+    assert response.status_code == 200, response.text
+
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["harness"]["prompt_cache"] == prompt_cache
+    assert config.get_settings_for_display()["harness"]["prompt_cache"] == prompt_cache
+
+
+def test_settings_api_rejects_non_boolean_prompt_cache_control(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
+
+    client = TestClient(app)
+    response = client.put(
+        "/api/settings",
+        json={"harness": {"prompt_cache": {"stable_tool_schema": "yes"}}},
+    )
+
+    assert response.status_code == 400
+    assert "stable_tool_schema must be a boolean" in response.json()["detail"]
+
+
 def test_settings_api_persists_deepagents_context_engineering_without_touching_chat(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     config_path.write_text("{}", encoding="utf-8")
@@ -908,7 +944,10 @@ def test_settings_api_persists_deepagents_context_engineering_without_touching_c
     payload = {
         "compression": {
             "deepagents": {
-                "summarization": {"trigger_tokens": 260000},
+                "summarization": {
+                    "model_id": "deepseek:deepseek-openai:deepseek-v4-flash:llm",
+                    "trigger_tokens": 260000,
+                },
                 "tool_context": {
                     "enabled": False,
                     "immediate_compaction_enabled": True,
@@ -925,6 +964,9 @@ def test_settings_api_persists_deepagents_context_engineering_without_touching_c
     assert response.status_code == 200, response.text
     displayed = client.get("/api/settings").json()
     deepagents = displayed["compression"]["deepagents"]
+    assert deepagents["summarization"]["model_id"] == (
+        "deepseek:deepseek-openai:deepseek-v4-flash:llm"
+    )
     assert deepagents["summarization"]["trigger_tokens"] == 260000
     assert "summary_input_tokens" not in deepagents["summarization"]
     assert deepagents["tool_context"] == {

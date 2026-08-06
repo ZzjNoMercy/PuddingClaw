@@ -101,7 +101,7 @@ Machine integrations should continue using stdin JSON rather than constructing a
 Parse stdout only after the process exits. It contains one JSON object.
 
 - `status == "completed"`: present `final_response` as the Worker answer. Fall back to `reply` only for an older compatible Worker that omits `final_response`.
-- `analytics_model_id` and `analytics_model_match`: Backend-selected audit output. Preserve them for tracing; never feed them back as CLI input.
+- `analytics_model_id` and `analytics_model_match`: Backend-selected audit output. Preserve them for tracing; never feed them back as CLI input. `analytics_model_match.status == "general"` means the Backend judged the question to be non-analytics (e.g. small talk or general knowledge) and answered it without binding an analytics model; in that case `analytics_model_id` is empty. This is a normal completed answer, not an error.
 - `reply`: aggregated visible content that may include intermediate assistant narration. Do not prefer it over `final_response`.
 - `outcome == "analytics_model_clarification_required"`: ask the user to clarify the actual business object, metric, time range, or analysis scenario, then submit the clarified question as a new request. Do not ask the user for a model ID and do not start a Session until the Backend finds one unique match.
 - `outcome == "analytics_model_unavailable"`: explain that the Worker Key has no usable model or its Session-bound model is no longer allowed; ask the user to contact the PuddingClaw administrator. Do not silently switch a continuous Session to another model.

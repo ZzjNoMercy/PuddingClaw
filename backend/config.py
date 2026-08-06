@@ -243,6 +243,10 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         "deepagents": {
             "summarization": {
                 "enabled": True,
+                # Optional registered Provider model id used by both automatic
+                # DeepAgents summarization and manual /compact. An empty value
+                # preserves the legacy behavior of following the Agent model.
+                "model_id": "",
                 "trigger_tokens": 160000,
                 "keep_messages": 20,
             },
@@ -1752,6 +1756,11 @@ def update_settings(updates: dict[str, Any]) -> None:
             if isinstance(summary_update, dict):
                 summary_update = dict(summary_update)
                 summary_update.pop("summary_input_tokens", None)
+                if "model_id" in summary_update:
+                    model_id = summary_update.get("model_id")
+                    if model_id is not None and not isinstance(model_id, str):
+                        raise ValueError("摘要 / Compact 模型 ID 必须是字符串")
+                    summary_update["model_id"] = str(model_id or "").strip()[:512]
                 if "trigger_tokens" in summary_update:
                     trigger = int(summary_update["trigger_tokens"])
                     if not 10000 <= trigger <= 1000000:
@@ -1825,6 +1834,20 @@ def _normalize_harness_update(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("harness settings must be an object")
     result = copy.deepcopy(value)
+
+    prompt_cache = result.get("prompt_cache")
+    if prompt_cache is not None:
+        if not isinstance(prompt_cache, dict):
+            raise ValueError("harness.prompt_cache must be an object")
+        for key in (
+            "trace_part_diagnostics",
+            "ordered_system_sections",
+            "tail_routing_message",
+            "deterministic_session_projection",
+            "stable_tool_schema",
+        ):
+            if key in prompt_cache and not isinstance(prompt_cache[key], bool):
+                raise ValueError(f"harness.prompt_cache.{key} must be a boolean")
 
     goals = result.get("goals")
     if goals is not None:
@@ -1991,6 +2014,7 @@ def get_deepagents_summarization_config() -> dict[str, Any]:
             "summarization",
             {
                 "enabled": True,
+                "model_id": "",
                 "trigger_tokens": 160000,
                 "keep_messages": 20,
             },

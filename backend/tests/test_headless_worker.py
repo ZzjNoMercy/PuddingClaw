@@ -7,23 +7,30 @@ from pathlib import Path
 import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from starlette.requests import Request
 
 from analytics.models.router import AnalyticsModelRoute
 from api import headless as headless_api
 from api.headless import (
+    HeadlessResumeDecision,
+    HeadlessResumeRequest,
     HeadlessRunRequest,
     _admin,
     _consume_run,
     _ensure_worker_project,
+    _resolve_external_permission,
     create_headless_run,
+    list_worker_access_logs,
+    resume_headless_run,
 )
 from graph.headless_resolver import HeadlessInterruptResolver
 from graph.permission_resume import permission_resume_registry
 from graph.session_manager import session_manager
 from headless_session_lifecycle import cleanup_stale_headless_sessions
+from knowledge.models import WorkerAccessLog
 from projects.registry import project_registry
-from worker_access import WorkerAccessStore
+from worker_access import WorkerAccessLogStore, WorkerAccessStore
 
 
 def _request_from(host: str) -> Request:
@@ -62,6 +69,45 @@ def test_model_routing_candidates_are_limited_by_worker_key(monkeypatch):
 
     assert [item["id"] for item in candidates] == ["allowed"]
     assert candidates[0]["applicability"] == "allowed applicability"
+
+
+@pytest.mark.asyncio
+async def test_worker_access_log_api_uses_beijing_time_and_fixed_page_size(monkeypatch):
+    captured: dict[str, object] = {}
+
+    async def fake_list(**kwargs):
+        captured.update(kwargs)
+        return {
+            "items": [
+                {
+                    "id": "wal-test",
+                    "created_at": 0.0,
+                    "key_id": "key-test",
+                    "key_name": "puddingteams",
+                    "query": "测试 query",
+                }
+            ],
+            "page": 1,
+            "page_size": 10,
+            "total": 1,
+            "total_pages": 1,
+            "key_names": ["puddingteams"],
+        }
+
+    monkeypatch.delenv("PUDDINGCLAW_ADMIN_TOKEN", raising=False)
+    monkeypatch.setattr(headless_api.worker_access_log_store, "list", fake_list)
+    result = await list_worker_access_logs(
+        _request_from("127.0.0.1"),
+        page=1,
+        key_name=None,
+        query_keyword=None,
+        start_at=None,
+        end_at=None,
+    )
+
+    assert captured["page_size"] == 10
+    assert result["timezone"] == "Asia/Shanghai"
+    assert result["items"][0]["created_at_beijing"] == "1970-01-01 08:00:00"
 
 
 def test_local_worker_key_management_does_not_require_admin_token(monkeypatch):
@@ -242,9 +288,23 @@ async def test_new_headless_run_returns_session_retention_metadata(tmp_path: Pat
     monkeypatch.setattr(
         headless_api,
         "_principal_for_scope",
-        lambda _authorization, _scope: {"key_id": "key-owner", "authority_profile": "smart"},
+        lambda _authorization, _scope: {
+            "key_id": "key-owner",
+            "name": "puddingteams",
+            "authority_profile": "smart",
+        },
     )
     monkeypatch.setattr(headless_api, "_ensure_worker_project", lambda: ("project-test", tmp_path))
+    logged: dict[str, object] = {}
+
+    async def fake_record(**kwargs):
+        logged.update(kwargs)
+
+    monkeypatch.setattr(
+        headless_api.worker_access_log_store,
+        "record",
+        fake_record,
+    )
 
     async def fake_route(_message, _principal):
         return AnalyticsModelRoute("matched", "analysis", 0.96, "semantic", "matched business scope")
@@ -270,6 +330,8 @@ async def test_new_headless_run_returns_session_retention_metadata(tmp_path: Pat
     assert response["session_ttl_seconds"] == 86_400
     assert response["session_expires_at"] > time.time()
     assert session_manager.get_metadata(response["session_id"])["analytics_model_id"] == "analysis"
+    assert logged["key_name"] == "puddingteams"
+    assert logged["query"] == "新任务"
 
 
 def test_worker_access_key_is_one_time_and_revocable(tmp_path: Path):
@@ -282,6 +344,42 @@ def test_worker_access_key_is_one_time_and_revocable(tmp_path: Path):
     assert store.authenticate(secret, "worker:runs:create") is None
     store.revoke(public["key_id"])
     assert store.authenticate(secret, "worker:models:read") is None
+
+
+@pytest.mark.asyncio
+async def test_worker_access_logs_filter_and_paginate_ten_per_page(tmp_path: Path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'worker-logs.db'}")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(WorkerAccessLog.__table__.create)
+    store = WorkerAccessLogStore(sessions)
+    for index in range(23):
+        await store.record(
+            key_id="key-teams" if index % 2 == 0 else "key-codex",
+            key_name="puddingteams" if index % 2 == 0 else "codex",
+            query=f"查询第 {index} 条销量" if index % 3 == 0 else f"查询第 {index} 条配置",
+            created_at=1_000.0 + index,
+        )
+
+    second_page = await store.list(page=2, page_size=10)
+    filtered = await store.list(
+        page=1,
+        page_size=10,
+        key_name="puddingteams",
+        query="销量",
+        start_at=1_000.0,
+        end_at=1_022.0,
+    )
+
+    assert second_page["page_size"] == 10
+    assert second_page["total"] == 23
+    assert len(second_page["items"]) == 10
+    assert second_page["items"][0]["created_at"] == 1_012.0
+    assert filtered["total"] == 4
+    assert {item["key_name"] for item in filtered["items"]} == {"puddingteams"}
+    assert all("销量" in item["query"] for item in filtered["items"])
+    assert filtered["key_names"] == ["codex", "puddingteams"]
+    await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -386,6 +484,176 @@ async def test_headless_response_separates_aggregate_reply_from_final_assistant_
 
 
 @pytest.mark.asyncio
+async def test_headless_permission_pauses_and_resume_continues_same_run(tmp_path: Path, monkeypatch):
+    session_id = "worker-session-external-hitl"
+    session_manager.initialize(tmp_path)
+    session_manager.create_session(
+        session_id,
+        metadata={
+            "runtime_mode": "headless_worker",
+            "headless_enabled": True,
+            "worker_key_id": "key-owner",
+        },
+    )
+    permission = permission_resume_registry.create_tool_action_request(
+        session_id=session_id,
+        query_id="query-same",
+        run_id="run-same",
+        tool_call_id="call-same",
+        tool_name="execute",
+        command="python3 /skills/example/run.py",
+        reason="managed_skill_script",
+        risk="high",
+    )
+
+    async def fake_stream(**kwargs):
+        assert kwargs["interaction_mode"] == "external"
+        yield {
+            "event": "run_started",
+            "data": json.dumps(
+                {"session_id": session_id, "query_id": "query-same", "run_id": "run-same"}
+            ),
+        }
+        yield {"event": "permission_required", "data": json.dumps(permission)}
+        decision = await permission_resume_registry.wait(permission["id"])
+        yield {
+            "event": "permission_resolved",
+            "data": json.dumps(
+                {
+                    "request_id": permission["id"],
+                    "interrupt_id": "interrupt-same",
+                    "decision": decision,
+                }
+            ),
+        }
+        yield {
+            "event": "run_outcome",
+            "data": json.dumps(
+                {
+                    "session_id": session_id,
+                    "query_id": "query-same",
+                    "run_id": "run-same",
+                    "status": "completed",
+                    "outcome": "completed",
+                }
+            ),
+        }
+        yield {
+            "event": "done",
+            "data": json.dumps({"content": "完成", "final_response": "完成"}),
+        }
+
+    monkeypatch.setattr(headless_api.deepagents_agent_manager, "astream", fake_stream)
+    monkeypatch.setattr(headless_api, "_model_binding", lambda model_id: {"id": model_id})
+    monkeypatch.setattr(
+        headless_api,
+        "_principal_for_scope",
+        lambda _authorization, _scope: {"key_id": "key-owner"},
+    )
+
+    paused = await _consume_run(
+        request=HeadlessRunRequest(message="运行 Skill"),
+        session_id=session_id,
+        project_id="project-test",
+        approval_mode="smart",
+        authority={"profile": "smart"},
+        request_received_at=1234.5,
+        analytics_model_id="analysis",
+        analytics_model_match={"status": "matched", "selected_id": "analysis"},
+        worker_key_id="key-owner",
+    )
+
+    assert paused["status"] == "needs_input"
+    assert paused["outcome"] == "waiting_hitl"
+    assert paused["run_id"] == "run-same"
+    assert paused["needs_input"]["request_id"] == permission["id"]
+    assert permission_resume_registry.get(permission["id"])["status"] == "pending"
+    persisted_pending = session_manager.get_metadata(session_id)["headless_pending_input"]
+    assert persisted_pending["status"] == "pending"
+    assert persisted_pending["requests"][0]["id"] == permission["id"]
+
+    completed = await resume_headless_run(
+        "run-same",
+        HeadlessResumeRequest(
+            continuation_token=paused["continuation_token"],
+            decisions=[
+                HeadlessResumeDecision(
+                    request_id=permission["id"],
+                    decision="reject",
+                    scope="once",
+                )
+            ],
+        ),
+        authorization="Bearer test",
+    )
+
+    assert completed["status"] == "completed"
+    assert completed["outcome"] == "completed"
+    assert completed["run_id"] == "run-same"
+    assert completed["final_response"] == "完成"
+    assert permission_resume_registry.get(permission["id"])["decision"]["type"] == "reject"
+    assert session_manager.get_metadata(session_id)["headless_pending_input"]["status"] == "completed"
+
+    retried = await resume_headless_run(
+        "run-same",
+        HeadlessResumeRequest(
+            continuation_token=paused["continuation_token"],
+            decisions=[
+                HeadlessResumeDecision(
+                    request_id=permission["id"],
+                    decision="reject",
+                    scope="once",
+                )
+            ],
+        ),
+        authorization="Bearer test",
+    )
+    assert retried["status"] == "completed"
+    assert retried["run_id"] == "run-same"
+
+
+@pytest.mark.asyncio
+async def test_headless_cli_approval_uses_canonical_permission_grant(tmp_path: Path):
+    session_id = "worker-session-external-approve"
+    session_manager.initialize(tmp_path)
+    session_manager.create_session(
+        session_id,
+        metadata={
+            "runtime_mode": "headless_worker",
+            "headless_enabled": True,
+            "worker_key_id": "key-owner",
+        },
+    )
+    permission = permission_resume_registry.create_tool_action_request(
+        session_id=session_id,
+        query_id="query-approve",
+        run_id="run-approve",
+        tool_call_id="call-approve",
+        tool_name="execute",
+        command="python3 /skills/example/run.py",
+        reason="managed_skill_script",
+        risk="high",
+    )
+
+    await _resolve_external_permission(
+        session_id=session_id,
+        decision=HeadlessResumeDecision(
+            request_id=permission["id"],
+            decision="approve",
+            scope="once",
+        ),
+    )
+
+    resolved = permission_resume_registry.get(permission["id"])
+    assert resolved["status"] == "resolved"
+    assert resolved["decision"]["type"] == "approve"
+    grants = session_manager.list_permission_grants(session_id)
+    assert len(grants) == 1
+    assert grants[0]["scope"] == "once"
+    assert grants[0]["metadata"]["run_id"] == "run-approve"
+
+
+@pytest.mark.asyncio
 async def test_ambiguous_model_route_does_not_create_or_run_session(tmp_path: Path, monkeypatch):
     session_manager.initialize(tmp_path)
     monkeypatch.setattr(
@@ -464,3 +732,112 @@ async def test_continuous_session_reuses_bound_model_without_rerouting(tmp_path:
 
     assert response["analytics_model_id"] == "product"
     assert response["analytics_model_match"]["strategy"] == "session_bound"
+
+
+@pytest.mark.asyncio
+async def test_general_route_runs_session_without_model(tmp_path: Path, monkeypatch):
+    session_manager.initialize(tmp_path)
+    monkeypatch.setattr(
+        headless_api,
+        "_principal_for_scope",
+        lambda _authorization, _scope: {"key_id": "key-owner", "authority_profile": "smart"},
+    )
+    monkeypatch.setattr(
+        headless_api,
+        "_model_options",
+        lambda _principal: [{"id": "sales"}, {"id": "product"}],
+    )
+    monkeypatch.setattr(headless_api, "_ensure_worker_project", lambda: ("project-test", tmp_path))
+
+    async def fake_route(_message, _principal):
+        return AnalyticsModelRoute("general", None, 0.9, "semantic", "weather_question")
+
+    consumed: dict[str, object] = {}
+
+    async def fake_consume(**kwargs):
+        consumed.update(kwargs)
+        return {
+            "schema_version": "1",
+            "session_id": kwargs["session_id"],
+            "analytics_model_id": kwargs["analytics_model_id"],
+            "status": "completed",
+            "outcome": "completed",
+            "final_response": "今天慈溪中雨转小雨。",
+        }
+
+    monkeypatch.setattr(headless_api, "_route_analytics_model", fake_route)
+    monkeypatch.setattr(headless_api, "_consume_run", fake_consume)
+
+    response = await create_headless_run(
+        HeadlessRunRequest(message="今天宁波慈溪天气如何"),
+        authorization="Bearer test",
+    )
+
+    assert response["status"] == "completed"
+    assert consumed["analytics_model_id"] == ""
+    assert session_manager.get_metadata(response["session_id"])["analytics_model_id"] == ""
+
+
+@pytest.mark.asyncio
+async def test_continuous_general_session_reroutes_and_can_bind_later(tmp_path: Path, monkeypatch):
+    session_manager.initialize(tmp_path)
+    session_id = "worker-session-general"
+    session_manager.create_session(
+        session_id,
+        metadata={
+            "runtime_mode": "headless_worker",
+            "headless_enabled": True,
+            "worker_key_id": "key-owner",
+            "analytics_model_id": "",
+        },
+    )
+    monkeypatch.setattr(
+        headless_api,
+        "_principal_for_scope",
+        lambda _authorization, _scope: {"key_id": "key-owner", "authority_profile": "smart"},
+    )
+    monkeypatch.setattr(
+        headless_api,
+        "_model_options",
+        lambda _principal: [{"id": "sales"}, {"id": "product"}],
+    )
+    monkeypatch.setattr(headless_api, "_ensure_worker_project", lambda: ("project-test", tmp_path))
+
+    routes = [
+        AnalyticsModelRoute("general", None, 0.9, "semantic", "weather_question"),
+        AnalyticsModelRoute("matched", "product", 0.96, "semantic", "matched business scope"),
+    ]
+
+    async def fake_route(_message, _principal):
+        return routes.pop(0)
+
+    consumed: list[dict[str, object]] = []
+
+    async def fake_consume(**kwargs):
+        consumed.append(kwargs)
+        return {
+            "schema_version": "1",
+            "session_id": kwargs["session_id"],
+            "analytics_model_id": kwargs["analytics_model_id"],
+            "status": "completed",
+            "outcome": "completed",
+        }
+
+    monkeypatch.setattr(headless_api, "_route_analytics_model", fake_route)
+    monkeypatch.setattr(headless_api, "_consume_run", fake_consume)
+
+    general = await create_headless_run(
+        HeadlessRunRequest(message="今天天气如何", session_id=session_id),
+        authorization="Bearer test",
+    )
+    assert general["status"] == "completed"
+    assert consumed[0]["analytics_model_id"] == ""
+    assert session_manager.get_metadata(session_id)["analytics_model_id"] == ""
+
+    bound = await create_headless_run(
+        HeadlessRunRequest(message="看看空气悬架配置率", session_id=session_id),
+        authorization="Bearer test",
+    )
+    assert bound["status"] == "completed"
+    assert consumed[1]["analytics_model_id"] == "product"
+    assert session_manager.get_metadata(session_id)["analytics_model_id"] == "product"

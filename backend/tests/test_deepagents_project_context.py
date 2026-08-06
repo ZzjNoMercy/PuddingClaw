@@ -152,16 +152,44 @@ def test_default_agent_prompt_requires_chinese_user_visible_output() -> None:
     assert "内部隐藏推理可以使用英文" in prompt
 
 
-def test_default_agent_prompt_routes_internal_knowledge_sources_together() -> None:
+def test_default_agent_prompt_reuses_summary_before_database_skill_activation() -> None:
+    prompt = (Path(__file__).resolve().parent.parent / "prompts" / "deepagents" / "AGENTS.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "## 压缩摘要、近期历史与重复查询" in prompt
+    assert "在激活任何 Skill 或调用任何查询工具之前" in prompt
+    assert "基于本会话已有结果" in prompt
+    assert "不要先激活 `/skills/database-analysis/SKILL.md`" in prompt
+    assert "询问用户是否需要按当前数据库重新查询" in prompt
+    assert "近期消息中的更新事实优先于较早摘要" in prompt
+    assert "用户确认后的新一轮" in prompt
+
+
+def test_default_agent_prompt_routes_markdown_wiki_first_and_documents_conditionally() -> None:
     prompt = (Path(__file__).resolve().parent.parent / "prompts" / "deepagents" / "AGENTS.md").read_text(
         encoding="utf-8"
     )
 
     assert "## Knowledge Source Routing" in prompt
-    assert "同时读取 `/skills/knowledge-search/SKILL.md` 与 `/skills/llm-wiki/SKILL.md`" in prompt
-    assert "不要因为其中一路先返回结果而跳过另一路" in prompt
-    assert "向文档知识库和 Wiki/GBrain 提交语义等价的查询" in prompt
-    assert "发布后的 Markdown LLM Wiki 是完整知识源" in prompt
-    assert "结果没有直接命中用户所问实体/主题" in prompt
-    assert "必须继续调用 `llm_wiki_query`" in prompt
-    assert "只有全部可用的内部来源均返回无结果、知识缺口或资料明显不足时" in prompt
+    assert "先读取 `/skills/llm-wiki/SKILL.md`" in prompt
+    assert "读取 Skill 只完成能力激活，不等于已经检索" in prompt
+    assert '`llm_wiki_context(operation="query")`' in prompt
+    assert "不默认并行调用 `llamaindex_knowledge_query`" in prompt
+    assert "Wiki 无直接命中、覆盖不完整" in prompt
+    assert "用户要求原始证据或具体 PDF/Markdown/图片/图表" in prompt
+    assert "才读取 `/skills/knowledge-search/SKILL.md`" in prompt
+    assert "仅在实体关系、图谱遍历或结构化筛选有价值时" in prompt
+    assert "不得替代或跳过本轮 `llm_wiki_query`" in prompt
+    assert "本轮按上述条件需要的补充路径" in prompt
+
+
+def test_knowledge_search_skill_requires_actual_document_index_query() -> None:
+    skill = (Path(__file__).resolve().parent.parent / "skills" / "knowledge-search" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    normalized = " ".join(skill.split())
+
+    assert "call `llamaindex_knowledge_query` after activating this Skill" in normalized
+    assert "Reading this file only activates the toolset" in normalized
+    assert "Markdown LLM Wiki and GBrain are separate knowledge paths" in normalized

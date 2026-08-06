@@ -75,6 +75,7 @@
     "deepagents": {
       "summarization": {
         "enabled": true,
+        "model_id": "",
         "trigger_tokens": 160000,
         "keep_messages": 20
       },

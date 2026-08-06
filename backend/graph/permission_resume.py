@@ -442,6 +442,14 @@ class PermissionResumeRegistry:
     async def wait(self, request_id: str) -> dict[str, Any]:
         future = self._pending.get(request_id)
         if future is None:
+            # A fast external consumer can resolve immediately after the
+            # required event is emitted, before the graph advances to this
+            # wait call. Preserve that authoritative decision on the request
+            # instead of turning the valid approval into a synthetic reject.
+            request = self._requests.get(request_id)
+            decision = request.get("decision") if isinstance(request, dict) else None
+            if request is not None and request.get("status") == "resolved" and isinstance(decision, dict):
+                return dict(decision)
             return {"type": "reject", "message": "Permission request is no longer active."}
         return await future
 

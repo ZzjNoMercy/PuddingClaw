@@ -4119,6 +4119,13 @@ export async function getSessionHistory(
   todos_authority?: { kind: "legacy" | "none" | "goal" | "run"; goal_id?: string; goal_revision?: number; run_id?: string };
   todo_ledger_revision?: number;
   graph?: GraphStructure | null;
+  headless_pending_input?: {
+    status?: string;
+    run_id?: string | null;
+    query_id?: string | null;
+    requests?: PermissionRequest[];
+    updated_at?: number;
+  };
   messages: Array<{
     role: string;
     content: string;
@@ -4335,18 +4342,86 @@ export async function getFileTokenCounts(
   return resp.json();
 }
 
+export interface AgentCompactResult {
+  status: "completed";
+  session_id: string;
+  operation_id: string;
+  trigger: "manual";
+  tokens_before: number;
+  tokens_after: number;
+  tokens_reduced: number;
+  reduction_percentage: number;
+  summarized_message_count: number;
+  kept_recent_message_count: number;
+  source_query_id: string;
+  source_run_id: string;
+  projection_version: number;
+  summary_model: string;
+}
+
+interface AgentCompactOperation extends Omit<Partial<AgentCompactResult>, "status" | "session_id" | "operation_id"> {
+  status: "running" | "completed" | "failed" | "expired";
+  session_id: string;
+  operation_id: string;
+  started_at?: number;
+  completed_at?: number;
+  error?: string;
+}
+
 /**
- * Compress a session's conversation history.
+ * Manually compact an idle Agent Session's model context projection.
+ * The visible/raw transcript and control-plane ledgers are not modified.
  */
-export async function compressSession(
-  sessionId: string
-): Promise<{ archived_count: number; remaining_count: number }> {
+export async function compactAgentSession(
+  sessionId: string,
+  focus = "",
+): Promise<AgentCompactResult> {
   const resp = await fetch(
-    `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/compress`,
-    { method: "POST" }
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/compact`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ focus }),
+    },
   );
-  if (!resp.ok) throw new Error(`Failed to compress session: ${resp.status}`);
-  return resp.json();
+  const text = await resp.text();
+  if (!resp.ok) {
+    throw new Error(apiErrorMessage(text, `Agent 上下文压缩失败：${resp.status}`));
+  }
+  const operation = JSON.parse(text) as AgentCompactOperation;
+  if (!operation.operation_id) {
+    throw new Error("Agent 上下文压缩未返回 operation_id。");
+  }
+
+  const deadline = Date.now() + 16 * 60 * 1000;
+  let consecutivePollFailures = 0;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => window.setTimeout(resolve, 750));
+    let terminalFailure: Error | null = null;
+    try {
+      const statusResp = await fetch(
+        `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/compact/${encodeURIComponent(operation.operation_id)}`,
+        { cache: "no-store" },
+      );
+      const statusText = await statusResp.text();
+      if (!statusResp.ok) {
+        throw new Error(apiErrorMessage(statusText, `读取压缩状态失败：${statusResp.status}`));
+      }
+      consecutivePollFailures = 0;
+      const status = JSON.parse(statusText) as AgentCompactOperation;
+      if (status.status === "completed") return status as AgentCompactResult;
+      if (status.status === "failed" || status.status === "expired") {
+        terminalFailure = new Error(
+          status.error || `Agent 上下文压缩已${status.status === "expired" ? "超时" : "失败"}。`,
+        );
+      }
+    } catch (error) {
+      consecutivePollFailures += 1;
+      if (consecutivePollFailures >= 5) throw error;
+    }
+    if (terminalFailure) throw terminalFailure;
+  }
+  throw new Error("等待 Agent 上下文压缩结果超时；可稍后重试或刷新 Session 状态。");
 }
 
 /**

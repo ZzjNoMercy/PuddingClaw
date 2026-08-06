@@ -3230,6 +3230,35 @@ def test_smart_mode_treats_script_entrypoints_as_sandboxed_computation(tmp_path,
     assert result.reason == "smart_sandbox_execute"
 
 
+def test_smart_mode_allows_mounted_skill_python_with_dev_null_fallback(tmp_path):
+    command = (
+        "python3 /skills/get-date/scripts/get_datetime.py 2>/dev/null || "
+        'python3 -c "from datetime import datetime; print(datetime.now())"'
+    )
+    pipeline = _smart_docker_pipeline(tmp_path)
+    request = ToolCallRequest(
+        tool_call={
+            "id": "smart-skill-python",
+            "name": "execute",
+            "args": {"command": command},
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+
+    requirements = ShellPolicyAnalyzer.requirements(
+        command,
+        workspace_path=tmp_path,
+    )
+    result = pipeline._preflight(request)
+
+    assert requirements.external_path_candidates == ()
+    assert pipeline._require_external_shell_authority(request) is None
+    assert result.decision == PolicyDecision.ALLOW
+    assert result.reason == "smart_sandbox_workspace_write"
+
+
 @pytest.mark.parametrize(
     "command",
     [

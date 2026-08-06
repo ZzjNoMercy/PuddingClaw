@@ -10,9 +10,15 @@ import secrets
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from db import get_sessionmaker
+from knowledge.models import WorkerAccessLog
 
 WORKER_SCOPES = frozenset(
     {
@@ -143,6 +149,7 @@ class WorkerAccessStore:
         if static and hmac.compare_digest(token, static):
             return {
                 "key_id": "static-dev-key",
+                "name": "Static Dev Key",
                 "scopes": sorted(WORKER_SCOPES),
                 "allowed_analytics_models": [],
                 "authority_profile": str(os.getenv("PUDDINGCLAW_HEADLESS_AUTHORITY_PROFILE", "smart")),
@@ -189,4 +196,128 @@ class WorkerAccessStore:
             self._write(records)
 
 
+class WorkerAccessLogStore:
+    """Database-backed audit log for authenticated Headless Worker Runs."""
+
+    def __init__(self, sessionmaker: async_sessionmaker[AsyncSession] | None = None) -> None:
+        self._sessionmaker = sessionmaker
+
+    def _sessions(self) -> async_sessionmaker[AsyncSession]:
+        return self._sessionmaker or get_sessionmaker()
+
+    @staticmethod
+    def _timestamp(value: datetime) -> float:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.timestamp()
+
+    async def record(
+        self,
+        *,
+        key_id: str,
+        key_name: str,
+        query: str,
+        created_at: float | None = None,
+    ) -> dict[str, Any]:
+        record = WorkerAccessLog(
+            id="wal_" + uuid.uuid4().hex,
+            created_at=datetime.fromtimestamp(
+                float(created_at if created_at is not None else time.time()),
+                tz=timezone.utc,
+            ),
+            key_id=str(key_id or "unknown-worker-key"),
+            key_name=str(key_name or key_id or "Unknown Worker Key")[:120],
+            query=str(query or ""),
+        )
+        async with self._sessions()() as session:
+            session.add(record)
+            await session.commit()
+        return {
+            "id": record.id,
+            "created_at": self._timestamp(record.created_at),
+            "key_id": record.key_id,
+            "key_name": record.key_name,
+            "query": record.query,
+        }
+
+    async def list(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 10,
+        key_name: str | None = None,
+        query: str | None = None,
+        start_at: float | None = None,
+        end_at: float | None = None,
+    ) -> dict[str, Any]:
+        safe_page = max(1, int(page))
+        safe_page_size = min(100, max(1, int(page_size)))
+        conditions: list[Any] = []
+        clean_key_name = str(key_name or "").strip()
+        clean_query = str(query or "").strip()
+        if clean_key_name:
+            conditions.append(WorkerAccessLog.key_name == clean_key_name)
+        if clean_query:
+            conditions.append(
+                func.lower(WorkerAccessLog.query).contains(clean_query.lower(), autoescape=True)
+            )
+        if start_at is not None:
+            conditions.append(
+                WorkerAccessLog.created_at
+                >= datetime.fromtimestamp(float(start_at), tz=timezone.utc)
+            )
+        if end_at is not None:
+            conditions.append(
+                WorkerAccessLog.created_at
+                <= datetime.fromtimestamp(float(end_at), tz=timezone.utc)
+            )
+        async with self._sessions()() as session:
+            total = int(
+                await session.scalar(
+                    select(func.count()).select_from(WorkerAccessLog).where(*conditions)
+                )
+                or 0
+            )
+            rows = list(
+                (
+                    await session.scalars(
+                        select(WorkerAccessLog)
+                        .where(*conditions)
+                        .order_by(WorkerAccessLog.created_at.desc(), WorkerAccessLog.id.desc())
+                        .limit(safe_page_size)
+                        .offset((safe_page - 1) * safe_page_size)
+                    )
+                ).all()
+            )
+            key_names = [
+                str(value)
+                for value in (
+                    await session.scalars(
+                        select(WorkerAccessLog.key_name)
+                        .distinct()
+                        .order_by(WorkerAccessLog.key_name)
+                    )
+                ).all()
+                if str(value).strip()
+            ]
+        return {
+            "items": [
+                {
+                    "id": row.id,
+                    "created_at": self._timestamp(row.created_at),
+                    "key_id": row.key_id,
+                    "key_name": row.key_name,
+                    "query": row.query,
+                }
+                for row in rows
+            ],
+            "page": safe_page,
+            "page_size": safe_page_size,
+            "total": total,
+            "total_pages": (total + safe_page_size - 1) // safe_page_size,
+            "key_names": key_names,
+        }
+
+
 worker_access_store = WorkerAccessStore()
+worker_access_log_store = WorkerAccessLogStore()

@@ -4,6 +4,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
+import { createInterface } from "node:readline/promises";
 import { WorkerClient, WorkerClientError } from "./client.js";
 import { exitCodeForResponse, writeDiagnostic, writeJson } from "./output.js";
 
@@ -36,6 +37,7 @@ function jsonMode(args) { return args.includes("--json"); }
 
 function emit(value, asJson) {
   if (asJson) writeJson(value);
+  else if (value?.status === "needs_input") writeJson(value);
   else if (typeof value?.final_response === "string" && value.final_response) process.stdout.write(`${value.final_response}\n`);
   else if (typeof value?.reply === "string") process.stdout.write(`${value.reply}\n`);
   else writeJson(value);
@@ -142,6 +144,80 @@ async function readInput(flags) {
   return value;
 }
 
+function pendingRequests(response) {
+  const needs = response?.needs_input;
+  if (!needs || needs.type !== "permission_request") return [];
+  return Array.isArray(needs.requests) && needs.requests.length ? needs.requests : [needs];
+}
+
+function permissionSummary(request) {
+  const command = String(request?.command || request?.request?.command || "").trim();
+  const pathValue = String(request?.path || request?.request?.path || "").trim();
+  const tool = String(request?.tool_name || request?.request?.tool_name || "").trim();
+  return command || pathValue || tool || String(request?.permission_type || "受保护操作");
+}
+
+async function collectApprovalDecisions(response) {
+  const requests = pendingRequests(response);
+  if (!requests.length) return null;
+  if (!process.stdin.isTTY || !process.stderr.isTTY) return null;
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  const decisions = [];
+  try {
+    for (const request of requests) {
+      const options = new Set(Array.isArray(request?.options) ? request.options.map(String) : []);
+      const supportsOnce = options.size === 0 || options.has("once")
+        || options.some((option) => option.endsWith("_run"));
+      const supportsSession = options.has("session")
+        || options.some((option) => option.endsWith("_session"));
+      process.stderr.write(`\nAgent 请求授权\n  ${permissionSummary(request)}\n`);
+      if (request?.reason) process.stderr.write(`  原因：${request.reason}\n`);
+      const choices = [
+        ...(supportsOnce ? ["[1] 仅允许本次"] : []),
+        ...(supportsSession ? ["[2] 本 Session 允许"] : []),
+        "[3] 拒绝",
+      ].join("  ");
+      const validChoices = new Set([
+        ...(supportsOnce ? ["1"] : []),
+        ...(supportsSession ? ["2"] : []),
+        "3",
+      ]);
+      let selected = "";
+      while (!validChoices.has(selected)) {
+        selected = String(await rl.question(`${choices}\n请选择：`)).trim();
+      }
+      decisions.push({
+        request_id: String(request.request_id),
+        decision: selected === "3" ? "reject" : "approve",
+        scope: selected === "2" ? "session" : "once",
+      });
+    }
+  } finally {
+    rl.close();
+  }
+  return decisions;
+}
+
+async function resumeWithCliApproval(client, response, { asJson, signal }) {
+  let current = response;
+  while (current?.status === "needs_input" && current?.outcome === "waiting_hitl") {
+    if (asJson) return current;
+    const decisions = await collectApprovalDecisions(current);
+    if (!decisions) return current;
+    const runId = String(current.run_id || "");
+    const token = String(current.continuation_token || "");
+    if (!runId || !token) {
+      throw new WorkerClientError("Headless approval response is missing continuation data", { code: "protocol_error" });
+    }
+    current = await client.request(`/api/headless/runs/${encodeURIComponent(runId)}/resume`, {
+      method: "POST",
+      body: { continuation_token: token, decisions },
+      signal,
+    });
+  }
+  return current;
+}
+
 async function runCommand(args) {
   const { positionals, flags } = parseFlags(args);
   const input = await readInput(flags);
@@ -167,8 +243,12 @@ async function runCommand(args) {
       ...(input?.metadata && typeof input.metadata === "object" ? { metadata: input.metadata } : {}),
       ...(input?.request_id ? { request_id: String(input.request_id) } : {}),
     };
-    const response = await client.request("/api/headless/runs", {
+    let response = await client.request("/api/headless/runs", {
       method: "POST", body, signal: controller.signal,
+    });
+    response = await resumeWithCliApproval(client, response, {
+      asJson: Boolean(flags.json),
+      signal: controller.signal,
     });
     emit(response, Boolean(flags.json));
     return exitCodeForResponse(response);

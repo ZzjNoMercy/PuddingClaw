@@ -118,6 +118,8 @@ async def lifespan(app: FastAPI):
     """Startup: scan skills, initialize agent, build memory index."""
     import traceback
 
+    print("🚀 Initializing PuddingClaw backend...")
+
     import capabilities
     from analytics.nl2sql.result_cleanup import query_result_cleanup_manager
     from analytics.semantic_assets import get_semantic_asset_registry
@@ -196,7 +198,7 @@ async def lifespan(app: FastAPI):
     if get_rag_mode():
         try:
             indexer = get_memory_indexer(BASE_DIR)
-            indexer.rebuild_index()
+            indexer.initialize_index()
         except Exception as e:
             print(f"⚠️ Memory index build failed: {e}")
     else:

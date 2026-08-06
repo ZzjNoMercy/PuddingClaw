@@ -96,6 +96,7 @@ type HarnessSection = {
 const HARNESS_SECTIONS: HarnessSection[] = [
   { id: "subagent", label: "SubAgent", description: "子代理注册与状态", icon: Bot },
   { id: "context", label: "上下文工程", description: "摘要与工具上下文压缩", icon: Brain },
+  { id: "prompt-cache", label: "Prompt 缓存", description: "稳定系统、消息与工具前缀", icon: Braces },
   { id: "completion", label: "Goal 与验收", description: "Goal Run Rubric 与执行预算", icon: Target },
   { id: "sandbox", label: "终端与沙箱", description: "内核优先与按需 Docker", icon: Box },
   { id: "runtime", label: "运行保护", description: "运行保护与权限策略", icon: ShieldCheck },
@@ -576,12 +577,20 @@ export default function SettingsPage() {
   const [compRatio, setCompRatio] = useState(0.5);
 
   // Harness context engineering (DeepAgents only)
+  const [contextSummaryModelId, setContextSummaryModelId] = useState("");
   const [contextSummaryTriggerTokens, setContextSummaryTriggerTokens] = useState("200000");
   const [toolContextEnabled, setToolContextEnabled] = useState(true);
   const [immediateToolCompactionEnabled, setImmediateToolCompactionEnabled] = useState(false);
   const [singleToolTriggerTokens, setSingleToolTriggerTokens] = useState("8000");
   const [backgroundMinResultTokens, setBackgroundMinResultTokens] = useState("1000");
   const [keepRecentToolResults, setKeepRecentToolResults] = useState("12");
+
+  // Harness prompt-cache stability
+  const [tracePartDiagnostics, setTracePartDiagnostics] = useState(true);
+  const [orderedSystemSections, setOrderedSystemSections] = useState(false);
+  const [tailRoutingMessage, setTailRoutingMessage] = useState(false);
+  const [deterministicSessionProjection, setDeterministicSessionProjection] = useState(false);
+  const [stableToolSchema, setStableToolSchema] = useState(false);
 
   // Harness runtime policy
   const [modelCallLimitEnabled, setModelCallLimitEnabled] = useState(true);
@@ -750,6 +759,7 @@ export default function SettingsPage() {
         setKbImageCollection(s.knowledge?.multimodal_index?.image_collection || "puddingclaw_knowledge_image");
         // Compression
         setCompRatio(s.compression.ratio);
+        setContextSummaryModelId(s.compression.deepagents?.summarization?.model_id || "");
         setContextSummaryTriggerTokens(
           String(s.compression.deepagents?.summarization?.trigger_tokens ?? 160000)
         );
@@ -766,6 +776,12 @@ export default function SettingsPage() {
         setKeepRecentToolResults(
           String(s.compression.deepagents?.tool_context?.keep_recent_tool_results ?? 12)
         );
+        const promptCache = s.harness?.prompt_cache;
+        setTracePartDiagnostics(promptCache?.trace_part_diagnostics ?? true);
+        setOrderedSystemSections(promptCache?.ordered_system_sections ?? false);
+        setTailRoutingMessage(promptCache?.tail_routing_message ?? false);
+        setDeterministicSessionProjection(promptCache?.deterministic_session_projection ?? false);
+        setStableToolSchema(promptCache?.stable_tool_schema ?? false);
         // Harness runtime policy
         const modelLimit = s.harness?.model_call_limit;
         setModelCallLimitEnabled(modelLimit?.enabled ?? true);
@@ -1209,6 +1225,7 @@ export default function SettingsPage() {
           ratio: compRatio,
           deepagents: {
             summarization: {
+              model_id: contextSummaryModelId,
               trigger_tokens: summaryTrigger,
             },
             tool_context: {
@@ -1221,6 +1238,13 @@ export default function SettingsPage() {
           },
         },
         harness: {
+          prompt_cache: {
+            trace_part_diagnostics: tracePartDiagnostics,
+            ordered_system_sections: orderedSystemSections,
+            tail_routing_message: tailRoutingMessage,
+            deterministic_session_projection: deterministicSessionProjection,
+            stable_tool_schema: stableToolSchema,
+          },
           model_call_limit: {
             enabled: modelCallLimitEnabled,
             run_limit: positiveIntOrNull(modelCallRunLimit) ?? 50,
@@ -3357,9 +3381,28 @@ export default function SettingsPage() {
                           <div className="mb-4">
                             <p className="text-[13px] font-semibold text-gray-900">DeepAgents 全局摘要</p>
                             <p className="mt-1 text-[11px] leading-relaxed text-gray-500">
-                              当模型上下文达到阈值时，由内置摘要中间件压缩历史；摘要输入预算由后端根据当前模型上下文窗口自动计算。
+                              自动摘要与手动 /compact 共用独立模型；摘要输入预算由后端根据当前模型上下文窗口自动计算。
                             </p>
                           </div>
+                          <FormField label="摘要 / Compact 模型">
+                            <ModelBindingSelect
+                              value={contextSummaryModelId}
+                              onChange={setContextSummaryModelId}
+                              variant="light"
+                              options={[
+                                { id: "", label: "跟随当前 Agent 模型" },
+                                ...allProviderModels
+                                  .filter((model) => model.capability === "llm" && model.provider.enabled)
+                                  .map((model) => ({
+                                    id: model.id,
+                                    label: `${model.provider.name} · ${model.name}`,
+                                  })),
+                              ]}
+                            />
+                            <p className="mt-1 text-[10px] leading-relaxed text-gray-400">
+                              推荐选择低延迟模型，例如 DeepSeek V4 Flash。该选择不会改变 Session 的主 Agent 模型。
+                            </p>
+                          </FormField>
                           <FormField label="全局摘要触发阈值（tokens）">
                             <input
                               type="number"
@@ -3466,6 +3509,7 @@ export default function SettingsPage() {
                             compression: {
                               deepagents: {
                                 summarization: {
+                                  model_id: contextSummaryModelId,
                                   trigger_tokens: positiveIntOrNull(contextSummaryTriggerTokens) ?? 160000,
                                 },
                                 tool_context: {
@@ -3475,6 +3519,80 @@ export default function SettingsPage() {
                                   background_min_result_tokens: positiveIntOrNull(backgroundMinResultTokens) ?? 1000,
                                   keep_recent_tool_results: positiveIntOrNull(keepRecentToolResults) ?? 12,
                                 },
+                              },
+                            },
+                          }}
+                        />
+                      </div>
+                    </SettingsCard>
+                  </section>
+
+                  <section id="harness-section-prompt-cache" className="scroll-mt-6">
+                    <SettingsCard title="Prompt 缓存" icon={Braces} color="#002fa7">
+                      <div className="space-y-4">
+                        <div className="rounded-xl border border-blue-100 bg-blue-50/60 px-3.5 py-3 text-[11px] leading-relaxed text-blue-800">
+                          Provider 通常按请求前缀复用 Prompt Cache。这里控制系统提示词、消息历史和工具
+                          Schema 是否以稳定、可诊断的形式发送。它只优化模型输入，不改变 Skill、权限或 Tool Gate 的权威判断。
+                        </div>
+
+                        <div className="grid gap-3 lg:grid-cols-2">
+                          <ToggleRow
+                            label="系统提示词分区排序"
+                            description="按 Stable Core → Project → Semantics → Memory → Active Runtime → Volatile Tail 固定排列，减少中间区块变化造成的缓存失效。"
+                            checked={orderedSystemSections}
+                            onChange={setOrderedSystemSections}
+                          />
+                          <ToggleRow
+                            label="尾部路由控制消息"
+                            description="保持用户原文不变，把 Skill 路由和能力建议合并为请求级临时尾消息；该消息不会写入 Session。"
+                            checked={tailRoutingMessage}
+                            onChange={setTailRoutingMessage}
+                          />
+                          <ToggleRow
+                            label="确定性 Session 消息投影"
+                            description="保持历史消息边界和顺序稳定，不再合并连续 Assistant 消息，有利于缓存比较和 Tool Call 协议恢复。"
+                            checked={deterministicSessionProjection}
+                            onChange={setDeterministicSessionProjection}
+                          />
+                          <ToggleRow
+                            label="稳定工具 Schema"
+                            description="发送已挂载工具的有界稳定超集并固定排序；Schema 可见不等于获得调用权限，实际调用仍由 Tool Gate 拦截。"
+                            checked={stableToolSchema}
+                            onChange={setStableToolSchema}
+                          />
+                        </div>
+
+                        <div className="rounded-xl border border-black/[0.06] bg-white/55 px-3.5 py-3">
+                          <div className="flex items-center justify-between gap-4">
+                            <div>
+                              <p className="text-[12px] font-semibold text-gray-800">缓存分段诊断</p>
+                              <p className="mt-1 text-[10px] leading-relaxed text-gray-500">
+                                在 Trace 中记录 system、tools、messages 各部分指纹及首个变化位置，便于判断缓存为什么命中或失效；不改变发送内容。
+                              </p>
+                            </div>
+                            <SwitchButton
+                              checked={tracePartDiagnostics}
+                              onChange={setTracePartDiagnostics}
+                              ariaLabel="启用 Prompt 缓存分段诊断"
+                            />
+                          </div>
+                        </div>
+
+                        {stableToolSchema && (
+                          <p className="rounded-lg bg-amber-50 px-3 py-2 text-[10px] leading-relaxed text-amber-700">
+                            稳定工具 Schema 可能增加每轮输入 token，并受 Provider 工具数量与 Schema 大小限制。建议结合缓存分段诊断按模型灰度验证。
+                          </p>
+                        )}
+
+                        <SpecPreview
+                          spec={{
+                            harness: {
+                              prompt_cache: {
+                                trace_part_diagnostics: tracePartDiagnostics,
+                                ordered_system_sections: orderedSystemSections,
+                                tail_routing_message: tailRoutingMessage,
+                                deterministic_session_projection: deterministicSessionProjection,
+                                stable_tool_schema: stableToolSchema,
                               },
                             },
                           }}

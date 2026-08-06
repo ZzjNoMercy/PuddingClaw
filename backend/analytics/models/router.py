@@ -30,11 +30,12 @@ _ROUTER_PROMPT = """你是 PuddingClaw 分析模型路由器。分析模型不�
 1. 只能选择候选列表里的一个 id，不能创造 id。
 2. 优先比较 description、tags 和适用问题；不要因为所有候选都属于同一行业就随意选择。
 3. 若两个模型都合理、问题缺少业务域信息或没有合适模型，selected_id 必须为 null。
-4. confidence 是 0 到 1；只有明确唯一匹配时才能高于 0.72。
-5. 不回答用户问题，不生成 SQL。
+4. 先判断问题性质：如果问题根本不是业务分析请求（例如闲聊、天气、通用知识、编程求助），selected_id 为 null 且 scope 为 "general"；如果是业务分析请求，scope 为 "analytics"。
+5. confidence 是 0 到 1；只有明确唯一匹配时才能高于 0.72。
+6. 不回答用户问题，不生成 SQL。
 
 只返回 JSON：
-{"selected_id":"候选 id 或 null","confidence":0.0,"reason":"简短路由原因"}
+{"selected_id":"候选 id 或 null","confidence":0.0,"scope":"analytics 或 general","reason":"简短路由原因"}
 """
 
 
@@ -155,6 +156,9 @@ class AnalyticsModelRouter:
             confidence = min(1.0, max(0.0, float(payload.get("confidence") or 0.0)))
             allowed_ids = {item["id"] for item in safe}
             reason = str(payload.get("reason") or "semantic_classifier")[:300]
+            scope = str(payload.get("scope") or "analytics").strip().lower()
+            if selected_id is None and scope == "general":
+                return AnalyticsModelRoute("general", None, confidence, "semantic", reason or "general_question")
             if selected_id not in allowed_ids or confidence < confidence_threshold:
                 return AnalyticsModelRoute("ambiguous", None, confidence, "semantic", reason or "low_confidence")
             return AnalyticsModelRoute("matched", selected_id, confidence, "semantic", reason)
