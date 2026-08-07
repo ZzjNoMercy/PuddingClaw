@@ -1907,6 +1907,16 @@ class SessionManager:
         item = ledger.get(generation_id) if isinstance(ledger, dict) else None
         return deepcopy(item) if isinstance(item, dict) else None
 
+    def list_sql_generations(self, session_id: str) -> list[dict[str, Any]]:
+        """List immutable generation ledger records for server-side derivation."""
+
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        ledger = harness.get("sql_generation_ledger") if isinstance(harness, dict) else None
+        if not isinstance(ledger, dict):
+            return []
+        return [deepcopy(item) for item in ledger.values() if isinstance(item, dict)]
+
     @_session_write_locked
     def record_sql_validation_receipt(
         self,
@@ -1938,6 +1948,50 @@ class SessionManager:
         receipts = harness.get("sql_validation_receipts") if isinstance(harness, dict) else None
         item = receipts.get(receipt_id) if isinstance(receipts, dict) else None
         return deepcopy(item) if isinstance(item, dict) else None
+
+    def list_sql_validation_receipts(self, session_id: str) -> list[dict[str, Any]]:
+        """List immutable validation receipts for server-side plan reuse."""
+
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        receipts = harness.get("sql_validation_receipts") if isinstance(harness, dict) else None
+        if not isinstance(receipts, dict):
+            return []
+        return [deepcopy(item) for item in receipts.values() if isinstance(item, dict)]
+
+    @_session_write_locked
+    def record_sql_execution_attestation(
+        self,
+        session_id: str,
+        validation_receipt_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist successful execution of one immutable validation receipt."""
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        harness = data.setdefault("harness", {})
+        attestations = harness.setdefault("sql_execution_attestations", {})
+        existing = attestations.get(validation_receipt_id)
+        if isinstance(existing, dict) and (
+            existing.get("generation_id") != payload.get("generation_id")
+            or existing.get("sql_sha256") != payload.get("sql_sha256")
+        ):
+            raise ValueError(f"SQL execution attestation {validation_receipt_id} is immutable")
+        if isinstance(existing, dict):
+            return deepcopy(existing)
+        attestations[validation_receipt_id] = deepcopy(payload)
+        self._write_file(session_id, data)
+        return deepcopy(payload)
+
+    def list_sql_execution_attestations(self, session_id: str) -> list[dict[str, Any]]:
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        attestations = harness.get("sql_execution_attestations") if isinstance(harness, dict) else None
+        if not isinstance(attestations, dict):
+            return []
+        return [deepcopy(item) for item in attestations.values() if isinstance(item, dict)]
 
     @_session_write_locked
     def upsert_run_state(
@@ -8410,7 +8464,7 @@ class SessionManager:
 
         deterministic_projection = bool(
             config.load_config().get("harness", {}).get("prompt_cache", {}).get(
-                "deterministic_session_projection", False
+                "deterministic_session_projection", True
             )
         )
         merged: list[dict[str, Any]] = []  # 合并后的结果列表

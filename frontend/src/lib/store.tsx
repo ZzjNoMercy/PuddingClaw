@@ -91,6 +91,22 @@ export interface ToolCall {
   summary_source?: string;
   is_error?: boolean;
   permissionRequest?: PermissionRequest;
+  progress?: {
+    stage: string;
+    label: string;
+    detail?: string;
+    elapsedMs?: number;
+    stageTimings?: Record<string, number>;
+    status?: string;
+    history?: Array<{
+      id?: string;
+      stage: string;
+      label: string;
+      detail?: string;
+      elapsedMs?: number;
+      status: string;
+    }>;
+  };
 }
 
 export type TimelineItem =
@@ -165,6 +181,24 @@ async function waitForGoalState(
       ? `目标仍在处理“${latest.requested_status}”请求，请稍后重试`
       : "目标状态更新超时，请刷新后重试",
   );
+}
+
+async function waitForLatestRunToSettle(
+  sessionId: string,
+  timeoutMs = 10_000,
+): Promise<{
+  state: Awaited<ReturnType<typeof apiGetSessionHarnessState>> | null;
+  settled: boolean;
+}> {
+  const deadline = Date.now() + timeoutMs;
+  let state: Awaited<ReturnType<typeof apiGetSessionHarnessState>> | null = null;
+  while (Date.now() < deadline) {
+    state = await apiGetSessionHarnessState(sessionId);
+    const latestRun = state.latest_run_id ? state.runs[state.latest_run_id] || null : null;
+    if (!runIsActive(latestRun)) return { state, settled: true };
+    await new Promise((resolve) => window.setTimeout(resolve, 250));
+  }
+  return { state, settled: false };
 }
 
 function readActiveRunRegistry(): ActiveRunRegistry {
@@ -2317,15 +2351,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             : message
         )
       );
-      // Immediately drop the streaming badge so the UI responds even if the
-      // SSE reader is slow to terminate.
-      updateStreamingSessions((prev) => {
-        const next = new Set(prev);
-        next.delete(sessionId);
-        return next;
+      // Keep this Session locked until the Backend has durably moved the Run
+      // into a terminal state. Releasing it here allows an immediate follow-up
+      // to race the cancellation commit and fail with "already has active Run".
+      updateSessionRunActivity(sessionId, {
+        phase: "running",
+        label: "正在停止",
       });
     }
-  }, [sessionId, updateSessionMessages, updateStreamingSessions]);
+  }, [sessionId, updateSessionMessages, updateSessionRunActivity]);
 
   const pauseActiveGoal = useCallback(async () => {
     if (!activeGoal) throw new Error("当前没有可暂停的目标");
@@ -4006,6 +4040,157 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             const msg = { ...updated[idx] };
 
             switch (event.event) {
+              case "database_sql_generation_progress": {
+                const calls = [...(msg.toolCalls || [])];
+                const tcId = String(event.data.tool_call_id || "");
+                let callIdx = tcId ? calls.findIndex((call) => call.id === tcId) : -1;
+                if (callIdx === -1) {
+                  for (let i = calls.length - 1; i >= 0; i--) {
+                    if (calls[i].tool === "database_sql_generate" && calls[i].status === "running") {
+                      callIdx = i;
+                      break;
+                    }
+                  }
+                }
+                if (callIdx !== -1) {
+                  const stage = String(event.data.stage || "sql_generation");
+                  const labels: Record<string, string> = {
+                    routing: "正在确定数据源与表",
+                    vanna_retrieval: "正在召回结构与实体证据",
+                    candidate_generation: "正在生成 SQL 草案",
+                    entity_inspection: "正在核对 EAV 字段与值分布",
+                    semantic_refinement: "模型正在结合探测值生成最终 SQL",
+                    deterministic_validation: "正在执行只读与语义预检",
+                    sql_parse_repair: "正在修复 SQL 结构（1/1）",
+                    eav_evidence_repair: "正在修复实体证据映射（1/1）",
+                    semantic_guardrail_repair: "正在修复业务口径冲突（1/1）",
+                    deterministic_repair: "正在修复 SQL 技术错误（1/1）",
+                    repair: "正在修复已识别的问题（1/1）",
+                    completed: "SQL 已生成",
+                    sql_generation: "正在完成 SQL 生成",
+                  };
+                  const completedLabels: Record<string, string> = {
+                    routing: "数据源与表已确定",
+                    vanna_retrieval: "结构与实体证据已召回",
+                    entity_inspection: "EAV 字段与原始值已探测",
+                    candidate_generation: "SQL 草案已生成",
+                    semantic_refinement: "模型已结合探测值生成最终 SQL",
+                    deterministic_validation: "只读与语义预检已完成",
+                    sql_parse_repair: "SQL 结构已修复",
+                    eav_evidence_repair: "实体证据映射已修复",
+                    semantic_guardrail_repair: "业务口径冲突已修复",
+                    deterministic_repair: "SQL 技术错误已修复",
+                    repair: "已识别问题已修复",
+                    completed: "SQL 已生成",
+                  };
+                  const elapsedMs = Number(event.data.elapsed_ms || 0);
+                  const status = String(event.data.status || "running");
+                  const isActive = status === "running"
+                    || status === "heartbeat"
+                    || status === "soft_timeout";
+                  const stageTimings = event.data.stage_timings as Record<string, number> | undefined;
+                  const timingSummary = stageTimings
+                    ? [
+                        ["路由", stageTimings.router_ms],
+                        ["召回", stageTimings.vanna_references_ms],
+                        ["候选", stageTimings.sql_candidate_generation_ms],
+                        ["实体画像", stageTimings.eav_value_profile_ms],
+                      ]
+                        .filter((item): item is [string, number] => typeof item[1] === "number")
+                        .map(([name, value]) => `${name} ${(value / 1000).toFixed(1)}s`)
+                        .join(" / ")
+                    : "";
+                  const detail = status === "failed"
+                    ? String(event.data.message || "SQL 生成已停止；系统不会自动循环重试")
+                    : status === "soft_timeout"
+                      ? String(event.data.detail || "已进入确定性收尾窗口")
+                    : isActive && elapsedMs >= 120_000
+                      ? "耗时异常，可停止后重试"
+                      : timingSummary || String(event.data.detail || "") || undefined;
+                  const stageLabel = status === "failed"
+                    ? "SQL 未生成"
+                    : status === "completed"
+                      ? completedLabels[stage] || labels[stage] || "阶段已完成"
+                      : labels[stage] || "正在生成 SQL";
+                  const history = [...(calls[callIdx].progress?.history || [])];
+                  if (status === "completed" || status === "failed") {
+                    const historyEventId = String(
+                      event.data.event_sha256
+                      || `${stage}:${status}:${event.data.timestamp || elapsedMs}:${history.length}`
+                    );
+                    const historyItem = {
+                      id: historyEventId,
+                      stage,
+                      label: stageLabel,
+                      detail,
+                      elapsedMs,
+                      status,
+                    };
+                    const existingHistoryIndex = history.findIndex(
+                      (item) => item.id === historyEventId
+                    );
+                    if (existingHistoryIndex === -1) {
+                      history.push(historyItem);
+                    } else {
+                      history[existingHistoryIndex] = historyItem;
+                    }
+                  }
+                  const updates: Partial<ToolCall> = {
+                    progress: {
+                      stage,
+                      label: stageLabel,
+                      detail,
+                      elapsedMs,
+                      stageTimings,
+                      status,
+                      history,
+                    },
+                  };
+                  calls[callIdx] = { ...calls[callIdx], ...updates };
+                  msg.toolCalls = calls;
+                  const timeline = msg.timeline ? [...msg.timeline] : [];
+                  updateToolInTimeline(timeline, tcId, "database_sql_generate", updates);
+                  msg.timeline = timeline;
+                  const segments = msg.segments ? [...msg.segments] : undefined;
+                  if (segments) {
+                    let segmentIdx = tcId
+                      ? segments.findIndex((segment) =>
+                          segment.timeline?.some(
+                            (item) => item.type === "tool" && item.toolCall.id === tcId
+                          )
+                        )
+                      : -1;
+                    if (segmentIdx === -1) {
+                      for (let i = segments.length - 1; i >= 0; i--) {
+                        if (segments[i].timeline?.some(
+                          (item) => item.type === "tool"
+                            && item.toolCall.tool === "database_sql_generate"
+                            && item.toolCall.status === "running"
+                        )) {
+                          segmentIdx = i;
+                          break;
+                        }
+                      }
+                    }
+                    if (segmentIdx !== -1) {
+                      const segmentTimeline = [...(segments[segmentIdx].timeline || [])];
+                      updateToolInTimeline(
+                        segmentTimeline,
+                        tcId,
+                        "database_sql_generate",
+                        updates,
+                      );
+                      segments[segmentIdx] = {
+                        ...segments[segmentIdx],
+                        timeline: segmentTimeline,
+                      };
+                      msg.segments = segments;
+                    }
+                  }
+                }
+                break;
+              }
+
               case "tool_start": {
                 const tcId = (event.data.id as string) || "";
                 // Defensive deduplication: skip if a running/done call with the
@@ -4190,6 +4375,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       } finally {
         flushPendingTokens();
         flushPendingReasoning();
+        let reconciledHarness: Awaited<ReturnType<typeof apiGetSessionHarnessState>> | null = null;
+        let releaseStreamingLock = true;
+        if (controller.signal.aborted) {
+          try {
+            const cancellation = await waitForLatestRunToSettle(sendSessionId);
+            reconciledHarness = cancellation.state;
+            releaseStreamingLock = cancellation.settled;
+          } catch {
+            releaseStreamingLock = false;
+          }
+        }
         // A closed SSE stream cannot own a live verification spinner. Normal
         // terminal events already settle these rows; this is the safety net
         // for disconnects and budget/control-plane termination.
@@ -4220,13 +4416,22 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         if (sessionIdRef.current === sendSessionId) {
           setMaintenanceStatus(null);
         }
-        updateSessionRunActivity(sendSessionId, null);
-        updateStreamingSessions((prev) => {
-          const next = new Set(prev);
-          next.delete(sendSessionId);
-          return next;
-        });
-        apiGetSessionHarnessState(sendSessionId)
+        updateSessionRunActivity(
+          sendSessionId,
+          releaseStreamingLock
+            ? null
+            : { phase: "running", label: "后端仍在停止，请稍候" },
+        );
+        if (releaseStreamingLock) {
+          updateStreamingSessions((prev) => {
+            const next = new Set(prev);
+            next.delete(sendSessionId);
+            return next;
+          });
+        }
+        (reconciledHarness
+          ? Promise.resolve(reconciledHarness)
+          : apiGetSessionHarnessState(sendSessionId))
           .then((state) => {
             const reconciledGoal = visibleGoalFromHarness(state);
             const latestRun = state.latest_run_id

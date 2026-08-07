@@ -40,6 +40,18 @@ def _enable_prompt_cache(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(config, "CONFIG_FILE", config_path)
 
 
+def test_cache_safe_request_layout_is_enabled_by_default(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
+
+    prompt_cache = config.load_config()["harness"]["prompt_cache"]
+    assert prompt_cache["ordered_system_sections"] is True
+    assert prompt_cache["tail_routing_message"] is True
+    assert prompt_cache["deterministic_session_projection"] is True
+    assert prompt_cache["stable_tool_schema"] is False
+
+
 def test_part_fingerprints_and_first_diff_are_deterministic() -> None:
     kwargs = {
         "system_prompt": "## Stable Core\ncore\n## Current Capability Manifest\n{}",

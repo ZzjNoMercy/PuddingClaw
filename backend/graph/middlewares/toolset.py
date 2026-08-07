@@ -1370,7 +1370,7 @@ class ToolsetMiddleware(AgentMiddleware):
         )
         cached_skill_instructions = self._cached_skill_instruction_section(request)
         ordered_sections = bool(
-            config.load_config().get("harness", {}).get("prompt_cache", {}).get("ordered_system_sections", False)
+            config.load_config().get("harness", {}).get("prompt_cache", {}).get("ordered_system_sections", True)
         )
         if ordered_sections:
             section = "\n\n".join(
@@ -1418,7 +1418,7 @@ class ToolsetMiddleware(AgentMiddleware):
             for item in missing
         )
         if bool(
-            config.load_config().get("harness", {}).get("prompt_cache", {}).get("tail_routing_message", False)
+            config.load_config().get("harness", {}).get("prompt_cache", {}).get("tail_routing_message", True)
         ):
             return request.override(
                 messages=append_control_message(

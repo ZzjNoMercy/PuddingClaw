@@ -23,9 +23,10 @@ from knowledge.models import KnowledgeDatabaseSource
 class SqlRunnerError(RuntimeError):
     """Raised when generated SQL is unsafe or cannot be executed."""
 
-    def __init__(self, message: str, *, sql: str | None = None) -> None:
+    def __init__(self, message: str, *, sql: str | None = None, error_code: str = "sql_validation_failed") -> None:
         super().__init__(message)
         self.sql = sql
+        self.error_code = error_code
 
 
 _SQL_FENCE_RE = re.compile(r"```(?:sql)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
@@ -70,6 +71,7 @@ _ALLOWED_ANONYMOUS_FUNCTION_NAMES = {
     "jsonb_object_agg",
     "make_date",
     "make_interval",
+    "btrim",
     "width_bucket",
 }
 _DIMENSION_HINTS = ("品牌", "brand", "车系", "serial", "车型", "name", "分类", "category", "类型", "type")
@@ -260,11 +262,22 @@ def _referenced_tables(sql: str) -> set[str]:
         if name in _FORBIDDEN_FUNCTION_NAMES or name.startswith(_FORBIDDEN_FUNCTION_PREFIXES):
             raise SqlRunnerError(f"SQL 包含未授权的关系或系统读取函数：{name}", sql=sql)
         if isinstance(function, exp.Anonymous) and name not in _ALLOWED_ANONYMOUS_FUNCTION_NAMES:
-            raise SqlRunnerError(f"SQL 包含未授权的自定义或未登记函数：{name}", sql=sql)
+            raise SqlRunnerError(
+                f"SQL 内置函数 registry 未登记，已确定性阻断：{name}",
+                sql=sql,
+                error_code="sql_builtin_registry_miss",
+            )
 
     tables: set[str] = set()
     for scope in root_scope.traverse():
         for source in scope.sources.values():
+            # sqlglot models a literal VALUES relation as a UDTF.  It is not a
+            # function and cannot widen table authorization; any physical
+            # relation referenced by an expression inside it is still exposed
+            # by a nested scope and checked below.  Test this before the generic
+            # UDTF fail-closed branch.
+            if isinstance(source, Scope) and isinstance(source.expression, exp.Values):
+                continue
             if isinstance(source, Scope) and isinstance(source.expression, exp.UDTF):
                 raise SqlRunnerError(
                     f"SQL FROM/JOIN 包含未授权的表函数：{source.expression.sql(dialect='postgres')}",

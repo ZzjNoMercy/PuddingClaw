@@ -389,6 +389,7 @@ class DelegationResultEnvelope(BaseModel):
     status: Literal["completed", "blocked", "timed_out", "failed", "cancelled"]
     subagent_run_id: str
     summary: str = ""
+    content_trust: Literal["trusted_tool_result", "untrusted_attachment_content"] = "trusted_tool_result"
     completed_todo_ids: list[str] = Field(default_factory=list)
     remaining_todo_ids: list[str] = Field(default_factory=list)
     evidence_refs: list[str] = Field(default_factory=list)
@@ -665,6 +666,7 @@ class RunRecord(BaseModel):
     delegation_contracts: list[DelegationContract] = Field(default_factory=list)
     delegation_results: list[DelegationResultEnvelope] = Field(default_factory=list)
     delegation_events: list[dict[str, Any]] = Field(default_factory=list)
+    attachment_instruction_promotions: list[dict[str, Any]] = Field(default_factory=list)
     status: RunStatus = RunStatus.PREPARING
     outcome: RunOutcome | None = None
     declared_verification_contract: RunVerificationContract | None = None

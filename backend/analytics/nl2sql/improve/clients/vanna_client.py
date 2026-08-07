@@ -452,6 +452,10 @@ def create_vanna_client(
     openai_client_kwargs = {
         "api_key": openai_api_key,
         "base_url": openai_base_url,
+        # The NL2SQL service applies a 120s per-provider budget.  Giving the
+        # sync SDK the same transport timeout ensures a cancelled asyncio task
+        # cannot leave an unbounded provider thread behind.
+        "timeout": 120.0,
     }
     parsed_openai_base_url = urlparse(str(openai_base_url or ""))
     if parsed_openai_base_url.hostname in {"localhost", "127.0.0.1", "::1"}:

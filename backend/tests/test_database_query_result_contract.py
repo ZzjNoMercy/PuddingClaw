@@ -74,6 +74,22 @@ def test_product_configuration_model_declares_default_pickup_exclusion() -> None
     assert "type_name = '级别'" in prompt
 
 
+def test_price_band_semantic_asset_is_exhaustive_and_keeps_unpriced_separate() -> None:
+    asset = (
+        Path(__file__).parents[1]
+        / "semantic-assets"
+        / "dimensions"
+        / "price_band"
+        / "dimension.md"
+    ).read_text(encoding="utf-8")
+
+    assert "5万元以下" in asset
+    assert "50万元以上" in asset
+    assert "50万以下" not in asset
+    assert "`未定价` 只包含 `price IS NULL OR price <= 0`" in asset
+    assert "WHEN price < 5 THEN '5万元以下'" in asset
+
+
 @pytest.mark.asyncio
 async def test_result_source_rejects_generation_id_with_actionable_guidance() -> None:
     result = await DatabaseQueryResultSourceTool(session_id="source-adapter-session")._arun(
@@ -500,6 +516,29 @@ def test_validate_readonly_sql_does_not_treat_is_distinct_from_column_as_table()
         )
         == sql
     )
+
+
+def test_validate_readonly_sql_allows_postgres_btrim_builtin() -> None:
+    sql = "SELECT btrim(type_value) AS value FROM vehicle_params"
+
+    assert validate_readonly_sql(sql, allowed_tables=["vehicle_params"]) == sql
+
+
+def test_validate_readonly_sql_allows_static_values_relation() -> None:
+    sql = """WITH bands(label, sort_order) AS (
+      SELECT * FROM (VALUES ('5-10万元', 1), ('10-15万元', 2)) AS value_rows(label, sort_order)
+    )
+    SELECT bands.label FROM bands ORDER BY bands.sort_order"""
+
+    assert validate_readonly_sql(sql, allowed_tables=["vehicle_params"]) == sql
+    assert _referenced_tables(sql) == set()
+
+
+def test_static_values_relation_does_not_hide_unauthorized_scalar_subquery() -> None:
+    sql = "SELECT * FROM (VALUES ((SELECT secret FROM private.secret_models))) AS value_rows(value)"
+
+    with pytest.raises(SqlRunnerError, match="private.secret_models"):
+        validate_readonly_sql(sql, allowed_tables=["vehicle_params"])
 
 
 def test_validate_readonly_sql_preserves_schema_qualified_table_scope() -> None:

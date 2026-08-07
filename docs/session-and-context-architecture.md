@@ -220,10 +220,10 @@ Model Request
 | 配置 | 作用 | 建议 |
 |---|---|---|
 | `trace_part_diagnostics` | 对 System、Tools、Messages 分别计算指纹，记录第一个变化部分 | 默认开启 |
-| `ordered_system_sections` | 固定系统提示词语义分区顺序，把变化频繁的块放在尾部 | 建议开启 |
-| `tail_routing_message` | 保持用户消息不变，把 Skill/能力路由放入不持久化的控制尾 | 建议开启 |
-| `deterministic_session_projection` | 保持历史消息边界稳定，不合并相邻 Assistant 消息 | 建议开启 |
-| `stable_tool_schema` | 发送有界、稳定排序的已挂载工具超集 | 按 Provider 灰度 |
+| `ordered_system_sections` | 固定系统提示词语义分区顺序，把变化频繁的块放在尾部 | 默认开启 |
+| `tail_routing_message` | 保持用户消息不变，把 Skill/能力路由放入不持久化的控制尾 | 默认开启 |
+| `deterministic_session_projection` | 保持历史消息边界稳定，不合并相邻 Assistant 消息 | 默认开启 |
+| `stable_tool_schema` | 发送有界、稳定排序的已挂载工具超集 | 默认关闭，按 Provider 灰度 |
 
 `stable_tool_schema` 只稳定模型看到的定义，不改变实际权限。它可能增加输入 token，也可能遇到 Provider 的工具数量或 Schema 大小限制，因此必须结合分段诊断验证收益。
 

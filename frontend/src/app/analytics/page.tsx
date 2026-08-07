@@ -2326,7 +2326,7 @@ function SemanticAssetCard({ asset, onOpen }: { asset: SemanticAssetSummary; onO
     <button
       type="button"
       onClick={() => onOpen(asset)}
-      className="rounded-3xl border border-black/[0.06] bg-white p-4 text-left shadow-sm transition hover:border-[#002fa7]/20 hover:bg-[#002fa7]/[0.015]"
+      className="flex h-full flex-col items-stretch justify-start rounded-3xl border border-black/[0.06] bg-white p-4 text-left align-top shadow-sm transition hover:border-[#002fa7]/20 hover:bg-[#002fa7]/[0.015]"
     >
       <div className="flex flex-wrap items-center gap-2">
         <span className="rounded-full bg-[#002fa7]/10 px-2.5 py-1 text-xs font-semibold text-[#002fa7]">

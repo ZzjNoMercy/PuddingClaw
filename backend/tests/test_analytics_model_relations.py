@@ -102,6 +102,48 @@ def test_product_config_monthly_template_resolves_guide_manifest_and_paths() -> 
     assert "active_template" not in context
 
 
+def test_product_config_topic_template_resolves_assets_and_routing_boundaries() -> None:
+    base_dir = Path(__file__).resolve().parents[1]
+    models = AnalyticsModelRegistry(base_dir)
+    models.refresh()
+
+    context = models.get_model_context("产品配置分析")
+    template = context["resolved_templates"]["topic_product_config_report"]
+
+    assert template["virtual_path"] == (
+        "/analytics-models/产品配置分析/templates/topic_product_config_report/index.html"
+    )
+    assert template["guide_virtual_path"] == (
+        "/analytics-models/产品配置分析/templates/topic_product_config_report/TEMPLATE.md"
+    )
+    assert template["asset_virtual_paths"] == [
+        "/analytics-models/产品配置分析/templates/topic_product_config_report/report-theme.css",
+        "/analytics-models/产品配置分析/templates/topic_product_config_report/report-renderer.js",
+        "/analytics-models/产品配置分析/templates/topic_product_config_report/echarts-6.1.0.min.js",
+    ]
+    assert template["guide_frontmatter"]["formatter"] == "analytics-template"
+    assert template["guide_frontmatter"]["id"] == "topic_product_config_report"
+    assert template["available"] is True
+    assert template["missing_paths"] == []
+    assert "生成产品配置专题分析 HTML" in template["use_when"]
+    assert "刷新月报或生成月度产品配置分析报告" in template["do_not_use_when"]
+    assert template["compiled_semantic_scope"] == context["resolved_templates"][
+        "monthly_product_config_report"
+    ]["compiled_semantic_scope"]
+
+    template_root = (
+        base_dir / "analytics-models" / "产品配置分析" / "templates" / "topic_product_config_report"
+    )
+    index_html = (template_root / "index.html").read_text(encoding="utf-8")
+    renderer = (template_root / "report-renderer.js").read_text(encoding="utf-8")
+    guide = (template_root / "TEMPLATE.md").read_text(encoding="utf-8")
+    assert '<script id="report-payload" type="application/json">' in index_html
+    assert '<script src="report-renderer.js"></script>' in index_html
+    assert "window.TopicProductConfigReport" in renderer
+    assert 'FORBIDDEN_PAYLOAD_KEYS = ["option", "options", "formatter"' in renderer
+    assert "与月报的结构区隔" in guide
+
+
 def test_template_discovery_does_not_change_with_query_wording() -> None:
     base_dir = Path(__file__).resolve().parents[1]
     models = AnalyticsModelRegistry(base_dir)

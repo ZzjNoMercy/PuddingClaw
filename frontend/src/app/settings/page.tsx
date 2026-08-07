@@ -527,6 +527,7 @@ export default function SettingsPage() {
   const [dbQaMaxCellCharsForLlm, setDbQaMaxCellCharsForLlm] = useState("500");
   const [dbQaResultMaterializationRowCap, setDbQaResultMaterializationRowCap] = useState("5000");
   const [dbQaQueryTimeoutSeconds, setDbQaQueryTimeoutSeconds] = useState("30");
+  const [dbQaSqlGenerationTimeoutSeconds, setDbQaSqlGenerationTimeoutSeconds] = useState("210");
   const [dbQaResultStoreEnabled, setDbQaResultStoreEnabled] = useState(true);
   const [dbQaResultStoreTtlHours, setDbQaResultStoreTtlHours] = useState("168");
   const [dbQaDefaultPageSize, setDbQaDefaultPageSize] = useState("100");
@@ -587,9 +588,9 @@ export default function SettingsPage() {
 
   // Harness prompt-cache stability
   const [tracePartDiagnostics, setTracePartDiagnostics] = useState(true);
-  const [orderedSystemSections, setOrderedSystemSections] = useState(false);
-  const [tailRoutingMessage, setTailRoutingMessage] = useState(false);
-  const [deterministicSessionProjection, setDeterministicSessionProjection] = useState(false);
+  const [orderedSystemSections, setOrderedSystemSections] = useState(true);
+  const [tailRoutingMessage, setTailRoutingMessage] = useState(true);
+  const [deterministicSessionProjection, setDeterministicSessionProjection] = useState(true);
   const [stableToolSchema, setStableToolSchema] = useState(false);
 
   // Harness runtime policy
@@ -712,6 +713,7 @@ export default function SettingsPage() {
         setDbQaMaxCellCharsForLlm(String(databaseQa?.max_cell_chars_for_llm ?? 500));
         setDbQaResultMaterializationRowCap(String(databaseQa?.result_materialization_row_cap ?? 5000));
         setDbQaQueryTimeoutSeconds(String(Math.max(1, Math.round((databaseQa?.query_timeout_ms ?? 30000) / 1000))));
+        setDbQaSqlGenerationTimeoutSeconds(String(Math.max(30, Math.round((databaseQa?.sql_generation_timeout_ms ?? 210000) / 1000))));
         setDbQaResultStoreEnabled(databaseQa?.result_store_enabled ?? true);
         setDbQaResultStoreTtlHours(String(databaseQa?.result_store_ttl_hours ?? 168));
         setDbQaDefaultPageSize(String(databaseQa?.default_page_size ?? 100));
@@ -778,9 +780,9 @@ export default function SettingsPage() {
         );
         const promptCache = s.harness?.prompt_cache;
         setTracePartDiagnostics(promptCache?.trace_part_diagnostics ?? true);
-        setOrderedSystemSections(promptCache?.ordered_system_sections ?? false);
-        setTailRoutingMessage(promptCache?.tail_routing_message ?? false);
-        setDeterministicSessionProjection(promptCache?.deterministic_session_projection ?? false);
+        setOrderedSystemSections(promptCache?.ordered_system_sections ?? true);
+        setTailRoutingMessage(promptCache?.tail_routing_message ?? true);
+        setDeterministicSessionProjection(promptCache?.deterministic_session_projection ?? true);
         setStableToolSchema(promptCache?.stable_tool_schema ?? false);
         // Harness runtime policy
         const modelLimit = s.harness?.model_call_limit;
@@ -1238,6 +1240,7 @@ export default function SettingsPage() {
             max_cell_chars_for_llm: positiveIntOrNull(dbQaMaxCellCharsForLlm) ?? 500,
             result_materialization_row_cap: positiveIntOrNull(dbQaResultMaterializationRowCap) ?? 5000,
             query_timeout_ms: (positiveIntOrNull(dbQaQueryTimeoutSeconds) ?? 30) * 1000,
+            sql_generation_timeout_ms: (positiveIntOrNull(dbQaSqlGenerationTimeoutSeconds) ?? 210) * 1000,
             result_store_enabled: dbQaResultStoreEnabled,
             result_store_ttl_hours: positiveIntOrNull(dbQaResultStoreTtlHours) ?? 168,
             default_page_size: positiveIntOrNull(dbQaDefaultPageSize) ?? 100,
@@ -1365,7 +1368,7 @@ export default function SettingsPage() {
     } finally {
       setSaving(false);
     }
-  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaResultMaterializationRowCap, dbQaQueryTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmBatchSize, knowledgeRootDir, wikiCompilerModelId, wikiGbrainEmbeddingModelId, wikiGbrainThinkModelId, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, toolContextEnabled, immediateToolCompactionEnabled, singleToolTriggerTokens, backgroundMinResultTokens, keepRecentToolResults, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, rubricMaxStagnantRepairs, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, sandboxMode, dockerConnection, dockerContext, dockerUseCustomImage, dockerImage, dockerCpuLimit, dockerMemoryLimitMb, dockerPidsLimit, dockerNetworkEnabled, dockerDependencySetupEnabled, subagentItems, showToast]);
+  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaResultMaterializationRowCap, dbQaQueryTimeoutSeconds, dbQaSqlGenerationTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmBatchSize, knowledgeRootDir, wikiCompilerModelId, wikiGbrainEmbeddingModelId, wikiGbrainThinkModelId, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, toolContextEnabled, immediateToolCompactionEnabled, singleToolTriggerTokens, backgroundMinResultTokens, keepRecentToolResults, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, rubricMaxStagnantRepairs, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, sandboxMode, dockerConnection, dockerContext, dockerUseCustomImage, dockerImage, dockerCpuLimit, dockerMemoryLimitMb, dockerPidsLimit, dockerNetworkEnabled, dockerDependencySetupEnabled, subagentItems, showToast]);
 
   const handleDatabaseModeChange = useCallback((mode: "bundled" | "external") => {
     setDatabaseMode(mode);
@@ -2388,6 +2391,13 @@ export default function SettingsPage() {
                         unit="秒"
                         value={dbQaQueryTimeoutSeconds}
                         onChange={setDbQaQueryTimeoutSeconds}
+                      />
+                      <DatabaseQaParameterField
+                        label="SQL 生成总超时"
+                        description="覆盖召回、候选生成、实体画像、语义修正和确定性预检；最后 30 秒仅用于收尾。"
+                        unit="秒"
+                        value={dbQaSqlGenerationTimeoutSeconds}
+                        onChange={setDbQaSqlGenerationTimeoutSeconds}
                       />
                     </div>
                   </div>

@@ -48,6 +48,7 @@ class DatabaseSqlValidationReceipt:
     semantic_guardrail_ids: list[str] | None = None
     semantic_evidence_refs: list[str] | None = None
     validator_version: str = "readonly+semantic-guardrails/v2"
+    verified_plan: dict[str, Any] | None = None
     created_at: float = 0.0
 
 
@@ -59,6 +60,7 @@ class DatabaseSqlRevisionResumeRegistry:
     def __init__(self) -> None:
         self._generations: dict[str, RegisteredDatabaseSqlGeneration] = {}
         self._validation_receipts: dict[str, DatabaseSqlValidationReceipt] = {}
+        self._execution_attestations: dict[str, dict[str, Any]] = {}
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._requests: dict[str, dict[str, Any]] = {}
         self._revision_keys: dict[tuple[str, str, str, str, str], str] = {}
@@ -254,8 +256,21 @@ class DatabaseSqlRevisionResumeRegistry:
                 + ",".join(sorted(allowed_tables))
             ).encode()
         ).hexdigest()[:20]
+        receipt_id = f"sql-validation-{digest}"
+        from analytics.nl2sql.query_plan import build_verified_query_plan
+
+        verified_plan = build_verified_query_plan(
+            question=generation.result.question,
+            sql=generation.result.sql,
+            generation_id=generation.id,
+            validation_receipt_id=receipt_id,
+            database_source_id=database_source_id,
+            allowed_tables=allowed_tables,
+            semantic_assets=generation.result.semantic_assets,
+            generation_trace=generation.result.generation,
+        )
         receipt = DatabaseSqlValidationReceipt(
-            id=f"sql-validation-{digest}",
+            id=receipt_id,
             session_id=generation.session_id,
             query_id=generation.query_id,
             run_id=generation.run_id,
@@ -267,6 +282,7 @@ class DatabaseSqlRevisionResumeRegistry:
             allowed_tables=sorted(set(allowed_tables)),
             semantic_guardrail_ids=sorted(set(semantic_guardrail_ids or [])),
             semantic_evidence_refs=sorted(set(semantic_evidence_refs or [])),
+            verified_plan=verified_plan,
             created_at=time.time(),
         )
         self._validation_receipts[receipt.id] = receipt
@@ -321,6 +337,11 @@ class DatabaseSqlRevisionResumeRegistry:
                         semantic_guardrail_ids=list(payload.get("semantic_guardrail_ids") or []),
                         semantic_evidence_refs=list(payload.get("semantic_evidence_refs") or []),
                         validator_version=str(payload.get("validator_version") or "readonly-sql/v1"),
+                        verified_plan=(
+                            dict(payload.get("verified_plan"))
+                            if isinstance(payload.get("verified_plan"), dict)
+                            else None
+                        ),
                         created_at=float(payload.get("created_at") or 0),
                     )
                     self._validation_receipts[receipt.id] = receipt
@@ -367,6 +388,91 @@ class DatabaseSqlRevisionResumeRegistry:
             key=lambda item: item.created_at,
         )
 
+    def list_session_verified_plans(self, *, session_id: str) -> list[dict[str, Any]]:
+        """Return validated plans across Runs without weakening Run-scoped receipts."""
+
+        payloads: list[dict[str, Any]] = []
+        if session_id:
+            try:
+                from graph.session_manager import session_manager
+
+                if session_manager.is_initialized:
+                    payloads = session_manager.list_sql_validation_receipts(session_id)
+            except (FileNotFoundError, RuntimeError, ValueError):
+                payloads = []
+        executed_receipt_ids: set[str] = set()
+        if session_id:
+            try:
+                from graph.session_manager import session_manager
+
+                if session_manager.is_initialized:
+                    executed_receipt_ids = {
+                        str(item.get("validation_receipt_id") or "")
+                        for item in session_manager.list_sql_execution_attestations(session_id)
+                        if item.get("status") == "executed"
+                    }
+            except (FileNotFoundError, RuntimeError, ValueError):
+                executed_receipt_ids = set()
+        executed_receipt_ids.update(
+            receipt_id
+            for receipt_id, item in self._execution_attestations.items()
+            if item.get("session_id") == session_id and item.get("status") == "executed"
+        )
+        plans = [
+            dict(payload.get("verified_plan") or {})
+            for payload in payloads
+            if isinstance(payload.get("verified_plan"), dict)
+            and str(payload.get("semantic_validation_status") or "") == "passed"
+            and str(payload.get("id") or "") in executed_receipt_ids
+        ]
+        known_hashes = {str(item.get("plan_hash") or "") for item in plans}
+        for receipt in self._validation_receipts.values():
+            if (
+                receipt.session_id != session_id
+                or receipt.id not in executed_receipt_ids
+                or not isinstance(receipt.verified_plan, dict)
+            ):
+                continue
+            plan_hash = str(receipt.verified_plan.get("plan_hash") or "")
+            if plan_hash not in known_hashes:
+                plans.append(dict(receipt.verified_plan))
+                known_hashes.add(plan_hash)
+        return plans
+
+    def attest_execution(
+        self,
+        *,
+        receipt: DatabaseSqlValidationReceipt,
+        generation: RegisteredDatabaseSqlGeneration,
+        row_count: int,
+    ) -> dict[str, Any]:
+        """Record that the validated SQL actually executed successfully."""
+
+        attestation = {
+            "id": f"sql-execution-{receipt.id.removeprefix('sql-validation-')}",
+            "session_id": receipt.session_id,
+            "validation_receipt_id": receipt.id,
+            "generation_id": generation.id,
+            "sql_sha256": generation.sql_sha256,
+            "status": "executed",
+            "row_count": int(row_count),
+            "executed_at": time.time(),
+        }
+        self._execution_attestations[receipt.id] = dict(attestation)
+        if receipt.session_id:
+            try:
+                from graph.session_manager import session_manager
+
+                if session_manager.is_initialized:
+                    session_manager.record_sql_execution_attestation(
+                        receipt.session_id,
+                        receipt.id,
+                        attestation,
+                    )
+            except (FileNotFoundError, RuntimeError, ValueError):
+                pass
+        return dict(attestation)
+
     @staticmethod
     def _serialize_validation_receipt(
         receipt: DatabaseSqlValidationReceipt,
@@ -386,6 +492,7 @@ class DatabaseSqlRevisionResumeRegistry:
             "semantic_guardrail_ids": list(receipt.semantic_guardrail_ids or []),
             "semantic_evidence_refs": list(receipt.semantic_evidence_refs or []),
             "validator_version": receipt.validator_version,
+            "verified_plan": dict(receipt.verified_plan or {}),
             "created_at": receipt.created_at,
         }
 

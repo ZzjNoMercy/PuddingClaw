@@ -120,7 +120,9 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
   const pendingDatabaseSqlRevisionRequests = (message.databaseSqlRevisionRequests || []).filter(
     (request) => (request.status || "pending") === "pending"
   );
-  const visibleUserInputRequests = message.userInputRequests || [];
+  const visibleUserInputRequests = (message.userInputRequests || []).filter(
+    (request) => (request.status || "pending") === "pending"
+  );
 
   const citationComponents: Components = {
     a: (props) => (

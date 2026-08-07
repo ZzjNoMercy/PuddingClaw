@@ -165,6 +165,12 @@ class DatabaseSqlExecuteTool(BaseTool):
             },
             metadata={"database_source_id": public_source.get("id")},
         )
+        if self.session_id:
+            database_sql_revision_resume_registry.attest_execution(
+                receipt=receipt,
+                generation=generation,
+                row_count=execution.total_row_count or execution.row_count,
+            )
 
         result_size = f"{execution.row_count} 行"
         if not execution.is_complete:

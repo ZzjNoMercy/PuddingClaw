@@ -56,7 +56,7 @@ import re
 import sqlite3
 import traceback
 from abc import ABC, abstractmethod
-from typing import List, Tuple, Union
+from typing import Any, List, Tuple, Union
 from urllib.parse import urlparse
 
 import pandas as pd
@@ -69,6 +69,48 @@ import sqlparse
 from ..exceptions import DependencyError, ImproperlyConfigured, ValidationError
 from ..types import TrainingPlan, TrainingPlanItem
 from ..utils import validate_config_path
+
+
+def _format_eav_value_profiles_for_prompt(profiles: Any) -> str:
+    """Render live EAV observations as facts for the first SQL model call."""
+
+    if not isinstance(profiles, list):
+        return ""
+    compact: list[dict[str, Any]] = []
+    for profile in profiles:
+        if not isinstance(profile, dict) or not str(profile.get("type_name") or "").strip():
+            continue
+        observed_values = [
+            {
+                "value": item.get("value"),
+                "row_count": item.get("row_count"),
+                "model_count": item.get("model_count"),
+            }
+            for item in profile.get("top_values") or []
+            if isinstance(item, dict)
+        ]
+        distinct_value_count = int(profile.get("distinct_value_count") or 0)
+        compact.append(
+            {
+                "type_name": str(profile.get("type_name") or ""),
+                "distinct_value_count": distinct_value_count,
+                "total_row_count": int(profile.get("total_row_count") or 0),
+                "profile_complete": bool(
+                    distinct_value_count > 0 and len(observed_values) >= distinct_value_count
+                ),
+                "observed_values": observed_values,
+            }
+        )
+    if not compact:
+        return ""
+    return (
+        "Live EAV value profiles collected before SQL generation. These are database facts, not business rules. "
+        "The model must choose the business meaning, but the SQL must use the evidence it was given. When "
+        "profile_complete=true, choose one or more observed_values according to the user's question and express "
+        "the type_value filter with exact literals (= or IN). Do not derive regexes, numeric casts, substrings, "
+        "or LIKE patterns for hypothetical values outside a complete profile. Do not invent fields or values.\n"
+        + json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+    )
 
 
 class VannaBase(ABC):
@@ -121,6 +163,9 @@ class VannaBase(ABC):
         """
         has_prefetched_entities = "entity_list" in kwargs
         prefetched_entity_list = kwargs.pop("entity_list", None)
+        eav_profile_documentation = _format_eav_value_profiles_for_prompt(
+            kwargs.pop("eav_value_profiles", None)
+        )
 
         if self.config is not None:
             initial_prompt = self.config.get("initial_prompt", None)
@@ -128,7 +173,9 @@ class VannaBase(ABC):
             initial_prompt = None
         question_sql_list = self.get_similar_question_sql(question, **kwargs)
         ddl_list = self.get_related_ddl(question, **kwargs)
-        doc_list = self.get_related_documentation(question, **kwargs)
+        doc_list = list(self.get_related_documentation(question, **kwargs) or [])
+        if eav_profile_documentation:
+            doc_list.insert(0, eav_profile_documentation)
         
         # Entity mappings may be pre-fetched by PuddingClaw's NL2SQL service so
         # Trace and SQL generation use the exact same candidates. If no
@@ -180,6 +227,8 @@ class VannaBase(ABC):
                 if entity_list:
                     entity_prompt = self.add_entities_to_prompt("", entity_list, **kwargs)
                     message_log.append(self.user_message(f"实体映射:\n{entity_prompt}"))
+                if eav_profile_documentation:
+                    message_log.append(self.user_message(eav_profile_documentation))
                 
                 # 添加历史示例
                 for example in question_sql_list:

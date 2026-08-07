@@ -1,13 +1,16 @@
 """Regression tests for OpenAI tool-call protocol repair."""
 
+from langchain.agents.middleware.types import ModelRequest, ModelResponse
 from langchain_core.messages import (
     AIMessage,
     HumanMessage,
+    SystemMessage,
     ToolMessage,
     message_to_dict,
     messages_from_dict,
 )
 
+from graph.middlewares import tool_protocol
 from graph.middlewares.tool_protocol import (
     ToolProtocolIntegrityMiddleware,
     pending_executable_tool_call_ids,
@@ -27,6 +30,35 @@ def _empty_report() -> dict[str, list[str]]:
         "canonicalized_tool_call_ids": [],
         "dropped_legacy_function_calls": [],
     }
+
+
+def test_context_usage_distinguishes_model_input_from_next_turn_context(monkeypatch) -> None:
+    events: list[dict] = []
+    monkeypatch.setattr(tool_protocol, "get_stream_writer", lambda: events.append)
+    request = ModelRequest(
+        model=None,
+        system_message=SystemMessage(content="system " * 200),
+        messages=[HumanMessage(content="hello")],
+        tools=[
+            {
+                "name": "demo",
+                "description": "tool schema " * 200,
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ],
+        state={"messages": []},
+    )
+    response = ModelResponse(result=[AIMessage(content="hello back")])
+
+    ToolProtocolIntegrityMiddleware()._emit_context_usage(request, response)
+
+    assert len(events) == 1
+    event = events[0]
+    assert event["used_tokens"] >= event["input_tokens_estimated"]
+    assert event["assistant_tokens_estimated"] == event["used_tokens"] - event["input_tokens_estimated"]
+    assert event["scope"] == "next_turn_effective_context"
+    assert event["measurement"] == "approximate"
+    assert event["includes_tool_schemas"] is True
 
 
 def test_protocol_repair_inserts_missing_tool_response_before_next_message() -> None:

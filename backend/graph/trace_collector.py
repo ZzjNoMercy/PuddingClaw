@@ -15,6 +15,8 @@ import uuid
 from contextvars import ContextVar
 from typing import Any
 
+from langchain_core.messages.utils import count_tokens_approximately
+
 import config
 from graph.prompt_cache import build_part_fingerprints, compare_part_inputs, digest
 from utils.json_serialization import to_json_compatible
@@ -248,7 +250,29 @@ class TraceCollector:
 
         preview = [self._message_preview(message) for message in messages]
         tool_schema_items = [self._tool_schema_contract(tool) for tool in (tool_schemas or [])]
-        estimated_tokens = sum(item.get("estimated_tokens", 0) for item in preview)
+        preview_message_estimated_tokens = sum(item.get("estimated_tokens", 0) for item in preview)
+        message_estimated_tokens = preview_message_estimated_tokens
+        tool_schema_estimated_tokens = 0
+        estimated_tokens = preview_message_estimated_tokens
+        token_estimator = "chars_div_4_fallback"
+        try:
+            # Use the same estimator as the runtime context meter.  The old
+            # trace value summed message previews only, so a request with a
+            # large bound tool cohort could be under-reported by tens of
+            # thousands of tokens even though the trace recorded the tools.
+            message_estimated_tokens = int(count_tokens_approximately(messages))
+            estimated_tokens = int(
+                count_tokens_approximately(messages, tools=tool_schemas or [])
+            )
+            tool_schema_estimated_tokens = max(
+                0, estimated_tokens - message_estimated_tokens
+            )
+            token_estimator = "langchain_count_tokens_approximately"
+        except Exception:
+            # Tracing must never break a model call.  Preserve the historical
+            # text-only estimate if a third-party message/tool object cannot be
+            # normalized by LangChain's estimator.
+            pass
         system_prompt_chars = sum(
             item.get("chars", 0) for item in preview if item.get("role") in {"system", "SystemMessage"}
         )
@@ -302,11 +326,15 @@ class TraceCollector:
             model_params=model_params or {},
             capture_boundary=capture_boundary,
             fingerprints=fingerprints,
+            tool_schema_estimated_tokens=tool_schema_estimated_tokens,
         )
         contract = {
             "message_count": len(messages),
             "system_prompt_chars": system_prompt_chars,
             "estimated_tokens": estimated_tokens,
+            "message_estimated_tokens": message_estimated_tokens,
+            "tool_schema_estimated_tokens": tool_schema_estimated_tokens,
+            "token_estimator": token_estimator,
             "tool_schema_count": tool_schema_count,
             "tool_schemas": tool_schema_items,
             "params": model_params or {},
@@ -321,6 +349,9 @@ class TraceCollector:
             "model_call_index": model_call_index,
             "message_count": len(messages),
             "estimated_tokens": estimated_tokens,
+            "message_estimated_tokens": message_estimated_tokens,
+            "tool_schema_estimated_tokens": tool_schema_estimated_tokens,
+            "token_estimator": token_estimator,
             "system_prompt_chars": system_prompt_chars,
             "tool_schema_count": tool_schema_count,
             "capture_boundary": capture_boundary,
@@ -378,6 +409,7 @@ class TraceCollector:
         model_params: dict[str, Any],
         capture_boundary: str,
         fingerprints: dict[str, str],
+        tool_schema_estimated_tokens: int,
     ) -> dict[str, Any]:
         """Describe how the final LLM payload is assembled at the model boundary."""
 
@@ -392,6 +424,10 @@ class TraceCollector:
 
         system_chars = sum(int(item.get("chars") or 0) for item in system_messages)
         message_chars = sum(int(item.get("chars") or 0) for item in conversation_messages)
+        system_estimated_tokens = sum(int(item.get("estimated_tokens") or 0) for item in system_messages)
+        conversation_estimated_tokens = sum(
+            int(item.get("estimated_tokens") or 0) for item in conversation_messages
+        )
         tool_call_count = sum(int(item.get("tool_call_count") or 0) for item in preview)
         provider_tool_call_count = sum(int(item.get("provider_tool_call_count") or 0) for item in preview)
         bind_kwargs = {
@@ -412,6 +448,7 @@ class TraceCollector:
                     "source": "LangChain messages with role=system",
                     "count": len(system_messages),
                     "chars": system_chars,
+                    "estimated_tokens": system_estimated_tokens,
                     "hash": fingerprints.get("system_prompt_hash"),
                     "included": len(system_messages) > 0,
                     "notes": [
@@ -425,6 +462,7 @@ class TraceCollector:
                     "source": "LangChain messages payload",
                     "count": len(conversation_messages),
                     "chars": message_chars,
+                    "estimated_tokens": conversation_estimated_tokens,
                     "hash": fingerprints.get("messages_hash"),
                     "included": len(conversation_messages) > 0,
                     "roles": role_counts,
@@ -440,6 +478,7 @@ class TraceCollector:
                     "label": "Tools",
                     "source": "ModelClient.bind_tools structured schema",
                     "count": len(tool_schema_items),
+                    "estimated_tokens": tool_schema_estimated_tokens,
                     "hash": fingerprints.get("tool_schema_hash"),
                     "included": len(tool_schema_items) > 0,
                     "binding": {
@@ -782,6 +821,9 @@ class TraceCollector:
             "model_call_index": metadata.get("model_call_index"),
             "message_count": metadata.get("message_count", len(preview)),
             "estimated_tokens": metadata.get("estimated_tokens", 0),
+            "message_estimated_tokens": metadata.get("message_estimated_tokens", 0),
+            "tool_schema_estimated_tokens": metadata.get("tool_schema_estimated_tokens", 0),
+            "token_estimator": metadata.get("token_estimator"),
             "system_prompt_chars": metadata.get("system_prompt_chars", 0),
             "tool_schema_count": metadata.get("tool_schema_count", 0),
             "fingerprints": metadata.get("fingerprints", {}),

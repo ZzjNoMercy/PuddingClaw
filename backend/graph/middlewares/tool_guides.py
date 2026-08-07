@@ -40,7 +40,7 @@ class ToolGuideMiddleware(AgentMiddleware[Any, Any, Any]):
         super().__init__()
         self.guide_dir = (base_dir / "prompts" / "deepagents" / "tool_guides").resolve()
         specs = self._load_specs()
-        if bool(config.load_config().get("harness", {}).get("prompt_cache", {}).get("ordered_system_sections", False)):
+        if bool(config.load_config().get("harness", {}).get("prompt_cache", {}).get("ordered_system_sections", True)):
             specs = tuple(sorted(specs, key=lambda spec: (spec.guide_id, spec.content_sha256)))
         self.specs = specs
 
@@ -149,7 +149,7 @@ class ToolGuideMiddleware(AgentMiddleware[Any, Any, Any]):
 
     def _request_with_guides(self, request: ModelRequest) -> ModelRequest:
         ordered_sections = bool(
-            config.load_config().get("harness", {}).get("prompt_cache", {}).get("ordered_system_sections", False)
+            config.load_config().get("harness", {}).get("prompt_cache", {}).get("ordered_system_sections", True)
         )
         activated: list[tuple[ToolGuideSpec, list[str]]] = []
         for spec in self.specs:

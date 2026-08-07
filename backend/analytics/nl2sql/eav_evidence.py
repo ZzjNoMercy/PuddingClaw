@@ -48,6 +48,12 @@ class EavEvidenceCheck:
     incomplete_bindings: tuple[EavEquivalenceBinding, ...]
     invalid_binding_resolutions: tuple[EavEquivalenceBinding, ...]
     unprovable_predicates: tuple[str, ...]
+    ambiguous_mappings: tuple[str, ...] = ()
+    profile_required: frozenset[str] = frozenset()
+
+    @property
+    def not_found(self) -> frozenset[str]:
+        return self.unsupported
 
     @property
     def passed(self) -> bool:
@@ -56,6 +62,8 @@ class EavEvidenceCheck:
             or self.incomplete_bindings
             or self.invalid_binding_resolutions
             or self.unprovable_predicates
+            or self.ambiguous_mappings
+            or self.profile_required
         )
 
 
@@ -406,6 +414,9 @@ def check_eav_evidence(
     *,
     live_type_names: Iterable[str],
     bindings: Iterable[EavEquivalenceBinding] = (),
+    ambiguous_mappings: Iterable[str] = (),
+    required_profile_type_names: Iterable[str] = (),
+    profiled_type_names: Iterable[str] = (),
 ) -> EavEvidenceCheck:
     """Require live existence and completeness for explicitly bound concepts."""
 
@@ -415,6 +426,8 @@ def check_eav_evidence(
     unsupported = frozenset(item for item in used if item not in live)
     incomplete: list[EavEquivalenceBinding] = []
     invalid_resolutions: list[EavEquivalenceBinding] = []
+    required_profiles = {str(item) for item in required_profile_type_names}
+    profiled = {str(item) for item in profiled_type_names}
     for binding in bindings:
         members = set(binding.type_names)
         if not members.issubset(used):
@@ -427,6 +440,8 @@ def check_eav_evidence(
         incomplete_bindings=tuple(incomplete),
         invalid_binding_resolutions=tuple(invalid_resolutions),
         unprovable_predicates=unprovable,
+        ambiguous_mappings=tuple(sorted(set(str(item) for item in ambiguous_mappings if str(item)))),
+        profile_required=frozenset((used & required_profiles) - profiled),
     )
 
 
@@ -493,6 +508,35 @@ def eav_mapping_fingerprint(
         return node
 
     tree = tree.transform(collapse_equivalent_coalesce)
+    payload = tree.sql(dialect=_DIALECT, pretty=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def eav_type_name_predicate_fingerprint(sql: str) -> str:
+    """Hash SQL after erasing only direct ``type_name`` predicate choices.
+
+    A bounded model repair may replace an unprovable LIKE predicate with one
+    exact, observed EAV field.  Everything around that predicate must remain
+    structurally identical.
+    """
+
+    tree = sqlglot.parse_one(sql, read=_DIALECT).copy()
+    type_name_ids, ambiguous_ids, _scopes = _resolved_eav_column_ids(tree, "type_name")
+
+    def is_type_name_predicate(node: exp.Expression) -> bool:
+        if not isinstance(node, (exp.EQ, exp.In, exp.Like, exp.ILike)):
+            return False
+        return any(
+            id(column) in type_name_ids or id(column) in ambiguous_ids
+            for column in node.find_all(exp.Column)
+            if column.name.lower() == "type_name"
+        )
+
+    marker = exp.EQ(
+        this=exp.Literal.string("__EAV_TYPE_NAME_PREDICATE__"),
+        expression=exp.Literal.string("__EAV_TYPE_NAME_PREDICATE__"),
+    )
+    tree = tree.transform(lambda node: marker.copy() if is_type_name_predicate(node) else node)
     payload = tree.sql(dialect=_DIALECT, pretty=False)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 

@@ -235,6 +235,7 @@ def test_bind_tools_preserves_conversation_model_route_and_thinking_level():
             "model_id": route,
             "temperature": 0.7,
             "thinking_level": "max",
+            "credential_name": "evaluate",
             "reasoning_effort": "max",
         }
 
@@ -247,6 +248,7 @@ def test_bind_tools_preserves_conversation_model_route_and_thinking_level():
             streaming=True,
             model_id_override=route,
             thinking_level="max",
+            credential_name="evaluate",
         ).bind_tools(
             [{"type": "function", "function": {"name": "probe"}}],
             tool_choice="auto",
@@ -255,8 +257,11 @@ def test_bind_tools_preserves_conversation_model_route_and_thinking_level():
     assert len(resolution_calls) == 2
     assert all(call["model_id_override"] == route for call in resolution_calls)
     assert all(call["thinking_level"] == "max" for call in resolution_calls)
+    assert all(call["credential_name"] == "evaluate" for call in resolution_calls)
     assert wrapped._client.model_id_override == route
     assert wrapped._client.thinking_level == "max"
+    assert wrapped._client.credential_name == "evaluate"
+    assert wrapped._model_trace_params()["credential_name"] == "evaluate"
     assert wrapped._client.cfg["provider"] == "kimi"
     assert wrapped._client.cfg["model"] == "kimi-k3"
 

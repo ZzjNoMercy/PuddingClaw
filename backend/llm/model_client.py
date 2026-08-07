@@ -746,6 +746,7 @@ class ModelClientChatModel(BaseChatModel):
             "role": self._client.role,
             "binding": self._client.binding,
             "model": self._client.cfg.get("model"),
+            "credential_name": self._client.credential_name or "default",
             "temperature": self._client.temperature,
             "streaming": self._client.streaming,
         }
@@ -871,6 +872,7 @@ class ModelClientChatModel(BaseChatModel):
             model_override=self._client.model_override,
             model_id_override=self._client.model_id_override,
             thinking_level=self._client.thinking_level,
+            credential_name=self._client.credential_name,
             binding=self._client.binding,
         )
 
@@ -886,6 +888,7 @@ class ModelClientChatModel(BaseChatModel):
             "model_override": self._client.model_override,
             "model_id_override": self._client.model_id_override,
             "thinking_level": self._client.thinking_level,
+            "credential_name": self._client.credential_name or "default",
             "tool_choice": self._client.bind_tools_kwargs.get("tool_choice"),
             "strict": self._client.bind_tools_kwargs.get("strict"),
         }

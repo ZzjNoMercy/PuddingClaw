@@ -76,6 +76,9 @@ function getToolLabel(toolCall: ToolCall): string {
   if (tool === "load_skill_context") {
     return "加载 Skill 上下文";
   }
+  if (tool === "database_sql_generate" && toolCall.progress?.label) {
+    return toolCall.progress.label;
+  }
   try {
     const parsed = JSON.parse(input);
     if (tool === "read_file" && parsed.path) {
@@ -290,7 +293,8 @@ export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
               const meta = getToolMeta(tc.tool);
               const Icon = meta.icon;
               const isOpen = expandedTools[item.id] ?? false;
-              const isRunning = tc.status === "running";
+                const isRunning = tc.status === "running";
+                const isFailed = Boolean(tc.is_error || tc.progress?.status === "failed");
               const duration = toolDurationMs(tc, now);
               const durationText = duration === null ? "" : formatDuration(duration);
 
@@ -317,7 +321,7 @@ export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
                       <span className="shrink-0">
                         {isRunning ? (
                           <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-500" />
-                        ) : tc.is_error ? (
+                        ) : isFailed ? (
                           <XCircle className="h-3.5 w-3.5 text-red-500" />
                         ) : (
                           <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />
@@ -332,6 +336,33 @@ export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
 
                     {isOpen && (
                       <div className="mt-2 space-y-2 pr-2">
+                        {tc.tool === "database_sql_generate" && tc.progress?.history?.length ? (
+                          <div>
+                            <span className="text-[10px] font-semibold uppercase tracking-wider text-gray-400">
+                              执行阶段
+                            </span>
+                            <div className="mt-1 space-y-1 rounded-lg bg-white/58 p-2">
+                              {tc.progress.history.map((stage, stageIndex) => (
+                                <div key={stage.id || `${stage.stage}-${stageIndex}`} className="flex items-start gap-2 text-[11px] text-gray-600">
+                                  {stage.status === "failed" ? (
+                                    <XCircle className="mt-0.5 h-3 w-3 shrink-0 text-red-500" />
+                                  ) : (
+                                    <CheckCircle2 className="mt-0.5 h-3 w-3 shrink-0 text-emerald-500" />
+                                  )}
+                                  <span className="min-w-0 flex-1">
+                                    {stage.label}
+                                    {stage.detail ? ` · ${stage.detail}` : ""}
+                                  </span>
+                                  {typeof stage.elapsedMs === "number" ? (
+                                    <span className="shrink-0 font-mono text-[10px] text-slate-400">
+                                      {formatDuration(stage.elapsedMs)}
+                                    </span>
+                                  ) : null}
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        ) : null}
                         {tc.input && (
                           <div>
                             <span className="text-[10px] font-semibold uppercase tracking-wider text-gray-400">
@@ -360,6 +391,13 @@ export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
                         )}
                       </div>
                     )}
+                    {!isOpen && tc.progress?.detail ? (
+                      <div className={`mt-1 text-[11px] ${
+                        (tc.progress.elapsedMs || 0) >= 120_000 ? "text-amber-600" : "text-gray-500"
+                      }`}>
+                        {tc.progress.detail}
+                      </div>
+                    ) : null}
                   </div>
                 </div>
               );

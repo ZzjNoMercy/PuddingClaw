@@ -226,6 +226,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "max_cell_chars_for_llm": 500,
             "result_materialization_row_cap": 5000,
             "query_timeout_ms": 30000,
+            "sql_generation_timeout_ms": 210000,
             "result_store_enabled": True,
             "result_store_ttl_hours": 168,
             "default_page_size": 100,
@@ -304,13 +305,14 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         },
     },
     "harness": {
-        # Prompt-cache rollout controls. Diagnostics are safe to enable first;
-        # the behavioral switches remain independently reversible.
+        # Cache-safe request layout is the default.  Stable tool schemas remain
+        # opt-in because a bounded schema superset can materially increase the
+        # input size for tool-heavy installations.
         "prompt_cache": {
             "trace_part_diagnostics": True,
-            "ordered_system_sections": False,
-            "tail_routing_message": False,
-            "deterministic_session_projection": False,
+            "ordered_system_sections": True,
+            "tail_routing_message": True,
+            "deterministic_session_projection": True,
             "stable_tool_schema": False,
         },
         "model_call_limit": {
@@ -1275,6 +1277,12 @@ def get_database_qa_config() -> dict[str, Any]:
             maximum=100000,
         ),
         "query_timeout_ms": _positive_int(database_qa.get("query_timeout_ms"), 30000, minimum=1000, maximum=300000),
+        "sql_generation_timeout_ms": _positive_int(
+            database_qa.get("sql_generation_timeout_ms"),
+            210000,
+            minimum=30000,
+            maximum=600000,
+        ),
         "result_store_enabled": bool(database_qa.get("result_store_enabled", True)),
         "result_store_ttl_hours": _positive_int(database_qa.get("result_store_ttl_hours"), 168, maximum=24 * 365),
         "default_page_size": _positive_int(database_qa.get("default_page_size"), 100, maximum=5000),
@@ -1559,6 +1567,7 @@ def update_settings(updates: dict[str, Any]) -> None:
                     "max_cell_chars_for_llm",
                     "result_materialization_row_cap",
                     "query_timeout_ms",
+                    "sql_generation_timeout_ms",
                     "result_store_ttl_hours",
                     "default_page_size",
                     "max_page_size",

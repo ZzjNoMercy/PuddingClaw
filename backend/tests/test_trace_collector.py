@@ -144,6 +144,9 @@ def test_trace_collector_adds_model_input_span():
     assert model_input["name"] == "model.input"
     assert model_input["metadata"]["message_count"] == 1
     assert model_input["metadata"]["tool_schema_count"] == 3
+    assert model_input["metadata"]["estimated_tokens"] > model_input["metadata"]["message_estimated_tokens"]
+    assert model_input["metadata"]["tool_schema_estimated_tokens"] > 0
+    assert model_input["metadata"]["token_estimator"] == "langchain_count_tokens_approximately"
     assert model_input["metadata"]["capture_boundary"] == "test.boundary"
     assert model_input["metadata"]["fingerprints"]["messages_hash"]
     assert model_input["metadata"]["fingerprints"]["tool_schema_hash"]
@@ -151,6 +154,8 @@ def test_trace_collector_adds_model_input_span():
     assert model_input["output"]["messages_preview"][0]["role"] == "user"
     contract = model_input["output"]["model_call_contract"]
     assert contract["params"]["model"] == "probe-model"
+    assert contract["estimated_tokens"] == model_input["metadata"]["estimated_tokens"]
+    assert contract["tool_schema_estimated_tokens"] > 0
     assert contract["tool_schemas"][0]["name"] == "probe"
     assert contract["fingerprints"] == model_input["metadata"]["fingerprints"]
     effect = next(item for item in trace["middleware_effects"] if item["category"] == "model_input")

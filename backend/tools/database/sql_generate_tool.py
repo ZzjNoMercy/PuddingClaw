@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import re
 
 from langchain.tools import ToolRuntime
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import BaseTool
+from langgraph.config import get_stream_writer
 from langgraph.types import interrupt
 from pydantic import BaseModel
 
@@ -15,12 +18,17 @@ from analytics.nl2sql.schemas import DatabaseQueryRequest
 from analytics.nl2sql.service import DatabaseKnowledgeQueryError, generate_database_sql
 from analytics.nl2sql.table_router import summarize_table_route
 from analytics.semantic_runtime import normalize_selected_semantic_asset_ids
+from config import get_database_qa_config
 from db import get_sessionmaker
-from graph.database_schema_evidence import database_schema_evidence_registry
+from graph.database_schema_evidence import (
+    database_schema_discovery_coordinator,
+    database_schema_evidence_registry,
+)
 from graph.database_sql_revision_resume import (
     RegisteredDatabaseSqlGeneration,
     database_sql_revision_resume_registry,
 )
+from graph.session_manager import session_manager
 
 from .formatting import format_query_error
 from .models import DatabaseSqlGenerateInput
@@ -64,6 +72,27 @@ _PRESCRIPTIVE_REVISION_PATTERN = re.compile(
     r"type_name|type_value|EAV)",
     re.IGNORECASE,
 )
+_FAILED_ERROR_SIGNATURES: dict[str, int] = {}
+
+
+def _generation_error_signature(
+    *,
+    query_id: str,
+    source_id: str,
+    table_names: list[str],
+    error_code: str,
+    field_or_concept: str,
+) -> str:
+    payload = {
+        "query_id": query_id,
+        "source_id": source_id,
+        "table_scope": sorted(set(table_names)),
+        "error_code": error_code,
+        "field_or_concept": field_or_concept,
+    }
+    return "sha256:" + hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def _message_text(message: object) -> str:
@@ -196,6 +225,19 @@ def _run_kind(runtime: ToolRuntime | None) -> str:
         if value:
             return value
     return "standalone"
+
+
+def _has_prior_tool_result(runtime: ToolRuntime | None, tool_name: str) -> bool:
+    state = getattr(runtime, "state", None)
+    if not isinstance(state, dict):
+        return False
+    for message in state.get("messages") or []:
+        name = getattr(message, "name", None)
+        if isinstance(message, dict):
+            name = message.get("name", name)
+        if str(name or "") == tool_name:
+            return True
+    return False
 
 
 def _format_untrusted_sql_error(findings: list[str], runtime: ToolRuntime | None) -> str:
@@ -420,8 +462,11 @@ class DatabaseSqlGenerateTool(BaseTool):
         "matched Measure/Reference. To propose a business-semantic change, call this tool with parent_generation_id and "
         "a natural-language revision_instruction; the user then chooses agree, reject, or modify. For SQL timeout, "
         "syntax, validation, or performance failures, report the observed problem through revision_instruction without "
-        "prescribing fields, tables, entities, JOIN/CTE shape, or replacement SQL. Evidence-backed physical EAV "
-        "repairs must carry the schema_evidence_receipt_id returned by database_schema_inspect and do not require HITL."
+        "prescribing fields, tables, entities, JOIN/CTE shape, or replacement SQL. The generator automatically consumes "
+        "same-Run Discovery Evidence and performs bounded profiling before candidate generation; never launch this tool "
+        "in parallel with database_schema_inspect and never create an "
+        "auxiliary SQL generation just to obtain a parent. A Repair Receipt is only for diagnosing an already registered SQL "
+        "generation and does not require business HITL."
     )
     args_schema: type[BaseModel] = DatabaseSqlGenerateInput
     risk_level: str = "moderate"
@@ -446,9 +491,23 @@ class DatabaseSqlGenerateTool(BaseTool):
         tool_call_id: str = "",
         runtime: ToolRuntime | None = None,
     ) -> str:
+        tool_call_id = str(tool_call_id or getattr(runtime, "tool_call_id", "") or "")
+        runtime_context = getattr(runtime, "context", None)
+        context = runtime_context if isinstance(runtime_context, dict) else {}
         state_model_id = ""
         if runtime is not None and isinstance(runtime.state, dict):
             state_model_id = str(runtime.state.get("analytics_model_id") or "").strip()
+        if (
+            not parent_generation_id
+            and _run_kind(runtime) == "standalone"
+            and not _has_prior_tool_result(runtime, "database_sql_generate")
+            and not _has_prior_tool_result(runtime, "request_user_input")
+            and runtime is not None
+            and isinstance(runtime.state, dict)
+        ):
+            run_objective = str(runtime.state.get("_run_objective") or "").strip()
+            if run_objective:
+                question = run_objective
         effective_model_id = state_model_id or model_id
         requested_table_names = list(table_names or [])
         selected_asset_ids = list(dict.fromkeys(selected_semantic_asset_ids or semantic_asset_ids or measure_ids or []))
@@ -491,8 +550,6 @@ class DatabaseSqlGenerateTool(BaseTool):
         disposition = "generated"
         applied_instruction = ""
         if parent_generation_id:
-            runtime_context = getattr(runtime, "context", None)
-            context = runtime_context if isinstance(runtime_context, dict) else {}
             parent = database_sql_revision_resume_registry.get_generation(
                 parent_generation_id,
                 session_id=self.session_id,
@@ -591,7 +648,68 @@ class DatabaseSqlGenerateTool(BaseTool):
                 disposition = "approved_revision"
         elif revision_instruction:
             return "🧮 SQL 重新生成失败：revision_instruction 必须与 parent_generation_id 一起使用。"
+        else:
+            discovery_ready = await database_schema_discovery_coordinator.wait_until_idle(
+                session_id=self.session_id,
+                query_id=self.query_id,
+                timeout_seconds=120.0,
+            )
+            if not discovery_ready:
+                protocol = {
+                    "status": "error",
+                    "error_code": "schema_discovery_in_progress",
+                    "stage": "entity_inspection",
+                    "recoverable": True,
+                    "next_action": "retry_once",
+                    "message": "同一 Query 的数据库探测仍在运行，生成器未读取不完整证据。",
+                }
+                return (
+                    "🧮 SQL 生成失败：同一 Query 的数据库探测仍在运行，生成器未读取不完整证据。"
+                    "请等待当前探测结束后继续。\n\n```json\n"
+                    + json.dumps(protocol, ensure_ascii=False, indent=2)
+                    + "\n```"
+                )
+            discovery_receipts: list[dict[str, object]] = []
+            if schema_evidence_receipt_id:
+                receipt = database_schema_evidence_registry.get_discovery(
+                    schema_evidence_receipt_id,
+                    session_id=self.session_id,
+                    query_id=self.query_id,
+                    run_id=str(context.get("run_id") or ""),
+                    goal_id=str(context.get("goal_id") or ""),
+                    goal_revision=context.get("goal_revision"),
+                )
+                if receipt is None:
+                    return (
+                        "🧮 SQL 生成失败：Discovery Receipt 无效、已过期、被篡改，"
+                        "或不属于当前 Session/Query/Run/Goal revision。"
+                    )
+                discovery_receipts = [receipt]
+            else:
+                discovery_receipts = database_schema_evidence_registry.list_discovery(
+                    session_id=self.session_id,
+                    query_id=self.query_id,
+                    run_id=str(context.get("run_id") or ""),
+                    goal_id=str(context.get("goal_id") or ""),
+                    goal_revision=context.get("goal_revision"),
+                )
+            if discovery_receipts:
+                request_payload["technical_evidence"] = {
+                    "kind": "schema_discovery",
+                    "schema_receipts": discovery_receipts,
+                }
 
+        try:
+            permission_epoch = int(session_manager.get_permission_policy(self.session_id)["policy_epoch"])
+        except (FileNotFoundError, KeyError, RuntimeError, TypeError, ValueError):
+            permission_epoch = 1
+        request_payload["technical_evidence"] = {
+            **dict(request_payload.get("technical_evidence") or {}),
+            "cache_scope": {"permission_epoch": permission_epoch},
+            "verified_plans": database_sql_revision_resume_registry.list_session_verified_plans(
+                session_id=self.session_id
+            )[-5:],
+        }
         request = DatabaseQueryRequest(
             question=str(request_payload["question"]),
             database_source_id=request_payload.get("database_source_id"),
@@ -601,11 +719,119 @@ class DatabaseSqlGenerateTool(BaseTool):
             semantic_question=request_payload.get("semantic_question"),
             technical_evidence=dict(request_payload.get("technical_evidence") or {}),
         )
+
+        def emit_progress(event: dict[str, object]) -> None:
+            event_sha256 = "sha256:" + hashlib.sha256(
+                json.dumps(event, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest()
+            payload = {
+                **event,
+                "tool_call_id": tool_call_id,
+                "generation_attempt_id": f"sql-attempt-{tool_call_id or self.query_id}",
+                "event_sha256": event_sha256,
+            }
+            trace_stage = {
+                "routing": "router",
+                "vanna_retrieval": "vanna_references",
+                "candidate_generation": "sql_candidate",
+                "entity_inspection": "eav_value_profile",
+                "semantic_refinement": "sql_refinement",
+                "deterministic_validation": "sql_guardrail",
+                "repair": "sql_guardrail",
+                "sql_parse_repair": "sql_guardrail",
+                "eav_evidence_repair": "sql_guardrail",
+                "semantic_guardrail_repair": "sql_guardrail",
+                "deterministic_repair": "sql_guardrail",
+                "completed": "sql_generation",
+            }.get(str(payload.get("stage") or ""), "sql_generation")
+            emit_database_span(
+                trace_stage,
+                {
+                    "status": payload.get("status"),
+                    "stage": payload.get("stage"),
+                    "elapsed_ms": payload.get("elapsed_ms"),
+                    "attempt": payload.get("attempt"),
+                    "max_attempts": payload.get("max_attempts"),
+                    "evidence_refs": payload.get("evidence_refs"),
+                    "error_code": payload.get("error_code"),
+                    "input_hash": "sha256:" + hashlib.sha256(question.encode("utf-8")).hexdigest(),
+                    "output_hash": event_sha256,
+                },
+                metadata={
+                    "status": payload.get("status"),
+                    "generation_attempt_id": payload["generation_attempt_id"],
+                    "tool_call_id": tool_call_id,
+                },
+            )
+            writer = getattr(runtime, "stream_writer", None) if runtime is not None else None
+            if writer is None:
+                try:
+                    writer = get_stream_writer()
+                except (KeyError, RuntimeError):
+                    writer = None
+            if writer is not None:
+                writer(payload)
         try:
+            timeout_config = get_database_qa_config()
+            hard_timeout_seconds = max(
+                30.0,
+                float(timeout_config.get("sql_generation_timeout_ms") or 210000) / 1000,
+            )
+            soft_timeout_seconds = max(1.0, hard_timeout_seconds - 30.0)
             sessionmaker = get_sessionmaker()
             async with sessionmaker() as session:
-                result = await generate_database_sql(session, request)
+                generation_task = asyncio.create_task(
+                    generate_database_sql(
+                        session,
+                        request,
+                        progress_callback=emit_progress,
+                    )
+                )
+                done, _pending = await asyncio.wait({generation_task}, timeout=soft_timeout_seconds)
+                if generation_task not in done:
+                    emit_progress(
+                        {
+                            "type": "database_sql_generation_progress",
+                            "stage": "sql_generation",
+                            "status": "soft_timeout",
+                            "elapsed_ms": round(soft_timeout_seconds * 1000, 2),
+                            "detail": "已进入 30 秒确定性收尾窗口",
+                        }
+                    )
+                try:
+                    result = await asyncio.wait_for(
+                        generation_task,
+                        timeout=30.0 if generation_task not in done else None,
+                    )
+                finally:
+                    if not generation_task.done():
+                        generation_task.cancel()
+                        await asyncio.gather(generation_task, return_exceptions=True)
+        except TimeoutError:
+            failure = DatabaseKnowledgeQueryError(
+                f"SQL 生成超过 {int(hard_timeout_seconds)} 秒硬上限，下游任务已取消。",
+                error_code="sql_generation_hard_timeout",
+                stage="sql_generation",
+                recoverable=True,
+                next_action="retry_once",
+            )
+            emit_progress({**failure.protocol(), "type": "database_sql_generation_progress", "status": "failed"})
+            return format_query_error(failure)
         except DatabaseKnowledgeQueryError as exc:
+            signature = _generation_error_signature(
+                query_id=self.query_id,
+                source_id=exc.source_id or str(request.database_source_id or ""),
+                table_names=exc.table_scope or list(request.table_names),
+                error_code=exc.error_code,
+                field_or_concept=exc.field_or_concept or exc.evidence_ref,
+            )
+            occurrence = _FAILED_ERROR_SIGNATURES.get(signature, 0) + 1
+            _FAILED_ERROR_SIGNATURES[signature] = occurrence
+            exc.error_signature = signature
+            if occurrence > 1:
+                exc.recoverable = False
+                exc.next_action = "stop_duplicate_error_signature"
+            emit_progress({**exc.protocol(), "type": "database_sql_generation_progress", "status": "failed"})
             return format_query_error(exc)
         except Exception as exc:
             return f"🧮 SQL 生成失败：{type(exc).__name__}: {exc}"
@@ -658,6 +884,7 @@ class DatabaseSqlGenerateTool(BaseTool):
         selected_semantic_asset_ids: list[str] | None = None,
         parent_generation_id: str | None = None,
         revision_instruction: str | None = None,
+        schema_evidence_receipt_id: str | None = None,
         runtime: ToolRuntime | None = None,
     ) -> str:
         try:
@@ -674,6 +901,7 @@ class DatabaseSqlGenerateTool(BaseTool):
                     selected_semantic_asset_ids=selected_semantic_asset_ids,
                     parent_generation_id=parent_generation_id,
                     revision_instruction=revision_instruction,
+                    schema_evidence_receipt_id=schema_evidence_receipt_id,
                     runtime=runtime,
                 )
             )

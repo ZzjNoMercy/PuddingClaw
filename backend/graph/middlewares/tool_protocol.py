@@ -349,24 +349,40 @@ class ToolProtocolIntegrityMiddleware(AgentMiddleware):
     def _emit_context_usage(self, request: ModelRequest, response: ModelResponse) -> None:
         if not self.emit_context_usage:
             return
-        messages = [
+        input_messages = [
             *([request.system_message] if request.system_message is not None else []),
             *request.messages,
+        ]
+        effective_messages = [
+            *input_messages,
             *response.result,
         ]
         try:
-            used_tokens = int(count_tokens_approximately(messages, tools=request.tools))
+            input_tokens_estimated = int(
+                count_tokens_approximately(input_messages, tools=request.tools)
+            )
+            used_tokens = int(
+                count_tokens_approximately(effective_messages, tools=request.tools)
+            )
         except TypeError:
-            used_tokens = int(count_tokens_approximately(messages))
+            input_tokens_estimated = int(count_tokens_approximately(input_messages))
+            used_tokens = int(count_tokens_approximately(effective_messages))
         try:
             writer = get_stream_writer()
             writer(
                 {
                     "type": "context_usage",
                     "used_tokens": used_tokens,
+                    "input_tokens_estimated": input_tokens_estimated,
+                    "assistant_tokens_estimated": max(
+                        0, used_tokens - input_tokens_estimated
+                    ),
                     "total_tokens": self.context_trigger_tokens,
                     "percentage": round(used_tokens / self.context_trigger_tokens * 100, 1),
                     "includes_tool_schemas": True,
+                    "scope": "next_turn_effective_context",
+                    "measurement": "approximate",
+                    "estimator": "langchain_count_tokens_approximately",
                 }
             )
         except RuntimeError:

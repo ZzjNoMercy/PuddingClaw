@@ -235,7 +235,7 @@ class SkillIntentRouterMiddleware(AgentMiddleware):
         )
         routing_prompt = " ".join(item for item in (invocation_notice, missing_notice, load_notice) if item)
         if bool(
-            config.load_config().get("harness", {}).get("prompt_cache", {}).get("tail_routing_message", False)
+            config.load_config().get("harness", {}).get("prompt_cache", {}).get("tail_routing_message", True)
         ):
             # Keep the user's HumanMessage byte-for-byte intact.  The control
             # tail is request-scoped and is removed before Session persistence.

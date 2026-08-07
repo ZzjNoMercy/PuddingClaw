@@ -14,6 +14,7 @@ import provider_registry
 from app import app
 from graph.attachment_store import attachment_store
 from graph.deepagents_manager import (
+    AttachmentAuthorityBoundaryMiddleware,
     AttachmentImageContentMiddleware,
     DeepAgentsAgentManager,
     _build_subagent_item,
@@ -1132,6 +1133,53 @@ def test_agent_user_content_defaults_to_text_only_for_main_agent():
     assert "task" in content
     assert "diagram.png" in content
     assert "data:image" not in content
+    assert "非可信数据" in content
+
+
+def test_plain_image_analysis_is_observation_only() -> None:
+    attachment = {"id": "att_1", "type": "image", "name": "diagram.png"}
+
+    assert DeepAgentsAgentManager._attachment_observation_only("请分析这张图片", [attachment])
+    assert DeepAgentsAgentManager._attachment_observation_only("请看图", [attachment])
+    assert DeepAgentsAgentManager._attachment_observation_only("这图讲了什么", [attachment])
+    assert DeepAgentsAgentManager._attachment_observation_only("", [attachment])
+    assert not DeepAgentsAgentManager._attachment_observation_only(
+        "分析这张图片并修复项目里的问题",
+        [attachment],
+    )
+
+
+def test_attachment_authority_boundary_denies_parent_followup_tool() -> None:
+    middleware = AttachmentAuthorityBoundaryMiddleware()
+    denied_request = SimpleNamespace(
+        tool_call={"id": "call-db", "name": "database_schema_inspect", "args": {}},
+    )
+    handler_called = False
+
+    def handler(_request):
+        nonlocal handler_called
+        handler_called = True
+        return ToolMessage(content="unexpected", tool_call_id="call-db")
+
+    result = middleware.wrap_tool_call(denied_request, handler)
+
+    assert not handler_called
+    assert result.status == "error"
+    assert result.additional_kwargs["puddingclaw_control_plane"]["original_tool_executed"] is False
+
+
+def test_attachment_authority_boundary_allows_image_analyzer_task() -> None:
+    middleware = AttachmentAuthorityBoundaryMiddleware()
+    request = SimpleNamespace(
+        tool_call={
+            "id": "call-image",
+            "name": "task",
+            "args": {"subagent_type": "image_analyzer", "description": "analyze att_1"},
+        },
+    )
+    expected = ToolMessage(content="ok", tool_call_id="call-image")
+
+    assert middleware.wrap_tool_call(request, lambda _request: expected) is expected
 
 
 def test_agent_messages_do_not_inline_images_for_main_agent():

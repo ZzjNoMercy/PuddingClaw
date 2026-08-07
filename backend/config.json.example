@@ -146,9 +146,9 @@
   "harness": {
     "prompt_cache": {
       "trace_part_diagnostics": true,
-      "ordered_system_sections": false,
-      "tail_routing_message": false,
-      "deterministic_session_projection": false,
+      "ordered_system_sections": true,
+      "tail_routing_message": true,
+      "deterministic_session_projection": true,
       "stable_tool_schema": false
     },
     "model_call_limit": {

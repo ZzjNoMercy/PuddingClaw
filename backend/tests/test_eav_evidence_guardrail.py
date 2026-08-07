@@ -4,6 +4,7 @@ import hashlib
 import json
 import time
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -353,6 +354,7 @@ async def test_top_k_miss_is_enriched_from_live_catalog_before_execution(
         @staticmethod
         def submit_prompt(prompt: list[dict[str, str]], **_kwargs: Any) -> str:
             assert "电池电量[kWh]" in prompt[1]["content"]
+            assert "conflict_model_count" in prompt[1]["content"]
             return "SELECT * FROM vehicle_params WHERE type_name = '电池电量[kWh]'"
 
     async def fake_inspect(**kwargs: Any) -> list[dict[str, Any]]:
@@ -360,6 +362,20 @@ async def test_top_k_miss_is_enriched_from_live_catalog_before_execution(
         return [{"type_name": "电池电量[kWh]", "count": 9748}]
 
     monkeypatch.setattr(nl2sql_service, "_inspect_live_eav_type_names", fake_inspect)
+    monkeypatch.setattr(
+        nl2sql_service,
+        "_inspect_live_eav_value_profiles",
+        AsyncMock(
+            return_value=[
+                {
+                    "type_name": "电池电量[kWh]",
+                    "distinct_value_count": 12,
+                    "conflict_model_count": 3,
+                    "top_values": [{"value": "100", "row_count": 20, "model_count": 20}],
+                }
+            ]
+        ),
+    )
     sql, references, _note, generation = await nl2sql_service._generate_grounded_sql(
         request=DatabaseQueryRequest(question=question),
         route=_route(),
@@ -374,6 +390,7 @@ async def test_top_k_miss_is_enriched_from_live_catalog_before_execution(
     assert generation["eav_evidence"]["automatic_repair"] is True
     assert generation["eav_evidence"]["complete"] is True
     assert references["eav_live_inspection"]["source"] == "live_database"
+    assert generation["eav_value_profiles"]["items"][0]["conflict_model_count"] == 3
 
 
 @pytest.mark.asyncio
@@ -421,6 +438,11 @@ async def test_explicit_cltc_binding_requires_all_physical_names(
         return [{"type_name": name, "count": 1} for name in names]
 
     monkeypatch.setattr(nl2sql_service, "_inspect_live_eav_type_names", fake_inspect)
+    monkeypatch.setattr(
+        nl2sql_service,
+        "_inspect_live_eav_value_profiles",
+        AsyncMock(return_value=[]),
+    )
     semantic_trace = {
         "matched": [
             {
@@ -507,6 +529,11 @@ async def test_schema_receipt_repairs_exact_binding_without_business_drift(
         return [{"type_name": "电池电量[kWh]", "count": 10}]
 
     monkeypatch.setattr(nl2sql_service, "_inspect_live_eav_type_names", fake_inspect)
+    monkeypatch.setattr(
+        nl2sql_service,
+        "_inspect_live_eav_value_profiles",
+        AsyncMock(return_value=[]),
+    )
     semantic_trace = {
         "resolution_mode": "selected_ids",
         "matched": [{

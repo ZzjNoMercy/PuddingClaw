@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from analytics.nl2sql.schemas import DatabaseQueryResult
@@ -83,7 +84,7 @@ def format_actions(actions: list[dict[str, Any]]) -> list[str]:
 
 
 def format_query_error(exc: DatabaseKnowledgeQueryError) -> str:
-    lines = [f"🧮 数据库问数失败：{exc}"]
+    lines = [f"🧮 数据库问数失败：{exc}", "", "```json", json.dumps(exc.protocol(), ensure_ascii=False), "```"]
     sql = str(getattr(exc, "sql", "") or "").strip()
     if sql:
         lines.extend(["", "生成 SQL：", "```sql", sql, "```"])

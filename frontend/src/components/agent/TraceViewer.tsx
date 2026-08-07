@@ -3805,9 +3805,17 @@ function ModelInputDetail({ span, allSpans = [] }: { span: TraceSpan; allSpans?:
 
   return (
     <div className="space-y-3">
-      <div className="grid gap-2 sm:grid-cols-4">
+      <div className="grid gap-2 sm:grid-cols-3 xl:grid-cols-6">
         <MiniMetric label="Messages" value={String(metadata.message_count ?? messages.length)} />
-        <MiniMetric label="Tokens" value={`~${metadata.estimated_tokens ?? 0}`} />
+        <MiniMetric label="Input Tokens" value={`~${metadata.estimated_tokens ?? contract?.estimated_tokens ?? 0}`} />
+        <MiniMetric
+          label="Message Tokens"
+          value={`~${metadata.message_estimated_tokens ?? contract?.message_estimated_tokens ?? 0}`}
+        />
+        <MiniMetric
+          label="Tool Tokens"
+          value={`~${metadata.tool_schema_estimated_tokens ?? contract?.tool_schema_estimated_tokens ?? 0}`}
+        />
         <MiniMetric label="Tools" value={String(metadata.tool_schema_count ?? 0)} />
         <MiniMetric label="LLM 调用方式" value={formatModelCallBoundary(metadata.capture_boundary)} />
       </div>
@@ -3922,6 +3930,9 @@ interface ModelCallContract {
   message_count?: number;
   system_prompt_chars?: number;
   estimated_tokens?: number;
+  message_estimated_tokens?: number;
+  tool_schema_estimated_tokens?: number;
+  token_estimator?: string;
   tool_schema_count?: number;
   tool_schemas?: ModelToolSchema[];
   params?: Record<string, unknown>;
@@ -3941,6 +3952,7 @@ interface ModelInputAssemblySection {
   source?: string;
   count?: number;
   chars?: number;
+  estimated_tokens?: number;
   hash?: string;
   included?: boolean;
   roles?: Record<string, number>;
@@ -4074,6 +4086,7 @@ function ModelInputAssemblyCard({ section }: { section: ModelInputAssemblySectio
   const metrics = [
     typeof section.count === "number" ? `${section.count} item${section.count === 1 ? "" : "s"}` : null,
     typeof section.chars === "number" ? `${section.chars} chars` : null,
+    typeof section.estimated_tokens === "number" ? `~${section.estimated_tokens} tokens` : null,
     typeof section.tool_call_count === "number" && section.tool_call_count > 0 ? `${section.tool_call_count} tool calls` : null,
   ].filter(Boolean);
   return (

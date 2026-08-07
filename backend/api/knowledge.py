@@ -20,6 +20,7 @@ from analytics.nl2sql.training import (
     recommend_database_entity_candidates,
     remove_vanna_entity,
     remove_vanna_training_data,
+    sync_curated_semantic_entities,
     train_vanna_ddl,
     train_vanna_documentation,
     train_vanna_sql,
@@ -145,13 +146,17 @@ class KnowledgeDatabaseSourceRequest(BaseModel):
 
 
 class VannaTrainingRequest(BaseModel):
-    training_type: str = Field(default="ddl", description="ddl | documentation | sql")
+    training_type: str = Field(
+        default="ddl",
+        description="ddl | documentation | sql | curated_semantic",
+    )
     table_name: str | None = None
     table_names: list[str] = Field(default_factory=list)
     ddl: str | None = None
     documentation: str | None = None
     question: str | None = None
     sql: str | None = None
+    semantic_asset_ids: list[str] = Field(default_factory=list)
     knowledge_base_id: str = Field(default=DEFAULT_KNOWLEDGE_BASE_ID)
 
 
@@ -364,6 +369,14 @@ async def train_database_source_vanna(
             if request.table_name and "数据库表：" not in question:
                 question = f"{question}\n数据库表：{request.table_name}"
             result = await train_vanna_sql(question, request.sql or "")
+        elif training_type == "curated_semantic":
+            if not request.table_name:
+                raise VannaTrainingError("curated_semantic 训练需要 table_name。")
+            result = await sync_curated_semantic_entities(
+                source_id=source_id,
+                table_name=request.table_name,
+                semantic_asset_ids=request.semantic_asset_ids,
+            )
         else:
             raise VannaTrainingError("暂不支持的训练类型。")
         return {

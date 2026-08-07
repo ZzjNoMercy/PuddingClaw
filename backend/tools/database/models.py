@@ -158,12 +158,16 @@ class DatabaseSchemaInspectInput(BaseModel):
 
     mode: str = Field(
         default="tables",
-        description="One of: tables, columns, type_names, sample.",
+        description="One of: tables, columns, type_names, type_values, value_profile, sample.",
     )
     database_source_id: str | None = Field(default=None, description="Optional configured database source id.")
     table_name: str | None = Field(default=None, description="Table name for columns/type_names/sample modes.")
     search: str | None = Field(default=None, description="Optional fuzzy search text for type_names.")
-    limit: int = Field(default=100, ge=1, le=1000, description="Maximum rows to return.")
+    type_name: str | None = Field(
+        default=None,
+        description="Exact EAV type_name required by type_values/value_profile modes.",
+    )
+    limit: int = Field(default=100, ge=1, le=200, description="Maximum rows to return (hard cap: 200).")
     parent_generation_id: str | None = Field(
         default=None,
         description="Optional SQL generation id whose physical mapping is being diagnosed.",

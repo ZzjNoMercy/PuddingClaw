@@ -2646,14 +2646,21 @@ def test_analytics_model_prompt_exposes_agent_selected_template_workflow() -> No
 
     assert payload is not None
     template = payload["resolved_templates"]["monthly_product_config_report"]
+    topic_template = payload["resolved_templates"]["topic_product_config_report"]
     assert template["guide_virtual_path"].endswith(
         "/templates/monthly_product_config_report/TEMPLATE.md"
     )
     assert "guide_frontmatter" not in template
     assert "compiled_semantic_scope" not in template
+    assert topic_template["guide_virtual_path"].endswith(
+        "/templates/topic_product_config_report/TEMPLATE.md"
+    )
+    assert "guide_frontmatter" not in topic_template
+    assert "compiled_semantic_scope" not in topic_template
     assert "template_route" not in payload
     assert "active_template" not in payload
     assert "/analytics-models/产品配置分析/templates/monthly_product_config_report/index.html" in prompt
+    assert "/analytics-models/产品配置分析/templates/topic_product_config_report/index.html" in prompt
     assert "自主比较模板的 use_when/do_not_use_when" in prompt
     assert "成功读取会把模板 manifest 渐进写入本轮可信 state" in prompt
 

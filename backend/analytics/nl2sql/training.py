@@ -8,21 +8,22 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Literal
+from pathlib import Path
+from typing import Any, Literal
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from analytics.nl2sql.entity_candidates import recommend_entity_candidates
 from analytics.nl2sql.runtime import build_vanna_client_from_app_config
+from analytics.semantic_assets import get_semantic_asset_registry
 from knowledge.database_sources import (
-    KnowledgeDatabaseSourceError,
     database_source_selected_tables,
     database_source_url,
 )
 from knowledge.models import KnowledgeDatabaseSource
-
 
 TrainingKind = Literal["sql", "ddl", "documentation"]
 
@@ -60,7 +61,6 @@ def _record_type(record_id: str, *, question: Any = None, content: str = "") -> 
     if normalized.startswith("create table"):
         return "ddl"
     return "documentation" if normalized else "unknown"
-    return "unknown"
 
 
 def _table_context_markers(table_name: str | None) -> list[str]:
@@ -444,6 +444,102 @@ async def train_vanna_sql(question: str, sql: str) -> TrainingResult:
     return TrainingResult("sql", ids, len(ids), "已写入 SQL 示例训练资料。")
 
 
+async def sync_curated_semantic_entities(
+    *,
+    source_id: str,
+    table_name: str,
+    semantic_asset_ids: list[str] | None = None,
+) -> TrainingResult:
+    """Sync reviewed semantic canonical names/aliases into Vanna entities.
+
+    Only authored semantic metadata is indexed. Dynamic ``type_value`` rows
+    remain in the revision-bound Profile Catalog and are never copied here.
+    """
+
+    schema, table, _qualified = _qualified_table_sql(table_name)
+    registry = get_semantic_asset_registry(Path(__file__).resolve().parents[2])
+    available = registry.list_assets().get("assets") or []
+    selected = {str(item) for item in semantic_asset_ids or [] if str(item)}
+    definitions: dict[str, set[str]] = {}
+    for summary in available:
+        asset_id = str(summary.get("id") or "")
+        if selected and asset_id not in selected:
+            continue
+        try:
+            detail = registry.get_asset(asset_id)
+        except Exception:
+            continue
+        frontmatter = detail.get("frontmatter") if isinstance(detail.get("frontmatter"), dict) else {}
+        resolution = frontmatter.get("resolution") if isinstance(frontmatter.get("resolution"), dict) else {}
+        for binding in resolution.get("bindings", []) if isinstance(resolution.get("bindings"), list) else []:
+            if not isinstance(binding, dict):
+                continue
+            asset_ref = str(binding.get("asset_ref") or "")
+            if asset_ref and not (
+                asset_ref == f"{source_id}.{table}"
+                or asset_ref == f"{source_id}.{schema}.{table}"
+                or asset_ref.endswith(f".{table}")
+            ):
+                continue
+            fields = binding.get("fields") if isinstance(binding.get("fields"), dict) else {}
+            canonical = str(fields.get("type_name") or "").strip()
+            if not canonical:
+                continue
+            aliases = definitions.setdefault(canonical, set())
+            aliases.update(
+                str(item).strip()
+                for item in [frontmatter.get("name"), *(frontmatter.get("aliases") or [])]
+                if str(item).strip() and str(item).strip() != canonical
+            )
+    if not definitions:
+        raise VannaTrainingError("没有找到绑定该数据源/表的已审核 semantic canonical/alias。")
+
+    vn = build_vanna_client_from_app_config()
+    table_column = f"{schema}.{table}.type_name"
+    existing = await _call_vanna_sync(
+        _query_existing_entities,
+        vn,
+        table_column=table_column,
+        entity_type="配置名称",
+        canonical_names=sorted(definitions),
+        batch_size=100,
+    )
+    ids: list[str] = []
+    for canonical, aliases in definitions.items():
+        previous = existing.get(canonical)
+        merged_aliases = sorted(
+            {
+                *aliases,
+                *(
+                    {str(item).strip() for item in previous.get("aliases") or [] if str(item).strip()}
+                    if previous
+                    else set()
+                ),
+            }
+        )
+        if previous:
+            previous_aliases = {str(item).strip() for item in previous.get("aliases") or [] if str(item).strip()}
+            if previous_aliases == set(merged_aliases):
+                continue
+            previous_id = str(previous.get("pk") or previous.get("id") or "")
+            if previous_id:
+                await _call_vanna_sync(vn.remove_entity, previous_id)
+        entity_id = await _call_vanna_sync(
+            vn.add_entity,
+            canonical_name=canonical,
+            entity_type="配置名称",
+            aliases=merged_aliases,
+            table_column=table_column,
+        )
+        ids.append(str(entity_id))
+    return TrainingResult(
+        "documentation",
+        ids,
+        len(ids),
+        f"已同步 {len(ids)} 条审核后的 EAV canonical/alias；未导入任何 type_value 明细。",
+    )
+
+
 def list_vanna_training_data(*, table_name: str | None = None) -> dict[str, Any]:
     vn = build_vanna_client_from_app_config()
     frame = vn.get_training_data()
@@ -796,4 +892,5 @@ __all__ = [
     "train_vanna_ddl",
     "train_vanna_documentation",
     "train_vanna_sql",
+    "sync_curated_semantic_entities",
 ]
