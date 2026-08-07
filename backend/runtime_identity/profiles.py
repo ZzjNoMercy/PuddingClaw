@@ -377,6 +377,17 @@ class CredentialProfileStore:
             self._write_json(self.registry_path, registry)
             return dict(profile)
 
+    def list_profiles(self) -> list[dict[str, Any]]:
+        """Return this owner's durable Profile inventory without creating one."""
+
+        with self._registry_lock:
+            registry = self._read_json(self.registry_path, {"version": 1, "profiles": [], "defaults": {}})
+            return [
+                dict(item)
+                for item in registry.get("profiles", [])
+                if isinstance(item, dict) and item.get("owner_user_id") == self.owner_user_id
+            ]
+
     def bind_project(self, project_id: str, provider: str, profile_id: str) -> None:
         project = safe_identity_component(project_id, field="project_id")
         provider = safe_identity_component(provider, field="provider")
@@ -437,6 +448,8 @@ class CredentialProfileStore:
         status: str,
         *,
         reason: str | None = None,
+        verified: bool | None = None,
+        token_status: str | None = None,
     ) -> None:
         """Persist a non-secret assessment for one provider identity.
 
@@ -468,6 +481,13 @@ class CredentialProfileStore:
                 }
                 if reason:
                     assessment["reason"] = str(reason)[:256]
+                if verified is not None:
+                    assessment["verified"] = bool(verified)
+                if token_status:
+                    assessment["token_status"] = safe_identity_component(
+                        token_status,
+                        field="token_status",
+                    )
                 identities[identity] = assessment
                 item["updated_at"] = now
                 self._write_json(self.registry_path, registry)

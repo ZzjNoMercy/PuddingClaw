@@ -233,6 +233,14 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
 
         if not isinstance(result, ToolMessage):
             return result
+        # A successful file may legitimately document strings such as
+        # "permission denied" or "operation not permitted".  Those strings
+        # are evidence of an OS access failure only when the underlying tool
+        # has already classified the call as an error.  Scanning successful
+        # content would turn ordinary documentation into a false EPERM and
+        # duplicate the entire file inside the generated error message.
+        if result.status != "error":
+            return result
         tool_name = str(request.tool_call.get("name") or "")
         path_arg = cls._PATH_ARGS.get(tool_name)
         args = dict(request.tool_call.get("args") or {})

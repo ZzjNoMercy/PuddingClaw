@@ -565,7 +565,13 @@ class ManagedCliService:
         self._recover_browser_watchers()
 
     def _recover_browser_watchers(self) -> None:
-        """Resume lifecycle collection for jobs that survived Backend restart."""
+        """Reconcile Runner inventory, durable leases, and Flow evidence.
+
+        Docker is execution infrastructure, not the source of truth. A live
+        Runner may be rebound to its deterministic Profile lease after a crash;
+        a lease with no live Runner is released; and an active Flow with no
+        phase-specific recovery evidence is reset or terminalized.
+        """
 
         if not hasattr(self.backend, "list_managed_browser_auth_jobs"):
             return
@@ -573,24 +579,39 @@ class ManagedCliService:
         try:
             jobs = self.backend.list_managed_browser_auth_jobs(owner_user_id=owner_user_id)
         except Exception:  # noqa: BLE001
+            # Failure to inventory the runtime is unknown state, not evidence
+            # that every Runner disappeared. Never expire durable work here.
             return
+        if not isinstance(jobs, list):
+            return
+        store = CredentialProfileStore(self.paths, owner_user_id)
+        flow_store = self._authorization_flow_store(store, owner_user_id)
+        live_jobs: set[tuple[str, str, str]] = set()
         for job in jobs:
+            if not isinstance(job, dict):
+                continue
             provider = str(job.get("provider") or "")
             try:
                 credential_state = ManagedCliRegistry.credential_state_for_provider(provider)
             except ValueError:
                 continue
-            store = CredentialProfileStore(self.paths, owner_user_id)
             profile_id = str(job.get("profile_id") or "")
             browser_job_id = str(job.get("browser_job_id") or "")
+            if not profile_id or not browser_job_id:
+                continue
             if job.get("credential_state_fingerprint") != credential_state.fingerprint:
                 try:
                     with store.profile_lock(provider, profile_id):
+                        current = store.resolve(
+                            provider,
+                            explicit_profile_id=profile_id,
+                            create_default=False,
+                        )
                         store.finish_browser_job(
                             profile_id,
                             browser_job_id,
                             "expired",
-                            str(job.get("credential_state_fingerprint") or ""),
+                            str((current or {}).get("credential_state_fingerprint") or ""),
                         )
                     self.backend.finalize_managed_browser_auth_cli(
                         owner_user_id=owner_user_id,
@@ -601,27 +622,74 @@ class ManagedCliService:
                 except Exception:  # noqa: BLE001
                     pass
                 continue
+            live_jobs.add((provider, profile_id, browser_job_id))
             try:
-                current = store.resolve(provider, explicit_profile_id=profile_id, create_default=False)
-                flow = self._authorization_flow_store(store, owner_user_id).active(provider, profile_id)
-                phase_one_staged = bool(
-                    flow is not None
-                    and LARK_APP_CONFIGURATION_PHASE.phase_id in flow.get("completed_phase_ids", [])
-                )
-                if (
-                    current is not None
-                    and not current.get("browser_job_id")
-                    and phase_one_staged
-                ):
-                    # Crash recovery for the narrow window after staging and
-                    # releasing the Profile lease but before container ACK.
-                    self.backend.finalize_managed_browser_auth_cli(
-                        owner_user_id=owner_user_id,
-                        provider=provider,
-                        profile_id=profile_id,
-                        browser_job_id=browser_job_id,
+                with store.profile_lock(provider, profile_id):
+                    current = store.resolve(
+                        provider,
+                        explicit_profile_id=profile_id,
+                        create_default=False,
                     )
-                    continue
+                    if current is None:
+                        self.backend.finalize_managed_browser_auth_cli(
+                            owner_user_id=owner_user_id,
+                            provider=provider,
+                            profile_id=profile_id,
+                            browser_job_id=browser_job_id,
+                        )
+                        continue
+                    flow = flow_store.active(provider, profile_id)
+                    phase_one_staged = bool(
+                        flow is not None
+                        and LARK_APP_CONFIGURATION_PHASE.phase_id
+                        in flow.get("completed_phase_ids", [])
+                        and flow_store.has_staged_state(flow)
+                    )
+                    leased_job_id = str(current.get("browser_job_id") or "")
+                    if not leased_job_id and phase_one_staged:
+                        # Crash window after staging and lease release but
+                        # before container ACK: the Runner is now redundant.
+                        self.backend.finalize_managed_browser_auth_cli(
+                            owner_user_id=owner_user_id,
+                            provider=provider,
+                            profile_id=profile_id,
+                            browser_job_id=browser_job_id,
+                        )
+                        continue
+                    if not leased_job_id:
+                        app_setup_waiting = bool(
+                            flow is not None
+                            and flow.get("status") == AuthorizationFlowStatus.AWAITING_USER.value
+                            and flow.get("phase_id") == LARK_APP_CONFIGURATION_PHASE.phase_id
+                            and LARK_APP_CONFIGURATION_PHASE.phase_id
+                            not in flow.get("completed_phase_ids", [])
+                        )
+                        if app_setup_waiting:
+                            # Deterministic job identity and Adapter
+                            # fingerprint prove this is the Flow's lost lease.
+                            store.begin_browser_job(
+                                profile_id,
+                                browser_job_id,
+                                credential_state.fingerprint,
+                            )
+                        else:
+                            self.backend.finalize_managed_browser_auth_cli(
+                                owner_user_id=owner_user_id,
+                                provider=provider,
+                                profile_id=profile_id,
+                                browser_job_id=browser_job_id,
+                            )
+                            continue
+                    elif leased_job_id != browser_job_id:
+                        # Never replace another durable lease merely because a
+                        # stale container happens to be alive.
+                        self.backend.finalize_managed_browser_auth_cli(
+                            owner_user_id=owner_user_id,
+                            provider=provider,
+                            profile_id=profile_id,
+                            browser_job_id=browser_job_id,
+                        )
+                        continue
             except Exception:  # noqa: BLE001
                 continue
             self._start_browser_watcher(
@@ -631,6 +699,99 @@ class ManagedCliService:
                 browser_job_id=browser_job_id,
                 credential_state=credential_state,
             )
+
+        # The runtime inventory succeeded, so absence is now meaningful. Clear
+        # leases whose Runner no longer exists before reconciling their Flows.
+        for profile in store.list_profiles():
+            provider = str(profile.get("provider") or "")
+            profile_id = str(profile.get("profile_id") or "")
+            browser_job_id = str(profile.get("browser_job_id") or "")
+            fingerprint = str(profile.get("credential_state_fingerprint") or "")
+            if not browser_job_id or (provider, profile_id, browser_job_id) in live_jobs:
+                continue
+            try:
+                with store.profile_lock(provider, profile_id):
+                    current = store.resolve(
+                        provider,
+                        explicit_profile_id=profile_id,
+                        create_default=False,
+                    )
+                    if current is None or current.get("browser_job_id") != browser_job_id:
+                        continue
+                    # The first inventory predates this lock. Another request
+                    # may have created the Runner while we were waiting, so
+                    # absence must be re-proven at the mutation boundary.
+                    try:
+                        refreshed_jobs = self.backend.list_managed_browser_auth_jobs(
+                            owner_user_id=owner_user_id
+                        )
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if not isinstance(refreshed_jobs, list):
+                        continue
+                    runner_now_live = any(
+                        isinstance(item, dict)
+                        and item.get("provider") == provider
+                        and item.get("profile_id") == profile_id
+                        and item.get("browser_job_id") == browser_job_id
+                        for item in refreshed_jobs
+                    )
+                    if runner_now_live:
+                        try:
+                            credential_state = ManagedCliRegistry.credential_state_for_provider(provider)
+                        except ValueError:
+                            continue
+                        self._start_browser_watcher(
+                            owner_user_id=owner_user_id,
+                            provider=provider,
+                            profile_id=profile_id,
+                            browser_job_id=browser_job_id,
+                            credential_state=credential_state,
+                        )
+                        continue
+                    store.finish_browser_job(
+                        profile_id,
+                        browser_job_id,
+                        "expired",
+                        fingerprint,
+                    )
+                    current = store.resolve(
+                        provider,
+                        explicit_profile_id=profile_id,
+                        create_default=False,
+                    )
+                    if current is not None:
+                        self._reconcile_authorization_flow_locked(
+                            flow_store=flow_store,
+                            current=current,
+                            provider=provider,
+                            profile_id=profile_id,
+                        )
+            except (OSError, ValueError):
+                continue
+
+        # Flows may outlive both Profile leases and containers if the Backend
+        # crashed between their separate durable writes. Reconcile every one,
+        # including User-consent and commit-recovery states.
+        for flow in flow_store.active_flows():
+            provider = str(flow.get("provider") or "")
+            profile_id = str(flow.get("profile_id") or "")
+            try:
+                with store.profile_lock(provider, profile_id):
+                    current = store.resolve(
+                        provider,
+                        explicit_profile_id=profile_id,
+                        create_default=False,
+                    )
+                    if current is not None:
+                        self._reconcile_authorization_flow_locked(
+                            flow_store=flow_store,
+                            current=current,
+                            provider=provider,
+                            profile_id=profile_id,
+                        )
+            except (OSError, ValueError):
+                continue
 
     def plan(self, match: ManagedCliMatch, context: dict[str, Any]) -> ManagedCliExecutionPlan:
         ref = self.toolchains.resolve_node()
@@ -733,6 +894,67 @@ class ManagedCliService:
             exit_code=0,
         )
 
+    @staticmethod
+    def _profile_status_during_authorization_payload(
+        plan: ManagedCliExecutionPlan,
+        current: dict[str, Any],
+        flow: dict[str, Any],
+    ) -> ManagedCliServiceResult:
+        """Return the durable Profile read model without touching Flow staging.
+
+        Provider CLIs may migrate local state or rotate tokens even for commands
+        named ``status`` or ``show``. While an authorization write transaction
+        owns the Profile, expose the last independently verified assessment and
+        a separate non-secret Flow summary instead of running unsafe inspection
+        or replacing the user's read request with an authorization card.
+        """
+
+        identities = current.get("identities") if isinstance(current.get("identities"), dict) else {}
+        safe_identities: dict[str, dict[str, Any]] = {}
+        for identity_name, raw in identities.items():
+            if not isinstance(identity_name, str) or not isinstance(raw, dict):
+                continue
+            safe_identities[identity_name] = {
+                key: raw.get(key)
+                for key in ("status", "reason", "verified", "token_status", "updated_at")
+                if raw.get(key) is not None
+            }
+        phase = flow.get("phase") if isinstance(flow.get("phase"), dict) else {}
+        return ManagedCliServiceResult(
+            payload={
+                "ok": True,
+                "managed_by": "managed_cli",
+                "adapter_id": plan.match.adapter_id,
+                "route": plan.match.route.value,
+                "action": plan.match.action.value,
+                "profile_id": plan.profile_id,
+                "status": "completed",
+                "profile_status": {
+                    "health": current.get("status"),
+                    "identities": safe_identities,
+                    "freshness": "cached",
+                    "reason": "authorization_write_in_progress",
+                },
+                "authorization_flow": {
+                    "flow_id": flow.get("flow_id"),
+                    "purpose": flow.get("purpose"),
+                    "status": flow.get("status"),
+                    "phase": {
+                        key: phase.get(key)
+                        for key in ("id", "step", "total", "title", "description")
+                        if phase.get(key) is not None
+                    },
+                    "completed_phase_ids": list(flow.get("completed_phase_ids", [])),
+                    "expires_at": flow.get("expires_at"),
+                },
+                "output": (
+                    "当前存在未完成的授权写事务；已返回 durable Profile 最近一次独立验证状态，"
+                    "未执行可能改写凭证的 Provider CLI。"
+                ),
+            },
+            exit_code=0,
+        )
+
     def _authorization_failure_payload(
         self,
         plan: ManagedCliExecutionPlan,
@@ -783,6 +1005,22 @@ class ManagedCliService:
         owner_user_id: str,
     ) -> AuthorizationFlowStore:
         return AuthorizationFlowStore(self.paths, owner_user_id, vault=store.vault)
+
+    @staticmethod
+    def _reconcile_authorization_flow_locked(
+        *,
+        flow_store: AuthorizationFlowStore,
+        current: dict[str, Any],
+        provider: str,
+        profile_id: str,
+    ) -> dict[str, Any] | None:
+        """Reconcile one Flow using its Adapter-declared evidence contract."""
+
+        return flow_store.reconcile_recovery(
+            provider,
+            profile_id,
+            runner_lease_present=bool(current.get("browser_job_id")),
+        )
 
     @staticmethod
     def _ensure_plan_is_current(
@@ -860,6 +1098,13 @@ class ManagedCliService:
                         reason=cancel_reason,
                     )
                     active = None
+
+                active = self._reconcile_authorization_flow_locked(
+                    flow_store=flow_store,
+                    current=current,
+                    provider=provider,
+                    profile_id=profile_id,
+                )
 
                 if current.get("browser_job_id"):
                     result = self._collect_browser_job_locked(
@@ -1174,7 +1419,78 @@ class ManagedCliService:
             with store.profile_lock(provider, profile_id):
                 current = self._ensure_plan_is_current(store, plan, provider, profile_id)
                 flow_store = self._authorization_flow_store(store, owner_user_id)
-                active = flow_store.active(provider, profile_id)
+                active = self._reconcile_authorization_flow_locked(
+                    flow_store=flow_store,
+                    current=current,
+                    provider=provider,
+                    profile_id=profile_id,
+                )
+                durable_state = store.read_state(
+                    provider,
+                    profile_id,
+                    credential_state=credential_state,
+                )
+                identities = current.get("identities") if isinstance(current.get("identities"), dict) else {}
+                bot_assessment = identities.get("bot") if isinstance(identities, dict) else None
+                bot_status = (
+                    str(bot_assessment.get("status") or "").lower()
+                    if isinstance(bot_assessment, dict)
+                    else ""
+                )
+                durable_bot_ready = bool(durable_state) and (
+                    bot_status in {"ready", "active"} or current.get("status") == "active"
+                )
+
+                # `auth login` explicitly asks for User authorization. If an
+                # earlier Agent mistakenly started a full replacement but its
+                # App-configuration browser step is still incomplete, prefer
+                # the last-known-good durable Bot/App and replace that orphaned
+                # flow with a 1/1 User reauthorization. A legitimately
+                # completed phase 1 is deliberately excluded: in that case the
+                # same command must continue the intended full setup to phase 2.
+                supersede_incomplete_full_setup = bool(
+                    durable_bot_ready
+                    and active is not None
+                    and active.get("purpose") == "lark_full_authorization"
+                    and active.get("phase_id") == LARK_APP_CONFIGURATION_PHASE.phase_id
+                    and LARK_APP_CONFIGURATION_PHASE.phase_id
+                    not in active.get("completed_phase_ids", [])
+                )
+                if supersede_incomplete_full_setup:
+                    pending_job_id = str(current.get("browser_job_id") or "")
+                    if pending_job_id:
+                        finalized = self.backend.finalize_managed_browser_auth_cli(
+                            owner_user_id=owner_user_id,
+                            provider=provider,
+                            profile_id=profile_id,
+                            browser_job_id=pending_job_id,
+                        )
+                        if not finalized:
+                            return self._error(
+                                "browser_auth_cleanup_failed",
+                                "无法终止误发起的飞书应用配置 Runner，请重试用户授权。",
+                            )
+                        if not store.finish_browser_job(
+                            profile_id,
+                            pending_job_id,
+                            "superseded",
+                            credential_state.fingerprint,
+                        ):
+                            return self._error(
+                                "authorization_profile_conflict",
+                                "飞书授权状态在切换为用户续权时发生变化，请刷新后重试。",
+                            )
+                        current = store.resolve(
+                            provider,
+                            explicit_profile_id=profile_id,
+                            create_default=False,
+                        ) or current
+                    flow_store.cancel_active(
+                        provider,
+                        profile_id,
+                        reason="superseded_by_user_reauthorization",
+                    )
+                    active = None
                 if current.get("browser_job_id"):
                     result = self._collect_browser_job_locked(
                         store=store,
@@ -1192,15 +1508,7 @@ class ManagedCliService:
                     # configuration (for example after an earlier login). Seed
                     # the transaction from that last-known-good state so a
                     # user-only reauthorization does not repeat step 1.
-                    durable_state = store.read_state(provider, profile_id, credential_state=credential_state)
                     if durable_state:
-                        identities = current.get("identities") if isinstance(current.get("identities"), dict) else {}
-                        bot_assessment = identities.get("bot") if isinstance(identities, dict) else None
-                        bot_status = (
-                            str(bot_assessment.get("status") or "").lower()
-                            if isinstance(bot_assessment, dict)
-                            else ""
-                        )
                         if bot_status in {"ready", "active"} or current.get("status") == "active":
                             if str(current.get("status") or "").startswith("awaiting_"):
                                 store.update_status(profile_id, "active")
@@ -1623,8 +1931,14 @@ class ManagedCliService:
                 if store.read_state(provider, profile_id, credential_state=credential_state) != staged_state:
                     raise RuntimeError("final credential Vault readback verification failed")
                 store.update_status(profile_id, "active")
-                store.update_identity_status(profile_id, "bot", "ready")
-                store.update_identity_status(profile_id, "user", "active")
+                store.update_identity_status(profile_id, "bot", "ready", verified=True)
+                store.update_identity_status(
+                    profile_id,
+                    "user",
+                    "active",
+                    verified=True,
+                    token_status="valid",
+                )
                 flow_store.complete(provider, profile_id, LARK_USER_CONSENT_PHASE.phase_id)
                 user_only = active.get("purpose") == "lark_user_reauthorization"
                 completed_phases = (
@@ -1764,10 +2078,16 @@ class ManagedCliService:
                     )
                 active_authorization: dict[str, Any] | None = None
                 if match.adapter_id == "lark-cli" and current is not None:
-                    active_authorization = self._authorization_flow_store(
+                    flow_store = self._authorization_flow_store(
                         store,
                         owner_user_id,
-                    ).active(provider, profile_id)
+                    )
+                    active_authorization = self._reconcile_authorization_flow_locked(
+                        flow_store=flow_store,
+                        current=current,
+                        provider=provider,
+                        profile_id=profile_id,
+                    )
                 if current is not None and current.get("browser_job_id"):
                     pending_job_id = str(current.get("browser_job_id") or "")
                     pending = self._collect_browser_job_locked(
@@ -1790,11 +2110,27 @@ class ManagedCliService:
                         pending.browser_status == "awaiting_user_browser"
                         and active_authorization is not None
                     ):
+                        if match.action == ManagedCliAction.CREDENTIAL_READ:
+                            return self._profile_status_during_authorization_payload(
+                                plan,
+                                current,
+                                active_authorization,
+                            )
                         return self._authorization_payload(
                             plan,
                             active_authorization,
                             output="飞书授权仍在等待当前浏览器步骤完成。",
                         )
+                    elif (
+                        pending.browser_status in {"failed", "missing"}
+                        and active_authorization is None
+                    ):
+                        # Collection has already released the dead Runner lease
+                        # and terminalized its Flow. Continue the originally
+                        # requested Provider command against the durable Profile
+                        # instead of replacing a status/read request with stale
+                        # browser-job diagnostics.
+                        result = None
                     else:
                         result = pending
 
@@ -1807,6 +2143,12 @@ class ManagedCliService:
                 # baseline.  Authorization entry/resume commands are routed to
                 # _lark_authorization_provider before reaching this branch.
                 if active_authorization is not None and result is None:
+                    if match.action == ManagedCliAction.CREDENTIAL_READ:
+                        return self._profile_status_during_authorization_payload(
+                            plan,
+                            current or {},
+                            active_authorization,
+                        )
                     completed_phases = active_authorization.get("completed_phase_ids", [])
                     if (
                         active_authorization.get("phase_id") == LARK_APP_CONFIGURATION_PHASE.phase_id
@@ -1965,14 +2307,52 @@ class ManagedCliService:
                         if next_status is not None:
                             store.update_status(profile_id, next_status)
                 if (
+                    match.adapter_id == "lark-cli"
+                    and match.requires_profile
+                    and result.exit_code == 0
+                    and lowered[:2] == ("auth", "status")
+                    and "--verify" in lowered
+                ):
+                    verified_status = _lark_identity_status(result.output)
+                    identities = (
+                        verified_status.get("identities")
+                        if isinstance(verified_status, dict)
+                        and isinstance(verified_status.get("identities"), dict)
+                        else {}
+                    )
+                    for identity_name in ("bot", "user"):
+                        assessment = identities.get(identity_name)
+                        if not isinstance(assessment, dict):
+                            continue
+                        identity_status = str(assessment.get("status") or "unknown").lower()
+                        token_status = assessment.get("tokenStatus", assessment.get("token_status"))
+                        store.update_identity_status(
+                            profile_id,
+                            identity_name,
+                            identity_status,
+                            verified=(assessment.get("verified") is True),
+                            token_status=(str(token_status).lower() if token_status else None),
+                        )
+                    if verified_status is not None:
+                        store.update_status(
+                            profile_id,
+                            "active" if _lark_full_identity_ready(verified_status) else "authorization_required",
+                        )
+                if (
                     match.requires_profile
                     and result.exit_code == 0
                     and lowered[:2] in {("auth", "logout"), ("config", "remove")}
                 ):
                     if lowered[:2] == ("config", "remove"):
                         store.update_status(profile_id, "revoked")
-                        store.update_identity_status(profile_id, "bot", "revoked")
-                        store.update_identity_status(profile_id, "user", "revoked")
+                        store.update_identity_status(profile_id, "bot", "revoked", verified=False)
+                        store.update_identity_status(
+                            profile_id,
+                            "user",
+                            "revoked",
+                            verified=False,
+                            token_status="revoked",
+                        )
                     else:
                         store.update_status(profile_id, "active")
                         store.update_identity_status(
@@ -1980,6 +2360,8 @@ class ManagedCliService:
                             "user",
                             "authorization_required",
                             reason="user_logged_out",
+                            verified=False,
+                            token_status="revoked",
                         )
                     self._authorization_flow_store(store, owner_user_id).cancel_active(
                         provider,
@@ -2126,9 +2508,31 @@ class ManagedCliService:
             store.finish_browser_job(
                 profile_id,
                 browser_job_id,
-                "expired",
+                "expired" if result.browser_status == "missing" else "failed",
                 credential_state.fingerprint,
             )
+            flow_store = self._authorization_flow_store(store, owner_user_id)
+            flow = flow_store.active(provider, profile_id)
+            if (
+                flow is not None
+                and flow.get("phase_id") == LARK_APP_CONFIGURATION_PHASE.phase_id
+                and LARK_APP_CONFIGURATION_PHASE.phase_id
+                not in flow.get("completed_phase_ids", [])
+            ):
+                flow_store.fail(
+                    provider,
+                    profile_id,
+                    status=(
+                        AuthorizationFlowStatus.EXPIRED.value
+                        if result.browser_status == "missing"
+                        else AuthorizationFlowStatus.FAILED.value
+                    ),
+                    error=(
+                        "browser_job_missing"
+                        if result.browser_status == "missing"
+                        else "browser_job_failed"
+                    ),
+                )
             if result.browser_status == "failed":
                 self.backend.finalize_managed_browser_auth_cli(
                     owner_user_id=owner_user_id,

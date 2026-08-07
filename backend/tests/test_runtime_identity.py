@@ -34,6 +34,9 @@ from runtime_identity.authorization import (
     LARK_APP_CONFIGURATION_PHASE,
     LARK_USER_CONSENT_PHASE,
     AuthorizationFlowStore,
+    AuthorizationMissingEvidenceAction,
+    AuthorizationPhaseSpec,
+    AuthorizationRecoveryEvidence,
 )
 from runtime_identity.paths import (
     PuddingClawPaths,
@@ -117,6 +120,47 @@ def _seed_lark_user_flow(
         expires_at=time.time() + 600,
     )
     return flow_store, active
+
+
+def test_flow_recovery_contract_is_provider_neutral(tmp_path):
+    paths = PuddingClawPaths(tmp_path / ".puddingclaw")
+    store = CredentialProfileStore(paths, "trusted_owner")
+    profile = store.create_profile("fixture", "fixture_default", "Fixture")
+    flow_store = AuthorizationFlowStore(paths, "trusted_owner", vault=store.vault)
+    phase = AuthorizationPhaseSpec(
+        phase_id="device_consent",
+        step=1,
+        total=1,
+        title="Authorize Fixture",
+        description="Authorize the fixture provider.",
+        completion_hint="Complete authorization and resume.",
+        recovery_evidence=AuthorizationRecoveryEvidence.STAGING_AND_CONTINUATION,
+        missing_evidence_action=AuthorizationMissingEvidenceAction.RESET_ATTEMPT,
+    )
+    flow = flow_store.begin_or_advance(
+        provider="fixture",
+        adapter_id="fixture-cli",
+        profile_id=profile["profile_id"],
+        purpose="connect",
+        phase=phase,
+        profile_revision=float(profile["updated_at"]),
+        base_state_revision="missing",
+        adapter_contract_fingerprint="a" * 64,
+        public={"verification_url": "https://example.test/device"},
+        secret={"device_code": "secret"},
+        expires_at=None,
+    )
+    flow_store.write_staged_state(flow, b"fixture-staging")
+
+    recovered = flow_store.reconcile_recovery(
+        "fixture",
+        profile["profile_id"],
+        runner_lease_present=False,
+    )
+
+    assert recovered["flow_id"] == flow["flow_id"]
+    assert recovered["status"] == "awaiting_user"
+    assert flow_store.read_staged_state(recovered) == b"fixture-staging"
 
 
 def test_puddingclaw_home_is_host_absolute_and_overridable(tmp_path, monkeypatch):
@@ -1131,6 +1175,144 @@ def test_browser_lifecycle_worker_persists_without_another_agent_turn(tmp_path, 
     ) == b""
 
 
+def test_orphaned_app_configuration_flow_expires_before_provider_status(tmp_path, monkeypatch):
+    """An awaiting Flow without Runner evidence must not hijack Profile reads."""
+
+    monkeypatch.setenv("PUDDINGCLAW_OWNER_USER_ID", "trusted_owner")
+    paths = PuddingClawPaths(tmp_path / ".puddingclaw")
+    old_state = _credential_archive(b'{"bot":"ready","user":"active"}')
+    store = CredentialProfileStore(paths, "trusted_owner")
+    profile = store.resolve("lark")
+    store.write_state("lark", profile["profile_id"], old_state, credential_state=_LARK_STATE)
+    store.update_status(profile["profile_id"], "active")
+    profile = store.resolve("lark")
+    flow_store = AuthorizationFlowStore(paths, "trusted_owner", vault=store.vault)
+    orphan = flow_store.begin_or_advance(
+        provider="lark",
+        adapter_id="lark-cli",
+        profile_id=profile["profile_id"],
+        purpose="lark_full_authorization",
+        phase=LARK_APP_CONFIGURATION_PHASE,
+        profile_revision=float(profile["updated_at"]),
+        base_state_revision=store.state_revision("lark", profile["profile_id"]),
+        adapter_contract_fingerprint=_LARK_STATE.fingerprint,
+        public={"verification_url": "https://open.feishu.cn/page/cli?user_code=ORPHAN"},
+        secret=None,
+        expires_at=None,
+    )
+
+    class Backend:
+        manager = SimpleNamespace(runtime_contract="test")
+
+        def __init__(self):
+            self.calls = []
+
+        def run_managed_provider_cli(self, **kwargs):
+            self.calls.append(kwargs)
+            return ManagedProviderExecutionResult(
+                json.dumps(
+                    {
+                        "identities": {
+                            "bot": {"status": "ready", "verified": True},
+                            "user": {
+                                "status": "active",
+                                "verified": True,
+                                "tokenStatus": "valid",
+                            },
+                        }
+                    }
+                ),
+                0,
+                old_state,
+            )
+
+    backend = Backend()
+    service = ManagedCliService(backend, paths=paths)
+    match = ManagedCliRegistry().match("lark-cli auth status --json --verify")
+    plan = service.plan(match, {})
+    executable = plan.toolchain_path / "bin" / "lark-cli"
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    executable.write_text("test", encoding="utf-8")
+
+    result = service.execute(plan, {})
+
+    assert result.payload["status"] == "completed"
+    assert backend.calls[0]["argv"] == ["lark-cli", "auth", "status", "--json", "--verify"]
+    assert flow_store.active("lark", profile["profile_id"]) is None
+    record = next(item for item in flow_store._read_registry()["flows"] if item["flow_id"] == orphan["flow_id"])
+    assert record["status"] == "expired"
+    assert record["error"] == "browser_job_missing"
+    assert store.read_state("lark", profile["profile_id"], credential_state=_LARK_STATE) == old_state
+
+
+def test_missing_browser_runner_terminalizes_flow_and_continues_provider_status(tmp_path, monkeypatch):
+    """Runner loss releases both the Profile lease and the corresponding Flow."""
+
+    monkeypatch.setenv("PUDDINGCLAW_OWNER_USER_ID", "trusted_owner")
+    paths = PuddingClawPaths(tmp_path / ".puddingclaw")
+    old_state = _credential_archive(b'{"bot":"ready","user":"active"}')
+    browser_job_id = _browser_job_id("trusted_owner", "lark", "lark_default")
+    store = CredentialProfileStore(paths, "trusted_owner")
+    profile = store.resolve("lark")
+    store.write_state("lark", profile["profile_id"], old_state, credential_state=_LARK_STATE)
+    store.update_status(profile["profile_id"], "active")
+    profile = store.resolve("lark")
+    flow_store = AuthorizationFlowStore(paths, "trusted_owner", vault=store.vault)
+    flow = flow_store.begin_or_advance(
+        provider="lark",
+        adapter_id="lark-cli",
+        profile_id=profile["profile_id"],
+        purpose="lark_full_authorization",
+        phase=LARK_APP_CONFIGURATION_PHASE,
+        profile_revision=float(profile["updated_at"]),
+        base_state_revision=store.state_revision("lark", profile["profile_id"]),
+        adapter_contract_fingerprint=_LARK_STATE.fingerprint,
+        public={"verification_url": "https://open.feishu.cn/page/cli?user_code=MISSING"},
+        secret=None,
+        expires_at=None,
+    )
+    store.begin_browser_job(profile["profile_id"], browser_job_id, _LARK_STATE.fingerprint)
+
+    class Backend:
+        manager = SimpleNamespace(runtime_contract="test")
+
+        def __init__(self):
+            self.provider_calls = []
+
+        def collect_managed_browser_auth_cli(self, **_kwargs):
+            return ManagedProviderExecutionResult(
+                "Managed browser authorization job is missing or expired.",
+                1,
+                None,
+                browser_status="missing",
+                browser_job_id=browser_job_id,
+            )
+
+        def run_managed_provider_cli(self, **kwargs):
+            self.provider_calls.append(kwargs)
+            return ManagedProviderExecutionResult('{"status":"ok"}', 0, old_state)
+
+    backend = Backend()
+    service = ManagedCliService(backend, paths=paths)
+    match = ManagedCliRegistry().match("lark-cli auth status --json --verify")
+    plan = service.plan(match, {})
+    executable = plan.toolchain_path / "bin" / "lark-cli"
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    executable.write_text("test", encoding="utf-8")
+
+    result = service.execute(plan, {})
+
+    assert result.payload["status"] == "completed"
+    assert len(backend.provider_calls) == 1
+    assert flow_store.active("lark", profile["profile_id"]) is None
+    record = next(item for item in flow_store._read_registry()["flows"] if item["flow_id"] == flow["flow_id"])
+    assert record["status"] == "expired"
+    assert record["error"] == "browser_job_missing"
+    current = store.resolve("lark")
+    assert "browser_job_id" not in current
+    assert current["last_browser_job_status"] == "expired"
+
+
 def test_provider_read_cannot_commit_phase_one_candidate_or_invalidate_flow(tmp_path, monkeypatch):
     """Regression: config show used to overwrite the durable Vault mid-flow."""
 
@@ -1190,10 +1372,14 @@ def test_provider_read_cannot_commit_phase_one_candidate_or_invalidate_flow(tmp_
     show_match = ManagedCliRegistry().match("lark-cli config show")
     result = service.execute(service.plan(show_match, {}), {})
 
-    assert result.payload["status"] == "authorization_phase_completed"
-    assert result.payload["next_action"].endswith(
-        "lark-cli auth login --domain all --no-wait --json"
-    )
+    assert result.payload["status"] == "completed"
+    assert result.payload["profile_status"]["freshness"] == "cached"
+    assert result.payload["profile_status"]["reason"] == "authorization_write_in_progress"
+    assert result.payload["authorization_flow"]["flow_id"]
+    assert result.payload["authorization_flow"]["status"] == "starting"
+    assert "authorization_request" not in result.payload
+    assert "verification_url" not in result.payload["authorization_flow"]
+    assert "next_action" not in result.payload
     assert backend.provider_calls == 0
     assert store.state_revision("lark", initial.profile_id) == base_revision
     assert store.read_state("lark", initial.profile_id, credential_state=_LARK_STATE) == old_state
@@ -1203,6 +1389,137 @@ def test_provider_read_cannot_commit_phase_one_candidate_or_invalidate_flow(tmp_
     assert active["status"] == "starting"
     assert LARK_APP_CONFIGURATION_PHASE.phase_id in active["completed_phase_ids"]
     assert flow_store.read_staged_state(active) == candidate_state
+
+
+def test_provider_read_during_live_browser_flow_returns_cached_profile_status(tmp_path, monkeypatch):
+    monkeypatch.setenv("PUDDINGCLAW_OWNER_USER_ID", "trusted_owner")
+    paths = PuddingClawPaths(tmp_path / ".puddingclaw")
+    durable_state = _credential_archive(b'{"bot":"ready","user":"active"}')
+    browser_job_id = _browser_job_id("trusted_owner", "lark", "lark_default")
+
+    class Backend:
+        manager = SimpleNamespace(runtime_contract="test")
+
+        def __init__(self):
+            self.provider_calls = 0
+
+        def run_managed_browser_auth_cli(self, **_kwargs):
+            return ManagedProviderExecutionResult(
+                "https://open.feishu.cn/page/cli?user_code=WAITING\n"
+                + "\n".join(["▀▄█ " * 12] * 12),
+                0,
+                None,
+                browser_status="awaiting_user_browser",
+                browser_job_id=browser_job_id,
+            )
+
+        def collect_managed_browser_auth_cli(self, **_kwargs):
+            return ManagedProviderExecutionResult(
+                "still waiting",
+                0,
+                None,
+                browser_status="awaiting_user_browser",
+                browser_job_id=browser_job_id,
+            )
+
+        def run_managed_provider_cli(self, **_kwargs):
+            self.provider_calls += 1
+            raise AssertionError("status CLI must not run while the Flow owns credential writes")
+
+    backend = Backend()
+    service = ManagedCliService(backend, paths=paths)
+    monkeypatch.setattr(service, "_start_browser_watcher", lambda **_kwargs: None)
+    init_match = ManagedCliRegistry().match("lark-cli config init --new")
+    init_plan = service.plan(init_match, {})
+    executable = init_plan.toolchain_path / "bin" / "lark-cli"
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    executable.write_text("test", encoding="utf-8")
+    store = CredentialProfileStore(paths, "trusted_owner")
+    store.write_state("lark", init_plan.profile_id, durable_state, credential_state=_LARK_STATE)
+    store.update_status(init_plan.profile_id, "active")
+    store.update_identity_status(init_plan.profile_id, "bot", "ready", verified=True)
+    store.update_identity_status(
+        init_plan.profile_id,
+        "user",
+        "active",
+        verified=True,
+        token_status="valid",
+    )
+
+    started = service.execute(service.plan(init_match, {}), {})
+    assert started.payload["status"] == "awaiting_user_browser"
+
+    status_match = ManagedCliRegistry().match("lark-cli auth status --json --verify")
+    result = service.execute(service.plan(status_match, {}), {})
+
+    assert result.payload["status"] == "completed"
+    assert result.payload["profile_status"] == {
+        "health": "active",
+        "identities": {
+            "bot": {
+                "status": "ready",
+                "verified": True,
+                "updated_at": result.payload["profile_status"]["identities"]["bot"]["updated_at"],
+            },
+            "user": {
+                "status": "active",
+                "verified": True,
+                "token_status": "valid",
+                "updated_at": result.payload["profile_status"]["identities"]["user"]["updated_at"],
+            },
+        },
+        "freshness": "cached",
+        "reason": "authorization_write_in_progress",
+    }
+    assert result.payload["authorization_flow"]["phase"]["id"] == "app_configuration"
+    assert "authorization_request" not in result.payload
+    assert backend.provider_calls == 0
+
+
+def test_fresh_verified_status_updates_independent_identity_assessment(tmp_path, monkeypatch):
+    monkeypatch.setenv("PUDDINGCLAW_OWNER_USER_ID", "trusted_owner")
+    paths = PuddingClawPaths(tmp_path / ".puddingclaw")
+    durable_state = _credential_archive(b'{"bot":"ready","user":"active"}')
+
+    class Backend:
+        manager = SimpleNamespace(runtime_contract="test")
+
+        def run_managed_provider_cli(self, **_kwargs):
+            return ManagedProviderExecutionResult(
+                json.dumps(
+                    {
+                        "identities": {
+                            "bot": {"status": "ready", "verified": True},
+                            "user": {
+                                "status": "expired",
+                                "verified": False,
+                                "tokenStatus": "expired",
+                            },
+                        }
+                    }
+                ),
+                0,
+                durable_state,
+            )
+
+    service = ManagedCliService(Backend(), paths=paths)
+    match = ManagedCliRegistry().match("lark-cli auth status --json --verify")
+    plan = service.plan(match, {})
+    executable = plan.toolchain_path / "bin" / "lark-cli"
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    executable.write_text("test", encoding="utf-8")
+    store = CredentialProfileStore(paths, "trusted_owner")
+    store.write_state("lark", plan.profile_id, durable_state, credential_state=_LARK_STATE)
+
+    result = service.execute(service.plan(match, {}), {})
+
+    assert result.payload["status"] == "completed"
+    profile = store.resolve("lark")
+    assert profile["status"] == "authorization_required"
+    assert profile["identities"]["bot"]["verified"] is True
+    assert profile["identities"]["user"]["status"] == "expired"
+    assert profile["identities"]["user"]["verified"] is False
+    assert profile["identities"]["user"]["token_status"] == "expired"
 
 
 def test_browser_recovery_acks_container_after_phase_one_was_durably_staged(tmp_path, monkeypatch):
@@ -1249,6 +1566,204 @@ def test_browser_recovery_acks_container_after_phase_one_was_durably_staged(tmp_
     ManagedCliService(Backend(), paths=paths)
 
     assert finalized[0]["browser_job_id"] == "browser-orphan"
+
+
+def test_browser_recovery_rebinds_live_runner_after_profile_lease_loss(tmp_path, monkeypatch):
+    monkeypatch.setenv("PUDDINGCLAW_OWNER_USER_ID", "trusted_owner")
+    paths = PuddingClawPaths(tmp_path / ".puddingclaw")
+    store = CredentialProfileStore(paths, "trusted_owner")
+    profile = store.resolve("lark")
+    browser_job_id = _browser_job_id("trusted_owner", "lark", profile["profile_id"])
+    flow_store = AuthorizationFlowStore(paths, "trusted_owner", vault=store.vault)
+    flow_store.begin_or_advance(
+        provider="lark",
+        adapter_id="lark-cli",
+        profile_id=profile["profile_id"],
+        purpose="lark_full_authorization",
+        phase=LARK_APP_CONFIGURATION_PHASE,
+        profile_revision=float(profile["updated_at"]),
+        base_state_revision="missing",
+        adapter_contract_fingerprint=_LARK_STATE.fingerprint,
+        public={"verification_url": "https://open.feishu.cn/page/cli?user_code=RECOVER"},
+        secret=None,
+        expires_at=None,
+    )
+    watchers = []
+
+    class Backend:
+        manager = SimpleNamespace(runtime_contract="test")
+
+        def list_managed_browser_auth_jobs(self, **_kwargs):
+            return [
+                {
+                    "provider": "lark",
+                    "profile_id": profile["profile_id"],
+                    "browser_job_id": browser_job_id,
+                    "credential_state_fingerprint": _LARK_STATE.fingerprint,
+                }
+            ]
+
+    monkeypatch.setattr(
+        ManagedCliService,
+        "_start_browser_watcher",
+        lambda self, **kwargs: watchers.append(kwargs),
+    )
+    ManagedCliService(Backend(), paths=paths)
+
+    recovered = store.resolve("lark")
+    assert recovered["browser_job_id"] == browser_job_id
+    assert recovered["browser_job_status"] == "awaiting_user_browser"
+    assert watchers[0]["browser_job_id"] == browser_job_id
+    assert flow_store.active("lark", profile["profile_id"])["status"] == "awaiting_user"
+
+
+def test_browser_recovery_expires_lease_and_flow_when_runner_is_gone(tmp_path, monkeypatch):
+    monkeypatch.setenv("PUDDINGCLAW_OWNER_USER_ID", "trusted_owner")
+    paths = PuddingClawPaths(tmp_path / ".puddingclaw")
+    store = CredentialProfileStore(paths, "trusted_owner")
+    profile = store.resolve("lark")
+    browser_job_id = _browser_job_id("trusted_owner", "lark", profile["profile_id"])
+    flow_store = AuthorizationFlowStore(paths, "trusted_owner", vault=store.vault)
+    flow = flow_store.begin_or_advance(
+        provider="lark",
+        adapter_id="lark-cli",
+        profile_id=profile["profile_id"],
+        purpose="lark_full_authorization",
+        phase=LARK_APP_CONFIGURATION_PHASE,
+        profile_revision=float(profile["updated_at"]),
+        base_state_revision="missing",
+        adapter_contract_fingerprint=_LARK_STATE.fingerprint,
+        public={"verification_url": "https://open.feishu.cn/page/cli?user_code=GONE"},
+        secret=None,
+        expires_at=None,
+    )
+    store.begin_browser_job(profile["profile_id"], browser_job_id, _LARK_STATE.fingerprint)
+
+    class Backend:
+        manager = SimpleNamespace(runtime_contract="test")
+
+        def list_managed_browser_auth_jobs(self, **_kwargs):
+            return []
+
+    ManagedCliService(Backend(), paths=paths)
+
+    recovered = store.resolve("lark")
+    assert "browser_job_id" not in recovered
+    assert recovered["last_browser_job_status"] == "expired"
+    assert flow_store.active("lark", profile["profile_id"]) is None
+    record = next(
+        item for item in flow_store._read_registry()["flows"] if item["flow_id"] == flow["flow_id"]
+    )
+    assert record["status"] == "expired"
+    assert record["error"] == "browser_job_missing"
+
+
+def test_browser_recovery_rechecks_runtime_before_expiring_a_new_lease(tmp_path, monkeypatch):
+    monkeypatch.setenv("PUDDINGCLAW_OWNER_USER_ID", "trusted_owner")
+    paths = PuddingClawPaths(tmp_path / ".puddingclaw")
+    store = CredentialProfileStore(paths, "trusted_owner")
+    profile = store.resolve("lark")
+    browser_job_id = _browser_job_id("trusted_owner", "lark", profile["profile_id"])
+    flow_store = AuthorizationFlowStore(paths, "trusted_owner", vault=store.vault)
+    flow_store.begin_or_advance(
+        provider="lark",
+        adapter_id="lark-cli",
+        profile_id=profile["profile_id"],
+        purpose="lark_full_authorization",
+        phase=LARK_APP_CONFIGURATION_PHASE,
+        profile_revision=float(profile["updated_at"]),
+        base_state_revision="missing",
+        adapter_contract_fingerprint=_LARK_STATE.fingerprint,
+        public={"verification_url": "https://open.feishu.cn/page/cli?user_code=RACE"},
+        secret=None,
+        expires_at=None,
+    )
+    store.begin_browser_job(profile["profile_id"], browser_job_id, _LARK_STATE.fingerprint)
+    calls = 0
+    watchers = []
+
+    class Backend:
+        manager = SimpleNamespace(runtime_contract="test")
+
+        def list_managed_browser_auth_jobs(self, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return []
+            return [
+                {
+                    "provider": "lark",
+                    "profile_id": profile["profile_id"],
+                    "browser_job_id": browser_job_id,
+                    "credential_state_fingerprint": _LARK_STATE.fingerprint,
+                }
+            ]
+
+    monkeypatch.setattr(
+        ManagedCliService,
+        "_start_browser_watcher",
+        lambda self, **kwargs: watchers.append(kwargs),
+    )
+    ManagedCliService(Backend(), paths=paths)
+
+    recovered = store.resolve("lark")
+    assert recovered["browser_job_id"] == browser_job_id
+    assert flow_store.active("lark", profile["profile_id"])["status"] == "awaiting_user"
+    assert watchers[0]["browser_job_id"] == browser_job_id
+
+
+def test_flow_recovery_resets_user_attempt_when_continuation_is_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("PUDDINGCLAW_OWNER_USER_ID", "trusted_owner")
+    paths = PuddingClawPaths(tmp_path / ".puddingclaw")
+    store = CredentialProfileStore(paths, "trusted_owner")
+    profile = store.resolve("lark")
+    staged = _credential_archive(b'{"bot":"ready","user":null}')
+    flow_store = AuthorizationFlowStore(paths, "trusted_owner", vault=store.vault)
+    app_flow = flow_store.begin_or_advance(
+        provider="lark",
+        adapter_id="lark-cli",
+        profile_id=profile["profile_id"],
+        purpose="lark_full_authorization",
+        phase=LARK_APP_CONFIGURATION_PHASE,
+        profile_revision=float(profile["updated_at"]),
+        base_state_revision="missing",
+        adapter_contract_fingerprint=_LARK_STATE.fingerprint,
+        public={},
+        secret=None,
+        expires_at=None,
+    )
+    flow_store.write_staged_state(app_flow, staged)
+    flow_store.mark_phase_verified("lark", profile["profile_id"], LARK_APP_CONFIGURATION_PHASE.phase_id)
+    user_flow = flow_store.begin_or_advance(
+        provider="lark",
+        adapter_id="lark-cli",
+        profile_id=profile["profile_id"],
+        purpose="lark_full_authorization",
+        phase=LARK_USER_CONSENT_PHASE,
+        profile_revision=float(profile["updated_at"]),
+        base_state_revision="missing",
+        adapter_contract_fingerprint=_LARK_STATE.fingerprint,
+        public={"verification_url": "https://accounts.feishu.cn/oauth/v1/device/verify"},
+        secret={"device_code": "secret"},
+        expires_at=None,
+    )
+    for path in flow_store._secret_paths(user_flow["flow_id"]):
+        path.unlink()
+
+    class Backend:
+        manager = SimpleNamespace(runtime_contract="test")
+
+        def list_managed_browser_auth_jobs(self, **_kwargs):
+            return []
+
+    ManagedCliService(Backend(), paths=paths)
+
+    recovered = flow_store.active("lark", profile["profile_id"])
+    assert recovered["status"] == "starting"
+    assert recovered["retry_user_consent"] is True
+    assert recovered["error"] == "authorization_continuation_missing"
+    assert recovered["public"] == {}
+    assert flow_store.read_staged_state(recovered) == staged
 
 
 def test_lark_two_phase_flow_stages_then_atomically_commits_without_leaking_device_code(
@@ -2027,6 +2542,97 @@ def test_explicit_user_reauthorization_clears_only_staged_old_login(tmp_path, mo
     assert [call["argv"] for call in backend.calls].count(["lark-cli", "auth", "logout", "--json"]) == 1
     logout = next(call for call in backend.calls if call["argv"] == ["lark-cli", "auth", "logout", "--json"])
     assert logout["network_enabled"] is False
+
+
+def test_user_reauthorization_supersedes_incomplete_accidental_full_setup(tmp_path, monkeypatch):
+    monkeypatch.setenv("PUDDINGCLAW_OWNER_USER_ID", "trusted_owner")
+    paths = PuddingClawPaths(tmp_path / ".puddingclaw")
+    old_state = _credential_archive(b'{"user":"expired","bot":"ready"}')
+    bot_only_state = _credential_archive(b'{"user":null,"bot":"ready"}')
+    browser_job_id = _browser_job_id("trusted_owner", "lark", "lark_default")
+
+    class Backend:
+        manager = SimpleNamespace(runtime_contract="test")
+
+        def __init__(self):
+            self.calls = []
+            self.finalized_jobs = []
+
+        def finalize_managed_browser_auth_cli(self, **kwargs):
+            self.finalized_jobs.append(kwargs)
+            return True
+
+        def run_managed_provider_cli(self, **kwargs):
+            self.calls.append(kwargs)
+            argv = kwargs["argv"]
+            if argv == ["lark-cli", "auth", "logout", "--json"]:
+                assert kwargs["credential_state"] == old_state
+                return ManagedProviderExecutionResult("logged out", 0, bot_only_state)
+            if argv[:3] == ["lark-cli", "auth", "login"]:
+                assert kwargs["credential_state"] == bot_only_state
+                return ManagedProviderExecutionResult(
+                    json.dumps(
+                        {
+                            "device_code": "USER-REAUTH-DEVICE",
+                            "user_code": "USER-REAUTH-CODE",
+                            "verification_url": "https://accounts.feishu.cn/oauth/v1/device/verify",
+                            "expires_in": 600,
+                        }
+                    ),
+                    0,
+                    bot_only_state,
+                )
+            if argv[:3] == ["lark-cli", "auth", "qrcode"]:
+                return ManagedProviderExecutionResult("\n".join(["▀▄█ " * 12] * 12), 0, None)
+            raise AssertionError(argv)
+
+    backend = Backend()
+    service = ManagedCliService(backend, paths=paths)
+    match = ManagedCliRegistry().match("lark-cli auth login --domain all --no-wait --json")
+    plan = service.plan(match, {})
+    executable = plan.toolchain_path / "bin" / "lark-cli"
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    executable.write_text("test", encoding="utf-8")
+    store = CredentialProfileStore(paths, "trusted_owner")
+    store.write_state("lark", plan.profile_id, old_state, credential_state=_LARK_STATE)
+    store.update_status(plan.profile_id, "active")
+    store.update_identity_status(plan.profile_id, "bot", "ready")
+    store.update_identity_status(plan.profile_id, "user", "authorization_required")
+    profile = store.resolve("lark")
+    flow_store = AuthorizationFlowStore(paths, "trusted_owner", vault=store.vault)
+    accidental = flow_store.begin_or_advance(
+        provider="lark",
+        adapter_id="lark-cli",
+        profile_id=plan.profile_id,
+        purpose="lark_full_authorization",
+        phase=LARK_APP_CONFIGURATION_PHASE,
+        profile_revision=float(profile["updated_at"]),
+        base_state_revision=store.state_revision("lark", plan.profile_id),
+        adapter_contract_fingerprint=_LARK_STATE.fingerprint,
+        public={"verification_url": "https://open.feishu.cn/page/cli?user_code=OLD"},
+        secret=None,
+        expires_at=None,
+    )
+    store.begin_browser_job(plan.profile_id, browser_job_id, _LARK_STATE.fingerprint)
+
+    result = service.execute(service.plan(match, {}), {})
+
+    assert result.payload["status"] == "awaiting_user_browser"
+    request = result.payload["authorization_request"]
+    assert request["phase"]["step"] == 1
+    assert request["phase"]["total"] == 1
+    assert request["purpose"] == "lark_user_reauthorization"
+    replacement = flow_store.active("lark", plan.profile_id)
+    assert replacement["flow_id"] != accidental["flow_id"]
+    assert replacement["purpose"] == "lark_user_reauthorization"
+    old_record = next(
+        item for item in flow_store._read_registry()["flows"] if item["flow_id"] == accidental["flow_id"]
+    )
+    assert old_record["status"] == "cancelled"
+    assert old_record["cancel_reason"] == "superseded_by_user_reauthorization"
+    assert backend.finalized_jobs[0]["browser_job_id"] == browser_job_id
+    assert store.resolve("lark").get("browser_job_id") is None
+    assert store.read_state("lark", plan.profile_id, credential_state=_LARK_STATE) == old_state
 
 
 def test_full_replacement_supersedes_user_flow_without_deleting_old_vault(tmp_path, monkeypatch):

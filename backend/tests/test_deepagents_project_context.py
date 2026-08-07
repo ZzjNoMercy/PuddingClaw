@@ -137,6 +137,9 @@ def test_base_prompt_excludes_request_scoped_tool_guides() -> None:
     assert "## Resource Access" in prompt
     assert "## Completion discipline" in prompt
     assert "## Managed Browser Authorization" in prompt
+    assert "preserve the existing Bot/App configuration" in prompt
+    assert "never restart App configuration merely because the user says" in prompt
+    assert "Run `lark-cli config init --new` only for first-time setup" in prompt
     assert "## Source Citation Rules" in prompt
     assert "## Database Analysis" not in prompt
     assert "## Semantic Dimension Builds" not in prompt

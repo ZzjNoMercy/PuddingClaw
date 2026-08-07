@@ -34,6 +34,16 @@ class AuthorizationFlowStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class AuthorizationRecoveryEvidence(StrEnum):
+    RUNNER_LEASE = "runner_lease"
+    STAGING_AND_CONTINUATION = "staging_and_continuation"
+
+
+class AuthorizationMissingEvidenceAction(StrEnum):
+    EXPIRE_FLOW = "expire_flow"
+    RESET_ATTEMPT = "reset_attempt"
+
+
 _TERMINAL_FLOW_STATUSES = {
     AuthorizationFlowStatus.COMPLETED.value,
     AuthorizationFlowStatus.FAILED.value,
@@ -50,6 +60,8 @@ class AuthorizationPhaseSpec:
     title: str
     description: str
     completion_hint: str
+    recovery_evidence: AuthorizationRecoveryEvidence
+    missing_evidence_action: AuthorizationMissingEvidenceAction
 
     def __post_init__(self) -> None:
         safe_identity_component(self.phase_id, field="phase_id")
@@ -75,6 +87,8 @@ LARK_APP_CONFIGURATION_PHASE = AuthorizationPhaseSpec(
     title="创建或绑定飞书应用",
     description="选择或创建 CLI Bot，并安全保存应用凭证。",
     completion_hint="完成后告诉我，我会验证应用配置并进入下一步。",
+    recovery_evidence=AuthorizationRecoveryEvidence.RUNNER_LEASE,
+    missing_evidence_action=AuthorizationMissingEvidenceAction.EXPIRE_FLOW,
 )
 
 LARK_USER_CONSENT_PHASE = AuthorizationPhaseSpec(
@@ -84,6 +98,8 @@ LARK_USER_CONSENT_PHASE = AuthorizationPhaseSpec(
     title="授权应用访问你的飞书数据",
     description="这是用户身份授权，与上一步的应用配置不同。",
     completion_hint="完成后告诉我，我会验证最终授权状态。",
+    recovery_evidence=AuthorizationRecoveryEvidence.STAGING_AND_CONTINUATION,
+    missing_evidence_action=AuthorizationMissingEvidenceAction.RESET_ATTEMPT,
 )
 
 LARK_USER_REAUTHORIZATION_PHASE = AuthorizationPhaseSpec(
@@ -93,6 +109,8 @@ LARK_USER_REAUTHORIZATION_PHASE = AuthorizationPhaseSpec(
     title="重新授权访问你的飞书数据",
     description="保留现有应用/Bot 配置，只替换用户身份授权。",
     completion_hint="完成后告诉我，我会验证新授权并原子替换原连接。",
+    recovery_evidence=AuthorizationRecoveryEvidence.STAGING_AND_CONTINUATION,
+    missing_evidence_action=AuthorizationMissingEvidenceAction.RESET_ATTEMPT,
 )
 
 
@@ -138,6 +156,149 @@ class AuthorizationFlowStore:
             if not candidates:
                 return None
             return dict(max(candidates, key=lambda item: float(item.get("updated_at") or 0)))
+
+    def active_flows(self) -> list[dict[str, Any]]:
+        """Return every non-terminal Flow owned by this user.
+
+        Startup reconciliation needs a complete durable inventory; deriving it
+        from currently running jobs would make an orphaned Flow invisible.
+        Secret continuation and staged credential bytes remain in their
+        separate encrypted files and are never included here.
+        """
+
+        with self._lock:
+            registry = self._read_registry()
+            return [
+                dict(item)
+                for item in registry["flows"]
+                if isinstance(item, dict)
+                and item.get("owner_user_id") == self.owner_user_id
+                and item.get("status") not in _TERMINAL_FLOW_STATUSES
+            ]
+
+    def has_continuation(self, flow: dict[str, Any]) -> bool:
+        """Whether the current phase/attempt has resumable encrypted state."""
+
+        self._validate_flow_identity(flow)
+        phase_id = safe_identity_component(str(flow.get("phase_id") or ""), field="phase_id")
+        attempt = max(1, int(flow.get("attempt") or 0))
+        return self._secret_path(str(flow["flow_id"]), phase_id, attempt).exists() or self._legacy_secret_path(
+            str(flow["flow_id"])
+        ).exists()
+
+    def has_staged_state(self, flow: dict[str, Any]) -> bool:
+        """Whether a Flow still owns its provider-native staging archive."""
+
+        self._validate_flow_identity(flow)
+        return self._state_path(str(flow["flow_id"])).exists()
+
+    def has_candidate_state(self, flow: dict[str, Any]) -> bool:
+        """Whether the current attempt has an unverified candidate archive."""
+
+        self._validate_flow_identity(flow)
+        attempt = max(1, int(flow.get("attempt") or 0))
+        return self._candidate_state_path(str(flow["flow_id"]), attempt).exists()
+
+    def reconcile_recovery(
+        self,
+        provider: str,
+        profile_id: str,
+        *,
+        runner_lease_present: bool,
+    ) -> dict[str, Any] | None:
+        """Repair or terminalize one Flow from its declared evidence contract.
+
+        The core understands only generic evidence types. Provider Drivers
+        choose the evidence and missing-evidence action when defining a phase;
+        adding another Provider therefore does not add a branch here.
+        """
+
+        active = self.active(provider, profile_id)
+        if active is None:
+            return None
+        status = str(active.get("status") or "")
+        completed = [str(value) for value in active.get("completed_phase_ids", [])]
+        evidence = str(active.get("recovery_evidence") or "")
+        missing_action = str(active.get("missing_evidence_action") or "")
+
+        # Once a phase has verified staging, STARTING means that the next phase
+        # can be issued. VERIFYING is commit recovery. Neither still depends on
+        # the old Runner or continuation.
+        staging_only = status == AuthorizationFlowStatus.VERIFYING.value or (
+            status == AuthorizationFlowStatus.STARTING.value and bool(completed)
+        )
+        if staging_only:
+            if self.has_staged_state(active):
+                return active
+            self.fail(
+                provider,
+                profile_id,
+                status=AuthorizationFlowStatus.FAILED.value,
+                error="authorization_staged_state_missing",
+            )
+            return None
+
+        if evidence == AuthorizationRecoveryEvidence.RUNNER_LEASE.value:
+            if runner_lease_present:
+                return active
+            self.fail(
+                provider,
+                profile_id,
+                status=(
+                    AuthorizationFlowStatus.EXPIRED.value
+                    if missing_action == AuthorizationMissingEvidenceAction.EXPIRE_FLOW.value
+                    else AuthorizationFlowStatus.FAILED.value
+                ),
+                error="browser_job_missing",
+            )
+            return None
+
+        if evidence == AuthorizationRecoveryEvidence.STAGING_AND_CONTINUATION.value:
+            if not self.has_staged_state(active):
+                self.fail(
+                    provider,
+                    profile_id,
+                    status=AuthorizationFlowStatus.FAILED.value,
+                    error="authorization_staged_state_missing",
+                )
+                return None
+            if status not in {
+                AuthorizationFlowStatus.AWAITING_USER.value,
+                AuthorizationFlowStatus.COLLECTING.value,
+            }:
+                return active
+            if self.has_continuation(active) or self.has_candidate_state(active):
+                return active
+            if missing_action == AuthorizationMissingEvidenceAction.RESET_ATTEMPT.value:
+                return self.reset_user_attempt(
+                    provider,
+                    profile_id,
+                    error="authorization_continuation_missing",
+                    diagnostic={
+                        "reason": "authorization_continuation_missing",
+                        "exit_code": 1,
+                        "candidate_state_exported": False,
+                        "candidate_identity_verified": False,
+                    },
+                )
+            self.fail(
+                provider,
+                profile_id,
+                status=AuthorizationFlowStatus.EXPIRED.value,
+                error="authorization_continuation_missing",
+            )
+            return None
+
+        # Old or corrupt non-terminal records have no provable recovery
+        # contract. Fail closed rather than letting an inert public card own a
+        # Profile forever.
+        self.fail(
+            provider,
+            profile_id,
+            status=AuthorizationFlowStatus.FAILED.value,
+            error="authorization_recovery_contract_missing",
+        )
+        return None
 
     def begin_or_advance(
         self,
@@ -209,6 +370,8 @@ class AuthorizationFlowStore:
                     "profile_revision": float(profile_revision),
                     "base_state_revision": str(base_state_revision),
                     "adapter_contract_fingerprint": adapter_contract_fingerprint,
+                    "recovery_evidence": phase.recovery_evidence.value,
+                    "missing_evidence_action": phase.missing_evidence_action.value,
                     "public": self._safe_public(public),
                     "expires_at": float(expires_at) if expires_at is not None else None,
                     "updated_at": now,

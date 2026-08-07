@@ -68,11 +68,23 @@ class ConnectorRegistry:
         profile = profile_store.resolve(definition.provider, create_default=False)
         active_flow: dict[str, Any] | None = None
         if profile is not None:
-            active = AuthorizationFlowStore(
+            flow_store = AuthorizationFlowStore(
                 self.paths,
                 self.owner_user_id,
                 vault=profile_store.vault,
-            ).active(definition.provider, str(profile["profile_id"]))
+            )
+            profile_id = str(profile["profile_id"])
+            with profile_store.profile_lock(definition.provider, profile_id):
+                profile = profile_store.resolve(
+                    definition.provider,
+                    explicit_profile_id=profile_id,
+                    create_default=False,
+                )
+                active = flow_store.reconcile_recovery(
+                    definition.provider,
+                    profile_id,
+                    runner_lease_present=bool((profile or {}).get("browser_job_id")),
+                )
             if active is not None:
                 active_flow = AuthorizationFlowStore.projection(active)
         profile_projection = self._profile_projection(profile)
@@ -133,7 +145,7 @@ class ConnectorRegistry:
             raw = identities.get(name) if isinstance(identities, dict) else None
             return {
                 key: raw.get(key)
-                for key in ("status", "reason", "updated_at")
+                for key in ("status", "reason", "verified", "token_status", "updated_at")
                 if isinstance(raw, dict) and raw.get(key) is not None
             }
 

@@ -189,6 +189,31 @@ def test_managed_ls_eperm_is_normalized_before_model_sees_it(tmp_path):
     assert "do not request HITL authorization" in str(result.content)
 
 
+def test_successful_managed_read_with_permission_terms_is_not_normalized(tmp_path):
+    from graph.middlewares.workspace_path_router import WorkspacePathRouterMiddleware
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    content = "Handle `permission denied` without retrying operation not permitted."
+
+    def handler(request):
+        return ToolMessage(
+            content=content,
+            name="read_file",
+            tool_call_id=request.tool_call["id"],
+            status="success",
+        )
+
+    result = WorkspacePathRouterMiddleware().wrap_tool_call(
+        _request("read_file", {"file_path": "/skills/example/SKILL.md"}, workspace),
+        handler,
+    )
+
+    assert result.status == "success"
+    assert result.content == content
+    assert "managed_resource_unavailable" not in str(result.content)
+
+
 def test_absolute_workspace_path_is_rewritten_before_ls(tmp_path):
     from graph.middlewares.workspace_path_router import WorkspacePathRouterMiddleware
 

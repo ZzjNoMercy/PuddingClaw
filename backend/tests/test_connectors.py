@@ -74,6 +74,7 @@ def test_connector_projects_profile_and_authorization_flow_without_secrets(tmp_p
         secret=None,
         expires_at=None,
     )
+    flow_store.write_staged_state(flow, b"verified-app-staging")
     flow_store.mark_phase_verified("lark", profile["profile_id"], LARK_APP_CONFIGURATION_PHASE.phase_id)
     flow_store.begin_or_advance(
         provider="lark",
@@ -104,3 +105,46 @@ def test_connector_projects_profile_and_authorization_flow_without_secrets(tmp_p
     serialized = json.dumps(connector)
     assert "DO-NOT-EXPOSE" not in serialized
     assert "/home/puddingclaw" not in serialized
+
+
+def test_connector_status_does_not_treat_orphaned_flow_as_authorizing(tmp_path):
+    paths = PuddingClawPaths(tmp_path / ".puddingclaw")
+    _install_fake_lark(paths)
+    store = CredentialProfileStore(paths, "local")
+    profile = store.resolve("lark")
+    store.update_status(profile["profile_id"], "active")
+    store.update_identity_status(profile["profile_id"], "bot", "ready", verified=True)
+    store.update_identity_status(
+        profile["profile_id"],
+        "user",
+        "active",
+        verified=True,
+        token_status="valid",
+    )
+    profile = store.resolve("lark")
+    flow_store = AuthorizationFlowStore(paths, "local", vault=store.vault)
+    flow = flow_store.begin_or_advance(
+        provider="lark",
+        adapter_id="lark-cli",
+        profile_id=profile["profile_id"],
+        purpose="lark_full_authorization",
+        phase=LARK_APP_CONFIGURATION_PHASE,
+        profile_revision=float(profile["updated_at"]),
+        base_state_revision="old-vault",
+        adapter_contract_fingerprint="a" * 64,
+        public={"verification_url": "https://open.feishu.cn/page/cli?user_code=ORPHAN"},
+        secret=None,
+        expires_at=None,
+    )
+
+    connector = ConnectorRegistry(paths, "test", owner_user_id="local").get("lark")
+
+    assert connector["status"] == "connected"
+    assert connector["profile"]["app_identity"]["verified"] is True
+    assert connector["profile"]["user_identity"]["token_status"] == "valid"
+    assert connector["active_flow"] is None
+    record = next(
+        item for item in flow_store._read_registry()["flows"] if item["flow_id"] == flow["flow_id"]
+    )
+    assert record["status"] == "expired"
+    assert record["error"] == "browser_job_missing"
