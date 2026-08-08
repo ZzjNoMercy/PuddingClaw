@@ -19,7 +19,7 @@ def test_news_intent_still_routes_to_web_search() -> None:
 
     assert decision["matched"] is True
     assert "web_search" in decision["intents"]
-    assert decision["preferred_tools"][0] == "tavily_search"
+    assert decision["preferred_tools"][0] == "web_search"
 
 
 def test_database_business_question_routes_directly_without_schema_probe() -> None:

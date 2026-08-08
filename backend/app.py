@@ -268,6 +268,7 @@ from api.skills_api import router as skills_api_router
 from api.stats_api import router as stats_router
 from api.tokens import router as tokens_router
 from api.user_input_requests import router as user_input_requests_router
+from api.web_search_config import router as web_search_config_router
 
 app.include_router(chat_router, prefix="/api")
 app.include_router(agent_router, prefix="/api")
@@ -298,6 +299,7 @@ app.include_router(llm_wiki_router, prefix="/api")
 app.include_router(read_later_router, prefix="/api")
 app.include_router(headless_router, prefix="/api")
 app.include_router(worker_access_router, prefix="/api")
+app.include_router(web_search_config_router, prefix="/api")
 
 
 @app.get("/")

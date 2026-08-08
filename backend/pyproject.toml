@@ -141,6 +141,7 @@ only-include = [
     "tools",
     "utils",
     "vanna",
+    "web_search",
     "workspace",
 ]
 

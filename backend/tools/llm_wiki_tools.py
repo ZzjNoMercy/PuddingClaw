@@ -198,8 +198,10 @@ class LlmWikiLintTool(_WikiTool):
 class LlmWikiQueryTool(_WikiTool):
     name: str = "llm_wiki_query"
     description: str = (
-        "Read-only deterministic fallback query over published Wiki pages. It reads index.md and relevant Wiki pages only, "
-        "never raw/. Prefer the filtered gbrain query/get_page MCP tools when the compiled brain is online."
+        "Read-only deterministic query over published Wiki pages. It reads index.md and relevant Wiki pages only, "
+        "never raw/. Treat the published Markdown LLM Wiki as the primary and complete internal knowledge source. "
+        "Use filtered gbrain tools only after this query when entity relations, graph traversal, or structured filtering "
+        "adds value; gbrain must never replace or skip the Markdown Wiki query."
     )
     args_schema: type[BaseModel] = WikiQueryInput
     risk_level: str = "safe"

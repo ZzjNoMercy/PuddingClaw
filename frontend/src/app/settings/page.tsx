@@ -14,7 +14,6 @@ import {
   Eye,
   EyeOff,
   Zap,
-  ArrowLeft,
   Activity,
   Network,
   Route,
@@ -70,6 +69,7 @@ import {
 import MemoryEditor from "@/components/settings/MemoryEditor";
 import CapabilitiesStatus from "@/components/settings/CapabilitiesStatus";
 import WorkerAccessKeysPanel from "@/components/settings/WorkerAccessKeysPanel";
+import SettingsNavigation, { SETTINGS_CATEGORIES, type SettingsCategory } from "@/components/settings/SettingsNavigation";
 import Navbar from "@/components/layout/Navbar";
 import Link from "next/link";
 import deepseekLogo from "@lobehub/icons-static-svg/icons/deepseek-color.svg";
@@ -77,7 +77,6 @@ import bailianLogo from "@lobehub/icons-static-svg/icons/bailian-color.svg";
 import moonshotLogo from "@lobehub/icons-static-svg/icons/moonshot.svg";
 import siliconFlowLogo from "@lobehub/icons-static-svg/icons/siliconcloud-color.svg";
 
-type SettingsCategory = "ai" | "project" | "databaseQa" | "rag" | "knowledge" | "memory" | "harness" | "worker" | "advanced" | "system";
 type SubAgentConfigMap = Record<string, Omit<SubAgentItem, "name">>;
 type PendingModelCategoryEdit = {
   providerId: string;
@@ -106,19 +105,6 @@ const HARNESS_SECTIONS: HarnessSection[] = [
 const DATABASE_QA_SECTIONS: HarnessSection[] = [
   { id: "preview", label: "结果预览", description: "直传、摘要与读取体量", icon: Database },
   { id: "storage", label: "持久化存储", description: "落盘、保留与导出", icon: FileText },
-];
-
-const CATEGORIES: { key: SettingsCategory; label: string; icon: React.ElementType; color: string }[] = [
-  { key: "ai", label: "模型服务", icon: Network, color: "#002fa7" },
-  { key: "project", label: "项目上下文", icon: FileText, color: "#002fa7" },
-  { key: "databaseQa", label: "智能问数设置", icon: Database, color: "#002fa7" },
-  { key: "rag", label: "RAG 设置", icon: Database, color: "#002fa7" },
-  { key: "knowledge", label: "知识库", icon: FolderOpen, color: "#002fa7" },
-  { key: "memory", label: "记忆管理", icon: Brain, color: "#002fa7" },
-  { key: "harness", label: "Harness 配置", icon: Bot, color: "#002fa7" },
-  { key: "worker", label: "Worker 接入", icon: KeyRound, color: "#002fa7" },
-  { key: "advanced", label: "高级设置", icon: Sliders, color: "#6b7280" },
-  { key: "system", label: "系统状态", icon: Activity, color: "#002fa7" },
 ];
 
 const LLM_PROVIDERS = [
@@ -407,7 +393,7 @@ export default function SettingsPage() {
     setMounted(true);
     const params = new URLSearchParams(window.location.search);
     const categoryParam = params.get("category");
-    if (CATEGORIES.some((item) => item.key === categoryParam)) {
+    if (SETTINGS_CATEGORIES.some((item) => item.key === categoryParam)) {
       setCategory(categoryParam as SettingsCategory);
     }
   }, []);
@@ -424,7 +410,7 @@ export default function SettingsPage() {
   const [category, setCategory] = useState<SettingsCategory>(() => {
     if (typeof window === "undefined") return "ai";
     const saved = localStorage.getItem(SETTINGS_CATEGORY_KEY);
-    const valid = CATEGORIES.some((c) => c.key === saved);
+    const valid = SETTINGS_CATEGORIES.some((c) => c.key === saved);
     return (valid ? (saved as SettingsCategory) : "ai");
   });
   const [settings, setSettings] = useState<SystemSettings | null>(null);
@@ -1843,36 +1829,7 @@ export default function SettingsPage() {
         >
           <div className="h-full w-52 flex flex-col">
             <div className="h-11 shrink-0" />
-            <div className="flex-1 min-h-0 overflow-y-auto p-3">
-              <Link
-                href="/"
-                onClick={handleReturnToApp}
-                className="flex items-center gap-2.5 px-3 py-2.5 mb-3 text-[13px] font-medium text-gray-700 bg-white/55 hover:bg-white/80 rounded-xl transition-all group"
-              >
-                <ArrowLeft className="w-4 h-4 text-gray-500 group-hover:text-gray-700 transition-colors" />
-                返回应用
-              </Link>
-              <div className="space-y-0.5">
-                {CATEGORIES.map((cat) => {
-                  const Icon = cat.icon;
-                  const active = category === cat.key;
-                  return (
-                    <button
-                      key={cat.key}
-                      onClick={() => setCategory(cat.key)}
-                      className={`w-full flex items-center gap-2.5 px-3 py-2 text-[12px] rounded-lg transition-all text-left ${
-                        active
-                          ? "bg-white/80 text-gray-900 font-medium shadow-sm"
-                          : "text-gray-500 hover:bg-white/55 hover:text-gray-800"
-                      }`}
-                    >
-                      <Icon className="w-3.5 h-3.5" style={active ? { color: cat.color } : {}} />
-                      {cat.label}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
+            <SettingsNavigation active={category} onSelectCategory={setCategory} onReturnToApp={handleReturnToApp} />
           </div>
         </div>
 

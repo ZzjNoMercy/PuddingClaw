@@ -64,8 +64,8 @@ python3 scripts/fetch_github.py --repo langchain-ai/langchain | python3 scripts/
 - GitHub API 未认证请求速率限制 60 次/小时。对 4 个仓库（各 4 类请求 = 16 次调用）安全。
 - **重要**: 共享出口 IP（如终端沙箱、fetch_url）可能已被 GitHub 全局限速 → API 返回 403。
   此时应自动降级到 **Tavily Search 回退方案**：
-  1. 对每个仓库并行调用 `tavily_search(query="site:github.com {owner}/{repo} stars release")`
-  2. 再搜索 `tavily_search(query="{owner}/{repo} github latest release 2026")`
+  1. 对每个仓库并行调用 `web_search(query="site:github.com {owner}/{repo} stars release", source="web")`
+  2. 再搜索 `web_search(query="{owner}/{repo} github latest release 2026", source="web")`
   3. 从搜索结果中提取 star 数、release 版本、commit 信息、PR 动态
   4. 将结构化数据写入 `/knowledge/{owner}_{repo}_tracker.md`
 - 每次调用 `scripts/fetch_github.py` 必须指定 `--repo` 参数（格式 `owner/repo`）。

@@ -16,7 +16,7 @@ _tool_instance_cache: dict[tuple[str, str], List[BaseTool]] = {}
 # core 类别始终加载；其他类别根据用户消息意图检测按需激活
 TOOL_CATEGORIES: dict[str, list[str]] = {
     "core": ["read_file_tool", "write_file_tool", "terminal_tool", "task_manager_tool", "mineru_tool"],
-    "knowledge": ["search_knowledge_tool", "tavily_search_tool", "fetch_url_tool", "read_later_tool"],
+    "knowledge": ["search_knowledge_tool", "web_search_tool", "fetch_url_tool", "read_later_tool"],
     "table": ["pandas_knowledge_tool", "database_knowledge_tool"],
     # research 独立于 knowledge：deep_research 是 subagent 隔离工具，不是简单检索。
     # 当前 ToolIntentRouter 默认不自动路由到 research，后续需要时再显式接入。
@@ -70,7 +70,7 @@ def get_all_tools(base_dir: Path) -> List[BaseTool]:
     tool_files = sorted(set(tools_dir.glob("*_tool.py")) | set(tools_dir.glob("*_tools.py")))
     for tool_file in tool_files:
         module_name = tool_file.stem
-        if module_name in ("__init__", "skills_scanner"):
+        if module_name in ("__init__", "skills_scanner", "tavily_search_tool"):
             continue
         tools.extend(_load_tool_module(module_name, base_dir))
 

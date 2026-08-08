@@ -133,10 +133,10 @@ _DEFAULT_INTENT_REGISTRY: dict[str, dict[str, Any]] = {
             "网页", "url", "http", "https", "链接", "新闻", "资讯", "最近有什么",
             "最新消息", "近况", "联网", "搜索一下", "web", "search", "find",
         ],
-        "preferred_tools": ["tavily_search", "fetch_url"],
+        "preferred_tools": ["web_search", "fetch_url"],
         "tool_categories": ["knowledge"],
         "routing_prompt": (
-            "用户意图为网页或最新信息检索。公开网页、新闻和近期动态优先使用 tavily_search；"
+            "用户意图为网页或最新信息检索。优先使用 web_search，并按问题选择国内公网、全球公网或 X；"
             "已有明确 URL 时才使用 fetch_url 抓正文。"
         ),
     },

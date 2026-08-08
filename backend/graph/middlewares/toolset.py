@@ -789,6 +789,16 @@ class ToolsetMiddleware(AgentMiddleware):
         )
         session_id = str(runtime_context.get("session_id") or "")
         policy_epoch = self._context_policy_epoch(session_id)
+        if not self._runtime_tool_available(tool_name):
+            return ToolMessage(
+                content=(
+                    "Tool `web_search` is unavailable because managed web search is disabled "
+                    "or no provider is enabled and ready. Configure it in Settings > 联网搜索."
+                ),
+                tool_call_id=str(request.tool_call.get("id") or ""),
+                name=tool_name,
+                status="error",
+            )
         if tool_name == "execute":
             args = request.tool_call.get("args") or {}
             command = str(args.get("command") or args.get("cmd") or "") if isinstance(args, dict) else ""
@@ -951,6 +961,7 @@ class ToolsetMiddleware(AgentMiddleware):
             tool
             for tool in visible
             if self._tool_name(tool) not in _LEGACY_DATABASE_AGENT_TOOLS
+            and self._runtime_tool_available(self._tool_name(tool))
         ]
         if stable_schema:
             return self._sort_visible_tools(
@@ -958,6 +969,17 @@ class ToolsetMiddleware(AgentMiddleware):
                 dynamic_names=installed_skill_tools | set(self.mcp_tool_names),
             )
         return visible
+
+    @staticmethod
+    def _runtime_tool_available(tool_name: str) -> bool:
+        if tool_name != "web_search":
+            return True
+        try:
+            from web_search.registry import get_web_search_registry
+
+            return get_web_search_registry().available()
+        except Exception:
+            return False
 
     @classmethod
     def _sort_visible_tools(cls, tools: list[Any], *, dynamic_names: set[str]) -> list[Any]:

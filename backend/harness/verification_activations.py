@@ -32,6 +32,7 @@ from harness.tool_execution import ShellPolicyAnalyzer, ToolExecutionPipeline
 _WEB_TOOLS = frozenset(
     {
         "fetch_url",
+        "web_search",
         "tavily_search",
         "llamaindex_knowledge_query",
     }
@@ -157,7 +158,7 @@ _TEST_COMMAND_RE = re.compile(
 )
 _NETWORK_COMMAND_RE = re.compile(r"(?:^|\s)(?:curl|wget)\s+", re.IGNORECASE)
 _WEB_SKILL_SCRIPT_RE = re.compile(
-    r"(?:^|/)(?:aihot|tavily-search)/(?:.+/)?[^/\s]+\.(?:py|js|mjs|cjs)$",
+    r"(?:^|/)aihot/(?:.+/)?[^/\s]+\.(?:py|js|mjs|cjs)$",
     re.IGNORECASE,
 )
 _ANALYTICS_COMMAND_RE = re.compile(

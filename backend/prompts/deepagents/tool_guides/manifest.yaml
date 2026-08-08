@@ -37,3 +37,7 @@ guides:
     file: managed-lark-autonomy.md
     skill_prefixes:
       - lark-
+  - id: web-search
+    file: web-search.md
+    tools:
+      - web_search

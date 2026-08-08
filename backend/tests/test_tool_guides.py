@@ -24,13 +24,14 @@ def test_manifest_references_valid_unique_guide_files() -> None:
     middleware = ToolGuideMiddleware(base_dir=BASE_DIR)
 
     assert (middleware.guide_dir / "core.md").is_file()
-    assert [spec.guide_id for spec in middleware.specs] == [
+    assert set(spec.guide_id for spec in middleware.specs) == {
         "database-analysis",
         "semantic-dimension-builds",
         "table-analysis",
         "knowledge-retrieval",
         "managed-lark-autonomy",
-    ]
+        "web-search",
+    }
     assert all(spec.path.is_file() for spec in middleware.specs)
 
 
@@ -62,6 +63,18 @@ def test_filtered_business_tool_is_a_guide_activation_fallback() -> None:
     )
 
     assert "## Database Analysis" in str(updated.system_message.content)
+
+
+def test_web_search_tool_activates_managed_search_guide() -> None:
+    middleware = ToolGuideMiddleware(base_dir=BASE_DIR)
+
+    updated = middleware._request_with_guides(
+        _request(tools=[{"name": "read_file"}, {"name": "web_search"}])
+    )
+
+    prompt = str(updated.system_message.content)
+    assert "## Managed Web Search" in prompt
+    assert "source=x" in prompt
 
 
 def test_successful_skill_read_activates_guide_on_next_model_turn() -> None:

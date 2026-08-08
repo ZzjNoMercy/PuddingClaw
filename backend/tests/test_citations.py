@@ -558,7 +558,7 @@ def test_news_intent_routes_to_tavily_search():
 
     assert decision["matched"] is True
     assert "web_search" in decision["intents"]
-    assert decision["preferred_tools"][0] == "tavily_search"
+    assert decision["preferred_tools"][0] == "web_search"
 
 
 def test_tool_result_adapter_handles_markdown_links_and_dedupes_urls():

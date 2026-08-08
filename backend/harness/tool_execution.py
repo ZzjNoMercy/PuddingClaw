@@ -27,8 +27,8 @@ from langchain.agents.middleware.types import ToolCallRequest, hook_config
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.types import Command, interrupt
 
-from graph.effective_grants import EffectiveGrantSet, SelectedGrantSet
 from graph.citations import dedupe_sources, materialize_artifact_citations
+from graph.effective_grants import EffectiveGrantSet, SelectedGrantSet
 from graph.permission_policy import RunPermissionContext
 from graph.permission_resume import permission_resume_registry
 from graph.session_manager import session_manager
@@ -264,7 +264,7 @@ _EMBEDDED_WRITE_API_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _KNOWN_NETWORK_SKILL_ENTRYPOINT_PATTERN = re.compile(
-    r"(?:python3?|node)\s+/skills/(?:aihot|tavily-search)/[^\s\"']+",
+    r"(?:python3?|node)\s+/skills/aihot/[^\s\"']+",
     re.IGNORECASE,
 )
 _EMBEDDED_DESTRUCTIVE_API_PATTERN = re.compile(
@@ -999,7 +999,7 @@ class ShellPolicyAnalyzer:
                 _NETWORK_URL_PATTERN.search(joined_args)
                 or _EMBEDDED_NETWORK_API_PATTERN.search(joined_args)
                 or _KNOWN_NETWORK_SKILL_ENTRYPOINT_PATTERN.search(" ".join(tokens))
-                or any(item.startswith(("/skills/aihot/", "/skills/tavily-search/")) for item in args)
+                or any(item.startswith("/skills/aihot/") for item in args)
             ):
                 network = True
             if (
@@ -1629,6 +1629,7 @@ class ToolExecutionPipeline(AgentMiddleware):
     )
     NETWORK_TOOLS = frozenset(
         {
+            "web_search",
             "tavily_search",
             "fetch_url",
             "prepare_skill_install",
@@ -3107,10 +3108,10 @@ class ToolExecutionPipeline(AgentMiddleware):
             )
         if tool_name in self.NETWORK_TOOLS:
             if self.permission_context.smart:
-                if tool_name == "tavily_search":
+                if tool_name in {"web_search", "tavily_search"}:
                     return ToolPolicyResult(
                         PolicyDecision.ALLOW,
-                        "smart_controlled_network:tavily_search",
+                        f"smart_controlled_network:{tool_name}",
                         "network",
                     )
                 if tool_name in {"prepare_skill_install", "prepare_skill_update"}:
@@ -3867,7 +3868,7 @@ class ToolExecutionPipeline(AgentMiddleware):
             return ["execute", "temporary_network"]
         if tool_name in self.SKILL_COMMIT_TOOLS:
             return ["execute", "managed_skill_write"]
-        if tool_name in {"fetch_url", "tavily_search"}:
+        if tool_name in {"fetch_url", "web_search", "tavily_search"}:
             return ["execute", "network_access"]
         if tool_name in self.mcp_tool_names:
             return ["execute", "network_access"]
@@ -4016,11 +4017,11 @@ class ToolExecutionPipeline(AgentMiddleware):
             # Skill writes are always bound to the exact immutable plan and
             # may never become reusable Session authority.
             return None
-        if tool_name == "tavily_search":
+        if tool_name in {"web_search", "tavily_search"}:
             return {
                 "target_kind": "network_profile",
-                "target": "web_search:tavily",
-                "label": "本 Session 允许 Tavily 网页搜索",
+                "target": "web_search:configured",
+                "label": "本 Session 允许使用已配置的联网搜索服务",
             }
         if tool_name == "fetch_url":
             args = request.tool_call.get("args") or {}

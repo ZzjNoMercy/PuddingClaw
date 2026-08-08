@@ -59,4 +59,5 @@ export const ROUTE_TITLES: Record<string, string> = {
   "/evaluation/datasets": "评测集",
   "/evaluation/experiments": "Experiments",
   "/settings": "系统设置",
+  "/settings/web-search": "联网搜索",
 };

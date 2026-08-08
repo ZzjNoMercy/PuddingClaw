@@ -146,15 +146,7 @@ def test_skill_catalog_is_discovered_from_installed_frontmatter() -> None:
     assert by_id["database-analysis"]["name"] == "database-analysis"
     assert "relational data" in by_id["database-analysis"]["description"]
     assert by_id["database-analysis"]["path"] == ("/skills/database-analysis/SKILL.md")
-
-
-def test_tavily_skill_uses_native_controlled_tool() -> None:
-    skill_path = Path(__file__).resolve().parents[1] / "skills" / "tavily-search" / "SKILL.md"
-    instructions = skill_path.read_text(encoding="utf-8")
-
-    assert "Use the platform-native `tavily_search` tool" in instructions
-    assert "python3 {baseDir}/scripts/tavily_search.py" not in instructions
-    assert "Do not ask the user for `TAVILY_API_KEY`" in instructions
+    assert {"tavily-search", "web-tools-guide"}.isdisjoint(by_id)
 
 
 def test_every_registered_agent_custom_tool_has_an_explicit_policy() -> None:
@@ -1431,15 +1423,16 @@ def test_business_tool_execution_is_denied_until_skill_is_active(tmp_path) -> No
     assert calls == ["database_sql_generate"]
 
 
-def test_native_and_explicit_base_tools_are_unconditionally_visible_and_executable(tmp_path) -> None:
+def test_native_and_explicit_base_tools_are_unconditionally_visible_and_executable(tmp_path, monkeypatch) -> None:
     middleware = ToolsetMiddleware(skills_dir=tmp_path, toolsets_by_skill={})
+    monkeypatch.setattr(middleware, "_runtime_tool_available", lambda _name: True)
     tools = [
         {"name": "read_file"},
         {"name": "write_file"},
         {"name": "task"},
         {"name": "execute"},
         {"name": "read_resource"},
-        {"name": "tavily_search"},
+        {"name": "web_search"},
         {"name": "fetch_url"},
         {"name": "edit_file"},
         {"name": "inspect_file_version"},
@@ -1462,7 +1455,7 @@ def test_native_and_explicit_base_tools_are_unconditionally_visible_and_executab
         "task",
         "execute",
         "read_resource",
-        "tavily_search",
+        "web_search",
         "fetch_url",
         "inspect_file_version",
         "patch_file",
@@ -1471,7 +1464,7 @@ def test_native_and_explicit_base_tools_are_unconditionally_visible_and_executab
     ]
 
     calls: list[str] = []
-    for tool_name in ("execute", "tavily_search", "fetch_url"):
+    for tool_name in ("execute", "web_search", "fetch_url"):
         tool_request = ToolCallRequest(
             tool_call={"name": tool_name, "args": {}, "id": tool_name, "type": "tool_call"},
             tool=None,
@@ -1490,7 +1483,7 @@ def test_native_and_explicit_base_tools_are_unconditionally_visible_and_executab
                 )
             ),
         )
-    assert calls == ["execute", "tavily_search", "fetch_url"]
+    assert calls == ["execute", "web_search", "fetch_url"]
 
     bypass = ToolCallRequest(
         tool_call={
@@ -1509,6 +1502,31 @@ def test_native_and_explicit_base_tools_are_unconditionally_visible_and_executab
     )
     assert denied.status == "error"
     assert "legacy lease owner" in str(denied.content)
+
+
+def test_web_search_is_hidden_and_denied_when_no_provider_is_ready(tmp_path, monkeypatch) -> None:
+    middleware = ToolsetMiddleware(skills_dir=tmp_path, toolsets_by_skill={})
+    monkeypatch.setattr(middleware, "_runtime_tool_available", lambda name: name != "web_search")
+    request = ModelRequest(
+        model=None,
+        messages=[],
+        tools=[{"name": "read_file"}, {"name": "web_search"}],
+        state={"messages": [], "active_skill_ids": []},
+    )
+
+    assert [tool["name"] for tool in middleware._visible_tools(request)] == ["read_file"]
+    tool_request = ToolCallRequest(
+        tool_call={"name": "web_search", "args": {}, "id": "search", "type": "tool_call"},
+        tool=None,
+        state={"messages": [], "active_skill_ids": []},
+        runtime=None,
+    )
+    denied = middleware.wrap_tool_call(
+        tool_request,
+        lambda _request: (_ for _ in ()).throw(AssertionError("unavailable tool executed")),
+    )
+    assert denied.status == "error"
+    assert "Settings > 联网搜索" in str(denied.content)
 
 
 def test_legacy_lease_tools_are_visible_only_to_active_owner_and_audited(

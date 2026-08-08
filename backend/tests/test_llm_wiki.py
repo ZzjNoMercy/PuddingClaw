@@ -110,6 +110,15 @@ def test_llm_wiki_skill_uses_markdown_first_and_gbrain_conditionally() -> None:
     assert "never replaces or skips the Markdown Wiki query" in normalized
 
 
+def test_llm_wiki_query_tool_description_uses_markdown_first() -> None:
+    tool = LlmWikiQueryTool(base_dir=Path(__file__).resolve().parent.parent)
+    normalized = " ".join(tool.description.split())
+
+    assert "primary and complete internal knowledge source" in normalized
+    assert "Use filtered gbrain tools only after this query" in normalized
+    assert "must never replace or skip the Markdown Wiki query" in normalized
+
+
 def test_markdown_file_snapshot_preserves_final_bytes_and_detects_changes(
     wiki_env: LlmWikiService,
     tmp_path: Path,

@@ -47,7 +47,7 @@ UNCONDITIONAL_EXTENSION_TOOLSETS: dict[str, frozenset[str]] = {
         "commit_external_directory",
         "validate_artifact_contract",
     }),
-    "web_research": frozenset({"tavily_search", "fetch_url"}),
+    "web_research": frozenset({"web_search", "fetch_url"}),
     "package_management": frozenset({"install_packages"}),
     "read_later_capture": frozenset({"read_later_save_url"}),
 }
@@ -268,7 +268,7 @@ TOOL_CONTROL_DESCRIPTORS: dict[str, ToolControlDescriptor] = {
     "read_resource": _READ_ONLY,
     "read_evidence": _READ_ONLY,
     # Controlled network and runtime setup.
-    "tavily_search": _CONTROLLED_NETWORK,
+    "web_search": _CONTROLLED_NETWORK,
     "fetch_url": _CONTROLLED_NETWORK,
     # The Tool only queues an idempotent internal bookmark mutation. The
     # worker performs the separately sandboxed public-network fetch later.
