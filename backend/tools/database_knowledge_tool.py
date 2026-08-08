@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from tools.database import (
     DatabaseKnowledgeInput,
+    DatabaseEvidenceSearchInput,
+    DatabaseEvidenceSearchTool,
     DatabaseKnowledgeQueryTool,
     DatabaseQueryResultPageInput,
     DatabaseQueryResultPageTool,
@@ -21,6 +23,8 @@ from tools.database import (
     DatabaseSqlExecuteTool,
     DatabaseSqlGenerateInput,
     DatabaseSqlGenerateTool,
+    LegacyDatabaseSqlValidateInput,
+    LegacyDatabaseSqlValidateTool,
     DatabaseSqlValidateInput,
     DatabaseSqlValidateTool,
     _extract_sql_block,
@@ -30,6 +34,8 @@ from tools.database import (
 
 __all__ = [
     "DatabaseKnowledgeInput",
+    "DatabaseEvidenceSearchInput",
+    "DatabaseEvidenceSearchTool",
     "DatabaseKnowledgeQueryTool",
     "DatabaseQueryResultPageInput",
     "DatabaseQueryResultPageTool",
@@ -43,6 +49,8 @@ __all__ = [
     "DatabaseSqlExecuteTool",
     "DatabaseSqlGenerateInput",
     "DatabaseSqlGenerateTool",
+    "LegacyDatabaseSqlValidateInput",
+    "LegacyDatabaseSqlValidateTool",
     "DatabaseSqlValidateInput",
     "DatabaseSqlValidateTool",
     "_extract_sql_block",

@@ -233,6 +233,13 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "max_page_size": 500,
             "export_enabled": False,
             "profile_enabled": True,
+            # Retained for migration telemetry and non-Agent compatibility.
+            # Agent tool exposure no longer depends on these rollout values:
+            # legacy SQL generation/validation is always hidden from Agents.
+            "database_agent_sql_path_enabled": False,
+            "database_agent_sql_path_rollout_percentage": 1,
+            "database_agent_sql_fallback_enabled": True,
+            "database_agent_sql_shadow_compare_enabled": False,
         },
     },
     "compression": {
@@ -1264,6 +1271,14 @@ def get_database_qa_config() -> dict[str, Any]:
             return min(maximum, parsed)
         return parsed
 
+    try:
+        agent_sql_rollout_percentage = int(
+            database_qa.get("database_agent_sql_path_rollout_percentage", 1) or 0
+        )
+    except (TypeError, ValueError):
+        agent_sql_rollout_percentage = 100
+    agent_sql_rollout_percentage = max(0, min(100, agent_sql_rollout_percentage))
+
     return {
         "full_rows_token_budget": _positive_int(database_qa.get("full_rows_token_budget"), 10000, maximum=100000),
         "preview_rows_token_budget": _positive_int(database_qa.get("preview_rows_token_budget"), 3000, maximum=50000),
@@ -1289,6 +1304,10 @@ def get_database_qa_config() -> dict[str, Any]:
         "max_page_size": _positive_int(database_qa.get("max_page_size"), 500, maximum=10000),
         "export_enabled": bool(database_qa.get("export_enabled", False)),
         "profile_enabled": bool(database_qa.get("profile_enabled", True)),
+        "database_agent_sql_path_enabled": bool(database_qa.get("database_agent_sql_path_enabled", False)),
+        "database_agent_sql_path_rollout_percentage": agent_sql_rollout_percentage,
+        "database_agent_sql_fallback_enabled": bool(database_qa.get("database_agent_sql_fallback_enabled", True)),
+        "database_agent_sql_shadow_compare_enabled": bool(database_qa.get("database_agent_sql_shadow_compare_enabled", False)),
     }
 
 
@@ -1571,10 +1590,25 @@ def update_settings(updates: dict[str, Any]) -> None:
                     "result_store_ttl_hours",
                     "default_page_size",
                     "max_page_size",
+                    "database_agent_sql_path_rollout_percentage",
                 ):
                     if key in database_qa_update:
-                        config["analytics"]["database_qa"][key] = database_qa_update[key]
-                for key in ("result_store_enabled", "export_enabled", "profile_enabled"):
+                        if key == "database_agent_sql_path_rollout_percentage":
+                            try:
+                                parsed_rollout = int(database_qa_update[key])
+                            except (TypeError, ValueError):
+                                continue
+                            config["analytics"]["database_qa"][key] = max(0, min(100, parsed_rollout))
+                        else:
+                            config["analytics"]["database_qa"][key] = database_qa_update[key]
+                for key in (
+                    "result_store_enabled",
+                    "export_enabled",
+                    "profile_enabled",
+                    "database_agent_sql_path_enabled",
+                    "database_agent_sql_fallback_enabled",
+                    "database_agent_sql_shadow_compare_enabled",
+                ):
                     if key in database_qa_update:
                         config["analytics"]["database_qa"][key] = bool(database_qa_update[key])
 

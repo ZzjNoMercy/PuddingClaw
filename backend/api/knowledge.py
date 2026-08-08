@@ -6,6 +6,7 @@ import hashlib
 import logging
 import mimetypes
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -17,6 +18,7 @@ from analytics.nl2sql.training import (
     VannaTrainingError,
     list_vanna_entities,
     list_vanna_training_data,
+    preview_table_entity_import,
     recommend_database_entity_candidates,
     remove_vanna_entity,
     remove_vanna_training_data,
@@ -32,6 +34,7 @@ from knowledge.database_sources import (
     delete_database_source,
     get_database_source,
     list_database_sources,
+    list_database_table_column_values,
     list_database_table_columns,
     list_database_tables,
     test_database_source,
@@ -166,12 +169,34 @@ class VannaEntityCandidateRequest(BaseModel):
     knowledge_base_id: str = Field(default=DEFAULT_KNOWLEDGE_BASE_ID)
 
 
+class DatabaseColumnValuesRequest(BaseModel):
+    table_name: str
+    column: str
+    search: str = Field(default="", max_length=200)
+    limit: int = Field(default=100, ge=1, le=200)
+    knowledge_base_id: str = Field(default=DEFAULT_KNOWLEDGE_BASE_ID)
+
+
+class VannaEntityFilterRequest(BaseModel):
+    column: str = Field(min_length=1, max_length=200)
+    operator: Literal["in", "not_in"]
+    values: list[str] = Field(min_length=1, max_length=100)
+
+
 class VannaEntityImportRequest(BaseModel):
     table_name: str
     column: str
     entity_type: str
     alias_columns: list[str] = Field(default_factory=list)
+    filters: list[VannaEntityFilterRequest] = Field(default_factory=list, max_length=20)
     max_values: int | None = Field(default=None, ge=1)
+    knowledge_base_id: str = Field(default=DEFAULT_KNOWLEDGE_BASE_ID)
+
+
+class VannaEntityImportPreviewRequest(BaseModel):
+    table_name: str
+    column: str
+    filters: list[VannaEntityFilterRequest] = Field(default_factory=list, max_length=20)
     knowledge_base_id: str = Field(default=DEFAULT_KNOWLEDGE_BASE_ID)
 
 
@@ -314,6 +339,28 @@ async def list_knowledge_database_source_table_columns(
         raise HTTPException(status_code=503, detail=f"Failed to list database table columns: {exc}") from exc
 
 
+@router.post("/database-sources/{source_id}/column-values")
+async def list_knowledge_database_source_column_values(
+    source_id: str,
+    request: DatabaseColumnValuesRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        source = await get_database_source(session, source_id, knowledge_base_id=request.knowledge_base_id)
+        result = await list_database_table_column_values(
+            source,
+            request.table_name,
+            request.column,
+            search=request.search,
+            limit=request.limit,
+        )
+        return {**result, "column": request.column}
+    except KnowledgeDatabaseSourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to list database column values: {exc}") from exc
+
+
 @router.delete("/database-sources/{source_id}")
 async def delete_knowledge_database_source(
     source_id: str,
@@ -451,6 +498,7 @@ async def import_database_source_vanna_entities(
             column=request.column,
             entity_type=request.entity_type,
             alias_columns=request.alias_columns,
+            filters=[item.model_dump() for item in request.filters],
             max_values=request.max_values,
             knowledge_base_id=request.knowledge_base_id,
         )
@@ -461,6 +509,28 @@ async def import_database_source_vanna_entities(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Failed to import Vanna entities: {exc}") from exc
+
+
+@router.post("/database-sources/{source_id}/vanna/entities/preview")
+async def preview_database_source_vanna_entities(
+    source_id: str,
+    request: VannaEntityImportPreviewRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        source = await get_database_source(session, source_id, knowledge_base_id=request.knowledge_base_id)
+        return await preview_table_entity_import(
+            source,
+            table_name=request.table_name,
+            column=request.column,
+            filters=[item.model_dump() for item in request.filters],
+        )
+    except KnowledgeDatabaseSourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except VannaTrainingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to preview Vanna entities: {exc}") from exc
 
 
 @router.get("/database-sources/{source_id}/vanna/entities")

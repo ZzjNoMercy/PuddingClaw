@@ -59,6 +59,7 @@ import {
   importKnowledgeDatabaseSourceVannaEntities,
   importSemanticAssets,
   listAnalyticsModels,
+  listKnowledgeDatabaseSourceColumnValues,
   listTableAssetEntityCandidates,
   listKnowledgeDatabaseSourceVannaEntities,
   listKnowledgeDatabaseSourceVannaEntityCandidates,
@@ -73,6 +74,7 @@ import {
   listTableAssets,
   listTaskCenter,
   planAnalyticsProjectExport,
+  previewKnowledgeDatabaseSourceVannaEntities,
   readFile,
   refreshAnalyticsModels,
   refreshConcatDataset,
@@ -122,6 +124,9 @@ import {
   type TableEntityCandidate,
   type TaskCenterItem,
   type TaskJobEvent,
+  type VannaEntityFilter,
+  type VannaEntityFilterOperator,
+  type VannaEntityImportPreview,
   type VannaEntityListResult,
   type VannaEntityRecord,
   type VannaTrainingData,
@@ -142,7 +147,9 @@ type QueuedEntityImport = {
   column: string;
   entityType: string;
   supportColumnsKey: string;
+  filtersKey: string;
 };
+type EntityFilterDraft = VannaEntityFilter & { id: string };
 type TaskDetailState = {
   task: TaskCenterItem;
   job: Record<string, unknown>;
@@ -5831,6 +5838,153 @@ function PlusIcon() {
   return <span className="text-lg leading-none">+</span>;
 }
 
+function EntityFilterValuePicker({
+  sourceId,
+  tableName,
+  column,
+  values,
+  onChange,
+}: {
+  sourceId: string;
+  tableName: string;
+  column: string;
+  values: string[];
+  onChange: (values: string[]) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState("");
+  const [options, setOptions] = useState<string[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState("");
+  const [hasMore, setHasMore] = useState(false);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    setOpen(false);
+    setSearch("");
+    setOptions([]);
+    setLoadError("");
+    setHasMore(false);
+  }, [column, tableName]);
+
+  useEffect(() => {
+    if (!open) return;
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!containerRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", handlePointerDown);
+    return () => document.removeEventListener("mousedown", handlePointerDown);
+  }, [open]);
+
+  useEffect(() => {
+    if (!open || !sourceId || !tableName || !column) return;
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      setLoading(true);
+      setLoadError("");
+      void listKnowledgeDatabaseSourceColumnValues(sourceId, {
+        table_name: tableName,
+        column,
+        search: search.trim(),
+        limit: 100,
+      })
+        .then((result) => {
+          if (cancelled) return;
+          setOptions(result.values);
+          setHasMore(result.has_more);
+        })
+        .catch((error) => {
+          if (!cancelled) {
+            setOptions([]);
+            setHasMore(false);
+            setLoadError(errorMessage(error));
+          }
+        })
+        .finally(() => {
+          if (!cancelled) setLoading(false);
+        });
+    }, 250);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [column, open, search, sourceId, tableName]);
+
+  const selected = new Set(values);
+  const toggle = (value: string) => {
+    if (selected.has(value)) {
+      onChange(values.filter((item) => item !== value));
+    } else if (values.length < 100) {
+      onChange([...values, value]);
+    }
+  };
+
+  return (
+    <div ref={containerRef} className="relative flex min-w-0 flex-col gap-1">
+      <span className="block text-[11px] font-semibold text-gray-500">已有值</span>
+      <button
+        type="button"
+        disabled={!column}
+        onClick={() => setOpen((current) => !current)}
+        aria-expanded={open}
+        className="flex h-9 w-full min-w-0 items-center justify-between gap-2 rounded-xl border border-black/[0.08] bg-white px-2.5 text-left text-xs text-gray-700 outline-none transition focus:border-[#002fa7]/40 disabled:cursor-not-allowed disabled:bg-gray-50 disabled:text-gray-400"
+      >
+        <span className="min-w-0 truncate">
+          {!column ? "先选择字段" : values.length > 0 ? `${values.slice(0, 2).join("、")}${values.length > 2 ? ` 等 ${values.length} 项` : ""}` : "从已有值中选择"}
+        </span>
+        <ChevronDown className={`h-3.5 w-3.5 shrink-0 transition ${open ? "rotate-180" : ""}`} />
+      </button>
+
+      {open && column ? (
+        <div className="absolute left-0 right-0 z-30 mt-1 overflow-hidden rounded-2xl border border-black/[0.08] bg-white shadow-xl">
+          <div className="border-b border-black/[0.05] p-2">
+            <label className="relative block">
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-gray-400" />
+              <input
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") event.preventDefault();
+                }}
+                placeholder="搜索已有值"
+                autoFocus
+                className="h-8 w-full rounded-xl border border-black/[0.08] bg-gray-50 pl-8 pr-3 text-xs outline-none focus:border-[#002fa7]/30"
+              />
+            </label>
+          </div>
+          <div className="max-h-52 overflow-y-auto p-1.5">
+            {loading ? (
+              <div className="flex items-center justify-center gap-2 px-3 py-6 text-xs text-gray-400">
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />读取源表已有值
+              </div>
+            ) : loadError ? (
+              <p className="px-3 py-4 text-xs text-red-500">{loadError}</p>
+            ) : options.length > 0 ? (
+              options.map((option) => (
+                <label key={option} className="flex cursor-pointer items-center gap-2 rounded-xl px-2.5 py-2 text-xs text-gray-700 hover:bg-gray-50">
+                  <input
+                    type="checkbox"
+                    checked={selected.has(option)}
+                    onChange={() => toggle(option)}
+                    className="accent-[#002fa7]"
+                  />
+                  <span className="min-w-0 break-all">{option}</span>
+                </label>
+              ))
+            ) : (
+              <p className="px-3 py-6 text-center text-xs text-gray-400">没有匹配的已有值</p>
+            )}
+          </div>
+          <div className="flex items-center justify-between border-t border-black/[0.05] px-3 py-2 text-[10px] text-gray-400">
+            <span>已选 {values.length} 项</span>
+            <span>{hasMore ? "还有更多，请继续搜索" : "仅可选择源表已有值"}</span>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function DatabaseSourceCard({
   source,
   onManage,
@@ -5949,6 +6103,10 @@ function TableVannaTrainingModal({
   const [entityColumn, setEntityColumn] = useState("");
   const [entityType, setEntityType] = useState("");
   const [entitySupportColumns, setEntitySupportColumns] = useState<string[]>([]);
+  const [entityFilterColumns, setEntityFilterColumns] = useState<string[]>([]);
+  const [entityFilters, setEntityFilters] = useState<EntityFilterDraft[]>([]);
+  const [entityImportPreview, setEntityImportPreview] = useState<VannaEntityImportPreview | null>(null);
+  const [entityImportPreviewing, setEntityImportPreviewing] = useState(false);
   const [queuedEntityImport, setQueuedEntityImport] = useState<QueuedEntityImport | null>(null);
   const [entityListExpanded, setEntityListExpanded] = useState(false);
   const [entitySearch, setEntitySearch] = useState("");
@@ -6000,6 +6158,20 @@ function TableVannaTrainingModal({
   useEffect(() => {
     void loadEntityTopKSettings();
   }, [loadEntityTopKSettings]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setEntityFilterColumns([]);
+    if (!source.id || !tableName) return () => { cancelled = true; };
+    void listKnowledgeDatabaseSourceTableColumns(source.id, tableName)
+      .then((columns) => {
+        if (!cancelled) setEntityFilterColumns(columns);
+      })
+      .catch((error) => {
+        if (!cancelled) showTrainingStatus({ type: "error", message: errorMessage(error) });
+      });
+    return () => { cancelled = true; };
+  }, [showTrainingStatus, source.id, tableName]);
 
   const saveEntityTopKSettings = useCallback(async () => {
     const defaultTopK = positiveIntOrNull(entityTopKDefault) ?? 10;
@@ -6104,6 +6276,8 @@ function TableVannaTrainingModal({
     setEntityColumn("");
     setEntityType("");
     setEntitySupportColumns([]);
+    setEntityFilters([]);
+    setEntityImportPreview(null);
     setQueuedEntityImport(null);
     setEntityListExpanded(false);
     setEntitySearch("");
@@ -6144,12 +6318,46 @@ function TableVannaTrainingModal({
     () => entitySupportColumns.filter((item) => item && item !== entityColumn).sort(),
     [entityColumn, entitySupportColumns]
   );
+  const normalizedEntityFilters = useMemo<VannaEntityFilter[]>(
+    () => entityFilters.map((item) => ({
+      column: item.column.trim(),
+      operator: item.operator,
+      values: Array.from(new Set(item.values.map((value) => value.trim()).filter(Boolean))).sort(),
+    })),
+    [entityFilters]
+  );
+  const entityFiltersComplete = normalizedEntityFilters.every(
+    (item) => Boolean(item.column) && item.values.length > 0
+  );
+  const entityFiltersKey = JSON.stringify(normalizedEntityFilters);
+  useEffect(() => {
+    setEntityImportPreview(null);
+  }, [entityColumn, entityFiltersKey, tableName]);
+
+  const previewEntityImport = useCallback(async () => {
+    if (!source.id || !tableName || !entityColumn.trim() || !entityFiltersComplete) return;
+    setEntityImportPreviewing(true);
+    showTrainingStatus(null);
+    try {
+      const result = await previewKnowledgeDatabaseSourceVannaEntities(source.id, {
+        table_name: tableName,
+        column: entityColumn.trim(),
+        filters: normalizedEntityFilters,
+      });
+      setEntityImportPreview(result);
+    } catch (error) {
+      showTrainingStatus({ type: "error", message: errorMessage(error) });
+    } finally {
+      setEntityImportPreviewing(false);
+    }
+  }, [entityColumn, entityFiltersComplete, normalizedEntityFilters, showTrainingStatus, source.id, tableName]);
+
   const currentEntityImportKey = useMemo(
-    () => `${tableName}:${entityColumn.trim()}:${entityType.trim()}:${normalizedEntitySupportColumns.join("|")}`,
-    [entityColumn, entityType, normalizedEntitySupportColumns, tableName]
+    () => `${tableName}:${entityColumn.trim()}:${entityType.trim()}:${normalizedEntitySupportColumns.join("|")}:${entityFiltersKey}`,
+    [entityColumn, entityFiltersKey, entityType, normalizedEntitySupportColumns, tableName]
   );
   const queuedEntityImportKey = queuedEntityImport
-    ? `${queuedEntityImport.tableName}:${queuedEntityImport.column}:${queuedEntityImport.entityType}:${queuedEntityImport.supportColumnsKey}`
+    ? `${queuedEntityImport.tableName}:${queuedEntityImport.column}:${queuedEntityImport.entityType}:${queuedEntityImport.supportColumnsKey}:${queuedEntityImport.filtersKey}`
     : "";
   const entityImportQueued = Boolean(queuedEntityImport?.jobId && queuedEntityImportKey === currentEntityImportKey);
 
@@ -6167,6 +6375,7 @@ function TableVannaTrainingModal({
         column: entityColumn,
         entity_type: entityType,
         alias_columns: supportColumns,
+        filters: normalizedEntityFilters,
       });
       const jobId = result.job_id || result.job?.id || null;
       if (jobId) {
@@ -6176,6 +6385,7 @@ function TableVannaTrainingModal({
           column: entityColumn.trim(),
           entityType: entityType.trim(),
           supportColumnsKey: supportColumns.join("|"),
+          filtersKey: entityFiltersKey,
         });
       }
       if (!jobId) {
@@ -6191,9 +6401,11 @@ function TableVannaTrainingModal({
     }
   }, [
     entityColumn,
+    entityFiltersKey,
     entityImportQueued,
     entityType,
     normalizedEntitySupportColumns,
+    normalizedEntityFilters,
     queuedEntityImport?.jobId,
     refreshEntities,
     showTrainingStatus,
@@ -6339,6 +6551,15 @@ function TableVannaTrainingModal({
     return aliases.slice(0, 5);
   };
   const entitySupportOptions = entityCandidates.map((candidate) => candidate.column).filter((column) => column !== entityColumn);
+  const addEntityFilter = () => {
+    setEntityFilters((current) => [
+      ...current,
+      { id: `${Date.now()}-${current.length}`, column: "", operator: "not_in", values: [] },
+    ]);
+  };
+  const updateEntityFilter = (id: string, patch: Partial<EntityFilterDraft>) => {
+    setEntityFilters((current) => current.map((item) => item.id === id ? { ...item, ...patch } : item));
+  };
   const currentTrainingKey = `${source.id}:${tableName}`;
   const initialTrainingLoading = loadedTrainingKey !== currentTrainingKey;
 
@@ -6600,6 +6821,110 @@ function TableVannaTrainingModal({
               </div>
             ) : null}
 
+            <div className="mt-4 rounded-2xl border border-black/[0.06] bg-gray-50/70 p-3">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <p className="text-xs font-semibold text-gray-700">导入过滤（可选）</p>
+                  <p className="mt-1 text-[11px] text-gray-400">
+                    字段和值均来自当前表；搜索只筛选已有值，不能创建自定义值。多个条件同时满足才会导入。
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void previewEntityImport()}
+                    disabled={entityImportPreviewing || !entityColumn.trim() || !entityFiltersComplete}
+                    className="inline-flex h-8 items-center gap-1.5 rounded-xl border border-black/[0.08] bg-white px-3 text-[11px] font-semibold text-gray-600 transition hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-45"
+                  >
+                    {entityImportPreviewing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Search className="h-3.5 w-3.5" />}
+                    {entityImportPreviewing ? "计算中" : "预览数量"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={addEntityFilter}
+                    disabled={entityFilterColumns.length === 0}
+                    className="inline-flex h-8 items-center gap-1.5 rounded-xl border border-[#002fa7]/15 bg-white px-3 text-[11px] font-semibold text-[#002fa7] transition hover:bg-[#002fa7]/[0.04] disabled:cursor-not-allowed disabled:opacity-45"
+                  >
+                    <PlusIcon />
+                    添加条件
+                  </button>
+                </div>
+              </div>
+
+              {entityFilters.length > 0 ? (
+                <div className="mt-3 space-y-2">
+                  {entityFilters.map((filter, index) => (
+                    <div
+                      key={filter.id}
+                      className="grid items-end gap-2 rounded-2xl border border-black/[0.06] bg-white p-2.5 md:grid-cols-[minmax(140px,0.8fr)_minmax(130px,0.6fr)_minmax(240px,1.6fr)_36px]"
+                    >
+                      <label className="flex min-w-0 flex-col gap-1">
+                        <span className="text-[11px] font-semibold text-gray-500">字段</span>
+                        <select
+                          value={filter.column}
+                          onChange={(event) => updateEntityFilter(filter.id, { column: event.target.value, values: [] })}
+                          className="h-9 w-full rounded-xl border border-black/[0.08] bg-white px-2.5 text-xs text-gray-700 outline-none focus:border-[#002fa7]/40"
+                        >
+                          <option value="">选择字段</option>
+                          {entityFilterColumns.map((column) => <option key={column} value={column}>{column}</option>)}
+                        </select>
+                      </label>
+                      <label className="flex min-w-0 flex-col gap-1">
+                        <span className="text-[11px] font-semibold text-gray-500">条件</span>
+                        <select
+                          value={filter.operator}
+                          onChange={(event) => updateEntityFilter(filter.id, { operator: event.target.value as VannaEntityFilterOperator })}
+                          className="h-9 w-full rounded-xl border border-black/[0.08] bg-white px-2.5 text-xs text-gray-700 outline-none focus:border-[#002fa7]/40"
+                        >
+                          <option value="not_in">不属于所选值</option>
+                          <option value="in">属于所选值</option>
+                        </select>
+                      </label>
+                      <EntityFilterValuePicker
+                        sourceId={source.id}
+                        tableName={tableName}
+                        column={filter.column}
+                        values={filter.values}
+                        onChange={(values) => updateEntityFilter(filter.id, { values })}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setEntityFilters((current) => current.filter((item) => item.id !== filter.id))}
+                        className="flex h-9 w-9 items-center justify-center self-end rounded-xl text-gray-400 transition hover:bg-red-50 hover:text-red-600"
+                        aria-label={`删除过滤条件 ${index + 1}`}
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="mt-3 rounded-xl border border-dashed border-black/[0.08] px-3 py-2.5 text-center text-[11px] text-gray-400">
+                  暂无过滤条件，将读取实体字段的全部非空值。
+                </p>
+              )}
+
+              <div className="mt-3 flex flex-wrap items-center gap-x-5 gap-y-1 rounded-xl border border-[#002fa7]/10 bg-[#002fa7]/[0.035] px-3 py-2.5 text-xs">
+                {entityImportPreview ? (
+                  <>
+                    <span className="font-semibold text-gray-700">
+                      过滤前 <strong className="text-[#002fa7]">{entityImportPreview.total.toLocaleString("zh-CN")}</strong> 个
+                    </span>
+                    <span className="font-semibold text-gray-700">
+                      预计导入 <strong className="text-emerald-600">{entityImportPreview.filtered.toLocaleString("zh-CN")}</strong> 个
+                    </span>
+                    <span className="font-semibold text-gray-700">
+                      排除 <strong className="text-amber-600">{entityImportPreview.excluded.toLocaleString("zh-CN")}</strong> 个
+                    </span>
+                  </>
+                ) : (
+                  <span className="text-gray-500">
+                    预计导入数量：{entityColumn.trim() && entityFiltersComplete ? "点击“预览数量”计算" : "请先完整选择过滤条件"}
+                  </span>
+                )}
+              </div>
+            </div>
+
             <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
               {entityImportQueued && queuedEntityImport?.jobId ? (
                 <Link
@@ -6612,7 +6937,7 @@ function TableVannaTrainingModal({
               <button
                 type="button"
                 onClick={importEntities}
-                disabled={trainingBusy || entityImportQueued || !source.id || !tableName || !entityColumn.trim() || !entityType.trim()}
+                disabled={trainingBusy || entityImportQueued || !entityFiltersComplete || !source.id || !tableName || !entityColumn.trim() || !entityType.trim()}
                 className="inline-flex h-9 items-center gap-2 rounded-2xl bg-[#002fa7] px-4 text-xs font-semibold text-white shadow-sm transition hover:bg-[#001f7a] disabled:cursor-not-allowed disabled:opacity-45"
               >
                 {trainingBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
@@ -6713,7 +7038,7 @@ function TableVannaTrainingModal({
                       placeholder="搜索实体名称"
                       className="h-9 flex-1 rounded-2xl border border-black/[0.06] bg-white px-3 text-xs outline-none transition focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/[0.08]"
                     />
-                    <div className="flex min-w-0 items-center gap-1.5 overflow-x-auto pb-1 md:max-w-[52%] md:pb-0">
+                    <div className="-my-2 flex min-w-0 items-center gap-1.5 overflow-x-auto py-2 md:max-w-[52%]">
                       <button
                         type="button"
                         onClick={() => setEntityListExpanded((value) => !value)}

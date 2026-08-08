@@ -10,7 +10,8 @@ def test_vehicle_sales_metric_routes_to_pandas_table_tool() -> None:
     assert decision["matched"] is True
     assert decision["intents"] == ["table_analysis"]
     assert decision["preferred_tools"][0] == "pandas_knowledge_query"
-    assert "database_sql_generate" in decision["preferred_tools"]
+    assert "database_evidence_search" in decision["preferred_tools"]
+    assert "database_sql_generate" not in decision["preferred_tools"]
 
 
 def test_news_intent_still_routes_to_web_search() -> None:
@@ -26,11 +27,14 @@ def test_database_business_question_routes_directly_without_schema_probe() -> No
 
     assert decision["matched"] is True
     assert decision["intents"] == ["database_analysis"]
-    assert decision["preferred_tools"] == ["database_sql_generate", "database_sql_validate", "database_sql_execute"]
-    assert "直接问数时把用户原问题交给 database_sql_generate" in decision["routing_prompt"]
-    assert "Goal 任务可以拆成" in decision["routing_prompt"]
-    assert "不得添加用户未指定的表、字段" in decision["routing_prompt"]
-    assert "需要元数据时使用 database_schema_inspect" in decision["routing_prompt"]
+    assert decision["preferred_tools"] == [
+        "database_evidence_search",
+        "database_sql_validate",
+        "database_sql_execute",
+    ]
+    assert "由 Agent 结合用户问题和证据编写 SQL" in decision["routing_prompt"]
+    assert "旧 SQL 生成与校验工具不对 Agent 暴露" in decision["routing_prompt"]
+    assert "database_schema_inspect" in decision["routing_prompt"]
 
 
 def test_product_config_metric_routes_to_database_without_explicit_database_word() -> None:
@@ -38,7 +42,11 @@ def test_product_config_metric_routes_to_database_without_explicit_database_word
 
     assert decision["matched"] is True
     assert decision["intents"] == ["database_analysis"]
-    assert decision["preferred_tools"] == ["database_sql_generate", "database_sql_validate", "database_sql_execute"]
+    assert decision["preferred_tools"] == [
+        "database_evidence_search",
+        "database_sql_validate",
+        "database_sql_execute",
+    ]
     assert "汽车产品配置分析" in decision["routing_prompt"]
 
 
@@ -79,7 +87,8 @@ def test_table_metric_wins_over_generic_knowledge_words() -> None:
     assert decision["matched"] is True
     assert decision["intents"] == ["table_analysis"]
     assert decision["preferred_tools"][0] == "pandas_knowledge_query"
-    assert "database_sql_generate" in decision["preferred_tools"]
+    assert "database_evidence_search" in decision["preferred_tools"]
+    assert "database_sql_generate" not in decision["preferred_tools"]
 
 
 def test_data_analysis_wins_over_knowledge_rag() -> None:
@@ -88,7 +97,8 @@ def test_data_analysis_wins_over_knowledge_rag() -> None:
     assert decision["matched"] is True
     assert decision["intents"] == ["table_analysis"]
     assert decision["preferred_tools"][0] == "pandas_knowledge_query"
-    assert "database_sql_generate" in decision["preferred_tools"]
+    assert "database_evidence_search" in decision["preferred_tools"]
+    assert "database_sql_generate" not in decision["preferred_tools"]
 
 
 def test_document_knowledge_request_routes_to_llm_wiki_first() -> None:

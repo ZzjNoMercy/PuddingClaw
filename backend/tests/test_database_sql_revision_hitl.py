@@ -19,7 +19,7 @@ from graph.database_sql_revision_resume import DatabaseSqlRevisionResumeRegistry
 from tools.database.schema_inspect_tool import DatabaseSchemaInspectTool
 from tools.database.sql_execute_tool import DatabaseSqlExecuteTool
 from tools.database.sql_generate_tool import DatabaseSqlGenerateTool
-from tools.database.sql_validate_tool import DatabaseSqlValidateTool
+from tools.database.sql_validate_legacy_tool import LegacyDatabaseSqlValidateTool
 
 
 def _result(question: str, sql: str = "SELECT 1") -> DatabaseSqlGenerationResult:
@@ -46,7 +46,7 @@ def _result(question: str, sql: str = "SELECT 1") -> DatabaseSqlGenerationResult
 def test_database_sql_generate_runtime_is_hidden_from_llm_schema() -> None:
     for tool in (
         DatabaseSqlGenerateTool(),
-        DatabaseSqlValidateTool(),
+        LegacyDatabaseSqlValidateTool(),
         DatabaseSqlExecuteTool(),
         DatabaseSchemaInspectTool(),
     ):
@@ -893,7 +893,7 @@ async def test_rejected_revision_reuses_original_generation_without_regeneration
     assert "用户拒绝修改" in rejected
     assert "HITL 状态：已完成（resolved）" in rejected
     assert "不要再次询问用户选择" in rejected
-    assert "database_sql_validate" in rejected
+    assert "database_sql_validate_legacy" in rejected
     assert "database_sql_execute" in rejected
     assert "SELECT original" in rejected
 
@@ -1145,7 +1145,7 @@ async def test_agent_mode_validate_and_execute_use_registered_sql(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import tools.database.sql_execute_tool as execute_module
-    import tools.database.sql_validate_tool as validate_module
+    import tools.database.sql_validate_legacy_tool as validate_module
     from graph.database_sql_revision_resume import database_sql_revision_resume_registry
 
     generation = database_sql_revision_resume_registry.register_generation(
@@ -1167,7 +1167,7 @@ async def test_agent_mode_validate_and_execute_use_registered_sql(
     monkeypatch.setattr(execute_module, "resolve_database_source_scope", fake_resolve)
     monkeypatch.setattr(execute_module, "run_readonly_sql", fake_run)
 
-    validate_output = await DatabaseSqlValidateTool(session_id="session-block")._arun(
+    validate_output = await LegacyDatabaseSqlValidateTool(session_id="session-block")._arun(
         sql="SELECT 2",
         generation_id=generation.id,
     )
@@ -1190,7 +1190,7 @@ async def test_agent_mode_validate_and_execute_use_registered_sql(
 async def test_validator_replays_semantic_guardrails_and_withholds_receipt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import tools.database.sql_validate_tool as validate_module
+    import tools.database.sql_validate_legacy_tool as validate_module
     from graph.database_sql_revision_resume import database_sql_revision_resume_registry
 
     semantic_result = _result(
@@ -1216,7 +1216,7 @@ async def test_validator_replays_semantic_guardrails_and_withholds_receipt(
 
     monkeypatch.setattr(validate_module, "resolve_database_source_scope", fake_resolve)
 
-    output = await DatabaseSqlValidateTool(session_id="session-semantic-validator")._arun(
+    output = await LegacyDatabaseSqlValidateTool(session_id="session-semantic-validator")._arun(
         generation_id=generation.id,
     )
 

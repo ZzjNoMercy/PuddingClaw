@@ -1918,6 +1918,138 @@ class SessionManager:
         return [deepcopy(item) for item in ledger.values() if isinstance(item, dict)]
 
     @_session_write_locked
+    def record_sql_submission(
+        self,
+        session_id: str,
+        submission_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist an Agent-authored SQL submission as an immutable ledger entry."""
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        harness = data.setdefault("harness", {})
+        ledger = harness.setdefault("sql_submission_ledger", {})
+        existing = ledger.get(submission_id)
+        if isinstance(existing, dict) and existing != payload:
+            raise ValueError(f"SQL submission {submission_id} is immutable")
+        ledger[submission_id] = deepcopy(payload)
+        self._write_file(session_id, data)
+        return deepcopy(ledger[submission_id])
+
+    def get_sql_submission(self, session_id: str, submission_id: str) -> dict[str, Any] | None:
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        ledger = harness.get("sql_submission_ledger") if isinstance(harness, dict) else None
+        item = ledger.get(submission_id) if isinstance(ledger, dict) else None
+        return deepcopy(item) if isinstance(item, dict) else None
+
+    @_session_write_locked
+    def record_database_evidence(
+        self,
+        session_id: str,
+        evidence_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist an immutable Agent database-evidence envelope."""
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        harness = data.setdefault("harness", {})
+        ledger = harness.setdefault("database_evidence_ledger", {})
+        existing = ledger.get(evidence_id)
+        if isinstance(existing, dict) and existing != payload:
+            raise ValueError(f"Database evidence {evidence_id} is immutable")
+        ledger[evidence_id] = deepcopy(payload)
+        self._write_file(session_id, data)
+        return deepcopy(ledger[evidence_id])
+
+    def get_database_evidence(self, session_id: str, evidence_id: str) -> dict[str, Any] | None:
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        ledger = harness.get("database_evidence_ledger") if isinstance(harness, dict) else None
+        item = ledger.get(evidence_id) if isinstance(ledger, dict) else None
+        return deepcopy(item) if isinstance(item, dict) else None
+
+    @_session_write_locked
+    def record_database_schema_evidence(
+        self,
+        session_id: str,
+        receipt_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist a schema/profile Receipt for process-restart recovery."""
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        harness = data.setdefault("harness", {})
+        ledger = harness.setdefault("database_schema_evidence_ledger", {})
+        existing = ledger.get(receipt_id)
+        if isinstance(existing, dict) and existing != payload:
+            raise ValueError(f"Database schema evidence {receipt_id} is immutable")
+        ledger[receipt_id] = deepcopy(payload)
+        self._write_file(session_id, data)
+        return deepcopy(ledger[receipt_id])
+
+    def get_database_schema_evidence(self, session_id: str, receipt_id: str) -> dict[str, Any] | None:
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        ledger = harness.get("database_schema_evidence_ledger") if isinstance(harness, dict) else None
+        item = ledger.get(receipt_id) if isinstance(ledger, dict) else None
+        return deepcopy(item) if isinstance(item, dict) else None
+
+    @_session_write_locked
+    def record_database_path_event(
+        self,
+        session_id: str,
+        event_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist one immutable Agent/legacy database path transition."""
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        harness = data.setdefault("harness", {})
+        ledger = harness.setdefault("database_path_events", {})
+        existing = ledger.get(event_id)
+        if isinstance(existing, dict) and existing != payload:
+            raise ValueError(f"Database path event {event_id} is immutable")
+        ledger[event_id] = deepcopy(payload)
+        self._write_file(session_id, data)
+        return deepcopy(ledger[event_id])
+
+    def list_database_path_events(
+        self,
+        session_id: str,
+        *,
+        query_id: str = "",
+        run_id: str = "",
+        goal_id: str = "",
+        goal_revision: int | None = None,
+    ) -> list[dict[str, Any]]:
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        ledger = harness.get("database_path_events") if isinstance(harness, dict) else None
+        if not isinstance(ledger, dict):
+            return []
+        return sorted(
+            (
+                deepcopy(item)
+                for item in ledger.values()
+                if isinstance(item, dict)
+                and (not query_id or str(item.get("query_id") or "") == str(query_id))
+                and (not run_id or str(item.get("run_id") or "") == str(run_id))
+                and (not goal_id or str(item.get("goal_id") or "") == str(goal_id))
+                and (goal_revision is None or item.get("goal_revision") == goal_revision)
+            ),
+            key=lambda item: float(item.get("created_at") or 0),
+        )
+
+    @_session_write_locked
     def record_sql_validation_receipt(
         self,
         session_id: str,

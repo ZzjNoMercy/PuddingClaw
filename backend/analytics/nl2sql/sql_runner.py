@@ -59,8 +59,9 @@ _FORBIDDEN_FUNCTION_NAMES = {
 _FORBIDDEN_FUNCTION_PREFIXES = ("dblink", "pg_ls_", "pg_read_")
 _ALLOWED_ANONYMOUS_FUNCTION_NAMES = {
     # sqlglot does not model these PostgreSQL built-ins with a dedicated
-    # expression class. Unknown scalar functions fail closed because a
-    # SECURITY DEFINER function can read relations absent from the query AST.
+    # expression class. The legacy path uses this fixed registry. Agent v3 may
+    # defer additional names to a pg_catalog lookup; user-defined functions
+    # remain blocked because SECURITY DEFINER could bypass table scope.
     "json_agg",
     "json_build_array",
     "json_build_object",
@@ -220,17 +221,19 @@ def _strip_sql_comments(sql: str) -> str:
     return "".join(output)
 
 
-def _table_aliases(table_name: str) -> set[str]:
+def _table_aliases(table_name: str, *, strict_schema: bool = False) -> set[str]:
     normalized = _normalize_identifier(table_name)
     if not normalized:
         return set()
     if "." in normalized:
         schema, table = normalized.split(".", 1)
+        if strict_schema and schema != "public":
+            return {normalized}
         return {normalized, table, f"public.{table}" if schema == "public" else normalized}
     return {normalized, f"public.{normalized}"}
 
 
-def _referenced_tables(sql: str) -> set[str]:
+def _referenced_tables(sql: str, *, allow_unregistered_functions: bool = False) -> set[str]:
     """Return physical PostgreSQL tables referenced by a read-only query.
 
     Table scope is an authorization boundary, so derive it from SQL structure
@@ -261,9 +264,13 @@ def _referenced_tables(sql: str) -> set[str]:
                 raise SqlRunnerError(f"SQL 包含未授权的 schema 限定函数：{name}", sql=sql)
         if name in _FORBIDDEN_FUNCTION_NAMES or name.startswith(_FORBIDDEN_FUNCTION_PREFIXES):
             raise SqlRunnerError(f"SQL 包含未授权的关系或系统读取函数：{name}", sql=sql)
-        if isinstance(function, exp.Anonymous) and name not in _ALLOWED_ANONYMOUS_FUNCTION_NAMES:
+        if (
+            isinstance(function, exp.Anonymous)
+            and name not in _ALLOWED_ANONYMOUS_FUNCTION_NAMES
+            and not allow_unregistered_functions
+        ):
             raise SqlRunnerError(
-                f"SQL 内置函数 registry 未登记，已确定性阻断：{name}",
+                f"SQL 包含未授权的内置函数（registry 未登记）：{name}",
                 sql=sql,
                 error_code="sql_builtin_registry_miss",
             )
@@ -279,6 +286,10 @@ def _referenced_tables(sql: str) -> set[str]:
             if isinstance(source, Scope) and isinstance(source.expression, exp.Values):
                 continue
             if isinstance(source, Scope) and isinstance(source.expression, exp.UDTF):
+                if allow_unregistered_functions and any(
+                    isinstance(item, exp.Func) for item in source.expression.walk()
+                ):
+                    continue
                 raise SqlRunnerError(
                     f"SQL FROM/JOIN 包含未授权的表函数：{source.expression.sql(dialect='postgres')}",
                     sql=sql,
@@ -286,6 +297,8 @@ def _referenced_tables(sql: str) -> set[str]:
             if not isinstance(source, exp.Table):
                 continue
             if not isinstance(source.this, exp.Identifier):
+                if allow_unregistered_functions and isinstance(source.this, exp.Func):
+                    continue
                 raise SqlRunnerError(
                     f"SQL FROM/JOIN 包含未授权的表函数：{source.this.sql(dialect='postgres')}",
                     sql=sql,
@@ -297,7 +310,27 @@ def _referenced_tables(sql: str) -> set[str]:
     return tables
 
 
-def validate_readonly_sql(sql: str, *, allowed_tables: list[str]) -> str:
+def unregistered_function_names(sql: str) -> set[str]:
+    """Return anonymous functions that require database-catalog authorization."""
+
+    try:
+        tree = sqlglot.parse_one(_strip_sql_comments(sql), dialect="postgres")
+    except ParseError as exc:
+        raise SqlRunnerError(f"SQL 解析失败：{exc}", sql=sql) from exc
+    return {
+        str(function.name or "").lower()
+        for function in tree.find_all(exp.Anonymous)
+        if str(function.name or "").lower() not in _ALLOWED_ANONYMOUS_FUNCTION_NAMES
+    }
+
+
+def validate_readonly_sql(
+    sql: str,
+    *,
+    allowed_tables: list[str],
+    require_schema_qualified: bool = False,
+    allow_unregistered_functions: bool = False,
+) -> str:
     """Validate SQL safety and table scope before execution."""
 
     clean_sql = extract_sql(sql)
@@ -318,9 +351,12 @@ def validate_readonly_sql(sql: str, *, allowed_tables: list[str]) -> str:
 
     allowed_aliases: set[str] = set()
     for table_name in allowed_tables:
-        allowed_aliases |= _table_aliases(table_name)
+        allowed_aliases |= _table_aliases(table_name, strict_schema=require_schema_qualified)
 
-    referenced = _referenced_tables(clean_sql)
+    referenced = _referenced_tables(
+        clean_sql,
+        allow_unregistered_functions=allow_unregistered_functions,
+    )
     blocked = sorted(ref for ref in referenced if ref not in allowed_aliases)
     if blocked:
         raise SqlRunnerError(f"SQL 引用了未授权数据表：{', '.join(blocked)}", sql=clean_sql)
@@ -475,6 +511,7 @@ async def run_readonly_sql(
     allowed_tables: list[str],
     limit: int = 100,
     timeout_ms: int | None = None,
+    allow_unregistered_functions: bool = False,
 ) -> SqlExecutionResult:
     """Execute validated SQL and return a completeness-aware result contract."""
 
@@ -498,7 +535,11 @@ async def run_readonly_sql(
     full_column_cap = int(config.get("full_rows_hard_column_cap") or 20)
     full_token_budget = int(config.get("full_rows_token_budget") or 10000)
     effective_timeout_ms = int(timeout_ms or config.get("query_timeout_ms") or 30000)
-    clean_sql = validate_readonly_sql(sql, allowed_tables=allowed_tables)
+    clean_sql = validate_readonly_sql(
+        sql,
+        allowed_tables=allowed_tables,
+        allow_unregistered_functions=allow_unregistered_functions,
+    )
     engine = create_async_engine(database_source_url(source), pool_pre_ping=True)
     try:
         async with engine.connect() as conn:

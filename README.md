@@ -180,6 +180,8 @@ analysis-project/
 
 知识库未来的目标迁移单元是一个 Brain 目录：`schema/`、`AGENTS.md`、`raw/` 和 `wiki/` 可以整体打包；gbrain PostgreSQL 数据不作为必需资产，可从 Schema + Wiki 重建。该导出/导入链路属于 LLM Wiki + gbrain 方案，当前尚未实现。
 
+低优先级兼容待办：在 Brain 可移植打包稳定后评估 Open Knowledge Format（OKF）导入/导出适配。现有 LLM Wiki 已具备 Markdown、frontmatter、路径标识、来源追溯、index/log 和互链等相近结构，因此不引入第二套内部知识模型；适配层仅负责 OKF Bundle 与当前 Canonical Schema Bundle 之间的字段、来源和链接转换，并保持内部 `[[<type-directory>/<slug>]]`、自定义 Page/Link Types 及 gbrain 编译规范不变。
+
 ## 典型使用流程
 
 1. 在“设置 → 模型服务”登记 Provider、接口和凭证，并为对话、视觉、文本 Embedding、多模态 Embedding、Rerank 绑定默认模型。
@@ -459,6 +461,7 @@ npm run build
 仍在持续演进或尚未实施的方向包括：
 
 - LLM Wiki 文件协议与编译契约、贯穿式 Schema、gbrain/PostgreSQL 托管运行时、筛选后的 MCP 查询与 Brain 可移植打包；
+- Brain 可移植打包稳定后的 OKF 导入/导出兼容层（低优先级，不改变内部 Schema、wikilink 或 gbrain 规范）；
 - 多用户 / 组织级 RBAC 与完整企业权限后台；
 - 更通用的外部 HTTP / MCP 副作用 receipt 与幂等执行层；
 - 语义资产的更强确定性编译、自动评估与版本治理；

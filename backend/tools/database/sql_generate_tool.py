@@ -14,6 +14,10 @@ from langgraph.config import get_stream_writer
 from langgraph.types import interrupt
 from pydantic import BaseModel
 
+from analytics.nl2sql.agent_path_policy import (
+    record_database_path_event,
+    record_legacy_fallback_used_if_offered,
+)
 from analytics.nl2sql.schemas import DatabaseQueryRequest
 from analytics.nl2sql.service import DatabaseKnowledgeQueryError, generate_database_sql
 from analytics.nl2sql.table_router import summarize_table_route
@@ -127,9 +131,10 @@ def _trusted_user_scope_text(runtime: ToolRuntime | None) -> str:
             # Runtime context is server-owned and is inherited by subagents.
             # Never let a delegated HumanMessage redefine user authorization.
             return run_objective.strip()
-    if not isinstance(runtime.state, dict):
+    runtime_state = getattr(runtime, "state", None)
+    if not isinstance(runtime_state, dict):
         return ""
-    state = runtime.state
+    state = runtime_state
     objective = state.get("_run_objective")
     if isinstance(objective, str) and objective.strip():
         # PrivateState is populated from the server-owned Run objective and is
@@ -412,7 +417,7 @@ def _format_generation(
                 "- HITL 状态：已完成（resolved）",
                 "- 用户决策：reject；保留原 generation 和原 SQL",
                 "- 下一步：不要再次询问用户选择。立即仅使用 generation_id 调用 "
-                "database_sql_validate，再调用 database_sql_execute。",
+                "database_sql_validate_legacy，再调用 database_sql_execute。",
             ]
         )
     elif disposition == "approved_revision":
@@ -439,7 +444,7 @@ def _format_generation(
         lines.append(f"- 耗时：总计 {total_seconds:.2f}s，SQL生成 {generation_seconds:.2f}s")
     lines.extend(_format_semantic_contract(result.semantic_assets))
     lines.append(
-        "- 执行约束：先用 generation_id 调用 database_sql_validate 获得 validation_receipt_id；"
+        "- 执行约束：先用 generation_id 调用 database_sql_validate_legacy 获得 validation_receipt_id；"
         "再将两者一起传给 database_sql_execute。Agent 模式无需回传 SQL，工具会从服务器账本加载登记结果。"
     )
     lines.extend(["", "```sql", result.sql, "```"])
@@ -494,6 +499,22 @@ class DatabaseSqlGenerateTool(BaseTool):
         tool_call_id = str(tool_call_id or getattr(runtime, "tool_call_id", "") or "")
         runtime_context = getattr(runtime, "context", None)
         context = runtime_context if isinstance(runtime_context, dict) else {}
+        fallback_event = record_legacy_fallback_used_if_offered(
+            session_id=self.session_id,
+            query_id=self.query_id,
+            run_id=str(context.get("run_id") or ""),
+            goal_id=str(context.get("goal_id") or ""),
+            goal_revision=context.get("goal_revision"),
+        )
+        if (
+            self.session_id
+            and (context.get("run_id") or context.get("goal_id"))
+            and fallback_event is None
+        ):
+            return (
+                "🧮 SQL 兼容路径未获准：只有 Agent evidence/validator 明确记录的基础设施 fallback "
+                "才能调用 database_sql_generate。请先完成 Agent SQL 路径，或报告当前故障。"
+            )
         state_model_id = ""
         if runtime is not None and isinstance(runtime.state, dict):
             state_model_id = str(runtime.state.get("analytics_model_id") or "").strip()
@@ -700,7 +721,11 @@ class DatabaseSqlGenerateTool(BaseTool):
                 }
 
         try:
-            permission_epoch = int(session_manager.get_permission_policy(self.session_id)["policy_epoch"])
+            permission_epoch = (
+                int(session_manager.get_permission_policy(self.session_id)["policy_epoch"])
+                if self.session_id and session_manager.is_initialized
+                else 1
+            )
         except (FileNotFoundError, KeyError, RuntimeError, TypeError, ValueError):
             permission_epoch = 1
         request_payload["technical_evidence"] = {
@@ -871,6 +896,20 @@ class DatabaseSqlGenerateTool(BaseTool):
             parent_generation_id=parent.id if parent is not None else "",
             revision_instruction=applied_instruction,
         )
+        if fallback_event is not None:
+            record_database_path_event(
+                session_id=self.session_id,
+                query_id=self.query_id,
+                run_id=str(runtime_context.get("run_id") or ""),
+                goal_id=str(runtime_context.get("goal_id") or ""),
+                goal_revision=runtime_context.get("goal_revision"),
+                event_type="fallback_generation_registered",
+                error_code=str(fallback_event.get("error_code") or ""),
+                source_path="agent",
+                target_path="legacy_generation",
+                offer_event_id=str(fallback_event.get("offer_event_id") or ""),
+                metadata={"generation_id": generation.id},
+            )
         return _format_generation(generation, disposition=disposition)
 
     def _run(

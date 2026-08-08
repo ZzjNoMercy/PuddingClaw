@@ -104,6 +104,59 @@ def _quote_ident(identifier: str) -> str:
     return '"' + str(identifier).replace('"', '""') + '"'
 
 
+def _normalize_entity_filters(
+    filters: list[dict[str, Any]] | None,
+    *,
+    available_columns: set[str],
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for raw_filter in filters or []:
+        if not isinstance(raw_filter, dict):
+            raise VannaTrainingError("实体过滤条件格式无效。")
+        filter_column = str(raw_filter.get("column") or "").strip()
+        operator = str(raw_filter.get("operator") or "").strip()
+        values = list(
+            dict.fromkeys(
+                str(item).strip()
+                for item in raw_filter.get("values") or []
+                if str(item or "").strip()
+            )
+        )
+        if filter_column not in available_columns:
+            raise VannaTrainingError(f"筛选字段不存在：{filter_column}")
+        if operator not in {"in", "not_in"}:
+            raise VannaTrainingError(f"不支持的筛选操作符：{operator}")
+        if not values:
+            raise VannaTrainingError(f"筛选条件没有选择已有值：{filter_column}")
+        if len(values) > 100:
+            raise VannaTrainingError("单个筛选条件最多选择 100 个值。")
+        normalized.append({"column": filter_column, "operator": operator, "values": values})
+    return normalized
+
+
+def _entity_filter_where_sql(
+    entity_column: str,
+    filters: list[dict[str, Any]],
+) -> tuple[str, dict[str, Any]]:
+    params: dict[str, Any] = {}
+    clauses = [f"{_quote_ident(entity_column)} IS NOT NULL"]
+    for filter_index, item in enumerate(filters):
+        quoted_filter_column = _quote_ident(str(item["column"]))
+        placeholders: list[str] = []
+        for value_index, value in enumerate(item["values"]):
+            parameter = f"filter_{filter_index}_value_{value_index}"
+            placeholders.append(f":{parameter}")
+            params[parameter] = value
+        values_sql = ", ".join(placeholders)
+        if item["operator"] == "in":
+            clauses.append(f"BTRIM({quoted_filter_column}::text) IN ({values_sql})")
+        else:
+            clauses.append(
+                f"({quoted_filter_column} IS NULL OR BTRIM({quoted_filter_column}::text) NOT IN ({values_sql}))"
+            )
+    return " AND ".join(clauses), params
+
+
 def _qualified_table_sql(raw_table: str) -> tuple[str, str, str]:
     schema, table = _split_table_name(raw_table)
     schema = schema or "public"
@@ -581,6 +634,7 @@ async def import_table_entities(
     column: str,
     entity_type: str,
     alias_columns: list[str] | None = None,
+    filters: list[dict[str, Any]] | None = None,
     max_values: int | None = None,
     batch_size: int = 100,
     continue_on_error: bool = False,
@@ -610,11 +664,15 @@ async def import_table_entities(
         if alias_column not in available_columns:
             raise VannaTrainingError(f"辅助匹配字段不存在：{alias_column}")
 
+    normalized_filters = _normalize_entity_filters(filters, available_columns=available_columns)
+
     selected_sql = ", ".join([f"{_quote_ident(column)}::text AS canonical", *[f"{_quote_ident(alias)}::text AS {_quote_ident(alias)}" for alias in alias_columns]])
     engine = create_async_engine(database_source_url(source), pool_pre_ping=True)
     grouped: dict[str, set[str]] = {}
     limit_clause = "\n                    LIMIT :limit" if clean_max_values is not None else ""
     query_params = {"limit": clean_max_values * 10 if alias_columns else clean_max_values} if clean_max_values is not None else {}
+    where_sql, filter_params = _entity_filter_where_sql(column, normalized_filters)
+    query_params.update(filter_params)
     try:
         async with engine.connect() as conn:
             result = await conn.execute(
@@ -622,7 +680,7 @@ async def import_table_entities(
                     f"""
                     SELECT {selected_sql}
                     FROM {qualified}
-                    WHERE {_quote_ident(column)} IS NOT NULL{limit_clause}
+                    WHERE {where_sql}{limit_clause}
                     """
                 ),
                 query_params,
@@ -739,6 +797,63 @@ async def import_table_entities(
         "total": total,
         "entities": imported[:50],
         "updated_entities": updated[:50],
+    }
+
+
+async def preview_table_entity_import(
+    source: KnowledgeDatabaseSource | dict[str, Any],
+    *,
+    table_name: str,
+    column: str,
+    filters: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Count distinct entities before and after applying import filters."""
+
+    selected = set(database_source_selected_tables(source))
+    if selected and table_name not in selected:
+        raise VannaTrainingError("请先在数据库源里勾选这张表。")
+    column = str(column or "").strip()
+    if not column:
+        raise VannaTrainingError("请选择实体字段。")
+
+    _schema, _table, qualified = _qualified_table_sql(table_name)
+    available_columns = {item["name"] for item in await _list_columns(source, table_name)}
+    if column not in available_columns:
+        raise VannaTrainingError("实体字段不存在。")
+    normalized_filters = _normalize_entity_filters(filters, available_columns=available_columns)
+    where_sql, query_params = _entity_filter_where_sql(column, normalized_filters)
+    quoted_column = _quote_ident(column)
+
+    engine = create_async_engine(database_source_url(source), pool_pre_ping=True)
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("SET LOCAL statement_timeout = '90s'"))
+            result = await conn.execute(
+                text(
+                    f"""
+                    SELECT
+                      COUNT(DISTINCT NULLIF(BTRIM({quoted_column}::text), '')) AS total,
+                      COUNT(DISTINCT CASE
+                        WHEN {where_sql} THEN NULLIF(BTRIM({quoted_column}::text), '')
+                      END) AS filtered
+                    FROM {qualified}
+                    """
+                ),
+                query_params,
+            )
+            row = result.one()
+    finally:
+        await engine.dispose()
+
+    total = int(row.total or 0)
+    filtered = int(row.filtered or 0)
+    return {
+        "table_name": table_name,
+        "column": column,
+        "total": total,
+        "filtered": filtered,
+        "excluded": max(0, total - filtered),
+        "filters": normalized_filters,
     }
 
 
@@ -885,6 +1000,7 @@ __all__ = [
     "generate_postgres_ddl",
     "import_table_entities",
     "list_vanna_training_data",
+    "preview_table_entity_import",
     "list_vanna_entities",
     "recommend_database_entity_candidates",
     "remove_vanna_entity",

@@ -358,3 +358,76 @@ async def list_database_table_columns(
             return [str(row.column_name) for row in result]
     finally:
         await engine.dispose()
+
+
+async def list_database_table_column_values(
+    source: KnowledgeDatabaseSource | dict[str, Any],
+    table_name: str,
+    column: str,
+    *,
+    search: str = "",
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Return real distinct values for a constrained filter picker."""
+
+    normalized_table = str(table_name or "").strip()
+    selected_tables = database_source_selected_tables(source)
+    if normalized_table not in selected_tables:
+        raise KnowledgeDatabaseSourceError("只能读取数据源已登记表的字段值。")
+
+    if "." in normalized_table:
+        schema, table = normalized_table.split(".", 1)
+    else:
+        schema, table = "public", normalized_table
+    normalized_column = str(column or "").strip()
+    if not schema or not table or not normalized_column:
+        raise KnowledgeDatabaseSourceError("表名或字段名无效。")
+
+    clean_limit = max(1, min(int(limit or 100), 200))
+    clean_search = str(search or "").strip()
+    engine = create_async_engine(_source_url(_connection_source(source)), pool_pre_ping=True)
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("SET LOCAL statement_timeout = '15s'"))
+            column_result = await conn.execute(
+                text(
+                    """
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = :schema
+                      AND table_name = :table
+                      AND column_name = :column
+                    """
+                ),
+                {"schema": schema, "table": table, "column": normalized_column},
+            )
+            if column_result.scalar_one_or_none() is None:
+                raise KnowledgeDatabaseSourceError("筛选字段不存在。")
+
+            quoted_schema = '"' + schema.replace('"', '""') + '"'
+            quoted_table = '"' + table.replace('"', '""') + '"'
+            quoted_column = '"' + normalized_column.replace('"', '""') + '"'
+            search_clause = ""
+            params: dict[str, Any] = {"limit": clean_limit + 1}
+            if clean_search:
+                search_clause = f"AND {quoted_column}::text ILIKE :search"
+                params["search"] = f"%{clean_search}%"
+            result = await conn.execute(
+                text(
+                    f"""
+                    SELECT DISTINCT BTRIM({quoted_column}::text) AS value
+                    FROM {quoted_schema}.{quoted_table}
+                    WHERE {quoted_column} IS NOT NULL
+                      AND BTRIM({quoted_column}::text) <> ''
+                      {search_clause}
+                    ORDER BY value
+                    LIMIT :limit
+                    """
+                ),
+                params,
+            )
+            values = [str(row.value) for row in result]
+            has_more = len(values) > clean_limit
+            return {"values": values[:clean_limit], "has_more": has_more}
+    finally:
+        await engine.dispose()

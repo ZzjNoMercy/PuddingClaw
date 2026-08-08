@@ -67,19 +67,17 @@ _DEFAULT_INTENT_REGISTRY: dict[str, dict[str, Any]] = {
             "产品配置", "汽车配置", "配置分析", "配置率", "搭载率", "配备率", "装配率",
             "空气悬架", "空气悬挂", "激光雷达", "充电倍率", "能源类型", "车型级别",
         ],
-        "preferred_tools": ["database_sql_generate", "database_sql_validate", "database_sql_execute"],
+        "preferred_tools": ["database_evidence_search", "database_sql_validate", "database_sql_execute"],
         "tool_categories": ["table"],
         "routing_prompt": (
             "用户意图为结构化数据库问数。只要问题涉及已配置数据库源、数据库表、SQL、"
             "Vanna/NL2SQL、实体字典、DDL、表结构，或用户明确在问数据库里的业务数据，"
             "或涉及汽车产品配置分析、配置率/搭载率/配备率、空气悬架、激光雷达、充电倍率等指标，"
-            "必须优先调用 database_sql_generate 生成 SQL，再用 database_sql_validate 或 "
-            "database_sql_execute 校验/执行。直接问数时把用户原问题交给 database_sql_generate；"
-            "Goal 任务可以拆成只包含指标、维度、粒度、筛选和时间范围的业务子问题，"
-            "但不得添加用户未指定的表、字段、EAV值、实体映射或SQL实现；"
-            "该工具会执行表 Router、加载语义资产、召回 Vanna 资料并生成 SQL，但不会执行。"
-            "不要先探查 schema、枚举品牌/字段/type_name，除非用户明确要求查看这些元数据；"
-            "需要元数据时使用 database_schema_inspect。Excel/CSV 文件仍使用 pandas_knowledge_query。"
+            "先调用 database_evidence_search 获取相关结构、实体、历史 SQL 和 EAV 原始值证据，"
+            "由 Agent 结合用户问题和证据编写 SQL，再调用 database_sql_validate 和 "
+            "database_sql_execute。相似 SQL 只是参考，不是权威；Agent 可按需使用 "
+            "database_schema_inspect 补充探测。旧 SQL 生成与校验工具不对 Agent 暴露。"
+            "Excel/CSV 文件仍使用 pandas_knowledge_query。"
         ),
     },
     "table_analysis": {
@@ -93,7 +91,12 @@ _DEFAULT_INTENT_REGISTRY: dict[str, dict[str, Any]] = {
             "销量", "周销量", "月销量", "环比", "同比", "占比", "配置率", "渗透率",
             "品牌", "车型", "车系", "款型", "价格段", "终端", "批发", "零售",
         ],
-        "preferred_tools": ["pandas_knowledge_query", "database_sql_generate", "database_sql_execute"],
+        "preferred_tools": [
+            "pandas_knowledge_query",
+            "database_evidence_search",
+            "database_sql_validate",
+            "database_sql_execute",
+        ],
         "tool_categories": ["table"],
         "routing_prompt": (
             "用户意图为表格问数。只要问题涉及已导入 Excel/CSV/TSV、刚才导入的表格、字段/列名、"
@@ -102,9 +105,8 @@ _DEFAULT_INTENT_REGISTRY: dict[str, dict[str, Any]] = {
             "如果用户是在问当前知识库有哪些文件、有哪些表格文件、导入了哪些数据集、文件清单、目录清单或资产清单，"
             "不要调用 pandas_knowledge_query；应使用文件系统 ls/glob 查看 /knowledge。"
             "如果上下文是 Excel/CSV/TSV 或用户说“导入的表格/Excel”，调用 pandas_knowledge_query；"
-            "如果上下文是数据库源/数据库表/SQL/Vanna，先调用 database_sql_generate，再调用 "
-            "database_sql_execute 执行确认过的 SQL。处理业务问数时，应直接传入用户原问题生成 SQL，"
-            "不要先探查表结构或字段，除非用户明确要求元数据。"
+            "如果上下文是数据库源/数据库表/SQL/Vanna，先调用 database_evidence_search，"
+            "由 Agent 编写 SQL，再调用 database_sql_validate 和 database_sql_execute。"
             "不要先调用 llamaindex_knowledge_query、glob 或 grep 来查结构化数据。"
         ),
     },
@@ -291,7 +293,13 @@ class ToolIntentRouterMiddleware(AgentMiddleware):
             decision["intents"],
             decision["preferred_tools"],
         )
-        return {"messages": cleaned}
+        result: dict[str, Any] = {"messages": cleaned}
+        if "database_analysis" in decision["intents"]:
+            # Server-owned marker consumed by the legacy generator admission
+            # guard.  A feature flag alone is not enough: standalone/API
+            # callers may intentionally keep using the legacy contract.
+            result["_database_agent_sql_path"] = True
+        return result
 
 
 def build_tool_intent_router_middlewares(config: dict) -> list:

@@ -59,6 +59,7 @@ _LEGACY_EXTERNAL_LEASE_TOOLS = frozenset(
         "commit_external_directory",
     }
 )
+_LEGACY_DATABASE_AGENT_TOOLS = frozenset({"database_sql_generate", "database_sql_validate_legacy"})
 _INSPECTION_BLOCKED_READISH_TOOLS = frozenset(
     {
         "stage_external_artifact",
@@ -942,6 +943,15 @@ class ToolsetMiddleware(AgentMiddleware):
                 and (not inspection or self._inspection_tool_allowed(self._tool_name(tool)))
                 and (legacy_enabled or self._tool_name(tool) not in _LEGACY_EXTERNAL_LEASE_TOOLS)
             ]
+        # Legacy generation/validation remains registered for direct
+        # standalone/API compatibility, but it is not part of the Agent
+        # capability surface.  This is deliberately independent of rollout
+        # flags: a disabled experiment must not silently re-expose old tools.
+        visible = [
+            tool
+            for tool in visible
+            if self._tool_name(tool) not in _LEGACY_DATABASE_AGENT_TOOLS
+        ]
         if stable_schema:
             return self._sort_visible_tools(
                 visible,
@@ -1124,7 +1134,12 @@ class ToolsetMiddleware(AgentMiddleware):
             for tool in visible_tools
             if self._tool_name(tool) in allowed_names
         )
-        mounted = sorted({self._tool_name(tool) for tool in request.tools if self._tool_name(tool)})
+        mounted = sorted({
+            self._tool_name(tool)
+            for tool in request.tools
+            if self._tool_name(tool)
+            and self._tool_name(tool) not in _LEGACY_DATABASE_AGENT_TOOLS
+        })
         unavailable: list[dict[str, Any]] = []
         for name in mounted:
             if name in set(allowed):

@@ -4046,7 +4046,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 let callIdx = tcId ? calls.findIndex((call) => call.id === tcId) : -1;
                 if (callIdx === -1) {
                   for (let i = calls.length - 1; i >= 0; i--) {
-                    if (calls[i].tool === "database_sql_generate" && calls[i].status === "running") {
+                    if (["database_sql_generate", "database_evidence_search", "database_sql_validate"].includes(calls[i].tool) && calls[i].status === "running") {
                       callIdx = i;
                       break;
                     }

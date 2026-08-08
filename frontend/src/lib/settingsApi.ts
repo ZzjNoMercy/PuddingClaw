@@ -100,6 +100,10 @@ export interface DatabaseQaSettings {
   max_page_size: number;
   export_enabled: boolean;
   profile_enabled: boolean;
+  database_agent_sql_path_enabled: boolean;
+  database_agent_sql_path_rollout_percentage: number;
+  database_agent_sql_fallback_enabled: boolean;
+  database_agent_sql_shadow_compare_enabled: boolean;
 }
 
 export interface AnalyticsSettings {

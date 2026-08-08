@@ -3679,9 +3679,13 @@ function databaseStageLabel(stage: string): string {
     semantic_assets: "语义资产",
     vanna_references: "Vanna 资料",
     vanna_entities: "实体召回",
+    evidence_search: "数据库证据检索",
+    eav_value_profile: "EAV 当前值画像",
+    fallback: "兼容路径切换",
     sql_generation: "SQL 生成",
     sql_generate: "SQL 生成",
     sql_validate: "SQL 校验",
+    sql_validate_v2: "Agent SQL 独立校验",
     sql_execution: "SQL 执行",
     sql_execute: "SQL 执行",
     schema_inspect: "结构检查",
@@ -3714,6 +3718,37 @@ function databasePayloadSummary(stage: string, payload: Record<string, unknown>)
       { label: "source", value: formatTraceSummaryValue(payload.source) },
       { label: "tables", value: formatUnknownList(payload.allowed_tables) },
       { label: "valid", value: String(payload.valid ?? "-") },
+    ].filter((item) => item.value !== "-");
+  }
+  if (stage === "sql_validate_v2") {
+    return [
+      { label: "source", value: formatTraceSummaryValue(payload.source) },
+      { label: "tables", value: formatUnknownList(payload.allowed_tables) },
+      { label: "valid", value: String(payload.valid ?? payload.status ?? "-") },
+      { label: "sql_submission_id", value: formatTraceSummaryValue(payload.sql_submission_id) },
+    ].filter((item) => item.value !== "-");
+  }
+  if (stage === "evidence_search") {
+    return [
+      { label: "source", value: formatTraceSummaryValue(payload.source) },
+      { label: "tables", value: formatUnknownList(payload.tables) },
+      { label: "DDL", value: String(payload.ddl_count ?? "-") },
+      { label: "文档", value: String(payload.documentation_count ?? "-") },
+      { label: "相似 SQL", value: String(payload.similar_sql_count ?? "-") },
+    ].filter((item) => item.value !== "-");
+  }
+  if (stage === "eav_value_profile") {
+    return [
+      { label: "profiles", value: String(payload.profile_count ?? "-") },
+      { label: "observations", value: String(payload.observations ? "已记录" : "-") },
+    ].filter((item) => item.value !== "-");
+  }
+  if (stage === "fallback") {
+    return [
+      { label: "status", value: formatTraceSummaryValue(payload.status) },
+      { label: "from", value: formatTraceSummaryValue(payload.from_path) },
+      { label: "to", value: formatTraceSummaryValue(payload.to_path) },
+      { label: "reason", value: formatTraceSummaryValue(payload.error_code) },
     ].filter((item) => item.value !== "-");
   }
   if (stage === "sql_execution" || stage === "sql_execute") {

@@ -101,6 +101,7 @@ def _job_metadata_for_api(job: KnowledgeImportJob) -> dict[str, Any]:
         "column",
         "entity_type",
         "alias_columns",
+        "filters",
         "max_values",
         "progress_detail",
         "deepagents_backend",
@@ -171,6 +172,7 @@ def job_to_list_dict(job: KnowledgeImportJob) -> dict[str, Any]:
         "column",
         "entity_type",
         "alias_columns",
+        "filters",
         "max_values",
         "progress_detail",
         "raw_paths",
@@ -528,6 +530,7 @@ async def create_vanna_entity_import_job(
     column: str,
     entity_type: str,
     alias_columns: list[str] | None = None,
+    filters: list[dict[str, Any]] | None = None,
     max_values: int | None = None,
     knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
 ) -> KnowledgeImportJob:
@@ -549,6 +552,22 @@ async def create_vanna_entity_import_job(
         for item in alias_columns or []
         if str(item or "").strip() and str(item).strip() != clean_column
     ]
+    clean_filters: list[dict[str, Any]] = []
+    for raw_filter in filters or []:
+        if not isinstance(raw_filter, dict):
+            raise KnowledgeServiceError("实体过滤条件格式无效。")
+        filter_column = str(raw_filter.get("column") or "").strip()
+        operator = str(raw_filter.get("operator") or "").strip()
+        values = list(
+            dict.fromkeys(
+                str(item).strip()
+                for item in raw_filter.get("values") or []
+                if str(item or "").strip()
+            )
+        )
+        if not filter_column or operator not in {"in", "not_in"} or not values:
+            raise KnowledgeServiceError("实体过滤条件必须选择字段、操作符和已有值。")
+        clean_filters.append({"column": filter_column, "operator": operator, "values": values})
     clean_max_values = int(max_values) if max_values is not None else None
     if clean_max_values is not None and clean_max_values < 1:
         raise KnowledgeServiceError("导入数量必须大于 0。")
@@ -576,6 +595,7 @@ async def create_vanna_entity_import_job(
             "column": clean_column,
             "entity_type": clean_entity_type,
             "alias_columns": clean_alias_columns,
+            "filters": clean_filters,
             "max_values": clean_max_values,
             "progress_detail": {
                 "stage": "queued",
@@ -810,6 +830,7 @@ async def process_vanna_entity_import_job(
     column = str(metadata.get("column") or "").strip()
     entity_type = str(metadata.get("entity_type") or "").strip()
     alias_columns = [str(item).strip() for item in metadata.get("alias_columns") or [] if str(item or "").strip()]
+    filters = [dict(item) for item in metadata.get("filters") or [] if isinstance(item, dict)]
     raw_max_values = metadata.get("max_values")
     max_values = int(raw_max_values) if raw_max_values not in (None, "", 0) else None
     batch_size = int((metadata.get("progress_detail") or {}).get("batch_size") or 100)
@@ -838,10 +859,6 @@ async def process_vanna_entity_import_job(
         nonlocal last_event_done
         done = int(progress_payload.get("done") or 0)
         total = int(progress_payload.get("total") or 0)
-        imported = int(progress_payload.get("imported") or 0)
-        updated = int(progress_payload.get("updated") or 0)
-        skipped_duplicates = int(progress_payload.get("skipped_duplicates") or 0)
-        failed = int(progress_payload.get("failed") or 0)
         stage = str(progress_payload.get("stage") or "indexing")
         percent = 15 + int((done / total) * 75) if total > 0 else 15
         if stage == "done":
@@ -873,6 +890,7 @@ async def process_vanna_entity_import_job(
             column=column,
             entity_type=entity_type,
             alias_columns=alias_columns,
+            filters=filters,
             max_values=max_values,
             batch_size=batch_size,
             continue_on_error=True,

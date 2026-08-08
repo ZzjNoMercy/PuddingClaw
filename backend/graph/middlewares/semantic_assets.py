@@ -31,12 +31,13 @@ SEMANTIC_ASSETS_SYSTEM_PROMPT = """
 
 The selected analytics model exposes the following semantic-asset metadata.
 Use this index to choose only the measures, dimensions, and grains relevant to
-the user's current analytics question. Pass their exact ids in
-`database_sql_generate.selected_semantic_asset_ids` for database work or
-`pandas_knowledge_query.selected_semantic_asset_ids` for spreadsheet work.
-Do not pass every available asset. Both tools load the selected assets' complete
-authoritative definitions through the shared semantic runtime; do not copy
-their bodies into the question.
+the user's current analytics question. For database work, pass their exact ids
+to `database_evidence_search` and retain them when submitting SQL to
+`database_sql_validate`; for spreadsheet work, pass them to
+`pandas_knowledge_query.selected_semantic_asset_ids`. Do not pass every
+available asset. These tools load the selected assets' complete authoritative
+definitions through the shared semantic runtime; do not copy their bodies into
+the question.
 
 Selected model: `{model_id}`
 

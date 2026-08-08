@@ -288,6 +288,39 @@ def test_global_guardrail_allows_left_join_with_filtered_tuple_count_distinct() 
     assert conflicts == []
 
 
+def test_global_guardrail_allows_counting_preserved_left_side_tuple() -> None:
+    rule = GuardrailRule.model_validate(
+        {
+            "id": "postgres_count_distinct_nullable_tuple_after_left_join",
+            "name": "PostgreSQL LEFT JOIN 后禁止直接 COUNT DISTINCT 右表 nullable tuple",
+            "type": "forbid_sql_pattern",
+            "scope": {"table_scope": {"mode": "any", "values": []}, "semantic_assets": []},
+            "params": {
+                "pattern": r"(?=[\s\S]*\bLEFT\s+JOIN\b)(?=[\s\S]*\bCOUNT\s*\(\s*DISTINCT\s*\([^)]*\.[^)]*,[^)]*\)\s*\))",
+            },
+        }
+    )
+    sql = """
+    SELECT COUNT(DISTINCT (m.brand, m.serial_name, m.car_name)) AS model_count
+    FROM models_896 m
+    LEFT JOIN vehicle_params vp
+      ON vp.brand = m.brand
+    LEFT JOIN vehicle_params vp2
+      ON vp2.brand = m.brand
+    """
+    route = SimpleNamespace(table_names=["vehicle_params"])
+
+    conflicts = detect_guardrail_conflicts(
+        sql,
+        source_name="insight_data",
+        route=route,
+        semantic_trace={"matched": [], "references": []},
+        rules=[rule],
+    )
+
+    assert conflicts == []
+
+
 def test_guardrail_rules_are_loaded_from_markdown_assets(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(guardrail_module, "BASE_DIR", tmp_path)
     monkeypatch.setattr(guardrail_module, "GUARDRAILS_ROOT", tmp_path / "sql-guardrails")

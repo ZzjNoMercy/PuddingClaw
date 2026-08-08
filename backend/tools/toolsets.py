@@ -97,8 +97,10 @@ BUSINESS_TOOLSETS: dict[str, frozenset[str]] = {
         }
     ),
     "database_analysis": frozenset({
+        "database_evidence_search",
         "database_schema_inspect",
         "database_sql_generate",
+        "database_sql_validate_legacy",
         "database_sql_validate",
         "database_sql_execute",
         "database_query_trace_inspect",
@@ -307,11 +309,13 @@ TOOL_CONTROL_DESCRIPTORS: dict[str, ToolControlDescriptor] = {
     "gbrain_schema_graph": _READ_ONLY,
     "gbrain_schema_explain_type": _READ_ONLY,
     "database_schema_inspect": _READ_ONLY,
+    "database_evidence_search": _READ_ONLY,
     # These tools may be business-read-only, but they create durable
     # generations, validation receipts, and query-result artifacts.  Model
     # control contracts describe observable control-plane mutation, not SQL
     # verb semantics.
     "database_sql_generate": _INTERNAL_MUTATION,
+    "database_sql_validate_legacy": _INTERNAL_MUTATION,
     "database_sql_validate": _INTERNAL_MUTATION,
     "database_sql_execute": _INTERNAL_MUTATION,
     "database_query_trace_inspect": _READ_ONLY,

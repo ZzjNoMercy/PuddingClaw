@@ -39,8 +39,10 @@ _WEB_TOOLS = frozenset(
 _ANALYTICS_TOOLS = frozenset(
     {
         "pandas_knowledge_query",
+        "database_evidence_search",
         "database_schema_inspect",
         "database_sql_generate",
+        "database_sql_validate_legacy",
         "database_sql_validate",
         "database_sql_execute",
         "database_query_trace_inspect",
@@ -170,7 +172,7 @@ _COMMAND_EXIT_RE = re.compile(
 _PLAIN_EXIT_RE = re.compile(r"(?:^|\n)Exit code:\s*(?P<code>-?\d+)\s*$", re.IGNORECASE)
 _ANALYTICS_RESULT_REF_RE = re.compile(
     r"(?P<ref_kind>result_id|query_trace_id|trace_id|database_source_id|"
-    r"generation_id|validation_receipt_id|数据源)[：:\s]+"
+    r"generation_id|sql_submission_id|evidence_search_id|validation_receipt_id|数据源)[：:\s]+"
     r"(?P<value>[A-Za-z0-9_.:/-]+)",
     re.IGNORECASE,
 )

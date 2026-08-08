@@ -156,6 +156,14 @@ class DatabaseSchemaEvidenceRegistry:
             "sha256": f"sha256:{digest}",
         }
         self._receipts[receipt["id"]] = deepcopy(receipt)
+        if session_id:
+            try:
+                from graph.session_manager import session_manager
+
+                if session_manager.is_initialized:
+                    session_manager.record_database_schema_evidence(session_id, receipt["id"], receipt)
+            except (FileNotFoundError, RuntimeError, ValueError):
+                pass
         return deepcopy(receipt)
 
     @staticmethod
@@ -176,7 +184,18 @@ class DatabaseSchemaEvidenceRegistry:
         goal_id: str,
         goal_revision: int | None,
     ) -> dict[str, Any] | None:
-        receipt = self._receipts.get(str(receipt_id or ""))
+        normalized_id = str(receipt_id or "")
+        receipt = self._receipts.get(normalized_id)
+        if receipt is None and session_id:
+            try:
+                from graph.session_manager import session_manager
+
+                if session_manager.is_initialized:
+                    receipt = session_manager.get_database_schema_evidence(session_id, normalized_id)
+                    if receipt:
+                        self._receipts[normalized_id] = deepcopy(receipt)
+            except (FileNotFoundError, RuntimeError, ValueError):
+                receipt = None
         if not receipt or float(receipt.get("expires_at") or 0) < time.time():
             return None
         if str(receipt.get("receipt_kind") or "") != "discovery":
@@ -235,7 +254,18 @@ class DatabaseSchemaEvidenceRegistry:
         allowed_tables: list[str],
         parent_sql_sha256: str = "",
     ) -> dict[str, Any] | None:
-        receipt = self._receipts.get(str(receipt_id or ""))
+        normalized_id = str(receipt_id or "")
+        receipt = self._receipts.get(normalized_id)
+        if receipt is None and session_id:
+            try:
+                from graph.session_manager import session_manager
+
+                if session_manager.is_initialized:
+                    receipt = session_manager.get_database_schema_evidence(session_id, normalized_id)
+                    if receipt:
+                        self._receipts[normalized_id] = deepcopy(receipt)
+            except (FileNotFoundError, RuntimeError, ValueError):
+                receipt = None
         if not receipt or float(receipt.get("expires_at") or 0) < time.time():
             return None
         if not parent_generation_id or not str(receipt.get("parent_generation_id") or ""):

@@ -41,11 +41,14 @@ class EvidenceRecord(BaseModel):
     result_id: str | None = None
     query_trace_id: str | None = None
     generation_id: str | None = None
+    sql_submission_id: str | None = None
+    evidence_search_id: str | None = None
     sql_validation_receipt_id: str | None = None
     artifact_id: str | None = None
     validation_receipt_id: str | None = None
     receipt_id: str | None = None
     content_sha256: str | None = None
+    profile_revisions: list[str] = Field(default_factory=list)
     source_id: str | None = None
     uri: str | None = None
     status: Literal["active", "stale", "revoked", "deleted"] = "active"
@@ -121,6 +124,10 @@ def _identity(raw: dict[str, Any]) -> tuple[str, str] | None:
         return "legacy_evidence", str(raw["ref"])
     if raw.get("sql_validation_receipt_id"):
         return "sql_validation", str(raw["sql_validation_receipt_id"])
+    if raw.get("evidence_search_id"):
+        return "database_evidence", str(raw["evidence_search_id"])
+    if raw.get("sql_submission_id"):
+        return "sql_submission", str(raw["sql_submission_id"])
     if raw.get("validation_receipt_id"):
         return "validation_receipt", str(raw["validation_receipt_id"])
     if raw.get("artifact_id"):
@@ -151,6 +158,8 @@ def _record_for_raw(
         output_digest = _digest(raw)
     result_id = str(raw.get("result_id") or "") or None
     generation_id = str(raw.get("generation_id") or _first(evidence, "generation_id") or "") or None
+    sql_submission_id = str(raw.get("sql_submission_id") or _first(evidence, "sql_submission_id") or "") or None
+    evidence_search_id = str(raw.get("evidence_search_id") or _first(evidence, "evidence_search_id") or "") or None
     sql_validation_receipt_id = (
         str(raw.get("sql_validation_receipt_id") or _first(evidence, "sql_validation_receipt_id") or "") or None
     )
@@ -213,11 +222,14 @@ def _record_for_raw(
         result_id=result_id,
         query_trace_id=query_trace_id,
         generation_id=generation_id,
+        sql_submission_id=sql_submission_id,
+        evidence_search_id=evidence_search_id,
         sql_validation_receipt_id=sql_validation_receipt_id,
         artifact_id=str(raw.get("artifact_id") or "") or None,
         validation_receipt_id=str(raw.get("validation_receipt_id") or "") or None,
         receipt_id=str(raw.get("receipt_id") or "") or None,
         content_sha256=str(raw.get("content_sha256") or raw.get("after_sha256") or "") or None,
+        profile_revisions=[str(item) for item in raw.get("profile_revisions") or [] if str(item)],
         source_id=str(raw.get("source_id") or "") or None,
         uri=str(raw.get("uri") or "") or None,
         status=(

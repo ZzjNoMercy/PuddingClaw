@@ -99,6 +99,46 @@ def test_project_skill_frontmatter_declares_known_toolsets() -> None:
     assert all(name in TOOLSETS for values in skills.values() for name in values)
 
 
+def test_agent_sql_path_hides_legacy_database_tools_from_manifest(
+    tmp_path,
+) -> None:
+    _install_test_skill(tmp_path, "database-analysis", {"database_analysis"})
+    middleware = ToolsetMiddleware(
+        skills_dir=tmp_path,
+        toolsets_by_skill={"database-analysis": {"database_analysis"}},
+    )
+    state = _active_skill_state(middleware, "database-analysis")
+    request = ModelRequest(
+        model=None,
+        messages=[HumanMessage(content="查询产品配置")],
+        system_message=SystemMessage(content="base"),
+        tools=[
+            {"name": "database_evidence_search"},
+            {"name": "database_sql_generate"},
+            {"name": "database_sql_validate_legacy"},
+            {"name": "database_sql_validate"},
+            {"name": "database_sql_execute"},
+        ],
+        state=state,
+        runtime=SimpleNamespace(context={"run_id": "run-agent"}),
+    )
+
+    visible = middleware._visible_tools(request)
+    manifest = middleware._capability_manifest(request, visible)
+
+    assert [item["name"] for item in visible] == [
+        "database_evidence_search",
+        "database_sql_validate",
+        "database_sql_execute",
+    ]
+    assert "database_sql_generate" not in manifest.allowed_tool_names
+    assert "database_sql_validate_legacy" not in manifest.allowed_tool_names
+    assert all(
+        item["tool"] not in {"database_sql_generate", "database_sql_validate_legacy"}
+        for item in manifest.unavailable_tools
+    )
+
+
 def test_skill_catalog_is_discovered_from_installed_frontmatter() -> None:
     catalog = discover_skill_catalog(Path(__file__).resolve().parents[1] / "skills")
     by_id = {item["skill_id"]: item for item in catalog}

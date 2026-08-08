@@ -8,8 +8,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
+import sqlglot
 import yaml
 from pydantic import BaseModel, Field
+from sqlglot import exp
 
 from analytics.nl2sql.guardrail_runtime import detector_failed, scope_status
 
@@ -582,7 +584,47 @@ def _conflict(rule: GuardrailRule, fallback_message: str) -> GuardrailConflict:
 def _detect_forbid_sql_pattern(sql: str, rule: GuardrailRule) -> GuardrailConflict | None:
     if not detector_failed(sql, rule.model_dump(mode="json")):
         return None
+    if (
+        rule.id == "postgres_count_distinct_nullable_tuple_after_left_join"
+        and not _counts_distinct_tuple_from_nullable_join_side(sql)
+    ):
+        return None
     return _conflict(rule, f"SQL 命中禁止模式：{rule.params.get('pattern') or ''}")
+
+
+def _counts_distinct_tuple_from_nullable_join_side(sql: str) -> bool:
+    """Return whether a DISTINCT tuple reads a nullable LEFT JOIN side."""
+
+    try:
+        tree = sqlglot.parse_one(sql, read="postgres")
+    except Exception:
+        # The native database planner/Validator owns syntax validity. Preserve
+        # the configured regex diagnostic when AST refinement is unavailable.
+        return True
+    nullable_aliases = {
+        str(join.this.alias_or_name or "").strip().lower()
+        for join in tree.find_all(exp.Join)
+        if str(join.side or "").strip().upper() == "LEFT"
+        and str(join.this.alias_or_name or "").strip()
+    }
+    if not nullable_aliases:
+        return False
+    for count in tree.find_all(exp.Count):
+        distinct = count.this
+        if not isinstance(distinct, exp.Distinct):
+            continue
+        tuples = list(distinct.find_all(exp.Tuple))
+        if not tuples:
+            continue
+        counted_aliases = {
+            str(column.table or "").strip().lower()
+            for tuple_expression in tuples
+            for column in tuple_expression.find_all(exp.Column)
+            if str(column.table or "").strip()
+        }
+        if counted_aliases & nullable_aliases:
+            return True
+    return False
 
 
 def _detect_require_sql_contains(sql: str, rule: GuardrailRule) -> GuardrailConflict | None:

@@ -1015,6 +1015,23 @@ export interface TableEntityCandidate {
   dtype?: string | null;
 }
 
+export type VannaEntityFilterOperator = "in" | "not_in";
+
+export interface VannaEntityFilter {
+  column: string;
+  operator: VannaEntityFilterOperator;
+  values: string[];
+}
+
+export interface VannaEntityImportPreview {
+  table_name: string;
+  column: string;
+  total: number;
+  filtered: number;
+  excluded: number;
+  filters: VannaEntityFilter[];
+}
+
 export interface VannaEntityRecord {
   pk?: number | string;
   id?: number | string;
@@ -1289,6 +1306,29 @@ export async function listKnowledgeDatabaseSourceTableColumns(sourceId: string, 
   return Array.isArray(payload.columns) ? payload.columns.map(String) : [];
 }
 
+export async function listKnowledgeDatabaseSourceColumnValues(
+  sourceId: string,
+  payload: { table_name: string; column: string; search?: string; limit?: number }
+): Promise<{ values: string[]; has_more: boolean }> {
+  const response = await fetch(
+    `${API_BASE}/knowledge/database-sources/${encodeURIComponent(sourceId)}/column-values`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }
+  );
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to load database column values: ${response.status}`));
+  }
+  const result = await response.json();
+  return {
+    values: Array.isArray(result.values) ? result.values.map(String) : [],
+    has_more: Boolean(result.has_more),
+  };
+}
+
 export async function deleteKnowledgeDatabaseSource(sourceId: string): Promise<void> {
   const response = await fetch(`${API_BASE}/knowledge/database-sources/${encodeURIComponent(sourceId)}`, {
     method: "DELETE",
@@ -1387,6 +1427,7 @@ export async function importKnowledgeDatabaseSourceVannaEntities(
     column: string;
     entity_type: string;
     alias_columns?: string[];
+    filters?: VannaEntityFilter[];
     max_values?: number;
   }
 ): Promise<VannaEntityImportResult> {
@@ -1403,6 +1444,33 @@ export async function importKnowledgeDatabaseSourceVannaEntities(
     throw new Error(apiErrorMessage(text, `Failed to import Vanna entities: ${response.status}`));
   }
   return response.json();
+}
+
+export async function previewKnowledgeDatabaseSourceVannaEntities(
+  sourceId: string,
+  payload: { table_name: string; column: string; filters?: VannaEntityFilter[] }
+): Promise<VannaEntityImportPreview> {
+  const response = await fetch(
+    `${API_BASE}/knowledge/database-sources/${encodeURIComponent(sourceId)}/vanna/entities/preview`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }
+  );
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, `Failed to preview Vanna entities: ${response.status}`));
+  }
+  const result = await response.json();
+  return {
+    table_name: String(result.table_name || payload.table_name),
+    column: String(result.column || payload.column),
+    total: Number(result.total || 0),
+    filtered: Number(result.filtered || 0),
+    excluded: Number(result.excluded || 0),
+    filters: Array.isArray(result.filters) ? result.filters : [],
+  };
 }
 
 export async function listKnowledgeDatabaseSourceVannaEntities(

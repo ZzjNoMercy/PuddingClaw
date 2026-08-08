@@ -73,7 +73,7 @@
 
 | 度量 | 公式/口径 |
 | --- | --- |
-| `model_count` | `COUNT(DISTINCT brand, serial_name, car_name)` |
+| `model_count` | PostgreSQL 使用 `COUNT(DISTINCT (brand, serial_name, car_name))`；三列必须放在行构造器中 |
 | `series_count` | `COUNT(DISTINCT brand, serial_name)`；跨源时统计 `entity_key` |
 | `new_model_count` | 统计期内首次上市的唯一款型数 |
 | `renewal_count` | 按明确的新增/改款/换代规则统计更新事件数 |

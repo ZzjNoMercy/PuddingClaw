@@ -8,7 +8,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from time import perf_counter
 from typing import Any
 
@@ -489,16 +489,31 @@ async def _inspect_live_eav_value_profiles_fallback(
     return [grouped[name] for name in sorted(grouped)]
 
 
+def _bounded_profile_type_names(
+    type_names: Iterable[str],
+    *,
+    limit: int | None = 3,
+) -> list[str]:
+    """Select bounded EAV profiles without discarding retrieval relevance."""
+
+    raw_names = [str(item).strip() for item in type_names if str(item).strip()]
+    if isinstance(type_names, (set, frozenset)):
+        raw_names.sort()
+    unique_names = list(dict.fromkeys(raw_names))
+    return unique_names if limit is None else unique_names[: max(1, int(limit))]
+
+
 async def _inspect_live_eav_value_profiles(
     *,
     source: Any,
     route: Any,
-    type_names: set[str],
+    type_names: Iterable[str],
     values_per_type: int = 200,
     timeout_seconds: float = 10.0,
     semantic_hash: str = "",
     semantic_contract_hashes: dict[str, str] | None = None,
     permission_epoch: int = 1,
+    type_name_limit: int | None = 3,
 ) -> list[dict[str, Any]]:
     """Profile exact EAV values before the first semantic SQL refinement.
 
@@ -509,7 +524,10 @@ async def _inspect_live_eav_value_profiles(
     """
 
     table_name = _vehicle_params_table(route)
-    names = sorted(str(item) for item in type_names if str(item))[:3]
+    # Ranked callers pass a sequence and expect the bounded profile budget to
+    # follow that relevance order. Legacy set callers retain deterministic
+    # alphabetical behavior.
+    names = _bounded_profile_type_names(type_names, limit=type_name_limit)
     if not table_name or not names:
         return []
     exact_placeholders = [f":profile_name_{index}" for index, _ in enumerate(names)]

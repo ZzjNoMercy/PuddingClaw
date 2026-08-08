@@ -1,11 +1,30 @@
 ## Database Analysis
 
-When the Current Capability Manifest lists `database_sql_generate`, use it first for
-configured PostgreSQL / NL2SQL business questions. If it is absent, read
-`/skills/database-analysis/SKILL.md` before following the database protocol below.
+When the Current Capability Manifest lists `database_evidence_search`, use the
+Agent-authored SQL path for configured PostgreSQL business questions. If it is
+absent, read `/skills/database-analysis/SKILL.md` before following the database
+protocol below.
 
 This includes automotive product configuration analysis and metrics such as 配置率, 搭载率, 配备率, 装配率, 空气悬架, 空气悬挂, 激光雷达, 充电倍率, 能源类型, 车型级别, 上市时间, and price-band analysis over configured database tables.
 
-For a direct database question, pass the user's original business question to `database_sql_generate`. For a multi-step Goal, compile each planned query into a focused **business sub-question**: the Agent owns the subject/metric, dimensions, grain, filters, time range, and required output, while the SQL generator owns physical tables, columns, EAV names/values, entity resolution, joins, CTEs, and all other SQL implementation. Never add a physical choice the user did not state, even as a confident assumption or “判断依据”. The UI-selected `model_id` and allowed semantic-asset id range are injected automatically from trusted runtime state; do not override them. Select only matching ids from the model-scoped semantic metadata index and pass them through `selected_semantic_asset_ids`. Then call `database_sql_validate` with `generation_id`; use the returned `validation_receipt_id` together with the same `generation_id` when calling `database_sql_execute`. Omit `sql`, because all three stages load the authoritative generation from the server-side ledger and Execute rejects a missing or hash-mismatched receipt. Never copy, reformat, or hand-edit generated SQL. If generation, validation, or execution fails, call `database_sql_generate` with the original `parent_generation_id` and describe only the observed error, timeout, empty result, conflict, or anomalous result in `revision_instruction`; do not prescribe a field, table, entity, JOIN/EXISTS/CTE shape, or replacement SQL. The generator classifies and repairs technical defects automatically without business HITL. Only when the business semantics or user-requested metric definition truly needs to change may the same revision path open HITL; the user then chooses 同意、拒绝、 or 修改, and only the generator may produce the resulting SQL. Never start a fresh generation with an Agent-invented physical workaround, and never launch multiple revision requests in parallel. After HITL resumes, treat the returned decision as final: on reject, do not ask for another choice—validate and execute the returned original generation; on agree or modify, validate and execute the new generation. Do not first search the knowledge base, inspect schema, enumerate fields, or call `pandas_knowledge_query`, unless the user explicitly asks for metadata or says the data is from an imported Excel/CSV/TSV file.
+For a direct database question, pass the user's original business question to
+`database_evidence_search`. For a multi-step Goal, compile each planned query
+into a focused business sub-question with the subject, metric, dimensions,
+grain, filters, time range, and required output. Select only relevant ids from
+the model-scoped semantic metadata index and pass them through
+`selected_semantic_asset_ids`. Use the returned DDL, documentation, entity and
+EAV profiles, and reference-only similar SQL as evidence; they are not an
+exhaustive business-rule registry and do not author the final SQL.
 
-Use `database_schema_inspect` only when the user explicitly asks for metadata such as available tables, columns, or EAV `type_name` values.
+The Agent writes the SQL, calls `database_sql_validate`, and executes only the
+returned `sql_submission_id` with its paired validation Receipt through
+`database_sql_execute`. On a recoverable parse, bind, type, or execution error,
+the Agent owns the repair and submits the revised SQL again. Treat semantic,
+EAV, and Guardrail warnings as advisory quality signals. Hard rejection is
+reserved for authorization, dangerous operations, invalid physical tables or
+columns, unauthorized functions, and SQL that PostgreSQL cannot plan. Never
+execute unregistered raw SQL and never bypass the Receipt chain.
+
+Use `database_schema_inspect` when the user explicitly asks for metadata or when
+the retrieved evidence is insufficient for a physical mapping. Excel/CSV/TSV
+work still uses `pandas_knowledge_query`.

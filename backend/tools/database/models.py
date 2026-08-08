@@ -106,7 +106,7 @@ class DatabaseSqlGenerateInput(BaseModel):
     runtime: ToolRuntime
 
 
-class DatabaseSqlValidateInput(BaseModel):
+class LegacyDatabaseSqlValidateInput(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     sql: str = Field(
@@ -125,25 +125,75 @@ class DatabaseSqlValidateInput(BaseModel):
     runtime: ToolRuntime
 
 
+class DatabaseSqlValidateInput(BaseModel):
+    """Untrusted Agent SQL plus server-owned evidence references."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    sql: str = Field(description="Agent-authored read-only SQL to validate and register.")
+    database_source_id: str | None = Field(default=None, description="Optional source subset; never broadens runtime scope.")
+    table_names: list[str] = Field(default_factory=list, description="Optional table subset; never broadens model/source scope.")
+    selected_semantic_asset_ids: list[str] = Field(
+        default_factory=list,
+        description="Optional semantic hints used for advisory diagnostics; they do not authorize or block SQL execution.",
+    )
+    evidence_search_id: str = Field(
+        default="",
+        description="Optional database_evidence_search provenance id used for advisory diagnostics only.",
+    )
+    schema_evidence_receipt_ids: list[str] = Field(default_factory=list, description="Server-issued inspect receipts.")
+    runtime: ToolRuntime
+
+
+class DatabaseEvidenceSearchInput(BaseModel):
+    """Agent-facing, evidence-only database search contract."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    question: str = Field(description="The user's business question. This tool retrieves evidence and never writes SQL.")
+    database_source_id: str | None = Field(default=None, description="Optional configured database source id.")
+    table_names: list[str] = Field(default_factory=list, description="Optional table subset; it can only narrow scope.")
+    selected_semantic_asset_ids: list[str] = Field(default_factory=list, description="Semantic asset ids selected from the active model.")
+    focus_fields: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Optional physical column names used only to filter retrieved entity candidates; "
+            "this does not select EAV type_name values or business enums."
+        ),
+    )
+    entity_types: list[str] = Field(default_factory=list, description="Optional Vanna entity types to retrieve.")
+    include_similar_sql: bool = Field(default=True, description="Whether to include reference-only similar SQL examples.")
+    reference_top_k: int = Field(default=5, ge=1, le=20)
+    value_profile_limit: int = Field(default=50, ge=1, le=200)
+    runtime: ToolRuntime
+
+
 class DatabaseSqlExecuteInput(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     sql: str = Field(
         default="",
         description=(
-            "Optional explicit SQL for non-Agent callers. In Agent mode, omit this field; the authoritative SQL "
-            "is loaded server-side from generation_id."
+            "Optional explicit SQL for non-Agent callers. For Agent SQL, omit this field; the authoritative SQL is "
+            "loaded server-side from sql_submission_id."
         ),
     )
     generation_id: str = Field(
         default="",
-        description="Generation id returned by database_sql_generate. Required in Agent mode.",
+        description="Legacy generation id returned by database_sql_generate.",
+    )
+    sql_submission_id: str = Field(
+        default="",
+        description="Agent-authored SQL submission id returned by database_sql_validate.",
+    )
+    agent_validation_receipt_id: str = Field(
+        default="",
+        description="Validation Receipt id returned by database_sql_validate for sql_submission_id.",
     )
     validation_receipt_id: str = Field(
         default="",
         description=(
-            "Receipt id returned by database_sql_validate. Required in Agent mode and bound to the exact "
-            "generation SQL hash."
+            "Legacy Receipt id returned by database_sql_validate_legacy, bound to the exact generation SQL hash."
         ),
     )
     database_source_id: str | None = Field(default=None, description="Optional configured database source id.")

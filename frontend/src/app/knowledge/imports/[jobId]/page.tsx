@@ -707,6 +707,15 @@ function VannaEntityJobDetail({ job, events }: { job: KnowledgeImportJob | null;
   const aliasColumns = Array.isArray(metadata.alias_columns)
     ? metadata.alias_columns.filter((item): item is string => typeof item === "string")
     : [];
+  const filters = Array.isArray(metadata.filters)
+    ? metadata.filters.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+    : [];
+  const filterSummary = filters.map((item) => {
+    const filterColumn = typeof item.column === "string" ? item.column : "-";
+    const operator = item.operator === "in" ? "属于" : "不属于";
+    const values = Array.isArray(item.values) ? item.values.map(String).join("、") : "-";
+    return `${filterColumn} ${operator}（${values}）`;
+  }).join("；");
   const sourceName = typeof source?.name === "string" ? source.name : typeof metadata.database_source_id === "string" ? metadata.database_source_id : "-";
   const database = typeof source?.database === "string" ? source.database : "-";
   const host = typeof source?.host === "string" ? source.host : "-";
@@ -754,6 +763,7 @@ function VannaEntityJobDetail({ job, events }: { job: KnowledgeImportJob | null;
             <InfoRow label="实体字段" value={column} />
             <InfoRow label="实体类型" value={entityType} />
             <InfoRow label="辅助字段" value={aliasColumns.length > 0 ? aliasColumns.join("、") : "-"} />
+            <InfoRow label="导入过滤" value={filterSummary || "-"} />
             <InfoRow label="导入范围" value={metadata.max_values ? `最多 ${metadataNumber(metadata.max_values)} 个` : "全量"} />
             <InfoRow label="任务编号" value={job?.id || "-"} />
             <InfoRow label="开始时间" value={formatTime(job?.started_at)} />

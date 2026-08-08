@@ -534,6 +534,10 @@ export default function SettingsPage() {
   const [dbQaMaxPageSize, setDbQaMaxPageSize] = useState("500");
   const [dbQaExportEnabled, setDbQaExportEnabled] = useState(false);
   const [dbQaProfileEnabled, setDbQaProfileEnabled] = useState(true);
+  const [dbQaAgentSqlPathEnabled, setDbQaAgentSqlPathEnabled] = useState(false);
+  const [dbQaAgentSqlRolloutPercentage, setDbQaAgentSqlRolloutPercentage] = useState("1");
+  const [dbQaAgentSqlFallbackEnabled, setDbQaAgentSqlFallbackEnabled] = useState(true);
+  const [dbQaAgentSqlShadowCompareEnabled, setDbQaAgentSqlShadowCompareEnabled] = useState(false);
 
   // Knowledge base
   const [databaseMode, setDatabaseMode] = useState<"bundled" | "external">("bundled");
@@ -720,6 +724,10 @@ export default function SettingsPage() {
         setDbQaMaxPageSize(String(databaseQa?.max_page_size ?? 500));
         setDbQaExportEnabled(databaseQa?.export_enabled ?? false);
         setDbQaProfileEnabled(databaseQa?.profile_enabled ?? true);
+        setDbQaAgentSqlPathEnabled(databaseQa?.database_agent_sql_path_enabled ?? false);
+        setDbQaAgentSqlRolloutPercentage(String(databaseQa?.database_agent_sql_path_rollout_percentage ?? 1));
+        setDbQaAgentSqlFallbackEnabled(databaseQa?.database_agent_sql_fallback_enabled ?? true);
+        setDbQaAgentSqlShadowCompareEnabled(databaseQa?.database_agent_sql_shadow_compare_enabled ?? false);
         // Knowledge base
         setDatabaseMode(s.database?.mode === "external" ? "external" : "bundled");
         setDatabaseHost(s.database?.host || "127.0.0.1");
@@ -1247,6 +1255,15 @@ export default function SettingsPage() {
             max_page_size: positiveIntOrNull(dbQaMaxPageSize) ?? 500,
             export_enabled: dbQaExportEnabled,
             profile_enabled: dbQaProfileEnabled,
+            database_agent_sql_path_enabled: dbQaAgentSqlPathEnabled,
+            database_agent_sql_path_rollout_percentage: Math.max(
+              0,
+              Math.min(100, Number.isFinite(Number.parseInt(dbQaAgentSqlRolloutPercentage, 10))
+                ? Number.parseInt(dbQaAgentSqlRolloutPercentage, 10)
+                : 100),
+            ),
+            database_agent_sql_fallback_enabled: dbQaAgentSqlFallbackEnabled,
+            database_agent_sql_shadow_compare_enabled: dbQaAgentSqlShadowCompareEnabled,
           },
         },
         database: {
@@ -1368,7 +1385,7 @@ export default function SettingsPage() {
     } finally {
       setSaving(false);
     }
-  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaResultMaterializationRowCap, dbQaQueryTimeoutSeconds, dbQaSqlGenerationTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmBatchSize, knowledgeRootDir, wikiCompilerModelId, wikiGbrainEmbeddingModelId, wikiGbrainThinkModelId, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, toolContextEnabled, immediateToolCompactionEnabled, singleToolTriggerTokens, backgroundMinResultTokens, keepRecentToolResults, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, rubricMaxStagnantRepairs, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, sandboxMode, dockerConnection, dockerContext, dockerUseCustomImage, dockerImage, dockerCpuLimit, dockerMemoryLimitMb, dockerPidsLimit, dockerNetworkEnabled, dockerDependencySetupEnabled, subagentItems, showToast]);
+  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaResultMaterializationRowCap, dbQaQueryTimeoutSeconds, dbQaSqlGenerationTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, dbQaAgentSqlPathEnabled, dbQaAgentSqlRolloutPercentage, dbQaAgentSqlFallbackEnabled, dbQaAgentSqlShadowCompareEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmBatchSize, knowledgeRootDir, wikiCompilerModelId, wikiGbrainEmbeddingModelId, wikiGbrainThinkModelId, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, toolContextEnabled, immediateToolCompactionEnabled, singleToolTriggerTokens, backgroundMinResultTokens, keepRecentToolResults, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, rubricMaxStagnantRepairs, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, sandboxMode, dockerConnection, dockerContext, dockerUseCustomImage, dockerImage, dockerCpuLimit, dockerMemoryLimitMb, dockerPidsLimit, dockerNetworkEnabled, dockerDependencySetupEnabled, subagentItems, showToast]);
 
   const handleDatabaseModeChange = useCallback((mode: "bundled" | "external") => {
     setDatabaseMode(mode);
@@ -2453,6 +2470,43 @@ export default function SettingsPage() {
                       value={dbQaMaxCellCharsForLlm}
                       onChange={setDbQaMaxCellCharsForLlm}
                     />
+                  </div>
+                </SettingsCard>
+                <SettingsCard title="Agent SQL 路径灰度" icon={Route} color="#7c3aed">
+                  <div className="rounded-xl border border-violet-100 bg-violet-50/60 px-3.5 py-3 text-[10px] leading-4 text-violet-700">
+                    新路径默认关闭。开启后按<strong>模型、Run、Session 的稳定哈希</strong>灰度，业务歧义、越权和缺失证据不会自动切回旧路径。
+                  </div>
+                  <ToggleRow
+                    label="启用 Agent SQL 路径"
+                    description="启用 evidence search → Agent SQL → 独立 Validator → Receipt 执行链。"
+                    checked={dbQaAgentSqlPathEnabled}
+                    onChange={setDbQaAgentSqlPathEnabled}
+                  />
+                  <div className="grid gap-4 md:grid-cols-2">
+                    <DatabaseQaParameterField
+                      label="灰度比例"
+                      description="0 表示不放量，100 表示所有符合条件的 Run。"
+                      unit="%"
+                      value={dbQaAgentSqlRolloutPercentage}
+                      onChange={setDbQaAgentSqlRolloutPercentage}
+                      disabled={!dbQaAgentSqlPathEnabled}
+                    />
+                    <div className="space-y-3 rounded-xl border border-violet-100 bg-violet-50/30 px-3.5 py-3">
+                      <ToggleRow
+                        label="允许基础设施 fallback"
+                        description="仅 evidence search 基础设施故障等明确可靠性错误允许切回 legacy generator。"
+                        checked={dbQaAgentSqlFallbackEnabled}
+                        onChange={setDbQaAgentSqlFallbackEnabled}
+                        disabled={!dbQaAgentSqlPathEnabled}
+                      />
+                      <ToggleRow
+                        label="记录 shadow compare 请求"
+                        description="记录新旧路径对比所需的 case/指标，不改变 Agent 路径的执行结果。"
+                        checked={dbQaAgentSqlShadowCompareEnabled}
+                        onChange={setDbQaAgentSqlShadowCompareEnabled}
+                        disabled={!dbQaAgentSqlPathEnabled}
+                      />
+                    </div>
                   </div>
                 </SettingsCard>
                   </>

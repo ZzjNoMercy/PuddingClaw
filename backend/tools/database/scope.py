@@ -15,6 +15,8 @@ from knowledge.database_sources import (
 async def resolve_database_source_scope(
     database_source_id: str | None,
     table_names: list[str] | None,
+    *,
+    enforce_selected_tables: bool = True,
 ) -> tuple[Any, dict[str, Any], list[str]]:
     sessionmaker = get_sessionmaker()
     async with sessionmaker() as session:
@@ -28,7 +30,13 @@ async def resolve_database_source_scope(
         source = await get_database_source(session, source_id)
 
     selected_tables = database_source_selected_tables(source)
-    allowed_tables = [str(item).strip() for item in (table_names or []) if str(item).strip()] or selected_tables
+    requested_tables = [str(item).strip() for item in (table_names or []) if str(item).strip()]
+    if enforce_selected_tables and requested_tables:
+        selected_scopes = {normalize_table_scope(item) for item in selected_tables}
+        requested_scopes = {normalize_table_scope(item) for item in requested_tables}
+        if not requested_scopes.issubset(selected_scopes):
+            raise RuntimeError("请求表范围超出数据源 selected_tables。")
+    allowed_tables = requested_tables or selected_tables
     if not allowed_tables:
         raise RuntimeError("当前数据源没有 selected_tables，请传入 table_names 或先在数据资产里选择表。")
 

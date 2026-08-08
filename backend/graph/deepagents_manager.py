@@ -3358,7 +3358,9 @@ class DeepAgentsAgentManager:
                     for key, value in request_updates.items():
                         setattr(tool, key, value)
             elif getattr(tool, "name", "") in {
+                "database_evidence_search",
                 "database_sql_generate",
+                "database_sql_validate_legacy",
                 "database_sql_validate",
                 "database_sql_execute",
                 "database_schema_inspect",

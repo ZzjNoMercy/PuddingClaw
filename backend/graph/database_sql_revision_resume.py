@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import time
 import uuid
 from dataclasses import dataclass
@@ -33,6 +34,21 @@ class RegisteredDatabaseSqlGeneration:
 
 
 @dataclass(slots=True)
+class RegisteredSqlSubmission:
+    id: str
+    session_id: str
+    query_id: str
+    run_id: str
+    goal_id: str
+    goal_revision: int | None
+    sql: str
+    request: dict[str, Any]
+    sql_sha256: str
+    provenance: str = "agent_authored"
+    created_at: float = 0.0
+
+
+@dataclass(slots=True)
 class DatabaseSqlValidationReceipt:
     id: str
     session_id: str
@@ -50,6 +66,17 @@ class DatabaseSqlValidationReceipt:
     validator_version: str = "readonly+semantic-guardrails/v2"
     verified_plan: dict[str, Any] | None = None
     created_at: float = 0.0
+    submission_id: str = ""
+    provenance: str = "legacy_generation"
+    trusted_question_sha256: str = ""
+    analytics_model_id: str = ""
+    analytics_model_revision: str = ""
+    semantic_context_hash: str = ""
+    route_hash: str = ""
+    evidence_search_id: str = ""
+    schema_evidence_receipt_ids: list[str] | None = None
+    profile_revisions: list[str] | None = None
+    permission_epoch: int = 1
 
 
 def _sql_sha256(sql: str) -> str:
@@ -59,11 +86,89 @@ def _sql_sha256(sql: str) -> str:
 class DatabaseSqlRevisionResumeRegistry:
     def __init__(self) -> None:
         self._generations: dict[str, RegisteredDatabaseSqlGeneration] = {}
+        self._submissions: dict[str, RegisteredSqlSubmission] = {}
         self._validation_receipts: dict[str, DatabaseSqlValidationReceipt] = {}
         self._execution_attestations: dict[str, dict[str, Any]] = {}
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._requests: dict[str, dict[str, Any]] = {}
         self._revision_keys: dict[tuple[str, str, str, str, str], str] = {}
+
+    def register_submission(
+        self,
+        *,
+        session_id: str,
+        query_id: str,
+        sql: str,
+        request: dict[str, Any],
+        run_id: str = "",
+        goal_id: str = "",
+        goal_revision: int | None = None,
+    ) -> RegisteredSqlSubmission:
+        submission_id = f"sql-submission-{uuid.uuid4().hex[:12]}"
+        submission = RegisteredSqlSubmission(
+            id=submission_id,
+            session_id=session_id,
+            query_id=query_id,
+            run_id=run_id,
+            goal_id=goal_id,
+            goal_revision=goal_revision,
+            sql=sql,
+            request=dict(request),
+            sql_sha256=_sql_sha256(sql),
+            created_at=time.time(),
+        )
+        self._submissions[submission_id] = submission
+        if session_id:
+            try:
+                from graph.session_manager import session_manager
+
+                if session_manager.is_initialized:
+                    session_manager.record_sql_submission(
+                        session_id,
+                        submission_id,
+                        self._serialize_submission(submission),
+                    )
+            except (FileNotFoundError, RuntimeError, ValueError):
+                pass
+        return submission
+
+    def get_submission(
+        self,
+        submission_id: str,
+        *,
+        session_id: str = "",
+        query_id: str = "",
+        run_id: str = "",
+        goal_id: str = "",
+        goal_revision: int | None = None,
+    ) -> RegisteredSqlSubmission | None:
+        if session_id and not (run_id or goal_id):
+            return None
+        submission = self._submissions.get(submission_id)
+        if submission is None and session_id:
+            try:
+                from graph.session_manager import session_manager
+
+                payload = session_manager.get_sql_submission(session_id, submission_id) if session_manager.is_initialized else None
+                if isinstance(payload, dict):
+                    submission = self._deserialize_submission(payload)
+                    self._submissions[submission_id] = submission
+            except (FileNotFoundError, RuntimeError, ValueError):
+                submission = None
+        if submission is None or (session_id and submission.session_id != session_id):
+            return None
+        if query_id and submission.query_id != query_id:
+            return None
+        if not self._scope_matches(
+            submission.run_id,
+            submission.goal_id,
+            submission.goal_revision,
+            run_id=run_id,
+            goal_id=goal_id,
+            goal_revision=goal_revision,
+        ):
+            return None
+        return submission
 
     def register_generation(
         self,
@@ -115,6 +220,7 @@ class DatabaseSqlRevisionResumeRegistry:
         generation_id: str,
         *,
         session_id: str = "",
+        query_id: str = "",
         run_id: str = "",
         goal_id: str = "",
         goal_revision: int | None = None,
@@ -137,6 +243,8 @@ class DatabaseSqlRevisionResumeRegistry:
         if generation is None:
             return None
         if session_id and generation.session_id and generation.session_id != session_id:
+            return None
+        if query_id and generation.query_id != query_id:
             return None
         if not self._scope_matches(
             generation.run_id,
@@ -169,14 +277,17 @@ class DatabaseSqlRevisionResumeRegistry:
                 item
                 for item in self._generations.values()
                 if item.created_at >= created_after
-                and self.get_generation(
-                    item.id,
-                    session_id=session_id,
-                    run_id=run_id,
-                    goal_id=goal_id,
-                    goal_revision=goal_revision,
+                and item.session_id == session_id
+                and (
+                    (not run_id and not goal_id)
+                    or
+                    (bool(run_id) and item.run_id == run_id and not item.goal_id)
+                    or (
+                        bool(goal_id)
+                        and item.goal_id == goal_id
+                        and int(item.goal_revision or 1) == int(goal_revision or 1)
+                    )
                 )
-                is not None
             ),
             key=lambda item: item.created_at,
         )
@@ -300,11 +411,79 @@ class DatabaseSqlRevisionResumeRegistry:
                 pass
         return receipt
 
+    def register_agent_validation_receipt(
+        self,
+        *,
+        submission: RegisteredSqlSubmission,
+        database_source_id: str,
+        allowed_tables: list[str],
+        metadata: dict[str, Any],
+    ) -> DatabaseSqlValidationReceipt:
+        digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "submission_id": submission.id,
+                    "sql_sha256": submission.sql_sha256,
+                    "database_source_id": database_source_id,
+                    "allowed_tables": sorted(set(allowed_tables)),
+                    "metadata": metadata,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode()
+        ).hexdigest()[:20]
+        receipt = DatabaseSqlValidationReceipt(
+            id=f"sql-validation-v2-{digest}",
+            session_id=submission.session_id,
+            query_id=submission.query_id,
+            run_id=submission.run_id,
+            goal_id=submission.goal_id,
+            goal_revision=submission.goal_revision,
+            generation_id="",
+            submission_id=submission.id,
+            sql_sha256=submission.sql_sha256,
+            database_source_id=database_source_id,
+            allowed_tables=sorted(set(allowed_tables)),
+            semantic_validation_status=str(metadata.get("semantic_validation_status") or "advisory"),
+            semantic_guardrail_ids=list(metadata.get("semantic_guardrail_ids") or []),
+            semantic_evidence_refs=list(metadata.get("semantic_evidence_refs") or []),
+            validator_version="readonly+authorization/agent-submission-v3",
+            verified_plan=None,
+            created_at=time.time(),
+            provenance="agent_authored",
+            trusted_question_sha256=str(metadata.get("trusted_question_sha256") or ""),
+            analytics_model_id=str(metadata.get("analytics_model_id") or ""),
+            analytics_model_revision=str(metadata.get("analytics_model_revision") or ""),
+            semantic_context_hash=str(metadata.get("semantic_context_hash") or ""),
+            route_hash=str(metadata.get("route_hash") or ""),
+            evidence_search_id=str(metadata.get("evidence_search_id") or ""),
+            schema_evidence_receipt_ids=list(metadata.get("schema_evidence_receipt_ids") or []),
+            profile_revisions=list(metadata.get("profile_revisions") or []),
+            permission_epoch=max(1, int(metadata.get("permission_epoch") or 1)),
+        )
+        self._validation_receipts[receipt.id] = receipt
+        if receipt.session_id:
+            try:
+                from graph.session_manager import session_manager
+
+                if session_manager.is_initialized:
+                    session_manager.record_sql_validation_receipt(
+                        receipt.session_id,
+                        receipt.id,
+                        self._serialize_validation_receipt(receipt),
+                    )
+            except (FileNotFoundError, RuntimeError, ValueError):
+                pass
+        return receipt
+
     def get_validation_receipt(
         self,
         receipt_id: str,
         *,
         session_id: str,
+        query_id: str = "",
         run_id: str = "",
         goal_id: str = "",
         goal_revision: int | None = None,
@@ -343,11 +522,24 @@ class DatabaseSqlRevisionResumeRegistry:
                             else None
                         ),
                         created_at=float(payload.get("created_at") or 0),
+                        submission_id=str(payload.get("submission_id") or ""),
+                        provenance=str(payload.get("provenance") or "legacy_generation"),
+                        trusted_question_sha256=str(payload.get("trusted_question_sha256") or ""),
+                        analytics_model_id=str(payload.get("analytics_model_id") or ""),
+                        analytics_model_revision=str(payload.get("analytics_model_revision") or ""),
+                        semantic_context_hash=str(payload.get("semantic_context_hash") or ""),
+                        route_hash=str(payload.get("route_hash") or ""),
+                        evidence_search_id=str(payload.get("evidence_search_id") or ""),
+                        schema_evidence_receipt_ids=list(payload.get("schema_evidence_receipt_ids") or []),
+                        profile_revisions=list(payload.get("profile_revisions") or []),
+                        permission_epoch=max(1, int(payload.get("permission_epoch") or 1)),
                     )
                     self._validation_receipts[receipt.id] = receipt
             except (FileNotFoundError, RuntimeError, ValueError):
                 receipt = None
         if receipt is None or receipt.session_id != session_id:
+            return None
+        if query_id and receipt.query_id != query_id:
             return None
         if not self._scope_matches(
             receipt.run_id,
@@ -357,6 +549,29 @@ class DatabaseSqlRevisionResumeRegistry:
             goal_id=goal_id,
             goal_revision=goal_revision,
         ):
+            return None
+        return receipt
+
+    def get_submission_validation_receipt(
+        self,
+        receipt_id: str,
+        *,
+        session_id: str,
+        submission_id: str,
+        query_id: str = "",
+        run_id: str = "",
+        goal_id: str = "",
+        goal_revision: int | None = None,
+    ) -> DatabaseSqlValidationReceipt | None:
+        receipt = self.get_validation_receipt(
+            receipt_id,
+            session_id=session_id,
+            query_id=query_id,
+            run_id=run_id,
+            goal_id=goal_id,
+            goal_revision=goal_revision,
+        )
+        if receipt is None or receipt.provenance != "agent_authored" or receipt.submission_id != submission_id:
             return None
         return receipt
 
@@ -376,14 +591,17 @@ class DatabaseSqlRevisionResumeRegistry:
                 item
                 for item in self._validation_receipts.values()
                 if item.created_at >= created_after
-                and self.get_validation_receipt(
-                    item.id,
-                    session_id=session_id,
-                    run_id=run_id,
-                    goal_id=goal_id,
-                    goal_revision=goal_revision,
+                and item.session_id == session_id
+                and (
+                    (not run_id and not goal_id)
+                    or
+                    (bool(run_id) and item.run_id == run_id and not item.goal_id)
+                    or (
+                        bool(goal_id)
+                        and item.goal_id == goal_id
+                        and int(item.goal_revision or 1) == int(goal_revision or 1)
+                    )
                 )
-                is not None
             ),
             key=lambda item: item.created_at,
         )
@@ -473,6 +691,34 @@ class DatabaseSqlRevisionResumeRegistry:
                 pass
         return dict(attestation)
 
+    def attest_submission_execution(
+        self,
+        *,
+        receipt: DatabaseSqlValidationReceipt,
+        submission: RegisteredSqlSubmission,
+        row_count: int,
+    ) -> dict[str, Any]:
+        attestation = {
+            "id": f"sql-execution-{receipt.id.removeprefix('sql-validation-v2-')}",
+            "session_id": receipt.session_id,
+            "validation_receipt_id": receipt.id,
+            "submission_id": submission.id,
+            "sql_sha256": submission.sql_sha256,
+            "status": "executed",
+            "row_count": int(row_count),
+            "executed_at": time.time(),
+        }
+        self._execution_attestations[receipt.id] = dict(attestation)
+        if receipt.session_id:
+            try:
+                from graph.session_manager import session_manager
+
+                if session_manager.is_initialized:
+                    session_manager.record_sql_execution_attestation(receipt.session_id, receipt.id, attestation)
+            except (FileNotFoundError, RuntimeError, ValueError):
+                pass
+        return dict(attestation)
+
     @staticmethod
     def _serialize_validation_receipt(
         receipt: DatabaseSqlValidationReceipt,
@@ -494,7 +740,50 @@ class DatabaseSqlRevisionResumeRegistry:
             "validator_version": receipt.validator_version,
             "verified_plan": dict(receipt.verified_plan or {}),
             "created_at": receipt.created_at,
+            "submission_id": receipt.submission_id,
+            "provenance": receipt.provenance,
+            "trusted_question_sha256": receipt.trusted_question_sha256,
+            "analytics_model_id": receipt.analytics_model_id,
+            "analytics_model_revision": receipt.analytics_model_revision,
+            "semantic_context_hash": receipt.semantic_context_hash,
+            "route_hash": receipt.route_hash,
+            "evidence_search_id": receipt.evidence_search_id,
+            "schema_evidence_receipt_ids": list(receipt.schema_evidence_receipt_ids or []),
+            "profile_revisions": list(receipt.profile_revisions or []),
+            "permission_epoch": receipt.permission_epoch,
         }
+
+    @staticmethod
+    def _serialize_submission(submission: RegisteredSqlSubmission) -> dict[str, Any]:
+        return {
+            "id": submission.id,
+            "session_id": submission.session_id,
+            "query_id": submission.query_id,
+            "run_id": submission.run_id,
+            "goal_id": submission.goal_id,
+            "goal_revision": submission.goal_revision,
+            "sql": submission.sql,
+            "request": dict(submission.request),
+            "sql_sha256": submission.sql_sha256,
+            "provenance": submission.provenance,
+            "created_at": submission.created_at,
+        }
+
+    @staticmethod
+    def _deserialize_submission(payload: dict[str, Any]) -> RegisteredSqlSubmission:
+        return RegisteredSqlSubmission(
+            id=str(payload["id"]),
+            session_id=str(payload.get("session_id") or ""),
+            query_id=str(payload.get("query_id") or ""),
+            run_id=str(payload.get("run_id") or ""),
+            goal_id=str(payload.get("goal_id") or ""),
+            goal_revision=payload.get("goal_revision"),
+            sql=str(payload.get("sql") or ""),
+            request=dict(payload.get("request") or {}),
+            sql_sha256=str(payload.get("sql_sha256") or ""),
+            provenance=str(payload.get("provenance") or "agent_authored"),
+            created_at=float(payload.get("created_at") or 0),
+        )
 
     def create_revision_request(
         self,
