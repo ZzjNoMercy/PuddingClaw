@@ -12,7 +12,20 @@ import { exitCodeForResponse, writeDiagnostic, writeJson } from "./output.js";
 const VERSION = "0.2.0";
 const CAPABILITIES = ["data.query", "data.analysis", "data.nl2sql", "knowledge.query"];
 
-async function ensureWorkspace() {
+async function ensureWorkspace(workspacePath) {
+  if (workspacePath !== undefined) {
+    if (typeof workspacePath !== "string" || !workspacePath.trim() || !path.isAbsolute(workspacePath)) {
+      throw new WorkerClientError("workspace_path must be an absolute host path", { code: "argument_error" });
+    }
+    const resolved = path.resolve(workspacePath);
+    try {
+      const stat = await fs.stat(resolved);
+      if (!stat.isDirectory()) throw new Error("not a directory");
+    } catch (error) {
+      throw new WorkerClientError(`workspace_path is unavailable: ${resolved}`, { code: error?.code === "ENOENT" ? "argument_error" : "configuration_error" });
+    }
+    return resolved;
+  }
   const root = String(process.env.PUDDINGCLAW_PROJECTS_ROOT || os.homedir());
   const target = path.resolve(root, "puddingclaw");
   const rootResolved = path.resolve(root);
@@ -140,11 +153,11 @@ function validateExportDir(value) {
   return path.resolve(clean);
 }
 
-async function exportArtifacts(response, exportDir) {
+async function exportArtifacts(response, exportDir, workspaceRoot) {
   const target = validateExportDir(exportDir);
   if (!target) return response;
   const artifacts = Array.isArray(response?.artifacts) ? response.artifacts : [];
-  const projectRoot = path.resolve(String(process.env.PUDDINGCLAW_PROJECTS_ROOT || os.homedir()), "puddingclaw");
+  const projectRoot = path.resolve(workspaceRoot || path.resolve(String(process.env.PUDDINGCLAW_PROJECTS_ROOT || os.homedir()), "puddingclaw"));
   await fs.mkdir(target, { recursive: true, mode: 0o700 });
   const exported = [];
   const skipped = [];
@@ -280,11 +293,14 @@ async function runCommand(args) {
   if (input?.model !== undefined || input?.analytics_model_id !== undefined) {
     throw new WorkerClientError("model input is not supported; PuddingClaw routes the question on the backend", { code: "argument_error" });
   }
+  if (input?.workspace_path !== undefined && typeof input.workspace_path !== "string") {
+    throw new WorkerClientError("workspace_path must be an absolute host path", { code: "argument_error" });
+  }
   if (flags.session !== undefined && inputSession !== undefined && String(flags.session) !== String(inputSession)) {
     throw new WorkerClientError("--session conflicts with stdin session_id", { code: "argument_error" });
   }
   const sessionId = flags.session ?? inputSession;
-  await ensureWorkspace();
+  const workspacePath = await ensureWorkspace(input?.workspace_path);
   const client = new WorkerClient(config());
   const controller = new AbortController();
   const onSignal = () => controller.abort();
@@ -293,6 +309,7 @@ async function runCommand(args) {
     const body = {
       message: String(message),
       ...(sessionId ? { session_id: String(sessionId) } : {}),
+      ...(input?.workspace_path !== undefined ? { workspace_path: workspacePath } : {}),
       ...(input?.metadata && typeof input.metadata === "object" ? { metadata: input.metadata } : {}),
       ...(input?.request_id ? { request_id: String(input.request_id) } : {}),
     };
@@ -306,7 +323,7 @@ async function runCommand(args) {
           if (event?.event !== "result") writeJson(event);
         },
       });
-      response = await exportArtifacts(response, flags.exportDir);
+      response = await exportArtifacts(response, flags.exportDir, workspacePath);
       writeJson({ event: "result", data: response });
       return exitCodeForResponse(response);
     }
@@ -317,7 +334,7 @@ async function runCommand(args) {
       asJson: Boolean(flags.json || flags.jsonl),
       signal: controller.signal,
     });
-    response = await exportArtifacts(response, flags.exportDir);
+    response = await exportArtifacts(response, flags.exportDir, workspacePath);
     emit(response, Boolean(flags.json || flags.jsonl));
     return exitCodeForResponse(response);
   } finally { process.removeListener("SIGINT", onSignal); }
@@ -335,6 +352,9 @@ async function respondCommand(args) {
   if (!Array.isArray(input.decisions) || input.decisions.length === 0) {
     throw new WorkerClientError("decisions must be a non-empty array", { code: "protocol_error" });
   }
+  if (input.workspace_path !== undefined && typeof input.workspace_path !== "string") {
+    throw new WorkerClientError("workspace_path must be an absolute host path", { code: "argument_error" });
+  }
   for (const decision of input.decisions) {
     if (!decision || typeof decision !== "object" || typeof decision.request_id !== "string"
       || !["approve", "reject"].includes(String(decision.decision))
@@ -342,16 +362,18 @@ async function respondCommand(args) {
       throw new WorkerClientError("decisions must contain request_id, decision and scope", { code: "protocol_error" });
     }
   }
+  const workspacePath = await ensureWorkspace(input.workspace_path);
   const client = new WorkerClient(config());
   const body = {
     continuation_token: input.continuation_token,
     decisions: input.decisions,
+    ...(input.workspace_path !== undefined ? { workspace_path: workspacePath } : {}),
     ...(input.request_id ? { request_id: String(input.request_id) } : {}),
   };
   let response = await client.request(`/api/headless/runs/${encodeURIComponent(runId)}/resume`, {
     method: "POST", body,
   });
-  response = await exportArtifacts(response, flags.exportDir);
+  response = await exportArtifacts(response, flags.exportDir, workspacePath);
   emit(response, Boolean(flags.json || flags.jsonl));
   return exitCodeForResponse(response);
 }

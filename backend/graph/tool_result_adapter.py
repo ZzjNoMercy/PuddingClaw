@@ -39,6 +39,14 @@ class ToolResultAdapter:
         tool_input: str = "",
         tool_call_id: str = "",
     ) -> AdaptedToolResult:
+        # A real browser may contain private, authenticated, or user-entered
+        # material. Never promote its output into public citation sources,
+        # even if the page happens to contain URLs or a daemon returns an
+        # envelope that resembles a retrieval result.
+        if tool_name == "browser":
+            answer_context, _sources = parse_tool_result(raw_output, tool_call_id)
+            return AdaptedToolResult(answer_context or raw_output, [], "browser_private")
+
         # 1. Explicit PuddingClaw envelope: highest-trust contract.
         answer_context, sources = parse_tool_result(raw_output, tool_call_id)
         if sources or answer_context != raw_output:

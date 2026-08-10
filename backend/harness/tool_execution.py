@@ -16,11 +16,12 @@ import re
 import shlex
 import stat
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from contextlib import nullcontext
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ToolCallRequest, hook_config
@@ -34,7 +35,13 @@ from graph.permission_resume import permission_resume_registry
 from graph.session_manager import session_manager
 from graph.skill_plan_resume import skill_plan_resume_registry
 from graph.virtual_paths import PathAuthority, classify_path_authority
-from harness.execution_context import AuthorizedExecution, bind_authorized_execution
+from harness.execution_context import (
+    AuthorizedBrowserAction,
+    AuthorizedExecution,
+    bind_authorized_browser_action,
+    bind_authorized_execution,
+    browser_action_digest,
+)
 from harness.execution_permits import ExecutionPermit
 from harness.permission_reviewer import PermissionReviewer
 from harness.sandbox_profiles import SandboxGrantProfile
@@ -74,6 +81,13 @@ class ShellCapabilities:
 
 
 @dataclass(frozen=True)
+class _ManagedCliPolicyProjection:
+    adapter_id: str
+    requires_network: bool
+    workspace_writable: bool = False
+
+
+@dataclass(frozen=True)
 class FilesystemIntent:
     """One statically proven external filesystem effect."""
 
@@ -92,6 +106,7 @@ class ExecutionRequirements:
     opaque_reason: str = ""
     execution_command: str = ""
     external_path_candidates: tuple[str, ...] = ()
+    environment_binding_digest: str = ""
 
     @property
     def digest(self) -> str:
@@ -110,6 +125,7 @@ class ExecutionRequirements:
             "opaque_reason": self.opaque_reason,
             "execution_command": self.execution_command,
             "external_path_candidates": list(self.external_path_candidates),
+            "environment_binding_digest": self.environment_binding_digest,
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return "sha256:" + hashlib.sha256(encoded).hexdigest()
@@ -514,10 +530,7 @@ class ShellPolicyAnalyzer:
                         raw_path,
                         workspace_root=workspace_path,
                     )
-                    if (
-                        classified.authority is PathAuthority.EXTERNAL
-                        and classified.canonical_host_path is not None
-                    ):
+                    if classified.authority is PathAuthority.EXTERNAL and classified.canonical_host_path is not None:
                         candidates.append(str(classified.canonical_host_path))
         return tuple(dict.fromkeys(candidates))
 
@@ -562,10 +575,7 @@ class ShellPolicyAnalyzer:
             # application-specific target.  Leave that form opaque so the
             # authority preflight derives a conservative directory prompt for
             # every external path instead of silently omitting one.
-            if any(
-                Path(arg).expanduser().is_absolute()
-                for arg in tokens[script_index + 1 :]
-            ):
+            if any(Path(arg).expanduser().is_absolute() for arg in tokens[script_index + 1 :]):
                 return "unsupported_command_grammar"
             return ([(tokens[script_index], "read")], [script_index])
         short_options = {
@@ -578,7 +588,19 @@ class ShellPolicyAnalyzer:
             "cp": frozenset({"--archive", "--recursive", "--preserve", "--force", "--no-clobber", "--verbose"}),
             "mv": frozenset({"--force", "--no-clobber", "--verbose"}),
             "mkdir": frozenset({"--parents", "--verbose"}),
-            "ls": frozenset({"--all", "--almost-all", "--long", "--classify", "--directory", "--inode", "--human-readable", "--reverse", "--recursive"}),
+            "ls": frozenset(
+                {
+                    "--all",
+                    "--almost-all",
+                    "--long",
+                    "--classify",
+                    "--directory",
+                    "--inode",
+                    "--human-readable",
+                    "--reverse",
+                    "--recursive",
+                }
+            ),
         }
         if executable not in short_options:
             return "unsupported_command_grammar"
@@ -682,16 +704,24 @@ class ShellPolicyAnalyzer:
         return cls._unwrap(tokens)
 
     @staticmethod
-    def _lark_cli_requires_network(tokens: list[str]) -> bool:
-        """Keep purely local CLI discovery offline; all real actions need net."""
+    def _managed_cli_match(tokens: list[str]):
+        """Classify built-in managed CLIs through the same Adapter boundary."""
 
-        lowered = [item.lower() for item in tokens[1:]]
-        if not lowered:
-            return False
-        return not (
-            any(item in {"-h", "--help"} for item in lowered)
-            or lowered[0] in {"help", "version", "--version", "schema"}
-        )
+        registry = ManagedCliRegistry()
+        surface = shlex.join(tokens)
+        try:
+            return registry.match(surface)
+        except UnsupportedManagedCliCommand:
+            if registry.claims(surface):
+                # Claimed-but-invalid managed syntax must never look like an
+                # offline opaque command to the legacy shell analyzer. The
+                # managed preflight will reject it at the authoritative edge;
+                # this conservative projection only prevents policy downgrade.
+                return _ManagedCliPolicyProjection(
+                    adapter_id=Path(tokens[0]).name.lower(),
+                    requires_network=True,
+                )
+            return None
 
     @classmethod
     def network_intent(cls, command: str) -> NetworkIntent:
@@ -715,14 +745,15 @@ class ShellPolicyAnalyzer:
         if not tokens:
             return NetworkIntent(required=True, remote_effect="unknown", transport_profile="opaque")
         executable = Path(tokens[0]).name.lower()
-        if executable == "lark-cli":
+        managed_match = cls._managed_cli_match(tokens)
+        if managed_match is not None:
             lowered = [item.lower() for item in tokens[1:]]
             effect = "auth" if lowered[:1] in (["auth"], ["config"]) else "unknown"
             return NetworkIntent(
-                required=True,
+                required=managed_match.requires_network,
                 target_known=False,
                 remote_effect=effect,
-                transport_profile="declared_cli:lark",
+                transport_profile=f"declared_cli:{managed_match.adapter_id}",
             )
         if executable != "curl":
             return NetworkIntent(required=True, remote_effect="unknown", transport_profile="opaque")
@@ -863,11 +894,10 @@ class ShellPolicyAnalyzer:
                 network = True
                 if executable == "wget" or (executable == "curl" and cls._curl_writes_material_output(tokens)):
                     workspace_write = True
-            if executable == "lark-cli" and cls._lark_cli_requires_network(tokens):
-                # Routing and authorization are intentionally separate.  This
-                # marks every non-local lark action for the one-shot network
-                # container without claiming the action itself is safe.
-                network = True
+            managed_match = cls._managed_cli_match(tokens)
+            if managed_match is not None:
+                network = network or managed_match.requires_network
+                workspace_write = workspace_write or managed_match.workspace_writable
             if executable in _DESTRUCTIVE_OR_WRITE_COMMANDS:
                 workspace_write = True
             if executable == "rm" and any(
@@ -1312,16 +1342,17 @@ class ShellPolicyAnalyzer:
                 f"network_access:{command}",
                 "network",
             )
-        if command == "lark-cli":
-            if not self._lark_cli_requires_network(tokens):
+        managed_match = self._managed_cli_match(tokens)
+        if managed_match is not None:
+            if not managed_match.requires_network:
                 return ToolPolicyResult(
                     PolicyDecision.ALLOW,
-                    "declared_cli_local_inspection:lark-cli",
+                    f"declared_cli_local_inspection:{managed_match.adapter_id}",
                     "low",
                 )
             return ToolPolicyResult(
                 PolicyDecision.ASK,
-                "network_access:lark-cli",
+                f"network_access:{managed_match.adapter_id}",
                 "network",
             )
         if command in _PACKAGE_COMMANDS:
@@ -1679,6 +1710,24 @@ class ToolExecutionPipeline(AgentMiddleware):
         )
 
     @staticmethod
+    def _permission_resume_decision(value: Any) -> Any:
+        """Normalize LangGraph's permission resume envelope.
+
+        Permission interrupts use the standard ``{"decisions": [...]}``
+        payload when resumed through the streaming coordinator. Direct unit
+        callers historically returned the sole decision object itself. Both
+        forms describe the same one-action approval and must reach the exact
+        suspended middleware frame with identical semantics.
+        """
+
+        if not isinstance(value, dict) or "decisions" not in value:
+            return value
+        decisions = value.get("decisions")
+        if not isinstance(decisions, list) or len(decisions) != 1 or not isinstance(decisions[0], dict):
+            return value
+        return decisions[0]
+
+    @staticmethod
     def _external_authority_requirements(
         requirements: ExecutionRequirements,
     ) -> ExecutionRequirements:
@@ -1701,8 +1750,7 @@ class ToolExecutionPipeline(AgentMiddleware):
         return ExecutionRequirements(
             capabilities=requirements.capabilities,
             filesystem_intents=tuple(
-                FilesystemIntent(path=path, access=access)
-                for path in requirements.external_path_candidates
+                FilesystemIntent(path=path, access=access) for path in requirements.external_path_candidates
             ),
             shell_access_required=bool(requirements.external_path_candidates),
             external_path_candidates=requirements.external_path_candidates,
@@ -1788,12 +1836,11 @@ class ToolExecutionPipeline(AgentMiddleware):
                 "decisions": [{"type": "approve"}, {"type": "reject"}],
             }
         )
+        resume_value = self._permission_resume_decision(resume_value)
         # LangGraph resumes at the exact interrupt call site; it does not
         # replay this middleware from the top. Trust only newly persisted
         # authority, never the client-provided resume payload by itself.
-        resumed_grants, resumed_revision = session_manager.permission_grants_snapshot(
-            session_id
-        )
+        resumed_grants, resumed_revision = session_manager.permission_grants_snapshot(session_id)
         resumed_effective = EffectiveGrantSet.resolve(
             resumed_grants,
             run_id=run_id,
@@ -1804,11 +1851,7 @@ class ToolExecutionPipeline(AgentMiddleware):
         try:
             SelectedGrantSet.select(resumed_effective, authority_requirements)
         except PermissionError:
-            decision = (
-                str(resume_value.get("type") or "")
-                if isinstance(resume_value, dict)
-                else ""
-            )
+            decision = str(resume_value.get("type") or "") if isinstance(resume_value, dict) else ""
             detail = "rejected" if decision == "reject" else "not persisted"
             return ToolMessage(
                 content=f"External shell authority was {detail} after resume.",
@@ -1844,11 +1887,18 @@ class ToolExecutionPipeline(AgentMiddleware):
         requirements = ShellPolicyAnalyzer.requirements(command, workspace_path=workspace)
         session_id = str(context.get("session_id") or "")
         run_id = str(context.get("run_id") or "")
-        grants, revision = (
-            session_manager.permission_grants_snapshot(session_id)
-            if session_id
-            else ([], 0)
+        active_skill_ids = tuple(
+            dict.fromkeys(
+                str(item.get("skill_id") or "")
+                for item in (
+                    session_manager.get_effective_run_skill_activations(session_id, run_id)
+                    if session_id and run_id
+                    else []
+                )
+                if str(item.get("skill_id") or "")
+            )
         )
+        grants, revision = session_manager.permission_grants_snapshot(session_id) if session_id else ([], 0)
         effective = EffectiveGrantSet.resolve(
             grants,
             run_id=run_id,
@@ -1862,17 +1912,60 @@ class ToolExecutionPipeline(AgentMiddleware):
             # cannot ride the earlier middleware decision.
             SelectedGrantSet.select(effective, authority_requirements)
         selected = SelectedGrantSet.all_shell_authority(effective)
+        runtime_for_command = getattr(self.workspace_backend, "skill_runtime_for_command", None)
+        explicit_docker_skill = bool(
+            callable(runtime_for_command) and runtime_for_command(command) == "docker"
+        )
         selected_runner = (
             "docker"
             if self.backend_mode == "docker"
             or self.backend_mode == "adaptive"
             and (
-                requirements.capabilities.network
-                or requirements.capabilities.package_install
+                explicit_docker_skill
                 or "/opt/puddingclaw/bin/validate-html-report-e2e.mjs" in command
             )
             else "kernel_macos_seatbelt"
         )
+        runtime_read_roots: tuple[Path, ...] = ()
+        runtime_environment: tuple[tuple[str, str], ...] = ()
+        runtime_secret_values: tuple[str, ...] = ()
+
+        def runtime_environment_current() -> bool:
+            return True
+        if selected_runner == "kernel_macos_seatbelt":
+            prepare_host = getattr(self.workspace_backend, "prepare_host_execution", None)
+            if callable(prepare_host):
+                projection = prepare_host(
+                    command,
+                    active_skill_ids=active_skill_ids,
+                )
+                execution_command, runtime_read_roots = projection
+                runtime_environment = tuple(getattr(projection, "environment", ()) or ())
+                runtime_secret_values = tuple(getattr(projection, "secret_values", ()) or ())
+                runtime_environment_current = getattr(
+                    projection,
+                    "environment_current",
+                    runtime_environment_current,
+                )
+                binding_digest = str(getattr(projection, "environment_binding_digest", "") or "")
+                if execution_command != command or binding_digest:
+                    requirements = replace(
+                        requirements,
+                        execution_command=execution_command,
+                        environment_binding_digest=binding_digest,
+                    )
+        elif explicit_docker_skill:
+            prepare_docker = getattr(self.workspace_backend, "prepare_docker_execution", None)
+            if callable(prepare_docker):
+                projection = prepare_docker(command)
+                execution_command, runtime_read_roots = projection
+                requirements = replace(
+                    requirements,
+                    execution_command=execution_command,
+                    environment_binding_digest=str(
+                        getattr(projection, "environment_binding_digest", "") or ""
+                    ),
+                )
         managed_readonly_roots = (
             tuple(getattr(self.workspace_backend, "managed_readonly_host_roots", ()) or ())
             if selected_runner == "kernel_macos_seatbelt"
@@ -1881,13 +1974,14 @@ class ToolExecutionPipeline(AgentMiddleware):
         profile = SandboxGrantProfile.build(
             workspace_root=workspace,
             scratch_root=scratch,
-            external_read_roots=(*selected.read_roots, *managed_readonly_roots),
+            external_read_roots=(
+                *selected.read_roots,
+                *managed_readonly_roots,
+                *runtime_read_roots,
+            ),
             external_write_roots=selected.write_roots,
             external_delete_roots=selected.delete_roots,
-            network_allowed=(
-                selected_runner == "docker"
-                and requirements.capabilities.network
-            ),
+            network_allowed=requirements.capabilities.network,
         )
         tool_call_id = str(request.tool_call.get("id") or "")
         permit = ExecutionPermit.issue(
@@ -1902,9 +1996,7 @@ class ToolExecutionPipeline(AgentMiddleware):
         def current_revision() -> int:
             if not session_id:
                 return 0
-            _current_grants, current = session_manager.permission_grants_snapshot(
-                session_id
-            )
+            _current_grants, current = session_manager.permission_grants_snapshot(session_id)
             return current
 
         return AuthorizedExecution(
@@ -1913,6 +2005,9 @@ class ToolExecutionPipeline(AgentMiddleware):
             requirements=requirements,
             profile=profile,
             current_permission_revision=current_revision,
+            environment=runtime_environment,
+            secret_values=runtime_secret_values,
+            environment_current=runtime_environment_current,
         )
 
     def _granted_external_shell_fast_path(
@@ -1945,11 +2040,7 @@ class ToolExecutionPipeline(AgentMiddleware):
         executable = Path(tokens[0]).name.lower() if tokens else ""
         if executable not in {"cp", "mv", "mkdir"}:
             return None
-        write_targets = [
-            Path(intent.path)
-            for intent in requirements.filesystem_intents
-            if intent.access == "write"
-        ]
+        write_targets = [Path(intent.path) for intent in requirements.filesystem_intents if intent.access == "write"]
         if not write_targets or any(path.exists() for path in write_targets):
             return None
         grants, revision = session_manager.permission_grants_snapshot(session_id)
@@ -2130,10 +2221,12 @@ class ToolExecutionPipeline(AgentMiddleware):
     ) -> ToolMessage | Command[Any]:
         authorized = self._compile_kernel_execution(request)
         if authorized is None:
-            return await handler(request)
+            with self._browser_authorization_context(request):
+                return await handler(request)
         before = self._shell_mutation_before(authorized)
         with bind_authorized_execution(authorized):
-            result = await handler(request)
+            with self._browser_authorization_context(request):
+                result = await handler(request)
         return self._attach_shell_mutation_evidence(
             result,
             authorized=authorized,
@@ -2147,14 +2240,39 @@ class ToolExecutionPipeline(AgentMiddleware):
     ) -> ToolMessage | Command[Any]:
         authorized = self._compile_kernel_execution(request)
         if authorized is None:
-            return handler(request)
+            with self._browser_authorization_context(request):
+                return handler(request)
         before = self._shell_mutation_before(authorized)
         with bind_authorized_execution(authorized):
-            result = handler(request)
+            with self._browser_authorization_context(request):
+                result = handler(request)
         return self._attach_shell_mutation_evidence(
             result,
             authorized=authorized,
             before=before,
+        )
+
+    @staticmethod
+    def _browser_authorization_context(request: ToolCallRequest):
+        if str(request.tool_call.get("name") or "") != "browser":
+            return nullcontext()
+        args = request.tool_call.get("args") or {}
+        try:
+            from connectors.kimi_webbridge.models import BrowserCommand
+
+            command = BrowserCommand.model_validate(args)
+        except Exception:
+            return nullcontext()
+        runtime = request.runtime.context if request.runtime is not None else {}
+        context = runtime if isinstance(runtime, dict) else {}
+        return bind_authorized_browser_action(
+            AuthorizedBrowserAction(
+                session_id=str(context.get("session_id") or ""),
+                run_id=str(context.get("run_id") or ""),
+                tool_call_id=str(request.tool_call.get("id") or ""),
+                action=command.action,
+                args_digest=browser_action_digest(command.action, command.args),
+            )
         )
 
     @staticmethod
@@ -2613,18 +2731,23 @@ class ToolExecutionPipeline(AgentMiddleware):
         file_path = str(args.get("file_path") or "")
         content = args.get("content")
         if not isinstance(content, str) or Path(file_path).suffix.lower() not in {
-            ".md", ".markdown", ".html", ".htm",
+            ".md",
+            ".markdown",
+            ".html",
+            ".htm",
         }:
             return request
         session_id = str(self._context(request).get("session_id") or "")
         if not session_id:
             return request
-        sources = dedupe_sources([
-            source
-            for message in session_manager.load_session(session_id)
-            for source in message.get("sources", []) or []
-            if isinstance(source, dict)
-        ])
+        sources = dedupe_sources(
+            [
+                source
+                for message in session_manager.load_session(session_id)
+                for source in message.get("sources", []) or []
+                if isinstance(source, dict)
+            ]
+        )
         rendered, report = materialize_artifact_citations(
             content,
             sources,
@@ -2703,11 +2826,10 @@ class ToolExecutionPipeline(AgentMiddleware):
         managed_cli: Any | None = None
         if is_execute and not contains_managed_add:
             try:
-                managed_match = self.managed_cli_registry.match(command)
                 managed_cli = (
-                    self.managed_cli_service.plan(managed_match, self._context(request))
-                    if managed_match is not None and self.managed_cli_service is not None
-                    else managed_match
+                    self.managed_cli_service.plan_command(command, self._context(request))
+                    if self.managed_cli_service is not None
+                    else self.managed_cli_registry.match(command)
                 )
             except UnsupportedManagedCliCommand as exc:
                 # Like Skill Manager ownership, Adapter ownership begins
@@ -2743,9 +2865,10 @@ class ToolExecutionPipeline(AgentMiddleware):
             else self._action_preview(request)
         )
         tool_name = str(request.tool_call.get("name") or "")
+        fingerprint_command = self._permission_fingerprint_command(request, command)
         fingerprint = permission_resume_registry.tool_action_fingerprint(
             tool_name=tool_name,
-            command=command,
+            command=fingerprint_command,
             reason=result.reason,
         )
         session_scope = self._session_grant_scope(request)
@@ -2797,6 +2920,7 @@ class ToolExecutionPipeline(AgentMiddleware):
             run_id=str(context.get("run_id") or ""),
             grant_bindings=self.permission_context.grant_bindings(),
             required_capabilities=required_capabilities,
+            fingerprint_command=fingerprint_command,
             change_preview=self._skill_change_preview(request),
             policy_source=result.source,
             policy_explanation=result.explanation,
@@ -2816,6 +2940,7 @@ class ToolExecutionPipeline(AgentMiddleware):
                 "decisions": [{"type": "approve"}, {"type": "reject"}],
             }
         )
+        decision = self._permission_resume_decision(decision)
         if run_id:
             session_manager.transition_run_status(
                 session_id,
@@ -2859,11 +2984,10 @@ class ToolExecutionPipeline(AgentMiddleware):
         managed_cli: Any | None = None
         if str(request.tool_call.get("name") or "") == "execute":
             try:
-                managed_match = self.managed_cli_registry.match(self._command(request))
                 managed_cli = (
-                    self.managed_cli_service.plan(managed_match, self._context(request))
-                    if managed_match is not None and self.managed_cli_service is not None
-                    else managed_match
+                    self.managed_cli_service.plan_command(self._command(request), self._context(request))
+                    if self.managed_cli_service is not None
+                    else self.managed_cli_registry.match(self._command(request))
                 )
             except UnsupportedManagedCliCommand as exc:
                 return self._managed_cli_rejection(request, str(exc))
@@ -3013,6 +3137,7 @@ class ToolExecutionPipeline(AgentMiddleware):
                 "decisions": [{"type": "approve"}, {"type": "reject"}],
             }
         )
+        decision = self._permission_resume_decision(decision)
         if run_id:
             session_manager.transition_run_status(
                 session_id,
@@ -3055,10 +3180,7 @@ class ToolExecutionPipeline(AgentMiddleware):
                     PolicyDecision.ASK,
                     "mcp_tool_requires_user_approval",
                     "high",
-                    explanation=(
-                        "MCP 工具来自已启用的外部 MCP Server，但没有静态控制描述；"
-                        "首次执行需要用户确认。"
-                    ),
+                    explanation=("MCP 工具来自已启用的外部 MCP Server，但没有静态控制描述；首次执行需要用户确认。"),
                 )
             return ToolPolicyResult(
                 PolicyDecision.DENY,
@@ -3071,8 +3193,70 @@ class ToolExecutionPipeline(AgentMiddleware):
                 "versioned_patch_required: use inspect_file_version then patch_file",
                 "managed_write",
             )
+        if tool_name == "browser":
+            args = request.tool_call.get("args") or {}
+            try:
+                from connectors.kimi_webbridge.models import BrowserCommand
+                from connectors.kimi_webbridge.policy import classify_browser_command, sanitize_action_args
+
+                command = BrowserCommand.model_validate(args)
+                sanitize_action_args(command.action, command.args)
+            except Exception:
+                return ToolPolicyResult(
+                    PolicyDecision.DENY,
+                    "browser_action_invalid_arguments",
+                    "critical",
+                    explanation=(
+                        "browser 动作或参数不符合 WebBridge 契约；快照中的 @e 引用应作为 "
+                        "click/fill 的 args.selector 传入。"
+                    ),
+                )
+            browser_policy = classify_browser_command(command.action, command.args)
+            if browser_policy.decision == "deny":
+                return ToolPolicyResult(
+                    PolicyDecision.DENY,
+                    browser_policy.reason,
+                    browser_policy.risk,
+                )
+            if browser_policy.decision == "ask":
+                if self.permission_context.smart and command.action in {"click", "fill"}:
+                    return ToolPolicyResult(
+                        PolicyDecision.ALLOW,
+                        "smart_browser_interaction",
+                        "browser_interaction",
+                        explanation=(
+                            "当前 Run 使用智能模式；click/fill 由 Harness 绑定到本次 Run、"
+                            "当前 tab 和完整参数后自动授权。"
+                        ),
+                    )
+                return ToolPolicyResult(
+                    PolicyDecision.ASK,
+                    browser_policy.reason,
+                    browser_policy.risk,
+                    explanation=(
+                        "浏览器交互动作必须绑定本次 Run、当前 tab 状态和一次性用户确认；"
+                        "批准不会产生 Session 级或永久授权。"
+                    ),
+                )
+            return ToolPolicyResult(
+                PolicyDecision.ALLOW,
+                browser_policy.reason,
+                browser_policy.risk,
+            )
         if tool_name == "execute":
             command = self._command(request)
+            if self._contains_webbridge_direct_access(command):
+                return ToolPolicyResult(
+                    PolicyDecision.DENY,
+                    "webbridge_daemon_direct_access_forbidden",
+                    "critical",
+                )
+            if self._contains_webbridge_indirect_access(command):
+                return ToolPolicyResult(
+                    PolicyDecision.DENY,
+                    "webbridge_daemon_indirect_access_forbidden",
+                    "critical",
+                )
             if self._contains_npx_skills_add(command):
                 if self._managed_npx_skills_add(command) is None:
                     return ToolPolicyResult(
@@ -3143,10 +3327,10 @@ class ToolExecutionPipeline(AgentMiddleware):
                 "managed_skill_write",
             )
         if tool_name == "install_packages":
-            if self.permission_context.backend_mode not in {"docker", "adaptive"}:
+            if self.permission_context.backend_mode not in {"kernel", "adaptive"}:
                 return ToolPolicyResult(
                     PolicyDecision.DENY,
-                    "package_install_requires_docker",
+                    "package_install_requires_host_runtime",
                     "critical",
                 )
             return ToolPolicyResult(
@@ -3154,11 +3338,23 @@ class ToolExecutionPipeline(AgentMiddleware):
                 "package_management:install_packages",
                 "package_install",
             )
+        if tool_name == "request_skill_runtime":
+            if self.permission_context.backend_mode != "adaptive":
+                return ToolPolicyResult(
+                    PolicyDecision.DENY,
+                    "explicit_docker_skill_requires_adaptive_runtime",
+                    "critical",
+                )
+            return ToolPolicyResult(
+                PolicyDecision.ASK,
+                "explicit_skill_runtime_selection",
+                "high",
+            )
         if tool_name == "execute_external_directory":
-            if (
-                self.permission_context.backend_mode not in {"docker", "adaptive"}
-                or self.backend_mode not in {"docker", "adaptive"}
-            ):
+            if self.permission_context.backend_mode not in {"docker", "adaptive"} or self.backend_mode not in {
+                "docker",
+                "adaptive",
+            }:
                 return ToolPolicyResult(
                     PolicyDecision.DENY,
                     "external_directory_command_requires_docker",
@@ -3419,15 +3615,18 @@ class ToolExecutionPipeline(AgentMiddleware):
         # points are ordinary sandboxed computation: their effects are bounded
         # by the same profile as inline Python/Node and do not need a separate
         # executable-name allowlist.
-        if result.reason.startswith(
-            (
-                "unknown_command:",
-                "shell_parse_failed",
-                "wrapper_without_command",
-                "node_command",
-                "python_tool:",
+        if (
+            result.reason.startswith(
+                (
+                    "unknown_command:",
+                    "shell_parse_failed",
+                    "wrapper_without_command",
+                    "node_command",
+                    "python_tool:",
+                )
             )
-        ) and script_entrypoint is None:
+            and script_entrypoint is None
+        ):
             return None
         if result.reason.startswith("managed_git_write:"):
             if not self._smart_git_write_allowed(command, result.reason):
@@ -3510,12 +3709,39 @@ class ToolExecutionPipeline(AgentMiddleware):
             return False
         lowered = [item.lower() for item in tokens[1:]]
         forbidden_flags = {
-            "-d", "--data", "--data-ascii", "--data-binary", "--data-raw",
-            "--data-urlencode", "-f", "--form", "--form-string", "-t",
-            "--upload-file", "--json", "-u", "--user", "-h", "--header",
-            "-b", "--cookie", "-c", "--cookie-jar", "-k", "--config",
-            "--netrc", "--netrc-file", "--cert", "--key", "-l", "--location",
-            "--location-trusted", "--proxy", "-x", "--resolve", "--connect-to",
+            "-d",
+            "--data",
+            "--data-ascii",
+            "--data-binary",
+            "--data-raw",
+            "--data-urlencode",
+            "-f",
+            "--form",
+            "--form-string",
+            "-t",
+            "--upload-file",
+            "--json",
+            "-u",
+            "--user",
+            "-h",
+            "--header",
+            "-b",
+            "--cookie",
+            "-c",
+            "--cookie-jar",
+            "-k",
+            "--config",
+            "--netrc",
+            "--netrc-file",
+            "--cert",
+            "--key",
+            "-l",
+            "--location",
+            "--location-trusted",
+            "--proxy",
+            "-x",
+            "--resolve",
+            "--connect-to",
         }
         if any(
             item in forbidden_flags
@@ -3733,11 +3959,90 @@ class ToolExecutionPipeline(AgentMiddleware):
         args = request.tool_call.get("args") or {}
         return str(args.get("command") or "")
 
+    @staticmethod
+    def _contains_webbridge_direct_access(command: str) -> bool:
+        """Hard-deny shell attempts to bypass the structured browser tool."""
+
+        candidate = str(command or "")
+        for _ in range(4):
+            lowered = candidate.lower()
+            if re.search(r"(?:^|[\s/])(?:kimi-webbridge|kimi_webbridge|qweb-bridge|qweb_bridge)(?:[\s/]|$)", lowered):
+                return True
+            if re.search(
+                r"\b(?:python(?:\d+(?:\.\d+)*)?|node|deno)\b[^\n;&|]*\s(?:-c|-e|--eval(?:=|\s))", lowered
+            ) and re.search(r"\b(?:base64|b64decode|buffer\.from|atob)\b", lowered):
+                # Obfuscated inline interpreters cannot be inspected for a
+                # loopback target by the shell policy. Keep them out of the
+                # bypass path instead of turning them into ordinary ASK.
+                return True
+            if "10086" not in lowered and "%31%30%30%38%36" not in lowered:
+                decoded = unquote(candidate)
+                if decoded == candidate:
+                    break
+                candidate = decoded
+                continue
+            # Literal and encoded loopback spellings, including IPv4 integer
+            # and hexadecimal forms accepted by common URL parsers.
+            loopback_tokens = (
+                "127.0.0.1",
+                "127.0.0.1.",
+                "localhost",
+                "::1",
+                "[::1]",
+                "0:0:0:0:0:0:0:1",
+                "[0:0:0:0:0:0:0:1]",
+                "::ffff:127.0.0.1",
+                "2130706433",
+                "0x7f000001",
+            )
+            if any(token in lowered for token in loopback_tokens):
+                return True
+            decoded = unquote(candidate)
+            if decoded == candidate:
+                break
+            candidate = decoded
+        return False
+
+    @staticmethod
+    def _contains_webbridge_indirect_access(command: str) -> bool:
+        """Reject shell network indirection that can hide the daemon target."""
+
+        candidate = str(command or "")
+        for _ in range(3):
+            decoded = unquote(candidate).lower()
+            if decoded == candidate.lower():
+                break
+            candidate = decoded
+        lowered = candidate.lower()
+        if not re.search(r"\b(curl|wget|httpie|python|python3|node|deno)\b", lowered):
+            return False
+        # These options move the destination out of the command text or make
+        # redirects/proxies authoritative, so lexical inspection cannot prove
+        # that the process will not reach loopback:10086.
+        return bool(
+            re.search(
+                r"(?:--config(?:=|\s)|\s-k(?:\s|$)|\s-k\S|--input-file(?:=|\s)|"
+                r"--proxy(?:=|\s)|--resolve(?:=|\s)|--connect-to(?:=|\s)|"
+                r"(?:^|\s)-l(?:\s|$)|--location(?:\s|$)|\$\(|`|\$\{)",
+                lowered,
+            )
+        )
+
     def _action_preview(self, request: ToolCallRequest) -> str:
         tool_name = str(request.tool_call.get("name") or "")
         if tool_name == "execute":
             return self._command(request)
         args = request.tool_call.get("args") or {}
+        if tool_name == "browser" and isinstance(args, dict):
+            try:
+                from connectors.kimi_webbridge.policy import redact_browser_args
+
+                args = {
+                    **args,
+                    "args": redact_browser_args(args.get("args") or {}),
+                }
+            except Exception:
+                args = {"action": str(args.get("action") or "browser"), "args": "<redacted>"}
         if tool_name in self.SKILL_COMMIT_TOOLS and self.base_dir is not None:
             try:
                 from services.skill_management import get_skill_management_service
@@ -3752,6 +4057,22 @@ class ToolExecutionPipeline(AgentMiddleware):
         except (TypeError, ValueError):
             rendered = str(args)
         return rendered[:4000]
+
+    @staticmethod
+    def _permission_fingerprint_command(request: ToolCallRequest, preview: str) -> str:
+        """Hash the complete browser action while keeping its preview redacted."""
+
+        if str(request.tool_call.get("name") or "") != "browser":
+            return preview
+        args = request.tool_call.get("args") or {}
+        try:
+            from connectors.kimi_webbridge.models import BrowserCommand
+
+            command = BrowserCommand.model_validate(args)
+            canonical = command.model_dump(mode="json")
+            return json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return repr(args)
 
     def _skill_change_preview(self, request: ToolCallRequest) -> dict[str, str] | None:
         tool_name = str(request.tool_call.get("name") or "")
@@ -3811,7 +4132,7 @@ class ToolExecutionPipeline(AgentMiddleware):
     def _managed_cli_preflight(cls, plan: Any) -> ToolPolicyResult:
         """Apply the frozen Adapter decision instead of re-parsing managed argv.
 
-        Lark Provider operations run in the credential control plane, where
+        Managed Provider operations run in the credential control plane, where
         networking is an execution requirement rather than a per-command
         permission prompt.  Installer mutations and deletion semantics retain
         their explicit approval boundaries.
@@ -3824,20 +4145,20 @@ class ToolExecutionPipeline(AgentMiddleware):
                 PolicyDecision.ASK,
                 "managed_cli_toolchain_install",
                 "package_install",
-                explanation="共享 Toolchain 安装或更新需要确认。",
+                explanation="受管 Toolchain 安装或更新需要确认。",
             )
         if bool(getattr(match, "destructive", False)):
             return ToolPolicyResult(
                 PolicyDecision.ASK,
                 "managed_cli_destructive_action",
                 "high",
-                explanation="删除类飞书操作仍需用户明确确认。",
+                explanation="受管 CLI 删除或撤销操作仍需用户明确确认。",
             )
         return ToolPolicyResult(
             PolicyDecision.ALLOW,
             "managed_cli_personal_autonomy",
             "managed_write",
-            explanation="受管飞书非删除操作默认联网并自动执行。",
+            explanation="受管 CLI 非删除操作按 Adapter 契约执行。",
         )
 
     def _required_capabilities(
@@ -3864,6 +4185,15 @@ class ToolExecutionPipeline(AgentMiddleware):
             return ["execute", "temporary_network"]
         if tool_name == "install_packages":
             return ["execute", "package_install", "temporary_network"]
+        if tool_name == "browser":
+            args = request.tool_call.get("args") or {}
+            action = str(args.get("action") or "") if isinstance(args, dict) else ""
+            capabilities = ["execute", "browser_control"]
+            if action in {"click", "fill", "close_tab", "close_session"}:
+                capabilities.append("browser_final_action")
+            elif action == "navigate":
+                capabilities.append("browser_navigation")
+            return capabilities
         if tool_name in {"prepare_skill_install", "prepare_skill_update"}:
             return ["execute", "temporary_network"]
         if tool_name in self.SKILL_COMMIT_TOOLS:
@@ -4035,16 +4365,14 @@ class ToolExecutionPipeline(AgentMiddleware):
                 "label": f"本 Session 允许读取 {host}",
             }
         if tool_name == "install_packages":
-            if (
-                not self.permission_context.smart
-                or self.permission_context.backend_mode not in {"docker", "adaptive"}
-            ):
-                return None
-            return {
-                "target_kind": "capability",
-                "target": "docker_package_install",
-                "label": "本 Session 允许在隔离安装器中安装 Skill 依赖",
-            }
+            # A dependency mutation is bound to one exact Skill + complete
+            # desired-set diff.  A reusable capability grant would allow a
+            # later unrelated package set to ride the first approval.
+            return None
+        # Browser approvals are intentionally once-only. A Session grant must
+        # never turn into standing authority over the user's live tab state.
+        if tool_name == "browser":
+            return None
         if tool_name != "execute":
             return None
 

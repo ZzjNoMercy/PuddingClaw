@@ -8,12 +8,16 @@ import zipfile
 from pathlib import Path
 
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi.testclient import TestClient
 from langchain.agents.middleware.types import ToolCallRequest
+from starlette.requests import Request
 
 from api import skill_plans as skill_plans_api
+from api import skills_api as skills_api_module
 from api.permissions import ToolActionGrantRequest, grant_tool_action_permission, list_permissions
 from api.skill_plans import SkillPlanDecision, cancel_skill_plan, commit_skill_plan, get_skill_plan
+from api.skills_api import UploadPlanDecision, commit_uploaded_skill, import_skill
 from graph.permission_resume import permission_resume_registry
 from graph.session_manager import session_manager
 from harness.tool_execution import PolicyDecision, ToolExecutionPipeline
@@ -153,6 +157,208 @@ def test_archive_rejects_path_traversal_and_symlink(tmp_path):
         service._extract_archive(linked.getvalue(), tmp_path / "payload-b", subpath="", github_archive=False)
 
 
+def test_uploaded_skill_file_uses_managed_plan_and_commits_direct_install(tmp_path, monkeypatch):
+    service = SkillManagementService(tmp_path)
+    monkeypatch.setattr(service, "_refresh_skill_snapshot", lambda: None)
+
+    plan = service.prepare_upload(
+        filename="local-demo.skill",
+        content=b"# Local demo\n\nImported directly by the user.\n",
+    )
+
+    assert plan["action"] == "install"
+    assert plan["skill_name"] == "local-demo"
+    assert plan["source"] == "upload:local-demo.skill"
+    assert not (tmp_path / "skills" / "local-demo").exists()
+
+    installed = service.commit(
+        action="install",
+        plan_id=plan["plan_id"],
+        plan_sha256=plan["plan_sha256"],
+    )
+
+    assert installed["provenance_recorded"] is False
+    assert (tmp_path / "skills" / "local-demo" / "SKILL.md").read_bytes().startswith(b"# Local demo")
+
+
+def test_uploaded_folder_update_requires_plan_commit_and_can_be_cancelled(tmp_path, monkeypatch):
+    installed = tmp_path / "skills" / "demo-skill"
+    _write_skill(installed, version="1.0.0")
+    (installed / "old.txt").write_text("keep me", encoding="utf-8")
+    service = SkillManagementService(tmp_path)
+    monkeypatch.setattr(service, "_refresh_skill_snapshot", lambda: None)
+
+    plan = service.prepare_upload(
+        filename="demo-skill.folder",
+        skill_name="demo-skill",
+        uploaded_files=[
+            (
+                "demo-skill/SKILL.md",
+                b"---\nname: demo-skill\nversion: 2.0.0\ndescription: demo\n---\n# Demo\n",
+            ),
+            ("demo-skill/new.txt", b"new"),
+        ],
+    )
+
+    assert plan["action"] == "update"
+    assert plan["diff"]["added"] == ["new.txt"]
+    assert plan["diff"]["removed"] == ["old.txt"]
+    assert "version: 1.0.0" in (installed / "SKILL.md").read_text(encoding="utf-8")
+    assert (installed / "old.txt").read_text(encoding="utf-8") == "keep me"
+
+    cancelled = service.cancel(plan_id=plan["plan_id"], plan_sha256=plan["plan_sha256"])
+    assert cancelled["status"] == "cancelled"
+    assert "version: 1.0.0" in (installed / "SKILL.md").read_text(encoding="utf-8")
+    assert (installed / "old.txt").is_file()
+
+
+def test_uploaded_folder_rejects_unsafe_names_paths_and_oversized_archives(tmp_path, monkeypatch):
+    service = SkillManagementService(tmp_path)
+
+    with pytest.raises(SkillManagementError) as unsafe_name:
+        service.prepare_upload(
+            filename="escape.folder",
+            skill_name="../../escape",
+            uploaded_files=[("escape/SKILL.md", b"# Escape")],
+        )
+    assert unsafe_name.value.code == "invalid_skill_name"
+    assert not (tmp_path.parent / "escape").exists()
+
+    with pytest.raises(SkillManagementError) as unsafe_path:
+        service.prepare_upload(
+            filename="demo.folder",
+            skill_name="demo-skill",
+            uploaded_files=[("demo/../SKILL.md", b"# Escape")],
+        )
+    assert unsafe_path.value.code == "invalid_relative_path"
+
+    archive_bytes = io.BytesIO()
+    with zipfile.ZipFile(archive_bytes, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("large-skill/SKILL.md", "---\nname: large-skill\n---\n" + ("x" * 512))
+    monkeypatch.setattr(skill_management_module, "_MAX_TOTAL_BYTES", 128)
+    with pytest.raises(SkillManagementError) as oversized:
+        service.prepare_upload(filename="large-skill.zip", content=archive_bytes.getvalue())
+    assert oversized.value.code == "skill_size_limit_exceeded"
+    assert not service.plans_dir.exists() or not any(service.plans_dir.iterdir())
+
+
+def test_upload_api_installs_new_skill_and_requires_confirmation_for_update(tmp_path, monkeypatch):
+    service = SkillManagementService(tmp_path)
+    monkeypatch.setattr(service, "_refresh_skill_snapshot", lambda: None)
+    monkeypatch.setattr(skills_api_module, "_upload_service", lambda: service)
+
+    created = asyncio.run(
+        import_skill(
+            files=[
+                UploadFile(
+                    filename="api-demo.skill",
+                    file=io.BytesIO(b"---\nname: api-demo\nversion: 1.0.0\n---\n# API demo\n"),
+                )
+            ],
+            skill_name=None,
+        )
+    )
+    assert created["requires_confirmation"] is False
+    assert "version: 1.0.0" in (tmp_path / "skills" / "api-demo" / "SKILL.md").read_text(encoding="utf-8")
+
+    prepared = asyncio.run(
+        import_skill(
+            files=[
+                UploadFile(
+                    filename="api-demo.skill",
+                    file=io.BytesIO(b"---\nname: api-demo\nversion: 2.0.0\n---\n# API demo\n"),
+                )
+            ],
+            skill_name=None,
+        )
+    )
+    assert prepared["requires_confirmation"] is True
+    assert prepared["plan"]["action"] == "update"
+    assert "version: 1.0.0" in (tmp_path / "skills" / "api-demo" / "SKILL.md").read_text(encoding="utf-8")
+
+    committed = asyncio.run(
+        commit_uploaded_skill(
+            prepared["plan"]["plan_id"],
+            UploadPlanDecision(plan_sha256=prepared["plan"]["plan_sha256"]),
+        )
+    )
+    assert committed["requires_confirmation"] is False
+    assert committed["plan"]["snapshot_id"]
+    assert "version: 2.0.0" in (tmp_path / "skills" / "api-demo" / "SKILL.md").read_text(encoding="utf-8")
+
+
+def test_upload_api_rejects_untrusted_browser_origins():
+    trusted = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/skills/import",
+            "headers": [(b"origin", b"http://localhost:3000")],
+        }
+    )
+    skills_api_module._require_trusted_upload_origin(trusted)
+
+    untrusted = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/skills/import",
+            "headers": [(b"origin", b"https://evil.example")],
+        }
+    )
+    with pytest.raises(HTTPException) as blocked:
+        skills_api_module._require_trusted_upload_origin(untrusted)
+    assert blocked.value.status_code == 403
+
+
+def test_upload_http_contract_accepts_files_multipart_field(tmp_path, monkeypatch):
+    service = SkillManagementService(tmp_path)
+    monkeypatch.setattr(service, "_refresh_skill_snapshot", lambda: None)
+    monkeypatch.setattr(skills_api_module, "_upload_service", lambda: service)
+    api = FastAPI()
+    api.include_router(skills_api_module.router, prefix="/api")
+
+    with TestClient(api) as client:
+        response = client.post(
+            "/api/skills/import",
+            files={"files": ("multipart-demo.skill", b"# Multipart demo\n", "text/markdown")},
+            headers={"Origin": "http://localhost:3000"},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["skill_name"] == "multipart-demo"
+    assert (tmp_path / "skills" / "multipart-demo" / "SKILL.md").is_file()
+
+
+def test_upload_http_contract_accepts_legacy_file_field_with_anthropic_style_zip(tmp_path, monkeypatch):
+    service = SkillManagementService(tmp_path)
+    monkeypatch.setattr(service, "_refresh_skill_snapshot", lambda: None)
+    monkeypatch.setattr(skills_api_module, "_upload_service", lambda: service)
+    api = FastAPI()
+    api.include_router(skills_api_module.router, prefix="/api")
+    archive_bytes = io.BytesIO()
+    with zipfile.ZipFile(archive_bytes, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "pdf/SKILL.md",
+            "---\nname: pdf\ndescription: Read and process PDF files.\n"
+            "license: Proprietary. LICENSE.txt has complete terms\n---\n# PDF\n",
+        )
+        archive.writestr("pdf/LICENSE.txt", "License terms\n")
+        archive.writestr("pdf/scripts/convert_pdf_to_images.py", "print('ok')\n")
+
+    with TestClient(api) as client:
+        response = client.post(
+            "/api/skills/import",
+            files={"file": ("anthropic-pdf-skill.zip", archive_bytes.getvalue(), "application/zip")},
+            headers={"Origin": "http://localhost:3000"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["skill_name"] == "pdf"
+    assert (tmp_path / "skills" / "pdf" / "SKILL.md").is_file()
+    assert (tmp_path / "skills" / "pdf" / "scripts" / "convert_pdf_to_images.py").is_file()
+
+
 def test_web_directory_discovers_bounded_referenced_files(tmp_path, monkeypatch):
     service = SkillManagementService(tmp_path)
     payloads = {
@@ -238,9 +444,11 @@ def test_npx_add_well_known_source_requires_selection_without_yes(tmp_path, monk
     monkeypatch.setattr(
         service,
         "_download",
-        lambda url: json.dumps(index).encode()
-        if url == "https://skills.example/.well-known/agent-skills/index.json"
-        else (_ for _ in ()).throw(SkillManagementError("http_error_404")),
+        lambda url: (
+            json.dumps(index).encode()
+            if url == "https://skills.example/.well-known/agent-skills/index.json"
+            else (_ for _ in ()).throw(SkillManagementError("http_error_404"))
+        ),
     )
 
     result = service.prepare_npx_skills_add(source="https://skills.example")
@@ -273,9 +481,7 @@ def test_well_known_v2_skill_md_digest_is_verified(tmp_path, monkeypatch):
     monkeypatch.setattr(
         service,
         "_download",
-        lambda url: payloads[url]
-        if url in payloads
-        else (_ for _ in ()).throw(SkillManagementError("http_error_404")),
+        lambda url: payloads[url] if url in payloads else (_ for _ in ()).throw(SkillManagementError("http_error_404")),
     )
 
     result = service.prepare_npx_skills_add(
@@ -447,6 +653,7 @@ def test_skill_management_permission_api_rejects_session_scope(tmp_path):
             permission_resume_registry.resolve(pending["id"], {"type": "reject"})
 
     asyncio.run(scenario())
+
 
 def test_skill_permission_history_remains_visible_after_one_time_consumption(tmp_path):
     session_manager.initialize(tmp_path)

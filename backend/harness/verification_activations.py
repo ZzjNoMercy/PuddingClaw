@@ -500,6 +500,43 @@ def resolve_published_attachment(
     return attachment_store.public_item(stored) if all(checks) else None
 
 
+def resolve_browser_generated_attachment(
+    raw_output: str,
+    *,
+    session_id: str,
+    run_id: str,
+) -> dict[str, Any] | None:
+    """Promote a browser screenshot/PDF artifact into the chat attachment list.
+
+    BrowserTool already stores the bytes through AttachmentStore. The model
+    result only carries a public receipt; re-read the session-scoped manifest
+    instead of trusting the URL or path in that receipt.
+    """
+
+    try:
+        payload = json.loads(raw_output)
+    except (TypeError, ValueError):
+        return None
+    data = payload.get("data") if isinstance(payload, dict) else None
+    candidate = data.get("artifact") if isinstance(data, dict) else None
+    if not isinstance(candidate, dict):
+        return None
+    attachment_id = str(candidate.get("id") or "")
+    if not attachment_id:
+        return None
+    stored = attachment_store.get(session_id, attachment_id)
+    if not isinstance(stored, dict):
+        return None
+    expected_sha = str(candidate.get("sha256") or "")
+    if (
+        stored.get("source") != "generated"
+        or str(stored.get("created_by_run_id") or "") != run_id
+        or (expected_sha and stored.get("sha256") != expected_sha)
+    ):
+        return None
+    return attachment_store.public_item(stored)
+
+
 def _result_evidence_refs(
     *,
     tool_call_id: str,

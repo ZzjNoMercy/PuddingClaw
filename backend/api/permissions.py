@@ -403,6 +403,18 @@ async def grant_tool_action_permission(
             status_code=400,
             detail="permission request is not a tool action",
         )
+    if str(pending.get("tool_name") or "") == "browser":
+        if req.scope != "once":
+            raise HTTPException(
+                status_code=400,
+                detail="WebBridge browser actions only support one-time approval",
+            )
+        pending_run_id = str(pending.get("run_id") or "")
+        run = session_manager.get_run_state(session_id, pending_run_id) if pending_run_id else None
+        if not pending_run_id or not isinstance(run, dict):
+            raise HTTPException(status_code=409, detail="WebBridge approval is not bound to an active Run")
+        if str(run.get("status") or "") not in {"running", "waiting_hitl"}:
+            raise HTTPException(status_code=409, detail="WebBridge approval Run is no longer active")
     if pending.get("status") != "pending":
         raise HTTPException(
             status_code=409,

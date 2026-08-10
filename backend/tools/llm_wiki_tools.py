@@ -226,7 +226,7 @@ class LlmWikiQueryTool(_WikiTool):
                         "title": str(reference.get("title") or slug),
                         "uri": str(reference.get("uri") or ""),
                         "document_id": f"llm-wiki:{slug}",
-                        "chunk_id": slug,
+                        "chunk_id": str(reference.get("chunk_id") or slug),
                         "source_type": "llm_wiki",
                         "quote": content[:1200],
                         "score": reference.get("score"),
@@ -235,6 +235,9 @@ class LlmWikiQueryTool(_WikiTool):
                             "page_type": reference.get("type"),
                             "raw_sources": reference.get("sources", []),
                             "virtual_path": reference.get("uri"),
+                            "matched_by": reference.get("matched_by", []),
+                            "chunk_title": reference.get("chunk_title"),
+                            "retrieval_mode": payload.get("retrieval", {}).get("mode"),
                         },
                     }
                 )

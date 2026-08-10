@@ -331,7 +331,7 @@ window.echarts = {
         )
     docker = shutil.which("docker")
     assert docker is not None, "Chromium E2E requires the configured Docker runtime"
-    image = "puddingclaw/sandbox:python3.12-node22-chromium-v4"
+    image = "puddingclaw/sandbox:python3.12-node22-chromium-v5"
     image_check = subprocess.run(
         [docker, "image", "inspect", image],
         check=False,

@@ -16,6 +16,7 @@ import {
   ChevronRight,
   Code2,
   DatabaseZap,
+  Database,
   FileCheck2,
   FileCode2,
   FileUp,
@@ -27,6 +28,7 @@ import {
   Plus,
   RefreshCw,
   Save,
+  Search,
   ShieldCheck,
   Trash2,
   X,
@@ -42,9 +44,11 @@ import {
   createLlmWikiIngestJob,
   getBrainSchemaBundle,
   getBrainSchemaCatalog,
+  getLlmWikiEmbeddingStatus,
   getLlmWikiWorkspaceStatus,
   initializeBrainSchema,
   lintLlmWiki,
+  syncLlmWikiEmbeddings,
   previewBrainCustomSchema,
   rebuildLlmWikiAgents,
   saveBrainCustomSchema,
@@ -58,11 +62,13 @@ import {
   type GbrainSchemaCatalogPack,
   type GbrainSchemaPackManifest,
   type LlmWikiCompileResult,
+  type LlmWikiEmbeddingStatus,
   type LlmWikiLintResult,
   type LlmWikiWorkspaceStatus,
 } from "@/lib/api";
 import "@/lib/monaco-config";
 import { useApp } from "@/lib/store";
+import { getSettings } from "@/lib/settingsApi";
 import { ReorderButtons, StringListEditor } from "./advanced-schema-editor";
 import { schemaFieldLabel } from "./schema-ui-labels";
 
@@ -75,7 +81,7 @@ const MonacoEditor = dynamic(() => import("@monaco-editor/react"), {
   ),
 });
 
-type MainTab = "workflow" | "builtins" | "custom" | "resolved";
+type MainTab = "workflow" | "embedding" | "builtins" | "custom" | "resolved";
 type RawTarget = "custom" | "resolved" | "parent" | "brain";
 type PageTypeEditorTarget = { index: number | null; initial: GbrainPageType };
 type LinkTypeEditorTarget = { index: number | null; initial: GbrainLinkType };
@@ -636,6 +642,211 @@ function WikiWorkflowPanel({
   );
 }
 
+function WikiEmbeddingPanel({
+  embedding,
+  loading,
+  loadError,
+  settingEnabled,
+  settingLoading,
+  settingError,
+  busy,
+  onSync,
+  onReload,
+}: {
+  embedding: LlmWikiEmbeddingStatus | null;
+  loading: boolean;
+  loadError: string | null;
+  settingEnabled: boolean | null;
+  settingLoading: boolean;
+  settingError: string | null;
+  busy: string | null;
+  onSync: (force: boolean) => void;
+  onReload: () => void;
+}) {
+  const [pageSearch, setPageSearch] = useState("");
+  const [pageNumber, setPageNumber] = useState(1);
+  const pageSize = 12;
+  const filteredPages = useMemo(() => {
+    const query = pageSearch.trim().toLowerCase();
+    const pages = embedding?.pages || [];
+    if (!query) return pages;
+    return pages.filter((page) => [
+      page.slug,
+      page.state,
+      page.content_sha256,
+      page.indexed_content_sha256 || "",
+      page.error || "",
+    ].some((value) => value.toLowerCase().includes(query)));
+  }, [embedding?.pages, pageSearch]);
+  const totalPages = Math.max(1, Math.ceil(filteredPages.length / pageSize));
+  const currentPage = Math.min(pageNumber, totalPages);
+  const visiblePages = filteredPages.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+
+  useEffect(() => {
+    setPageNumber(1);
+  }, [embedding?.pages.length, pageSearch]);
+
+  const settingMismatch = settingEnabled !== null && embedding !== null && settingEnabled !== embedding.hybrid_enabled;
+  const settingProbe = (
+    <section className="flex flex-wrap items-center gap-3 rounded-2xl border border-black/[0.06] bg-white px-4 py-3">
+      <span className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl ${settingEnabled ? "bg-emerald-50 text-emerald-700" : "bg-gray-100 text-gray-500"}`}>
+        {settingLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
+      </span>
+      <div className="min-w-0 flex-1">
+        <div className="flex flex-wrap items-center gap-2">
+          <p className="text-xs font-semibold text-gray-900">设置页检索开关</p>
+          <span className={`rounded-full px-2.5 py-1 text-[10px] font-medium ${settingEnabled === true ? "bg-emerald-50 text-emerald-700" : settingEnabled === false ? "bg-gray-100 text-gray-500" : "bg-amber-50 text-amber-700"}`}>
+            {settingLoading ? "正在探测" : settingEnabled === true ? "已开启混合检索" : settingEnabled === false ? "未开启 · 仅 Markdown Query" : "探测失败"}
+          </span>
+        </div>
+        <p className={`mt-1 text-[11px] ${settingError || settingMismatch ? "text-red-600" : "text-gray-400"}`}>
+          {settingError || (settingMismatch ? "设置值与当前运行时状态不一致，请重启后端后重新探测。" : "直接读取知识库设置中的 LLM Wiki 混合检索选项。")}
+        </p>
+      </div>
+      <button type="button" onClick={onReload} disabled={settingLoading || loading} className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-black/[0.08] bg-white px-3 text-[11px] font-medium text-gray-600 disabled:opacity-40 hover:text-[#002fa7]">
+        <RefreshCw className={`h-3.5 w-3.5 ${settingLoading || loading ? "animate-spin" : ""}`} /> 重新探测
+      </button>
+    </section>
+  );
+  if (!embedding) {
+    if (loading) {
+      return <div className="space-y-4">{settingProbe}<div className="flex min-h-40 items-center justify-center text-xs text-gray-400"><Loader2 className="mr-2 h-4 w-4 animate-spin" />加载 Embedding 状态…</div></div>;
+    }
+    return (
+      <div className="space-y-4">
+        {settingProbe}
+        <div className="flex min-h-40 flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-black/[0.08] bg-white/70 px-6 text-center">
+          <p className="text-xs text-red-600">{loadError || "暂时无法读取 Embedding 状态。"}</p>
+        </div>
+      </div>
+    );
+  }
+  const syncing = busy === "embedding" || busy === "embedding-rebuild";
+  const actionable = embedding.counts.pending + embedding.counts.outdated + embedding.counts.failed;
+  const stateStyle: Record<string, string> = {
+    indexed: "bg-emerald-50 text-emerald-700",
+    pending: "bg-amber-50 text-amber-700",
+    outdated: "bg-orange-50 text-orange-700",
+    failed: "bg-red-50 text-red-700",
+  };
+  const stateLabel: Record<string, string> = {
+    indexed: "已同步",
+    pending: "待同步",
+    outdated: "页面已更新",
+    failed: "同步失败",
+  };
+  return (
+    <div className="space-y-4">
+      {settingProbe}
+      <section className="rounded-2xl border border-[#002fa7]/10 bg-gradient-to-br from-[#002fa7]/[0.055] to-white p-4">
+        <div className="flex flex-wrap items-start gap-3">
+          <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[#002fa7]/10 text-[#002fa7]"><Database className="h-4 w-4" /></span>
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="text-base font-semibold text-gray-950">Wiki Embedding</h2>
+              <span className={`rounded-full px-2.5 py-1 text-[10px] font-medium ${embedding.hybrid_enabled ? "bg-emerald-50 text-emerald-700" : "bg-gray-100 text-gray-500"}`}>
+                {embedding.hybrid_enabled ? "设置已开启 · 混合检索" : "设置未开启 · 仅 Markdown Query"}
+              </span>
+            </div>
+            <p className="mt-1 text-xs leading-5 text-gray-500">Markdown Wiki 是事实源；这里管理它在共享 LlamaIndex Text Collection 中的可重建语义投影。</p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <button type="button" disabled={syncing || !embedding.infrastructure_ready || actionable === 0} onClick={() => onSync(false)} className="inline-flex h-9 items-center gap-1.5 rounded-xl bg-[#002fa7] px-3 text-xs font-medium text-white disabled:opacity-35">
+              {busy === "embedding" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+              同步待更新页面
+            </button>
+            <button type="button" disabled={syncing || !embedding.infrastructure_ready || embedding.counts.total === 0} onClick={() => onSync(true)} className="inline-flex h-9 items-center gap-1.5 rounded-xl border border-black/[0.08] bg-white px-3 text-xs font-medium text-gray-600 disabled:opacity-35">
+              {busy === "embedding-rebuild" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <DatabaseZap className="h-3.5 w-3.5" />}
+              全量重建
+            </button>
+          </div>
+        </div>
+        {!embedding.hybrid_enabled ? (
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-100 bg-amber-50/70 px-3 py-2.5 text-[11px] text-amber-700">
+            <span>当前查询不会访问向量；已有 Embedding 可以保留，开启混合检索后直接使用。</span>
+            <Link href="/settings?category=knowledge" className="font-semibold text-amber-800 hover:underline">前往设置开启</Link>
+          </div>
+        ) : null}
+        {!embedding.infrastructure_ready ? (
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-red-100 bg-red-50/70 px-3 py-2.5 text-[11px] text-red-700">
+            <span>共享 Milvus 文本索引尚未启用，当前只能使用 Markdown Query。</span>
+            <Link href="/settings?category=knowledge" className="font-semibold text-red-800 hover:underline">检查知识库索引设置</Link>
+          </div>
+        ) : null}
+        {embedding.error ? <p className="mt-3 rounded-xl bg-red-50 px-3 py-2 text-[11px] text-red-700">{embedding.error}</p> : null}
+      </section>
+
+      <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        {[
+          ["Wiki 页面", embedding.counts.total, "text-gray-900"],
+          ["已同步", embedding.counts.indexed, "text-emerald-700"],
+          ["需要更新", actionable, actionable ? "text-amber-700" : "text-gray-900"],
+          ["有效切片", embedding.counts.chunks, "text-[#002fa7]"],
+        ].map(([label, value, color]) => (
+          <div key={String(label)} className="rounded-2xl border border-black/[0.06] bg-white p-4">
+            <p className={`text-2xl font-semibold ${color}`}>{value}</p>
+            <p className="mt-1 text-xs text-gray-400">{label}</p>
+          </div>
+        ))}
+      </section>
+
+      <section className="rounded-2xl border border-black/[0.06] bg-white p-4">
+        <div className="flex flex-wrap items-start gap-3">
+          <div className="min-w-0 flex-1">
+            <h3 className="text-sm font-semibold text-gray-900">当前索引配置</h3>
+            <p className="mt-1 text-[11px] text-gray-400">页面内容 Hash、Embedding 模型或切块版本任一变化，都会把对应页面标为需要更新。</p>
+          </div>
+          <span className="rounded-full bg-[#002fa7]/[0.055] px-2.5 py-1 font-mono text-[10px] text-[#002fa7]">共享 Collection</span>
+        </div>
+        <div className="mt-3 grid gap-2 text-[11px] sm:grid-cols-2">
+          <div className="rounded-xl bg-black/[0.025] px-3 py-2 text-gray-600"><span className="text-gray-400">Embedding</span> · {embedding.profile?.embedding_provider || "-"}:{embedding.profile?.embedding_model || "-"} · {embedding.profile?.embedding_dimension || 0} 维</div>
+          <div className="rounded-xl bg-black/[0.025] px-3 py-2 text-gray-600"><span className="text-gray-400">切块</span> · {embedding.profile?.parser || "MarkdownNodeParser"} v{embedding.profile?.parser_version || 1}</div>
+          <div className="rounded-xl bg-black/[0.025] px-3 py-2 font-mono text-[10px] text-gray-500 sm:col-span-2"><span className="font-sans text-gray-400">Collection</span> · {embedding.profile?.text_collection || "puddingclaw_knowledge_text"}</div>
+        </div>
+      </section>
+
+      <section className="overflow-hidden rounded-2xl border border-black/[0.06] bg-white">
+        <div className="flex flex-wrap items-center gap-3 border-b border-black/[0.05] px-4 py-3">
+          <div className="min-w-0 flex-1"><h3 className="text-sm font-semibold text-gray-900">页面同步明细</h3><p className="mt-0.5 text-[11px] text-gray-400">按 Wiki 页面管理，不暴露内部切片编辑。</p></div>
+          <label className="relative block w-full sm:w-64">
+            <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-gray-400" />
+            <input
+              value={pageSearch}
+              onChange={(event) => setPageSearch(event.target.value)}
+              placeholder="搜索页面、状态或 Hash"
+              className="h-9 w-full rounded-xl border border-black/[0.07] bg-black/[0.018] pl-9 pr-3 text-[11px] text-gray-700 outline-none transition placeholder:text-gray-400 focus:border-[#002fa7]/25 focus:bg-white"
+            />
+          </label>
+          {embedding.last_sync?.completed_at ? <time className="text-[10px] text-gray-400" dateTime={embedding.last_sync.completed_at}>最近同步 {formatDateTime(embedding.last_sync.completed_at)}</time> : null}
+        </div>
+        <div className="p-3">
+          {embedding.pages.length === 0 ? <div className="rounded-xl border border-dashed border-black/[0.08] py-10 text-center text-xs text-gray-400">还没有可建立 Embedding 的 Wiki 页面。</div> : visiblePages.length === 0 ? <div className="rounded-xl border border-dashed border-black/[0.08] py-10 text-center text-xs text-gray-400">没有匹配的 Wiki 页面。</div> : visiblePages.map((page) => (
+            <div key={page.slug} className="flex items-start gap-3 rounded-xl px-3 py-2.5 hover:bg-black/[0.02]">
+              <span className="min-w-0 flex-1">
+                <span className="block truncate font-mono text-[11px] font-medium text-gray-800">{page.slug}</span>
+                <span className="mt-1 block truncate font-mono text-[9px] text-gray-400">SHA {page.content_sha256.slice(0, 12)}{page.indexed_content_sha256 ? ` · indexed ${page.indexed_content_sha256.slice(0, 12)}` : ""}</span>
+                {page.error ? <span className="mt-1 block break-all text-[10px] text-red-600">{page.error}</span> : null}
+              </span>
+              <span className="shrink-0 text-[10px] text-gray-400">{page.chunk_count} chunks</span>
+              <span className={`shrink-0 rounded-full px-2 py-1 text-[10px] font-medium ${stateStyle[page.state] || "bg-gray-100 text-gray-500"}`}>{stateLabel[page.state] || page.state}</span>
+            </div>
+          ))}
+        </div>
+        {embedding.pages.length > 0 ? (
+          <div className="flex flex-wrap items-center justify-between gap-3 border-t border-black/[0.05] px-4 py-3 text-[11px] text-gray-400">
+            <span>共 {filteredPages.length} 个页面{pageSearch ? ` · 搜索自 ${embedding.pages.length} 个页面` : ""}</span>
+            <div className="flex items-center gap-2">
+              <button type="button" disabled={currentPage <= 1} onClick={() => setPageNumber((value) => Math.max(1, value - 1))} className="h-8 rounded-lg border border-black/[0.07] bg-white px-3 font-medium text-gray-600 disabled:cursor-not-allowed disabled:opacity-35 hover:text-[#002fa7]">上一页</button>
+              <span className="min-w-16 text-center">{currentPage} / {totalPages}</span>
+              <button type="button" disabled={currentPage >= totalPages} onClick={() => setPageNumber((value) => Math.min(totalPages, value + 1))} className="h-8 rounded-lg border border-black/[0.07] bg-white px-3 font-medium text-gray-600 disabled:cursor-not-allowed disabled:opacity-35 hover:text-[#002fa7]">下一页</button>
+            </div>
+          </div>
+        ) : null}
+      </section>
+    </div>
+  );
+}
+
 function BuiltinCard({
   pack,
   expanded,
@@ -752,6 +963,12 @@ export default function BrainSchemaPage() {
   const [tab, setTab] = useState<MainTab>("workflow");
   const [rawTarget, setRawTarget] = useState<RawTarget>("parent");
   const [workspace, setWorkspace] = useState<LlmWikiWorkspaceStatus | null>(null);
+  const [embeddingStatus, setEmbeddingStatus] = useState<LlmWikiEmbeddingStatus | null>(null);
+  const [embeddingLoading, setEmbeddingLoading] = useState(false);
+  const [embeddingError, setEmbeddingError] = useState<string | null>(null);
+  const [hybridSettingEnabled, setHybridSettingEnabled] = useState<boolean | null>(null);
+  const [hybridSettingLoading, setHybridSettingLoading] = useState(false);
+  const [hybridSettingError, setHybridSettingError] = useState<string | null>(null);
   const [selectedRaw, setSelectedRaw] = useState<Set<string>>(new Set());
   const [workflowBusy, setWorkflowBusy] = useState<string | null>(null);
   const [workflowResult, setWorkflowResult] = useState<WorkflowResult>(null);
@@ -794,6 +1011,7 @@ export default function BrainSchemaPage() {
       if (nextBundle) {
         const nextWorkspace = await getLlmWikiWorkspaceStatus();
         setWorkspace(nextWorkspace);
+        setEmbeddingStatus(nextWorkspace.embedding || null);
         setSelectedRaw((current) => new Set(Array.from(current).filter((path) => (
           nextWorkspace.raw.some((item) => item.snapshot_path === path && !item.compiled && item.integrity === "ok")
         ))));
@@ -815,6 +1033,40 @@ export default function BrainSchemaPage() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  const loadEmbeddingStatus = useCallback(async () => {
+    setEmbeddingLoading(true);
+    setEmbeddingError(null);
+    try {
+      const nextEmbedding = await getLlmWikiEmbeddingStatus();
+      setEmbeddingStatus(nextEmbedding);
+      setWorkspace((current) => current ? { ...current, embedding: nextEmbedding } : current);
+    } catch (loadError) {
+      setEmbeddingError(messageOf(loadError));
+    } finally {
+      setEmbeddingLoading(false);
+    }
+  }, []);
+
+  const probeHybridSetting = useCallback(async () => {
+    setHybridSettingLoading(true);
+    setHybridSettingError(null);
+    try {
+      const settings = await getSettings();
+      setHybridSettingEnabled(settings.knowledge?.llm_wiki?.retrieval?.hybrid_enabled ?? false);
+    } catch (loadError) {
+      setHybridSettingEnabled(null);
+      setHybridSettingError(messageOf(loadError));
+    } finally {
+      setHybridSettingLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (tab !== "embedding") return;
+    void loadEmbeddingStatus();
+    void probeHybridSetting();
+  }, [loadEmbeddingStatus, probeHybridSetting, tab]);
 
   useEffect(() => {
     if (!draft) return;
@@ -1060,6 +1312,27 @@ export default function BrainSchemaPage() {
     }
   }, []);
 
+  const runEmbeddingSync = useCallback(async (force: boolean) => {
+    setWorkflowBusy(force ? "embedding-rebuild" : "embedding");
+    setError(null);
+    try {
+      const value = await syncLlmWikiEmbeddings(force);
+      const updated = value.updated?.length || 0;
+      const failed = value.failed?.length || 0;
+      setNotice(failed ? `Embedding 同步完成：更新 ${updated} 个，失败 ${failed} 个。` : `Embedding 同步完成：更新 ${updated} 个页面。`);
+      if (value.status) {
+        setEmbeddingStatus(value.status);
+        setWorkspace((current) => current ? { ...current, embedding: value.status } : current);
+      } else {
+        await loadEmbeddingStatus();
+      }
+    } catch (actionError) {
+      setError(messageOf(actionError));
+    } finally {
+      setWorkflowBusy(null);
+    }
+  }, [loadEmbeddingStatus]);
+
   const startAgentIngest = useCallback(async () => {
     const rawPaths = Array.from(selectedRaw)
       .filter((path) => workspace?.raw.some((item) => (
@@ -1222,6 +1495,7 @@ export default function BrainSchemaPage() {
                   <nav className="flex shrink-0 items-center gap-1 border-b border-black/[0.055] bg-white/85 p-2">
                     {([
                       ["workflow", "编译工作台", Bot],
+                      ["embedding", "Embedding", Database],
                       ["builtins", "官方内置", Layers3],
                       ["custom", "我的扩展", FileCode2],
                       ["resolved", "合并结果", DatabaseZap],
@@ -1238,15 +1512,15 @@ export default function BrainSchemaPage() {
                       </button>
                     ))}
                     <div className="ml-auto flex items-center gap-1.5 pr-2 text-[11px]">
-                      {tab !== "workflow" && validating ? (
+                      {tab !== "workflow" && tab !== "embedding" && validating ? (
                         <span className="inline-flex items-center text-gray-400"><Loader2 className="mr-1 h-3 w-3 animate-spin" />校验中</span>
-                      ) : tab !== "workflow" && preview ? (
+                      ) : tab !== "workflow" && tab !== "embedding" && preview ? (
                         <span className="inline-flex items-center text-emerald-600"><Check className="mr-1 h-3 w-3" />{preview?.validation_mode === "structural" ? "结构有效 · 保存时运行 gbrain" : "官方格式有效"}</span>
                       ) : null}
                       {dirty ? <span className="h-2 w-2 rounded-full bg-amber-400" title="有未保存更改" /> : null}
                       {versionNeedsBump ? <span className="text-amber-600">请升级 SemVer</span> : null}
                     </div>
-                    {tab !== "workflow" && !rawPreviewOpen ? (
+                    {tab !== "workflow" && tab !== "embedding" && !rawPreviewOpen ? (
                       <button
                         type="button"
                         onClick={() => setRawPreviewOpen(true)}
@@ -1281,6 +1555,23 @@ export default function BrainSchemaPage() {
                         onIngest={() => void startAgentIngest()}
                         onLint={() => void runWikiLint()}
                         onCompile={(importPages) => void runGbrainCompile(importPages)}
+                      />
+                    ) : null}
+
+                    {tab === "embedding" ? (
+                      <WikiEmbeddingPanel
+                        embedding={embeddingStatus || workspace?.embedding || null}
+                        loading={embeddingLoading}
+                        loadError={embeddingError}
+                        settingEnabled={hybridSettingEnabled}
+                        settingLoading={hybridSettingLoading}
+                        settingError={hybridSettingError}
+                        busy={workflowBusy}
+                        onSync={(force) => void runEmbeddingSync(force)}
+                        onReload={() => {
+                          void loadEmbeddingStatus();
+                          void probeHybridSetting();
+                        }}
                       />
                     ) : null}
 
@@ -1458,7 +1749,7 @@ export default function BrainSchemaPage() {
                   </div>
                 </section>
 
-                {tab !== "workflow" && rawPreviewOpen ? <aside className="flex min-w-0 flex-1 flex-col overflow-hidden rounded-2xl border border-black/[0.06] bg-white">
+                {tab !== "workflow" && tab !== "embedding" && rawPreviewOpen ? <aside className="flex min-w-0 flex-1 flex-col overflow-hidden rounded-2xl border border-black/[0.06] bg-white">
                   <div className="flex shrink-0 items-center gap-2 border-b border-black/[0.055] px-3 py-2">
                     <Code2 className="h-4 w-4 text-gray-400" />
                     <span className="mr-auto text-xs font-semibold text-gray-700">原始文件预览</span>

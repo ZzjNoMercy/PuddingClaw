@@ -8,6 +8,7 @@ import re
 import shlex
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,18 +20,22 @@ from runtime_identity.adapters import (
     ManagedCliMatch,
     ManagedCliRegistry,
     ManagedCliRoute,
-    is_lark_destructive_argv,
+    UnsupportedManagedCliCommand,
+    generic_node_cli_install,
 )
 from runtime_identity.authorization import (
-    LARK_APP_CONFIGURATION_PHASE,
-    LARK_USER_CONSENT_PHASE,
-    LARK_USER_REAUTHORIZATION_PHASE,
     AuthorizationFlowStatus,
     AuthorizationFlowStore,
 )
+from runtime_identity.authorization_drivers import (
+    AuthorizationDriver,
+    AuthorizationDriverRegistry,
+    AuthorizationPhaseKind,
+    AuthorizationPhaseNode,
+)
 from runtime_identity.paths import PuddingClawPaths, trusted_owner_user_id
 from runtime_identity.profiles import CredentialProfileStore
-from runtime_identity.toolchains import ToolchainManager
+from runtime_identity.toolchains import ToolchainManager, version_satisfies
 
 _SECRET_PATTERNS = (
     re.compile(
@@ -152,7 +157,7 @@ def _lark_device_authorization(output: str) -> dict[str, Any] | None:
 
 
 def _validated_lark_authorization_url(raw_url: str, *, phase_id: str) -> str | None:
-    candidate = str(raw_url or "").strip().strip('"\'')
+    candidate = str(raw_url or "").strip().strip("\"'")
     try:
         parsed = urlsplit(candidate)
     except ValueError:
@@ -386,9 +391,7 @@ def _lark_authorization_failure(output: str) -> _LarkAuthorizationFailure:
     if (
         (error_type == "validation" and subtype == "invalid_argument")
         or str(provider_code) == "20001"
-        or any(
-            marker in normalized for marker in ("invalid_request", "invalid request", "请求不合法")
-        )
+        or any(marker in normalized for marker in ("invalid_request", "invalid request", "请求不合法"))
     ):
         return _LarkAuthorizationFailure(
             "provider_invalid_request",
@@ -399,10 +402,14 @@ def _lark_authorization_failure(output: str) -> _LarkAuthorizationFailure:
             message,
         )
     provider_status = int(provider_code) if str(provider_code).isdigit() else None
-    if any(
-        marker in normalized
-        for marker in ("timeout", "timed out", "econnreset", "connection reset", "dns", "tls", "rate limit")
-    ) or provider_status == 429 or (provider_status is not None and 500 <= provider_status <= 599):
+    if (
+        any(
+            marker in normalized
+            for marker in ("timeout", "timed out", "econnreset", "connection reset", "dns", "tls", "rate limit")
+        )
+        or provider_status == 429
+        or (provider_status is not None and 500 <= provider_status <= 599)
+    ):
         return _LarkAuthorizationFailure(
             "provider_retryable_error",
             AuthorizationFlowStatus.FAILED.value,
@@ -517,6 +524,16 @@ class ManagedCliExecutionPlan:
     profile_revision: float | None
     toolchain_path: Path
     toolchain_revision: str
+    adapter_contract_fingerprint: str = ""
+    package_contract_fingerprint: str = ""
+    resolved_distribution: str = ""
+    resolved_version: str = ""
+    resolved_integrity: str = ""
+    runtime_image_digest: str = ""
+    resolution_fingerprint: str = ""
+    toolchain_lease_id: str = ""
+    toolchain_lease_expires_at: float = 0
+    profile_state_revision: str = ""
 
     def approval_preview(self) -> str:
         return json.dumps(
@@ -528,7 +545,15 @@ class ManagedCliExecutionPlan:
                 "owner_user_id": self.owner_user_id,
                 "profile_id": self.profile_id,
                 "profile_revision": self.profile_revision,
+                "profile_state_revision": self.profile_state_revision,
                 "toolchain_revision": self.toolchain_revision,
+                "adapter_contract_fingerprint": self.adapter_contract_fingerprint,
+                "package_contract_fingerprint": self.package_contract_fingerprint,
+                "resolved_distribution": self.resolved_distribution,
+                "resolved_version": self.resolved_version,
+                "resolved_integrity": self.resolved_integrity,
+                "runtime_image_digest": self.runtime_image_digest,
+                "resolution_fingerprint": self.resolution_fingerprint,
                 "destructive": self.match.destructive,
             },
             ensure_ascii=False,
@@ -546,23 +571,298 @@ class ManagedCliExecutionPlan:
             "argv": list(self.match.argv),
             "profile_id": self.profile_id,
             "profile_revision": self.profile_revision,
+            "profile_state_revision": self.profile_state_revision,
             "toolchain_revision": self.toolchain_revision,
+            "adapter_contract_fingerprint": self.adapter_contract_fingerprint,
+            "package_contract_fingerprint": self.package_contract_fingerprint,
+            "resolution_fingerprint": self.resolution_fingerprint,
+            "runtime_image_digest": self.runtime_image_digest,
+            "toolchain_lease_id": self.toolchain_lease_id,
             "action": action,
             "risk": risk,
         }
         return hashlib.sha256(json.dumps(frozen, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
+@dataclass(frozen=True)
+class GenericNodeCliInstallMatch:
+    """One user-approved npm CLI install with no Provider semantics."""
+
+    package: str
+    distribution: str
+    argv: tuple[str, ...]
+    adapter_id: str = "generic-node-cli"
+    action: ManagedCliAction = ManagedCliAction.INSTALL
+    route: ManagedCliRoute = ManagedCliRoute.INSTALLER
+    requires_network: bool = True
+    workspace_writable: bool = False
+    destructive: bool = False
+
+
+@dataclass(frozen=True)
+class GenericNodeCliInstallPlan:
+    match: GenericNodeCliInstallMatch
+    resolved_distribution: str
+    resolved_version: str
+    resolved_integrity: str
+    executables: tuple[str, ...]
+    runtime_image_digest: str
+    toolchain_revision: str
+    resolution_fingerprint: str
+
+    def approval_preview(self) -> str:
+        return json.dumps(
+            {
+                "kind": "generic_node_cli_install",
+                "package": self.match.package,
+                "requested_distribution": self.match.distribution,
+                "resolved_distribution": self.resolved_distribution,
+                "resolved_version": self.resolved_version,
+                "resolved_integrity": self.resolved_integrity,
+                "executables": list(self.executables),
+                "runtime_image_digest": self.runtime_image_digest,
+                "toolchain_revision": self.toolchain_revision,
+                "resolution_fingerprint": self.resolution_fingerprint,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+
+@dataclass(frozen=True)
+class ToolchainRollbackPlan:
+    plan_id: str
+    owner_user_id: str
+    adapter_id: str
+    target_revision: str
+    expected_current_revision: str
+    adapter_contract_fingerprint: str
+    package_contract_fingerprint: str
+    credential_state_fingerprint: str
+    runtime_image_digest: str
+    target_version: str
+    target_integrity: str
+    expires_at: float
+    toolchain_lease_id: str
+    binding: str
+
+    def approval_preview(self) -> str:
+        return json.dumps(
+            {
+                "action": "managed_toolchain_rollback",
+                "plan_id": self.plan_id,
+                "adapter_id": self.adapter_id,
+                "from_revision": self.expected_current_revision,
+                "target_revision": self.target_revision,
+                "target_version": self.target_version,
+                "target_integrity": self.target_integrity,
+                "runtime_image_digest": self.runtime_image_digest,
+                "expires_at": self.expires_at,
+                "binding": self.binding,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+    def record(self) -> dict[str, object]:
+        return {key: getattr(self, key) for key in self.__dataclass_fields__}
+
+    @classmethod
+    def from_record(cls, value: dict[str, object]) -> ToolchainRollbackPlan:
+        return cls(
+            plan_id=str(value.get("plan_id") or ""),
+            owner_user_id=str(value.get("owner_user_id") or ""),
+            adapter_id=str(value.get("adapter_id") or ""),
+            target_revision=str(value.get("target_revision") or ""),
+            expected_current_revision=str(value.get("expected_current_revision") or ""),
+            adapter_contract_fingerprint=str(value.get("adapter_contract_fingerprint") or ""),
+            package_contract_fingerprint=str(value.get("package_contract_fingerprint") or ""),
+            credential_state_fingerprint=str(value.get("credential_state_fingerprint") or ""),
+            runtime_image_digest=str(value.get("runtime_image_digest") or ""),
+            target_version=str(value.get("target_version") or ""),
+            target_integrity=str(value.get("target_integrity") or ""),
+            expires_at=float(value.get("expires_at") or 0),
+            toolchain_lease_id=str(value.get("toolchain_lease_id") or ""),
+            binding=str(value.get("binding") or ""),
+        )
+
+
 class ManagedCliService:
-    def __init__(self, backend: object, *, paths: PuddingClawPaths | None = None) -> None:
+    def __init__(
+        self,
+        backend: object,
+        *,
+        paths: PuddingClawPaths | None = None,
+        registry: ManagedCliRegistry | None = None,
+        authorization_drivers: AuthorizationDriverRegistry | None = None,
+    ) -> None:
         self.backend = backend
         self.paths = paths or PuddingClawPaths.from_environment()
+        self.registry = registry or ManagedCliRegistry()
+        if authorization_drivers is None:
+            default_drivers = AuthorizationDriverRegistry().drivers()
+            registered_ids = {adapter.adapter_id for adapter in self.registry.adapters()}
+            authorization_drivers = AuthorizationDriverRegistry(
+                tuple(driver for driver in default_drivers if driver.adapter_id in registered_ids)
+            )
+        self.authorization_drivers = authorization_drivers
+        for driver in self.authorization_drivers.drivers():
+            adapter = self.registry.adapter(driver.adapter_id)
+            if adapter.provider != driver.provider or not re.fullmatch(r"[0-9a-f]{64}", driver.contract_fingerprint):
+                raise ValueError("authorization Driver does not match its registered Adapter contract")
         runtime_owner = getattr(backend, "manager", backend)
         runtime_contract = str(getattr(runtime_owner, "runtime_contract", "")).strip()
         if not runtime_contract:
             raise ValueError("managed CLI backend does not expose a runtime contract")
         self.toolchains = ToolchainManager(self.paths, runtime_contract)
         self._recover_browser_watchers()
+
+    def _authorization_driver(
+        self,
+        match: ManagedCliMatch,
+        *,
+        required: bool = False,
+    ) -> AuthorizationDriver | None:
+        driver = self.authorization_drivers.for_adapter(match.adapter_id, required=required)
+        if driver is not None and not driver.handles(match):
+            raise ValueError("authorization Driver rejected the Adapter/provider identity")
+        return driver
+
+    def _adapter_contract_fingerprint(self, adapter_id: str) -> str:
+        adapter_fingerprint = self.registry.adapter_contract_fingerprint(adapter_id)
+        driver = self.authorization_drivers.for_adapter(adapter_id, required=False)
+        if driver is None:
+            return adapter_fingerprint
+        return hashlib.sha256(f"{adapter_fingerprint}\0{driver.contract_fingerprint}".encode()).hexdigest()
+
+    def _runtime_image_digest(self) -> str:
+        resolver = getattr(self.backend, "managed_runtime_image_digest", None)
+        if not callable(resolver):
+            raise ValueError("managed CLI backend does not expose an immutable runtime image digest")
+        value = str(resolver() or "")
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", value):
+            return value
+        raise ValueError("managed CLI backend returned an invalid runtime image digest")
+
+    @staticmethod
+    def _resolution_fingerprint(
+        *,
+        adapter_id: str,
+        package_fingerprint: str,
+        distribution: str,
+        version: str,
+        integrity: str,
+        runtime_image_digest: str,
+    ) -> str:
+        payload = {
+            "adapter_id": adapter_id,
+            "package_fingerprint": package_fingerprint,
+            "distribution": distribution,
+            "version": version,
+            "integrity": integrity,
+            "runtime_image_digest": runtime_image_digest,
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _generic_cli_resolution_fingerprint(
+        *,
+        package: str,
+        distribution: str,
+        version: str,
+        integrity: str,
+        executables: tuple[str, ...],
+        runtime_image_digest: str,
+        toolchain_revision: str,
+    ) -> str:
+        payload = {
+            "kind": "generic_node_cli_install",
+            "package": package,
+            "distribution": distribution,
+            "version": version,
+            "integrity": integrity,
+            "executables": list(executables),
+            "runtime_image_digest": runtime_image_digest,
+            "toolchain_revision": toolchain_revision,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def plan_command(
+        self,
+        command: str,
+        context: dict[str, Any],
+    ) -> ManagedCliExecutionPlan | GenericNodeCliInstallPlan | None:
+        """Plan an Adapter command or a generic credentialless npm CLI install."""
+
+        try:
+            managed = self.registry.match(command)
+        except UnsupportedManagedCliCommand:
+            generic = generic_node_cli_install(command)
+            if generic is None:
+                raise
+            requested_distribution, package = generic
+            return self._plan_generic_node_cli_install(
+                package=package,
+                distribution=requested_distribution,
+            )
+        if managed is None:
+            return None
+        return self.plan(managed, context)
+
+    def _plan_generic_node_cli_install(
+        self,
+        *,
+        package: str,
+        distribution: str,
+    ) -> GenericNodeCliInstallPlan:
+        resolver = getattr(self.backend, "resolve_generic_node_cli", None)
+        if not callable(resolver):
+            raise ValueError("host CLI runtime cannot resolve package metadata")
+        resolution = resolver(distribution=distribution, package=package)
+        resolved_version = str(getattr(resolution, "version", "") or "")
+        resolved_distribution = str(getattr(resolution, "distribution", "") or "")
+        resolved_integrity = str(getattr(resolution, "integrity", "") or "")
+        runtime_image_digest = str(getattr(resolution, "runtime_image_digest", "") or "")
+        executables = tuple(sorted(set(str(item) for item in getattr(resolution, "executables", ()))))
+        if (
+            getattr(resolution, "package", None) != package
+            or resolved_distribution != f"{package}@{resolved_version}"
+            or not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", resolved_version)
+            or not re.fullmatch(r"sha512-[A-Za-z0-9+/]+={0,2}", resolved_integrity)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", runtime_image_digest)
+            or not executables
+            or any(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", item) is None for item in executables)
+        ):
+            raise ValueError("npm package does not expose a reproducible top-level CLI contract")
+        current_resolver = getattr(self.backend, "generic_node_runtime_current", None)
+        if not callable(current_resolver):
+            raise ValueError("host CLI runtime cannot inspect its current revision")
+        current = current_resolver(runtime_image_digest)
+        fingerprint = self._generic_cli_resolution_fingerprint(
+            package=package,
+            distribution=resolved_distribution,
+            version=resolved_version,
+            integrity=resolved_integrity,
+            executables=executables,
+            runtime_image_digest=runtime_image_digest,
+            toolchain_revision=current.name,
+        )
+        return GenericNodeCliInstallPlan(
+            match=GenericNodeCliInstallMatch(
+                package=package,
+                distribution=distribution,
+                argv=("npm", "install", "--global", distribution),
+            ),
+            resolved_distribution=resolved_distribution,
+            resolved_version=resolved_version,
+            resolved_integrity=resolved_integrity,
+            executables=executables,
+            runtime_image_digest=runtime_image_digest,
+            toolchain_revision=current.name,
+            resolution_fingerprint=fingerprint,
+        )
 
     def _recover_browser_watchers(self) -> None:
         """Reconcile Runner inventory, durable leases, and Flow evidence.
@@ -592,14 +892,22 @@ class ManagedCliService:
                 continue
             provider = str(job.get("provider") or "")
             try:
-                credential_state = ManagedCliRegistry.credential_state_for_provider(provider)
+                adapter = self.registry.for_provider(provider)
+                credential_state = adapter.credential_state
+                driver = self.authorization_drivers.for_adapter(adapter.adapter_id)
             except ValueError:
                 continue
+            assert driver is not None
             profile_id = str(job.get("profile_id") or "")
             browser_job_id = str(job.get("browser_job_id") or "")
             if not profile_id or not browser_job_id:
                 continue
-            if job.get("credential_state_fingerprint") != credential_state.fingerprint:
+            if (
+                job.get("adapter_id") != adapter.adapter_id
+                or job.get("authorization_contract_fingerprint")
+                != self._adapter_contract_fingerprint(adapter.adapter_id)
+                or job.get("credential_state_fingerprint") != credential_state.fingerprint
+            ):
                 try:
                     with store.profile_lock(provider, profile_id):
                         current = store.resolve(
@@ -639,10 +947,20 @@ class ManagedCliService:
                         )
                         continue
                     flow = flow_store.active(provider, profile_id)
+                    try:
+                        browser_phase = driver.graph.node(str((flow or {}).get("phase_id") or ""))
+                    except ValueError:
+                        browser_phase = None
+                    if browser_phase is None or browser_phase.kind != AuthorizationPhaseKind.BROWSER_CONFIGURATION:
+                        self.backend.finalize_managed_browser_auth_cli(
+                            owner_user_id=owner_user_id,
+                            provider=provider,
+                            profile_id=profile_id,
+                            browser_job_id=browser_job_id,
+                        )
+                        continue
                     phase_one_staged = bool(
-                        flow is not None
-                        and LARK_APP_CONFIGURATION_PHASE.phase_id
-                        in flow.get("completed_phase_ids", [])
+                        browser_phase.phase.phase_id in flow.get("completed_phase_ids", [])
                         and flow_store.has_staged_state(flow)
                     )
                     leased_job_id = str(current.get("browser_job_id") or "")
@@ -660,9 +978,8 @@ class ManagedCliService:
                         app_setup_waiting = bool(
                             flow is not None
                             and flow.get("status") == AuthorizationFlowStatus.AWAITING_USER.value
-                            and flow.get("phase_id") == LARK_APP_CONFIGURATION_PHASE.phase_id
-                            and LARK_APP_CONFIGURATION_PHASE.phase_id
-                            not in flow.get("completed_phase_ids", [])
+                            and flow.get("phase_id") == browser_phase.phase.phase_id
+                            and browser_phase.phase.phase_id not in flow.get("completed_phase_ids", [])
                         )
                         if app_setup_waiting:
                             # Deterministic job identity and Adapter
@@ -722,9 +1039,7 @@ class ManagedCliService:
                     # may have created the Runner while we were waiting, so
                     # absence must be re-proven at the mutation boundary.
                     try:
-                        refreshed_jobs = self.backend.list_managed_browser_auth_jobs(
-                            owner_user_id=owner_user_id
-                        )
+                        refreshed_jobs = self.backend.list_managed_browser_auth_jobs(owner_user_id=owner_user_id)
                     except Exception:  # noqa: BLE001
                         continue
                     if not isinstance(refreshed_jobs, list):
@@ -738,7 +1053,7 @@ class ManagedCliService:
                     )
                     if runner_now_live:
                         try:
-                            credential_state = ManagedCliRegistry.credential_state_for_provider(provider)
+                            credential_state = self.registry.state_for_provider(provider)
                         except ValueError:
                             continue
                         self._start_browser_watcher(
@@ -794,10 +1109,92 @@ class ManagedCliService:
                 continue
 
     def plan(self, match: ManagedCliMatch, context: dict[str, Any]) -> ManagedCliExecutionPlan:
-        ref = self.toolchains.resolve_node()
+        self.registry.validate_match(match)
+        adapter = self.registry.adapter(match.adapter_id)
+        if match.authorization_phase:
+            driver = self._authorization_driver(match, required=True)
+            assert driver is not None
+            driver.graph.node(match.authorization_phase)
+        adapter_contract_fingerprint = self._adapter_contract_fingerprint(match.adapter_id)
+        resolved_distribution = ""
+        resolved_version = ""
+        resolved_integrity = ""
+        resolution_fingerprint = ""
+        if match.route == ManagedCliRoute.INSTALLER:
+            resolver = getattr(self.backend, "resolve_managed_node_cli", None)
+            if not callable(resolver) or not match.distribution:
+                raise ValueError("managed CLI backend cannot resolve package metadata")
+            # This is a trusted, credentialless control-plane lookup against
+            # the Adapter-fixed npm package. It accepts no Agent URL, registry,
+            # environment, or executable input. The resolved immutable tuple
+            # is shown in the subsequent installation approval.
+            resolution = resolver(
+                distribution=match.distribution,
+                package=adapter.toolchain_package.package,
+            )
+            resolved_distribution = str(getattr(resolution, "distribution", "") or "")
+            resolved_version = str(getattr(resolution, "version", "") or "")
+            resolved_integrity = str(getattr(resolution, "integrity", "") or "")
+            runtime_image_digest = str(getattr(resolution, "runtime_image_digest", "") or "")
+            if (
+                getattr(resolution, "package", None) != adapter.toolchain_package.package
+                or resolved_distribution != f"{adapter.toolchain_package.package}@{resolved_version}"
+                or not re.fullmatch(
+                    r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?",
+                    resolved_version,
+                )
+                or not re.fullmatch(r"sha512-[A-Za-z0-9+/]+={0,2}", resolved_integrity)
+                or not re.fullmatch(r"sha256:[0-9a-f]{64}", runtime_image_digest)
+                or (
+                    adapter.toolchain_package.compatibility
+                    and not version_satisfies(
+                        resolved_version,
+                        adapter.toolchain_package.compatibility,
+                    )
+                )
+                or (
+                    adapter.toolchain_package.expected_integrity
+                    and resolved_integrity != adapter.toolchain_package.expected_integrity
+                )
+            ):
+                raise ValueError("resolved managed package metadata violates the Adapter contract")
+            resolution_fingerprint = self._resolution_fingerprint(
+                adapter_id=match.adapter_id,
+                package_fingerprint=adapter.toolchain_package.fingerprint,
+                distribution=resolved_distribution,
+                version=resolved_version,
+                integrity=resolved_integrity,
+                runtime_image_digest=runtime_image_digest,
+            )
+            self.toolchains.record_event(
+                match.adapter_id,
+                {
+                    "event": "package_resolution_prepared",
+                    "requested_distribution": match.distribution,
+                    "resolved_distribution": resolved_distribution,
+                    "resolved_integrity": resolved_integrity,
+                    "runtime_image_digest": runtime_image_digest,
+                    "resolution_fingerprint": resolution_fingerprint,
+                    "created_at": time.time(),
+                },
+            )
+            # An install/update is also the repair path for an obsolete or
+            # incompatible current revision. Freeze its identity for CAS, but
+            # do not require the old contract to validate before replacement.
+            ref = self.toolchains.resolve_node(match.adapter_id)
+        else:
+            runtime_image_digest = self._runtime_image_digest()
+            ref = self.toolchains.resolve_for_adapter(
+                adapter_id=match.adapter_id,
+                spec=adapter.toolchain_package,
+                adapter_contract_fingerprint=adapter_contract_fingerprint,
+                credential_state_fingerprint=adapter.credential_state.fingerprint,
+                runtime_image_digest=runtime_image_digest,
+            )
         owner_user_id = trusted_owner_user_id()
         profile_id: str | None = None
         profile_revision: float | None = None
+        profile_state_revision = ""
         if match.requires_profile:
             store = CredentialProfileStore(self.paths, owner_user_id)
             profile = store.resolve(
@@ -813,6 +1210,14 @@ class ManagedCliService:
             # overwriting its last-known-good Vault before final verification.
             profile_id = str(profile["profile_id"])
             profile_revision = float(profile.get("updated_at") or 0)
+            profile_state_revision = store.state_revision(match.provider or "", profile_id)
+        lease_id, lease_expires_at = self.toolchains.acquire_revision_lease(
+            adapter_id=match.adapter_id,
+            revision=ref.host_path.name,
+            owner_kind="plan",
+            owner_id=str(context.get("run_id") or context.get("query_id") or uuid.uuid4().hex),
+            contract_fingerprint=adapter_contract_fingerprint,
+        )
         return ManagedCliExecutionPlan(
             match=match,
             owner_user_id=owner_user_id,
@@ -820,23 +1225,380 @@ class ManagedCliService:
             profile_revision=profile_revision,
             toolchain_path=ref.host_path,
             toolchain_revision=ref.host_path.name,
+            adapter_contract_fingerprint=adapter_contract_fingerprint,
+            package_contract_fingerprint=adapter.toolchain_package.fingerprint,
+            resolved_distribution=resolved_distribution,
+            resolved_version=resolved_version,
+            resolved_integrity=resolved_integrity,
+            runtime_image_digest=runtime_image_digest,
+            resolution_fingerprint=resolution_fingerprint,
+            toolchain_lease_id=lease_id,
+            toolchain_lease_expires_at=lease_expires_at,
+            profile_state_revision=profile_state_revision,
         )
+
+    @staticmethod
+    def _rollback_binding(payload: dict[str, object]) -> str:
+        frozen = {key: value for key, value in payload.items() if key != "binding"}
+        return hashlib.sha256(json.dumps(frozen, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+    def list_toolchain_revisions(self, adapter_id: str) -> list[dict[str, object]]:
+        adapter = self.registry.adapter(adapter_id)
+        runtime_image_digest = self._runtime_image_digest()
+        return self.toolchains.list_revisions(
+            adapter_id=adapter_id,
+            spec=adapter.toolchain_package,
+            adapter_contract_fingerprint=self._adapter_contract_fingerprint(adapter_id),
+            credential_state_fingerprint=adapter.credential_state.fingerprint,
+            runtime_image_digest=runtime_image_digest,
+        )
+
+    def plan_toolchain_rollback(
+        self,
+        adapter_id: str,
+        target_revision: str,
+        *,
+        ttl_seconds: int = 300,
+    ) -> ToolchainRollbackPlan:
+        if ttl_seconds < 30 or ttl_seconds > 900:
+            raise ValueError("Toolchain rollback approval TTL is invalid")
+        adapter = self.registry.adapter(adapter_id)
+        adapter_fingerprint = self._adapter_contract_fingerprint(adapter_id)
+        runtime_image_digest = self._runtime_image_digest()
+        ref = self.toolchains.resolve_for_adapter(
+            adapter_id=adapter_id,
+            spec=adapter.toolchain_package,
+            adapter_contract_fingerprint=adapter_fingerprint,
+            credential_state_fingerprint=adapter.credential_state.fingerprint,
+            runtime_image_digest=runtime_image_digest,
+        )
+        revisions = self.list_toolchain_revisions(adapter_id)
+        target = next(
+            (item for item in revisions if item.get("revision") == target_revision),
+            None,
+        )
+        if target is None:
+            raise ValueError("Toolchain rollback target is unavailable or incompatible")
+        if target_revision == ref.host_path.name:
+            raise ValueError("Toolchain rollback target is already current")
+        plan_id = uuid.uuid4().hex
+        lease_id, _lease_expires_at = self.toolchains.acquire_revision_lease(
+            adapter_id=adapter_id,
+            revision=target_revision,
+            owner_kind="rollback",
+            owner_id=plan_id,
+            contract_fingerprint=adapter_fingerprint,
+            ttl_seconds=ttl_seconds,
+        )
+        payload: dict[str, object] = {
+            "plan_id": plan_id,
+            "owner_user_id": trusted_owner_user_id(),
+            "adapter_id": adapter_id,
+            "target_revision": target_revision,
+            "expected_current_revision": ref.host_path.name,
+            "adapter_contract_fingerprint": adapter_fingerprint,
+            "package_contract_fingerprint": adapter.toolchain_package.fingerprint,
+            "credential_state_fingerprint": adapter.credential_state.fingerprint,
+            "runtime_image_digest": runtime_image_digest,
+            "target_version": str(target.get("version") or ""),
+            "target_integrity": str(target.get("integrity") or ""),
+            "expires_at": time.time() + ttl_seconds,
+            "toolchain_lease_id": lease_id,
+        }
+        payload["binding"] = self._rollback_binding(payload)
+        plan = ToolchainRollbackPlan.from_record(payload)
+        self.toolchains.store_rollback_plan(adapter_id, plan.record())
+        self.toolchains.record_event(
+            adapter_id,
+            {
+                "event": "rollback_planned",
+                "plan_id": plan.plan_id,
+                "from_revision": plan.expected_current_revision,
+                "target_revision": plan.target_revision,
+                "binding": plan.binding,
+                "created_at": time.time(),
+            },
+        )
+        return plan
+
+    def execute_toolchain_rollback(
+        self,
+        adapter_id: str,
+        plan_id: str,
+        binding: str,
+        *,
+        confirmed: bool = False,
+    ) -> ManagedCliServiceResult:
+        consumed_plan: ToolchainRollbackPlan | None = None
+        if not confirmed:
+            return self._error(
+                "managed_toolchain_rollback_confirmation_required",
+                "Toolchain rollback requires an explicit user confirmation.",
+            )
+        try:
+            record = self.toolchains.consume_rollback_plan(adapter_id, plan_id, binding)
+            plan = ToolchainRollbackPlan.from_record(record)
+            consumed_plan = plan
+            adapter = self.registry.adapter(adapter_id)
+            if (
+                plan.adapter_id != adapter_id
+                or plan.owner_user_id != trusted_owner_user_id()
+                or plan.binding != self._rollback_binding(record)
+                or time.time() > plan.expires_at
+                or plan.adapter_contract_fingerprint != self._adapter_contract_fingerprint(adapter_id)
+                or plan.package_contract_fingerprint != adapter.toolchain_package.fingerprint
+                or plan.credential_state_fingerprint != adapter.credential_state.fingerprint
+                or plan.runtime_image_digest != self._runtime_image_digest()
+            ):
+                raise ValueError("Toolchain rollback plan is stale or incompatible")
+            ref = self.toolchains.rollback_node(
+                adapter_id=adapter_id,
+                release_id=plan.target_revision,
+                spec=adapter.toolchain_package,
+                adapter_contract_fingerprint=plan.adapter_contract_fingerprint,
+                credential_state_fingerprint=plan.credential_state_fingerprint,
+                runtime_image_digest=plan.runtime_image_digest,
+                expected_revision=plan.expected_current_revision,
+            )
+            audit_status = "recorded"
+            try:
+                self.toolchains.record_event(
+                    adapter_id,
+                    {
+                        "event": "rollback_succeeded",
+                        "plan_id": plan.plan_id,
+                        "from_revision": plan.expected_current_revision,
+                        "target_revision": plan.target_revision,
+                        "completed_at": time.time(),
+                    },
+                )
+            except (OSError, ValueError):
+                # ``rollback_node`` already crossed the atomic current
+                # symlink commit point. Audit storage degradation must be
+                # surfaced without lying that the rollback itself failed.
+                audit_status = "failed"
+            return ManagedCliServiceResult(
+                payload={
+                    "ok": True,
+                    "managed_by": "managed_cli",
+                    "action": "toolchain_rollback",
+                    "adapter_id": adapter_id,
+                    "previous_revision": plan.expected_current_revision,
+                    "active_revision": ref.host_path.name,
+                    "version": plan.target_version,
+                    "audit_status": audit_status,
+                },
+                exit_code=0,
+            )
+        except (OSError, ValueError) as exc:
+            try:
+                self.toolchains.record_event(
+                    adapter_id,
+                    {
+                        "event": "rollback_failed",
+                        "plan_id": plan_id,
+                        "error_type": type(exc).__name__,
+                        "completed_at": time.time(),
+                    },
+                )
+            except (OSError, ValueError):
+                pass
+            return self._error(
+                "managed_toolchain_rollback_failed",
+                "Toolchain rollback approval is invalid, stale, or no longer compatible.",
+            )
+        finally:
+            if consumed_plan is not None and consumed_plan.toolchain_lease_id:
+                try:
+                    self.toolchains.release_revision_lease(
+                        adapter_id=adapter_id,
+                        lease_id=consumed_plan.toolchain_lease_id,
+                    )
+                    self.toolchains.gc_revisions(adapter_id)
+                except (OSError, ValueError):
+                    pass
 
     def execute(
         self,
-        plan: ManagedCliExecutionPlan | ManagedCliMatch,
+        plan: ManagedCliExecutionPlan | ManagedCliMatch | GenericNodeCliInstallPlan,
         context: dict[str, Any] | None = None,
     ) -> ManagedCliServiceResult:
         if isinstance(plan, ManagedCliMatch):
             plan = self.plan(plan, context or {})
-        if plan.match.route == ManagedCliRoute.INSTALLER:
-            return self._install(plan.match)
-        return self._provider(plan, context or {})
+        if isinstance(plan, GenericNodeCliInstallPlan):
+            return self._install_generic_node_cli(plan)
+        promoted = False
+        try:
+            if plan.match.route == ManagedCliRoute.INSTALLER:
+                result = self._install(plan)
+            else:
+                result = self._provider(plan, context or {})
+            if plan.toolchain_lease_id and result.payload.get("status") == "awaiting_user_browser":
+                runner_id = str(
+                    result.payload.get("browser_job_id")
+                    or _browser_job_id(
+                        plan.owner_user_id,
+                        plan.match.provider or "",
+                        plan.profile_id or "",
+                    )
+                )
+                self.toolchains.renew_revision_lease(
+                    adapter_id=plan.match.adapter_id,
+                    lease_id=plan.toolchain_lease_id,
+                    revision=plan.toolchain_revision,
+                    owner_kind="runner",
+                    owner_id=runner_id,
+                    contract_fingerprint=plan.adapter_contract_fingerprint,
+                    ttl_seconds=3600,
+                )
+                promoted = True
+            return result
+        finally:
+            if plan.toolchain_lease_id and not promoted:
+                try:
+                    self.toolchains.release_revision_lease(
+                        adapter_id=plan.match.adapter_id,
+                        lease_id=plan.toolchain_lease_id,
+                    )
+                    self.toolchains.gc_revisions(plan.match.adapter_id)
+                except (OSError, ValueError):
+                    # Lease corruption fails GC closed but never changes the
+                    # already-known command result.
+                    pass
 
-    def _install(self, match: ManagedCliMatch) -> ManagedCliServiceResult:
-        if match.adapter_id != "lark-cli" or not match.distribution:
+    def _install_generic_node_cli(
+        self,
+        plan: GenericNodeCliInstallPlan,
+    ) -> ManagedCliServiceResult:
+        expected_fingerprint = self._generic_cli_resolution_fingerprint(
+            package=plan.match.package,
+            distribution=plan.resolved_distribution,
+            version=plan.resolved_version,
+            integrity=plan.resolved_integrity,
+            executables=plan.executables,
+            runtime_image_digest=plan.runtime_image_digest,
+            toolchain_revision=plan.toolchain_revision,
+        )
+        if (
+            plan.resolution_fingerprint != expected_fingerprint
+            or plan.resolved_distribution != f"{plan.match.package}@{plan.resolved_version}"
+        ):
+            return self._error(
+                "managed_install_plan_stale",
+                "Generic CLI package resolution changed while installation approval was pending.",
+            )
+        try:
+            installer = getattr(self.backend, "install_generic_node_cli", None)
+            if not callable(installer):
+                raise ValueError("host CLI runtime cannot publish package bytes")
+            installed = installer(
+                package=plan.match.package,
+                distribution=plan.resolved_distribution,
+                executables=plan.executables,
+                integrity=plan.resolved_integrity,
+                owner_revision=plan.resolution_fingerprint,
+                runtime_digest=plan.runtime_image_digest,
+                base_revision=plan.toolchain_revision,
+            )
+        except (OSError, ValueError) as exc:
+            return self._error(
+                "managed_install_failed",
+                f"Generic CLI staging failed before publication: {type(exc).__name__}: {exc}",
+            )
+        return ManagedCliServiceResult(
+            payload={
+                "ok": installed.exit_code == 0,
+                "managed_by": "software_runtime",
+                "kind": "generic_node_cli",
+                "route": plan.match.route.value,
+                "action": plan.match.action.value,
+                "package": plan.match.package,
+                "requested_distribution": plan.match.distribution,
+                "resolved_distribution": plan.resolved_distribution,
+                "resolved_version": plan.resolved_version,
+                "resolved_integrity": plan.resolved_integrity,
+                "executables": list(plan.executables),
+                "previous_revision": installed.previous_revision,
+                "active_revision": installed.revision or installed.previous_revision,
+                "runtime_image_digest": plan.runtime_image_digest,
+                "reproducible_request": True,
+                "credentials": "none",
+                "output": redact_managed_cli_output(installed.output),
+            },
+            exit_code=installed.exit_code,
+        )
+
+    def _install(self, plan: ManagedCliExecutionPlan) -> ManagedCliServiceResult:
+        match = plan.match
+        if not match.distribution:
             return self._error("unsupported_managed_install", "No trusted installer owns this request.")
-        result = self.toolchains.install_lark(self.backend, match.distribution)
+        try:
+            adapter = self.registry.adapter(match.adapter_id)
+        except ValueError:
+            return self._error("unsupported_managed_install", "No trusted installer owns this request.")
+        adapter_contract_fingerprint = self._adapter_contract_fingerprint(match.adapter_id)
+        if (
+            plan.adapter_contract_fingerprint != adapter_contract_fingerprint
+            or plan.package_contract_fingerprint != adapter.toolchain_package.fingerprint
+        ):
+            return self._error(
+                "managed_install_plan_stale",
+                "Managed CLI Adapter contract changed while installation approval was pending.",
+            )
+        expected_resolution_fingerprint = self._resolution_fingerprint(
+            adapter_id=match.adapter_id,
+            package_fingerprint=adapter.toolchain_package.fingerprint,
+            distribution=plan.resolved_distribution,
+            version=plan.resolved_version,
+            integrity=plan.resolved_integrity,
+            runtime_image_digest=plan.runtime_image_digest,
+        )
+        if (
+            not plan.resolution_fingerprint
+            or plan.resolution_fingerprint != expected_resolution_fingerprint
+            or plan.resolved_distribution != f"{adapter.toolchain_package.package}@{plan.resolved_version}"
+        ):
+            return self._error(
+                "managed_install_plan_stale",
+                "Managed package resolution is missing or changed; prepare a new installation approval.",
+            )
+        try:
+            result = self.toolchains.install_package(
+                self.backend,
+                adapter_id=adapter.adapter_id,
+                spec=adapter.toolchain_package,
+                distribution=plan.resolved_distribution,
+                expected_integrity=plan.resolved_integrity,
+                runtime_image_digest=plan.runtime_image_digest,
+                adapter_contract_fingerprint=adapter_contract_fingerprint,
+                credential_state_fingerprint=adapter.credential_state.fingerprint,
+                expected_revision=plan.toolchain_revision,
+            )
+        except (OSError, ValueError) as exc:
+            diagnostic = redact_managed_cli_output(str(exc)).strip()
+            return self._error(
+                "managed_install_failed",
+                (
+                    f"Managed Toolchain staging failed before publication: {type(exc).__name__}: "
+                    f"{diagnostic or 'no diagnostic'}"
+                ),
+            )
+        try:
+            self.toolchains.record_event(
+                match.adapter_id,
+                {
+                    "event": ("installation_succeeded" if result.exit_code == 0 else "installation_failed"),
+                    "requested_distribution": match.distribution,
+                    "resolved_distribution": plan.resolved_distribution,
+                    "resolved_integrity": plan.resolved_integrity,
+                    "runtime_image_digest": plan.runtime_image_digest,
+                    "from_revision": result.previous_revision,
+                    "active_revision": result.active_revision,
+                    "completed_at": time.time(),
+                },
+            )
+        except OSError:
+            pass
         return ManagedCliServiceResult(
             payload={
                 "ok": result.exit_code == 0,
@@ -845,14 +1607,19 @@ class ManagedCliService:
                 "route": match.route.value,
                 "action": match.action.value,
                 "distribution": match.distribution,
-                "toolchain": (f"user://runtime/toolchains/node/{self.toolchains.resolve_node().runtime_contract}"),
+                "resolved_distribution": plan.resolved_distribution,
+                "resolved_version": result.resolved_version,
+                "previous_revision": result.previous_revision,
+                "active_revision": result.active_revision,
+                "reproducible_request": True,
+                "toolchain": f"user://runtime/node/{self.toolchains.runtime_contract}",
                 "output": redact_managed_cli_output(result.output),
             },
             exit_code=result.exit_code,
         )
 
-    def _lark_authorization_provider(self, plan: ManagedCliExecutionPlan) -> ManagedCliServiceResult:
-        """Execute the two-phase Lark authorization state machine.
+    def _authorization_provider(self, plan: ManagedCliExecutionPlan) -> ManagedCliServiceResult:
+        """Execute the Driver-selected authorization state machine.
 
         Public browser material is projected as structured data. Provider
         continuation secrets and staged credentials never enter the returned
@@ -861,13 +1628,19 @@ class ManagedCliService:
         """
 
         match = plan.match
-        if match.authorization_phase == LARK_APP_CONFIGURATION_PHASE.phase_id:
-            return self._start_lark_app_configuration(plan)
+        driver = self._authorization_driver(match, required=True)
+        assert driver is not None
         if match.action == ManagedCliAction.AUTHORIZATION_RESUME:
-            return self._resume_lark_user_consent(plan)
-        if match.authorization_phase == LARK_USER_CONSENT_PHASE.phase_id:
-            return self._start_lark_user_consent(plan)
-        return self._error("unsupported_authorization_phase", "The Lark authorization phase is not supported.")
+            return self._resume_user_consent(plan)
+        try:
+            node = driver.graph.node(str(match.authorization_phase or ""))
+        except ValueError:
+            return self._error("unsupported_authorization_phase", "The provider authorization phase is not supported.")
+        if node.kind == AuthorizationPhaseKind.BROWSER_CONFIGURATION:
+            return self._start_app_configuration(plan, node=node)
+        if node.kind == AuthorizationPhaseKind.DEVICE_AUTHORIZATION:
+            return self._start_user_consent(plan, node=node)
+        return self._error("unsupported_authorization_phase", "The Driver phase kind is not supported.")
 
     def _authorization_payload(
         self,
@@ -1006,8 +1779,8 @@ class ManagedCliService:
     ) -> AuthorizationFlowStore:
         return AuthorizationFlowStore(self.paths, owner_user_id, vault=store.vault)
 
-    @staticmethod
     def _reconcile_authorization_flow_locked(
+        self,
         *,
         flow_store: AuthorizationFlowStore,
         current: dict[str, Any],
@@ -1015,6 +1788,22 @@ class ManagedCliService:
         profile_id: str,
     ) -> dict[str, Any] | None:
         """Reconcile one Flow using its Adapter-declared evidence contract."""
+
+        active = flow_store.active(provider, profile_id)
+        if active is not None:
+            adapter = self.registry.for_provider(provider)
+            expected_fingerprint = self._adapter_contract_fingerprint(adapter.adapter_id)
+            stored_fingerprint = str(active.get("adapter_contract_fingerprint") or "")
+            if stored_fingerprint != expected_fingerprint:
+                # Legacy flows froze only the credential-state fingerprint.
+                # Driver/argv semantics can no longer be proven, so never
+                # resume them under the current authorization implementation.
+                flow_store.cancel_active(
+                    provider,
+                    profile_id,
+                    reason="authorization_contract_changed",
+                )
+                return None
 
         return flow_store.reconcile_recovery(
             provider,
@@ -1034,10 +1823,21 @@ class ManagedCliService:
             raise ValueError("Credential Profile changed while the managed command was being prepared; retry it.")
         return current
 
-    def _start_lark_app_configuration(self, plan: ManagedCliExecutionPlan) -> ManagedCliServiceResult:
+    def _start_app_configuration(
+        self,
+        plan: ManagedCliExecutionPlan,
+        *,
+        node: AuthorizationPhaseNode | None = None,
+    ) -> ManagedCliServiceResult:
         match = plan.match
+        driver = self._authorization_driver(match, required=True)
+        assert driver is not None
+        node = node or driver.graph.node(driver.graph.app_configuration.phase_id)
+        if node.kind != AuthorizationPhaseKind.BROWSER_CONFIGURATION:
+            return self._error("unsupported_authorization_phase", "Authorization phase is not browser-driven.")
+        app_phase = node.phase
         owner_user_id = plan.owner_user_id
-        provider = match.provider or "lark"
+        provider = match.provider or driver.provider
         profile_id = plan.profile_id or ""
         credential_state = match.credential_state
         assert credential_state is not None
@@ -1051,12 +1851,12 @@ class ManagedCliService:
                 base_revision = store.state_revision(provider, profile_id)
                 active_base_revision = str(active.get("base_state_revision") or "") if active else ""
                 restart_active = active is not None and (
-                    active.get("purpose") != "lark_full_authorization"
+                    active.get("purpose") != driver.graph.full_purpose
                     or active_base_revision not in {"", base_revision}
                     # An explicit full replacement while phase 2 is active
                     # starts over from an empty staging state. Reusing the
                     # phase-2 Flow would mix two replacement transactions.
-                    or active.get("phase_id") != LARK_APP_CONFIGURATION_PHASE.phase_id
+                    or active.get("phase_id") != app_phase.phase_id
                 )
                 if restart_active:
                     if current.get("browser_job_id"):
@@ -1082,11 +1882,14 @@ class ManagedCliService:
                                 "authorization_profile_conflict",
                                 "旧的飞书浏览器授权 lease 已变化，请刷新状态后重试。",
                             )
-                        current = store.resolve(
-                            provider,
-                            explicit_profile_id=profile_id,
-                            create_default=False,
-                        ) or current
+                        current = (
+                            store.resolve(
+                                provider,
+                                explicit_profile_id=profile_id,
+                                create_default=False,
+                            )
+                            or current
+                        )
                     cancel_reason = (
                         "stale_base_state"
                         if active_base_revision not in {"", base_revision}
@@ -1123,8 +1926,8 @@ class ManagedCliService:
                             output="正在等待第 1/2 步的浏览器操作完成。",
                         )
 
-                if active is not None and active.get("phase_id") == LARK_APP_CONFIGURATION_PHASE.phase_id:
-                    if LARK_APP_CONFIGURATION_PHASE.phase_id in active.get("completed_phase_ids", []):
+                if active is not None and active.get("phase_id") == app_phase.phase_id:
+                    if app_phase.phase_id in active.get("completed_phase_ids", []):
                         return ManagedCliServiceResult(
                             payload={
                                 "ok": True,
@@ -1132,7 +1935,7 @@ class ManagedCliService:
                                 "adapter_id": match.adapter_id,
                                 "profile_id": profile_id,
                                 "status": "authorization_phase_completed",
-                                "phase": LARK_APP_CONFIGURATION_PHASE.projection(),
+                                "phase": app_phase.projection(),
                                 "output": "飞书应用配置已验证，可以进入第 2/2 步用户授权。",
                             },
                             exit_code=0,
@@ -1149,11 +1952,11 @@ class ManagedCliService:
                     provider=provider,
                     adapter_id=match.adapter_id,
                     profile_id=profile_id,
-                    purpose="lark_full_authorization",
-                    phase=LARK_APP_CONFIGURATION_PHASE,
+                    purpose=driver.graph.full_purpose,
+                    phase=app_phase,
                     profile_revision=float(current.get("updated_at") or 0),
                     base_state_revision=base_revision,
-                    adapter_contract_fingerprint=credential_state.fingerprint,
+                    adapter_contract_fingerprint=plan.adapter_contract_fingerprint,
                     public={},
                     secret=None,
                     expires_at=None,
@@ -1172,6 +1975,9 @@ class ManagedCliService:
                     owner_user_id=owner_user_id,
                     provider=provider,
                     profile_id=profile_id,
+                    adapter_id=match.adapter_id,
+                    authorization_contract_fingerprint=plan.adapter_contract_fingerprint,
+                    expected_runtime_image_digest=plan.runtime_image_digest,
                 )
                 if result.browser_job_id != browser_job_id:
                     raise RuntimeError("browser authorization runner returned the wrong job id")
@@ -1192,43 +1998,50 @@ class ManagedCliService:
                             "adapter_id": match.adapter_id,
                             "profile_id": profile_id,
                             "status": "authorization_phase_completed",
-                            "phase": LARK_APP_CONFIGURATION_PHASE.projection(),
+                            "phase": app_phase.projection(),
                             "output": "飞书应用配置已验证，可以进入第 2/2 步用户授权。",
                         },
                         exit_code=0,
                     )
                 if result.browser_status != "awaiting_user_browser":
-                    flow_store.fail(provider, profile_id, status=AuthorizationFlowStatus.FAILED.value, error="app setup failed")
-                    store.finish_browser_job(profile_id, browser_job_id, "repair_required", credential_state.fingerprint)
+                    flow_store.fail(
+                        provider, profile_id, status=AuthorizationFlowStatus.FAILED.value, error="app setup failed"
+                    )
+                    store.finish_browser_job(
+                        profile_id, browser_job_id, "repair_required", credential_state.fingerprint
+                    )
                     return self._error(
                         "lark_app_configuration_failed",
                         "飞书应用配置未完成；旧 Credential Profile 保持不变，可重新发起配置。",
                     )
-                verification_url = _lark_config_authorization_url(result.output)
+                verification_url = driver.config_authorization_url(result.output)
                 if verification_url is None:
                     raise RuntimeError("Lark app configuration did not return a trusted verification URL")
                 qr_ascii = _terminal_qr(result.output)
                 if not qr_ascii:
-                    qr = self.backend.run_managed_provider_cli(
-                        argv=["lark-cli", "auth", "qrcode", verification_url, "--ascii"],
-                        environment=dict(match.env),
-                        credential_state_spec=None,
-                        toolchain_path=plan.toolchain_path,
-                        container_path="/opt/puddingclaw/toolchain/node",
-                        credential_state=b"",
-                        network_enabled=False,
-                        workspace_writable=False,
-                    )
-                    qr_ascii = _terminal_qr(qr.output)
+                    qr_argv = driver.qrcode_argv(verification_url)
+                    if qr_argv is not None:
+                        qr = self.backend.run_managed_provider_cli(
+                            argv=list(qr_argv),
+                            environment=dict(match.env),
+                            credential_state_spec=None,
+                            toolchain_path=plan.toolchain_path,
+                            container_path="/opt/puddingclaw/toolchain/node",
+                            credential_state=b"",
+                            network_enabled=False,
+                            workspace_writable=False,
+                            expected_runtime_image_digest=plan.runtime_image_digest,
+                        )
+                        qr_ascii = _terminal_qr(qr.output)
                 flow = flow_store.begin_or_advance(
                     provider=provider,
                     adapter_id=match.adapter_id,
                     profile_id=profile_id,
-                    purpose="lark_full_authorization",
-                    phase=LARK_APP_CONFIGURATION_PHASE,
+                    purpose=driver.graph.full_purpose,
+                    phase=app_phase,
                     profile_revision=float(current.get("updated_at") or 0),
                     base_state_revision=base_revision,
-                    adapter_contract_fingerprint=credential_state.fingerprint,
+                    adapter_contract_fingerprint=plan.adapter_contract_fingerprint,
                     public={
                         "verification_url": verification_url,
                         "user_code": _query_user_code(verification_url),
@@ -1257,7 +2070,7 @@ class ManagedCliService:
                 f"{type(exc).__name__}: 托管授权事务未能继续；Credential Profile 未被提交。",
             )
 
-    def _issue_lark_user_attempt_locked(
+    def _issue_user_attempt_locked(
         self,
         *,
         plan: ManagedCliExecutionPlan,
@@ -1268,17 +2081,23 @@ class ManagedCliService:
         credential_state: CredentialStateSpec,
         reset_staged_user: bool,
         renewal: bool,
+        node: AuthorizationPhaseNode | None = None,
     ) -> ManagedCliServiceResult:
         """Create one device-code attempt without mutating the durable Profile."""
 
         match = plan.match
-        provider = match.provider or "lark"
+        driver = self._authorization_driver(match, required=True)
+        assert driver is not None
+        node = node or driver.graph.node(str(active.get("phase_id") or match.authorization_phase or ""))
+        if node.kind != AuthorizationPhaseKind.DEVICE_AUTHORIZATION:
+            return self._error("unsupported_authorization_phase", "Authorization phase is not device-driven.")
+        provider = match.provider or driver.provider
         profile_id = plan.profile_id or ""
-        purpose = str(active.get("purpose") or "lark_full_authorization")
+        purpose = str(active.get("purpose") or driver.graph.full_purpose)
         staged_state = flow_store.read_staged_state(active)
-        if purpose != "lark_user_reauthorization":
+        if node.requires_prerequisite_identity and purpose != driver.graph.reauthorization_purpose:
             preflight = self.backend.run_managed_provider_cli(
-                argv=["lark-cli", "auth", "status", "--json", "--verify"],
+                argv=list(driver.identity_status_argv),
                 environment=dict(match.env),
                 credential_state_spec=credential_state,
                 toolchain_path=plan.toolchain_path,
@@ -1286,11 +2105,12 @@ class ManagedCliService:
                 credential_state=staged_state,
                 network_enabled=True,
                 workspace_writable=False,
+                expected_runtime_image_digest=plan.runtime_image_digest,
             )
             if preflight.credential_state is not None:
                 flow_store.write_staged_state(active, preflight.credential_state)
                 staged_state = preflight.credential_state
-            if not _lark_bot_ready(_lark_identity_status(preflight.output)):
+            if not driver.bot_ready(driver.identity_status(preflight.output)):
                 return self._error(
                     "authorization_prerequisite_failed",
                     "飞书应用配置未通过 Bot 身份验证；请完整重新配置，而不是继续重试用户授权。",
@@ -1300,7 +2120,7 @@ class ManagedCliService:
             # durable Profile bytes are untouched until independent verify and
             # CAS commit. Provider adapters must keep this operation local-only.
             reset = self.backend.run_managed_provider_cli(
-                argv=["lark-cli", "auth", "logout", "--json"],
+                argv=list(driver.logout_argv),
                 environment=dict(match.env),
                 credential_state_spec=credential_state,
                 toolchain_path=plan.toolchain_path,
@@ -1308,6 +2128,7 @@ class ManagedCliService:
                 credential_state=staged_state,
                 network_enabled=False,
                 workspace_writable=False,
+                expected_runtime_image_digest=plan.runtime_image_digest,
             )
             if reset.exit_code != 0 or reset.credential_state is None:
                 return self._error(
@@ -1318,9 +2139,7 @@ class ManagedCliService:
             staged_state = reset.credential_state
             active = flow_store.mark_staging_user_cleared(provider, profile_id) or active
         initiation_argv = (
-            list(match.argv)
-            if match.action == ManagedCliAction.BROWSER_AUTH
-            else ["lark-cli", "auth", "login", "--domain", "all", "--no-wait", "--json"]
+            list(match.argv) if match.action == ManagedCliAction.BROWSER_AUTH else list(driver.user_login_argv)
         )
         result = self.backend.run_managed_provider_cli(
             argv=initiation_argv,
@@ -1331,20 +2150,21 @@ class ManagedCliService:
             credential_state=staged_state,
             network_enabled=True,
             workspace_writable=False,
+            expected_runtime_image_digest=plan.runtime_image_digest,
         )
         if result.exit_code != 0:
             return self._error(
                 "lark_user_authorization_failed",
                 "飞书用户授权无法启动；应用配置和旧 Credential Profile 保持不变。",
             )
-        device = _lark_device_authorization(result.output)
+        device = driver.device_authorization(result.output)
         if device is None:
             return self._error(
                 "lark_user_authorization_invalid_response",
                 "飞书用户授权启动结果缺少完整的设备授权数据；应用配置和旧 Credential Profile 保持不变。",
             )
-        verification_url = _validated_lark_authorization_url(
-            str(device["verification_url"]), phase_id=LARK_USER_CONSENT_PHASE.phase_id
+        verification_url = driver.validated_authorization_url(
+            str(device["verification_url"]), phase_id=node.phase.phase_id
         )
         if verification_url is None:
             return self._error(
@@ -1353,22 +2173,22 @@ class ManagedCliService:
             )
         if result.credential_state is not None:
             flow_store.write_staged_state(active, result.credential_state)
-        qr = self.backend.run_managed_provider_cli(
-            argv=["lark-cli", "auth", "qrcode", verification_url, "--ascii"],
-            environment=dict(match.env),
-            credential_state_spec=None,
-            toolchain_path=plan.toolchain_path,
-            container_path="/opt/puddingclaw/toolchain/node",
-            credential_state=b"",
-            network_enabled=False,
-            workspace_writable=False,
-        )
+        qr_argv = driver.qrcode_argv(verification_url)
+        qr = None
+        if qr_argv is not None:
+            qr = self.backend.run_managed_provider_cli(
+                argv=list(qr_argv),
+                environment=dict(match.env),
+                credential_state_spec=None,
+                toolchain_path=plan.toolchain_path,
+                container_path="/opt/puddingclaw/toolchain/node",
+                credential_state=b"",
+                network_enabled=False,
+                workspace_writable=False,
+                expected_runtime_image_digest=plan.runtime_image_digest,
+            )
         expires_in = _positive_float(device.get("expires_in"))
-        phase = (
-            LARK_USER_REAUTHORIZATION_PHASE
-            if purpose == "lark_user_reauthorization"
-            else LARK_USER_CONSENT_PHASE
-        )
+        phase = driver.graph.phase(node.phase.phase_id, purpose_id=purpose)
         flow = flow_store.begin_or_advance(
             provider=provider,
             adapter_id=match.adapter_id,
@@ -1376,14 +2196,12 @@ class ManagedCliService:
             purpose=purpose,
             phase=phase,
             profile_revision=float(current.get("updated_at") or 0),
-            base_state_revision=str(
-                active.get("base_state_revision") or store.state_revision(provider, profile_id)
-            ),
-            adapter_contract_fingerprint=credential_state.fingerprint,
+            base_state_revision=str(active.get("base_state_revision") or store.state_revision(provider, profile_id)),
+            adapter_contract_fingerprint=plan.adapter_contract_fingerprint,
             public={
                 "verification_url": verification_url,
                 "user_code": device.get("user_code"),
-                "qr_ascii": _terminal_qr(qr.output),
+                "qr_ascii": _terminal_qr(qr.output) if qr is not None else "",
             },
             secret={"device_code": str(device["device_code"])},
             expires_at=(time.time() + expires_in if expires_in is not None else None),
@@ -1391,26 +2209,41 @@ class ManagedCliService:
         )
         if renewal:
             last_attempt = active.get("last_user_attempt")
-            last_reason = (
-                str(last_attempt.get("reason") or "")
-                if isinstance(last_attempt, dict)
-                else ""
-            )
+            last_reason = str(last_attempt.get("reason") or "") if isinstance(last_attempt, dict) else ""
             output = (
                 "上一飞书授权链接已过期，已生成新的二维码；旧连接保持不变。"
                 if last_reason in {"", "authorization_expired"}
                 else "上一飞书用户授权尝试未完成，已生成新的二维码；应用配置和旧连接保持不变。"
             )
-        elif purpose == "lark_user_reauthorization":
+        elif purpose == driver.graph.reauthorization_purpose:
             output = "第 1/1 步已开始：请重新授权访问你的飞书数据。"
         else:
             output = "第 2/2 步已开始：请授权 CLI 应用访问你的飞书数据。"
         return self._authorization_payload(plan, flow, output=output)
 
-    def _start_lark_user_consent(self, plan: ManagedCliExecutionPlan) -> ManagedCliServiceResult:
+    def _start_user_consent(
+        self,
+        plan: ManagedCliExecutionPlan,
+        *,
+        node: AuthorizationPhaseNode | None = None,
+    ) -> ManagedCliServiceResult:
         match = plan.match
+        driver = self._authorization_driver(match, required=True)
+        assert driver is not None
+        node = node or driver.graph.node(str(match.authorization_phase or ""))
+        if node.kind != AuthorizationPhaseKind.DEVICE_AUTHORIZATION:
+            return self._error("unsupported_authorization_phase", "Authorization phase is not device-driven.")
+        browser_node = next(
+            (
+                candidate
+                for candidate in driver.graph.phases
+                if candidate.kind == AuthorizationPhaseKind.BROWSER_CONFIGURATION
+                and candidate.phase.phase_id in node.prerequisites
+            ),
+            None,
+        )
         owner_user_id = plan.owner_user_id
-        provider = match.provider or "lark"
+        provider = match.provider or driver.provider
         profile_id = plan.profile_id or ""
         credential_state = match.credential_state
         assert credential_state is not None
@@ -1432,11 +2265,7 @@ class ManagedCliService:
                 )
                 identities = current.get("identities") if isinstance(current.get("identities"), dict) else {}
                 bot_assessment = identities.get("bot") if isinstance(identities, dict) else None
-                bot_status = (
-                    str(bot_assessment.get("status") or "").lower()
-                    if isinstance(bot_assessment, dict)
-                    else ""
-                )
+                bot_status = str(bot_assessment.get("status") or "").lower() if isinstance(bot_assessment, dict) else ""
                 durable_bot_ready = bool(durable_state) and (
                     bot_status in {"ready", "active"} or current.get("status") == "active"
                 )
@@ -1449,12 +2278,12 @@ class ManagedCliService:
                 # completed phase 1 is deliberately excluded: in that case the
                 # same command must continue the intended full setup to phase 2.
                 supersede_incomplete_full_setup = bool(
-                    durable_bot_ready
+                    browser_node is not None
+                    and durable_bot_ready
                     and active is not None
-                    and active.get("purpose") == "lark_full_authorization"
-                    and active.get("phase_id") == LARK_APP_CONFIGURATION_PHASE.phase_id
-                    and LARK_APP_CONFIGURATION_PHASE.phase_id
-                    not in active.get("completed_phase_ids", [])
+                    and active.get("purpose") == driver.graph.full_purpose
+                    and active.get("phase_id") == browser_node.phase.phase_id
+                    and browser_node.phase.phase_id not in active.get("completed_phase_ids", [])
                 )
                 if supersede_incomplete_full_setup:
                     pending_job_id = str(current.get("browser_job_id") or "")
@@ -1480,11 +2309,14 @@ class ManagedCliService:
                                 "authorization_profile_conflict",
                                 "飞书授权状态在切换为用户续权时发生变化，请刷新后重试。",
                             )
-                        current = store.resolve(
-                            provider,
-                            explicit_profile_id=profile_id,
-                            create_default=False,
-                        ) or current
+                        current = (
+                            store.resolve(
+                                provider,
+                                explicit_profile_id=profile_id,
+                                create_default=False,
+                            )
+                            or current
+                        )
                     flow_store.cancel_active(
                         provider,
                         profile_id,
@@ -1503,29 +2335,51 @@ class ManagedCliService:
                     active = flow_store.active(provider, profile_id)
                     if result.browser_status == "awaiting_user_browser" and active is not None:
                         return self._authorization_payload(plan, active, output="第 1/2 步尚未完成，请先完成应用配置。")
+                created_entry = False
                 if active is None:
+                    if not node.prerequisites:
+                        purpose = driver.graph.purpose_for_entry(node.phase.phase_id)
+                        phase = driver.graph.phase(node.phase.phase_id, purpose_id=purpose.purpose_id)
+                        active = flow_store.begin_or_advance(
+                            provider=provider,
+                            adapter_id=match.adapter_id,
+                            profile_id=profile_id,
+                            purpose=purpose.purpose_id,
+                            phase=phase,
+                            profile_revision=float(current.get("updated_at") or 0),
+                            base_state_revision=store.state_revision(provider, profile_id),
+                            adapter_contract_fingerprint=plan.adapter_contract_fingerprint,
+                            public={},
+                            secret=None,
+                            expires_at=None,
+                        )
+                        flow_store.write_staged_state(active, durable_state)
+                        created_entry = True
                     # Existing Profiles may already contain a verified Bot/App
                     # configuration (for example after an earlier login). Seed
                     # the transaction from that last-known-good state so a
                     # user-only reauthorization does not repeat step 1.
-                    if durable_state:
+                    elif durable_state and browser_node is not None:
                         if bot_status in {"ready", "active"} or current.get("status") == "active":
                             if str(current.get("status") or "").startswith("awaiting_"):
                                 store.update_status(profile_id, "active")
-                                current = store.resolve(
-                                    provider,
-                                    explicit_profile_id=profile_id,
-                                    create_default=False,
-                                ) or current
+                                current = (
+                                    store.resolve(
+                                        provider,
+                                        explicit_profile_id=profile_id,
+                                        create_default=False,
+                                    )
+                                    or current
+                                )
                             active = flow_store.begin_or_advance(
                                 provider=provider,
                                 adapter_id=match.adapter_id,
                                 profile_id=profile_id,
-                                purpose="lark_user_reauthorization",
-                                phase=LARK_APP_CONFIGURATION_PHASE,
+                                purpose=driver.graph.reauthorization_purpose,
+                                phase=browser_node.phase,
                                 profile_revision=float(current.get("updated_at") or 0),
                                 base_state_revision=store.state_revision(provider, profile_id),
-                                adapter_contract_fingerprint=credential_state.fingerprint,
+                                adapter_contract_fingerprint=plan.adapter_contract_fingerprint,
                                 public={},
                                 secret=None,
                                 expires_at=None,
@@ -1537,20 +2391,21 @@ class ManagedCliService:
                             flow_store.mark_phase_verified(
                                 provider,
                                 profile_id,
-                                LARK_APP_CONFIGURATION_PHASE.phase_id,
+                                browser_node.phase.phase_id,
                             )
                             active = flow_store.active(provider, profile_id)
                         else:
                             store.update_status(profile_id, "repair_required")
-                if active is None or LARK_APP_CONFIGURATION_PHASE.phase_id not in active.get(
-                    "completed_phase_ids", []
-                ):
+                completed_ids = set(active.get("completed_phase_ids", [])) if active is not None else set()
+                if active is None or not set(node.prerequisites).issubset(completed_ids):
                     return self._error(
                         "authorization_prerequisite_failed",
                         "第 1/2 步应用配置尚未通过 Backend 验证，不能提前发起用户授权。",
                     )
                 if (
-                    active.get("phase_id") == LARK_USER_CONSENT_PHASE.phase_id
+                    not created_entry
+                    and
+                    active.get("phase_id") == node.phase.phase_id
                     and active.get("status") == AuthorizationFlowStatus.AWAITING_USER.value
                 ):
                     expires_at = _positive_float(active.get("expires_at"))
@@ -1560,7 +2415,7 @@ class ManagedCliService:
                             active,
                             output="正在等待浏览器完成飞书用户授权。",
                         )
-                    return self._issue_lark_user_attempt_locked(
+                    return self._issue_user_attempt_locked(
                         plan=plan,
                         store=store,
                         flow_store=flow_store,
@@ -1568,20 +2423,22 @@ class ManagedCliService:
                         active=active,
                         credential_state=credential_state,
                         reset_staged_user=(
-                            active.get("purpose") == "lark_user_reauthorization"
+                            active.get("purpose") == driver.graph.reauthorization_purpose
                             and active.get("staged_user_cleared") is not True
                         ),
                         renewal=True,
+                        node=node,
                     )
-                return self._issue_lark_user_attempt_locked(
+                return self._issue_user_attempt_locked(
                     plan=plan,
                     store=store,
                     flow_store=flow_store,
                     current=current,
                     active=active,
                     credential_state=credential_state,
-                    reset_staged_user=active.get("purpose") == "lark_user_reauthorization",
+                    reset_staged_user=active.get("purpose") == driver.graph.reauthorization_purpose,
                     renewal=active.get("retry_user_consent") is True,
+                    node=node,
                 )
         except Exception as exc:  # noqa: BLE001
             return self._error(
@@ -1589,10 +2446,12 @@ class ManagedCliService:
                 f"{type(exc).__name__}: 托管授权事务未能继续；Credential Profile 未被提交。",
             )
 
-    def _resume_lark_user_consent(self, plan: ManagedCliExecutionPlan) -> ManagedCliServiceResult:
+    def _resume_user_consent(self, plan: ManagedCliExecutionPlan) -> ManagedCliServiceResult:
         match = plan.match
+        driver = self._authorization_driver(match, required=True)
+        assert driver is not None
         owner_user_id = plan.owner_user_id
-        provider = match.provider or "lark"
+        provider = match.provider or driver.provider
         profile_id = plan.profile_id or ""
         credential_state = match.credential_state
         assert credential_state is not None
@@ -1601,10 +2460,30 @@ class ManagedCliService:
             with store.profile_lock(provider, profile_id):
                 current = self._ensure_plan_is_current(store, plan, provider, profile_id)
                 flow_store = self._authorization_flow_store(store, owner_user_id)
-                active = flow_store.active(provider, profile_id)
+                active = self._reconcile_authorization_flow_locked(
+                    flow_store=flow_store,
+                    current=current,
+                    provider=provider,
+                    profile_id=profile_id,
+                )
+                purpose = None
+                try:
+                    node = driver.graph.node(str((active or {}).get("phase_id") or ""))
+                    purpose = driver.graph.purpose(str((active or {}).get("purpose") or ""))
+                except ValueError:
+                    node = None
+                    if active is not None:
+                        flow_store.cancel_active(
+                            provider,
+                            profile_id,
+                            reason="authorization_graph_changed",
+                        )
                 if (
                     active is None
-                    or active.get("phase_id") != LARK_USER_CONSENT_PHASE.phase_id
+                    or node is None
+                    or purpose is None
+                    or node.phase.phase_id not in purpose.phase_ids
+                    or node.kind != AuthorizationPhaseKind.DEVICE_AUTHORIZATION
                     or active.get("status")
                     not in {
                         AuthorizationFlowStatus.AWAITING_USER.value,
@@ -1621,7 +2500,7 @@ class ManagedCliService:
                     and expires_at <= time.time()
                     and recoverable_candidate is None
                 ):
-                    return self._issue_lark_user_attempt_locked(
+                    return self._issue_user_attempt_locked(
                         plan=plan,
                         store=store,
                         flow_store=flow_store,
@@ -1629,10 +2508,11 @@ class ManagedCliService:
                         active=active,
                         credential_state=credential_state,
                         reset_staged_user=(
-                            active.get("purpose") == "lark_user_reauthorization"
+                            active.get("purpose") == driver.graph.reauthorization_purpose
                             and active.get("staged_user_cleared") is not True
                         ),
                         renewal=True,
+                        node=node,
                     )
                 staged_state = flow_store.read_staged_state(active)
                 recovering_commit = active.get("status") == AuthorizationFlowStatus.VERIFYING.value
@@ -1651,7 +2531,7 @@ class ManagedCliService:
                         if not device_code:
                             raise RuntimeError("authorization continuation is incomplete")
                         result = self.backend.run_managed_provider_cli(
-                            argv=["lark-cli", "auth", "login"],
+                            argv=list(driver.continuation_argv),
                             environment=dict(match.env),
                             credential_state_spec=credential_state,
                             toolchain_path=plan.toolchain_path,
@@ -1659,7 +2539,10 @@ class ManagedCliService:
                             credential_state=staged_state,
                             network_enabled=True,
                             workspace_writable=False,
+                            expected_runtime_image_digest=plan.runtime_image_digest,
                             continuation_secret=device_code.encode("utf-8"),
+                            continuation_argument=driver.continuation.argument,
+                            continuation_trailing_argv=driver.continuation.trailing_argv,
                         )
                         if result.credential_state is not None:
                             candidate_state = result.credential_state
@@ -1671,7 +2554,7 @@ class ManagedCliService:
                     diagnostic = None
                     if candidate_state is not None:
                         candidate_verify = self.backend.run_managed_provider_cli(
-                            argv=["lark-cli", "auth", "status", "--json", "--verify"],
+                            argv=list(driver.identity_status_argv),
                             environment=dict(match.env),
                             credential_state_spec=credential_state,
                             toolchain_path=plan.toolchain_path,
@@ -1679,12 +2562,13 @@ class ManagedCliService:
                             credential_state=candidate_state,
                             network_enabled=True,
                             workspace_writable=False,
+                            expected_runtime_image_digest=plan.runtime_image_digest,
                         )
                         if candidate_verify.credential_state is not None:
                             candidate_state = candidate_verify.credential_state
                             flow_store.write_candidate_state(active, candidate_state)
-                        candidate_identity = _lark_identity_status(candidate_verify.output)
-                        if candidate_verify.exit_code == 0 and _lark_full_identity_ready(candidate_identity):
+                        candidate_identity = driver.identity_status(candidate_verify.output)
+                        if candidate_verify.exit_code == 0 and driver.full_identity_ready(candidate_identity):
                             # Only independently verified bytes may replace the
                             # Step-1 staging baseline.
                             flow_store.write_staged_state(active, candidate_state)
@@ -1692,7 +2576,7 @@ class ManagedCliService:
                             verify = candidate_verify
                             identity = candidate_identity
                         elif candidate_verify.exit_code != 0:
-                            candidate_failure = _lark_authorization_failure(candidate_verify.output)
+                            candidate_failure = driver.authorization_failure(candidate_verify.output)
                             diagnostic = _safe_authorization_diagnostic(
                                 candidate_verify.output,
                                 candidate_failure,
@@ -1702,7 +2586,7 @@ class ManagedCliService:
                             )
                             if candidate_failure.retryable:
                                 origin_failure = (
-                                    _lark_authorization_failure(result.output)
+                                    driver.authorization_failure(result.output)
                                     if result is not None and result.exit_code != 0
                                     else None
                                 )
@@ -1734,7 +2618,7 @@ class ManagedCliService:
                             # continuation result: provider runners export the
                             # unchanged baseline archive on every exit.
                             if result is not None and result.exit_code != 0:
-                                failure = _lark_authorization_failure(result.output)
+                                failure = driver.authorization_failure(result.output)
                                 diagnostic_output = result.output
                                 diagnostic_exit_code = result.exit_code
                             elif (origin_failure := _candidate_origin_failure(active)) is not None:
@@ -1761,7 +2645,7 @@ class ManagedCliService:
 
                     if verify is None:
                         if failure is None and result is not None and result.exit_code != 0:
-                            failure = _lark_authorization_failure(result.output)
+                            failure = driver.authorization_failure(result.output)
                         elif failure is None and candidate_state is None:
                             failure = _LarkAuthorizationFailure(
                                 "provider_authorization_error",
@@ -1785,7 +2669,7 @@ class ManagedCliService:
                                 candidate_identity_verified=False,
                             )
                         if failure.flow_status == AuthorizationFlowStatus.EXPIRED.value:
-                            return self._issue_lark_user_attempt_locked(
+                            return self._issue_user_attempt_locked(
                                 plan=plan,
                                 store=store,
                                 flow_store=flow_store,
@@ -1794,6 +2678,7 @@ class ManagedCliService:
                                 credential_state=credential_state,
                                 reset_staged_user=False,
                                 renewal=True,
+                                node=node,
                             )
                         if failure.flow_status == AuthorizationFlowStatus.AWAITING_USER.value or failure.retryable:
                             preserved = flow_store.record_retryable_user_error(
@@ -1832,7 +2717,7 @@ class ManagedCliService:
                         )
                 if verify is None:
                     verify = self.backend.run_managed_provider_cli(
-                        argv=["lark-cli", "auth", "status", "--json", "--verify"],
+                        argv=list(driver.identity_status_argv),
                         environment=dict(match.env),
                         credential_state_spec=credential_state,
                         toolchain_path=plan.toolchain_path,
@@ -1840,9 +2725,10 @@ class ManagedCliService:
                         credential_state=staged_state,
                         network_enabled=True,
                         workspace_writable=False,
+                        expected_runtime_image_digest=plan.runtime_image_digest,
                     )
-                    identity = _lark_identity_status(verify.output)
-                if verify.exit_code != 0 or not _lark_full_identity_ready(identity):
+                    identity = driver.identity_status(verify.output)
+                if verify.exit_code != 0 or not driver.full_identity_ready(identity):
                     if not recovering_commit:
                         failure = _LarkAuthorizationFailure(
                             "authorization_verification_failed",
@@ -1873,7 +2759,7 @@ class ManagedCliService:
                             request_status=AuthorizationFlowStatus.FAILED.value,
                             diagnostic=diagnostic,
                         )
-                    verification_failure = _lark_authorization_failure(verify.output)
+                    verification_failure = driver.authorization_failure(verify.output)
                     if verification_failure.retryable:
                         return self._error(
                             "authorization_verification_retryable",
@@ -1901,6 +2787,9 @@ class ManagedCliService:
                         )
                         or active
                     )
+                purpose_id = str(active.get("purpose") or "")
+                completed_phases = driver.graph.completed_projections(purpose_id)
+                user_only = purpose_id == driver.graph.reauthorization_purpose
                 staged_sha256 = hashlib.sha256(staged_state).hexdigest()
                 current_revision = store.state_revision(provider, profile_id)
                 base_revision = str(active.get("base_state_revision") or "")
@@ -1922,33 +2811,31 @@ class ManagedCliService:
                         )
                     flow_store.mark_verifying(provider, profile_id, staged_sha256=staged_sha256)
                 if current_revision == base_revision:
-                    store.write_state(
+                    committed_revision = store.write_state_if_revision(
                         provider,
                         profile_id,
                         staged_state,
+                        expected_revision=base_revision,
                         credential_state=credential_state,
                     )
+                    if committed_revision is None:
+                        return self._error(
+                            "authorization_profile_conflict",
+                            "授权提交时 Credential Profile 已变化；当前结果未覆盖其他流程。",
+                        )
                 if store.read_state(provider, profile_id, credential_state=credential_state) != staged_state:
                     raise RuntimeError("final credential Vault readback verification failed")
                 store.update_status(profile_id, "active")
-                store.update_identity_status(profile_id, "bot", "ready", verified=True)
-                store.update_identity_status(
-                    profile_id,
-                    "user",
-                    "active",
-                    verified=True,
-                    token_status="valid",
-                )
-                flow_store.complete(provider, profile_id, LARK_USER_CONSENT_PHASE.phase_id)
-                user_only = active.get("purpose") == "lark_user_reauthorization"
-                completed_phases = (
-                    [LARK_USER_REAUTHORIZATION_PHASE.projection()]
-                    if user_only
-                    else [
-                        LARK_APP_CONFIGURATION_PHASE.projection(),
-                        LARK_USER_CONSENT_PHASE.projection(),
-                    ]
-                )
+                for identity_name, identity_status, verified, token_status in driver.profile_identity_updates(identity):
+                    store.update_identity_status(
+                        profile_id,
+                        identity_name,
+                        identity_status,
+                        verified=verified,
+                        token_status=token_status or None,
+                    )
+                assert node is not None
+                flow_store.complete(provider, profile_id, node.phase.phase_id)
                 return ManagedCliServiceResult(
                     payload={
                         "ok": True,
@@ -1958,11 +2845,11 @@ class ManagedCliService:
                         "status": "completed",
                         "authorization_completed": True,
                         "completed_phases": completed_phases,
-                        "identity": _safe_lark_identity_projection(identity),
+                        "identity": driver.safe_identity_projection(identity),
                         "output": (
-                            "飞书用户授权已验证，Credential Profile 已原子替换。"
+                            f"{driver.display_name} 用户授权已验证，Credential Profile 已原子替换。"
                             if user_only
-                            else "飞书应用配置和用户授权均已验证，Credential Profile 已原子更新。"
+                            else f"{driver.display_name} 授权已验证，Credential Profile 已原子更新。"
                         ),
                     },
                     exit_code=0,
@@ -1979,14 +2866,42 @@ class ManagedCliService:
         context: dict[str, Any],
     ) -> ManagedCliServiceResult:
         match = plan.match
-        executable = plan.toolchain_path / "bin" / "lark-cli"
-        if not executable.exists():
+        try:
+            runtime_image_digest = self._runtime_image_digest()
+        except (OSError, ValueError) as exc:
             return self._error(
-                "managed_cli_not_installed",
-                "lark-cli is not installed in the shared Toolchain. Run npm install -g @larksuite/cli.",
+                "managed_runtime_unavailable", f"Managed runtime validation failed: {type(exc).__name__}."
             )
-        if match.adapter_id == "lark-cli" and match.authorization_phase:
-            return self._lark_authorization_provider(plan)
+        if runtime_image_digest != plan.runtime_image_digest:
+            return self._error(
+                "managed_runtime_image_changed",
+                "Managed runtime image changed while approval was pending; prepare a new plan.",
+            )
+        adapter = self.registry.adapter(match.adapter_id)
+        executable = plan.toolchain_path / "bin" / adapter.toolchain_package.executable
+        if not executable.exists():
+            package = adapter.toolchain_package
+            return ManagedCliServiceResult(
+                payload={
+                    "ok": False,
+                    "managed_by": "managed_cli",
+                    "error": "managed_cli_not_installed",
+                    "message": (
+                        f"{package.executable} is not installed in its managed Toolchain. "
+                        f"Install {package.package} through the trusted Adapter."
+                    ),
+                    "installation": {
+                        "adapter_id": match.adapter_id,
+                        "ecosystem": package.ecosystem,
+                        "package": package.package,
+                        "command_argv": ["npm", "install", "--global", package.package],
+                    },
+                },
+                exit_code=1,
+            )
+        driver = self._authorization_driver(match, required=bool(match.authorization_phase))
+        if match.authorization_phase:
+            return self._authorization_provider(plan)
         owner_user_id = plan.owner_user_id
         store = CredentialProfileStore(self.paths, owner_user_id)
         profile_id = plan.profile_id or ""
@@ -2021,6 +2936,11 @@ class ManagedCliService:
                         return self._error(
                             "managed_plan_stale",
                             "Credential Profile changed while approval was pending; retry the command.",
+                        )
+                    if store.state_revision(provider, profile_id) != plan.profile_state_revision:
+                        return self._error(
+                            "managed_plan_stale",
+                            "Credential state changed while approval was pending; retry the command.",
                         )
                     state = store.read_state(
                         provider,
@@ -2077,7 +2997,7 @@ class ManagedCliService:
                         create_default=False,
                     )
                 active_authorization: dict[str, Any] | None = None
-                if match.adapter_id == "lark-cli" and current is not None:
+                if driver is not None and current is not None:
                     flow_store = self._authorization_flow_store(
                         store,
                         owner_user_id,
@@ -2098,18 +3018,15 @@ class ManagedCliService:
                         browser_job_id=pending_job_id,
                         credential_state=credential_state,
                     )
-                    if match.adapter_id == "lark-cli":
+                    if driver is not None:
                         active_authorization = self._authorization_flow_store(
                             store,
                             owner_user_id,
                         ).active(provider, profile_id)
                     if pending.browser_status == "completed" and pending.credential_state is not None:
-                        if match.argv == ("lark-cli", "config", "init", "--new"):
+                        if driver is not None and match.argv == driver.app_configuration_argv:
                             result = pending
-                    elif (
-                        pending.browser_status == "awaiting_user_browser"
-                        and active_authorization is not None
-                    ):
+                    elif pending.browser_status == "awaiting_user_browser" and active_authorization is not None:
                         if match.action == ManagedCliAction.CREDENTIAL_READ:
                             return self._profile_status_during_authorization_payload(
                                 plan,
@@ -2121,10 +3038,7 @@ class ManagedCliService:
                             active_authorization,
                             output="飞书授权仍在等待当前浏览器步骤完成。",
                         )
-                    elif (
-                        pending.browser_status in {"failed", "missing"}
-                        and active_authorization is None
-                    ):
+                    elif pending.browser_status in {"failed", "missing"} and active_authorization is None:
                         # Collection has already released the dead Runner lease
                         # and terminalized its Flow. Continue the originally
                         # requested Provider command against the durable Profile
@@ -2141,7 +3055,7 @@ class ManagedCliService:
                 # archives even for `config show`/`auth status`, which would
                 # mutate the durable Vault and invalidate the transaction's CAS
                 # baseline.  Authorization entry/resume commands are routed to
-                # _lark_authorization_provider before reaching this branch.
+                # _authorization_provider before reaching this branch.
                 if active_authorization is not None and result is None:
                     if match.action == ManagedCliAction.CREDENTIAL_READ:
                         return self._profile_status_during_authorization_payload(
@@ -2150,10 +3064,12 @@ class ManagedCliService:
                             active_authorization,
                         )
                     completed_phases = active_authorization.get("completed_phase_ids", [])
-                    if (
-                        active_authorization.get("phase_id") == LARK_APP_CONFIGURATION_PHASE.phase_id
-                        and LARK_APP_CONFIGURATION_PHASE.phase_id in completed_phases
-                    ):
+                    active_phase_id = str(active_authorization.get("phase_id") or "")
+                    if driver is not None and active_phase_id in completed_phases:
+                        phase = driver.graph.phase(
+                            active_phase_id,
+                            purpose_id=str(active_authorization.get("purpose") or driver.graph.full_purpose),
+                        )
                         return ManagedCliServiceResult(
                             payload={
                                 "ok": True,
@@ -2164,22 +3080,20 @@ class ManagedCliService:
                                 "profile_id": profile_id,
                                 "status": "authorization_phase_completed",
                                 "authorization_completed": False,
-                                "phase": LARK_APP_CONFIGURATION_PHASE.projection(),
-                                "output": "飞书应用配置已验证，可以进入第 2/2 步用户授权。",
-                                "next_action": (
-                                    "Run exactly: lark-cli auth login --domain all --no-wait --json"
-                                ),
+                                "phase": phase.projection(),
+                                "output": f"{driver.display_name} 授权阶段已验证，可以进入下一阶段。",
+                                "next_action": f"Run exactly: {shlex.join(driver.user_login_argv)}",
                             },
                             exit_code=0,
                         )
                     return self._authorization_payload(
                         plan,
                         active_authorization,
-                        output="飞书授权仍在等待当前浏览器步骤完成。",
+                        output=f"{driver.display_name if driver is not None else 'Provider'} 授权仍在等待当前浏览器步骤完成。",
                     )
 
                 if result is None:
-                    if match.argv == ("lark-cli", "config", "init", "--new"):
+                    if driver is not None and match.argv == driver.app_configuration_argv:
                         expected_job_id = _browser_job_id(owner_user_id, provider, profile_id)
                         store.begin_browser_job(
                             profile_id,
@@ -2196,6 +3110,9 @@ class ManagedCliService:
                             owner_user_id=owner_user_id,
                             provider=provider,
                             profile_id=profile_id,
+                            adapter_id=match.adapter_id,
+                            authorization_contract_fingerprint=plan.adapter_contract_fingerprint,
+                            expected_runtime_image_digest=plan.runtime_image_digest,
                         )
                         if result.browser_job_id != expected_job_id:
                             raise RuntimeError("browser authorization runner returned the wrong job id")
@@ -2233,9 +3150,14 @@ class ManagedCliService:
                             credential_state=state,
                             network_enabled=match.requires_network,
                             workspace_writable=match.workspace_writable,
+                            expected_runtime_image_digest=plan.runtime_image_digest,
                         )
 
-                confirmation = _lark_confirmation_required(result.output) if result.exit_code == 10 else None
+                confirmation = (
+                    driver.confirmation_required(result.output)
+                    if driver is not None and result.exit_code == 10
+                    else None
+                )
                 if confirmation is not None:
                     action = str(confirmation["action"])
                     try:
@@ -2252,8 +3174,10 @@ class ManagedCliService:
                             "invalid_confirmation_envelope",
                             "lark-cli confirmation action does not match the frozen command.",
                         )
-                    action_argv = ["lark-cli", *action_tokens]
-                    destructive = match.destructive or is_lark_destructive_argv(action_argv)
+                    action_argv = [match.argv[0], *action_tokens]
+                    destructive = match.destructive or (
+                        driver.destructive_argv(action_argv) if driver is not None else True
+                    )
                     supplied_binding = str(context.get("_managed_cli_destructive_approval") or "")
                     approved = supplied_binding in {
                         plan.destructive_approval_binding(),
@@ -2273,11 +3197,14 @@ class ManagedCliService:
                             credential_state=retry_state,
                             network_enabled=match.requires_network,
                             workspace_writable=match.workspace_writable,
+                            expected_runtime_image_digest=plan.runtime_image_digest,
                         )
                         auto_confirmed = not destructive
                         confirmation = None
                 if result.exit_code != 0 and match.action == ManagedCliAction.PROVIDER_OPERATION:
-                    user_authorization_repair = _lark_user_credential_failure(result.output)
+                    user_authorization_repair = (
+                        driver.user_credential_failure(result.output) if driver is not None else None
+                    )
                     if user_authorization_repair is not None:
                         store.update_identity_status(
                             profile_id,
@@ -2291,12 +3218,18 @@ class ManagedCliService:
                     and result.credential_state is not None
                     and result.browser_status is None
                 ):
-                    store.write_state(
+                    committed_revision = store.write_state_if_revision(
                         provider,
                         profile_id,
                         result.credential_state,
+                        expected_revision=plan.profile_state_revision,
                         credential_state=credential_state,
                     )
+                    if committed_revision is None:
+                        return self._error(
+                            "credential_writeback_conflict",
+                            "Credential state changed during execution; rotated token bytes were not committed.",
+                        )
                     if result.exit_code == 0:
                         next_status: str | None = None
                         lowered = tuple(item.lower() for item in match.argv[1:])
@@ -2307,17 +3240,45 @@ class ManagedCliService:
                         if next_status is not None:
                             store.update_status(profile_id, next_status)
                 if (
-                    match.adapter_id == "lark-cli"
+                    driver is not None
+                    and match.requires_profile
+                    and match.action == ManagedCliAction.PROVIDER_OPERATION
+                    and result.exit_code == 0
+                ):
+                    for identity_name, identity_status, verified, token_status in (
+                        driver.successful_operation_identity_updates(result.output)
+                    ):
+                        store.update_identity_status(
+                            profile_id,
+                            identity_name,
+                            identity_status,
+                            verified=verified,
+                            token_status=token_status or None,
+                        )
+                    refreshed_profile = store.resolve(
+                        provider,
+                        explicit_profile_id=profile_id,
+                        create_default=False,
+                    )
+                    refreshed_identities = (
+                        refreshed_profile.get("identities")
+                        if isinstance(refreshed_profile, dict)
+                        and isinstance(refreshed_profile.get("identities"), dict)
+                        else {}
+                    )
+                    if driver.durable_profile_ready(refreshed_identities):
+                        store.update_status(profile_id, "active")
+                if (
+                    driver is not None
                     and match.requires_profile
                     and result.exit_code == 0
                     and lowered[:2] == ("auth", "status")
                     and "--verify" in lowered
                 ):
-                    verified_status = _lark_identity_status(result.output)
+                    verified_status = driver.identity_status(result.output)
                     identities = (
                         verified_status.get("identities")
-                        if isinstance(verified_status, dict)
-                        and isinstance(verified_status.get("identities"), dict)
+                        if isinstance(verified_status, dict) and isinstance(verified_status.get("identities"), dict)
                         else {}
                     )
                     for identity_name in ("bot", "user"):
@@ -2336,7 +3297,7 @@ class ManagedCliService:
                     if verified_status is not None:
                         store.update_status(
                             profile_id,
-                            "active" if _lark_full_identity_ready(verified_status) else "authorization_required",
+                            "active" if driver.full_identity_ready(verified_status) else "authorization_required",
                         )
                 if (
                     match.requires_profile
@@ -2368,11 +3329,7 @@ class ManagedCliService:
                         profile_id,
                         reason="profile_revoked",
                     )
-                if (
-                    match.requires_profile
-                    and result.exit_code != 0
-                    and _MISSING_CLIENT_SECRET.search(result.output)
-                ):
+                if match.requires_profile and result.exit_code != 0 and _MISSING_CLIENT_SECRET.search(result.output):
                     store.update_status(profile_id, "expired")
                     credential_profile_incomplete = True
         except Exception as exc:  # noqa: BLE001
@@ -2386,9 +3343,8 @@ class ManagedCliService:
                 credential_state=credential_state,
             )
         if user_authorization_repair is not None:
-            consent_match = ManagedCliRegistry().match(
-                "lark-cli auth login --domain all --no-wait --json"
-            )
+            assert driver is not None
+            consent_match = self.registry.match(shlex.join(driver.user_login_argv))
             assert consent_match is not None
             consent_plan = self.plan(
                 consent_match,
@@ -2397,26 +3353,21 @@ class ManagedCliService:
                     "project_id": context.get("project_id"),
                 },
             )
-            started = self._start_lark_user_consent(consent_plan)
+            started = self._start_user_consent(consent_plan)
             if started.payload.get("status") == "awaiting_user_browser":
                 started.payload["trigger"] = {
                     "reason": user_authorization_repair.reason,
                     "identity": "user",
                     "safe_to_retry": True,
-                    "interrupted_action_sha256": hashlib.sha256(
-                        "\0".join(match.argv).encode("utf-8")
-                    ).hexdigest(),
+                    "interrupted_action_sha256": hashlib.sha256("\0".join(match.argv).encode("utf-8")).hexdigest(),
                 }
                 started.payload["output"] = (
-                    "原飞书操作因用户授权失效而暂停。Bot 身份保持可用；"
-                    "请完成用户授权，成功后重试原操作。"
+                    "原飞书操作因用户授权失效而暂停。Bot 身份保持可用；请完成用户授权，成功后重试原操作。"
                 )
             return started
         output = redact_managed_cli_output(result.output)
         awaiting = result.browser_status == "awaiting_user_browser" or (
-            match.route == ManagedCliRoute.BROWSER_AUTH
-            and match.argv[:2] == ("lark-cli", "auth")
-            and result.exit_code == 0
+            match.route == ManagedCliRoute.BROWSER_AUTH and driver is not None and result.exit_code == 0
         )
         payload: dict[str, Any] = {
             "ok": result.exit_code == 0,
@@ -2482,15 +3433,22 @@ class ManagedCliService:
     ) -> Any:
         """Persist phase-1 output to staging before ACKing its tmpfs container."""
 
+        adapter = self.registry.for_provider(provider)
+        driver = self.authorization_drivers.for_adapter(adapter.adapter_id)
+        assert driver is not None
         if result.browser_status == "completed" and result.credential_state is not None:
             flow_store = self._authorization_flow_store(store, owner_user_id)
             flow = flow_store.active(provider, profile_id)
-            if flow is None or flow.get("phase_id") != LARK_APP_CONFIGURATION_PHASE.phase_id:
+            try:
+                node = driver.graph.node(str((flow or {}).get("phase_id") or ""))
+            except ValueError as exc:
+                raise RuntimeError("browser authorization flow identity is missing") from exc
+            if flow is None or node.kind != AuthorizationPhaseKind.BROWSER_CONFIGURATION:
                 raise RuntimeError("browser authorization flow identity is missing")
             flow_store.write_staged_state(flow, result.credential_state)
             if flow_store.read_staged_state(flow) != result.credential_state:
                 raise RuntimeError("staged credential readback verification failed")
-            flow_store.mark_phase_verified(provider, profile_id, LARK_APP_CONFIGURATION_PHASE.phase_id)
+            flow_store.mark_phase_verified(provider, profile_id, node.phase.phase_id)
             if not store.finish_browser_job(
                 profile_id,
                 browser_job_id,
@@ -2513,11 +3471,16 @@ class ManagedCliService:
             )
             flow_store = self._authorization_flow_store(store, owner_user_id)
             flow = flow_store.active(provider, profile_id)
+            try:
+                node = driver.graph.node(str((flow or {}).get("phase_id") or ""))
+            except ValueError:
+                node = None
             if (
                 flow is not None
-                and flow.get("phase_id") == LARK_APP_CONFIGURATION_PHASE.phase_id
-                and LARK_APP_CONFIGURATION_PHASE.phase_id
-                not in flow.get("completed_phase_ids", [])
+                and node is not None
+                and node.kind == AuthorizationPhaseKind.BROWSER_CONFIGURATION
+                and flow.get("phase_id") == node.phase.phase_id
+                and node.phase.phase_id not in flow.get("completed_phase_ids", [])
             ):
                 flow_store.fail(
                     provider,
@@ -2527,11 +3490,7 @@ class ManagedCliService:
                         if result.browser_status == "missing"
                         else AuthorizationFlowStatus.FAILED.value
                     ),
-                    error=(
-                        "browser_job_missing"
-                        if result.browser_status == "missing"
-                        else "browser_job_failed"
-                    ),
+                    error=("browser_job_missing" if result.browser_status == "missing" else "browser_job_failed"),
                 )
             if result.browser_status == "failed":
                 self.backend.finalize_managed_browser_auth_cli(
@@ -2540,6 +3499,17 @@ class ManagedCliService:
                     profile_id=profile_id,
                     browser_job_id=browser_job_id,
                 )
+        if result.browser_status in {"completed", "failed", "missing"}:
+            try:
+                adapter = self.registry.for_provider(provider)
+                self.toolchains.release_revision_leases_by_owner(
+                    adapter_id=adapter.adapter_id,
+                    owner_kind="runner",
+                    owner_id=browser_job_id,
+                )
+                self.toolchains.gc_revisions(adapter.adapter_id)
+            except (OSError, ValueError):
+                pass
         return result
 
     def _collect_browser_job_locked(
@@ -2554,11 +3524,14 @@ class ManagedCliService:
     ) -> Any:
         if not browser_job_id:
             raise RuntimeError("browser authorization Profile lease is missing its job id")
+        adapter = self.registry.for_provider(provider)
         result = self.backend.collect_managed_browser_auth_cli(
             owner_user_id=owner_user_id,
             provider=provider,
             profile_id=profile_id,
             credential_state_spec=credential_state,
+            adapter_id=adapter.adapter_id,
+            authorization_contract_fingerprint=self._adapter_contract_fingerprint(adapter.adapter_id),
         )
         if result.browser_job_id != browser_job_id:
             raise RuntimeError("browser authorization job identity changed")

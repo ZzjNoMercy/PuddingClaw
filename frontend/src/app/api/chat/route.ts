@@ -1,5 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 
+// LEGACY COMPATIBILITY PROXY — the Chat runtime is retired and no longer
+// maintained. The product conversation UI uses /api/agent instead. Keep this
+// route only for callers that have not migrated yet.
+
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 

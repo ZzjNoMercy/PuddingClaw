@@ -25,7 +25,7 @@ NATIVE_TOOLSETS: dict[str, frozenset[str]] = {
 # does not gate or expand access.
 UNCONDITIONAL_EXTENSION_TOOLSETS: dict[str, frozenset[str]] = {
     "goal_completion": frozenset({"update_goal"}),
-    "human_input": frozenset({"request_user_input"}),
+    "human_input": frozenset({"request_user_input", "request_skill_secret"}),
     "evidence_read": frozenset({"read_evidence"}),
     "harness_files": frozenset({
         "inspect_file_version",
@@ -48,7 +48,10 @@ UNCONDITIONAL_EXTENSION_TOOLSETS: dict[str, frozenset[str]] = {
         "validate_artifact_contract",
     }),
     "web_research": frozenset({"web_search", "fetch_url"}),
-    "package_management": frozenset({"install_packages"}),
+    # WebBridge is enabled by the connector control plane, not by a Skill.
+    # ToolsetMiddleware applies the runtime enabled gate before exposing it.
+    "webbridge_browser": frozenset({"browser"}),
+    "package_management": frozenset({"install_packages", "request_skill_runtime"}),
     "read_later_capture": frozenset({"read_later_save_url"}),
 }
 
@@ -231,6 +234,13 @@ TOOL_CONTROL_DESCRIPTORS: dict[str, ToolControlDescriptor] = {
     "update_todos": _INTERNAL_MUTATION,
     "update_goal": _INTERNAL_MUTATION,
     "request_user_input": _INTERNAL_MUTATION,
+    "request_skill_secret": _INTERNAL_MUTATION,
+    "request_skill_runtime": ToolControlDescriptor(
+        side_effect="runtime_binding_write",
+        idempotency="required",
+        approval_scope="call",
+        policy="dynamic",
+    ),
     "write_file": _WORKSPACE_WRITE,
     "edit_file": _WORKSPACE_WRITE,
     "execute": _DYNAMIC_EXECUTION,
@@ -270,6 +280,13 @@ TOOL_CONTROL_DESCRIPTORS: dict[str, ToolControlDescriptor] = {
     # Controlled network and runtime setup.
     "web_search": _CONTROLLED_NETWORK,
     "fetch_url": _CONTROLLED_NETWORK,
+    "browser": ToolControlDescriptor(
+        side_effect="browser_control",
+        data_classification="user_browser_session",
+        network_scope="local_browser_daemon",
+        approval_scope="action",
+        policy="webbridge_policy",
+    ),
     # The Tool only queues an idempotent internal bookmark mutation. The
     # worker performs the separately sandboxed public-network fetch later.
     "read_later_save_url": _INTERNAL_MUTATION,

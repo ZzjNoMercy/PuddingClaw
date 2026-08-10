@@ -4571,11 +4571,16 @@ def test_deepagents_manager_streams_and_persists_published_attachment(tmp_path, 
     events = asyncio.run(collect())
     assert sum(event["event"] == "attachment_published" for event in events) == 1
     published_event = next(json.loads(event["data"]) for event in events if event["event"] == "attachment_published")
-    assert published_event["attachment"] == emitted[0]
+    assert published_event["tool_call_id"] == "call_publish"
+    assert published_event["attachment"] == {
+        **emitted[0],
+        "created_by_tool_call_id": "call_publish",
+    }
     history = session_manager.load_session("published-attachment-session")
     assistant = next(item for item in history if item["role"] == "assistant")
     assert assistant["output_attachments"][0]["id"] == emitted[0]["id"]
     assert assistant["output_attachments"][0]["download_url"] == emitted[0]["download_url"]
+    assert assistant["output_attachments"][0]["created_by_tool_call_id"] == "call_publish"
 
 
 def test_deepagents_manager_emits_sources_citations_and_title(tmp_path, monkeypatch):

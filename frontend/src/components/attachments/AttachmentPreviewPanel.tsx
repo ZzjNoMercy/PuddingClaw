@@ -1,16 +1,17 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import ReactMarkdown from "react-markdown";
 import {
   ArrowLeft,
   ChevronLeft,
   ChevronRight,
   Download,
-  Expand,
   ImageOff,
   FileText,
   Minimize2,
+  ZoomIn,
   X,
 } from "lucide-react";
 import { useApp } from "@/lib/store";
@@ -38,6 +39,7 @@ export default function AttachmentPreviewPanel() {
   const [textPreview, setTextPreview] = useState("");
   const [textLoading, setTextLoading] = useState(false);
   const [textError, setTextError] = useState("");
+  const [portalReady, setPortalReady] = useState(false);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const images = useMemo(
     () => collectPreviewableImageAttachments(messages),
@@ -48,9 +50,12 @@ export default function AttachmentPreviewPanel() {
     [activeAttachmentPreview, messages, sessionId],
   );
   const activeImage = active && isPreviewableImageAttachment(active) ? active : null;
+  const activeId = active?.id;
   const activeIndex = activeImage
     ? images.findIndex((attachment) => attachment.id === activeImage.id)
     : -1;
+
+  useEffect(() => setPortalReady(true), []);
 
   useEffect(() => {
     if (activeAttachmentPreview?.sessionId === sessionId && !active) {
@@ -64,7 +69,25 @@ export default function AttachmentPreviewPanel() {
     setTextPreview("");
     setTextLoading(false);
     setTextError("");
-  }, [active?.id]);
+  }, [activeId]);
+
+  useEffect(() => {
+    if (!activeId || !portalReady) return;
+    const previousBodyOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    closeButtonRef.current?.focus();
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      closeAttachmentPreview();
+      setInspectorOpen(false);
+    };
+    window.addEventListener("keydown", handleEscape);
+    return () => {
+      window.removeEventListener("keydown", handleEscape);
+      document.body.style.overflow = previousBodyOverflow;
+    };
+  }, [activeId, closeAttachmentPreview, portalReady, setInspectorOpen]);
 
   useEffect(() => {
     if (!active || activeImage) return;
@@ -117,7 +140,7 @@ export default function AttachmentPreviewPanel() {
     return () => window.removeEventListener("keydown", handleArrowKey);
   });
 
-  if (!active) return null;
+  if (!active || !portalReady) return null;
 
   const close = () => {
     const attachmentId = active.id;
@@ -147,12 +170,14 @@ export default function AttachmentPreviewPanel() {
         ? "文本"
         : "文件";
 
-  return (
+  const preview = (
     <section
-      className="flex h-full min-h-0 flex-col border-l border-slate-200/80 bg-white"
-      aria-label="图片预览"
+      className="fixed inset-0 z-[150] flex h-dvh min-h-0 flex-col bg-white"
+      role="dialog"
+      aria-modal="true"
+      aria-label="附件预览"
     >
-      <header className="flex min-h-14 shrink-0 items-center gap-2 border-b border-slate-200 px-3">
+      <header className="flex min-h-16 shrink-0 items-center gap-2 border-b border-slate-200 bg-white px-4 sm:px-6">
         <button
           type="button"
           onClick={backToCollection}
@@ -178,7 +203,7 @@ export default function AttachmentPreviewPanel() {
             aria-label={actualSize ? "适应窗口" : "查看原始尺寸"}
             title={actualSize ? "适应窗口" : "原始尺寸"}
           >
-            {actualSize ? <Minimize2 className="h-4 w-4" /> : <Expand className="h-4 w-4" />}
+            {actualSize ? <Minimize2 className="h-4 w-4" /> : <ZoomIn className="h-4 w-4" />}
           </button>
         ) : null}
         {active.download_url ? (
@@ -204,8 +229,8 @@ export default function AttachmentPreviewPanel() {
         </button>
       </header>
 
-      <div className={`relative min-h-0 flex-1 overflow-auto p-5 ${activeImage ? "bg-[linear-gradient(45deg,#f4f6f9_25%,transparent_25%),linear-gradient(-45deg,#f4f6f9_25%,transparent_25%),linear-gradient(45deg,transparent_75%,#f4f6f9_75%),linear-gradient(-45deg,transparent_75%,#f4f6f9_75%)] bg-[length:20px_20px] bg-[position:0_0,0_10px,10px_-10px,-10px_0px]" : "bg-white"}`}>
-        <div className="flex min-h-full min-w-full items-center justify-center">
+      <div className={`relative min-h-0 flex-1 overflow-auto p-5 sm:p-7 ${activeImage ? "bg-[linear-gradient(45deg,#f4f6f9_25%,transparent_25%),linear-gradient(-45deg,#f4f6f9_25%,transparent_25%),linear-gradient(45deg,transparent_75%,#f4f6f9_75%),linear-gradient(-45deg,transparent_75%,#f4f6f9_75%)] bg-[length:20px_20px] bg-[position:0_0,0_10px,10px_-10px,-10px_0px]" : "bg-white"}`}>
+        <div className={`flex min-w-full items-center justify-center ${activeImage ? "h-full" : "min-h-full"}`}>
           {activeImage && loadFailed ? (
             <div className="rounded-2xl border border-slate-200 bg-white px-6 py-8 text-center shadow-sm">
               <ImageOff className="mx-auto h-8 w-8 text-slate-400" />
@@ -227,7 +252,6 @@ export default function AttachmentPreviewPanel() {
                   ? "block max-w-none"
                   : "block max-h-full max-w-full object-contain"
                 }
-                style={actualSize ? undefined : { maxHeight: "calc(100vh - 180px)" }}
               />
             </div>
           ) : textLoading ? (
@@ -308,4 +332,5 @@ export default function AttachmentPreviewPanel() {
       ) : null}
     </section>
   );
+  return createPortal(preview, document.body);
 }

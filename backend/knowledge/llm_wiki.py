@@ -11,6 +11,7 @@ import asyncio
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -50,6 +51,84 @@ LEGACY_WORKSPACE_WIKILINK_RE = re.compile(rf"\[\[wiki/(?P<slug>{TYPED_SLUG_PATTE
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 WORD_RE = re.compile(r"[\w\u4e00-\u9fff-]+", re.UNICODE)
 SPECIAL_WIKI_FILES = frozenset({"index.md", "log.md"})
+ASCII_SEARCH_TERM_RE = re.compile(r"[a-z0-9][a-z0-9_+.-]+", re.IGNORECASE)
+CJK_SEARCH_RUN_RE = re.compile(r"[\u4e00-\u9fff]+")
+
+
+def _hybrid_query_terms(question: str) -> list[str]:
+    """Build bounded lexical features for Chinese/English hybrid ranking."""
+
+    lowered = question[:4000].lower()
+    terms = {
+        token
+        for token in ASCII_SEARCH_TERM_RE.findall(lowered)
+        if len(token) > 1
+    }
+    for run in CJK_SEARCH_RUN_RE.findall(lowered):
+        if 2 <= len(run) <= 6:
+            terms.add(run)
+        for width in (2, 3, 4):
+            if len(run) < width:
+                continue
+            terms.update(run[index:index + width] for index in range(len(run) - width + 1))
+    # Long, specific features are more useful than generic two-character ones
+    # when very large prompts are passed as questions.
+    return sorted(terms, key=lambda item: (-len(item), item))[:256]
+
+
+def _hybrid_lexical_scores(
+    question: str,
+    documents: dict[str, tuple[str, str]],
+) -> dict[str, float]:
+    """IDF-weighted title/body overlap used only by hybrid retrieval."""
+
+    terms = _hybrid_query_terms(question)
+    if not terms or not documents:
+        return {}
+    lowered = {
+        slug: (title.lower(), body.lower())
+        for slug, (title, body) in documents.items()
+    }
+    document_count = len(lowered)
+    document_frequency = {
+        term: sum(term in title or term in body for title, body in lowered.values())
+        for term in terms
+    }
+    scores: dict[str, float] = {}
+    for slug, (title, body) in lowered.items():
+        score = 0.0
+        for term in terms:
+            title_count = min(title.count(term), 2)
+            body_count = min(body.count(term), 3)
+            if not title_count and not body_count:
+                continue
+            inverse_frequency = math.log((document_count + 1) / (document_frequency[term] + 0.5)) + 1.0
+            score += inverse_frequency * ((4.0 * title_count) + body_count)
+        if score > 0:
+            scores[slug] = score
+    return scores
+
+
+def _hybrid_page_boost(
+    question: str,
+    *,
+    title: str,
+    page_type: str,
+    exact_title_bonus: float,
+    intent_type_bonus: float,
+) -> float:
+    """Small deterministic priors; evidence scores remain the main signal."""
+
+    compact_question = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", question.lower())
+    compact_title = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", title.lower())
+    boost = exact_title_bonus if len(compact_title) >= 3 and compact_title in compact_question else 0.0
+    if page_type == "concept" and any(token in question for token in ("概念", "原理", "方法", "是什么", "分别")):
+        boost += intent_type_bonus
+    elif page_type == "engineering_practice" and any(token in question for token in ("实践", "流程", "步骤", "怎么", "如何")):
+        boost += intent_type_bonus * 0.5
+    elif page_type == "media" and any(token in question for token in ("文章", "报道", "作者", "公众号", "来源")):
+        boost += intent_type_bonus
+    return boost
 
 
 def _markdown_level_two_section(body: str, title: str) -> str:
@@ -325,6 +404,20 @@ class LlmWikiService:
     def gbrain_runtime_home(self) -> Path:
         configured = os.getenv("PUDDINGCLAW_GBRAIN_HOME", "").strip()
         return Path(configured).expanduser().resolve() if configured else self.root / ".puddingclaw" / "gbrain-home"
+
+    def _embedding_service(self):
+        from knowledge.llm_wiki_embeddings import get_llm_wiki_embedding_service
+
+        return get_llm_wiki_embedding_service(self.base_dir, self.root)
+
+    def embedding_status(self) -> dict[str, Any]:
+        # Status is intentionally independent from the Schema Bundle lock and
+        # GBrain runtime. A missing Wiki simply reports zero pages.
+        return self._embedding_service().status()
+
+    def sync_embeddings(self, *, slugs: list[str] | None = None, force: bool = False) -> dict[str, Any]:
+        self._require_initialized()
+        return self._embedding_service().sync(slugs=slugs, force=force)
 
     def _require_initialized(self) -> dict[str, Any]:
         try:
@@ -650,6 +743,20 @@ class LlmWikiService:
 
         gbrain_config_path = self.gbrain_runtime_home / ".gbrain" / "config.json"
         import_status = self._gbrain_import_status()
+        try:
+            embedding_status = self._embedding_service().status()
+        except Exception as exc:  # noqa: BLE001 - Studio must remain available without Milvus/model config
+            from config import get_llm_wiki_retrieval_config
+
+            hybrid_enabled = bool(get_llm_wiki_retrieval_config().get("hybrid_enabled"))
+            embedding_status = {
+                "hybrid_enabled": hybrid_enabled,
+                "query_mode": "hybrid" if hybrid_enabled else "lexical",
+                "infrastructure_ready": False,
+                "counts": {"total": len(wiki_pages), "indexed": 0, "pending": len(wiki_pages), "outdated": 0, "failed": 0, "chunks": 0, "stale": 0},
+                "pages": [],
+                "error": f"{type(exc).__name__}: {exc}",
+            }
         return {
             "brain_root": str(self.root),
             "bundle_hash": bundle["bundle_hash"],
@@ -665,6 +772,7 @@ class LlmWikiService:
                 "index": (self.wiki_dir / "index.md").is_file(),
                 "log": (self.wiki_dir / "log.md").is_file(),
             },
+            "embedding": embedding_status,
             "gbrain": {
                 "cli_installed": resolve_gbrain_binary() is not None,
                 "postgres_configured": gbrain_config_path.is_file(),
@@ -1123,6 +1231,21 @@ class LlmWikiService:
             "published_at": datetime.now(UTC).isoformat(),
             "lint": report,
         }
+        from config import get_llm_wiki_retrieval_config
+
+        if get_llm_wiki_retrieval_config().get("hybrid_enabled"):
+            try:
+                embedding_result = self._embedding_service().sync(slugs=changed)
+                receipt["embedding"] = {
+                    key: embedding_result.get(key)
+                    for key in ("ok", "updated", "skipped", "failed", "profile_changed", "completed_at")
+                }
+            except Exception as exc:  # noqa: BLE001 - Wiki publish is durable even if its projection is unavailable
+                receipt["embedding"] = {
+                    "ok": False,
+                    "updated": [],
+                    "failed": [{"slug": slug, "error": f"{type(exc).__name__}: {exc}"} for slug in changed],
+                }
         _atomic_write(
             self.root / ".puddingclaw" / "jobs" / f"{job_id}.json",
             json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -1267,6 +1390,18 @@ class LlmWikiService:
                 if receipt_path.is_file():
                     receipt_path.unlink()
                 raise
+            from config import get_llm_wiki_retrieval_config
+
+            if get_llm_wiki_retrieval_config().get("hybrid_enabled"):
+                try:
+                    embedding_result = self._embedding_service().sync()
+                    receipt["embedding"] = {
+                        key: embedding_result.get(key)
+                        for key in ("ok", "updated", "skipped", "failed", "profile_changed", "completed_at")
+                    }
+                except Exception as exc:  # noqa: BLE001
+                    receipt["embedding"] = {"ok": False, "failed": [{"slug": "*", "error": f"{type(exc).__name__}: {exc}"}]}
+                _atomic_write(receipt_path, json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
             return {"retired": True, "already_retired": False, **receipt}
 
     def _matching_retirement_receipt(
@@ -1474,6 +1609,10 @@ class LlmWikiService:
         """Read-only Wiki query context; never falls back to raw files."""
 
         self._require_initialized()
+        from config import get_llm_wiki_retrieval_config
+
+        retrieval_config = get_llm_wiki_retrieval_config()
+        hybrid_requested = bool(retrieval_config.get("hybrid_enabled"))
         terms = {term.lower() for term in WORD_RE.findall(question) if len(term) > 1}
         candidates: list[tuple[int, str, str]] = []
         for path in _wiki_page_paths(self.wiki_dir):
@@ -1483,32 +1622,126 @@ class LlmWikiService:
             if score or not terms:
                 candidates.append((score, _wiki_slug(self.wiki_dir, path), content))
         candidates.sort(key=lambda item: (-item[0], item[1]))
-        selected = candidates[: max(1, min(limit, 20))]
+        bounded_limit = max(1, min(limit, 20))
+        semantic: dict[str, Any] = {"hits": [], "error": None}
+        if hybrid_requested:
+            try:
+                semantic = self._embedding_service().semantic_query(question, limit=bounded_limit)
+            except Exception as exc:  # noqa: BLE001 - deterministic lexical query is the required fallback
+                semantic = {"hits": [], "error": f"{type(exc).__name__}: {exc}"}
+
+        content_by_slug = {
+            _wiki_slug(self.wiki_dir, path): path.read_text(encoding="utf-8")
+            for path in _wiki_page_paths(self.wiki_dir)
+        }
+        parsed_by_slug = {
+            slug: _frontmatter(content, source=f"wiki/{slug}.md")
+            for slug, content in content_by_slug.items()
+        }
+        semantic_by_slug = {
+            str(hit.get("slug") or ""): hit
+            for hit in semantic.get("hits", [])
+            if isinstance(hit, dict) and str(hit.get("slug") or "") in content_by_slug
+        }
+        hybrid_active = hybrid_requested and bool(semantic_by_slug)
+        if hybrid_active:
+            fused: dict[str, float] = {}
+            matched_by: dict[str, list[str]] = {}
+            lexical_scores = _hybrid_lexical_scores(
+                question,
+                {
+                    slug: (str(metadata.get("title") or slug), body)
+                    for slug, (metadata, body) in parsed_by_slug.items()
+                },
+            )
+            lexical_ranked = sorted(lexical_scores, key=lambda slug: (-lexical_scores[slug], slug))
+            candidate_multiplier = max(2, int(retrieval_config.get("candidate_multiplier") or 4))
+            lexical_ranked = lexical_ranked[:bounded_limit * candidate_multiplier]
+            max_lexical_score = max(lexical_scores.values(), default=1.0)
+            rrf_k = max(1.0, float(retrieval_config.get("rrf_k") or 10.0))
+            lexical_strength_weight = float(retrieval_config.get("lexical_strength_weight") or 0.03)
+            for rank, slug in enumerate(lexical_ranked, start=1):
+                lexical_strength = lexical_scores[slug] / max_lexical_score
+                fused[slug] = (
+                    fused.get(slug, 0.0)
+                    + float(retrieval_config["lexical_weight"]) / (rrf_k + rank)
+                    + lexical_strength_weight * lexical_strength
+                )
+                matched_by.setdefault(slug, []).append("keyword")
+            for rank, hit in enumerate(semantic.get("hits", []), start=1):
+                slug = str(hit.get("slug") or "") if isinstance(hit, dict) else ""
+                if slug not in content_by_slug:
+                    continue
+                fused[slug] = fused.get(slug, 0.0) + float(retrieval_config["semantic_weight"]) / (rrf_k + rank)
+                matched_by.setdefault(slug, []).append("semantic")
+            dual_channel_bonus = float(retrieval_config.get("dual_channel_bonus") or 0.008)
+            exact_title_bonus = float(retrieval_config.get("exact_title_bonus") or 0.04)
+            intent_type_bonus = float(retrieval_config.get("intent_type_bonus") or 0.012)
+            for slug in fused:
+                if len(set(matched_by.get(slug, []))) > 1:
+                    fused[slug] += dual_channel_bonus
+                metadata, _body = parsed_by_slug[slug]
+                fused[slug] += _hybrid_page_boost(
+                    question,
+                    title=str(metadata.get("title") or slug),
+                    page_type=str(metadata.get("type") or "unknown"),
+                    exact_title_bonus=exact_title_bonus,
+                    intent_type_bonus=intent_type_bonus,
+                )
+            selected_slugs = sorted(fused, key=lambda slug: (-fused[slug], slug))[:bounded_limit]
+            selected = [
+                (fused[slug], slug, content_by_slug[slug], matched_by.get(slug, []))
+                for slug in selected_slugs
+            ]
+        else:
+            selected = [
+                (float(score), slug, content, ["keyword"])
+                for score, slug, content in candidates[:bounded_limit]
+            ]
         pages: list[dict[str, Any]] = []
         references: list[dict[str, Any]] = []
-        for score, slug, content in selected:
-            metadata, body = _frontmatter(content, source=f"wiki/{slug}.md")
+        for score, slug, content, matched_by in selected:
+            metadata, body = parsed_by_slug[slug]
             raw_sources = metadata.get("sources")
             if not isinstance(raw_sources, list):
                 raw_sources = []
+            semantic_hit = semantic_by_slug.get(slug, {})
+            semantic_quote = str(semantic_hit.get("quote") or "").strip()
             reference = {
                 "slug": slug,
                 "title": str(metadata.get("title") or slug),
                 "type": str(metadata.get("type") or "unknown"),
                 "uri": f"/knowledge/llm-wiki/wiki/{slug}.md",
                 "score": score,
-                "excerpt": body.strip()[:1200],
+                "excerpt": (semantic_quote or body.strip())[:1200],
                 "sources": [str(item) for item in raw_sources if str(item).strip()],
             }
-            pages.append({"slug": slug, "score": score, "content": content})
+            page = {"slug": slug, "score": score, "content": content}
+            if hybrid_active:
+                reference.update({
+                    "matched_by": matched_by,
+                    "chunk_id": semantic_hit.get("chunk_id"),
+                    "chunk_title": semantic_hit.get("chunk_title"),
+                })
+                page["matched_by"] = matched_by
+            pages.append(page)
             references.append(reference)
         return {
             "question": question,
             "index_md": (self.wiki_dir / "index.md").read_text(encoding="utf-8"),
             "pages": pages,
             "references": references,
-            "knowledge_gap": not candidates,
+            "knowledge_gap": not selected,
             "source_policy": "wiki-only",
+            "retrieval": {
+                "mode": "hybrid" if hybrid_active else "lexical",
+                "hybrid_enabled": hybrid_requested,
+                "semantic_used": bool(semantic_by_slug),
+                "keyword_candidates": len(candidates),
+                "semantic_candidates": len(semantic_by_slug),
+                "semantic_error": semantic.get("error"),
+                "ranking_version": "weighted-rrf-v2" if hybrid_active else "lexical-v1",
+            },
         }
 
     @contextmanager

@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-import json
-import re
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from runtime_identity.adapters import ManagedCliRegistry
 from runtime_identity.authorization import AuthorizationFlowStore
+from runtime_identity.authorization_drivers import AuthorizationDriverRegistry
 from runtime_identity.paths import PuddingClawPaths, trusted_owner_user_id
 from runtime_identity.profiles import CredentialProfileStore
+from runtime_identity.toolchains import ToolchainManager
 
 
 @dataclass(frozen=True)
@@ -26,16 +28,16 @@ class ConnectorDefinition:
     capabilities: tuple[str, ...]
 
 
-LARK_CONNECTOR = ConnectorDefinition(
-    connector_id="lark",
-    provider="lark",
-    adapter_id="lark-cli",
-    display_name="飞书",
-    description="消息、文档、云盘、日历、多维表格等飞书能力",
-    driver_kind="managed_cli",
-    executable="lark-cli",
-    package="@larksuite/cli",
-    capabilities=("消息", "文档", "云盘", "日历", "多维表格", "审批", "任务", "知识库"),
+KIMI_WEBBRIDGE_CONNECTOR = ConnectorDefinition(
+    connector_id="kimi-webbridge",
+    provider="kimi-webbridge",
+    adapter_id="kimi-webbridge-localhost-v1",
+    display_name="Kimi WebBridge",
+    description="控制本机浏览器并复用现有登录态；公开资料请优先使用联网搜索",
+    driver_kind="managed_local_daemon",
+    executable="kimi-webbridge",
+    package="Kimi WebBridge",
+    capabilities=("标签页", "导航", "页面快照", "点击与填写", "截图/PDF"),
 )
 
 
@@ -48,13 +50,38 @@ class ConnectorRegistry:
         runtime_contract: str,
         *,
         owner_user_id: str | None = None,
+        managed_registry: ManagedCliRegistry | None = None,
+        authorization_drivers: AuthorizationDriverRegistry | None = None,
+        runtime_image_digest: str | None = None,
     ) -> None:
         self.paths = paths
         self.runtime_contract = str(runtime_contract).strip()
         if not self.runtime_contract:
             raise ValueError("connector registry requires a runtime contract")
         self.owner_user_id = owner_user_id or trusted_owner_user_id()
-        self.definitions = {LARK_CONNECTOR.connector_id: LARK_CONNECTOR}
+        self.managed_registry = managed_registry or ManagedCliRegistry()
+        self.authorization_drivers = authorization_drivers or AuthorizationDriverRegistry()
+        self.runtime_image_digest = runtime_image_digest
+        self.toolchains = ToolchainManager(paths, self.runtime_contract)
+        self.definitions: dict[str, ConnectorDefinition] = {}
+        for adapter in self.managed_registry.adapters():
+            metadata = getattr(adapter, "connector", None)
+            if metadata is None:
+                continue
+            if metadata.connector_id == KIMI_WEBBRIDGE_CONNECTOR.connector_id:
+                raise ValueError("managed Connector id conflicts with another Connector driver")
+            self.definitions[metadata.connector_id] = ConnectorDefinition(
+                connector_id=metadata.connector_id,
+                provider=adapter.provider,
+                adapter_id=adapter.adapter_id,
+                display_name=metadata.display_name,
+                description=metadata.description,
+                driver_kind="managed_cli",
+                executable=adapter.toolchain_package.executable,
+                package=adapter.toolchain_package.package,
+                capabilities=metadata.capabilities,
+            )
+        self.definitions[KIMI_WEBBRIDGE_CONNECTOR.connector_id] = KIMI_WEBBRIDGE_CONNECTOR
 
     def list(self) -> list[dict[str, Any]]:
         return [self.get(connector_id) for connector_id in self.definitions]
@@ -63,7 +90,9 @@ class ConnectorRegistry:
         definition = self.definitions.get(str(connector_id))
         if definition is None:
             raise KeyError("connector does not exist")
-        environment = self._lark_environment(definition)
+        if definition.connector_id == KIMI_WEBBRIDGE_CONNECTOR.connector_id:
+            return self._webbridge_projection(definition)
+        environment = self._managed_environment(definition)
         profile_store = CredentialProfileStore(self.paths, self.owner_user_id)
         profile = profile_store.resolve(definition.provider, create_default=False)
         active_flow: dict[str, Any] | None = None
@@ -88,7 +117,8 @@ class ConnectorRegistry:
             if active is not None:
                 active_flow = AuthorizationFlowStore.projection(active)
         profile_projection = self._profile_projection(profile)
-        status = self._aggregate_status(environment, profile_projection, active_flow)
+        driver = self.authorization_drivers.for_adapter(definition.adapter_id, required=False)
+        status = self._aggregate_status(environment, profile_projection, active_flow, driver=driver)
         return {
             "connector_id": definition.connector_id,
             "provider": definition.provider,
@@ -101,38 +131,84 @@ class ConnectorRegistry:
             "active_flow": active_flow,
             "status": status,
             "capabilities": list(definition.capabilities),
-            "installed_skill_count": self._lark_skill_count(),
+            "installed_skill_count": self._installed_skill_count(definition),
+            "authorization_supported": self.authorization_drivers.for_adapter(
+                definition.adapter_id,
+                required=False,
+            )
+            is not None,
         }
 
-    def _lark_environment(self, definition: ConnectorDefinition) -> dict[str, Any]:
-        root = self.paths.node_toolchain(self.runtime_contract)
-        current = root / "current"
-        executable = current / "bin" / definition.executable
-        resolved: Path | None = None
+    def _managed_environment(self, definition: ConnectorDefinition) -> dict[str, Any]:
+        adapter = self.managed_registry.adapter(definition.adapter_id)
+        adapter_fingerprint = self.managed_registry.adapter_contract_fingerprint(adapter.adapter_id)
+        driver = self.authorization_drivers.for_adapter(adapter.adapter_id, required=False)
+        if driver is not None:
+            adapter_fingerprint = hashlib.sha256(
+                f"{adapter_fingerprint}\0{driver.contract_fingerprint}".encode()
+            ).hexdigest()
         try:
-            resolved = current.resolve(strict=True)
-        except FileNotFoundError:
-            pass
-        available = executable.is_file()
-        version: str | None = None
-        revision: str | None = resolved.name if resolved is not None else None
-        if resolved is not None:
-            package_json = resolved / "lib" / "node_modules" / "@larksuite" / "cli" / "package.json"
-            try:
-                package = json.loads(package_json.read_text(encoding="utf-8"))
-                raw_version = package.get("version") if isinstance(package, dict) else None
-                if isinstance(raw_version, str) and re.fullmatch(r"[0-9A-Za-z.+_-]+", raw_version):
-                    version = raw_version
-            except (FileNotFoundError, json.JSONDecodeError, OSError):
-                pass
+            installed = self.toolchains.inspect_current(
+                adapter_id=adapter.adapter_id,
+                spec=adapter.toolchain_package,
+                adapter_contract_fingerprint=adapter_fingerprint,
+                credential_state_fingerprint=adapter.credential_state.fingerprint,
+                runtime_image_digest=self.runtime_image_digest,
+            )
+            health = "available" if installed is not None else "unavailable"
+        except (OSError, ValueError):
+            installed = None
+            health = "repair_required"
         return {
-            "health": "available" if available else "unavailable",
+            "health": health,
             "runtime": "node",
             "executable": definition.executable,
             "package": definition.package,
-            "version": version,
+            "version": installed.get("version") if installed is not None else None,
             "availability_scope": "all_projects",
-            "toolchain_revision": revision,
+            "toolchain_revision": installed.get("revision") if installed is not None else None,
+        }
+
+    def _webbridge_projection(self, definition: ConnectorDefinition) -> dict[str, Any]:
+        from connectors.kimi_webbridge.lifecycle import KimiWebBridgeLifecycle
+
+        lifecycle = KimiWebBridgeLifecycle(self.paths)
+        state = lifecycle.probe()
+        if not state.installed:
+            status = "environment_unavailable"
+        elif not state.enabled:
+            status = "unconfigured"
+        elif state.ready:
+            status = "connected"
+        else:
+            status = "repair_required"
+        return {
+            "connector_id": definition.connector_id,
+            "provider": definition.provider,
+            "adapter_id": definition.adapter_id,
+            "display_name": definition.display_name,
+            "description": definition.description,
+            "driver_kind": definition.driver_kind,
+            "environment": {
+                "health": "available" if state.installed else "unavailable",
+                "runtime": "host",
+                "executable": str(lifecycle.daemon_path),
+                "package": definition.package,
+                "version": state.version,
+                "availability_scope": "local_user",
+                "daemon_running": state.daemon_running,
+                "extension_connected": state.extension_connected,
+                "enabled": state.enabled,
+                "ready": state.ready,
+                "version_compatible": state.version_compatible,
+                "extension_version": state.extension_version,
+                "error": state.error,
+            },
+            "profile": None,
+            "active_flow": None,
+            "status": status,
+            "capabilities": list(definition.capabilities),
+            "installed_skill_count": 0,
         }
 
     @staticmethod
@@ -149,6 +225,12 @@ class ConnectorRegistry:
                 if isinstance(raw, dict) and raw.get(key) is not None
             }
 
+        safe_identities = {
+            name: identity(name)
+            for name in identities
+            if isinstance(name, str) and isinstance(identities.get(name), dict)
+        }
+
         return {
             "id": profile.get("profile_id"),
             "label": profile.get("label"),
@@ -156,15 +238,20 @@ class ConnectorRegistry:
             "sharing_policy": profile.get("sharing_policy"),
             "app_identity": identity("bot"),
             "user_identity": identity("user"),
+            "identities": safe_identities,
             "last_updated_at": profile.get("updated_at"),
         }
 
-    @staticmethod
     def _aggregate_status(
+        self,
         environment: dict[str, Any],
         profile: dict[str, Any] | None,
         active_flow: dict[str, Any] | None,
+        *,
+        driver: Any | None,
     ) -> str:
+        if environment.get("health") == "repair_required":
+            return "repair_required"
         if environment.get("health") != "available":
             return "environment_unavailable"
         if active_flow is not None:
@@ -176,22 +263,40 @@ class ConnectorRegistry:
             return "revoked"
         if health in {"repair_required", "expired"}:
             return "repair_required"
+        identities = profile.get("identities") if isinstance(profile.get("identities"), dict) else {}
+        if driver is not None and driver.durable_profile_ready(identities):
+            return "connected"
         app_status = str((profile.get("app_identity") or {}).get("status") or "")
         user_status = str((profile.get("user_identity") or {}).get("status") or "")
-        if app_status in {"ready", "active"} and user_status in {"ready", "active"}:
+        app_identity = profile.get("app_identity") or {}
+        user_identity = profile.get("user_identity") or {}
+        if driver is None and (
+            app_status in {"ready", "active"}
+            and app_identity.get("verified") is True
+            and user_status in {"ready", "active"}
+            and user_identity.get("verified") is True
+            and user_identity.get("token_status") == "valid"
+        ):
             return "connected"
         if app_status in {"ready", "active"} or health == "active":
             return "authorization_required"
         return "unconfigured"
 
-    @staticmethod
-    def _lark_skill_count() -> int:
+    def _installed_skill_count(self, definition: ConnectorDefinition) -> int:
+        try:
+            adapter = self.managed_registry.adapter(definition.adapter_id)
+        except ValueError:
+            return 0
+        metadata = getattr(adapter, "connector", None)
+        prefix = str(getattr(metadata, "skill_prefix", "") or "")
+        if not prefix:
+            return 0
         skills_root = Path(__file__).resolve().parents[1] / "skills"
         try:
             return sum(
                 1
                 for child in skills_root.iterdir()
-                if child.is_dir() and child.name.startswith("lark-") and (child / "SKILL.md").is_file()
+                if child.is_dir() and child.name.startswith(prefix) and (child / "SKILL.md").is_file()
             )
         except OSError:
             return 0

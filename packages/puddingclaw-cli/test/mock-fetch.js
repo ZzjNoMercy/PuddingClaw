@@ -99,5 +99,6 @@ globalThis.fetch = async (url, options) => {
     analytics_model_id: "auto-analysis",
     analytics_model_match: { status: "matched", selected_id: "auto-analysis", strategy: "semantic" },
     session_id: body.session_id,
+    ...(body.workspace_path ? { workspace_path: body.workspace_path } : {}),
   }), { status: 200, headers: { "content-type": "application/json" } });
 };

@@ -42,7 +42,7 @@ export interface ConnectorInfo {
   adapter_id: string;
   display_name: string;
   description: string;
-  driver_kind: "managed_cli" | "mcp" | "http_api" | "desktop_bridge";
+  driver_kind: "managed_cli" | "mcp" | "http_api" | "desktop_bridge" | "managed_local_daemon";
   status: ConnectorStatus;
   environment: {
     health: string;
@@ -52,6 +52,13 @@ export interface ConnectorInfo {
     version?: string | null;
     availability_scope: string;
     toolchain_revision?: string | null;
+    daemon_running?: boolean;
+    extension_connected?: boolean;
+    enabled?: boolean;
+    ready?: boolean;
+    version_compatible?: boolean;
+    extension_version?: string | null;
+    error?: string | null;
   };
   profile?: {
     id: string;
@@ -65,6 +72,7 @@ export interface ConnectorInfo {
   active_flow?: ConnectorAuthorizationFlow | null;
   capabilities: string[];
   installed_skill_count: number;
+  authorization_supported?: boolean;
 }
 
 async function errorMessage(response: Response, fallback: string): Promise<string> {
@@ -126,5 +134,25 @@ export async function revokeConnector(connectorId: string): Promise<Record<strin
     body: JSON.stringify({ confirmed: true }),
   });
   if (!response.ok) throw new Error(await errorMessage(response, "连接器断开失败"));
+  return response.json();
+}
+
+export async function probeKimiWebBridge(): Promise<Record<string, unknown>> {
+  const response = await fetch(`${API_BASE}/connectors/kimi-webbridge/probe`, { method: "POST" });
+  if (!response.ok) throw new Error(await errorMessage(response, "WebBridge 检测失败"));
+  return response.json();
+}
+
+export async function installKimiWebBridge(): Promise<Record<string, unknown>> {
+  const response = await fetch(`${API_BASE}/connectors/kimi-webbridge/install`, { method: "POST" });
+  if (!response.ok) throw new Error(await errorMessage(response, "WebBridge 安装状态获取失败"));
+  return response.json();
+}
+
+export async function setKimiWebBridgeEnabled(enabled: boolean): Promise<Record<string, unknown>> {
+  const response = await fetch(`${API_BASE}/connectors/kimi-webbridge/${enabled ? "enable" : "disable"}`, {
+    method: "POST",
+  });
+  if (!response.ok) throw new Error(await errorMessage(response, enabled ? "WebBridge 启用失败" : "WebBridge 停用失败"));
   return response.json();
 }

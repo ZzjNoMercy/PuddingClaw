@@ -7,6 +7,7 @@ does not import, mount, or modify the user's real Credential Profiles.
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 from pathlib import Path
 
@@ -21,12 +22,26 @@ class _EphemeralBackend:
         self.manager = manager
         self.workspace = workspace
 
-    def install_managed_node_cli(self, *, distribution: str, toolchain_path: Path, container_path: str):
-        return self.manager.install_managed_node_cli(
+    def managed_runtime_image_digest(self) -> str:
+        return self.manager.managed_runtime_image_digest(self.workspace)
+
+    def resolve_managed_node_cli(self, *, distribution: str, package: str):
+        return self.manager.resolve_managed_node_cli(
             self.workspace,
             distribution=distribution,
-            toolchain_path=toolchain_path,
-            container_path=container_path,
+            package=package,
+        )
+
+    def resolve_shared_node_runtime(self, **kwargs):
+        return self.manager.resolve_shared_node_runtime(
+            self.workspace,
+            **kwargs,
+        )
+
+    def build_shared_node_runtime(self, **kwargs):
+        return self.manager.build_shared_node_runtime(
+            self.workspace,
+            **kwargs,
         )
 
     def run_managed_provider_cli(self, **kwargs):
@@ -38,6 +53,7 @@ def main() -> int:
         root = Path(temporary)
         workspace = root / "workspace"
         workspace.mkdir()
+        os.environ["PUDDINGCLAW_HOME"] = str(root / ".puddingclaw")
         manager = ProjectSandboxManager({})
         available, reason = manager.probe()
         if not available:

@@ -120,6 +120,9 @@ class HeadlessRunRequest(BaseModel):
 
     message: str = Field(min_length=1, max_length=100_000)
     session_id: str | None = Field(default=None, max_length=200)
+    # The local Platform/CLI may provide the host workspace.  It is resolved
+    # and registered by PuddingClaw; callers never need to know project_id.
+    workspace_path: str | None = Field(default=None, max_length=4_096)
     metadata: dict[str, Any] = Field(default_factory=dict)
     request_id: str | None = Field(default=None, max_length=200)
 
@@ -145,6 +148,7 @@ class HeadlessResumeRequest(BaseModel):
     continuation_token: str = Field(min_length=20, max_length=500)
     decisions: list[HeadlessResumeDecision] = Field(min_length=1, max_length=50)
     request_id: str | None = Field(default=None, max_length=200)
+    workspace_path: str | None = Field(default=None, max_length=4_096)
 
 
 def _headless_artifacts(session_id: str, project_id: str) -> list[dict[str, Any]]:
@@ -567,6 +571,34 @@ def _ensure_worker_project() -> tuple[str, Path]:
     return record.project_id, path
 
 
+def _resolve_worker_project(workspace_path: str | None) -> tuple[str, Path]:
+    """Resolve an optional Platform workspace into PuddingClaw's project id.
+
+    The absolute path is an integration boundary between two local processes;
+    ``project_id`` remains an internal Backend identifier.  When omitted, keep
+    the original standalone CLI behavior and use the default worker project.
+    """
+
+    raw = str(workspace_path or "").strip()
+    if not raw:
+        return _ensure_worker_project()
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        raise HTTPException(status_code=400, detail="workspace_path must be an absolute host path")
+    path = candidate.resolve()
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="workspace_path does not exist")
+    if not path.is_dir():
+        raise HTTPException(status_code=400, detail="workspace_path must be a directory")
+    try:
+        record = project_registry.register(str(path), name=path.name or _WORKER_PROJECT_NAME)
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise HTTPException(status_code=400, detail="workspace_path is unavailable") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="workspace project is unavailable") from exc
+    return record.project_id, path
+
+
 def _principal_for_scope(
     authorization: str | None,
     scope: str,
@@ -625,6 +657,7 @@ def _request_hash(request: HeadlessRunRequest, *, principal: dict[str, Any]) -> 
     payload = {
         "message": request.message,
         "session_id": request.session_id,
+        "workspace_path": request.workspace_path,
         "metadata": request.metadata,
         "key_id": principal.get("key_id"),
     }
@@ -635,6 +668,7 @@ def _resume_request_hash(request: HeadlessResumeRequest) -> str:
     payload = {
         "continuation_token": request.continuation_token,
         "decisions": [item.model_dump(mode="json") for item in request.decisions],
+        "workspace_path": request.workspace_path,
     }
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
@@ -705,6 +739,7 @@ def _needs_input(event_name: str, payload: dict[str, Any]) -> dict[str, Any] | N
     mapping = {
         "permission_required": "permission_request",
         "user_input_required": "user_input",
+        "skill_secret_required": "skill_secret",
         "database_sql_revision_required": "database_sql_revision",
         "dimension_build_rule_required": "dimension_build_rule",
         "logical_dataset_rule_required": "logical_dataset_rule",
@@ -740,6 +775,14 @@ def _needs_input(event_name: str, payload: dict[str, Any]) -> dict[str, Any] | N
         )
     if input_type == "user_input":
         result["questions"] = payload.get("questions") or []
+    if input_type == "skill_secret":
+        result.update(
+            {
+                "prompt": "该 Skill 需要用户在桌面安全输入框配置凭证；Worker 不接收 Secret。",
+                "skill_id": payload.get("skill_id"),
+                "env_name": payload.get("env_name"),
+            }
+        )
     return result
 
 
@@ -964,6 +1007,8 @@ async def create_headless_run(
 
     requested_session_id = str(request.session_id or "").strip()
     session_id = requested_session_id or f"worker-session-{uuid.uuid4().hex[:16]}"
+    project_id = ""
+    workspace_path: Path | None = None
     selected = ""
     model_route: AnalyticsModelRoute | None = None
     authority = headless_authority_from_environment()
@@ -982,6 +1027,12 @@ async def create_headless_run(
             metadata = session_manager.get_metadata(session_id)
             if not metadata.get("headless_enabled") or metadata.get("worker_key_id") != principal.get("key_id"):
                 raise HTTPException(status_code=403, detail="Session is not authorized for this Worker")
+            bound_workspace = str(metadata.get("workspace_path") or "").strip()
+            if request.workspace_path and bound_workspace:
+                requested_path = Path(request.workspace_path).expanduser()
+                if not requested_path.is_absolute() or requested_path.resolve() != Path(bound_workspace).expanduser().resolve():
+                    raise HTTPException(status_code=409, detail="workspace_path cannot change for a continuous Session")
+            project_id, workspace_path = _resolve_worker_project(request.workspace_path or bound_workspace or None)
             harness = session_manager.get_harness_state(session_id)
             active = [
                 item
@@ -1048,7 +1099,13 @@ async def create_headless_run(
                             idempotency_finished = True
                         return response
                     session_manager.update_metadata(session_id, {"analytics_model_id": selected})
+            if metadata.get("workspace_path") != str(workspace_path) or metadata.get("project_id") != project_id:
+                session_manager.update_metadata(
+                    session_id,
+                    {"workspace_path": str(workspace_path), "project_id": project_id},
+                )
         else:
+            project_id, workspace_path = _resolve_worker_project(request.workspace_path)
             model_route = await _route_analytics_model(request.message, principal)
             if model_route.status == "general":
                 selected = ""
@@ -1069,12 +1126,14 @@ async def create_headless_run(
                     "worker_key_id": principal.get("key_id"),
                     "interaction_mode": "external",
                     "analytics_model_id": selected,
+                    "workspace_path": str(workspace_path),
+                    "project_id": project_id,
                 },
                 approval_mode=approval_mode,
             )
 
         _maybe_cleanup_stale_headless_sessions(now=request_received_at)
-        project_id, _workspace_path = _ensure_worker_project()
+        assert workspace_path is not None
         assert model_route is not None
         try:
             response = await _consume_run(
@@ -1168,6 +1227,16 @@ async def resume_headless_run(
         raise HTTPException(status_code=403, detail="Run is not authorized for this Worker")
     if not hmac.compare_digest(execution.token, request.continuation_token):
         raise HTTPException(status_code=403, detail="Headless continuation token is invalid")
+    if request.workspace_path:
+        requested_path = Path(request.workspace_path).expanduser()
+        if not requested_path.is_absolute():
+            raise HTTPException(status_code=400, detail="workspace_path must be an absolute host path")
+        try:
+            bound_path = project_registry.resolve(execution.project_id)
+        except (KeyError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=410, detail="Headless workspace is no longer registered") from exc
+        if requested_path.resolve() != bound_path.resolve():
+            raise HTTPException(status_code=409, detail="workspace_path does not match the active Run")
     request_id = str(request.request_id or "").strip()
     request_hash = _resume_request_hash(request)
     if request_id:

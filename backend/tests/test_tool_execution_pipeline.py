@@ -6,6 +6,7 @@ import json
 import os
 import shlex
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -26,6 +27,7 @@ from graph.session_manager import SessionManager, session_manager
 from harness.dependency_setup import detect_workspace_dependency_plan
 from harness.execution_context import AuthorizedExecution, bind_authorized_execution
 from harness.execution_permits import ExecutionPermit
+from harness.host_skill_runtime import HostExecutionProjection
 from harness.models import RunRecord
 from harness.permission_reviewer import ModelPermissionReviewer, PermissionReviewVerdict
 from harness.sandbox_profiles import SandboxGrantProfile
@@ -106,10 +108,7 @@ def test_compound_cp_and_mkdir_p_share_one_canonical_execution_description(
     alias.symlink_to(external, target_is_directory=True)
     source = external / "source.txt"
     source.write_bytes(b"exact bytes\n")
-    command = (
-        f"cp {alias / 'source.txt'} {alias / 'copy.txt'}"
-        f" && mkdir -p {alias / 'nested'}"
-    )
+    command = f"cp {alias / 'source.txt'} {alias / 'copy.txt'} && mkdir -p {alias / 'nested'}"
 
     requirements = ShellPolicyAnalyzer.requirements(command, workspace_path=workspace)
 
@@ -119,9 +118,7 @@ def test_compound_cp_and_mkdir_p_share_one_canonical_execution_description(
         FilesystemIntent(path=str(external / "copy.txt"), access="write"),
         FilesystemIntent(path=str(external / "nested"), access="write"),
     )
-    assert requirements.execution_command == (
-        f"cp {source} {external / 'copy.txt'} && mkdir -p {external / 'nested'}"
-    )
+    assert requirements.execution_command == (f"cp {source} {external / 'copy.txt'} && mkdir -p {external / 'nested'}")
 
 
 def test_external_ls_with_common_flags_uses_directory_shell_authority(tmp_path: Path) -> None:
@@ -136,9 +133,7 @@ def test_external_ls_with_common_flags_uses_directory_shell_authority(tmp_path: 
     )
 
     assert requirements.opaque is False
-    assert requirements.filesystem_intents == (
-        FilesystemIntent(path=str(external), access="read"),
-    )
+    assert requirements.filesystem_intents == (FilesystemIntent(path=str(external), access="read"),)
     assert requirements.execution_command == f"ls -la {external}"
 
 
@@ -160,9 +155,7 @@ def test_external_python_script_requires_only_read_authority(
     )
 
     assert requirements.opaque is False
-    assert requirements.filesystem_intents == (
-        FilesystemIntent(path=str(script), access="read"),
-    )
+    assert requirements.filesystem_intents == (FilesystemIntent(path=str(script), access="read"),)
     assert requirements.shell_access_required is True
     assert requirements.execution_command == f"{interpreter} {script}"
 
@@ -398,6 +391,122 @@ async def test_permission_interrupt_persists_waiting_and_resume_status(tmp_path,
     assert result.status == "error"
 
 
+@pytest.mark.asyncio
+async def test_wrapped_permission_resume_executes_approved_managed_cli_install(
+    tmp_path,
+    monkeypatch,
+):
+    """The real stream coordinator resumes permission interrupts in an envelope."""
+
+    from harness import tool_execution as tool_execution_module
+    from harness.coordinators import HarnessRunCoordinator
+    from harness.models import RunStatus
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("managed-install-resume-session")
+    coordinator = HarnessRunCoordinator(session_manager)
+    run, _ = coordinator.start_run(
+        session_id="managed-install-resume-session",
+        query_id="query-managed-install-resume",
+        objective="install managed cli",
+        goal_mode=False,
+    )
+    coordinator.bind_execution_snapshot(
+        run,
+        {
+            "backend_mode": "adaptive",
+            "backend_id": "adaptive:test",
+            "workspace_id": "workspace:managed-install-resume",
+        },
+    )
+    coordinator.transition(run, RunStatus.RUNNING)
+    persisted = session_manager.get_run_state("managed-install-resume-session", run.run_id)
+    assert persisted is not None
+    permission_context = RunPermissionContext.from_config_snapshot(persisted["config_snapshot"])
+
+    class InstallPlan:
+        match = SimpleNamespace(
+            route=SimpleNamespace(value="installer"),
+            requires_network=True,
+            workspace_writable=False,
+            destructive=False,
+        )
+
+        @staticmethod
+        def approval_preview():
+            return '{"adapter_id":"fixture","resolved_version":"1.0.0"}'
+
+    plan = InstallPlan()
+    executed: list[object] = []
+
+    class ManagedService:
+        @staticmethod
+        def plan_command(command, context):
+            assert command == "npm install --global fixture-cli"
+            assert context["run_id"] == run.run_id
+            return plan
+
+        @staticmethod
+        def execute(candidate, context):
+            executed.append(candidate)
+            assert context["run_id"] == run.run_id
+            return SimpleNamespace(
+                payload={"ok": True, "managed_by": "managed_cli"},
+                content='{"managed_by":"managed_cli","ok":true}',
+                exit_code=0,
+            )
+
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute"},
+        backend_mode="adaptive",
+        permission_context=permission_context,
+        managed_cli_service=ManagedService(),
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "id": "call-managed-install-resume",
+            "name": "execute",
+            "args": {"command": "npm install --global fixture-cli"},
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(
+            context={
+                "session_id": "managed-install-resume-session",
+                "query_id": run.query_id,
+                "run_id": run.run_id,
+                "workspace_path": str(tmp_path),
+            }
+        ),
+    )
+
+    def fake_interrupt(payload):
+        pending = payload["request"]
+        decision = {"type": "approve"}
+        session_manager.add_permission_grant(
+            "managed-install-resume-session",
+            grant_type="tool_action",
+            target_kind="fingerprint",
+            target=pending["fingerprint"],
+            capabilities=pending["capabilities"],
+            scope="once",
+            metadata={"run_id": run.run_id},
+            bindings=pending["grant_bindings"],
+        )
+        assert tool_execution_module.permission_resume_registry.resolve(pending["id"], decision)
+        return {"decisions": [decision]}
+
+    monkeypatch.setattr(tool_execution_module, "interrupt", fake_interrupt)
+
+    async def forbidden_handler(_request):
+        raise AssertionError("managed CLI installation must execute through its service")
+
+    result = await pipeline.awrap_tool_call(request, forbidden_handler)
+
+    assert result.status == "success"
+    assert executed == [plan]
+
+
 def test_docker_backend_rejects_spec_drift_within_run(tmp_path, monkeypatch):
     workspace = tmp_path / "project"
     workspace.mkdir()
@@ -538,9 +647,7 @@ def test_docker_external_command_uses_same_canonical_paths_as_bind_profile(
     assert result.exit_code == 0
     docker_run = calls[0]
     assert f"type=bind,src={external},dst={external}" in docker_run
-    assert docker_run[-1] == (
-        f"cp {source} {external / 'copy.txt'} && mkdir -p {external / 'nested'}"
-    )
+    assert docker_run[-1] == (f"cp {source} {external / 'copy.txt'} && mkdir -p {external / 'nested'}")
 
 
 @pytest.mark.parametrize(
@@ -993,13 +1100,13 @@ def test_smart_mode_allows_only_controlled_network_tools(tmp_path):
         }
     )
     pipeline = ToolExecutionPipeline(
-        known_tools={"fetch_url", "tavily_search", "execute"},
+        known_tools={"fetch_url", "web_search", "execute"},
         backend_mode="docker",
         permission_context=context,
     )
 
-    tavily = ToolCallRequest(
-        tool_call={"id": "search", "name": "tavily_search", "args": {"query": "AI"}},
+    web_search = ToolCallRequest(
+        tool_call={"id": "search", "name": "web_search", "args": {"query": "AI"}},
         tool=None,
         state={},
         runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
@@ -1035,7 +1142,7 @@ def test_smart_mode_allows_only_controlled_network_tools(tmp_path):
         runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
     )
 
-    assert pipeline._preflight(tavily).decision == PolicyDecision.ALLOW
+    assert pipeline._preflight(web_search).decision == PolicyDecision.ALLOW
     assert pipeline._preflight(public_fetch).decision == PolicyDecision.ALLOW
     assert pipeline._preflight(private_fetch).decision == PolicyDecision.DENY
     shell_result = pipeline._preflight(shell_network)
@@ -1122,7 +1229,7 @@ def test_network_intent_distinguishes_read_upload_and_declared_auth():
     assert read.origins == ("https://example.com:443",)
     assert upload.remote_effect == "mutate"
     assert auth.remote_effect == "auth"
-    assert auth.transport_profile == "declared_cli:lark"
+    assert auth.transport_profile == "declared_cli:lark-cli"
 
 
 @pytest.mark.parametrize(
@@ -1137,11 +1244,11 @@ def test_network_intent_distinguishes_read_upload_and_declared_auth():
             },
         ),
         (
-            "tavily_search",
+            "web_search",
             {
                 "target_kind": "network_profile",
-                "target": "web_search:tavily",
-                "label": "本 Session 允许 Tavily 网页搜索",
+                "target": "web_search:configured",
+                "label": "本 Session 允许使用已配置的联网搜索服务",
             },
         ),
     ],
@@ -1618,9 +1725,7 @@ def test_kernel_mode_selects_kernel_backend_without_docker_probe(tmp_path, monke
 
     assert selection.mode == "kernel"
     assert isinstance(selection.backend, KernelWorkspaceBackend)
-    assert selection.backend.managed_readonly_path_aliases == (
-        ("/skills", skills.resolve()),
-    )
+    assert selection.backend.managed_readonly_path_aliases == (("/skills", skills.resolve()),)
     assert probed == []
     assert selection.backend.execute("pwd").exit_code == 126
 
@@ -1695,7 +1800,7 @@ def test_forced_docker_backend_keeps_runner_neutral_scratch_root(tmp_path, monke
     assert authorized.permit.selected_runner == "docker"
 
 
-def test_auto_mode_constructs_docker_only_on_first_docker_capability(tmp_path, monkeypatch):
+def test_auto_mode_installs_skill_packages_without_constructing_docker(tmp_path, monkeypatch):
     from harness import workspace_backends
 
     workspace = tmp_path / "workspace"
@@ -1710,15 +1815,11 @@ def test_auto_mode_constructs_docker_only_on_first_docker_capability(tmp_path, m
         lambda self: calls.append("probe") or (True, "ok"),
     )
 
-    class FakeDockerBackend:
-        def __init__(self, **kwargs):
-            calls.append("construct")
-
-        def install_packages(self, ecosystem, packages):
-            calls.append((ecosystem, tuple(packages)))
+    class FakeHostRuntime:
+        def install_packages(self, skill_id, skill_version, ecosystem, packages):
+            calls.append(("host", skill_id, skill_version, ecosystem, tuple(packages)))
             return ExecuteResponse(output="installed", exit_code=0)
 
-    monkeypatch.setattr(workspace_backends, "DockerWorkspaceBackend", FakeDockerBackend)
     selection = build_workspace_execution_backend(
         workspace,
         {
@@ -1729,13 +1830,98 @@ def test_auto_mode_constructs_docker_only_on_first_docker_capability(tmp_path, m
     )
 
     assert calls == []
-    result = selection.backend.install_packages("python", ["pandas"])
+    selection.backend._host_runtime = FakeHostRuntime()
+    result = selection.backend.install_packages("demo", "sha256-fixture", "python", ["pandas==2.2.3"])
 
     assert result.exit_code == 0
-    assert calls == ["probe", "construct", ("python", ("pandas",))]
+    assert calls == [
+        ("host", "demo", "sha256-fixture", "python", ("pandas==2.2.3",)),
+    ]
 
 
-def test_adaptive_permit_routes_local_and_network_commands_deterministically(
+def test_explicit_docker_skill_binding_selects_docker_without_fallback(tmp_path, monkeypatch):
+    from harness import workspace_backends
+    from runtime_identity.paths import PuddingClawPaths
+    from runtime_identity.skill_runtimes import SkillRuntimeBindingStore
+    from runtime_identity.software_runtime import skill_content_version
+
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    skills = tmp_path / "skills"
+    script = skills / "linux-only" / "scripts" / "run.py"
+    workspace.mkdir()
+    scratch.mkdir()
+    script.parent.mkdir(parents=True)
+    (script.parents[1] / "SKILL.md").write_text("# Linux only\n", encoding="utf-8")
+    script.write_text("print('ok')\n", encoding="utf-8")
+    monkeypatch.setenv("PUDDINGCLAW_HOME", str(tmp_path / ".puddingclaw"))
+    monkeypatch.setattr(workspace_backends, "_macos_seatbelt_available", lambda: True)
+    version = skill_content_version(script.parents[1])
+    SkillRuntimeBindingStore(PuddingClawPaths.from_environment()).bind(
+        skill_id="linux-only",
+        skill_version=version,
+        runtime="docker",
+    )
+    backend = AdaptiveWorkspaceBackend(
+        root_dir=workspace,
+        scratch_path=scratch,
+        docker_config={},
+        managed_readonly_path_aliases=(("/skills", skills.resolve()),),
+    )
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute"},
+        backend_mode="adaptive",
+        workspace_backend=backend,
+    )
+    command = "python3 /skills/linux-only/scripts/run.py"
+    request = ToolCallRequest(
+        tool_call={"id": "call-linux-skill", "name": "execute", "args": {"command": command}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(workspace)}),
+    )
+
+    authorized = pipeline._compile_kernel_execution(request)
+
+    assert authorized is not None
+    assert authorized.permit.selected_runner == "docker"
+    assert authorized.requirements.environment_binding_digest == "docker-python"
+
+
+def test_explicit_skill_runtime_selection_always_uses_confirmation_gate(tmp_path):
+    context = RunPermissionContext.from_config_snapshot(
+        {
+            "permissions": {"approval_mode": "smart", "policy_epoch": 1},
+            "execution": {
+                "backend_mode": "adaptive",
+                "backend_id": "adaptive:kernel-first:fixture",
+                "workspace_id": "sha256:workspace",
+            },
+        }
+    )
+    pipeline = ToolExecutionPipeline(
+        known_tools={"request_skill_runtime"},
+        backend_mode="adaptive",
+        permission_context=context,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "id": "runtime-choice",
+            "name": "request_skill_runtime",
+            "args": {"skill_id": "linux-only", "runtime": "docker", "reason": "requires Linux"},
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+
+    result = pipeline._preflight(request)
+
+    assert result.decision is PolicyDecision.ASK
+    assert result.reason == "explicit_skill_runtime_selection"
+
+
+def test_adaptive_permit_keeps_host_network_commands_inside_seatbelt(
     tmp_path,
     monkeypatch,
 ):
@@ -1766,12 +1952,11 @@ def test_adaptive_permit_routes_local_and_network_commands_deterministically(
         )
 
     local = pipeline._compile_kernel_execution(request("call-local", "pwd"))
-    network = pipeline._compile_kernel_execution(
-        request("call-network", "curl https://example.com")
-    )
+    network = pipeline._compile_kernel_execution(request("call-network", "curl https://example.com"))
 
     assert local is not None and local.permit.selected_runner == "kernel_macos_seatbelt"
-    assert network is not None and network.permit.selected_runner == "docker"
+    assert network is not None and network.permit.selected_runner == "kernel_macos_seatbelt"
+    assert network.profile.network_allowed is True
 
 
 def test_forced_docker_permit_routes_local_command_to_docker(tmp_path):
@@ -1833,18 +2018,13 @@ async def test_external_compound_copy_and_mkdir_create_one_atomic_shell_prompt(
     )
     coordinator.transition(run, RunStatus.RUNNING)
     run_state = session_manager.get_run_state("shell-prompt-session", run.run_id)
-    permission_context = RunPermissionContext.from_config_snapshot(
-        run_state["config_snapshot"]
-    )
+    permission_context = RunPermissionContext.from_config_snapshot(run_state["config_snapshot"])
     pipeline = ToolExecutionPipeline(
         known_tools={"execute"},
         backend_mode="adaptive",
         permission_context=permission_context,
     )
-    command = (
-        f"cp {source / 'report.txt'} {destination / 'copy.txt'}"
-        f" && mkdir -p {destination / 'nested'}"
-    )
+    command = f"cp {source / 'report.txt'} {destination / 'copy.txt'} && mkdir -p {destination / 'nested'}"
     request = ToolCallRequest(
         tool_call={"id": "call-shell-prompt", "name": "execute", "args": {"command": command}},
         tool=None,
@@ -1881,10 +2061,7 @@ async def test_external_compound_copy_and_mkdir_create_one_atomic_shell_prompt(
     permission_request = captured[0]["request"]
     assert permission_request["type"] == "shell_directory_access"
     assert permission_request["authority_plane"] == "shell"
-    assert {
-        (item["target"], item["access"])
-        for item in permission_request["grant_specs"]
-    } == {
+    assert {(item["target"], item["access"]) for item in permission_request["grant_specs"]} == {
         (str(source), "read"),
         (str(destination), "read"),
         (str(destination), "write"),
@@ -1928,9 +2105,7 @@ async def test_approved_shell_interrupt_continues_same_middleware_frame(
     )
     coordinator.transition(run, RunStatus.RUNNING)
     run_state = session_manager.get_run_state("shell-resume-session", run.run_id)
-    permission_context = RunPermissionContext.from_config_snapshot(
-        run_state["config_snapshot"]
-    )
+    permission_context = RunPermissionContext.from_config_snapshot(run_state["config_snapshot"])
     pipeline = ToolExecutionPipeline(
         known_tools={"execute"},
         backend_mode="kernel",
@@ -2037,9 +2212,7 @@ async def test_smart_external_python_script_prompts_once_then_executes(
     )
     coordinator.transition(run, RunStatus.RUNNING)
     run_state = session_manager.get_run_state("smart-python-session", run.run_id)
-    permission_context = RunPermissionContext.from_config_snapshot(
-        run_state["config_snapshot"]
-    )
+    permission_context = RunPermissionContext.from_config_snapshot(run_state["config_snapshot"])
     pipeline = ToolExecutionPipeline(
         known_tools={"execute"},
         backend_mode="adaptive",
@@ -2101,10 +2274,9 @@ async def test_smart_external_python_script_prompts_once_then_executes(
     assert invoked == [True]
     assert len(captured) == 1
     assert captured[0]["type"] == "shell_directory_access"
-    assert [
-        (item["target"], item["access"], item["delete"])
-        for item in captured[0]["grant_specs"]
-    ] == [(str(external), "read", False)]
+    assert [(item["target"], item["access"], item["delete"]) for item in captured[0]["grant_specs"]] == [
+        (str(external), "read", False)
+    ]
 
 
 def test_opaque_external_shell_command_derives_conservative_directory_authority(tmp_path):
@@ -2124,9 +2296,7 @@ def test_opaque_external_shell_command_derives_conservative_directory_authority(
 
     assert requirements.opaque is True
     assert authority.opaque is False
-    assert authority.filesystem_intents == (
-        FilesystemIntent(path=str(external), access="read"),
-    )
+    assert authority.filesystem_intents == (FilesystemIntent(path=str(external), access="read"),)
 
 
 def test_non_overwriting_mv_is_allowed_after_explicit_delete_directory_grant(tmp_path):
@@ -2163,9 +2333,7 @@ def test_non_overwriting_mv_is_allowed_after_explicit_delete_directory_grant(tmp
     )
     coordinator.transition(run, RunStatus.RUNNING)
     run_state = session_manager.get_run_state("shell-mv-session", run.run_id)
-    permission_context = RunPermissionContext.from_config_snapshot(
-        run_state["config_snapshot"]
-    )
+    permission_context = RunPermissionContext.from_config_snapshot(run_state["config_snapshot"])
     session_manager.add_shell_directory_grants_atomic(
         "shell-mv-session",
         grant_specs=[
@@ -2252,7 +2420,7 @@ def test_kernel_backend_executes_permit_bound_canonical_command(tmp_path, monkey
     )
     observed = []
 
-    def fake_execute(self, effective_command, *, timeout=None, spawn_guard=None):
+    def fake_execute(self, effective_command, *, timeout=None, spawn_guard=None, environment=None):
         observed.append((effective_command, bool(spawn_guard and spawn_guard())))
         return ExecuteResponse(output="ok", exit_code=0)
 
@@ -2269,6 +2437,99 @@ def test_kernel_backend_executes_permit_bound_canonical_command(tmp_path, monkey
     ]
 
 
+def test_kernel_backend_injects_secret_outside_command_and_redacts_output(tmp_path, monkeypatch):
+    from harness import workspace_backends
+    from harness.kernel_sandbox import MacOSSeatbeltRunner
+
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    workspace.mkdir()
+    scratch.mkdir()
+    monkeypatch.setattr(workspace_backends, "_macos_seatbelt_available", lambda: True)
+    backend = KernelWorkspaceBackend(root_dir=workspace, scratch_path=scratch)
+    command = "python3 -c 'print(1)'"
+    requirements = replace(
+        ShellPolicyAnalyzer.requirements(command, workspace_path=workspace),
+        environment_binding_digest="sha256:secret-binding",
+    )
+    profile = SandboxGrantProfile.build(workspace_root=workspace, scratch_root=scratch)
+    permit = ExecutionPermit.issue(
+        tool_call_id="call-secret-env",
+        command=command,
+        requirements=requirements,
+        permission_revision=0,
+        profile_digest=profile.digest,
+        selected_runner="kernel_macos_seatbelt",
+    )
+    authorized = AuthorizedExecution(
+        permit=permit,
+        command=command,
+        requirements=requirements,
+        profile=profile,
+        current_permission_revision=lambda: 0,
+        environment=(("DEMO_API_KEY", "top-secret-value"),),
+        secret_values=("top-secret-value",),
+    )
+    observed = []
+
+    def fake_execute(self, effective_command, *, timeout=None, spawn_guard=None, environment=None):
+        observed.append((effective_command, dict(environment or {})))
+        return ExecuteResponse(output="key=top-secret-value", exit_code=0)
+
+    monkeypatch.setattr(MacOSSeatbeltRunner, "execute", fake_execute)
+    with bind_authorized_execution(authorized):
+        result = backend.execute(command)
+
+    assert observed == [(command, {"DEMO_API_KEY": "top-secret-value"})]
+    assert "top-secret-value" not in result.output
+    assert result.output == "key=***"
+    assert "top-secret-value" not in repr(authorized)
+
+
+def test_kernel_backend_rejects_stale_secret_environment_before_spawn(tmp_path, monkeypatch):
+    from harness import workspace_backends
+    from harness.kernel_sandbox import MacOSSeatbeltRunner
+
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    workspace.mkdir()
+    scratch.mkdir()
+    monkeypatch.setattr(workspace_backends, "_macos_seatbelt_available", lambda: True)
+    backend = KernelWorkspaceBackend(root_dir=workspace, scratch_path=scratch)
+    command = "pwd"
+    requirements = replace(
+        ShellPolicyAnalyzer.requirements(command, workspace_path=workspace),
+        environment_binding_digest="sha256:stale",
+    )
+    profile = SandboxGrantProfile.build(workspace_root=workspace, scratch_root=scratch)
+    permit = ExecutionPermit.issue(
+        tool_call_id="call-stale-secret",
+        command=command,
+        requirements=requirements,
+        permission_revision=0,
+        profile_digest=profile.digest,
+        selected_runner="kernel_macos_seatbelt",
+    )
+    authorized = AuthorizedExecution(
+        permit=permit,
+        command=command,
+        requirements=requirements,
+        profile=profile,
+        current_permission_revision=lambda: 0,
+        environment=(("DEMO_TOKEN", "old"),),
+        secret_values=("old",),
+        environment_current=lambda: False,
+    )
+    spawned = []
+    monkeypatch.setattr(MacOSSeatbeltRunner, "execute", lambda *args, **kwargs: spawned.append(True))
+
+    with bind_authorized_execution(authorized):
+        result = backend.execute(command)
+
+    assert result.exit_code == 126
+    assert spawned == []
+
+
 def test_kernel_backend_projects_managed_skills_namespace_read_only(tmp_path, monkeypatch):
     from harness import workspace_backends
     from harness.kernel_sandbox import MacOSSeatbeltRunner
@@ -2280,6 +2541,7 @@ def test_kernel_backend_projects_managed_skills_namespace_read_only(tmp_path, mo
         path.mkdir()
     script_dir = skills / "get-date" / "scripts"
     script_dir.mkdir(parents=True)
+    (skills / "get-date" / "SKILL.md").write_text("# Get date\n", encoding="utf-8")
     script = script_dir / "get_datetime.py"
     script.write_text("print('ok')\n", encoding="utf-8")
 
@@ -2309,7 +2571,7 @@ def test_kernel_backend_projects_managed_skills_namespace_read_only(tmp_path, mo
 
     observed = []
 
-    def fake_execute(self, effective_command, *, timeout=None, spawn_guard=None):
+    def fake_execute(self, effective_command, *, timeout=None, spawn_guard=None, environment=None):
         observed.append((effective_command, bool(spawn_guard and spawn_guard())))
         return ExecuteResponse(output="ok", exit_code=0)
 
@@ -2321,6 +2583,67 @@ def test_kernel_backend_projects_managed_skills_namespace_read_only(tmp_path, mo
     assert len(observed) == 1
     assert shlex.split(observed[0][0]) == ["python3", str(script)]
     assert observed[0][1] is True
+
+
+def test_kernel_execution_projects_trusted_active_skill_for_inline_python(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    workspace.mkdir()
+    scratch.mkdir()
+    observed_active_skills: list[tuple[str, ...]] = []
+
+    class Backend:
+        scratch_path = scratch
+
+        def prepare_host_execution(self, command, *, active_skill_ids=()):
+            observed_active_skills.append(active_skill_ids)
+            return HostExecutionProjection(
+                command,
+                environment=(("PATH", "/managed/fixture/.venv/bin:/usr/bin:/bin"),),
+                environment_binding_digest="sha256:fixture-runtime",
+            )
+
+    monkeypatch.setattr(
+        session_manager,
+        "get_effective_run_skill_activations",
+        lambda session_id, run_id: [
+            {"skill_id": "pdf"},
+            {"skill_id": "pdf"},
+        ],
+    )
+    monkeypatch.setattr(
+        session_manager,
+        "permission_grants_snapshot",
+        lambda session_id: ([], 0),
+    )
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute"},
+        backend_mode="kernel",
+        workspace_backend=Backend(),
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "id": "call-inline-python",
+            "name": "execute",
+            "args": {"command": "python3 -c 'import pypdf'"},
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(
+            context={
+                "workspace_path": str(workspace),
+                "session_id": "session-active-skill",
+                "run_id": "run-active-skill",
+            }
+        ),
+    )
+
+    authorized = pipeline._compile_kernel_execution(request)
+
+    assert authorized is not None
+    assert observed_active_skills == [("pdf",)]
+    assert dict(authorized.environment)["PATH"].startswith("/managed/fixture/.venv/bin")
+    assert authorized.requirements.environment_binding_digest == "sha256:fixture-runtime"
 
 
 def test_managed_skills_alias_does_not_rewrite_partial_path(tmp_path, monkeypatch):
@@ -2338,14 +2661,20 @@ def test_managed_skills_alias_does_not_rewrite_partial_path(tmp_path, monkeypatc
         managed_readonly_path_aliases=(("/skills", skills.resolve()),),
     )
 
-    assert workspace_backends._rewrite_managed_virtual_paths(
-        "printf /skills-extra/file",
-        backend.managed_readonly_path_aliases,
-    ) == "printf /skills-extra/file"
-    assert workspace_backends._rewrite_managed_virtual_paths(
-        "python3 /skills/get-date/script.py",
-        backend.managed_readonly_path_aliases,
-    ) == f"python3 '{skills.resolve()}'/get-date/script.py"
+    assert (
+        workspace_backends._rewrite_managed_virtual_paths(
+            "printf /skills-extra/file",
+            backend.managed_readonly_path_aliases,
+        )
+        == "printf /skills-extra/file"
+    )
+    assert (
+        workspace_backends._rewrite_managed_virtual_paths(
+            "python3 /skills/get-date/script.py",
+            backend.managed_readonly_path_aliases,
+        )
+        == f"python3 '{skills.resolve()}'/get-date/script.py"
+    )
 
 
 @pytest.mark.asyncio
@@ -2361,7 +2690,7 @@ async def test_kernel_pipeline_binds_one_shot_permit_to_backend(tmp_path, monkey
     backend = KernelWorkspaceBackend(root_dir=workspace, scratch_path=scratch)
     observed = []
 
-    def fake_execute(self, command, *, timeout=None, spawn_guard=None):
+    def fake_execute(self, command, *, timeout=None, spawn_guard=None, environment=None):
         observed.append((command, timeout, bool(spawn_guard and spawn_guard())))
         return ExecuteResponse(output=str(self.profile.workspace_root), exit_code=0)
 
@@ -2472,7 +2801,7 @@ async def test_kernel_pipeline_rejects_permission_revision_change_before_spawn(
     monkeypatch.setattr(workspace_backends, "_macos_seatbelt_available", lambda: True)
     backend = KernelWorkspaceBackend(root_dir=workspace, scratch_path=scratch)
 
-    def revoke_before_spawn(self, command, *, timeout=None, spawn_guard=None):
+    def revoke_before_spawn(self, command, *, timeout=None, spawn_guard=None, environment=None):
         session_manager.add_permission_grant(
             "kernel-revision-session",
             grant_type="external_file_read",
@@ -2623,7 +2952,7 @@ def test_managed_sandbox_runtime_declares_browser_as_base_capability():
     dockerfile = Path(__file__).parents[1] / "harness" / "docker" / "Dockerfile"
     content = dockerfile.read_text(encoding="utf-8")
 
-    assert 'com.puddingclaw.runtime="python3.12-node22-chromium-v4"' in content
+    assert 'com.puddingclaw.runtime="python3.12-node22-chromium-v5"' in content
     assert "curl" in content
     assert "chromium" in content
     assert "chromium" in RUNTIME_CONTRACT
@@ -3750,22 +4079,26 @@ def test_smart_package_scope_never_applies_to_raw_shell(tmp_path):
         {
             "permissions": {"approval_mode": "smart", "policy_epoch": 2},
             "execution": {
-                "backend_mode": "docker",
-                "backend_id": "docker:project:spec",
+                "backend_mode": "adaptive",
+                "backend_id": "adaptive:kernel-first:project",
                 "workspace_id": "sha256:workspace",
             },
         }
     )
     pipeline = ToolExecutionPipeline(
         known_tools={"execute", "install_packages"},
-        backend_mode="docker",
+        backend_mode="adaptive",
         permission_context=context,
     )
     typed = ToolCallRequest(
         tool_call={
             "id": "typed",
             "name": "install_packages",
-            "args": {"ecosystem": "python", "packages": ["pandas==2.2.0"]},
+            "args": {
+                "skill_id": "table-analysis",
+                "ecosystem": "python",
+                "packages": ["pandas==2.2.0"],
+            },
         },
         tool=None,
         state={},
@@ -3783,11 +4116,7 @@ def test_smart_package_scope_never_applies_to_raw_shell(tmp_path):
     )
 
     assert pipeline._preflight(typed).risk == "package_install"
-    assert pipeline._session_grant_scope(typed) == {
-        "target_kind": "capability",
-        "target": "docker_package_install",
-        "label": "本 Session 允许在隔离安装器中安装 Skill 依赖",
-    }
+    assert pipeline._session_grant_scope(typed) is None
     assert pipeline._session_grant_scope(chained) is None
     assert pipeline._required_capabilities(typed) == [
         "execute",

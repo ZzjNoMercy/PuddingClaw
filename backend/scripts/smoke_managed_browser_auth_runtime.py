@@ -14,6 +14,7 @@ from pathlib import Path
 
 from harness.workspace_backends import ProjectSandboxManager, _lark_config_verification_url
 from runtime_identity.adapters import ManagedCliRegistry
+from runtime_identity.authorization_drivers import LarkAuthorizationDriver
 from runtime_identity.paths import PuddingClawPaths
 from runtime_identity.toolchains import ToolchainManager
 
@@ -34,6 +35,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="puddingclaw-browser-auth-") as temporary:
         workspace = Path(temporary) / "workspace"
         workspace.mkdir()
+        runtime_image_digest = manager.managed_runtime_image_digest(workspace)
         try:
             result = manager.run_managed_browser_auth_cli(
                 workspace,
@@ -49,6 +51,9 @@ def main() -> int:
                 owner_user_id=owner_user_id,
                 provider="lark",
                 profile_id=profile_id,
+                adapter_id="lark-cli",
+                authorization_contract_fingerprint=LarkAuthorizationDriver.contract_fingerprint,
+                expected_runtime_image_digest=runtime_image_digest,
             )
             print(
                 json.dumps(

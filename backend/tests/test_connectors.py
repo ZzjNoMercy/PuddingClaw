@@ -1,28 +1,178 @@
 from __future__ import annotations
 
+import hashlib
 import json
+from types import SimpleNamespace
 
+import pytest
+
+from runtime_identity.adapters import (
+    CredentialStateSpec,
+    ManagedCliRegistry,
+    ManagedConnectorSpec,
+    ToolchainPackageSpec,
+)
 from runtime_identity.authorization import (
     LARK_APP_CONFIGURATION_PHASE,
     LARK_USER_REAUTHORIZATION_PHASE,
     AuthorizationFlowStore,
 )
+from runtime_identity.authorization_drivers import AuthorizationDriverRegistry
 from runtime_identity.connectors import ConnectorRegistry
 from runtime_identity.paths import PuddingClawPaths
 from runtime_identity.profiles import CredentialProfileStore
+from runtime_identity.toolchains import ToolchainManager
+
+_TEST_IMAGE_DIGEST = "sha256:" + "1" * 64
+_TEST_INTEGRITY = "sha512-YWJj"
+
+
+class _FakeInstaller:
+    @staticmethod
+    def managed_runtime_image_digest():
+        return _TEST_IMAGE_DIGEST
+
+    @staticmethod
+    def resolve_shared_node_runtime(
+        *,
+        dependencies,
+        expected_runtime_image_digest,
+        resolution_path,
+    ):
+        assert expected_runtime_image_digest == _TEST_IMAGE_DIGEST
+        dependencies = dict(sorted(dependencies.items()))
+        (resolution_path / "package.json").write_text(
+            json.dumps(
+                {
+                    "name": "puddingclaw-managed-runtime",
+                    "private": True,
+                    "version": "0.0.0",
+                    "dependencies": dependencies,
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (resolution_path / "package-lock.json").write_text(
+            json.dumps(
+                {
+                    "lockfileVersion": 3,
+                    "packages": {
+                        "": {"dependencies": dependencies},
+                        **{
+                            f"node_modules/{package}": {
+                                "name": package,
+                                "version": version,
+                                "integrity": _TEST_INTEGRITY,
+                                "resolved": f"https://registry.npmjs.org/{package}/-/{version}.tgz",
+                            }
+                            for package, version in dependencies.items()
+                        },
+                    },
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return SimpleNamespace(output="resolved", exit_code=0)
+
+    @staticmethod
+    def build_shared_node_runtime(
+        *,
+        expected_runtime_image_digest,
+        runtime_path,
+        container_path,
+    ):
+        assert expected_runtime_image_digest == _TEST_IMAGE_DIGEST
+        desired = json.loads((runtime_path / "desired-packages.json").read_text(encoding="utf-8"))
+        dependencies = json.loads((runtime_path / "package.json").read_text(encoding="utf-8"))["dependencies"]
+        for package, version in dependencies.items():
+            package_root = runtime_path / "node_modules" / package
+            package_root.mkdir(parents=True, exist_ok=True)
+            bins = desired["packages"][package]["declared_bins"]
+            package_root.joinpath("package.json").write_text(
+                json.dumps(
+                    {
+                        "name": package,
+                        "version": version,
+                        "bin": {executable: "cli.js" for executable in bins},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cli = package_root / "cli.js"
+            cli.write_text(f"binary-{version}", encoding="utf-8")
+            cli.chmod(0o755)
+        return SimpleNamespace(output="built", exit_code=0, truncated=False)
+
+    def install_managed_node_cli(
+        self,
+        *,
+        distribution,
+        package,
+        executable,
+        toolchain_path,
+        **_kwargs,
+    ):
+        version = distribution.rsplit("@", 1)[-1]
+        installed = toolchain_path / "bin" / executable
+        installed.write_text(f"binary-{version}", encoding="utf-8")
+        installed.chmod(0o755)
+        package_root = toolchain_path / "lib" / "node_modules" / package
+        package_root.mkdir(parents=True, exist_ok=True)
+        (package_root / "package.json").write_text(
+            json.dumps({"name": package, "version": version}),
+            encoding="utf-8",
+        )
+        (toolchain_path / "lib" / "node_modules" / ".package-lock.json").write_text(
+            json.dumps(
+                {
+                    "packages": {
+                        f"node_modules/{package}": {
+                            "name": package,
+                            "version": version,
+                            "integrity": _TEST_INTEGRITY,
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        return SimpleNamespace(output=version, exit_code=0, truncated=False)
+
+
+def _install_adapter(
+    paths: PuddingClawPaths,
+    registry: ManagedCliRegistry,
+    adapter_id: str,
+    version: str,
+    runtime_contract: str = "test",
+) -> None:
+    adapter = registry.adapter(adapter_id)
+    fingerprint = registry.adapter_contract_fingerprint(adapter_id)
+    driver = AuthorizationDriverRegistry().for_adapter(adapter_id, required=False)
+    if driver is not None:
+        fingerprint = hashlib.sha256(f"{fingerprint}\0{driver.contract_fingerprint}".encode()).hexdigest()
+    manager = ToolchainManager(paths, runtime_contract)
+    current = manager.resolve_node(adapter_id).host_path.name
+    result = manager.install_package(
+        _FakeInstaller(),
+        adapter_id=adapter_id,
+        spec=adapter.toolchain_package,
+        distribution=f"{adapter.toolchain_package.package}@{version}",
+        expected_integrity=_TEST_INTEGRITY,
+        runtime_image_digest=_TEST_IMAGE_DIGEST,
+        adapter_contract_fingerprint=fingerprint,
+        credential_state_fingerprint=adapter.credential_state.fingerprint,
+        expected_revision=current,
+    )
+    assert result.exit_code == 0
 
 
 def _install_fake_lark(paths: PuddingClawPaths, runtime_contract: str = "test") -> None:
-    root = paths.node_toolchain(runtime_contract)
-    release = root / "releases" / "release-test"
-    executable = release / "bin" / "lark-cli"
-    executable.parent.mkdir(parents=True)
-    executable.write_text("test", encoding="utf-8")
-    package = release / "lib" / "node_modules" / "@larksuite" / "cli" / "package.json"
-    package.parent.mkdir(parents=True)
-    package.write_text(json.dumps({"version": "1.0.78"}), encoding="utf-8")
-    current = root / "current"
-    current.symlink_to(release)
+    _install_adapter(paths, ManagedCliRegistry(), "lark-cli", "1.0.78", runtime_contract)
 
 
 def test_application_registers_connector_routes():
@@ -34,13 +184,21 @@ def test_application_registers_connector_routes():
     assert "/api/connectors/{connector_id}/authorize" in paths
     assert "/api/connectors/{connector_id}/resume" in paths
     assert "/api/connectors/{connector_id}/revoke" in paths
+    assert "/api/toolchains/{adapter_id}/revisions" in paths
+    assert "/api/toolchains/{adapter_id}/rollback/preview" in paths
+    assert "/api/toolchains/{adapter_id}/rollback/commit" in paths
 
 
 def test_connector_catalog_does_not_create_profile_when_only_viewed(tmp_path):
     paths = PuddingClawPaths(tmp_path / ".puddingclaw")
     _install_fake_lark(paths)
 
-    connector = ConnectorRegistry(paths, "test", owner_user_id="local").get("lark")
+    connector = ConnectorRegistry(
+        paths,
+        "test",
+        owner_user_id="local",
+        runtime_image_digest=_TEST_IMAGE_DIGEST,
+    ).get("lark")
 
     assert connector["status"] == "unconfigured"
     assert connector["environment"]["health"] == "available"
@@ -49,6 +207,135 @@ def test_connector_catalog_does_not_create_profile_when_only_viewed(tmp_path):
     assert connector["driver_kind"] == "managed_cli"
     assert connector["profile"] is None
     assert CredentialProfileStore(paths, "local").resolve("lark", create_default=False) is None
+
+
+def test_installed_adapter_is_automatically_projected_into_connector_catalog(tmp_path):
+    paths = PuddingClawPaths(tmp_path / ".puddingclaw")
+
+    class FixtureAdapter:
+        adapter_id = "fixture-cli"
+        provider = "fixture"
+        executables = frozenset({"fixture-cli"})
+        toolchain_package = ToolchainPackageSpec(
+            ecosystem="node",
+            package="@fixture/cli",
+            executable="fixture-cli",
+        )
+        credential_state = CredentialStateSpec(paths=(".fixture-cli",))
+        connector = ManagedConnectorSpec(
+            connector_id="fixture",
+            display_name="Fixture Cloud",
+            description="Fixture managed CLI connector",
+            capabilities=("记录", "查询"),
+            skill_prefix="fixture-",
+        )
+
+        def claims(self, command):
+            return "fixture-cli" in command
+
+        def parse(self, _tokens, _env):
+            return None
+
+    registry = ManagedCliRegistry((FixtureAdapter(),))
+    _install_adapter(paths, registry, "fixture-cli", "2.4.0")
+
+    catalog = ConnectorRegistry(
+        paths,
+        "test",
+        owner_user_id="local",
+        managed_registry=registry,
+        runtime_image_digest=_TEST_IMAGE_DIGEST,
+    ).list()
+
+    assert [item["connector_id"] for item in catalog] == ["fixture", "kimi-webbridge"]
+    fixture = catalog[0]
+    assert fixture["status"] == "unconfigured"
+    assert fixture["environment"]["health"] == "available"
+    assert fixture["environment"]["version"] == "2.4.0"
+    assert fixture["capabilities"] == ["记录", "查询"]
+
+
+def test_connector_catalog_ignores_obsolete_per_adapter_release(tmp_path):
+    paths = PuddingClawPaths(tmp_path / ".puddingclaw")
+    root = paths.root / "runtime" / "toolchains" / "node" / "obsolete" / "adapters" / "lark-cli"
+    release = root / "releases" / "release-forged"
+    executable = release / "bin" / "lark-cli"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("not-a-verified-release", encoding="utf-8")
+    executable.chmod(0o755)
+    (release / "toolchain-manifest.json").write_text(
+        json.dumps({"version": 3, "adapter_id": "lark-cli"}),
+        encoding="utf-8",
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "current").symlink_to(release)
+
+    connector = ConnectorRegistry(paths, "test", owner_user_id="local").get("lark")
+
+    assert connector["status"] == "repair_required"
+    assert connector["environment"]["health"] == "repair_required"
+    assert connector["environment"]["version"] is None
+
+
+def test_connector_catalog_treats_empty_toolchain_as_not_installed(tmp_path):
+    paths = PuddingClawPaths(tmp_path / ".puddingclaw")
+    ToolchainManager(paths, "test").resolve_node("lark-cli")
+
+    connector = ConnectorRegistry(
+        paths,
+        "test",
+        owner_user_id="local",
+        runtime_image_digest=_TEST_IMAGE_DIGEST,
+    ).get("lark")
+
+    assert connector["status"] == "environment_unavailable"
+    assert connector["environment"]["health"] == "unavailable"
+
+
+def test_connector_catalog_marks_runtime_image_drift_for_repair(tmp_path):
+    paths = PuddingClawPaths(tmp_path / ".puddingclaw")
+    _install_fake_lark(paths)
+
+    connector = ConnectorRegistry(
+        paths,
+        "test",
+        owner_user_id="local",
+        runtime_image_digest="sha256:" + "2" * 64,
+    ).get("lark")
+
+    assert connector["status"] == "repair_required"
+    assert connector["environment"]["health"] == "repair_required"
+
+
+def test_connector_catalog_rejects_cross_driver_connector_id_collision(tmp_path):
+    class ConflictingAdapter:
+        adapter_id = "conflicting-cli"
+        provider = "conflicting"
+        executables = frozenset({"conflicting-cli"})
+        toolchain_package = ToolchainPackageSpec(
+            ecosystem="node",
+            package="@fixture/conflicting",
+            executable="conflicting-cli",
+        )
+        credential_state = CredentialStateSpec(paths=(".conflicting",))
+        connector = ManagedConnectorSpec(
+            connector_id="kimi-webbridge",
+            display_name="Collision",
+            description="Must fail closed",
+        )
+
+        def claims(self, _command):
+            return False
+
+        def parse(self, _tokens, _env):
+            return None
+
+    with pytest.raises(ValueError, match="conflicts"):
+        ConnectorRegistry(
+            PuddingClawPaths(tmp_path / ".puddingclaw"),
+            "test",
+            managed_registry=ManagedCliRegistry((ConflictingAdapter(),)),
+        )
 
 
 def test_connector_projects_profile_and_authorization_flow_without_secrets(tmp_path):
@@ -93,7 +380,12 @@ def test_connector_projects_profile_and_authorization_flow_without_secrets(tmp_p
         expires_at=9999999999,
     )
 
-    connector = ConnectorRegistry(paths, "test", owner_user_id="local").get("lark")
+    connector = ConnectorRegistry(
+        paths,
+        "test",
+        owner_user_id="local",
+        runtime_image_digest=_TEST_IMAGE_DIGEST,
+    ).get("lark")
 
     assert connector["status"] == "authorizing"
     assert connector["profile"]["health"] == "active"
@@ -137,14 +429,17 @@ def test_connector_status_does_not_treat_orphaned_flow_as_authorizing(tmp_path):
         expires_at=None,
     )
 
-    connector = ConnectorRegistry(paths, "test", owner_user_id="local").get("lark")
+    connector = ConnectorRegistry(
+        paths,
+        "test",
+        owner_user_id="local",
+        runtime_image_digest=_TEST_IMAGE_DIGEST,
+    ).get("lark")
 
     assert connector["status"] == "connected"
     assert connector["profile"]["app_identity"]["verified"] is True
     assert connector["profile"]["user_identity"]["token_status"] == "valid"
     assert connector["active_flow"] is None
-    record = next(
-        item for item in flow_store._read_registry()["flows"] if item["flow_id"] == flow["flow_id"]
-    )
+    record = next(item for item in flow_store._read_registry()["flows"] if item["flow_id"] == flow["flow_id"])
     assert record["status"] == "expired"
     assert record["error"] == "browser_job_missing"

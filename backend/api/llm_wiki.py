@@ -67,6 +67,11 @@ class WikiIngestJobPayload(StrictPayload):
     )
 
 
+class WikiEmbeddingSyncPayload(StrictPayload):
+    slugs: list[str] = Field(default_factory=list, max_length=500)
+    force: bool = False
+
+
 def _service():
     return get_llm_wiki_service(BASE_DIR)
 
@@ -82,6 +87,26 @@ async def workspace_status() -> dict[str, Any]:
     try:
         return await run_in_threadpool(_service().workspace_status)
     except (LlmWikiError, OSError) as exc:
+        raise _bad_request(exc) from exc
+
+
+@router.get("/embedding")
+async def embedding_status() -> dict[str, Any]:
+    try:
+        return await run_in_threadpool(_service().embedding_status)
+    except (LlmWikiError, OSError, RuntimeError, ValueError) as exc:
+        raise _bad_request(exc) from exc
+
+
+@router.post("/embedding/sync")
+async def sync_embeddings(payload: WikiEmbeddingSyncPayload) -> dict[str, Any]:
+    try:
+        return await run_in_threadpool(
+            _service().sync_embeddings,
+            slugs=payload.slugs or None,
+            force=payload.force,
+        )
+    except (LlmWikiError, OSError, RuntimeError, ValueError) as exc:
         raise _bad_request(exc) from exc
 
 

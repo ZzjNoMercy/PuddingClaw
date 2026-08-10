@@ -1,4 +1,9 @@
-"""POST /api/chat — SSE streaming chat with Agent."""
+"""LEGACY ``POST /api/chat`` compatibility endpoint.
+
+The Chat runtime has been retired from the product UI and is no longer
+maintained. New conversation flows must use ``POST /api/agent``. This module
+remains temporarily to avoid breaking callers that have not migrated yet.
+"""
 
 import asyncio
 import json
@@ -989,7 +994,7 @@ async def event_generator(
             }
 
 
-@router.post("/chat")
+@router.post("/chat", deprecated=True)
 async def chat(request: ChatRequest):
     request_received_at = time.time()
     try:

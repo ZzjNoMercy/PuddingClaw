@@ -11,6 +11,14 @@ import pytest
 from graph.session_manager import session_manager
 
 
+def test_new_sessions_default_to_agent_runtime(tmp_path):
+    session_manager.initialize(tmp_path)
+
+    metadata = session_manager.create_session("default-runtime")
+
+    assert metadata["runtime_mode"] == "agent"
+
+
 def test_metadata_cannot_create_or_overwrite_control_plane_state(tmp_path):
     session_manager.initialize(tmp_path)
 
@@ -1573,6 +1581,8 @@ def test_assistant_output_attachments_survive_draft_upserts_and_history_reload(t
         "derived_from": "att_source123",
         "created_by_run_id": "run-1",
         "created_by_query_id": "query-1",
+        "created_by_tool_call_id": "call-generate-1",
+        "created_at": 1234.5,
         "download_url": "/api/attachments/att_generated123/download?session_id=attachment-output-session",
         "preview_url": "/api/attachments/att_generated123/preview?session_id=attachment-output-session",
         "preview_mime_type": "image/png",

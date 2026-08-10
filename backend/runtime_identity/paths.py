@@ -61,15 +61,63 @@ class PuddingClawPaths:
     def from_environment(cls) -> PuddingClawPaths:
         return cls(resolve_puddingclaw_home())
 
-    def node_toolchain(self, runtime_contract: str) -> Path:
+    def shared_node_runtime(self, runtime_contract: str) -> Path:
+        """Return the user-global declarative Node runtime root.
+
+        The runtime contract and architecture are part of the physical
+        identity because native addons built for one image/architecture must
+        never be consumed by another one.
+        """
+
         contract = re.sub(r"[^A-Za-z0-9_.+-]+", "-", runtime_contract).strip("-")
         if not contract:
             raise ValueError("runtime_contract must be non-empty")
-        return self.root / "runtime" / "toolchains" / "node" / f"{contract}-{runtime_arch()}"
+        return self.root / "runtime" / "node" / f"{contract}-{runtime_arch()}"
+
+    def python_skill_runtime(
+        self,
+        runtime_contract: str,
+        skill_id: str,
+        skill_version: str,
+    ) -> Path:
+        """Return one Skill-version-isolated Python runtime root."""
+
+        contract = re.sub(r"[^A-Za-z0-9_.+-]+", "-", runtime_contract).strip("-")
+        if not contract:
+            raise ValueError("runtime_contract must be non-empty")
+        skill = safe_identity_component(skill_id, field="skill_id")
+        version = safe_identity_component(skill_version, field="skill_version")
+        return (
+            self.root
+            / "runtime"
+            / "python"
+            / "skills"
+            / skill
+            / version
+            / f"{contract}-{runtime_arch()}"
+        )
+
+    def python_environment_runtime(self, runtime_contract: str) -> Path:
+        """Return the dependency-hash-addressed Python environment store."""
+
+        contract = re.sub(r"[^A-Za-z0-9_.+-]+", "-", runtime_contract).strip("-")
+        if not contract:
+            raise ValueError("runtime_contract must be non-empty")
+        return self.root / "runtime" / "python" / "environments" / f"{contract}-{runtime_arch()}"
+
+    def python_uv_cache(self) -> Path:
+        return self.root / "runtime" / "python" / "uv-cache"
 
     def credentials_root(self, owner_user_id: str) -> Path:
         owner = safe_identity_component(owner_user_id, field="owner_user_id")
         return self.root / "users" / owner / "credentials"
+
+    def skill_secret_registry(self, owner_user_id: str) -> Path:
+        owner = safe_identity_component(owner_user_id, field="owner_user_id")
+        return self.root / "users" / owner / "skill-secrets" / "registry.enc"
+
+    def skill_runtime_bindings(self) -> Path:
+        return self.root / "runtime" / "skill-runtime-bindings.json"
 
     def provider_profile(self, owner_user_id: str, provider: str, profile_id: str) -> Path:
         provider_name = safe_identity_component(provider, field="provider")

@@ -125,6 +125,7 @@ from graph.permissioned_filesystem_backend import PermissionedCompositeBackend
 from graph.prompt_cache import CONTROL_SOURCE, is_prompt_control_message
 from graph.session_manager import session_manager
 from graph.skill_plan_resume import skill_plan_resume_registry
+from graph.skill_secret_resume import skill_secret_resume_registry
 from graph.tool_result_adapter import tool_result_adapter
 from graph.trace_collector import TraceCollector, TraceSpan
 from graph.user_input_resume import user_input_resume_registry
@@ -163,6 +164,7 @@ from harness.task_profiles import (
 from harness.tool_execution import ToolExecutionPipeline
 from harness.verification_activations import (
     VerificationActivationMiddleware,
+    resolve_browser_generated_attachment,
     resolve_published_attachment,
 )
 from harness.workspace_backends import build_workspace_execution_backend
@@ -174,9 +176,12 @@ from llm.model_client import (
 )
 from observability import emit_harness_metric
 from projects.registry import project_registry
+from runtime_identity.paths import PuddingClawPaths
 from tools import get_all_tools
 from tools.filesystem.factory import VersionedPatchMiddleware
 from tools.package_install import create_install_packages_tool
+from tools.request_skill_runtime_tool import create_request_skill_runtime_tool
+from tools.request_skill_secret_tool import create_request_skill_secret_tool
 from tools.request_user_input_tool import create_request_user_input_tool
 from tools.toolsets import agent_custom_tool_names, tool_control_descriptor
 from tools.update_goal_tool import create_update_goal_tool
@@ -2543,13 +2548,6 @@ class AttachmentImageContentMiddleware(AgentMiddleware[Any, Any, Any]):
     IMAGE_PATH_RE = re.compile(r"^PuddingClaw-Resource-Image-Path:\s*(.+?)\s*$", re.MULTILINE)
 
     @staticmethod
-    def _session_id_from_text(text: str) -> str:
-        match = re.search(r"harness_attachment_session_id:\s*([A-Za-z0-9_.:-]+)", text)
-        if not match:
-            match = re.search(r"harness_image_session_id:\s*([A-Za-z0-9_.:-]+)", text)
-        return match.group(1) if match else ""
-
-    @staticmethod
     def _content_text(content: Any) -> str:
         if isinstance(content, str):
             return content
@@ -2565,25 +2563,65 @@ class AttachmentImageContentMiddleware(AgentMiddleware[Any, Any, Any]):
             return "\n".join(parts)
         return str(content or "")
 
+    @staticmethod
+    def _tool_name(tool: Any) -> str:
+        if isinstance(tool, dict):
+            return str(tool.get("name") or "")
+        return str(getattr(tool, "name", "") or "")
+
+    @classmethod
+    def _bound_read_resource_tool(cls, request: ModelRequest[Any]) -> Any | None:
+        for tool in getattr(request, "tools", []) or []:
+            if cls._tool_name(tool) == "read_resource":
+                return tool
+        return None
+
+    @staticmethod
+    def _successful_read_resource_calls(messages: list[Any]) -> dict[str, str]:
+        calls: dict[str, str] = {}
+        for message in messages:
+            if not isinstance(message, AIMessage):
+                continue
+            for call in getattr(message, "tool_calls", []) or []:
+                if not isinstance(call, dict) or str(call.get("name") or "") != "read_resource":
+                    continue
+                args = call.get("args") if isinstance(call.get("args"), dict) else {}
+                resource = str(args.get("resource") or "").strip()
+                call_id = str(call.get("id") or "")
+                if call_id and resource:
+                    calls[call_id] = resource
+        return calls
+
     def _image_inputs(self, request: ModelRequest[Any]) -> list[dict[str, Any]]:
-        all_text = "\n".join(
-            self._content_text(getattr(message, "content", "")) for message in getattr(request, "messages", [])
-        )
-        state = getattr(request, "state", {}) or {}
-        session_id = (
-            str(state.get("harness_attachment_session_id") or "")
-            or str(state.get("harness_image_session_id") or "")
-            or self._session_id_from_text(all_text)
-        )
-        tool_text = "\n".join(
-            self._content_text(getattr(message, "content", ""))
-            for message in getattr(request, "messages", [])
-            if isinstance(message, ToolMessage)
-        )
+        messages = list(getattr(request, "messages", []) or [])
+        read_resource_tool = self._bound_read_resource_tool(request)
+        session_id = str(getattr(read_resource_tool, "session_id", "") or "")
+        if not session_id:
+            return []
+        successful_calls = self._successful_read_resource_calls(messages)
+        verified_attachment_ids: list[str] = []
+        verified_paths: list[str] = []
+        for message in messages:
+            if not isinstance(message, ToolMessage):
+                continue
+            if str(getattr(message, "name", "") or "") != "read_resource":
+                continue
+            if str(getattr(message, "status", "") or "").lower() in {"error", "failed"}:
+                continue
+            expected_resource = successful_calls.get(str(getattr(message, "tool_call_id", "") or ""))
+            if not expected_resource:
+                continue
+            tool_text = self._content_text(getattr(message, "content", ""))
+            for attachment_id in self.IMAGE_ATTACHMENT_RE.findall(tool_text):
+                if attachment_id == expected_resource:
+                    verified_attachment_ids.append(attachment_id)
+            for raw_path in self.IMAGE_PATH_RE.findall(tool_text):
+                if raw_path.strip() == expected_resource:
+                    verified_paths.append(raw_path)
 
         image_inputs: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for attachment_id in self.IMAGE_ATTACHMENT_RE.findall(tool_text):
+        for attachment_id in verified_attachment_ids:
             if not session_id or attachment_id in seen:
                 continue
             seen.add(attachment_id)
@@ -2606,7 +2644,7 @@ class AttachmentImageContentMiddleware(AgentMiddleware[Any, Any, Any]):
                     "source": "attachment",
                 }
             )
-        for raw_path in self.IMAGE_PATH_RE.findall(tool_text):
+        for raw_path in verified_paths:
             path_key = raw_path.strip()
             if not path_key or path_key in seen:
                 continue
@@ -2693,8 +2731,10 @@ def _build_subagent_item(
         )
     native_hint = (
         "Use this subagent via the native task tool whenever the user provides image attachments "
-        "or local image paths. Preserve the harness_attachment_session_id and image refs from the user "
-        "message in the task description."
+        "or local image paths, or when a browser screenshot result exposes a puddingclaw_visual_route "
+        "and the trusted user request requires visual interpretation. Preserve the "
+        "harness_attachment_session_id and image refs from the user message or screenshot route in the "
+        "task description."
     )
     if is_image_analyzer and native_hint not in description:
         description = f"{description} {native_hint}"
@@ -2721,6 +2761,19 @@ def _build_subagent_item(
 
     tools_cfg = item.get("tools", {})
     tools = default_tools if tools_cfg.get("mode", "inherit") == "inherit" else []
+    if is_image_analyzer:
+        # Image content is untrusted evidence.  The visual worker gets one
+        # deterministic capability: opening the exact attachment/path it was
+        # delegated.  It cannot browse, execute, write, or recursively delegate.
+        tools = []
+        for tool in default_tools:
+            if str(getattr(tool, "name", "") or "") != "read_resource":
+                continue
+            try:
+                tool = tool.model_copy(update={"enforce_attachment_allowlist": True})
+            except Exception:
+                setattr(tool, "enforce_attachment_allowlist", True)
+            tools.append(tool)
 
     skills_cfg = item.get("skills", {})
     if skills_cfg.get("mode", "inherit") == "inherit":
@@ -3298,6 +3351,8 @@ class DeepAgentsAgentManager:
                 "install_skill",
                 "update_skill",
                 "request_user_input",
+                "request_skill_secret",
+                "request_skill_runtime",
             }:
                 # DeepAgents binds these controls explicitly below or handles
                 # them through the Session-bound frontend API. Keeping the
@@ -3327,7 +3382,13 @@ class DeepAgentsAgentManager:
             elif getattr(tool, "name", "") == "read_resource":
                 resource_updates = {
                     "session_id": session_id,
+                    "run_id": run_id,
                     "workspace_path": str(workspace_path),
+                    "allowed_attachment_ids": [
+                        str(item.get("id") or "")
+                        for item in current_attachments or []
+                        if isinstance(item, dict) and item.get("id")
+                    ],
                 }
                 try:
                     tool = tool.model_copy(update=resource_updates)
@@ -3343,6 +3404,16 @@ class DeepAgentsAgentManager:
                     tool = tool.model_copy(update=evidence_updates)
                 except Exception:
                     for key, value in evidence_updates.items():
+                        setattr(tool, key, value)
+            elif getattr(tool, "name", "") == "browser":
+                browser_updates = {
+                    "session_id": session_id,
+                    "run_id": run_id,
+                }
+                try:
+                    tool = tool.model_copy(update=browser_updates)
+                except Exception:
+                    for key, value in browser_updates.items():
                         setattr(tool, key, value)
             elif getattr(tool, "name", "") in {
                 "request_dimension_build_rule",
@@ -3417,7 +3488,12 @@ class DeepAgentsAgentManager:
             tools.append(tool)
         installer = getattr(execution_backend, "install_packages", None)
         if callable(installer):
-            tools.append(create_install_packages_tool(installer))
+            tools.append(
+                create_install_packages_tool(
+                    installer,
+                    skills_dir=self._base_dir / "skills",
+                )
+            )
         # This tool is attached only to the main Agent.  The middleware owns
         # its trusted Run binding; subagents never receive the declaration.
         tools.append(create_update_goal_tool())
@@ -3428,6 +3504,23 @@ class DeepAgentsAgentManager:
                 run_id=run_id,
                 goal_id=goal_id,
                 goal_revision=goal_revision,
+            )
+        )
+        tools.append(
+            create_request_skill_secret_tool(
+                session_id=session_id,
+                query_id=query_id,
+                run_id=run_id,
+                goal_id=goal_id,
+                goal_revision=goal_revision,
+                skills_dir=self._base_dir / "skills",
+                paths=PuddingClawPaths.from_environment(),
+            )
+        )
+        tools.append(
+            create_request_skill_runtime_tool(
+                skills_dir=self._base_dir / "skills",
+                paths=PuddingClawPaths.from_environment(),
             )
         )
         return tools
@@ -5142,6 +5235,7 @@ class DeepAgentsAgentManager:
             "logical_dataset_rule_request",
             "database_sql_revision_request",
             "user_input_request",
+            "skill_secret_request",
             "skill_plan_confirmation_request",
         }
         extracted: list[tuple[str, dict[str, Any], str]] = []
@@ -5234,6 +5328,7 @@ class DeepAgentsAgentManager:
                 "logical_dataset_rule_request": "logical_dataset_rule_required",
                 "database_sql_revision_request": "database_sql_revision_required",
                 "user_input_request": "user_input_required",
+                "skill_secret_request": "skill_secret_required",
                 "skill_plan_confirmation_request": "skill_plan_confirmation_required",
             }
             for interrupted_type, interrupted_request, _interrupt_id in pending_interrupts:
@@ -5245,6 +5340,7 @@ class DeepAgentsAgentManager:
                 "logical_dataset_rule_request": logical_dataset_resume_registry,
                 "database_sql_revision_request": database_sql_revision_resume_registry,
                 "user_input_request": user_input_resume_registry,
+                "skill_secret_request": skill_secret_resume_registry,
                 "skill_plan_confirmation_request": skill_plan_resume_registry,
             }
             span_names = {
@@ -5253,6 +5349,7 @@ class DeepAgentsAgentManager:
                 "logical_dataset_rule_request": "logical_dataset_rule.decision",
                 "database_sql_revision_request": "database_sql_revision.decision",
                 "user_input_request": "user_input.decision",
+                "skill_secret_request": "skill_secret.decision",
                 "skill_plan_confirmation_request": "skill_plan_confirmation.decision",
             }
             resolved_events = {
@@ -5261,6 +5358,7 @@ class DeepAgentsAgentManager:
                 "logical_dataset_rule_request": "logical_dataset_rule_resolved",
                 "database_sql_revision_request": "database_sql_revision_resolved",
                 "user_input_request": "user_input_resolved",
+                "skill_secret_request": "skill_secret_resolved",
                 "skill_plan_confirmation_request": "skill_plan_confirmation_resolved",
             }
             goal_id = str(context.get("goal_id") or "")
@@ -5378,6 +5476,7 @@ class DeepAgentsAgentManager:
                     "agree",
                     "modify",
                     "submit",
+                    "configured",
                     "agent_decide",
                 }
                 trace_collector.add_custom_span(
@@ -8029,8 +8128,19 @@ class DeepAgentsAgentManager:
                                     goal_id=run_record.goal_id,
                                     goal_revision=run_record.goal_revision,
                                 )
+                                if published_attachment is None and tool_name == "browser":
+                                    published_attachment = resolve_browser_generated_attachment(
+                                        original_output,
+                                        session_id=session_id,
+                                        run_id=run_record.run_id,
+                                    )
+                                if isinstance(published_attachment, dict) and tc_id:
+                                    published_attachment = {
+                                        **published_attachment,
+                                        "created_by_tool_call_id": tc_id,
+                                    }
                                 if (
-                                    tool_name == "publish_attachment"
+                                    tool_name in {"publish_attachment", "browser"}
                                     and isinstance(published_attachment, dict)
                                     and published_attachment.get("id")
                                     and not any(
@@ -9093,13 +9203,13 @@ class DeepAgentsAgentManager:
             if completion_accepted:
                 if defer_final_publication:
                     for attachment in published_attachments:
-                        yield self._sse(
-                            "attachment_published",
-                            {
-                                "tool_call_id": attachment.get("tool_call_id"),
-                                "query_id": query_id,
-                                "attachment": attachment,
-                            },
+                                yield self._sse(
+                                    "attachment_published",
+                                    {
+                                        "tool_call_id": attachment.get("created_by_tool_call_id"),
+                                        "query_id": query_id,
+                                        "attachment": attachment,
+                                    },
                         )
                 yield self._sse(
                     "final_response",
@@ -9251,6 +9361,11 @@ class DeepAgentsAgentManager:
                 )
                 if run_record is not None:
                     user_input_resume_registry.reject_run(
+                        session_id,
+                        run_record.run_id,
+                        "Agent stream was cancelled by the client.",
+                    )
+                    skill_secret_resume_registry.reject_run(
                         session_id,
                         run_record.run_id,
                         "Agent stream was cancelled by the client.",
@@ -9618,6 +9733,11 @@ class DeepAgentsAgentManager:
             if run_record is not None:
                 try:
                     user_input_resume_registry.reject_run(
+                        session_id,
+                        run_record.run_id,
+                        "Owning Run reached a terminal boundary.",
+                    )
+                    skill_secret_resume_registry.reject_run(
                         session_id,
                         run_record.run_id,
                         "Owning Run reached a terminal boundary.",

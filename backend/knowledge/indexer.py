@@ -71,6 +71,8 @@ def refresh_document_knowledge_index(
     base_dir: Path,
     document_path: Path,
     progress_callback: VectorProgressCallback | None = None,
+    *,
+    include_linked_images: bool = True,
 ) -> dict[str, Any]:
     """Update one Markdown document and its linked images in Milvus."""
 
@@ -85,7 +87,7 @@ def refresh_document_knowledge_index(
     if not index_config.get("enabled") or str(index_config.get("vector_store") or "local").lower() != "milvus":
         return {"refreshed": False, "reason": "single-document rebuild requires the Milvus multimodal index"}
 
-    all_images = _collect_image_files(knowledge_dir)
+    all_images = _collect_image_files(knowledge_dir) if include_linked_images else []
     image_files = [Path(path) for path in _linked_images_for_markdown(markdown_path, all_images)]
     virtual_path = f"/knowledge/{markdown_path.relative_to(knowledge_dir).as_posix()}"
     result = _try_build_multimodal_index(

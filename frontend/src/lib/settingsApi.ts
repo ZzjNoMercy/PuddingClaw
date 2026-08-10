@@ -118,6 +118,9 @@ export interface KnowledgeSettings {
     compiler_agent?: {
       model_id: string;
     };
+    retrieval?: {
+      hybrid_enabled: boolean;
+    };
     gbrain?: {
       embedding_model_id: string;
       think_model_id: string;
@@ -349,7 +352,7 @@ export interface ProviderRegistry {
 }
 
 export async function getSettings(): Promise<SystemSettings> {
-  const resp = await fetch(`${API_BASE}/settings`);
+  const resp = await fetch(`${API_BASE}/settings`, { cache: "no-store" });
   if (!resp.ok) throw new Error(`Failed to get settings: ${resp.status}`);
   return resp.json();
 }

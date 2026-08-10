@@ -372,6 +372,7 @@ export interface AgentAttachment {
   derived_from?: string;
   created_by_run_id?: string;
   created_by_query_id?: string;
+  created_by_tool_call_id?: string;
   created_by_goal_id?: string;
   created_by_goal_revision?: number;
   download_url?: string;
@@ -686,6 +687,7 @@ export interface LlmWikiWorkspaceStatus {
     error?: string;
   }>;
   files: { index: boolean; log: boolean };
+  embedding?: LlmWikiEmbeddingStatus;
   gbrain: {
     cli_installed: boolean;
     postgres_configured: boolean;
@@ -716,6 +718,52 @@ export interface LlmWikiWorkspaceStatus {
       error: string;
     };
   };
+}
+
+export interface LlmWikiEmbeddingStatus {
+  hybrid_enabled: boolean;
+  query_mode: "lexical" | "hybrid";
+  infrastructure_ready: boolean;
+  shared_collection?: boolean;
+  profile?: {
+    embedding_model_id: string;
+    embedding_model: string;
+    embedding_provider: string;
+    embedding_dimension: number;
+    parser: string;
+    parser_version: number;
+    text_collection: string;
+    milvus_uri: string;
+  };
+  profile_matches?: boolean;
+  counts: {
+    total: number;
+    indexed: number;
+    pending: number;
+    outdated: number;
+    failed: number;
+    chunks: number;
+    stale: number;
+  };
+  pages: Array<{
+    slug: string;
+    virtual_path: string;
+    content_sha256: string;
+    indexed_content_sha256?: string | null;
+    state: "indexed" | "pending" | "outdated" | "failed";
+    chunk_count: number;
+    indexed_at?: string | null;
+    error?: string | null;
+  }>;
+  stale_pages?: string[];
+  last_sync?: {
+    completed_at?: string;
+    force?: boolean;
+    updated?: string[];
+    skipped?: string[];
+    failed?: Array<{ slug: string; error: string }>;
+  } | null;
+  error?: string;
 }
 
 export interface LlmWikiLintResult {
@@ -1149,6 +1197,45 @@ export async function getLlmWikiWorkspaceStatus(): Promise<LlmWikiWorkspaceStatu
     throw new Error(apiErrorMessage(text, `加载 LLM Wiki 工作区失败：${response.status}`));
   }
   return JSON.parse(text) as LlmWikiWorkspaceStatus;
+}
+
+export async function getLlmWikiEmbeddingStatus(): Promise<LlmWikiEmbeddingStatus> {
+  const response = await fetch(`${API_BASE}/knowledge/brain/wiki/embedding`, { cache: "no-store" });
+  const text = await response.text();
+  if (response.status === 404) {
+    const workspace = await getLlmWikiWorkspaceStatus();
+    if (workspace.embedding) return workspace.embedding;
+    throw new Error("当前后端尚未加载 Wiki Embedding 状态接口，请重启后端服务后重新探测。");
+  }
+  if (!response.ok) {
+    throw new Error(apiErrorMessage(text, `加载 Wiki Embedding 状态失败：${response.status}`));
+  }
+  return JSON.parse(text) as LlmWikiEmbeddingStatus;
+}
+
+export async function syncLlmWikiEmbeddings(force = false, slugs: string[] = []): Promise<{
+  ok: boolean;
+  updated: string[];
+  skipped: string[];
+  failed: Array<{ slug: string; error: string }>;
+  status?: LlmWikiEmbeddingStatus;
+}> {
+  const response = await fetch(`${API_BASE}/knowledge/brain/wiki/embedding/sync`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ force, slugs }),
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(apiErrorMessage(text, `同步 Wiki Embedding 失败：${response.status}`));
+  }
+  return JSON.parse(text) as {
+    ok: boolean;
+    updated: string[];
+    skipped: string[];
+    failed: Array<{ slug: string; error: string }>;
+    status?: LlmWikiEmbeddingStatus;
+  };
 }
 
 export async function snapshotLlmWikiRaw(payload: {
@@ -3462,6 +3549,46 @@ export async function resolveUserInputRequest(
   return response.json();
 }
 
+export interface SkillSecretRequest {
+  id: string;
+  version: number;
+  type: "skill_secret" | string;
+  session_id: string;
+  query_id: string;
+  run_id: string;
+  status: "pending" | "resolved" | "cancelled" | string;
+  skill_id: string;
+  skill_version: string;
+  env_name: string;
+  reason: string;
+  mode: "enter" | "reuse";
+  decision?: { action?: "configured" | "cancel" | string; env_name?: string };
+}
+
+export async function resolveSkillSecretRequest(
+  sessionId: string,
+  requestId: string,
+  payload: {
+    request_version: number;
+    action: "configure" | "reuse" | "cancel";
+    secret_value?: string;
+  },
+): Promise<{ request_id: string; decision: Record<string, unknown>; resumed: boolean }> {
+  const response = await fetch(
+    `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/skill-secret-requests/${encodeURIComponent(requestId)}/resolve`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(apiErrorMessage(text, "Failed to configure Skill Secret"));
+  }
+  return response.json();
+}
+
 export async function resolveDatabaseSqlRevisionRequest(
   requestId: string,
   payload: { action: "agree" | "reject" | "modify"; revision_instruction?: string }
@@ -3479,7 +3606,11 @@ export async function resolveDatabaseSqlRevisionRequest(
 }
 
 /**
- * Stream chat messages via POST SSE.
+ * LEGACY: Stream messages through the retired Chat runtime via POST SSE.
+ * This compatibility client is no longer used by the main conversation UI
+ * and is not maintained. New product flows must use streamAgent.
+ *
+ * @deprecated Use streamAgent instead.
  * Yields parsed SSE events as they arrive.
  */
 export async function* streamChat(

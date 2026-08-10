@@ -4,8 +4,12 @@
  * Drives the evaluation state machine:
  *   idle → evaluating → completed
  *
- * Streams the evaluation prompt via streamChat (SSE), parses format markers
- * from the accumulated token buffer, and manages all derived state.
+ * LEGACY DEPENDENCY: this review hook still calls the retired streamChat
+ * compatibility client. The old runtime is no longer maintained; migrate this
+ * workflow to a dedicated evaluator before changing or extending it.
+ *
+ * Streams the evaluation prompt via SSE, parses format markers from the
+ * accumulated token buffer, and manages all derived state.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";

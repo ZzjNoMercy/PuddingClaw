@@ -65,6 +65,7 @@ iterm2_workspace.iterm2arrangement
 # contract publishable while leaving other local planning documents ignored.
 /docs/*
 !/docs/session-and-context-architecture.md
+!/docs/legacy-chat.md
 
 # Logs
 *.log
@@ -87,6 +88,9 @@ data/
 
 # Generated design artifacts
 designs/
+
+# Locally downloaded artifacts
+artifacts/
 
 # SkillHub runtime lock
 backend/skills/.skills_store_lock.json

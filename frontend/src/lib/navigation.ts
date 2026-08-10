@@ -27,10 +27,11 @@ export const NAV_ITEMS: NavItem[] = [
   },
   {
     label: "扩展",
-    href: "/extension/skills",
+    href: "/extension/connectors",
     icon: "Puzzle",
     children: [
-      { label: "扩展管理", href: "/extension/skills", icon: "Settings2" },
+      { label: "连接器", href: "/extension/connectors", icon: "Link2" },
+      { label: "技能", href: "/extension/skills", icon: "Settings2" },
       { label: "MCP 服务", href: "/extension/mcp", icon: "Server" },
       { label: "版本对比", href: "/extension/skills/compare", icon: "GitCompare" },
       { label: "评估审核", href: "/extension/skills/review", icon: "ClipboardCheck" },
@@ -52,7 +53,8 @@ export const ROUTE_TITLES: Record<string, string> = {
   "/": "对话",
   "/knowledge": "知识库",
   "/analytics": "智能问数",
-  "/extension/skills": "扩展管理",
+  "/extension/connectors": "连接器",
+  "/extension/skills": "技能",
   "/extension/mcp": "MCP 服务",
   "/extension/skills/compare": "版本对比",
   "/extension/skills/review": "评估审核",

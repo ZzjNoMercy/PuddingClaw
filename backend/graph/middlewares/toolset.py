@@ -790,11 +790,17 @@ class ToolsetMiddleware(AgentMiddleware):
         session_id = str(runtime_context.get("session_id") or "")
         policy_epoch = self._context_policy_epoch(session_id)
         if not self._runtime_tool_available(tool_name):
-            return ToolMessage(
-                content=(
+            unavailable_message = (
+                "Tool `browser` is unavailable because Kimi WebBridge is disabled. "
+                "Enable it from the Connectors page first."
+                if tool_name == "browser"
+                else (
                     "Tool `web_search` is unavailable because managed web search is disabled "
                     "or no provider is enabled and ready. Configure it in Settings > 联网搜索."
-                ),
+                )
+            )
+            return ToolMessage(
+                content=unavailable_message,
                 tool_call_id=str(request.tool_call.get("id") or ""),
                 name=tool_name,
                 status="error",
@@ -972,6 +978,14 @@ class ToolsetMiddleware(AgentMiddleware):
 
     @staticmethod
     def _runtime_tool_available(tool_name: str) -> bool:
+        if tool_name == "browser":
+            try:
+                from connectors.kimi_webbridge.lifecycle import KimiWebBridgeLifecycle
+                from runtime_identity.paths import PuddingClawPaths
+
+                return KimiWebBridgeLifecycle(PuddingClawPaths.from_environment()).is_enabled()
+            except Exception:
+                return False
         if tool_name != "web_search":
             return True
         try:

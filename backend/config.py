@@ -120,6 +120,10 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             # Dedicated background compiler Agent. An empty model_id follows
             # the main Agent binding from Model Services.
             "compiler_agent": {"model_id": ""},
+            # Keep the deterministic Markdown query as the compatibility
+            # default. Hybrid mode adds a rebuildable LlamaIndex/Milvus
+            # projection without changing the Wiki source of truth.
+            "retrieval": {"hybrid_enabled": False},
             # gbrain uses a text embedding model while importing/searching and
             # a chat model for `think`. Empty ids follow the global bindings.
             "gbrain": {
@@ -357,7 +361,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
                 "connection": "",
                 "context": "",
                 "probe_timeout_seconds": 5,
-                "image": "puddingclaw/sandbox:python3.12-node22-chromium-v4",
+                "image": "puddingclaw/sandbox:python3.12-node22-chromium-v5",
                 "cpu_limit": "2",
                 "memory_limit_mb": 2048,
                 "pids_limit": 256,
@@ -491,7 +495,7 @@ def _migrate_legacy_config(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         "puddingclaw/sandbox:python3.12-node22-v2",
         "puddingclaw/sandbox:python3.12-node22-curl-v3",
     }:
-        docker["image"] = "puddingclaw/sandbox:python3.12-node22-chromium-v4"
+        docker["image"] = "puddingclaw/sandbox:python3.12-node22-chromium-v5"
         docker.setdefault("dependency_setup_enabled", False)
         migrated = True
     if isinstance(docker, dict):
@@ -940,6 +944,30 @@ def get_llm_wiki_compiler_agent_config(
         "model": str(resolved.get("name") or ""),
         "provider": str(resolved.get("provider_id") or ""),
         "uses_agent_default": not configured_model_id,
+    }
+
+
+def get_llm_wiki_retrieval_config() -> dict[str, Any]:
+    """Return the LLM Wiki query mode and its shared vector infrastructure."""
+
+    config = load_config()
+    settings = (
+        config.get("knowledge", {})
+        .get("llm_wiki", {})
+        .get("retrieval", {})
+    )
+    if not isinstance(settings, dict):
+        settings = {}
+    return {
+        "hybrid_enabled": bool(settings.get("hybrid_enabled", False)),
+        "lexical_weight": 0.45,
+        "semantic_weight": 0.55,
+        "candidate_multiplier": 6,
+        "rrf_k": 10,
+        "lexical_strength_weight": 0.03,
+        "dual_channel_bonus": 0.008,
+        "exact_title_bonus": 0.04,
+        "intent_type_bonus": 0.012,
     }
 
 
@@ -1735,6 +1763,14 @@ def update_settings(updates: dict[str, Any]) -> None:
                             raise ValueError("LLM Wiki 编译 Agent 只能选择 LLM 模型")
                     existing_compiler["model_id"] = model_id
                 existing_llm_wiki["compiler_agent"] = existing_compiler
+            if isinstance(llm_wiki_update, dict) and "retrieval" in llm_wiki_update:
+                retrieval_update = llm_wiki_update.get("retrieval")
+                existing_retrieval = existing_llm_wiki.get("retrieval", {})
+                if not isinstance(existing_retrieval, dict):
+                    existing_retrieval = {}
+                if isinstance(retrieval_update, dict) and "hybrid_enabled" in retrieval_update:
+                    existing_retrieval["hybrid_enabled"] = bool(retrieval_update.get("hybrid_enabled"))
+                existing_llm_wiki["retrieval"] = existing_retrieval
             if isinstance(llm_wiki_update, dict) and "gbrain" in llm_wiki_update:
                 gbrain_update = llm_wiki_update.get("gbrain")
                 existing_gbrain = existing_llm_wiki.get("gbrain", {})

@@ -268,7 +268,7 @@ class SessionManager:
             "title": "New Chat",  # 默认标题
             "created_at": now,  # 创建时间
             "updated_at": now,  # 更新时间
-            "runtime_mode": "chat",  # 默认会话运行时；Agent 路由会覆盖为 agent
+            "runtime_mode": "agent",  # Chat 已退役；新会话统一使用 Agent
             "messages": [],  # 空消息列表
             "permissions": {
                 "approval_mode": normalize_approval_mode(approval_mode or DEFAULT_APPROVAL_MODE).value,
@@ -433,6 +433,8 @@ class SessionManager:
 
         data = self._read_file(session_id)
         if not data:
+            # Missing runtime metadata identifies pre-Agent/legacy Chat data;
+            # all newly created Sessions are stamped as Agent above.
             return {"id": session_id, "title": session_id, "runtime_mode": "chat"}
         return self._metadata_from_data(session_id, data)
 
@@ -831,8 +833,10 @@ class SessionManager:
                     "derived_from": str(item.get("derived_from") or ""),
                     "created_by_run_id": str(item.get("created_by_run_id") or ""),
                     "created_by_query_id": str(item.get("created_by_query_id") or ""),
+                    "created_by_tool_call_id": str(item.get("created_by_tool_call_id") or ""),
                     "created_by_goal_id": str(item.get("created_by_goal_id") or ""),
                     "created_by_goal_revision": item.get("created_by_goal_revision"),
+                    "created_at": float(item.get("created_at") or 0),
                     "download_url": str(item.get("download_url") or ""),
                     "preview_url": str(item.get("preview_url") or ""),
                     "preview_mime_type": str(item.get("preview_mime_type") or ""),
@@ -4580,7 +4584,18 @@ class SessionManager:
                 query_id = str(message.get("query_id") or "")
                 if query_id not in by_query:
                     continue
-                message["output_attachments"] = deepcopy(by_query[query_id])
+                persisted_by_id = {
+                    str(item.get("id") or ""): item
+                    for item in message.get("output_attachments") or []
+                    if isinstance(item, dict) and item.get("id")
+                }
+                message["output_attachments"] = [
+                    {
+                        **deepcopy(persisted_by_id.get(str(item.get("id") or ""), {})),
+                        **deepcopy(item),
+                    }
+                    for item in by_query[query_id]
+                ]
                 seen_queries.add(query_id)
             # A crash can happen after durable publish but before the stream
             # consumes its ToolMessage. Keep the generated file discoverable.
@@ -4661,6 +4676,8 @@ class SessionManager:
                 "id": f.stem,  # 会话 ID = 文件名（不含 .json）
                 "title": title,  # 会话标题
                 "updated_at": updated_at,  # 最后更新时间
+                # Files without runtime_mode predate Agent mode and remain
+                # classified as legacy Chat instead of being silently migrated.
                 "runtime_mode": raw.get("runtime_mode", "chat") if isinstance(raw, dict) else "chat",
             }
             if isinstance(raw, dict):

@@ -37,6 +37,25 @@ test("stdin JSON preserves non-ASCII message while backend selects the model", a
   assert.equal(JSON.parse(stdout).analytics_model_id, "auto-analysis");
 });
 
+test("stdin JSON forwards an absolute Platform workspace path", async () => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "puddingclaw-cli-workspace-"));
+  try {
+    const child = spawn(process.execPath, ["--import", path.join(root, "test", "mock-fetch.js"), cli, "run", "--input-json", "-", "--json"], {
+      env: { ...process.env, PUDDINGCLAW_URL: "http://127.0.0.1:8888", PUDDINGCLAW_TOKEN: "test-token" },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = ""; let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.stdin.end(JSON.stringify({ message: "路径绑定", workspace_path: workspace }));
+    const [result] = await once(child, "close");
+    assert.equal(result, 0, stderr);
+    assert.equal(JSON.parse(stdout).workspace_path, workspace);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 test("run accepts an explicit session for a continuous task", async () => {
   const child = spawn(process.execPath, ["--import", path.join(root, "test", "mock-fetch.js"), cli, "run", "继续分析", "--session", "worker-session-existing", "--json"], {
     env: { ...process.env, PUDDINGCLAW_URL: "http://127.0.0.1:8888", PUDDINGCLAW_TOKEN: "test-token", PUDDINGCLAW_PROJECTS_ROOT: "/tmp/puddingclaw-cli-test" },

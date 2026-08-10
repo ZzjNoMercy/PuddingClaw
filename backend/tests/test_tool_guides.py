@@ -29,10 +29,21 @@ def test_manifest_references_valid_unique_guide_files() -> None:
         "semantic-dimension-builds",
         "table-analysis",
         "knowledge-retrieval",
-        "managed-lark-autonomy",
-        "web-search",
-    }
+            "managed-lark-autonomy",
+            "web-search",
+            "webbridge-browser",
+        }
     assert all(spec.path.is_file() for spec in middleware.specs)
+
+
+def test_core_guide_forbids_narrating_cli_install_without_a_tool_call() -> None:
+    core = (BASE_DIR / "prompts" / "deepagents" / "tool_guides" / "core.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Invoke that command in the same turn" in core
+    assert "HITL card is the confirmation boundary" in core
+    assert "A narrated intent" in core
 
 
 def test_no_request_scoped_guide_is_injected_before_activation() -> None:
@@ -75,6 +86,23 @@ def test_web_search_tool_activates_managed_search_guide() -> None:
     prompt = str(updated.system_message.content)
     assert "## Managed Web Search" in prompt
     assert "source=x" in prompt
+
+
+def test_browser_guide_routes_screenshot_pixels_conditionally() -> None:
+    middleware = ToolGuideMiddleware(base_dir=BASE_DIR)
+
+    updated = middleware._request_with_guides(
+        _request(tools=[{"name": "read_file"}, {"name": "browser"}])
+    )
+
+    prompt = str(updated.system_message.content)
+    assert "puddingclaw_visual_route.status=not_analyzed" in prompt
+    assert "subagent_type=image_analyzer" in prompt
+    assert "do not invoke `image_analyzer`" in prompt
+    assert "Never claim to have seen or verified screenshot contents" in prompt
+    assert "Never click a comment, avatar, link" in prompt
+    assert "PDF is currently a user-facing output artifact" in prompt
+    assert "Reconcile evidence after every navigation" in prompt
 
 
 def test_successful_skill_read_activates_guide_on_next_model_turn() -> None:

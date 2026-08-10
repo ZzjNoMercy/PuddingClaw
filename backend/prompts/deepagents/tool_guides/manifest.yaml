@@ -41,3 +41,7 @@ guides:
     file: web-search.md
     tools:
       - web_search
+  - id: webbridge-browser
+    file: webbridge-browser.md
+    tools:
+      - browser

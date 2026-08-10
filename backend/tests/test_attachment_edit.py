@@ -1,3 +1,4 @@
+import base64
 import io
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,7 +18,7 @@ from api.attachments import (
     preview_attachment,
     router as attachments_router,
 )
-from graph.attachment_store import attachment_store
+from graph.attachment_store import AttachmentStore, attachment_store
 from graph.middlewares.attachment_edit import (
     MAX_EDITABLE_ATTACHMENT_BYTES,
     AttachmentEditMiddleware,
@@ -69,6 +70,31 @@ def _setup(tmp_path):
         "goal_revision": 3,
     }
     return source, scratch, backend, prepare, publish, context
+
+
+def test_attachment_store_reads_legacy_webbridge_root_without_writing_to_it(tmp_path):
+    legacy_base = tmp_path / "legacy"
+    canonical_base = tmp_path / "canonical"
+    legacy_store = AttachmentStore()
+    legacy_store.initialize(legacy_base)
+    saved = legacy_store.save_bytes(
+        session_id="legacy-session",
+        attachment_id="att_legacyimage",
+        filename="screenshot.png",
+        mime_type="image/png",
+        data=base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        ),
+    )
+
+    store = AttachmentStore()
+    store.initialize(canonical_base, legacy_base_dirs=(legacy_base,))
+
+    restored = store.get("legacy-session", saved["id"])
+    assert restored is not None
+    assert Path(restored["path"]).is_relative_to(legacy_base)
+    assert store.root_dir == canonical_base / "data" / "attachments"
+    assert store.legacy_root_dirs == (legacy_base / "data" / "attachments",)
 
 
 def test_attachment_edit_stages_exact_bytes_and_publishes_new_immutable_attachment(tmp_path):

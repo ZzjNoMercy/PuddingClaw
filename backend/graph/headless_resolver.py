@@ -19,6 +19,7 @@ from graph.dimension_build_resume import dimension_build_resume_registry
 from graph.logical_dataset_resume import logical_dataset_resume_registry
 from graph.permission_resume import permission_resume_registry
 from graph.skill_plan_resume import skill_plan_resume_registry
+from graph.skill_secret_resume import skill_secret_resume_registry
 from graph.user_input_resume import user_input_resume_registry
 
 
@@ -32,6 +33,7 @@ class HeadlessInterruptResolver:
         "database_sql_revision_request": database_sql_revision_resume_registry,
         "user_input_request": user_input_resume_registry,
         "skill_plan_confirmation_request": skill_plan_resume_registry,
+        "skill_secret_request": skill_secret_resume_registry,
     }
 
     def __init__(self, *, context: dict[str, Any]) -> None:
@@ -94,6 +96,12 @@ class HeadlessInterruptResolver:
 
     def _decision(self, interrupt_type: str, request: dict[str, Any]) -> dict[str, Any]:
         if interrupt_type == "permission_request":
+            # A live browser action is always human-in-the-loop. Full-access
+            # is an unattended filesystem/network authority profile and must
+            # never silently authorize click/fill/close/navigate on a user's
+            # real logged-in browser.
+            if str(request.get("tool_name") or "") == "browser":
+                return {"type": "reject", "reason": "browser_action_requires_interactive_user"}
             mode = str(self.context.get("permission_policy", {}).get("approval_mode") or "smart")
             if mode == "full_access" and self._within_authority_scope(request):
                 return {"type": "approve", "source": "headless_full_access"}
@@ -102,6 +110,8 @@ class HeadlessInterruptResolver:
             if bool(request.get("allow_agent_decide", True)):
                 return {"action": "agent_decide"}
             return {"action": "cancel", "reason": "headless_user_input_required"}
+        if interrupt_type == "skill_secret_request":
+            return {"action": "cancel", "reason": "interactive_secret_entry_required"}
         if interrupt_type == "database_sql_revision_request":
             return {"action": "reject", "reason": "headless_business_confirmation_required"}
         if interrupt_type in {
@@ -125,6 +135,9 @@ class HeadlessInterruptResolver:
             # owning future without pretending that any plan was committed.
             return registry.cancel(request_id, "headless_business_confirmation_required")
         result = registry.resolve(request_id, decision)
+        if registry is skill_secret_resume_registry:
+            normalized, _resumed = result
+            return normalized
         return result if isinstance(result, dict) else (dict(decision) if result else None)
 
     def _within_authority_scope(self, request: dict[str, Any]) -> bool:

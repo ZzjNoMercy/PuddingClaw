@@ -86,6 +86,20 @@ def test_default_tool_guides_require_execution_self_check_before_completion() ->
     assert "the same Run" in prompt
 
 
+def test_default_tool_guides_route_disposable_html_to_the_message() -> None:
+    prompt = (Path(__file__).resolve().parent.parent / "prompts" / "deepagents" / "tool_guides" / "core.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "## Lightweight HTML placement" in prompt
+    assert "one complete, standalone HTML document" in prompt
+    assert "chart libraries" in prompt
+    assert "not write that lightweight HTML" in prompt
+    assert "`/workspace`" in prompt
+    assert "formal reports" in prompt
+    assert "reusable pages" in prompt
+
+
 def test_default_tool_guides_define_managed_browser_authorization_lifecycle() -> None:
     prompt = (Path(__file__).resolve().parent.parent / "prompts" / "deepagents" / "tool_guides" / "core.md").read_text(
         encoding="utf-8"
@@ -137,6 +151,10 @@ def test_base_prompt_excludes_request_scoped_tool_guides() -> None:
     assert "## Resource Access" in prompt
     assert "## Completion discipline" in prompt
     assert "## Managed Browser Authorization" in prompt
+    assert "## Managed CLI Toolchain Installation" in prompt
+    assert "Never use `install_packages`" in prompt
+    assert "Do not inspect the host with `which`" in prompt
+    assert "Do not request external-directory access" in prompt
     assert "preserve the existing Bot/App configuration" in prompt
     assert "never restart App configuration merely because the user says" in prompt
     assert "Run `lark-cli config init --new` only for first-time setup" in prompt

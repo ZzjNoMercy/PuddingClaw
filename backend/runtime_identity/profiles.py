@@ -38,9 +38,7 @@ def validate_credential_archive(
 
     if not allowed_roots:
         raise ValueError("credential state archive requires an Adapter path allow-list")
-    normalized_roots: tuple[tuple[str, ...], ...] = tuple(
-        PurePosixPath(root).parts for root in allowed_roots
-    )
+    normalized_roots: tuple[tuple[str, ...], ...] = tuple(PurePosixPath(root).parts for root in allowed_roots)
     if any(
         not root
         or root.startswith("/")
@@ -105,7 +103,11 @@ def _atomic_write(path: Path, payload: bytes, *, mode: int = 0o600) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
-        os.chmod(path, mode)
+        parent_descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
     finally:
         if descriptor >= 0:
             os.close(descriptor)
@@ -460,8 +462,9 @@ class CredentialProfileStore:
 
         profile_id = safe_identity_component(profile_id, field="profile_id")
         identity = safe_identity_component(identity, field="identity")
-        if identity not in {"bot", "user"}:
-            raise ValueError("credential profile identity is unsupported")
+        # Identity keys are Driver-owned safe identifiers (for example
+        # ``bot``/``user`` or a single ``account``).  The Store persists
+        # assessments but does not impose one Provider's identity topology.
         normalized_status = safe_identity_component(status, field="identity_status")
         now = time.time()
         with self._registry_lock:
@@ -599,7 +602,6 @@ class CredentialProfileStore:
             provider=provider,
             profile_id=profile_id,
         )
-        _atomic_write(directory / "vault.enc", envelope)
         metadata = {
             "profile_id": profile_id,
             "owner_user_id": self.owner_user_id,
@@ -610,7 +612,40 @@ class CredentialProfileStore:
             "credential_state_fingerprint": credential_state.fingerprint,
             "updated_at": time.time(),
         }
+        # Metadata contains no secret and is prepared first. ``vault.enc`` is
+        # the commit point: a metadata failure therefore cannot replace token
+        # bytes while reporting that the write failed.
         self._write_json(directory / "profile.json", metadata)
+        _atomic_write(directory / "vault.enc", envelope)
+
+    def write_state_if_revision(
+        self,
+        provider: str,
+        profile_id: str,
+        payload: bytes,
+        *,
+        expected_revision: str,
+        credential_state: CredentialStateSpec,
+    ) -> str | None:
+        """Replace encrypted state only when the caller's snapshot is current.
+
+        Callers must hold ``profile_lock(provider, profile_id)`` across the
+        provider execution and this commit. The comparison is repeated here so
+        every writeback path gets the same fail-closed CAS boundary.
+        """
+
+        if self.state_revision(provider, profile_id) != expected_revision:
+            return None
+        self.write_state(
+            provider,
+            profile_id,
+            payload,
+            credential_state=credential_state,
+        )
+        revision = self.state_revision(provider, profile_id)
+        if revision == "missing":
+            raise RuntimeError("credential Vault writeback was not durable")
+        return revision
 
     def read_state_metadata(self, provider: str, profile_id: str) -> dict[str, Any] | None:
         """Return non-secret Vault metadata when a durable state archive exists."""

@@ -16,7 +16,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from deepagents.backends.protocol import ExecuteResponse
@@ -60,11 +60,22 @@ class MacOSSeatbeltRunner:
         Path("/dev"),
     )
 
-    def __init__(self, profile: SandboxGrantProfile) -> None:
+    def __init__(
+        self,
+        profile: SandboxGrantProfile,
+        *,
+        runtime_root: Path | None = None,
+    ) -> None:
         if sys.platform != "darwin" or not self.executable.is_file():
             raise RuntimeError("macOS Seatbelt sandbox-exec is unavailable")
         self.profile = profile
-        runtime = profile.workspace_root / ".puddingclaw" / "runtime" / "kernel"
+        runtime = (
+            runtime_root.expanduser().resolve()
+            if runtime_root is not None
+            else profile.workspace_root / ".puddingclaw" / "runtime" / "kernel"
+        )
+        if runtime.is_symlink():
+            raise ValueError("Seatbelt runtime root must not be a symlink")
         self.home = runtime / "home"
         self.tmp = runtime / "tmp"
         self.home.mkdir(parents=True, exist_ok=True)
@@ -181,6 +192,7 @@ class MacOSSeatbeltRunner:
         *,
         timeout: int | None = None,
         spawn_guard: Callable[[], bool] | None = None,
+        environment: Mapping[str, str] | None = None,
     ) -> ExecuteResponse:
         if not isinstance(command, str) or not command.strip():
             return ExecuteResponse(output="Error: Command must be non-empty.", exit_code=1)
@@ -203,12 +215,20 @@ class MacOSSeatbeltRunner:
             "-c",
             self._map_virtual_paths(command),
         ]
-        env = {
+        env: dict[str, str] = {
             "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
             "HOME": str(self.home),
             "TMPDIR": str(self.tmp),
             "LANG": "C.UTF-8",
         }
+        for key, value in (environment or {}).items():
+            normalized_key = str(key)
+            normalized_value = str(value)
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", normalized_key):
+                raise ValueError("Seatbelt environment contains an invalid variable name")
+            if "\x00" in normalized_value:
+                raise ValueError("Seatbelt environment contains a NUL byte")
+            env[normalized_key] = normalized_value
         process = subprocess.Popen(  # noqa: S603
             argv,
             cwd=self.profile.workspace_root,

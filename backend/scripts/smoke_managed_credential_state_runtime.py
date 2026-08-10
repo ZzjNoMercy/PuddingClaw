@@ -54,7 +54,7 @@ def main() -> int:
     state = ManagedCliRegistry.credential_state_for_provider("lark")
     toolchain = ToolchainManager(
         PuddingClawPaths.from_environment(),
-        "python3.12+node22+chromium-v4",
+        "python3.12+node22+chromium-v5",
     ).resolve_node().host_path
     with tempfile.TemporaryDirectory(prefix="puddingclaw-credential-state-") as temporary:
         probe = Path(temporary).resolve()

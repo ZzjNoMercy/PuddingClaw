@@ -60,6 +60,11 @@
   },
   "knowledge": {
     "root_dir": "",
+    "llm_wiki": {
+      "compiler_agent": {"model_id": ""},
+      "retrieval": {"hybrid_enabled": false},
+      "gbrain": {"embedding_model_id": "", "think_model_id": ""}
+    },
     "multimodal_index": {
       "enabled": true,
       "vector_store": "milvus",

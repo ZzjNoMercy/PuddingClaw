@@ -20,6 +20,7 @@ from api.headless import (
     _consume_run,
     _ensure_worker_project,
     _resolve_external_permission,
+    _resolve_worker_project,
     cancel_headless_run,
     create_headless_run,
     list_worker_access_logs,
@@ -128,6 +129,59 @@ def test_worker_project_has_internal_identity(tmp_path, monkeypatch):
     project_registry.initialize(tmp_path)
     _project_id, path = _ensure_worker_project()
     assert path == tmp_path / "puddingclaw"
+
+
+def test_platform_workspace_path_creates_then_reuses_project_id(tmp_path):
+    project_registry.initialize(tmp_path)
+    workspace = tmp_path / "room-workspace"
+    workspace.mkdir()
+
+    first_id, first_path = _resolve_worker_project(str(workspace))
+    second_id, second_path = _resolve_worker_project(str(workspace))
+
+    assert first_path == second_path == workspace.resolve()
+    assert first_id == second_id
+    assert len(project_registry.list_projects()) == 1
+
+
+@pytest.mark.asyncio
+async def test_headless_run_binds_platform_workspace_path(tmp_path, monkeypatch):
+    session_manager.initialize(tmp_path)
+    project_registry.initialize(tmp_path)
+    workspace = tmp_path / "teams-room"
+    workspace.mkdir()
+    monkeypatch.setattr(
+        headless_api,
+        "_principal_for_scope",
+        lambda _authorization, _scope: {"key_id": "key-owner", "authority_profile": "smart"},
+    )
+    monkeypatch.setattr(headless_api, "_model_options", lambda _principal: [{"id": "analysis"}])
+
+    async def fake_route(_message, _principal):
+        return AnalyticsModelRoute("matched", "analysis", 0.96, "semantic", "matched")
+
+    consumed: dict[str, object] = {}
+
+    async def fake_consume(**kwargs):
+        consumed.update(kwargs)
+        return {
+            "schema_version": "1",
+            "session_id": kwargs["session_id"],
+            "project_id": kwargs["project_id"],
+            "status": "completed",
+            "outcome": "completed",
+        }
+
+    monkeypatch.setattr(headless_api, "_route_analytics_model", fake_route)
+    monkeypatch.setattr(headless_api, "_consume_run", fake_consume)
+
+    response = await create_headless_run(
+        HeadlessRunRequest(message="使用房间目录", workspace_path=str(workspace)),
+        authorization="Bearer test",
+    )
+
+    assert response["project_id"] == consumed["project_id"]
+    assert session_manager.get_metadata(response["session_id"])["workspace_path"] == str(workspace.resolve())
 
 
 def _set_session_updated_at(session_id: str, updated_at: float) -> None:
@@ -438,6 +492,29 @@ async def test_full_access_only_approves_workspace_scoped_permission():
     outside["path"] = "/etc/passwd"
     denied = HeadlessInterruptResolver(context=context).resolve("permission_request", outside)
     assert denied["type"] == "reject"
+
+
+@pytest.mark.asyncio
+async def test_headless_never_auto_approves_browser_actions():
+    request = permission_resume_registry.create_tool_action_request(
+        session_id="browser-headless",
+        query_id="q-browser",
+        tool_call_id="browser-call",
+        tool_name="browser",
+        command="click",
+        reason="browser_interaction_confirmation",
+        risk="browser_interaction",
+    )
+    context = {
+        "permission_policy": {"approval_mode": "full_access"},
+        "authority_profile": "workspace",
+        "workspace_path": "/workspace",
+    }
+
+    decision = HeadlessInterruptResolver(context=context).resolve("permission_request", request)
+
+    assert decision["type"] == "reject"
+    assert permission_resume_registry.get(request["id"])["status"] == "resolved"
 
 
 def test_worker_access_store_does_not_persist_secret(tmp_path: Path):

@@ -101,6 +101,9 @@ class DeepResearchTool(BaseTool):
         # 延迟 import 防循环依赖
         from langchain.agents import create_agent
         from langchain_core.messages import HumanMessage
+        # LEGACY DEPENDENCY: this helper still borrows the retired Chat
+        # runtime's model. Migrate it before removing graph.agent; do not add
+        # new dependencies on that unmaintained runtime.
         from graph.agent import agent_manager
         from graph.middlewares import build_compression_middlewares
         from config import get_middleware_config

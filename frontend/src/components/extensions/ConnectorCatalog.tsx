@@ -1,6 +1,7 @@
 "use client";
 
 import Image from "next/image";
+import moonshotLogo from "@lobehub/icons-static-svg/icons/moonshot.svg";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import {
@@ -12,6 +13,7 @@ import {
   ExternalLink,
   KeyRound,
   Loader2,
+  Plug,
   RotateCcw,
   Server,
   Unplug,
@@ -21,8 +23,11 @@ import {
 import {
   authorizeConnector,
   getConnector,
+  installKimiWebBridge,
   listConnectors,
+  probeKimiWebBridge,
   revokeConnector,
+  setKimiWebBridgeEnabled,
   type ConnectorIdentityStatus,
   type ConnectorInfo,
   type ConnectorStatus,
@@ -37,6 +42,8 @@ const STATUS_COPY: Record<ConnectorStatus, { label: string; dot: string; badge: 
   unconfigured: { label: "未连接", dot: "bg-gray-300", badge: "bg-gray-100 text-gray-600" },
   environment_unavailable: { label: "环境不可用", dot: "bg-red-500", badge: "bg-red-50 text-red-700" },
 };
+
+const WEBBRIDGE_UPDATE_URL = "https://www.kimi.com/zh-cn/features/webbridge";
 
 function identityLabel(identity: ConnectorIdentityStatus | undefined, kind: "bot" | "user") {
   const status = identity?.status || "unconfigured";
@@ -56,7 +63,22 @@ function formatRelativeTime(value?: number) {
   return new Date(value * 1000).toLocaleDateString("zh-CN");
 }
 
-function LarkMark({ large = false }: { large?: boolean }) {
+function ConnectorMark({ connectorId, large = false }: { connectorId: string; large?: boolean }) {
+  if (connectorId === "kimi-webbridge") {
+    const logoSrc = typeof moonshotLogo === "string" ? moonshotLogo : moonshotLogo.src;
+    return (
+      <div className={`${large ? "h-16 w-16 rounded-2xl p-2.5" : "h-11 w-11 rounded-xl p-2"} flex shrink-0 items-center justify-center bg-white shadow-sm ring-1 ring-black/[0.06]`}>
+        <img src={logoSrc} alt="" className="h-full w-full object-contain" />
+      </div>
+    );
+  }
+  if (connectorId !== "lark") {
+    return (
+      <div className={`${large ? "h-16 w-16 rounded-2xl" : "h-11 w-11 rounded-xl"} flex shrink-0 items-center justify-center bg-indigo-50 text-[#002fa7] shadow-sm ring-1 ring-black/[0.06]`}>
+        <Plug className={large ? "h-8 w-8" : "h-5 w-5"} />
+      </div>
+    );
+  }
   return (
     <div className={`${large ? "h-16 w-16 rounded-2xl p-2.5" : "h-11 w-11 rounded-xl p-1.5"} flex shrink-0 items-center justify-center bg-white shadow-sm ring-1 ring-black/[0.06]`}>
       <Image
@@ -92,7 +114,18 @@ export default function ConnectorCatalog({
     }
   }, []);
 
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    void load();
+    const refresh = () => { if (document.visibilityState === "visible") void load(); };
+    const timer = window.setInterval(refresh, 5000);
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [load]);
   const selected = connectors.find((connector) => connector.connector_id === selectedId) || null;
   const closeConnector = useCallback(() => setSelectedId(null), []);
   const refreshSelected = useCallback(async () => {
@@ -124,7 +157,7 @@ export default function ConnectorCatalog({
                   onClick={() => setSelectedId(connector.connector_id)}
                   className="group flex min-h-28 items-start gap-3.5 rounded-2xl border border-black/[0.06] bg-white p-4 text-left shadow-sm transition-all hover:-translate-y-0.5 hover:border-[#002fa7]/20 hover:shadow-md"
                 >
-                  <LarkMark />
+                  <ConnectorMark connectorId={connector.connector_id} />
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2">
                       <h2 className="text-[16px] font-semibold text-gray-900">{connector.display_name}</h2>
@@ -133,7 +166,7 @@ export default function ConnectorCatalog({
                     </div>
                     <p className="mt-1.5 line-clamp-2 text-[13px] leading-5 text-gray-500">{connector.description}</p>
                     <p className="mt-2 text-[11px] text-gray-400">
-                      托管 CLI{connector.environment.version ? ` · v${connector.environment.version}` : ""} · {connector.installed_skill_count} 个技能
+                      {connector.driver_kind === "managed_local_daemon" ? "本地 WebBridge" : "托管 CLI"}{connector.environment.version ? ` · v${connector.environment.version}` : ""}{connector.driver_kind === "managed_local_daemon" ? "" : ` · ${connector.installed_skill_count} 个技能`}
                     </p>
                   </div>
                   <ChevronRight className="mt-1 h-5 w-5 shrink-0 text-gray-300 transition-transform group-hover:translate-x-0.5 group-hover:text-[#002fa7]" />
@@ -170,6 +203,8 @@ function ConnectorStatusModal({
   const closeRef = useRef<HTMLButtonElement>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const isWebBridge = connector.driver_kind === "managed_local_daemon";
+  const isLark = connector.connector_id === "lark";
   const status = STATUS_COPY[connector.status];
   const app = identityLabel(connector.profile?.app_identity, "bot");
   const user = identityLabel(connector.profile?.user_identity, "user");
@@ -183,6 +218,8 @@ function ConnectorStatusModal({
 
   useEffect(() => {
     const returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const previousBodyOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
     closeRef.current?.focus();
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
@@ -209,6 +246,7 @@ function ConnectorStatusModal({
     window.addEventListener("keydown", onKeyDown);
     return () => {
       window.removeEventListener("keydown", onKeyDown);
+      document.body.style.overflow = previousBodyOverflow;
       returnFocus?.focus();
     };
   }, [onClose]);
@@ -234,17 +272,17 @@ function ConnectorStatusModal({
 
   const primaryAction = () => {
     if (connector.status === "environment_unavailable") {
-      onUse("请安装并配置飞书 CLI：https://open.feishu.cn/document/no_class/mcp-archive/feishu-cli-installation-guide.md");
+      onUse(`请安装并配置 ${connector.display_name} 的托管 CLI（${connector.environment.package}）。`);
       onClose();
       return;
     }
     if (connector.status === "connected") {
-      onUse("使用飞书帮我……");
+      onUse(`使用 ${connector.display_name} 帮我……`);
       onClose();
       return;
     }
     if (connector.status === "authorizing") {
-      onUse("我已完成飞书授权，请继续验证并完成当前授权流程。");
+      onUse(`我已完成 ${connector.display_name} 的浏览器授权，请继续验证并完成当前授权流程。`);
       onClose();
       return;
     }
@@ -254,12 +292,13 @@ function ConnectorStatusModal({
 
   const modal = (
     <div className="fixed inset-0 z-[120] flex items-center justify-center bg-slate-950/45 p-4 backdrop-blur-[2px]" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-      <section ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="connector-title" className="relative max-h-[calc(100vh-2rem)] w-full max-w-[700px] overflow-y-auto rounded-3xl border border-white/60 bg-white px-6 pb-6 pt-5 shadow-2xl sm:px-9 sm:pb-8">
-        <button ref={closeRef} type="button" onClick={onClose} aria-label="关闭连接器状态" className="absolute right-5 top-5 flex h-9 w-9 items-center justify-center rounded-full text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-700">
+      <section ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="connector-title" className="relative flex max-h-[calc(100vh-2rem)] w-full max-w-[700px] flex-col overflow-hidden rounded-3xl border border-white/60 bg-white shadow-2xl">
+        <button ref={closeRef} type="button" onClick={onClose} aria-label="关闭连接器状态" className="absolute right-5 top-5 z-10 flex h-9 w-9 items-center justify-center rounded-full bg-white/90 text-gray-400 shadow-sm ring-1 ring-black/[0.04] backdrop-blur transition-colors hover:bg-gray-100 hover:text-gray-700">
           <X className="h-5 w-5" />
         </button>
+        <div className="my-2 mr-2 min-h-0 flex-1 overflow-y-auto overscroll-contain px-6 pb-4 pt-3 [scrollbar-gutter:stable] sm:px-9 sm:pb-6">
         <div className="flex flex-col items-center px-8 pb-5 pt-5 text-center">
-          <LarkMark large />
+          <ConnectorMark connectorId={connector.connector_id} large />
           <h2 id="connector-title" className="mt-4 text-2xl font-semibold text-gray-950">{connector.display_name}</h2>
           <p className="mt-2 max-w-xl text-[14px] leading-6 text-gray-500">{connector.description}</p>
           <span className={`mt-3 inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium ${status.badge}`}>
@@ -268,27 +307,71 @@ function ConnectorStatusModal({
         </div>
 
         <div className="space-y-3">
-          <StatusGroup icon={<Server className="h-4 w-4" />} title="运行环境">
-            <StatusRow label="共享 Toolchain" value={connector.environment.health === "available" ? "可用" : "不可用"} ok={connector.environment.health === "available"} />
-            <StatusRow label="执行驱动" value={`托管 CLI${connector.environment.version ? ` · v${connector.environment.version}` : ""}`} />
-            <StatusRow label="可用范围" value="所有项目" />
-          </StatusGroup>
-          <StatusGroup icon={<KeyRound className="h-4 w-4" />} title="授权状态">
-            <StatusRow
-              icon={<Bot className="h-4 w-4" />}
-              label="应用 / Bot 配置"
-              value={appVerifiedInCurrentFlow ? "本次流程已验证，待提交" : app.text}
-              ok={appVerifiedInCurrentFlow || app.ok}
-            />
-            <StatusRow
-              icon={<UserRound className="h-4 w-4" />}
-              label="用户数据授权"
-              value={authorizationAttemptExpired ? "链接已过期，等待续发" : connector.active_flow ? "授权进行中" : user.text}
-              ok={!connector.active_flow && user.ok}
-              pending={Boolean(connector.active_flow) && !authorizationAttemptExpired}
-            />
-            <StatusRow icon={<Clock3 className="h-4 w-4" />} label="最近验证" value={formatRelativeTime(connector.profile?.last_updated_at)} />
-          </StatusGroup>
+          {isWebBridge ? (
+            <>
+            <StatusGroup icon={<Server className="h-4 w-4" />} title="连接状态">
+              <StatusRow label="本地组件" value={connector.environment.health === "available" ? "已安装" : "未安装"} ok={connector.environment.health === "available"} />
+              <StatusRow label="PuddingClaw" value={connector.environment.enabled ? "已启用" : "未启用"} ok={connector.environment.enabled} />
+              <StatusRow label="本地 daemon" value={connector.environment.daemon_running ? "运行中" : "未运行"} ok={connector.environment.daemon_running} />
+              <StatusRow label="浏览器扩展" value={connector.environment.extension_connected ? "已连接" : "未连接"} ok={connector.environment.extension_connected} />
+              <StatusRow label="版本匹配" value={connector.environment.version_compatible === false ? "不匹配，请升级扩展" : "已匹配"} ok={connector.environment.version_compatible !== false} />
+            </StatusGroup>
+            {connector.environment.version_compatible === false ? (
+              <div className="rounded-2xl border border-amber-200 bg-amber-50/80 p-4 text-xs leading-5 text-amber-900">
+                <p className="font-semibold">检测到 daemon 与浏览器扩展版本不一致</p>
+                <p className="mt-1">当前 daemon：{connector.environment.version || "未知"} · 扩展：{connector.environment.extension_version || "未知"}</p>
+                <ol className="mt-2 list-decimal space-y-1 pl-4">
+                  <li>打开 Chrome 或 Edge 的扩展管理页：<code>chrome://extensions/</code> 或 <code>edge://extensions/</code>。</li>
+                  <li>在商店中更新 Kimi WebBridge；如果是手动安装，请从官方页面下载新版并重新加载解压后的扩展目录。</li>
+                  <li>重启浏览器，确认 WebBridge 图标显示已连接。</li>
+                  <li>回到这里点击“重新检测”。</li>
+                </ol>
+                <a href={WEBBRIDGE_UPDATE_URL} target="_blank" rel="noreferrer" className="mt-3 inline-flex items-center gap-1 font-medium text-[#002fa7] underline underline-offset-2">
+                  打开 Kimi 官方安装/更新页面 <ExternalLink className="h-3.5 w-3.5" />
+                </a>
+              </div>
+            ) : null}
+            </>
+          ) : (
+            <>
+              <StatusGroup icon={<Server className="h-4 w-4" />} title="运行环境">
+                <StatusRow label="共享 Toolchain" value={connector.environment.health === "available" ? "可用" : "不可用"} ok={connector.environment.health === "available"} />
+                <StatusRow label="执行驱动" value={`托管 CLI${connector.environment.version ? ` · v${connector.environment.version}` : ""}`} />
+                <StatusRow label="可用范围" value="所有项目" />
+              </StatusGroup>
+              <StatusGroup icon={<KeyRound className="h-4 w-4" />} title="授权状态">
+                {isLark ? (
+                  <>
+                <StatusRow
+                  icon={<Bot className="h-4 w-4" />}
+                  label="应用 / Bot 配置"
+                  value={appVerifiedInCurrentFlow ? "本次流程已验证，待提交" : app.text}
+                  ok={appVerifiedInCurrentFlow || app.ok}
+                />
+                <StatusRow
+                  icon={<UserRound className="h-4 w-4" />}
+                  label="用户数据授权"
+                  value={authorizationAttemptExpired ? "链接已过期，等待续发" : connector.active_flow ? "授权进行中" : user.text}
+                  ok={!connector.active_flow && user.ok}
+                  pending={Boolean(connector.active_flow) && !authorizationAttemptExpired}
+                />
+                <StatusRow icon={<Clock3 className="h-4 w-4" />} label="最近验证" value={formatRelativeTime(connector.profile?.last_updated_at)} />
+                  </>
+                ) : (
+                  <>
+                    <StatusRow
+                      icon={<KeyRound className="h-4 w-4" />}
+                      label="连接凭证"
+                      value={connector.active_flow ? "授权进行中" : connector.profile?.health || "未配置"}
+                      ok={connector.status === "connected"}
+                      pending={Boolean(connector.active_flow)}
+                    />
+                    <StatusRow icon={<Clock3 className="h-4 w-4" />} label="最近验证" value={formatRelativeTime(connector.profile?.last_updated_at)} />
+                  </>
+                )}
+              </StatusGroup>
+            </>
+          )}
         </div>
 
         {connector.active_flow ? (
@@ -300,7 +383,7 @@ function ConnectorStatusModal({
             ) : connector.active_flow.user_code ? <p className="mt-2 text-xs text-slate-600">验证码：<span className="font-mono font-semibold text-slate-900">{connector.active_flow.user_code}</span></p> : null}
             {connector.active_flow.verification_url && !authorizationAttemptExpired ? (
               <a href={connector.active_flow.verification_url} target="_blank" rel="noreferrer" className="mt-3 inline-flex items-center gap-1.5 text-xs font-medium text-[#002fa7] underline underline-offset-2">
-                打开飞书授权页面 <ExternalLink className="h-3.5 w-3.5" />
+                打开 {connector.display_name} 授权页面 <ExternalLink className="h-3.5 w-3.5" />
               </a>
             ) : null}
           </div>
@@ -309,23 +392,29 @@ function ConnectorStatusModal({
         {error ? <div className="mt-4 flex items-start gap-2 rounded-xl bg-red-50 px-3 py-2.5 text-xs text-red-700"><AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />{error}</div> : null}
 
         <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
-          {connector.status === "connected" ? (
+          {connector.driver_kind === "managed_local_daemon" ? (
+            <>
+              <button type="button" disabled={Boolean(busy)} onClick={() => void run("probe", () => probeKimiWebBridge())} className="inline-flex h-10 items-center gap-2 rounded-xl border border-gray-200 px-4 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50 disabled:opacity-50"><RotateCcw className="h-4 w-4" />重新检测</button>
+              {connector.environment.version_compatible === false ? <a href={WEBBRIDGE_UPDATE_URL} target="_blank" rel="noreferrer" className="inline-flex h-10 items-center gap-2 rounded-xl border border-amber-200 px-4 text-sm font-medium text-amber-700 transition-colors hover:bg-amber-50">更新浏览器扩展 <ExternalLink className="h-4 w-4" /></a> : connector.environment.enabled ? <button type="button" disabled={Boolean(busy)} onClick={() => void run("disable", () => setKimiWebBridgeEnabled(false))} className="inline-flex h-10 items-center gap-2 rounded-xl border border-gray-200 px-4 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50 disabled:opacity-50">停用</button> : connector.environment.health === "available" ? <button type="button" disabled={Boolean(busy)} onClick={() => void run("enable", () => setKimiWebBridgeEnabled(true))} className="inline-flex h-10 items-center gap-2 rounded-xl bg-[#002fa7] px-5 text-sm font-medium text-white shadow-sm transition-colors hover:bg-[#001f7a] disabled:opacity-50">启用</button> : <button type="button" disabled={Boolean(busy)} onClick={() => void run("install", () => installKimiWebBridge())} className="inline-flex h-10 items-center gap-2 rounded-xl border border-amber-200 px-4 text-sm font-medium text-amber-700 transition-colors hover:bg-amber-50 disabled:opacity-50">安装说明</button>}
+            </>
+          ) : null}
+          {connector.driver_kind !== "managed_local_daemon" && connector.authorization_supported !== false && connector.status === "connected" ? (
             <button type="button" disabled={Boolean(busy)} onClick={() => void run("reauthorize", () => authorizeConnector(connector.connector_id, "user_reauthorize"))} className="inline-flex h-10 items-center gap-2 rounded-xl border border-gray-200 px-4 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50 disabled:opacity-50">
               {busy === "reauthorize" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}重新授权
             </button>
           ) : null}
-          <button type="button" disabled={Boolean(busy)} onClick={primaryAction} className="inline-flex h-10 items-center gap-2 rounded-xl bg-[#002fa7] px-5 text-sm font-medium text-white shadow-sm transition-colors hover:bg-[#001f7a] disabled:opacity-50">
+          {connector.driver_kind !== "managed_local_daemon" && connector.authorization_supported !== false ? <button type="button" disabled={Boolean(busy)} onClick={primaryAction} className="inline-flex h-10 items-center gap-2 rounded-xl bg-[#002fa7] px-5 text-sm font-medium text-white shadow-sm transition-colors hover:bg-[#001f7a] disabled:opacity-50">
             {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : connector.status === "connected" ? <ChevronRight className="h-4 w-4" /> : <KeyRound className="h-4 w-4" />}
-            {connector.status === "connected" ? "去使用飞书" : connector.status === "authorizing" ? authorizationAttemptExpired ? "回到对话刷新链接" : "回到对话继续" : connector.status === "authorization_required" ? "重新授权" : connector.status === "environment_unavailable" ? "安装运行环境" : "连接飞书"}
-          </button>
+            {connector.status === "connected" ? `去使用 ${connector.display_name}` : connector.status === "authorizing" ? authorizationAttemptExpired ? "回到对话刷新链接" : "回到对话继续" : connector.status === "authorization_required" ? "重新授权" : connector.status === "environment_unavailable" ? "安装运行环境" : `连接 ${connector.display_name}`}
+          </button> : null}
         </div>
         <div className="mt-4 flex flex-wrap items-center justify-center gap-4 text-xs">
-          {connector.status !== "unconfigured" && connector.status !== "environment_unavailable" ? (
+          {connector.driver_kind !== "managed_local_daemon" && connector.authorization_supported !== false && connector.status !== "unconfigured" && connector.status !== "environment_unavailable" ? (
             <button type="button" disabled={Boolean(busy)} onClick={() => void run("full", () => authorizeConnector(connector.connector_id, "full_replace"))} className="text-gray-500 hover:text-gray-800 disabled:opacity-50">完整重新配置</button>
           ) : null}
           {connector.profile && connector.status !== "revoked" ? (
             <button type="button" disabled={Boolean(busy)} onClick={() => {
-              if (!window.confirm("断开飞书连接会撤销当前 Profile，并使正在进行的授权失效。确定继续吗？")) return;
+              if (!window.confirm(`断开 ${connector.display_name} 连接会撤销当前 Profile，并使正在进行的授权失效。确定继续吗？`)) return;
               void run("revoke", () => revokeConnector(connector.connector_id));
             }} className="inline-flex items-center gap-1 text-red-500 hover:text-red-700 disabled:opacity-50"><Unplug className="h-3.5 w-3.5" />断开连接…</button>
           ) : null}
@@ -334,11 +423,22 @@ function ConnectorStatusModal({
           <summary className="cursor-pointer font-medium text-gray-600">技术信息</summary>
           <dl className="mt-3 grid grid-cols-[100px_1fr] gap-x-3 gap-y-2">
             <dt>实现</dt><dd>{connector.environment.package}</dd>
-            <dt>驱动</dt><dd>{connector.driver_kind === "managed_cli" ? "托管 CLI" : connector.driver_kind}</dd>
-            <dt>Profile</dt><dd>{connector.profile?.label || "尚未创建"}</dd>
-            <dt>凭证</dt><dd>由 PuddingClaw 加密管理</dd>
+            <dt>驱动</dt><dd>{isWebBridge ? "本地 daemon" : "托管 CLI"}</dd>
+            {isWebBridge ? (
+              <>
+                <dt>范围</dt><dd>当前用户</dd>
+                <dt>版本</dt><dd>{connector.environment.version || "未知"}</dd>
+                <dt>扩展版本</dt><dd>{connector.environment.extension_version || "未知"}</dd>
+              </>
+            ) : (
+              <>
+                <dt>Profile</dt><dd>{connector.profile?.label || "尚未创建"}</dd>
+                <dt>凭证</dt><dd>由 PuddingClaw 加密管理</dd>
+              </>
+            )}
           </dl>
         </details>
+        </div>
       </section>
     </div>
   );

@@ -1,15 +1,15 @@
 """ExecuteSkillTool — parse SKILL.md and execute its scripts in order."""
 
-import os
 import re
-import subprocess
-import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Type
 
 import yaml
+from deepagents.backends.protocol import ExecuteResponse
 from langchain_core.tools import BaseTool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+
+from runtime_identity.software_runtime import skill_content_version
 
 
 class ExecuteSkillInput(BaseModel):
@@ -18,15 +18,17 @@ class ExecuteSkillInput(BaseModel):
 
 
 class ExecuteSkillTool(BaseTool):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
     name: str = "execute_skill"
     description: str = (
         "执行一个已注册的 Skill。传入 skill_name（技能名称），工具会读取 SKILL.md，"
         "自动执行其中声明的 Python 脚本并返回结果。"
         "适用于需要主动调用某项技能（如获取日期、查询天气等）的场景。"
     )
-    args_schema: Type[BaseModel] = ExecuteSkillInput
+    args_schema: type[BaseModel] = ExecuteSkillInput
     risk_level: str = "moderate"
     skills_dir: str = ""
+    runner: Callable[[str, str, str, str], ExecuteResponse] = Field(exclude=True, repr=False)
 
     def _parse_frontmatter(self, content: str) -> dict:
         """从 SKILL.md 解析 YAML frontmatter（--- 之间的内容）。"""
@@ -120,23 +122,13 @@ class ExecuteSkillTool(BaseTool):
                 continue
 
             try:
-                result = subprocess.run(
-                    [sys.executable, str(abs_script)],
-                    cwd=str(skill_dir),
-                    env={
-                        **os.environ,
-                        "SKILL_NAME": skill_name,
-                        "SKILL_USER_QUERY": user_query,
-                    },
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                    encoding="utf-8",
-                    errors="replace",
+                result = self.runner(
+                    skill_name,
+                    skill_content_version(skill_dir),
+                    script_path,
+                    user_query,
                 )
-                output = result.stdout
-                if result.stderr:
-                    output += f"\n[stderr]: {result.stderr}"
+                output = result.output
                 if not output.strip():
                     output = "(脚本执行完成，无输出)"
                 # 结构化结果必须先解析，避免 stdout 截断破坏 sources[]。
@@ -149,8 +141,6 @@ class ExecuteSkillTool(BaseTool):
                     source.setdefault("metadata", {})["skill_name"] = skill_name
                 collected_sources.extend(sources)
                 results.append(f"[{script_path}]\n{answer_context}")
-            except subprocess.TimeoutExpired:
-                results.append(f"[{script_path}] 错误：执行超时（30秒限制）")
             except Exception as e:
                 results.append(f"[{script_path}] 错误：{str(e)}")
 
@@ -159,5 +149,8 @@ class ExecuteSkillTool(BaseTool):
         return encode_tool_result(answer, collected_sources) if collected_sources else answer
 
 
-def create_execute_skill_tool(base_dir: Path) -> ExecuteSkillTool:
-    return ExecuteSkillTool(skills_dir=str(base_dir / "skills"))
+def create_execute_skill_tool(
+    base_dir: Path,
+    runner: Callable[[str, str, str, str], ExecuteResponse],
+) -> ExecuteSkillTool:
+    return ExecuteSkillTool(skills_dir=str(base_dir / "skills"), runner=runner)

@@ -248,7 +248,7 @@ export default function SessionSearchDialog({
                         ) : null}
                       </span>
                       <span className="flex shrink-0 items-center gap-2 pt-0.5 text-[10px] text-gray-400">
-                        <span>{projectName || (session.runtime_mode === "agent" ? "Agent" : "Chat")}</span>
+                        <span>{projectName || (session.runtime_mode === "agent" ? "Agent" : "Legacy Chat（已停用）")}</span>
                         <span>{formatUpdatedAt(session.updated_at)}</span>
                         {index === activeIndex ? <CornerDownLeft className="h-3 w-3 text-[#002fa7]" /> : null}
                       </span>

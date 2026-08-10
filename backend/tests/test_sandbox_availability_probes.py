@@ -120,7 +120,54 @@ def test_adaptive_managed_method_lookup_does_not_probe_docker(tmp_path, monkeypa
         docker_config={},
     )
 
-    method = backend.run_managed_provider_cli
+    methods = (
+        backend.managed_runtime_image_digest,
+        backend.resolve_managed_node_cli,
+        backend.run_managed_provider_cli,
+    )
 
-    assert callable(method)
+    assert all(callable(method) for method in methods)
     assert docker_probes == []
+
+
+def test_adaptive_toolchain_planning_methods_delegate_to_lazy_docker_backend(tmp_path, monkeypatch):
+    from harness import workspace_backends
+
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    workspace.mkdir()
+    scratch.mkdir()
+    monkeypatch.setattr(workspace_backends, "_macos_seatbelt_available", lambda: True)
+    backend = AdaptiveWorkspaceBackend(
+        root_dir=workspace,
+        scratch_path=scratch,
+        docker_config={},
+    )
+    resolution = object()
+    calls: list[tuple[object, ...]] = []
+
+    class FakeDockerBackend:
+        @staticmethod
+        def managed_runtime_image_digest():
+            calls.append(("runtime_digest",))
+            return "sha256:" + "a" * 64
+
+        @staticmethod
+        def resolve_managed_node_cli(*, distribution, package):
+            calls.append(("resolve", distribution, package))
+            return resolution
+
+    monkeypatch.setattr(backend, "_docker_backend", lambda: FakeDockerBackend())
+
+    assert backend.managed_runtime_image_digest() == "sha256:" + "a" * 64
+    assert (
+        backend.resolve_managed_node_cli(
+            distribution="@larksuite/cli",
+            package="@larksuite/cli",
+        )
+        is resolution
+    )
+    assert calls == [
+        ("runtime_digest",),
+        ("resolve", "@larksuite/cli", "@larksuite/cli"),
+    ]

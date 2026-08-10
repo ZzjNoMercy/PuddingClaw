@@ -27,14 +27,61 @@ from harness.dependency_setup import (
 from runtime_identity.adapters import CredentialStateSpec, ManagedCliRegistry
 from runtime_identity.profiles import validate_credential_archive
 
-DEFAULT_SANDBOX_IMAGE = "puddingclaw/sandbox:python3.12-node22-chromium-v4"
-RUNTIME_CONTRACT = "python3.12+node22+chromium-v4"
+DEFAULT_SANDBOX_IMAGE = "puddingclaw/sandbox:python3.12-node22-chromium-v5"
+RUNTIME_CONTRACT = "python3.12+node22+chromium-v5"
 logger = logging.getLogger(__name__)
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _LARK_CONFIG_URL = re.compile(
     r"https://(?:open\.feishu\.cn|open\.larksuite\.com)/page/cli\?[^\s\x1b<>\"']+",
     re.IGNORECASE,
 )
+
+
+def _shared_runtime_executable(
+    release: Path,
+    requested_executable: str,
+    expected_runtime_image_digest: str,
+) -> str:
+    """Validate one executable projection from the shared runtime manifest."""
+
+    if re.fullmatch(r"[A-Za-z0-9_.-]+", requested_executable) is None:
+        raise ValueError("managed runtime executable name is invalid")
+    release = release.expanduser().resolve(strict=True)
+    manifest_path = release / "runtime-manifest.json"
+    if manifest_path.is_symlink():
+        raise ValueError("managed runtime manifest must not be a symlink")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError("managed runtime manifest is missing or invalid") from exc
+    packages = manifest.get("packages") if isinstance(manifest, dict) else None
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("version") != 1
+        or manifest.get("kind") != "shared-node-runtime"
+        or manifest.get("runtime_image_digest") != expected_runtime_image_digest
+        or not isinstance(packages, dict)
+    ):
+        raise ValueError("managed runtime manifest contract is incompatible")
+    targets: list[Path] = []
+    for package in packages.values():
+        bins = package.get("declared_bins") if isinstance(package, dict) else None
+        relative = bins.get(requested_executable) if isinstance(bins, dict) else None
+        if not isinstance(relative, str) or not relative:
+            continue
+        target = (release / relative).resolve(strict=True)
+        target.relative_to(release)
+        if not target.is_file():
+            raise ValueError("managed runtime executable target is invalid")
+        targets.append(target)
+    launcher = release / "bin" / requested_executable
+    if (
+        len(targets) != 1
+        or not launcher.is_symlink()
+        or launcher.resolve(strict=True) != targets[0]
+    ):
+        raise ValueError("managed runtime executable projection is invalid")
+    return requested_executable
 
 
 def _managed_readonly_path_aliases(
@@ -129,6 +176,16 @@ class ManagedProviderExecutionResult:
     truncated: bool = False
     browser_status: str | None = None
     browser_job_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ManagedNodePackageResolution:
+    package: str
+    version: str
+    integrity: str
+    distribution: str
+    runtime_image_digest: str
+    executables: tuple[str, ...] = ()
 
 
 def _lark_config_verification_url(output: str) -> str | None:
@@ -403,9 +460,9 @@ class KernelWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         self.managed_readonly_host_roots = tuple(
             host_root for _virtual_root, host_root in self.managed_readonly_path_aliases
         )
-        workspace_digest = hashlib.sha256(
-            str(self.workspace_path).encode("utf-8")
-        ).hexdigest()[:16]
+        self._host_runtime: Any | None = None
+        self._host_runtime_lock = threading.RLock()
+        workspace_digest = hashlib.sha256(str(self.workspace_path).encode("utf-8")).hexdigest()[:16]
         self._id = f"kernel:macos-seatbelt:{workspace_digest}"
 
     @property
@@ -428,10 +485,7 @@ class KernelWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
                 exit_code=126,
             )
         profile = authorized.profile
-        if (
-            profile.workspace_root != self.workspace_path
-            or profile.scratch_root != self.scratch_path
-        ):
+        if profile.workspace_root != self.workspace_path or profile.scratch_root != self.scratch_path:
             return ExecuteResponse(
                 output="Error: Execution permit belongs to another workspace.",
                 exit_code=126,
@@ -449,14 +503,107 @@ class KernelWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
             authorized.execution_command,
             self.managed_readonly_path_aliases,
         )
-        return runner.execute(
+        response = runner.execute(
             execution_command,
             timeout=timeout or self._default_timeout,
             spawn_guard=lambda: authorized.valid_at_spawn(
                 command=command,
                 selected_runner=runner.mode,
             ),
+            environment=dict(authorized.environment),
         )
+        output = response.output
+        for secret in sorted(
+            {value for value in authorized.secret_values if value},
+            key=len,
+            reverse=True,
+        ):
+            output = output.replace(secret, "***")
+        if output == response.output:
+            return response
+        return ExecuteResponse(
+            output=output,
+            exit_code=response.exit_code,
+            truncated=response.truncated,
+        )
+
+    def _host_runtime_backend(self) -> Any:
+        from harness.host_skill_runtime import HostSkillRuntimeBackend
+        from runtime_identity.paths import PuddingClawPaths
+
+        with self._host_runtime_lock:
+            if self._host_runtime is None:
+                self._host_runtime = HostSkillRuntimeBackend(
+                    PuddingClawPaths.from_environment(),
+                    timeout=max(self._default_timeout, 900),
+                )
+            return self._host_runtime
+
+    def install_packages(self, *args: Any, **kwargs: Any) -> ExecuteResponse:
+        """Install ordinary Skill dependencies on the host ABI under Seatbelt."""
+
+        return self._host_runtime_backend().install_packages(*args, **kwargs)
+
+    def prepare_host_skill_execution(
+        self,
+        command: str,
+        *,
+        active_skill_ids: tuple[str, ...] = (),
+    ) -> Any:
+        """Return an immutable host-runtime projection for an installed Skill."""
+
+        match = re.search(r"/skills/([A-Za-z0-9][A-Za-z0-9_.-]{0,127})(?:/|\b)", command)
+        skills_root = next(
+            (root for virtual, root in self.managed_readonly_path_aliases if virtual == "/skills"),
+            None,
+        )
+        if skills_root is None:
+            from harness.host_skill_runtime import HostExecutionProjection
+
+            return HostExecutionProjection(command)
+        selected_skill_id = match.group(1) if match is not None else None
+        if selected_skill_id is None:
+            trusted_ids = tuple(dict.fromkeys(active_skill_ids))
+            if len(trusted_ids) == 1:
+                selected_skill_id = trusted_ids[0]
+            elif trusted_ids:
+                published = self._host_runtime_backend().published_python_skill_ids(
+                    trusted_ids,
+                    self.managed_readonly_path_aliases,
+                )
+                if len(published) == 1:
+                    selected_skill_id = published[0]
+        if selected_skill_id is None:
+            from harness.host_skill_runtime import HostExecutionProjection
+
+            return HostExecutionProjection(command)
+        return self._host_runtime_backend().project_skill_execution(
+            command,
+            self.managed_readonly_path_aliases,
+            skill_id=selected_skill_id,
+        )
+
+    def prepare_host_execution(
+        self,
+        command: str,
+        *,
+        active_skill_ids: tuple[str, ...] = (),
+    ) -> Any:
+        """Project published ordinary Skill/CLI runtimes into one command."""
+
+        from runtime_identity.paths import PuddingClawPaths
+
+        paths = PuddingClawPaths.from_environment()
+        has_node_runtime = (paths.root / "runtime" / "node").is_dir()
+        skill_projection = self.prepare_host_skill_execution(
+            command,
+            active_skill_ids=active_skill_ids,
+        )
+        if "/skills/" in command or skill_projection.environment_binding_digest:
+            return skill_projection
+        if not has_node_runtime:
+            return skill_projection
+        return self._host_runtime_backend().project_cli_execution(command)
 
 
 class ProjectSandboxManager:
@@ -890,15 +1037,20 @@ class ProjectSandboxManager:
                 )
         if bool(self.config.get("_managed_user_toolchain", False)):
             from runtime_identity.paths import PuddingClawPaths
-            from runtime_identity.toolchains import ToolchainManager
+            from runtime_identity.software_runtime import SoftwareRuntimeManager
 
-            toolchain = ToolchainManager(PuddingClawPaths.from_environment(), RUNTIME_CONTRACT).resolve_node()
+            image = str(self.config.get("image") or DEFAULT_SANDBOX_IMAGE)
+            image_id = self.ensure_image(image)
+            current = SoftwareRuntimeManager(
+                PuddingClawPaths.from_environment(),
+                RUNTIME_CONTRACT,
+            ).node_current(image_id)
             readonly_mounts.append(
                 {
                     # Resolve on every spec calculation. An atomic ``current``
                     # switch therefore changes the source and forces stale
                     # workspace containers to be recreated.
-                    "source": str(toolchain.mount_path.resolve()),
+                    "source": str(current),
                     "target": "/opt/puddingclaw/toolchain/node",
                     "workspace_target": None,
                 }
@@ -1109,8 +1261,9 @@ class ProjectSandboxManager:
                 "npm_config_prefix=/home/puddingclaw/.npm-global",
                 "--env",
                 (
-                    "PATH=/opt/puddingclaw/toolchain/node/bin:/home/puddingclaw/.local/bin:"
-                    "/home/puddingclaw/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
+                    "PATH=/home/puddingclaw/.local/bin:/opt/puddingclaw/toolchain/node/public-bin:"
+                    "/home/puddingclaw/.npm-global/bin:"
+                    "/usr/local/bin:/usr/bin:/bin"
                 ),
                 "--env",
                 (
@@ -1250,8 +1403,9 @@ class ProjectSandboxManager:
             "npm_config_prefix=/home/puddingclaw/.npm-global",
             "--env",
             (
-                "PATH=/opt/puddingclaw/toolchain/node/bin:/home/puddingclaw/.local/bin:"
-                "/home/puddingclaw/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
+                "PATH=/home/puddingclaw/.local/bin:/opt/puddingclaw/toolchain/node/public-bin:"
+                "/home/puddingclaw/.npm-global/bin:"
+                "/usr/local/bin:/usr/bin:/bin"
             ),
             "--env",
             (
@@ -1346,41 +1500,60 @@ class ProjectSandboxManager:
             truncated=truncated,
         )
 
-    def install_managed_node_cli(
-        self,
-        workspace: Path,
-        *,
-        distribution: str,
-        toolchain_path: Path,
-        container_path: str,
-        timeout: int = 600,
-        max_output_bytes: int = 100_000,
-    ) -> ExecuteResponse:
-        """Install one Adapter-approved distribution into a shared Toolchain."""
+    def managed_runtime_image_digest(self, workspace: Path | None = None) -> str:
+        workspace = (workspace or Path.cwd()).expanduser().resolve()
+        return self.ensure_image(self._spec(workspace)["image"])
 
-        workspace = workspace.expanduser().resolve()
-        toolchain_path = toolchain_path.expanduser().resolve()
-        toolchain_path.mkdir(parents=True, exist_ok=True)
+    def inspect_managed_runtime_image_digest(self, workspace: Path | None = None) -> str:
+        """Resolve the locally present immutable image id without pull/build."""
+
+        workspace = (workspace or Path.cwd()).expanduser().resolve()
+        return self._image_id(self._spec(workspace)["image"])
+
+    def _managed_runtime_build_args(
+        self,
+        *,
+        workspace: Path,
+        runtime_path: Path | None,
+        container_path: str,
+        expected_runtime_image_digest: str,
+        kind: str,
+        network: str,
+        extra_mounts: list[str] | None = None,
+    ) -> tuple[list[str], str]:
+        """Build an isolated installer prefix bound to one immutable image."""
+
+        from runtime_identity.paths import PuddingClawPaths
+
+        runtime_path = runtime_path.expanduser().resolve(strict=True)
+        runtime_path.relative_to(PuddingClawPaths.from_environment().root / "runtime")
+        if runtime_path.is_symlink() or not runtime_path.is_dir():
+            raise ValueError("managed runtime candidate must be a real directory")
+        if not re.fullmatch(r"/opt/puddingclaw/runtime/[A-Za-z0-9._/-]+", container_path):
+            raise ValueError("managed runtime container path is invalid")
         spec = self._spec(workspace)
         image_id = self.ensure_image(spec["image"])
+        if image_id != expected_runtime_image_digest:
+            raise ValueError("managed runtime image changed after dependency approval")
         args = [
             "run",
             "--rm",
             "--label",
             "com.puddingclaw.managed=true",
             "--label",
-            "com.puddingclaw.kind=installer",
+            f"com.puddingclaw.kind={kind}",
             "--label",
             f"com.puddingclaw.owner={self._owner_label()}",
             "--network",
-            "bridge",
+            network,
             "--read-only",
             "--tmpfs",
-            "/tmp:rw,nosuid,nodev,size=256m",
+            "/tmp:rw,nosuid,nodev,size=512m",
             "--tmpfs",
             "/home/puddingclaw:rw,nosuid,nodev,size=256m",
             "--mount",
-            f"type=bind,src={toolchain_path},dst={container_path}",
+            f"type=bind,src={runtime_path},dst={container_path}",
+            *(extra_mounts or []),
             "--cap-drop",
             "ALL",
             "--security-opt",
@@ -1396,59 +1569,434 @@ class ProjectSandboxManager:
             "--env",
             "npm_config_cache=/home/puddingclaw/.cache/npm",
             "--env",
-            f"npm_config_prefix={container_path}",
+            "UV_CACHE_DIR=/home/puddingclaw/.cache/uv",
+            "--workdir",
+            container_path,
+        ]
+        if spec["uid"] is not None and spec["gid"] is not None:
+            args.extend(["--user", f"{spec['uid']}:{spec['gid']}"])
+        return args, image_id
+
+    def resolve_shared_node_runtime(
+        self,
+        workspace: Path | None = None,
+        *,
+        dependencies: dict[str, str],
+        expected_runtime_image_digest: str,
+        resolution_path: Path,
+        timeout: int = 300,
+    ) -> ExecuteResponse:
+        """Generate a complete npm lock without executing package scripts."""
+
+        from runtime_identity.software_runtime import parse_exact_node_distribution
+
+        workspace = (workspace or Path.cwd()).expanduser().resolve()
+        normalized: dict[str, str] = {}
+        for package, version in sorted(dependencies.items()):
+            parsed_package, parsed_version = parse_exact_node_distribution(f"{package}@{version}")
+            normalized[parsed_package] = parsed_version
+        resolution_path = resolution_path.expanduser().resolve(strict=True)
+        package_json = {
+            "name": "puddingclaw-managed-runtime",
+            "private": True,
+            "version": "0.0.0",
+            "dependencies": normalized,
+        }
+        package_path = resolution_path / "package.json"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(package_path, flags, 0o600)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", closefd=False) as destination:
+                json.dump(package_json, destination, ensure_ascii=False, sort_keys=True)
+                destination.write("\n")
+                destination.flush()
+                os.fsync(destination.fileno())
+        finally:
+            os.close(descriptor)
+        args, image_id = self._managed_runtime_build_args(
+            workspace=workspace,
+            runtime_path=resolution_path,
+            container_path="/opt/puddingclaw/runtime/node-resolution",
+            expected_runtime_image_digest=expected_runtime_image_digest,
+            kind="node-runtime-resolver",
+            network="bridge",
+        )
+        args.extend(
+            [
+                "--entrypoint",
+                "npm",
+                image_id,
+                "install",
+                "--package-lock-only",
+                "--ignore-scripts",
+                "--no-audit",
+                "--no-fund",
+                "--registry=https://registry.npmjs.org/",
+            ]
+        )
+        try:
+            result = self._run(args, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return ExecuteResponse(output="Node runtime resolution timed out.", exit_code=124)
+        output, truncated = _bounded_output(result.stdout, result.stderr, max_output_bytes=100_000)
+        return ExecuteResponse(output=output, exit_code=result.returncode, truncated=truncated)
+
+    def build_shared_node_runtime(
+        self,
+        workspace: Path | None = None,
+        *,
+        expected_runtime_image_digest: str,
+        runtime_path: Path,
+        container_path: str,
+        timeout: int = 900,
+    ) -> ExecuteResponse:
+        """Materialize a frozen npm lock from an empty node_modules tree."""
+
+        workspace = (workspace or Path.cwd()).expanduser().resolve()
+        args, image_id = self._managed_runtime_build_args(
+            workspace=workspace,
+            runtime_path=runtime_path,
+            container_path=container_path,
+            expected_runtime_image_digest=expected_runtime_image_digest,
+            kind="node-runtime-builder",
+            network="bridge",
+        )
+        args.extend(
+            [
+                "--entrypoint",
+                "npm",
+                image_id,
+                "ci",
+                "--no-audit",
+                "--no-fund",
+                "--registry=https://registry.npmjs.org/",
+            ]
+        )
+        try:
+            result = self._run(args, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return ExecuteResponse(output="Node runtime build timed out.", exit_code=124)
+        output, truncated = _bounded_output(result.stdout, result.stderr, max_output_bytes=100_000)
+        return ExecuteResponse(output=output, exit_code=result.returncode, truncated=truncated)
+
+    def resolve_python_skill_runtime(
+        self,
+        workspace: Path | None = None,
+        *,
+        expected_runtime_image_digest: str,
+        resolution_path: Path,
+        timeout: int = 300,
+    ) -> ExecuteResponse:
+        """Resolve exact Skill requirements into a transitive hash lock."""
+
+        workspace = (workspace or Path.cwd()).expanduser().resolve()
+        args, image_id = self._managed_runtime_build_args(
+            workspace=workspace,
+            runtime_path=resolution_path,
+            container_path="/opt/puddingclaw/runtime/python-resolution",
+            expected_runtime_image_digest=expected_runtime_image_digest,
+            kind="python-skill-resolver",
+            network="bridge",
+        )
+        args.extend(
+            [
+                "--entrypoint",
+                "uv",
+                image_id,
+                "pip",
+                "compile",
+                "--generate-hashes",
+                "--no-header",
+                "--no-annotate",
+                "--index-url",
+                "https://pypi.org/simple",
+                "--output-file",
+                "/opt/puddingclaw/runtime/python-resolution/requirements.lock",
+                "/opt/puddingclaw/runtime/python-resolution/requirements.in",
+            ]
+        )
+        try:
+            result = self._run(args, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return ExecuteResponse(output="Python Skill dependency resolution timed out.", exit_code=124)
+        output, truncated = _bounded_output(result.stdout, result.stderr, max_output_bytes=100_000)
+        return ExecuteResponse(output=output, exit_code=result.returncode, truncated=truncated)
+
+    def build_python_skill_runtime(
+        self,
+        workspace: Path | None = None,
+        *,
+        expected_runtime_image_digest: str,
+        runtime_path: Path,
+        container_path: str,
+        uv_cache_path: Path,
+        timeout: int = 900,
+    ) -> ExecuteResponse:
+        """Create one isolated Skill venv and install only its frozen lock."""
+
+        workspace = (workspace or Path.cwd()).expanduser().resolve()
+        from runtime_identity.paths import PuddingClawPaths
+
+        uv_cache_path = uv_cache_path.expanduser()
+        if uv_cache_path.is_symlink():
+            raise ValueError("managed uv cache must not be a symlink")
+        uv_cache_path.mkdir(parents=True, mode=0o700, exist_ok=True)
+        uv_cache_path = uv_cache_path.resolve(strict=True)
+        uv_cache_path.relative_to(
+            (PuddingClawPaths.from_environment().root / "runtime" / "python").resolve(strict=True)
+        )
+        args, image_id = self._managed_runtime_build_args(
+            workspace=workspace,
+            runtime_path=runtime_path,
+            container_path=container_path,
+            expected_runtime_image_digest=expected_runtime_image_digest,
+            kind="python-skill-builder",
+            network="bridge",
+            extra_mounts=["--mount", f"type=bind,src={uv_cache_path},dst=/uv-cache"],
+        )
+        command = (
+            f"python3 -m venv --copies {shlex.quote(container_path + '/.venv')} && "
+            f"UV_CACHE_DIR=/uv-cache uv pip sync --require-hashes --python "
+            f"{shlex.quote(container_path + '/.venv/bin/python')} "
+            f"{shlex.quote(container_path + '/requirements.lock')}"
+        )
+        args.extend(["--entrypoint", "sh", image_id, "-c", command])
+        try:
+            result = self._run(args, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return ExecuteResponse(output="Python Skill runtime build timed out.", exit_code=124)
+        output, truncated = _bounded_output(result.stdout, result.stderr, max_output_bytes=100_000)
+        return ExecuteResponse(output=output, exit_code=result.returncode, truncated=truncated)
+
+    def run_python_skill(
+        self,
+        workspace: Path,
+        *,
+        skill_id: str,
+        skill_root: Path,
+        runtime_path: Path | None,
+        script_relative: str,
+        interpreter_args: list[str],
+        script_args: list[str],
+        timeout: int,
+        max_output_bytes: int,
+        network_enabled: bool,
+        expected_runtime_image_digest: str,
+        user_query: str = "",
+    ) -> ExecuteResponse:
+        """Run one exact Skill script with only its validated Python env."""
+
+        from runtime_identity.paths import PuddingClawPaths, safe_identity_component
+
+        skill_id = safe_identity_component(skill_id, field="skill_id")
+        workspace = workspace.expanduser().resolve(strict=True)
+        skill_root = skill_root.expanduser().resolve(strict=True)
+        if runtime_path is not None:
+            runtime_path = runtime_path.expanduser().resolve(strict=True)
+            runtime_path.relative_to(PuddingClawPaths.from_environment().root / "runtime" / "python")
+        script = (skill_root / script_relative).resolve(strict=True)
+        script.relative_to(skill_root)
+        if script.is_symlink() or not script.is_file() or script.suffix != ".py":
+            raise ValueError("managed Skill script is invalid")
+        spec = self._spec(workspace)
+        image_id = self.ensure_image(spec["image"])
+        if image_id != expected_runtime_image_digest:
+            raise ValueError("Python Skill runtime image changed before execution")
+        runtime_mount = (
+            [
+                "--mount",
+                (
+                    f"type=bind,src={runtime_path},"
+                    "dst=/opt/puddingclaw/runtime/python-skill,readonly"
+                ),
+            ]
+            if runtime_path is not None
+            else []
+        )
+        args = [
+            "run",
+            "--rm",
+            "--label",
+            "com.puddingclaw.managed=true",
+            "--label",
+            "com.puddingclaw.kind=python-skill-runner",
+            "--label",
+            f"com.puddingclaw.owner={self._owner_label()}",
+            "--network",
+            "bridge" if network_enabled else "none",
+            "--read-only",
+            "--tmpfs",
+            "/tmp:rw,nosuid,nodev,size=256m",
+            "--tmpfs",
+            "/home/puddingclaw:rw,nosuid,nodev,size=128m",
+            "--mount",
+            f"type=bind,src={workspace},dst=/workspace",
+            "--mount",
+            f"type=bind,src={skill_root},dst=/skills/{skill_id},readonly",
+            *runtime_mount,
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--pids-limit",
+            str(spec["pids_limit"]),
+            "--memory",
+            f"{spec['memory_limit_mb']}m",
+            "--cpus",
+            spec["cpu_limit"],
+            "--workdir",
+            "/workspace",
             "--env",
-            f"PATH={container_path}/bin:/usr/local/bin:/usr/bin:/bin",
+            "HOME=/home/puddingclaw",
+            "--env",
+            f"SKILL_NAME={skill_id}",
+            "--env",
+            f"SKILL_USER_QUERY={user_query}",
+            *_managed_credential_state_tmpfs_args(),
+            "--entrypoint",
+            (
+                "/opt/puddingclaw/runtime/python-skill/.venv/bin/python"
+                if runtime_path is not None
+                else "python3"
+            ),
+        ]
+        if spec["uid"] is not None and spec["gid"] is not None:
+            args.extend(["--user", f"{spec['uid']}:{spec['gid']}"])
+        args.extend(
+            [
+                image_id,
+                *interpreter_args,
+                f"/skills/{skill_id}/{script_relative}",
+                *script_args,
+            ]
+        )
+        try:
+            result = self._run(args, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return ExecuteResponse(output="Python Skill execution timed out.", exit_code=124)
+        output, truncated = _bounded_output(result.stdout, result.stderr, max_output_bytes=max_output_bytes)
+        if result.returncode != 0:
+            output = f"{output.rstrip()}\n\nExit code: {result.returncode}"
+        return ExecuteResponse(output=output, exit_code=result.returncode, truncated=truncated)
+
+    def resolve_managed_node_cli(
+        self,
+        workspace: Path | None = None,
+        *,
+        distribution: str,
+        package: str,
+        timeout: int = 60,
+    ) -> ManagedNodePackageResolution:
+        """Resolve a selector to immutable registry identity before approval."""
+
+        workspace = (workspace or Path.cwd()).expanduser().resolve()
+        spec = self._spec(workspace)
+        image_id = self.ensure_image(spec["image"])
+        args = [
+            "run",
+            "--rm",
+            "--label",
+            "com.puddingclaw.managed=true",
+            "--label",
+            "com.puddingclaw.kind=installer-resolver",
+            "--label",
+            f"com.puddingclaw.owner={self._owner_label()}",
+            "--network",
+            "bridge",
+            "--read-only",
+            "--tmpfs",
+            "/home/puddingclaw:rw,nosuid,nodev,size=128m",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--pids-limit",
+            str(spec["pids_limit"]),
+            "--memory",
+            f"{spec['memory_limit_mb']}m",
+            "--cpus",
+            spec["cpu_limit"],
+            "--env",
+            "HOME=/home/puddingclaw",
             "--entrypoint",
             "npm",
         ]
         if spec["uid"] is not None and spec["gid"] is not None:
             args.extend(["--user", f"{spec['uid']}:{spec['gid']}"])
-        args.extend([image_id, "install", "--global", distribution])
-        try:
-            installed = self._run(args, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            return ExecuteResponse(
-                output=f"Error: Managed CLI installation timed out after {timeout} seconds.",
-                exit_code=124,
-            )
-        output, truncated = _bounded_output(
-            installed.stdout,
-            installed.stderr,
-            max_output_bytes=max_output_bytes,
-        )
-        if installed.returncode != 0:
-            return ExecuteResponse(output=output, exit_code=installed.returncode, truncated=truncated)
-        verified = self._run(
+        args.extend(
             [
-                "run",
-                "--rm",
-                "--network",
-                "none",
-                "--read-only",
-                "--mount",
-                f"type=bind,src={toolchain_path},dst={container_path},readonly",
-                "--cap-drop",
-                "ALL",
-                "--security-opt",
-                "no-new-privileges",
-                "--entrypoint",
-                f"{container_path}/bin/lark-cli",
                 image_id,
-                "--version",
-            ],
-            timeout=60,
+                "view",
+                distribution,
+                "name",
+                "version",
+                "dist.integrity",
+                "bin",
+                "--json",
+            ]
         )
-        verification, verification_truncated = _bounded_output(
-            verified.stdout,
-            verified.stderr,
-            max_output_bytes=max_output_bytes,
+        try:
+            result = self._run(args, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise ValueError("managed package resolution timed out") from exc
+        if result.returncode != 0:
+            raise ValueError("managed package selector could not be resolved")
+        try:
+            value = json.loads(result.stdout)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("managed package registry returned invalid metadata") from exc
+        if not isinstance(value, dict):
+            raise ValueError("managed package selector must resolve to exactly one version")
+        resolved_name = str(value.get("name") or "")
+        resolved_version = str(value.get("version") or "")
+        dist = value.get("dist")
+        resolved_integrity = str(
+            value.get("dist.integrity") or (dist.get("integrity") if isinstance(dist, dict) else "") or ""
         )
-        combined = f"{output.rstrip()}\n\nVerification:\n{verification}"
-        return ExecuteResponse(
-            output=combined,
-            exit_code=verified.returncode,
-            truncated=truncated or verification_truncated,
+        raw_bin = value.get("bin")
+        if isinstance(raw_bin, str):
+            executables = (resolved_name.rsplit("/", 1)[-1],)
+        elif isinstance(raw_bin, dict):
+            executables = tuple(sorted(str(name) for name in raw_bin))
+        else:
+            executables = ()
+        if (
+            resolved_name != package
+            or not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", resolved_version)
+            or not re.fullmatch(r"sha512-[A-Za-z0-9+/]+={0,2}", resolved_integrity)
+            or any(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", name) is None for name in executables)
+        ):
+            raise ValueError("managed package registry identity is incompatible")
+        return ManagedNodePackageResolution(
+            package=resolved_name,
+            version=resolved_version,
+            integrity=resolved_integrity,
+            distribution=f"{resolved_name}@{resolved_version}",
+            runtime_image_digest=image_id,
+            executables=executables,
+        )
+
+    def install_managed_node_cli(
+        self,
+        workspace: Path | None = None,
+        *,
+        distribution: str,
+        package: str,
+        expected_runtime_image_digest: str,
+        executable: str,
+        verification_argv: tuple[str, ...] = ("--version",),
+        toolchain_path: Path,
+        container_path: str,
+        timeout: int = 600,
+        max_output_bytes: int = 100_000,
+    ) -> ExecuteResponse:
+        """Reject the removed single-package incremental installer."""
+
+        raise RuntimeError(
+            "single-package managed CLI installation is disabled; "
+            "use the declarative shared Node runtime transaction"
         )
 
     @staticmethod
@@ -1471,6 +2019,8 @@ class ProjectSandboxManager:
         provider: str,
         profile_id: str,
         credential_state_spec: CredentialStateSpec,
+        adapter_id: str,
+        authorization_contract_fingerprint: str,
         max_output_bytes: int = 100_000,
     ) -> ManagedProviderExecutionResult:
         """Poll and prepare one browser-auth result without destroying it.
@@ -1488,7 +2038,11 @@ class ProjectSandboxManager:
             [
                 "inspect",
                 "--format",
-                '{{.State.Running}} {{ index .Config.Labels "com.puddingclaw.credential-state" }}',
+                (
+                    '{{.State.Running}} {{ index .Config.Labels "com.puddingclaw.credential-state" }} '
+                    '{{ index .Config.Labels "com.puddingclaw.adapter" }} '
+                    '{{ index .Config.Labels "com.puddingclaw.authorization-contract" }}'
+                ),
                 name,
             ],
             timeout=10,
@@ -1497,7 +2051,7 @@ class ProjectSandboxManager:
         if (
             inspection.returncode != 0
             or inspection_parts[:1] != ["true"]
-            or inspection_parts[1:] != [credential_state_fingerprint]
+            or inspection_parts[1:] != [credential_state_fingerprint, adapter_id, authorization_contract_fingerprint]
         ):
             return ManagedProviderExecutionResult(
                 output="Managed browser authorization job is missing or expired.",
@@ -1625,10 +2179,14 @@ class ProjectSandboxManager:
             provider = str(labels.get("com.puddingclaw.provider") or "")
             profile_id = str(labels.get("com.puddingclaw.profile") or "")
             job_id = str(labels.get("com.puddingclaw.browser-job") or "")
+            adapter_id = str(labels.get("com.puddingclaw.adapter") or "")
+            authorization_contract_fingerprint = str(labels.get("com.puddingclaw.authorization-contract") or "")
             credential_state_fingerprint = str(labels.get("com.puddingclaw.credential-state") or "")
             if (
                 not provider
                 or not profile_id
+                or not re.fullmatch(r"[a-z0-9][a-z0-9_.-]*", adapter_id)
+                or not re.fullmatch(r"[0-9a-f]{64}", authorization_contract_fingerprint)
                 or not re.fullmatch(r"[0-9a-f]{64}", credential_state_fingerprint)
                 or job_id != self._managed_browser_job_id(owner_user_id, provider, profile_id)
             ):
@@ -1638,6 +2196,8 @@ class ProjectSandboxManager:
                     "provider": provider,
                     "profile_id": profile_id,
                     "browser_job_id": job_id,
+                    "adapter_id": adapter_id,
+                    "authorization_contract_fingerprint": authorization_contract_fingerprint,
                     "credential_state_fingerprint": credential_state_fingerprint,
                 }
             )
@@ -1656,17 +2216,38 @@ class ProjectSandboxManager:
         owner_user_id: str,
         provider: str,
         profile_id: str,
+        adapter_id: str,
+        authorization_contract_fingerprint: str,
+        expected_runtime_image_digest: str,
         wait_for_url_seconds: float = 30.0,
         max_output_bytes: int = 100_000,
     ) -> ManagedProviderExecutionResult:
-        """Launch exact blocking browser auth and return once its URL appears."""
+        """Launch one Adapter-owned blocking browser process.
 
-        if argv != ["lark-cli", "config", "init", "--new"]:
-            raise ValueError("managed browser runner currently owns only config init --new")
+        Provider output stays opaque at this layer. The trusted Authorization
+        Driver validates public URLs and phase semantics after collection.
+        """
+
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]*", adapter_id):
+            raise ValueError("managed browser Adapter id is invalid")
+        if not re.fullmatch(r"[0-9a-f]{64}", authorization_contract_fingerprint):
+            raise ValueError("managed browser authorization contract is invalid")
         workspace = workspace.expanduser().resolve()
         toolchain_path = toolchain_path.expanduser().resolve(strict=True)
+        if not argv:
+            raise ValueError("browser runner argv is not owned by the mounted Toolchain revision")
+        try:
+            allowed_executable = _shared_runtime_executable(
+                toolchain_path,
+                argv[0],
+                expected_runtime_image_digest,
+            )
+        except ValueError as exc:
+            raise ValueError("browser runner argv is not owned by the mounted Toolchain revision") from exc
         spec = self._spec(workspace)
         image_id = self.ensure_image(spec["image"])
+        if image_id != expected_runtime_image_digest:
+            raise ValueError("managed browser runtime image changed after approval")
         job_id = self._managed_browser_job_id(owner_user_id, provider, profile_id)
         name = self._managed_browser_container_name(owner_user_id, provider, profile_id)
         state_paths = _credential_state_paths(credential_state_spec.paths)
@@ -1687,6 +2268,8 @@ class ProjectSandboxManager:
             provider=provider,
             profile_id=profile_id,
             credential_state_spec=credential_state_spec,
+            adapter_id=adapter_id,
+            authorization_contract_fingerprint=authorization_contract_fingerprint,
             max_output_bytes=max_output_bytes,
         )
         if existing.browser_status != "missing":
@@ -1695,7 +2278,7 @@ class ProjectSandboxManager:
         home_tmpfs = "/home/puddingclaw:rw,nosuid,nodev,size=128m"
         if spec["uid"] is not None and spec["gid"] is not None:
             home_tmpfs += f",uid={spec['uid']},gid={spec['gid']}"
-        exact_command = shlex.join([f"{container_path}/bin/lark-cli", *argv[1:]])
+        exact_command = shlex.join([f"{container_path}/bin/{allowed_executable}", *argv[1:]])
         supervisor = (
             f"set +e; {_credential_state_mkdir_command(state_paths)}; "
             "ready_wait=0; while [ ! -f /tmp/puddingclaw-browser-ready ]; do "
@@ -1729,6 +2312,10 @@ class ProjectSandboxManager:
             f"com.puddingclaw.profile={profile_id}",
             "--label",
             f"com.puddingclaw.credential-state={credential_state_fingerprint}",
+            "--label",
+            f"com.puddingclaw.adapter={adapter_id}",
+            "--label",
+            f"com.puddingclaw.authorization-contract={authorization_contract_fingerprint}",
             "--network",
             "bridge",
             "--read-only",
@@ -1820,22 +2407,29 @@ class ProjectSandboxManager:
             if ready.returncode != 0:
                 raise RuntimeError(ready.stderr)
             deadline = time.monotonic() + max(1.0, wait_for_url_seconds)
+            output_seen_at: float | None = None
             while True:
                 result = self.collect_managed_browser_auth_cli(
                     owner_user_id=owner_user_id,
                     provider=provider,
                     profile_id=profile_id,
                     credential_state_spec=credential_state_spec,
+                    adapter_id=adapter_id,
+                    authorization_contract_fingerprint=authorization_contract_fingerprint,
                     max_output_bytes=max_output_bytes,
                 )
                 if result.browser_status != "awaiting_user_browser":
                     return result
-                if _lark_config_verification_url(result.output) is not None:
-                    return result
+                if result.output.strip():
+                    output_seen_at = output_seen_at or time.monotonic()
+                    # Give line-buffered CLIs a short provider-neutral window
+                    # to finish emitting their initial public material.
+                    if time.monotonic() - output_seen_at >= 0.5:
+                        return result
                 if time.monotonic() >= deadline:
                     self._run(["rm", "-f", name], timeout=30)
                     return ManagedProviderExecutionResult(
-                        output="Browser authorization did not emit a verification URL in time.",
+                        output="Browser authorization did not emit public output in time.",
                         exit_code=1,
                         credential_state=None,
                         browser_status="failed",
@@ -1858,26 +2452,37 @@ class ProjectSandboxManager:
         credential_state: bytes,
         network_enabled: bool,
         workspace_writable: bool,
+        expected_runtime_image_digest: str,
         continuation_secret: bytes | None = None,
+        continuation_argument: str | None = None,
+        continuation_trailing_argv: tuple[str, ...] = (),
         timeout: int = 120,
         max_output_bytes: int = 100_000,
     ) -> ManagedProviderExecutionResult:
         """Run exact Adapter-owned argv with credentials only in container tmpfs."""
 
-        if not argv or argv[0] != "lark-cli":
-            raise ValueError("provider runner accepts only Adapter-normalized lark-cli argv")
         workspace = workspace.expanduser().resolve()
         toolchain_path = toolchain_path.expanduser().resolve(strict=True)
+        if not argv:
+            raise ValueError("provider runner argv is not owned by the mounted Toolchain revision")
+        try:
+            _shared_runtime_executable(
+                toolchain_path,
+                argv[0],
+                expected_runtime_image_digest,
+            )
+        except ValueError as exc:
+            raise ValueError("provider runner argv is not owned by the mounted Toolchain revision") from exc
         spec = self._spec(workspace)
         image_id = self.ensure_image(spec["image"])
+        if image_id != expected_runtime_image_digest:
+            raise ValueError("managed provider runtime image changed after approval")
         name = f"puddingclaw-provider-{uuid.uuid4().hex[:20]}"
         state_paths = _credential_state_paths(
             credential_state_spec.paths if credential_state_spec is not None else (),
             allow_empty=True,
         )
-        credential_state_environment = (
-            dict(credential_state_spec.env) if credential_state_spec is not None else {}
-        )
+        credential_state_environment = dict(credential_state_spec.env) if credential_state_spec is not None else {}
         if not state_paths and (credential_state_environment or credential_state):
             raise ValueError("credentialless managed command cannot receive provider state")
         if credential_state:
@@ -1943,10 +2548,7 @@ class ProjectSandboxManager:
                 image_id,
                 "sh",
                 "-c",
-                (
-                    f"{state_setup} && "
-                    f"timeout {max(timeout + 60, 300)}s sleep infinity"
-                ),
+                (f"{state_setup} && timeout {max(timeout + 60, 300)}s sleep infinity"),
             ]
         )
         created = self._run(create, timeout=60)
@@ -1988,8 +2590,16 @@ class ProjectSandboxManager:
             exec_args = ["exec", "--workdir", "/workspace"]
             for key, value in sorted(environment.items()):
                 exec_args.extend(["--env", f"{key}={value}"])
-            if continuation_secret is not None and argv != ["lark-cli", "auth", "login"]:
-                raise ValueError("continuation secret is supported only by the fixed lark auth-resume command")
+            if continuation_secret is not None and not (
+                continuation_argument and re.fullmatch(r"--[a-z0-9][a-z0-9-]*", continuation_argument)
+            ):
+                raise ValueError("continuation secret requires a trusted Driver argument contract")
+            if continuation_secret is None and continuation_argument is not None:
+                raise ValueError("continuation argument cannot be used without a continuation secret")
+            if continuation_secret is None and continuation_trailing_argv:
+                raise ValueError("continuation trailing argv cannot be used without a continuation secret")
+            if any(not value or "\x00" in value for value in continuation_trailing_argv):
+                raise ValueError("continuation trailing argv is invalid")
             provider_timeout = max(1, int(timeout))
             docker_exec_timeout = provider_timeout + 10
             try:
@@ -2008,22 +2618,32 @@ class ProjectSandboxManager:
                 else:
                     # The provider continuation secret must not appear in
                     # Docker's host argv, process inspection, traces, or logs.
-                    # Only this fixed Backend-owned wrapper may receive it,
+                    # Only this Backend-owned positional wrapper may receive it,
                     # over stdin, inside the credential-isolated runner.
                     # docker exec does not attach stdin unless -i is explicit;
                     # without it `cat` returns an empty string and lark-cli
                     # silently starts/validates a new authorization instead of
                     # consuming the browser-approved device code.
                     exec_args.insert(1, "-i")
+                    continuation_command = shlex.join(
+                        [
+                            "timeout",
+                            "--signal=TERM",
+                            "--kill-after=5s",
+                            f"{provider_timeout}s",
+                            *argv,
+                            str(continuation_argument),
+                        ]
+                    )
+                    trailing_command = shlex.join(list(continuation_trailing_argv))
                     exec_args.extend(
                         [
                             name,
                             "sh",
                             "-c",
                             (
-                                'secret="$(cat)"; exec timeout --signal=TERM --kill-after=5s '
-                                f'{provider_timeout}s lark-cli auth login '
-                                '--device-code "$secret" --json'
+                                f'secret="$(cat)"; exec {continuation_command} "$secret"'
+                                + (f" {trailing_command}" if trailing_command else "")
                             ),
                         ]
                     )
@@ -2049,14 +2669,10 @@ class ProjectSandboxManager:
                     stderr=timeout_message,
                 )
             result_stdout = (
-                result.stdout.decode("utf-8", errors="replace")
-                if isinstance(result.stdout, bytes)
-                else result.stdout
+                result.stdout.decode("utf-8", errors="replace") if isinstance(result.stdout, bytes) else result.stdout
             )
             result_stderr = (
-                result.stderr.decode("utf-8", errors="replace")
-                if isinstance(result.stderr, bytes)
-                else result.stderr
+                result.stderr.decode("utf-8", errors="replace") if isinstance(result.stderr, bytes) else result.stderr
             )
             output, truncated = _bounded_output(
                 result_stdout,
@@ -2173,8 +2789,8 @@ class ProjectSandboxManager:
             "HOME=/home/puddingclaw",
             "--env",
             (
-                "PATH=/opt/puddingclaw/toolchain/node/bin:/home/puddingclaw/.local/bin:"
-                "/home/puddingclaw/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
+                "PATH=/home/puddingclaw/.local/bin:/home/puddingclaw/.npm-global/bin:"
+                "/usr/local/bin:/usr/bin:/bin"
             ),
             *_managed_credential_state_tmpfs_args(),
             "--entrypoint",
@@ -2277,8 +2893,8 @@ class ProjectSandboxManager:
             "HOME=/home/puddingclaw",
             "--env",
             (
-                "PATH=/opt/puddingclaw/toolchain/node/bin:/home/puddingclaw/.local/bin:"
-                "/home/puddingclaw/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
+                "PATH=/home/puddingclaw/.local/bin:/home/puddingclaw/.npm-global/bin:"
+                "/usr/local/bin:/usr/bin:/bin"
             ),
             *_managed_credential_state_tmpfs_args(),
             "--entrypoint",
@@ -2432,11 +3048,7 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         scratch_relative = str(manager.config.get("_scratch_relative") or "").strip("/")
         spec = manager._spec(self.workspace_path)
         scratch_mount = next(
-            (
-                item
-                for item in spec.get("writable_mounts") or []
-                if item.get("target") == "/scratch"
-            ),
+            (item for item in spec.get("writable_mounts") or [] if item.get("target") == "/scratch"),
             None,
         )
         scratch_source = str((scratch_mount or {}).get("source") or "").strip()
@@ -2459,6 +3071,64 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
     @property
     def id(self) -> str:
         return f"docker:{self.container_name}:{self.spec_hash[:12]}"
+
+    def _python_skill_invocation(
+        self,
+        command: str,
+    ) -> tuple[str, Path, str, list[str], list[str]] | None:
+        """Parse the narrow direct Python Skill execution surface."""
+
+        if "/skills/" not in command or re.search(r"(?:^|\s)(?:python|python3)\b", command) is None:
+            return None
+        try:
+            argv = shlex.split(command, posix=True)
+        except ValueError as exc:
+            raise ValueError("Python Skill command has invalid quoting") from exc
+        if not argv or Path(argv[0]).name not in {"python", "python3"}:
+            raise ValueError("Python Skill dependencies require a direct managed Python invocation")
+        if any(re.search(r"[|&;<>]", token) for token in argv):
+            raise ValueError("Python Skill dependencies do not allow a compound shell command")
+        interpreter_args: list[str] = []
+        script_index = 1
+        allowed_flags = {"-B", "-E", "-I", "-s", "-S", "-u"}
+        while script_index < len(argv) and argv[script_index].startswith("-"):
+            flag = argv[script_index]
+            if flag not in allowed_flags:
+                raise ValueError(f"unsupported managed Python interpreter flag: {flag}")
+            interpreter_args.append(flag)
+            script_index += 1
+        if script_index >= len(argv):
+            raise ValueError("Python Skill command has no script")
+        script_virtual = PurePosixPath(argv[script_index])
+        if (
+            not script_virtual.is_absolute()
+            or len(script_virtual.parts) < 4
+            or script_virtual.parts[1] != "skills"
+            or script_virtual.suffix != ".py"
+            or ".." in script_virtual.parts
+        ):
+            raise ValueError("Python Skill script must be an exact /skills/<id>/*.py path")
+        skill_id = script_virtual.parts[2]
+        source = next(
+            (
+                Path(str(item.get("source") or ""))
+                for item in self.manager.config.get("_managed_readonly_mounts") or []
+                if isinstance(item, dict) and item.get("target") == "/skills"
+            ),
+            None,
+        )
+        if source is None:
+            raise ValueError("managed Skill source is unavailable")
+        source = source.expanduser().resolve(strict=True)
+        skill_root = source / skill_id
+        if skill_root.is_symlink() or not skill_root.is_dir():
+            raise ValueError("managed Skill is unavailable")
+        relative = PurePosixPath(*script_virtual.parts[3:]).as_posix()
+        host_script = (skill_root / relative).resolve(strict=True)
+        host_script.relative_to(skill_root.resolve())
+        if host_script.is_symlink() or not host_script.is_file():
+            raise ValueError("managed Skill script is unavailable")
+        return skill_id, skill_root, relative, interpreter_args, argv[script_index + 1 :]
 
     def execute(
         self,
@@ -2532,6 +3202,41 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
                     command,
                     workspace_path=self.workspace_path,
                 )
+                skill_invocation = self._python_skill_invocation(command)
+                if skill_invocation is not None:
+                    from runtime_identity.paths import PuddingClawPaths
+                    from runtime_identity.software_runtime import (
+                        SoftwareRuntimeManager,
+                        skill_content_version,
+                    )
+
+                    skill_id, skill_root, script_relative, interpreter_args, script_args = skill_invocation
+                    image_id = self.manager.ensure_image(
+                        str(self.manager.config.get("image") or DEFAULT_SANDBOX_IMAGE)
+                    )
+                    runtime = SoftwareRuntimeManager(
+                        PuddingClawPaths.from_environment(),
+                        self.manager.runtime_contract,
+                    ).python_skill_current(
+                        skill_id,
+                        skill_content_version(skill_root),
+                        image_id,
+                    )
+                    result = self.manager.run_python_skill(
+                        self.workspace_path,
+                        skill_id=skill_id,
+                        skill_root=skill_root,
+                        runtime_path=runtime,
+                        script_relative=script_relative,
+                        interpreter_args=interpreter_args,
+                        script_args=script_args,
+                        timeout=effective_timeout,
+                        max_output_bytes=self._max_output_bytes,
+                        network_enabled=effects.network,
+                        expected_runtime_image_digest=image_id,
+                    )
+                    self.manager.mark_activity(self.container_name)
+                    return result
                 if not bool(self.manager.config.get("network_enabled", False)) and effects.network:
                     result = self.manager.run_ephemeral_network_command(
                         self.workspace_path,
@@ -2606,51 +3311,31 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
                 exit_code=1,
             )
 
-    def install_packages(
-        self,
-        ecosystem: str,
-        packages: list[str],
-    ) -> ExecuteResponse:
-        """Install Skill dependencies without networking the runtime container."""
+    def managed_runtime_image_digest(self) -> str:
+        return self.manager.managed_runtime_image_digest(self.workspace_path)
 
-        if ecosystem == "python":
-            argv = ["python3", "-m", "pip", "install", "--user", *packages]
-        elif ecosystem == "node":
-            argv = ["npm", "install", "--global", *packages]
-        else:
-            return ExecuteResponse(
-                output=f"Error: Unsupported package ecosystem {ecosystem!r}.",
-                exit_code=1,
-            )
-        with self.manager._lock(self.container_name):
-            # Ensure the persistent runtime/dependency volumes exist, but do
-            # not attach the long-lived container to a network.
-            container_name, spec_hash = self.manager.ensure_container(self.workspace_path)
-            if container_name != self.container_name or spec_hash != self.spec_hash:
-                raise RuntimeError("Docker sandbox specification changed after this Run started; start a new Run.")
-            result = self.manager.run_ephemeral_network_command(
-                self.workspace_path,
-                argv=argv,
-                timeout=max(self._default_timeout, 300),
-                max_output_bytes=self._max_output_bytes,
-            )
-            self.manager.mark_activity(self.container_name)
-            return result
+    def resolve_shared_node_runtime(self, **kwargs: Any) -> ExecuteResponse:
+        return self.manager.resolve_shared_node_runtime(self.workspace_path, **kwargs)
 
-    def install_managed_node_cli(
+    def build_shared_node_runtime(self, **kwargs: Any) -> ExecuteResponse:
+        return self.manager.build_shared_node_runtime(self.workspace_path, **kwargs)
+
+    def resolve_python_skill_runtime(self, **kwargs: Any) -> ExecuteResponse:
+        return self.manager.resolve_python_skill_runtime(self.workspace_path, **kwargs)
+
+    def build_python_skill_runtime(self, **kwargs: Any) -> ExecuteResponse:
+        return self.manager.build_python_skill_runtime(self.workspace_path, **kwargs)
+
+    def resolve_managed_node_cli(
         self,
         *,
         distribution: str,
-        toolchain_path: Path,
-        container_path: str,
-    ) -> ExecuteResponse:
-        return self.manager.install_managed_node_cli(
+        package: str,
+    ) -> ManagedNodePackageResolution:
+        return self.manager.resolve_managed_node_cli(
             self.workspace_path,
             distribution=distribution,
-            toolchain_path=toolchain_path,
-            container_path=container_path,
-            timeout=max(self._default_timeout, 600),
-            max_output_bytes=self._max_output_bytes,
+            package=package,
         )
 
     def run_managed_provider_cli(
@@ -2664,7 +3349,10 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         credential_state: bytes,
         network_enabled: bool,
         workspace_writable: bool,
+        expected_runtime_image_digest: str,
         continuation_secret: bytes | None = None,
+        continuation_argument: str | None = None,
+        continuation_trailing_argv: tuple[str, ...] = (),
     ) -> ManagedProviderExecutionResult:
         return self.manager.run_managed_provider_cli(
             self.workspace_path,
@@ -2676,7 +3364,10 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
             credential_state=credential_state,
             network_enabled=network_enabled,
             workspace_writable=workspace_writable,
+            expected_runtime_image_digest=expected_runtime_image_digest,
             continuation_secret=continuation_secret,
+            continuation_argument=continuation_argument,
+            continuation_trailing_argv=continuation_trailing_argv,
             timeout=self._default_timeout,
             max_output_bytes=self._max_output_bytes,
         )
@@ -2693,6 +3384,9 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         owner_user_id: str,
         provider: str,
         profile_id: str,
+        adapter_id: str,
+        authorization_contract_fingerprint: str,
+        expected_runtime_image_digest: str,
     ) -> ManagedProviderExecutionResult:
         return self.manager.run_managed_browser_auth_cli(
             self.workspace_path,
@@ -2705,6 +3399,9 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
             owner_user_id=owner_user_id,
             provider=provider,
             profile_id=profile_id,
+            adapter_id=adapter_id,
+            authorization_contract_fingerprint=authorization_contract_fingerprint,
+            expected_runtime_image_digest=expected_runtime_image_digest,
             max_output_bytes=self._max_output_bytes,
         )
 
@@ -2715,12 +3412,16 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         provider: str,
         profile_id: str,
         credential_state_spec: CredentialStateSpec,
+        adapter_id: str,
+        authorization_contract_fingerprint: str,
     ) -> ManagedProviderExecutionResult:
         return self.manager.collect_managed_browser_auth_cli(
             owner_user_id=owner_user_id,
             provider=provider,
             profile_id=profile_id,
             credential_state_spec=credential_state_spec,
+            adapter_id=adapter_id,
+            authorization_contract_fingerprint=authorization_contract_fingerprint,
             max_output_bytes=self._max_output_bytes,
         )
 
@@ -2750,7 +3451,12 @@ class AdaptiveWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
     runtime_contract = RUNTIME_CONTRACT
     _MANAGED_DOCKER_METHODS = frozenset(
         {
-            "install_managed_node_cli",
+            "managed_runtime_image_digest",
+            "resolve_shared_node_runtime",
+            "build_shared_node_runtime",
+            "resolve_python_skill_runtime",
+            "build_python_skill_runtime",
+            "resolve_managed_node_cli",
             "run_managed_provider_cli",
             "run_managed_browser_auth_cli",
             "collect_managed_browser_auth_cli",
@@ -2785,9 +3491,9 @@ class AdaptiveWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         self._default_timeout = timeout
         self._docker: DockerWorkspaceBackend | None = None
         self._docker_lock = threading.RLock()
-        workspace_digest = hashlib.sha256(
-            str(self.workspace_path).encode("utf-8")
-        ).hexdigest()[:16]
+        self._host_runtime: Any | None = None
+        self._host_runtime_lock = threading.RLock()
+        workspace_digest = hashlib.sha256(str(self.workspace_path).encode("utf-8")).hexdigest()[:16]
         self._id = f"adaptive:kernel-first:{workspace_digest}"
 
     @property
@@ -2810,6 +3516,18 @@ class AdaptiveWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
                 require_execution_permit=True,
             )
             return self._docker
+
+    def _host_runtime_backend(self) -> Any:
+        from harness.host_skill_runtime import HostSkillRuntimeBackend
+        from runtime_identity.paths import PuddingClawPaths
+
+        with self._host_runtime_lock:
+            if self._host_runtime is None:
+                self._host_runtime = HostSkillRuntimeBackend(
+                    PuddingClawPaths.from_environment(),
+                    timeout=max(self._default_timeout, 900),
+                )
+            return self._host_runtime
 
     def execute(
         self,
@@ -2862,8 +3580,164 @@ class AdaptiveWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
     def execute_external_directory(self, *args: Any, **kwargs: Any) -> ExecuteResponse:
         return self._docker_backend().execute_external_directory(*args, **kwargs)
 
-    def install_packages(self, *args: Any, **kwargs: Any) -> ExecuteResponse:
-        return self._docker_backend().install_packages(*args, **kwargs)
+    def _skill_runtime(self, skill_id: str, skill_version: str) -> str:
+        from runtime_identity.paths import PuddingClawPaths
+        from runtime_identity.skill_runtimes import SkillRuntimeBindingStore
+
+        return SkillRuntimeBindingStore(PuddingClawPaths.from_environment()).runtime_for(
+            skill_id=skill_id,
+            skill_version=skill_version,
+        )
+
+    def skill_runtime_for_command(self, command: str) -> str:
+        from runtime_identity.software_runtime import skill_content_version
+
+        skill_ids = set(
+            re.findall(
+                r"(?:^|[\s'\"])/skills/([A-Za-z0-9][A-Za-z0-9_.-]{0,127})(?:/|[\s'\"]|$)",
+                command,
+            )
+        )
+        if len(skill_ids) != 1:
+            return "host"
+        skill_id = next(iter(skill_ids))
+        skills_root = next(
+            (root for virtual, root in self.managed_readonly_path_aliases if virtual == "/skills"),
+            None,
+        )
+        if skills_root is None:
+            return "host"
+        skill_root = (skills_root / skill_id).resolve(strict=True)
+        skill_root.relative_to(skills_root.resolve(strict=True))
+        return self._skill_runtime(skill_id, skill_content_version(skill_root))
+
+    def prepare_docker_execution(self, command: str) -> Any:
+        """Project only Linux-built runtime bytes for an explicitly bound Skill."""
+
+        from harness.host_skill_runtime import HostExecutionProjection
+        from runtime_identity.paths import PuddingClawPaths
+        from runtime_identity.software_runtime import SoftwareRuntimeManager
+
+        if self.skill_runtime_for_command(command) != "docker":
+            return HostExecutionProjection(command)
+        if re.search(r"(?:^|\s)(?:python|python3)\b", command):
+            return HostExecutionProjection(command, environment_binding_digest="docker-python")
+        docker = self._docker_backend()
+        digest = docker.managed_runtime_image_digest()
+        release = SoftwareRuntimeManager(
+            PuddingClawPaths.from_environment(),
+            docker.manager.runtime_contract,
+        ).node_current(digest)
+        if release.name == "empty":
+            return HostExecutionProjection(command, environment_binding_digest="docker-node-empty")
+        path = ":".join((str(release / "bin"), "/usr/local/bin", "/usr/bin", "/bin"))
+        projected = (
+            f"export PATH={shlex.quote(path)}; "
+            f"export NODE_PATH={shlex.quote(str(release / 'node_modules'))}; {command}"
+        )
+        return HostExecutionProjection(
+            projected,
+            (release,),
+            environment_binding_digest=hashlib.sha256(
+                f"docker-node\0{digest}\0{release.name}".encode()
+            ).hexdigest(),
+        )
+
+    def install_packages(
+        self,
+        skill_id: str,
+        skill_version: str,
+        ecosystem: str,
+        packages: list[str],
+        executables: dict[str, list[str]] | None = None,
+    ) -> ExecuteResponse:
+        if self._skill_runtime(skill_id, skill_version) != "docker":
+            installer = self._host_runtime_backend().install_packages
+            if executables:
+                return installer(skill_id, skill_version, ecosystem, packages, executables)
+            return installer(skill_id, skill_version, ecosystem, packages)
+        from runtime_identity.paths import PuddingClawPaths
+        from runtime_identity.software_runtime import SoftwareRuntimeManager
+
+        docker = self._docker_backend()
+        manager = SoftwareRuntimeManager(
+            PuddingClawPaths.from_environment(),
+            docker.manager.runtime_contract,
+        )
+        try:
+            if ecosystem == "python":
+                installed = manager.install_python_skill(
+                    docker,
+                    skill_id=skill_id,
+                    skill_version=skill_version,
+                    requirements=packages,
+                )
+            elif ecosystem == "node":
+                installed = manager.install_node_owner(
+                    docker,
+                    owner=f"skill:{skill_id}",
+                    owner_revision=skill_version,
+                    distributions=packages,
+                    declared_bins={
+                        package: tuple(bins) for package, bins in (executables or {}).items()
+                    },
+                    merge_owner=True,
+                )
+            else:
+                return ExecuteResponse(output=f"Unsupported package ecosystem: {ecosystem}", exit_code=64)
+        except (OSError, ValueError) as exc:
+            return ExecuteResponse(
+                output=f"Docker Skill dependency transaction failed: {type(exc).__name__}: {exc}",
+                exit_code=65,
+            )
+        return ExecuteResponse(
+            output=json.dumps(
+                {
+                    "status": "installed" if installed.exit_code == 0 else "failed",
+                    "skill_id": skill_id,
+                    "skill_version": skill_version,
+                    "ecosystem": ecosystem,
+                    "runtime": "docker",
+                    "revision": installed.revision,
+                    "runtime_environment_digest": installed.runtime_image_digest,
+                    "diagnostic": installed.output,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            exit_code=installed.exit_code,
+        )
+
+    def prepare_host_skill_execution(
+        self,
+        command: str,
+        *,
+        active_skill_ids: tuple[str, ...] = (),
+    ) -> Any:
+        return self.kernel.prepare_host_skill_execution(
+            command,
+            active_skill_ids=active_skill_ids,
+        )
+
+    def prepare_host_execution(
+        self,
+        command: str,
+        *,
+        active_skill_ids: tuple[str, ...] = (),
+    ) -> Any:
+        return self.kernel.prepare_host_execution(
+            command,
+            active_skill_ids=active_skill_ids,
+        )
+
+    def resolve_generic_node_cli(self, **kwargs: Any) -> Any:
+        return self._host_runtime_backend().resolve_generic_node_cli(**kwargs)
+
+    def generic_node_runtime_current(self, runtime_digest: str) -> Path:
+        return self._host_runtime_backend().generic_node_runtime_current(runtime_digest)
+
+    def install_generic_node_cli(self, **kwargs: Any) -> Any:
+        return self._host_runtime_backend().install_generic_node_cli(**kwargs)
 
     def __getattr__(self, name: str) -> Any:
         if name in self._MANAGED_DOCKER_METHODS:
@@ -2881,12 +3755,7 @@ class AdaptiveWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
 
 @dataclass(frozen=True)
 class WorkspaceBackendSelection:
-    backend: (
-        RestrictedHostWorkspaceBackend
-        | KernelWorkspaceBackend
-        | AdaptiveWorkspaceBackend
-        | DockerWorkspaceBackend
-    )
+    backend: RestrictedHostWorkspaceBackend | KernelWorkspaceBackend | AdaptiveWorkspaceBackend | DockerWorkspaceBackend
     mode: str
     fallback_reason: str | None = None
     dependency_plan: WorkspaceDependencyPlan | None = None
@@ -2902,11 +3771,7 @@ def build_workspace_execution_backend(
     sandbox_mode = str(terminal_config.get("sandbox_mode") or "").strip().lower()
     if sandbox_mode not in {"", "auto", "kernel", "docker"}:
         raise ValueError("sandbox_mode must be auto, kernel, or docker")
-    docker_enabled = (
-        sandbox_mode == "docker"
-        if sandbox_mode
-        else bool(terminal_config.get("docker_enabled", False))
-    )
+    docker_enabled = sandbox_mode == "docker" if sandbox_mode else bool(terminal_config.get("docker_enabled", False))
     docker_config = dict(terminal_config.get("docker") or {})
     managed_readonly_aliases = _managed_readonly_path_aliases(docker_config)
     scratch_host_path_raw = str(terminal_config.get("_scratch_host_path") or "").strip()

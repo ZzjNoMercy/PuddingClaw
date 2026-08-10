@@ -1,17 +1,21 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { Children, isValidElement, useEffect, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
-import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Database, Download, FileSpreadsheet, FileText, FolderOpen, Globe2, HelpCircle, ImageIcon, Key, KeyRound, Layers3, Maximize2, PauseCircle, Plus, Sparkles, SquareTerminal, Trash2 } from "lucide-react";
-import { denyPermissionRequest, grantExternalFilePermission, grantShellDirectoryPermission, grantToolActionPermission, openLocalFile, resolveDatabaseSqlRevisionRequest, resolveDimensionBuildRuleRequest, resolveLogicalDatasetRuleRequest, resolveUserInputRequest, type AgentAttachment, type DatabaseSqlRevisionRequest, type DimensionBuildRuleRequest, type LogicalDatasetRuleRequest, type PermissionRequest, type UserInputAnswer, type UserInputRequest } from "@/lib/api";
+import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Database, Download, FileSpreadsheet, FileText, FolderOpen, Globe2, HelpCircle, ImageIcon, Key, KeyRound, Layers3, Loader2, Maximize2, PauseCircle, Plus, Sparkles, SquareTerminal, Trash2, XCircle } from "lucide-react";
+import { denyPermissionRequest, grantExternalFilePermission, grantShellDirectoryPermission, grantToolActionPermission, resolveDatabaseSqlRevisionRequest, resolveDimensionBuildRuleRequest, resolveLogicalDatasetRuleRequest, resolveSkillSecretRequest, resolveUserInputRequest, type AgentAttachment, type DatabaseSqlRevisionRequest, type DimensionBuildRuleRequest, type LogicalDatasetRuleRequest, type PermissionRequest, type SkillSecretRequest, type UserInputAnswer, type UserInputRequest } from "@/lib/api";
 import { markdownRemarkPlugins, markdownUrlTransform } from "@/lib/markdown";
-import { useApp, type ChatMessage as ChatMessageType, type SourceRecord, type TimelineItem } from "@/lib/store";
+import { useApp, type ChatMessage as ChatMessageType, type SourceRecord, type TimelineItem, type ToolCall } from "@/lib/store";
 import { isPreviewableImageAttachment, isQrImageAttachment } from "@/lib/imageAttachments";
+import { placeOutputAttachments } from "@/lib/artifactPlacement";
 import { splitTimelineAtManagedAuthorizations } from "@/lib/managedAuthorization";
+import { parseLightweightHtmlDocument } from "@/lib/lightweightHtml";
 import ThoughtChain, { SkillPlanCards } from "./ThoughtChain";
 import RetrievalCard from "./RetrievalCard";
 import ManagedAuthorizationCards from "./ManagedAuthorizationCard";
+import HtmlArtifactCard from "./HtmlArtifactCard";
+import LocalFileAttachmentCard from "./LocalFileAttachmentCard";
 
 interface Props {
   message: ChatMessageType;
@@ -62,6 +66,23 @@ const ScrollableMarkdownTable: Components["table"] = ({ node: _node, ...props })
   </div>
 );
 
+const HtmlAwarePre: NonNullable<Components["pre"]> = ({ node: _node, children, ...props }) => {
+  if (Children.count(children) === 1) {
+    const child = Children.only(children);
+    if (isValidElement<{ className?: string; children?: ReactNode }>(child) && child.type === "code") {
+      const code = Children.toArray(child.props.children)
+        .filter((value): value is string => typeof value === "string")
+        .join("");
+      const document = parseLightweightHtmlDocument(child.props.className, code);
+      if (document) {
+        return <HtmlArtifactCard html={document.html} title={document.title} />;
+      }
+    }
+  }
+
+  return <pre {...props}>{children}</pre>;
+};
+
 /** Detect 401 / API key errors without matching arbitrary numbers like patent IDs. */
 function isAuthError(content: string): boolean {
   const lower = content.toLowerCase();
@@ -71,6 +92,55 @@ function isAuthError(content: string): boolean {
   const hasApiKeyError = /invalid.*api\s*key|api\s*key.*invalid|api\s*key.*missing|api\s*key.*not\s*set|apikey.*invalid/i.test(lower);
   const hasAuthFail = /authentication\s*(fail|error|failed)|认证失败|鉴权失败|未通过认证|授权失败/i.test(content);
   return has401 || hasApiKeyError || hasAuthFail;
+}
+
+type AttachmentAnalysisMap = Record<string, ToolCall[]>;
+
+function taskAttachmentRefs(toolCall: ToolCall): string[] {
+  if (toolCall.tool !== "task" && !toolCall.tool.includes("subagent")) return [];
+  let searchable = toolCall.input || "";
+  try {
+    const parsed = JSON.parse(searchable) as Record<string, unknown>;
+    searchable = String(parsed.description || parsed.prompt || searchable);
+  } catch {
+    // Legacy persisted calls may contain plain-text task input.
+  }
+  return Array.from(new Set(searchable.match(/att_[a-zA-Z0-9]+/g) || []));
+}
+
+function attachmentAnalysisMap(message: ChatMessageType): AttachmentAnalysisMap {
+  const attachmentIds = new Set(
+    (message.outputAttachments || []).map((attachment) => attachment.id).filter(Boolean),
+  );
+  const calls = [
+    ...(message.toolCalls || []),
+    ...(message.timeline || []).flatMap((item) => item.type === "tool" && item.toolCall ? [item.toolCall] : []),
+    ...(message.segments || []).flatMap((segment) => [
+      ...(segment.toolCalls || []),
+      ...(segment.timeline || []).flatMap((item) => item.type === "tool" && item.toolCall ? [item.toolCall] : []),
+    ]),
+  ];
+  const uniqueCalls = Array.from(new Map(calls.map((call) => [call.id, call])).values());
+  const result: AttachmentAnalysisMap = {};
+  for (const call of uniqueCalls) {
+    for (const ref of taskAttachmentRefs(call)) {
+      if (!attachmentIds.has(ref)) continue;
+      result[ref] = [...(result[ref] || []), call];
+    }
+  }
+  return result;
+}
+
+function withoutEmbeddedAttachmentAnalysis(
+  timeline: TimelineItem[] = [],
+  analysisByAttachmentId: AttachmentAnalysisMap,
+): TimelineItem[] {
+  const embeddedToolIds = new Set(
+    Object.values(analysisByAttachmentId).flatMap((calls) => calls.map((call) => call.id)),
+  );
+  return timeline.filter(
+    (item) => item.type !== "tool" || !item.toolCall || !embeddedToolIds.has(item.toolCall.id),
+  );
 }
 
 export default function ChatMessage({ message, sessionSources = [], isStreaming = false, showInterruptionNotice = false }: Props) {
@@ -123,6 +193,13 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
   const visibleUserInputRequests = (message.userInputRequests || []).filter(
     (request) => (request.status || "pending") === "pending"
   );
+  const visibleSkillSecretRequests = (message.skillSecretRequests || []).filter(
+    (request) => (request.status || "pending") === "pending"
+  );
+  const outputAttachmentPlacement = message.segments?.length
+    ? placeOutputAttachments(message.outputAttachments, message.segments, message.toolCalls)
+    : { bySegment: [], unplaced: message.outputAttachments || [] };
+  const analysisByAttachmentId = attachmentAnalysisMap(message);
 
   const citationComponents: Components = {
     a: (props) => (
@@ -139,6 +216,7 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
     ),
     img: SafeMarkdownImage,
     table: ScrollableMarkdownTable,
+    ...(!isStreaming ? { pre: HtmlAwarePre } : {}),
   };
 
   return (
@@ -177,8 +255,16 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
                       isStreaming={isStreaming}
                       isLast={index === message.segments!.length - 1}
                       verificationSummary={index === message.segments!.length - 1 ? message.verificationSummary : undefined}
+                      outputAttachments={outputAttachmentPlacement.bySegment[index]}
+                      analysisByAttachmentId={analysisByAttachmentId}
                     />
                   ))}
+                  {outputAttachmentPlacement.unplaced.length ? (
+                    <AssistantAttachmentList
+                      attachments={outputAttachmentPlacement.unplaced}
+                      analysisByAttachmentId={analysisByAttachmentId}
+                    />
+                  ) : null}
                   <SkillPlanCards timeline={orphanSkillPlanTimeline} sessionId={sessionId} />
                   {message.retrievals && message.retrievals.length > 0 && (
                     <RetrievalCard retrievals={message.retrievals} />
@@ -202,7 +288,10 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
                   {visibleUserInputRequests.map((request) => (
                     <UserInputRequestCard key={request.id} request={request} sessionId={sessionId} />
                   ))}
-                  {(message.segments.length > 0 || pendingPermissionRequests.length > 0 || pendingDimensionBuildRuleRequests.length > 0 || pendingLogicalDatasetRuleRequests.length > 0 || pendingDatabaseSqlRevisionRequests.length > 0 || visibleUserInputRequests.length > 0) && (
+                  {visibleSkillSecretRequests.map((request) => (
+                    <SkillSecretRequestCard key={request.id} request={request} sessionId={sessionId} />
+                  ))}
+                  {(message.segments.length > 0 || pendingPermissionRequests.length > 0 || pendingDimensionBuildRuleRequests.length > 0 || pendingLogicalDatasetRuleRequests.length > 0 || pendingDatabaseSqlRevisionRequests.length > 0 || visibleUserInputRequests.length > 0 || visibleSkillSecretRequests.length > 0) && (
                     <div className="text-[10px] text-gray-400 mt-1 pl-1">
                       {formatTime(message.timestamp)}
                     </div>
@@ -211,11 +300,15 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
               ) : (
                 <>
                   {(() => {
-                    const hasTools = message.timeline?.some((item) => item.type === "tool") ?? false;
+                    const displayTimeline = withoutEmbeddedAttachmentAnalysis(
+                      message.timeline || [],
+                      analysisByAttachmentId,
+                    );
+                    const hasTools = displayTimeline.some((item) => item.type === "tool");
 
-                    const thoughtChain = message.timeline && message.timeline.length > 0 ? (
+                    const thoughtChain = displayTimeline.length > 0 ? (
                       <TimelineWithManagedAuthorization
-                        timeline={message.timeline}
+                        timeline={displayTimeline}
                         isStreaming={isStreaming}
                       />
                       ) : message.reasoning ? (
@@ -258,6 +351,12 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
                         {contentBlock}
                         {hasTools && thoughtChain}
                         <SkillPlanCards timeline={skillPlanTimeline} sessionId={sessionId} />
+                        {outputAttachmentPlacement.unplaced.length ? (
+                          <AssistantAttachmentList
+                            attachments={outputAttachmentPlacement.unplaced}
+                            analysisByAttachmentId={analysisByAttachmentId}
+                          />
+                        ) : null}
                         {pendingPermissionRequests.map((request) => (
                           <PermissionRequestCard
                             key={request.id}
@@ -277,7 +376,10 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
                         {visibleUserInputRequests.map((request) => (
                           <UserInputRequestCard key={request.id} request={request} sessionId={sessionId} />
                         ))}
-                        {((message.content || thoughtChain) || pendingPermissionRequests.length > 0 || pendingDimensionBuildRuleRequests.length > 0 || pendingLogicalDatasetRuleRequests.length > 0 || pendingDatabaseSqlRevisionRequests.length > 0 || visibleUserInputRequests.length > 0) && (
+                        {visibleSkillSecretRequests.map((request) => (
+                          <SkillSecretRequestCard key={request.id} request={request} sessionId={sessionId} />
+                        ))}
+                        {((message.content || thoughtChain) || pendingPermissionRequests.length > 0 || pendingDimensionBuildRuleRequests.length > 0 || pendingLogicalDatasetRuleRequests.length > 0 || pendingDatabaseSqlRevisionRequests.length > 0 || visibleUserInputRequests.length > 0 || visibleSkillSecretRequests.length > 0) && (
                           <div className="text-[10px] text-gray-400 mt-1 pl-1">
                             {formatTime(message.timestamp)}
                           </div>
@@ -288,10 +390,6 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
                 </>
               )}
                 </details>
-
-              {message.outputAttachments?.length ? (
-                <AssistantAttachmentList attachments={message.outputAttachments} />
-              ) : null}
 
               {showInterruptionNotice && message.interrupted && message.interruptionNotice ? (
                 <InterruptionNotice text={message.interruptionNotice} />
@@ -331,14 +429,24 @@ function SafeMarkdownImage({ alt }: React.ImgHTMLAttributes<HTMLImageElement>) {
 function InlineImageAttachment({
   attachment,
   align = "left",
+  analysisTools = [],
 }: {
   attachment: AgentAttachment & { id: string; preview_url: string };
   align?: "left" | "right";
+  analysisTools?: ToolCall[];
 }) {
   const { openAttachmentPreview } = useApp();
   const [failed, setFailed] = useState(false);
   const isQr = isQrImageAttachment(attachment);
   const label = attachment.name || "图片附件";
+  const analysisRunning = analysisTools.some((tool) => tool.status === "running");
+  const analysisFailed = analysisTools.some((tool) => Boolean(tool.is_error));
+  const AnalysisIcon = analysisRunning ? Loader2 : analysisFailed ? XCircle : CheckCircle2;
+  const analysisLabel = analysisRunning
+    ? "子代理正在分析图片"
+    : analysisFailed
+      ? "子代理图片分析未完成"
+      : `子代理图片分析已完成${analysisTools.length > 1 ? ` · ${analysisTools.length} 次核对` : ""}`;
 
   if (failed) {
     return (
@@ -372,6 +480,20 @@ function InlineImageAttachment({
       <span className="block truncate border-t border-slate-100 px-3 py-2 text-[11px] font-medium text-slate-700">
         {label}
       </span>
+      {analysisTools.length > 0 ? (
+        <span className="flex items-center gap-1.5 border-t border-slate-100 bg-slate-50/80 px-3 py-2 text-[11px] text-slate-600">
+          <AnalysisIcon
+            className={`h-3.5 w-3.5 shrink-0 ${
+              analysisRunning
+                ? "animate-spin text-[#002fa7]"
+                : analysisFailed
+                  ? "text-rose-500"
+                  : "text-emerald-600"
+            }`}
+          />
+          <span className="truncate">{analysisLabel}</span>
+        </span>
+      ) : null}
     </button>
   );
 }
@@ -412,7 +534,13 @@ function formatAttachmentSize(size?: number): string {
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function AssistantAttachmentList({ attachments }: { attachments: AgentAttachment[] }) {
+function AssistantAttachmentList({
+  attachments,
+  analysisByAttachmentId = {},
+}: {
+  attachments: AgentAttachment[];
+  analysisByAttachmentId?: AttachmentAnalysisMap;
+}) {
   const images = attachments.filter(isPreviewableImageAttachment);
   const files = attachments.filter((attachment) => !isPreviewableImageAttachment(attachment));
   return (
@@ -421,6 +549,7 @@ function AssistantAttachmentList({ attachments }: { attachments: AgentAttachment
         <InlineImageAttachment
           key={`${attachment.id}-${index}`}
           attachment={attachment}
+          analysisTools={analysisByAttachmentId[attachment.id] || []}
         />
       ))}
       {files.map((attachment, index) => {
@@ -992,6 +1121,85 @@ function ToolActionPermissionCard({
   );
 }
 
+function SkillSecretRequestCard({ request, sessionId }: { request: SkillSecretRequest; sessionId: string }) {
+  const [value, setValue] = useState("");
+  const [status, setStatus] = useState<"idle" | "loading" | "done" | "cancelled" | "error">("idle");
+  const [error, setError] = useState("");
+  const submittingRef = useRef(false);
+
+  const resolve = async (action: "configure" | "reuse" | "cancel") => {
+    if (submittingRef.current) return;
+    if (action === "configure" && !value) {
+      setError("请输入凭证值。");
+      return;
+    }
+    submittingRef.current = true;
+    setStatus("loading");
+    setError("");
+    try {
+      await resolveSkillSecretRequest(sessionId, request.id, {
+        request_version: request.version,
+        action,
+        ...(action === "configure" ? { secret_value: value } : {}),
+      });
+      setValue("");
+      setStatus(action === "cancel" ? "cancelled" : "done");
+    } catch (nextError) {
+      submittingRef.current = false;
+      setStatus("error");
+      setError(nextError instanceof Error ? nextError.message : "配置失败，请重试");
+    }
+  };
+
+  if (status === "done" || request.decision?.action === "configured") {
+    return <div className="mb-3 inline-flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800" role="status"><CheckCircle2 className="h-4 w-4" />已安全配置 {request.env_name}，Agent 将继续执行。</div>;
+  }
+  if (status === "cancelled" || request.decision?.action === "cancel") {
+    return <div className="mb-3 inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-600" role="status"><XCircle className="h-4 w-4" />已取消凭证配置。</div>;
+  }
+
+  const reuse = request.mode === "reuse";
+  return (
+    <form
+      className="mb-4 max-w-[820px] rounded-2xl border border-amber-200 bg-white p-5 shadow-sm shadow-amber-950/[0.04]"
+      onSubmit={(event) => { event.preventDefault(); void resolve(reuse ? "reuse" : "configure"); }}
+    >
+      <div className="flex items-start gap-3">
+        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-amber-50 text-amber-700"><KeyRound className="h-5 w-5" /></div>
+        <div>
+          <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-amber-700">安全凭证输入</p>
+          <h3 className="mt-1 text-base font-bold text-slate-950">为 {request.skill_id} 配置 {request.env_name}</h3>
+          <p className="mt-1 text-sm leading-6 text-slate-500">{request.reason}</p>
+          <p className="mt-1 text-xs leading-5 text-slate-400">值不会发送给 Agent，也不会出现在命令、消息或执行日志中。</p>
+        </div>
+      </div>
+      {!reuse ? (
+        <label className="mt-4 block text-sm font-semibold text-slate-700">
+          {request.env_name}
+          <input
+            type="password"
+            autoComplete="off"
+            spellCheck={false}
+            value={value}
+            disabled={status === "loading"}
+            onChange={(event) => setValue(event.target.value)}
+            className="mt-2 w-full rounded-xl border border-slate-200 px-3 py-2 font-mono text-sm outline-none focus:border-amber-500 focus:ring-2 focus:ring-amber-100"
+          />
+        </label>
+      ) : (
+        <p className="mt-4 rounded-xl bg-amber-50 px-3 py-2 text-sm text-amber-800">这个变量已有保存值。确认后只为当前版本的 {request.skill_id} 建立使用绑定，不会向 Agent 展示值。</p>
+      )}
+      {error ? <p className="mt-2 text-xs text-rose-600">{error}</p> : null}
+      <div className="mt-4 flex items-center gap-2">
+        <button type="submit" disabled={status === "loading"} className="rounded-full bg-[#002fa7] px-4 py-2 text-xs font-semibold text-white disabled:opacity-50">
+          {status === "loading" ? "处理中..." : reuse ? "允许当前 Skill 使用" : "保存并继续"}
+        </button>
+        <button type="button" disabled={status === "loading"} onClick={() => void resolve("cancel")} className="rounded-full px-3 py-2 text-xs font-semibold text-slate-500 hover:bg-slate-50">取消</button>
+      </div>
+    </form>
+  );
+}
+
 function UserInputRequestCard({ request, sessionId }: { request: UserInputRequest; sessionId: string }) {
   type Draft = { optionIds: string[]; text: string };
   const draftStorageKey = `puddingclaw:user-input-draft:${sessionId}:${request.id}:v${request.version}`;
@@ -1487,6 +1695,8 @@ function SegmentBlock({
   isStreaming,
   isLast,
   verificationSummary,
+  outputAttachments,
+  analysisByAttachmentId,
 }: {
   segment: {
     content: string;
@@ -1498,6 +1708,8 @@ function SegmentBlock({
   isStreaming?: boolean;
   isLast?: boolean;
   verificationSummary?: string;
+  outputAttachments?: AgentAttachment[];
+  analysisByAttachmentId: AttachmentAnalysisMap;
 }) {
   const { sessionId, setActiveSourceId, setInspectorOpen, closeAttachmentPreview } = useApp();
   // Terminal text is withheld by the backend until accepted.  Segments shown
@@ -1520,14 +1732,19 @@ function SegmentBlock({
     ),
     img: SafeMarkdownImage,
     table: ScrollableMarkdownTable,
+    ...(!(isStreaming && isLast) ? { pre: HtmlAwarePre } : {}),
   };
 
-  const hasTools = segment.timeline?.some((item) => item.type === "tool") ?? false;
+  const displayTimeline = withoutEmbeddedAttachmentAnalysis(
+    segment.timeline || [],
+    analysisByAttachmentId,
+  );
+  const hasTools = displayTimeline.some((item) => item.type === "tool");
 
   const thoughtChain =
-    segment.timeline && segment.timeline.length > 0 ? (
+    displayTimeline.length > 0 ? (
       <TimelineWithManagedAuthorization
-        timeline={segment.timeline}
+        timeline={displayTimeline}
         isStreaming={isStreaming && isLast}
       />
     ) : segment.reasoning ? (
@@ -1560,7 +1777,13 @@ function SegmentBlock({
       {!hasTools && thoughtChain}
       {contentBlock}
       {hasTools && thoughtChain}
-      <SkillPlanCards timeline={segment.timeline || []} sessionId={sessionId} />
+      <SkillPlanCards timeline={displayTimeline} sessionId={sessionId} />
+      {outputAttachments?.length ? (
+        <AssistantAttachmentList
+          attachments={outputAttachments}
+          analysisByAttachmentId={analysisByAttachmentId}
+        />
+      ) : null}
     </div>
   );
 }
@@ -1765,23 +1988,18 @@ function CitationLink({
 }) {
   if (!href?.startsWith("#source-")) {
     if (href?.startsWith("file://")) {
+      let localPath = href.slice("file://".length);
+      try {
+        localPath = decodeURIComponent(new URL(href).pathname);
+      } catch {
+        // Keep the original path for the existing open-file error handling.
+      }
       return (
-        <a
+        <LocalFileAttachmentCard
           href={href}
-          className="not-prose my-1 inline-flex items-center gap-2 rounded-xl border border-[#002fa7]/15 bg-[#002fa7]/[0.06] px-3 py-2 text-[13px] font-semibold text-[#002fa7] shadow-sm shadow-blue-950/[0.03] transition hover:border-[#002fa7]/30 hover:bg-[#002fa7]/[0.1]"
-          onClick={async (event) => {
-            event.preventDefault();
-            try {
-              const url = new URL(href);
-              await openLocalFile(decodeURIComponent(url.pathname), sessionId);
-            } catch (error) {
-              window.alert(error instanceof Error ? error.message : "打开本地文件失败");
-            }
-          }}
-        >
-          <FileText className="h-4 w-4 shrink-0" />
-          {children}
-        </a>
+          filePath={localPath}
+          sessionId={sessionId}
+        />
       );
     }
     return <a href={href}>{children}</a>;

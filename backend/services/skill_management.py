@@ -1,13 +1,14 @@
 """Managed Skill installation and update plans.
 
-Remote content is downloaded into a bounded staging area first.  The managed
-``skills/`` directory is only changed by :meth:`commit`, after Harness has
-approved the immutable plan id and digest.
+Remote and user-uploaded content enters a bounded staging area first. The
+managed ``skills/`` directory is only changed by :meth:`commit`, after either
+Harness approval or an explicit user upload action confirms the immutable plan.
 """
 
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import re
@@ -18,6 +19,7 @@ import threading
 import time
 import uuid
 import zipfile
+from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 from urllib.parse import quote, urljoin, urlsplit
@@ -98,9 +100,7 @@ class SkillManagementService:
             subpath = subpath if subpath is not None else str(provenance.get("subpath") or "")
             files = files if files is not None else list(provenance.get("files") or [])
             source_digest = (
-                source_digest
-                if source_digest is not None
-                else str(provenance.get("source_digest") or "") or None
+                source_digest if source_digest is not None else str(provenance.get("source_digest") or "") or None
             )
         if not requested_source:
             raise SkillManagementError("source_required")
@@ -131,6 +131,109 @@ class SkillManagementService:
         if skill_name and not _SKILL_NAME.fullmatch(skill_name):
             raise SkillManagementError("invalid_skill_name", skill_name)
 
+        return self._prepare_plan(
+            action=action,
+            source=requested_source,
+            skill_name=skill_name,
+            fallback_skill_name=None,
+            ref=resolved_ref,
+            subpath=resolved_subpath,
+            files=resolved_files,
+            source_digest=source_digest,
+            request_context=normalized_context,
+            request_key=request_key,
+            stage=lambda target: self._stage_source(
+                source=requested_source,
+                target=target,
+                ref=resolved_ref,
+                subpath=resolved_subpath,
+                files=resolved_files,
+                source_digest=source_digest,
+            ),
+        )
+
+    def prepare_upload(
+        self,
+        *,
+        filename: str | None = None,
+        content: bytes | None = None,
+        uploaded_files: list[tuple[str, bytes]] | None = None,
+        skill_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Stage a user-uploaded Skill through the managed installation path.
+
+        Upload selection and the Import click are the user's authorization for a
+        new install. Existing Skills still produce an update plan so the caller
+        can show the immutable diff before committing it.
+        """
+
+        if skill_name and not _SKILL_NAME.fullmatch(skill_name):
+            raise SkillManagementError("invalid_skill_name", skill_name)
+        if (content is None) == (uploaded_files is None):
+            raise SkillManagementError("invalid_upload_payload")
+
+        clean_filename = PurePosixPath((filename or "upload").replace("\\", "/")).name
+        source = f"upload:{clean_filename[:256]}"
+        fallback_name: str | None = None
+
+        if content is not None:
+            suffix = PurePosixPath(clean_filename).suffix.lower()
+            if suffix == ".skill":
+                fallback_name = PurePosixPath(clean_filename).stem
+
+                def stage(target: Path) -> None:
+                    target.mkdir(parents=True, exist_ok=False)
+                    (target / "SKILL.md").write_bytes(content)
+
+            elif suffix == ".zip":
+                fallback_name = self._archive_skill_name(content, PurePosixPath(clean_filename).stem)
+
+                def stage(target: Path) -> None:
+                    self._extract_archive(content, target, subpath="", github_archive=False)
+
+            else:
+                raise SkillManagementError("unsupported_upload_type", clean_filename)
+        else:
+            if not skill_name:
+                raise SkillManagementError("skill_name_missing", "Folder uploads require a Skill name")
+            normalized_files = self._normalize_uploaded_files(uploaded_files or [])
+
+            def stage(target: Path) -> None:
+                target.mkdir(parents=True, exist_ok=False)
+                for relative, data in normalized_files:
+                    destination = target / relative
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_bytes(data)
+
+        return self._prepare_plan(
+            action="auto",
+            source=source,
+            skill_name=skill_name,
+            fallback_skill_name=fallback_name,
+            ref="",
+            subpath="",
+            files=[],
+            source_digest=None,
+            request_context={},
+            request_key="",
+            stage=stage,
+        )
+
+    def _prepare_plan(
+        self,
+        *,
+        action: Literal["install", "update", "auto"],
+        source: str,
+        skill_name: str | None,
+        fallback_skill_name: str | None,
+        ref: str,
+        subpath: str,
+        files: list[str],
+        source_digest: str | None,
+        request_context: dict[str, str],
+        request_key: str,
+        stage: Callable[[Path], None],
+    ) -> dict[str, Any]:
         self._cleanup_expired_plans()
         if request_key:
             existing = self._find_plan_by_request_key(request_key)
@@ -141,17 +244,10 @@ class SkillManagementService:
         payload_dir = plan_dir / "payload"
         plan_dir.mkdir(parents=True, exist_ok=False)
         try:
-            self._stage_source(
-                source=requested_source,
-                target=payload_dir,
-                ref=resolved_ref,
-                subpath=resolved_subpath,
-                files=resolved_files,
-                source_digest=source_digest,
-            )
+            stage(payload_dir)
             staged = self._manifest(payload_dir)
             declared_name = str(staged["metadata"].get("name") or "").strip()
-            resolved_name = skill_name or declared_name
+            resolved_name = skill_name or declared_name or fallback_skill_name
             if not resolved_name or not _SKILL_NAME.fullmatch(resolved_name):
                 raise SkillManagementError(
                     "skill_name_missing",
@@ -164,22 +260,27 @@ class SkillManagementService:
                 )
 
             target = self.skills_dir / resolved_name
+            if target.is_symlink():
+                raise SkillManagementError("skill_target_symlink", resolved_name)
             exists = target.is_dir() and not target.is_symlink()
-            if action == "install" and exists:
+            resolved_action: Literal["install", "update"] = (
+                "update" if action == "auto" and exists else "install" if action == "auto" else action
+            )
+            if resolved_action == "install" and exists:
                 raise SkillManagementError("skill_already_exists", resolved_name)
-            if action == "update" and not exists:
+            if resolved_action == "update" and not exists:
                 raise SkillManagementError("skill_not_found", resolved_name)
             current = self._manifest(target) if exists else None
             diff = self._diff(current, staged)
             now = time.time()
             plan: dict[str, Any] = {
                 "plan_id": plan_id,
-                "action": action,
+                "action": resolved_action,
                 "skill_name": resolved_name,
-                "source": requested_source,
-                "ref": resolved_ref,
-                "subpath": resolved_subpath,
-                "files": resolved_files,
+                "source": source,
+                "ref": ref,
+                "subpath": subpath,
+                "files": files,
                 "created_at": now,
                 "expires_at": now + _PLAN_TTL_SECONDS,
                 "status": "prepared",
@@ -190,8 +291,8 @@ class SkillManagementService:
             }
             if source_digest:
                 plan["source_digest"] = source_digest
-            if normalized_context:
-                plan["request_context"] = normalized_context
+            if request_context:
+                plan["request_context"] = request_context
             if request_key:
                 plan["request_key"] = request_key
             plan["plan_sha256"] = _json_digest(plan)
@@ -415,11 +516,7 @@ class SkillManagementService:
                 {
                     "name": name,
                     "source": f"{resolved_base.rstrip('/')}/{well_known_path}/{name}",
-                    "files": [
-                        path
-                        for path in normalized_files
-                        if path.casefold() not in {"skill.md", "readme.md"}
-                    ],
+                    "files": [path for path in normalized_files if path.casefold() not in {"skill.md", "readme.md"}],
                     "digest": "",
                 }
             )
@@ -537,14 +634,20 @@ class SkillManagementService:
         *,
         plan_id: str,
         plan_sha256: str,
-        expected_session_id: str,
+        expected_session_id: str | None = None,
     ) -> dict[str, Any]:
         """Persist cancellation so a historical plan card never looks pending."""
 
         with self._lock:
             self._cleanup_expired_plans()
             plan = self._load_plan(plan_id)
-            self._validate_plan_owner(plan, expected_session_id)
+            if expected_session_id is not None:
+                self._validate_plan_owner(plan, expected_session_id)
+            elif isinstance(plan.get("request_context"), dict) and plan["request_context"].get("session_id"):
+                raise SkillManagementError(
+                    "plan_requires_structured_commit",
+                    "Session-bound plans must be cancelled through the structured plan card",
+                )
             if not plan_sha256 or plan.get("plan_sha256") != plan_sha256:
                 raise SkillManagementError("plan_digest_mismatch")
             status = str(plan.get("status") or "")
@@ -727,6 +830,67 @@ class SkillManagementService:
             archive_path.unlink(missing_ok=True)
             shutil.rmtree(unpacked, ignore_errors=True)
 
+    @staticmethod
+    def _archive_skill_name(content: bytes, fallback: str) -> str:
+        """Infer the legacy root-folder name without trusting it as a path."""
+
+        try:
+            with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                manifests = [
+                    PurePosixPath(info.filename)
+                    for info in archive.infolist()
+                    if PurePosixPath(info.filename).name.casefold() == "skill.md"
+                ]
+        except zipfile.BadZipFile as exc:
+            raise SkillManagementError("invalid_zip_archive") from exc
+        if len(manifests) == 1 and manifests[0].parent != PurePosixPath("."):
+            candidate = manifests[0].parent.name
+            if _SKILL_NAME.fullmatch(candidate):
+                return candidate
+        return fallback
+
+    @staticmethod
+    def _normalize_uploaded_files(
+        uploaded_files: list[tuple[str, bytes]],
+    ) -> list[tuple[PurePosixPath, bytes]]:
+        if not uploaded_files:
+            raise SkillManagementError("empty_upload")
+        if len(uploaded_files) > _MAX_FILES:
+            raise SkillManagementError("skill_file_limit_exceeded")
+
+        parsed: list[tuple[PurePosixPath, bytes]] = []
+        for raw_name, data in uploaded_files:
+            normalized = raw_name.replace("\\", "/").strip()
+            path = PurePosixPath(normalized)
+            if not normalized or path.is_absolute() or ".." in path.parts:
+                raise SkillManagementError("invalid_relative_path", raw_name)
+            parsed.append((path, data))
+
+        common_root = (
+            parsed[0][0].parts[0]
+            if all(len(path.parts) > 1 and path.parts[0] == parsed[0][0].parts[0] for path, _ in parsed)
+            else None
+        )
+        normalized_files: list[tuple[PurePosixPath, bytes]] = []
+        seen: set[str] = set()
+        total = 0
+        for path, data in parsed:
+            relative = PurePosixPath(*path.parts[1:]) if common_root else path
+            relative_name = relative.as_posix()
+            if not relative_name or relative_name == "." or relative_name in seen:
+                raise SkillManagementError("duplicate_or_empty_upload_path", relative_name)
+            if relative.suffix.lower() in _FORBIDDEN_SUFFIXES:
+                raise SkillManagementError("forbidden_skill_file", relative_name)
+            total += len(data)
+            if total > _MAX_TOTAL_BYTES:
+                raise SkillManagementError("skill_size_limit_exceeded")
+            seen.add(relative_name)
+            normalized_files.append((relative, data))
+
+        if "SKILL.md" not in seen:
+            raise SkillManagementError("skill_manifest_missing")
+        return normalized_files
+
     def _download(self, url: str) -> bytes:
         current = url
         for _ in range(6):
@@ -882,6 +1046,8 @@ class SkillManagementService:
         return dict(entry) if isinstance(entry, dict) else None
 
     def _record_provenance(self, plan: dict[str, Any]) -> bool:
+        if str(plan.get("source") or "").startswith("upload:"):
+            return False
         try:
             registry = self._load_registry()
             skills = registry.setdefault("skills", {})
@@ -1020,8 +1186,7 @@ class SkillManagementService:
                 "requires_confirmation": status == "prepared",
                 "installed": status == "committed",
                 "ui_commit_supported": bool(
-                    isinstance(plan.get("request_context"), dict)
-                    and plan["request_context"].get("session_id")
+                    isinstance(plan.get("request_context"), dict) and plan["request_context"].get("session_id")
                 ),
             }
         )

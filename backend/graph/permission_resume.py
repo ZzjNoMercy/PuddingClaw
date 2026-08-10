@@ -357,13 +357,14 @@ class PermissionResumeRegistry:
         grant_bindings: dict[str, Any] | None = None,
         required_capabilities: list[str] | None = None,
         change_preview: dict[str, str] | None = None,
+        fingerprint_command: str | None = None,
         policy_source: str = "deterministic",
         policy_explanation: str = "",
         control_descriptor: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         fingerprint = self.tool_action_fingerprint(
             tool_name=tool_name,
-            command=command,
+            command=fingerprint_command if fingerprint_command is not None else command,
             reason=reason,
         )
         semantic_key = ""

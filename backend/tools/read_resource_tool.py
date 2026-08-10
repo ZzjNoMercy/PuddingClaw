@@ -43,12 +43,24 @@ class ReadResourceTool(BaseTool):
     args_schema: type[BaseModel] = ReadResourceInput
     risk_level: str = "moderate"
     session_id: str = ""
+    run_id: str = ""
     workspace_path: str = ""
+    allowed_attachment_ids: list[str] = Field(default_factory=list, exclude=True)
+    enforce_attachment_allowlist: bool = Field(default=False, exclude=True)
 
     def _read_attachment(self, attachment_id: str) -> str:
         item = attachment_store.get(self.session_id, attachment_id)
         if not item:
             return f"❌ Attachment not found: {attachment_id}"
+        if self.enforce_attachment_allowlist:
+            explicitly_allowed = attachment_id in set(self.allowed_attachment_ids)
+            generated_by_current_run = (
+                str(item.get("source") or "") == "generated"
+                and bool(self.run_id)
+                and str(item.get("created_by_run_id") or "") == self.run_id
+            )
+            if not explicitly_allowed and not generated_by_current_run:
+                return "❌ Attachment is outside this image-analysis delegation."
         attachment_type = str(item.get("type") or "file")
         if attachment_type == "image":
             return (
@@ -60,10 +72,9 @@ class ReadResourceTool(BaseTool):
             )
         if attachment_type in {"pdf", "document"}:
             return (
-                f"Attachment {attachment_id} is {attachment_type}. Text extraction for this type is not enabled yet; "
-                "ask the user to export it as Markdown/text for now."
+                f"Attachment {attachment_id} is {attachment_type}. Text extraction for this type is not enabled yet. "
+                "Do not retry its internal artifact path; treat it as a user-facing output attachment."
             )
-
         path = Path(str(item.get("path") or ""))
         if not path.is_file():
             return f"❌ Attachment file missing: {attachment_id}"

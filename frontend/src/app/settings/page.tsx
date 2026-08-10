@@ -540,6 +540,8 @@ export default function SettingsPage() {
   const [knowledgeConfiguredBy, setKnowledgeConfiguredBy] = useState("default");
   const [knowledgeEnvOverride, setKnowledgeEnvOverride] = useState(false);
   const [wikiCompilerModelId, setWikiCompilerModelId] = useState("");
+  const [wikiHybridEnabled, setWikiHybridEnabled] = useState(false);
+  const [wikiHybridSaving, setWikiHybridSaving] = useState(false);
   const [wikiGbrainEmbeddingModelId, setWikiGbrainEmbeddingModelId] = useState("");
   const [wikiGbrainThinkModelId, setWikiGbrainThinkModelId] = useState("");
   const [gbrainWorkspace, setGbrainWorkspace] = useState<LlmWikiWorkspaceStatus | null>(null);
@@ -727,6 +729,7 @@ export default function SettingsPage() {
         setKnowledgeConfiguredBy(s.knowledge?.configured_by || "default");
         setKnowledgeEnvOverride(Boolean(s.knowledge?.environment_override));
         setWikiCompilerModelId(s.knowledge?.llm_wiki?.compiler_agent?.model_id || "");
+        setWikiHybridEnabled(s.knowledge?.llm_wiki?.retrieval?.hybrid_enabled ?? false);
         setWikiGbrainEmbeddingModelId(s.knowledge?.llm_wiki?.gbrain?.embedding_model_id || "");
         setWikiGbrainThinkModelId(s.knowledge?.llm_wiki?.gbrain?.think_model_id || "");
         setGbrainDatabaseHost(s.database?.host || "127.0.0.1");
@@ -1270,6 +1273,9 @@ export default function SettingsPage() {
             compiler_agent: {
               model_id: wikiCompilerModelId,
             },
+            retrieval: {
+              hybrid_enabled: wikiHybridEnabled,
+            },
             gbrain: {
               embedding_model_id: wikiGbrainEmbeddingModelId,
               think_model_id: wikiGbrainThinkModelId,
@@ -1365,13 +1371,42 @@ export default function SettingsPage() {
       setDatabaseEnvOverride(Boolean(fresh.database?.environment_override));
       setKnowledgeConfiguredBy(fresh.knowledge?.configured_by || "default");
       setKnowledgeEnvOverride(Boolean(fresh.knowledge?.environment_override));
+      setWikiHybridEnabled(fresh.knowledge?.llm_wiki?.retrieval?.hybrid_enabled ?? false);
       getLlmWikiWorkspaceStatus().then(setGbrainWorkspace).catch(() => {});
     } catch (err) {
       showToast("error", err instanceof Error ? err.message : "保存失败");
     } finally {
       setSaving(false);
     }
-  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaResultMaterializationRowCap, dbQaQueryTimeoutSeconds, dbQaSqlGenerationTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, dbQaAgentSqlPathEnabled, dbQaAgentSqlRolloutPercentage, dbQaAgentSqlFallbackEnabled, dbQaAgentSqlShadowCompareEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmBatchSize, knowledgeRootDir, wikiCompilerModelId, wikiGbrainEmbeddingModelId, wikiGbrainThinkModelId, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, toolContextEnabled, immediateToolCompactionEnabled, singleToolTriggerTokens, backgroundMinResultTokens, keepRecentToolResults, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, rubricMaxStagnantRepairs, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, sandboxMode, dockerConnection, dockerContext, dockerUseCustomImage, dockerImage, dockerCpuLimit, dockerMemoryLimitMb, dockerPidsLimit, dockerNetworkEnabled, dockerDependencySetupEnabled, subagentItems, showToast]);
+  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaResultMaterializationRowCap, dbQaQueryTimeoutSeconds, dbQaSqlGenerationTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, dbQaAgentSqlPathEnabled, dbQaAgentSqlRolloutPercentage, dbQaAgentSqlFallbackEnabled, dbQaAgentSqlShadowCompareEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmBatchSize, knowledgeRootDir, wikiCompilerModelId, wikiHybridEnabled, wikiGbrainEmbeddingModelId, wikiGbrainThinkModelId, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, toolContextEnabled, immediateToolCompactionEnabled, singleToolTriggerTokens, backgroundMinResultTokens, keepRecentToolResults, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, rubricMaxStagnantRepairs, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, sandboxMode, dockerConnection, dockerContext, dockerUseCustomImage, dockerImage, dockerCpuLimit, dockerMemoryLimitMb, dockerPidsLimit, dockerNetworkEnabled, dockerDependencySetupEnabled, subagentItems, showToast]);
+
+  const handleWikiHybridChange = useCallback(async (enabled: boolean) => {
+    if (wikiHybridSaving) return;
+    const previous = wikiHybridEnabled;
+    setWikiHybridEnabled(enabled);
+    setWikiHybridSaving(true);
+    try {
+      await updateSettings({
+        knowledge: {
+          llm_wiki: {
+            retrieval: { hybrid_enabled: enabled },
+          },
+        },
+      });
+      const fresh = await getSettings();
+      const persisted = fresh.knowledge?.llm_wiki?.retrieval?.hybrid_enabled ?? false;
+      if (persisted !== enabled) {
+        throw new Error("后端未返回刚保存的混合检索配置");
+      }
+      setWikiHybridEnabled(persisted);
+      showToast("success", enabled ? "Wiki 混合检索已开启" : "Wiki 混合检索已关闭");
+    } catch (err) {
+      setWikiHybridEnabled(previous);
+      showToast("error", err instanceof Error ? err.message : "混合检索配置保存失败");
+    } finally {
+      setWikiHybridSaving(false);
+    }
+  }, [showToast, wikiHybridEnabled, wikiHybridSaving]);
 
   const handleDatabaseModeChange = useCallback((mode: "bundled" | "external") => {
     setDatabaseMode(mode);
@@ -3032,7 +3067,11 @@ export default function SettingsPage() {
                   </Link>
                 </SettingsCard>
 
-                <SettingsCard title="LLM Wiki 编译 Agent" icon={Bot} color="#7c3aed">
+                <SettingsCard title="LLM Wiki" icon={Bot} color="#7c3aed">
+                  <div className="flex items-center gap-2">
+                    <Bot className="h-4 w-4 text-violet-600" />
+                    <p className="text-[12px] font-semibold text-gray-800">编译 Agent</p>
+                  </div>
                   <div className="rounded-xl border border-violet-100 bg-violet-50/50 px-3.5 py-3">
                     <p className="text-[11px] leading-relaxed text-violet-700">
                       专门在后台把 Raw 编译成 Wiki。它不进入聊天 Session，只加载 Context、Publish 和 Lint 三个工具；模型接口与密钥仍由「模型服务」统一管理。
@@ -3065,6 +3104,42 @@ export default function SettingsPage() {
                     管理模型与密钥
                     <ExternalLink className="h-3.5 w-3.5" />
                   </button>
+
+                  <div className="border-t border-black/[0.06] pt-4">
+                    <div className="mb-3 flex items-center gap-2">
+                      <Search className="h-4 w-4 text-[#002fa7]" />
+                      <p className="text-[12px] font-semibold text-gray-800">查询与 Embedding</p>
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-between gap-4 rounded-xl border border-black/[0.06] bg-white/60 px-3.5 py-3">
+                    <div className="min-w-0">
+                      <p className="text-[12px] font-medium text-gray-800">启用关键词 + Embedding 混合检索</p>
+                      <p className="mt-1 text-[11px] leading-relaxed text-gray-500">
+                        关闭时完全沿用当前 Markdown Query；开启后在同一 LlamaIndex Text Collection 中加入 Wiki 语义召回，并与关键词结果融合。向量不可用时自动回退，不影响 Wiki 查询。
+                      </p>
+                    </div>
+                    <SwitchButton
+                      checked={wikiHybridEnabled}
+                      onChange={(enabled) => void handleWikiHybridChange(enabled)}
+                      ariaLabel="启用 LLM Wiki 混合检索"
+                      disabled={wikiHybridSaving}
+                    />
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className={`rounded-full px-2.5 py-1 text-[10px] font-medium ${wikiHybridEnabled ? "bg-emerald-50 text-emerald-700" : "bg-gray-100 text-gray-500"}`}>
+                      {wikiHybridEnabled ? "混合检索" : "仅 Markdown Query"}
+                    </span>
+                    <p className="text-[11px] text-gray-400">
+                      {wikiHybridSaving ? "正在保存…" : "开关会自动保存；首次开启请到 Studio 同步已有页面。"}
+                    </p>
+                  </div>
+                  <Link
+                    href="/knowledge/schema"
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-black/[0.06] bg-white px-3 py-2 text-[11px] font-medium text-gray-600 hover:text-[#002fa7]"
+                  >
+                    管理 Wiki Embedding
+                    <ExternalLink className="h-3.5 w-3.5" />
+                  </Link>
                 </SettingsCard>
 
                 <div id="gbrain-database" className="scroll-mt-6">

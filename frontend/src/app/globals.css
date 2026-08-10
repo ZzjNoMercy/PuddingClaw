@@ -226,10 +226,75 @@ body {
   font-weight: 700;
 }
 .markdown-content pre code { background: none; padding: 0; color: inherit; font-size: 1em; }
+/* Agent handoffs often include both a clickable host file URL and the matching
+   `/workspace/...` virtual path. Once the URL is rendered as a full file card,
+   suppress only that immediately adjacent duplicate path and forced line break. */
+.markdown-content .local-file-attachment-card + code,
+.markdown-content .local-file-attachment-card + br + code {
+  display: none;
+}
+.markdown-content .local-file-attachment-card + br {
+  display: none;
+}
+.markdown-content li:has(> .local-file-attachment-card) {
+  margin-block: 0;
+}
+.html-source-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.8) rgba(255, 255, 255, 0.06);
+}
+.html-source-scroll::-webkit-scrollbar { width: 10px; height: 10px; }
+.html-source-scroll::-webkit-scrollbar-track { background: rgba(255, 255, 255, 0.06); }
+.html-source-scroll::-webkit-scrollbar-thumb {
+  min-height: 36px;
+  border: 2px solid #111827;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.8);
+}
+.html-source-scroll::-webkit-scrollbar-thumb:hover { background: rgba(203, 213, 225, 0.95); }
 .markdown-content blockquote {
   border-left: 3px solid var(--accent); padding-left: 1em; color: var(--text-secondary);
   margin: 0.5em 0; font-style: italic;
 }
+
+/* Read-later renders Markdown outside the chat surface. Keep these rules
+   explicit: this project does not load Tailwind's Typography plugin, so
+   `prose` classes do not provide paragraph spacing or article typography. */
+.read-later-content {
+  color: #252a32;
+  font-size: 1rem;
+  line-height: 1.85;
+}
+
+.read-later-content p {
+  margin: 1.15em 0;
+  line-height: 1.85;
+}
+
+.read-later-content > :first-child { margin-top: 0; }
+.read-later-content > :last-child { margin-bottom: 0; }
+
+.read-later-content h2 {
+  margin-top: 1.8em;
+  scroll-margin-top: 5rem;
+}
+
+.read-later-content h3 {
+  margin-top: 1.45em;
+  scroll-margin-top: 5rem;
+}
+
+.read-later-content a { color: #002fa7; text-decoration: underline; text-underline-offset: 0.18em; }
+
+.read-later-content img {
+  height: auto;
+  margin: 1.75rem auto;
+  border-radius: 1rem;
+  box-shadow: 0 8px 28px rgba(15, 23, 42, 0.08);
+}
+
+.read-later-content pre { border-radius: 0.75rem; }
+.read-later-content table { font-size: 0.875rem; }
 
 .markdown-content a[href^="#source-"] {
   display: inline-flex;

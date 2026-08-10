@@ -43,15 +43,40 @@ def _attachment_store_locked(method):
 class AttachmentStore:
     def __init__(self) -> None:
         self._base_dir: Path | None = None
+        self._legacy_base_dirs: tuple[Path, ...] = ()
         self._lock = threading.RLock()
 
-    def initialize(self, base_dir: Path) -> None:
-        self._base_dir = base_dir / "data" / "attachments"
-        self._base_dir.mkdir(parents=True, exist_ok=True)
+    def initialize(
+        self,
+        base_dir: Path,
+        *,
+        legacy_base_dirs: tuple[Path, ...] = (),
+    ) -> None:
+        canonical = (base_dir / "data" / "attachments").resolve()
+        canonical.mkdir(parents=True, exist_ok=True)
+        legacy_roots: list[Path] = []
+        for legacy_base_dir in legacy_base_dirs:
+            legacy_root = (legacy_base_dir / "data" / "attachments").resolve()
+            if legacy_root != canonical and legacy_root not in legacy_roots:
+                legacy_roots.append(legacy_root)
+        with self._lock:
+            self._base_dir = canonical
+            # These roots are compatibility reads for attachments written by
+            # the former WebBridge integration. New bytes always use the
+            # canonical Backend attachment root above.
+            self._legacy_base_dirs = tuple(legacy_roots)
 
     @property
     def root_dir(self) -> Path | None:
         return self._base_dir
+
+    @property
+    def legacy_root_dirs(self) -> tuple[Path, ...]:
+        return self._legacy_base_dirs
+
+    def _read_roots(self) -> tuple[Path, ...]:
+        assert self._base_dir is not None
+        return (self._base_dir, *self._legacy_base_dirs)
 
     @staticmethod
     def _safe_id(value: str) -> str:
@@ -234,27 +259,29 @@ class AttachmentStore:
         safe_attachment = self._safe_id(attachment_id)
         if safe_session != session_id or safe_attachment != attachment_id:
             return None
-        manifest = self._base_dir / safe_session / safe_attachment / "manifest.json"
-        if not manifest.exists():
-            return None
-        try:
-            item = json.loads(manifest.read_text(encoding="utf-8"))
-        except Exception:
-            return None
-        path = Path(str(item.get("path") or ""))
-        try:
-            resolved_folder = manifest.parent.resolve(strict=True)
-            resolved_path = path.resolve(strict=True)
-            resolved_path.relative_to(resolved_folder)
-        except (FileNotFoundError, OSError, ValueError):
-            return None
-        if not resolved_path.is_file():
-            return None
-        item["path"] = str(resolved_path)
-        item.setdefault("session_id", safe_session)
-        if not item.get("sha256"):
-            item["sha256"] = f"sha256:{hashlib.sha256(resolved_path.read_bytes()).hexdigest()}"
-        return item
+        for root in self._read_roots():
+            manifest = root / safe_session / safe_attachment / "manifest.json"
+            if not manifest.exists():
+                continue
+            try:
+                item = json.loads(manifest.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            path = Path(str(item.get("path") or ""))
+            try:
+                resolved_folder = manifest.parent.resolve(strict=True)
+                resolved_path = path.resolve(strict=True)
+                resolved_path.relative_to(resolved_folder)
+            except (FileNotFoundError, OSError, ValueError):
+                continue
+            if not resolved_path.is_file():
+                continue
+            item["path"] = str(resolved_path)
+            item.setdefault("session_id", safe_session)
+            if not item.get("sha256"):
+                item["sha256"] = f"sha256:{hashlib.sha256(resolved_path.read_bytes()).hexdigest()}"
+            return item
+        return None
 
     @_attachment_store_locked
     def delete_session(self, session_id: str) -> None:
@@ -264,7 +291,8 @@ class AttachmentStore:
         safe_session = self._safe_id(session_id)
         if safe_session != session_id:
             raise ValueError("invalid session_id")
-        shutil.rmtree(self._base_dir / safe_session, ignore_errors=True)
+        for root in self._read_roots():
+            shutil.rmtree(root / safe_session, ignore_errors=True)
 
     @staticmethod
     def public_item(item: dict[str, Any]) -> dict[str, Any]:

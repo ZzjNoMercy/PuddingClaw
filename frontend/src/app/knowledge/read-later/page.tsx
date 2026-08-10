@@ -376,7 +376,7 @@ export default function ReadLaterPage() {
                   <h1 className="text-2xl font-semibold leading-tight tracking-tight text-gray-950 xl:text-3xl">{detail.title || hostname(detail.original_url)}</h1>
                   <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-gray-400"><span>{detail.author || detail.site_name || hostname(detail.original_url)}</span><span>·</span><span>{relativeTime(detail.created_at)}</span></div>
                   {detail.parse_status === "ready" && detail.content ? (
-                    <div className="prose prose-slate mt-8 max-w-none prose-headings:tracking-tight prose-a:text-[#002fa7] prose-img:mx-auto prose-img:rounded-2xl prose-img:shadow-sm prose-pre:rounded-xl prose-table:text-sm">
+                    <div className="markdown-content read-later-content mt-8 max-w-none">
                       <ReactMarkdown
                         remarkPlugins={[remarkGfm]}
                         components={{

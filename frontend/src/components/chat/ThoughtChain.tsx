@@ -314,7 +314,7 @@ export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
                     >
                       <span className="text-[13px] text-gray-700">{getToolLabel(tc)}</span>
                       {durationText && (
-                        <span className="rounded-full bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] text-slate-500">
+                        <span className="inline-flex shrink-0 items-center whitespace-nowrap rounded-full bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] text-slate-500">
                           {isRunning ? durationText : `耗时 ${durationText}`}
                         </span>
                       )}

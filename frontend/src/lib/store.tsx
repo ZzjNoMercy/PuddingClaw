@@ -11,7 +11,6 @@ import React, {
 } from "react";
 import type { AttachmentPreviewSelection } from "./imageAttachments";
 import {
-  streamChat,
   streamAgent,
   getSessionTokenCount,
   getToolContextJobStatus,
@@ -54,6 +53,7 @@ import {
   LogicalDatasetRuleRequest,
   DatabaseSqlRevisionRequest,
   UserInputRequest,
+  SkillSecretRequest,
   AgentAttachment,
   HarnessGoal,
   HarnessRun,
@@ -282,6 +282,7 @@ export interface ChatMessage {
   logicalDatasetRuleRequests?: LogicalDatasetRuleRequest[];
   databaseSqlRevisionRequests?: DatabaseSqlRevisionRequest[];
   userInputRequests?: UserInputRequest[];
+  skillSecretRequests?: SkillSecretRequest[];
   interrupted?: boolean;
   interruptionNotice?: string;
   errorNotice?: string;
@@ -356,9 +357,9 @@ export interface SendMessageOptions {
 
 interface AppState {
   // Runtime mode
-  runtimeMode: "agent" | "chat";
+  runtimeMode: "agent";
   runtimeReady: boolean;
-  setRuntimeMode: (mode: "agent" | "chat") => void;
+  setRuntimeMode: (mode: "agent") => void;
   currentProjectId: string | null;
   setCurrentProjectId: (id: string | null) => void;
   analyticsModelId: string | null;
@@ -1056,7 +1057,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
   const sessionsRef = useRef<SessionMeta[]>([]);
   const [sessionsLoaded, setSessionsLoaded] = useState(false);
-  const [runtimeMode, setRuntimeModeRaw] = useState<"agent" | "chat">("chat");
+  const runtimeMode = "agent" as const;
   const [runtimeReady, setRuntimeReady] = useState(false);
   const [currentProjectId, setCurrentProjectIdRaw] = useState<string | null>(null);
   const [analyticsModelId, setAnalyticsModelIdRaw] = useState<string | null>(null);
@@ -1377,10 +1378,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   // switching away from the session that initiated it.
   const hasActiveRun = runningSessionIds.has(sessionId);
 
-  const setRuntimeMode = useCallback((mode: "agent" | "chat") => {
-    setRuntimeModeRaw(mode);
+  const setRuntimeMode = useCallback((_mode: "agent") => {
     try {
-      localStorage.setItem("puddingclaw_runtime_mode", mode);
+      localStorage.setItem("puddingclaw_runtime_mode", "agent");
     } catch {
       // ignore storage errors
     }
@@ -1398,10 +1398,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     try {
-      const savedMode = localStorage.getItem("puddingclaw_runtime_mode");
-      if (savedMode === "agent" || savedMode === "chat") {
-        setRuntimeModeRaw(savedMode);
-      }
+      // Chat mode was retired. Overwrite older persisted selections so every
+      // product conversation now enters the maintained Agent runtime.
+      localStorage.setItem("puddingclaw_runtime_mode", "agent");
       const savedProjectId = localStorage.getItem("puddingclaw_current_project_id");
       if (savedProjectId) setCurrentProjectIdRaw(savedProjectId);
     } catch {
@@ -1713,14 +1712,20 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       let target: string | null = null;
       try {
         const saved = sessionStorage.getItem("puddingclaw_session_id");
-        if (saved && saved !== "default" && list.some((s) => s.id === saved)) {
+        if (
+          saved
+          && saved !== "default"
+          && list.some((s) => s.id === saved && s.runtime_mode === "agent")
+        ) {
           target = saved;
         }
       } catch {
         // ignore storage errors
       }
       if (!target) {
-        const latest = [...list].sort((a, b) => b.updated_at - a.updated_at)[0];
+        const latest = [...list]
+          .filter((session) => session.runtime_mode === "agent")
+          .sort((a, b) => b.updated_at - a.updated_at)[0];
         if (latest && latest.id !== sessionIdRef.current) target = latest.id;
       }
       if (target) {
@@ -2092,7 +2097,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     if (!sessionsLoaded || !restoredSessionRef.current) return;
     if (sessionIdRef.current === "default") return;
     if (sessions.some((s) => s.id === sessionIdRef.current)) return;
-    const latest = [...sessions].sort((a, b) => b.updated_at - a.updated_at)[0];
+    const latest = [...sessions]
+      .filter((session) => session.runtime_mode === "agent")
+      .sort((a, b) => b.updated_at - a.updated_at)[0];
     if (latest && latest.id !== sessionIdRef.current) {
       setSessionId(latest.id);
     }
@@ -2483,7 +2490,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       // attachment upload and React renders may finish later, but this Run must
       // not silently inherit a newer draft selection.
       const runOptions = {
-        runtimeMode: options.goalControlAction === "start" ? "agent" as const : runtimeMode,
+        runtimeMode,
         projectId: currentProjectId,
         analyticsModelId:
           analyticsModelIdsMapRef.current[sendSessionId] ?? analyticsModelId ?? null,
@@ -2756,25 +2763,23 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       };
 
       try {
-        const eventStream = runOptions.runtimeMode === "agent"
-          ? streamAgent(
-              processedText,
-              sendSessionId,
-              runOptions.projectId,
-              controller.signal,
-              userId,
-              attachments,
-              runOptions.analyticsModelId,
-              goalModeForRun,
-              options.goalControlAction === "start" ? goalForRun?.goal_id || null : null,
-              contextGoalIdForRun,
-              options.goalControlAction || null,
-              options.skillHints,
-              runOptions.llmSelection.modelId,
-              runOptions.llmSelection.thinkingLevel,
-              runOptions.llmSelection.credentialName,
-            )
-          : streamChat(processedText, sendSessionId, controller.signal, userId);
+        const eventStream = streamAgent(
+          processedText,
+          sendSessionId,
+          runOptions.projectId,
+          controller.signal,
+          userId,
+          attachments,
+          runOptions.analyticsModelId,
+          goalModeForRun,
+          options.goalControlAction === "start" ? goalForRun?.goal_id || null : null,
+          contextGoalIdForRun,
+          options.goalControlAction || null,
+          options.skillHints,
+          runOptions.llmSelection.modelId,
+          runOptions.llmSelection.thinkingLevel,
+          runOptions.llmSelection.credentialName,
+        );
 
         for await (const event of eventStream) {
           if (controller.signal.aborted) break;
@@ -3130,6 +3135,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             const targetId = getAssistantId();
             const attachment = event.data.attachment as unknown as AgentAttachment;
             if (attachment?.id) {
+              const toolCallId = String(
+                event.data.tool_call_id || attachment.created_by_tool_call_id || ""
+              );
+              const attributedAttachment = toolCallId
+                ? { ...attachment, created_by_tool_call_id: toolCallId }
+                : attachment;
               updateMsgs((prev) => {
                 const updated = [...prev];
                 const idx = updated.findIndex((m) => m.id === targetId);
@@ -3139,8 +3150,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                   ...updated[idx],
                   queryId: String(event.data.query_id || updated[idx].queryId || "") || undefined,
                   outputAttachments: existing.some((item) => item.id === attachment.id)
-                    ? existing.map((item) => item.id === attachment.id ? { ...item, ...attachment } : item)
-                    : [...existing, attachment],
+                    ? existing.map((item) => item.id === attachment.id ? { ...item, ...attributedAttachment } : item)
+                    : [...existing, attributedAttachment],
                 };
                 return updated;
               });
@@ -3822,6 +3833,28 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             continue;
           }
 
+          if (event.event === "skill_secret_required") {
+            updateSessionRunActivity(sendSessionId, {
+              phase: "hitl",
+              label: "等待你安全填写凭证",
+            });
+            const targetId = getAssistantId();
+            const request = event.data as unknown as SkillSecretRequest;
+            updateMsgs((prev) => {
+              const updated = [...prev];
+              const idx = updated.findIndex((message) => message.id === targetId);
+              if (idx === -1) return prev;
+              const message = { ...updated[idx] };
+              const existing = message.skillSecretRequests || [];
+              message.skillSecretRequests = existing.some((item) => item.id === request.id)
+                ? existing.map((item) => item.id === request.id ? request : item)
+                : [...existing, request];
+              updated[idx] = message;
+              return updated;
+            });
+            continue;
+          }
+
           if (event.event === "dimension_build_rule_resolved") {
             const targetId = getAssistantId();
             const requestId = String(event.data.request_id || "");
@@ -3891,6 +3924,33 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                       ...request,
                       status: "resolved",
                       decision: event.data.decision as UserInputRequest["decision"],
+                    }
+                  : request
+              );
+              updated[idx] = message;
+              return updated;
+            });
+            continue;
+          }
+
+          if (event.event === "skill_secret_resolved") {
+            updateSessionRunActivity(sendSessionId, {
+              phase: "continuing",
+              label: "Agent 正在继续执行",
+            });
+            const targetId = getAssistantId();
+            const requestId = String(event.data.request_id || "");
+            updateMsgs((prev) => {
+              const updated = [...prev];
+              const idx = updated.findIndex((message) => message.id === targetId);
+              if (idx === -1 || !requestId) return prev;
+              const message = { ...updated[idx] };
+              message.skillSecretRequests = (message.skillSecretRequests || []).map((request) =>
+                request.id === requestId
+                  ? {
+                      ...request,
+                      status: "resolved",
+                      decision: event.data.decision as SkillSecretRequest["decision"],
                     }
                   : request
               );
@@ -4351,6 +4411,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                     }
                   : request
               );
+              interrupted.skillSecretRequests = (interrupted.skillSecretRequests || []).map((request) =>
+                request.status === "pending"
+                  ? { ...request, status: "cancelled", decision: { action: "cancel" } }
+                  : request
+              );
               updated[idx] = interrupted;
             }
             return updated;
@@ -4406,6 +4471,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                   status: "cancelled",
                   decision: { action: "cancel", answers: [] },
                 }
+              : request
+          );
+          finalized.skillSecretRequests = (finalized.skillSecretRequests || []).map((request) =>
+            request.status === "pending"
+              ? { ...request, status: "cancelled", decision: { action: "cancel" } }
               : request
           );
           updated[idx] = finalized;

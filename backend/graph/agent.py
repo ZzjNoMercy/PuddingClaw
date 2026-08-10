@@ -1,4 +1,9 @@
-"""AgentManager — Core Agent using LangChain create_agent API with DeepSeek.
+"""LEGACY Chat runtime built on LangChain ``create_agent``.
+
+This runtime backs only the retired ``POST /api/chat`` compatibility endpoint
+and is no longer maintained. Product conversations use DeepAgents through
+``POST /api/agent``. Some compatibility helpers may still import this module
+until their migrations are complete.
 
 基于 V5 结构，融合魔镜Claw 的优化：
 - Token 预算感知 + Context Rot 检测

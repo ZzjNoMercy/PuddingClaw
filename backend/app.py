@@ -62,10 +62,7 @@ async def _warm_mcp_discovery(
                 await asyncio.sleep(max(0.0, retry_delay_seconds))
             else:
                 retry_note = " after one cold-start retry" if attempt > 1 else ""
-                print(
-                    f"🔌 MCP discovery warmed{retry_note}: "
-                    f"{len(tools)} filtered tools"
-                )
+                print(f"🔌 MCP discovery warmed{retry_note}: {len(tools)} filtered tools")
                 return
     except asyncio.CancelledError:
         raise
@@ -99,10 +96,7 @@ async def _install_cli_runtime_in_background() -> None:
     try:
         status = await asyncio.to_thread(ensure_cli_runtime, BASE_DIR)
         if status.get("installed"):
-            print(
-                f"🧩 Worker CLI ready: {status.get('command')} "
-                f"v{status.get('version')} ({status.get('path')})"
-            )
+            print(f"🧩 Worker CLI ready: {status.get('command')} v{status.get('version')} ({status.get('path')})")
         else:
             print(
                 "⚠️ Worker CLI remains unavailable; backend is still usable. "
@@ -135,6 +129,7 @@ async def lifespan(app: FastAPI):
     from knowledge.portal_search import knowledge_catalog_watcher
     from knowledge.semantic_dimension_worker import semantic_dimension_build_worker_manager
     from projects.registry import project_registry
+    from runtime_identity.paths import PuddingClawPaths
     from tools.skills_scanner import scan_skills
     from worker_access import worker_access_store
 
@@ -142,7 +137,10 @@ async def lifespan(app: FastAPI):
     semantic_assets = get_semantic_asset_registry(BASE_DIR).refresh()
     print(f"🧭 Semantic assets loaded: {semantic_assets.get('count', 0)}")
     project_registry.initialize(BASE_DIR)
-    attachment_store.initialize(BASE_DIR)
+    attachment_store.initialize(
+        BASE_DIR,
+        legacy_base_dirs=(PuddingClawPaths.from_environment().root,),
+    )
     knowledge_catalog_watcher.start(BASE_DIR)
     # SQL Evidence catalog backfill needs the durable Session owner index.
     session_manager.initialize(BASE_DIR)
@@ -173,12 +171,14 @@ async def lifespan(app: FastAPI):
     await _warm_mcp_discovery()
     caps = await capabilities.detect_capabilities(force=True)
     print(f"🔌 Capabilities: {caps.to_dict()}")
+    # LEGACY compatibility bootstrap. /api/chat and one deep-research helper
+    # still depend on it while they await migration; new flows must not do so.
     try:
         agent_manager.initialize(BASE_DIR)
     except Exception as e:
-        print(f"⚠️ Chat Agent initialization failed (missing LLM API key?): {e}")
+        print(f"⚠️ Legacy Chat compatibility runtime initialization failed: {e}")
         traceback.print_exc()
-        print("ℹ️ Server will continue running, but chat features require a valid LLM API key.")
+        print("ℹ️ Server will continue running; the maintained Agent runtime initializes separately.")
     try:
         deepagents_agent_manager.initialize(BASE_DIR)
     except Exception as e:
@@ -244,7 +244,7 @@ from api.analytics import router as analytics_router
 from api.attachments import router as attachments_router
 from api.brain_schema import router as brain_schema_router
 from api.capabilities import router as capabilities_router
-from api.chat import router as chat_router
+from api.chat import router as chat_router  # LEGACY: compatibility only; no longer maintained.
 from api.compress import router as compress_router
 from api.config_api import router as config_router
 from api.connectors import router as connectors_router
@@ -264,13 +264,15 @@ from api.projects import router as projects_router
 from api.read_later import router as read_later_router
 from api.sessions import router as sessions_router
 from api.skill_plans import router as skill_plans_router
+from api.skill_secret_requests import router as skill_secret_requests_router
 from api.skills_api import router as skills_api_router
 from api.stats_api import router as stats_router
 from api.tokens import router as tokens_router
+from api.toolchains import router as toolchains_router
 from api.user_input_requests import router as user_input_requests_router
 from api.web_search_config import router as web_search_config_router
 
-app.include_router(chat_router, prefix="/api")
+app.include_router(chat_router, prefix="/api")  # LEGACY: new conversations use /api/agent.
 app.include_router(agent_router, prefix="/api")
 app.include_router(skills_api_router, prefix="/api")  # Must come before files_router
 app.include_router(files_router, prefix="/api")
@@ -286,6 +288,7 @@ app.include_router(capabilities_router, prefix="/api")
 app.include_router(projects_router, prefix="/api")
 app.include_router(permissions_router, prefix="/api")
 app.include_router(skill_plans_router, prefix="/api")
+app.include_router(skill_secret_requests_router, prefix="/api")
 app.include_router(attachments_router, prefix="/api")
 app.include_router(knowledge_router, prefix="/api")
 app.include_router(analytics_router, prefix="/api")
@@ -294,6 +297,7 @@ app.include_router(logical_dataset_rules_router, prefix="/api")
 app.include_router(database_sql_revisions_router, prefix="/api")
 app.include_router(user_input_requests_router, prefix="/api")
 app.include_router(connectors_router, prefix="/api")
+app.include_router(toolchains_router, prefix="/api")
 app.include_router(brain_schema_router, prefix="/api")
 app.include_router(llm_wiki_router, prefix="/api")
 app.include_router(read_later_router, prefix="/api")

@@ -41,6 +41,22 @@ from tools.llm_wiki_tools import (
 def wiki_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> LlmWikiService:
     monkeypatch.setenv("PUDDINGCLAW_KNOWLEDGE_DIR", str(tmp_path / "knowledge"))
     monkeypatch.delenv("PUDDINGCLAW_GBRAIN_HOME", raising=False)
+    # Unit tests must never inherit the developer machine's hybrid setting and
+    # accidentally connect to a real embedding provider or Milvus on publish.
+    monkeypatch.setattr(
+        "config.get_llm_wiki_retrieval_config",
+        lambda: {
+            "hybrid_enabled": False,
+            "lexical_weight": 0.45,
+            "semantic_weight": 0.55,
+            "candidate_multiplier": 6,
+            "rrf_k": 10,
+            "lexical_strength_weight": 0.03,
+            "dual_channel_bonus": 0.008,
+            "exact_title_bonus": 0.04,
+            "intent_type_bonus": 0.012,
+        },
+    )
     schema = BrainSchemaService(Path(__file__).resolve().parent.parent)
     try:
         schema.initialize()
@@ -117,6 +133,127 @@ def test_llm_wiki_query_tool_description_uses_markdown_first() -> None:
     assert "primary and complete internal knowledge source" in normalized
     assert "Use filtered gbrain tools only after this query" in normalized
     assert "must never replace or skip the Markdown Wiki query" in normalized
+
+
+def test_llm_wiki_hybrid_query_adds_semantic_page_and_keeps_structured_reference(
+    wiki_env: LlmWikiService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = wiki_env.snapshot_raw(source_id="kb", asset_id="semantic", title="Semantic", content="# Semantic\n")
+    bundle = wiki_env.schema.bundle()
+    assert wiki_env.publish(
+        pages=[{
+            "slug": "concepts/semantic-only",
+            "content": _page("Semantic Only", "concept", raw["snapshot_path"], "concepts/semantic-only"),
+        }],
+        expected_bundle_hash=bundle["bundle_hash"],
+        summary="semantic query fixture",
+        model="test:model",
+        raw_paths=[raw["snapshot_path"]],
+    )["published"] is True
+
+    class FakeEmbeddingService:
+        def semantic_query(self, _question: str, *, limit: int):
+            assert limit == 3
+            return {
+                "hits": [{
+                    "slug": "concepts/semantic-only",
+                    "quote": "模型理解出的相关段落",
+                    "chunk_id": "chunk-semantic",
+                    "chunk_title": "Semantic Only",
+                }],
+                "error": None,
+            }
+
+    monkeypatch.setattr(
+        "config.get_llm_wiki_retrieval_config",
+        lambda: {"hybrid_enabled": True, "lexical_weight": 0.45, "semantic_weight": 0.55},
+    )
+    monkeypatch.setattr(wiki_env, "_embedding_service", lambda: FakeEmbeddingService())
+
+    result = wiki_env.query("正文中完全不存在的提问", limit=3)
+
+    assert result["retrieval"]["mode"] == "hybrid"
+    assert result["retrieval"]["semantic_used"] is True
+    assert result["pages"][0]["slug"] == "concepts/semantic-only"
+    assert result["references"][0]["excerpt"] == "模型理解出的相关段落"
+    assert result["references"][0]["matched_by"] == ["semantic"]
+    assert result["references"][0]["chunk_id"] == "chunk-semantic"
+
+
+def test_llm_wiki_hybrid_ranking_keeps_both_core_concepts_above_generic_noise(
+    wiki_env: LlmWikiService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = wiki_env.snapshot_raw(source_id="kb", asset_id="hybrid-ranking", title="Hybrid", content="# Hybrid\n")
+    retrieval = {
+        "hybrid_enabled": False,
+        "lexical_weight": 0.45,
+        "semantic_weight": 0.55,
+        "candidate_multiplier": 6,
+        "rrf_k": 10,
+        "lexical_strength_weight": 0.03,
+        "dual_channel_bonus": 0.008,
+        "exact_title_bonus": 0.04,
+        "intent_type_bonus": 0.012,
+    }
+    monkeypatch.setattr("config.get_llm_wiki_retrieval_config", lambda: dict(retrieval))
+    bundle = wiki_env.schema.bundle()
+    pages = [
+        {
+            "slug": "media/source-article",
+            "content": _page("Prompt 来源文章", "media", raw["snapshot_path"], "media/source-article")
+            + "文章同时介绍从基本事实生成方案，以及主动质疑和验证方案。\n",
+        },
+        {
+            "slug": "systems/opencode",
+            "content": _page("OpenCode", "system", raw["snapshot_path"], "systems/opencode")
+            + "AI 编程工具提供通用方法和工作流。\n",
+        },
+        {
+            "slug": "concepts/first-principles",
+            "content": _page("第一性原理", "concept", raw["snapshot_path"], "concepts/first-principles")
+            + "从最基本的事实出发重新推导并生成方案。\n",
+        },
+        {
+            "slug": "concepts/adversarial-review",
+            "content": _page("对抗式审查", "concept", raw["snapshot_path"], "concepts/adversarial-review")
+            + "主动质疑并验证方案，以攻击视角寻找漏洞。\n",
+        },
+    ]
+    assert wiki_env.publish(
+        pages=pages,
+        expected_bundle_hash=bundle["bundle_hash"],
+        summary="hybrid ranking fixture",
+        model="test:model",
+        raw_paths=[raw["snapshot_path"]],
+    )["published"] is True
+
+    class FakeEmbeddingService:
+        def semantic_query(self, _question: str, *, limit: int):
+            assert limit == 3
+            return {
+                "hits": [
+                    {"slug": "media/source-article", "quote": "来源汇总", "chunk_id": "media"},
+                    {"slug": "systems/opencode", "quote": "通用工具", "chunk_id": "noise"},
+                    {"slug": "concepts/first-principles", "quote": "基本事实", "chunk_id": "first"},
+                    {"slug": "concepts/adversarial-review", "quote": "主动质疑", "chunk_id": "review"},
+                ],
+                "error": None,
+            }
+
+    retrieval["hybrid_enabled"] = True
+    monkeypatch.setattr(wiki_env, "_embedding_service", lambda: FakeEmbeddingService())
+    result = wiki_env.query(
+        "在 AI 编程中，一个方法负责从基本事实生成方案，另一个方法负责主动质疑和验证方案。它们分别是什么？",
+        limit=3,
+    )
+
+    selected = {page["slug"] for page in result["pages"]}
+    assert "concepts/first-principles" in selected
+    assert "concepts/adversarial-review" in selected
+    assert "systems/opencode" not in selected
+    assert result["retrieval"]["ranking_version"] == "weighted-rrf-v2"
 
 
 def test_markdown_file_snapshot_preserves_final_bytes_and_detects_changes(

@@ -20,8 +20,6 @@ import {
   Database,
   BarChart3,
   FolderKanban,
-  Bot,
-  MessagesSquare,
   Workflow,
   Settings,
   Github,
@@ -122,10 +120,6 @@ export default function Sidebar() {
     (session: (typeof sessions)[number]) => session.runtime_mode === "agent",
     []
   );
-  const isChatSession = useCallback(
-    (session: (typeof sessions)[number]) => session.runtime_mode !== "agent",
-    []
-  );
   const projectSessions = useMemo(() => {
     const grouped = new Map<string, typeof sessions>();
     for (const session of sortedSessions) {
@@ -158,12 +152,10 @@ export default function Sidebar() {
       setExpandedProjects(next);
     }
   }
-  const conversationSessions = useMemo(() => {
-    if (runtimeMode === "agent") {
-      return sortedSessions.filter((session) => isAgentSession(session) && !session.project_id);
-    }
-    return sortedSessions.filter((session) => isChatSession(session));
-  }, [runtimeMode, sortedSessions, isAgentSession, isChatSession]);
+  const conversationSessions = useMemo(
+    () => sortedSessions.filter((session) => isAgentSession(session) && !session.project_id),
+    [sortedSessions, isAgentSession],
+  );
 
   const handleProjectPathSelected = useCallback(async (path: string) => {
     const project = await registerProject(path.trim());
@@ -192,9 +184,8 @@ export default function Sidebar() {
   );
 
   const handleSearchResultSelect = useCallback((session: SessionSearchResult) => {
-    const nextMode = session.runtime_mode === "agent" ? "agent" : "chat";
-    setRuntimeMode(nextMode);
-    setCurrentProjectId(nextMode === "agent" ? session.project_id || null : null);
+    setRuntimeMode("agent");
+    setCurrentProjectId(session.project_id || null);
     setSessionId(session.id);
     setWorkspaceView("chat");
     setSearchOpen(false);
@@ -231,42 +222,6 @@ export default function Sidebar() {
     <aside className="flex flex-col h-full relative bg-transparent text-gray-700">
       {/* Primary actions */}
       <div className="px-2 pt-2 pb-1 space-y-0.5">
-        <div className="mb-1 grid grid-cols-2 rounded-xl bg-black/[0.035] p-0.5">
-          <button
-            type="button"
-            onClick={() => {
-              setRuntimeMode("agent");
-              const latest = sortedSessions.find((s) => s.runtime_mode === "agent");
-              setSessionId(latest ? latest.id : "default");
-              if (pathname !== "/") router.push("/");
-            }}
-            className={`flex items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-[12px] transition-all ${
-              runtimeReady && runtimeMode === "agent"
-                ? "bg-white/85 text-gray-900 shadow-sm"
-                : "text-gray-500 hover:text-gray-800"
-            }`}
-          >
-            <Bot className="h-3.5 w-3.5" />
-            Agent
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setRuntimeMode("chat");
-              const latest = sortedSessions.find((s) => s.runtime_mode !== "agent");
-              setSessionId(latest ? latest.id : "default");
-              if (pathname !== "/") router.push("/");
-            }}
-            className={`flex items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-[12px] transition-all ${
-              runtimeReady && runtimeMode === "chat"
-                ? "bg-white/85 text-gray-900 shadow-sm"
-                : "text-gray-500 hover:text-gray-800"
-            }`}
-          >
-            <MessagesSquare className="h-3.5 w-3.5" />
-            Chat
-          </button>
-        </div>
         <button
           onClick={() => {
             // Already sitting on an unsent new chat: keep the draft and
@@ -321,7 +276,7 @@ export default function Sidebar() {
           智能问数
         </Link>
         <Link
-          href="/extension/skills"
+          href="/extension/connectors"
           className={`w-full flex items-center gap-2 px-3 py-2 text-[13px] rounded-xl transition-all ${
             runtimeReady && pathname.startsWith("/extension")
               ? "bg-[#002fa7] text-white font-medium shadow-sm shadow-[#002fa7]/20"
@@ -485,13 +440,8 @@ export default function Sidebar() {
                 isRunning={runningSessionIds.has(s.id)}
                 isActive={isChatRoute && sessionId === s.id}
                 onSelect={() => {
-                  if (s.runtime_mode === "agent") {
-                    setRuntimeMode("agent");
-                    setCurrentProjectId(null);
-                  } else {
-                    setRuntimeMode("chat");
-                    setCurrentProjectId(null);
-                  }
+                  setRuntimeMode("agent");
+                  setCurrentProjectId(null);
                   setSessionId(s.id);
                   setWorkspaceView("chat");
                   if (pathname !== "/") {

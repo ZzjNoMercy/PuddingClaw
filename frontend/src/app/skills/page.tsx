@@ -76,7 +76,11 @@ export default function SkillsPage() {
     setPendingInput,
   } = useApp();
   const [extensionView, setExtensionView] = useState<"connectors" | "skills" | "mcp">(
-    pathname === "/extension/mcp" ? "mcp" : "skills"
+    pathname === "/extension/connectors"
+      ? "connectors"
+      : pathname === "/extension/mcp"
+        ? "mcp"
+        : "skills"
   );
   const [skills, setSkills] = useState<SkillInfo[]>([]);
   const [loading, setLoading] = useState(true);
@@ -110,6 +114,8 @@ export default function SkillsPage() {
   useEffect(() => {
     if (pathname === "/skills") {
       router.replace(`/extension/skills${window.location.search}`);
+    } else if (pathname === "/extension/connectors") {
+      setExtensionView("connectors");
     } else if (pathname === "/extension/mcp") {
       setExtensionView("mcp");
     } else if (pathname === "/extension/skills") {
@@ -261,27 +267,53 @@ export default function SkillsPage() {
     [showToast, loadSkills, loadSkillDetail]
   );
 
-  // ── Import skill from ZIP ────────────────────────────
+  // ── Import skill from ZIP, .skill, or folder ─────────
   const handleImportSkill = useCallback(
-    async (file: File) => {
+    async (formData: FormData) => {
       setImporting(true);
       try {
-        const formData = new FormData();
-        formData.append("file", file);
-
         const response = await fetch("/api/skills/import", {
           method: "POST",
           body: formData,
         });
 
         if (!response.ok) {
-          const error = await response.json();
-          throw new Error(error.detail || "导入失败");
+          throw new Error(await importErrorMessage(response));
         }
 
-        const result = await response.json();
+        let result = await response.json();
+        if (result.requires_confirmation && result.plan) {
+          const plan = result.plan;
+          const diff = plan.diff ?? {};
+          const confirmed = window.confirm(
+            `Skill "${plan.skill_name}" 已存在，是否更新？\n\n` +
+              `变更：${diff.summary ?? "未知"}\n` +
+              `新增 ${diff.added?.length ?? 0}，修改 ${diff.changed?.length ?? 0}，删除 ${diff.removed?.length ?? 0}`
+          );
+          if (!confirmed) {
+            await fetch(`/api/skills/import/${encodeURIComponent(plan.plan_id)}/cancel`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ plan_sha256: plan.plan_sha256 }),
+            });
+            showToast("success", `已取消更新 Skill "${plan.skill_name}"`);
+            return;
+          }
+          const commitResponse = await fetch(
+            `/api/skills/import/${encodeURIComponent(plan.plan_id)}/commit`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ plan_sha256: plan.plan_sha256 }),
+            }
+          );
+          if (!commitResponse.ok) {
+            throw new Error(await importErrorMessage(commitResponse));
+          }
+          result = await commitResponse.json();
+        }
         showToast("success", `Skill "${result.skill_name}" 导入成功`);
-        loadSkills();
+        await loadSkills();
         setShowImportModal(false);
       } catch (err) {
         showToast("error", err instanceof Error ? err.message : "导入失败");
@@ -383,16 +415,9 @@ export default function SkillsPage() {
       if (view === extensionView) return;
       if (isDirty && !window.confirm("当前文件有未保存的更改，确定要切换吗？")) return;
       setExtensionView(view);
-      if (view === "mcp") {
-        window.history.pushState(null, "", "/extension/mcp");
-        return;
-      }
-      if (view === "skills") {
-        window.history.pushState(null, "", "/extension/skills");
-        return;
-      }
+      router.push(`/extension/${view}`);
     },
-    [extensionView, isDirty]
+    [extensionView, isDirty, router]
   );
 
   // ── Loading state ────────────────────────────────────
@@ -1009,7 +1034,7 @@ function ImportSkillModal({
   importing,
 }: {
   onClose: () => void;
-  onImport: (file: File) => Promise<void>;
+  onImport: (formData: FormData) => Promise<void>;
   importing: boolean;
 }) {
   const [uploadMode, setUploadMode] = useState<UploadMode>("zip");
@@ -1078,10 +1103,10 @@ function ImportSkillModal({
   };
 
   const handleSubmit = async () => {
+    const formData = new FormData();
     if (uploadMode === "folder") {
       if (!selectedFiles || !skillName.trim()) return;
 
-      const formData = new FormData();
       Array.from(selectedFiles).forEach((file) => {
         // Use webkitRelativePath as filename to preserve folder structure
         const relativePath = (file as any).webkitRelativePath || file.name;
@@ -1089,30 +1114,11 @@ function ImportSkillModal({
         formData.append("files", file, relativePath);
       });
       formData.append("skill_name", skillName.trim());
-
-      try {
-        // Use full backend URL instead of relative path
-        const API_BASE = "/api";
-        const response = await fetch(`${API_BASE}/skills/import`, {
-          method: "POST",
-          body: formData,
-        });
-
-        if (!response.ok) {
-          const error = await response.json();
-          throw new Error(error.detail || "导入失败");
-        }
-
-        const result = await response.json();
-        // Trigger parent refresh
-        window.location.reload();
-      } catch (err) {
-        alert(err instanceof Error ? err.message : "导入失败");
-      }
     } else {
       if (!selectedFile) return;
-      await onImport(selectedFile);
+      formData.append("files", selectedFile);
     }
+    await onImport(formData);
   };
 
   const getAcceptAttr = () => {
@@ -1287,9 +1293,9 @@ function ImportSkillModal({
                 </div>
               </div>
               <div className="text-[10px] text-gray-400 mt-2">
-                {uploadMode === "zip" && "仅支持 .zip 格式，最大 50MB"}
-                {uploadMode === "skill" && "仅支持 .skill 格式，最大 50MB"}
-                {uploadMode === "folder" && "选择包含 SKILL.md 的文件夹"}
+                {uploadMode === "zip" && "压缩包最大 50MB，解压后最大 20MB"}
+                {uploadMode === "skill" && "仅支持 .skill 格式，最大 20MB"}
+                {uploadMode === "folder" && "包含 SKILL.md，总大小最大 20MB"}
               </div>
             </div>
           )}
@@ -1334,6 +1340,27 @@ function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes}B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+}
+
+async function importErrorMessage(response: Response): Promise<string> {
+  const payload = await response.json().catch(() => null);
+  const detail = payload?.detail;
+  if (typeof detail === "string") return detail;
+  if (detail && typeof detail.message === "string") return detail.message;
+  if (Array.isArray(detail)) {
+    const messages = detail
+      .map((item) => {
+        if (!item || typeof item !== "object") return null;
+        const message = typeof item.msg === "string" ? item.msg : null;
+        const location = Array.isArray(item.loc)
+          ? item.loc.filter((part: unknown) => part !== "body").join(".")
+          : "";
+        return message ? `${location ? `${location}: ` : ""}${message}` : null;
+      })
+      .filter((message): message is string => Boolean(message));
+    if (messages.length > 0) return messages.join("；");
+  }
+  return `导入失败 (${response.status})`;
 }
 
 // ── Rename Skill Modal ──────────────────────────────────
