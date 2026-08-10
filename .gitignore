@@ -66,6 +66,7 @@ iterm2_workspace.iterm2arrangement
 /docs/*
 !/docs/session-and-context-architecture.md
 !/docs/legacy-chat.md
+!/docs/spawn-kernel-execution-architecture.md
 
 # Logs
 *.log
