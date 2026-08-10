@@ -1,7 +1,9 @@
 # Spawn + Kernel 双执行模式重构方案
 
 状态：设计方案，待实施
+
 日期：2026-08-11
+
 范围：只移除 PuddingClaw 自己的 Docker 沙箱与 Docker 运行时选择；不移除项目、工具或第三方服务对 Docker 的正常依赖。
 
 ## 1. 决策摘要
@@ -532,12 +534,13 @@ class RuntimeBinding:
 | 旧值 | 迁移策略 |
 | --- | --- |
 | 显式 `kernel` | 自动迁移为 `execution_mode=kernel` |
-| 显式 `auto` | 标记为待选择；UI 一次性要求选择，Headless 启动返回可操作的配置错误 |
+| 显式 `auto` | 自动迁移为 `execution_mode=kernel`；保留旧模式的 kernel-first 安全意图，Kernel 不可用时改走新的 Run 级询问 |
 | 显式 `docker` | 标记为待选择；不能假装等价迁移 |
-| 只有旧 `docker_enabled` | 标记为 legacy unresolved；要求选择 |
+| 只有旧 `docker_enabled=true` | 标记为 legacy unresolved；要求用户选择 |
+| 只有旧 `docker_enabled=false` | 自动迁移为 `execution_mode=spawn` |
 | 新安装或确知从未显式配置 | 使用 `spawn` 默认值 |
 
-如果希望降低迁移打扰，可以把旧 `auto` 保守映射为 `kernel`，因为这是收紧而不是放宽；但不能自动映射为 `spawn`。实施前应在一个迁移测试中固定最终选择。
+`auto -> kernel` 是保守迁移，不会把旧的隔离意图静默降级为宿主执行。旧 `docker` 无法无损映射到任一新模式，因此 UI 必须一次性要求选择，Headless 启动则返回可操作的配置错误。
 
 ### 9.3 历史 Run 和 manifest
 
